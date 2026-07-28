@@ -315,7 +315,105 @@ export function isPassRunning(): boolean {
 
 /** How a pass ended. `cancelled` marks the deliberate-handoff path — an `ok: false` that is NOT
  *  a failure, so it must not warn or park the agent on "blocked". */
-type PassOutcome = { ok: boolean; text: string; cancelled?: boolean };
+type PassOutcome = {
+  ok: boolean;
+  text: string;
+  cancelled?: boolean;
+  timedOut?: boolean;
+  /** Resolves when the watchdog's kill invoke has RETURNED. Carried on the outcome so the
+   *  leftovers probe can be ordered after the process group is actually gone — see
+   *  `reportTimeoutLeftovers`. Never rejects. */
+  killed?: Promise<boolean>;
+};
+
+/** How long the leftovers probe waits for the kill to be reaped, and then for park itself. Both
+ *  are bounds on a path that runs BEFORE the in-flight latch is released, so neither may be
+ *  unbounded; a diagnostic must never be able to end the hourly loop. */
+export const PROBE_KILL_WAIT_MS = 10_000;
+export const PROBE_TIMEOUT_MS = 20_000;
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Say what a pass killed by the watchdog LEFT BEHIND in the worktree.
+ *
+ *  The timeout message names the wall and stops there, which makes the single most common way a
+ *  pass fails also the least actionable one. Two very different things hide behind one line: a pass
+ *  that was still editing when SIGKILL arrived (30 minutes of uncommitted work, gone) and a pass
+ *  that had committed and pushed and merely overran its wrap-up (nothing lost at all). The
+ *  responses are opposite — shrink the scope the mission prompt asks for, versus nothing.
+ *
+ *  It also joins up two log signatures that are the SAME event seen an hour apart from opposite
+ *  ends. A kill that leaves the tree dirty is exactly why the next hour's pass declines to park and
+ *  reports `starting from a stale base`, and until now nothing connected them: the drift looked
+ *  spontaneous at the point it was observed, and the kill looked consequence-free at the point it
+ *  was caused.
+ *
+ *  The probe is `parkWorktreeOnBase` rather than a status of its own, because park already answers
+ *  precisely the question worth asking — is there anything here worth NOT throwing away — and it
+ *  declines, naming the reason, whenever there is. Running it now is not extra work either: it is
+ *  the same call the next pass makes at startup, an hour earlier. Advisory throughout, exactly like
+ *  the startup park: a pass has already failed by the time this runs, and a probe must not be able
+ *  to turn that into a thrown error on the way out. */
+async function reportTimeoutLeftovers(
+  repoPath: string,
+  defaultBranch: string,
+  killed: Promise<boolean> | undefined,
+): Promise<void> {
+  try {
+    // A CONFIRMED REAP IS A PRECONDITION, NOT A DELAY. `parkWorktreeOnBase` is not read-only — it
+    // stashes tooling churn and checks the worktree out onto the base — so running it while the
+    // process group may still be alive would let it check out over a `claude` that is still
+    // writing, and would sample the tree before the writes stopped. It would destroy the very work
+    // it exists to report on, and then report that there was none.
+    //
+    // So the two ways the kill fails to confirm — the wait expiring, and the invoke REJECTING —
+    // must both abandon the probe rather than fall through it. They are exactly the cases where
+    // the group is most likely still running, which makes falling through worst precisely when it
+    // is least safe. A diagnostic is not worth a worktree; say so and stop.
+    const reaped = await Promise.race([
+      killed ?? Promise.resolve(true),
+      delay(PROBE_KILL_WAIT_MS).then(() => false),
+    ]);
+    if (!reaped) {
+      console.warn(
+        "improvement pass: could not confirm the kill, so the worktree was left untouched " +
+          "and unexamined",
+      );
+      return;
+    }
+    const park = await Promise.race([
+      parkWorktreeOnBase(repoPath, SPARKLE_PROJECT_ID, SPARKLE_AGENT_ID, defaultBranch),
+      // BOUNDED, because this is awaited before the latch is released. Park takes the per-repo git
+      // lock and fetches, so an unbounded wait here could hold `passRunning` forever — which is the
+      // exact wedge the watchdog exists to prevent, reintroduced on the most common failure path.
+      delay(PROBE_TIMEOUT_MS).then(() => null),
+    ]);
+    if (park === null) {
+      console.warn("improvement pass: gave up waiting to see what the killed pass left behind");
+    } else if (park.reason === "dirty" || park.reason === "unpushed") {
+      console.warn(
+        "improvement pass: the killed pass left work behind —",
+        park.reason,
+        "— the next pass will start from a stale base",
+      );
+    } else if (park.parked || park.reason === "already-fresh") {
+      // Says nothing about whether the pass ACCOMPLISHED anything — a pass that committed, pushed
+      // and opened its PR parks clean too. It says only that the kill destroyed nothing, which is
+      // the half of the question the worktree can actually answer.
+      console.warn("improvement pass: the killed pass left nothing at risk in the worktree");
+    } else {
+      // `no-worktree`, `no-base`, `checkout-failed`: the probe could not CONCLUDE. Reporting those
+      // as leftovers would be the same ambiguity this change exists to remove, moved one line down
+      // — and would attach a stale-base prediction that is simply false for `no-worktree`.
+      console.warn(
+        "improvement pass: could not tell what the killed pass left behind —",
+        park.reason,
+      );
+    }
+  } catch (e) {
+    console.warn("improvement pass: could not tell what the killed pass left behind:", e);
+  }
+}
 
 /** Settles the in-flight pass when it is killed from OUTSIDE its own promise. Null when no pass
  *  is running. The Rust cancel is silent by design (it emits no error event, so a cancel can't
@@ -468,8 +566,19 @@ export async function runImprovementPass(
       // Hung-pass watchdog: kill the pass and release the latch rather than wait forever
       // (roborev #24516). cancel is silent by design (no error event), so settle here.
       const timer = setTimeout(() => {
-        void cancelImprovementPass().catch(() => {});
-        settle({ ok: false, text: `pass timed out after ${PASS_BUDGET_MINUTES} minutes and was killed` });
+        // Handed to the outcome, not discarded: the leftovers probe MUST NOT touch the worktree
+        // until this has returned. `settle` still runs synchronously right after, so the timeout
+        // text keeps winning the race against the cancel hook.
+        const killed = cancelImprovementPass().then(
+          () => true,
+          () => false,
+        );
+        settle({
+          ok: false,
+          timedOut: true,
+          killed,
+          text: `pass timed out after ${PASS_BUDGET_MINUTES} minutes and was killed`,
+        });
       }, PASS_TIMEOUT_MS);
       // Each unlistener is captured as ITS OWN listen resolves (not from Promise.all's result):
       // if one listen registers and the other rejects, the fulfilled handle must still reach
@@ -519,6 +628,11 @@ export async function runImprovementPass(
       setStatus(SPARKLE_AGENT_ID, "idle");
     } else {
       console.warn("improvement pass failed:", outcome.text);
+      // Only on a timeout. Every other failure shape either never started the agent (preflight,
+      // transport) or was reported BY it, so there is no half-finished work to characterize — and
+      // an unconditional probe would park the worktree out from under the retry armed just below.
+      if (outcome.timedOut)
+        await reportTimeoutLeftovers(ws.repoPath, ws.defaultBranch, outcome.killed);
       armRetryIfTransient(outcome.text);
       setStatus(SPARKLE_AGENT_ID, "blocked");
     }

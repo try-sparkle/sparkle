@@ -61,6 +61,8 @@ import {
   isPassRunning,
   PASS_TIMEOUT_MS,
   passRetryDueAt,
+  PROBE_KILL_WAIT_MS,
+  PROBE_TIMEOUT_MS,
   resetPassRetryForTests,
   runImprovementPass,
 } from "./improvementPass";
@@ -384,6 +386,221 @@ describe("runImprovementPass watchdog", () => {
         "improvement pass failed:",
         expect.stringContaining("timed out"),
       );
+    });
+  });
+
+  // A killed pass is the single most common way a pass fails (measured: ~1 in 5), and the timeout
+  // line alone cannot tell "30 minutes of edits went in the bin" from "it had already pushed".
+  // These pin the after-the-kill probe that answers it — and, in the last one, pin that the probe
+  // is confined to timeouts, since parking on any other failure would move the worktree out from
+  // under the connectivity retry armed on the very next line.
+  describe("what a killed pass left behind", () => {
+    /** Park outcomes to hand back in order: index 0 is the pass's own startup park, index 1 is the
+     *  post-kill probe. Positional on purpose — asserting on the SECOND call is what distinguishes
+     *  a probe that ran from a startup park being miscounted as one. */
+    function planParks(
+      first: import("./worktree").ParkOutcome,
+      ...rest: Array<import("./worktree").ParkOutcome>
+    ) {
+      const outcomes = [first, ...rest];
+      let n = 0;
+      // The clamp keeps a probe that runs when none was planned from getting `undefined` — it
+      // repeats the last outcome instead, so the miscount shows up as the call-count assertion
+      // failing rather than as a crash inside the service.
+      harness.parkImpl = () =>
+        Promise.resolve(outcomes[Math.min(n++, outcomes.length - 1)] ?? first);
+      return () => n;
+    }
+
+    it("names the leftovers, and the drift they cause, when the probe declines", async () => {
+      const parks = planParks(
+        { parked: true, reason: "parked" },
+        { parked: false, reason: "dirty" },
+      );
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+        await pass;
+
+        expect(parks()).toBe(2);
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass: the killed pass left work behind —",
+          "dirty",
+          "— the next pass will start from a stale base",
+        );
+      });
+    });
+
+    it.each(["parked", "already-fresh"] as const)(
+      "reports nothing at risk when the probe comes back %s",
+      async (reason) => {
+        // Both shapes mean the same thing to the caller — the kill destroyed nothing — and
+        // `already-fresh` is the one a declined-park regression would most easily mislabel as
+        // leftovers, since it is a NOT-parked outcome that is nonetheless clean.
+        planParks(
+          { parked: true, reason: "parked" },
+          { parked: reason === "parked", reason },
+        );
+        await withWarnSpy(async (warn) => {
+          const pass = runImprovementPass("always");
+          await untilRunInvoked();
+          await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+          await pass;
+
+          expect(warn).toHaveBeenCalledWith(
+            "improvement pass: the killed pass left nothing at risk in the worktree",
+          );
+        });
+      },
+    );
+
+    it("a failure that is not a timeout is not probed at all", async () => {
+      const parks = planParks({ parked: true, reason: "parked" });
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        harness.handlers.get("sparkle_improve:error")?.({
+          payload: { message: "You've hit your weekly limit" },
+        });
+        await pass;
+
+        // The startup park and nothing more.
+        expect(parks()).toBe(1);
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass failed:",
+          expect.stringContaining("weekly limit"),
+        );
+        expect(
+          warn.mock.calls.some((c) => String(c[0]).includes("the killed pass left")),
+        ).toBe(false);
+      });
+    });
+
+    it("an indeterminate park reason is NOT reported as lost work", async () => {
+      // `no-worktree`/`no-base`/`checkout-failed` mean the probe could not conclude. Calling those
+      // leftovers would put back the same ambiguity this change removes, and the stale-base
+      // prediction is simply false for them.
+      planParks({ parked: true, reason: "parked" }, { parked: false, reason: "no-base" });
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+        await pass;
+
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass: could not tell what the killed pass left behind —",
+          "no-base",
+        );
+        expect(
+          warn.mock.calls.some((c) => String(c[0]).includes("left work behind")),
+        ).toBe(false);
+      });
+    });
+
+    it("does not touch the worktree until the kill invoke has returned", async () => {
+      // The probe is not read-only — park stashes and checks out — so running it while the process
+      // group is still being reaped would check out over a `claude` that is still writing, and
+      // sample the tree before its writes stopped. Ordering is the whole guard.
+      let cancelDone!: () => void;
+      harness.invokeImpl = (cmd) =>
+        cmd === "sparkle_improve_cancel"
+          ? new Promise<void>((r) => {
+              cancelDone = r;
+            })
+          : undefined;
+      const parks = planParks({ parked: true, reason: "parked" });
+      await withWarnSpy(async () => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+
+        // Kill still in flight: the startup park and nothing more.
+        expect(parks()).toBe(1);
+        cancelDone();
+        await pass;
+        expect(parks()).toBe(2);
+      });
+    });
+
+    it.each([
+      ["the kill wait expires", "expire" as const],
+      ["the kill invoke rejects", "reject" as const],
+    ])("leaves the worktree untouched when %s", async (_name, mode) => {
+      // These are the cases where the process group is most likely STILL ALIVE, which makes
+      // falling through into park worst exactly where it is least safe: park stashes and checks
+      // out, so it would destroy the work it exists to report on. A diagnostic is not worth a
+      // worktree — no park at all, and a line that says so.
+      harness.invokeImpl = (cmd) =>
+        cmd === "sparkle_improve_cancel"
+          ? mode === "reject"
+            ? Promise.reject(new Error("kill failed"))
+            : new Promise<void>(() => {}) // never returns
+          : undefined;
+      const parks = planParks({ parked: true, reason: "parked" });
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+        await vi.advanceTimersByTimeAsync(PROBE_KILL_WAIT_MS);
+        await pass;
+
+        // The startup park and nothing more.
+        expect(parks()).toBe(1);
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass: could not confirm the kill, so the worktree was left untouched " +
+            "and unexamined",
+        );
+        // The bound exists so a diagnostic can never end the hourly loop.
+        expect(isPassRunning()).toBe(false);
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      });
+    });
+
+    it("a park that never returns cannot hold the hourly loop", async () => {
+      // The probe is awaited BEFORE the latch is released, and park takes the per-repo git lock and
+      // fetches. Unbounded, it would reintroduce the exact wedge the watchdog exists to prevent —
+      // on the most common failure path.
+      planParks({ parked: true, reason: "parked" });
+      let n = 0;
+      harness.parkImpl = () =>
+        n++ === 0
+          ? Promise.resolve({ parked: true, reason: "parked" })
+          : new Promise(() => {}); // never settles
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+        await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS);
+        await pass;
+
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass: gave up waiting to see what the killed pass left behind",
+        );
+        expect(isPassRunning()).toBe(false);
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      });
+    });
+
+    it("a probe that throws is swallowed — the pass still ends blocked, with the latch released", async () => {
+      let n = 0;
+      harness.parkImpl = () =>
+        n++ === 0
+          ? Promise.resolve({ parked: true, reason: "parked" })
+          : Promise.reject(new Error("git is busy"));
+      await withWarnSpy(async (warn) => {
+        const pass = runImprovementPass("always");
+        await untilRunInvoked();
+        await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+        await expect(pass).resolves.toBeUndefined();
+
+        expect(isPassRunning()).toBe(false);
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+        expect(warn).toHaveBeenCalledWith(
+          "improvement pass: could not tell what the killed pass left behind:",
+          expect.any(Error),
+        );
+      });
     });
   });
 

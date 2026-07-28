@@ -1013,6 +1013,48 @@ fn hooks_path_warned() -> &'static Mutex<HashSet<String>> {
     WARNED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Which git config SCOPE sets `core.hooksPath`, from `git config --show-scope --get` output
+/// (`<scope>\t<value>`). Returns `"unknown"` for anything unrecognised.
+///
+/// The scope is the missing half of the inert-hooks warning below. "Point `core.hooksPath` at the
+/// repo's own hooks dir, or unset it" is not actionable without it: `--unset` needs the right
+/// `--global`/`--local` flag to do anything, and a GLOBAL setting is the one case where unsetting is
+/// the wrong advice — it would disable the user's hooks in every repo on the machine to fix one.
+///
+/// Knowing the scope is also what keeps the REMEDY honest, and the honest answer is that BOTH ways
+/// out cost something — so the message states the costs rather than recommending one, and every
+/// clause in it is there because the confident version of it was wrong:
+///   * `core.hooksPath` is a single path, not additive. A repo-local override does not sit alongside
+///     the configured dir; it replaces it for that repo, and whatever hooks lived there (husky, a
+///     company `pre-commit`, a secret scanner) stop running. Trading one silent no-op for another is
+///     the failure this warning exists to surface.
+///   * Populating the configured dir instead is not free either. `ROBOREV_HOOKS` is
+///     `post-commit`/`post-rewrite` — names a hook manager commonly owns — so a plain copy clobbers
+///     one, the exact data loss `may_write_hook` refuses to commit 30 lines below. And a
+///     global/system dir is shared by every repo on the machine, which is why this code does not
+///     write there itself (see `hooks_dir_for`).
+///   * `worktree` scope outranks local when `extensions.worktreeConfig` is on, so an override there
+///     must be written with `--worktree` or it is silently a no-op. `command` scope takes neither
+///     route: the redirect comes from the invocation environment, which no config write reaches.
+/// The warn is deduped per repo, so the user acts on it once — a caveat left out is not one they get
+/// a second chance to hear.
+///
+/// Only the scope token is taken, never the value: this runs for every project the user opens,
+/// including their own repositories, and a configured path is theirs. The token is a small fixed
+/// vocabulary, so it carries the whole decision above and nothing else. Anything outside that
+/// vocabulary — a git too old for `--show-scope`, an empty or garbled line — reads as `"unknown"`
+/// rather than being echoed, so an unexpected shape can never leak through as content.
+fn hooks_path_scope(raw: &str) -> &'static str {
+    match raw.split('\t').next().map(str::trim) {
+        Some("system") => "system",
+        Some("global") => "global",
+        Some("local") => "local",
+        Some("worktree") => "worktree",
+        Some("command") => "command",
+        _ => "unknown",
+    }
+}
+
 /// Would hooks written to `installed_into` be INERT — i.e. is git configured to read hooks from
 /// somewhere else entirely?
 ///
@@ -1101,12 +1143,26 @@ pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String
             .map(|mut w| w.insert(repo_root.to_string()))
             .unwrap_or(true);
         if first_time {
+            // Which scope set it decides what the user should actually DO — see `hooks_path_scope`.
+            // A second `git config` call, on this rare path only, so the read above that park and
+            // the inertness check depend on keeps its exact shape.
+            let scope = git(repo_root, &["config", "--show-scope", "--get", "core.hooksPath"])
+                .map(|raw| hooks_path_scope(&raw))
+                .unwrap_or("unknown");
             tracing::warn!(
                 repo = %repo_root,
                 installed_into = %hooks_dir.display(),
+                scope = %scope,
                 "roborev hooks installed but core.hooksPath redirects git elsewhere — they will \
-                 not run; point core.hooksPath at the repo's own hooks dir, or unset it, to \
-                 re-enable per-commit review"
+                 not run, so per-commit review is inert here. Re-enabling means one of two \
+                 things, each with a cost: make the configured dir run them (it may already hold \
+                 a post-commit/post-rewrite of its own, which wants chaining rather than \
+                 overwriting, and a global/system dir is shared by every repo on this machine), \
+                 or point core.hooksPath at installed_into for this repo — core.hooksPath is a \
+                 single path, not additive, so that REPLACES the configured dir here and its \
+                 hooks stop running in this repo. Write that override with --worktree, not \
+                 --local, when the scope below is `worktree`; a scope of `command` comes from the \
+                 invocation environment (-c / GIT_CONFIG_*), which no config change reaches."
             );
         }
     }
@@ -4934,6 +4990,42 @@ mod tests {
         );
         // Empty-but-present foreign file is still foreign.
         assert!(!may_write_hook(true, Some(""), marker));
+    }
+
+    /// The warning is only actionable if it says which SCOPE set `core.hooksPath`, and the scope
+    /// must be read out of `--show-scope`'s `<scope>\t<value>` WITHOUT the value coming with it —
+    /// that value is a path in the user's own repository. Every unrecognised shape has to collapse
+    /// to `"unknown"`, because the alternative on this path is echoing content.
+    #[test]
+    fn hooks_path_scope_reads_the_token_and_never_the_value() {
+        // The real shapes: scope, a tab, then the configured path.
+        assert_eq!(hooks_path_scope("global\t/Users/someone/.config/git/hooks"), "global");
+        assert_eq!(hooks_path_scope("local\t.githooks"), "local");
+        assert_eq!(hooks_path_scope("system\t/etc/githooks"), "system");
+        assert_eq!(hooks_path_scope("worktree\t.git/hooks"), "worktree");
+        assert_eq!(hooks_path_scope("command\t/tmp/h"), "command");
+
+        // `git` trims its output, so a trailing newline (and a stray space) must still resolve.
+        assert_eq!(hooks_path_scope("global\t/x/y\n"), "global");
+        assert_eq!(hooks_path_scope(" global \t/x/y"), "global");
+
+        // Anything else is `unknown` — never a passthrough. A git too old for `--show-scope` prints
+        // the bare value, which is precisely the string that must NOT be reported.
+        assert_eq!(hooks_path_scope("/Users/someone/.config/git/hooks"), "unknown");
+        assert_eq!(hooks_path_scope(""), "unknown");
+        assert_eq!(hooks_path_scope("\t/x/y"), "unknown");
+        assert_eq!(hooks_path_scope("GLOBAL\t/x/y"), "unknown", "scope tokens are lowercase");
+
+        // The returned token is 'static and from the fixed vocabulary, so no caller can smuggle a
+        // borrowed slice of the input out of here.
+        for raw in ["global\t/secret/path", "/secret/path", "nonsense"] {
+            let scope = hooks_path_scope(raw);
+            assert!(
+                ["system", "global", "local", "worktree", "command", "unknown"].contains(&scope),
+                "scope {scope:?} escaped the vocabulary"
+            );
+            assert!(!scope.contains('/'), "scope {scope:?} carried part of the value");
+        }
     }
 
     /// `core.hooksPath` is frequently set GLOBALLY, which silently redirects git away from the
