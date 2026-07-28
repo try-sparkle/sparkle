@@ -11,18 +11,22 @@ import {
 import type { EffectiveConfig } from "../services/config";
 
 describe("effectiveChiefPat — PAT resolution order", () => {
-  it("prefers a user-entered (stored) PAT, trimmed", () => {
-    expect(effectiveChiefPat("  pat_user  ", "pat_runtime")).toBe("pat_user");
+  it("prefers the OS-keychain PAT, trimmed", () => {
+    expect(effectiveChiefPat("  pat_keychain  ", "pat_user", "pat_runtime")).toBe("pat_keychain");
   });
 
-  it("falls back to the runtime env-resolved PAT when nothing is stored", () => {
-    expect(effectiveChiefPat("", "pat_runtime")).toBe("pat_runtime");
-    expect(effectiveChiefPat("   ", "pat_runtime")).toBe("pat_runtime");
+  it("falls back to the legacy stored PAT when the keychain is empty", () => {
+    expect(effectiveChiefPat("", "  pat_user  ", "pat_runtime")).toBe("pat_user");
   });
 
-  it("is empty when neither a stored nor a runtime PAT exists (no build-env token in tests)", () => {
+  it("falls back to the runtime env-resolved PAT when neither keychain nor stored is set", () => {
+    expect(effectiveChiefPat("", "", "pat_runtime")).toBe("pat_runtime");
+    expect(effectiveChiefPat("   ", "  ", "pat_runtime")).toBe("pat_runtime");
+  });
+
+  it("is empty when no keychain, stored, or runtime PAT exists (no build-env token in tests)", () => {
+    expect(effectiveChiefPat("", "", "")).toBe("");
     expect(effectiveChiefPat("", "")).toBe("");
-    expect(effectiveChiefPat("")).toBe("");
   });
 });
 

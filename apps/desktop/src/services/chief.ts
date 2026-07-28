@@ -12,6 +12,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { useSettingsStore } from "../stores/settingsStore";
 
 const BASE = import.meta.env.DEV ? "/chief-api" : "https://api.storytell.ai";
 
@@ -838,4 +839,95 @@ export async function createLabel(
     body: JSON.stringify({ name, color: opts.color, icon: opts.icon }),
   });
   return (await parseOrThrow(res)) as { label_id?: string; name: string };
+}
+
+// ── User-entered PAT: OS keychain secure store (bead ) ──────────────
+// The user-entered Chief PAT is written to the OS keychain (Rust chief_pat_secure_*) whenever it is
+// saved, and read keychain-first at launch into the in-memory keychainChiefPat. A legacy plaintext
+// value still in localStorage keeps working as a READ-ONLY fallback until the user next saves; this
+// module never migrates, scrubs, or stashes that legacy value (full migration is a follow-up bead).
+
+/** Read the user-entered Chief PAT from the OS keychain. Returns an empty string when absent. */
+export async function getStoredChiefPat(): Promise<string> {
+  try {
+    const raw = await invoke<string>("chief_pat_secure_get");
+    return (raw ?? "").trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Write the PAT into the OS keychain. Returns true ONLY on a confirmed write. */
+export async function storeChiefPat(pat: string): Promise<boolean> {
+  try {
+    await invoke("chief_pat_secure_set", { pat });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Delete the PAT from the OS keychain. Returns true ONLY on a confirmed delete. */
+export async function clearStoredChiefPat(): Promise<boolean> {
+  try {
+    await invoke("chief_pat_secure_clear");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Seed the in-memory keychainChiefPat from the OS keychain at launch (the keychain-first read). Sets
+ * the value unconditionally, including an empty string, so a removed/cleared keychain entry does not
+ * leave a stale value; effectiveChiefPat then falls back to the legacy localStorage PAT or the env
+ * PAT. Never throws.
+ */
+export async function seedKeychainChiefPat(): Promise<void> {
+  // Retire the abandoned migration pending key: an earlier build on this branch (699209e) stashed a
+  // plaintext PAT under "sparkle-chief-pat-pending" for a migration that was later cut. Best-effort
+  // delete any leftover so it cannot linger as plaintext at rest. Safe to drop after a release or two.
+  try {
+    localStorage.removeItem("sparkle-chief-pat-pending");
+  } catch {
+    // best-effort
+  }
+  const pat = await getStoredChiefPat();
+  useSettingsStore.getState().setKeychainChiefPat(pat);
+}
+
+/**
+ * THE write path for a newly entered / changed PAT: write the OS keychain first and only reflect it
+ * into the in-memory keychainChiefPat when the write is confirmed, so the store of record (keychain)
+ * and the value the app uses cannot diverge. Returns true on success. Any connect UI must call this.
+ */
+export async function saveChiefPat(pat: string): Promise<boolean> {
+  const ok = await storeChiefPat(pat);
+  if (ok) {
+    const s = useSettingsStore.getState();
+    s.setKeychainChiefPat(pat.trim());
+    // Clear the superseded legacy localStorage copy so a stale value cannot win during the pre-idle
+    // startup window or outlive the value the user just saved. Consistency on a value the user just
+    // acted on -- not the deferred bulk migration.
+    s.setChiefPat("");
+  }
+  return ok;
+}
+
+/**
+ * THE disconnect path: delete from the OS keychain and, only on a confirmed delete, clear the
+ * in-memory keychainChiefPat. Returns false on a failed or denied delete instead of pretending to
+ * disconnect while the secret is still stored and would be re-seeded next launch.
+ */
+export async function disconnectChiefPat(): Promise<boolean> {
+  const ok = await clearStoredChiefPat();
+  if (ok) {
+    const s = useSettingsStore.getState();
+    s.setKeychainChiefPat("");
+    // Also clear the legacy localStorage copy so the app does not keep authenticating with the PAT
+    // the user just disconnected (it would otherwise be the effectiveChiefPat fallback and survive a
+    // restart).
+    s.setChiefPat("");
+  }
+  return ok;
 }

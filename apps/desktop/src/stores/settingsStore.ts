@@ -3,8 +3,10 @@
 // mapping from a Sparkle project id -> the Chief project id we auto-created for it. Persisted
 // to localStorage like the other stores.
 //
-// NOTE: the PAT lives in localStorage for this MVP. That's fine for a single-user desktop app,
-// but a follow-up should move it into Tauri's secure store / OS keychain (tracked on the epic).
+// NOTE: the user-entered PAT is written to the OS keychain on save (Rust chief_pat_secure_*) and
+// read keychain-first via keychainChiefPat (seeded at launch by services/chief). A legacy
+// localStorage chiefPat remains a READ-ONLY fallback; scrubbing/migrating that copy is deferred to
+// a follow-up bead, so chiefPat is still persisted here to keep that fallback readable.
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
@@ -208,13 +210,12 @@ export function migrateSettings(persisted: unknown, version: number): unknown {
 const BUILD_ENV_CHIEF_PAT = ((import.meta.env.VITE_CHIEF_PAT as string | undefined) ?? "").trim();
 
 /**
- * The PAT to actually use, in priority order: the user-entered (stored) one, then the runtime
- * env-resolved one (Rust `chief_pat`, seeded into the store at startup), then the dev build-time
- * fallback. `runtime` is passed by callers reading `runtimeChiefPat` from the store so they
- * re-render when it lands.
+ * The PAT to actually use, in priority order: the OS-keychain value (keychainChiefPat, seeded at
+ * launch), then the legacy user-entered localStorage value (stored), then the runtime env-resolved
+ * one (Rust chief_pat), then the dev build-time fallback.
  */
-export function effectiveChiefPat(stored: string, runtime = ""): string {
-  return stored.trim() || runtime.trim() || BUILD_ENV_CHIEF_PAT;
+export function effectiveChiefPat(keychain: string, stored: string, runtime = ""): string {
+  return keychain.trim() || stored.trim() || runtime.trim() || BUILD_ENV_CHIEF_PAT;
 }
 
 /**
@@ -255,8 +256,13 @@ export type SparkleImprovementConsent = "always" | "case_by_case" | "never";
 export const DEFAULT_SPARKLE_CONSENT: SparkleImprovementConsent = "case_by_case";
 
 interface SettingsState {
-  /** Chief / Storytell Personal Access Token (begins with `pat_`). Empty until the user connects. */
+  /** Legacy user-entered Chief PAT (begins with `pat_`), persisted in localStorage. Kept as a
+   *  READ-ONLY fallback; the OS keychain value (keychainChiefPat) is preferred. */
   chiefPat: string;
+  /** The Chief PAT read from the OS keychain at launch (Rust chief_pat_secure_get). The keychain is
+   *  the store of record, so this is NOT persisted; it is preferred over the legacy localStorage
+   *  value. Written by saveChiefPat and cleared by disconnectChiefPat (services/chief). */
+  keychainChiefPat: string;
   /** PAT the Rust backend resolved from env / .env.local at launch. Not persisted — re-resolved
    *  fresh each session (the env token can rotate). Used as a fallback when none is stored. */
   runtimeChiefPat: string;
@@ -425,6 +431,8 @@ interface SettingsState {
 
   setChiefPat: (pat: string) => void;
   setRuntimeChiefPat: (pat: string) => void;
+  /** Set the OS-keychain-sourced PAT in memory (services/chief seeds this at launch and on save). */
+  setKeychainChiefPat: (pat: string) => void;
   setChiefProject: (sparkleProjectId: string, chiefProjectId: string) => void;
   setChiefProjectDocState: (chiefProjectId: string, map: Record<string, ChiefDocState>) => void;
   clearChiefDocState: (chiefProjectId: string) => void;
@@ -489,6 +497,7 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       chiefPat: "",
       runtimeChiefPat: "",
+      keychainChiefPat: "",
       chiefProjectByProject: {},
       chiefDocStateByProject: {},
       maxConcurrentWorkers: 20,
@@ -542,6 +551,7 @@ export const useSettingsStore = create<SettingsState>()(
 
       setChiefPat: (pat) => set({ chiefPat: pat.trim() }),
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
+      setKeychainChiefPat: (pat) => set({ keychainChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
       setDeleteMergedBranch: (on) => set({ deleteMergedBranch: on }),
@@ -724,6 +734,8 @@ export const useSettingsStore = create<SettingsState>()(
       // re-arming billable AI/credits). They stay in lockstep with the file because every UI write
       // goes through both (configActions: optimistic store update → file write → hydrate).
       partialize: (s) => ({
+        // chiefPat stays persisted as the READ-ONLY legacy fallback (keychain is preferred; the
+        // full localStorage scrub is deferred to a follow-up bead).
         chiefPat: s.chiefPat,
         chiefProjectByProject: s.chiefProjectByProject,
         chiefDocStateByProject: s.chiefDocStateByProject,

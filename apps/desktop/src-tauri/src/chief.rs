@@ -61,3 +61,93 @@ mod tests {
         }
     }
 }
+
+// ── User-entered PAT: OS keychain secure store (bead ) ──────────────────────────────
+// A PAT the user pastes is a long-lived secret and belongs in the OS keychain, NOT in the webview's
+// localStorage (where it sat in plaintext for the MVP). The three `chief_pat_secure_*` commands
+// below back that value with the same `keyring` item pattern auth.rs / trial_remote.rs /
+// builder_index.rs use, so it lives in the macOS Keychain / Windows Credential Manager and never
+// persists in the JS bundle's storage. The frontend migrates any legacy localStorage PAT into here
+// once, then reads keychain-first (services/chief.ts `resolveAndMigrateChiefPat`).
+
+const KEYCHAIN_USER: &str = "chief-pat";
+
+/// The keychain item for the user-entered Chief PAT. Dev-suffixed service name in debug builds
+/// (see dev_identity) so a `tauri dev` build never touches the production app's keychain ACL,
+/// mirroring auth.rs / trial_remote.rs / builder_index.rs. The `keyring::Entry` API is identical
+/// across the macOS (`apple-native`) and Windows (`windows-native`) backends, so this needs no
+/// `cfg` gating (see the note in Cargo.toml).
+fn entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(&crate::dev_identity::keychain_service(), KEYCHAIN_USER)
+        .map_err(|e| e.to_string())
+}
+
+/// Trim a PAT and reject anything that can't ride in an `X-API-Key` header (Chief sends the PAT as
+/// that header, see services/chief.ts). A stray newline or non-ASCII byte from a bad paste would
+/// otherwise malform every request; catch it at the boundary. Empty maps to `None`. Pure, so the
+/// contract is unit-tested without touching the keychain (mirrors builder_index's validate).
+fn normalize_pat(raw: &str) -> Option<String> {
+    let pat = raw.trim();
+    if pat.is_empty() || !pat.chars().all(|c| c.is_ascii_graphic()) {
+        return None;
+    }
+    Some(pat.to_string())
+}
+
+/// Read the user-entered Chief PAT from the OS keychain. `None` when none is stored (fresh install
+/// or signed-out) or when the stored value fails validation, so the frontend treats an empty result
+/// as "nothing in the secure store" and falls back to the env / build PAT. Validated on READ as
+/// well as write so a value written by an older build with an interior newline can't malform the
+/// header forever (mirrors builder_index).
+#[tauri::command]
+pub fn chief_pat_secure_get() -> Option<String> {
+    let stored = entry().ok()?.get_password().ok()?;
+    normalize_pat(&stored)
+}
+
+/// Store the user-entered Chief PAT in the OS keychain. Rejects an empty / header-invalid value
+/// before it reaches the keychain so a bad paste fails loudly rather than turning into a confusing
+/// transport error on every later request.
+#[tauri::command]
+pub fn chief_pat_secure_set(pat: String) -> Result<(), String> {
+    let Some(pat) = normalize_pat(&pat) else {
+        return Err("that PAT is empty or contains spaces/line breaks; check the paste".to_string());
+    };
+    entry()?.set_password(&pat).map_err(|e| e.to_string())
+}
+
+/// Delete the user-entered Chief PAT from the OS keychain (disconnect). A missing item is the state
+/// the caller wanted, so `NoEntry` is success.
+#[tauri::command]
+pub fn chief_pat_secure_clear() -> Result<(), String> {
+    match entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod secure_store_tests {
+    use super::normalize_pat;
+
+    #[test]
+    fn trims_and_keeps_a_valid_pat() {
+        assert_eq!(normalize_pat("  pat_abc123  "), Some("pat_abc123".to_string()));
+        assert_eq!(normalize_pat("pat_abc123"), Some("pat_abc123".to_string()));
+    }
+
+    #[test]
+    fn rejects_empty_or_blank() {
+        assert_eq!(normalize_pat(""), None);
+        assert_eq!(normalize_pat("    "), None);
+    }
+
+    #[test]
+    fn rejects_interior_whitespace_and_newlines() {
+        // A PAT is used verbatim as an X-API-Key header; a space or newline from a bad paste is
+        // rejected outright rather than malforming the request.
+        assert_eq!(normalize_pat("pat_a b"), None);
+        assert_eq!(normalize_pat("pat_a\nb"), None);
+    }
+}

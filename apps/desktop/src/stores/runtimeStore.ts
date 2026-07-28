@@ -133,7 +133,7 @@ export function scheduleChiefSync(projectId: string, agentId: string): void {
  *  a Chief/git hiccup must not break the UI, and an un-persisted ledger simply retries next run. */
 export async function runChiefSync(projectId: string, agentId: string): Promise<void> {
   const settings = useSettingsStore.getState();
-  const pat = effectiveChiefPat(settings.chiefPat, settings.runtimeChiefPat);
+  const pat = effectiveChiefPat(settings.keychainChiefPat, settings.chiefPat, settings.runtimeChiefPat);
   if (!pat) return;
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
   if (!project) return;

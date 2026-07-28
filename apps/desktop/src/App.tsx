@@ -4,7 +4,7 @@ import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
-import { resolveEnvChiefPat } from "./services/chief";
+import { resolveEnvChiefPat, seedKeychainChiefPat } from "./services/chief";
 import { healAgentHooks } from "./services/worktree";
 import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
@@ -142,6 +142,10 @@ export function App() {
     let cancelled = false;
     onIdle(() => {
       if (cancelled) return;
+      // Seed the OS-keychain PAT into memory (bead ), read keychain-first. A legacy
+      // localStorage PAT remains a read-only fallback via effectiveChiefPat. Best-effort and safe
+      // alongside the env-resolved runtime PAT below.
+      void seedKeychainChiefPat();
       void resolveEnvChiefPat().then((pat) =>
         useSettingsStore.getState().setRuntimeChiefPat(pat),
       );
