@@ -37,11 +37,45 @@
 import type { AgentKind, AgentTabStatus } from "../types";
 import { bandOfStatus } from "./buildSections";
 
-/** Per-orchestrator: does this parent have a worker in the `needs_you` band right now?
+/** What one orchestrator's worker subtree is saying about itself right now.
  *
- *  EVERY build agent gets an entry, explicitly `false` when no worker of its needs you. That false
- *  is the load-bearing part, not noise: {@link expandOnWorkerAttention} reads a MISSING id as "never
- *  observed" and skips it, so if calm parents were omitted, an orchestrator's first red worker would
+ *  THREE states, not two, and the third is the whole point: `unknown` means "this pass has no PTY
+ *  reading for at least one worker under this head". It was a boolean at first, with a not-yet-live
+ *  worker folded into `false`. That is correct for the EXPAND direction, which only ever acts on a
+ *  rising edge to `needs_you` and so treats a missing reading as "nothing to do" — and wrong for the
+ *  COLLAPSE direction added later, which acts on `calm` and so read "I don't know" as "nothing needs
+ *  you" and shut the subtree on it (roborev 53994). Two ways that bit:
+ *
+ *    * AT LAUNCH `runtimeStore.status` is empty and fills in as panes mount, so the first pass saw
+ *      every head as calm and closed every subtree carrying a PERSISTED auto mark — which then
+ *      re-opened a moment later when the PTY reported red. An open/shut/open flash, with a persisted
+ *      write per bounce.
+ *    * IN THE OPEN/EVICT RACE a worker's status entry disappears and comes back (see below), so each
+ *      round was a close followed by a rising-edge re-open. The never-live-is-calm rule exists to
+ *      keep that race from re-opening subtrees; on the collapse side it re-created the same flap
+ *      from the other end.
+ *
+ *  `unknown` drives NEITHER direction, so a missing reading does nothing at all — which is what "we
+ *  have no information" should mean.
+ *
+ *  And it means a reading we are still WAITING FOR, not merely one we don't have. The first cut said
+ *  "no live status ⇒ unknown", which is permanent for a worker whose pane is closed: `runtimeStore`
+ *  does not persist `status`, so such a worker is statusless for the whole session, its head reads
+ *  `unknown` forever, and auto-collapse is dead for that head — the wall of settled worker rows this
+ *  feature exists to clear, only now with a persisted mark that never clears either (roborev 54018).
+ *  So the caller says whether a reading is EXPECTED (`expectsLiveStatus`): a mounted pane that has
+ *  not reported yet, or a spawned-but-unstarted strand. A pane closed alongside its orchestrator
+ *  expects nothing and reads calm, so its head collapses like any other. (A strand — pane shut,
+ *  orchestrator live — stays `unknown` on purpose: it is painted red and being re-opened, and its
+ *  row is the one the user has to click. See the predicate in AgentSidebar.) */
+export type WorkerAttention = "needs_you" | "unknown" | "calm";
+
+/** Per-orchestrator: is a worker under this parent asking for you, is one unreadable, or is the
+ *  subtree quiet?
+ *
+ *  EVERY build agent gets an entry, explicitly `calm` when no worker of its needs you. That entry is
+ *  the load-bearing part, not noise: {@link expandOnWorkerAttention} reads a MISSING id as "never
+ *  observed" and skips it, so if quiet parents were omitted, an orchestrator's first red worker would
  *  arrive against an absent baseline and be classified as a first sighting rather than a transition.
  *  The subtree would stay collapsed for the one alarm that most needs to be seen, and only a SECOND
  *  red would open it. (That was the shape of the growth rule's first cut — roborev 53672.)
@@ -50,16 +84,20 @@ import { bandOfStatus } from "./buildSections";
  *  de-escalated by the time it reaches here and correctly does not re-open anything.
  *
  *  `isLive` is "does this worker have a live PTY status of its own", and a worker without one is
- *  treated as CALM however red `statusOf` paints it. That is not an optimization, it is the second
- *  half of discipline 1. `withUnstartedWorkerAttention` synthesizes a red `approval` for a worker
- *  whose worktree is cut but whose pane never mounted — a condition produced by an internal
- *  open/evict race (orchestrationListener.ensureWorkersOpen has observed the same worker re-opened
- *  ~10 times in a sub-millisecond burst), not by anything the user did. Each evict→re-open cycle is
- *  a falling edge followed by a fresh RISING one, so honoring it would let invisible machinery
- *  re-open a subtree the user just collapsed, over and over — the exact failure "transition, not
- *  state" exists to prevent, reached through the falling edge instead of the steady one. Nothing is
- *  lost: the strand still bubbles its red to the orchestrator's own head row, which is where the
- *  user looks and clicks.
+ *  never `needs_you` however red `statusOf` paints it — it makes its parent `unknown` when
+ *  `expectsLiveStatus` says a reading is still coming, and says nothing at all when it isn't. That is
+ *  not an optimization, it is the second half of discipline 1. `withUnstartedWorkerAttention` synthesizes a
+ *  red `approval` for a worker whose worktree is cut but whose pane never mounted — a condition
+ *  produced by an internal open/evict race (orchestrationListener.ensureWorkersOpen has observed the
+ *  same worker re-opened ~10 times in a sub-millisecond burst), not by anything the user did. Each
+ *  evict→re-open cycle is a falling edge followed by a fresh RISING one, so honoring it would let
+ *  invisible machinery re-open a subtree the user just collapsed, over and over — the exact failure
+ *  "transition, not state" exists to prevent, reached through the falling edge instead of the steady
+ *  one. Nothing is lost: the strand still bubbles its red to the orchestrator's own head row, which
+ *  is where the user looks and clicks.
+ *
+ *  `needs_you` OUTRANKS `unknown`: a live worker sitting on a question is a fact, and one unreadable
+ *  sibling must not demote it to "no information" and swallow the expand.
  *
  *  Only `kind: "worker"` children are considered: they are the only agents that render as child
  *  rows, so anything else would expand a parent for a row the subtree never shows. And the band
@@ -69,19 +107,26 @@ export function workerAttention<T extends { id: string; kind: AgentKind; parentI
   agents: readonly T[],
   statusOf: (id: string) => AgentTabStatus,
   isLive: (id: string) => boolean,
-): Record<string, boolean> {
-  const out: Record<string, boolean> = {};
+  expectsLiveStatus: (worker: T) => boolean,
+): Record<string, WorkerAttention> {
+  const out: Record<string, WorkerAttention> = {};
   // Two passes: a build agent can appear after its own worker in the array (disk reconcile adopts in
-  // no guaranteed order), and seeding in one pass would let `out[parent] = false` clobber a flag
+  // no guaranteed order), and seeding in one pass would let `out[parent] = "calm"` clobber a state
   // already recorded for it.
   for (const a of agents) {
-    if (a.kind === "build") out[a.id] = false;
+    if (a.kind === "build") out[a.id] = "calm";
   }
   for (const a of agents) {
     if (a.kind !== "worker" || !a.parentId) continue;
-    if (!isLive(a.id)) continue; // a never-live worker's red is synthetic — see above
-    if (bandOfStatus(statusOf(a.id)) !== "needs_you") continue;
-    out[a.parentId] = true;
+    if (!isLive(a.id)) {
+      // No PTY reading for this worker: its red would be synthetic and its calm would be a guess.
+      // Only counts as `unknown` while a reading is still expected — a closed pane is not a pending
+      // one, and treating it as such would pin its head open for the rest of the session.
+      if (expectsLiveStatus(a) && out[a.parentId] !== "needs_you") out[a.parentId] = "unknown";
+      continue;
+    }
+    if (bandOfStatus(statusOf(a.id)) !== "needs_you") continue; // live and quiet: says nothing
+    out[a.parentId] = "needs_you";
   }
   return out;
 }
@@ -89,17 +134,22 @@ export function workerAttention<T extends { id: string; kind: AgentKind; parentI
 /** The orchestrator ids that just went from "no red worker" to "has a red worker", and so should be
  *  expanded.
  *
- *  Rising edge only. A steady `true` reports nothing (discipline 1 above), a falling edge reports
- *  nothing (we never auto-collapse), and ids absent from `prev` report nothing (discipline 2). */
+ *  Rising edge only. A steady `needs_you` reports nothing (discipline 1 above), a falling edge
+ *  reports nothing (expansion is automatic, collapsing is the rule below), and ids absent from
+ *  `prev` report nothing (discipline 2).
+ *
+ *  `unknown` → `needs_you` DOES count: that is a worker whose pane finally came live still asking,
+ *  and the subtree has to open for it. `unknown` itself is never a target — you cannot expand on a
+ *  reading you do not have. */
 export function expandOnWorkerAttention(
-  prev: Record<string, boolean>,
-  next: Record<string, boolean>,
+  prev: Record<string, WorkerAttention>,
+  next: Record<string, WorkerAttention>,
 ): string[] {
   const attention: string[] = [];
-  for (const [id, red] of Object.entries(next)) {
+  for (const [id, state] of Object.entries(next)) {
     const before = prev[id];
     if (before === undefined) continue; // first sighting is a baseline, not a transition
-    if (red && !before) attention.push(id);
+    if (state === "needs_you" && before !== "needs_you") attention.push(id);
   }
   return attention;
 }
@@ -131,19 +181,22 @@ export function expandOnWorkerAttention(
 /** The AUTO-expanded orchestrator ids that should now close: `attention` says nothing under them
  *  needs you, and the user is not reading that subtree.
  *
- *  A head absent from `attention` is left alone rather than closed — it is a head this pass never
- *  observed (a different project's, mid-reconcile), and "not observed" is not "calm". A head present
- *  with no workers at all IS closed: it reads `false`, renders no chevron, and an auto mark left on
- *  it is stale bookkeeping.
+ *  ONLY `calm` closes. A head reading `unknown` is left open — some worker under it has no PTY
+ *  reading this pass, and closing on that would act on a fact we do not have (roborev 53994: at
+ *  launch the status map is empty, so every head would read quiet and every persisted auto mark
+ *  would slam shut and re-open a beat later). A head absent from `attention` entirely is likewise
+ *  left alone — that one belongs to another project, or arrived mid-reconcile. A head present with
+ *  no workers at all IS closed: it reads `calm`, renders no chevron, and an auto mark left on it is
+ *  stale bookkeeping.
  *
  *  Disjoint from {@link expandOnWorkerAttention} by construction — that one reports only rising
- *  edges to `true`, this one only ids sitting at `false` — so a caller may apply both in either
+ *  edges to `needs_you`, this one only ids sitting at `calm` — so a caller may apply both in either
  *  order without them fighting over an id in the same tick. */
 export function autoCollapseTargets<
   T extends { id: string; kind: AgentKind; parentId: string | null },
 >(
   agents: readonly T[],
-  attention: Record<string, boolean>,
+  attention: Record<string, WorkerAttention>,
   isAutoExpanded: (headId: string) => boolean,
   selectedAgentId: string | null,
 ): string[] {
@@ -154,7 +207,7 @@ export function autoCollapseTargets<
   const out: string[] = [];
   for (const a of agents) {
     if (a.kind !== "build") continue;
-    if (attention[a.id] !== false) continue; // needs you, or never observed this pass
+    if (attention[a.id] !== "calm") continue; // needs you, unreadable, or not seen this pass
     if (!isAutoExpanded(a.id)) continue; // the user's own expansion is theirs to undo
     if (a.id === selectedAgentId || a.id === selectedParentId) continue; // you are reading it
     out.push(a.id);

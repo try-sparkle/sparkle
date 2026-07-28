@@ -297,6 +297,128 @@ describe("AgentSidebar — the user's own chevron outranks the automation", () =
   });
 });
 
+// Auto-collapse acts on the CURRENT snapshot with no baseline of its own, which is only safe while
+// "nothing needs you" and "I have no reading" stay different answers. They were the same `false` at
+// first, and closing on it meant the app acted on facts it did not have (roborev 53994).
+describe("AgentSidebar — a subtree is never closed on a status we haven't read", () => {
+  // AT LAUNCH `runtimeStore.status` is empty and fills in as panes mount. With no-reading folded
+  // into calm, the very first commit closed every subtree carrying a PERSISTED auto mark and dropped
+  // the mark, then re-opened a beat later when the PTY reported red — a visible open/shut/open, with
+  // a persisted write per bounce.
+  it("leaves a persisted auto-expanded subtree alone until a status arrives", () => {
+    useUiStore.setState({
+      collapsedOrchestrators: { a1: false },
+      autoExpandedOrchestrators: { a1: true },
+    } as never);
+    const project = seed();
+    setStatus({}); // nothing live yet — exactly the state one commit after launch
+    render(<AgentSidebar project={project} />);
+
+    expect(collapsed("a1")).toBe(false);
+    expect(queryRow("Parser Worker")).toBeTruthy();
+    // And the mark survives, so the subtree still puts itself away once the fleet reports in calm.
+    expect(useUiStore.getState().autoExpandedOrchestrators.a1).toBe(true);
+
+    setStatus(ALL_WORKING);
+
+    expect(collapsed("a1")).toBe(true);
+  });
+
+  // The OTHER side of that rule, and the reason it is "a reading we are WAITING for" rather than
+  // "a reading we don't have": `runtimeStore` does not persist `status`, so a worker whose pane is
+  // closed is statusless for the whole session. Treating every one of those as unknown pinned its
+  // head open forever — auto-collapse dead for that head, with a persisted mark that never cleared
+  // either (roborev 54018).
+  //
+  // These two cases pin the line, and they use the PRODUCTION shape: a materialized worker always
+  // carries a `worktreePath` (workerSpawn sets it at the cut, and the disk reconcile sets it on
+  // adopt), so a test built on `mkAgent`'s default `worktreePath: null` proves nothing about either
+  // (roborev 54031 — the first cut of this test did exactly that).
+  const materialized = (id: string, name: string, parentId: string): AgentTab =>
+    mkAgent(id, name, {
+      kind: "worker",
+      parentId,
+      baseBranch: "main",
+      worktreePath: `/tmp/demo/${id}`,
+    });
+
+  it("collapses a head whose workers are closed panes under a closed orchestrator", () => {
+    useUiStore.setState({
+      collapsedOrchestrators: { a1: false },
+      autoExpandedOrchestrators: { a1: true },
+    } as never);
+    const project = seed();
+    const restored: Project = {
+      ...project,
+      agents: [
+        mkAgent("a1", "Alpha"),
+        materialized("w1", "Parser Worker", "a1"),
+        materialized("w2", "Lexer Worker", "a1"),
+      ],
+    };
+    useProjectStore.setState({ projects: [restored] } as never);
+    act(() => {
+      // A relaunch that restored the ROWS but opened nothing: no panes, no statuses.
+      useRuntimeStore.setState({ status: {}, openAgentIds: [] } as never);
+    });
+    render(<AgentSidebar project={restored} />);
+
+    expect(collapsed("a1")).toBe(true);
+    expect(useUiStore.getState().autoExpandedOrchestrators.a1).toBeUndefined();
+  });
+
+  // A materialized, statusless worker under a LIVE orchestrator is not a closed pane — it is the
+  // STRAND (engine/workerAttention.isUnstartedWorker): its worktree is cut, its pane never mounted,
+  // and the app paints it RED and re-opens it. Holding its subtree open is the point, not a leak —
+  // the red row is the one the user has to click to start it. Pinned here so the day someone decides
+  // an exhausted self-heal should collapse instead, they change this deliberately.
+  it("holds a head open while a worker under it is an unstarted strand", () => {
+    useUiStore.setState({
+      collapsedOrchestrators: { a1: false },
+      autoExpandedOrchestrators: { a1: true },
+    } as never);
+    const project = seed();
+    const stranded: Project = {
+      ...project,
+      agents: [mkAgent("a1", "Alpha"), materialized("w1", "Parser Worker", "a1")],
+    };
+    useProjectStore.setState({ projects: [stranded] } as never);
+    act(() => {
+      // Orchestrator live, worker's pane never mounted — the spawn/evict strand.
+      useRuntimeStore.setState({ status: { a1: "working" }, openAgentIds: ["a1"] } as never);
+    });
+    render(<AgentSidebar project={stranded} />);
+
+    expect(collapsed("a1")).toBe(false);
+    expect(queryRow("Parser Worker")).toBeTruthy();
+    expect(useUiStore.getState().autoExpandedOrchestrators.a1).toBe(true);
+  });
+
+  // THE OPEN/EVICT RACE. `ensureWorkersOpen` has observed the same worker re-opened ~10 times in a
+  // sub-millisecond burst; each round removes and restores its status entry. Reading the gap as calm
+  // made every round a close followed by a rising-edge re-open — the flap the never-live rule exists
+  // to prevent, reached from the collapse side.
+  it("does not flap when a worker's status entry disappears and comes back", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+
+    setStatus({ ...ALL_WORKING, w1: "waiting" }); // opened by the app, and marked
+    expect(collapsed("a1")).toBe(false);
+
+    const { w1: _evicted, ...withoutW1 } = ALL_WORKING;
+    setStatus(withoutW1); // evicted mid-race: no reading for w1
+    expect(collapsed("a1")).toBe(false);
+    expect(useUiStore.getState().autoExpandedOrchestrators.a1).toBe(true);
+
+    setStatus({ ...ALL_WORKING, w1: "waiting" }); // back, still asking
+    expect(collapsed("a1")).toBe(false);
+
+    // The race settles and the worker really is calm — NOW it puts itself away.
+    setStatus(ALL_WORKING);
+    expect(collapsed("a1")).toBe(true);
+  });
+});
+
 describe("AgentSidebar — a deliberate reveal is not the app's to take back", () => {
   // The concierge's "Show me" and its rowless digest line expand exactly the heads the user clicked
   // to see, through this same store action. Marking those auto would fold every one but the selected

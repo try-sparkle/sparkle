@@ -71,11 +71,16 @@ import {
 } from "../engine/workerRollup";
 import { StageSectionHeader } from "./StageSectionHeader";
 import { StatusFilterBar } from "./StatusFilterBar";
-import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
+import {
+  isUnstartedWorker,
+  withUnstartedWorkerAttention,
+  withRedWorkerAttention,
+} from "../engine/workerAttention";
 import {
   autoCollapseTargets,
   expandOnWorkerAttention,
   workerAttention,
+  type WorkerAttention,
 } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
@@ -264,6 +269,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   const close = useRuntimeStore((s) => s.close);
   const liveStatus = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // The open set, built once: the strand overlay below and `expectsLiveStatus` further down both
+  // ask it, and two Sets from one array is two allocations per render for the same answer.
+  const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
   // A spawned-but-never-started worker has no live status, so it (and the orchestrator it's
   // blocking) would render GRAY. Overlay RED ("Approve?") on the strand and bubble it to the parent
   // so the orchestrator row goes red — matching the TopBar dot cluster. No-op (same ref) when
@@ -275,9 +283,9 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     // services/windowStatus.isRedStatus) — bubbles its own red to its orchestrator so the
     // orchestrator floats up and shows red. Order matters — run (2) after
     // (1) so a strand's synthetic red also bubbles.
-    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, new Set(openAgentIds));
+    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, openIds);
     return withRedWorkerAttention(project.agents, s1);
-  }, [project, liveStatus, openAgentIds]);
+  }, [project, liveStatus, openIds]);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
   // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
@@ -1151,13 +1159,37 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // subtrees only ever opened; with auto-collapse below it means the subtree is shut and stays shut
   // on the one alarm that most needs to be seen. A map keyed by project id makes "did THIS project
   // just go red" the actual question, and an unvisited project still baselines and expands nothing.
-  const prevWorkerAttention = useRef(new Map<string, Record<string, boolean>>());
+  // Is a live PTY status still COMING for this worker? The third state of the attention snapshot
+  // hangs off this: a worker with no status entry is `unknown` only while one is expected, and says
+  // nothing at all otherwise. Two ways a reading is pending — the pane is mounted (in `openAgentIds`)
+  // and simply has not reported yet, which is every worker for the first commit after launch; or the
+  // worker is a spawned-but-unstarted STRAND, the open/evict race that drops it out of `openAgentIds`
+  // before its pane mounts (engine/workerAttention.isUnstartedWorker — the same predicate that paints
+  // its synthetic red, so the two can't disagree).
+  //
+  // A worker that is neither is a closed pane under a closed orchestrator — the settled fleet after a
+  // relaunch that restored the rows but opened nothing. `runtimeStore` does not persist `status`, so
+  // that worker is statusless for the WHOLE session; counting it as pending pinned its head open
+  // forever, auto-collapse dead for that head with a mark that never cleared (roborev 54018).
+  //
+  // Note what the strand clause therefore does NOT cover, and deliberately: a materialized worker
+  // whose pane is shut while its orchestrator is LIVE is not a closed pane, it is a strand — the app
+  // paints it red and `ensureWorkersOpen` re-opens it. Its subtree stays open, which is the point:
+  // that red row is the one the user has to click. If the self-heal exhausts its budget the subtree
+  // stays open showing red, rather than filing a broken worker away out of sight (roborev 54031).
+  const expectsLiveStatus = useCallback(
+    (w: AgentTab) => openIds.has(w.id) || isUnstartedWorker(w, liveStatus, openIds),
+    [openIds, liveStatus],
+  );
+
+  const prevWorkerAttention = useRef(new Map<string, Record<string, WorkerAttention>>());
   useEffect(() => {
     if (!project) return;
     const next = workerAttention(
       project.agents,
       (id) => effectiveStatus[id] ?? "stopped",
       (id) => liveStatus[id] !== undefined,
+      expectsLiveStatus,
     );
     const attention = expandOnWorkerAttention(
       prevWorkerAttention.current.get(project.id) ?? {},
@@ -1166,7 +1198,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     prevWorkerAttention.current.set(project.id, next);
     if (attention.length > 0)
       useUiStore.getState().expandOrchestrators(attention, { auto: true });
-  }, [project, effectiveStatus, liveStatus]);
+  }, [project, effectiveStatus, liveStatus, expectsLiveStatus]);
 
   // REVEAL THE SELECTION. Orthogonal to attention above: a SELECTED worker must always have a
   // visible row, or the terminal shows an agent that no row is highlighting — the original bug that
@@ -1221,6 +1253,12 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // the mark changing, neither of which that effect watches — and it must not re-run the expansion's
   // edge detector, which would consume a rising edge as a side effect of a selection change. The
   // snapshot is recomputed rather than shared for the same reason; it is one pure pass over `agents`.
+  //
+  // Acts on the CURRENT snapshot with no baseline of its own, which is only safe because that
+  // snapshot distinguishes `calm` from `unknown`: a subtree with any worker the PTY has not reported
+  // on reads `unknown` and is left alone. Without that third state this effect closed every
+  // persisted auto mark on the first commit after launch — the status map is still empty then — and
+  // flapped a subtree shut-and-open on every round of the open/evict race (roborev 53994).
   const autoExpandedRecord = useUiStore((s) => s.autoExpandedOrchestrators);
   useEffect(() => {
     if (!project) return;
@@ -1228,6 +1266,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       project.agents,
       (id) => effectiveStatus[id] ?? "stopped",
       (id) => liveStatus[id] !== undefined,
+      expectsLiveStatus,
     );
     const stale = autoCollapseTargets(
       project.agents,
@@ -1236,7 +1275,7 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       project.selectedAgentId,
     );
     if (stale.length > 0) useUiStore.getState().collapseAutoExpanded(stale);
-  }, [project, liveStatus, effectiveStatus, autoExpandedRecord]);
+  }, [project, liveStatus, effectiveStatus, autoExpandedRecord, expectsLiveStatus]);
 
   // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
   // `project.agents` order within each section (that order is the user's own drag arrangement), with
