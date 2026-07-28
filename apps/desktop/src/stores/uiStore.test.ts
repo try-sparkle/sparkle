@@ -166,7 +166,7 @@ describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
 describe("uiStore orchestrator collapse", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ collapsedOrchestrators: {} });
+    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
   });
 
   it("workers start collapsed (a missing entry reads as collapsed)", () => {
@@ -184,6 +184,87 @@ describe("uiStore orchestrator collapse", () => {
     // Reference the destructured selectors so they're not flagged unused.
     expect(typeof toggleOrchestratorCollapsed).toBe("function");
     expect(typeof isOrchestratorCollapsed).toBe("function");
+  });
+});
+
+// The mark that makes auto-collapse safe. `collapsedOrchestrators` records the STATE; this records
+// WHO CHOSE IT, which is the only thing standing between "put the subtree away when it goes quiet"
+// and "close the subtree the user just opened".
+describe("uiStore auto-expanded mark", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
+  });
+
+  it("marks what an AUTO expandOrchestrators actually opened", () => {
+    useUiStore.getState().expandOrchestrators(["b1", "b2"], { auto: true });
+    expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: false, b2: false });
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({ b1: true, b2: true });
+  });
+
+  // The default is user-intent, and the concierge's reveal paths rely on it: a "Show me" or a
+  // rowless digest line expands exactly the heads the user clicked to see, and a mark would let the
+  // sidebar fold all but the selected one away on the next status tick (the 53737 bug).
+  it("leaves a plain expandOrchestrators unmarked, so a reveal is not revocable", () => {
+    useUiStore.getState().expandOrchestrators(["b1", "b2"]);
+    expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: false, b2: false });
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+  });
+
+  // A reveal of a subtree the app had already opened makes it the user's — including when the
+  // collapse state is already `false` and there is nothing to open, which is the case an
+  // identity-stable early return is most likely to skip.
+  it("a user-intent expand strips a mark the app had left", () => {
+    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+    useUiStore.getState().expandOrchestrators(["b1"]);
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
+  });
+
+  it("is identity-stable when an auto expand opens nothing", () => {
+    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+    const before = useUiStore.getState().collapsedOrchestrators;
+    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
+  });
+
+  // Stamping an already-open row would quietly convert someone else's choice — almost always the
+  // user's chevron — into something auto-collapse may revoke.
+  it("does not mark a row that was already expanded", () => {
+    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // the user opens it
+    useUiStore.getState().expandOrchestrators(["b1", "b2"], { auto: true });
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({ b2: true });
+  });
+
+  it("collapseAutoExpanded closes a marked row and clears its mark", () => {
+    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+    useUiStore.getState().collapseAutoExpanded(["b1"]);
+    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(true);
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+  });
+
+  // The store's own veto: even if a caller asks, an unmarked row is not the app's to close.
+  it("collapseAutoExpanded refuses a row the user expanded", () => {
+    useUiStore.getState().toggleOrchestratorCollapsed("b1");
+    useUiStore.getState().collapseAutoExpanded(["b1"]);
+    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
+  });
+
+  it("collapseAutoExpanded is identity-stable when nothing is marked", () => {
+    const before = useUiStore.getState().collapsedOrchestrators;
+    useUiStore.getState().collapseAutoExpanded(["b1", "b2"]);
+    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
+  });
+
+  // Touching the chevron transfers ownership in BOTH directions — including the case where the user
+  // collapses an auto-expanded row by hand, which must not leave a stale mark behind.
+  it("the chevron clears the mark whichever way it moves the row", () => {
+    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // user closes it themselves
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // and re-opens it — now theirs
+    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
   });
 });
 
@@ -287,6 +368,12 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     "activeSpecial",
     "statusFilter",
     "collapsedOrchestrators",
+    // Which of those expansions the APP made rather than the user. Persisted deliberately, and it
+    // has to travel with collapsedOrchestrators: if the mark were transient, every app-expanded
+    // subtree would come back from a relaunch looking like a deliberate user choice, and
+    // auto-collapse — which refuses to touch the user's own expansions — would leave it open
+    // forever. That is the very stuck-open state the mark exists to clear.
+    "autoExpandedOrchestrators",
     // The concierge compose box's dragged height. Persisted on purpose — the user asked for the
     // size to stick across relaunches.
     "conciergeComposeH",

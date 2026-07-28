@@ -80,7 +80,7 @@ function openClosePrompt() {
   // select the agent so the affordance is present, then click it. (Hovering no longer expands a row.)
   const p = useProjectStore.getState().projects[0]!;
   useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
-  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
   render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
   fireEvent.click(screen.getByLabelText("Close agent"));
 }
@@ -102,7 +102,7 @@ function silentCloseProject(): Project {
 const agentsNow = () => useProjectStore.getState().projects[0]!.agents.map((a) => a.id);
 
 beforeEach(() => {
-  useUiStore.setState({ collapsedOrchestrators: {} } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} } as never);
   landAgentBranch.mockReset().mockResolvedValue({ ok: true, target: "main" });
   refreshAgentBranch.mockReset().mockResolvedValue({ ok: true });
   pushAgentBranch.mockReset().mockResolvedValue("pushed");
@@ -119,7 +119,7 @@ describe("AgentSidebar — persistent close on the active row", () => {
     const project = buildAgentProject();
     // The row the user is looking at — its output fills the main pane — is the selected/active one.
     useProjectStore.setState({ projects: [{ ...project, selectedAgentId: "a1" }] } as never);
-    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
     // No mouseEnter: the active row must expose a persistent close affordance, not a hover-only one.
     expect(screen.getByLabelText("Close agent")).toBeTruthy();
@@ -128,7 +128,7 @@ describe("AgentSidebar — persistent close on the active row", () => {
   it("does NOT show the Close button on an inactive, un-interacted row", () => {
     const project = buildAgentProject();
     useProjectStore.setState({ projects: [{ ...project, selectedAgentId: null }] } as never);
-    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
     // The × is reserved for the active row (or the open detail card) — a resting inactive row has none.
     expect(screen.queryByLabelText("Close agent")).toBeNull();
@@ -146,7 +146,7 @@ describe("AgentSidebar — silent close removes the row without waiting on git",
     silentCloseProject();
     const p = useProjectStore.getState().projects[0]!;
     useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
-    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
     render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
     fireEvent.click(screen.getByLabelText("Close agent"));
     // No await, no waitFor: the store must already have dropped the row synchronously with the click,

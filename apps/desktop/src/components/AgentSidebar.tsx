@@ -70,7 +70,11 @@ import {
 import { StageSectionHeader } from "./StageSectionHeader";
 import { StatusFilterBar } from "./StatusFilterBar";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
-import { expandOnWorkerAttention, workerAttention } from "../engine/workerExpansion";
+import {
+  autoCollapseTargets,
+  expandOnWorkerAttention,
+  workerAttention,
+} from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
@@ -1028,17 +1032,31 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // a relaunch with an already-red worker respects the persisted collapse (the head row shows that
   // red on its own). There is deliberately no second `first render?` guard here — one rule, in the
   // tested pure helper, rather than two that can drift. See engine/workerExpansion.
-  const prevWorkerAttention = useRef<Record<string, boolean>>({});
+  //
+  // Remembered PER PROJECT, for the same reason the selection map below is: one AgentSidebar stays
+  // mounted across project switches, and the snapshot only ever covers the CURRENT project's agents.
+  // With a single record, switching away drops every other project's entry, so coming back reads as
+  // first observation — and since red is a level and not an edge, a worker that went red while you
+  // were elsewhere would never open its subtree on any later tick either. That was invisible while
+  // subtrees only ever opened; with auto-collapse below it means the subtree is shut and stays shut
+  // on the one alarm that most needs to be seen. A map keyed by project id makes "did THIS project
+  // just go red" the actual question, and an unvisited project still baselines and expands nothing.
+  const prevWorkerAttention = useRef(new Map<string, Record<string, boolean>>());
   useEffect(() => {
+    if (!project) return;
     const next = workerAttention(
-      project?.agents ?? [],
+      project.agents,
       (id) => effectiveStatus[id] ?? "stopped",
       (id) => liveStatus[id] !== undefined,
     );
-    const attention = expandOnWorkerAttention(prevWorkerAttention.current, next);
-    prevWorkerAttention.current = next;
-    if (attention.length > 0) useUiStore.getState().expandOrchestrators(attention);
-  }, [project?.agents, effectiveStatus, liveStatus]);
+    const attention = expandOnWorkerAttention(
+      prevWorkerAttention.current.get(project.id) ?? {},
+      next,
+    );
+    prevWorkerAttention.current.set(project.id, next);
+    if (attention.length > 0)
+      useUiStore.getState().expandOrchestrators(attention, { auto: true });
+  }, [project, effectiveStatus, liveStatus]);
 
   // REVEAL THE SELECTION. Orthogonal to attention above: a SELECTED worker must always have a
   // visible row, or the terminal shows an agent that no row is highlighting — the original bug that
@@ -1074,17 +1092,41 @@ export function AgentSidebar({ project }: { project: Project | null }) {
     if (selectedAgentId !== null && !sel) return;
     seen.set(project.id, selectedAgentId);
     if (sel?.kind === "worker" && sel.parentId) {
-      useUiStore.getState().expandOrchestrators([sel.parentId]);
+      // `auto`, like the attention rule: the reason this subtree opened is that you are looking at
+      // the worker inside it, so once you look elsewhere the reason is spent. Auto-collapse exempts
+      // the subtree holding the selection, so this can never be undone while it is still true.
+      useUiStore.getState().expandOrchestrators([sel.parentId], { auto: true });
     }
   }, [selectedAgentId, project]);
 
-  // NOTE: `main` grew its own red-expansion effect here (redWorkerCounts / expandOnRedWorker) while
-  // this branch was building §14. Both solved the same problem; this branch's version won the merge
-  // and lives in the single effect above. The difference is not cosmetic: main kept `expandOnGrowth`
-  // alongside it, so a subtree there still pops open on every spawn — the exact behavior §14 exists
-  // to remove ("default to a closed not open state, and only open when the underlying worker needs
-  // something and is red"). Keeping both effects would have re-armed spawn-expansion through the
-  // back door. See engine/workerExpansion.workerAttention.
+
+  // PUT IT AWAY AGAIN. The counterpart to the two rules above, and the end of the one-way expansion
+  // that let a settled fleet leave a wall of green worker rows with no undo but a chevron click per
+  // orchestrator. A subtree the APP opened closes once nothing under it needs you — never the one you
+  // are reading, and never one you opened yourself. The rule and its exemptions are pure and tested
+  // in engine/workerExpansion.autoCollapseTargets; this is the wiring.
+  //
+  // Its own effect rather than a tail on the attention effect, and the deps are the reason: closing
+  // has to react to the SELECTION moving (navigating away from a subtree is what releases it) and to
+  // the mark changing, neither of which that effect watches — and it must not re-run the expansion's
+  // edge detector, which would consume a rising edge as a side effect of a selection change. The
+  // snapshot is recomputed rather than shared for the same reason; it is one pure pass over `agents`.
+  const autoExpandedRecord = useUiStore((s) => s.autoExpandedOrchestrators);
+  useEffect(() => {
+    if (!project) return;
+    const attention = workerAttention(
+      project.agents,
+      (id) => effectiveStatus[id] ?? "stopped",
+      (id) => liveStatus[id] !== undefined,
+    );
+    const stale = autoCollapseTargets(
+      project.agents,
+      attention,
+      (headId) => autoExpandedRecord[headId] === true,
+      project.selectedAgentId,
+    );
+    if (stale.length > 0) useUiStore.getState().collapseAutoExpanded(stale);
+  }, [project, liveStatus, effectiveStatus, autoExpandedRecord]);
 
   // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
   // `project.agents` order within each section (that order is the user's own drag arrangement), with

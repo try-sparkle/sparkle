@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { expandOnWorkerAttention, workerAttention } from "./workerExpansion";
+import { autoCollapseTargets, expandOnWorkerAttention, workerAttention } from "./workerExpansion";
 import type { AgentKind, AgentTabStatus } from "../types";
 
 interface Node {
@@ -188,5 +188,82 @@ describe("workerAttention — the snapshot expandOnWorkerAttention compares", ()
       () => true,
     );
     expect(expandOnWorkerAttention(stranded, live)).toEqual(["p1"]);
+  });
+});
+
+// THE OTHER HALF: putting a subtree the app opened away again. Fixture: two orchestrators, two
+// workers each. `attention` is the same snapshot the expansion rule compares, so these cases are
+// stated in terms of it rather than re-deriving red from statuses.
+const FLEET: Node[] = [
+  { id: "p1", kind: "build", parentId: null },
+  { id: "w1a", kind: "worker", parentId: "p1" },
+  { id: "w1b", kind: "worker", parentId: "p1" },
+  { id: "p2", kind: "build", parentId: null },
+  { id: "w2a", kind: "worker", parentId: "p2" },
+];
+const CALM = { p1: false, p2: false };
+const auto =
+  (...ids: string[]) =>
+  (id: string) =>
+    ids.includes(id);
+const never = () => false;
+const always = () => true;
+
+describe("autoCollapseTargets — putting an auto-expanded subtree away again", () => {
+  it("closes an auto-expanded head once nothing under it needs you", () => {
+    expect(autoCollapseTargets(FLEET, CALM, auto("p1"), null)).toEqual(["p1"]);
+  });
+
+  it("leaves it open while a worker still needs you", () => {
+    expect(autoCollapseTargets(FLEET, { p1: true, p2: false }, auto("p1"), null)).toEqual([]);
+  });
+
+  // The user's own chevron is theirs to undo — nothing marks p1 here.
+  it("never closes a subtree the user expanded by hand", () => {
+    expect(autoCollapseTargets(FLEET, CALM, never, null)).toEqual([]);
+  });
+
+  it("leaves the head you are reading open", () => {
+    expect(autoCollapseTargets(FLEET, CALM, auto("p1"), "p1")).toEqual([]);
+  });
+
+  // Collapsing here would hide the row for the agent the terminal pane is showing — the original
+  // reason workers have rows at all.
+  it("leaves open the head of the WORKER you are reading", () => {
+    expect(autoCollapseTargets(FLEET, CALM, auto("p1"), "w1b")).toEqual([]);
+  });
+
+  it("closes the other auto-expanded heads while you read one of them", () => {
+    expect(autoCollapseTargets(FLEET, CALM, auto("p1", "p2"), "w1a")).toEqual(["p2"]);
+  });
+
+  // "Never observed this pass" is not "calm": a head missing from the snapshot belongs to some other
+  // project, or arrived mid-reconcile, and closing it would act on a fact this pass does not have.
+  it("leaves a head absent from the attention snapshot alone", () => {
+    expect(autoCollapseTargets(FLEET, { p2: false }, always, null)).toEqual(["p2"]);
+  });
+
+  it("closes an auto-expanded head with no workers left, clearing the stale mark", () => {
+    const solo: Node[] = [{ id: "p1", kind: "build", parentId: null }];
+    expect(autoCollapseTargets(solo, { p1: false }, auto("p1"), null)).toEqual(["p1"]);
+  });
+
+  it("never returns a worker or a non-build row", () => {
+    const agents: Node[] = [
+      { id: "s1", kind: "shell", parentId: null },
+      { id: "w1a", kind: "worker", parentId: "p1" },
+    ];
+    expect(autoCollapseTargets(agents, { s1: false, w1a: false }, always, null)).toEqual([]);
+  });
+
+  // Both halves run against the same snapshot in the same tick, so an id must never be in both.
+  it("is disjoint from expandOnWorkerAttention on the same snapshot", () => {
+    const prev = { p1: true, p2: false };
+    const next = { p1: false, p2: true };
+    const opening = expandOnWorkerAttention(prev, next);
+    const closing = autoCollapseTargets(FLEET, next, always, null);
+    expect(opening).toEqual(["p2"]);
+    expect(closing).toEqual(["p1"]);
+    expect(opening.filter((id) => closing.includes(id))).toEqual([]);
   });
 });

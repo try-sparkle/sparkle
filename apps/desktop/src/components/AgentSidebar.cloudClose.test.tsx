@@ -72,7 +72,7 @@ function seed(
     workflowStage: {},
     pollBranchStatus: vi.fn(() => Promise.resolve()),
   } as never);
-  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
   return project;
 }
 

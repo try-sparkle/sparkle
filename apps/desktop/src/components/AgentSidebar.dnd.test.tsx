@@ -47,7 +47,7 @@ function seed(agents?: AgentTab[]): Project {
 }
 
 // Reset shared UI state so one test's orchestrator-expand can't leak into the next.
-beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
+beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} }));
 afterEach(() => cleanup());
 
 const agentOrder = () => useProjectStore.getState().projects[0]!.agents.map((a) => a.id);

@@ -111,7 +111,7 @@ function seedExpanded(status: Record<string, AgentTabStatus> = {}): Project {
 }
 
 beforeEach(() => {
-  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
   open.mockClear();
 });
 afterEach(cleanup);

@@ -103,3 +103,61 @@ export function expandOnWorkerAttention(
   }
   return attention;
 }
+
+
+// ---------------------------------------------------------------------------
+// THE OTHER HALF: when a subtree the app opened should close itself again.
+//
+// The module header above states an asymmetry — expansion automatic, collapsing the user's gesture —
+// on the grounds that yanking a subtree shut while someone is reading it is worse than leaving it
+// open. That reasoning is right about the subtree you are READING and wrong about every other one:
+// with no way back, a fleet that has settled leaves a wall of green worker rows the user never asked
+// to keep, and the only undo is one chevron click per orchestrator. So the asymmetry narrows to its
+// actual justification rather than disappearing:
+//
+//   * a subtree the APP opened closes again once no worker under it needs you;
+//   * EXCEPT the one you are reading — the selected head, or the head of the selected worker. That
+//     second case is not politeness: a selected worker with no visible row leaves the terminal
+//     showing an agent nothing in the sidebar points at, the original reason workers have rows;
+//   * EXCEPT a subtree you opened YOURSELF with the chevron. Only the app's own expansions are the
+//     app's to undo — uiStore's `autoExpandedOrchestrators` mark is what records the difference,
+//     and `collapseAutoExpanded` refuses anything unmarked.
+//
+// It reads the SAME `workerAttention` snapshot the expansion does, so "the red dot went out" and
+// "the subtree closed" cannot disagree — including a worker whose red is synthetic (never live),
+// which that snapshot already counts as calm, and a dismissed alarm, which `statusOf` has already
+// de-escalated. One notion of attention, two directions.
+
+/** The AUTO-expanded orchestrator ids that should now close: `attention` says nothing under them
+ *  needs you, and the user is not reading that subtree.
+ *
+ *  A head absent from `attention` is left alone rather than closed — it is a head this pass never
+ *  observed (a different project's, mid-reconcile), and "not observed" is not "calm". A head present
+ *  with no workers at all IS closed: it reads `false`, renders no chevron, and an auto mark left on
+ *  it is stale bookkeeping.
+ *
+ *  Disjoint from {@link expandOnWorkerAttention} by construction — that one reports only rising
+ *  edges to `true`, this one only ids sitting at `false` — so a caller may apply both in either
+ *  order without them fighting over an id in the same tick. */
+export function autoCollapseTargets<
+  T extends { id: string; kind: AgentKind; parentId: string | null },
+>(
+  agents: readonly T[],
+  attention: Record<string, boolean>,
+  isAutoExpanded: (headId: string) => boolean,
+  selectedAgentId: string | null,
+): string[] {
+  // The parent of the selected agent, if it is a worker — the one indirect exemption. Resolved once
+  // rather than by scanning each head's children, so this stays a single pass over `agents`.
+  const selected = selectedAgentId === null ? undefined : agents.find((a) => a.id === selectedAgentId);
+  const selectedParentId = selected?.kind === "worker" ? selected.parentId : null;
+  const out: string[] = [];
+  for (const a of agents) {
+    if (a.kind !== "build") continue;
+    if (attention[a.id] !== false) continue; // needs you, or never observed this pass
+    if (!isAutoExpanded(a.id)) continue; // the user's own expansion is theirs to undo
+    if (a.id === selectedAgentId || a.id === selectedParentId) continue; // you are reading it
+    out.push(a.id);
+  }
+  return out;
+}
