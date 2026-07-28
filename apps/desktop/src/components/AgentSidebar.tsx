@@ -863,6 +863,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   // Deliberately dep-less: content height changes whenever the row set re-renders, and the check is
   // one DOM read + a bail-out setState. Container-size changes that DON'T re-render React (window /
   // column resize) are caught by the ResizeObserver below.
+  //
+  // The rule's concern is an infinite chain of updates from a dep-less effect that setStates. The
+  // bail-out below makes that impossible: `prev === next ? prev : next` returns the SAME reference
+  // when the value is unchanged, so React bails out of the re-render and the loop cannot sustain
+  // itself. Adding `[]` — the rule's suggested fix — would be wrong here: it would run the check
+  // once on mount and never again, so the button placement would stop tracking the row set.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     const sc = listScrollRef.current;
     if (!sc) return;
