@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside, blocksKeychainCommand } from "../../src-tauri/resources/worktree-guard.mjs";
+import { isInside, blocksKeychainCommand, isAllowlistedNoteDir } from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -129,5 +129,71 @@ describe("blocksKeychainCommand", () => {
     expect(blocksKeychainCommand("run-security-scan --target ai.sparkle.desktop generic-password")).toBe(false);
     // Non-string input is safely ignored.
     expect(blocksKeychainCommand(undefined)).toBe(false);
+  });
+});
+
+// item 1j: the guard allows writes to two NARROW append-only per-agent note dirs that live outside
+// every worktree by design - $HOME/.claude/plans/ and $HOME/.claude/projects/<any>/memory/ - so an
+// agent can record cross-session knowledge and plan files for the next agent. Everything else under
+// ~/.claude stays blocked, and a symlink planted inside an allow-listed dir cannot tunnel out.
+describe("isAllowlistedNoteDir (real dirs on disk)", () => {
+  let home: string;
+  let outside: string;
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-home-")));
+    outside = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-out-")));
+    writeFileSync(join(outside, "evil.md"), "x");
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("allows a per-agent memory-dir path (existing and not-yet-created)", () => {
+    const memDir = join(home, ".claude", "projects", "proj-abc", "memory");
+    mkdirSync(memDir, { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(memDir, "notes.md"))).toBe(true);
+    writeFileSync(join(memDir, "real.md"), "x");
+    expect(isAllowlistedNoteDir(home, join(memDir, "real.md"))).toBe(true);
+    expect(isAllowlistedNoteDir(home, memDir)).toBe(true);
+  });
+
+  it("allows a plans path", () => {
+    const plansDir = join(home, ".claude", "plans");
+    mkdirSync(plansDir, { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(plansDir, "my-plan.md"))).toBe(true);
+    expect(isAllowlistedNoteDir(home, join(plansDir, "nested", "deep.md"))).toBe(true);
+  });
+
+  it("still blocks siblings: commands, projects/<id>/other, and the rest of ~/.claude", () => {
+    const commands = join(home, ".claude", "commands");
+    mkdirSync(commands, { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(commands, "foo.md"))).toBe(false);
+    const other = join(home, ".claude", "projects", "proj-abc", "other");
+    mkdirSync(other, { recursive: true });
+    expect(isAllowlistedNoteDir(home, join(other, "x.md"))).toBe(false);
+    expect(isAllowlistedNoteDir(home, join(home, ".claude", "projects", "proj-abc", "config.json"))).toBe(false);
+    expect(isAllowlistedNoteDir(home, join(home, ".claude", "settings.json"))).toBe(false);
+  });
+
+  it("blocks a symlink-escape out of an allow-listed memory dir", () => {
+    const memDir = join(home, ".claude", "projects", "proj-abc", "memory");
+    mkdirSync(memDir, { recursive: true });
+    symlinkSync(outside, join(memDir, "escape"));
+    expect(isAllowlistedNoteDir(home, join(memDir, "escape", "evil.md"))).toBe(false);
+  });
+
+  it("blocks a symlink-escape out of the plans dir", () => {
+    const plansDir = join(home, ".claude", "plans");
+    mkdirSync(plansDir, { recursive: true });
+    symlinkSync(outside, join(plansDir, "escape"));
+    expect(isAllowlistedNoteDir(home, join(plansDir, "escape", "evil.md"))).toBe(false);
+  });
+
+  it("blocks when the memory dir itself is a symlink pointing outside", () => {
+    const proj = join(home, ".claude", "projects", "proj-xyz");
+    mkdirSync(proj, { recursive: true });
+    symlinkSync(outside, join(proj, "memory"));
+    expect(isAllowlistedNoteDir(home, join(proj, "memory", "notes.md"))).toBe(false);
   });
 });

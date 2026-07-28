@@ -5,4 +5,8 @@ declare module "*/worktree-guard.mjs" {
   // Keychain guard predicate (sparkle-0ezz): true iff a Bash command shells out to the macOS
   // `security` CLI against the ai.sparkle.desktop generic-password keychain item.
   export function blocksKeychainCommand(command: unknown): boolean;
+  // Narrow allow-list predicate (item 1j): true iff target resolves into $HOME/.claude/plans/ or a
+  // $HOME/.claude/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
+  // per-agent note dirs the guard permits even though they live outside the worktree).
+  export function isAllowlistedNoteDir(homeDir: string, target: string): boolean;
 }

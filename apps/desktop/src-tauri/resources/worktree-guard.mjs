@@ -13,6 +13,7 @@
 // (it reads that item in-process via keyring); only an agent does, so we stop the command from running.
 import { relative, sep, isAbsolute, dirname } from "node:path";
 import { lstatSync, readlinkSync } from "node:fs";
+import { homedir } from "node:os";
 
 // Canonicalize `p` by resolving symlinks one path segment at a time — a from-scratch realpath
 // that also tolerates not-yet-existing trailing segments (the file a Write is about to create).
@@ -106,6 +107,38 @@ export function blocksKeychainCommand(command) {
   return genericPassword && appService;
 }
 
+/** True iff target resolves into one of the two NARROW append-only per-agent note dirs we allow
+ *  writes to even though they live outside every worktree by design (item 1j):
+ *    - $HOME/.claude/plans/                  plan files, and
+ *    - $HOME/.claude/projects/<any>/memory/  per-agent cross-session memory.
+ *  These are append-only NOTES, not code, so allowing them does not undermine the guard job of
+ *  stopping an agent editing another agent code, and the header above already states this is
+ *  "NOT a security sandbox". Both checks canonicalize through symlinks via the same
+ *  realResolve/isInside machinery the containment check uses, so a symlink planted inside an
+ *  allow-listed dir that points elsewhere does NOT tunnel a write out: the RESOLVED target simply
+ *  will not be inside the allow-listed root. Kept deliberately narrow: ONLY these two dir classes,
+ *  never all of ~/.claude/. Fails closed (false) on any unresolvable path. */
+export function isAllowlistedNoteDir(homeDir, target) {
+  if (typeof homeDir !== "string" || homeDir.length === 0) return false;
+  if (typeof target !== "string" || target.length === 0) return false;
+  const claudeRoot = `${homeDir}${sep}.claude`;
+  // (1) Plan files: anywhere at/under $HOME/.claude/plans/ (reuse the symlink-safe isInside).
+  if (isInside(`${claudeRoot}${sep}plans`, target)) return true;
+  // (2) Per-agent memory: $HOME/.claude/projects/<anything>/memory/ and descendants. We cannot
+  // express the <anything> wildcard through one isInside root, so canonicalize both the projects
+  // root and the target, confirm the target is inside projects/, then require the resolved path to
+  // be <projectId>/memory[/...]. Canonicalizing the target FIRST is what makes this symlink-safe:
+  // an escaping symlink resolves OUT of projectsRoot and is rejected below.
+  const projectsRoot = realResolve(`${claudeRoot}${sep}projects`);
+  const t = realResolve(isAbsolute(target) ? target : `${process.cwd()}${sep}${target}`);
+  if (projectsRoot === null || t === null) return false;
+  const rel = relative(projectsRoot, t);
+  if (rel === "" || rel.startsWith("..")) return false; // not inside projects/
+  const parts = rel.split(sep);
+  // parts[0] = the project id; the very next segment must be the memory dir itself.
+  return parts.length >= 2 && parts[1] === "memory";
+}
+
 async function main() {
   const root = process.argv[2];
   if (!root) process.exit(0); // misconfigured guard must not block work
@@ -140,6 +173,17 @@ async function main() {
     inside = false;
   }
   if (inside) process.exit(0);
+  // Narrow allow-list (item 1j): permit writes to the two append-only per-agent note dirs that
+  // live OUTSIDE every worktree by design (plan files and cross-session memory) so an agent can
+  // record what it learned for the next agent. Safe because these are notes, not code, and
+  // isAllowlistedNoteDir canonicalizes through symlinks (same fail-closed machinery as above).
+  let allowedNoteDir = false;
+  try {
+    allowedNoteDir = isAllowlistedNoteDir(homedir(), target);
+  } catch {
+    allowedNoteDir = false;
+  }
+  if (allowedNoteDir) process.exit(0);
   process.stderr.write(
     `Blocked: ${target} is outside this agent's worktree (${root}). ` +
       `Edit only files inside your worktree.\n`,
