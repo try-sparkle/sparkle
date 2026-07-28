@@ -14,7 +14,6 @@ import {
   rollupDotAccessor,
   withWorkerRollupGreen,
 } from "./workerRollup";
-import { bandOfStatus } from "./buildSections";
 import type { AgentTabStatus } from "../types";
 
 /** A worker set built from statuses; the helper exists so each case reads as its truth-table row. */

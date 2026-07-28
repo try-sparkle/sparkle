@@ -5,7 +5,7 @@
 // Kept in its own file rather than appended to ProjectTabs.test.tsx: this tab bar is under active
 // concurrent rewrite, and a separate file can't conflict with it.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { ProjectTabs } from "./ProjectTabs";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 

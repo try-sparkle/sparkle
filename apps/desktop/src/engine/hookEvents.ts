@@ -55,6 +55,7 @@ export function hookEventToStatus(ev: HookEvent): AgentTabStatus | null {
     case "PreToolUse":
     case "PostToolUse":
     // A subagent finishing doesn't end the main turn — Claude keeps working.
+    // falls through
     case "SubagentStop":
       return "working";
     case "Notification":

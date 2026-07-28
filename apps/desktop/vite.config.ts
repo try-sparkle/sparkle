@@ -130,6 +130,10 @@ export default defineConfig(({ mode, command }) => {
     // the repo, so it is also the biggest single contributor to the process storm.
     poolOptions: testPoolOptions(),
     setupFiles: ["./src/test-setup.ts"],
+    // Keep the per-test deadline strictly above Testing Library's async default so a slow
+    // real-timer waitFor under coverage instrumentation surfaces its own RTL error/DOM dump
+    // rather than a bare vitest timeout ().
+    testTimeout: 15000,
     // Coverage with a blocking ratchet (bead .1): CI fails if statement/line
     // coverage regresses below the floor below. The floor is set a few points UNDER the
     // measured coverage so it doesn't flake on the CI runner; raise it as coverage climbs,
@@ -141,8 +145,8 @@ export default defineConfig(({ mode, command }) => {
       reporter: ["text-summary", "json-summary"],
       // Blocking floor — a few points below the measured statement/line coverage.
       thresholds: {
-        statements: 30,
-        lines: 30,
+        statements: 82,
+        lines: 82,
       },
     },
   },

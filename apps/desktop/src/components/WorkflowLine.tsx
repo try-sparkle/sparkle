@@ -7,7 +7,6 @@
 import { memo } from "react";
 import { stageFraction, stageLineColor, stageMeta, LINE_FROM } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { C } from "../theme/colors";
 
 // Unfilled track: a faint muted rail so the remaining path reads as "to do" without looking broken.
 const TRACK_BG = "rgba(138,160,196,0.22)";

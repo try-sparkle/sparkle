@@ -61,7 +61,7 @@ import {
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withRedWorkerAttention, withUnstartedWorkerAttention } from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
-import type { AgentKind, AgentTab, AgentTabStatus } from "./types";
+import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
 
 /** The "answer now" red statuses relayed to the phone + counted by the badge (mirrors

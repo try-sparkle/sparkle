@@ -308,10 +308,9 @@ describe("AppBoot — boot selection respects closed tabs", () => {
       if (ms !== UI_HYDRATION_GRACE_MS || typeof handler !== "function")
         return realSetTimeout(handler as never, ms, ...(rest as never[]));
       armed += 1;
-      let id: unknown;
       // A timer that FIRES is no longer pending — without this, "still armed" and "already ran"
       // would be indistinguishable and a leak check could never fail honestly.
-      id = realSetTimeout(
+      const id: unknown = realSetTimeout(
         ((...args: unknown[]) => {
           pending.delete(id);
           (handler as (...a: unknown[]) => void)(...args);

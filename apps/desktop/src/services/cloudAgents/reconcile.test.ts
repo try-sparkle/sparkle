@@ -59,7 +59,6 @@ describe("reconcileCloudSessions", () => {
   it("ignores malformed rows (missing/empty id)", () => {
     const r = reconcileCloudSessions({
       existingTabIds: [],
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sessions: [{ status: "active" } as any, s("", "active"), s("ok", "active")],
     });
     expect(r.toCreate.map((c) => c.id)).toEqual(["ok"]);

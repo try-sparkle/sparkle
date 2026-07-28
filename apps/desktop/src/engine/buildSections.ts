@@ -12,7 +12,7 @@
 //
 // Kept free of React so it's unit-tested in isolation; the rendering lives in AgentSidebar.tsx.
 import type { AgentTabStatus } from "../types";
-import { type WorkflowStageId, stageIndex } from "./workflowStage";
+import { type WorkflowStageId } from "./workflowStage";
 
 // ── The ladder ───────────────────────────────────────────────────────────────────────────────
 export type BuildSectionId =

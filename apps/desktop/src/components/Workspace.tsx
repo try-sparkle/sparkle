@@ -135,7 +135,6 @@ export function Workspace() {
     () => resolvePinnedProjectId(projects, pinnedProjectId),
     [projects, pinnedProjectId],
   );
-  const liveStatus = useRuntimeStore((s) => s.status);
   // Improve Sparkle is per-window: this window's own Sparkle copy is keyed by this id (the main
   // window keeps the canonical id, secondary windows get their own). See services/sparkleAgent.
   const sparkleAgentId = sparkleAgentIdFor(currentWindowLabel);

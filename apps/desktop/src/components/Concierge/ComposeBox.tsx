@@ -82,7 +82,6 @@ import {
 import { ComposerOutOfCreditsNotice } from "../OutOfCreditsNotice";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
 import {
-  COMPOSE_MIN_H,
   CONCIERGE_THREAD_TESTID,
   composeDragH,
   composeDragReleasesManual,

@@ -21,7 +21,6 @@ const {
   outRef,
   exitRef,
   outUnlisten,
-  exitUnlisten,
 } = vi.hoisted(() => {
   const outRef = { id: null as string | null, cb: null as null | ((e: { chunk: string; bytes: number }) => void) };
   const exitRef = { cb: null as null | ((e: { id: string }) => void) };

@@ -1,6 +1,5 @@
 import { useEffect, type CSSProperties, type ComponentType, type ReactNode } from "react";
 import {
-  FiMessageSquare,
   FiMic,
   FiShare2,
   FiGithub,

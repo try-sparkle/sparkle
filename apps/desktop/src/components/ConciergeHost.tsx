@@ -40,7 +40,6 @@ import {
   type ConciergeNudge,
   type ConciergeNudgeAction,
   type ConciergeReceipt,
-  type ConciergeSparkleMessage,
   type ConciergeViewModel,
 } from "./Concierge";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";

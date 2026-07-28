@@ -18,8 +18,8 @@ export default defineConfig({
       reporter: ["text-summary", "json-summary"],
       // Blocking floor — a few points below the measured statement/line coverage.
       thresholds: {
-        statements: 72,
-        lines: 72,
+        statements: 85,
+        lines: 85,
       },
     },
   },

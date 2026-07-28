@@ -53,7 +53,6 @@ describe("Markdown", () => {
   });
 
   it("does not open a javascript: href (defense in depth)", () => {
-    // eslint-disable-next-line no-script-url
     render(<Markdown text="[x](javascript:alert(1))" />);
     const link = screen.getByText("x");
     expect(link.getAttribute("href")).toBeNull();

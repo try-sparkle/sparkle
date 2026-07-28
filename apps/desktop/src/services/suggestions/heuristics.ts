@@ -13,7 +13,7 @@ const TAIL_LINES = 12;
 // "y/n" / "yes/no" word forms. (An earlier YN_DEFAULT regex was removed — it was fully subsumed
 // by this one and added no behavior.)
 const YN = /\b(y\/n|yes\/no)\b|\[y\/n\]|\[yes\/no\]/i;
-const MENU_LINE = /^\s*[\[(]?(\d{1,2})[\]).]\s+\S/; // "1) x", "2. x", "[3] x", "(4) x"
+const MENU_LINE = /^\s*[[(]?(\d{1,2})[\]).]\s+\S/; // "1) x", "2. x", "[3] x", "(4) x"
 
 // A real choice prompt either names the action, or is a pure-punctuation prompt like "? " / ">"
 // (a single-word label ending in ":" such as "Changes:"/"Results:" is a HEADER, not a prompt —

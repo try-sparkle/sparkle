@@ -16,7 +16,7 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
 import { FiCloud } from "react-icons/fi";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, CHAT_USER_BUBBLE, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
+import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { WEB_BASE_URL } from "../services/sparkleApi";
@@ -64,7 +64,6 @@ import {
 import {
   bandOfRollup,
   rollupDot,
-  rollupDotAccessor,
   rollupLabel,
   type RollupDot,
 } from "../engine/workerRollup";
@@ -73,7 +72,6 @@ import { StatusFilterBar } from "./StatusFilterBar";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
 import { expandOnWorkerAttention, workerAttention } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
-import { isInMotion } from "../engine/inMotion";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";

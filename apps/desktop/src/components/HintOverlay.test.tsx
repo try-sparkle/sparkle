@@ -4,6 +4,13 @@ import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HintOverlay } from "./HintOverlay";
 import { AGENT_OVERFLOW_POOL } from "../keyboardHints/hintTargets";
+import { configure } from "@testing-library/dom";
+
+// This suite drove PR #633's coverage-only flake: RTL waitFor on REAL timers, whose 1000ms
+// default is tripped by v8 instrumentation load on a 2-vCPU CI runner. The coverage gate is
+// blocking, so raise the async deadline for THIS file only — it uses no fake timers, so there is
+// no virtual-clock coupling (). testTimeout (vite.config) sits above this at 15s.
+configure({ asyncUtilTimeout: 5000 });
 
 // jsdom gives every element a 0×0 rect and a null offsetParent, which our visibility filter would
 // reject. Stub both so tagged controls count as on-screen during the test.

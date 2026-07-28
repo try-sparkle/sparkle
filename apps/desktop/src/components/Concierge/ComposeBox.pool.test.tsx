@@ -61,15 +61,6 @@ const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAr
 const handle = () => screen.getByTestId("concierge-compose-handle");
 const px = (v: string) => parseFloat(v);
 
-/** Give an element the laid-out sizes jsdom refuses to compute. */
-function stubSize(el: HTMLElement, o: { client?: number; offset?: number }) {
-  if (o.client != null) {
-    Object.defineProperty(el, "clientHeight", { configurable: true, get: () => o.client });
-  }
-  if (o.offset != null) {
-    Object.defineProperty(el, "offsetHeight", { configurable: true, get: () => o.offset });
-  }
-}
 
 /** A column shaped like the real one: the thread is `flex: 1`, so it gets whatever the compose box
  *  does not. `columnH` is the space those two SHARE (the section minus its fixed header), and the

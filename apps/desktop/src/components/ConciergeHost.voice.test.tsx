@@ -202,8 +202,8 @@ function mount(opts: { aimable?: boolean } = {}) {
  *  region carrying the last finished line (roborev 53010), so a document-wide getByText would match
  *  the same string twice — and would pass even if the visible thread stopped rendering it. */
 const thread = () => screen.getByTestId("concierge-thread");
-const inThread = (re: RegExp | string) => within(thread()).getByText(re);
 const findInThread = (re: RegExp | string) => within(thread()).findByText(re);
+const inThread = (re: RegExp | string) => within(thread()).getByText(re);
 
 // The turn-token guard (roborev 53004). Ids like "t1" are not tokens — they take the "not a number
 // → always surface" escape hatch, so the numeric branch would be dead in tests while being the

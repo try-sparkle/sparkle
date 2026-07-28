@@ -65,14 +65,14 @@ export async function createDictationController(
 ): Promise<DictationController> {
   // Keep a stable reference to the callback so callers can swap it out
   // without recreating the controller (mirrors the useRef pattern in the hook).
-  let onSegment = options.onSegment;
+  const onSegment = options.onSegment;
   const onResumeActive = options.onResumeActive;
   // Only the focused window should consume the (app-broadcast) committed text + live preview, so a
   // phrase doesn't land in every open window at once. Default to a real per-window focus check.
   const isWindowActive =
     options.isWindowActive ?? (() => typeof document === "undefined" || document.hasFocus());
 
-  const { setStatus, setLevel, setSpeaking, setError, setModelProgress } =
+  const { setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
 
   // --- Per-window cloud-stream ownership (sparkle-ozvr) ------------------------------------------

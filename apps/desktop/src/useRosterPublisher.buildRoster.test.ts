@@ -15,7 +15,6 @@ const project: Project = {
 describe("buildRoster", () => {
   it("joins live status into the roster payload", () => {
     const r = buildRoster([project], { a1: "working" }, {}, {});
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!).toMatchObject({
       id: "a1", kind: "build", status: "working", status_color: "#34c759",
     });
@@ -23,9 +22,7 @@ describe("buildRoster", () => {
 
   it("defaults unknown status to stopped/grey", () => {
     const r = buildRoster([project], {}, {}, {});
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!.status).toBe("stopped");
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!.status_color).toBe("#8aa0c4");
   });
 });
@@ -55,7 +52,6 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
     // Code units 79 and 80 are the 🎉 pair — precisely where slice(0, 80) used to cut.
     const prompt = "x".repeat(79) + "\u{1F389}" + " and more text after the emoji";
     const r = rosterFor(prompt);
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const carried = r.projects[0]!.agents[0]!.recent_prompts![0]!.text;
 
     expect(hasLoneSurrogate(carried)).toBe(false);
@@ -68,13 +64,11 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
   it("repairs a prompt that arrives already malformed", () => {
     // Not our truncation's fault — a lone surrogate pasted/scraped into the prompt itself.
     const r = rosterFor("broken \uD83C tail");
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(hasLoneSurrogate(r.projects[0]!.agents[0]!.recent_prompts![0]!.text)).toBe(false);
   });
 
   it("still carries a short emoji prompt intact", () => {
     const r = rosterFor("ship it \u{1F389}");
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.agents[0]!.recent_prompts![0]!.text).toBe("ship it \u{1F389}");
   });
 
@@ -103,7 +97,6 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
   ])("repairs a lone surrogate in the %s", (_label, corrupt) => {
     const p = projectFixture();
     corrupt(p);
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const r = buildRoster([p], { [p.agents[0]!.id]: "working" }, {}, {});
     const wire = JSON.stringify(r);
     expect(hasLoneSurrogate(wire)).toBe(false);
@@ -114,7 +107,6 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
   // the truncation path the original fix guarded.
   it("repairs a lone surrogate in workflow_stage", () => {
     const r = buildRoster([projectFixture()], { a1: "working" }, { a1: "review \uD83D" }, {});
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(hasLoneSurrogate(r.projects[0]!.agents[0]!.workflow_stage!)).toBe(false);
     expect(JSON.stringify(r)).not.toMatch(/\\ud[89ab][0-9a-f]{2}/i);
   });
@@ -124,9 +116,7 @@ describe("roster payload is always well-formed UTF-16 (hex-escape regression)", 
     const p = projectFixture();
     p.name = "Proj \u{1F680}";
     const r = buildRoster([p], { a1: "working" }, { a1: "review" }, {});
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const agent = r.projects[0]!.agents[0]!;
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(r.projects[0]!.name).toBe("Proj \u{1F680}");
     expect(agent.workflow_stage).toBe("review");
     expect(agent.parent_id).toBeNull();
