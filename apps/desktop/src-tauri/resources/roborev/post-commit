@@ -231,6 +231,31 @@ if [ -n "$_changed" ] && ! printf '%s\n' "$_changed" | grep -qvE '^PRD/'; then
     exit 0
 fi
 
+# Round-cap: stop auto-enqueuing once a branch has piled up many un-landed commits — the signature of
+# a non-convergent fix->review->fix loop, where each fix commit spawns another review and the loop
+# provably does not converge (findings plateau; a one-file change can draw 8-12 rounds). Past the cap
+# the change is landable — its Medium+ findings are what gate — and new rounds just burn a worker and
+# the shared review quota. This never blocks landing: the pre-push gate still checks the EXISTING
+# reviews, and a specific commit can still be reviewed on demand with `roborev review`. Measured as
+# commits since this branch diverged from origin/main; fail OPEN (enqueue) on ANY ambiguity — no
+# resolvable origin/main, an unreadable merge-base or count, or a non-numeric result. Env-overridable
+# so the test can exercise the cap without building a 12-deep history.
+_cap=${ROBOREV_ROUND_CAP:-12}
+_base=$(git rev-parse --verify -q origin/main 2>/dev/null)
+if [ -n "$_base" ]; then
+    _mb=$(git merge-base HEAD "$_base" 2>/dev/null)
+    if [ -n "$_mb" ]; then
+        _ahead=$(git rev-list --count "$_mb"..HEAD 2>/dev/null || echo 0)
+        case "$_ahead" in ''|*[!0-9]*) _ahead=0 ;; esac
+        if [ "$_ahead" -ge "$_cap" ]; then
+            echo "roborev: this branch has $_ahead un-landed commits — auto-review paused (this is" \
+                 "usually a fix->review->fix loop). Resolve open findings and land it, or run" \
+                 "'roborev review' on a specific commit on demand." >&2
+            exit 0
+        fi
+    fi
+fi
+
 # NOTE: `roborev install-hook --force` (e.g. a roborev self-update) does NOT replace
 # this file — it SPLICES its unguarded stub in below the shebang and leaves this
 # wrapper underneath, which makes every guard above dead code while the file still
