@@ -109,7 +109,12 @@ body {
   /* token: forest (app background) / cream (primary text) — themed via CSS vars */
   background: var(--c-forest);
   color: var(--c-cream);
-  font-family: "IBM Plex Sans", sans-serif;
+  /* THE SYSTEM FACE, per the approved Blueprint spec (PRD/sparkle/ui-directions/index.html,
+     `--k-ui`). This was "IBM Plex Sans", with the concierge column additionally rendering in
+     Verdana — and a humanist webfont plus Verdana against `system-ui` is most of why the running
+     app read as a different product from the design it was built to. The @font-face declarations
+     above still ship IBM Plex for anything that asks for it by name; nothing does any more. */
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }

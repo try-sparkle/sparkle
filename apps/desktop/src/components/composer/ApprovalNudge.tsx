@@ -117,8 +117,8 @@ const bar: CSSProperties = {
   padding: "6px 10px",
   background: C.barSurface,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  borderRadius: 6,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const toast: CSSProperties = {
@@ -129,10 +129,10 @@ const toast: CSSProperties = {
   padding: "6px 10px",
   background: C.barSurface,
   border: `1px solid ${C.teal}`,
-  borderRadius: 8,
+  borderRadius: 6,
   color: C.cream,
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -144,7 +144,7 @@ const primaryBtn: CSSProperties = {
   padding: "4px 12px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -155,7 +155,7 @@ const ghostBtn: CSSProperties = {
   borderRadius: 6,
   padding: "4px 10px",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -166,7 +166,7 @@ const linkBtn: CSSProperties = {
   padding: "2px 4px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
   textDecoration: "underline",
 };

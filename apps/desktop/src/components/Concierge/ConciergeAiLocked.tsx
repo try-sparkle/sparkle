@@ -56,7 +56,7 @@ const settingsBtn: CSSProperties = {
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   whiteSpace: "nowrap",
 };
 

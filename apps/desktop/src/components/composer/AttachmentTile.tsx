@@ -69,8 +69,8 @@ export function AttachmentTile({
             <FileIcon />
             <span
               style={{
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 11,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontSize: 12,
                 fontWeight: FONT_WEIGHT.semibold,
                 lineHeight: 1.2,
                 overflow: "hidden",
@@ -124,7 +124,7 @@ export function AttachmentTile({
           right: -6,
           width: 18,
           height: 18,
-          borderRadius: 9,
+          borderRadius: 6,
           background: C.sienna,
           color: ON_BRAND_FILL,
           border: "none",

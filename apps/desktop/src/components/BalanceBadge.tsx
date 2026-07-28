@@ -16,14 +16,14 @@ const badge: CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   padding: "3px 9px",
-  borderRadius: 8,
+  borderRadius: 6,
   // pillFill, not forest: this badge is a FILLED chip on the concierge column, and a plane
   // fill on a near-black plane is not a chip. See theme/colors `pillFill`.
   background: C.pillFill,
   color: C.cream,
   fontSize: 12,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   whiteSpace: "nowrap",
 };
 

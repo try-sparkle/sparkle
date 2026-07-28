@@ -25,7 +25,7 @@ import {
 const accent = C.accentInk;
 
 const sectionLabel: CSSProperties = {
-  fontSize: 9.5,
+  fontSize: 10,
   fontWeight: FONT_WEIGHT.bold,
   letterSpacing: "0.05em",
   textTransform: "uppercase",
@@ -38,7 +38,7 @@ const rowStyle: CSSProperties = {
   display: "flex",
   alignItems: "baseline",
   gap: 6,
-  fontSize: 12.5,
+  fontSize: 12,
   color: C.cream,
   padding: "2px 0",
 };
@@ -56,10 +56,10 @@ const rowStyle: CSSProperties = {
 // against. That is true of every muted string on the card, not just this chip, so it belongs to the
 // card's surface. Measured in theme/amberInk.test.ts; tracked in PRD/sparkle/concierge-presence.md.
 const projectChip: CSSProperties = {
-  fontSize: 9.5,
+  fontSize: 10,
   color: C.conciergeMuted,
   border: `1px solid color-mix(in srgb, ${C.amber} 40%, transparent)`,
-  borderRadius: 5,
+  borderRadius: 4,
   padding: "1px 5px",
   flex: "none",
 };
@@ -189,7 +189,7 @@ export function RecapCard({ recap }: { recap: ConciergeRecapMessage }) {
         maxWidth: "100%",
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,
         border: `1px solid color-mix(in srgb, ${accent} 32%, transparent)`,
-        borderRadius: 12,
+        borderRadius: 6,
         padding: "12px 13px",
       }}
     >

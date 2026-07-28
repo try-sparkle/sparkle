@@ -12,7 +12,7 @@ export function OpenTargetDialog({
 }) {
   return (
     <ModalShell width={420} onCancel={onCancel}>
-      <div style={{ fontSize: 16, fontWeight: FONT_WEIGHT.semibold, marginBottom: 6 }}>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 6 }}>
         Open project
       </div>
       <div style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
@@ -25,10 +25,10 @@ export function OpenTargetDialog({
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "11px 14px",
             cursor: "pointer",
-            fontSize: 14,
+            fontSize: 13,
             textAlign: "left",
           }}
         >
@@ -40,10 +40,10 @@ export function OpenTargetDialog({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "11px 14px",
             cursor: "pointer",
-            fontSize: 14,
+            fontSize: 13,
             fontWeight: FONT_WEIGHT.semibold,
             textAlign: "left",
           }}
@@ -58,7 +58,7 @@ export function OpenTargetDialog({
             background: "transparent",
             color: C.muted,
             border: `1px solid ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "8px 16px",
             cursor: "pointer",
           }}

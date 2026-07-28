@@ -158,25 +158,25 @@ export function SelectionPopup({
         width: WIDTH,
         background: C.deepForest,
         border: `1px solid ${C.hairline}`,
-        borderRadius: 10,
+        borderRadius: 6,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         color: C.cream,
         padding: "10px 4px 8px",
         animation: "sparkle-tooltip-in 90ms ease-out",
       }}
     >
-      <div style={{ color: C.tealInk, fontSize: 11.5, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px", display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ color: C.tealInk, fontSize: 12, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px", display: "flex", alignItems: "center", gap: 4 }}>
         <FiCheck size={13} /> Copied to clipboard
       </div>
       <div
         style={{
           fontFamily: '"Source Code Pro", monospace',
-          fontSize: 11,
+          fontSize: 12,
           color: C.muted,
           background: C.forest,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 5,
+          borderRadius: 4,
           padding: "5px 8px",
           margin: "8px 10px",
           whiteSpace: "nowrap",

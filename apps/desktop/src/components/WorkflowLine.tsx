@@ -71,7 +71,7 @@ export const WorkflowLine = memo(function WorkflowLine({
         <span
           style={{
             flex: "0 0 auto",
-            fontSize: 11,
+            fontSize: 12,
             lineHeight: 1.2,
             fontWeight: 600,
             color: end, // inked the line's rightmost color: cyan at Uncommitted, blue at Merged

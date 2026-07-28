@@ -12,7 +12,7 @@
 // through portals, so the hover card's mouseenter/mouseleave liveness survives both portals.
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { C, FONT } from "../theme/colors";
+import { C } from "../theme/colors";
 import {
   CLAUDE_MODELS,
   isDefaultModel,
@@ -148,10 +148,10 @@ export function ModelPill({
           // it carries were re-measured on the new fill — see the caret below.
           background: C.pillFill,
           border: `1px solid ${C.muted}`,
-          borderRadius: 5,
+          borderRadius: 4,
           color: C.cream,
-          fontFamily: FONT.ui,
-          fontSize: compact ? 10 : 11,
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontSize: compact ? 10 : 12,
           fontWeight: 600,
           lineHeight: 1,
           padding: compact ? "2px 6px" : "3px 8px",
@@ -183,7 +183,7 @@ export function ModelPill({
                 minWidth: 200,
                 background: C.deepForest,
                 border: `1px solid ${C.hairline}`,
-                borderRadius: 8,
+                borderRadius: 6,
                 boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
                 padding: 6,
                 zIndex: MENU_Z,
@@ -215,7 +215,7 @@ export function ModelPill({
                       border: "none",
                       borderRadius: 6,
                       cursor: "pointer",
-                      fontFamily: FONT.ui,
+                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                       fontSize: 12,
                       color: C.cream,
                       // pillFill, not forest: the selected row's fill IS the selection, and

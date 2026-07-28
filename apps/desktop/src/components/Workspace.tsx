@@ -5,7 +5,7 @@ import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colo
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
-import { ColumnResizeTab } from "./ColumnResizeTab";
+import { ColumnPullTab } from "./ColumnPullTab";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -638,7 +638,7 @@ export function Workspace() {
         // terminal darkest; the shell itself sits below all three).
         background: C.deepForest,
         color: C.cream,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       {/* Spans the very top of the app, just below the window chrome, above the tabs.
@@ -665,13 +665,13 @@ export function Workspace() {
             same keyboard contract, and the 2×3 dot grip that fades in on hover; see
             ColumnResizeTab for why the grip is hidden at rest and why it cannot take pointer
             events. */}
-        <ColumnResizeTab
+        <ColumnPullTab
           width={conciergeWidth}
           onWidth={setConciergeWidth}
           min={CONCIERGE_MIN_WIDTH}
           max={CONCIERGE_MAX_WIDTH}
           label="Sparkle column"
-          testId="concierge-resize-tab"
+          testId="concierge-pull-tab"
         />
         {/* ② + ③. Position:relative so Plan mode can lay ONE wide card column over both of them —
             covering, never unmounting: a Terminal unmount kills its PTY, so a mode flip must not
@@ -773,11 +773,11 @@ export function Workspace() {
                       background: C.teal,
                       color: ON_BRAND_FILL,
                       border: "none",
-                      borderRadius: 8,
+                      borderRadius: 6,
                       padding: "10px 20px",
                       fontWeight: FONT_WEIGHT.semibold,
                       cursor: "pointer",
-                      fontFamily: '"IBM Plex Sans", sans-serif',
+                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                     }}
                   >
                     Show that window
@@ -796,12 +796,12 @@ export function Workspace() {
                       background: "transparent",
                       color: C.cream,
                       border: `1px solid ${C.muted}`,
-                      borderRadius: 8,
+                      borderRadius: 6,
                       padding: "10px 20px",
                       fontWeight: FONT_WEIGHT.semibold,
                       cursor: reclaimingIds.has(project.id) ? "default" : "pointer",
                       opacity: reclaimingIds.has(project.id) ? 0.6 : 1,
-                      fontFamily: '"IBM Plex Sans", sans-serif',
+                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                     }}
                   >
                     {reclaimingIds.has(project.id) ? "Bringing it back…" : "Bring it back here"}
@@ -822,7 +822,7 @@ export function Workspace() {
                 <div style={{ height: 60 }} />
                 <div
                   style={{
-                    fontSize: 24,
+                    fontSize: 17,
                     fontWeight: FONT_WEIGHT.semibold,
                     color: C.cream,
                     lineHeight: 1.5,
@@ -843,11 +843,11 @@ export function Workspace() {
                     background: C.teal,
                     color: ON_BRAND_FILL,
                     border: "none",
-                    borderRadius: 8,
+                    borderRadius: 6,
                     padding: "10px 20px",
                     fontWeight: FONT_WEIGHT.semibold,
                     cursor: "pointer",
-                    fontFamily: '"IBM Plex Sans", sans-serif',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                   }}
                 >
                   ▶ Start this agent
@@ -950,7 +950,7 @@ function Hint({ title, children }: { title: string; children: React.ReactNode })
         padding: 24,
       }}
     >
-      <div style={{ fontSize: 18, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>{title}</div>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>{title}</div>
       <div style={{ color: C.muted, maxWidth: 420, lineHeight: 1.5 }}>{children}</div>
     </div>
   );
@@ -972,7 +972,7 @@ function KbdKey({ children }: { children: React.ReactNode }) {
         font: `700 15px/1 ${FONT.mono}`,
         letterSpacing: 0.5,
         padding: "3px 8px",
-        borderRadius: 5,
+        borderRadius: 4,
         border: `1px solid ${ON_GOLD_FILL}`,
         boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
         textTransform: "uppercase",

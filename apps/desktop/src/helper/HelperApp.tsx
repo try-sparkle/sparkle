@@ -577,7 +577,7 @@ export function HelperApp() {
           role="menu"
           style={{
             position: "absolute", top: 4, right: 4, zIndex: 10,
-            background: C.forest, borderRadius: 8, padding: 4,
+            background: C.forest, borderRadius: 6, padding: 4,
             display: "flex", flexDirection: "column", gap: 2,
             border: `1px solid ${C.deepForest}`,
           }}
@@ -624,10 +624,10 @@ export function HelperApp() {
 const menuItem = {
   all: "unset" as const,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   fontSize: 12,
   color: C.cream,
   padding: "5px 10px",
-  borderRadius: 5,
+  borderRadius: 4,
   whiteSpace: "nowrap" as const,
 };

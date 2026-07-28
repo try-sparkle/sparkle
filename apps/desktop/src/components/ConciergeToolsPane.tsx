@@ -177,7 +177,7 @@ function ToolRow({
           )}
         </div>
         <span style={{ color: C.muted, fontSize: 12, lineHeight: 1.45 }}>{tool.summary}</span>
-        <span style={{ color: unreadable ? C.amber : C.muted, fontSize: 11 }}>
+        <span style={{ color: unreadable ? C.amber : C.muted, fontSize: 12 }}>
           {statusText(tool, evaluation)}
         </span>
       </div>
@@ -270,7 +270,7 @@ const row: CSSProperties = {
 
 const groupHeading: CSSProperties = {
   margin: 0,
-  fontSize: 11,
+  fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.muted,
   textTransform: "uppercase",
@@ -292,7 +292,7 @@ const noticeBox: CSSProperties = {
   lineHeight: 1.5,
   background: C.forest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
 };
 
@@ -305,7 +305,7 @@ const gateBox: CSSProperties = {
   gap: 6,
   background: `linear-gradient(${C.forest}, ${C.forest}) padding-box, ${AI_ENHANCEMENTS_GRADIENT} border-box`,
   border: "1.5px solid transparent",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "10px 12px",
 };
 
@@ -327,7 +327,7 @@ const gateBody: CSSProperties = {
 
 const gateFoot: CSSProperties = {
   margin: 0,
-  fontSize: 11,
+  fontSize: 12,
   lineHeight: 1.45,
   color: C.muted,
 };
@@ -340,7 +340,7 @@ const turnOnBtn: CSSProperties = {
   padding: "4px 12px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
@@ -375,10 +375,10 @@ function btn(active: boolean): CSSProperties {
     // Text ON a brand-teal fill: the token for exactly that, which stays light in BOTH themes.
     color: active ? ON_BRAND_FILL : C.cream,
     border: `1px solid ${active ? C.teal : C.muted}`,
-    borderRadius: RADIUS.md,
+    borderRadius: RADIUS.input,
     padding: "5px 9px",
     fontSize: 12,
-    fontFamily: '"IBM Plex Sans", sans-serif',
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     cursor: "pointer",
     whiteSpace: "nowrap",
   };

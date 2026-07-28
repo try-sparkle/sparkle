@@ -54,7 +54,7 @@ export function ComposerOutOfCreditsNotice() {
  *  line 1 the bold, centered headline; line 2 the refill call-to-action with the clickable link. */
 export function SidebarOutOfCreditsNotice() {
   return (
-    <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
+    <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>
       <span style={{ display: "block", fontWeight: FONT_WEIGHT.semibold }}>
         You are out of credits.
       </span>

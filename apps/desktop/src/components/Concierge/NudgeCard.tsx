@@ -27,11 +27,11 @@ export function nudgeAccent(): string {
  *  TEXT on the concierge column, so the label reads `dangerInk` — the same red, themed — while the
  *  fill keeps the literal that color-mix() needs. See theme/colors `dangerInk`. */
 const badgeStyle = (accent: string, ink: string): CSSProperties => ({
-  fontSize: 9.5,
+  fontSize: 10,
   fontWeight: FONT_WEIGHT.bold,
   letterSpacing: "0.04em",
   padding: "2px 6px",
-  borderRadius: 5,
+  borderRadius: 4,
   color: ink,
   background: `color-mix(in srgb, ${accent} 16%, transparent)`,
   border: `1px solid color-mix(in srgb, ${accent} 60%, transparent)`,
@@ -70,7 +70,7 @@ export function NudgeCard({
         // stripe (founder, 2026-07-24: keeps the orange/red, doesn't want the left-side shading).
         // Deliberately a uniform 1px border so the card sits symmetrically once the bar is gone.
         border: `1px solid color-mix(in srgb, ${accent} 40%, transparent)`,
-        borderRadius: 12,
+        borderRadius: 6,
         padding: "12px 13px",
         boxShadow: `0 0 26px color-mix(in srgb, ${accent} 10%, transparent)`,
         cursor: "pointer",
@@ -81,7 +81,7 @@ export function NudgeCard({
           display: "inline-flex",
           alignItems: "center",
           gap: 6,
-          fontSize: 11,
+          fontSize: 12,
           color: C.conciergeMuted,
           marginBottom: 6,
         }}
@@ -89,13 +89,13 @@ export function NudgeCard({
         <span style={badgeStyle(accent, C.dangerInk)}>{label}</span>
         <span
           style={{
-            fontSize: 9.5,
+            fontSize: 10,
             // Prototype `.nudge .proj { color: var(--gold); border: 1px solid rgba(gold,.4) }` —
             // the project chip is concierge GOLD, not the amber status token it was standing in
             // for. Themed ink on the label, literal gold in the color-mix border.
             color: C.goldInk,
             border: `1px solid color-mix(in srgb, ${C.gold} 40%, transparent)`,
-            borderRadius: 5,
+            borderRadius: 4,
             padding: "1px 5px",
           }}
         >
@@ -103,7 +103,7 @@ export function NudgeCard({
         </span>
         {nudge.agentName}
       </div>
-      <div style={{ fontSize: 13.5, color: C.cream }}>{nudge.text}</div>
+      <div style={{ fontSize: 13, color: C.cream }}>{nudge.text}</div>
       {nudge.actions.length > 0 && (
         <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
           {nudge.actions.map((act) => (
@@ -115,7 +115,7 @@ export function NudgeCard({
                 onNudgeAction(nudge, act.id);
               }}
               style={{
-                fontSize: 11,
+                fontSize: 12,
                 fontWeight: FONT_WEIGHT.bold,
                 borderRadius: 999,
                 padding: "6px 11px",

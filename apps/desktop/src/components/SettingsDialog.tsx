@@ -180,7 +180,7 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
       <div data-testid="settings-backdrop" onClick={onClose} style={backdrop} />
       <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Settings" style={dialog}>
         <div style={titleBar}>
-          <div style={{ fontSize: 15, fontWeight: FONT_WEIGHT.semibold }}>Settings</div>
+          <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>Settings</div>
           <button type="button" aria-label="Close settings" onClick={onClose} style={closeBtn}>
             <FiX size={18} />
           </button>
@@ -522,7 +522,7 @@ const dialog: CSSProperties = {
   flexDirection: "column",
   background: C.deepForest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 12,
+  borderRadius: 6,
   boxShadow: "0 24px 64px rgba(0,0,0,0.5)",
   zIndex: 41,
   overflow: "hidden",
@@ -592,10 +592,10 @@ const searchInput: CSSProperties = {
   // the field sits in a rail painted `C.forest`, and that pair fell from 1.50:1 to 1.11:1 with
   // the repaint, so the box had no outer boundary left either. See theme/colors `hairline`.
   border: `1px solid ${C.hairline}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 10px 7px 28px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   outline: "none",
 };
 
@@ -613,10 +613,10 @@ const railItem: CSSProperties = {
   width: "100%",
   textAlign: "left",
   border: "none",
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "9px 11px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -629,7 +629,7 @@ const pane: CSSProperties = {
 
 const paneHeading: CSSProperties = {
   margin: "0 0 3px",
-  fontSize: 15,
+  fontSize: 17,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.cream,
 };
@@ -642,7 +642,7 @@ const paneBlurb: CSSProperties = {
 };
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -658,8 +658,8 @@ const stepBtn: CSSProperties = {
   padding: "6px 0",
   minWidth: 34,
   cursor: "pointer",
-  fontSize: 14,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 13,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   textAlign: "center",
 };
 
@@ -688,10 +688,10 @@ const fullButton: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 14px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   textAlign: "left",
 };

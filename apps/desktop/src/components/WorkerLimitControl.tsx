@@ -104,15 +104,15 @@ const readout: CSSProperties = {
   minWidth: 28,
   textAlign: "right",
   color: C.cream,
-  fontSize: 14,
+  fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const hint: CSSProperties = {
   color: C.muted,
   fontSize: 12,
   lineHeight: 1.4,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };

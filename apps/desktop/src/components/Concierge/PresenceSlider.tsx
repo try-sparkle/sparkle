@@ -168,7 +168,7 @@ export function PresenceSlider() {
             // user twice said the opposite. Two clicks on Away mean Away.
             onDoubleClick={seg === "away" ? (e) => e.stopPropagation() : undefined}
             style={{
-              fontSize: 11,
+              fontSize: 12,
               fontWeight: active ? FONT_WEIGHT.bold : FONT_WEIGHT.regular,
               fontFamily: "inherit",
               color: active ? ink : C.conciergeMuted,

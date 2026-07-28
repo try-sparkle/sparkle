@@ -44,10 +44,10 @@ export function ModalShell({
           maxWidth: "90vw",
           background: C.deepForest,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 12,
+          borderRadius: 6,
           padding: 22,
           color: C.cream,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
         }}
       >

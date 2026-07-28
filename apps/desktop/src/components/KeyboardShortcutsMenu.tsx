@@ -109,7 +109,7 @@ export function KeyboardShortcutsMenu() {
 }
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -124,11 +124,11 @@ const captureBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   textAlign: "center",
 };
 
@@ -141,12 +141,12 @@ const resetBtn: CSSProperties = {
   background: "transparent",
   color: C.muted,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   width: 32,
   height: 32,
   cursor: "pointer",
-  fontSize: 15,
+  fontSize: 17,
   lineHeight: 1,
 };
 
-const tip: CSSProperties = { margin: 0, fontSize: 11, color: C.muted, lineHeight: 1.5 };
+const tip: CSSProperties = { margin: 0, fontSize: 12, color: C.muted, lineHeight: 1.5 };

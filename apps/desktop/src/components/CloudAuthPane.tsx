@@ -206,7 +206,7 @@ function MethodOption({
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ──────
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -217,7 +217,7 @@ const subLabel: CSSProperties = {
 const panel: CSSProperties = {
   background: C.forest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "14px 16px",
   display: "flex",
   flexDirection: "column",
@@ -243,7 +243,7 @@ const input: CSSProperties = {
   background: C.barSurface,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
   fontSize: 13,
   fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -256,9 +256,9 @@ const actionBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };

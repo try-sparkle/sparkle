@@ -498,7 +498,7 @@ function SparkleOverlayInner({
         height: r.height,
         zIndex: 38,
         pointerEvents: "none",
-        borderRadius: 12,
+        borderRadius: 6,
         // "Infused with sparkle energy": a pure, motionless amber glow — no orbiting.
         boxShadow: `0 0 0 1px ${hexToRgba(C.amber, 0.5)}, 0 0 46px ${hexToRgba(C.amber, 0.34)}, inset 0 0 34px ${hexToRgba(C.amber, 0.14)}`,
         transition: "box-shadow .5s ease",
@@ -560,7 +560,7 @@ function SparkleOverlayInner({
           alignItems: "center",
           textAlign: "center",
           padding: "26px 34px",
-          borderRadius: 26,
+          borderRadius: 6,
           background: `radial-gradient(ellipse at center, color-mix(in srgb, ${C.forest} 92%, transparent) 40%, color-mix(in srgb, ${C.forest} 55%, transparent) 75%, transparent 100%)`,
           transition:
             "top .28s cubic-bezier(.3,1.1,.35,1), left .28s cubic-bezier(.3,1.1,.35,1)",
@@ -585,7 +585,7 @@ function SparkleOverlayInner({
           style={{
             display: "none",
             fontFamily: '"Iowan Old Style", "Palatino", "Georgia", serif',
-            fontSize: 17.5,
+            fontSize: 17,
             lineHeight: 1.45,
             color: C.amber,
             textShadow: `0 0 18px ${hexToRgba(C.amber, 0.3)}`,

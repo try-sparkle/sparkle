@@ -29,7 +29,7 @@ const seg: CSSProperties = {
   padding: "6px 0",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 export function ThemeToggle() {

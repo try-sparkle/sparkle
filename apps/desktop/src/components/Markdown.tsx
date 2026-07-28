@@ -8,7 +8,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { C, FONT } from "../theme/colors";
+import { C } from "../theme/colors";
 
 const MONO = '"IBM Plex Mono", monospace';
 
@@ -22,8 +22,8 @@ const SUBTLE = "rgba(52, 224, 240, 0.10)";
 const HAIRLINE = "rgba(138, 160, 196, 0.30)"; // muted, low-alpha — borders/rules
 
 const prose: CSSProperties = {
-  fontFamily: FONT.ui,
-  fontSize: 14,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: 13,
   lineHeight: 1.55,
   color: C.cream,
   // Long unbroken tokens (URLs, hashes) must wrap instead of widening the bubble.
@@ -32,7 +32,7 @@ const prose: CSSProperties = {
 };
 
 const heading = (size: number, top: number): CSSProperties => ({
-  fontFamily: FONT.ui,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   fontWeight: 600,
   fontSize: size,
   lineHeight: 1.3,
@@ -119,7 +119,7 @@ const components: Components = {
     if (isBlock) {
       // Inside our <pre> slab; the slab owns the background + scroll.
       return (
-        <code style={{ fontFamily: MONO, fontSize: 12.5, color: C.cream, background: "transparent" }}>
+        <code style={{ fontFamily: MONO, fontSize: 12, color: C.cream, background: "transparent" }}>
           {children}
         </code>
       );
@@ -128,7 +128,7 @@ const components: Components = {
       <code
         style={{
           fontFamily: MONO,
-          fontSize: 12.5,
+          fontSize: 12,
           background: SUBTLE,
           padding: "1px 5px",
           borderRadius: 4,

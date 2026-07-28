@@ -187,19 +187,19 @@ export function BuilderIndexConsentModal() {
 
   return (
     <ModalShell width={480} zIndex={300} onCancel={close}>
-      <h2 style={{ margin: "0 0 10px", fontSize: 18, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+      <h2 style={{ margin: "0 0 10px", fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
         Publish your token totals to the Builder Index?
       </h2>
-      <p style={{ margin: "0 0 12px", fontSize: 13.5, color: C.muted, lineHeight: 1.6 }}>
+      <p style={{ margin: "0 0 12px", fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
         The tokenmaxxing leaderboard is a public ranking of how much builders actually spend. Sparkle
         can report your daily totals every couple of hours.
       </p>
-      <ul style={{ margin: "0 0 6px", paddingLeft: 18, fontSize: 12.5, color: C.muted, lineHeight: 1.6 }}>
+      <ul style={{ margin: "0 0 6px", paddingLeft: 18, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
         {SENDS.map((line) => (
           <li key={line}>{line}</li>
         ))}
       </ul>
-      <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.cream, lineHeight: 1.6 }}>{NEVER}</p>
+      <p style={{ margin: "0 0 16px", fontSize: 12, color: C.cream, lineHeight: 1.6 }}>{NEVER}</p>
 
       <label style={labelStyle} htmlFor="bi-username">
         tokenmaxxing username
@@ -228,7 +228,7 @@ export function BuilderIndexConsentModal() {
         autoComplete="off"
         style={inputStyle}
       />
-      <div style={{ fontSize: 11, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
         Stored in your system keychain, never in Sparkle&apos;s config or logs.
       </div>
 
@@ -270,7 +270,7 @@ export function BuilderIndexConsentModal() {
 
 const labelStyle: React.CSSProperties = {
   display: "block",
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 0.8,
   color: C.muted,
@@ -283,11 +283,11 @@ const inputStyle: React.CSSProperties = {
   boxSizing: "border-box",
   background: "transparent",
   border: `1px solid ${C.hairline}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
   color: C.cream,
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   marginBottom: 12,
 };
 
@@ -295,10 +295,10 @@ const secondaryStyle: React.CSSProperties = {
   background: "transparent",
   border: `1px solid ${C.hairline}`,
   color: C.muted,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "9px 16px",
-  fontSize: 13.5,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 13,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -311,10 +311,10 @@ const primaryStyle: React.CSSProperties = {
   background: C.accentInk,
   border: "none",
   color: C.deepForest,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "9px 18px",
-  fontSize: 13.5,
+  fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };

@@ -29,7 +29,7 @@ const btn: CSSProperties = {
   padding: "6px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   whiteSpace: "nowrap",
 };
 
@@ -61,7 +61,7 @@ function SelfReportObservability() {
     background: C.deepForest,
     border: `1px solid ${C.muted}`,
     borderRadius: 6,
-    fontSize: 12.5,
+    fontSize: 12,
     lineHeight: 1.6,
     color: C.cream,
     fontFamily: '"IBM Plex Mono", monospace',
@@ -85,7 +85,7 @@ function SelfReportObservability() {
           <span style={label}>Naming</span> — self-report/aiTitle {naming.covered} · paid Haiku{" "}
           {naming.paid} → coverage {pct(naming.pct)}
         </div>
-        <div style={{ ...label, fontSize: 11.5, marginBottom: 6 }}>
+        <div style={{ ...label, fontSize: 12, marginBottom: 6 }}>
           deferred {namingOutcomes.deferred_first_turn} · skipped {namingOutcomes.skipped_thin}
         </div>
         <div style={{ marginBottom: 6 }}>
@@ -228,7 +228,7 @@ export function AdvancedConfigMenu() {
           border: `1px solid ${error ? "#d66" : C.muted}`,
           borderRadius: 6,
           padding: 10,
-          fontSize: 12.5,
+          fontSize: 12,
           lineHeight: 1.5,
           fontFamily: '"IBM Plex Mono", monospace',
           whiteSpace: "pre",
@@ -238,12 +238,12 @@ export function AdvancedConfigMenu() {
       />
 
       {error && (
-        <div style={{ color: "#e88", fontSize: 12.5, marginTop: 6, fontFamily: '"IBM Plex Mono", monospace' }}>
+        <div style={{ color: "#e88", fontSize: 12, marginTop: 6, fontFamily: '"IBM Plex Mono", monospace' }}>
           {error}
         </div>
       )}
       {status && !error && (
-        <div style={{ color: C.tealInk, fontSize: 12.5, marginTop: 6 }}>{status}</div>
+        <div style={{ color: C.tealInk, fontSize: 12, marginTop: 6 }}>{status}</div>
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>

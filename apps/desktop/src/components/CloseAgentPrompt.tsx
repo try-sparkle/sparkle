@@ -37,12 +37,12 @@ export function CloseAgentPrompt({
         background: "transparent",
         color,
         border: `1px solid ${color}`,
-        borderRadius: 8,
+        borderRadius: 6,
         padding: "9px 18px",
         cursor: "pointer",
-        fontSize: 14,
+        fontSize: 13,
         fontWeight: FONT_WEIGHT.semibold,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       {label}
@@ -60,7 +60,7 @@ export function CloseAgentPrompt({
         fontSize: 13,
         textDecoration: "underline",
         padding: 0,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       {label}

@@ -106,9 +106,9 @@ export function TerminalDropPill({
         boxSizing: "border-box",
         background: C.deepForest,
         border: `1px solid ${C.hairline}`,
-        borderRadius: 10,
+        borderRadius: 6,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         color: C.cream,
         padding: "12px 12px 10px",
         animation: "sparkle-tooltip-in 90ms ease-out",
@@ -151,7 +151,7 @@ export function TerminalDropPill({
 
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
         <FiPaperclip size={16} style={{ flex: "none", color: C.tealInk, marginTop: 1 }} aria-hidden />
-        <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
+        <div style={{ fontSize: 12, lineHeight: 1.4 }}>
           Attached {describeDrop(count, images)} to <strong>{agentName}</strong>. Nothing has been
           sent yet — say what you want done with it in the Sparkle box and hit Send.
         </div>
@@ -165,7 +165,7 @@ export function TerminalDropPill({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 5,
+            borderRadius: 4,
             padding: "5px 12px",
             fontSize: 12,
             fontWeight: FONT_WEIGHT.semibold,

@@ -18,9 +18,9 @@ const wrap: CSSProperties = {
   borderRadius: 4,
   border: "1.5px solid transparent",
   background: `linear-gradient(${C.forest}, ${C.forest}) padding-box, ${AI_ENHANCEMENTS_GRADIENT} border-box`,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   fontWeight: 700,
-  fontSize: 18,
+  fontSize: 17,
 };
 
 export function AiEnhancementsBadge() {

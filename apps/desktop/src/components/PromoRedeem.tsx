@@ -12,12 +12,12 @@ const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "12px 22px",
-  fontSize: 16,
+  fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const promoInput: CSSProperties = {
@@ -29,8 +29,8 @@ const promoInput: CSSProperties = {
   border: `1px solid ${C.muted}`,
   borderRadius: 6,
   padding: "8px 10px",
-  fontSize: 14,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 13,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   width: 160,
 };
 

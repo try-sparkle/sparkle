@@ -16,7 +16,7 @@ const checkboxRow: CSSProperties = {
   cursor: "pointer",
   textAlign: "left",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   color: C.cream,
 };
 

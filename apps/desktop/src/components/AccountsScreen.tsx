@@ -38,11 +38,11 @@ export interface AccountsScreenProps {
   deps?: Partial<AccountsDeps>;
 }
 
-const fontStack = '"IBM Plex Sans", sans-serif';
+const fontStack = 'system-ui, -apple-system, "Segoe UI", sans-serif';
 
 const card: CSSProperties = {
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: 12,
   marginBottom: 10,
   fontFamily: fontStack,
@@ -113,7 +113,7 @@ function UsageBar({
   const pct = peakTokens > 0 ? Math.min(100, (tokens / peakTokens) * 100) : 0;
   return (
     <div style={{ marginTop: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted }}>
         <span>{label}</span>
         <span>{fmtTokens(tokens)}</span>
       </div>
@@ -275,7 +275,7 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
   return (
     <div style={{ fontFamily: fontStack, color: C.cream }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-        <div style={{ fontSize: 14, fontWeight: 600 }}>Claude accounts</div>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Claude accounts</div>
         {!adding && (
           <button type="button" style={primaryBtn} onClick={() => setAdding(true)}>
             + Add account
@@ -371,19 +371,19 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
               ) : (
                 <span style={{ flex: 1, minWidth: 0 }}>
                   <span
-                    style={{ fontSize: 14, fontWeight: 600, display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    style={{ fontSize: 13, fontWeight: 600, display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                     title={identity?.email ? undefined : "Not signed in — showing nickname until you log in"}
                   >
                     {primary}
                   </span>
                   {alias && (
-                    <span style={{ fontSize: 11, color: C.muted, display: "block" }}>alias: {alias}</span>
+                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>alias: {alias}</span>
                   )}
                   {identity?.organization && (
-                    <span style={{ fontSize: 11, color: C.muted, display: "block" }}>{identity.organization}</span>
+                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{identity.organization}</span>
                   )}
                   {!isSignedIn(identity) && (
-                    <span style={{ fontSize: 11, color: C.amber, display: "block" }}>Not signed in</span>
+                    <span style={{ fontSize: 12, color: C.amber, display: "block" }}>Not signed in</span>
                   )}
                 </span>
               )}

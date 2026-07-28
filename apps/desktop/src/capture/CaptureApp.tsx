@@ -277,7 +277,7 @@ export function CaptureApp() {
             color: MUTED,
             border: `1px solid ${NAVY_DEEP}`,
             borderRadius: 4,
-            fontSize: 15,
+            fontSize: 17,
             lineHeight: 1,
             cursor: "pointer",
           }}
@@ -338,7 +338,7 @@ export function CaptureApp() {
               fontSize: 13,
               lineHeight: 1.5,
               outline: "none",
-              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             }}
           />
           {audioActive && interim && (
@@ -349,7 +349,7 @@ export function CaptureApp() {
                 fontSize: 13,
                 lineHeight: 1.4,
                 padding: "0 2px",
-                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             >
               {interim}

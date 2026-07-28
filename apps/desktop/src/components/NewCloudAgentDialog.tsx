@@ -122,7 +122,7 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
       <div data-testid="cloud-dialog-backdrop" onClick={onClose} style={backdrop} />
       <div role="dialog" aria-modal="true" aria-label="New cloud agent" style={dialog}>
         <div style={titleBar}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 15, fontWeight: FONT_WEIGHT.semibold }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>
             <FiCloud size={16} />
             New cloud agent
           </div>
@@ -237,11 +237,11 @@ const dialog: CSSProperties = {
   maxWidth: "90vw",
   background: C.barSurface,
   color: C.cream,
-  borderRadius: 12,
+  borderRadius: 6,
   zIndex: 61,
   display: "flex",
   flexDirection: "column",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const titleBar: CSSProperties = {
@@ -270,7 +270,7 @@ const body: CSSProperties = {
 
 const panel: CSSProperties = {
   background: C.forest,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "12px 14px",
   display: "flex",
   flexDirection: "column",
@@ -290,10 +290,10 @@ const fieldBase: CSSProperties = {
   background: C.forest,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const input: CSSProperties = fieldBase;
@@ -306,11 +306,11 @@ const actionBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const primaryBtn: CSSProperties = {

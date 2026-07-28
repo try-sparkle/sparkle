@@ -23,7 +23,7 @@ const indicator: CSSProperties = {
   alignItems: "center",
   fontSize: 12,
   color: C.cream,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   minWidth: 0,
   flexShrink: 1,
   overflow: "hidden",
@@ -46,14 +46,14 @@ const unlockBtn: CSSProperties = {
   whiteSpace: "nowrap",
 };
 // Bounded so the fallback can't widen the bar and shove the action buttons off-screen.
-const failNote: CSSProperties = { color: DANGER, fontSize: 11, whiteSpace: "nowrap" };
+const failNote: CSSProperties = { color: DANGER, fontSize: 12, whiteSpace: "nowrap" };
 const copyLinkBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
   borderRadius: 4,
   padding: "3px 8px",
-  fontSize: 11,
+  fontSize: 12,
   cursor: "pointer",
   whiteSpace: "nowrap",
   flexShrink: 0,

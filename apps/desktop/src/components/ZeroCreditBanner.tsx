@@ -47,7 +47,7 @@ const bar: CSSProperties = {
   padding: "6px 32px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   letterSpacing: 0.2,
 };
 

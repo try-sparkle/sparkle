@@ -61,7 +61,7 @@ export function RoutingReceipt({
       // this line is plain visual text.
       style={{
         marginTop: 4,
-        fontSize: 11,
+        fontSize: 12,
         color: C.conciergeMuted,
         display: "flex",
         gap: 8,
@@ -77,11 +77,11 @@ export function RoutingReceipt({
           data-testid="routing-redirect"
           onClick={onRedirect}
           style={{
-            fontSize: 11,
+            fontSize: 12,
             color: C.cream,
             background: "transparent",
             border: `1px solid color-mix(in srgb, ${C.muted} 35%, transparent)`,
-            borderRadius: 7,
+            borderRadius: 6,
             padding: "2px 7px",
             cursor: "pointer",
           }}

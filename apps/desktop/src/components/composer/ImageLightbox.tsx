@@ -63,7 +63,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
           title={att.path}
           style={{
             color: C.cream,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             fontWeight: FONT_WEIGHT.semibold,
             fontSize: 13,
             overflow: "hidden",
@@ -92,7 +92,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
           >
             <DownloadIcon />
           </button>
-          <button onClick={onClose} title="Close" style={{ ...iconBtn, fontSize: 20 }}>
+          <button onClick={onClose} title="Close" style={{ ...iconBtn, fontSize: 17 }}>
             ×
           </button>
         </div>
@@ -117,7 +117,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
             style={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain", display: "block" }}
           />
         ) : (
-          <span style={{ color: C.muted, fontFamily: '"IBM Plex Sans", sans-serif', fontSize: 14 }}>
+          <span style={{ color: C.muted, fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif', fontSize: 13 }}>
             No preview available — use Download to save this file.
           </span>
         )}
@@ -131,8 +131,8 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
             padding: "8px 12px",
             borderTop: `1px solid ${C.hairline}`,
             color: C.sienna,
-            fontFamily: '"IBM Plex Sans", sans-serif',
-            fontSize: 12.5,
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontSize: 12,
           }}
         >
           {failed}

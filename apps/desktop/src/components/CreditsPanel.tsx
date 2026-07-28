@@ -570,7 +570,7 @@ function Upsell({ unpaid, refresh }: { unpaid: boolean; refresh: () => Promise<v
   };
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 12 }}>
-      <div style={{ fontSize: 14, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+      <div style={{ fontSize: 13, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
         Unlock Sparkle
       </div>
       <p style={{ margin: 0, fontSize: 13, color: C.muted, maxWidth: 380, lineHeight: 1.5 }}>
@@ -595,7 +595,7 @@ function Upsell({ unpaid, refresh }: { unpaid: boolean; refresh: () => Promise<v
 // ── styles (inline CSSProperties, matching SettingsDialog's pane idiom) ─────────────────────
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -604,23 +604,23 @@ const subLabel: CSSProperties = {
 };
 
 const balanceText: CSSProperties = {
-  fontSize: 28,
+  fontSize: 17,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.cream,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const packBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 14px",
   cursor: "pointer",
   fontSize: 13,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const quietHint: CSSProperties = {
@@ -633,12 +633,12 @@ const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "10px 18px",
-  fontSize: 14,
+  fontSize: 13,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const smallBtn: CSSProperties = {
@@ -649,7 +649,7 @@ const smallBtn: CSSProperties = {
   padding: "4px 10px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const selectStyle: CSSProperties = {
@@ -660,7 +660,7 @@ const selectStyle: CSSProperties = {
   borderRadius: 6,
   padding: "4px 8px",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const warnRow: CSSProperties = {
@@ -678,7 +678,7 @@ const historyRow: CSSProperties = {
   alignItems: "baseline",
   gap: 10,
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 // The project column. Fixed width (like the date) so the label column keeps taking the slack and

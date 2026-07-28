@@ -46,12 +46,12 @@ const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
 const kindBadge = (kind: HistoryHit["kind"]): CSSProperties => ({
   flex: "0 0 auto",
-  fontSize: 9,
+  fontSize: 10,
   textTransform: "uppercase",
   letterSpacing: 0.5,
   fontWeight: FONT_WEIGHT.semibold,
   padding: "1px 5px",
-  borderRadius: 5,
+  borderRadius: 4,
   // THE KIND IS CARRIED BY EDGE WEIGHT, ON THE THEMED INK. Three attempts converged here and the
   // dead ends are worth recording, because each one looked right (roborev 54169 → 54231 → 54253).
   //
@@ -199,7 +199,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
         alignItems: "flex-start",
         paddingTop: "12vh",
         background: "rgba(2, 6, 18, 0.55)",
-        fontFamily: "Verdana, Geneva, sans-serif",
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <div
@@ -211,7 +211,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
           background: C.deepForest,
           color: C.cream,
           border: `1px solid ${line}`,
-          borderRadius: 14,
+          borderRadius: 6,
           boxShadow: "0 18px 60px rgba(0,0,0,0.45)",
           overflow: "hidden",
         }}
@@ -247,7 +247,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
               border: "none",
               outline: "none",
               color: C.cream,
-              fontSize: 14,
+              fontSize: 13,
               fontFamily: "inherit",
             }}
           />
@@ -257,7 +257,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
               fontSize: 10,
               color: C.muted,
               border: `1px solid ${line}`,
-              borderRadius: 5,
+              borderRadius: 4,
               padding: "2px 5px",
               fontFamily: "inherit",
             }}
@@ -268,12 +268,12 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
 
         <div id="concierge-palette-results" role="listbox" aria-label="History results" style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
           {!hasQuery ? (
-            <div style={{ color: C.muted, fontSize: 12.5, padding: "18px 16px", lineHeight: 1.5 }}>
+            <div style={{ color: C.muted, fontSize: 12, padding: "18px 16px", lineHeight: 1.5 }}>
               Type to search your conversation and agent history — prompts and replies, across
               every project.
             </div>
           ) : results.length === 0 ? (
-            <div style={{ color: C.muted, fontSize: 12.5, padding: "18px 16px" }}>
+            <div style={{ color: C.muted, fontSize: 12, padding: "18px 16px" }}>
               {searching ? "Searching…" : `No matches in ${RETENTION_LABEL[entitlement]}.`}
             </div>
           ) : (
@@ -313,7 +313,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
                         flex: 1,
                         minWidth: 0,
                         color: C.muted,
-                        fontSize: 11,
+                        fontSize: 12,
                         overflow: "hidden",
                         textOverflow: "ellipsis",
                         whiteSpace: "nowrap",
@@ -321,14 +321,14 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
                     >
                       {[h.projectName, h.agentName].filter(Boolean).join(" · ") || "—"}
                     </span>
-                    <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 11 }}>
+                    <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 12 }}>
                       {relativeTime(h.createdAt)}
                     </span>
                   </div>
                   <div
                     style={{
                       color: isSelected ? C.cream : C.muted,
-                      fontSize: 12.5,
+                      fontSize: 12,
                       lineHeight: 1.45,
                       // Clamp the snippet to two lines so a long hit can't blow out the row.
                       display: "-webkit-box",
@@ -345,7 +345,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
                       style={{
                         marginTop: 4,
                         color: DANGER,
-                        fontSize: 11,
+                        fontSize: 12,
                         fontWeight: FONT_WEIGHT.semibold,
                       }}
                     >
@@ -367,7 +367,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
             padding: "7px 14px",
             borderTop: `1px solid ${line}`,
             color: C.muted,
-            fontSize: 10.5,
+            fontSize: 10,
           }}
         >
           <span style={{ flex: 1, minWidth: 0 }}>
@@ -390,24 +390,24 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
       title="Search history (⌘K)"
       onClick={onOpen}
       style={{
-        fontSize: 11,
+        fontSize: 12,
         color: C.muted,
         background: "transparent",
         border: `1px solid ${line}`,
-        borderRadius: 8,
+        borderRadius: 6,
         padding: "5px 9px",
         cursor: "pointer",
         display: "inline-flex",
         gap: 5,
         alignItems: "center",
-        fontFamily: "Verdana, Geneva, sans-serif",
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <FiSearch size={12} aria-hidden />
       Search
       <kbd
         style={{
-          fontSize: 9,
+          fontSize: 10,
           color: C.muted,
           border: `1px solid ${line}`,
           borderRadius: 4,

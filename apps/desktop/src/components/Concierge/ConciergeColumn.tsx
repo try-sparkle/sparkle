@@ -85,8 +85,8 @@ export function ConciergeColumn({
         // to the chrome floor on every plane in both themes.
         borderRight: `1px solid ${C.hairline}`,
         color: C.cream,
-        fontFamily: "Verdana, Geneva, sans-serif",
-        fontSize: 14,
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontSize: 13,
         lineHeight: 1.5,
       }}
     >

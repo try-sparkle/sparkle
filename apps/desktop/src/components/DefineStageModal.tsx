@@ -580,7 +580,7 @@ function CriterionBadge({ c }: { c: StageCriterion }) {
 
 // ── styles (inline CSSProperties, matching the app's convention) ────────────────────────────
 const header: CSSProperties = { marginBottom: 14 };
-const title: CSSProperties = { fontSize: 15, fontWeight: FONT_WEIGHT.semibold, color: C.cream };
+const title: CSSProperties = { fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream };
 const subtitle: CSSProperties = { fontSize: 12, color: C.muted, marginTop: 2 };
 
 const transcript: CSSProperties = {
@@ -605,7 +605,7 @@ const userLine: CSSProperties = {
   lineHeight: 1.5,
   color: C.cream,
   background: CHAT_USER_BUBBLE,
-  borderRadius: 10,
+  borderRadius: 6,
   padding: "8px 11px",
   alignSelf: "flex-end",
   maxWidth: "85%",
@@ -613,7 +613,7 @@ const userLine: CSSProperties = {
 
 const previewCard: CSSProperties = {
   border: `1px solid ${C.hairline}`,
-  borderRadius: 10,
+  borderRadius: 6,
   padding: "10px 12px",
   background: C.forest,
 };
@@ -632,13 +632,13 @@ const critItem: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   gap: 8,
-  fontSize: 12.5,
+  fontSize: 12,
 };
 
 const critText: CSSProperties = { color: C.cream };
 
 const badge: CSSProperties = {
-  fontSize: 10.5,
+  fontSize: 10,
   border: "1px solid",
   borderRadius: 6,
   padding: "1px 6px",
@@ -669,7 +669,7 @@ const errorBanner: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   gap: 10,
-  fontSize: 12.5,
+  fontSize: 12,
   // The shared alert red, not a second copy of its hex — this banner and the trial/redeem alerts
   // were drifting apart one literal at a time.
   //
@@ -682,7 +682,7 @@ const errorBanner: CSSProperties = {
   // plane in both themes by theme/chromeContrast.test.ts. Nothing to keep in step.
   color: C.dangerInk,
   border: `1px solid ${DANGER}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
   marginBottom: 10,
 };
@@ -697,33 +697,33 @@ const chatInput: CSSProperties = {
   background: C.deepForest,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 11px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const primaryBtn: CSSProperties = {
   background: ROW_ACTIVE_BUBBLE,
   color: C.cream,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 16px",
   cursor: "pointer",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const ghostBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 16px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 export default DefineStageModal;

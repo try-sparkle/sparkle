@@ -146,6 +146,6 @@ describe("the you-bubble", () => {
     expect(bubble.style.borderWidth).toBe("");
     // …and the two things that DO carry it are still present.
     expect(bubble.style.background).toBeTruthy();
-    expect(bubble.style.borderRadius).toBe("14px 14px 4px 14px");
+    expect(bubble.style.borderRadius).toBe("4px 4px 0 4px");
   });
 });

@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { C, FONT, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import type { BuildSectionMeta } from "../engine/buildSections";
 
 /**
@@ -32,7 +32,7 @@ export const StageSectionHeader = memo(function StageSectionHeader({
         // Tight above, looser below: the header belongs to the rows that follow it, and asymmetric
         // padding is what makes that grouping read without needing a rule or a box.
         padding: "12px 10px 4px",
-        fontFamily: FONT.ui,
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         fontSize: 10,
         fontWeight: FONT_WEIGHT.semibold,
         letterSpacing: 0.6,

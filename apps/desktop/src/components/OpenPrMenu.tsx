@@ -258,7 +258,7 @@ export function OpenPrMenu({
               overflowY: "auto",
               background: C.deepForest,
               border: `1px solid ${C.hairline}`,
-              borderRadius: 8,
+              borderRadius: 6,
               boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
               padding: 6,
               zIndex: 41,
@@ -359,7 +359,7 @@ export function OpenPrMenu({
                     <div
                       style={{
                         color: C.muted,
-                        fontSize: 11,
+                        fontSize: 12,
                         overflow: "hidden",
                         textOverflow: "ellipsis",
                         whiteSpace: "nowrap",

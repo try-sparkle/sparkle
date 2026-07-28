@@ -212,7 +212,7 @@ export function SetupChecklist({ onReady }: { onReady: () => void }) {
       }}
     >
       <style>{SPIN_KEYFRAMES}</style>
-      <div style={{ fontSize: 22, fontWeight: FONT_WEIGHT.semibold }}>Let’s finish setting up</div>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>Let’s finish setting up</div>
       <div style={{ color: C.muted, maxWidth: 520, lineHeight: 1.5, textAlign: "center" }}>
         Sparkle runs Claude on your own Mac. We’ll install everything it needs — no Terminal
         required — then sign you in to Claude Code (Sparkle never sees your credentials).
@@ -272,14 +272,14 @@ function PrereqRowView({ row, onInstall }: { row: PrereqRow; onInstall: () => vo
         alignItems: "center",
         gap: 12,
         padding: "12px 14px",
-        borderRadius: 10,
+        borderRadius: 6,
         background: C.deepForest,
         border: `1px solid ${C.hairline}`,
       }}
     >
       <Icon size={20} style={{ color: C.muted, flexShrink: 0 }} aria-hidden />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontWeight: FONT_WEIGHT.semibold, fontSize: 14 }}>{meta.label}</div>
+        <div style={{ fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>{meta.label}</div>
         <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>
           {row.phase === "installing" && row.progress
             ? truncate(row.progress, 72)
@@ -348,7 +348,7 @@ function LoginRow({
         flexDirection: "column",
         gap: 10,
         padding: "12px 14px",
-        borderRadius: 10,
+        borderRadius: 6,
         background: C.deepForest,
         border: `1px solid ${C.hairline}`,
         opacity: phase === "locked" ? 0.55 : 1,
@@ -357,7 +357,7 @@ function LoginRow({
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
         <FiTerminal size={20} style={{ color: C.muted, flexShrink: 0 }} aria-hidden />
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: FONT_WEIGHT.semibold, fontSize: 14 }}>Sign in to Claude Code</div>
+          <div style={{ fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>Sign in to Claude Code</div>
           <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>
             Runs <code>claude login</code> in your browser. Sparkle never handles your credentials.
           </div>
@@ -387,7 +387,7 @@ function LoginRow({
             style={{
               height: 300,
               border: `1px solid ${C.hairline}`,
-              borderRadius: 8,
+              borderRadius: 6,
               overflow: "hidden",
               padding: 6,
             }}
@@ -443,7 +443,7 @@ const primaryBtn: React.CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 16px",
   fontWeight: FONT_WEIGHT.semibold,
   fontSize: 13,
@@ -456,7 +456,7 @@ function secondaryBtn(disabled: boolean): React.CSSProperties {
     background: "transparent",
     color: C.cream,
     border: `1px solid ${C.muted}`,
-    borderRadius: 8,
+    borderRadius: 6,
     padding: "8px 16px",
     fontWeight: FONT_WEIGHT.medium,
     fontSize: 13,

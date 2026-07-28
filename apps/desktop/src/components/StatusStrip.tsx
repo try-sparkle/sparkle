@@ -38,8 +38,8 @@ function linkStyle(hover: boolean) {
     padding: 0,
     margin: 0,
     color: hover ? C.cream : C.muted,
-    fontSize: 11,
-    fontFamily: '"IBM Plex Sans", sans-serif',
+    fontSize: 12,
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     textDecoration: "underline",
     textUnderlineOffset: 2,
     cursor: "pointer",
@@ -112,7 +112,7 @@ export function StatusStrip() {
           background: C.deepForest,
           borderTop: `1px solid ${C.barSurface}`,
           color: C.muted,
-          fontSize: 11,
+          fontSize: 12,
           userSelect: "none",
         }}
       >
@@ -168,8 +168,8 @@ export function StatusStrip() {
               padding: 0,
               margin: 0,
               color: hover === "version" && version ? C.cream : C.muted,
-              fontSize: 11,
-              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontSize: 12,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: version ? "pointer" : "default",
             }}
           >

@@ -36,21 +36,21 @@ const tabBtn = (active: boolean): CSSProperties => ({
   borderBottom: `2px solid ${active ? C.teal : "transparent"}`,
   padding: "10px 12px",
   cursor: "pointer",
-  fontSize: 14,
+  fontSize: 13,
   fontWeight: active ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 });
 
 const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "11px 16px",
   cursor: "pointer",
-  fontSize: 14,
+  fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   display: "inline-flex",
   alignItems: "center",
   gap: 8,
@@ -60,11 +60,11 @@ const secondaryBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "9px 14px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const inputStyle: CSSProperties = {
@@ -73,10 +73,10 @@ const inputStyle: CSSProperties = {
   background: C.barSurface,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "9px 12px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 /** A project that exists but has no tab — offered for one-click reopen on the folder tab. */
@@ -116,7 +116,7 @@ export function NewProjectDialog({
   return (
     <ModalShell width={560} onCancel={onClose}>
       <style>{SPIN_KEYFRAMES}</style>
-      <div style={{ fontSize: 18, fontWeight: FONT_WEIGHT.semibold, marginBottom: 14 }}>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 14 }}>
         Open a Project
       </div>
 
@@ -218,14 +218,14 @@ function FolderTab({
                   cursor: "pointer",
                   color: C.cream,
                   fontSize: 13,
-                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                 }}
               >
                 <span style={{ fontWeight: FONT_WEIGHT.semibold }}>{p.name}</span>
                 <span
                   style={{
                     color: C.muted,
-                    fontSize: 11,
+                    fontSize: 12,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     whiteSpace: "nowrap",
@@ -378,11 +378,11 @@ function RepoRow({ repo, onSelect }: { repo: GithubRepo; onSelect: () => void })
         gap: 10,
         background: C.barSurface,
         border: `1px solid ${C.hairline}`,
-        borderRadius: 8,
+        borderRadius: 6,
         padding: "10px 12px",
         cursor: "pointer",
         textAlign: "left",
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <span style={{ marginTop: 2, color: C.muted, flex: "0 0 auto" }} title={repo.private ? "Private" : "Public"}>
@@ -433,7 +433,7 @@ function DestinationView({
 }) {
   if (cloning) {
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 0", color: C.cream, fontSize: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 0", color: C.cream, fontSize: 13 }}>
         <Spinner />
         Cloning <strong style={{ fontWeight: FONT_WEIGHT.semibold }}>{repo.fullName}</strong>…
       </div>
@@ -451,7 +451,7 @@ function DestinationView({
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
         <span style={{ color: C.muted }}>{repo.private ? <FiLock aria-label="Private" /> : <FiGlobe aria-label="Public" />}</span>
-        <span style={{ color: C.cream, fontSize: 15, fontWeight: FONT_WEIGHT.semibold }}>{repo.fullName}</span>
+        <span style={{ color: C.cream, fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>{repo.fullName}</span>
       </div>
 
       <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }} htmlFor="clone-dest">
@@ -467,7 +467,7 @@ function DestinationView({
       {cloneError?.kind === "git_missing" && (
         <div
           role="alert"
-          style={{ background: C.barSurface, border: `1px solid ${C.muted}`, borderRadius: 8, padding: "12px 14px", marginBottom: 18 }}
+          style={{ background: C.barSurface, border: `1px solid ${C.muted}`, borderRadius: 6, padding: "12px 14px", marginBottom: 18 }}
         >
           <div style={{ color: C.cream, fontSize: 13, fontWeight: FONT_WEIGHT.medium, marginBottom: 6 }}>
             Git isn&apos;t installed yet

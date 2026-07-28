@@ -369,9 +369,9 @@ export function OnePasswordPane() {
 // ── styles ──────────────────────────────────────────────────────────────────────────────────
 
 const block: CSSProperties = { display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-start" };
-const body: CSSProperties = { fontSize: 12.5, color: C.muted, lineHeight: 1.5, margin: 0 };
+const body: CSSProperties = { fontSize: 12, color: C.muted, lineHeight: 1.5, margin: 0 };
 const groupLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -382,7 +382,7 @@ const noticeStyle: CSSProperties = {
   flexDirection: "column",
   gap: 8,
   padding: 12,
-  borderRadius: 8,
+  borderRadius: 6,
   border: `1px solid ${C.hairline}`,
 };
 const noticeTitle: CSSProperties = {
@@ -426,14 +426,14 @@ const selectStyle: CSSProperties = {
   border: `1px solid ${C.hairline}`,
   background: "transparent",
   color: C.cream,
-  fontSize: 12.5,
+  fontSize: 12,
 };
 const hintStyle: CSSProperties = {
   display: "flex",
   alignItems: "center",
   gap: 4,
   flexWrap: "wrap",
-  fontSize: 11.5,
+  fontSize: 12,
   color: C.muted,
   marginTop: 6,
   lineHeight: 1.45,
@@ -452,7 +452,7 @@ const fileRow: CSSProperties = {
   borderBottom: `1px solid ${C.hairline}`,
 };
 const fileTitle: CSSProperties = {
-  fontSize: 12.5,
+  fontSize: 12,
   color: C.cream,
   overflow: "hidden",
   textOverflow: "ellipsis",
@@ -466,7 +466,7 @@ const statusPill: CSSProperties = {
   padding: "1px 8px",
   borderRadius: 999,
   border: "1px solid",
-  fontSize: 10.5,
+  fontSize: 10,
   fontWeight: FONT_WEIGHT.semibold,
   whiteSpace: "nowrap",
 };
@@ -474,7 +474,7 @@ const checkRow: CSSProperties = {
   display: "flex",
   alignItems: "flex-start",
   gap: 8,
-  fontSize: 12.5,
+  fontSize: 12,
   cursor: "pointer",
 };
 const errorStyle: CSSProperties = {

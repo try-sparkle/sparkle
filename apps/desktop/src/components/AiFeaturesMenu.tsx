@@ -54,20 +54,20 @@ function scopeBtn(active: boolean): CSSProperties {
     borderRadius: 6,
     padding: "5px 8px",
     fontSize: 12,
-    fontFamily: '"IBM Plex Sans", sans-serif',
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     cursor: "pointer",
     lineHeight: 1.2,
   };
 }
 
-const scopeHint: CSSProperties = { color: C.muted, fontSize: 11, lineHeight: 1.4 };
+const scopeHint: CSSProperties = { color: C.muted, fontSize: 12, lineHeight: 1.4 };
 
 const scopeWarn: CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   gap: 4,
   color: C.amber,
-  fontSize: 11,
+  fontSize: 12,
   lineHeight: 1.4,
 };
 
@@ -80,7 +80,7 @@ const seg: CSSProperties = {
   borderRadius: 6,
   padding: "6px 0",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 /** The All | Some | Off master segment. All/Off are actions; Some is a derived status only. */

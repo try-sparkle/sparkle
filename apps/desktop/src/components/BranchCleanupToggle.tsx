@@ -30,7 +30,7 @@ const opt: CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   textAlign: "left",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 export function BranchCleanupToggle() {

@@ -123,10 +123,10 @@ export const menuItemStyle: CSSProperties = {
   background: "transparent",
   border: "none",
   padding: "7px 10px",
-  borderRadius: 5,
+  borderRadius: 4,
   color: C.cream,
-  fontSize: 12.5,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontSize: 12,
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
@@ -136,7 +136,7 @@ export const menuSurface: CSSProperties = {
   padding: 6,
   background: C.deepForest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 8,
+  borderRadius: 6,
   boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
   zIndex: 1000,
 };

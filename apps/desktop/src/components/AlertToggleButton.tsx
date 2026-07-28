@@ -36,7 +36,7 @@ export function AlertToggleButton({
       style={{
         flexShrink: 0,
         cursor: "pointer",
-        fontSize: 11,
+        fontSize: 12,
         fontWeight: FONT_WEIGHT.semibold,
         lineHeight: 1,
         padding: "3px 8px",

@@ -29,9 +29,9 @@ export function TextPillModal({
         <span
           style={{
             color: C.cream,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             fontWeight: FONT_WEIGHT.semibold,
-            fontSize: 14,
+            fontSize: 13,
           }}
         >
           Pasted text · {block.lineCount} lines
@@ -44,7 +44,7 @@ export function TextPillModal({
             border: "none",
             color: C.muted,
             cursor: "pointer",
-            fontSize: 20,
+            fontSize: 17,
             lineHeight: 1,
             padding: 4,
           }}
@@ -88,11 +88,11 @@ export function TextPillModal({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 16px",
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             fontWeight: FONT_WEIGHT.semibold,
-            fontSize: 14,
+            fontSize: 13,
             cursor: "pointer",
           }}
         >

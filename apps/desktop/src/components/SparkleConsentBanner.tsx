@@ -121,7 +121,7 @@ export function SparkleConsentBanner() {
         }}
       >
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13.5 }}>
+          <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>
             Can we use your logs &amp; crash reports to automatically improve Sparkle?
           </span>
           {/* Disclosure toggle: a real button so the detail is reachable by click/tap (not just
@@ -156,7 +156,7 @@ export function SparkleConsentBanner() {
           style={{
             display: "inline-flex",
             border: `1px solid ${C.teal}`,
-            borderRadius: 8,
+            borderRadius: 6,
             overflow: "hidden",
           }}
         >
@@ -173,7 +173,7 @@ export function SparkleConsentBanner() {
                   background: selected ? C.teal : "transparent",
                   color: selected ? ON_BRAND_FILL : C.cream,
                   fontWeight: selected ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
-                  fontSize: 12.5,
+                  fontSize: 12,
                   padding: "5px 12px",
                   cursor: "pointer",
                 }}
@@ -222,7 +222,7 @@ export function SparkleConsentBanner() {
             right: 0,
             padding: "10px 14px 12px",
             color: C.muted,
-            fontSize: 12.5,
+            fontSize: 12,
             lineHeight: 1.5,
             background: C.deepForest,
             borderBottom: `1px solid ${CHAT_USER_BUBBLE}`,

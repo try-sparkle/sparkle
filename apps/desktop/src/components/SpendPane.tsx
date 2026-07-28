@@ -366,7 +366,7 @@ function Table({
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ─────────────────────
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -377,7 +377,7 @@ const subLabel: CSSProperties = {
 const panel: CSSProperties = {
   background: C.forest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "14px 16px",
   display: "flex",
   flexDirection: "column",
@@ -392,13 +392,13 @@ const hint: CSSProperties = {
 };
 
 const footnote: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   color: C.muted,
   lineHeight: 1.5,
 };
 
 const warnText: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   color: C.amber,
   lineHeight: 1.5,
 };
@@ -413,12 +413,12 @@ const statBox: CSSProperties = {
   flex: "1 1 96px",
   minWidth: 96,
   background: C.forest,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "10px 12px",
 };
 
 const statValue = (accent?: boolean): CSSProperties => ({
-  fontSize: 19,
+  fontSize: 17,
   fontWeight: FONT_WEIGHT.semibold,
   color: accent ? C.accentInk : C.cream,
   fontVariantNumeric: "tabular-nums",
@@ -426,7 +426,7 @@ const statValue = (accent?: boolean): CSSProperties => ({
 });
 
 const statLabel: CSSProperties = {
-  fontSize: 10.5,
+  fontSize: 10,
   textTransform: "uppercase",
   letterSpacing: 0.6,
   color: C.muted,
@@ -434,7 +434,7 @@ const statLabel: CSSProperties = {
 };
 
 const chartMax: CSSProperties = {
-  fontSize: 10.5,
+  fontSize: 10,
   color: C.muted,
   marginBottom: 6,
 };
@@ -456,7 +456,7 @@ const barTrack: CSSProperties = {
 
 const bar: CSSProperties = {
   width: "100%",
-  borderRadius: 2,
+  borderRadius: 3,
   minHeight: 0,
 };
 
@@ -469,7 +469,7 @@ const chartAxis: CSSProperties = {
 const axisCell: CSSProperties = {
   flex: 1,
   minWidth: 2,
-  fontSize: 9.5,
+  fontSize: 10,
   color: C.muted,
   textAlign: "center",
   whiteSpace: "nowrap",
@@ -487,7 +487,7 @@ const th: CSSProperties = {
   padding: "6px 8px",
   color: C.muted,
   fontWeight: FONT_WEIGHT.semibold,
-  fontSize: 10.5,
+  fontSize: 10,
   textTransform: "uppercase",
   letterSpacing: 0.5,
   borderBottom: `1px solid ${C.hairline}`,
@@ -515,12 +515,12 @@ const monoCell: CSSProperties = {
 };
 
 const unpricedTag: CSSProperties = {
-  fontSize: 9.5,
+  fontSize: 10,
   textTransform: "uppercase",
   letterSpacing: 0.4,
   color: C.amber,
   border: `1px solid ${C.amber}`,
-  borderRadius: 5,
+  borderRadius: 4,
   padding: "0 5px",
   flex: "none",
 };
@@ -532,7 +532,7 @@ const chipBtn: CSSProperties = {
   padding: "4px 11px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const iconBtn: CSSProperties = {
@@ -553,9 +553,9 @@ const actionBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };

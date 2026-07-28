@@ -169,7 +169,10 @@ export function ConciergeThread({
                   // The tail corner is what identifies it as YOURS (14/14/4/14 — square-ish into
                   // the bottom-right, where the column's own edge is), which is the same
                   // shape-not-hue reasoning the status dots and the palette badges use.
-                  borderRadius: "14px 14px 4px 14px",
+                  // 4px corners with a HARD tail (0), per the spec's `--r-bubble: 4px`. This was 14/14/4/14 — a
+                  // pill. The direction draws boxes rather than filling lozenges, so the bubble is a
+                  // tight rectangle whose square bottom-right corner points at the column edge.
+                  borderRadius: "4px 4px 0 4px",
                   padding: "9px 12px",
                 }}
               >
@@ -219,13 +222,13 @@ export function ConciergeThread({
                 display: "flex",
                 alignItems: "center",
                 gap: 8,
-                fontSize: 12.5,
+                fontSize: 12,
                 fontFamily: "inherit",
                 color: C.cream,
                 background: `color-mix(in srgb, ${tint} 8%, transparent)`,
                 border: `1px solid color-mix(in srgb, ${tint} 30%, transparent)`,
                 borderLeft: `3px solid ${tint}`,
-                borderRadius: 10,
+                borderRadius: 6,
                 padding: "7px 10px",
                 cursor: "pointer",
               }}
@@ -240,7 +243,7 @@ export function ConciergeThread({
               key={m.id}
               style={{
                 alignSelf: "stretch",
-                fontSize: 11.5,
+                fontSize: 12,
                 color: C.conciergeMuted,
                 textAlign: "center",
                 padding: "6px 0",
@@ -283,7 +286,7 @@ export function ConciergeThread({
                   display: "flex",
                   alignItems: "center",
                   gap: 5,
-                  fontSize: 11,
+                  fontSize: 12,
                   color: C.conciergeMuted,
                   marginBottom: 3,
                 }}
@@ -304,7 +307,7 @@ export function ConciergeThread({
         <div
           aria-hidden
           aria-label="Sparkle is typing"
-          style={{ alignSelf: "flex-start", fontSize: 13.5, color: C.conciergeMuted }}
+          style={{ alignSelf: "flex-start", fontSize: 13, color: C.conciergeMuted }}
         >
           {/* index.css's existing "working on it" opacity breathe — no motion, reduced-motion safe. */}
           <span className="sparkle-pulse">…</span>

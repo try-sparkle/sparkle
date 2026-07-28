@@ -1356,7 +1356,7 @@ export function Composer({
                 padding: "4px 10px",
                 fontSize: 12,
                 color: C.muted,
-                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             >
               <span>
@@ -1371,7 +1371,7 @@ export function Composer({
                   color: C.accentInk,
                   cursor: "pointer",
                   fontSize: 12,
-                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                   textDecoration: "underline",
                   padding: 0,
                 }}
@@ -1406,7 +1406,7 @@ export function Composer({
           gap: 6,
           cursor: "ns-resize",
           color: C.muted,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           fontSize: 12,
           userSelect: "none",
         }}
@@ -1421,7 +1421,7 @@ export function Composer({
               gap: 6,
               padding: "3px 16px",
               // Rounded only on top: the flat bottom meets the window edge, so it reads as a tab.
-              borderRadius: "9px 9px 0 0",
+              borderRadius: "6px 6px 0 0",
               background: `linear-gradient(180deg, ${C.accent} 0%, ${C.teal} 100%)`,
               color: ON_BRAND_FILL,
               fontWeight: FONT_WEIGHT.semibold,
@@ -1456,9 +1456,9 @@ export function Composer({
               border: "none",
               background: C.accent,
               color: ON_BRAND_FILL,
-              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               fontWeight: FONT_WEIGHT.semibold,
-              fontSize: 11,
+              fontSize: 12,
               lineHeight: 1.4,
               whiteSpace: "nowrap",
               cursor: "pointer",
@@ -1470,7 +1470,7 @@ export function Composer({
             </span>
           </button>
         ) : (
-          <div style={{ width: 36, height: 3, borderRadius: 2, background: C.muted, opacity: 0.6 }} />
+          <div style={{ width: 36, height: 3, borderRadius: 3, background: C.muted, opacity: 0.6 }} />
         )}
       </div>
 
@@ -1509,7 +1509,7 @@ export function Composer({
                 // Amber + alert glyph, matching ComposerVoiceError — the sibling inline notice in
                 // this same box, so the two read as one treatment.
                 color: C.amber,
-                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                 fontSize: 12,
                 lineHeight: 1.3,
               }}
@@ -1538,10 +1538,10 @@ export function Composer({
                 // Transparent border of the same width keeps the content box aligned with the
                 // textarea's (whose visible border is painted on top).
                 border: dropActive ? "1.5px solid transparent" : "1px solid transparent",
-                borderRadius: 8,
+                borderRadius: 6,
                 padding: "8px 10px",
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 14,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontSize: 13,
                 lineHeight: 1.4,
                 whiteSpace: "pre-wrap",
                 overflowWrap: "break-word",
@@ -1646,10 +1646,10 @@ export function Composer({
                 color: C.cream,
                 // Highlight the drop target while a file is dragged over the window.
                 border: dropActive ? `1.5px dashed ${C.teal}` : `1px solid ${CHAT_USER_BUBBLE}`,
-                borderRadius: 8,
+                borderRadius: 6,
                 padding: "8px 10px",
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 14,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontSize: 13,
                 lineHeight: 1.4,
                 // Match the mirror's long-token wrapping so a pasted URL/path breaks at the
                 // same point in both layers and the ghost stays aligned with the caret.
@@ -1696,8 +1696,8 @@ export function Composer({
                 // Click-through like the placeholder overlay it stands in for, so the textarea
                 // underneath still focuses on click; Dismiss re-enables pointer events on itself.
                 pointerEvents: "none",
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 14,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontSize: 13,
                 lineHeight: 1.4,
               }}
             >
@@ -1729,8 +1729,8 @@ export function Composer({
                 right: suggestionButtons.length > 0 ? SUGGESTION_PILL_ZONE : 11,
                 pointerEvents: "none",
                 color: C.muted,
-                fontFamily: '"IBM Plex Sans", sans-serif',
-                fontSize: 14,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontSize: 13,
                 lineHeight: 1.4,
               }}
             >
@@ -1790,7 +1790,7 @@ export function Composer({
             background: "transparent",
             color: C.cream,
             border: `1.5px dashed ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             cursor: disabled || capturing ? "not-allowed" : "pointer",
             opacity: disabled ? 0.6 : 1,
             padding: 0,
@@ -1806,10 +1806,10 @@ export function Composer({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 18px",
             fontWeight: FONT_WEIGHT.semibold,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             cursor: disabled ? "not-allowed" : "pointer",
             height: 40,
             opacity: disabled ? 0.6 : 1,

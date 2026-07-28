@@ -36,7 +36,7 @@ const baseBox: CSSProperties = {
   alignItems: "flex-start",
   textAlign: "left",
   padding: 24,
-  borderRadius: 16,
+  borderRadius: 6,
   width: 380,
   boxSizing: "border-box",
   background: C.deepForest,
@@ -51,12 +51,12 @@ const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "12px 22px",
-  fontSize: 16,
+  fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   alignSelf: "stretch",
 };
 const ul: CSSProperties = {
@@ -83,8 +83,8 @@ export function WelcomeScreen({
 }) {
   return (
     <div style={screen}>
-      <h1 style={{ fontSize: 34, margin: 0 }}>Welcome to Sparkle</h1>
-      <p style={{ color: C.muted, maxWidth: 620, margin: 0, fontSize: 16 }}>
+      <h1 style={{ fontSize: 17, margin: 0 }}>Welcome to Sparkle</h1>
+      <p style={{ color: C.muted, maxWidth: 620, margin: 0, fontSize: 17 }}>
         You are <strong style={{ color: C.cream }}>$99</strong> away from unlocking the full power of
         Sparkle. Unsure? Try it free for your first 100 prompts.
       </p>
@@ -107,7 +107,7 @@ export function WelcomeScreen({
         </div>
         {onTryFree && (
           <div style={freeBox}>
-            <h2 style={{ fontSize: 18, margin: 0 }}>Try it free for 100 prompts</h2>
+            <h2 style={{ fontSize: 17, margin: 0 }}>Try it free for 100 prompts</h2>
             <button style={primaryBtn} onClick={onTryFree}>
               Try it now
             </button>

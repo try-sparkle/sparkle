@@ -27,15 +27,15 @@ export function TextPill({
           background: C.deepForest,
           color: C.cream,
           cursor: "pointer",
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         }}
       >
-        <span style={{ fontSize: 16, lineHeight: 1 }}>📄</span>
+        <span style={{ fontSize: 17, lineHeight: 1 }}>📄</span>
         <span style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
           <span style={{ fontSize: 12, fontWeight: FONT_WEIGHT.semibold, lineHeight: 1.3 }}>
             Pasted text
           </span>
-          <span style={{ fontSize: 11, color: C.muted, lineHeight: 1.3 }}>
+          <span style={{ fontSize: 12, color: C.muted, lineHeight: 1.3 }}>
             {block.lineCount} lines
           </span>
         </span>
@@ -49,7 +49,7 @@ export function TextPill({
           right: -6,
           width: 18,
           height: 18,
-          borderRadius: 9,
+          borderRadius: 6,
           background: C.sienna,
           color: ON_BRAND_FILL,
           border: "none",

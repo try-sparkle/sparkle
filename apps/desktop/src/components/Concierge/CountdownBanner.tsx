@@ -87,7 +87,7 @@ export function CountdownBanner({
             gap: 10,
             padding: "8px 10px",
             marginTop: 6,
-            borderRadius: 8,
+            borderRadius: 6,
             background: `color-mix(in srgb, ${C.muted} 18%, transparent)`,
             border: `1px solid color-mix(in srgb, ${C.muted} 35%, transparent)`,
             fontSize: 12,

@@ -80,7 +80,7 @@ const wrap: CSSProperties = {
   display: "flex",
   gap: 2,
   padding: 2,
-  borderRadius: 8,
+  borderRadius: 6,
   background: C.deepForest,
   alignSelf: "stretch",
 };
@@ -95,7 +95,7 @@ const option: CSSProperties = {
   borderRadius: 6,
   padding: "4px 8px",
   cursor: "pointer",
-  fontSize: 11,
+  fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };

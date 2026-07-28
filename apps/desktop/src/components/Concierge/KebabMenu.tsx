@@ -130,7 +130,7 @@ export function KebabMenu() {
           border: "none",
           color: hover ? C.cream : C.muted,
           padding: 6,
-          borderRadius: 8,
+          borderRadius: 6,
           cursor: "pointer",
         }}
       >

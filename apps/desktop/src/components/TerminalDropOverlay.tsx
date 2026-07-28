@@ -27,7 +27,7 @@ export function TerminalDropOverlay({ agentName }: { agentName: string }) {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        borderRadius: 8,
+        borderRadius: 6,
         border: `2px dashed ${C.teal}`,
         background: `color-mix(in srgb, ${C.teal} 10%, rgba(0,0,0,0.35))`,
       }}
@@ -42,7 +42,7 @@ export function TerminalDropOverlay({ agentName }: { agentName: string }) {
           background: C.deepForest,
           border: `1px solid ${C.teal}`,
           color: C.cream,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           fontSize: 13,
           fontWeight: FONT_WEIGHT.semibold,
           boxShadow: "0 10px 28px rgba(0,0,0,0.45)",

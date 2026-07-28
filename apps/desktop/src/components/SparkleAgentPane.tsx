@@ -183,7 +183,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             background: C.deepForest,
             borderBottom: `1px solid ${CHAT_USER_BUBBLE}`,
             color: C.muted,
-            fontSize: 12.5,
+            fontSize: 12,
             lineHeight: 1.5,
           }}
         >
@@ -281,7 +281,7 @@ function PrimaryButton({ children, onClick }: { children: React.ReactNode; onCli
         background: C.teal,
         color: ON_BRAND_FILL,
         border: "none",
-        borderRadius: 8,
+        borderRadius: 6,
         padding: "9px 18px",
         fontWeight: FONT_WEIGHT.semibold,
         cursor: "pointer",

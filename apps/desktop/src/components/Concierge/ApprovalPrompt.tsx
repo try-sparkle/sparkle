@@ -92,7 +92,7 @@ function ApprovalCard({
       {/* WHAT IT WILL DO — the catalog's own one-liner, then the risk map's own note. */}
       <div style={{ fontSize: TYPE.body, color: C.cream }}>{approval.summary}</div>
       {approval.riskNote && (
-        <div style={{ fontSize: TYPE.tiny, color: C.conciergeMuted, marginTop: 3 }}>
+        <div style={{ fontSize: TYPE.small, color: C.conciergeMuted, marginTop: 3 }}>
           {approval.riskNote}
         </div>
       )}
@@ -152,7 +152,7 @@ function ApprovalCard({
 const card: CSSProperties = {
   background: `linear-gradient(180deg, color-mix(in srgb, ${ACCENT} 9%, transparent), color-mix(in srgb, ${ACCENT} 3%, transparent))`,
   border: `1px solid color-mix(in srgb, ${ACCENT} 40%, transparent)`,
-  borderRadius: 12,
+  borderRadius: 6,
   padding: "12px 13px",
   marginTop: 6,
   boxShadow: `0 0 26px color-mix(in srgb, ${ACCENT} 10%, transparent)`,
@@ -163,7 +163,7 @@ const metaRow: CSSProperties = {
   alignItems: "center",
   gap: 6,
   flexWrap: "wrap",
-  fontSize: 11,
+  fontSize: 12,
   color: C.conciergeMuted,
   marginBottom: 6,
 };
@@ -210,9 +210,9 @@ const argsBlock: CSSProperties = {
   gap: 2,
   margin: "8px 0 0",
   padding: "6px 8px",
-  borderRadius: 8,
+  borderRadius: 6,
   background: CHAT_USER_BUBBLE,
-  fontSize: 11,
+  fontSize: 12,
   fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
 };
 
@@ -232,7 +232,7 @@ function actionBtn(): CSSProperties {
     display: "inline-flex",
     alignItems: "center",
     gap: 4,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: FONT_WEIGHT.bold,
     borderRadius: 999,
     padding: "6px 11px",

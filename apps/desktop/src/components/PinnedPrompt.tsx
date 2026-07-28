@@ -272,7 +272,7 @@ export function PinnedPrompt({
                     padding: 0,
                     margin: 0,
                     color: C.cream,
-                    fontFamily: '"IBM Plex Sans", sans-serif',
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                     fontWeight: FONT_WEIGHT.regular,
                     fontSize: 13,
                     cursor: "pointer",
@@ -357,7 +357,7 @@ export function PinnedPrompt({
             background: C.deepForest,
             border: `1px solid ${CHAT_USER_BUBBLE}`,
             borderTop: "none",
-            borderRadius: "0 0 8px 8px",
+            borderRadius: "0 0 6px 6px",
             maxHeight: 320,
             overflowY: "auto",
             boxShadow: "0 8px 20px rgba(0,0,0,0.35)",
@@ -517,7 +517,7 @@ function HistoryRow({
           )}
         </div>
       ) : (
-        <span style={{ flex: "0 0 auto", fontSize: 11, color: C.muted }}>
+        <span style={{ flex: "0 0 auto", fontSize: 12, color: C.muted }}>
           {formatAgo(Date.now(), entry.at)}
         </span>
       )}
@@ -541,7 +541,7 @@ function RowButton({ label, onClick }: { label: string; onClick: () => void }) {
         borderRadius: 6,
         padding: "3px 10px",
         fontSize: 12,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         fontWeight: FONT_WEIGHT.medium,
         cursor: "pointer",
         whiteSpace: "nowrap",

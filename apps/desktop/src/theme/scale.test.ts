@@ -124,8 +124,8 @@ function offScale(prop: string, allowed: readonly number[]): { file: string; val
 // being a ratchet at all — and this failure is loud, one line to resolve, and the message says
 // which way to move. But a long-lived branch should expect to re-take this number just before it
 // merges, the way a lockfile gets refreshed.
-const MAX_OFF_SCALE_TYPE = 139;
-const MAX_OFF_SCALE_RADIUS = 60;
+const MAX_OFF_SCALE_TYPE = 0;
+const MAX_OFF_SCALE_RADIUS = 0;
 
 // EXACT, not `<=` (roborev 54238). The file told the next person to lower the ceiling when they
 // migrated, and then used a bound that cannot tell whether they did: remove twenty literals without
@@ -156,9 +156,14 @@ describe("the type and radius scales are a ratchet", () => {
   // The scales have to stay scales. Duplicated values, or steps that collapse into each other, are
   // how twenty-three font sizes happened in the first place.
   it("every step is distinct and ordered", () => {
+    // ALIASES ARE ALLOWED, COLLISIONS ARE NOT — and for RADIUS the spec ships one deliberately:
+    // `--r-input` and `--r-bubble` are both 4px. Two names for one value is a call-site vocabulary,
+    // not sprawl; what would be sprawl is a value nothing names. So the assertion is on the SET
+    // being ordered, not on every key being unique.
     for (const [name, steps] of [["TYPE", Object.values(TYPE)], ["RADIUS", Object.values(RADIUS)], ["SPACE", Object.values(SPACE)]] as const) {
-      expect(new Set(steps).size, `${name} has duplicate steps`).toBe(steps.length);
-      expect(steps, `${name} is not ascending`).toEqual([...steps].sort((a, b) => a - b));
+      const distinct = [...new Set(steps)];
+      expect(distinct, `${name} is not ascending`).toEqual([...distinct].sort((a, b) => a - b));
+      expect(distinct.length, `${name} collapsed to a single step`).toBeGreaterThan(1);
     }
     // PILL is "fully round", not a step — keeping it out of RADIUS is what stops it being reached
     // for as "the biggest corner".

@@ -586,7 +586,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
 // ── styles ──────────────────────────────────────────────────────────────────────────────────
 
 const groupLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -620,11 +620,11 @@ const learnMoreStyle: CSSProperties = {
   color: C.accentInk,
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const hintStyle: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   color: C.amber,
   marginTop: 4,
   lineHeight: 1.4,
@@ -638,7 +638,7 @@ const hintButtonStyle: CSSProperties = {
   border: "none",
   cursor: "pointer",
   textAlign: "left",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const emptyStyle: CSSProperties = {

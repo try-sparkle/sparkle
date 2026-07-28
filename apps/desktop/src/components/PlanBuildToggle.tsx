@@ -96,7 +96,7 @@ function createBtnStyle(
     marginLeft: leftNotch ? -(CHEVRON - SEAM) : 0,
     clipPath: chevronClip(leftNotch, rightPoint),
     cursor: "pointer",
-    fontFamily: '"IBM Plex Sans", sans-serif',
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     fontSize: 13,
     whiteSpace: "nowrap",
     background: BUILD_FILL,
@@ -145,7 +145,7 @@ export function PlanBuildToggle({
       style={{
         display: "flex",
         margin: "0 10px 8px",
-        borderRadius: 8,
+        borderRadius: 6,
         overflow: "hidden",
         // Seam between chevrons = the column background (theme-aware), not white.
         background: C.deepForest,

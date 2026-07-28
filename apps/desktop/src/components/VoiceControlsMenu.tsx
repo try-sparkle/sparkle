@@ -26,15 +26,15 @@ const label: CSSProperties = {
   fontWeight: 600,
   color: C.cream,
   marginBottom: 4,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const caption: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   color: C.muted,
   marginTop: 4,
   lineHeight: 1.35,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const input: CSSProperties = {
@@ -46,7 +46,7 @@ const input: CSSProperties = {
   padding: "6px 8px",
   color: C.cream,
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const seg: CSSProperties = {
@@ -58,7 +58,7 @@ const seg: CSSProperties = {
   borderRadius: 6,
   padding: "6px 0",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -197,7 +197,7 @@ export function VoiceControlsMenu() {
           padding: "6px 10px",
           color: C.muted,
           fontSize: 12,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           cursor: "pointer",
         }}
       >

@@ -52,12 +52,12 @@ const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "12px 22px",
-  fontSize: 16,
+  fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const linkBtn: CSSProperties = {
@@ -250,7 +250,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (view === "unpaid") {
     return (
       <Screen>
-        <h1 style={{ fontSize: 28, margin: 0 }}>Unlock Sparkle</h1>
+        <h1 style={{ fontSize: 17, margin: 0 }}>Unlock Sparkle</h1>
         <p style={{ color: C.muted, maxWidth: 420 }}>
           One-time <strong style={{ color: C.cream }}>$99</strong> — includes{" "}
           <strong style={{ color: C.cream }}>$200 of AI credits</strong> to power building and

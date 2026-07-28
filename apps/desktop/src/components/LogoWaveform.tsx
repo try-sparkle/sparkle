@@ -403,7 +403,7 @@ export function LogoWaveform() {
                 // height is intentionally NOT set here — the rAF loop owns it via `paintBar`
                 // (direct DOM write). Omitting it from the inline style means a React re-render
                 // (e.g. a phase change flipping the gradient) never clobbers the live height.
-                borderRadius: 1,
+                borderRadius: 3,
                 // Gray when passive/paused; brand teal→blue fade across the row when live+active
                 // (cyan/teal on the LEFT, dark blue C.teal #2f6bff on the RIGHT).
                 background: liveActive
@@ -490,7 +490,7 @@ export function LogoWaveform() {
         // unrecognized). Styled to match the sibling notices in this slot: bold headline line, muted
         // detail line, 11px (the old 10px was the smallest type in the app for the most important
         // thing it had to say).
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>
           <span
             style={{
               display: "flex",
@@ -546,7 +546,7 @@ export function LogoWaveform() {
         // The one-time model fetch. "Setting up" rather than "Downloading" because the percentage
         // tracks the COMPRESSED byte stream — it hits 100% with an unpack still to run, and
         // "Downloading… 100%" sitting there would read as a hang.
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>
           {preparingCaption(modelPercent(modelProgress))}
         </div>
       ) : presentation === "activeListening" || presentation === "passiveWaiting" ? (
@@ -566,7 +566,7 @@ export function LogoWaveform() {
             border: "none",
             cursor: "pointer",
             color: C.muted,
-            fontSize: 11,
+            fontSize: 12,
           }}
         >
           {/* Line 1 — current status. Same slot/styling in both phases. */}
@@ -593,7 +593,7 @@ export function LogoWaveform() {
         // Armed but paused (focus lost): show the honest caption as plain text — not a
         // wake hint, since saying "Hey Sparkle" right now wouldn't be heard. `caption` here is
         // captionFor's "Listening paused…" string (non-null because focusPaused ⇒ enabled).
-        <div style={{ marginTop: 4, color: C.muted, fontSize: 11, textAlign: "center" }}>{caption}</div>
+        <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>{caption}</div>
       ) : null /* presentation === "off": disarmed, no caption */}
     </div>
   );

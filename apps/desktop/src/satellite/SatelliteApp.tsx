@@ -262,7 +262,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
         width: "100vw",
         background: C.deepForest,
         color: C.cream,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
@@ -309,11 +309,11 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
                   background: C.teal,
                   color: "#04231d",
                   border: "none",
-                  borderRadius: 8,
+                  borderRadius: 6,
                   padding: "10px 20px",
                   fontWeight: FONT_WEIGHT.semibold,
                   cursor: "pointer",
-                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                 }}
               >
                 ▶ Start this agent
@@ -370,7 +370,7 @@ function Hint({ title, children }: { title: string; children?: React.ReactNode }
         padding: 24,
       }}
     >
-      <div style={{ fontSize: 18, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>{title}</div>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>{title}</div>
       {children && (
         <div style={{ color: C.muted, maxWidth: 420, lineHeight: 1.5 }}>{children}</div>
       )}

@@ -12,7 +12,7 @@
 // still reaches the persistent log file + crash pipeline (frontend_log → Rust) exactly as an
 // uncaught error would — we recover the UI WITHOUT losing the diagnostic.
 import { Component, useState, type ErrorInfo, type ReactNode } from "react";
-import { C, FONT } from "../theme/colors";
+import { C } from "../theme/colors";
 import { log } from "../logger";
 import { SupportModal } from "./SupportModal";
 import { paneVisibilityStyle } from "./paneVisibility";
@@ -77,11 +77,11 @@ function buttonStyle(filled: boolean) {
     background: filled ? C.accentInk : "transparent",
     border: `1px solid ${C.accentInk}`,
     color: filled ? C.deepForest : C.accentInk,
-    borderRadius: 8,
+    borderRadius: 6,
     padding: "9px 18px",
-    fontSize: 13.5,
+    fontSize: 13,
     fontWeight: 600,
-    fontFamily: FONT.ui,
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     cursor: "pointer",
   } as const;
 }
@@ -108,11 +108,11 @@ export function AppErrorFallback({ reset }: { error: Error; reset: () => void })
         textAlign: "center",
         background: C.forest,
         color: C.cream,
-        fontFamily: FONT.ui,
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
-      <h1 style={{ margin: 0, fontSize: 22, fontWeight: 600 }}>Something broke</h1>
-      <p style={{ margin: 0, maxWidth: 440, fontSize: 14, lineHeight: 1.6, color: C.muted }}>
+      <h1 style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>Something broke</h1>
+      <p style={{ margin: 0, maxWidth: 440, fontSize: 13, lineHeight: 1.6, color: C.muted }}>
         The app hit an unexpected error. Your agents are still running in the background — reload the
         UI to get back to them, or report it and we'll take a look.
       </p>
@@ -158,11 +158,11 @@ export function AgentPaneErrorCard({
         textAlign: "center",
         background: C.forest,
         color: C.cream,
-        fontFamily: FONT.ui,
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <h2 style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>This agent's view hit an error</h2>
-      <p style={{ margin: 0, maxWidth: 380, fontSize: 13.5, lineHeight: 1.6, color: C.muted }}>
+      <p style={{ margin: 0, maxWidth: 380, fontSize: 13, lineHeight: 1.6, color: C.muted }}>
         The rest of your agents are unaffected. Retry to reload just this pane.
       </p>
       <button onClick={reset} style={buttonStyle(true)}>

@@ -353,7 +353,7 @@ function relativeTime(iso: string | null | undefined, now: number): string {
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ──────
 
 const subLabel: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   textTransform: "uppercase",
   letterSpacing: 1,
   color: C.muted,
@@ -364,7 +364,7 @@ const subLabel: CSSProperties = {
 const panel: CSSProperties = {
   background: C.forest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "14px 16px",
   display: "flex",
   flexDirection: "column",
@@ -373,7 +373,7 @@ const panel: CSSProperties = {
 };
 
 const codeStyle: CSSProperties = {
-  fontSize: 42,
+  fontSize: 17,
   fontWeight: FONT_WEIGHT.semibold,
   letterSpacing: 12,
   color: C.cream,
@@ -405,11 +405,11 @@ const actionBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const iconBtn: CSSProperties = {
@@ -428,7 +428,7 @@ const deviceRow: CSSProperties = {
   alignItems: "center",
   gap: 12,
   background: C.forest,
-  borderRadius: 9,
+  borderRadius: 6,
   padding: "11px 14px",
 };
 
@@ -457,13 +457,13 @@ const currentBadge: CSSProperties = {
   letterSpacing: 0.5,
   color: C.accentInk,
   border: `1px solid ${C.accentInk}`,
-  borderRadius: 5,
+  borderRadius: 4,
   padding: "1px 6px",
   flex: "none",
 };
 
 const deviceMeta: CSSProperties = {
-  fontSize: 11.5,
+  fontSize: 12,
   color: C.muted,
   marginTop: 2,
 };
@@ -472,9 +472,9 @@ const smallBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 7,
+  borderRadius: 6,
   padding: "5px 10px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };

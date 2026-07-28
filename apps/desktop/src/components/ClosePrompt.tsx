@@ -33,7 +33,7 @@ export function ClosePrompt({
         : `the agents in ${runningProjectNames[0]} and ${others} other ${others === 1 ? "project" : "projects"}`;
   return (
     <ModalShell width={440} zIndex={200} onCancel={onCancel}>
-      <div style={{ fontSize: 16, fontWeight: FONT_WEIGHT.semibold, marginBottom: 6 }}>
+      <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 6 }}>
         Close {projectName} Project Window?
       </div>
       <div style={{ color: C.muted, fontSize: 13, marginBottom: 18 }}>
@@ -49,10 +49,10 @@ export function ClosePrompt({
             // navy in light mode, which would go low-contrast on the blue fill).
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "11px 14px",
             cursor: "pointer",
-            fontSize: 14,
+            fontSize: 13,
             fontWeight: FONT_WEIGHT.semibold,
             textAlign: "left",
           }}
@@ -65,10 +65,10 @@ export function ClosePrompt({
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.sienna}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "11px 14px",
             cursor: "pointer",
-            fontSize: 14,
+            fontSize: 13,
             textAlign: "left",
           }}
         >
@@ -84,7 +84,7 @@ export function ClosePrompt({
             background: "transparent",
             color: C.muted,
             border: `1px solid ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "8px 16px",
             cursor: "pointer",
           }}

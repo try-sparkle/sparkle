@@ -37,10 +37,10 @@ export function RoborevConsentModal() {
 
   return (
     <ModalShell width={440} zIndex={300} onCancel={cancel}>
-      <h2 style={{ margin: "0 0 10px", fontSize: 18, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+      <h2 style={{ margin: "0 0 10px", fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
         Turn on roborev code review?
       </h2>
-      <p style={{ margin: "0 0 18px", fontSize: 13.5, color: C.muted, lineHeight: 1.6 }}>
+      <p style={{ margin: "0 0 18px", fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
         roborev runs a quick AI review of each commit your BUILD agents make, using your existing
         Claude login — nothing else is sent anywhere. You can turn it off anytime in Tools.
       </p>
@@ -53,10 +53,10 @@ export function RoborevConsentModal() {
             background: "transparent",
             border: `1px solid ${C.hairline}`,
             color: C.muted,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 16px",
-            fontSize: 13.5,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 13,
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             cursor: busy ? "default" : "pointer",
             opacity: busy ? 0.6 : 1,
           }}
@@ -71,11 +71,11 @@ export function RoborevConsentModal() {
             background: C.accentInk,
             border: "none",
             color: C.deepForest,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 18px",
-            fontSize: 13.5,
+            fontSize: 13,
             fontWeight: FONT_WEIGHT.semibold,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             cursor: busy ? "default" : "pointer",
             opacity: busy ? 0.6 : 1,
           }}

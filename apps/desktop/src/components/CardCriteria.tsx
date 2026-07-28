@@ -135,7 +135,7 @@ export function CardCriteria({
         </ul>
       )}
 
-      {err && <div style={{ color: C.sienna, fontSize: 11 }}>{err}</div>}
+      {err && <div style={{ color: C.sienna, fontSize: 12 }}>{err}</div>}
     </div>
   );
 }
@@ -152,10 +152,10 @@ const progressChip: CSSProperties = {
   border: `1px solid ${C.hairline}`,
   borderRadius: 6,
   padding: "2px 8px",
-  fontSize: 11,
+  fontSize: 12,
   cursor: "pointer",
   color: C.muted,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const markButton: CSSProperties = {
@@ -164,10 +164,10 @@ const markButton: CSSProperties = {
   border: "none",
   borderRadius: 6,
   padding: "3px 12px",
-  fontSize: 11.5,
+  fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const critList: CSSProperties = {
@@ -182,7 +182,7 @@ const critList: CSSProperties = {
 };
 
 const critHeader: CSSProperties = {
-  fontSize: 10.5,
+  fontSize: 10,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.muted,
   textTransform: "uppercase",
@@ -195,7 +195,7 @@ const critItem: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   gap: 8,
-  fontSize: 11.5,
+  fontSize: 12,
 };
 
 const critLabel: CSSProperties = {
@@ -208,9 +208,9 @@ const critLabel: CSSProperties = {
 
 const tag: CSSProperties = {
   flex: "0 0 auto",
-  fontSize: 9.5,
+  fontSize: 10,
   border: "1px solid",
-  borderRadius: 5,
+  borderRadius: 4,
   padding: "0 5px",
   whiteSpace: "nowrap",
   fontFamily: '"IBM Plex Mono", monospace',

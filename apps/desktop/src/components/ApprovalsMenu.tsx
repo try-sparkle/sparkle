@@ -216,7 +216,7 @@ function ResumeScopeGroup({
 }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-      <span style={{ color: C.muted, fontSize: 11, minWidth: 78 }}>{label}</span>
+      <span style={{ color: C.muted, fontSize: 12, minWidth: 78 }}>{label}</span>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
         {RESUME_CHOICES.map((rule) => (
           <button
@@ -261,7 +261,7 @@ const noticeBox: CSSProperties = {
   lineHeight: 1.5,
   background: C.forest,
   border: `1px solid ${C.hairline}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 10px",
 };
 
@@ -285,10 +285,10 @@ function btn(active: boolean): CSSProperties {
     // (the themed `cream` flips to navy in light and would go low-contrast on teal).
     color: active ? ON_BRAND_FILL : C.cream,
     border: `1px solid ${active ? C.teal : C.muted}`,
-    borderRadius: 7,
+    borderRadius: 6,
     padding: "5px 9px",
     fontSize: 12,
-    fontFamily: '"IBM Plex Sans", sans-serif',
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     cursor: "pointer",
     whiteSpace: "nowrap",
   };

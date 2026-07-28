@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useRef } from "react";
 import { IoFilter } from "react-icons/io5";
-import { C, FONT, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT } from "../theme/colors";
 import { STATUS_BANDS, type StatusBand } from "../engine/buildSections";
 import { bandCountLabel, bandColor } from "../engine/statusBandLabels";
 import { BandBadge } from "./BandBadge";
@@ -210,8 +210,8 @@ export const StatusFilterBar = memo(function StatusFilterBar({
               // plane below the sidebar has no shape left to keep under the near-black palette.
               borderColor: on ? dot : C.hairline,
               background: on ? `${dot}1f` : "transparent",
-              fontFamily: FONT.ui,
-              fontSize: 11,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontSize: 12,
               fontWeight: FONT_WEIGHT.semibold,
               cursor: "pointer",
               // NO OPACITY on the OFF chip, for the same reason the Plan/Build strip lost its 0.9
@@ -270,8 +270,8 @@ export const StatusFilterBar = memo(function StatusFilterBar({
           background: "none",
           border: "none",
           padding: "0 2px",
-          fontFamily: FONT.ui,
-          fontSize: 11,
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontSize: 12,
           color: C.accent,
           cursor: "pointer",
           textDecoration: "underline",

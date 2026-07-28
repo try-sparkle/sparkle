@@ -153,7 +153,7 @@ const titleStack: CSSProperties = {
 /** The count line: same muted ink, but out of the uppercase/tracked treatment the label carries —
  *  a number rendered with 1px letter-spacing reads as a code, not a quantity. */
 const countLine: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   letterSpacing: 0,
   textTransform: "none",
   fontWeight: FONT_WEIGHT.regular,
@@ -182,7 +182,7 @@ const statusChip: CSSProperties = {
   border: "1px solid",
   borderRadius: 6,
   padding: "1px 6px",
-  fontSize: 9.5,
+  fontSize: 10,
   letterSpacing: 0.3,
   textTransform: "none",
   maxWidth: 160,
@@ -208,12 +208,12 @@ const ctaButton: CSSProperties = {
   // the same token.
   color: C.cream,
   border: "none",
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "8px 16px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
-const ctaHint: CSSProperties = { color: C.muted, opacity: 0.7, fontSize: 11, lineHeight: 1.4, maxWidth: 200 };
+const ctaHint: CSSProperties = { color: C.muted, opacity: 0.7, fontSize: 12, lineHeight: 1.4, maxWidth: 200 };

@@ -32,7 +32,7 @@ const chiclet = {
   display: "flex",
   alignItems: "center",
   gap: 5,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   fontSize: 13,
   fontWeight: 600,
   color: C.cream,
@@ -149,7 +149,7 @@ export function HelperIsland({
         background: C.deepForest,
         // Matches HELPER_CORNER_RADIUS in mac_panel.rs — if these drift you get a visible seam
         // where the square webview corner meets the rounded window edge.
-        borderRadius: 12,
+        borderRadius: 6,
         boxSizing: "border-box",
         // The capture-failure notice hangs off the bottom of THIS box, so it must be the
         // positioning context — otherwise it anchors to the wrapper and needs a hardcoded offset
@@ -284,7 +284,7 @@ export function HelperIsland({
             boxSizing: "border-box",
             color: C.cream,
             background: C.sienna,
-            fontSize: 11,
+            fontSize: 12,
             padding: "4px 8px",
             borderRadius: 6,
           }}

@@ -71,15 +71,15 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           flexDirection: "column",
           background: C.deepForest,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 12,
+          borderRadius: 6,
           padding: 16,
           color: C.cream,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>Log in to “{account.nickname}”</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Log in to “{account.nickname}”</div>
           <button
             type="button"
             onClick={onClose}
@@ -115,7 +115,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
             : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
         </p>
-        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: 8, overflow: "hidden", padding: 6 }}>
+        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: 6, overflow: "hidden", padding: 6 }}>
           {spawn ? (
             <Terminal
               agentId={`account-login-${account.id}`}

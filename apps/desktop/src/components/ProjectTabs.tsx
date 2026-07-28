@@ -200,7 +200,7 @@ function DropCaret() {
         alignSelf: "stretch",
         width: 2,
         marginBottom: 2,
-        borderRadius: 1,
+        borderRadius: 3,
         background: C.teal,
       }}
     />
@@ -408,7 +408,7 @@ export function ProjectTabs({
               // the top-right cluster instead of ellipsizing. `minWidth: 0` lets the tab shrink so
               // the label's own `text-overflow` actually gets to do its job under crowding.
               minWidth: 0,
-              borderRadius: "9px 9px 0 0",
+              borderRadius: "6px 6px 0 0",
               cursor: "pointer",
               fontSize: 12,
               position: "relative",
@@ -479,9 +479,9 @@ export function ProjectTabs({
                 data-testid={`count-${p.id}`}
                 style={{
                   fontWeight: 700,
-                  fontSize: 9,
+                  fontSize: 10,
                   padding: "1px 5px",
-                  borderRadius: 5,
+                  borderRadius: 4,
                   color: "#ff9a9a",
                   border: `1px solid ${RED}99`,
                 }}

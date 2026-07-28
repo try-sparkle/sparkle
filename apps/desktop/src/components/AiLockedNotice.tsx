@@ -27,7 +27,7 @@ const wrap: CSSProperties = {
   padding: "8px 12px",
   fontSize: 12,
   color: C.cream,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
 const message: CSSProperties = {
@@ -46,13 +46,13 @@ const unlockBtn: CSSProperties = {
   fontSize: 12,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   whiteSpace: "nowrap",
 };
 
 const failNote: CSSProperties = {
   color: DANGER,
-  fontSize: 11,
+  fontSize: 12,
   flexBasis: "100%",
 };
 

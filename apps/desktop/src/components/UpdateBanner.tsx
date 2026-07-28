@@ -25,7 +25,7 @@ const bar: CSSProperties = {
   borderBottom: `1px solid ${C.accent}`,
   color: C.cream,
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
 };
 
@@ -40,7 +40,7 @@ const primaryBtn: CSSProperties = {
   padding: "5px 12px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 
@@ -54,7 +54,7 @@ const dismissBtn: CSSProperties = {
   borderRadius: 6,
   padding: "5px 10px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   cursor: "pointer",
 };
 

@@ -397,7 +397,7 @@ export function ScopeVitals({
       style={{
         textAlign: "center",
         marginTop: 8,
-        fontSize: 11,
+        fontSize: 12,
         color: C.conciergeMuted,
         // THE ONE-LINE PROMISE, enforced rather than merely budgeted. `MAX_SEGMENTS` and
         // `MAX_NAME_CHARS` bound the line in CHARACTERS — the thing that actually decides a wrap —

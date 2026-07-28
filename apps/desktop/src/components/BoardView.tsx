@@ -222,7 +222,7 @@ export function BoardView({ project }: { project: Project }) {
           flexShrink: 0,
         }}
       >
-        <div style={{ fontSize: 15, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+        <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
           Tasks — {project.name}
         </div>
         {/* Errors keep any prior snapshot visible; surface the message in sienna without wiping. */}
@@ -233,7 +233,7 @@ export function BoardView({ project }: { project: Project }) {
 
       {/* No snapshot yet → loading. Otherwise the four columns. */}
       {!board ? (
-        <div style={{ padding: 24, color: C.muted, fontSize: 14 }}>Loading tasks…</div>
+        <div style={{ padding: 24, color: C.muted, fontSize: 13 }}>Loading tasks…</div>
       ) : (
         <div
           style={{
@@ -329,7 +329,7 @@ function Column({
         display: "flex",
         flexDirection: "column",
         background: C.deepForest,
-        borderRadius: 10,
+        borderRadius: 6,
         minHeight: 0,
       }}
     >
@@ -432,12 +432,12 @@ function Card({
       style={{
         background: C.forest,
         border: `1px solid ${C.hairline}`,
-        borderRadius: 8,
+        borderRadius: 6,
         padding: "10px 12px",
         display: "flex",
         flexDirection: "column",
         gap: 6,
-        fontFamily: '"IBM Plex Sans", sans-serif',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
       <button
@@ -452,7 +452,7 @@ function Card({
           flexDirection: "column",
           gap: 6,
           width: "100%",
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         }}
       >
         <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13, lineHeight: 1.3 }}>
@@ -465,14 +465,14 @@ function Card({
           style={{
             color: C.muted,
             opacity: 0.7,
-            fontSize: 11,
+            fontSize: 12,
             fontFamily: '"IBM Plex Mono", monospace',
           }}
         >
           {bead.id}
         </div>
         {workers.length > 0 && (
-          <div style={{ color: C.tealInk, fontSize: 11, lineHeight: 1.4 }}>
+          <div style={{ color: C.tealInk, fontSize: 12, lineHeight: 1.4 }}>
             <FiUsers size={11} style={{ verticalAlign: "-2px", marginRight: 3 }} aria-hidden />
             {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
           </div>
@@ -587,7 +587,7 @@ function StartControls({
           fontSize: 12,
           fontWeight: FONT_WEIGHT.semibold,
           cursor: startDisabled ? "default" : "pointer",
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         }}
       >
         Build It
@@ -603,8 +603,8 @@ function StartControls({
             color: C.muted,
             cursor: "pointer",
             padding: "2px 8px",
-            fontSize: 11,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           }}
         >
           decomposing…
@@ -621,14 +621,14 @@ function StartControls({
             color: C.sienna,
             cursor: "pointer",
             padding: "2px 8px",
-            fontSize: 11,
-            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           }}
         >
           decompose failed
         </button>
       )}
-      {err && <span style={{ color: C.sienna, fontSize: 11 }}>{err}</span>}
+      {err && <span style={{ color: C.sienna, fontSize: 12 }}>{err}</span>}
     </div>
   );
 }
@@ -708,7 +708,7 @@ function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] 
       </div>
       <WorkflowLine stage={stage} height={3} />
       {workers.length > 0 && (
-        <div style={{ color: C.tealInk, fontSize: 11, lineHeight: 1.4 }}>{workers.join(", ")}</div>
+        <div style={{ color: C.tealInk, fontSize: 12, lineHeight: 1.4 }}>{workers.join(", ")}</div>
       )}
     </div>
   );
@@ -829,7 +829,7 @@ function DetailOverlay({
           overflowY: "auto",
           background: C.deepForest,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 12,
+          borderRadius: 6,
           boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
           padding: 20,
           display: "flex",
@@ -838,7 +838,7 @@ function DetailOverlay({
         }}
       >
         <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-          <div style={{ flex: 1, fontSize: 16, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+          <div style={{ flex: 1, fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
             {bead.title}
           </div>
           <button
@@ -852,9 +852,9 @@ function DetailOverlay({
               color: C.muted,
               cursor: "pointer",
               padding: "2px 8px",
-              fontSize: 14,
+              fontSize: 13,
               lineHeight: 1.2,
-              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             }}
           >
             ✕
@@ -876,7 +876,7 @@ function DetailOverlay({
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <span
               style={{
-                fontSize: 11,
+                fontSize: 12,
                 textTransform: "uppercase",
                 letterSpacing: 0.5,
                 color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
@@ -895,13 +895,13 @@ function DetailOverlay({
                 background: C.teal,
                 color: ON_BRAND_FILL,
                 border: "none",
-                borderRadius: 8,
+                borderRadius: 6,
                 padding: "6px 16px",
                 fontSize: 13,
                 fontWeight: FONT_WEIGHT.semibold,
                 cursor: buildBusy ? "default" : "pointer",
                 opacity: buildBusy ? 0.7 : 1,
-                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             >
               {buildBusy ? "Building…" : "Build It"}
@@ -916,13 +916,13 @@ function DetailOverlay({
                   background: "transparent",
                   color: C.tealInk,
                   border: `1px solid ${C.teal}`,
-                  borderRadius: 8,
+                  borderRadius: 6,
                   padding: "6px 16px",
                   fontSize: 13,
                   fontWeight: FONT_WEIGHT.semibold,
                   cursor: buildBusy ? "default" : "pointer",
                   opacity: buildBusy ? 0.7 : 1,
-                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                 }}
               >
                 {`Build all ${prdEpics.length} epics in this PRD`}
@@ -943,13 +943,13 @@ function DetailOverlay({
                 background: C.teal,
                 color: ON_BRAND_FILL,
                 border: "none",
-                borderRadius: 8,
+                borderRadius: 6,
                 padding: "6px 16px",
                 fontSize: 13,
                 fontWeight: FONT_WEIGHT.semibold,
                 cursor: buildBusy ? "default" : "pointer",
                 opacity: buildBusy ? 0.7 : 1,
-                fontFamily: '"IBM Plex Sans", sans-serif',
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             >
               {buildBusy ? "Building…" : "Build It"}
@@ -965,7 +965,7 @@ function DetailOverlay({
           <div
             style={{
               color: C.cream,
-              fontSize: 14,
+              fontSize: 13,
               lineHeight: 1.6,
               whiteSpace: "pre-wrap", // preserve newlines in the full description
             }}

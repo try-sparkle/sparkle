@@ -9,7 +9,7 @@
 // done in Rust (supportApi.ts → support::* commands); this component is presentation + orchestration.
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { C, FONT, CHAT_USER_BUBBLE } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE } from "../theme/colors";
 import { ModalShell } from "./ModalShell";
 import { Markdown } from "./Markdown";
 import { getIdentities } from "../services/accountStore";
@@ -205,7 +205,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
           <span style={{ color: C.accentInk, display: "inline-flex" }}>
             <LifeBuoyIcon />
           </span>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: C.cream }}>How can we help?</h2>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 600, color: C.cream }}>How can we help?</h2>
         </div>
         <p style={{ margin: "0 0 14px", fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
           Tell us what's going on and we'll try to help right away. You can open a ticket any time —
@@ -238,9 +238,9 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                   alignSelf: "flex-end",
                   maxWidth: "85%",
                   background: CHAT_USER_BUBBLE,
-                  borderRadius: 10,
+                  borderRadius: 6,
                   padding: "8px 12px",
-                  fontSize: 14,
+                  fontSize: 13,
                   lineHeight: 1.5,
                   whiteSpace: "pre-wrap",
                   overflowWrap: "anywhere",
@@ -254,7 +254,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                   style={{
                     background: C.forest,
                     border: `1px solid ${C.hairline}`,
-                    borderRadius: 10,
+                    borderRadius: 6,
                     padding: "8px 12px",
                   }}
                 >
@@ -277,7 +277,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                           borderRadius: 4,
                           padding: "3px 10px",
                           fontSize: 12,
-                          fontFamily: FONT.ui,
+                          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                           cursor: "pointer",
                         }}
                       >
@@ -298,7 +298,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {chatError && (
-          <p style={{ margin: "8px 0 0", fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>{chatError}</p>
+          <p style={{ margin: "8px 0 0", fontSize: 12, color: C.muted, lineHeight: 1.5 }}>{chatError}</p>
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
@@ -318,11 +318,11 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               resize: "none",
               background: C.forest,
               border: `1px solid ${C.hairline}`,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "8px 10px",
               color: C.cream,
-              fontSize: 14,
-              fontFamily: FONT.ui,
+              fontSize: 13,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               lineHeight: 1.4,
             }}
           />
@@ -338,11 +338,11 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: C.accentInk,
               color: C.deepForest,
               border: "none",
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "0 14px",
               fontSize: 13,
               fontWeight: 600,
-              fontFamily: FONT.ui,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: !input.trim() || chatBusy ? "default" : "pointer",
               opacity: !input.trim() || chatBusy ? 0.5 : 1,
             }}
@@ -366,11 +366,11 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                 marginBottom: 10,
                 background: C.forest,
                 border: `1px solid ${C.hairline}`,
-                borderRadius: 8,
+                borderRadius: 6,
                 padding: "8px 10px",
                 color: C.cream,
                 fontSize: 13,
-                fontFamily: FONT.ui,
+                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               }}
             />
           )}
@@ -386,11 +386,11 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: emphasizeTicket ? C.accentInk : "transparent",
               border: `1px solid ${C.accentInk}`,
               color: emphasizeTicket ? C.deepForest : C.accentInk,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "9px 14px",
-              fontSize: 13.5,
+              fontSize: 13,
               fontWeight: 600,
-              fontFamily: FONT.ui,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: ticketBusy ? "default" : "pointer",
               opacity: ticketBusy ? 0.6 : 1,
             }}
@@ -399,9 +399,9 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
             {ticketBusy ? "Opening your ticket…" : "Open a support ticket"}
           </button>
           {ticketError && (
-            <p style={{ margin: "8px 0 0", fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>{ticketError}</p>
+            <p style={{ margin: "8px 0 0", fontSize: 12, color: C.muted, lineHeight: 1.5 }}>{ticketError}</p>
           )}
-          <p style={{ margin: "8px 0 0", fontSize: 11.5, color: C.muted, lineHeight: 1.5 }}>
+          <p style={{ margin: "8px 0 0", fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
             We'll attach recent app logs (with API keys and tokens removed) so we can help faster.
           </p>
         </div>
@@ -417,9 +417,9 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
           <span style={{ color: C.successInk, display: "inline-flex" }}>
             <CheckIcon />
           </span>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600, color: C.cream }}>We've got it — you're in good hands</h2>
+          <h2 style={{ margin: 0, fontSize: 17, fontWeight: 600, color: C.cream }}>We've got it — you're in good hands</h2>
         </div>
-        <p style={{ margin: "0 0 16px", fontSize: 13.5, color: C.cream, lineHeight: 1.6 }}>
+        <p style={{ margin: "0 0 16px", fontSize: 13, color: C.cream, lineHeight: 1.6 }}>
           Your ticket is open and a real person will follow up by email. Here's your private link to
           view the conversation and reply any time — no sign-in needed. We're on it.
         </p>
@@ -431,7 +431,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
             gap: 8,
             background: C.forest,
             border: `1px solid ${C.hairline}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "8px 10px",
             marginBottom: 14,
           }}
@@ -445,8 +445,8 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: "transparent",
               border: "none",
               color: C.cream,
-              fontSize: 12.5,
-              fontFamily: FONT.ui,
+              fontSize: 12,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               outline: "none",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -465,7 +465,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               borderRadius: 6,
               padding: "4px 10px",
               fontSize: 12,
-              fontFamily: FONT.ui,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: "pointer",
               whiteSpace: "nowrap",
             }}
@@ -487,11 +487,11 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: C.accentInk,
               color: C.deepForest,
               border: "none",
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "10px 14px",
-              fontSize: 13.5,
+              fontSize: 13,
               fontWeight: 600,
-              fontFamily: FONT.ui,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: "pointer",
             }}
           >
@@ -505,10 +505,10 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: "transparent",
               border: `1px solid ${C.hairline}`,
               color: C.muted,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "10px 16px",
-              fontSize: 13.5,
-              fontFamily: FONT.ui,
+              fontSize: 13,
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
               cursor: "pointer",
             }}
           >

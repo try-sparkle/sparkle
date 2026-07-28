@@ -92,14 +92,14 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
           maxWidth: "90vw",
           background: C.deepForest,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 12,
+          borderRadius: 6,
           padding: 22,
           color: C.cream,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
         }}
       >
-        <div style={{ fontSize: 16, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
+        <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
           Project settings
         </div>
 
@@ -115,9 +115,9 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 11px",
-            fontSize: 14,
+            fontSize: 13,
             outline: "none",
             marginBottom: 16,
           }}
@@ -132,7 +132,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             style={{
               flex: 1,
               background: C.forest,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "9px 11px",
               fontSize: 13,
               color: C.cream,
@@ -149,7 +149,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: "transparent",
               color: C.accentInk,
               border: `1px solid ${C.muted}`,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "8px 12px",
               cursor: "pointer",
               fontSize: 13,
@@ -184,9 +184,9 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 8,
+            borderRadius: 6,
             padding: "9px 11px",
-            fontSize: 14,
+            fontSize: 13,
             outline: "none",
             marginBottom: 6,
             boxSizing: "border-box",
@@ -208,7 +208,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: "transparent",
               color: C.muted,
               border: `1px solid ${C.muted}`,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "9px 16px",
               cursor: "pointer",
             }}
@@ -222,7 +222,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: C.teal,
               color: ON_BRAND_FILL,
               border: "none",
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "9px 18px",
               fontWeight: FONT_WEIGHT.semibold,
               cursor: busy ? "wait" : !nameValid ? "not-allowed" : "pointer",

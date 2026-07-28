@@ -137,11 +137,11 @@ const PLACEHOLDER_INSET = { top: 11, left: 13, right: 13, bottom: 11 };
 const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 };
 
 const attachStyle: CSSProperties = {
-  fontSize: 11,
+  fontSize: 12,
   color: C.conciergeMuted,
   background: "transparent",
   border: `1px solid ${line}`,
-  borderRadius: 8,
+  borderRadius: 6,
   padding: "5px 9px",
   cursor: "pointer",
   display: "inline-flex",
@@ -817,7 +817,7 @@ export function ComposeBox({
               // near-black TERMINAL plane and punches a hole through the composer.
               background: C.barSurface,
               border: `1px solid ${line}`,
-              borderRadius: 12,
+              borderRadius: 6,
               color: C.cream,
               padding: "10px 12px",
               fontSize: 13,
@@ -920,7 +920,7 @@ export function ComposeBox({
             color: ON_GOLD_FILL,
             background: C.goldFill,
             border: "none",
-            borderRadius: 12,
+            borderRadius: 6,
             padding: "10px 15px",
             cursor: canSend ? "pointer" : "default",
             opacity: canSend ? 1 : 0.45,

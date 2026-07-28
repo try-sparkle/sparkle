@@ -115,7 +115,7 @@ export function renderSnippet(snippet: string): ReactNode[] {
 
 const badgeStyle = (kind: HistoryHit["kind"]): CSSProperties => ({
   flex: "0 0 auto",
-  fontSize: 9,
+  fontSize: 10,
   textTransform: "uppercase",
   letterSpacing: 0.5,
   fontWeight: FONT_WEIGHT.semibold,
@@ -259,10 +259,10 @@ export function HistorySearch({
           background: C.deepForest,
           color: C.cream,
           border: `1px solid ${C.hairline}`,
-          borderRadius: 8,
+          borderRadius: 6,
           padding: "7px 10px",
           fontSize: 13,
-          fontFamily: '"IBM Plex Sans", sans-serif',
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
           outline: "none",
         }}
       />
@@ -272,7 +272,7 @@ export function HistorySearch({
           style={{
             marginTop: 6,
             border: `1px solid ${C.hairline}`,
-            borderRadius: 8,
+            borderRadius: 6,
             overflow: "hidden",
             background: C.deepForest,
           }}
@@ -309,7 +309,7 @@ export function HistorySearch({
                       cursor: disabled ? "default" : "pointer",
                       opacity: disabled ? 0.5 : 1,
                       padding: "8px 12px",
-                      fontFamily: '"IBM Plex Sans", sans-serif',
+                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
@@ -319,7 +319,7 @@ export function HistorySearch({
                           flex: 1,
                           minWidth: 0,
                           color: C.muted,
-                          fontSize: 11,
+                          fontSize: 12,
                           overflow: "hidden",
                           textOverflow: "ellipsis",
                           whiteSpace: "nowrap",
@@ -327,7 +327,7 @@ export function HistorySearch({
                       >
                         {[h.projectName, h.agentName].filter(Boolean).join(" · ") || "—"}
                       </span>
-                      <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 11 }}>
+                      <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 12 }}>
                         {relativeTime(h.createdAt)}
                       </span>
                     </div>
@@ -351,7 +351,7 @@ export function HistorySearch({
                         style={{
                           marginTop: 4,
                           color: DANGER,
-                          fontSize: 11,
+                          fontSize: 12,
                           fontWeight: FONT_WEIGHT.semibold,
                         }}
                       >
@@ -374,7 +374,7 @@ export function HistorySearch({
               padding: "6px 12px",
               borderTop: `1px solid ${C.hairline}`,
               color: C.muted,
-              fontSize: 11,
+              fontSize: 12,
             }}
           >
             <span style={{ flex: 1, minWidth: 0 }}>
@@ -392,10 +392,10 @@ export function HistorySearch({
                   background: "transparent",
                   color: C.accentInk,
                   cursor: "pointer",
-                  fontSize: 11,
+                  fontSize: 12,
                   fontWeight: FONT_WEIGHT.semibold,
                   padding: 0,
-                  fontFamily: '"IBM Plex Sans", sans-serif',
+                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                 }}
               >
                 Extend history →

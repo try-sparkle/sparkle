@@ -71,7 +71,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
               gap: 6,
               padding: shown ? 0 : "5px 8px",
               maxWidth: 160,
-              borderRadius: 8,
+              borderRadius: 6,
               border: `1px solid color-mix(in srgb, ${C.muted} 30%, transparent)`,
               background: shown ? "transparent" : CHAT_USER_BUBBLE,
               cursor: "pointer",
@@ -95,8 +95,8 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
                 <FiFile size={13} color={C.conciergeMuted} aria-hidden style={{ flex: "0 0 auto" }} />
                 <span
                   style={{
-                    fontFamily: '"IBM Plex Sans", sans-serif',
-                    fontSize: 11.5,
+                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                    fontSize: 12,
                     fontWeight: FONT_WEIGHT.semibold,
                     lineHeight: 1.3,
                     color: C.cream,
@@ -110,7 +110,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
                 {ext && (
                   <span
                     style={{
-                      fontFamily: '"IBM Plex Sans", sans-serif',
+                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
                       fontSize: 10,
                       lineHeight: 1.3,
                       color: C.conciergeMuted,

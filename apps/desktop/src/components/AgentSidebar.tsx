@@ -123,10 +123,10 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   borderWidth: 1,
   borderStyle: "dashed",
   borderColor: C.muted,
-  borderRadius: 8,
+  borderRadius: 6,
   background: "transparent",
   color: C.muted,
-  fontFamily: '"IBM Plex Sans", sans-serif',
+  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
@@ -1974,12 +1974,12 @@ export function AgentSidebar({
               background: "transparent",
               color: C.accent,
               border: `1px solid ${C.accent}`,
-              borderRadius: 8,
+              borderRadius: 6,
               padding: "9px 18px",
               cursor: "pointer",
               fontSize: TYPE.body,
               fontWeight: FONT_WEIGHT.semibold,
-              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
             }}
           >
             Got it
@@ -2061,7 +2061,7 @@ export function AgentSidebar({
               width: 4,
               height: 28,
               marginRight: 1,
-              borderRadius: 2,
+              borderRadius: 3,
               background: C.hairline,
               pointerEvents: "none",
             }}
@@ -2131,7 +2131,7 @@ const ROW_PAD_Y = 4;
 const ROW_PAD_X = 10;
 
 // Radius of the concave fillets that flare the active row's right edge open into the terminal.
-const ACTIVE_FILLET = 8;
+const ACTIVE_FILLET = 6;
 
 // What a rolled-up disc is painted. The three definite marks reuse the AGENT_STATUS tier colors
 // straight (NOT statusInk — that resolves a color to a legible TEXT ink, and this is a filled
@@ -2228,7 +2228,7 @@ function ElapsedTimer({ since, now, color }: { since: number; now: number; color
         height: GLYPH_SLOT_H,
         display: "flex",
         alignItems: "center",
-        fontSize: 11,
+        fontSize: 12,
         color,
         fontVariantNumeric: "tabular-nums",
       }}
@@ -2894,7 +2894,7 @@ const AgentRow = memo(function AgentRow({
       <span
         aria-label={`${workerCount} ${workerCount === 1 ? "worker" : "workers"}`}
         title={`${workerCount} ${workerCount === 1 ? "worker" : "workers"} — click the row to show`}
-        style={{ flex: "0 0 auto", color: C.muted, fontSize: 11, lineHeight: 1 }}
+        style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1 }}
       >
         +{workerCount}
       </span>
@@ -3174,7 +3174,7 @@ const AgentRow = memo(function AgentRow({
               title={a.activity}
               style={{
                 color: C.muted,
-                fontSize: 11,
+                fontSize: 12,
                 lineHeight: 1.3,
                 marginTop: 1,
                 overflow: "hidden",
@@ -3248,12 +3248,12 @@ const AgentRow = memo(function AgentRow({
           from the (now removed) collapsed worker-lines block so the collapsed row stays title + bar. */}
       {beadHover && (
         <DetailLine label="Bead">
-          <span style={{ color: C.muted, fontSize: 11 }}>{beadHover}</span>
+          <span style={{ color: C.muted, fontSize: 12 }}>{beadHover}</span>
         </DetailLine>
       )}
       {epicHover && (
         <DetailLine label="Epic">
-          <span style={{ color: C.muted, fontSize: 11 }}>{epicHover}</span>
+          <span style={{ color: C.muted, fontSize: 12 }}>{epicHover}</span>
         </DetailLine>
       )}
       {/* One stacked detail block per worker — as if every worker had been expanded onto this single
@@ -3446,7 +3446,7 @@ const AgentRow = memo(function AgentRow({
           // other row is transparent, plus the square right corner and the fillets shaping that
           // edge into an opening — and, once the card is open, its 4px `hairline` outline. Not the
           // fill step against the column, which is ~1.08:1 and never was the signal.
-          borderRadius: isActive ? "8px 0 0 8px" : 8,
+          borderRadius: isActive ? "6px 0 0 6px" : 6,
           marginRight: isActive ? -8 : 0,
           cursor: "pointer",
           // The whole card is a drag handle for reorderable rows — suppress text selection so a
@@ -3606,7 +3606,7 @@ const AgentRow = memo(function AgentRow({
                 // whole job is to be a line you can see on any plane (see theme/colors, and the floor
                 // in theme/chromeContrast.test.ts).
                 border: `${cardBorder}px solid ${C.hairline}`,
-                borderRadius: "8px 8px 0 8px",
+                borderRadius: "6px 6px 0 6px",
               }}
             >
               {CardHeader({ expanded: true, ownsInput: false })}
@@ -3654,7 +3654,7 @@ const AgentRow = memo(function AgentRow({
                 borderLeft: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
                 borderRight: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
                 borderBottom: `${mergeIntoTerminal ? "4px" : "2px"} solid ${C.hairline}`,
-                borderRadius: "0 0 8px 8px",
+                borderRadius: "0 0 6px 6px",
               }}
             >
               {CardDetail()}
@@ -3715,7 +3715,7 @@ function AgentDetailLines({
     fontSize: 10,
     fontWeight: 700,
     lineHeight: 1,
-    fontFamily: FONT.ui,
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
     padding: "2px 7px",
     // RADIUS.sm, not a hand-typed 5. theme/scale.test.ts is a ratchet on off-scale values and this
     // pill was one of them; 4 vs 5 is imperceptible at this size, and the migration is the
@@ -3778,12 +3778,12 @@ function AgentDetailLines({
             </button>
           )
         ) : (
-          <span style={{ color: C.muted, fontSize: 11 }}>Up to date with {baseLabel}</span>
+          <span style={{ color: C.muted, fontSize: 12 }}>Up to date with {baseLabel}</span>
         )}
       </DetailLine>
       {progressPct != null && (
         <DetailLine label="Progress">
-          <span style={{ color: C.muted, fontSize: 11 }}>
+          <span style={{ color: C.muted, fontSize: 12 }}>
             {workerCount > 0 ? `${workerCount} worker${workerCount === 1 ? "" : "s"}. ` : ""}
             {progressPct}% complete{workerCount > 0 ? " overall" : ""}.
             {/* The sticky "landed" signal, in WORDS. The ✓ glyph that used to lead it went with the
@@ -3806,7 +3806,7 @@ function AgentDetailLines({
 function DetailLine({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-      <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 11, fontWeight: FONT_WEIGHT.semibold }}>
+      <span style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
         {label}:
       </span>
       <span style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center" }}>{children}</span>
@@ -3829,7 +3829,7 @@ function PathReveal({ path }: { path: string }) {
       title="Click to reveal this folder in Finder"
       style={{
         color: hover ? C.accentInk : C.muted,
-        fontSize: 11,
+        fontSize: 12,
         fontFamily: FONT.mono,
         whiteSpace: "nowrap",
         cursor: "pointer",
@@ -3864,7 +3864,7 @@ function CloseAgentButton({ onClose, width }: { onClose: () => void; width: numb
       aria-label="Close agent"
       style={{
         color: hover ? C.accentInk : C.muted,
-        fontSize: 18,
+        fontSize: 17,
         lineHeight: 1,
         flex: "0 0 auto",
         display: "inline-flex",
@@ -3920,7 +3920,7 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
         gap: 8,
         margin: "0 8px 6px",
         padding: "8px 10px",
-        borderRadius: 8,
+        borderRadius: 6,
         cursor: "pointer",
         // THE FILL IS A PLANE, AND THE PLANE IS NOT THE SIGNAL. Both halves matter.
         //
@@ -4116,7 +4116,7 @@ const SupportTicketRow = memo(function SupportTicketRow() {
           alignItems: "center",
           gap: 8,
           padding: "8px 10px",
-          borderRadius: expanded ? "8px 8px 0 0" : 8,
+          borderRadius: expanded ? "6px 6px 0 0" : 6,
           cursor: "pointer",
           background: C.teal,
           color: ON_BRAND_FILL,
@@ -4136,7 +4136,7 @@ const SupportTicketRow = memo(function SupportTicketRow() {
           Ticket: {label}
         </span>
         {multiple && (
-          <span style={{ flex: "0 0 auto", fontSize: 11, opacity: 0.85 }}>{openTickets.length}</span>
+          <span style={{ flex: "0 0 auto", fontSize: 12, opacity: 0.85 }}>{openTickets.length}</span>
         )}
         {alert && (
           // Top-right corner alert marker (support replied, waiting on the user). A white halo keeps
@@ -4163,7 +4163,7 @@ const SupportTicketRow = memo(function SupportTicketRow() {
           style={{
             border: `1px solid ${C.teal}`,
             borderTop: "none",
-            borderRadius: "0 0 8px 8px",
+            borderRadius: "0 0 6px 6px",
             overflow: "hidden",
           }}
         >
@@ -4193,7 +4193,7 @@ const SupportTicketRow = memo(function SupportTicketRow() {
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     whiteSpace: "nowrap",
-                    fontSize: 12.5,
+                    fontSize: 12,
                     color: C.cream,
                   }}
                 >
@@ -4207,7 +4207,7 @@ const SupportTicketRow = memo(function SupportTicketRow() {
                   <span
                     style={{
                       flex: "0 0 auto",
-                      fontSize: 10.5,
+                      fontSize: 10,
                       fontWeight: FONT_WEIGHT.semibold,
                       color: C.muted,
                       letterSpacing: 0.2,
