@@ -1,6 +1,6 @@
 // The one compose box in the app (the terminal has none — the concierge is where you talk).
-// Attach row (Screenshot / Image / Files) above a textarea + Send row; ⌘/Ctrl+Enter submits.
-// Purely presentational: submit reports trimmed text via onSend and clears.
+// Attach row (ONE paperclip, expanding to Screenshot / Upload) above a textarea + Send row;
+// ⌘/Ctrl+Enter submits. Purely presentational: submit reports trimmed text via onSend and clears.
 //
 // THERE IS NO MIC BUTTON HERE, and putting one back would re-create the bug this box was fixed for.
 // It used to carry one immediately left of the textarea, next to Send — which meant the concierge
@@ -9,7 +9,7 @@
 // control (arm / mute / off) and it also names the concierge as the voice surface, which is what
 // steers dictated speech into this box. See LogoWaveform and dictationStore.voiceSurface.
 //
-// ATTACHMENTS (parity row #21). The attach buttons report a KIND; the host runs the picker and owns
+// ATTACHMENTS (parity row #21). The attach control reports a KIND; the host runs the picker and owns
 // the resulting list, which comes back as `attachments` and renders as removable chips. The box
 // stays Tauri-free — it never opens a dialog, reads a file, or listens for a drop. It only paints
 // `dropActive`; the drag hit-test itself is on the COLUMN around it (CONCIERGE_COLUMN_DND_TARGET,
@@ -74,7 +74,7 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { FiCamera, FiFile, FiImage, FiPaperclip, FiX } from "react-icons/fi";
+import { FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
 import { C, COMPOSE_SCRIM, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
@@ -149,11 +149,178 @@ const attachStyle: CSSProperties = {
   alignItems: "center",
 };
 
-const ATTACHMENTS: { kind: ConciergeAttachKind; label: string; Icon: typeof FiCamera; title: string }[] = [
-  { kind: "screenshot", label: "Screenshot", Icon: FiCamera, title: "Capture a screenshot" },
-  { kind: "image", label: "Image", Icon: FiImage, title: "Upload an image" },
-  { kind: "files", label: "Files", Icon: FiPaperclip, title: "Attach files from your desktop" },
+/** The id `aria-controls` points at — one control, one target, so a constant rather than a hook. */
+const ATTACH_ACTIONS_ID = "concierge-attach-actions";
+
+/** THE TWO THINGS THE PAPERCLIP CAN DO. The row used to be three permanently-visible labelled
+ *  buttons — Screenshot / Image / Files — which is three controls' worth of chrome above a compose
+ *  box whose whole design is to look empty. It is one resting icon now, expanding into these on
+ *  hover or focus (see AttachControl).
+ *
+ *  Two, not three: `image` and `files` are the same OS panel, differing only in whether it is
+ *  narrowed to the image extensions, and "upload an image" vs "upload a file" is not a distinction
+ *  worth a second target in a two-target menu — the unfiltered picker takes images too, and the
+ *  chip it produces is identical (loadAttachment classifies by extension, so a picked .png is still
+ *  `kind: "image"` with a thumbnail).
+ *
+ *  `pickAttachments("image")` is NOT dead: the kind stays in ConciergeAttachKind and keeps its unit
+ *  coverage in services/conciergeAttach.test.ts. It is a supported service option this surface
+ *  currently doesn't spend a target on. Don't delete it to "clean up" — restoring an image-narrowed
+ *  entry point (a paste path, a second surface) should not have to re-derive the picker. */
+const ATTACH_ACTIONS: {
+  kind: ConciergeAttachKind;
+  label: string;
+  Icon: typeof FiCamera;
+  title: string;
+}[] = [
+  { kind: "screenshot", label: "Screenshot", Icon: FiCamera, title: "Capture a screen region" },
+  { kind: "files", label: "Upload", Icon: FiUpload, title: "Upload a file from your desktop" },
 ];
+
+/**
+ * ONE resting paperclip that expands into its two real actions on hover — the founder's ask, and
+ * the reason it is a hover EXPANSION rather than a click-then-menu: a menu makes you commit a click
+ * before it will tell you what is behind the icon, and there are only two things back there.
+ *
+ * HOVER IS NOT THE ONLY PATH, and that is not decoration. A pointer-only disclosure is unusable by
+ * keyboard and by touch, so `open` is driven by TWO independent inputs:
+ *   • `hovered` — mouseenter/mouseleave on the group.
+ *   • `pinned`  — focus anywhere inside the group (React's onFocus/onBlur are focusin/focusout, so
+ *     they bubble from the buttons), plus a click on the paperclip for touch, where nothing hovers.
+ * `open = hovered || pinned`, so neither input can close what the other is holding open: tabbing
+ * in opens it and it stays open while you tab BETWEEN the two actions (the blur only counts when
+ * the new target is outside the group), and moving the mouse away doesn't yank it from under a
+ * keyboard user.
+ *
+ * THE PAPERCLIP'S CLICK OPENS; IT NEVER CLOSES. A toggle reads tidier but is wrong on the mouse
+ * path: by the time you can click it, hover has already opened it, so the click's only visible
+ * effect would be to collapse the thing you just aimed at, out from under a cursor that cannot
+ * re-fire mouseenter without leaving and coming back. Escape closes (and returns focus to the
+ * paperclip), and so does leaving/tabbing away. `aria-expanded` still reports the true state.
+ *
+ * The actions carry the `hidden` attribute when collapsed rather than being unmounted or merely
+ * painted out: `hidden` takes them out of the accessibility tree AND the tab order together, so the
+ * announced state and the reachable state can't drift apart. Choosing one collapses the group back
+ * to the single icon — the picker it opened is the surface now.
+ */
+function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => void }) {
+  const [hovered, setHovered] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const groupRef = useRef<HTMLDivElement>(null);
+  const clipRef = useRef<HTMLButtonElement>(null);
+  // Escape closes the group AND hands focus back to the paperclip — but that refocus lands INSIDE
+  // the group, so the focusin it raises would immediately re-pin what Escape just closed and the
+  // key would do nothing at all. This one-shot flag lets the handler know that focus event is our
+  // own. Set only when a focus event will actually fire (i.e. the clip isn't already focused), so
+  // it can never be left armed to swallow a genuine one.
+  const reclaimingFocus = useRef(false);
+  const open = hovered || pinned;
+  // BOTH INPUTS, because `open` is their OR and an explicit dismissal has to beat both (roborev
+  // 54158). Clearing `pinned` alone is not closing: on the ordinary mouse path the pointer is still
+  // over the group when Escape is pressed — keydown only fires with focus inside, and that focus
+  // almost always arrived by clicking the paperclip — so hover holds the group open, `aria-expanded`
+  // stays "true", and Escape looks inert. The group is then un-closable by keyboard until the
+  // pointer physically leaves. Choosing an action is the same bug and the worse one: the picker it
+  // opens takes the pointer away without necessarily delivering a `mouseleave` to the webview, so
+  // `hovered` latches true and the row stays expanded after the picker dismisses.
+  //
+  // Hover is cleared, not disarmed: `mouseenter` fires again the next time the pointer actually
+  // enters the group, which is what "I dismissed this" should mean — dismissed until you come back.
+  //
+  // Closing takes the actions OUT of the tree (`hidden` + display:none), so whoever closed it must
+  // also say where focus goes — otherwise it falls to <body>, dropping the user out of the compose
+  // box entirely, and for a moment leaves a focused element inside a hidden subtree (roborev
+  // 54233). That was invisible while `pinned` was cleared alone: hover kept the group mounted, so
+  // the focused action button stayed valid. Both close paths need the handback, and both need the
+  // `reclaimingFocus` guard with it, since the paperclip is INSIDE the group and the focus event it
+  // raises would otherwise re-pin what we just closed.
+  //
+  // ONLY when focus is already inside the group, though. WebKit on macOS does not focus a <button>
+  // on click unless Full Keyboard Access is on, and this app is a WKWebView — so the ordinary path
+  // is "caret in the textarea, user clicks Screenshot", and grabbing focus unconditionally would
+  // yank the caret out of the composer to attach a file. Focus outside the group is already
+  // somewhere the user chose; only focus that is about to be destroyed needs rehoming.
+  const close = useCallback(() => {
+    setHovered(false);
+    setPinned(false);
+    const active = document.activeElement;
+    if (active !== clipRef.current && groupRef.current?.contains(active)) {
+      reclaimingFocus.current = true;
+      clipRef.current?.focus();
+    }
+  }, []);
+
+  return (
+    <div
+      ref={groupRef}
+      data-testid="concierge-attach"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => {
+        if (reclaimingFocus.current) {
+          reclaimingFocus.current = false;
+          return;
+        }
+        setPinned(true);
+      }}
+      onBlur={(e) => {
+        // Only a focus move OUT of the group closes it — moving between the paperclip and the two
+        // actions fires blur too, and treating that as "left" would collapse the group mid-tab.
+        if (!groupRef.current?.contains(e.relatedTarget as Node | null)) setPinned(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Escape" || !open) return;
+        // Stop here: Escape inside the compose box otherwise reaches the surfaces around it, and
+        // closing this group is the whole of what the user asked for.
+        e.stopPropagation();
+        // `close` carries the focus handback — a keydown can only have reached here with focus
+        // inside the group, so its guard is always satisfied on this path.
+        close();
+      }}
+      style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+    >
+      <button
+        ref={clipRef}
+        type="button"
+        aria-label="Attach"
+        aria-expanded={open}
+        aria-controls={ATTACH_ACTIONS_ID}
+        title="Attach a screenshot or a file"
+        onClick={() => setPinned(true)}
+        style={{
+          ...attachStyle,
+          padding: "5px 7px",
+          // The one lit-on-open cue the resting state gets: with the label gone, nothing else says
+          // this icon is the thing the two buttons came out of.
+          color: open ? C.cream : C.conciergeMuted,
+        }}
+      >
+        <FiPaperclip size={13} aria-hidden />
+      </button>
+      <div
+        id={ATTACH_ACTIONS_ID}
+        hidden={!open}
+        style={{ display: open ? "inline-flex" : "none", gap: 6, alignItems: "center" }}
+      >
+        {ATTACH_ACTIONS.map(({ kind, label, Icon, title }) => (
+          <button
+            key={kind}
+            type="button"
+            title={title}
+            onClick={() => {
+              onAttach(kind);
+              close();
+            }}
+            style={attachStyle}
+          >
+            <Icon size={12} aria-hidden />
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /** Where a committed dictation segment goes in the box: appended, space-separated, never
  *  double-spaced. Pure so the commit rule is testable without a mic. */
@@ -522,18 +689,7 @@ export function ComposeBox({
         </div>
       )}
       <div style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
-        {ATTACHMENTS.map(({ kind, label, Icon, title }) => (
-          <button
-            key={kind}
-            type="button"
-            title={title}
-            onClick={() => onAttach(kind)}
-            style={attachStyle}
-          >
-            <Icon size={12} aria-hidden />
-            {label}
-          </button>
-        ))}
+        <AttachControl onAttach={onAttach} />
         {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the
             action whose autonomy it governs. It reads and writes presenceStore itself rather than
             taking props; see PresenceSlider's header for why, and note this box already reads

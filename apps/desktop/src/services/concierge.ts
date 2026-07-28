@@ -17,6 +17,7 @@
 // or listen is logged and delivered to `onConciergeError` subscribers as a synthetic event, so
 // the concierge column always has something to render.
 import { invoke } from "@tauri-apps/api/core";
+import { conciergeAiEnabled } from "./conciergeTools/policyBinding";
 import { listen } from "@tauri-apps/api/event";
 import { conciergeSessionInfo, type ClaudeSessionInfo } from "../preflight";
 
@@ -66,6 +67,56 @@ export function isSupersededDetail(detail: string): boolean {
 /** The `id` used for errors synthesized on THIS side of the bridge (a rejected invoke/listen),
  *  where no Rust turn token exists. */
 export const CONCIERGE_LOCAL_ERROR_ID = "local";
+
+/** The Rust side's sentinel for "this PROACTIVE push stood down because the user owns the turn"
+ *  (`concierge.rs::PROACTIVE_DECLINED_ERR`). Pinned as a literal on both sides — see the mirrored
+ *  tests — because nothing else ties the two languages together. */
+export const PROACTIVE_DECLINED_DETAIL =
+  "concierge_proactive_turn: declined; the user owns the conversation";
+
+/** Is this failure detail a declined push rather than a real failure? Substring, for the same
+ *  reason {@link isSupersededDetail} is: Tauri wraps a command's `Err` string. */
+export function isProactiveDeclinedDetail(detail: string): boolean {
+  return detail.includes(PROACTIVE_DECLINED_DETAIL);
+}
+
+/**
+ * How many recent push turn ids to remember. Bounded because nothing else prunes it: a push that
+ * neither completes nor errors (the webview reloads, the child is orphaned) would otherwise leave
+ * an id behind for the life of the page.
+ *
+ * Sixteen is far more than can ever be live at once — the channel is capped at six turns an hour
+ * and only one is ever in flight — while still outliving any bubble the thread is still rendering,
+ * which is what the host reads it for.
+ */
+export const PROACTIVE_TURN_MEMORY = 16;
+
+/** Turn ids this module opened with `concierge_proactive_turn`, newest last.
+ *
+ *  WHY THIS EXISTS (roborev 54166-M3). `concierge.rs` streams a push over the SAME
+ *  `concierge:delta` / `concierge:done` / `concierge:error` events as a send, under the same turn
+ *  token, and the payloads carry nothing that says which command produced them. So a push that
+ *  failed AFTER spawning was indistinguishable from a send that failed: the error listener below
+ *  rolled the user's live session pointer back for a turn nobody asked for, and the same event fanned
+ *  out to every subscriber, where the host posted "I couldn't reach my brain just now" for a message
+ *  the user never requested. Neither is filterable by any subscriber, because the information is not
+ *  in the event — it is here, at the only place that knows which invoke opened which id. */
+const proactiveTurnIds: string[] = [];
+
+function rememberProactiveTurn(id: string): void {
+  if (proactiveTurnIds.includes(id)) return;
+  proactiveTurnIds.push(id);
+  if (proactiveTurnIds.length > PROACTIVE_TURN_MEMORY) proactiveTurnIds.shift();
+}
+
+/** Was this turn started by the PROACTIVE push channel rather than by a user send?
+ *
+ *  Read by the concierge column to render a push as a push — `proactive` + its digest, so
+ *  {@link markStaleProactive} can retract it later — and by the error listener below to keep a
+ *  push's failure off both the session pointer and the thread. */
+export function isProactiveTurn(id: string): boolean {
+  return proactiveTurnIds.includes(id);
+}
 
 type Callback<T> = (event: T) => void;
 
@@ -156,6 +207,20 @@ function ensureWired(): Promise<void> {
           // (`should_retry_without_resume`), so a stale fallback self-heals on the next turn and the
           // `done` above replaces it with the fresh id. With no fallback (no transcript on disk yet)
           // the behavior is unchanged: null, and the next turn starts fresh.
+          //
+          // AND UNLESS IT IS A PUSH (roborev 54166-M3). A proactive turn is one nobody asked for,
+          // so its failure owns neither of the two things this branch does. It must not roll the
+          // user's live conversation pointer back — the push rides the user's session, and a turn
+          // they did not request has no business rewriting where their next one resumes. And it
+          // must not reach the fan-out, where the host renders "I couldn't reach my brain just now"
+          // and clears the typing indicator for a message the user never requested. That is the
+          // "silent on every failure" contract this command promises; it used to hold only on the
+          // invoke-rejection path, which covers a push that never started and not one that died
+          // after spawning.
+          if (isProactiveTurn(ev.payload.id)) {
+            console.debug("concierge: proactive turn failed after spawning:", ev.payload.detail);
+            return;
+          }
           if (!isSupersededDetail(ev.payload.detail)) currentSessionId = fallbackSessionId;
           dispatch(errorCallbacks, ev.payload);
         }),
@@ -282,10 +347,30 @@ export function restoreConciergeSession(): Promise<void> {
  * turn never started (a rejected invoke). Callers key supersession bookkeeping on it, so the null
  * contract matters: no id means there is no turn to attribute anything to (roborev 53088).
  */
+/** Thrown when a concierge turn is asked for while AI enhancements are off. Carried as a typed
+ *  error rather than a silent `null` so the column can render the upsell instead of a dead send —
+ *  a send that quietly does nothing is the worst of the three outcomes. */
+export class ConciergeAiDisabledError extends Error {
+  constructor() {
+    super("AI enhancements are off, so the concierge can't think or act.");
+    this.name = "ConciergeAiDisabledError";
+  }
+}
+
 export async function startConciergeTurn(
   prompt: string,
   resumeSessionId?: string,
 ): Promise<string | null> {
+  // THE AI-ENHANCEMENTS GATE (bead sparkle-4562), checked before anything is spawned.
+  //
+  // A concierge turn is a `claude -p` CHILD PROCESS and it costs money, so the gate has to stop it
+  // HERE rather than let the turn run and refuse its tools: the thinking is itself the paid part,
+  // and `resolve_concierge_mcp_config` would also mint a privileged control socket for a surface
+  // the human has turned off. Refusing at the door means neither happens.
+  //
+  // Also the open-source case: a build with no Sparkle backend has no signed-in `me`, so this reads
+  // false and the concierge never spawns — no separate open-source code path to keep in step.
+  if (!conciergeAiEnabled()) throw new ConciergeAiDisabledError();
   try {
     // Wire listeners BEFORE the invoke so a fast first delta/done can't slip past the manager, and
     // finish the boot restore before `resume` is computed — a probe still in flight would let the
@@ -315,6 +400,50 @@ export async function startConciergeTurn(
     }
     console.warn("concierge: failed to start turn:", e);
     dispatchLocalError(detail);
+    return null;
+  }
+}
+
+/**
+ * Start one PROACTIVE turn — the brain speaking first, with no user message behind it
+ * (PRD/sparkle/concierge-proactive-push.md; the gap is PRD/sparkle/concierge-mode.md §2a).
+ *
+ * SAME TRANSPORT as {@link startConciergeTurn}: it resolves with the Rust turn token, and the reply
+ * arrives on the same `concierge:delta` / `concierge:done` / `concierge:error` stream under that id.
+ * Only the command differs, and the difference is the whole safety property — `concierge_proactive_turn`
+ * publishes no retirement floor and stands down for any user turn, in flight or merely preparing.
+ *
+ * SAME SESSION, deliberately: it resumes the ongoing conversation, so the push sees what the user has
+ * been saying and the user's next turn remembers what the concierge volunteered.
+ *
+ * SILENT ON EVERY FAILURE, which is where it parts company with the send path. That path synthesizes
+ * a local error event so the column can say "I couldn't reach my brain just now" — correct when the
+ * user is waiting on an answer, and wrong here: nobody asked for this, so an apology for failing to
+ * deliver it is noise the user cannot act on. Resolves null instead.
+ */
+export async function startProactiveConciergeTurn(prompt: string): Promise<string | null> {
+  if (!prompt.trim()) return null;
+  try {
+    await Promise.all([ensureWired(), restoreConciergeSession()]);
+    const resume = currentSessionId ?? undefined;
+    const id = await invoke<string>("concierge_proactive_turn", {
+      prompt,
+      resumeSessionId: resume ?? null,
+    });
+    if (resume) currentSessionId = resume;
+    if (typeof id !== "string") return null;
+    // Record it BEFORE returning, so the first event this turn produces already resolves as a push.
+    // Rust emits deltas as soon as claude speaks, and the caller has not run a line yet.
+    rememberProactiveTurn(id);
+    return id;
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    // Declined (or superseded) is the channel doing its job: the user owns the conversation.
+    if (isProactiveDeclinedDetail(detail) || isSupersededDetail(detail)) {
+      console.debug("concierge: proactive turn stood down:", detail);
+    } else {
+      console.warn("concierge: proactive turn failed to start:", e);
+    }
     return null;
   }
 }
@@ -400,4 +529,5 @@ export function _resetConciergeForTests(): void {
   fallbackSessionId = null;
   wiring = null;
   restoring = null;
+  proactiveTurnIds.length = 0;
 }

@@ -18,6 +18,7 @@ import { TbPinFilled } from "react-icons/tb";
 // FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
 import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
+import { RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { SIDEBAR_OVERLAY_Z } from "./layers";
@@ -36,7 +37,8 @@ import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
 import { shouldPromptOnClose, selectionAfterClose } from "../engine/closeAgent";
-import { shipAgent, saveAgent, discardAgentGit } from "../services/closeAgentActions";
+import { shipAgent, saveAgent, discardAgentGit, type ShipOutcome } from "../services/closeAgentActions";
+import { ModalShell } from "./ModalShell";
 import { refreshAgentTitle } from "../services/sessionTitle";
 import {
   isNameFromWorkCandidate,
@@ -492,6 +494,11 @@ export function AgentSidebar({
   const [editing, setEditing] = useState<string | null>(null);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
+  // What the chosen close outcome ACTUALLY did, when that differs from what the button promised
+  // (roborev 54225). Rendered as a ModalShell card — the same dialog chrome CloseAgentPrompt uses,
+  // stepped into the slot it just vacated, rather than a new notification channel. `null` on the
+  // clean paths: a PR that opened and a branch that reached the remote need no announcement.
+  const [closeNotice, setCloseNotice] = useState<{ title: string; body: string } | null>(null);
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
   // a sane range so the column can't be dragged to nothing or take over the window.
@@ -787,15 +794,25 @@ export function AgentSidebar({
 
   // Ship it: push + open a PR (review, not straight to main); local-land fallback when remoteless.
   // Orchestration (incl. the bead close/deliver + land-failure handling) lives in shipAgent so it's
-  // unit-tested; here we just resolve the target and tear down after.
+  // unit-tested; here we just resolve the target, READ THE OUTCOME, and tear down after.
+  //
+  // THE OUTCOME IS NOT OPTIONAL READING (roborev 54225). shipAgent returns a discriminated
+  // ShipOutcome and only `pr-opened` / `landed` mean the work went somewhere. This handler used to
+  // discard it and call teardownAgent unconditionally, so `land-failed` (nothing happened at all)
+  // and `pushed-no-pr` (branch is safe, no review open) both looked exactly like a shipped PR: the
+  // tab and worktree vanished, the bead stayed untouched, and nothing said why. The concierge's
+  // lifecycle.shipAgent has refused/reported on these since 54175 — this is the same path taken by
+  // the button most people actually click, so it has to tell the same story.
   const onShipClose = async () => {
     const id = closePromptId;
     setClosePromptId(null);
     if (!id || !project) return;
     const agent = project.agents.find((a) => a.id === id);
     const target = project.defaultBranch ?? agent?.baseBranch ?? "main";
+    const name = agent?.name || "this agent";
+    let outcome: ShipOutcome;
     try {
-      await shipAgent({
+      outcome = await shipAgent({
         root: project.rootPath,
         agentId: id,
         targetBranch: target,
@@ -803,19 +820,56 @@ export function AgentSidebar({
         beadId: agent?.beadId,
       });
     } catch (e) {
+      // Only a PUSH failure throws — the branch never left the machine. Keep the agent, exactly as
+      // lifecycle.shipAgent does; tearing down here removed the worktree over a failed ship.
       console.warn("ship-on-close failed (agent kept):", e);
+      setCloseNotice({
+        title: `Couldn’t ship “${name}”`,
+        body: `Pushing the branch failed (${e instanceof Error ? e.message : String(e)}). I’ve left the agent open, so nothing is lost — its branch and worktree are exactly where they were.`,
+      });
+      return;
+    }
+    if (outcome.kind === "land-failed") {
+      // No remote AND the local merge failed: the work is where it was. Same treatment as a throw.
+      setCloseNotice({
+        title: `Couldn’t ship “${name}”`,
+        body: `This repo has no remote, and merging the branch into ${target} locally failed (${outcome.reason}). I’ve left the agent open, so nothing is lost.`,
+      });
+      return;
     }
     await teardownAgent(id);
+    if (outcome.kind === "pushed-no-pr") {
+      // The BRANCH is safe on the remote, so the teardown loses nothing — but there is no review
+      // open and the bead is still in progress, and neither is guessable from a tab that vanished.
+      setCloseNotice({
+        title: `Pushed “${name}”, but no pull request was opened`,
+        body: `The branch is on the remote, so nothing is lost — but nothing is under review either (${outcome.reason}). Open the pull request when you’re ready; the task stays open until you do.`,
+      });
+    }
   };
 
   // Save for later: back the branch up to the remote (best-effort), keep the bead; teardownAgent
-  // removes the worktree but KEEPS the branch — exactly "save".
+  // removes the worktree but KEEPS the branch — exactly "save". The push is best-effort, so what it
+  // DID comes back as a SaveOutcome: the button's promise ("keep the branch, backed up to the
+  // remote") is half a claim about the network, made after the worktree is already gone (54225).
   const onSaveClose = async () => {
     const id = closePromptId;
     setClosePromptId(null);
     if (!id || !project) return;
-    await saveAgent(project.rootPath, id);
+    const name = project.agents.find((a) => a.id === id)?.name || "this agent";
+    const save = await saveAgent(project.rootPath, id);
+    // Every SaveOutcome is a success — the branch and the bead survive locally, which is what save
+    // promises — so the teardown is unconditional. Only the sentence changes.
     await teardownAgent(id);
+    if (!save.pushed) {
+      setCloseNotice({
+        title: `Saved “${name}” — but the branch wasn’t backed up`,
+        body:
+          save.kind === "no-remote"
+            ? "This repo has no remote, so there was nowhere to push it. The branch (and its task) are kept, on this machine only."
+            : `Pushing it to the remote failed (${save.reason}). The branch (and its task) are kept, on this machine only — push it yourself when you’re back online.`,
+      });
+    }
   };
 
   // Discard: drop the agent + its workers from the store, delete their worktrees + branches and ALL
@@ -1487,6 +1541,58 @@ export function AgentSidebar({
           : null),
       }}
     >
+      {/* THE SEAM: this column's edge against the terminal stage. It is a 1px `hairline` rule and
+          it is drawn HERE, as the column's first positioned child at `right: 0`, rather than as
+          the column's `border-right`. The position is the whole point.
+
+          A `border-right` sits OUTSIDE the padding box, so nothing inside the column can paint on
+          it — the rule ran unbroken down the full height, including across the SELECTED row. That
+          row is supposed to read as an opening onto the terminal: it fills with the terminal's own
+          `C.forest`, squares its right corners, extends `marginRight:-8` to eat the list's padding
+          and reach this edge, and flares into the stage with the concave fillets below. A rule
+          across that edge cancels the effect — the row stops bleeding and starts butting against a
+          drawn line. The founder reported exactly that, and it is a regression from ea1b7bd93,
+          which turned this edge from `forest` (a seam matching the terminal, i.e. invisible) into
+          `hairline` (a visible rule) for roborev 53551. That finding was right about the general
+          case and wrong about this one pixel column.
+
+          Moving the rule one pixel INWARD — into the last 1px of the padding box — resolves both.
+          The hairline still marks the app's most prominent structural boundary everywhere the
+          rows don't reach (idle rows stop 8px short of it), so 53551 stays fixed. But the ACTIVE
+          row's fill now overlaps this element's 1px and, being a later positioned sibling in tree
+          order, paints OVER it — so the seam breaks exactly across the selected row and the bleed
+          is restored, with no geometry to measure and nothing to keep in sync while scrolling.
+
+          Consequences of that choice, so they aren't "fixed" back later:
+            • This must stay the column's FIRST child and must NOT take a z-index, AND the agent row
+              must stay `position: relative`. All three are what put the rows above it. The last one
+              is the least obvious and the most fragile: a NON-positioned block's background paints
+              in step 4 of the painting order, which is BELOW positioned `z-index: auto` elements
+              (step 8) — so a row that lost `position: relative` would go back under this rule and
+              the reported regression would return silently. The row carries it for the fillets and
+              the drop target too, which is exactly why it looks safe to move.
+            • The column's OUTER width is unchanged. `index.css` sets `* { box-sizing: border-box }`
+              globally and this column has an explicit `width`, so the border was always inside that
+              box — dropping it doesn't narrow the column, it widens the CONTENT box by the 1px the
+              border used to occupy. That extra pixel is the one the active row's `-8` now laps, and
+              it is why the hover card's measured `colW` is unaffected. Do NOT "compensate" with
+              `width + 1`: that WOULD shift the terminal and re-break the geometry.
+            • The pull-tab / overlay button cluster at `right: 0` covers the seam for its own
+              height. It is a chrome shape with its own `hairline` outline sitting on the edge, so
+              the boundary is still drawn there — by the tab instead of by this rule. */}
+      <div
+        aria-hidden
+        data-testid="sidebar-terminal-seam"
+        style={{
+          position: "absolute",
+          top: 0,
+          right: 0,
+          width: 1,
+          height: "100%",
+          background: C.hairline,
+          pointerEvents: "none",
+        }}
+      />
       {/* The brand chrome that used to top this column — the Sparkle.ai logo, the voice waveform
           under it, and the remaining-credit badge — now tops column ①, the concierge, which is
           mounted for the life of the app rather than only while a project is open
@@ -1848,6 +1954,37 @@ export function AgentSidebar({
           onDiscard={onDiscardClose}
           onCancel={() => setClosePromptId(null)}
         />
+      )}
+
+      {/* What that choice actually DID, when it wasn't what the button promised (roborev 54225):
+          a ship that landed nowhere (agent kept), a push with no PR behind it, a save that never
+          reached the remote. Same ModalShell chrome + zIndex as the prompt it replaces, so the
+          outcome lands where the human is already looking instead of in a console nobody reads. */}
+      {closeNotice && (
+        <ModalShell width={460} zIndex={200} onCancel={() => setCloseNotice(null)}>
+          <div style={{ fontSize: TYPE.title, fontWeight: FONT_WEIGHT.bold, marginBottom: 8 }}>
+            {closeNotice.title}
+          </div>
+          <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+            {closeNotice.body}
+          </div>
+          <button
+            onClick={() => setCloseNotice(null)}
+            style={{
+              background: "transparent",
+              color: C.accent,
+              border: `1px solid ${C.accent}`,
+              borderRadius: 8,
+              padding: "9px 18px",
+              cursor: "pointer",
+              fontSize: TYPE.body,
+              fontWeight: FONT_WEIGHT.semibold,
+              fontFamily: '"IBM Plex Sans", sans-serif',
+            }}
+          >
+            Got it
+          </button>
+        </ModalShell>
       )}
 
       {/* THE TWO PULL TABS on the right edge (§10). Left boundary only — this is the one column
@@ -3279,6 +3416,11 @@ const AgentRow = memo(function AgentRow({
         onMouseEnter={armSelect}
         onMouseLeave={onRowLeave}
         style={{
+          // LOAD-BEARING FOR THE BLEED, not just for the fillets and the drop target that anchor
+          // against it. The column's seam is an absolutely positioned element, and a NON-positioned
+          // block's background paints in step 4 of the painting order — BELOW positioned
+          // `z-index: auto` elements at step 8. Drop this and the active row's fill goes back UNDER
+          // the seam, redrawing the vertical rule across it. See the seam's note on the column.
           position: "relative",
           display: "flex",
           flexDirection: "column",
@@ -3292,16 +3434,18 @@ const AgentRow = memo(function AgentRow({
           // sidebar (8px); the right edge is square here, with CONCAVE fillets (below) shaping it
           // into an opening rather than a convex "button" corner. Idle rows are fully rounded.
           //
-          // THIS USED TO SAY the row "flows into the terminal window", because the sidebar's right
-          // border was ALSO C.forest, matching the terminal on the other side — the row bled through
-          // an edge that wasn't drawn. That border is C.hairline now (see the column's own note
-          // above): the app's most prominent structural boundary, deliberately made visible because
-          // a seam that matches on a near-black palette is not subtle, it is absent. So the row no
-          // longer bleeds through; it DOCKS against a drawn edge. What still carries the active
-          // state is the fill being the terminal's own colour where every other row is transparent,
-          // plus the square corner and fillets shaping that edge into an opening — and, once the
-          // card is open, its 4px `hairline` outline. Not the fill step against the column, which is
-          // ~1.08:1 and never was the signal.
+          // THE ROW BLEEDS THROUGH THE COLUMN'S EDGE, and the -8 is what makes that possible: it
+          // eats the list's 8px right padding so the fill reaches the seam and laps its last pixel,
+          // painting over it (the seam is a positioned sibling EARLIER in tree order — see the
+          // column's own note). For one release the edge was a `border-right`, which no descendant
+          // can paint on, and the rule ran straight across this row: the bleed became a dock
+          // against a drawn line. Don't reintroduce that by moving the seam back onto the border or
+          // by giving it a z-index.
+          //
+          // What carries the active state is the fill being the terminal's own colour where every
+          // other row is transparent, plus the square right corner and the fillets shaping that
+          // edge into an opening — and, once the card is open, its 4px `hairline` outline. Not the
+          // fill step against the column, which is ~1.08:1 and never was the signal.
           borderRadius: isActive ? "8px 0 0 8px" : 8,
           marginRight: isActive ? -8 : 0,
           cursor: "pointer",
@@ -3573,7 +3717,10 @@ function AgentDetailLines({
     lineHeight: 1,
     fontFamily: FONT.ui,
     padding: "2px 7px",
-    borderRadius: 5,
+    // RADIUS.sm, not a hand-typed 5. theme/scale.test.ts is a ratchet on off-scale values and this
+    // pill was one of them; 4 vs 5 is imperceptible at this size, and the migration is the
+    // direction the ratchet exists to push.
+    borderRadius: RADIUS.sm,
     flex: "0 0 auto",
     whiteSpace: "nowrap",
   };

@@ -503,8 +503,10 @@ pub fn stop_orchestration_bridge(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpPaths {
-    node_path: String,
-    server_path: String,
+    // pub(crate) so `concierge.rs` can build its own `--mcp-config` from these without going
+    // through the Tauri command boundary (it runs in-process, not from the WebView).
+    pub(crate) node_path: String,
+    pub(crate) server_path: String,
 }
 
 /// Resolve the node binary + the bundled mcp-orchestrator server.js (Tauri command).
@@ -715,7 +717,7 @@ fn handle_request_line_ctx(
 // It lets the user's own Claude Code drive the desktop UI first-person (name itself, narrate what
 // it's building, adjust theme/config) via a sibling `sparkle-control` MCP.
 //
-// Because the socket is shared, identity CANNOT be derived from the connection. Instead every op
+// Because THAT socket is shared, identity cannot be derived from the connection. Instead every op
 // carries an explicit `callerAgentId` in the request JSON (the MCP server stamps it from its
 // per-agent SPARKLE_AGENT_ID env var). The bridge passes `callerAgentId` through to the frontend
 // event verbatim; it does NOT trust any id nested inside `payload`, and it does NOT attempt to
@@ -727,6 +729,13 @@ fn handle_request_line_ctx(
 // blocks on the shared pending rendezvous, and returns whatever `control_respond` resolves. This
 // reuses the exact register_pending/wait_pending/resolve_pending primitives + ROUNDTRIP_TIMEOUT as
 // the orchestrator — so a new op is just a name added to CONTROL_OPS + a frontend dispatch case.
+//
+// THERE IS A SECOND CONTROL SOCKET (bead `sparkle-9a8j`): the concierge brain's. It is not an agent
+// tab — it is a headless `claude -p` child — so it has no SPARKLE_AGENT_ID to stamp and would fail
+// every privileged check. It therefore gets its own listener, its own token, and an identity the
+// bridge stamps SERVER-SIDE from the socket the connection arrived on (`ControlCaller`), which is
+// the same "confused-deputy closed by construction" shape the orchestrator bridge uses for
+// buildAgentId. See `CONCIERGE_CALLER_AGENT_ID` and `resolve_control_caller`.
 
 /// The allow-listed control ops. Anything else is rejected with "unknown op". This is only the
 /// COARSE existence gate — the finer free-vs-privileged safety tier is enforced frontend-side in
@@ -746,10 +755,47 @@ const CONTROL_OPS: &[&str] = &[
     "set_agent_ordering",
     "set_zoom",
     "navigate",
+    // Phase 4 (the concierge tool surface). ONE generic op rather than ~55 named ones: the
+    // frontend registry (services/conciergeTools/registry.ts) routes { domain, op, args } to the
+    // right domain module. Deliberate — every MCP tool schema is permanently resident in the
+    // concierge's context and it re-spawns per turn, so a wide named surface costs real tokens
+    // on every single turn. The fine-grained allow/ask/deny decision is made frontend-side on
+    // the INNER `op`, not on this outer name.
+    "concierge_tool",
 ];
 
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
 const CONTROL_RESERVED_FIELDS: &[&str] = &["id", "token", "op", "callerAgentId"];
+
+/// The RESERVED caller id for the concierge brain (bead `sparkle-9a8j`, design A7.3).
+///
+/// The concierge is not an agent tab — it is a headless `claude -p` child (`concierge.rs`) — so it
+/// can never resolve through `controlListener.findAgent`, and `callerMayAdminister` denies every
+/// unresolvable caller by design. Rather than weakening that fail-closed check for everyone, the
+/// concierge gets an identity that is STRUCTURAL rather than claimed: it connects on its OWN control
+/// socket, and every request arriving there is stamped with this id server-side, whatever the client
+/// sent. A request on the SHARED socket that merely *claims* this id is rejected outright — so the
+/// id cannot be minted by anything except this process, on that socket. Same "confused-deputy closed
+/// by construction" shape as the orchestrator bridge deriving buildAgentId from the socket handle.
+///
+/// The colon makes it unmistakably NOT an agent-tab id (those are UUIDs), so it can never collide.
+///
+/// MIRRORED in `apps/desktop/src/services/controlListener.ts` as `CONCIERGE_CALLER_AGENT_ID`; the
+/// two literals must stay in step and `concierge_caller_id_is_mirrored_in_typescript` asserts it.
+pub const CONCIERGE_CALLER_AGENT_ID: &str = "sparkle:concierge";
+
+/// WHICH control socket a request arrived on — the sole source of caller identity truth.
+///
+/// This is deliberately not a value carried in the request: a client can lie about a field, it
+/// cannot lie about which listener accepted its connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ControlCaller {
+    /// The singleton app-level socket, shared by every agent kind. Identity is the top-level
+    /// `callerAgentId` the MCP server stamped from its per-agent `SPARKLE_AGENT_ID`.
+    Shared,
+    /// The concierge's dedicated socket. Identity is ALWAYS `CONCIERGE_CALLER_AGENT_ID`.
+    Concierge,
+}
 
 struct ControlBridgeHandle {
     socket_path: PathBuf,
@@ -758,35 +804,82 @@ struct ControlBridgeHandle {
     alive: Arc<AtomicBool>,
 }
 
-/// Singleton state for the app-level control bridge. `inner` caches the one live handle (None until
-/// the first `start_control_bridge`); `pending` is the shared reqId→reply rendezvous map, cloned
-/// into every serve thread exactly like `BridgeManager::pending`.
+/// Singleton state for the app-level control bridge. `inner` caches the one live SHARED handle
+/// (None until the first `start_control_bridge`), `concierge` the one live CONCIERGE handle (None
+/// until the first `start_concierge_control_bridge`); `pending` is the shared reqId→reply rendezvous
+/// map, cloned into every serve thread exactly like `BridgeManager::pending`.
+///
+/// One `pending` map for BOTH sockets is deliberate and safe: reqIds are freshly generated 32-hex
+/// tokens, so they never collide across sockets, and `control_respond` resolves by reqId alone —
+/// the frontend does not (and must not) need to know which socket a request came in on.
 #[derive(Default)]
 pub struct ControlBridgeManager {
     inner: Mutex<Option<ControlBridgeHandle>>,
+    concierge: Mutex<Option<ControlBridgeHandle>>,
     pending: PendingMap,
 }
 
-/// Singleton app-level control socket path: `sparkle-ctrl-<16hex>.sock` in the per-user temp dir
-/// (`$TMPDIR`, 0700 on macOS). Short random suffix keeps the path under macOS's ~104-byte
-/// `sun_path` cap — the same constraint that forces the orchestrator socket into temp_dir.
-fn control_socket_path(hex: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sparkle-ctrl-{hex}.sock"))
+/// The handle slot for a socket kind. Each kind is its own independent singleton: its own socket
+/// path, its own token, its own accept loop.
+fn control_slot(manager: &ControlBridgeManager, caller: ControlCaller) -> &Mutex<Option<ControlBridgeHandle>> {
+    match caller {
+        ControlCaller::Shared => &manager.inner,
+        ControlCaller::Concierge => &manager.concierge,
+    }
 }
 
-/// Start (or return the cached) singleton control bridge. Idempotent: the first call binds the
-/// socket, spawns the accept loop, and caches {socketPath, token}; every subsequent call returns
-/// the SAME socket + token while the accept loop is alive. If the loop died (fatal-error branch),
-/// the stale handle is torn down and a fresh one is bound. `app` is `Option<AppHandle>` so unit
-/// tests (no Tauri runtime) can pass `None`; production passes `Some(app)`.
+/// Control socket path: `sparkle-ctrl-<16hex>.sock` (shared) / `sparkle-conc-<16hex>.sock`
+/// (concierge) in the per-user temp dir (`$TMPDIR`, 0700 on macOS). Short random suffix keeps the
+/// path under macOS's ~104-byte `sun_path` cap — the same constraint that forces the orchestrator
+/// socket into temp_dir. The two prefixes are the same length, so both stay within the cap.
+fn control_socket_path(caller: ControlCaller, hex: &str) -> PathBuf {
+    let prefix = match caller {
+        ControlCaller::Shared => "sparkle-ctrl",
+        ControlCaller::Concierge => "sparkle-conc",
+    };
+    std::env::temp_dir().join(format!("{prefix}-{hex}.sock"))
+}
+
+/// Start (or return the cached) singleton SHARED app-level control bridge. See
+/// `start_control_bridge_kind`.
 pub fn start_control_bridge_at(
     app: Option<AppHandle>,
     manager: &ControlBridgeManager,
 ) -> Result<(PathBuf, String), String> {
+    start_control_bridge_kind(app, manager, ControlCaller::Shared)
+}
+
+/// Start (or return the cached) singleton CONCIERGE control bridge — a second listener on its own
+/// socket path with its own independently-minted token. Every request that arrives here is stamped
+/// with `CONCIERGE_CALLER_AGENT_ID`; nothing on the shared socket can claim that identity. Nothing
+/// launches a client against it yet (bead `sparkle-9a8j` is identity only — wiring the concierge's
+/// MCP child is the next phase); it exists so that caller is representable and authorized.
+pub fn start_concierge_control_bridge_at(
+    app: Option<AppHandle>,
+    manager: &ControlBridgeManager,
+) -> Result<(PathBuf, String), String> {
+    start_control_bridge_kind(app, manager, ControlCaller::Concierge)
+}
+
+/// Start (or return the cached) singleton control bridge for one socket kind. Idempotent: the first
+/// call binds the socket, spawns the accept loop, and caches {socketPath, token}; every subsequent
+/// call returns the SAME socket + token while the accept loop is alive. If the loop died
+/// (fatal-error branch), the stale handle is torn down and a fresh one is bound. `app` is
+/// `Option<AppHandle>` so unit tests (no Tauri runtime) can pass `None`; production passes
+/// `Some(app)`.
+///
+/// The two kinds share nothing but the `pending` map: separate slots, separate sockets, separate
+/// tokens. `caller` is captured by the accept loop and handed to every connection it serves, which
+/// is what makes concierge identity structural — it is a property of the listener, not of the wire.
+fn start_control_bridge_kind(
+    app: Option<AppHandle>,
+    manager: &ControlBridgeManager,
+    caller: ControlCaller,
+) -> Result<(PathBuf, String), String> {
     // Hold the lock across check → bind → cache so two concurrent starts can't both bind (the loser
     // would orphan a thread whose shutdown flag stop_control_bridge could never signal). The accept
     // thread never takes this lock, so holding it here can't deadlock.
-    let mut guard = manager.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = control_slot(manager, caller).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = guard.as_ref() {
         if h.alive.load(Ordering::SeqCst) {
             return Ok((h.socket_path.clone(), h.token.clone()));
@@ -801,7 +894,7 @@ pub fn start_control_bridge_at(
     // Generate token + random socket suffix BEFORE bind so a failure here leaves no socket file.
     let token = generate_token()?;
     let suffix: String = generate_token()?.chars().take(16).collect();
-    let sock = control_socket_path(&suffix);
+    let sock = control_socket_path(caller, &suffix);
     let _ = std::fs::remove_file(&sock); // clear any stale socket
     let listener = UnixListener::bind(&sock).map_err(|e| format!("bind {sock:?}: {e}"))?;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
@@ -828,7 +921,7 @@ pub fn start_control_bridge_at(
                 let token_c = token_t.clone();
                 let app_c = app_t.clone();
                 let pending_c = pending_t.clone();
-                std::thread::spawn(move || serve_control_conn(stream, &token_c, app_c, pending_c));
+                std::thread::spawn(move || serve_control_conn(stream, &token_c, caller, app_c, pending_c));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -838,7 +931,7 @@ pub fn start_control_bridge_at(
                 continue;
             }
             Err(e) => {
-                eprintln!("[control-bridge] accept loop exiting on fatal error: {e}");
+                eprintln!("[control-bridge {caller:?}] accept loop exiting on fatal error: {e}");
                 alive_t.store(false, Ordering::SeqCst);
                 break;
             }
@@ -849,19 +942,42 @@ pub fn start_control_bridge_at(
     Ok((sock, token))
 }
 
-/// Signal shutdown, remove the socket file, and clear the cached handle. Idempotent no-op if the
-/// bridge was never started.
+/// Signal shutdown, remove the socket file, and clear the cached handle for BOTH control sockets.
+/// Idempotent no-op for a kind that was never started. Stopping "the control bridge" must take the
+/// concierge listener down with it — leaving a live socket behind after the app tore the surface
+/// down would be a privileged listener nobody is tracking.
+///
+/// ASYMMETRY NOTE (roborev 54164, finding 3). This stops both, while the frontend's only start
+/// path (`startControlBridge`) revives only the SHARED one — which would strand the concierge on a
+/// removed socket and a dead token. That gap is closed on the concierge's side rather than here:
+/// `concierge::resolve_concierge_mcp_config` calls `start_concierge_control_bridge_at` (idempotent)
+/// on EVERY turn and rewrites the child's 0600 `--mcp-config` from the CURRENT socket+token before
+/// spawning it. So a stop can at worst cost the in-flight turn its control surface — it degrades to
+/// observe-only and logs why — and the next turn re-establishes everything.
+///
+/// This holds ONLY because the concierge child is spawned per turn and never outlives one. If the
+/// concierge ever becomes a long-lived child, that child WILL hold a stale token across a stop, and
+/// this needs a real fix (scope the stop to the shared bridge + a separate concierge stop command).
 fn stop_control_bridge_inner(manager: &ControlBridgeManager) {
-    if let Some(h) = manager.inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        h.shutdown.store(true, Ordering::SeqCst);
-        let _ = std::fs::remove_file(&h.socket_path);
+    for caller in [ControlCaller::Shared, ControlCaller::Concierge] {
+        if let Some(h) = control_slot(manager, caller).lock().unwrap_or_else(|e| e.into_inner()).take() {
+            h.shutdown.store(true, Ordering::SeqCst);
+            let _ = std::fs::remove_file(&h.socket_path);
+        }
     }
 }
 
 /// Read newline-delimited control requests on one connection; write one response per request.
-/// Unlike the orchestrator's `serve_conn`, there is NO per-connection identity context — the shared
-/// socket carries identity in each request's `callerAgentId` field instead.
-fn serve_control_conn(stream: UnixStream, token: &str, app: Option<AppHandle>, pending: PendingMap) {
+/// Unlike the orchestrator's `serve_conn`, there is no per-connection AGENT context — the shared
+/// socket carries identity in each request's `callerAgentId` field instead. There IS a per-listener
+/// `caller` kind, though, and it is what decides whether that field is trusted at all.
+fn serve_control_conn(
+    stream: UnixStream,
+    token: &str,
+    caller: ControlCaller,
+    app: Option<AppHandle>,
+    pending: PendingMap,
+) {
     stream.set_nonblocking(false).ok();
     let peer = match stream.try_clone() {
         Ok(s) => s,
@@ -872,7 +988,7 @@ fn serve_control_conn(stream: UnixStream, token: &str, app: Option<AppHandle>, p
     for line in reader.lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
-        let resp = handle_control_request_line(&line, token, &app, &pending);
+        let resp = handle_control_request_line(&line, token, caller, &app, &pending);
         if writeln!(writer, "{resp}").is_err() { break; }
     }
 }
@@ -893,12 +1009,40 @@ fn build_control_payload(req: &Value) -> Value {
     Value::Object(map)
 }
 
+/// Resolve the AUTHORITATIVE caller id for one request, from the socket it arrived on.
+///
+/// - `Concierge` socket → always `CONCIERGE_CALLER_AGENT_ID`. Whatever the client put in
+///   `callerAgentId` is discarded, so a compromised concierge MCP child cannot impersonate a build
+///   agent any more than a build agent can impersonate the concierge.
+/// - `Shared` socket → the client-supplied top-level `callerAgentId` (absent → `""`, which the
+///   frontend's `callerMayAdminister` already fails closed on), EXCEPT that claiming the reserved
+///   concierge id is an error. That rejection is the whole anti-spoofing property: the reserved id
+///   exists on exactly one socket, and this process is the only thing that can mint it.
+///
+/// Pure, so the two branches are directly unit-testable without a socket or a Tauri app.
+fn resolve_control_caller(req: &Value, caller: ControlCaller) -> Result<String, String> {
+    match caller {
+        ControlCaller::Concierge => Ok(CONCIERGE_CALLER_AGENT_ID.to_string()),
+        ControlCaller::Shared => {
+            let claimed = req.get("callerAgentId").and_then(|c| c.as_str()).unwrap_or("");
+            if claimed == CONCIERGE_CALLER_AGENT_ID {
+                return Err(format!(
+                    "callerAgentId {CONCIERGE_CALLER_AGENT_ID} is reserved for the concierge control socket"
+                ));
+            }
+            Ok(claimed.to_string())
+        }
+    }
+}
+
 /// Pure request handler for the control bridge: one request JSON line → one response JSON line.
-/// Validates the token, checks the op against the allowlist, extracts `callerAgentId` + `payload`,
-/// then round-trips through the frontend. No socket IO, so it is directly unit-testable.
+/// Validates the token, checks the op against the allowlist, resolves `callerAgentId` from the
+/// SOCKET (see `resolve_control_caller`) plus the `payload`, then round-trips through the frontend.
+/// No socket IO, so it is directly unit-testable.
 fn handle_control_request_line(
     line: &str,
     token: &str,
+    caller: ControlCaller,
     app: &Option<AppHandle>,
     pending: &PendingMap,
 ) -> String {
@@ -917,8 +1061,12 @@ fn handle_control_request_line(
     if !CONTROL_OPS.contains(&op) {
         return json!({ "id": id, "ok": false, "error": "unknown op" }).to_string();
     }
-    // Authoritative identity is the TOP-LEVEL callerAgentId only; never anything nested in payload.
-    let caller_agent_id = req.get("callerAgentId").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    // Authoritative identity comes from the SOCKET (plus, on the shared socket only, the TOP-LEVEL
+    // callerAgentId) — never from anything nested in payload, which build_control_payload strips.
+    let caller_agent_id = match resolve_control_caller(&req, caller) {
+        Ok(c) => c,
+        Err(e) => return json!({ "id": id, "ok": false, "error": e }).to_string(),
+    };
     let payload = build_control_payload(&req);
     handle_control_op(id, op, &caller_agent_id, payload, app, pending)
 }
@@ -972,7 +1120,37 @@ pub fn start_control_bridge(
     Ok(BridgeInfo { socket_path: sock.to_string_lossy().to_string(), token })
 }
 
-/// Stop the singleton control bridge (Tauri command).
+/// Start (or return the cached) singleton CONCIERGE control bridge (Tauri command). Idempotent,
+/// exactly like `start_control_bridge`, but a distinct socket + token whose every request is
+/// stamped `CONCIERGE_CALLER_AGENT_ID`. Hand these to the concierge's control-MCP child as
+/// `SPARKLE_CONTROL_SOCKET`/`SPARKLE_CONTROL_TOKEN` — and to NOTHING else.
+///
+/// HOW STRONG THIS ACTUALLY IS (roborev 54164, finding 2 — read before relying on it).
+/// The identity is unforgeable *given the socket*: the listener stamps the caller id server-side,
+/// and the shared socket rejects anything merely claiming that id. What is NOT unforgeable is
+/// possession of the token, so the honest claim is "concierge authority requires a secret that is
+/// not casually visible", NOT "concierge authority cannot be obtained".
+///
+/// Specifically: `concierge::write_concierge_mcp_config` deliberately does NOT repeat the shared
+/// bridge's argv pattern — the token goes into a 0600 file passed as `--mcp-config <path>`, never
+/// inline JSON on the command line, so it is not exposed via `ps aux` (the original finding's
+/// concrete attack). But 0600 stops other *users*, not other processes of the SAME user, and the
+/// spawned child's environment is readable to them as well. Since "a worker with shell access" is
+/// exactly the adversary this design names, that residual exposure is real.
+///
+/// Closing it needs peer verification at accept time — `LOCAL_PEERPID` / `SO_PEERCRED` matched
+/// against the pid `concierge.rs` spawned. Until that lands, do not describe this as a hard
+/// boundary in docs, review, or user-facing copy.
+#[tauri::command]
+pub fn start_concierge_control_bridge(
+    app: AppHandle,
+    manager: State<ControlBridgeManager>,
+) -> Result<BridgeInfo, String> {
+    let (sock, token) = start_concierge_control_bridge_at(Some(app.clone()), &manager)?;
+    Ok(BridgeInfo { socket_path: sock.to_string_lossy().to_string(), token })
+}
+
+/// Stop BOTH control bridges — shared and concierge (Tauri command).
 #[tauri::command]
 pub fn stop_control_bridge(manager: State<ControlBridgeManager>) -> Result<(), String> {
     stop_control_bridge_inner(&manager);
@@ -1571,9 +1749,14 @@ mod tests {
 
     #[test]
     fn control_socket_path_is_short_and_temp_based() {
-        let p = control_socket_path("deadbeefdeadbeef");
+        let p = control_socket_path(ControlCaller::Shared, "deadbeefdeadbeef");
         assert_eq!(p, std::env::temp_dir().join("sparkle-ctrl-deadbeefdeadbeef.sock"));
         assert!(p.to_string_lossy().len() < 104, "control socket path must fit macOS sun_path");
+        // The concierge socket is a DIFFERENT path — same length class, so it fits sun_path too.
+        let c = control_socket_path(ControlCaller::Concierge, "deadbeefdeadbeef");
+        assert_eq!(c, std::env::temp_dir().join("sparkle-conc-deadbeefdeadbeef.sock"));
+        assert_ne!(p, c, "the two control sockets must never share a path");
+        assert!(c.to_string_lossy().len() < 104, "concierge socket path must fit macOS sun_path");
     }
 
     #[test]
@@ -1581,7 +1764,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let resp = handle_control_request_line(
             r#"{"id":"1","token":"WRONG","op":"get_state","callerAgentId":"a1"}"#,
-            "RIGHT", &None, &pending,
+            "RIGHT", ControlCaller::Shared, &None, &pending,
         );
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], "1");
@@ -1593,11 +1776,13 @@ mod tests {
     fn control_missing_and_unknown_op() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let missing: serde_json::Value = serde_json::from_str(
-            &handle_control_request_line(r#"{"id":"2","token":"T"}"#, "T", &None, &pending),
+            &handle_control_request_line(r#"{"id":"2","token":"T"}"#, "T", ControlCaller::Shared, &None, &pending),
         ).unwrap();
         assert_eq!(missing["error"], "missing op");
         let unknown: serde_json::Value = serde_json::from_str(
-            &handle_control_request_line(r#"{"id":"3","token":"T","op":"rm_rf"}"#, "T", &None, &pending),
+            &handle_control_request_line(
+                r#"{"id":"3","token":"T","op":"rm_rf"}"#, "T", ControlCaller::Shared, &None, &pending,
+            ),
         ).unwrap();
         assert_eq!(unknown["error"], "unknown op");
         // No pending entries were registered by rejected requests.
@@ -1611,10 +1796,16 @@ mod tests {
             "get_state", "rename_agent", "set_agent_activity", "set_theme", "get_config", "set_config",
             // Phase 3 breadth ops.
             "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
+            // Phase 4: the concierge tool surface (one generic op; domain/op ride in the payload).
+            "concierge_tool",
         ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }
-        assert_eq!(CONTROL_OPS.len(), 12, "exactly the frozen Phase-1 + Phase-3 control ops");
+        assert_eq!(
+            CONTROL_OPS.len(),
+            13,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops"
+        );
     }
 
     #[test]
@@ -1639,7 +1830,7 @@ mod tests {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let resp = handle_control_request_line(
             r#"{"id":"7","token":"T","op":"set_theme","callerAgentId":"a1","theme":"dark"}"#,
-            "T", &None, &pending,
+            "T", ControlCaller::Shared, &None, &pending,
         );
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], "7");
@@ -1709,5 +1900,228 @@ mod tests {
         let (_sock2, token2) = start_control_bridge_at(None, &mgr).unwrap();
         assert_ne!(token1, token2, "a fresh rebind must produce a new token, not the stale one");
         stop_control_bridge_inner(&mgr);
+    }
+
+    // ---- concierge caller identity (bead sparkle-9a8j, design A7.3) ----
+
+    #[test]
+    fn concierge_socket_stamps_the_reserved_caller_id_whatever_the_client_sent() {
+        // A client on the concierge socket claiming to be a build agent...
+        let impersonating: Value = serde_json::from_str(
+            r#"{"id":"1","token":"T","op":"set_theme","callerAgentId":"some-build-agent-uuid","theme":"dark"}"#,
+        ).unwrap();
+        assert_eq!(
+            resolve_control_caller(&impersonating, ControlCaller::Concierge).unwrap(),
+            CONCIERGE_CALLER_AGENT_ID,
+            "the concierge socket must OVERWRITE a claimed id, not merge with it",
+        );
+        // ...and one sending no id at all (mcp-control sends "" when SPARKLE_AGENT_ID is unset).
+        let anonymous: Value = serde_json::from_str(r#"{"id":"2","token":"T","op":"get_state"}"#).unwrap();
+        assert_eq!(
+            resolve_control_caller(&anonymous, ControlCaller::Concierge).unwrap(),
+            CONCIERGE_CALLER_AGENT_ID,
+            "an absent callerAgentId on the concierge socket still resolves to the reserved id",
+        );
+        let empty: Value =
+            serde_json::from_str(r#"{"id":"3","token":"T","op":"get_state","callerAgentId":""}"#).unwrap();
+        assert_eq!(
+            resolve_control_caller(&empty, ControlCaller::Concierge).unwrap(),
+            CONCIERGE_CALLER_AGENT_ID,
+        );
+    }
+
+    #[test]
+    fn shared_socket_rejects_a_request_claiming_the_reserved_concierge_id() {
+        // The pure resolver refuses it...
+        let spoof: Value = serde_json::from_str(&format!(
+            r#"{{"id":"1","token":"T","op":"set_theme","callerAgentId":"{CONCIERGE_CALLER_AGENT_ID}","theme":"dark"}}"#
+        )).unwrap();
+        let err = resolve_control_caller(&spoof, ControlCaller::Shared)
+            .expect_err("the reserved id must not be claimable on the shared socket");
+        assert!(err.contains(CONCIERGE_CALLER_AGENT_ID) && err.contains("reserved"), "got {err}");
+
+        // ...and so does the full request path, BEFORE any round-trip is registered. Note this is
+        // a token-AUTHORIZED request: holding the shared token still does not buy concierge
+        // authority, which is the point of minting identity from the socket.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let line = format!(
+            r#"{{"id":"9","token":"T","op":"set_theme","callerAgentId":"{CONCIERGE_CALLER_AGENT_ID}","theme":"dark"}}"#
+        );
+        let v: Value = serde_json::from_str(&handle_control_request_line(
+            &line, "T", ControlCaller::Shared, &None, &pending,
+        )).unwrap();
+        assert_eq!(v["id"], "9");
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("reserved"), "got {v}");
+        // Crucially NOT the "no app handle" error a request that got past identity would produce.
+        assert_ne!(v["error"], "no app handle", "must be refused at identity, not later");
+        assert!(pending.lock().unwrap().is_empty(), "a spoofed request must not register a pending entry");
+    }
+
+    #[test]
+    fn shared_socket_still_passes_an_ordinary_caller_through_unchanged() {
+        // The reserved-id rejection must not disturb every other caller.
+        let ordinary: Value = serde_json::from_str(
+            r#"{"id":"1","token":"T","op":"get_state","callerAgentId":"e4a0cd29-525c-4ce7-8214-8e0411385b5e"}"#,
+        ).unwrap();
+        assert_eq!(
+            resolve_control_caller(&ordinary, ControlCaller::Shared).unwrap(),
+            "e4a0cd29-525c-4ce7-8214-8e0411385b5e",
+        );
+        // An unidentified caller stays "" — the frontend's callerMayAdminister fails closed on it.
+        let anonymous: Value = serde_json::from_str(r#"{"id":"2","token":"T","op":"get_state"}"#).unwrap();
+        assert_eq!(resolve_control_caller(&anonymous, ControlCaller::Shared).unwrap(), "");
+    }
+
+    #[test]
+    fn concierge_socket_strips_a_payload_nested_caller_id_too() {
+        // Defense in depth: identity is overwritten from the socket AND the reserved-field strip
+        // keeps a smuggled copy out of the payload the frontend reads.
+        let req: Value = serde_json::from_str(
+            r#"{"id":"1","token":"T","op":"rename_agent","callerAgentId":"evil","name":"Neo"}"#,
+        ).unwrap();
+        assert_eq!(resolve_control_caller(&req, ControlCaller::Concierge).unwrap(), CONCIERGE_CALLER_AGENT_ID);
+        let payload = build_control_payload(&req);
+        assert!(payload.get("callerAgentId").is_none(), "callerAgentId must not ride inside payload");
+        assert_eq!(payload["name"], "Neo");
+    }
+
+    #[test]
+    fn concierge_bridge_is_a_separate_singleton_socket_and_token() {
+        let mgr = ControlBridgeManager::default();
+        let (shared_sock, shared_token) = start_control_bridge_at(None, &mgr).unwrap();
+        let (conc_sock, conc_token) = start_concierge_control_bridge_at(None, &mgr).unwrap();
+        assert_ne!(shared_sock, conc_sock, "the concierge must not share the app-level socket");
+        assert_ne!(shared_token, conc_token, "the concierge token is minted independently");
+        assert!(
+            conc_sock.file_name().unwrap().to_string_lossy().starts_with("sparkle-conc-"),
+            "concierge socket is the sparkle-conc-<hex> path: {conc_sock:?}",
+        );
+        // Idempotent singleton, same as the shared one.
+        let (again_sock, again_token) = start_concierge_control_bridge_at(None, &mgr).unwrap();
+        assert_eq!((conc_sock.clone(), conc_token.clone()), (again_sock, again_token));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&conc_sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "concierge socket must be owner-only");
+        }
+        // Its token is NOT interchangeable with the shared one, in either direction.
+        let mut s = UnixStream::connect(&conc_sock).unwrap();
+        writeln!(s, r#"{{"id":"1","token":"{shared_token}","op":"get_state"}}"#).unwrap();
+        let mut r = BufReader::new(s);
+        let mut resp = String::new();
+        r.read_line(&mut resp).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"], "unauthorized", "the shared token must not open the concierge socket");
+
+        // With its OWN token it authenticates and reaches the round-trip (no app handle in tests).
+        let mut s2 = UnixStream::connect(&conc_sock).unwrap();
+        writeln!(s2, r#"{{"id":"2","token":"{conc_token}","op":"get_state"}}"#).unwrap();
+        let mut r2 = BufReader::new(s2);
+        let mut resp2 = String::new();
+        r2.read_line(&mut resp2).unwrap();
+        let v2: Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["error"], "no app handle", "authed on its own token: {v2}");
+
+        // Stopping the control bridge takes BOTH listeners down.
+        stop_control_bridge_inner(&mgr);
+        assert!(!conc_sock.exists(), "concierge socket file removed on stop");
+        assert!(!shared_sock.exists(), "shared socket file removed on stop");
+        assert!(UnixStream::connect(&conc_sock).is_err(), "must not connect after stop");
+    }
+
+    #[test]
+    fn concierge_tool_survives_the_transport_not_just_the_frontend() {
+        // ROBOREV 54241 (High). The whole concierge tool spine is reachable only if `concierge_tool`
+        // is in CONTROL_OPS: `handle_control_request_line` rejects anything outside it with
+        // "unknown op" BEFORE the frontend event is ever emitted. Every other test of that spine
+        // bypasses this transport — the desktop tests fire the `control:request` payload directly
+        // and the mcp-control tests mock `Bridge` — so all of them stay green while every real
+        // sparkle_lifecycle/_terminal/_workflow/_workspace call dies at the socket.
+        //
+        // This drives the real request path. "no app handle" means it got PAST the allowlist and
+        // reached the frontend round-trip (there is no app in tests); "unknown op" would mean the
+        // spine is dead in production.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let line = r#"{"id":"1","token":"T","op":"concierge_tool","domain":"workspace","op2":"x"}"#;
+        let v: Value = serde_json::from_str(&handle_control_request_line(
+            line, "T", ControlCaller::Concierge, &None, &pending,
+        )).unwrap();
+        assert_ne!(
+            v["error"], "unknown op",
+            "concierge_tool must be in CONTROL_OPS or the entire tool spine is unreachable: {v}"
+        );
+        assert_eq!(v["error"], "no app handle", "expected to reach the round-trip: {v}");
+    }
+
+    #[test]
+    fn concierge_listener_actually_threads_its_caller_kind_end_to_end() {
+        // ROBOREV 54164, FINDING 1 — the mutant this kills.
+        //
+        // Concierge identity is "structural" only because the LISTENER's `caller` value is
+        // threaded serve_control_conn -> handle_control_request_line -> resolve_control_caller.
+        // Every other test either drives the pure resolver with a hand-passed caller, or drives
+        // the concierge socket with anonymous requests. Both stay green if someone hardcodes
+        // `ControlCaller::Shared` in the concierge accept loop: an anonymous request would then
+        // resolve to "" and still end at "no app handle", silently downgrading the concierge to
+        // an unprivileged empty id — the exact failure the whole design exists to prevent.
+        //
+        // The discriminator is a request carrying a callerAgentId ON THE CONCIERGE SOCKET:
+        //   - correctly threaded (Concierge) -> id is overwritten server-side -> "no app handle"
+        //   - mutated to Shared              -> the reserved-id claim is REJECTED -> "…reserved…"
+        // so the two kinds produce different errors for the same bytes.
+        let mgr = ControlBridgeManager::default();
+        let (_shared_sock, _shared_token) = start_control_bridge_at(None, &mgr).unwrap();
+        let (conc_sock, conc_token) = start_concierge_control_bridge_at(None, &mgr).unwrap();
+
+        // (a) A request that CLAIMS the reserved id. On the concierge socket the claim is simply
+        //     overwritten (it is already the truth), so it must sail past identity.
+        let mut s = UnixStream::connect(&conc_sock).unwrap();
+        writeln!(
+            s,
+            r#"{{"id":"1","token":"{conc_token}","op":"set_theme","callerAgentId":"{CONCIERGE_CALLER_AGENT_ID}","theme":"dark"}}"#
+        ).unwrap();
+        let mut r = BufReader::new(s);
+        let mut resp = String::new();
+        r.read_line(&mut resp).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["error"], "no app handle",
+            "on the CONCIERGE socket the reserved id is the stamped truth, not a spoof: {v}"
+        );
+        assert!(
+            !v["error"].as_str().unwrap_or_default().contains("reserved"),
+            "a 'reserved' error here means the accept loop passed ControlCaller::Shared: {v}"
+        );
+
+        // (b) A FOREIGN id on the same socket must also be overwritten, not honoured — otherwise
+        //     the concierge could impersonate a specific build agent by asking nicely.
+        let mut s2 = UnixStream::connect(&conc_sock).unwrap();
+        writeln!(
+            s2,
+            r#"{{"id":"2","token":"{conc_token}","op":"set_theme","callerAgentId":"e4a0cd29-525c-4ce7-8214-8e0411385b5e","theme":"dark"}}"#
+        ).unwrap();
+        let mut r2 = BufReader::new(s2);
+        let mut resp2 = String::new();
+        r2.read_line(&mut resp2).unwrap();
+        let v2: Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["error"], "no app handle", "a foreign claim is overwritten, not rejected: {v2}");
+
+        stop_control_bridge_inner(&mgr);
+    }
+
+    #[test]
+    fn concierge_caller_id_is_mirrored_in_typescript() {
+        // The reserved id is defined ONCE here and mirrored in the frontend gate. A drift between
+        // the two is silent and total: Rust would stamp an id `callerMayAdminister` does not admit,
+        // so every privileged concierge op would be refused with no error pointing at the cause.
+        let ts = std::fs::read_to_string("../src/services/controlListener.ts")
+            .expect("controlListener.ts must be readable from src-tauri (cargo runs at crate root)");
+        let literal = format!(r#""{CONCIERGE_CALLER_AGENT_ID}""#);
+        assert!(
+            ts.contains(&literal),
+            "controlListener.ts must define CONCIERGE_CALLER_AGENT_ID = {literal}",
+        );
     }
 }

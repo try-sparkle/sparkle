@@ -79,6 +79,13 @@ import { ConciergeHost } from "./ConciergeHost";
 import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { Attachment } from "./composer/attachments";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const shot: Attachment = {
   id: "s1",
@@ -97,6 +104,7 @@ const FEED = {
       name: "sparkle",
       inScope: true,
       counts: COUNTS,
+      scopedCounts: COUNTS,
       agents: [
         {
           id: "ag1",
@@ -124,10 +132,14 @@ const chips = () => screen.queryByTestId("concierge-attachment-chips");
 /** The text the agent's terminal actually received. */
 const sentText = () => h.dispatch.mock.calls.map((c) => c[1]);
 
+/** Stage a screenshot through the compose box's attach affordance. The paperclip rests collapsed,
+ *  so the actions have to be REVEALED first — hover is the mouse path (focus is the keyboard one;
+ *  ComposeBox.test.tsx covers both). What this suite cares about is only that a file is staged. */
 async function attachImage() {
   h.pick.mockResolvedValue([shot]);
+  fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
   await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
   });
 }
 /**

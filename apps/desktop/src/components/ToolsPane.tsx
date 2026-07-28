@@ -394,6 +394,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
   const aiAutoApprove = useSettingsStore((s) => s.aiAutoApprove);
+  const aiConcierge = useSettingsStore((s) => s.aiConcierge);
   // [tools] flags.
   const analyticsEnabled = useSettingsStore((s) => s.analyticsEnabled);
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
@@ -418,6 +419,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       aiComposer,
       aiSuggestedActions,
       aiAutoApprove,
+      aiConcierge,
     }) === "off";
 
   const toggleTools: ToggleTool[] = [

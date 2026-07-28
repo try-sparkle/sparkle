@@ -47,26 +47,61 @@ use crate::preflight::cached_claude_path;
 /// `sparkle_improve.rs` so the launcher can't diverge.
 const SHELL: &str = "/bin/zsh";
 
-/// Read-only tool allowlist for the concierge brain: reads + search + web only. No Bash, no
-/// writes, no Edit — in `-p` mode a disallowed tool is refused (not prompted), so the session
-/// can never hang AND can never mutate anything. Deliberately narrower than the Think tab's
-/// list (no Skill/Task): the concierge summarizes state it is HANDED; it doesn't need to spawn
-/// subagents or run skills, and the smaller surface is easier to reason about.
-const CONCIERGE_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebFetch,WebSearch,TodoWrite";
+/// Built-in tool allowlist for the concierge brain: reads + search + web only. No Bash, no
+/// writes, no Edit. Deliberately narrower than the Think tab's list (no Skill/Task): the
+/// concierge acts through the `sparkle-control` MCP surface, not by shelling out, and the
+/// smaller built-in surface is easier to reason about.
+///
+/// ⚠️ THIS FLAG DOES NOT GATE MCP TOOLS. Measured against Claude Code 2.1.220 (bead
+/// `sparkle-xbka`, P0): with `--mcp-config` present, an MCP tool ABSENT from `--allowedTools`
+/// still EXECUTED. Only `--disallowedTools` blocked it. An earlier version of this comment
+/// claimed `-p` mode refuses any non-allowlisted tool; that claim was false and load-bearing,
+/// which is why it is called out here rather than quietly deleted.
+///
+/// Two consequences that must not be forgotten:
+///  1. The app-side policy gate in `controlListener.dispatch` is the ONLY real gate on what the
+///     concierge can do — it is NOT defence-in-depth behind this string.
+///  2. The MCP server's registered tool surface is ITSELF a security boundary. Never register a
+///     tool on the concierge's control socket intending to hide it via this allowlist.
+///
+/// The `mcp__sparkle-control__*` entry below is therefore DOCUMENTATION OF INTENT, not
+/// enforcement; it keeps this list honest about what the concierge can reach.
+const CONCIERGE_ALLOWED_TOOLS: &str =
+    "Read,Grep,Glob,WebFetch,WebSearch,TodoWrite,mcp__sparkle-control__*";
 
 /// The concierge's role, appended to Claude Code's system prompt on every turn. Kept as ONE
 /// clearly-editable constant so tuning the concierge's voice is a one-line-of-history change.
-/// The mission ("observe and recommend, never act") must stay in sync with the read-only
-/// allowlist above — the persona states the contract, the allowlist enforces it.
+///
+/// HISTORY THAT MATTERS: this used to say "You OBSERVE and RECOMMEND only — you never take
+/// actions yourself", paired with a read-only allowlist. The founder's 2026-07-27 direction
+/// reversed that: column 1 is meant to be their SINGLE POINT OF CONTACT, able to do everything
+/// in the app, with the human tuning per-tool how autonomous it is. The concierge can now act
+/// through the `sparkle-control` MCP surface.
+///
+/// The persona no longer *enforces* anything — it only describes the posture. Enforcement is the
+/// app-side policy gate in `controlListener.dispatch` (allow / ask / deny per tool), because
+/// `--allowedTools` provably does not gate MCP tools (see `CONCIERGE_ALLOWED_TOOLS`). Do not
+/// re-introduce a persona sentence that *claims* a restriction the gate does not implement.
 pub(crate) const CONCIERGE_PERSONA: &str = "You are the user's cross-project concierge and \
-minder — their eyes, ears, and best friend across everything happening in their projects. Each \
-message you receive is a snapshot of live app state: builder agents and their statuses, what \
-needs attention, and terminal prompts awaiting a decision. Your job: tell the user plainly what \
-needs THEM right now, recommend the single best next action for each item, and stay calm and \
-brief — no filler, no alarmism. When nothing needs them, say so in a sentence. You OBSERVE and \
-RECOMMEND only — you never take actions yourself; the user dispatches any action through the \
-app. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the user, \
-one short line per item with your recommendation.";
+minder — their eyes, ears, and best friend across everything happening in their projects, and \
+their single point of contact for the whole app. Each message you receive is a snapshot of live \
+app state: builder agents and their statuses, what needs attention, and terminal prompts \
+awaiting a decision.\n\nYou CAN ACT. Through your Sparkle tools you can spawn and stop build \
+agents, read an agent's terminal and type into it, drive branches and pull requests, manage \
+projects and windows, and change settings. The human has configured, per tool, whether you may \
+act silently, must ask first, or may not act at all. When a tool requires asking, say plainly \
+what you intend to do and why, then wait. When a tool is denied, say so and offer the nearest \
+thing you can do. Never claim you took an action you did not take, and never report success you \
+did not observe — if a tool returns a refusal or an error, say exactly that.\n\nROUTE INTENT \
+CAREFULLY. Decide whether the user is talking TO you or THROUGH you. Questions, planning, \
+brainstorming and 'what should I do' are for you to answer directly. Text clearly meant for a \
+specific build agent — an answer to a prompt it is waiting on, a correction to what it is doing \
+— should be sent to that agent's terminal. When it is genuinely ambiguous, ask which you meant \
+rather than guessing; a message typed into the wrong agent's terminal is expensive to undo.\n\n\
+Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
+you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
+sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
+user, one short line per item with your recommendation.";
 
 /// Monotonic per-turn token (same guard as `claude_chat::TURN_SEQ`): the reader thread only
 /// reaps/emits when the slot STILL carries its own token, so a reader whose turn was superseded
@@ -96,6 +131,63 @@ static CANCEL_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// tell the user about, and both are ordinary outcomes of two fast sends (roborev 53186).
 pub const SUPERSEDED_ERR: &str = "concierge_turn: superseded before install";
 pub const CANCELLED_ERR: &str = "concierge_turn: cancelled";
+
+/// The third NON-failure, and the one this channel adds: a PROACTIVE push stood down because the
+/// user owns the conversation. Also matched by the frontend to stay silent — a refused push is the
+/// channel working correctly, not something to tell anyone about.
+pub const PROACTIVE_DECLINED_ERR: &str =
+    "concierge_proactive_turn: declined; the user owns the conversation";
+
+/// How many user sends are currently BETWEEN the top of `concierge_turn` and their install
+/// decision — i.e. preparing, with no token, no child and nothing in the slot yet.
+///
+/// This is the window a slot check cannot see, and it is exactly where the proactive push channel
+/// could otherwise do real damage. `concierge_turn` resolves the claude path, prepares the cwd and
+/// spawns a fresh `zsh`/`claude` before it takes the slot; a push that installed during that window
+/// would present at the send's own install site as a NEWER occupant, and `may_install` would make
+/// the SEND stand down (`spawn_turn` returns `SUPERSEDED_ERR` and kills its own child). The user's
+/// message would die unanswered, displaced by a message nobody asked for.
+///
+/// Maintained by `SendInFlight` rather than by paired increments: the command has six early returns.
+static PENDING_SENDS: AtomicU64 = AtomicU64::new(0);
+
+/// Proactive pushes spawned this process — the cost meter. Every push is a `claude` turn the user
+/// did not ask for, so the number is first-class rather than something to reconstruct from logs.
+static PROACTIVE_TURNS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII marker for "a user send is preparing". Held across the whole of `concierge_turn`, so every
+/// return path releases it (see PENDING_SENDS for why a forgotten decrement would silently wedge
+/// the push channel for the life of the process).
+struct SendInFlight;
+
+impl SendInFlight {
+    fn enter() -> Self {
+        PENDING_SENDS.fetch_add(1, Ordering::SeqCst);
+        SendInFlight
+    }
+}
+
+impl Drop for SendInFlight {
+    fn drop(&mut self) {
+        PENDING_SENDS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Is a user send preparing right now? Read as one function so both proactive gates (the cheap
+/// pre-check and the install site under the lock) ask the same question.
+fn sends_pending() -> bool {
+    PENDING_SENDS.load(Ordering::SeqCst) > 0
+}
+
+/// Count one spawned push, returning the new total.
+fn count_proactive_turn() -> u64 {
+    PROACTIVE_TURNS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Pushes spawned so far this process.
+pub fn proactive_turns_spawned() -> u64 {
+    PROACTIVE_TURNS.load(Ordering::Relaxed)
+}
 
 /// One in-flight concierge turn: the child (kept for kill/reap) tagged with its turn token.
 struct ConciergeTurn {
@@ -174,6 +266,11 @@ enum TurnKind {
     /// The stale-resume retry: the same logical turn, continuing, under the token its send already
     /// reserved. It publishes no floor and claims no recency.
     Continuation,
+    /// A PROACTIVE PUSH: a turn the brain initiates with no user message behind it, so column one
+    /// can say "these three need you" without being asked (PRD §2a). Like a continuation it
+    /// publishes no floor and claims no recency; unlike either user-driven kind it also stands down
+    /// while a send is merely PREPARING. See `may_install`.
+    Proactive,
 }
 
 /// May this turn take the slot? A REAL function, called from the install site under the lock, so
@@ -189,14 +286,52 @@ enum TurnKind {
 ///   emptied the slot itself, so whatever is in there now was installed AFTER that — i.e. by a send
 ///   the user made while the first attempt was failing. Comparing tokens cannot express that: the
 ///   continuation reuses its own turn's token, which is by definition older than that send's.
-fn may_install(kind: TurnKind, token: u64, retire_below: u64, slot_holds: Option<u64>) -> bool {
+/// * A `Proactive` push refuses any occupant AND any send that is merely PREPARING. It is the only
+///   kind that consults `sends_pending`, and it has to: a push is not something the user asked for,
+///   so it must never be the reason a message they DID send stands down. See PENDING_SENDS for the
+///   window, and `a_proactive_push_never_installs_over_a_user_turn` for the rule.
+///
+/// `sends_pending` is deliberately inert for the two user-driven kinds. A send holds its own pending
+/// guard for the whole of its prep, so consulting it there would make every send refuse itself.
+fn may_install(
+    kind: TurnKind,
+    token: u64,
+    retire_below: u64,
+    slot_holds: Option<u64>,
+    sends_pending: bool,
+) -> bool {
     if is_retired(token, retire_below) {
         return false;
     }
     match kind {
         TurnKind::Send => !matches!(slot_holds, Some(t) if t > token),
         TurnKind::Continuation => slot_holds.is_none(),
+        TurnKind::Proactive => slot_holds.is_none() && !sends_pending,
     }
+}
+
+/// May a proactive push even START — the same precedence rule as `may_install`, asked BEFORE the
+/// push spends a claude-path lookup and a process spawn on a turn it is about to refuse.
+///
+/// A real function the command calls (the pattern this module already uses for `cancelled_during_prep`
+/// / `refused_retry_stays_silent`), so a test drives production control flow and deleting the call
+/// leaves a dead-code warning rather than a silent hole. It is an OPTIMISATION, not the guarantee:
+/// the install site re-checks both facts under the slot lock, which is where the race is actually
+/// decided.
+fn proactive_may_start(sends_pending: bool, slot_occupied: bool) -> bool {
+    !sends_pending && !slot_occupied
+}
+
+/// A push's token: monotonic (its events need an id, and the install rules need a position in the
+/// ordering) but published WITHOUT a retirement floor.
+///
+/// That asymmetry with `reserve_turn_token` is the whole safety property of this channel. A floor is
+/// how a turn silences the ones before it; a push is a turn nobody asked for, so it must never be
+/// able to silence anything. Taking a real token still matters: a send that arrives afterwards gets
+/// a strictly higher one, so every existing rule — `is_retired`, `may_install`, `mine_to_tear_down`
+/// — reads the push as the older turn and lets the user's message supersede it for free.
+fn reserve_proactive_token() -> u64 {
+    TURN_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Did a failed retry SPAWN fail because the user moved on, rather than because anything is wrong?
@@ -315,7 +450,15 @@ struct ConciergeError {
 /// single-quoted via `shell_quote`; `--model` is intentionally OMITTED so the session inherits
 /// the user's configured Claude Code model; `--resume` continues the concierge's one ongoing
 /// session when the frontend passes the id back.
-fn build_concierge_exec(claude_path: &str, prompt: &str, resume_session_id: Option<&str>) -> String {
+fn build_concierge_exec(
+    claude_path: &str,
+    prompt: &str,
+    resume_session_id: Option<&str>,
+    // Path to the 0600 file holding the `mcpServers` JSON for this turn (see
+    // `write_concierge_mcp_config`). None = no control surface; the concierge degrades to
+    // observe-only rather than failing the turn.
+    mcp_config_path: Option<&std::path::Path>,
+) -> String {
     let mut cmd = format!("exec {}", shell_quote(claude_path));
     cmd.push_str(" -p ");
     cmd.push_str(&shell_quote(prompt));
@@ -324,6 +467,17 @@ fn build_concierge_exec(claude_path: &str, prompt: &str, resume_session_id: Opti
     cmd.push_str(&shell_quote(CONCIERGE_PERSONA));
     cmd.push_str(" --allowedTools ");
     cmd.push_str(&shell_quote(CONCIERGE_ALLOWED_TOOLS));
+    if let Some(path) = mcp_config_path {
+        // A PATH, never inline JSON: the config carries the concierge bridge token, and an
+        // inline `--mcp-config {…}` puts that token in argv where any same-user process can
+        // read it via `ps aux` (roborev 54164, finding 2 — the exact adversary named there is
+        // "a worker with shell access"). The file is written 0600 by the caller.
+        cmd.push_str(" --mcp-config ");
+        cmd.push_str(&shell_quote(&path.to_string_lossy()));
+        // Load ONLY our server: without this, the user's own ~/.claude.json MCP servers are
+        // also loaded into the concierge, silently widening a surface we reason about as closed.
+        cmd.push_str(" --strict-mcp-config");
+    }
     if let Some(sid) = resume_session_id {
         if !sid.is_empty() {
             cmd.push_str(" --resume ");
@@ -331,6 +485,181 @@ fn build_concierge_exec(claude_path: &str, prompt: &str, resume_session_id: Opti
         }
     }
     format!("export PATH=\"$HOME/.local/bin:$PATH\"; {cmd}")
+}
+
+/// Serialize the concierge's `mcpServers` map. Pure so the shape is unit-testable without an
+/// AppHandle, a live bridge, or a filesystem.
+///
+/// Mirrors `claudeSpawn.ts`'s `controlMcpServers`, with ONE deliberate difference: no
+/// `SPARKLE_AGENT_ID`. An agent's control identity is a claimed env var the server stamps onto
+/// each request; the concierge's is STRUCTURAL — the Rust listener stamps
+/// `CONCIERGE_CALLER_AGENT_ID` on everything arriving on this socket, whatever the client sends.
+/// Passing an id here would be inert at best and misleading at worst.
+fn concierge_mcp_config_json(
+    node_path: &str,
+    server_path: &str,
+    socket_path: &str,
+    token: &str,
+) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "sparkle-control": {
+                "command": node_path,
+                "args": [server_path],
+                "env": {
+                    "SPARKLE_CONTROL_SOCKET": socket_path,
+                    "SPARKLE_CONTROL_TOKEN": token,
+                },
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Write `json` to a 0600 file and return its path.
+///
+/// WHY A FILE, NOT ARGV: the JSON embeds the concierge bridge token, and possession of that token
+/// grants the privileged control tier. `--mcp-config '{"..."}'` inline would place it in argv,
+/// readable by any same-user process via `ps aux` — and "a worker with shell access" is precisely
+/// the adversary the concierge socket's threat model names (roborev 54164, finding 2).
+///
+/// RESIDUAL EXPOSURE, stated honestly rather than papered over: 0600 stops *other users*, not the
+/// same user. A process running as this user can still read the file, and the child's own env is
+/// readable to it too. On macOS one user's processes are not isolated from each other, so this
+/// narrows the window (no argv broadcast, no shell history) without making the token unforgeable.
+/// Closing it properly needs peer verification at accept time (`LOCAL_PEERPID` against the pid we
+/// spawned); that is tracked as follow-up, and until it lands the guarantee is "not casually
+/// visible", NOT "unobtainable".
+fn write_concierge_mcp_config(
+    dir: &std::path::Path,
+    json: &str,
+    // Unique per turn. A FIXED name would be shared and truncated by two overlapping turns — a
+    // superseded turn's child may not have lazily spawned its MCP server yet, and would then read a
+    // half-written file (roborev 54226, finding 4).
+    turn_token: u64,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("concierge mcp config dir: {e}"))?;
+    let path = dir.join(format!("concierge-mcp-{turn_token}.json"));
+    prune_stale_mcp_configs(dir, &path);
+
+    // Create with 0600 FROM THE START via OpenOptions.mode — writing then chmod-ing would leave a
+    // window in which the token sits in a world-readable file.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("concierge mcp config open: {e}"))?;
+    f.write_all(json.as_bytes())
+        .map_err(|e| format!("concierge mcp config write: {e}"))?;
+
+    // An existing file keeps its old mode through OpenOptions, so re-assert it explicitly.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+/// Delete concierge MCP configs left behind by earlier turns.
+///
+/// Each file holds a live-ish bridge token, so leaving them to accumulate turns a per-turn exposure
+/// into an unbounded one that outlives the app session (roborev 54226, finding 4). The child reads
+/// its config once at startup and we cannot observe that moment from here, so files are aged out
+/// rather than unlinked immediately — a minute is far longer than the read takes and far shorter
+/// than "forever".
+///
+/// Best-effort by design: a failure to prune must never fail a turn, so every error is swallowed.
+///
+/// TWO THINGS THIS GETS RIGHT, both learned the hard way (roborev 54255):
+///
+/// 1. The prefix is `concierge-mcp`, NOT `concierge-mcp-`. Earlier builds wrote a FIXED
+///    `concierge-mcp.json` (no trailing hyphen). Matching only the hyphenated per-turn form would
+///    have left the one token-bearing file this function exists to clean up sitting there forever
+///    on every machine that ran a prior build.
+///
+/// 2. `MAX_AGE` is 30 minutes, not the 60 seconds it started as. This prune runs BEFORE the new
+///    child is spawned and before the slot decides whether to install it, so anything it deletes
+///    may still belong to a LIVE turn — and concierge turns routinely run longer than a minute. A
+///    turn refused install (superseded) would prune, then kill only its own child, leaving an
+///    older still-running turn with its config gone: precisely the read that would then fail,
+///    silently degrading a live turn to observe-only. 30 minutes is far longer than any real turn
+///    and still bounds the exposure to something finite. The file for THIS turn is skipped
+///    outright, since we are about to write it.
+fn prune_stale_mcp_configs(dir: &std::path::Path, keep: &std::path::Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("concierge-mcp") || !name.ends_with(".json") {
+            continue;
+        }
+        if entry.path() == keep {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|m| m.elapsed().map(|age| age > MAX_AGE).unwrap_or(false))
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Resolve the concierge's control-MCP config for this turn: start (or reuse) the concierge
+/// bridge, resolve node + the bundled server, write the 0600 config, hand back its path.
+///
+/// Returns `None` — never an error — when any piece is unavailable (node missing, server not
+/// bundled, bridge won't bind). A concierge that can still SEE and ADVISE is far better than a
+/// turn that fails outright, so a missing control surface degrades to the old observe-only
+/// posture and logs why.
+fn resolve_concierge_mcp_config(app: &AppHandle, turn_token: u64) -> Option<std::path::PathBuf> {
+    let manager = app.try_state::<crate::bridge::ControlBridgeManager>()?;
+    let (sock, token) = match crate::bridge::start_concierge_control_bridge_at(
+        Some(app.clone()),
+        &manager,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "concierge control bridge unavailable; observe-only turn");
+            return None;
+        }
+    };
+    let paths = match crate::bridge::control_mcp_paths(app.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "concierge control MCP unavailable; observe-only turn");
+            return None;
+        }
+    };
+    let json = concierge_mcp_config_json(
+        &paths.node_path,
+        &paths.server_path,
+        &sock.to_string_lossy(),
+        &token,
+    );
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("concierge");
+    match write_concierge_mcp_config(&dir, &json, turn_token) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "concierge mcp config not written; observe-only turn");
+            None
+        }
+    }
 }
 
 /// Decide whether a FAILED turn should be retried once WITHOUT `--resume` (same self-heal as
@@ -406,10 +735,12 @@ fn spawn_turn(
     // here would mean the previous turn stays live until the new child finishes spawning.
     token: u64,
 ) -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
-    let script = build_concierge_exec(claude_path, prompt, resume_session_id);
+    let mcp_config = resolve_concierge_mcp_config(app, token);
+    let script = build_concierge_exec(claude_path, prompt, resume_session_id, mcp_config.as_deref());
     tracing::info!(
         %claude_path, cwd = %cwd.display(),
         resume = resume_session_id.map(|s| !s.is_empty()).unwrap_or(false),
+        control_surface = mcp_config.is_some(),
         "concierge_turn spawn"
     );
 
@@ -473,6 +804,10 @@ fn spawn_turn(
             token,
             RETIRE_BELOW.load(Ordering::Relaxed),
             slot.as_ref().map(|t| t.token),
+            // Read UNDER THE LOCK, so "no send is preparing" and "the slot is free" are decided as
+            // one fact. A push that checked them separately could see an empty slot, then have a
+            // send enter its prep, then install — the very window PENDING_SENDS exists to close.
+            sends_pending(),
         );
         // Total, not `expect` (roborev 53186): a panic here would fire while holding the turn
         // mutex, and `Child::drop` neither signals nor reaps — the failure mode of the assertion
@@ -739,6 +1074,10 @@ pub async fn concierge_turn(
     if prompt.trim().is_empty() {
         return Err("concierge_turn: prompt must be non-empty".into());
     }
+    // "A user send is preparing" — visible to the proactive push channel for the whole of this
+    // command, including every early return (see PENDING_SENDS). Held until this function returns,
+    // by which point the send has either taken the slot (where the slot check covers it) or failed.
+    let _send_in_flight = SendInFlight::enter();
     // Read BEFORE the prep below; re-read after it. A cancel in between is aimed at this send.
     let cancel_epoch = CANCEL_EPOCH.load(Ordering::Relaxed);
     let claude_path = cached_claude_path()
@@ -920,6 +1259,116 @@ pub async fn concierge_turn(
     Ok(started_id)
 }
 
+/// Run one PROACTIVE turn: the brain authors a thread message the user did not ask for.
+///
+/// This is the push path PRD §2a records as the blocking gap — "the brain has no channel to author
+/// a proactive thread message" — so aggregation could not belong to the brain as written. The
+/// trigger and the rate limiting live on the frontend (`services/conciergeProactive.ts`, which fires
+/// only on a CHANGE in a small digest of significant state, debounced, floored by a minimum interval
+/// and capped per hour); this command is the transport.
+///
+/// SAME TRANSPORT, deliberately. It emits `concierge:delta` / `concierge:done` / `concierge:error`
+/// under the same monotonic turn token as a send, so the frontend correlates a push exactly as it
+/// correlates a reply, and there is no second event channel to keep in step.
+///
+/// PRECEDENCE — THE USER'S OWN MESSAGE ALWAYS WINS, in three places:
+///
+///  1. It publishes no retirement floor (`reserve_proactive_token`), so it can never silence a turn
+///     the user is waiting on.
+///  2. It refuses to start, and refuses to install, while ANY turn holds the slot or any send is
+///     merely preparing (`proactive_may_start` / `may_install`). Both facts, and the second is read
+///     under the slot lock.
+///  3. A send that arrives afterwards takes a strictly higher token, so it retires this push at the
+///     floor and supersedes it at the install site — the push's reader then finds the slot changed
+///     and stays silent, exactly like any superseded turn.
+///
+/// It also does NOT retry a stale `--resume` (unlike a send). A push is speculative; re-spawning it
+/// would double its cost to rescue a message nobody asked for. The next USER turn self-heals the
+/// session through the existing path.
+#[tauri::command]
+pub async fn concierge_proactive_turn(
+    app: AppHandle,
+    prompt: String,
+    resume_session_id: Option<String>,
+) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("concierge_proactive_turn: prompt must be non-empty".into());
+    }
+    // The cheap pre-check: don't spend a path lookup and a process spawn on a turn we are about to
+    // refuse. The install site re-checks under the lock — that is where the race is decided.
+    let slot_occupied = {
+        let manager = app.state::<ConciergeManager>();
+        let occupied = lock_turn(&manager.turn).is_some();
+        occupied
+    };
+    if !proactive_may_start(sends_pending(), slot_occupied) {
+        tracing::debug!("concierge_proactive_turn: declined; the user owns the conversation");
+        return Err(PROACTIVE_DECLINED_ERR.into());
+    }
+    let claude_path = cached_claude_path().ok_or_else(|| {
+        "concierge_proactive_turn: claude binary not found (is Claude Code installed?)".to_string()
+    })?;
+    let cwd = crate::dev_identity::app_data_dir(&app)
+        .map_err(|e| format!("concierge_proactive_turn: {e}"))?;
+    std::fs::create_dir_all(&cwd)
+        .map_err(|e| format!("concierge_proactive_turn: app data dir unavailable: {e}"))?;
+
+    // A token, but NO floor — see reserve_proactive_token.
+    let token = reserve_proactive_token();
+    let blk_app = app.clone();
+    let blk_prompt = prompt;
+    let blk_resume = resume_session_id;
+    let spawned = tauri::async_runtime::spawn_blocking(move || {
+        spawn_turn(
+            &blk_app,
+            &blk_prompt,
+            &cwd,
+            &claude_path,
+            blk_resume.as_deref(),
+            TurnKind::Proactive,
+            token,
+        )
+    })
+    .await
+    .map_err(|e| format!("concierge_proactive_turn task failed: {e}"))
+    .and_then(|r| r);
+
+    // NO TEARDOWN on failure, and that is the point of the asymmetry with `concierge_turn`. That
+    // path kills the previous turn because its own floor already silenced it, so leaving it running
+    // would burn a claude process nobody can hear. A push retires nothing, so there is never
+    // anything of ours left behind — and "take whatever is in the slot" here would be the push
+    // killing the user's live turn, the one thing this channel must never do.
+    let (stdout, stderr, token) = match spawned {
+        Ok(v) => v,
+        // `spawn_turn` reports a refused install as SUPERSEDED_ERR; for a push that is not a
+        // supersession at all, it is the stand-down. Report it as such so the log and the frontend
+        // read the same story (both strings are silenced on the frontend either way).
+        Err(e) if e == SUPERSEDED_ERR => return Err(PROACTIVE_DECLINED_ERR.into()),
+        Err(e) => return Err(e),
+    };
+
+    let total = count_proactive_turn();
+    // The COST METER. One line per push, no prompt in it (the prompt carries app state, and the
+    // built script is never logged) — enough to answer "how many turns did the concierge take on
+    // its own initiative today?" without instrumenting anything else.
+    tracing::info!(token, total, "concierge proactive turn spawned");
+
+    let started_id = token.to_string();
+    let read_app = app.clone();
+    std::thread::spawn(move || {
+        let id = token.to_string();
+        let stderr_handle = drain_stderr(stderr);
+        let outcome = run_reader(&read_app, &id, token, stdout, stderr_handle);
+        // Superseded by the user, or cancelled: stay silent. No retry — see the doc above.
+        if !outcome.owned {
+            return;
+        }
+        emit_outcome(&read_app, &id, outcome);
+    });
+
+    Ok(started_id)
+}
+
 /// Cancel the in-flight concierge turn — the whole process group, so nothing it spawned keeps
 /// running. A no-op if none is in flight. The reader thread finds the slot token changed (entry
 /// gone) on EOF and stays silent, so no late done/error races the cancel.
@@ -940,8 +1389,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_exec_is_readonly_and_streamed() {
-        let script = build_concierge_exec("/usr/local/bin/claude", "snapshot", None);
+    fn build_exec_is_streamed_and_has_no_shell_escape_hatch() {
+        let script = build_concierge_exec("/usr/local/bin/claude", "snapshot", None, None);
         assert!(script.contains("export PATH=\"$HOME/.local/bin:$PATH\";"));
         assert!(script.contains("exec '/usr/local/bin/claude'"));
         assert!(script.contains("-p 'snapshot'"));
@@ -949,27 +1398,42 @@ mod tests {
         // The persona rides along on every turn.
         assert!(script.contains("--append-system-prompt "));
         assert!(script.contains("cross-project concierge"));
-        // Observe-only posture: the read-only allowlist is present, permission-skip is ABSENT,
-        // and no mutating tool sneaks onto the list.
-        assert!(script.contains("--allowedTools 'Read,Grep,Glob,WebFetch,WebSearch,TodoWrite'"));
+        // The concierge acts through MCP, never by shelling out: no Bash/Edit/Write on the
+        // BUILT-IN list, and no permission-skip. NB this allowlist does not gate MCP tools at
+        // all (see CONCIERGE_ALLOWED_TOOLS) — the real gate is controlListener.dispatch.
         assert!(!script.contains("--dangerously-skip-permissions"));
         for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
             assert!(
                 !CONCIERGE_ALLOWED_TOOLS.split(',').any(|t| t == tool),
-                "mutating tool {tool} must not be allowlisted"
+                "mutating built-in tool {tool} must not be allowlisted"
             );
         }
         // Inherit the user's configured model; fresh session when no resume id.
         assert!(!script.contains("--model"));
         assert!(!script.contains("--resume"));
+        // No control surface passed => no --mcp-config at all (observe-only degradation).
+        assert!(!script.contains("--mcp-config"));
+        assert!(!script.contains("--strict-mcp-config"));
+    }
+
+    #[test]
+    fn build_exec_passes_the_mcp_config_as_a_path_never_inline_json() {
+        let p = std::path::Path::new("/tmp/sparkle/concierge/concierge-mcp.json");
+        let script = build_concierge_exec("/bin/claude", "hi", None, Some(p));
+        assert!(script.contains("--mcp-config '/tmp/sparkle/concierge/concierge-mcp.json'"));
+        // Only our server is loaded — the user's own MCP servers must not ride along.
+        assert!(script.contains("--strict-mcp-config"));
+        // The bridge TOKEN must never reach argv: no inline JSON on the command line.
+        assert!(!script.contains("mcpServers"));
+        assert!(!script.contains("SPARKLE_CONTROL_TOKEN"));
     }
 
     #[test]
     fn build_exec_appends_resume_when_session_id_present() {
-        let script = build_concierge_exec("/bin/claude", "hi", Some("sess-42"));
+        let script = build_concierge_exec("/bin/claude", "hi", Some("sess-42"), None);
         assert!(script.contains("--resume 'sess-42'"));
         // An empty session id is treated as no resume (fresh turn).
-        let none = build_concierge_exec("/bin/claude", "hi", Some(""));
+        let none = build_concierge_exec("/bin/claude", "hi", Some(""), None);
         assert!(!none.contains("--resume"));
     }
 
@@ -977,17 +1441,139 @@ mod tests {
     fn build_exec_quotes_a_hostile_prompt() {
         // A snapshot that tries to close the quote and inject a command stays a single quoted
         // argument — the injected text can't escape into the shell.
-        let script = build_concierge_exec("/bin/claude", "'; rm -rf /; echo '", None);
+        let script = build_concierge_exec("/bin/claude", "'; rm -rf /; echo '", None, None);
         assert!(script.contains(r"-p ''\''; rm -rf /; echo '\'''"));
     }
 
     #[test]
-    fn persona_states_the_observe_only_contract() {
-        // The persona is the contract the allowlist enforces — if someone edits it into an
-        // "act on my behalf" prompt, this is the tripwire that says the allowlist (and U4's
-        // dispatch gate) must be revisited too.
-        assert!(CONCIERGE_PERSONA.contains("never take actions yourself"));
-        assert!(CONCIERGE_PERSONA.contains("OBSERVE and RECOMMEND"));
+    fn build_exec_quotes_a_hostile_mcp_config_path() {
+        // The path is app-derived, not user-supplied — but it is still quoted, so a directory
+        // name containing a quote can't break out of the argument.
+        let p = std::path::Path::new("/tmp/a'; rm -rf /; echo '/concierge-mcp.json");
+        let script = build_concierge_exec("/bin/claude", "hi", None, Some(p));
+        assert!(script.contains(r"--mcp-config '/tmp/a'\''; rm -rf /; echo '\''/concierge-mcp.json'"));
+    }
+
+    #[test]
+    fn persona_states_the_act_capable_contract() {
+        // The persona USED to promise "never take actions yourself". The founder's 2026-07-27
+        // direction reversed that, so this tripwire now guards the opposite regression: if
+        // someone reinstates an observe-only sentence, the control surface below is a lie.
+        assert!(!CONCIERGE_PERSONA.contains("never take actions yourself"));
+        assert!(!CONCIERGE_PERSONA.contains("OBSERVE and RECOMMEND"));
+        assert!(CONCIERGE_PERSONA.contains("You CAN ACT"));
+        // The two behaviours the founder asked for by name.
+        assert!(CONCIERGE_PERSONA.contains("ROUTE INTENT"));
+        assert!(CONCIERGE_PERSONA.contains("act silently, must ask first, or may not act at all"));
+        // Honesty about outcomes is part of the contract, not a nicety.
+        assert!(CONCIERGE_PERSONA.contains("never report success you did not observe"));
+    }
+
+    #[test]
+    fn mcp_config_json_wires_the_socket_and_omits_any_claimed_agent_id() {
+        let json = concierge_mcp_config_json("/usr/bin/node", "/app/server.js", "/tmp/c.sock", "tok");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let srv = &v["mcpServers"]["sparkle-control"];
+        assert_eq!(srv["command"], "/usr/bin/node");
+        assert_eq!(srv["args"][0], "/app/server.js");
+        assert_eq!(srv["env"]["SPARKLE_CONTROL_SOCKET"], "/tmp/c.sock");
+        assert_eq!(srv["env"]["SPARKLE_CONTROL_TOKEN"], "tok");
+        // Identity is STRUCTURAL (stamped by the Rust listener from the socket), never claimed
+        // by the client — so no SPARKLE_AGENT_ID here, unlike a build agent's control config.
+        assert!(srv["env"].get("SPARKLE_AGENT_ID").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_config_file_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("sparkle-conc-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_concierge_mcp_config(&dir, "{\"mcpServers\":{}}", 7).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file holds the bridge token; it must not be group/world readable");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"mcpServers\":{}}");
+
+        // Rewriting an EXISTING file must not silently inherit a loosened mode.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let again = write_concierge_mcp_config(&dir, "{\"mcpServers\":{\"x\":1}}", 7).unwrap();
+        let mode2 = std::fs::metadata(&again).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "a pre-existing loose mode must be re-tightened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_never_deletes_a_still_live_turns_config() {
+        // roborev 54255, finding 2. The prune runs before the child spawns and before the slot
+        // decides whether to install it, so a too-eager age threshold silently degrades a live
+        // turn to observe-only. Turns routinely run longer than a minute.
+        let dir = std::env::temp_dir().join(format!("sparkle-conc-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An older turn, still running, five minutes in.
+        let live = dir.join("concierge-mcp-1.json");
+        std::fs::write(&live, "{\"live\":true}").unwrap();
+        let five_min_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        let f = std::fs::File::options().write(true).open(&live).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(five_min_ago)).unwrap();
+
+        // A newer turn writes its own config; the older one must survive intact.
+        write_concierge_mcp_config(&dir, "{}", 2).unwrap();
+        assert!(live.exists(), "a 5-minute-old turn is still plausibly live and must not be pruned");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "{\"live\":true}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_turn_gets_its_own_config_file() {
+        // Two overlapping turns must not share one path: a superseded turn's child may not have
+        // spawned its MCP server yet, and a fixed name would let the newer turn truncate the file
+        // out from under it (roborev 54226, finding 4).
+        let dir = std::env::temp_dir().join(format!("sparkle-conc-uniq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = write_concierge_mcp_config(&dir, "{\"a\":1}", 1).unwrap();
+        let b = write_concierge_mcp_config(&dir, "{\"b\":2}", 2).unwrap();
+        assert_ne!(a, b, "each turn writes its own file");
+        // Both are still intact — neither clobbered the other.
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "{\"a\":1}");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "{\"b\":2}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_configs_are_pruned_but_fresh_ones_survive() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("sparkle-conc-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An aged token file, the LEGACY fixed-name file earlier builds wrote, and an unrelated
+        // file that must be left alone.
+        let old = dir.join("concierge-mcp-1.json");
+        std::fs::write(&old, "{}").unwrap();
+        let legacy = dir.join("concierge-mcp.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        let bystander = dir.join("something-else.json");
+        std::fs::write(&bystander, "{}").unwrap();
+        // Backdate both with std (no extra dependency just to age a file in a test).
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let times = std::fs::FileTimes::new().set_modified(two_hours_ago);
+        for p in [&old, &legacy, &bystander] {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_times(times).unwrap();
+        }
+
+        let fresh = write_concierge_mcp_config(&dir, "{}", 99).unwrap();
+        assert!(fresh.exists(), "the file just written must survive its own prune");
+        assert!(!old.exists(), "an aged concierge config must be pruned");
+        // The file the whole prune exists to clean up: earlier builds wrote this fixed name, so a
+        // `concierge-mcp-` prefix would have missed it forever (roborev 54255, finding 1).
+        assert!(!legacy.exists(), "the LEGACY fixed-name config must be pruned too");
+        assert!(bystander.exists(), "prune must only touch concierge-mcp*.json");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1162,16 +1748,16 @@ mod tests {
         // The REAL function the install site calls (roborev 53186) — a local copy would have
         // stayed green with that call deleted.
         // The live turn installs over an older entry.
-        assert!(may_install(TurnKind::Send, 6, 6, Some(5)));
+        assert!(may_install(TurnKind::Send, 6, 6, Some(5), true));
         // …but the older one, spawning a moment later, must NOT stomp it.
-        assert!(!may_install(TurnKind::Send, 5, 6, Some(6)));
+        assert!(!may_install(TurnKind::Send, 5, 6, Some(6), true));
         // Retired even with an empty slot (the floor moved while we were spawning).
-        assert!(!may_install(TurnKind::Send, 5, 6, None));
+        assert!(!may_install(TurnKind::Send, 5, 6, None, true));
         // First turn of the session.
-        assert!(may_install(TurnKind::Send, 1, 0, None));
+        assert!(may_install(TurnKind::Send, 1, 0, None, true));
         // Equal tokens cannot happen (each reservation is unique), but re-installing over yourself
         // is not a supersession either way.
-        assert!(may_install(TurnKind::Send, 7, 7, Some(7)));
+        assert!(may_install(TurnKind::Send, 7, 7, Some(7), true));
     }
 
     /// The stale-resume retry installs under a STRICTER rule than a send: any occupant at all wins
@@ -1181,28 +1767,28 @@ mod tests {
     #[test]
     fn a_continuation_never_installs_over_an_occupied_slot() {
         // The reap that precedes the retry emptied the slot itself, so this is the normal case.
-        assert!(may_install(TurnKind::Continuation, 5, 5, None));
+        assert!(may_install(TurnKind::Continuation, 5, 5, None, false));
 
         // A send landed while the first attempt was failing and has already installed. The retry
         // must stand down — killing turn 6's child strands the user's newest question, which gets
         // no terminal event at all, while the retry answers the PREVIOUS one under a retired id.
-        assert!(!may_install(TurnKind::Continuation, 5, 6, Some(6)));
+        assert!(!may_install(TurnKind::Continuation, 5, 6, Some(6), false));
 
         // THE REGRESSION ITSELF: the old code drew a fresh token for the retry, so it presented at
         // the install site numerically ABOVE the live send it was about to stomp — and a
         // send-shaped rule ("refuse only a strictly newer occupant") waves that straight through.
         // Both halves of the fix are needed for this line: the kind-aware rule, and a token that no
         // longer outranks a send.
-        assert!(!may_install(TurnKind::Continuation, 7, 6, Some(6)));
+        assert!(!may_install(TurnKind::Continuation, 7, 6, Some(6), false));
         // Same shape with the slot older still — a continuation is never anyone's cleanup crew.
-        assert!(!may_install(TurnKind::Continuation, 7, 0, Some(1)));
+        assert!(!may_install(TurnKind::Continuation, 7, 0, Some(1), false));
 
         // A send in the same position DOES install: it owns the floor, and the occupant is a turn
         // its own floor retired. The two rules genuinely differ, so neither can be dropped.
-        assert!(may_install(TurnKind::Send, 7, 7, Some(6)));
+        assert!(may_install(TurnKind::Send, 7, 7, Some(6), true));
 
         // The floor still comes first, whatever the kind.
-        assert!(!may_install(TurnKind::Continuation, 5, 6, None));
+        assert!(!may_install(TurnKind::Continuation, 5, 6, None, false));
     }
 
     /// A retry REFUSED at the install site emits nothing — the silence the reader keeps for
@@ -1292,6 +1878,119 @@ mod tests {
         assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
         assert_eq!(out.session_id, "sess-OLD");
         assert_eq!(out.acc, "the dead turn's buffered output");
+    }
+
+    /// THE PRECEDENCE RULE OF THE PROACTIVE PUSH CHANNEL: the user's own message always wins.
+    ///
+    /// A push is a turn nobody asked for, so it is never allowed to cost the user anything. It
+    /// refuses the slot whenever ANYTHING else holds it — a live send, a stale-resume continuation,
+    /// even another push — and, separately, whenever a send is merely PREPARING (see
+    /// `SendInFlight` / `sends_pending`), which is the window no slot check can see: `concierge_turn`
+    /// spends hundreds of milliseconds resolving the claude path and spawning `zsh` before it takes
+    /// the slot, and a push that installed in that window would be found by the send's own
+    /// `may_install` as a NEWER occupant — so the SEND would stand down and the user's message would
+    /// die unanswered. That is the exact failure this channel must never introduce.
+    #[test]
+    fn a_proactive_push_never_installs_over_a_user_turn() {
+        // The normal case: nothing in flight, no send preparing.
+        assert!(may_install(TurnKind::Proactive, 5, 0, None, false));
+
+        // A send is PREPARING — no token, no child, nothing in the slot yet, and the push must
+        // still stand down. A slot-only rule waves this straight through (see the doc above).
+        assert!(!may_install(TurnKind::Proactive, 5, 0, None, true));
+
+        // Anything at all in the slot refuses the push, whether older or newer than it. A push
+        // claims no recency, so token order says nothing about whether it may replace an occupant.
+        assert!(!may_install(TurnKind::Proactive, 9, 0, Some(3), false));
+        assert!(!may_install(TurnKind::Proactive, 3, 0, Some(9), false));
+
+        // A floor published by a later send retires the push like any other turn.
+        assert!(!may_install(TurnKind::Proactive, 5, 6, None, false));
+
+        // …and `sends_pending` is deliberately inert for the two USER-driven kinds: a send holds
+        // its own pending guard for the whole of its prep, so consulting it there would make every
+        // send refuse itself.
+        assert!(may_install(TurnKind::Send, 6, 6, Some(5), true));
+        assert!(may_install(TurnKind::Continuation, 5, 5, None, true));
+    }
+
+    /// The same rule at the CHEAP pre-check, before a push spends a claude-path lookup and a
+    /// process spawn on a turn it is about to refuse. A real function the command calls, so the
+    /// test drives production control flow rather than a restatement of it (the pattern the whole
+    /// module already uses — see `cancelled_during_prep`).
+    #[test]
+    fn a_proactive_push_does_not_even_start_while_the_user_owns_the_turn() {
+        assert!(proactive_may_start(false, false));
+        assert!(!proactive_may_start(true, false), "a send is preparing");
+        assert!(!proactive_may_start(false, true), "a turn is in flight");
+        assert!(!proactive_may_start(true, true));
+    }
+
+    /// `SendInFlight` is what makes "a send is preparing" observable, and it must be a GUARD rather
+    /// than a pair of manual increments: `concierge_turn` has six early-return paths, and one that
+    /// forgot to decrement would wedge the push channel silently for the life of the process — a
+    /// feature that simply stops working, with no error anywhere.
+    #[test]
+    fn a_send_is_observable_while_it_prepares_and_only_while_it_prepares() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = PENDING_SENDS.load(Ordering::SeqCst);
+        {
+            let _send = SendInFlight::enter();
+            assert_eq!(PENDING_SENDS.load(Ordering::SeqCst), before + 1);
+            assert!(!proactive_may_start(sends_pending(), false), "the push stands down");
+        }
+        assert_eq!(PENDING_SENDS.load(Ordering::SeqCst), before, "the guard released on drop");
+    }
+
+    /// A push takes a token (its events need an id, and the install rules need a position in the
+    /// ordering) but publishes NO retirement floor — the one property that keeps it from ever
+    /// silencing a turn the user is waiting on. Same shape as `continuation_install`'s guarantee,
+    /// and asserted against the real statics for the same reason.
+    #[test]
+    fn a_proactive_push_publishes_no_floor() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let send = reserve_turn_token();
+        let floor = RETIRE_BELOW.load(Ordering::Relaxed);
+        assert!(!is_retired(send, floor));
+
+        let push = reserve_proactive_token();
+        assert!(push > send, "a push still takes a monotonic token");
+        assert_eq!(
+            RETIRE_BELOW.load(Ordering::Relaxed),
+            floor,
+            "a push must never retire the turn the user is waiting on",
+        );
+        assert!(!is_retired(send, RETIRE_BELOW.load(Ordering::Relaxed)));
+
+        // And a send that arrives AFTER the push outranks it at both gates: its floor retires the
+        // push, and it may take the slot from it.
+        let later = reserve_turn_token();
+        let floor = RETIRE_BELOW.load(Ordering::Relaxed);
+        assert!(is_retired(push, floor), "the user's newer message retires the push");
+        assert!(may_install(TurnKind::Send, later, floor, Some(push), true));
+    }
+
+    /// The declined sentinel is matched by the frontend (services/concierge.ts) to stay SILENT: a
+    /// refused push is not an error the user should ever see — it means the channel did its job and
+    /// got out of the user's way. Mirrors `the_silent_outcome_sentinels_are_the_strings_the_frontend_matches`;
+    /// the TS side pins the same literal, and neither half may be deleted as duplication.
+    #[test]
+    fn the_declined_push_sentinel_is_the_string_the_frontend_matches() {
+        assert_eq!(
+            PROACTIVE_DECLINED_ERR,
+            "concierge_proactive_turn: declined; the user owns the conversation",
+        );
+    }
+
+    /// Every push costs money, so the count is a first-class number rather than something to infer
+    /// from logs later.
+    #[test]
+    fn proactive_pushes_are_counted() {
+        let _guard = TEST_SEQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = proactive_turns_spawned();
+        count_proactive_turn();
+        count_proactive_turn();
+        assert_eq!(proactive_turns_spawned(), before + 2);
     }
 
     /// The shared parser (`claude_chat::handle_event`) drives this module's delta emission and

@@ -37,6 +37,7 @@ import {
 import { chooseAccountForAgent } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
+import { noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
@@ -80,6 +81,43 @@ type Phase = "preparing" | "ready" | "no-claude" | "error";
  */
 export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
   return ["-l", "-c", 'eval "$1"; exec "$0" -l', shell, cmd];
+}
+
+/**
+ * Park a Stop event's transcript path where the concierge's terminal read chain can find it.
+ *
+ * THIS COMPONENT IS THE ONLY PLACE THE PATH IS EVER KNOWN. The Stop hook event carries it, the
+ * capture handler below reads the last assistant turn out of it, and it was then dropped on the
+ * floor — so `services/conciergeTools/terminal`'s tier (d) had no path for any agent and its
+ * four-tier read chain silently degraded to three. That module deliberately refuses to GUESS a path
+ * (a fabricated `~/.claude/projects/<slug>/<id>.jsonl` fails confusingly, and slug derivation is
+ * exactly the kind of guess a read chain shouldn't make), and it no longer accepts one as a caller
+ * argument either — a tool argument that names a file to read is an arbitrary-file read whose
+ * contents land in an LLM context. The registry is the seam between those two positions, and this is
+ * its one writer.
+ *
+ * Takes the whole event and makes the whole decision, and is wired as `noteTranscript` — a REQUIRED
+ * field of `HookEventHandlerDeps` — rather than as a line inside the capture closure below. That
+ * placement is the point: as a required dep, dropping the hand-off is a compile error, whereas a
+ * deleted line inside a closure broke nothing any test could see. It also puts the call behind the
+ * handler's session gate (a background `claude` sharing this worktree's log must not register ITS
+ * transcript against this agent) and ahead of `captureHistory`, so the registry write doesn't ride
+ * on the history store resolving.
+ *
+ * NOTHING CLEARS THE REGISTRY TODAY, and that is a considered position rather than an oversight.
+ * The obvious hook — the pane's unmount cleanup — is wrong twice over: it fires on a mere project
+ * switch, and tier (d) exists precisely to answer for agents whose pane ISN'T mounted, so clearing
+ * there would drop the entry exactly when it becomes useful. There is no other agent-close seam this
+ * component can see (`purgeBuildAgent` runs from that same unmount path). The cost of leaving it is
+ * one short string per agent id opened this process; a stale entry is not a hazard either, since
+ * reading a closed agent's final transcript is an honest answer. `forgetAgentTranscriptPath` exists
+ * for a caller that genuinely knows an agent is gone — there isn't one yet.
+ */
+export function noteTranscriptFromStop(agentId: string, ev: HookEvent): void {
+  if (ev.event !== "Stop") return;
+  const path = ev.transcriptPath?.trim();
+  if (!path) return;
+  noteAgentTranscriptPath(agentId, path);
 }
 
 /** Settle a pane's "switch:<id>" waterfall against its visibility, returning the effect cleanup.
@@ -441,6 +479,9 @@ function AgentPaneInner({
             engine: hookEngine,
             activate: () => router.activate(),
             captureHistory: captureHistoryFromHook,
+            // Tier (d) of the concierge's read chain. A REQUIRED dep, so this hand-off cannot be
+            // dropped without a compile error — see HookEventHandlerDeps.noteTranscript.
+            noteTranscript: (ev) => noteTranscriptFromStop(agent.id, ev),
           }),
           // Start at EOF: the log is keyed by worktree and accumulates prior runs + background
           // one-shot `claude` sessions. We want status from THIS spawn's session, which the engine

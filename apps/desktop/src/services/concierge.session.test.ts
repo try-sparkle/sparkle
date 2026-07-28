@@ -10,6 +10,8 @@
 // webview starts with, while the mocked `concierge_session_info` stands in for the transcript that
 // is still on disk.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useAuthStore } from "../stores/authStore";
+import { useSettingsStore } from "../stores/settingsStore";
 
 type Handler = (ev: { payload: unknown }) => void;
 const harness = vi.hoisted(() => ({
@@ -55,6 +57,18 @@ import {
   SUPERSEDED_DETAILS,
 } from "./concierge";
 
+
+// The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
+// for every tool call, so these suites — which test the mechanics, not the entitlement — open it
+// explicitly. `aiGate.concierge.test.ts` is where the gate's own behaviour is asserted.
+function openConciergeAiGate() {
+  useSettingsStore.setState({ aiConcierge: true });
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+    creditFloorCents: 0,
+  } as never);
+}
+
 /** The resume id the nth `concierge_turn` invoke carried (0-based). */
 function resumeOf(n: number): string | null {
   const call = harness.invokes.filter((c) => c.cmd === "concierge_turn").at(n);
@@ -73,6 +87,7 @@ function emit(name: "concierge:done" | "concierge:error", payload: unknown): voi
 
 describe("concierge session restore (C1)", () => {
   beforeEach(() => {
+    openConciergeAiGate();
     harness.handlers.clear();
     harness.invokes.length = 0;
     harness.diskSessionId = null;

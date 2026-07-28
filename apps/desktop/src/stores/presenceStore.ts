@@ -19,12 +19,26 @@
 //     NOT want the concierge acting alone. A short idle timeout would unblock autonomy precisely
 //     when it is least wanted.
 //
-// THE PIN, and the one subtlety worth reading twice (locked decision 2). Manually choosing Here
-// PINS Here against the idle timer. Blur still wins — a pin that survived blur would leave the
-// concierge unblocked-but-unwatched, the exact failure Away exists to prevent — but it wins only
-// FOR THE DURATION OF THE BLUR. `pinnedHere` is NOT cleared on blur, so refocusing restores Here
-// without the user having to re-assert it. That is why blur is a fact about the world (`focused`)
-// rather than a mutation of the pin.
+// THE PIN — FOUNDER OVERRIDE, 2026-07-27 (design §1, decision 2, recorded there as OVERRIDDEN with
+// the rationale it reverses left intact). Manually choosing Here PINS Here against EVERYTHING
+// automatic: the idle timer, blur, a screen lock, a machine that slept overnight. It holds until
+// the user takes it off — `togglePinnedHere`, or choosing Away.
+//
+// The decision it replaces said blur wins for the duration of the blur, because a pin that survived
+// blur leaves the concierge unblocked-but-unwatched — the exact failure Away exists to prevent.
+// That cost is real and was accepted. What outweighed it: a pin the app can silently revoke is not
+// a pin. Switching to a browser to read a doc for ten minutes is ordinary work, and under the old
+// rule that switch handed the concierge the autonomy the user had just explicitly refused, with
+// nothing said about it. An override the user cannot feel is worse than no override at all.
+//
+// Two consequences a reader should hold onto:
+//   • A pin left on overnight DOES strand the queue. That is now the user's to fix, which is why
+//     the slider carries a visible pin affordance (Concierge/PresenceSlider) rather than hiding a
+//     mode this sticky behind a state nobody can see. It also SURVIVES A RESTART — see
+//     {@link PRESENCE_PIN_STORAGE_KEY}; "until you unpin" cannot have an unspoken "…or until the
+//     app relaunches" in it.
+//   • `manualAway` still outranks the pin (see `resolveMode`). The pin has to be escapable or the
+//     control is a trap, and `setAway` drops it outright.
 import { create } from "zustand";
 import { getFrontmost, onFrontmostChanged } from "../services/helper";
 
@@ -40,11 +54,59 @@ export const IDLE_AWAY_MS = 5 * 60 * 1000;
  *  5-minute threshold is 5% — invisible, and it costs one comparison per tick. */
 export const PRESENCE_TICK_MS = 15_000;
 
+/**
+ * Where the pin outlives the process (roborev 54146-M2).
+ *
+ * The pin is the one presence fact that is a STANDING INSTRUCTION rather than an observation. The
+ * other three are re-derived from the world at launch — focus comes from the backend, the idle
+ * clock restarts, an explicit Away is a decision about a moment that has passed — but "hold Here
+ * until I say otherwise" is unfinished business, and the control promises exactly that in words:
+ * "stays Here through app-switches, screen lock and overnight, until you unpin".
+ *
+ * An in-memory-only pin broke that promise on the ONE transition the user never chose — a restart,
+ * a crash-relaunch, an auto-update, a dev reload — and broke it in the UNSAFE direction: presence
+ * fell back to auto-Away, which is precisely the state that lets the concierge dispatch unattended,
+ * with nothing on screen to say the override the user set had been dropped.
+ *
+ * Raw localStorage, not zustand `persist`: one boolean, rehydrated deliberately inside
+ * {@link startPresenceTracking} rather than at module load. `persist` would rehydrate
+ * asynchronously after the store is already being read from the non-React dispatch path, which is
+ * a window where the gate would see the wrong answer.
+ *
+ * DELIBERATELY THE ONLY PERSISTED FACT. `manualAway` stays session-scoped: "I'm stepping out" is
+ * about a stretch of time the relaunch has already ended, and restoring it would strand the queue
+ * with no visible cause. Restoring a pin fails safe (the concierge asks first); restoring an Away
+ * would not.
+ */
+export const PRESENCE_PIN_STORAGE_KEY = "sparkle.presence.pinnedHere";
+
+/** Read the persisted pin. Never throws — a webview with storage disabled or a quota-blocked
+ *  read must degrade to "not pinned", not take the whole presence signal down with it. */
+function readPersistedPin(): boolean {
+  try {
+    return localStorage.getItem(PRESENCE_PIN_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Write (or clear) the persisted pin. Same never-throws posture: presence is on the dispatch
+ *  path, so a storage failure may cost the restart promise but must not cost the signal. */
+function persistPin(on: boolean): void {
+  try {
+    if (on) localStorage.setItem(PRESENCE_PIN_STORAGE_KEY, "1");
+    else localStorage.removeItem(PRESENCE_PIN_STORAGE_KEY);
+  } catch {
+    /* storage unavailable — the pin is still live for this session */
+  }
+}
+
 /** The facts a mode is computed FROM. Split out so the rule is testable without a store. */
 export interface PresenceFacts {
   /** A real Sparkle window is frontmost (services/helper.onFrontmostChanged). */
   focused: boolean;
-  /** The user manually chose Here — pins against the idle timer, but not against blur. */
+  /** The user manually chose Here — pins against BOTH automatic signals, the idle timer and blur
+   *  alike, until they unpin. See the header's override note. */
   pinnedHere: boolean;
   /** The user manually chose Away — an explicit "I'm stepping out", which no amount of typing
    *  undoes. Only choosing Here clears it. See `setAway`. */
@@ -56,17 +118,23 @@ export interface PresenceFacts {
 /**
  * The whole presence rule, as a pure function. Ordering IS the policy — read it top to bottom:
  *
- * 1. Not focused → Away. Unconditional, so it outranks both pins. This is the clause that makes a
- *    pin transient rather than permanent.
- * 2. Manually Away → Away. An explicit choice is not undone by activity; the user said they are
- *    stepping out, and typing one more line before they go does not change that.
- * 3. Pinned Here → Here, regardless of the idle clock. This is the pin's entire job.
+ * 1. Manually Away → Away. An explicit choice is not undone by activity; the user said they are
+ *    stepping out, and typing one more line before they go does not change that. FIRST, because it
+ *    is the escape hatch from the pin below: `setAway` also clears `pinnedHere`, so the two are
+ *    never both set in practice, but an explicit "I am gone" must never resolve to Here even if a
+ *    future edit lets them coexist.
+ * 2. Pinned Here → Here. Beats the blur clause AND the idle clock — the founder override. Nothing
+ *    automatic gets past this line; only unpinning or an explicit Away does.
+ * 3. Not focused → Away. The strong automatic signal, and (since the override) the strongest thing
+ *    that is still allowed to move presence on its own.
  * 4. Otherwise the idle clock decides.
+ *
+ * The pre-override order had (3) first and unconditional, which is what made a pin transient.
  */
 export function resolveMode(facts: PresenceFacts, now: number): PresenceMode {
-  if (!facts.focused) return "away";
   if (facts.manualAway) return "away";
   if (facts.pinnedHere) return "here";
+  if (!facts.focused) return "away";
   return now - facts.lastInputAt >= IDLE_AWAY_MS ? "away" : "here";
 }
 
@@ -74,6 +142,25 @@ interface PresenceState extends PresenceFacts {
   /** The resolved answer. Stored, not derived on read, so non-React callers on the dispatch path
    *  get it from a plain `usePresenceStore.getState().mode` with no computation. */
   mode: PresenceMode;
+  /**
+   * What `manualAway` was when the pin last went ON — so taking the pin back OFF is a true no-op.
+   *
+   * NOT a {@link PresenceFacts} member on purpose: `resolveMode` must not consult it. It is
+   * bookkeeping for one gesture, not an input to the rule.
+   *
+   * WHY IT EXISTS (roborev 54146-M1). Pinning ON has to clear `manualAway` — `resolveMode` puts
+   * the explicit Away first, so a pin sitting on top of a latched Away would resolve to Away while
+   * the pin showed lit, which is a control that lies. But the pin's two gestures (a fast
+   * double-tap, two deliberate single taps) both END where they started, so the ON→OFF pair has to
+   * end where presence started too. Without this, a user in an explicit Away who double-tapped the
+   * pin came out in Here with the pin unlit: their "I'm stepping out" silently revoked by a gesture
+   * that visibly changed nothing.
+   *
+   * The story it encodes: pinning from Away is a TEMPORARY OVERRIDE of that Away, and unpinning
+   * hands it back. Clicking the Here segment is different — that is the user saying they are here,
+   * and it ends the Away for good (`setHere` clears this).
+   */
+  awayBeforePin: boolean;
   /** The user typed — in the compose box or straight into a terminal. Resets the idle clock. */
   noteInput: () => void;
   /** Frontmost changed. Already coalesced 120ms upstream in src-tauri/src/frontmost.rs, which is
@@ -83,6 +170,21 @@ interface PresenceState extends PresenceFacts {
   setHere: () => void;
   /** The user chose Away on the slider: latch it, and drop the pin. */
   setAway: () => void;
+  /**
+   * Set the pin directly (the slider's pin button, and its double-click gesture — which computes
+   * the new value from the state BEFORE the gesture's own clicks landed).
+   *
+   * ON clears `manualAway`, because a pin that left a latched Away underneath it would resolve to
+   * Away while showing a lit pin — but it REMEMBERS the Away it cleared (see
+   * {@link PresenceState.awayBeforePin}), so the gesture is undoable.
+   *
+   * OFF removes the pin, restores whatever Away the pin was overriding, and otherwise lets the
+   * facts speak: if the window is blurred or the idle deadline has passed, unpinning is immediately
+   * Away, which is the whole point of being able to take the pin off.
+   */
+  setPinnedHere: (on: boolean) => void;
+  /** Flip the pin — the slider's pin button. */
+  togglePinnedHere: () => void;
   /** Re-resolve against the wall clock. Called by the tick; the only way the idle edge fires. */
   evaluate: () => void;
   /** Test seam: back to a fresh, focused, just-typed state. */
@@ -112,10 +214,36 @@ export const usePresenceStore = create<PresenceState>((set, get) => {
   return {
     ...initialFacts(),
     mode: "here",
+    awayBeforePin: false,
     noteInput: () => commit({ lastInputAt: Date.now() }),
     setFocused: (focused) => commit({ focused }),
-    setHere: () => commit({ pinnedHere: true, manualAway: false, lastInputAt: Date.now() }),
-    setAway: () => commit({ pinnedHere: false, manualAway: true }),
+    setHere: () => {
+      persistPin(true);
+      // An explicit Here is a statement about NOW, not an override of an earlier Away — so it
+      // discards the pre-pin memory rather than arming an unpin to resurrect that Away.
+      set({ awayBeforePin: false });
+      commit({ pinnedHere: true, manualAway: false, lastInputAt: Date.now() });
+    },
+    setAway: () => {
+      persistPin(false);
+      // The newest explicit choice, so nothing older is left to restore.
+      set({ awayBeforePin: false });
+      commit({ pinnedHere: false, manualAway: true });
+    },
+    setPinnedHere: (on) => {
+      persistPin(on);
+      if (on) {
+        // Only capture on the OFF→ON edge: re-pinning an already-pinned Here would otherwise
+        // overwrite the remembered Away with the `false` the pin itself installed.
+        if (!get().pinnedHere) set({ awayBeforePin: get().manualAway });
+        commit({ pinnedHere: true, manualAway: false, lastInputAt: Date.now() });
+      } else {
+        const restore = get().awayBeforePin;
+        set({ awayBeforePin: false });
+        commit({ pinnedHere: false, manualAway: restore });
+      }
+    },
+    togglePinnedHere: () => get().setPinnedHere(!get().pinnedHere),
     evaluate: () => {
       const s = get();
       const next = resolveMode(s, Date.now());
@@ -123,7 +251,10 @@ export const usePresenceStore = create<PresenceState>((set, get) => {
       // every subscriber (and every consuming render) four times a minute for nothing.
       if (next !== s.mode) set({ mode: next });
     },
-    reset: () => set({ ...initialFacts(), mode: "here" }),
+    // Deliberately leaves STORAGE alone: this resets the in-memory store, which is exactly what a
+    // relaunch does, so a test can seed the key and then reset to express "the app came back up
+    // with the pin still set". Suites clear the key themselves.
+    reset: () => set({ ...initialFacts(), mode: "here", awayBeforePin: false }),
   };
 });
 
@@ -142,6 +273,12 @@ export const usePresenceStore = create<PresenceState>((set, get) => {
 export function startPresenceTracking(): () => void {
   refCount += 1;
   if (refCount > 1) return makeDisposer();
+
+  // REHYDRATE THE PIN FIRST, synchronously, before anything can observe presence (roborev
+  // 54146-M2). The frontmost seed below is async, so a relaunch into the background would otherwise
+  // resolve Away for a moment — and "a moment" is enough on the dispatch path, which reads
+  // `getState().mode` off any tick.
+  if (readPersistedPin()) usePresenceStore.getState().setPinnedHere(true);
 
   const store = usePresenceStore.getState();
   void getFrontmost().then((f) => {

@@ -49,8 +49,10 @@ function mkProject(id: string, name: string): Project {
 const feed: ConciergeFeed = {
   projects: [
     // Alpha needs you twice over; Beta only has work in flight, which must not badge.
-    { id: "p1", name: "Alpha", inScope: true, counts: { needs_you: 2, running: 1, done: 0 }, agents: [] },
-    { id: "p2", name: "Beta", inScope: true, counts: { needs_you: 0, running: 3, done: 4 }, agents: [] },
+    // `scopedCounts` mirrors `counts` here — nothing is muted or pinned away in this fixture. The
+    // BADGES read `counts` (the raw truth); the concierge header reads the scoped share.
+    { id: "p1", name: "Alpha", inScope: true, counts: { needs_you: 2, running: 1, done: 0 }, scopedCounts: { needs_you: 2, running: 1, done: 0 }, agents: [] },
+    { id: "p2", name: "Beta", inScope: true, counts: { needs_you: 0, running: 3, done: 4 }, scopedCounts: { needs_you: 0, running: 3, done: 4 }, agents: [] },
   ],
   counts: { needs_you: 2, running: 4, done: 4 },
   scopedCounts: { needs_you: 2, running: 4, done: 4 },

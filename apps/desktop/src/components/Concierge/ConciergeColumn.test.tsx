@@ -9,7 +9,7 @@
 // and an entitlement fetch into assertions about view-model rendering. WHERE they render is
 // SparkleLogo.placement.test's subject.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
@@ -17,7 +17,14 @@ vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
+import { enableAiEnhancementsForTests } from "../../testing/aiEnhancements";
 
+// PRECONDITION, stated rather than inherited: every assertion below is about the column's PAID
+// half — the thread and the compose box — which the column replaces with an upsell whenever the AI
+// gate is shut (./conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`),
+// which is locked. The locked state is ./ConciergeColumn.locked.test's subject, including the
+// status readout above it, which stays live either way.
+beforeEach(enableAiEnhancementsForTests);
 afterEach(() => cleanup());
 
 const nudge: ConciergeNudge = {
@@ -60,8 +67,11 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     // the accessible name moved from `alt` to `role="img"` + `aria-label`. Same name, no longer an
     // image element.
     expect(screen.getByRole("img", { name: "Sparkle" })).toBeTruthy();
-    expect(screen.getByText("Following all projects")).toBeTruthy();
-    expect(container.textContent).toContain("1 Needs you · 2 Running");
+    // ONE header line now, not two: scope + the Needs-you count, with `2 Running` deliberately
+    // absent (founder, 2026-07-27 — see ScopeVitals' header). The dot carries the words.
+    expect(screen.getByTestId("concierge-vitals-line").textContent).toBe("All projects · 1");
+    expect(screen.getByLabelText("1 Needs you")).toBeTruthy();
+    expect(container.textContent).not.toContain("2 Running");
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();
     expect(screen.getByText("Thanks, keep me posted.")).toBeTruthy();
     expect(screen.getByText("All projects calm · nothing needs you")).toBeTruthy();

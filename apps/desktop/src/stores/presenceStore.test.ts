@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   IDLE_AWAY_MS,
+  PRESENCE_PIN_STORAGE_KEY,
   PRESENCE_TICK_MS,
   resolveMode,
   startPresenceTracking,
@@ -31,6 +32,10 @@ beforeEach(() => {
   vi.setSystemTime(new Date("2026-07-27T12:00:00Z"));
   frontmostListeners.length = 0;
   frontmostSeed = true;
+  // The pin outlives the process now (see the persistence block below), so a leftover key would
+  // leak a pin into the next case. `reset()` deliberately does NOT clear storage — that is what
+  // makes "relaunch with the pin still set" expressible below.
+  localStorage.clear();
   usePresenceStore.getState().reset();
 });
 
@@ -70,8 +75,27 @@ describe("resolveMode — the rule, as a pure function", () => {
     );
   });
 
-  it("blur beats the pin", () => {
-    expect(resolveMode(facts({ pinnedHere: true, focused: false }), Date.now())).toBe("away");
+  // FOUNDER OVERRIDE (design §1 decision 2, 2026-07-27). This assertion is the reverse of the one
+  // it replaces ("blur beats the pin") — deliberately. A pin the machine can revoke is not a pin.
+  it("the pin beats BLUR too — app-switch cannot revoke it", () => {
+    expect(resolveMode(facts({ pinnedHere: true, focused: false }), Date.now())).toBe("here");
+  });
+
+  it("the pin beats blur AND the idle clock together — a screen lock overnight is still Here", () => {
+    const t0 = Date.now();
+    expect(
+      resolveMode(
+        facts({ pinnedHere: true, focused: false, lastInputAt: t0 }),
+        t0 + 14 * 60 * 60 * 1000,
+      ),
+    ).toBe("here");
+  });
+
+  it("an explicit Away still wins, because it is the way OUT", () => {
+    // The pin has to be escapable or it is a trap. `setAway` drops the pin (asserted below), so
+    // this combination is unreachable through the store — the ordering is asserted anyway, because
+    // "unreachable today" is not a property a future edit preserves for free.
+    expect(resolveMode(facts({ pinnedHere: true, manualAway: true }), Date.now())).toBe("away");
   });
 
   it("a manual Away is not undone by typing", () => {
@@ -115,16 +139,96 @@ describe("presenceStore transitions", () => {
     expect(usePresenceStore.getState().mode).toBe("here");
   });
 
-  it("blur overrides the pin, and refocus RESTORES it without re-asserting", () => {
+  // ── FOUNDER OVERRIDE (design §1 decision 2) ────────────────────────────────────────────────
+  // The pin is now absolute. These four are the override's contract; the pair they replace
+  // asserted the opposite ("blur overrides the pin, and refocus restores it").
+  it("a pinned Here survives a BLUR — the app-switch cannot move it", () => {
     usePresenceStore.getState().setHere();
-    // Idle past the threshold as well, so the restore can only come from the pin.
-    vi.advanceTimersByTime(IDLE_AWAY_MS * 2);
     usePresenceStore.getState().setFocused(false);
-    expect(usePresenceStore.getState().mode).toBe("away");
-    // The pin itself is untouched — that is what makes the override transient.
+    expect(usePresenceStore.getState().mode).toBe("here");
     expect(usePresenceStore.getState().pinnedHere).toBe(true);
+  });
+
+  it("a pinned Here survives an IDLE-TIMER expiry, blurred, overnight", () => {
+    usePresenceStore.getState().setHere();
+    usePresenceStore.getState().setFocused(false);
+    // Fourteen hours: the machine slept, the screen locked, the idle deadline passed long ago.
+    vi.advanceTimersByTime(14 * 60 * 60 * 1000);
+    usePresenceStore.getState().evaluate();
+    expect(usePresenceStore.getState().mode).toBe("here");
+  });
+
+  it("UNPINNING restores ordinary transitions — the blur that was ignored now applies", () => {
+    usePresenceStore.getState().setHere();
+    usePresenceStore.getState().setFocused(false);
+    expect(usePresenceStore.getState().mode).toBe("here");
+    // The manual unpin. Nothing else changed: still blurred, still idle.
+    usePresenceStore.getState().togglePinnedHere();
+    expect(usePresenceStore.getState().pinnedHere).toBe(false);
+    expect(usePresenceStore.getState().mode).toBe("away");
+    // And the idle clock is live again too, once focus comes back.
     usePresenceStore.getState().setFocused(true);
     expect(usePresenceStore.getState().mode).toBe("here");
+    vi.advanceTimersByTime(IDLE_AWAY_MS);
+    usePresenceStore.getState().evaluate();
+    expect(usePresenceStore.getState().mode).toBe("away");
+  });
+
+  it("togglePinnedHere pins Here from Away, clearing an explicit Away", () => {
+    usePresenceStore.getState().setAway();
+    expect(usePresenceStore.getState().mode).toBe("away");
+    usePresenceStore.getState().togglePinnedHere();
+    expect(usePresenceStore.getState().pinnedHere).toBe(true);
+    expect(usePresenceStore.getState().manualAway, "pinning is not half an Away").toBe(false);
+    expect(usePresenceStore.getState().mode).toBe("here");
+  });
+
+  // ── THE PIN ROUND-TRIP (roborev 54146-M1) ──────────────────────────────────────────────────
+  // The pin's two gestures (a fast double-tap on the button, two deliberate single taps) both end
+  // with the pin exactly where it started, so they must leave PRESENCE where it started too.
+  // Before this, pinning ON delegated to `setHere` — which also clears `manualAway` — while
+  // pinning OFF only dropped the pin, so a user who had explicitly stepped Away came back to a
+  // silently revoked Away with the pin unlit and nothing on screen saying so.
+  it("a pin ON→OFF round-trip restores an explicit Away instead of silently revoking it", () => {
+    usePresenceStore.getState().setAway();
+    usePresenceStore.getState().togglePinnedHere();
+    expect(usePresenceStore.getState().mode, "the pin overrides Away while it is ON").toBe("here");
+    usePresenceStore.getState().togglePinnedHere();
+    expect(usePresenceStore.getState().pinnedHere).toBe(false);
+    expect(usePresenceStore.getState().manualAway, "the explicit Away comes back").toBe(true);
+    expect(usePresenceStore.getState().mode).toBe("away");
+  });
+
+  it("an explicit HERE is not an override, so unpinning after it does NOT resurrect an old Away", () => {
+    // The distinction the restore turns on: clicking the Here SEGMENT is the user saying "I am
+    // here", which ends the Away for good; clicking the PIN from Away is a temporary override of
+    // it. Only the second one unwinds.
+    usePresenceStore.getState().setAway();
+    usePresenceStore.getState().setHere();
+    usePresenceStore.getState().togglePinnedHere();
+    expect(usePresenceStore.getState().pinnedHere).toBe(false);
+    expect(usePresenceStore.getState().manualAway).toBe(false);
+    expect(usePresenceStore.getState().mode).toBe("here");
+  });
+
+  it("a fresh explicit Away taken DURING a pin is not undone by the later unpin", () => {
+    // `setAway` drops the pin and is itself the newest explicit choice, so the pre-pin memory it
+    // would otherwise restore has to be discarded with it.
+    usePresenceStore.getState().togglePinnedHere();
+    usePresenceStore.getState().setAway();
+    usePresenceStore.getState().togglePinnedHere(); // pin back ON from Away
+    usePresenceStore.getState().togglePinnedHere(); // …and OFF again
+    expect(usePresenceStore.getState().manualAway).toBe(true);
+    expect(usePresenceStore.getState().mode).toBe("away");
+  });
+
+  it("choosing Away is the OTHER way out of a pin", () => {
+    // The pin outranks blur and the clock, so an explicit Away has to remain able to break it or
+    // the control is a trap.
+    usePresenceStore.getState().setHere();
+    usePresenceStore.getState().setAway();
+    expect(usePresenceStore.getState().pinnedHere).toBe(false);
+    expect(usePresenceStore.getState().mode).toBe("away");
   });
 
   it("choosing Away drops the pin and choosing Here takes it back", () => {
@@ -186,6 +290,38 @@ describe("startPresenceTracking", () => {
     vi.advanceTimersByTime(200); // a full coalescing window passes with no event
     expect(usePresenceStore.getState().mode).toBe(before);
     expect(usePresenceStore.getState().mode).toBe("here");
+    stop();
+  });
+
+  it("rehydrates a pin that was left ON before the relaunch", async () => {
+    // roborev 54146-M2. The tooltip promises "stays Here through app-switches, screen lock and
+    // overnight, until you unpin"; an in-memory-only pin breaks that promise on the ONE transition
+    // the user cannot see coming (restart, crash-relaunch, auto-update) and does it in the unsafe
+    // direction — presence falls back to auto-Away and the concierge is free to act unattended.
+    localStorage.setItem(PRESENCE_PIN_STORAGE_KEY, "1");
+    frontmostSeed = false; // relaunched into the background: without the pin this is Away
+    const stop = startPresenceTracking();
+    await vi.runOnlyPendingTimersAsync();
+    expect(usePresenceStore.getState().pinnedHere).toBe(true);
+    expect(usePresenceStore.getState().mode).toBe("here");
+    stop();
+  });
+
+  it("comes up unpinned when nothing was stored, and a live pin is what gets stored", async () => {
+    const stop = startPresenceTracking();
+    await vi.runOnlyPendingTimersAsync();
+    expect(usePresenceStore.getState().pinnedHere).toBe(false);
+    expect(localStorage.getItem(PRESENCE_PIN_STORAGE_KEY)).toBeNull();
+    usePresenceStore.getState().togglePinnedHere();
+    expect(localStorage.getItem(PRESENCE_PIN_STORAGE_KEY)).toBe("1");
+    // …and taking it off takes it out of storage, so the NEXT launch is genuinely unpinned.
+    usePresenceStore.getState().togglePinnedHere();
+    expect(localStorage.getItem(PRESENCE_PIN_STORAGE_KEY)).toBeNull();
+    // Choosing Away is the other way out of a pin, and it has to reach storage too.
+    usePresenceStore.getState().setHere();
+    expect(localStorage.getItem(PRESENCE_PIN_STORAGE_KEY)).toBe("1");
+    usePresenceStore.getState().setAway();
+    expect(localStorage.getItem(PRESENCE_PIN_STORAGE_KEY)).toBeNull();
     stop();
   });
 

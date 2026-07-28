@@ -81,6 +81,13 @@ import { useUiStore } from "../stores/uiStore";
 import { buildConciergeFeed } from "../services/conciergeFeed";
 import { bandCountLabel } from "../engine/statusBandLabels";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const tab = (id: string, over: Partial<AgentTab> = {}): AgentTab =>
   ({
@@ -375,10 +382,14 @@ describe("no red agent falls through the floor", () => {
 });
 
 describe("column one states ONE number", () => {
-  /** The vitals line's "N Need you", read off the rendered header. */
+  /** The vitals line's "N Need you", read off the rendered header.
+   *
+   *  By LABEL, not by text: the header collapsed to one line on 2026-07-27 and the count is now a
+   *  red status dot plus a bare number, with the inflected sentence surviving as the dot's
+   *  accessible name. Same string, same shared `bandCountLabel` — it just isn't printed any more. */
   const vitalsNeedsYou = (): number => {
     for (let n = 0; n <= 40; n++) {
-      if (screen.queryByText(bandCountLabel("needs_you", n))) return n;
+      if (screen.queryByLabelText(bandCountLabel("needs_you", n))) return n;
     }
     throw new Error("no needs_you vitals part rendered");
   };

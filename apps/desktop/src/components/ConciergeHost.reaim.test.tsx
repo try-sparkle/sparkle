@@ -83,10 +83,15 @@ vi.mock("../services/terminalScrollback", () => ({
 // suite was written). Omit it from the mock and the module factory throws; return false and the
 // engine never runs, so every pill assertion below would pass VACUOUSLY. These tests are about
 // which agent the engine is scoped to, not about billing — so credits are present throughout.
+// `aiEnhancementsEnabled` joins it for the same reason: the concierge column reads it to decide
+// whether its paid half is locked (Concierge/conciergeAiLock). Omit it and the factory throws;
+// return false and the column renders the upsell instead of the thread, so every assertion here
+// would fail for a billing reason that isn't this suite's subject.
 vi.mock("../services/aiGate", () => ({
   useAiFeature: () => true,
   aiFeatureNow: () => false,
   useHasAiCredits: () => true,
+  aiEnhancementsEnabled: () => true,
 }));
 vi.mock("../services/relayClient", () => ({ pushSuggestions: h.pushSuggestions }));
 // Both agents are your-turn; neither has a stage that yields a CTA (no branchStatus / stage →
@@ -110,6 +115,13 @@ import type { ConciergeFeed } from "../useConciergeFeed";
 import { useConnectionStore } from "../stores/connectionStore";
 import type { SuggestionButton } from "../services/suggestions/types";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 /** A's recommended action. `value` is what a click SENDS — the string that must never reach B. */
 const A_ACTION: SuggestionButton = {
@@ -152,6 +164,7 @@ const FEED = {
       name: "sparkle",
       inScope: true,
       counts: COUNTS,
+      scopedCounts: COUNTS,
       agents: [agent("ag1", "Agent A"), agent("ag2", "Agent B")],
     },
   ],

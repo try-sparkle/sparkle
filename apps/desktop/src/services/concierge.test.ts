@@ -5,6 +5,8 @@
 // rejected invoke surfaces as a synthetic error event. Tauri invoke/listen are mocked with the
 // same name-keyed harness improvementPass.watchdog.test.ts uses.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useAuthStore } from "../stores/authStore";
+import { useSettingsStore } from "../stores/settingsStore";
 
 type Handler = (ev: { payload: unknown }) => void;
 const harness = vi.hoisted(() => ({
@@ -45,6 +47,18 @@ import {
   SUPERSEDED_DETAILS,
 } from "./concierge";
 
+
+// The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
+// for every tool call, so these suites — which test the mechanics, not the entitlement — open it
+// explicitly. `aiGate.concierge.test.ts` is where the gate's own behaviour is asserted.
+function openConciergeAiGate() {
+  useSettingsStore.setState({ aiConcierge: true });
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+    creditFloorCents: 0,
+  } as never);
+}
+
 /** The args of the nth `concierge_turn` invoke (0-based). */
 function turnArgs(n: number): { prompt: string; resumeSessionId: string | null } {
   const call = harness.invokes.filter((c) => c.cmd === "concierge_turn").at(n);
@@ -54,6 +68,7 @@ function turnArgs(n: number): { prompt: string; resumeSessionId: string | null }
 
 describe("concierge service", () => {
   beforeEach(() => {
+    openConciergeAiGate();
     harness.handlers.clear();
     harness.invokes.length = 0;
     harness.invokeImpl = undefined;

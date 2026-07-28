@@ -96,12 +96,21 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 
 import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
+// The SELECTED project is what the header calls "here" — the only store the segment tests seed.
+import { useProjectStore } from "../stores/projectStore";
 import { buildConciergeFeed, conciergeBand } from "../services/conciergeFeed";
 import { topLevelAgents } from "../engine/agentOrdering";
 import { flattenSections, groupAgentsByStage, type StatusBand } from "../engine/buildSections";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import { resolveStage } from "../engine/workflowStage";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const tab = (id: string, over: Partial<AgentTab> = {}): AgentTab =>
   ({
@@ -547,5 +556,68 @@ describe("rowless agents digest like everything else", () => {
       running: false,
       done: false,
     });
+  });
+});
+
+// ── THE HEADER'S PER-PROJECT SEGMENTS ───────────────────────────────────────────────────────────
+//
+// The other cross-project navigation the column offers, and the one PRD §2a's open question was
+// about. The answer (founder, 2026-07-28): column two stays project-scoped, so column one's one
+// line is the GLOBAL index — `All projects · 2 here · 1 in mobile`, worst project first, with the
+// other-project segments switching to them.
+//
+// A count names a POPULATION, not an agent, so this click must switch and stop. That is the mirror
+// image of the bug bead `sparkle-vohh` fixed (a nudge selected an agent without switching project);
+// selecting an agent nobody named would be its other half. It also must not narrow column two the
+// way a DIGEST click does — the digest line states a band, the header segment states a project.
+describe("clicking a header segment switches project, and does nothing else", () => {
+  /** Two projects with Needs-you work, with `here` selected — so the line has both segment shapes. */
+  const twoProjects = () => {
+    const here = projectOf("p1", "here", [tab("h1"), tab("h2")]);
+    const there = projectOf("p2", "mobile", [tab("m1")]);
+    const status: Record<string, AgentTabStatus> = {
+      h1: "waiting",
+      h2: "blocked",
+      m1: "approval",
+    };
+    useProjectStore.setState({ selectedProjectId: "p1" } as never);
+    return { projects: [here, there], status };
+  };
+
+  it("reads worst-project-first across projects, with the current one as 'here'", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    expect(screen.getByTestId("concierge-vitals-line").textContent).toBe(
+      "All projects · 2 here · 1 in mobile",
+    );
+  });
+
+  it("switches to the named project — with no agent id, so nothing is selected on its behalf", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to mobile — 1 Needs you" }));
+    // ONE call, ONE argument. `toHaveBeenCalledWith` compares the whole argument list, so a stray
+    // agent id — the thing a count cannot honestly name — fails here.
+    expect(h.openProjectTab.mock.calls).toEqual([["p2"]]);
+  });
+
+  it("does NOT narrow column two the way a digest line does", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to mobile — 1 Needs you" }));
+    // Every band still visible: the segment named a project, not a band, and silently isolating one
+    // would hide the very rows the user switched over to look at.
+    expect(useUiStore.getState().statusFilter).toEqual({
+      needs_you: true,
+      running: true,
+      done: true,
+    });
+  });
+
+  it("the 'here' segment offers no switch at all — you are already there", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    expect(screen.queryByRole("button", { name: /^Switch to here/ })).toBeNull();
+    expect(screen.getByText("2 here").tagName).toBe("SPAN");
   });
 });

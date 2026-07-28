@@ -262,6 +262,47 @@ describe("buildConciergeFeed — counts", () => {
     expect(feed.pinnedProjectId).toBeNull();
   });
 
+  // The per-project SCOPED share — what the concierge header splits its one number by (PRD §2a:
+  // column one is the global index). The identity below is the whole reason the field exists: the
+  // header can name projects without its total drifting from what the thread accounts for.
+  it("per-project scopedCounts sum to the feed's scopedCounts, band by band", () => {
+    const feed = buildConciergeFeed({ projects: twoProjects, status });
+    expect(feed.projects.map((p) => p.scopedCounts)).toEqual([
+      { needs_you: 2, running: 0, done: 1 },
+      { needs_you: 1, running: 1, done: 0 },
+    ]);
+    for (const band of ["needs_you", "running", "done"] as const) {
+      expect(feed.projects.reduce((n, p) => n + p.scopedCounts[band], 0)).toBe(
+        feed.scopedCounts[band],
+      );
+    }
+  });
+
+  it("a pinned-away project's scoped share is ZERO while its raw counts stand", () => {
+    const feed = buildConciergeFeed({ projects: twoProjects, status, pinnedProjectId: "pB" });
+    const pA = feed.projects.find((p) => p.id === "pA")!;
+    expect(pA.counts).toEqual({ needs_you: 2, running: 0, done: 1 }); // the tab badge's truth
+    expect(pA.scopedCounts).toEqual(emptyCounts()); // …but the header says nothing about it
+    expect(feed.projects.find((p) => p.id === "pB")!.scopedCounts).toEqual(feed.scopedCounts);
+  });
+
+  it("mute and representation come out of the per-project share too, not just the global one", () => {
+    // Same three gates, applied once — the share is incremented from the global gate, never
+    // recomputed beside it.
+    const feed = buildConciergeFeed({
+      projects: [
+        project("p1", [agent("loud"), agent("hushed")]),
+        project("p2", [agent("orch"), agent("w1", { kind: "worker", parentId: "orch" })]),
+      ],
+      status: { loud: "waiting", hushed: "waiting", orch: "waiting", w1: "waiting" },
+      shouldInterrupt: (topic) => topic !== "hushed",
+    });
+    const byId = Object.fromEntries(feed.projects.map((p) => [p.id, p]));
+    expect(byId["p1"]!.scopedCounts.needs_you).toBe(1); // hushed is muted out
+    expect(byId["p2"]!.scopedCounts.needs_you).toBe(1); // the worker's red is the orchestrator's
+    expect(feed.scopedCounts.needs_you).toBe(2);
+  });
+
   it("emptyCounts is the all-zero shape every accumulator starts from", () => {
     expect(emptyCounts()).toEqual({ needs_you: 0, running: 0, done: 0 });
     const feed = buildConciergeFeed({ projects: [project("pEmpty", [])], status: {} });

@@ -42,6 +42,7 @@ import {
   type ResumeRule,
 } from "./suggestions/approvalCategories";
 import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
+import { conciergeToolConfigPath, type PolicyDecision } from "./conciergeTools/policy";
 import {
   DEFAULT_WAKE_WORD,
   DEFAULT_STOP_WORD,
@@ -55,6 +56,7 @@ const AI_CONFIG_PATH: Record<AiFeatureKey, string> = {
   composer: "ai.composer",
   suggestedActions: "ai.suggested_actions",
   autoApprove: "ai.auto_approve",
+  concierge: "ai.concierge",
 };
 
 /** Scope an approval rule is written to: the machine-wide global file or the current project's file. */
@@ -228,6 +230,32 @@ export async function setResumeRule(
     await setConfigValue(RESUME_PATH, rule);
   } catch (e) {
     console.warn("config write failed (resume global)", e);
+  }
+}
+
+/**
+ * Set (or CLEAR, with null) one concierge tool's autonomy rule in the GLOBAL config.toml.
+ *
+ * Global scope only, and that is a security boundary rather than a simplification: `[concierge]` is
+ * ignored in a per-project file (config.rs warns about it) precisely so a cloned repo cannot hand
+ * the concierge standing authority over the user's machine.
+ *
+ * A null decision UNSETS the key rather than writing a "default" sentinel. The default is DERIVED
+ * from the tool's risk class (services/conciergeTools/policy.ts), so an absent key is the only
+ * honest way to say "use the default" — writing today's derived value would freeze it and quietly
+ * stop tracking a future reclassification.
+ */
+export async function setConciergeToolPolicy(
+  tool: string,
+  decision: PolicyDecision | null,
+): Promise<void> {
+  useSettingsStore.getState().setConciergeToolPolicy(tool, decision);
+  const path = conciergeToolConfigPath(tool);
+  try {
+    if (decision) await setConfigValue(path, decision);
+    else await unsetConfigValue(path);
+  } catch (e) {
+    console.warn("config write failed (concierge tool policy)", e);
   }
 }
 

@@ -21,7 +21,12 @@ vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
 const { refreshAgentBranch, landAgentBranch, pushAgentBranch, openAgentPr, deleteAgentBranch } =
   vi.hoisted(() => ({
     refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
-    landAgentBranch: vi.fn(() => Promise.resolve({ ok: true, target: "main" })),
+    // Typed as the real LandResult union so a test can drive the FAILED arm (`{ ok: false, reason }`)
+    // — the inferred literal type from the happy-path default cannot express it.
+    landAgentBranch: vi.fn(
+      (): Promise<import("../services/branchStatus").LandResult> =>
+        Promise.resolve({ ok: true, target: "main" }),
+    ),
     pushAgentBranch: vi.fn(() => Promise.resolve("pushed")),
     openAgentPr: vi.fn(() => Promise.resolve("https://pr/1")),
     deleteAgentBranch: vi.fn(() => Promise.resolve()),
@@ -181,6 +186,55 @@ describe("AgentSidebar — close → Ship/Save/Discard", () => {
     expect(pushAgentBranch).toHaveBeenCalledWith("/tmp/demo", "a1"); // remote backup
     expect(landAgentBranch).not.toHaveBeenCalled();
     expect(openAgentPr).not.toHaveBeenCalled();
+  });
+
+  // ── roborev 54225-1: the HUMAN path must report the same truth the concierge path does ─────────
+  // shipAgent returns a discriminated ShipOutcome; the sidebar used to discard it and tear the agent
+  // down unconditionally, so a failed land or a failed `gh` looked exactly like a shipped PR — the
+  // tab and worktree vanished with nothing landed, no PR, and the bead untouched.
+  it("Ship: a failed local land (no remote) KEEPS the agent and says nothing landed", async () => {
+    buildAgentProject();
+    pushAgentBranch.mockResolvedValue("no-remote"); // → local land fallback
+    landAgentBranch.mockResolvedValue({ ok: false, reason: "conflict", files: ["src/a.ts"] });
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Ship it"));
+    await waitFor(() => expect(screen.getByText(/couldn.t ship/i)).toBeTruthy());
+    expect(screen.getByText(/conflict/)).toBeTruthy();
+    // The whole point: the row is still there, exactly as the concierge's refusal leaves it.
+    expect(agentsNow()).toContain("a1");
+    expect(removeAgentWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("Ship: a pushed branch whose PR failed tears down BUT says no pull request was opened", async () => {
+    buildAgentProject();
+    openAgentPr.mockRejectedValue(new Error("gh: not authenticated"));
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Ship it"));
+    // The branch IS safe on the remote, so tearing down loses nothing — but the human must not be
+    // left believing a review is open.
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(screen.getByText(/no pull request was opened/i)).toBeTruthy();
+    expect(screen.getByText(/not authenticated/)).toBeTruthy();
+  });
+
+  it("Ship: a clean PR reports nothing at all — the success path stays silent", async () => {
+    buildAgentProject();
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Ship it"));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(screen.queryByText(/couldn.t ship/i)).toBeNull();
+    expect(screen.queryByText(/no pull request was opened/i)).toBeNull();
+  });
+
+  it("Save: says so when the backup push never reached the remote", async () => {
+    buildAgentProject();
+    pushAgentBranch.mockRejectedValue(new Error("offline"));
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Save for later"));
+    // Save still succeeds — the branch and bead survive locally — but "backed up" is not claimed.
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+    expect(screen.getByText(/wasn.t backed up/i)).toBeTruthy();
+    expect(screen.getByText(/offline/)).toBeTruthy();
   });
 
   it("Discard requires a confirm, then deletes worktree + branch + bead and never lands", async () => {

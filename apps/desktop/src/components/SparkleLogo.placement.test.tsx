@@ -55,7 +55,7 @@ import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { LOGO_SRC } from "./SparkleWordmark";
+import { GOLD_SHEEN, LOGO_SRC, SparkleWordmark } from "./SparkleWordmark";
 import { C } from "../theme/colors";
 import { prefixedStyle } from "./statusDotTestUtils";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
@@ -139,7 +139,26 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(prefixedStyle(logo, "WebkitMaskImage")).toBe(`url(${LOGO_SRC})`);
     expect(logo.style.maskSize).toBe("contain");
     expect(prefixedStyle(logo, "WebkitMaskSize")).toBe("contain");
-    expect(logo.style.background).toBe(C.goldInk);
+    // THE PAINT BEHIND THE MASK — a gold SHEEN in this header since 2026-07-27 ("make the logo
+    // sparklier"), where it used to be the flat `C.goldInk`. What that change must not do is
+    // reintroduce the asset's own cyan→blue gradient, which is the entire reason the mark is a mask
+    // over a themed fill rather than an <img>; so this asserts the composition, not just "some
+    // background is set".
+    expect(logo.style.background).toBe(GOLD_SHEEN);
+    expect(logo.style.background).toContain(C.goldInk);
+    expect(logo.style.background).toContain(C.goldHotInk);
+    // The decorative hue, in either spelling the asset uses. A "sparklier" fill that reached for it
+    // would undo the token decision by the back door.
+    expect(logo.style.background.toLowerCase()).not.toContain("34e0f0");
+    expect(logo.style.background.toLowerCase()).not.toContain("3e7bff");
+  });
+
+  // The capture takeover and every other caller still get the FLAT fill: the sheen is opt-in, so
+  // this header's taste can't silently repaint a window that pins its own theme (CaptureApp.test
+  // holds the other end).
+  it("leaves the wordmark's default fill flat — the sheen is the concierge header's own choice", () => {
+    render(<SparkleWordmark />);
+    expect(screen.getByRole("img", { name: "Sparkle" }).style.background).toBe(C.goldInk);
   });
 
   it("ships the asset the mask points at — the one thing the mask itself cannot prove", () => {

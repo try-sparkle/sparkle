@@ -12,6 +12,11 @@
 // spawn (its AgentTab.id); the server stamps that as `callerAgentId` server-side (not caller-supplied
 // in the tool args), preserving anti-spoofing. Per-agent ops (rename / activity) default their
 // target to callerAgentId when `targetAgentId` is omitted.
+//
+// ONE caller is not an agent tab: the concierge brain (see CONCIERGE_CALLER_AGENT_ID). It connects
+// on a SECOND, dedicated control socket whose every request Rust stamps with a reserved id, so its
+// identity is structural rather than claimed. Everything below that says "the caller" still means
+// an AgentTab id, except where the reserved id is called out explicitly.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
@@ -25,11 +30,33 @@ import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { getModelCatalog } from "./models";
+import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools/registry";
+import { conciergeToolConfigPath } from "./conciergeTools/policy";
+import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
+import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 import { reportControlOp } from "./selfReportObservability";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab } from "../types";
 
 const EVENT = "control:request";
+
+/**
+ * The RESERVED `callerAgentId` for the concierge brain (bead `sparkle-9a8j`, design A7.3).
+ *
+ * MIRRORS `CONCIERGE_CALLER_AGENT_ID` in `src-tauri/src/bridge.rs`, which is where the id is
+ * actually MINTED — the Rust bridge stamps it on every request arriving on the concierge's own
+ * control socket, and REJECTS any request on the shared socket that claims it. So by the time a
+ * `control:request` event reaches this file, seeing this id is proof the request came in on that
+ * socket. It is a structural fact, not a claim, which is what lets `callerMayAdminister` admit it
+ * without weakening its fail-closed rule for everyone else.
+ *
+ * Never an AgentTab id (those are UUIDs; the colon makes collision impossible), so `findAgent` can
+ * never resolve it and per-agent ops must not try — see `resolveTargetId`.
+ *
+ * The two literals must stay in step; the Rust test `concierge_caller_id_is_mirrored_in_typescript`
+ * reads THIS FILE and fails if they drift.
+ */
+export const CONCIERGE_CALLER_AGENT_ID = "sparkle:concierge";
 
 /** The ops we tally as self-report signals (must match ControlOp). Any op outside this set (an
  *  unknown op → the dispatch default) is never counted. */
@@ -46,6 +73,9 @@ const TALLIED_OPS = new Set<ControlOp>([
   "set_agent_ordering",
   "set_zoom",
   "navigate",
+  // Counts how often the concierge actually reaches for a tool. The op name only — the domain and
+  // op INSIDE the payload are not recorded (see selfReportMetrics' privacy note).
+  "concierge_tool",
 ]);
 /** The per-agent ops whose target may differ from the caller (default to caller when omitted). */
 const PER_AGENT_OPS = new Set<ControlOp>([
@@ -90,7 +120,58 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   set_agent_ordering: "privileged",
   set_zoom: "privileged",
   navigate: "privileged",
+  // The concierge's tool spine. PRIVILEGED, and then some: the tier gate here is the ordinary
+  // "no unattended workers" check, and `handleConciergeTool` narrows it further to the ONE reserved
+  // caller. Both gates matter — this op reaches agent lifecycle, git, the workspace and a PTY, so a
+  // near-miss caller id must not get within reach of it. See the handler.
+  concierge_tool: "privileged",
 };
+
+/**
+ * Control ops the concierge policy gate does NOT consult (roborev 54255, finding 3).
+ *
+ * `concierge_tool` is exempt because its own handler applies the policy to the INNER { domain, op }
+ * — the thing that actually needs gating. The other two are RETIRED: their handlers refuse
+ * unconditionally and neither is registered in the MCP server, so they are deliberately absent from
+ * `APP_TOOL_NAMES` and must keep returning their own "was removed" explanation rather than a
+ * policy refusal blaming a Settings row that does not exist.
+ */
+const CONCIERGE_EXEMPT_OPS = new Set<ControlOp>([
+  "concierge_tool",
+  "pin_agent",
+  "set_agent_ordering",
+]);
+
+/**
+ * STRUCTURAL COVERAGE CHECK — every control op is either policy-classified or explicitly exempt.
+ *
+ * Without this, adding a control op later makes it silently unreachable for the concierge: the gate
+ * denies any op the policy layer cannot classify, so the new op would fail with an error blaming a
+ * Settings toggle the human never touched, and no test or typecheck would catch it. Keyed off
+ * `AppToolName` so the failure is a COMPILE error at the moment the op is added, naming the op.
+ *
+ * Purely a type-level assertion; it costs nothing at runtime.
+ */
+type _ConciergeGateCoversEveryControlOp = {
+  [K in Exclude<ControlOp, ControlOpExemptFromConciergePolicy>]: K extends AppToolName
+    ? true
+    : ["control op is missing from APP_TOOL_NAMES in conciergeTools/policy.ts", K];
+};
+type ControlOpExemptFromConciergePolicy = "concierge_tool" | "pin_agent" | "set_agent_ordering";
+// Instantiating it is what makes the mapped type actually check.
+const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
+  get_state: true,
+  get_config: true,
+  rename_agent: true,
+  set_agent_activity: true,
+  set_theme: true,
+  set_config: true,
+  unpin_agent: true,
+  set_agent_model: true,
+  set_zoom: true,
+  navigate: true,
+};
+void _conciergeGateCoverage;
 
 /** The Tauri event payload the Rust bridge emits for every sparkle-control op (frozen contract). */
 export interface ControlRequest {
@@ -123,10 +204,40 @@ function findAgent(agentId: string): { projectId: string; agent: AgentTab } | un
 
 /** Resolve the target of a per-agent op: an explicit STRING `targetAgentId`, else the caller. Guards
  *  against an unsound cast — a non-string targetAgentId (e.g. a number from a misbehaving client) is
- *  ignored rather than treated as a bogus id, so it falls back to the caller instead of erroring. */
-function resolveTargetId(req: ControlRequest): string {
+ *  ignored rather than treated as a bogus id, so it falls back to the caller instead of erroring.
+ *
+ *  Returns `undefined` for the CONCIERGE caller with no explicit target. "Default to the caller" is
+ *  meaningless there: the concierge is not an agent, so there is no own row to rename or narrate.
+ *  Defaulting anyway would hand `findAgent` an id that resolves to nothing — which today reads as
+ *  `unknown agent sparkle:concierge`, an error blaming a target the caller never named. Worse, if a
+ *  future refactor ever made an unresolved target fall back to "the selected agent", a targetless
+ *  concierge call would silently mutate whichever row the human happened to be looking at. Making
+ *  the absence explicit here is what lets each handler refuse with `targetRequired` instead. */
+function resolveTargetId(req: ControlRequest): string | undefined {
   const t = req.payload.targetAgentId;
-  return typeof t === "string" && t ? t : req.callerAgentId;
+  if (typeof t === "string" && t) return t;
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return undefined;
+  return req.callerAgentId;
+}
+
+/** The typed refusal for a per-agent op invoked without saying WHICH agent, by a caller that has no
+ *  own agent to default to.
+ *
+ *  `code` is the machine-readable half — the concierge brain is an LLM reading a tool result, and a
+ *  stable code is what lets it retry with a target rather than pattern-match English prose. It is
+ *  deliberately NOT a silent `{ ok: true }` no-op: a caller that believes it renamed an agent and
+ *  did not is exactly the failure mode `handlePinAgent` refuses for the same reason.
+ *
+ *  The WHY half of the message is derived from the caller rather than hardcoded to the concierge:
+ *  today the concierge is the only caller `resolveTargetId` can return `undefined` for, but a helper
+ *  that names a cause it did not check would misattribute the moment a second such caller exists —
+ *  and a wrong explanation is worse than a generic one. (roborev 54149.) */
+function targetRequired(op: string, req: ControlRequest): Record<string, unknown> {
+  const why =
+    req.callerAgentId === CONCIERGE_CALLER_AGENT_ID
+      ? "the concierge is not an agent, so there is no caller to default the target to"
+      : "this caller has no own agent to default the target to";
+  return { ok: false, code: "target_required", error: `${op} requires an explicit targetAgentId: ${why}` };
 }
 
 /** How much of the roster get_state returns. The roster is the single largest thing this API can
@@ -203,8 +314,26 @@ function livenessOf(
  *  tool call (dangerouslySkipPermissions), so persona prose alone can't stop one from changing the
  *  human's global theme/config — the dispatcher enforces it. An UNRESOLVABLE caller (stale, spoofed,
  *  or malformed id) is also denied: SPARKLE_AGENT_ID is injected by the app and stamped server-side,
- *  so a legitimate interactive caller always resolves to one of its own agent tabs. */
+ *  so a legitimate interactive caller always resolves to one of its own agent tabs.
+ *
+ *  EXACTLY ONE caller is admitted without resolving to an agent tab: the concierge (bead
+ *  `sparkle-9a8j`). It is the human's own front-of-house assistant, acting on the human's behalf in
+ *  the app they are looking at — the same standing an interactive Build/Think agent has, and the
+ *  opposite of an unattended worker. It cannot resolve to a tab because it is a headless `claude -p`
+ *  child rather than a tab, so the fail-closed rule below would deny it every privileged op forever.
+ *
+ *  This arm does NOT weaken the anti-spoofing property, because the id it admits is unforgeable
+ *  rather than trusted: Rust mints it from WHICH SOCKET the request arrived on and rejects the same
+ *  id on the shared socket (`bridge.rs resolve_control_caller`). A worker, a stale id, an empty id
+ *  and any other unresolvable id are all still denied by the line below — and a worker that claims
+ *  the reserved id never reaches this function at all; its request is refused in Rust.
+ *
+ *  Note this is deliberately NOT "the concierge is trusted because it said so". If the reserved id
+ *  could arrive on the shared socket, this arm WOULD be a hole — which is exactly why the Rust
+ *  rejection is tested (`shared_socket_rejects_a_request_claiming_the_reserved_concierge_id`) rather
+ *  than assumed. */
 function callerMayAdminister(callerAgentId: string): boolean {
+  if (callerAgentId === CONCIERGE_CALLER_AGENT_ID) return true;
   const kind = findAgent(callerAgentId)?.agent.kind;
   return kind != null && kind !== "worker";
 }
@@ -333,6 +462,7 @@ function handleGetState(req: ControlRequest): {
  *  pinned and un-unpinnable (the next self-name re-pinned it) — bug sparkle-pel7. */
 function handleRename(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("rename_agent", req);
   const name = req.payload.name;
   if (typeof name !== "string" || !name.trim()) return { ok: false, error: "name is required" };
   const found = findAgent(targetId);
@@ -344,6 +474,7 @@ function handleRename(req: ControlRequest): Record<string, unknown> {
 /** set_agent_activity → set THAT agent's live "what I'm building now" line (defaults to caller). */
 function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("set_agent_activity", req);
   const activity = req.payload.activity;
   if (typeof activity !== "string") return { ok: false, error: "activity must be a string" };
   const found = findAgent(targetId);
@@ -427,6 +558,7 @@ function handlePinAgent(_req: ControlRequest): Record<string, unknown> {
  *  so the name freeze is all that remains — which is still worth exposing. */
 function handleUnpinAgent(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("unpin_agent", req);
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   useProjectStore.getState().unpinAgent(found.projectId, targetId);
@@ -437,6 +569,7 @@ function handleUnpinAgent(req: ControlRequest): Record<string, unknown> {
  *  the live catalog (the Default sentinel is always the catalog head), rejecting an unknown id. */
 function handleSetAgentModel(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("set_agent_model", req);
   const model = req.payload.model;
   if (typeof model !== "string" || !model.trim()) return { ok: false, error: "model is required" };
   if (!getModelCatalog().some((m) => m.id === model)) {
@@ -493,6 +626,62 @@ function handleNavigate(req: ControlRequest): Record<string, unknown> {
   return { ok: false, error: 'view must be "sparkle" | "board" | "agent"' };
 }
 
+/**
+ * concierge_tool → the concierge's four tool domains (services/conciergeTools/registry).
+ *
+ * THE FROZEN WIRE CONTRACT, mirrored in `bridge.rs` CONTROL_OPS and in apps/mcp-control:
+ *   payload → { domain, op, args, toolCallId }
+ *   reply   → { ok: true, domain, op, data } | { ok: false, domain, op, code, message }
+ *
+ * CONCIERGE-ONLY, and stricter than every other op here. `callerMayAdminister` (the tier gate in
+ * `dispatch`) admits any interactive non-worker agent, which is the right rule for "change the
+ * human's theme" and the WRONG one for this: a single call can spawn or discard an agent, merge a
+ * PR, move a folder on disk, or type into another agent's terminal. So the caller must be EXACTLY
+ * `CONCIERGE_CALLER_AGENT_ID` — a build agent, a Think agent, a worker, an unresolvable caller and a
+ * near-miss like "sparkle:concierge2" are all refused. `===` on the reserved id is the whole check,
+ * which is why it cannot be fooled by a prefix or a suffix.
+ *
+ * That id is not a claim. Rust mints it from WHICH SOCKET the request arrived on and rejects it on
+ * the shared socket (`bridge.rs resolve_control_caller`), so by the time it reaches this function
+ * seeing it is proof of origin — the same structural fact `callerMayAdminister` documents.
+ *
+ * The refusal is shaped like every other reply on this op (`{ ok:false, domain, op, code, message }`)
+ * so the concierge — an LLM reading a tool result — can branch on `code` rather than pattern-match
+ * prose, exactly as it does for `unknown-op` or `bad-args`.
+ */
+async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolReply> {
+  // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
+  // the domain/op it was asked about even when they arrive as the wrong type.
+  const domain = typeof req.payload.domain === "string" ? req.payload.domain : "";
+  const op = typeof req.payload.op === "string" ? req.payload.op : "";
+  if (req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID) {
+    return {
+      ok: false,
+      domain,
+      op,
+      code: "forbidden",
+      message:
+        "concierge_tool is only callable by the concierge. Agents drive the app through the ordinary sparkle-control ops.",
+    };
+  }
+  // `toolCallId` is minted by the MCP server, never by the model. A blank one is not rejected here:
+  // it is the registry's authority constructor that refuses on it, and that refusal is the one that
+  // explains what a tool write needs.
+  const toolCallId = typeof req.payload.toolCallId === "string" ? req.payload.toolCallId : "";
+  // Total by contract — it resolves to a reply for an unknown domain, bad args, or an internal
+  // error, so nothing here needs a catch of its own (dispatch's outer one stays as the backstop).
+  //
+  // `configuredToolPolicy` is what makes the human's per-tool allow/ask/deny settings load-bearing.
+  // Passing it here is the ONE wiring line the registry's policy seam was built for. Omitting it
+  // would silently fall back to `permissiveToolPolicy` — every tool allowed — which is why the
+  // default is a NAMED export rather than an inline `() => ({ tier: "allow" })`: a missing policy
+  // is visible in review instead of looking like the intended behaviour.
+  return dispatchConciergeTool(
+    { domain, op, args: req.payload.args, toolCallId },
+    { policy: configuredToolPolicy },
+  );
+}
+
 /** Did a handler's result represent a successful op? A `{ error }` reply (unknown op, thrown error)
  *  is a failure; an explicit `{ ok }` reply follows its flag; the read ops (get_state / get_config)
  *  carry neither field and always succeed when they return. Pure. */
@@ -514,9 +703,9 @@ function reportControlOpSuccess(req: ControlRequest, result: unknown): void {
   const callerKind = findAgent(req.callerAgentId)?.agent.kind;
   // For per-agent ops the target may be a different agent; for the rest the op targets the app, so
   // there's no distinct target — mirror the caller kind (never anything identifying).
-  const targetKind = PER_AGENT_OPS.has(op)
-    ? findAgent(resolveTargetId(req))?.agent.kind
-    : callerKind;
+  const targetId = resolveTargetId(req);
+  const targetKind =
+    PER_AGENT_OPS.has(op) ? (targetId ? findAgent(targetId)?.agent.kind : undefined) : callerKind;
   reportControlOp(op, callerKind, targetKind);
 }
 
@@ -535,6 +724,55 @@ async function dispatch(req: ControlRequest): Promise<void> {
         error: `${req.op} is only permitted for interactive (non-worker) agents`,
       });
       return;
+    }
+    // SECOND GATE, CONCIERGE ONLY (roborev 54226, finding 1). The tier check above admits the
+    // concierge outright, which is right for every other caller that clears it — an interactive
+    // agent's input is the human's own typing. The concierge's is not: each turn's prompt is a
+    // snapshot of live agent and TERMINAL output, text this app did not author. Leaving these ops
+    // ungated therefore makes `set_config` a prompt-injection path into machine-wide configuration.
+    //
+    // `concierge_tool` is exempt because its own handler applies the SAME policy to the inner
+    // { domain, op } — the thing that actually needs gating. Applying it here as well would judge
+    // the outer wrapper name, which no policy entry describes, and deny everything.
+    if (
+      req.callerAgentId === CONCIERGE_CALLER_AGENT_ID &&
+      !CONCIERGE_EXEMPT_OPS.has(req.op as ControlOp)
+    ) {
+      // `reqId` is the approval's handle, and it has to be one the MODEL cannot choose: Rust mints
+      // it as a fresh 32-hex token per round trip (bridge.rs `generate_token`), exactly as the MCP
+      // server mints `toolCallId` for the concierge_tool path. Passing the payload alongside is what
+      // scopes the human's answer to THIS call — approving one `set_config` write must not approve
+      // the next one.
+      const decision = appOpPolicy(req.op, { requestId: req.reqId, args: req.payload });
+      if (decision.tier === "deny") {
+        // Distinguish "the human switched this off" from "nobody classified this op" — the second
+        // is a BUG, and blaming a Settings toggle the human never touched sends them hunting for a
+        // row that isn't there (roborev 54255, finding 3).
+        const known = APP_TOOL_NAMES.includes(req.op as AppToolName);
+        await respond(req.reqId, {
+          ok: false,
+          // Three different refusals wear the `deny` tier, and telling a human the wrong one sends
+          // them hunting for a Settings row that isn't there:
+          //   - a HELD verdict carries its own reason (config not read yet — transient, retry);
+          //   - an op nobody classified is a BUG, and says so rather than blaming the human;
+          //   - anything else really is a switch they threw, so name the exact config path.
+          error: decision.reason
+            ? `${req.op}: ${decision.reason}`
+            : known
+              ? `${req.op} is turned off for the concierge in Settings → Concierge tools (${conciergeToolConfigPath(req.op)}).`
+              : `${req.op} has no concierge policy entry, so it is refused. This is a bug — the op needs classifying in conciergeTools/policy.ts.`,
+        });
+        return;
+      }
+      if (decision.tier === "ask" && decision.approvedByUser !== true) {
+        // Say what is pending, say how to retry, and name the setting. The call is NOT held open —
+        // see policyBinding's header for why a concierge turn cannot wait on a human.
+        await respond(req.reqId, {
+          ok: false,
+          error: `${req.op} needs your go-ahead. I've put an approval request in your Sparkle column — approve it there and then tell me to go ahead, and I'll run it. To stop being asked each time, set ${conciergeToolConfigPath(req.op)} to "Allow" in Settings → Concierge tools.`,
+        });
+        return;
+      }
     }
     let result: unknown;
     switch (req.op) {
@@ -573,6 +811,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "navigate":
         result = handleNavigate(req);
+        break;
+      case "concierge_tool":
+        result = await handleConciergeTool(req);
         break;
       default:
         result = { error: `unknown op ${req.op}` };

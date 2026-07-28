@@ -14,6 +14,12 @@ import type { DigestVariant } from "../../services/conciergeDigest";
 // attachments.ts) — a pure, React-free, Tauri-free model, so importing it here does not break this
 // directory's "presentational only" rule, and it keeps the concierge off a parallel model.
 import type { Attachment } from "../composer/attachments";
+// The header line's per-project shape lives with the component that DERIVES it (ScopeVitals owns
+// the pure text rules the founder's strings are pinned against), and is re-exported here so the
+// column's contract still hands consumers one place to import from.
+import type { ProjectNeedsYou } from "./ScopeVitals";
+
+export type { ProjectNeedsYou };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
 // than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
@@ -73,6 +79,17 @@ export interface ConciergeSparkleMessage {
   id: string;
   kind: "sparkle";
   text: string;
+  /** True when the brain authored this WITHOUT a user message behind it — the proactive push
+   *  channel (services/conciergeProactive). An ordinary reply leaves it unset. */
+  proactive?: boolean;
+  /** The SURFACED-state digest this message was authored against (`surfacedDigest` — the ids and
+   *  statuses of the agents it actually names, not every in-scope agent). Only a
+   *  push carries one, and it is what makes {@link stale} decidable: a thread entry is append-only,
+   *  so without it "You have 3 P1s" keeps asserting a resolved count forever (PRD §2a, Staleness). */
+  digest?: string;
+  /** True once {@link digest} no longer matches the live state. The thread renders it visibly
+   *  superseded — a push that is no longer true must LOOK no longer true, not silently lie. */
+  stale?: boolean;
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */
@@ -161,11 +178,17 @@ export interface ConciergeReceipt {
 
 /** Everything the column renders, supplied by the integration layer. */
 export interface ConciergeViewModel {
-  /** Pinned → "Pinned to <name>" in gold; absent → "Following all projects". */
+  /** Pinned → "Pinned to <name>" in gold; absent → "All projects". Hand it the FULL folder name:
+   *  the header spends its own width budget on it (ScopeVitals `shortProjectName`) and keeps the
+   *  whole thing on hover, so truncating here would only lose the recoverable half. */
   scope: { pinnedProjectName?: string };
-  /** In-scope per-band counts. Nothing needing you and nothing running renders "all calm" —
-   *  see ScopeVitals.vitalsParts for why `done` is not a vital sign. */
+  /** In-scope per-band counts. The header states only `needs_you` (nothing → "all calm") — see
+   *  ScopeVitals' header for why `running` and `done` are carried but not printed. */
   vitals: Record<StatusBand, number>;
+  /** The per-project split of `vitals.needs_you`, worst project first once rendered. Column one is
+   *  the GLOBAL index (PRD §2a, answered 2026-07-28), so its one line reads across projects while
+   *  column two stays scoped to the selected one. Absent → the line states the undivided total. */
+  needsYouByProject?: ProjectNeedsYou[];
   /** The thread, oldest first. Nudges are messages of kind "nudge". */
   messages: ConciergeMessage[];
   /** True while Sparkle is composing a reply — renders the typing indicator row. */
@@ -197,6 +220,11 @@ export interface ConciergeController {
   /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
    *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
   onDigestClick?(digest: ConciergeDigestMessage): void;
+  /** A header segment naming ANOTHER project was clicked ("1 in mobile"): switch to that project.
+   *  Switch ONLY — no agent is named by a count, so nothing may be selected on its behalf. Bead
+   *  `sparkle-vohh` fixed the mirror-image bug (a nudge selected an agent without switching
+   *  project); this must not reintroduce its other half. */
+  onProjectClick?(projectId: string): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
@@ -236,6 +264,18 @@ export interface ConciergeColumnProps {
    *  It must NOT contain a live region: the countdown is announced through `announcement` above,
    *  and a second `aria-live` node would make a screen reader read every send twice. */
   countdownSlot?: ReactNode;
+  /** Concierge tool calls waiting on the human's yes or no
+   *  (components/Concierge/ConciergeApprovals), rendered directly above the countdown banner.
+   *
+   *  A SLOT for the same reason `countdownSlot` is one: the prompt subscribes to the pending-
+   *  approval ledger (stores/conciergeApprovals) and this column renders nothing it isn't handed.
+   *  It sits ABOVE the countdown because the two answer different questions — "may I do this at
+   *  all?" comes before "this is about to go out" — and because an unanswered approval is the one
+   *  thing in the column that has stopped a tool call dead.
+   *
+   *  Like the countdown it must carry NO live region of its own: `announcement` above is the
+   *  column's only one, and a second `aria-live` node would double-announce. */
+  approvalSlot?: ReactNode;
 }
 
 /** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists

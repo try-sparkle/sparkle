@@ -346,11 +346,13 @@ describe("createHookEventHandler", () => {
     const engine = new HookStatusEngine({ agentId: "a1", onStatus });
     const activate = vi.fn();
     const captureHistory = vi.fn();
+    const noteTranscript = vi.fn();
     return {
       onStatus,
       activate,
       captureHistory,
-      handle: createHookEventHandler({ engine, activate, captureHistory }),
+      noteTranscript,
+      handle: createHookEventHandler({ engine, activate, captureHistory, noteTranscript }),
     };
   };
 
@@ -359,6 +361,7 @@ describe("createHookEventHandler", () => {
     h.handle({ event: "UserPromptSubmit", session_id: "main" });
     expect(h.activate).toHaveBeenCalledTimes(1);
     expect(h.captureHistory).toHaveBeenCalledTimes(1);
+    expect(h.noteTranscript).toHaveBeenCalledTimes(1);
     expect(h.onStatus).toHaveBeenLastCalledWith("working");
   });
 
@@ -374,9 +377,12 @@ describe("createHookEventHandler", () => {
       engine,
       activate: () => order.push("activate"),
       captureHistory: () => order.push("capture"),
+      noteTranscript: () => order.push("transcript"),
     });
     handle({ event: "UserPromptSubmit", session_id: "main" });
-    expect(order).toEqual(["activate", "status", "capture"]);
+    // `transcript` before `capture`: captureHistory reads useHistoryStore.getState() inside its own
+    // error-swallowing try, and a throw there must not cost the concierge its transcript path.
+    expect(order).toEqual(["activate", "status", "transcript", "capture"]);
   });
 
   it("a background session's event drives NOTHING — not even liveness", () => {
@@ -387,13 +393,33 @@ describe("createHookEventHandler", () => {
     h.handle({ event: "UserPromptSubmit", session_id: "main" }); // adopts the lock
     h.activate.mockClear();
     h.captureHistory.mockClear();
+    h.noteTranscript.mockClear();
     h.onStatus.mockClear();
 
     h.handle({ event: "Stop", session_id: "bg" });
     h.handle({ event: "PreToolUse", session_id: "bg", tool: "Bash" });
     expect(h.activate).not.toHaveBeenCalled();
     expect(h.captureHistory).not.toHaveBeenCalled();
+    // The transcript registry especially: a background session's path registered against this agent
+    // would point the concierge's tier (d) at ANOTHER session's words and narrate them as this
+    // agent's, with full confidence. That Stop above carries exactly such a path in the wild.
+    expect(h.noteTranscript).not.toHaveBeenCalled();
     expect(h.onStatus).not.toHaveBeenCalled();
+  });
+
+  // Tier (d) of the concierge's terminal read chain begins here. A Stop event is the only place a
+  // session transcript path is ever known, so this hand-off is the difference between a four-tier
+  // read chain and a three-tier one — and it is a REQUIRED dep precisely so it cannot be dropped
+  // silently. The event must arrive verbatim: the consumer keys the registry off `transcriptPath`.
+  it("hands the Stop event to the transcript registry verbatim", () => {
+    const h = mk();
+    const stop = {
+      event: "Stop" as const,
+      session_id: "main",
+      transcriptPath: "/tmp/session.jsonl",
+    };
+    h.handle(stop);
+    expect(h.noteTranscript).toHaveBeenCalledWith(stop);
   });
 
   it("locks onto the first event's session, so a later foreign event is rejected", () => {

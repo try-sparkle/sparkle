@@ -21,7 +21,16 @@ import { SparkleWordmark } from "./SparkleWordmark";
  * swallowed promise. `href` stays on the element regardless — it is what makes this a link to
  * assistive tech, and what puts the target in the status bar on hover.
  */
-export function SparkleLogoLink({ height = 25 }: { height?: number }) {
+export function SparkleLogoLink({
+  height = 25,
+  /** Passed straight through to the mark — the concierge header hands it `GOLD_SHEEN`. The link
+   *  itself has no opinion about paint; forwarding is what keeps the header from having to reach
+   *  past this component to `SparkleWordmark` and rebuild the anchor around it. */
+  fill,
+}: {
+  height?: number;
+  fill?: string;
+}) {
   return (
     <a
       href="https://sparkle.ai"
@@ -34,7 +43,7 @@ export function SparkleLogoLink({ height = 25 }: { height?: number }) {
       }}
       style={{ display: "inline-flex", cursor: "pointer" }}
     >
-      <SparkleWordmark height={height} />
+      <SparkleWordmark height={height} {...(fill === undefined ? {} : { fill })} />
     </a>
   );
 }

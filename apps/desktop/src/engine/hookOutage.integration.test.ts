@@ -60,6 +60,7 @@ const mkPipeline = () => {
     engine,
     activate: () => router.activate(),
     captureHistory,
+    noteTranscript: vi.fn(),
   });
   // Count DISPATCHES, not statuses — see `drained`.
   let dispatched = 0;

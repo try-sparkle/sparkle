@@ -37,6 +37,9 @@ export interface AiConfig {
   suggested_actions: boolean;
   /** Master switch for Sparkle Auto-Approve (nudging + auto-answering). Default true. */
   auto_approve: boolean;
+  /** The concierge column's brain + tool surface. Optional so callers guard: a Rust backend
+   *  predating it omits the field (hydrate reads `?? true`). */
+  concierge?: boolean;
 }
 /** Per-category Sparkle Auto-Approve rules. Each is `"always"` / `"never"` / null (absent = ask +
  *  nudge). Serde serializes an absent rule as null. Mirrors ApprovalsConfig in config.rs. */
@@ -51,6 +54,16 @@ export interface ApprovalsConfig {
    *  (default "ask"). Governs how the Claude Code session-resume prompt is auto-answered while
    *  [ai].auto_approve is on. Optional so callers guard: a Rust backend predating it omits it. */
   resume?: string | null;
+}
+/** The concierge's PER-TOOL autonomy policy, mirroring ConciergeConfig in config.rs.
+ *
+ *  `tools` is a free-form map of tool name → `"allow"` | `"ask"` | `"deny"`. Typed as
+ *  `Record<string, string>` rather than a union on both sides ON PURPOSE: this is a hand-edited
+ *  file, so both the keys and the values are untrusted. The narrowing lives in
+ *  services/conciergeTools/policy.ts, which is also where an absent key resolves to a default
+ *  derived from the tool's risk class — so a small file is not a small policy. */
+export interface ConciergeConfig {
+  tools: Record<string, string>;
 }
 /** Opinionated non-AI tools (machine-wide; ignored in a per-project file). Each defaults on for a
  *  new install; false means that tool is used nowhere in Sparkle. Surfaced in the "Tools" pane. */
@@ -153,6 +166,11 @@ export interface SparkleConfig {
   /** Per-category Sparkle Auto-Approve rules. Optional so callers guard: an older Rust backend
    *  (predating [approvals]) omits it; the current backend always sends it. */
   approvals?: ApprovalsConfig;
+  /** The concierge's per-tool autonomy policy. Optional for the same back-compat reason as
+   *  `tools?`/`roborev?` above: a payload from a Rust backend predating [concierge] omits it.
+   *  An absent section means "no explicit rules", which is a perfectly good state — every tool
+   *  then sits on the default derived from its risk class. */
+  concierge?: ConciergeConfig;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */

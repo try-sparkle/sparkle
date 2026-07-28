@@ -1,0 +1,485 @@
+// THE PROACTIVE PUSH CHANNEL — the trigger, the cost controls, and the staleness rule
+// (PRD/sparkle/concierge-proactive-push.md; the gap is recorded in PRD/sparkle/concierge-mode.md §2a).
+//
+// §2a records this as a BLOCKING architectural gap, not a feature: "the brain has no channel to
+// author a proactive thread message. Today nudges are derived frontend-side … while concierge.rs /
+// services/concierge.ts only run a turn in response to onSend. 'Aggregation belongs to the brain' is
+// therefore not buildable as written." The founder's goal (2026-07-27) is that column one tells him
+// when agents need something instead of him polling the columns.
+//
+// This module is the TRIGGER half. The transport half is `concierge_proactive_turn` in
+// src-tauri/src/concierge.rs, which reuses the existing delta/done/error stream under the same
+// monotonic turn token — there is no second event channel. The MOUNT is in
+// components/ConciergeHost: it feeds this scheduler the roster, records each push's digest against
+// its turn id, renders the reply as a push rather than a reply, and runs `markStaleProactive` on
+// every tick. All three halves have to ship together — a trigger with no mount spends nothing, and
+// a transport with no mount produces an unretractable "You have 3 P1s" (roborev 54166-M5).
+//
+// PURE CORE, INJECTED EDGES. `significantDigest` / `accountedNeedsYou` / `buildProactivePrompt` /
+// `markStaleProactive` are data-in-data-out, and the scheduler takes its clock, its timers and its
+// "start a turn" effect as dependencies — so every rate-limiting rule below is tested as arithmetic
+// rather than by waiting two real minutes.
+//
+// WHY A DIGEST AND NOT A TICK. The Rust roster aggregator broadcasts `roster://changed` on every
+// window publish — every 250ms in practice (useRosterPublisher). Running a Claude turn on that is
+// ~14,400 turns an hour. So the scheduler fires on a CHANGE in a small digest of the state that
+// actually matters, never on a tick, and never on movement that is only a timestamp.
+import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
+import type { ConciergeMessage } from "../components/Concierge/types";
+import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
+
+/**
+ * How long a change is allowed to settle before the brain speaks about it.
+ *
+ * COALESCING, NOT DEBOUNCING, and the difference is load-bearing on a busy fleet. A true debounce
+ * restarts its wait on every new change, so a fleet whose digest moves every couple of seconds —
+ * i.e. exactly the fleet worth talking about — would never reach a quiet moment and the founder
+ * would never hear anything. This window instead opens at the FIRST change and closes on schedule,
+ * carrying whatever the state has become by then: at most this long after something starts needing
+ * him, he is told, and he is told about the latest state rather than the one that opened the window.
+ */
+export const PROACTIVE_COALESCE_MS = 4_000;
+
+/** The floor between two proactive turns. Nothing the concierge could say is worth interrupting for
+ *  twice inside this, and every turn is real money and real context. */
+export const PROACTIVE_MIN_INTERVAL_MS = 2 * 60_000;
+
+/** The hard ceiling: at most this many proactive turns in any rolling hour, whatever happens.
+ *  Six is roughly "once every ten minutes at worst" — a chief of staff, not a pager. */
+export const PROACTIVE_MAX_PER_HOUR = 6;
+
+/** The window {@link PROACTIVE_MAX_PER_HOUR} is counted over. */
+const HOUR_MS = 60 * 60_000;
+
+/** Why a change did NOT buy a turn. Counted, because "how much did the concierge decide not to
+ *  spend" is as much a part of the cost story as what it did spend.
+ *
+ *  `same-surface` is churn the push could not have mentioned; `declined` is a turn that was asked
+ *  for and never ran (the user owns the conversation, or the bridge failed) — the one reason that
+ *  leaves the change still owed to the founder rather than settled. */
+export type ProactiveSkipReason =
+  | "unchanged"
+  | "same-surface"
+  | "calm"
+  | "min-interval"
+  | "hourly-cap"
+  | "declined";
+
+export interface ProactiveStats {
+  /** Turns actually started. */
+  fired: number;
+  skipped: Record<ProactiveSkipReason, number>;
+}
+
+/** The edges: a clock, a timer, and the effect that actually spends money. */
+export interface ProactiveDeps {
+  now(): number;
+  setTimer(fn: () => void, ms: number): number;
+  clearTimer(handle: number): void;
+  /**
+   * Start one proactive turn. `digest` is the state it is being authored against — the caller
+   * records it against the turn id so the resulting message can be marked stale later.
+   *
+   * RETURNS WHETHER A TURN ACTUALLY STARTED, and that answer is load-bearing (roborev 54166-M2).
+   * `concierge_proactive_turn` stands down for any user turn — in flight or merely preparing — and
+   * the frontend transport resolves null on every other failure too. This channel exists to report
+   * a change the founder is not looking at; if "asked" counted as "delivered", the expected outcome
+   * of a push landing while he is typing would be the change being swallowed forever (the baseline
+   * moves, the message never arrives) AND one of the six hourly slots being spent on nothing.
+   *
+   * `boolean | Promise<boolean>` rather than plain `Promise<boolean>` so a synchronous edge settles
+   * synchronously — the scheduler is otherwise perfectly deterministic, and a mandatory microtask
+   * would make every caller's ordering depend on the event loop.
+   */
+  startTurn(prompt: string, digest: string): boolean | Promise<boolean>;
+}
+
+export interface ProactiveScheduler {
+  /** Feed one roster observation in. Cheap: the common case is a string compare. */
+  observe(feed: ConciergeFeed): void;
+  /** Stop scheduling and drop any armed timer. */
+  dispose(): void;
+  stats(): ProactiveStats;
+}
+
+/** Every agent in the feed, across projects. */
+function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
+  return feed.projects.flatMap((p) => p.agents);
+}
+
+/**
+ * The surfacing gate — in scope (per the pin), not muted, not already spoken for by an ancestor's
+ * row, and in the `needs_you` band.
+ *
+ * THE SAME POPULATION `ConciergeHost.accountedAgents` renders, and the host now delegates here so
+ * there is exactly one implementation. Two copies would drift, and the drift would be visible: the
+ * brain would announce a count the column does not show.
+ */
+export function accountedNeedsYou(feed: ConciergeFeed): ConciergeAgent[] {
+  return allAgents(feed).filter(
+    (a) => a.inScope && !a.muted && !a.representedElsewhere && a.band === "needs_you",
+  );
+}
+
+/**
+ * A small, stable fingerprint of the state worth interrupting a human about.
+ *
+ * WHAT IS IN IT: every in-scope, unmuted agent's id and status. Status is the right grain because
+ * every "significant" event in the brief lands on it — an agent entering or leaving `needs_you`, an
+ * agent finishing, and a stage advancing (the workflow-stage overlay is what produces `unmerged`;
+ * the concierge never sees a separate stage field — see conciergeFeed.publishedStatusFor).
+ *
+ * WHAT IS DELIBERATELY OUT: `since` (the user's last touch, which moves on every interaction),
+ * display names, ordering, and muted/out-of-scope agents. Those are the churn — they move on most
+ * roster ticks and mean nothing to a person, and including any of them would make every tick a
+ * "change" and defeat the whole gate.
+ *
+ * Sorted, so a reshuffled roster is not a change.
+ */
+export function significantDigest(feed: ConciergeFeed): string {
+  return allAgents(feed)
+    .filter((a) => a.inScope && !a.muted)
+    .map((a) => `${a.id}=${a.status}`)
+    .sort()
+    .join(";");
+}
+
+/**
+ * The fingerprint of what a push actually SAYS — {@link accountedNeedsYou}'s ids and statuses.
+ *
+ * TWO JOBS, and they are the same question asked twice (roborev 54166-M4):
+ *
+ *   1. THE FIRE GATE. {@link significantDigest} covers every in-scope agent, but the prompt only
+ *      ever describes the surfaced `needs_you` set — so a running worker moving `working` → `idle`,
+ *      or a rolled-up worker changing state, was a digest change with a non-empty needs-you set and
+ *      therefore bought a turn whose text was word-for-word the previous one. The rate limits
+ *      bounded that at six identical messages an hour rather than preventing it, and a notifier
+ *      that repeats itself gets muted — which costs the whole feature, not just the repeat.
+ *   2. STALENESS. It is what a push carries, so {@link markStaleProactive} marks a message
+ *      superseded exactly when the sentence it asserted stops holding — not when some agent it
+ *      never mentioned twitched. Scored against `significantDigest`, a true message was struck
+ *      through by unrelated churn on the next roster tick.
+ *
+ * `significantDigest` stays as the cheap pre-filter: it is one string compare on the hot path and
+ * it changes strictly more often than this does, so it settles the common "nothing at all moved"
+ * case without walking the surfacing gate.
+ *
+ * Sorted, so a reshuffled roster is not a change. Empty string means nothing needs the user.
+ */
+export function surfacedDigest(feed: ConciergeFeed): string {
+  return accountedNeedsYou(feed)
+    .map((a) => `${a.id}=${a.status}`)
+    .sort()
+    .join(";");
+}
+
+/**
+ * The prompt for a turn NOBODY ASKED FOR.
+ *
+ * Deliberately close to `ConciergeHost.buildSnapshot` in shape — same lines, same counts, same
+ * vocabulary — with one critical difference: it says outright that there is no question to answer.
+ * Handed the send-shaped prompt, the brain reliably answers the last thing the user said, because
+ * `--resume` means it can still see it.
+ */
+export function buildProactivePrompt(feed: ConciergeFeed): string {
+  const surfaced = accountedNeedsYou(feed);
+  const lines = surfaced.map(
+    (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (${bandLabel(a.band)})`,
+  );
+  const projects = new Set(surfaced.map((a) => a.projectId)).size;
+  return [
+    // COUNTED FROM THE LINES, not from `feed.scopedCounts.needs_you` (roborev 54166-M1). The two
+    // are different populations: the scoped count includes agents rolled up into an ancestor's row
+    // (`representedElsewhere`), which the surfacing gate excludes and the lines below therefore
+    // never mention. Handed the wider number the brain states a count column one does not show —
+    // "3 need you" over two visible items, with no way for the founder to find the third. This is
+    // a turn NOBODY ASKED FOR, so it has less licence to be approximately right than a reply does.
+    `${bandCountLabel("needs_you", surfaced.length)} across ${projects} project(s):`,
+    lines.join("\n"),
+    "",
+    "The user has not asked you anything. This is you speaking first, unprompted, because this " +
+      "state just changed and they are not looking at it. Say in ONE or TWO short sentences what " +
+      "needs them and what you recommend — digest it, do not enumerate every item. No greeting, no " +
+      "preamble, no offer to help; just the line.",
+  ].join("\n");
+}
+
+/**
+ * Mark every proactive message whose state no longer holds.
+ *
+ * THE PROBLEM §2a NAMES: "Today's nudge list is recomputed from the feed every render, so it
+ * self-heals. A brain-authored digest is an append-only thread entry that will still read 'You have
+ * 3 P1s' after they're resolved." A message that keeps asserting a resolved count is not merely
+ * stale, it is a lie the app is telling on its own initiative — which is worse than not having said
+ * anything.
+ *
+ * THE RULE: a push carries the digest it was authored against. When the current digest differs, the
+ * state it described no longer holds and the message is marked `stale` — the thread renders it
+ * visibly superseded rather than quietly wrong. Digest equality is the whole test, and it is
+ * deliberately strict: anything that would change the sentence (an item resolving, another arriving,
+ * a status moving) changes the digest. It also subsumes supersession — a newer push's digest is
+ * current by construction, so every older one is stale the moment it is written.
+ *
+ * A `you` bubble and an ordinary reply are never touched: a reply is an answer to a question that
+ * WAS asked, and it stays true as a record of that exchange.
+ *
+ * Returns the INPUT ARRAY UNCHANGED when nothing needed marking (the overwhelmingly common case).
+ * Bubbles are memoized on identity, so rebuilding the array on every roster tick would re-render the
+ * whole thread — the same rule `boundLiveThumbnails` follows in conciergeThreadStore.
+ */
+export function markStaleProactive(
+  chat: ConciergeMessage[],
+  currentDigest: string,
+): ConciergeMessage[] {
+  let out: ConciergeMessage[] | null = null;
+  for (let i = 0; i < chat.length; i++) {
+    const m = chat[i]!;
+    if (m.kind !== "sparkle" || !m.proactive || m.stale) continue;
+    if (m.digest === currentDigest) continue;
+    out ??= chat.slice();
+    out[i] = { ...m, stale: true };
+  }
+  return out ?? chat;
+}
+
+/** When a pending change may fire, and what is holding it. */
+interface Due {
+  at: number;
+  /** The binding constraint. "coalesce" is the ordinary settling window, not a refusal to spend. */
+  reason: "coalesce" | "min-interval" | "hourly-cap";
+}
+
+/**
+ * The trigger.
+ *
+ * SEEDS, THEN FIRES ON CHANGES. The first observation establishes the baseline and spends nothing.
+ * That is deliberate: at mount the column is ALREADY rendering the current state (the nudge cards
+ * and digest lines are derived from the feed and self-heal), so a turn to re-narrate the status quo
+ * would be pure cost on every app launch — and launch is exactly when a fleet looks busiest. The
+ * channel exists to report what changed while the founder wasn't looking.
+ *
+ * SAYS NOTHING ABOUT GOING CALM. A change that leaves nothing needing the user is real, but a turn
+ * spent to say "all clear" is money spent to say nothing — and the message that claimed otherwise is
+ * already handled, for free, by {@link markStaleProactive}.
+ */
+export function createProactiveScheduler(deps: ProactiveDeps): ProactiveScheduler {
+  /** The digest we last seeded or spoke about. */
+  let baseline: string | null = null;
+  /** The SURFACED projection of that same moment — what a push would actually have said about it.
+   *  Kept beside `baseline` because the two answer different questions: `baseline` settles "did
+   *  anything move at all", this settles "would the sentence be any different". */
+  let baselineSurfaced: string | null = null;
+  let pendingFeed: ConciergeFeed | null = null;
+  let pendingDigest: string | null = null;
+  let pendingSurfaced: string | null = null;
+  /** When the change now pending FIRST appeared — the coalescing window's origin. */
+  let pendingSince: number | null = null;
+  /** Limiter reasons already counted for the pending change, so a change held for two minutes
+   *  doesn't count one skip per roster tick. */
+  let counted = new Set<ProactiveSkipReason>();
+  /** Epoch ms of each turn the founder ACTUALLY GOT, pruned to the last hour. Drives the hourly
+   *  cap, which is a budget for delivered messages — a declined push must not consume one. */
+  let firedAt: number[] = [];
+  /** Epoch ms of the last turn we ASKED for, delivered or not. Drives the minimum interval, which
+   *  is a floor on attempts rather than on deliveries: without it a standing refusal (the user
+   *  holding the conversation) would retry once per coalescing window forever. */
+  let lastAttemptAt: number | null = null;
+  /** A turn is out at the transport and has not reported back. Nothing else may fire until it
+   *  does, or a slow bridge would let one change become several turns. */
+  let inFlight = false;
+  let timer: number | null = null;
+  let disposed = false;
+  const stats: ProactiveStats = {
+    fired: 0,
+    skipped: {
+      unchanged: 0,
+      "same-surface": 0,
+      calm: 0,
+      "min-interval": 0,
+      "hourly-cap": 0,
+      declined: 0,
+    },
+  };
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      deps.clearTimer(timer);
+      timer = null;
+    }
+  };
+
+  const dropPending = () => {
+    pendingFeed = null;
+    pendingDigest = null;
+    pendingSurfaced = null;
+    pendingSince = null;
+    counted = new Set();
+    clearTimer();
+  };
+
+  const prune = (now: number) => {
+    firedAt = firedAt.filter((t) => t > now - HOUR_MS);
+  };
+
+  /** The earliest moment the pending change may become a turn, and what is holding it back. */
+  const dueAt = (now: number): Due => {
+    let due: Due = { at: (pendingSince ?? now) + PROACTIVE_COALESCE_MS, reason: "coalesce" };
+    // ATTEMPTS, not deliveries — see `lastAttemptAt`.
+    const last = lastAttemptAt;
+    if (last !== null && last + PROACTIVE_MIN_INTERVAL_MS > due.at) {
+      due = { at: last + PROACTIVE_MIN_INTERVAL_MS, reason: "min-interval" };
+    }
+    if (firedAt.length >= PROACTIVE_MAX_PER_HOUR) {
+      // The oldest turn inside the cap has to age out of the hour before another may run.
+      const releases = firedAt[firedAt.length - PROACTIVE_MAX_PER_HOUR]! + HOUR_MS;
+      if (releases > due.at) due = { at: releases, reason: "hourly-cap" };
+    }
+    return due;
+  };
+
+  /**
+   * Ask for a turn, and commit NOTHING until the transport says one actually started.
+   *
+   * The split matters (roborev 54166-M2). Committing up front — advancing the baseline, spending an
+   * hourly slot, counting a delivery — was right only if every ask became a message, and the
+   * commonest non-delivery is the channel working exactly as designed: the push stands down because
+   * the user owns the conversation. Under the old order that outcome moved the baseline past the
+   * very change the channel exists to report, so the founder was never told about it and never
+   * would be, while the turn he did not receive still ate one of six slots for the hour.
+   *
+   * What IS committed immediately is `lastAttemptAt`, because the two-minute floor has to bind on
+   * asks. A refusal that stays refused for an hour must cost one attempt per floor, not one per
+   * four-second coalescing window.
+   */
+  const fire = (now: number) => {
+    const feed = pendingFeed;
+    const digest = pendingDigest;
+    const surfaced = pendingSurfaced;
+    if (!feed || digest === null || surfaced === null) return;
+    const prompt = buildProactivePrompt(feed);
+    lastAttemptAt = now;
+    dropPending();
+
+    let settled = false;
+    const settle = (delivered: boolean) => {
+      if (settled) return; // a transport that both resolves and throws must not double-count
+      settled = true;
+      inFlight = false;
+      if (disposed) return;
+      if (delivered) {
+        baseline = digest;
+        baselineSurfaced = surfaced;
+        firedAt.push(now);
+        stats.fired++;
+      } else {
+        stats.skipped.declined++;
+        // The change is still OWED. Re-pend it — unless a newer observation already did, in which
+        // case that one supersedes this and the baseline (deliberately not advanced) still differs
+        // from it. `pendingSince = now` puts the re-armed attempt behind the min-interval floor.
+        if (pendingSince === null) {
+          pendingFeed = feed;
+          pendingDigest = digest;
+          pendingSurfaced = surfaced;
+          pendingSince = deps.now();
+          counted = new Set();
+        }
+      }
+      arm();
+    };
+
+    // The SURFACED digest travels with the turn, not the significant one: it is what the message
+    // asserts, and therefore the only thing `markStaleProactive` can honestly score it against.
+    const outcome = deps.startTurn(prompt, surfaced);
+    if (typeof outcome === "boolean") {
+      settle(outcome);
+      return;
+    }
+    inFlight = true;
+    // A rejected transport is a decline, not a crash: `startProactiveConciergeTurn` never rejects,
+    // but this module must not become the place a future edge's rejection goes unhandled.
+    outcome.then(settle, () => settle(false));
+  };
+
+  /** (Re)arm the timer for whenever the pending change may fire, counting any limiter that is
+   *  holding it — once per pending change per reason. */
+  const arm = () => {
+    if (disposed || pendingSince === null) return;
+    const now = deps.now();
+    prune(now);
+    const due = dueAt(now);
+    if (due.reason !== "coalesce" && !counted.has(due.reason)) {
+      counted.add(due.reason);
+      stats.skipped[due.reason]++;
+    }
+    clearTimer();
+    timer = deps.setTimer(onTimer, Math.max(0, due.at - now));
+  };
+
+  function onTimer() {
+    timer = null;
+    if (disposed || pendingSince === null) return;
+    // A turn is still out. Don't arm a replacement here — that would busy-loop on an already-due
+    // change; `settle` re-arms once the transport reports back.
+    if (inFlight) return;
+    const now = deps.now();
+    prune(now);
+    // A limiter can have moved under us (another turn ran; the hour rolled differently than the
+    // arithmetic at arm time predicted), so the decision is re-taken here rather than trusted.
+    if (dueAt(now).at > now) {
+      arm();
+      return;
+    }
+    fire(now);
+  }
+
+  return {
+    observe(feed) {
+      if (disposed) return;
+      const digest = significantDigest(feed);
+      if (baseline === null) {
+        // Seed only — see the doc above.
+        baseline = digest;
+        baselineSurfaced = surfacedDigest(feed);
+        return;
+      }
+      if (digest === baseline) {
+        stats.skipped.unchanged++;
+        // The fleet flickered and settled back to the state we already spoke about (or seeded).
+        // There is nothing left to say, so a pending turn is cancelled rather than delivered late.
+        if (pendingSince !== null) dropPending();
+        return;
+      }
+      const surfaced = surfacedDigest(feed);
+      if (surfaced === "") {
+        stats.skipped.calm++;
+        // Adopt it: going calm is a real change, it just isn't one worth a turn. Adopting means a
+        // later return to a needing state is a change from THIS, and fires.
+        baseline = digest;
+        baselineSurfaced = surfaced;
+        if (pendingSince !== null) dropPending();
+        return;
+      }
+      if (surfaced === baselineSurfaced) {
+        // Something moved, but nothing the push could have MENTIONED — see `surfacedDigest`. Adopt
+        // the new significant digest so the same churn isn't re-examined on every roster tick, and
+        // say nothing: the message would have been word-for-word the last one.
+        stats.skipped["same-surface"]++;
+        baseline = digest;
+        if (pendingSince !== null) dropPending();
+        return;
+      }
+      pendingFeed = feed;
+      pendingDigest = digest;
+      pendingSurfaced = surfaced;
+      // NOT reset on each new change — that is what makes this a coalescing window rather than a
+      // debounce (see PROACTIVE_COALESCE_MS).
+      pendingSince ??= deps.now();
+      arm();
+    },
+    dispose() {
+      disposed = true;
+      dropPending();
+    },
+    stats: () => ({ fired: stats.fired, skipped: { ...stats.skipped } }),
+  };
+}

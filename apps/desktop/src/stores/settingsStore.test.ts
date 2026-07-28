@@ -54,6 +54,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
     aiComposer: true,
     aiSuggestedActions: true,
     aiAutoApprove: true,
+    aiConcierge: true,
     ...over,
   });
 
@@ -69,6 +70,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
         aiComposer: false,
         aiSuggestedActions: false,
         aiAutoApprove: false,
+        aiConcierge: false,
       }),
     ).toBe("off");
   });
@@ -83,6 +85,7 @@ describe("aiFeatureMode — derived All/Some/Off", () => {
         aiComposer: false,
         aiSuggestedActions: false,
         aiAutoApprove: false,
+        aiConcierge: false,
       }),
     ).toBe("some");
   });
@@ -95,6 +98,7 @@ describe("suggestedActions AI flag", () => {
     aiComposer: true,
     aiSuggestedActions: true,
     aiAutoApprove: true,
+    aiConcierge: true,
   };
 
   it("maps the menu key to its store field", () => {
@@ -162,6 +166,7 @@ describe("settingsStore — AI feature setters", () => {
     useSettingsStore.getState().setAiFeature("composer", true);
     useSettingsStore.getState().setAiFeature("suggestedActions", true);
     useSettingsStore.getState().setAiFeature("autoApprove", true);
+    useSettingsStore.getState().setAiFeature("concierge", true);
     const s = useSettingsStore.getState();
     expect([
       s.aiAutoRename,
@@ -169,7 +174,8 @@ describe("settingsStore — AI feature setters", () => {
       s.aiComposer,
       s.aiSuggestedActions,
       s.aiAutoApprove,
-    ]).toEqual([true, true, true, true, true]);
+      s.aiConcierge,
+    ]).toEqual([true, true, true, true, true, true]);
     expect(aiFeatureMode(s)).toBe("all");
   });
 });
@@ -733,6 +739,101 @@ describe("1Password env backup — config hydration", () => {
     useSettingsStore.getState().hydrateFromConfig(eff);
     expect(useSettingsStore.getState().onepasswordEnabled).toBe(false);
     expect(useSettingsStore.getState().roborevEnabled).toBe(true);
+  });
+});
+
+// The concierge's per-tool autonomy rules. The pane and the policy layer both read this mirror, so
+// what matters here is that it stays a faithful copy of `[concierge.tools]` — including values the
+// policy layer will refuse to read, which must survive rather than being cleaned up into a
+// permissive default.
+describe("[concierge.tools] mirror", () => {
+  /** A minimal-but-complete effective config, with `concierge` swapped in per case. */
+  const eff = (concierge?: { tools: Record<string, string> }) =>
+    ({
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+        },
+        workers: { max_concurrent: 5 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          composer: true,
+          suggested_actions: true,
+          auto_approve: true,
+        },
+        ...(concierge ? { concierge } : {}),
+        roborev: { consent_prompted: false },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+      },
+      warnings: [],
+    }) satisfies EffectiveConfig;
+
+  it("mirrors each tool rule verbatim", () => {
+    useSettingsStore
+      .getState()
+      .hydrateFromConfig(eff({ tools: { merge_pr: "deny", list_projects: "allow" } }));
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({
+      merge_pr: "deny",
+      list_projects: "allow",
+    });
+  });
+
+  it("reads an ABSENT [concierge] section as no rules — which is a complete policy, not a gap", () => {
+    // Every tool then sits on the default derived from its risk class, so an older backend that
+    // omits the section is governed exactly as well as a current one with an empty table.
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: { quit_app: "deny" } }));
+    useSettingsStore.getState().hydrateFromConfig(eff());
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({});
+  });
+
+  it("KEEPS a value the policy layer can't read, instead of tidying it away", () => {
+    // The policy layer reads an unrecognized rule as "ask" — stricter than the derived default.
+    // Dropping it here would silently restore `allow` on exactly the rule the user was tightening.
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: { list_projects: "dney" } }));
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({ list_projects: "dney" });
+  });
+
+  it("drops non-string values, which can never read as a rule", () => {
+    const raw = { merge_pr: true, quit_app: 3, push_agent_branch: "ask" } as unknown as Record<
+      string,
+      string
+    >;
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: raw }));
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({ push_agent_branch: "ask" });
+  });
+
+  it("setConciergeToolPolicy sets one rule and CLEARS by deleting the key", () => {
+    // Clearing must delete rather than write a "default" sentinel: the default is derived, so a
+    // frozen copy of today's value would stop tracking a future reclassification.
+    const store = () => useSettingsStore.getState();
+    // Start from a known table: the store is a module singleton shared with the hydrate cases above.
+    useSettingsStore.setState({ conciergeToolPolicy: {} });
+    store().setConciergeToolPolicy("merge_pr", "deny");
+    store().setConciergeToolPolicy("quit_app", "ask");
+    expect(store().conciergeToolPolicy).toEqual({ merge_pr: "deny", quit_app: "ask" });
+    store().setConciergeToolPolicy("merge_pr", null);
+    expect(store().conciergeToolPolicy).toEqual({ quit_app: "ask" });
+    expect("merge_pr" in store().conciergeToolPolicy).toBe(false);
   });
 });
 

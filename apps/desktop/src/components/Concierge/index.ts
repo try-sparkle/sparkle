@@ -8,6 +8,10 @@ export { CommandPalette, PaletteTrigger } from "./CommandPalette";
 export { useCommandPalette, isPaletteShortcut } from "./useCommandPalette";
 export type { CommandPaletteController } from "./useCommandPalette";
 export { ConciergeTopRight, KebabMenu } from "./KebabMenu";
+// The pending tool-approval prompt (the column's `approvalSlot`) and the presentational card it
+// renders — the card is exported too because it is independently useful in a test or a story.
+export { ConciergeApprovals } from "./ConciergeApprovals";
+export { ApprovalPrompt } from "./ApprovalPrompt";
 export type {
   Attachment,
   ConciergeAnnouncement,

@@ -27,6 +27,7 @@ const FEATURES: Array<{ key: AiFeatureKey; label: string }> = [
   { key: "composer", label: "Use AI-enhanced composer" },
   { key: "suggestedActions", label: "Suggested actions" },
   { key: "autoApprove", label: "Auto-answer Claude Code permission prompts (uncheck to be asked each time)" },
+  { key: "concierge", label: "Let the concierge column think and act for you" },
 ];
 
 const row: CSSProperties = { display: "flex", alignItems: "center", gap: 6 };
@@ -131,6 +132,7 @@ export function AiFeaturesMenu() {
   const aiComposer = useSettingsStore((s) => s.aiComposer);
   const aiSuggestedActions = useSettingsStore((s) => s.aiSuggestedActions);
   const aiAutoApprove = useSettingsStore((s) => s.aiAutoApprove);
+  const aiConcierge = useSettingsStore((s) => s.aiConcierge);
 
   const flags = {
     aiAutoRename,
@@ -138,6 +140,7 @@ export function AiFeaturesMenu() {
     aiComposer,
     aiSuggestedActions,
     aiAutoApprove,
+    aiConcierge,
   };
   const mode = aiFeatureMode(flags);
   const valueByKey: Record<AiFeatureKey, boolean> = {
@@ -146,6 +149,7 @@ export function AiFeaturesMenu() {
     composer: aiComposer,
     suggestedActions: aiSuggestedActions,
     autoApprove: aiAutoApprove,
+    concierge: aiConcierge,
   };
 
   return (

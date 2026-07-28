@@ -98,6 +98,12 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   SUPERSEDED_DETAILS: (await importOriginal<Concierge>()).SUPERSEDED_DETAILS,
   isSupersededDetail: (await importOriginal<Concierge>()).isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,
+  // The PROACTIVE push channel the host mounts. Stubbed to "the transport stood down", which is
+  // both the cheapest answer and a real production outcome (the user owns the conversation), so
+  // none of the cases below spend a turn they did not ask for. Its own wiring is covered in
+  // ConciergeHost.proactive.test.tsx.
+  startProactiveConciergeTurn: vi.fn(async (): Promise<string | null> => null),
+  isProactiveTurn: () => false,
   onConciergeDelta: (cb: (e: { id: string; text: string }) => void) => {
     h.brain.delta = cb;
     return () => {};
@@ -216,6 +222,13 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // installed later never sees these lines — a row asserting on one would pass against silent code.
 import { log } from "../logger";
 import type { Project } from "../types";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
 
@@ -247,7 +260,9 @@ function feedWith(status: string, band: StatusBand = "needs_you", statusLabel = 
   };
   const counts = { needs_you: 0, running: 0, done: 0, [band]: 1 };
   return {
-    projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents: [agent] }],
+    projects: [
+      { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents: [agent] },
+    ],
     counts,
     scopedCounts: counts,
     pinnedProjectId: null,
@@ -1601,7 +1616,9 @@ describe("ConciergeHost — digest instead of a card wall", () => {
     }));
     const counts: Record<StatusBand, number> = { ...EMPTY_COUNTS, needs_you: n };
     return {
-      projects: [{ id: "p1", name: "sparkle-desktop", inScope: true, counts, agents }],
+      projects: [
+        { id: "p1", name: "sparkle-desktop", inScope: true, counts, scopedCounts: counts, agents },
+      ],
       counts,
       scopedCounts: counts,
       pinnedProjectId: null,
@@ -1856,7 +1873,9 @@ describe("ConciergeHost — Away → Here recap", () => {
     ];
     const counts = { needs_you: 0, running: 0, done: 0 };
     return {
-      projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents }],
+      projects: [
+        { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents },
+      ],
       counts, scopedCounts: counts, pinnedProjectId: null,
     };
   };
@@ -1980,7 +1999,9 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     }));
     const counts = { needs_you: agents.length, running: 0, done: 0 };
     return {
-      projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents }],
+      projects: [
+        { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents },
+      ],
       counts,
       scopedCounts: counts,
       pinnedProjectId: null,

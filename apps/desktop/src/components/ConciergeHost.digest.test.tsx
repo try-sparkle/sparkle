@@ -22,6 +22,13 @@ import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 /** A feed with `n` agents of one band in one project — >= 2 is what collapses them into a digest. */
 function feedOf(n: number, band: StatusBand = "needs_you", projectName = "sparkle-desktop") {
@@ -51,7 +58,9 @@ function feedOf(n: number, band: StatusBand = "needs_you", projectName = "sparkl
   }));
   const counts = { needs_you: 0, running: 0, done: 0, [band]: n };
   return {
-    projects: [{ id: "p1", name: projectName, inScope: true, counts, agents }],
+    projects: [
+      { id: "p1", name: projectName, inScope: true, counts, scopedCounts: counts, agents },
+    ],
     counts,
     scopedCounts: counts,
     pinnedProjectId: null,

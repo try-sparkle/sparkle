@@ -37,10 +37,33 @@ const LOGO_ASPECT = 850.23 / 188.31;
 /** The wordmark asset, used as an alpha MASK rather than painted. See the note above. */
 export const LOGO_SRC = "/sparkle-logo.svg";
 
+/**
+ * A GOLD SHEEN — a single specular glint sweeping the letters, for callers that want the mark to
+ * carry more of the app's gradient wordmark treatment than a flat fill does (founder, 2026-07-27:
+ * "make the logo sparklier", kept elegant). The concierge header uses it; the capture takeover and
+ * the default stay flat.
+ *
+ * A GRADIENT works here for free: the mask is what cuts the letterforms, and `background` behind it
+ * can be any paint — which is exactly why `fill` is a string rather than a color type.
+ *
+ * WHY GOLD AND NOT THE ASSET'S CYAN. The shipped SVG's own cyan→blue gradient is the thing this
+ * component exists to NOT paint (see the note above); reintroducing it as a "sparklier" fill would
+ * undo that decision by the back door. So the sheen is built from the two THEMED gold tokens, and
+ * the highlight stop is `goldHotInk`, which moves AWAY from the surface in both themes — lighter
+ * than `goldInk` on dark, darker on light (see theme/colors) — so no stop can land closer to the
+ * plane than the flat fill chromeContrast.test.ts already holds to AA.
+ *
+ * STATIC, not animated: an animating wordmark is a permanent motion source at the top of the one
+ * column that is always on screen, and would need a `prefers-reduced-motion` escape. One glint
+ * reads as material, not as an effect.
+ */
+export const GOLD_SHEEN = `linear-gradient(100deg, ${C.goldInk} 0%, ${C.goldInk} 34%, ${C.goldHotInk} 50%, ${C.goldInk} 66%, ${C.goldInk} 100%)`;
+
 export function SparkleWordmark({
   height = 25,
-  /** The paint behind the mask. Defaults to the themed gold ink; the capture takeover passes the
-   *  dark literal because that window is dark regardless of the app theme. */
+  /** The paint behind the mask — any CSS `background` value, so a gradient works as well as a
+   *  color (see GOLD_SHEEN). Defaults to the themed gold ink; the capture takeover passes the dark
+   *  literal because that window is dark regardless of the app theme. */
   fill = C.goldInk,
 }: {
   height?: number;

@@ -141,6 +141,16 @@ export interface ConciergeProject {
   inScope: boolean;
   /** This project's raw per-band totals (mute/scope ignored) — the per-tab glow + count. */
   counts: ConciergeCounts;
+  /** This project's share of `ConciergeFeed.scopedCounts` — the SAME three gates (in scope, not
+   *  muted, not already spoken for), applied per project. Summing this field over every project
+   *  reproduces `scopedCounts` exactly, by construction rather than by two computations agreeing.
+   *
+   *  That identity is what lets column one's header state a cross-project split (PRD §2a, answered
+   *  2026-07-28: column one is the GLOBAL index, column two stays project-scoped) without the
+   *  header's number drifting from the one the thread accounts for. `counts` above cannot do the
+   *  job: it is the RAW truth for the tab badges, so it counts muted, out-of-scope and
+   *  already-represented agents that the concierge deliberately never surfaces. */
+  scopedCounts: ConciergeCounts;
   /** Sorted Needs you → Running → Done; within a band, live questions first, then most recent,
    *  then name. */
   agents: ConciergeAgent[];
@@ -362,6 +372,9 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   const outProjects: ConciergeProject[] = projects.map((p) => {
     const inScope = pinnedProjectId === null || p.id === pinnedProjectId;
     const projectCounts = emptyCounts();
+    // This project's share of the scoped total — incremented from the SAME gate below, never
+    // recomputed, so the per-project split and the global number cannot disagree.
+    const projectScoped = emptyCounts();
     // Closed over THIS PROJECT's agents, matching AgentSidebar exactly: the sidebar asks
     // `isTopLevelAgent(project.agents)`, so nesting is judged against the same population on both
     // sides. Judging it against the flattened fleet instead would call a worker whose orchestrator
@@ -397,7 +410,10 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       // three gates — so the vitals number and the items the thread accounts for are one population
       // by construction, not two computations that happen to agree. `counts` above stays the raw
       // truth (every agent, once per agent), which is what the per-project tab badges read.
-      if (inScope && !muted && !representedElsewhere) scopedCounts[band]++;
+      if (inScope && !muted && !representedElsewhere) {
+        scopedCounts[band]++;
+        projectScoped[band]++;
+      }
       return {
         id: a.id,
         name: displayName(a),
@@ -420,7 +436,14 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     });
     agents.sort(compareAgents);
     for (const b of STATUS_BANDS) counts[b.id] += projectCounts[b.id];
-    return { id: p.id, name: p.name, inScope, counts: projectCounts, agents };
+    return {
+      id: p.id,
+      name: p.name,
+      inScope,
+      counts: projectCounts,
+      scopedCounts: projectScoped,
+      agents,
+    };
   });
 
   return { projects: outProjects, counts, scopedCounts, pinnedProjectId };

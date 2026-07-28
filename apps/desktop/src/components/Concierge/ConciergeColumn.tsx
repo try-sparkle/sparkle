@@ -17,7 +17,10 @@ import { C } from "../../theme/colors";
 import { BalanceBadge } from "../BalanceBadge";
 import { LogoWaveform } from "../LogoWaveform";
 import { SparkleLogoLink } from "../SparkleLogoLink";
+import { GOLD_SHEEN } from "../SparkleWordmark";
 import { ComposeBox } from "./ComposeBox";
+import { ConciergeAiLocked } from "./ConciergeAiLocked";
+import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
 import { ScopeVitals } from "./ScopeVitals";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
@@ -40,7 +43,11 @@ export function ConciergeColumn({
   onTextEdit,
   announcement = EMPTY_ANNOUNCEMENT,
   countdownSlot,
+  approvalSlot,
 }: ConciergeColumnProps) {
+  // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
+  // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
+  const aiLock = useConciergeAiLock();
   return (
     <section
       aria-label="Sparkle concierge"
@@ -108,7 +115,10 @@ export function ConciergeColumn({
             marginBottom: 8,
           }}
         >
-          <SparkleLogoLink />
+          {/* The SHEEN fill, not the flat one (founder, 2026-07-27: "make the logo sparklier").
+              Still the same masked mark and the same themed gold — see SparkleWordmark.GOLD_SHEEN
+              for why it is a gold glint rather than the asset's own cyan gradient. */}
+          <SparkleLogoLink fill={GOLD_SHEEN} />
           <BalanceBadge />
         </div>
         {/* The always-listening voice ring + waveform, directly under the brand row. It followed
@@ -119,22 +129,45 @@ export function ConciergeColumn({
         <div style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}>
           <LogoWaveform />
         </div>
-        <ScopeVitals pinnedProjectName={model.scope.pinnedProjectName} counts={model.vitals} />
+        {/* ONE line, not two: scope + who needs you (`All projects · 2 here · 1 in mobile`). See
+            ScopeVitals' header for what was dropped and why — the founder's "it's taking up too
+            much space", 2026-07-27. */}
+        <ScopeVitals
+          pinnedProjectName={model.scope.pinnedProjectName}
+          counts={model.vitals}
+          byProject={model.needsYouByProject}
+          onProjectClick={controller.onProjectClick}
+        />
         {searchSlot && <div style={{ marginTop: 10 }}>{searchSlot}</div>}
       </div>
-      <ConciergeThread
-        messages={model.messages}
-        typing={model.typing}
-        onNudgeClick={controller.onNudgeClick}
-        onNudgeAction={controller.onNudgeAction}
-        onRedirect={controller.onRedirect}
-        onDigestClick={controller.onDigestClick}
-      />
+      {/* THE LOCKED STATE swaps the paid half — the chat with the `claude -p` brain — for the
+          upsell, and NOTHING above this line changes: the header, the scope line, the needs-you
+          counts and the per-project segments are all derived from local app state, cost nothing to
+          run, and stay live. That adjacency is the design: the lock sells what the human is missing
+          while sitting next to live proof it would be useful (Concierge/ConciergeAiLocked). */}
+      {aiLock ? (
+        <ConciergeAiLocked reason={aiLock} />
+      ) : (
+        <ConciergeThread
+          messages={model.messages}
+          typing={model.typing}
+          onNudgeClick={controller.onNudgeClick}
+          onNudgeAction={controller.onNudgeAction}
+          onRedirect={controller.onRedirect}
+          onDigestClick={controller.onDigestClick}
+        />
+      )}
       {/* NO RECOMMENDED-ACTION ROW HERE any more. It used to sit in a `suggestionsSlot` directly
           above the compose box; it now renders over the terminal itself, pinned bottom-right on the
           CLI's input line, because the action is about the agent you are looking at. The host still
           mounts it (keyed per agent) — it just portals its output into the pane. See
           Concierge/ConciergeSuggestions. */}
+      {/* Tool calls the concierge has STOPPED on, waiting for your yes or no
+          (Concierge/ConciergeApprovals). Above the countdown deliberately: "may I do this at all?"
+          precedes "this is about to go out", and an unanswered approval is the one thing here that
+          has already halted a call. A slot, like the countdown, and for the same reason — it reads
+          the pending-approval ledger and this column renders only what it is handed. */}
+      {approvalSlot}
       {/* Armed sends counting down (Concierge/CountdownBanner), directly above the box — the last
           thing between the user's words and an agent's terminal, so it sits where the eye already
           is after hitting Send. A SLOT, not a view-model field: the banner reads a module-level
@@ -170,16 +203,21 @@ export function ConciergeColumn({
           {announcement.text}
         </span>
       </div>
-      <ComposeBox
-        onSend={controller.onSend}
-        onAttach={controller.onAttach}
-        onRemoveAttachment={controller.onRemoveAttachment}
-        attachments={model.attachments}
-        dropActive={model.dropActive}
-        interim={interim}
-        registerInsert={registerInsert}
-        onTextEdit={onTextEdit}
-      />
+      {/* No composer while locked — the structural half of the guarantee. A column in this state
+          has nothing to type into and no Send to press, so a gated send can never be ATTEMPTED
+          from here at all (the service-level refusal stays the backstop, not the only line). */}
+      {!aiLock && (
+        <ComposeBox
+          onSend={controller.onSend}
+          onAttach={controller.onAttach}
+          onRemoveAttachment={controller.onRemoveAttachment}
+          attachments={model.attachments}
+          dropActive={model.dropActive}
+          interim={interim}
+          registerInsert={registerInsert}
+          onTextEdit={onTextEdit}
+        />
+      )}
     </section>
   );
 }

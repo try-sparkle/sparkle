@@ -288,7 +288,8 @@ describe("configActions", () => {
       s.aiComposer,
       s.aiSuggestedActions,
       s.aiAutoApprove,
-    ]).toEqual([false, false, false, false, false]);
+      s.aiConcierge,
+    ]).toEqual([false, false, false, false, false, false]);
     // A single batched write — not separate ones (the anti-flicker fix).
     expect(setConfigValues).toHaveBeenCalledTimes(1);
     expect(setConfigValue).not.toHaveBeenCalled();
@@ -298,6 +299,7 @@ describe("configActions", () => {
       "ai.composer": false,
       "ai.suggested_actions": false,
       "ai.auto_approve": false,
+      "ai.concierge": false,
     });
   });
 

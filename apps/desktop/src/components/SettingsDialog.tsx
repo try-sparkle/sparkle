@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield } from "react-icons/fi";
 import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -22,6 +22,7 @@ import { VoiceControlsMenu } from "./VoiceControlsMenu";
 import { ToolsPane, TOOLS_SEARCH_ENTRIES } from "./ToolsPane";
 import { categoryEntries, matchesAny, paneQueryFor } from "../engine/settingsSearch";
 import { ApprovalsMenu } from "./ApprovalsMenu";
+import { ConciergeToolsPane, CONCIERGE_TOOLS_SEARCH_TERMS } from "./ConciergeToolsPane";
 import { CloudAuthPane } from "./CloudAuthPane";
 import { OnePasswordPane } from "./OnePasswordPane";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
@@ -94,6 +95,7 @@ const CATEGORIES: Category[] = [
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: ["phone pair devices"] },
   { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: ["wake word stop word dictation microphone"] },
   { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: ["auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue"] },
+  { id: "conciergetools", label: "Concierge tools", Icon: FiShield, blurb: "How much the concierge may do on its own — tool by tool.", keywords: CONCIERGE_TOOLS_SEARCH_TERMS },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly.", keywords: ["config toml file raw editor"] },
 ];
 
@@ -276,6 +278,8 @@ function PaneBody({
       return <VoiceControlsMenu />;
     case "approvals":
       return <ApprovalsMenu />;
+    case "conciergetools":
+      return <ConciergeToolsPane />;
     case "advanced":
       return <AdvancedConfigMenu />;
   }

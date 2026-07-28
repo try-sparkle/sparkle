@@ -22,6 +22,40 @@
 // services/agentModel (`/model`), services/requery. None of them import this module, and none
 // should.
 
+declare const TOOL_POLICY_STAMP: unique symbol;
+
+/**
+ * The `policy` of a concierge-tool authority — a BRANDED `"allow" | "approved"`.
+ *
+ * The brand is the difference between a convention and a boundary. Without it the arm is a plain
+ * structural type, so `{ kind: "concierge-tool", toolCallId: "x", policy: "allow" }` typechecks
+ * anywhere, passes the runtime validator, and delivers — meaning the tool surface can authorize
+ * itself without a policy decision ever being consulted, which is the one thing this arm exists to
+ * prevent.
+ *
+ * NOT EXPORTED, and that is the load-bearing part rather than an oversight. An exported brand is a
+ * one-assertion forge: `policy: "allow" as ToolPolicyStamp` needs no `as unknown` laundering and
+ * would reduce the guarantee straight back to a convention. Unexported, a call site cannot even NAME
+ * the type, so `conciergeToolAuthority` really is the only way to obtain one. (Nothing outside needs
+ * it — the arm is reachable as `ConciergeToolAuthority`, and no declaration emit is configured.)
+ *
+ * WHAT IT DOES NOT STOP, stated so the next reader doesn't over-trust it: a call site holding a
+ * legitimately minted authority can still spread it (`{...minted, toolCallId: "other"}`) and re-aim
+ * it at a different call. The brand stops FABRICATION from nothing, not derivation from a real one.
+ * Closing that would need a nominal runtime token, which buys little while `conciergeToolAuthority`
+ * has exactly one consumer — but it is the assumption to revisit if the arm grows call sites.
+ *
+ * The runtime shape is unchanged — it is still the string `"allow"` or `"approved"` on the wire, so
+ * `isDispatchAuthority`, logging and any store round trip are unaffected. The brand deliberately
+ * does NOT survive to runtime: a JS caller or an object rebuilt off the wire never went through tsc,
+ * which is exactly why the tool layer re-checks at runtime rather than trusting the type.
+ */
+type ToolPolicyStamp = ("allow" | "approved") & { readonly [TOOL_POLICY_STAMP]: true };
+
+/** Mint a stamp. Module-private on purpose — this cast is the whole boundary, so it lives in one
+ *  place, next to the factory that is allowed to perform it. */
+const stamp = (policy: "allow" | "approved"): ToolPolicyStamp => policy as ToolPolicyStamp;
+
 /**
  * The user gesture that authorizes one dispatch into a build agent's terminal.
  *
@@ -41,21 +75,139 @@ export type DispatchAuthority =
   /** The user clicked Approve on a nudge card. */
   | { kind: "nudge-approve"; agentId: string }
   /** The user clicked a recommended-action pill (components/composer/SuggestionRow). */
-  | { kind: "suggestion"; agentId: string };
+  | { kind: "suggestion"; agentId: string }
+  /**
+   * The concierge's own TOOL layer wrote to an agent (services/conciergeTools/terminal).
+   *
+   * Read the `policy` field as the reason, not as a label. An AI tool call is NOT a user gesture —
+   * it is the same class of thing as the router's verdict, and the union has no `router` arm for
+   * exactly that reason. So this arm does not say "the concierge wanted to"; it names the POLICY
+   * DECISION that made the write legal, and only two decisions ever do:
+   *   • `"allow"`    — the tool sits in the allow tier, a standing decision the user configured.
+   *   • `"approved"` — the tool is ask-tier and a human answered the prompt with yes.
+   * There is deliberately no arm for a policy that is unresolved (`ask`, still pending) or denied:
+   * those are not representable, so a dispatch cannot be built from one even by mistake. Build this
+   * through {@link conciergeToolAuthority} rather than by hand — it is the only path that turns a
+   * decision into an authority, and it returns `null` for every decision that isn't one of the two.
+   * Nor is "rather than by hand" advisory: `policy` is a {@link ToolPolicyStamp}, which nothing
+   * outside this module can mint, so a hand-written literal does not compile.
+   */
+  | { kind: "concierge-tool"; toolCallId: string; policy: ToolPolicyStamp };
 
 export type DispatchAuthorityKind = DispatchAuthority["kind"];
+
+/** The tool arm on its own. The concierge tool layer takes THIS, not the whole union: every other
+ *  arm is a user gesture that a tool call has no business claiming, and most are constructible from
+ *  an agent id the tool call already carries. See services/conciergeTools/terminal `sendToAgentTerminal`. */
+export type ConciergeToolAuthority = Extract<DispatchAuthority, { kind: "concierge-tool" }>;
 
 /** Which field carries each kind's id. A `Record` over the union KEY, so adding an arm to
  *  `DispatchAuthority` without teaching this map about it is a compile error — the validator below
  *  can therefore never silently pass a kind it doesn't understand. */
-const AUTHORITY_REF_FIELD: Record<DispatchAuthorityKind, string> = {
+const AUTHORITY_REF_FIELD: Readonly<Record<DispatchAuthorityKind, string>> = Object.freeze({
   mention: "agentId",
   approval: "proposalId",
   countdown: "intentId",
   redirect: "receiptId",
   "nudge-approve": "agentId",
   suggestion: "agentId",
-};
+  "concierge-tool": "toolCallId",
+});
+
+/**
+ * Per-kind checks the generic id check below can't express.
+ *
+ * `concierge-tool` is the only arm whose legality rests on more than "an id is present" TODAY: its
+ * `policy` records WHICH decision permitted the write, and a shape that arrives with a missing,
+ * pending (`"ask"`) or denied policy is not an authority at all.
+ *
+ * TOTAL over the union key, exactly like `AUTHORITY_REF_FIELD`, and for the same reason — the six
+ * `() => true` entries are the point, not noise. A `Partial` map defaults a new arm to "nothing to
+ * prove", so the next arm whose legality rests on more than an id (this one is the proof such arms
+ * exist) would pass the validator unvalidated with nothing to warn whoever added it. Total means
+ * adding an arm is a compile error until someone states what it has to prove, even if the answer is
+ * "nothing".
+ *
+ * MODULE-PRIVATE and frozen. This table is the only thing standing between `{policy:"ask"}` and a
+ * PTY write, on a seam with no second line behind it, so exporting the value — even just for a test
+ * — would let any module in the bundle do `AUTHORITY_EXTRA_CHECK["concierge-tool"] = () => true` and
+ * permanently disable the policy check. Totality needs no export to be tested: a missing entry now
+ * makes `isDispatchAuthority` REFUSE that kind (see the `typeof extra === "function"` guard), so the
+ * suite's "accepts every well-formed sample" walk over `DISPATCH_AUTHORITY_KINDS` fails the moment
+ * an arm loses its entry. The compile-time `Record` is the primary guarantee either way.
+ */
+const AUTHORITY_EXTRA_CHECK: Readonly<
+  Record<DispatchAuthorityKind, (v: Record<string, unknown>) => boolean>
+> = Object.freeze({
+  // Nothing beyond the id: the gesture IS the authorization, and the id says which one.
+  mention: () => true,
+  approval: () => true,
+  countdown: () => true,
+  redirect: () => true,
+  "nudge-approve": () => true,
+  suggestion: () => true,
+  "concierge-tool": (v) => v.policy === "allow" || v.policy === "approved",
+});
+
+/**
+ * A tool-policy decision, as the concierge's policy layer produces it.
+ *
+ * Three tiers, and only two of them can ever authorize a write — which is the entire reason this
+ * type exists separately from the authority union. `deny` carries its reason for the refusal copy.
+ *
+ * The `ask` tier splits in two, and that split is load-bearing. An approval is not a boolean flag
+ * floating free of what it approved: `approvedByUser: true` must name the CALL the human answered
+ * for. A bare boolean can be transplanted — `conciergeToolAuthority(callB, approvalForCallA)` would
+ * mint a perfectly valid authority for a call nobody approved, and no layer below could detect it,
+ * which re-opens the attribution hole the whole arm exists to close. A loosely-keyed approval map or
+ * a re-render reusing the last decision object is all it takes. So the approving arm carries
+ * `approvedForToolCallId` and the factory refuses a mismatch; the un-approved arm needs nothing,
+ * because "we showed a prompt" attributes to nothing at all.
+ */
+export type ToolPolicyDecision =
+  | { tier: "allow" }
+  | { tier: "ask"; approvedByUser: false }
+  | { tier: "ask"; approvedByUser: true; approvedForToolCallId: string }
+  | { tier: "deny"; reason?: string };
+
+/**
+ * Turn a tool-policy decision into a dispatch authority, or `null` when the decision doesn't
+ * authorize anything.
+ *
+ * THE NARROW GATE for the whole concierge tool surface. A caller cannot reach a PTY write without
+ * coming through here — the arm's `policy` is a {@link ToolPolicyStamp} only this function can mint
+ * — and here refuses four ways:
+ *
+ *   • a denied tool;
+ *   • an ask-tier tool nobody has approved yet ("the user was asked" is not "the user said yes", so
+ *     a prompt still on screen, or one the user dismissed, produces no authority and no send);
+ *   • a call with no tool-call id to attribute the write to; and
+ *   • an approval that was given for a DIFFERENT call — see `ToolPolicyDecision`.
+ */
+export function conciergeToolAuthority(
+  toolCallId: string,
+  decision: ToolPolicyDecision,
+): ConciergeToolAuthority | null {
+  // No id, no attribution — and an unattributable write is exactly what the union exists to stop.
+  const id = typeof toolCallId === "string" ? toolCallId.trim() : "";
+  if (id === "") return null;
+  if (decision.tier === "allow") {
+    return { kind: "concierge-tool", toolCallId: id, policy: stamp("allow") };
+  }
+  if (decision.tier === "ask" && decision.approvedByUser === true) {
+    // The binding is re-read defensively (`typeof`) rather than trusted: the type says `string`, but
+    // a JS caller or a decision rebuilt off a store round trip never met the compiler. Both sides are
+    // trimmed before comparing, for the same reason the stored id is trimmed — a padded id must not
+    // read as a different call in either direction. Missing, blank or mismatched all fail CLOSED.
+    const approvedFor =
+      typeof decision.approvedForToolCallId === "string"
+        ? decision.approvedForToolCallId.trim()
+        : "";
+    if (approvedFor === "" || approvedFor !== id) return null;
+    return { kind: "concierge-tool", toolCallId: id, policy: stamp("approved") };
+  }
+  return null;
+}
 
 /** Every authority kind, derived from the field map so the two can never disagree. */
 export const DISPATCH_AUTHORITY_KINDS = Object.keys(
@@ -83,6 +235,8 @@ export function authorityRef(a: DispatchAuthority): string {
       return a.agentId;
     case "suggestion":
       return a.agentId;
+    case "concierge-tool":
+      return a.toolCallId;
     default: {
       const unhandled: never = a;
       void unhandled;
@@ -112,6 +266,12 @@ export function describeAuthority(a: DispatchAuthority): string {
       return "the user clicked Approve on a nudge card";
     case "suggestion":
       return "the user clicked a recommended action";
+    case "concierge-tool":
+      // Two different facts, and a forwarding complaint needs to know WHICH: a standing allow-tier
+      // policy the user configured once, or a human answering this specific prompt with yes.
+      return a.policy === "approved"
+        ? "the user approved this concierge tool call"
+        : "a concierge tool call ran under an allow-tier policy";
     default: {
       const unhandled: never = a;
       void unhandled;
@@ -131,8 +291,18 @@ export function isDispatchAuthority(v: unknown): v is DispatchAuthority {
   if (typeof v !== "object" || v === null) return false;
   const kind = (v as { kind?: unknown }).kind;
   if (typeof kind !== "string") return false;
+  // OWN properties only. The kind is a lookup key into two plain object literals, so a `kind` of
+  // "constructor" or "toString" resolves to an inherited Object.prototype member and reads as a
+  // DECLARED kind. Nothing useful comes back from it today, but "safe because the next line happens
+  // to fail" is not a gate — an undeclared kind is refused here, explicitly.
+  if (!Object.prototype.hasOwnProperty.call(AUTHORITY_REF_FIELD, kind)) return false;
   const field = AUTHORITY_REF_FIELD[kind as DispatchAuthorityKind];
-  if (field === undefined) return false;
   const ref = (v as Record<string, unknown>)[field];
-  return typeof ref === "string" && ref.trim() !== "";
+  if (typeof ref !== "string" || ref.trim() === "") return false;
+  // Whatever else this kind has to prove. Six arms prove nothing beyond their id; `concierge-tool`'s
+  // policy must name a decision that actually authorizes a write, so `{policy:"ask"}`,
+  // `{policy:"deny"}` and a missing policy all fail here rather than riding in on a good toolCallId.
+  // The map is TOTAL, so a missing entry means the union grew behind this function's back — refuse.
+  const extra = AUTHORITY_EXTRA_CHECK[kind as DispatchAuthorityKind];
+  return typeof extra === "function" && extra(v as Record<string, unknown>);
 }

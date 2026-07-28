@@ -13,6 +13,10 @@ import type { AgentTabStatus } from "../types";
 // Type-only import: erased at compile time, so the store stays free of the Tauri runtime dep
 // (services/config pulls in @tauri-apps) and remains testable under jsdom.
 import type { EffectiveConfig } from "../services/config";
+// Type-only for a SECOND reason on top of the Tauri one above: policy.ts imports the concierge tool
+// domains, and services/conciergeTools/lifecycle.ts imports THIS store. A value import would close
+// that loop; `import type` is erased, so it can't.
+import type { PolicyDecision, ToolPolicyOverrides } from "../services/conciergeTools/policy";
 import {
   DEFAULT_WAKE_WORD,
   DEFAULT_STOP_WORD,
@@ -65,7 +69,9 @@ export type AiFeatureKey =
   | "voiceDictation"
   | "composer"
   | "suggestedActions"
-  | "autoApprove";
+  | "autoApprove"
+  /** The concierge column: its brain (a `claude -p` turn) and its whole tool surface. */
+  | "concierge";
 
 /** Derived state of the master segment: every feature on / off / a mix. */
 export type AiMode = "all" | "some" | "off";
@@ -79,6 +85,10 @@ export interface AiFeatureFlags {
   aiSuggestedActions: boolean;
   /** Sparkle Auto-Approve master toggle (nudging + auto-answering permission prompts). */
   aiAutoApprove: boolean;
+  /** The concierge column. Gates BOTH halves that cost money: the `claude -p` turn behind the
+   *  chat, and every tool it can drive. The column's status readout is derived from local state
+   *  and stays on — see ConciergeColumn. */
+  aiConcierge: boolean;
 }
 
 /** Map a menu feature key to its settings-store field name. The single source of this
@@ -89,6 +99,7 @@ export const AI_FEATURE_FIELD: Record<AiFeatureKey, keyof AiFeatureFlags> = {
   composer: "aiComposer",
   suggestedActions: "aiSuggestedActions",
   autoApprove: "aiAutoApprove",
+  concierge: "aiConcierge",
 };
 
 // --- Tools (the opinionated [tools] flags, surfaced in the ⋯ Settings → "Tools" pane) ---------
@@ -158,6 +169,26 @@ export function normalizeVaultId(vaultId: string | null | undefined): string | n
   return vaultId?.trim() || null;
 }
 
+/** Narrow a raw `[concierge.tools]` payload into the store's mirror: drop non-string values, keep
+ *  every string VERBATIM.
+ *
+ *  A structural twin of services/conciergeTools/policy.ts's `toToolPolicyOverrides`, and it is a
+ *  copy for a reason worth stating rather than a duplication to clean up: policy.ts imports the four
+ *  concierge tool domains, and one of them (lifecycle.ts) imports THIS store — so a value import
+ *  would close an import cycle. The type is still shared (`import type` above, which is erased), and
+ *  settingsStore.test.ts asserts the two agree on every input, so the copy cannot drift silently.
+ *
+ *  Values are NOT validated here: an unrecognized rule must survive to `evaluateToolPolicy`, which
+ *  reads it as "ask". Dropping it would restore the tool's (possibly permissive) default. */
+export function toConciergeToolPolicy(raw: unknown): ToolPolicyOverrides {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
+}
+
 /** Derive the master segment from the four flags: all on → "all", all off → "off", else "some". */
 export function aiFeatureMode(f: AiFeatureFlags): AiMode {
   const vals = [
@@ -166,6 +197,7 @@ export function aiFeatureMode(f: AiFeatureFlags): AiMode {
     f.aiComposer,
     f.aiSuggestedActions,
     f.aiAutoApprove,
+    f.aiConcierge,
   ];
   if (vals.every(Boolean)) return "all";
   if (vals.every((v) => !v)) return "off";
@@ -303,6 +335,10 @@ interface SettingsState {
    *  permission prompts per the [approvals] rules. Off → no nudging AND no auto-answering. Mirrors
    *  [ai].auto_approve. */
   aiAutoApprove: boolean;
+  /** The concierge column's brain + tool surface. Off → the column still shows what needs the
+   *  human (that readout is local state and costs nothing), but the chat and every tool are
+   *  locked. Mirrors [ai].concierge. */
+  aiConcierge: boolean;
   /** GLOBAL (all-projects) auto-approve rules, mirrored from config.toml's `[approvals]`. Per-project
    *  overrides live in approvalsStore (read via `get_config(root)`); this is the global layer used
    *  as the effective value when no project is in context and as the "all projects" scope in the
@@ -313,6 +349,22 @@ interface SettingsState {
    *  Per-project overrides live in approvalsStore; this is the all-projects layer / the effective
    *  value when no project is in context. Config-mirrored, NOT persisted. */
   resumeRule: ResumeRule;
+  /** The concierge's explicit PER-TOOL autonomy rules, mirrored from config.toml's
+   *  `[concierge.tools]`. Tool name → "allow" | "ask" | "deny", holding ONLY the rules the human
+   *  set: a tool with no entry sits on the default derived from its risk class
+   *  (services/conciergeTools/policy.ts), so an empty map is a complete policy, not an absent one.
+   *
+   *  Kept RAW (values unnarrowed) on purpose. `evaluateToolPolicy` reads an unrecognized value as
+   *  "ask" — stricter than the derived default — and narrowing here would erase the difference
+   *  between "the user typo'd a rule" and "the user set no rule", handing back the permissive
+   *  default on exactly the rule they were tightening. Config-mirrored, NOT persisted. */
+  conciergeToolPolicy: ToolPolicyOverrides;
+  /** Has `hydrateFromConfig` run yet? Distinguishes "the human set no rules" from "we have not
+   *  READ the human's rules", which the empty map alone cannot express (roborev 54247, finding 3).
+   *  The difference matters: before the first hydrate, a tool the human explicitly set to `deny`
+   *  is indistinguishable from one they never touched, so resolving through derived defaults would
+   *  silently ignore their rule. Config-mirrored, NOT persisted — so it is false on every boot. */
+  conciergeToolPolicyHydrated: boolean;
   /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
    *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
@@ -449,6 +501,19 @@ interface SettingsState {
   /** Optimistically set/clear a GLOBAL approval rule (configActions persists to [approvals]).
    *  `rule` null removes the category from the global mirror. */
   setGlobalApproval: (category: ApprovalCategory, rule: ApprovalRule | null) => void;
+  /** Optimistically set (or clear, with null) one concierge tool's autonomy rule. Clearing returns
+   *  that tool to its derived default rather than to some other value — which is why this deletes
+   *  the key instead of writing a "default" sentinel. configActions persists to
+   *  [concierge.tools].<tool>. */
+  setConciergeToolPolicy: (tool: string, decision: PolicyDecision | null) => void;
+  /** Mark the concierge policy as SETTLED without a successful config read.
+   *
+   *  Called only from the launch path's `getConfig` failure branch. The policy layer holds back
+   *  every non-read-only tool until the human's rules have been read, and with no retry or timeout
+   *  a failed read would make that hold permanent for the session (roborev 54260). A read that
+   *  failed IS an answer to "what rules did they set" — none we can see — so the derived defaults
+   *  are the whole policy, and those are `ask` for everything risky. */
+  markConciergeToolPolicySettled: () => void;
   /** Optimistically set the GLOBAL session-resume rule (configActions persists to
    *  [approvals].resume). Mirrors setGlobalApproval but for the resume sibling. */
   setGlobalResume: (rule: ResumeRule) => void;
@@ -510,7 +575,12 @@ export const useSettingsStore = create<SettingsState>()(
       aiComposer: true,
       aiSuggestedActions: true,
       aiAutoApprove: true,
+      aiConcierge: true,
       approvals: {},
+      // No explicit rules until the user sets one. Every tool is still governed — by its derived
+      // default — so this is a complete starting policy, not an unguarded one.
+      conciergeToolPolicy: {},
+      conciergeToolPolicyHydrated: false,
       resumeRule: DEFAULT_RESUME_RULE,
       autoApplyUpdates: true,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
@@ -565,6 +635,7 @@ export const useSettingsStore = create<SettingsState>()(
           aiComposer: on,
           aiSuggestedActions: on,
           aiAutoApprove: on,
+          aiConcierge: on,
         }),
       setGlobalApproval: (category, rule) =>
         set((s) => {
@@ -572,6 +643,19 @@ export const useSettingsStore = create<SettingsState>()(
           if (rule) next[category] = rule;
           else delete next[category];
           return { approvals: next };
+        }),
+      markConciergeToolPolicySettled: () =>
+        set((s) =>
+          // Never UNDO a real hydrate: a slow config read that lands after a transient failure
+          // must win, and this must not clobber rules already loaded.
+          s.conciergeToolPolicyHydrated ? {} : { conciergeToolPolicyHydrated: true },
+        ),
+      setConciergeToolPolicy: (tool, decision) =>
+        set((s) => {
+          const next = { ...s.conciergeToolPolicy };
+          if (decision) next[tool] = decision;
+          else delete next[tool];
+          return { conciergeToolPolicy: next };
         }),
       setGlobalResume: (rule) => set({ resumeRule: asResumeRule(rule) }),
       setWakeWord: (wakeWord) => set({ wakeWord }),
@@ -649,9 +733,16 @@ export const useSettingsStore = create<SettingsState>()(
           aiSuggestedActions: config.ai.suggested_actions,
           // Auto-approve master toggle (`?? true` covers an older backend predating [ai].auto_approve).
           aiAutoApprove: config.ai.auto_approve ?? true,
+          // `?? true` covers a backend predating [ai].concierge, same as auto_approve above.
+          aiConcierge: config.ai.concierge ?? true,
           // GLOBAL approval rules mirror. App.tsx hydrates from the global layer (no project root),
           // so this stays the all-projects view; per-project overrides come from approvalsStore.
           approvals: toApprovalMap(config.approvals),
+          // The concierge's per-tool rules, kept verbatim. An absent [concierge] section (an older
+          // backend, or simply a user who has set no rules) is the empty map — which is a COMPLETE
+          // policy, because every tool falls back to its derived default.
+          conciergeToolPolicy: toConciergeToolPolicy(config.concierge?.tools),
+          conciergeToolPolicyHydrated: true,
           // GLOBAL session-resume rule (sibling of approvals; own value domain). Coerced so an
           // absent/unknown value degrades to "ask".
           resumeRule: asResumeRule(config.approvals?.resume),
@@ -745,6 +836,7 @@ export const useSettingsStore = create<SettingsState>()(
         aiComposer: s.aiComposer,
         aiSuggestedActions: s.aiSuggestedActions,
         aiAutoApprove: s.aiAutoApprove,
+        aiConcierge: s.aiConcierge,
         autoApplyUpdates: s.autoApplyUpdates,
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,

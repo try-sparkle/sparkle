@@ -160,12 +160,188 @@ describe("ComposeBox — the box names no destination", () => {
 });
 
 describe("ComposeBox — attachments", () => {
-  it("each attach button reports its kind", () => {
+  it("each revealed attach action reports its kind", () => {
     const { onAttach } = setup();
+    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
-    fireEvent.click(screen.getByRole("button", { name: "Image" }));
-    fireEvent.click(screen.getByRole("button", { name: "Files" }));
-    expect(onAttach.mock.calls).toEqual([["screenshot"], ["image"], ["files"]]);
+    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
+    expect(onAttach.mock.calls).toEqual([["screenshot"], ["files"]]);
+  });
+});
+
+// THE ATTACH AFFORDANCE IS ONE ICON THAT EXPANDS, and every assertion here is about a way that can
+// go wrong rather than about the happy path alone.
+//
+// The row was three permanently-visible labelled buttons (Screenshot / Image / Files) over a
+// compose box designed to look empty. The founder asked for the single paperclip to stay single at
+// rest and to REVEAL its two actions on hover — not a click-then-menu, which makes you commit a
+// click before it will say what is behind the icon.
+//
+// Hover alone would be unusable by keyboard and by touch, so the group opens on `hovered ||
+// pinned` (focus/click), and the two inputs are independent on purpose: neither may close what the
+// other holds open. The collapsed actions carry `hidden`, which drops them from the accessibility
+// tree and the tab order TOGETHER — the failure mode being guarded against is an invisible button
+// that is still focusable, or an announced one that isn't reachable.
+describe("ComposeBox — the attach affordance expands from one icon", () => {
+  const clip = () => screen.getByRole("button", { name: "Attach" });
+  const group = () => screen.getByTestId("concierge-attach");
+  const actions = () => document.getElementById("concierge-attach-actions") as HTMLElement;
+
+  it("rests as a SINGLE paperclip — neither action is shown, announced or focusable", () => {
+    setup();
+    expect(clip().getAttribute("aria-expanded")).toBe("false");
+    expect(actions().hidden).toBe(true);
+    expect(actions().style.display).toBe("none");
+    // `hidden` is what testing-library reads for accessibility, so these two are the announced-
+    // and-reachable check, not a repeat of the style assertion above.
+    expect(screen.queryByRole("button", { name: "Screenshot" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Upload" })).toBeNull();
+  });
+
+  it("hovering reveals BOTH actions — a screenshot and a file upload", () => {
+    setup();
+    fireEvent.mouseEnter(group());
+    expect(clip().getAttribute("aria-expanded")).toBe("true");
+    expect(actions().hidden).toBe(false);
+    expect(screen.getByRole("button", { name: "Screenshot" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Upload" })).toBeTruthy();
+    fireEvent.mouseLeave(group());
+    expect(actions().hidden).toBe(true);
+  });
+
+  it("is reachable by KEYBOARD — focus alone opens it, with no pointer involved", () => {
+    const { onAttach } = setup();
+    fireEvent.focus(clip());
+    expect(clip().getAttribute("aria-expanded")).toBe("true");
+    const upload = screen.getByRole("button", { name: "Upload" });
+    // Tabbing BETWEEN the paperclip and an action blurs the clip; that must not collapse the group
+    // out from under the very keystroke that is walking into it.
+    fireEvent.blur(clip(), { relatedTarget: upload });
+    fireEvent.focus(upload);
+    expect(actions().hidden).toBe(false);
+    fireEvent.click(upload);
+    expect(onAttach).toHaveBeenCalledWith("files");
+  });
+
+  it("closes on Escape and hands focus back to the paperclip", () => {
+    setup();
+    // REAL focus, not fireEvent.focus: the handback is guarded on where focus actually IS (it must
+    // not yank the caret out of the textarea — see close() in ComposeBox), and fireEvent.focus
+    // dispatches the event without moving document.activeElement, so it cannot model that.
+    act(() => clip().focus());
+    // Tab on into an action, so Escape has somewhere real to reclaim focus FROM — this is the path
+    // where the handback matters, since closing takes that button out of the tree under it.
+    act(() => screen.getByRole("button", { name: "Screenshot" }).focus());
+    fireEvent.keyDown(group(), { key: "Escape" });
+    expect(clip().getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(clip());
+  });
+
+  it("does NOT grab focus that was never inside the group (roborev 54233)", () => {
+    // WebKit on macOS does not focus a <button> on click, so the ordinary path is "caret in the
+    // textarea, user clicks Screenshot". Reclaiming focus unconditionally would drag the caret out
+    // of the app's only composer to attach a file.
+    const { onAttach } = setup();
+    act(() => box().focus());
+    fireEvent.mouseEnter(group());
+    fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
+    expect(onAttach).toHaveBeenCalledWith("screenshot");
+    expect(actions().hidden).toBe(true);
+    expect(document.activeElement).toBe(box());
+  });
+
+  it("Escape closes it with the POINTER still over the group (roborev 54158)", () => {
+    // The real Escape path, and the one the keyboard-only test above cannot see. `open = hovered ||
+    // pinned`, so clearing `pinned` alone leaves hover holding the group open — and the pointer IS
+    // still over it, because the focus almost always arrived by clicking the paperclip. Escape then
+    // appears to do nothing, and the group is un-closable by keyboard until the mouse physically
+    // leaves.
+    setup();
+    fireEvent.mouseEnter(group());
+    act(() => clip().focus());
+    fireEvent.keyDown(group(), { key: "Escape" });
+    expect(actions().hidden).toBe(true);
+    expect(clip().getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(clip());
+  });
+
+  it("a dismissed group re-arms on the next real mouseenter, not on a stale hover", () => {
+    // Escape clears hover, which is what "I dismissed this" has to mean — but it must not disarm
+    // hover for good, or the paperclip would be mouse-dead for the rest of the session.
+    setup();
+    fireEvent.mouseEnter(group());
+    fireEvent.keyDown(group(), { key: "Escape" });
+    expect(actions().hidden).toBe(true);
+    fireEvent.mouseLeave(group());
+    fireEvent.mouseEnter(group());
+    expect(actions().hidden).toBe(false);
+  });
+
+  it("tabbing OUT closes it, but the mouse cannot close what focus is holding open", () => {
+    setup();
+    fireEvent.mouseEnter(group());
+    fireEvent.focus(screen.getByRole("button", { name: "Screenshot" }));
+    // Pointer leaves while focus is still inside → stays open (the keyboard user is mid-choice).
+    fireEvent.mouseLeave(group());
+    expect(actions().hidden).toBe(false);
+    // Focus leaves for something outside the group → now it closes.
+    fireEvent.blur(screen.getByRole("button", { name: "Screenshot" }), {
+      relatedTarget: screen.getByRole("textbox", { name: "Message" }),
+    });
+    expect(actions().hidden).toBe(true);
+  });
+
+  it("clicking the paperclip OPENS and never collapses it under the cursor", () => {
+    setup();
+    // The touch/click path: no hover, one tap opens.
+    fireEvent.click(clip());
+    expect(actions().hidden).toBe(false);
+    // And a second click — the case a toggle would get wrong, since hover has already opened it by
+    // the time the pointer can click and mouseenter cannot re-fire without leaving first.
+    fireEvent.mouseEnter(group());
+    fireEvent.click(clip());
+    expect(actions().hidden).toBe(false);
+  });
+
+  it("collapses back to one icon once an action is chosen", () => {
+    const { onAttach } = setup();
+    fireEvent.focus(clip());
+    fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
+    expect(onAttach).toHaveBeenCalledWith("screenshot");
+    expect(actions().hidden).toBe(true);
+  });
+
+  it("hands focus back to the paperclip when an action is chosen (roborev 54233)", () => {
+    // The consequence of closing BOTH inputs on the action path: a mouse click focuses the button
+    // (mousedown focus), so the actions container gets `hidden` + display:none WHILE focus is
+    // inside it. Focus falls to <body> — the user loses their place in the compose box, and for a
+    // moment a focused element sits in a hidden subtree. Hover used to keep the group mounted on
+    // this path, so the button stayed valid; clearing `hovered` is what exposed it.
+    const { onAttach } = setup();
+    fireEvent.mouseEnter(group());
+    const upload = screen.getByRole("button", { name: "Upload" });
+    act(() => upload.focus()); // what a click does anywhere mousedown-focus is in effect
+    fireEvent.click(upload);
+    expect(onAttach).toHaveBeenCalledWith("files");
+    expect(actions().hidden).toBe(true);
+    expect(document.activeElement).toBe(clip());
+    // …and the handback must not RE-PIN what the click just closed — the same trap the Escape path
+    // needs `reclaimingFocus` for, since this refocus also lands inside the group.
+    expect(clip().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("collapses on the MOUSE path too — the one that can get stuck (roborev 54158)", () => {
+    // The primary path, and the worst one to leave open: choosing an action hands the OS a picker,
+    // which takes the pointer away without necessarily delivering a mouseleave to the webview. With
+    // `hovered` still latched true the row stays expanded after the picker dismisses, with no
+    // gesture left that would close it.
+    const { onAttach } = setup();
+    fireEvent.mouseEnter(group());
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
+    expect(onAttach).toHaveBeenCalledWith("files");
+    expect(actions().hidden).toBe(true);
+    expect(clip().getAttribute("aria-expanded")).toBe("false");
   });
 });
 

@@ -53,8 +53,16 @@ import {
   onConciergeDone,
   onConciergeError,
   startConciergeTurn,
+  startProactiveConciergeTurn,
+  isProactiveTurn,
   isSupersededDetail,
 } from "../services/concierge";
+import {
+  accountedNeedsYou,
+  createProactiveScheduler,
+  markStaleProactive,
+  surfacedDigest,
+} from "../services/conciergeProactive";
 import {
   agentCanAcceptInput,
   answersLivePicker,
@@ -73,6 +81,7 @@ import {
   resumeQueuedIntents,
   subscribeIntents,
 } from "../services/dispatchIntent";
+import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { routeMessage } from "../services/conciergeRouter";
 import { buildDigest } from "../services/conciergeDigest";
@@ -89,6 +98,10 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // host renders from the feed, and a project-store subscription would re-render it on every unrelated
 // agent write.
 import { useProjectStore } from "../stores/projectStore";
+// The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
+// re-renders this host only when the selection actually changes, which is the narrow subscription
+// the note above rules the whole `projects` array out in favour of.
+import { useCurrentProjectId } from "../windowContext";
 import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
 import { maybePauseOnSubmit } from "../services/dictationControls";
@@ -313,11 +326,15 @@ function feedStatuses(feed: ConciergeFeed): Omit<AwaySnapshot, "at"> {
  *  Note the remaining asymmetry is the SAFE direction. `muted` can make this set smaller than the
  *  rows the filter leaves standing, so the sentence can under-state. That is fine — every row it
  *  promised is there, plus one you asked not to be interrupted about. Over-stating is the bug,
- *  because the missing rows do not exist to be shown. */
+ *  because the missing rows do not exist to be shown.
+ *
+ *  ONE IMPLEMENTATION, in services/conciergeProactive — this delegates rather than restating the
+ *  filter (roborev 54166-M5). The proactive push channel builds its prompt from the same population
+ *  and the two copies were verbatim duplicates, which is exactly the drift the paragraph above is
+ *  about: the brain would announce, unprompted, a count this column does not show. It lives there
+ *  and not here because that module is pure and React-free, so the rule is testable as data. */
 function accountedAgents(feed: ConciergeFeed): ConciergeAgent[] {
-  return allAgents(feed).filter(
-    (a) => a.inScope && !a.muted && !a.representedElsewhere && a.band === "needs_you",
-  );
+  return accountedNeedsYou(feed);
 }
 
 /** The half of {@link accountedAgents} that is OWED A ROW in column two — the digest's pool.
@@ -518,6 +535,12 @@ export function ConciergeHost({
   // re-derived from the rendered thread so the done handler can announce the WHOLE reply into the
   // column's live region at once, rather than per streamed delta.
   const brainTextRef = useRef<Record<string, string>>({});
+  // The surfaced-state digest each PUSH was authored against, keyed by its turn id — recorded when
+  // the scheduler starts the turn, read when the turn's first event builds the bubble. Bounded for
+  // the same reason services/concierge bounds its push-id memory: a turn that never produces an
+  // event (webview reload, orphaned child) would otherwise leave an entry for the life of the page.
+  const pushDigestRef = useRef<Map<string, string>>(new Map());
+  const schedulerRef = useRef<ReturnType<typeof createProactiveScheduler> | null>(null);
   // The newest turn id seen from the brain stream, as a number (see supersededTurn below).
   const latestTurnRef = useRef(-1);
   // Every turn up to and including this id has been superseded by a send. See supersededTurn.
@@ -823,13 +846,21 @@ export function ConciergeHost({
       }
       return false;
     };
+    // WHAT MARKS A BUBBLE AS A PUSH (roborev 54166-M5). A proactive turn streams over the same
+    // events as a reply, so without this its `done` produces an ordinary sparkle bubble — an
+    // append-only "You have 3 P1s" that keeps asserting a resolved count with no way to retract it
+    // (PRD §2a). `proactive` is what the thread renders differently; `digest` is what makes the
+    // retraction decidable (see markStaleProactive below). Stamped from the FIRST delta, not at
+    // `done`, so a push that dies mid-stream is still identifiable as one.
+    const pushFields = (id: string): { proactive?: true; digest?: string } =>
+      isProactiveTurn(id) ? { proactive: true, digest: pushDigestRef.current.get(id) } : {};
     const upsert = (id: string, text: string, replace: boolean) => {
       const prior = brainTextRef.current[id] ?? "";
       brainTextRef.current[id] = replace ? text : prior + text;
       setChat((prev) => {
         const k = key(id);
         const i = prev.findIndex((m) => m.id === k);
-        if (i === -1) return [...prev, { id: k, kind: "sparkle", text }];
+        if (i === -1) return [...prev, { id: k, kind: "sparkle", text, ...pushFields(id) }];
         const next = prev.slice();
         const cur = next[i]!;
         next[i] = {
@@ -839,6 +870,7 @@ export function ConciergeHost({
           // but the union now contains a variant with no `text` at all (the recap card), so the
           // narrowing has to be explicit rather than a defensive `?? ""`.
           text: replace ? text : (cur.kind === "sparkle" ? cur.text : "") + text,
+          ...pushFields(id),
         };
         return next;
       });
@@ -852,7 +884,10 @@ export function ConciergeHost({
         delete brainTextRef.current[e.id];
         return;
       }
-      setTyping(false);
+      // A push owns no typing indicator — nobody is waiting on it. The Rust command stands down
+      // for any user turn so the two should never overlap, but if that ever changes, clearing here
+      // would take the indicator away from the reply the user IS waiting on.
+      if (!isProactiveTurn(e.id)) setTyping(false);
       if (e.text) upsert(e.id, e.text, true);
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
@@ -897,6 +932,51 @@ export function ConciergeHost({
       offError();
     };
   }, [announce]);
+
+  // ══ THE PROACTIVE PUSH CHANNEL ═══════════════════════════════════════════════════════════════
+  //
+  // The brain speaking FIRST, with no user message behind it (services/conciergeProactive, PRD
+  // §2a). The trigger and every cost control are pure and live in that module; this is the whole of
+  // the wiring — a clock, the browser's timers, and the transport.
+  //
+  // WHY IT MOUNTS HERE. This host is the only thing that both observes the feed on every roster
+  // tick and owns the thread the push has to land in. It is also mounted unconditionally for the
+  // life of the window, so the channel neither restarts nor duplicates as the user moves around.
+  useEffect(() => {
+    const s = createProactiveScheduler({
+      now: () => Date.now(),
+      setTimer: (fn, ms) => window.setTimeout(fn, ms),
+      clearTimer: (h) => window.clearTimeout(h),
+      startTurn: async (prompt, digest) => {
+        const id = await startProactiveConciergeTurn(prompt);
+        // Null means no turn ran — the user owns the conversation, or the bridge failed. Reporting
+        // that honestly is what keeps the change pending instead of silently swallowed.
+        if (id === null) return false;
+        pushDigestRef.current.set(id, digest);
+        const oldest = pushDigestRef.current.keys().next();
+        if (pushDigestRef.current.size > 16 && !oldest.done) pushDigestRef.current.delete(oldest.value);
+        return true;
+      },
+    });
+    schedulerRef.current = s;
+    return () => {
+      s.dispose();
+      schedulerRef.current = null;
+    };
+  }, []);
+
+  // Feed the trigger, and retract any push the state has moved past.
+  //
+  // BOTH ON THE SAME TICK, deliberately. A push is an append-only thread entry, so the moment its
+  // sentence stops being true it is the app volunteering something false — worse than having said
+  // nothing. `markStaleProactive` returns the SAME array when nothing needed marking (the
+  // overwhelmingly common case), so this costs one string build and one identity comparison per
+  // roster tick and re-renders nothing.
+  useEffect(() => {
+    schedulerRef.current?.observe(feed);
+    const digest = surfacedDigest(feed);
+    setChat((prev) => markStaleProactive(prev, digest));
+  }, [feed]);
 
   const resolveAgent = useCallback(
     (id: string) => allAgents(feedRef.current).find((a) => a.id === id) ?? null,
@@ -1651,6 +1731,13 @@ export function ConciergeHost({
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
       // switches to Build, and selects the referenced agent". openProjectTab does all three — the
       // tab select plus the shared reveal — so a nudge from a background project lands correctly.
+      // A HEADER SEGMENT naming another project ("1 in mobile"). Switch the tab and stop there:
+      // `openProjectTab` with no agent id selects nothing and mounts no PTY, which is the whole
+      // contract. A count names a POPULATION, not an agent, so inventing one to reveal would be the
+      // mirror image of the bug bead `sparkle-vohh` fixed — and this is that same shared path, not
+      // a second switcher. What to do once you are there is column two's job; the digest lines in
+      // the thread are what narrow it.
+      onProjectClick: (projectId: string) => openProjectTab(projectId),
       onNudgeClick: (n: ConciergeNudge) => {
         const a = resolveAgent(n.id);
         // `revealAgent`, not a bare `openProjectTab`: a singleton nested-rowless agent keeps a CARD,
@@ -1752,6 +1839,27 @@ export function ConciergeHost({
     return feed.projects.find((p) => p.id === feed.pinnedProjectId)?.name;
   }, [feed]);
 
+  // Which project the workspace is looking at — the one the header calls "here". Column TWO is
+  // scoped to it; column one is the global index, so the header names the others (PRD §2a).
+  const currentProjectId = useCurrentProjectId();
+
+  // The header's per-project split, straight off the feed's own per-project share of the number the
+  // line states. Summing `scopedCounts.needs_you` over these projects reproduces
+  // `feed.scopedCounts.needs_you` exactly (services/conciergeFeed), which is what lets the split be
+  // rendered without the header's total drifting from what the thread accounts for.
+  const needsYouByProject = useMemo(
+    () =>
+      feed.projects
+        .filter((p) => p.scopedCounts.needs_you > 0)
+        .map((p) => ({
+          projectId: p.id,
+          projectName: p.name,
+          needsYou: p.scopedCounts.needs_you,
+          isActive: p.id === currentProjectId,
+        })),
+    [feed, currentProjectId],
+  );
+
   // Sends that are armed and counting down (services/dispatchIntent). A module-level registry
   // rather than component state on purpose: an intent must outlive any one render and must not be
   // lost if this host re-mounts mid-countdown, which would strand a timer with no way to cancel it.
@@ -1795,6 +1903,7 @@ export function ConciergeHost({
     return {
       scope: { pinnedProjectName },
       vitals: feed.scopedCounts,
+      needsYouByProject,
       // In arrival order. This used to be `[...chat, ...digests, ...nudges]`, which pinned every
       // notice below the entire conversation no matter when it arrived — so the digests read as
       // stuck to the bottom of the pane rather than as part of the thread.
@@ -1803,7 +1912,7 @@ export function ConciergeHost({
       attachments,
       dropActive,
     };
-  }, [feed, chat, typing, pinnedProjectName, attachments, dropActive]);
+  }, [feed, chat, typing, pinnedProjectName, needsYouByProject, attachments, dropActive]);
 
   return (
     <>
@@ -1815,6 +1924,10 @@ export function ConciergeHost({
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's
         // own onCancel (which restores the files and posts to the thread), so the controller here
         // has nothing to remember — see services/dispatchIntent.
+        // Concierge tool calls stopped on the human's yes or no. Self-contained on purpose: it
+        // subscribes to the pending-approval ledger and writes the answer straight back, so this
+        // host has nothing to remember — same arrangement as the countdown below.
+        approvalSlot={<ConciergeApprovals />}
         countdownSlot={
           <CountdownBanner
             intents={pendingIntents}

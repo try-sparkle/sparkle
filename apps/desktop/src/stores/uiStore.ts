@@ -27,6 +27,7 @@ export type CategoryId =
   | "mobile"
   | "voice"
   | "approvals"
+  | "conciergetools"
   | "advanced";
 
 /** Keys that must never round-trip through the persisted blob — in EITHER direction. `partialize`

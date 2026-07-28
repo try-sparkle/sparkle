@@ -92,6 +92,13 @@ import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { Attachment } from "./composer/attachments";
 import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const shot: Attachment = {
   id: "s1",
@@ -124,7 +131,9 @@ function feed(): ConciergeFeed {
   };
   const counts = { needs_you: 1, running: 0, done: 0 };
   return {
-    projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents: [agent] }],
+    projects: [
+      { id: "p1", name: "sparkle", inScope: true, counts, scopedCounts: counts, agents: [agent] },
+    ],
     counts,
     scopedCounts: counts,
     pinnedProjectId: null,
@@ -133,9 +142,13 @@ function feed(): ConciergeFeed {
 
 const mount = () => render(<ConciergeHost feed={feed()} promptTarget={target} />);
 
-async function attachImage() {
+/** Stage a file through the compose box's attach affordance. The paperclip rests collapsed, so the
+ *  two actions have to be REVEALED before either can be clicked — hover here (focus is the other
+ *  path; ComposeBox.test.tsx owns both). */
+async function attachViaUpload() {
+  fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
   await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Image" }));
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
     await Promise.resolve();
   });
 }
@@ -201,19 +214,27 @@ const threadEl = () => screen.getByTestId("concierge-thread");
 const inThread = (re: RegExp | string) => within(threadEl()).getByText(re);
 
 describe("ConciergeHost — attach pickers", () => {
-  it("the Image button runs the picker and stages a chip", async () => {
+  it("the Upload action runs the picker and stages a chip", async () => {
     mount();
-    await attachImage();
-    expect(h.pick).toHaveBeenCalledWith("image");
+    await attachViaUpload();
+    expect(h.pick).toHaveBeenCalledWith("files");
     expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
   });
 
-  it("each button runs its own picker kind", async () => {
+  // Both of the paperclip's actions, each on its own kind. They are revealed by hover here; the
+  // reveal itself (and its keyboard equivalence) is ComposeBox.test.tsx's — this row is only about
+  // the host running the right picker for the action that was chosen.
+  it("each revealed action runs its own picker kind", async () => {
     mount();
     h.pick.mockResolvedValue([]);
+    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
-      fireEvent.click(screen.getByRole("button", { name: "Files" }));
+      await Promise.resolve();
+    });
+    fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Upload" }));
       await Promise.resolve();
     });
     expect(h.pick).toHaveBeenCalledWith("screenshot");
@@ -222,7 +243,7 @@ describe("ConciergeHost — attach pickers", () => {
 
   it("removing a chip un-stages it", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     fireEvent.click(screen.getByRole("button", { name: "Remove shot.png" }));
     expect(screen.queryByTestId("concierge-attachment-chips")).toBeNull();
   });
@@ -231,7 +252,7 @@ describe("ConciergeHost — attach pickers", () => {
 describe("ConciergeHost — attachments reach the dispatched prompt", () => {
   it("prefixes the path when the prompt goes to the AGENT, as a user prompt", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("what is wrong here?");
     await clickSend();
@@ -255,7 +276,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
   // countdown consumes it, on a send that carries a real attachment.
   it("arms the countdown with the user's words, never the attachment path", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("what is wrong here?");
     await act(async () => {
@@ -279,7 +300,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
 
   it("prefixes the path into the BRAIN snapshot too", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("what is wrong here?");
     await clickSend();
     const snapshot = h.startConciergeTurn.mock.calls[0]![0];
@@ -289,7 +310,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
 
   it("delivers an attachment with no typed text at all", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     await clickSend();
     // An attachments-only send: the naming basis is EMPTY by construction, which is what makes
@@ -309,7 +330,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
 describe("ConciergeHost — the thread, and clearing", () => {
   it("shows counts in the transcript and never the temp path", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("look");
     await clickSend();
     const bubble = inThread(/look/).textContent ?? "";
@@ -319,7 +340,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
 
   it("clears the chips once the send lands, so the next message starts empty", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("look");
     await clickSend();
     expect(screen.queryByTestId("concierge-attachment-chips")).toBeNull();
@@ -328,7 +349,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
   it("restores the chips when the agent send did NOT land", async () => {
     h.dispatch.mockResolvedValue({ ok: false, path: "pty-gone" });
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("look");
     await clickSend();
@@ -341,7 +362,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
   it("hands the files back when a HELD send never lands", async () => {
     h.dispatch.mockResolvedValue({ ok: true, path: "queued" });
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("look");
     await clickSend();
@@ -366,7 +387,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     type("just words");
     await clickSend();
     // 2) …then one carrying a file.
-    await attachImage();
+    await attachViaUpload();
     type("look");
     await clickSend();
     expect(screen.queryByTestId("concierge-attachment-chips")).toBeNull();
@@ -392,7 +413,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
     mount();
     fireEvent.click(screen.getByText("Approve"));
     await act(async () => {});
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("look");
     await clickSend();
@@ -412,7 +433,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
   it("does NOT hand them back when the held send lands after all", async () => {
     h.dispatch.mockResolvedValue({ ok: true, path: "queued" });
     mount();
-    await attachImage();
+    await attachViaUpload();
     routeToAgent();
     type("look");
     await clickSend();
@@ -432,7 +453,7 @@ describe("ConciergeHost — the thread, and clearing", () => {
 describe("ConciergeHost — the sent attachment stays visible in the bubble", () => {
   it("renders the image inline, and it is still there after a later message", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("look");
     await clickSend();
 
@@ -457,7 +478,7 @@ describe("ConciergeHost — the sent attachment stays visible in the bubble", ()
       { id: "f1", kind: "file", path: "/tmp/notes.pdf", name: "notes.pdf" } satisfies Attachment,
     ]);
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("read this");
     await clickSend();
 
@@ -468,7 +489,7 @@ describe("ConciergeHost — the sent attachment stays visible in the bubble", ()
 
   it("clicking the thumbnail opens the full-size lightbox", async () => {
     mount();
-    await attachImage();
+    await attachViaUpload();
     type("look");
     await clickSend();
 

@@ -126,7 +126,10 @@ fn resolve_bd_uncached() -> Option<String> {
 /// bd's resolved absolute path, cached for the session (positive-hit-only, per the cache note).
 /// Concurrent callers may both resolve on a cold cache (idempotent); a poisoned lock falls back to
 /// an uncached resolve.
-fn cached_bd_path() -> Option<String> {
+/// `pub(crate)` so `beads_cmd` (the typed planning/beads command surface) resolves bd through THIS
+/// resolver instead of standing up a second, divergent one — the same reuse rationale
+/// `preflight::run_in_login_shell` documents at its own definition.
+pub(crate) fn cached_bd_path() -> Option<String> {
     if let Ok(guard) = bd_path_cache().lock() {
         if let Some(path) = guard.as_ref() {
             return Some(path.clone());
@@ -145,7 +148,9 @@ fn cached_bd_path() -> Option<String> {
 /// git-backed jsonl storage, and a GUI app's inherited PATH is too bare to find it. Built ONCE
 /// from bd's dir + the resolved git dir (reusing preflight's cached git resolver) + the canonical
 /// bin locations, ahead of the inherited PATH. Cached for the session.
-fn bd_exec_path() -> String {
+/// `pub(crate)` for `beads_cmd` — see the note on [`cached_bd_path`]. Sharing this matters more than
+/// sharing the resolver: the PATH bd's own `git` child needs is easy to get subtly wrong twice.
+pub(crate) fn bd_exec_path() -> String {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -698,7 +703,7 @@ pub async fn bead_label(
 /// A bead id is safe to pass as a positional operand only if it can't be mistaken for a flag. Even
 /// though it's already an argv arg (not shell-interpolated), an id beginning with `-` would be parsed
 /// by `bd` as an OPTION, not an issue id. Restrict to bd's id charset and forbid a leading dash.
-fn valid_bead_id(id: &str) -> bool {
+pub(crate) fn valid_bead_id(id: &str) -> bool {
     !id.is_empty()
         && !id.starts_with('-')
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')

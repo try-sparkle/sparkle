@@ -135,17 +135,41 @@ export function pushAgentBranch(root: string, agentId: string): Promise<string> 
   return invoke<string>("push_agent_branch", { root, agentId });
 }
 
-/** Delete an agent's local branch (close-agent Discard). Idempotent. The worktree must be removed
- *  first (git refuses to delete a checked-out branch). */
-export function deleteAgentBranch(root: string, agentId: string): Promise<void> {
-  return invoke<void>("delete_agent_branch", { root, agentId });
+/**
+ * WHAT A DELETE ACTUALLY DID (Rust `BranchDeleteOutcome`). Both delete commands RESOLVE in cases
+ * where the branch is still on disk — the merged-only one keeps an unlanded branch by design, and
+ * both are idempotent for a branch that was already gone — so "the promise resolved" is not evidence
+ * the ref was destroyed. Read this, never the fact that it resolved.
+ *
+ * A Rust build predating the field resolves `undefined` here; treat that as UNKNOWN, not as a
+ * delete (the type says so via `| undefined` at the call sites that care).
+ */
+export type BranchDeleteOutcome = "deleted" | "already-absent" | "kept-not-merged";
+
+/** Delete an agent's local branch (close-agent Discard). Force-deletes (`git branch -D`) — that is
+ *  what Discard means. Idempotent: an already-absent branch resolves `"already-absent"` rather than
+ *  claiming a delete. The worktree must be removed first (git refuses to delete a checked-out
+ *  branch). */
+export function deleteAgentBranch(
+  root: string,
+  agentId: string,
+): Promise<BranchDeleteOutcome | undefined> {
+  return invoke<BranchDeleteOutcome | undefined>("delete_agent_branch", { root, agentId });
 }
 
-/** SAFELY delete an agent's merged branch (close a shipped agent). Uses `git branch -d`, which
- *  refuses to delete a branch that isn't actually merged, so this can never lose unmerged work —
- *  an unmerged branch is simply kept. Idempotent; remove the worktree first. */
-export function deleteAgentBranchIfMerged(root: string, agentId: string): Promise<void> {
-  return invoke<void>("delete_agent_branch_if_merged", { root, agentId });
+/** SAFELY delete an agent's merged branch (close a shipped agent). NOT `git branch -d`: it tests
+ *  ancestry OR merge-equivalence against the project's default branch (so a squash/rebase merge is
+ *  recognized, which `-d` refuses) and then force-deletes. An unlanded branch is simply KEPT, and
+ *  resolves `"kept-not-merged"` — a success, but a different one from `"deleted"`, and the caller
+ *  must not conflate them. Idempotent; remove the worktree first. */
+export function deleteAgentBranchIfMerged(
+  root: string,
+  agentId: string,
+): Promise<BranchDeleteOutcome | undefined> {
+  return invoke<BranchDeleteOutcome | undefined>("delete_agent_branch_if_merged", {
+    root,
+    agentId,
+  });
 }
 
 /** Open a GitHub PR for an agent's branch (close-agent Ship). Resolves the PR URL; rejects when gh

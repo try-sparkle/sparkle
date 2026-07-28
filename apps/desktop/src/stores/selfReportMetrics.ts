@@ -25,7 +25,12 @@ export type ControlOp =
   | "set_agent_model"
   | "set_agent_ordering"
   | "set_zoom"
-  | "navigate";
+  | "navigate"
+  // The concierge's tool spine (services/conciergeTools/registry). ONE op carrying a
+  // { domain, op, args } envelope, so this counter answers "is the concierge actually using its
+  // tools?" without recording WHICH tool — the op name is all that is stored, same as every other
+  // key here, and the domain/op inside the payload is deliberately not tallied.
+  | "concierge_tool";
 
 /** The mutually-exclusive result of one auto-naming trigger (see agentNaming.namingOutcome). */
 export type NamingOutcome =
@@ -74,6 +79,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   set_agent_ordering: 0,
   set_zoom: 0,
   navigate: 0,
+  concierge_tool: 0,
 });
 
 const emptyNamingOutcomes = (): Record<NamingOutcome, number> => ({

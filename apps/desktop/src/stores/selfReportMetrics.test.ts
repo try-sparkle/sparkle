@@ -75,6 +75,8 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         "get_config", "get_state", "rename_agent", "set_agent_activity", "set_config", "set_theme",
         // Phase-3 breadth ops.
         "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
+        // The concierge tool spine — the op name only; the domain/op inside its payload is not tallied.
+        "concierge_tool",
       ].sort(),
     );
   });

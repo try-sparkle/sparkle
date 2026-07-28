@@ -231,7 +231,24 @@ export function App() {
         // checks a fresh install or a restart. Fire-and-forget: it must never delay first paint.
         void refreshRoborevAuth();
       })
-      .catch((e) => console.warn("getConfig failed", e));
+      .catch((e) => {
+        console.warn("getConfig failed", e);
+        if (cancelled) return;
+        // HYDRATION MUST BE TERMINAL, not best-effort (roborev 54260, finding 1).
+        //
+        // The concierge policy layer holds back every non-read-only tool until it has READ the
+        // human's rules, because before that it cannot tell "no rule" from "a rule we haven't
+        // loaded". That hold is justified only because it is brief. On this path it isn't: there
+        // is no retry and no timeout, so a failed config read would leave the flag false for the
+        // entire session and permanently refuse navigate / rename_agent / close_agent / every
+        // useful tool — recoverable only by restarting, with no clue why.
+        //
+        // A config read that FAILED is a definite answer to "what rules did the human set": none
+        // we can see, so the derived defaults are genuinely the whole policy. Marking it settled
+        // is therefore honest, not a shortcut — and it fails toward the tool defaults, which are
+        // `ask` for everything risky, not toward blanket permission.
+        useSettingsStore.getState().markConciergeToolPolicySettled();
+      });
     // Keep the listen() promise; safeUnlisten awaits it on cleanup so a listener that resolves
     // AFTER unmount is still torn down (and the Tauri teardown race is swallowed).
     const unlistenPromise = onConfigChanged(hydrate);

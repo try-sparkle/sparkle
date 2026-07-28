@@ -3814,21 +3814,44 @@ pub async fn push_agent_branch(root: String, agent_id: String) -> Result<String,
         .map_err(|e| format!("push_agent_branch task failed: {e}"))?
 }
 
+/// WHAT A DELETE ACTUALLY DID. Both delete commands below succeed (`Ok`) in cases where the branch
+/// is still there — `delete_agent_branch_if_merged_at` keeps an unlanded branch by design, and both
+/// are idempotent for a branch that was already gone. A caller that reads "the call resolved" as
+/// "the branch is deleted" therefore reports a deletion that never happened, which is exactly the
+/// false report the concierge tool layer exists to prevent. This is the observed outcome, so the
+/// caller never has to assume.
+///
+/// Serialized as a plain kebab-case string (`"deleted"` / `"already-absent"` / `"kept-not-merged"`).
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BranchDeleteOutcome {
+    /// The ref existed and is now gone.
+    Deleted,
+    /// There was no such branch — nothing was destroyed.
+    AlreadyAbsent,
+    /// The branch is NOT landed on the target, so it was left alone. Only `*_if_merged` returns this.
+    KeptNotMerged,
+}
+
 /// Core (testable): delete an agent's local branch — the Discard path. Force (`-D`) because the
 /// branch is intentionally unmerged here; that's what Discard means. Idempotent: an already-gone
-/// branch is Ok. The caller MUST remove the worktree first (git refuses to delete a checked-out
-/// branch) and gate this behind an explicit confirmation.
-pub fn delete_agent_branch_at(root: &str, agent_id: &str) -> Result<(), String> {
+/// branch is Ok, reported as `AlreadyAbsent` so the caller can tell it apart from a real delete.
+/// The caller MUST remove the worktree first (git refuses to delete a checked-out branch) and gate
+/// this behind an explicit confirmation.
+pub fn delete_agent_branch_at(root: &str, agent_id: &str) -> Result<BranchDeleteOutcome, String> {
     let branch = format!("sparkle/agent-{agent_id}");
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(()); // already gone — Discard is idempotent
+        return Ok(BranchDeleteOutcome::AlreadyAbsent); // already gone — Discard is idempotent
     }
-    git(root, &["branch", "-D", &branch]).map(|_| ())
+    git(root, &["branch", "-D", &branch]).map(|_| BranchDeleteOutcome::Deleted)
 }
 
 /// Delete an agent's local branch (Discard). See `delete_agent_branch_at`.
 #[tauri::command]
-pub async fn delete_agent_branch(root: String, agent_id: String) -> Result<(), String> {
+pub async fn delete_agent_branch(
+    root: String,
+    agent_id: String,
+) -> Result<BranchDeleteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || delete_agent_branch_at(&root, &agent_id))
         .await
         .map_err(|e| format!("delete_agent_branch task failed: {e}"))?
@@ -3848,10 +3871,18 @@ pub async fn delete_agent_branch(root: String, agent_id: String) -> Result<(), S
 /// shipped gate (a zero-work branch never ships); a future caller without that gate must not reuse
 /// this assuming it strictly means "merged". Idempotent (already-gone is Ok); the caller MUST remove
 /// the worktree first (git refuses to delete a checked-out branch).
-pub fn delete_agent_branch_if_merged_at(root: &str, agent_id: &str) -> Result<(), String> {
+///
+/// KEEPING THE BRANCH IS A SUCCESS, NOT AN ERROR — but it is a DIFFERENT success from deleting it,
+/// so the two are reported as distinct `BranchDeleteOutcome`s rather than as one indistinguishable
+/// `Ok(())`. A failed `git branch -D` is likewise propagated instead of swallowed: it used to be
+/// `let _ = git(...)`, which returned Ok for a branch git had refused to delete.
+pub fn delete_agent_branch_if_merged_at(
+    root: &str,
+    agent_id: &str,
+) -> Result<BranchDeleteOutcome, String> {
     let branch = format!("sparkle/agent-{agent_id}");
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(()); // already gone — idempotent
+        return Ok(BranchDeleteOutcome::AlreadyAbsent); // already gone — idempotent
     }
     let target = resolve_default_branch(root);
     // Refresh origin first when there's a remote: a squash/rebase PR merge lands on origin/<target>,
@@ -3861,18 +3892,21 @@ pub fn delete_agent_branch_if_merged_at(root: &str, agent_id: &str) -> Result<()
         maybe_refresh_origin(root, &target);
     }
     let tip = git(root, &["rev-parse", &branch]).unwrap_or_default();
-    if branch_landed(root, &target, &branch, tip.trim()) {
-        // Confirmed landed on local OR origin <target> → safe to remove (force, since a squash/rebase
-        // merge means `-d`'s ancestry check would refuse a branch that IS effectively landed).
-        let _ = git(root, &["branch", "-D", &branch]);
+    if !branch_landed(root, &target, &branch, tip.trim()) {
+        return Ok(BranchDeleteOutcome::KeptNotMerged); // not landed → keep the branch
     }
-    Ok(()) // not landed → keep the branch (no-op, no error)
+    // Confirmed landed on local OR origin <target> → safe to remove (force, since a squash/rebase
+    // merge means `-d`'s ancestry check would refuse a branch that IS effectively landed).
+    git(root, &["branch", "-D", &branch]).map(|_| BranchDeleteOutcome::Deleted)
 }
 
 /// SAFELY delete an agent's merged branch (close a shipped agent). See
 /// `delete_agent_branch_if_merged_at`.
 #[tauri::command]
-pub async fn delete_agent_branch_if_merged(root: String, agent_id: String) -> Result<(), String> {
+pub async fn delete_agent_branch_if_merged(
+    root: String,
+    agent_id: String,
+) -> Result<BranchDeleteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || delete_agent_branch_if_merged_at(&root, &agent_id))
         .await
         .map_err(|e| format!("delete_agent_branch_if_merged task failed: {e}"))?
@@ -5919,8 +5953,71 @@ mod tests {
         git(&r, &["merge", "--no-ff", "-m", "merge", "sparkle/agent-m1"]).unwrap();
         assert!(branch_exists(&r, "sparkle/agent-m1"));
 
-        delete_agent_branch_if_merged_at(&r, "m1").unwrap();
+        let out = delete_agent_branch_if_merged_at(&r, "m1").unwrap();
+        assert_eq!(out, BranchDeleteOutcome::Deleted, "the caller must be told it was deleted");
         assert!(!branch_exists(&r, "sparkle/agent-m1"), "merged branch should be deleted");
+    }
+
+    // THE POINT OF THE OUTCOME TYPE. This command reports success (`Ok`) whether it deleted the
+    // branch or kept it, so a caller that reads "the call resolved" as "the branch is gone" tells the
+    // human a branch was deleted while it is still sitting there. The outcome is the only thing that
+    // distinguishes the two, so every arm asserts it explicitly.
+    #[test]
+    fn safe_delete_reports_the_outcome_it_actually_produced() {
+        let r = init_repo("safedel-outcome");
+        // Kept: a real unmerged change.
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-k1"]).unwrap();
+        std::fs::write(format!("{r}/k.txt"), "unmerged work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        assert_eq!(
+            delete_agent_branch_if_merged_at(&r, "k1").unwrap(),
+            BranchDeleteOutcome::KeptNotMerged,
+            "an unmerged branch is KEPT, and the caller must be able to see that"
+        );
+        assert!(branch_exists(&r, "sparkle/agent-k1"));
+
+        // Absent: never existed. Distinct from "deleted" — nothing was destroyed here.
+        assert_eq!(
+            delete_agent_branch_if_merged_at(&r, "ghost").unwrap(),
+            BranchDeleteOutcome::AlreadyAbsent
+        );
+    }
+
+    // The force-delete used to be `let _ = git(...)`, so a `-D` that failed (e.g. the branch is
+    // checked out in a worktree) still returned Ok and read as "deleted". Now it propagates.
+    #[test]
+    fn safe_delete_propagates_a_failed_force_delete_instead_of_swallowing_it() {
+        let r = init_repo("safedel-checkedout");
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-c1"]).unwrap();
+        git(&r, &["commit", "--allow-empty", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--no-ff", "-m", "merge", "sparkle/agent-c1"]).unwrap();
+        // Check the (merged) branch out in a second worktree: git now refuses to delete the ref.
+        let wt = unique_root("safedel-checkedout-wt");
+        git(&r, &["worktree", "add", wt.to_str().unwrap(), "sparkle/agent-c1"]).unwrap();
+
+        let err = delete_agent_branch_if_merged_at(&r, "c1")
+            .expect_err("a `git branch -D` that git refuses must not read as a successful delete");
+        assert!(!err.is_empty());
+        assert!(branch_exists(&r, "sparkle/agent-c1"), "the branch is still there");
+    }
+
+    #[test]
+    fn discard_delete_reports_deleted_vs_already_absent() {
+        let r = init_repo("discard-outcome");
+        git(&r, &["checkout", "-q", "-b", "sparkle/agent-d1"]).unwrap();
+        std::fs::write(format!("{r}/d.txt"), "unmerged").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-m", "work"]).unwrap();
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+
+        // Discard force-deletes even an unmerged branch — that IS what Discard means.
+        assert_eq!(delete_agent_branch_at(&r, "d1").unwrap(), BranchDeleteOutcome::Deleted);
+        assert!(!branch_exists(&r, "sparkle/agent-d1"));
+        // Idempotent, but the second call must not claim to have deleted anything.
+        assert_eq!(delete_agent_branch_at(&r, "d1").unwrap(), BranchDeleteOutcome::AlreadyAbsent);
     }
 
     #[test]
@@ -5936,7 +6033,8 @@ mod tests {
         git(&r, &["checkout", "-q", "main"]).unwrap();
         assert!(branch_exists(&r, "sparkle/agent-u1"));
 
-        delete_agent_branch_if_merged_at(&r, "u1").unwrap();
+        let out = delete_agent_branch_if_merged_at(&r, "u1").unwrap();
+        assert_eq!(out, BranchDeleteOutcome::KeptNotMerged, "the caller must be told it was KEPT");
         assert!(branch_exists(&r, "sparkle/agent-u1"), "unmerged branch must be kept");
     }
 

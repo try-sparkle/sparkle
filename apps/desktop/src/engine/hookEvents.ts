@@ -207,7 +207,7 @@ export class HookStatusEngine {
   }
 }
 
-/** Wiring for `createHookEventHandler` — the three consumers of a hook event, injected so the
+/** Wiring for `createHookEventHandler` — the four consumers of a hook event, injected so the
  *  handler is testable without AgentPane's worktree/PTY/store surface. */
 export interface HookEventHandlerDeps {
   engine: HookStatusEngine;
@@ -216,6 +216,20 @@ export interface HookEventHandlerDeps {
   activate: () => void;
   /** Persist prompts/responses to history (and dispatch the followup judge). */
   captureHistory: (ev: HookEvent) => void;
+  /**
+   * Park a Stop event's transcript path for the concierge's terminal read chain (tier d) —
+   * `components/AgentPane.noteTranscriptFromStop`.
+   *
+   * REQUIRED, not optional, and that is the point of it living here rather than inline in the
+   * component. A Stop event is the only place a session transcript path is ever known, and the
+   * concierge's `readAgentTerminal` has no other way to obtain one — it refuses to guess a path, and
+   * it no longer accepts one as a caller argument (a tool argument naming a file to read is an
+   * arbitrary-file read whose contents land in an LLM context). So this hand-off is the entire
+   * difference between a four-tier read chain and a three-tier one, and when it lived as a line
+   * inside AgentPane's capture closure, deleting it broke nothing that any test could see. As a
+   * required dep, dropping it is a compile error.
+   */
+  noteTranscript: (ev: HookEvent) => void;
 }
 
 /**
@@ -228,12 +242,18 @@ export interface HookEventHandlerDeps {
  *  2. The session gate SECOND, before anything else, so a background `claude` sharing this
  *     worktree's log drives NOTHING. It must not reach `captureHistory` (its Stop would be read,
  *     judged, and fromJudge("waiting")-ed onto this agent's row; its UserPromptSubmit would bump
- *     the turn counter and make the turn-token guard discard a legitimate verdict), and it must not
- *     reach `activate` (which stamps the hook-liveness clock — a chatty background session would
- *     keep the clock fresh and defeat the status router's staleness watchdog precisely when the
- *     main session's own stream is dead or mis-locked).
+ *     the turn counter and make the turn-token guard discard a legitimate verdict), it must not
+ *     reach `noteTranscript` (a foreign session's transcript path registered against this agent
+ *     would point the concierge's tier (d) at ANOTHER session's words and report them as this
+ *     agent's, with full confidence), and it must not reach `activate` (which stamps the
+ *     hook-liveness clock — a chatty background session would keep the clock fresh and defeat the
+ *     status router's staleness watchdog precisely when the main session's own stream is dead or
+ *     mis-locked).
  *  3. `activate` BEFORE `ingest`, because ingest drives the router's fromHook, which only emits once
  *     hooks are live — activating after it would swallow the first event's status.
+ *  4. `noteTranscript` BEFORE `captureHistory`, so the registry write does not ride on the history
+ *     store resolving. `captureHistory` reads `useHistoryStore.getState()` inside its own
+ *     error-swallowing try, and a throw there must not cost the concierge its transcript path.
  */
 export function createHookEventHandler(deps: HookEventHandlerDeps): (ev: HookEvent) => void {
   return (ev) => {
@@ -241,6 +261,7 @@ export function createHookEventHandler(deps: HookEventHandlerDeps): (ev: HookEve
     if (!deps.engine.isMainSession(ev)) return;
     deps.activate();
     deps.engine.ingest(ev);
+    deps.noteTranscript(ev);
     deps.captureHistory(ev);
   };
 }

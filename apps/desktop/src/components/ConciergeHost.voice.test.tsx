@@ -5,7 +5,7 @@
 // in this app speaks. What is left here is the mic seam plus the turn-token guard, which used to be
 // observed through "which reply gets spoken" and is now observed through the thread itself.
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type Append = (text: string) => void;
 
@@ -45,6 +45,10 @@ vi.mock("../services/concierge", async (importOriginal) => ({
   isSupersededDetail: (await importOriginal<typeof import("../services/concierge")>())
     .isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,
+  // The proactive push channel the host mounts. Stubbed as "stood down" so no case here spends an
+  // unasked-for turn; its wiring is covered in ConciergeHost.proactive.test.tsx.
+  startProactiveConciergeTurn: vi.fn(async (): Promise<string | null> => null),
+  isProactiveTurn: () => false,
   onConciergeDelta: (cb: (e: { id: string; text: string }) => void) => {
     h.brain.delta = cb;
     return () => {};
@@ -86,6 +90,13 @@ vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: h.maybePau
 import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
+import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+
+// PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
+// and the column locks that half — thread and composer both — whenever the AI gate is shut
+// (Concierge/conciergeAiLock). A fresh test's default is the anonymous trial (`me: null`), which is
+// locked. The locked state has its own suite: Concierge/ConciergeColumn.locked.test.
+beforeEach(enableAiEnhancementsForTests);
 
 const calmFeed = {
   projects: [],
@@ -130,6 +141,7 @@ const feedWithAgent = {
       name: "sparkle",
       inScope: true,
       counts: { needs_you: 0, running: 0, done: 0 },
+      scopedCounts: { needs_you: 0, running: 0, done: 0 },
       agents: [
         {
           id: "ag1",

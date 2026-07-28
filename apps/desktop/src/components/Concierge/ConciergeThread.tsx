@@ -2,6 +2,7 @@
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
 import { useEffect, useRef } from "react";
+import { FiBell } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
@@ -257,6 +258,42 @@ export function ConciergeThread({
         // run together on one line. Reuses the app's shared renderer (components/Markdown), which
         // already owns the GFM styling and the link/image scheme allow-lists, rather than growing
         // a second one here.
+        //
+        // A PUSH IS NOT A REPLY, and it has to look like it isn't (services/conciergeProactive,
+        // PRD §2a). Two things a plain sparkle bubble cannot say:
+        //
+        //   • WHO STARTED THIS. Every other left-aligned line in the thread answers something the
+        //     user said. A push doesn't, and a paragraph that appears with no question above it
+        //     reads as the app having lost track of the conversation unless it is labelled.
+        //   • WHETHER IT IS STILL TRUE. A thread entry is append-only, so "3 need you" keeps
+        //     asserting a resolved count forever. `markStaleProactive` decides that from the digest
+        //     the push was authored against; this is where the decision becomes visible. Dimmed and
+        //     relabelled rather than struck through or removed: the founder may well be reading it
+        //     as it goes stale, and a line that vanishes mid-read is its own bug.
+        if (m.proactive)
+          return (
+            <div
+              key={m.id}
+              data-testid="concierge-push"
+              data-stale={m.stale ? "true" : "false"}
+              style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1 }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  fontSize: 11,
+                  color: C.conciergeMuted,
+                  marginBottom: 3,
+                }}
+              >
+                <FiBell size={11} aria-hidden />
+                <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
+              </div>
+              <Markdown text={m.text} />
+            </div>
+          );
         return (
           <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
             <Markdown text={m.text} />

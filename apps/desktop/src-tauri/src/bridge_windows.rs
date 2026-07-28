@@ -76,7 +76,7 @@ pub fn orchestration_respond(
 // ----------------------------------------------------------------------------
 // sparkle-control (singleton app-level bridge) — Windows stub.
 //
-// Mirrors the Unix `ControlBridgeManager` + the four `#[tauri::command]`s wired in `lib.rs` so the
+// Mirrors the Unix `ControlBridgeManager` + the five `#[tauri::command]`s wired in `lib.rs` so the
 // rest of the crate stays platform-agnostic. Like the orchestration bridge, the control bridge is a
 // Unix-domain socket and is a Phase-2 follow-up on Windows.
 
@@ -88,6 +88,16 @@ pub struct ControlBridgeManager;
 
 #[tauri::command]
 pub fn start_control_bridge(
+    _app: AppHandle,
+    _manager: State<ControlBridgeManager>,
+) -> Result<BridgeInfo, String> {
+    Err(UNSUPPORTED.to_string())
+}
+
+/// Mirrors the Unix concierge control bridge (bead `sparkle-9a8j`). Unavailable here for the same
+/// reason as the shared one: both are Unix-domain sockets.
+#[tauri::command]
+pub fn start_concierge_control_bridge(
     _app: AppHandle,
     _manager: State<ControlBridgeManager>,
 ) -> Result<BridgeInfo, String> {

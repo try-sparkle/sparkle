@@ -92,11 +92,79 @@ describe("shipAgent", () => {
   });
 });
 
+// roborev 54175-1: the caller cannot tell "shipped, PR opened" from "nothing landed at all" if the
+// only signal is the absence of a throw. Every path now RETURNS what happened.
+describe("shipAgent → ShipOutcome", () => {
+  it("pushed + PR opened → kind 'pr-opened', carrying the PR url", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
+    vi.mocked(branch.openAgentPr).mockResolvedValue("https://pr/7");
+    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    expect(r).toEqual({
+      kind: "pr-opened",
+      pushed: true,
+      prOpened: true,
+      landed: false,
+      prUrl: "https://pr/7",
+    });
+  });
+
+  it("pushed but `gh` failed → kind 'pushed-no-pr' with the reason (NOT a silent success)", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
+    vi.mocked(branch.openAgentPr).mockRejectedValue(new Error("gh: not found"));
+    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    expect(r).toMatchObject({ kind: "pushed-no-pr", pushed: true, prOpened: false, landed: false });
+    expect(r.kind === "pushed-no-pr" && r.reason).toMatch(/gh: not found/);
+  });
+
+  it("no remote + land ok → kind 'landed' with the merge SHA", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
+    vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main", mergeSha: "abc123" });
+    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    expect(r).toEqual({
+      kind: "landed",
+      pushed: false,
+      prOpened: false,
+      landed: true,
+      mergeSha: "abc123",
+    });
+  });
+
+  it("no remote + land FAILED → kind 'land-failed' carrying git's reason", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
+    vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: false, reason: "conflict", files: ["a.ts"] });
+    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    expect(r).toMatchObject({ kind: "land-failed", pushed: false, prOpened: false, landed: false });
+    expect(r.kind === "land-failed" && r.reason).toMatch(/conflict/);
+  });
+});
+
+// roborev 54225-2. These used to assert `resolves.toBeUndefined()` for a REJECTED push — i.e. they
+// pinned the swallow. That assertion encoded the wrong behaviour (the caller then told the human the
+// branch was "backed up to the remote" when nothing left the machine, with the worktree already
+// gone), so it is deliberately replaced: save now reports what the push actually did, exactly as
+// ship reports its ShipOutcome. The BRANCH is kept locally in every case, so a failed push is a
+// reportable outcome, never a refusal.
 describe("saveAgent", () => {
-  it("pushes the branch (best-effort backup) and swallows a push error", async () => {
-    vi.mocked(branch.pushAgentBranch).mockRejectedValue(new Error("offline"));
-    await expect(saveAgent("/r", "a")).resolves.toBeUndefined();
+  it("reports the backup push it actually performed", async () => {
+    await expect(saveAgent("/r", "a")).resolves.toMatchObject({ kind: "pushed", pushed: true });
     expect(branch.pushAgentBranch).toHaveBeenCalledWith("/r", "a");
+  });
+
+  it("reports a FAILED push instead of swallowing it — nothing reached the remote", async () => {
+    vi.mocked(branch.pushAgentBranch).mockRejectedValue(new Error("offline"));
+    await expect(saveAgent("/r", "a")).resolves.toMatchObject({
+      kind: "push-failed",
+      pushed: false,
+      reason: expect.stringContaining("offline"),
+    });
+  });
+
+  it("distinguishes 'no remote to back up to' from a push that failed", async () => {
+    vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
+    await expect(saveAgent("/r", "a")).resolves.toMatchObject({
+      kind: "no-remote",
+      pushed: false,
+    });
   });
 });
 
@@ -108,6 +176,7 @@ describe("discardAgentGit", () => {
     });
     vi.mocked(branch.deleteAgentBranch).mockImplementation(async (_r, id) => {
       order.push(`del:${id}`);
+      return "deleted";
     });
     await discardAgentGit({
       root: "/r",
@@ -130,6 +199,7 @@ describe("spinDownAgentGit (close a shipped build agent)", () => {
     });
     vi.mocked(branch.deleteAgentBranchIfMerged).mockImplementation(async (_r, id) => {
       order.push(`del:${id}`);
+      return "deleted";
     });
     await spinDownAgentGit({ root: "/r", projectId: "p1", ids: ["parent", "w1"], deleteBranch: true });
     expect(order).toEqual(["rm:parent", "del:parent", "rm:w1", "del:w1"]);

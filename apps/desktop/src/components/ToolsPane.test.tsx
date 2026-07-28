@@ -77,6 +77,7 @@ function seedAiOff() {
     aiComposer: false,
     aiSuggestedActions: false,
     aiAutoApprove: false,
+    aiConcierge: false,
     analyticsEnabled: true,
     beadsEnabled: true,
     githubEnabled: true,

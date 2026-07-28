@@ -83,6 +83,13 @@ pub struct AiConfig {
     /// with this on a fresh install auto-answers skill/bash/edit/tool/web/other prompts. Off
     /// disables ALL nudging AND all auto-answering regardless of [approvals].
     pub auto_approve: bool,
+    /// The concierge column (bead sparkle-4562). Gates the two halves that cost money: the
+    /// `claude -p` turn behind the chat, and the whole tool surface it can drive. Default true.
+    ///
+    /// The column's STATUS readout is deliberately not gated — it is derived from local app state
+    /// and costs nothing — so a build with AI enhancements off still shows what needs the human,
+    /// and only the thinking and acting are locked.
+    pub concierge: bool,
 }
 
 /// Per-category Sparkle Auto-Approve rules. Each value is `"always"` (auto-approve that class of
@@ -172,6 +179,43 @@ pub struct ToolsConfig {
     /// so the user opts in from the Tools pane once those prerequisites are met.
     pub onepassword: bool,
 }
+
+/// The concierge's PER-TOOL AUTONOMY POLICY (`[concierge.tools]`).
+///
+/// One key per concierge tool, each `"allow"` (the concierge acts silently), `"ask"` (it needs the
+/// human's word first), or `"deny"` (refused outright). This is deliberately NOT a single coarse
+/// autonomy dial: a dial has to be set to the strictness of the most dangerous thing it governs, so
+/// "read my terminals freely" and "never merge a PR unasked" would collapse into one number.
+///
+/// EVERY KEY IS OPTIONAL, and an absent key is the normal case rather than a gap. The frontend
+/// policy layer (services/conciergeTools/policy.ts) derives a default for each tool from the risk
+/// its tool domain already classifies it with — read-only/routine → allow, everything irreversible,
+/// outward-facing, metered, disruptive or main-touching → ask. So this table holds only the rules
+/// the human actually changed, and a missing key resolves through a total function rather than
+/// falling into a hole.
+///
+/// A FREE-FORM MAP, not a struct of named fields, on purpose. The authoritative tool list lives in
+/// the TypeScript domain modules, where each operation union is paired with an exhaustive risk map
+/// (adding a tool without classifying it is a typecheck failure there). Restating ~40 tool names
+/// here would create a second list that drifts from the first, and Rust would have no way to notice.
+/// So this layer stays schema-agnostic about NAMES and validates only VALUES.
+///
+/// Machine-wide, like [ai]/[tools]: a per-project value is ignored with a warning. That is a
+/// security boundary rather than tidiness — a `.sparkle/config.toml` checked into a repo could
+/// otherwise grant the concierge silent `quit_app`/`remove_project` authority over the user's whole
+/// machine just by being cloned.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConciergeConfig {
+    /// Tool name → `"allow"` | `"ask"` | `"deny"`. Empty by default (every tool on its derived
+    /// default). Values are kept VERBATIM, including unrecognized ones: `validate` warns about them
+    /// but does not drop them, because the frontend treats an unreadable rule as `ask` and dropping
+    /// it here would silently restore a permissive default on a rule the user was trying to tighten.
+    pub tools: std::collections::BTreeMap<String, String>,
+}
+
+/// The three values a `[concierge.tools]` entry may take. Mirrors PolicyDecision in policy.ts.
+const CONCIERGE_TOOL_DECISIONS: [&str; 3] = ["allow", "ask", "deny"];
 
 /// 1Password env-backup state that isn't a simple on/off toggle. Machine-wide (like [tools]): a
 /// per-project value is ignored with a warning, because the vault is a property of the user's
@@ -456,6 +500,8 @@ pub struct SparkleConfig {
     pub voice: VoiceConfig,
     /// Per-category Sparkle Auto-Approve rules (repo-scoped overridable, like [workflow]/[freshness]).
     pub approvals: ApprovalsConfig,
+    /// The concierge's per-tool autonomy policy. Machine-wide (see ConciergeConfig).
+    pub concierge: ConciergeConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -492,10 +538,16 @@ impl Default for SparkleConfig {
                 composer: true,
                 suggested_actions: true,
                 auto_approve: true,
+                concierge: true,
             },
             // Ships auto-approve ON for every category except bash (see ApprovalsConfig::default),
             // so a fresh install isn't blocked by permission prompts. bash stays ask-each-time.
             approvals: ApprovalsConfig::default(),
+            // EMPTY by design, and it is meant to stay mostly empty: every concierge tool sits on
+            // the default derived from its risk class (policy.ts), so the file only ever carries the
+            // rules the human actually changed. An empty table is not "no policy" — it is "the
+            // derived policy", which is total.
+            concierge: ConciergeConfig::default(),
             // Opinionated defaults: every tool ships on for a new install — except onepassword,
             // which needs an external account + CLI before it can do anything (see the field doc).
             tools: ToolsConfig {
@@ -615,6 +667,7 @@ struct PartialAi {
     composer: Option<bool>,
     suggested_actions: Option<bool>,
     auto_approve: Option<bool>,
+    concierge: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -626,6 +679,21 @@ struct PartialApprovals {
     fetch: Option<String>,
     other: Option<String>,
     resume: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialConcierge {
+    /// Deliberately `toml::Value`, NOT `String` (roborev 54240).
+    ///
+    /// With `String`, a single hand-edit — `merge_pr = true`, or a nested
+    /// `[concierge.tools.x]` table — fails `toml::from_str::<PartialConfig>` for the WHOLE FILE.
+    /// That discards the entire global layer and sets `hard_error`, so every unrelated setting in
+    /// the file silently reverts to its default. One typo in one concierge rule should not cost
+    /// the user their whole configuration.
+    ///
+    /// Non-string values are dropped in `apply_concierge` and read as "no rule", which is what the
+    /// TS side already documents and asserts. This makes the two halves agree.
+    tools: Option<std::collections::BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -718,6 +786,7 @@ struct PartialConfig {
     capture: Option<PartialCapture>,
     voice: Option<PartialVoice>,
     approvals: Option<PartialApprovals>,
+    concierge: Option<PartialConcierge>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
 }
@@ -834,6 +903,9 @@ fn apply_ai(into: &mut AiConfig, p: Option<PartialAi>) {
     if let Some(v) = p.auto_approve {
         into.auto_approve = v;
     }
+    if let Some(v) = p.concierge {
+        into.concierge = v;
+    }
 }
 
 /// Overlay a partial `[approvals]` table. Each category present in the layer overrides; an absent
@@ -861,6 +933,36 @@ fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
     }
     if let Some(v) = p.resume {
         into.resume = Some(v);
+    }
+}
+
+/// Overlay a partial `[concierge]` section. Per-KEY, like `apply_approvals` and for the same reason:
+/// a layer that mentions two tools must not erase the rules the lower layer set for the other forty.
+/// Wholesale-replacing the map would make writing one rule by hand a silent reset of every other.
+fn apply_concierge(into: &mut ConciergeConfig, p: Option<PartialConcierge>) {
+    let Some(p) = p else { return };
+    if let Some(tools) = p.tools {
+        for (name, decision) in tools {
+            // Keep the RAW string, unnarrowed — the TS policy layer reads an unrecognized value as
+            // `ask`, which is stricter than the derived default, and narrowing here would erase the
+            // difference between "the user typo'd a rule" and "the user set no rule", handing back
+            // exactly the authority they were trying to remove.
+            //
+            // A non-string (a bool, a number, a nested table) is DROPPED rather than rejected: it
+            // reads as no rule for that tool, and every other setting in the file survives.
+            match decision.as_str() {
+                Some(v) => {
+                    into.tools.insert(name, v.to_string());
+                }
+                None => {
+                    tracing::warn!(
+                        tool = %name,
+                        kind = decision.type_str(),
+                        "[concierge.tools] value is not a string; ignoring this rule"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1203,6 +1305,19 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
         ));
         cfg.worktree_pool.size = 16;
     }
+    // A [concierge.tools] value that isn't allow/ask/deny is surfaced but NOT dropped. The frontend
+    // policy layer reads an unrecognized rule as "ask" — deliberately stricter than the derived
+    // default — so deleting it here would silently restore the permissive default on exactly the
+    // rule the user was trying to tighten. Names are not checked: the authoritative tool list lives
+    // in the TypeScript domain modules (see ConciergeConfig), and a second copy here would drift.
+    for (tool, decision) in &cfg.concierge.tools {
+        if !CONCIERGE_TOOL_DECISIONS.contains(&decision.as_str()) {
+            warnings.push(format!(
+                "[concierge.tools].{tool} is \"{decision}\", which is not allow, ask, or deny; \
+                 Sparkle will ask you before that tool runs until it is fixed"
+            ));
+        }
+    }
     // Incoherent if a build would be blocked before staleness is even warned about.
     let f = &cfg.freshness;
     if f.stale_build_block_commits < f.staleness_warn_commits {
@@ -1243,6 +1358,7 @@ fn build_effective(
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_voice(&mut cfg.voice, p.voice);
                 apply_approvals(&mut cfg.approvals, p.approvals);
+                apply_concierge(&mut cfg.concierge, p.concierge);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -1304,6 +1420,18 @@ fn build_effective(
                     warnings.push(
                         "[voice] in a per-project .sparkle/config.toml is ignored — the wake/stop \
                          words are a machine-wide preference; set them in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                // A SECURITY boundary, not just tidiness. [concierge.tools] grants the concierge
+                // standing authority over the whole app — quit_app, remove_project, discard_agent —
+                // so a repo could otherwise hand itself that authority over the user's machine
+                // merely by being cloned with a rule in its checked-in config.
+                if p.concierge.is_some() {
+                    warnings.push(
+                        "[concierge] in a per-project .sparkle/config.toml is ignored — how \
+                         autonomous the concierge is over YOUR machine is not something a repo gets \
+                         to set; use the global config.toml (or ⋯ Settings → \"Concierge tools\")"
                             .to_string(),
                     );
                 }
@@ -1605,6 +1733,31 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # bash   = "never"     # opt bash back out — go back to confirming every command yourself
 # fetch  = "never"     # or turn any other category back to ask-each-time
 # resume = "summary"   # auto-resume from summary on every restart (or "full", or "ask")
+
+# --- Concierge autonomy, PER TOOL (per-machine; ignored in a project file) ---------------
+# How much the concierge may do on its own, tool by tool. Three values:
+#   "allow" = it just does it, silently.
+#   "ask"   = it asks you first, every time.
+#   "deny"  = it refuses outright (not "asks and expects a no" — there is no prompt to answer).
+#
+# There is no single autonomy dial on purpose: one number would have to be set to the strictness
+# of the most dangerous tool it governs, so "read my terminals freely" and "never merge a PR
+# unasked" would end up sharing a setting. You tune each tool instead.
+#
+# EVERY KEY IS OPTIONAL, and leaving this section out entirely is the normal case. A tool with no
+# line here uses a default DERIVED from how risky it is: read-only and local/reversible work is
+# allowed silently, and anything irreversible, outward-facing (a push, a PR), metered, disruptive,
+# or that touches your main branch asks first. Nothing defaults to "deny" — turning a tool off
+# completely is always your explicit choice, never something Sparkle infers.
+#
+# Edit here or in ⋯ Settings → "Concierge tools", which lists every tool with its risk and its
+# default. Ignored in a project file: how autonomous the concierge is over YOUR machine is not
+# something a cloned repo gets to decide.
+# [concierge.tools]
+# read_agent_terminal = "allow"   # already the default (read-only) — shown for shape
+# merge_pr            = "deny"    # never merge a PR, even if you ask it to in chat
+# push_agent_branch   = "allow"   # let it push branches without stopping to ask
+# discard_agent       = "deny"    # never let it destroy unmerged work
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -2373,6 +2526,45 @@ mod tests {
 
     fn effective(global: Option<&str>, project: Option<&str>) -> (SparkleConfig, Vec<String>, bool) {
         build_effective(SparkleConfig::default(), global, project)
+    }
+
+    #[test]
+    fn a_non_string_concierge_rule_does_not_discard_the_whole_config() {
+        // roborev 54240. `tools: BTreeMap<String, String>` made a single hand-edit like
+        // `merge_pr = true` fail the WHOLE-FILE parse, which discards the entire global layer and
+        // sets hard_error — every unrelated setting silently reverts to its default. One typo in
+        // one concierge rule must not cost the user their configuration.
+        let global = r#"
+[workflow]
+require_pr = false
+
+[concierge.tools]
+merge_pr = true
+discard_agent = "deny"
+quit_app = 42
+"#;
+        let (cfg, _warns, hard) = effective(Some(global), None);
+        assert!(!hard, "a bad concierge value must not be a hard error");
+        // The unrelated setting survives — this is the property that actually matters.
+        assert!(!cfg.workflow.require_pr, "an unrelated setting must not revert to its default");
+        // The readable rule is kept, raw and unnarrowed.
+        assert_eq!(cfg.concierge.tools.get("discard_agent").map(String::as_str), Some("deny"));
+        // The non-string ones are DROPPED, so they read as "no rule" and fall to the derived
+        // default — matching what the TS policy layer already documents.
+        assert!(cfg.concierge.tools.get("merge_pr").is_none(), "a bool is not a rule");
+        assert!(cfg.concierge.tools.get("quit_app").is_none(), "an int is not a rule");
+    }
+
+    #[test]
+    fn an_unreadable_concierge_string_is_kept_not_dropped() {
+        // The two cases are different on purpose: a non-string is not a rule at all, but a
+        // misspelt STRING is a rule we cannot read — and the TS layer resolves that to `ask`,
+        // stricter than the derived default. Narrowing it away here would hand back exactly the
+        // authority the user was trying to remove.
+        let global = "[concierge.tools]\nmerge_pr = \"denyy\"\n";
+        let (cfg, _warns, hard) = effective(Some(global), None);
+        assert!(!hard);
+        assert_eq!(cfg.concierge.tools.get("merge_pr").map(String::as_str), Some("denyy"));
     }
 
     #[test]
@@ -3446,6 +3638,135 @@ mod tests {
         assert_eq!(cfg.approvals.other.as_deref(), Some("always"));
         // The sibling `resume` key defaults to "ask" and is untouched by writing only bash.
         assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"));
+    }
+
+    // --- [concierge.tools] — the concierge's per-tool autonomy policy ------------------------
+
+    #[test]
+    fn concierge_tools_default_to_an_empty_table() {
+        // Empty is not "no policy" — every tool sits on the default DERIVED from its risk class in
+        // policy.ts. The file only ever carries rules the human changed, which is why a missing key
+        // can never be a policy hole.
+        let (cfg, warns, _) = effective(None, None);
+        assert!(cfg.concierge.tools.is_empty());
+        assert!(!warns.iter().any(|w| w.contains("[concierge")));
+    }
+
+    #[test]
+    fn concierge_tools_reads_each_key_verbatim() {
+        let g = "[concierge.tools]\nmerge_pr = \"deny\"\npush_agent_branch = \"allow\"\n\
+                 list_projects = \"ask\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.concierge.tools.get("merge_pr").map(String::as_str), Some("deny"));
+        assert_eq!(cfg.concierge.tools.get("push_agent_branch").map(String::as_str), Some("allow"));
+        assert_eq!(cfg.concierge.tools.get("list_projects").map(String::as_str), Some("ask"));
+        // A tool nobody mentioned is simply absent — the frontend resolves it from its risk class.
+        assert!(cfg.concierge.tools.get("quit_app").is_none());
+        assert!(warns.is_empty(), "three valid rules produce no warnings: {warns:?}");
+    }
+
+    #[test]
+    fn concierge_tools_accepts_a_name_this_backend_has_never_heard_of() {
+        // Rust is deliberately schema-agnostic about tool NAMES: the authoritative list lives in the
+        // TypeScript domain modules, where an unclassified op is a typecheck failure. A second copy
+        // here would drift, and a desktop binary older than a tool would reject that tool's rule.
+        let g = "[concierge.tools]\nsome_future_tool = \"deny\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.concierge.tools.get("some_future_tool").map(String::as_str), Some("deny"));
+        assert!(warns.is_empty(), "an unknown NAME is not a warning: {warns:?}");
+    }
+
+    #[test]
+    fn concierge_tools_warns_about_an_unreadable_value_but_keeps_it() {
+        // KEEPS it. The frontend reads an unrecognized rule as "ask" — stricter than the derived
+        // default — so dropping it here would silently restore the permissive default on exactly the
+        // rule the user was trying to tighten (list_projects defaults to "allow").
+        let g = "[concierge.tools]\nlist_projects = \"dney\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a bad VALUE is a warning, never a hard error");
+        assert_eq!(cfg.concierge.tools.get("list_projects").map(String::as_str), Some("dney"));
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.tools].list_projects") && w.contains("dney")),
+            "the warning must name the key and the value: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn partial_concierge_section_preserves_rules_it_does_not_mention() {
+        // Per-KEY overlay, like [approvals]. Writing one rule must not reset the other forty — the
+        // failure mode of a wholesale map replacement, which would look like the settings pane
+        // silently forgetting everything the moment a second rule is written.
+        let g = "[concierge.tools]\nmerge_pr = \"deny\"\nquit_app = \"deny\"\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        let mut base = SparkleConfig::default();
+        base.concierge = cfg.concierge.clone();
+        // Now overlay a layer that mentions only ONE of them.
+        let (merged, _, _) = build_effective(base, Some("[concierge.tools]\nmerge_pr = \"ask\"\n"), None);
+        assert_eq!(merged.concierge.tools.get("merge_pr").map(String::as_str), Some("ask"));
+        assert_eq!(
+            merged.concierge.tools.get("quit_app").map(String::as_str),
+            Some("deny"),
+            "a rule the layer didn't mention must survive"
+        );
+    }
+
+    #[test]
+    fn concierge_is_ignored_in_a_project_file_with_a_warning() {
+        // A SECURITY boundary, not tidiness: [concierge.tools] grants standing authority over the
+        // whole app (quit_app, remove_project, discard_agent), so a cloned repo must not be able to
+        // hand itself that authority over the user's machine.
+        let p = "[concierge.tools]\nquit_app = \"allow\"\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        assert!(
+            cfg.concierge.tools.is_empty(),
+            "a per-project concierge rule must not take effect: {:?}",
+            cfg.concierge.tools
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge]")),
+            "the user must be told their project rule was ignored: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn concierge_template_documents_the_section_and_stays_commented_out() {
+        // The shipped template must EXPLAIN the section without writing any rule: a default install
+        // has to sit on the derived defaults, and an uncommented example would be a real policy the
+        // user never chose.
+        assert!(DEFAULT_TEMPLATE.contains("[concierge.tools]"));
+        assert!(DEFAULT_TEMPLATE.contains("# [concierge.tools]"), "must ship commented out");
+        let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert!(
+            cfg.concierge.tools.is_empty(),
+            "the template must not set a rule: {:?}",
+            cfg.concierge.tools
+        );
+    }
+
+    #[test]
+    fn concierge_tools_round_trip_through_the_dotted_setter() {
+        // The settings pane writes `concierge.tools.<name>` and clears it by unsetting the key —
+        // both must work on a nested section the file doesn't have yet.
+        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
+        set_dotted(&mut doc, "concierge.tools.merge_pr", "deny".into()).unwrap();
+        set_dotted(&mut doc, "concierge.tools.quit_app", "ask".into()).unwrap();
+        let (cfg, _, hard) = effective(Some(&doc.to_string()), None);
+        assert!(!hard, "the written file must parse: {}", doc);
+        assert_eq!(cfg.concierge.tools.get("merge_pr").map(String::as_str), Some("deny"));
+        assert_eq!(cfg.concierge.tools.get("quit_app").map(String::as_str), Some("ask"));
+
+        unset_dotted(&mut doc, "concierge.tools.merge_pr").unwrap();
+        let (cfg, _, _) = effective(Some(&doc.to_string()), None);
+        assert!(cfg.concierge.tools.get("merge_pr").is_none(), "cleared rule is gone");
+        assert_eq!(
+            cfg.concierge.tools.get("quit_app").map(String::as_str),
+            Some("ask"),
+            "clearing one rule must not disturb its neighbour"
+        );
     }
 
     #[test]

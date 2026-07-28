@@ -8,6 +8,7 @@ mod attention;
 mod attention_summary;
 mod audio;
 mod auth;
+mod beads_cmd;
 /// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
 mod builder_index;
 // The orchestration bridge is built on a Unix-domain socket (std::os::unix::net), so the real
@@ -421,6 +422,7 @@ pub fn run() {
             sparkle_improve::sparkle_improve_cancel,
             concierge::concierge_turn,
             concierge::concierge_cancel,
+            concierge::concierge_proactive_turn,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::agent_session_title,
@@ -495,6 +497,7 @@ pub fn run() {
             bridge::orchestration_respond,
             bridge::orchestrator_mcp_paths,
             bridge::start_control_bridge,
+            bridge::start_concierge_control_bridge,
             bridge::stop_control_bridge,
             bridge::control_respond,
             bridge::control_mcp_paths,
@@ -513,6 +516,14 @@ pub fn run() {
             notes::delete_bead,
             notes::bead_claim,
             notes::bead_close,
+            // The typed/capped planning surface (services/beadsCommands.ts). Distinct from the
+            // notes::* commands above, which stay the board's raw-JSON path — see beads_cmd.rs.
+            beads_cmd::beads_query,
+            beads_cmd::beads_detail,
+            beads_cmd::beads_create,
+            beads_cmd::beads_update,
+            beads_cmd::beads_close,
+            beads_cmd::beads_comment,
             ai::anthropic_chat,
             judge::judge_turn_followup,
             history::history_record,

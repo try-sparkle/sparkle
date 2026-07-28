@@ -25,7 +25,11 @@ vi.mock("./suggestions/heuristics", () => ({
 
 import { submitPrompt, writePty } from "../pty";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
-import { DISPATCH_AUTHORITY_KINDS, type DispatchAuthority } from "./dispatchAuthority";
+import {
+  DISPATCH_AUTHORITY_KINDS,
+  conciergeToolAuthority,
+  type DispatchAuthority,
+} from "./dispatchAuthority";
 
 /** One well-formed authority per kind, built from the union's OWN key list so a new arm added to
  *  `DispatchAuthority` shows up here as an undefined sample rather than as silent under-coverage. */
@@ -36,6 +40,12 @@ const SAMPLES: Record<string, DispatchAuthority> = {
   redirect: { kind: "redirect", receiptId: "r1" },
   "nudge-approve": { kind: "nudge-approve", agentId: "a1" },
   suggestion: { kind: "suggestion", agentId: "a1" },
+  // The one arm that is not a user GESTURE: it names the policy decision that permitted a concierge
+  // tool call to write (services/conciergeTools/terminal). Both authorizing policies deliver; the
+  // non-authorizing ones are unrepresentable and are pinned in dispatchAuthority.test.ts.
+  // Built through the FACTORY, which is now the only thing that can build it: the arm's `policy` is
+  // a branded stamp, so an inline literal no longer typechecks anywhere — including here.
+  "concierge-tool": conciergeToolAuthority("call-1", { tier: "allow" })!,
 };
 
 afterEach(() => {

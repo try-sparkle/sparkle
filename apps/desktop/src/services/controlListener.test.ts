@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -41,8 +42,52 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
 });
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...(a as [string, unknown])) }));
 
-import { startControlListener, isControlOpSuccess, type ControlRequest } from "./controlListener";
+// --- the concierge tool spine. Mocked so this file tests the LISTENER's gate (who may call it, and
+//     what is forwarded), not the registry — which has its own suite next door. ---
+interface ToolCallOnTheWire {
+  domain: string;
+  op: string;
+  args: unknown;
+  toolCallId: string;
+}
+// Captures BOTH arguments. The second one (the policy option) is what makes the human's per-tool
+// settings load-bearing, and dropping it here would let `{ policy: configuredToolPolicy }` be
+// deleted from the call site with every test still green — a silent revert to "allow everything"
+// (roborev 54247, finding 2).
+const dispatchConciergeToolMock = vi.fn(
+  async (_call: ToolCallOnTheWire, _opts?: { policy?: unknown }) => ({
+    ok: true,
+    domain: "workspace",
+    op: "list_projects",
+    data: [{ id: "p1" }],
+  }),
+);
+vi.mock("./conciergeTools/registry", () => ({
+  dispatchConciergeTool: (...a: unknown[]) =>
+    dispatchConciergeToolMock(...(a as [ToolCallOnTheWire, { policy?: unknown }?])),
+}));
+
+import { configuredToolPolicy } from "./conciergeTools/policyBinding";
+import { useSettingsStore } from "../stores/settingsStore";
+import {
+  startControlListener,
+  isControlOpSuccess,
+  CONCIERGE_CALLER_AGENT_ID,
+  type ControlRequest,
+} from "./controlListener";
 import { useSelfReportMetrics } from "../stores/selfReportMetrics";
+
+
+// The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
+// for every tool call, so these suites — which test the mechanics, not the entitlement — open it
+// explicitly. `aiGate.concierge.test.ts` is where the gate's own behaviour is asserted.
+function openConciergeAiGate() {
+  useSettingsStore.setState({ aiConcierge: true });
+  useAuthStore.setState({
+    me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+    creditFloorCents: 0,
+  } as never);
+}
 
 const fire = (req: ControlRequest) => firedHandler!({ payload: req });
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -55,12 +100,18 @@ describe("controlListener", () => {
   let otherId: string;
 
   beforeEach(async () => {
+    openConciergeAiGate();
     firedHandler = undefined;
     invokeMock.mockClear();
     unlistenMock.mockClear();
     controlResponds.length = 0;
     setConfigCalls.length = 0;
     setConfigValuesCalls.length = 0;
+    dispatchConciergeToolMock.mockClear();
+    // A BOOTED app: config has been read, and the human has set no per-tool overrides. Without the
+    // hydrated flag the policy layer deliberately holds back `allow` for anything that can change
+    // something, since it cannot yet tell "no rule" from "a rule we haven't loaded".
+    useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
     useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
     // Reset BOTH liveness inputs get_state's "active" scope reads — the in-memory open set and the
     // shared persisted one (readPersistedOpenAgentIds reads localStorage) — or open ids leak between
@@ -570,6 +621,225 @@ describe("controlListener", () => {
     await flush();
     const ops = useSelfReportMetrics.getState().controlOps;
     expect(Object.values(ops).every((n) => n === 0)).toBe(true);
+  });
+
+  // ── concierge caller identity (bead sparkle-9a8j, design A7.3) ────────────────────────────
+  //
+  // The reserved id can ONLY be minted by Rust, on the concierge's own control socket — a request
+  // on the shared socket claiming it is rejected there (bridge.rs
+  // `shared_socket_rejects_a_request_claiming_the_reserved_concierge_id`). By the time an event
+  // reaches this listener the id is therefore a fact about which socket it arrived on. These tests
+  // cover THIS half: given that id, what the frontend gate does with it.
+  describe("concierge caller", () => {
+    it("may run a PRIVILEGED op even though it resolves to no agent tab", async () => {
+      fire({ reqId: "c1", op: "set_theme", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { theme: "dark" } });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(useUiStore.getState().themePref).toBe("dark");
+    });
+
+    it("must ASK before writing config, unlike a Build agent (roborev 54226)", async () => {
+      // Deliberate behaviour change. The concierge clears `callerMayAdminister` outright, so this
+      // used to be a silent global config write. Its prompt is a snapshot of untrusted agent and
+      // TERMINAL output, which made that a prompt-injection path into machine-wide settings — text
+      // in some agent's terminal could talk the concierge into a config write. `set_config` now
+      // defaults to `ask` in the policy layer's `app` domain, and nothing has approved this call.
+      fire({
+        reqId: "c2",
+        op: "set_config",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { path: "workers.max_concurrent", value: 9 },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(setConfigCalls).toEqual([]); // the gate is BEFORE the mutation, not after
+    });
+
+    it("still runs the routine UI ops without asking", async () => {
+      // The other half of the trade: gating everything would make the concierge useless. `navigate`
+      // is visible, trivially undone, and a core concierge move ("put me where the work is").
+      fire({
+        reqId: "c2b",
+        op: "navigate",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { view: "board" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+    });
+
+    it("admitting it does NOT widen the gate: a worker and an unknown id are still refused", async () => {
+      // The regression that matters — an over-broad arm (e.g. "any caller findAgent can't resolve")
+      // would let both of these through, and both tests below would still be the only signal.
+      fire({ reqId: "c3", op: "set_theme", callerAgentId: otherId, payload: { theme: "light" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      fire({ reqId: "c4", op: "set_theme", callerAgentId: "ghost-caller", payload: { theme: "light" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      // A near-miss on the reserved id is NOT the reserved id.
+      fire({ reqId: "c5", op: "set_theme", callerAgentId: "sparkle:concierge2", payload: { theme: "light" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(useUiStore.getState().themePref).toBe("auto"); // none of the three changed it
+    });
+
+    it("REFUSES a per-agent op with no targetAgentId instead of mutating a random agent", async () => {
+      const before = useProjectStore.getState().projects[0]!.agents.map((a) => ({ ...a }));
+      fire({ reqId: "c6", op: "rename_agent", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { name: "Nobody" } });
+      await flush();
+      // A TYPED refusal: a stable machine-readable code, not just prose the brain must parse.
+      expect(lastReply()).toMatchObject({ ok: false, code: "target_required" });
+      // And nothing moved — in particular no agent got renamed "Nobody".
+      expect(useProjectStore.getState().projects[0]!.agents).toEqual(before);
+    });
+
+    it("refuses EVERY per-agent op without a target, not just rename", async () => {
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ["rename_agent", { name: "Nobody" }],
+        ["set_agent_activity", { activity: "narrating nothing" }],
+        ["unpin_agent", {}],
+        ["set_agent_model", { model: "claude-opus-4-8" }],
+      ];
+      for (const [op, payload] of cases) {
+        fire({ reqId: `c7-${op}`, op, callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload });
+        await flush();
+        expect(lastReply(), `${op} must refuse a targetless concierge call`).toMatchObject({
+          ok: false,
+          code: "target_required",
+        });
+      }
+    });
+
+    it("runs a per-agent op normally once it names a target", async () => {
+      fire({
+        reqId: "c8",
+        op: "set_agent_activity",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: otherId, activity: "told by the concierge" },
+      });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(
+        useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.activity,
+      ).toBe("told by the concierge");
+    });
+
+    it("still defaults an ORDINARY caller's per-agent op to itself (the refusal is concierge-only)", async () => {
+      fire({ reqId: "c9", op: "set_agent_activity", callerAgentId: callerId, payload: { activity: "self narrated" } });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+      expect(
+        useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.activity,
+      ).toBe("self narrated");
+    });
+
+    it("get_state works, and scope 'self' is empty — the concierge has no row of its own", async () => {
+      fire({ reqId: "c10", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
+      await flush();
+      const all = lastReply() as { agents: unknown[] };
+      expect(all.agents).toHaveLength(2); // it can read the whole roster...
+      fire({ reqId: "c11", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "self" } });
+      await flush();
+      const self = lastReply() as { agents: unknown[] };
+      expect(self.agents).toEqual([]); // ...but is not IN it, so "self" is legitimately empty
+    });
+  });
+
+  // ── concierge_tool — the one op that reaches agent lifecycle, git, the workspace and a PTY ─────
+  //
+  // Its gate is deliberately narrower than every other privileged op's. `callerMayAdminister` says
+  // "any interactive agent", which is right for the theme and wrong for this, so the handler demands
+  // the RESERVED id exactly. Every test below asserts the registry was never reached, not merely
+  // that `ok` was false — a refusal that still ran the tool is the failure that matters.
+  describe("concierge_tool", () => {
+    const toolPayload = {
+      domain: "workspace",
+      op: "list_projects",
+      args: { some: "args" },
+      toolCallId: "tc-42",
+    };
+
+    it("forwards the concierge's call to the registry and replies with the registry's reply verbatim", async () => {
+      fire({
+        reqId: "t1",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: toolPayload,
+      });
+      await flush();
+      expect(dispatchConciergeToolMock).toHaveBeenCalledTimes(1);
+      // The frozen wire contract, unchanged in both directions.
+      expect(dispatchConciergeToolMock.mock.calls[0]![0]).toEqual({
+        domain: "workspace",
+        op: "list_projects",
+        args: { some: "args" },
+        toolCallId: "tc-42",
+      });
+      // The seam is CONNECTED — the human's configured policy is handed to the registry, not the
+      // permissive default. Without this assertion the wiring can be deleted silently.
+      expect(dispatchConciergeToolMock.mock.calls[0]![1]).toEqual({
+        policy: configuredToolPolicy,
+      });
+      expect(lastReply()).toEqual({
+        ok: true,
+        domain: "workspace",
+        op: "list_projects",
+        data: [{ id: "p1" }],
+      });
+    });
+
+    it("coerces a non-string domain/op to \"\" rather than handing the registry a number", async () => {
+      fire({
+        reqId: "t2",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { domain: 7, op: null, args: {}, toolCallId: "tc-43" },
+      });
+      await flush();
+      expect(dispatchConciergeToolMock.mock.calls[0]![0]).toMatchObject({ domain: "", op: "" });
+    });
+
+    it("refuses a BUILD agent — an interactive caller passes the tier gate but not this one", async () => {
+      fire({ reqId: "t3", op: "concierge_tool", callerAgentId: callerId, payload: toolPayload });
+      await flush();
+      const reply = lastReply();
+      expect(reply.ok).toBe(false);
+      // Shaped like every other concierge_tool reply, so the caller can branch on `code`.
+      expect(reply).toMatchObject({ code: "forbidden", domain: "workspace", op: "list_projects" });
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    it("refuses a WORKER at the privileged tier gate, before the handler is even reached", async () => {
+      fire({ reqId: "t4", op: "concierge_tool", callerAgentId: otherId, payload: toolPayload });
+      await flush();
+      const reply = lastReply();
+      expect(reply.ok).toBe(false);
+      // The tier-gate wording — proof that concierge_tool is classified `privileged`, not `free`.
+      expect(String(reply.error)).toContain("interactive (non-worker) agents");
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    // The near-miss is the one worth spelling out: the check is `===` on the reserved id, so no
+    // prefix, suffix or lookalike gets through. The others cover the fail-closed rule for a caller
+    // that resolves to nothing at all.
+    it.each([
+      ["a near-miss id", "sparkle:concierge2"],
+      ["a prefix of the reserved id", "sparkle:concierg"],
+      ["an unresolvable id", "ghost-agent-does-not-exist"],
+      ["an empty id", ""],
+    ])("refuses %s and never reaches the registry", async (_label, callerAgentId) => {
+      fire({ reqId: `t5-${callerAgentId}`, op: "concierge_tool", callerAgentId, payload: toolPayload });
+      await flush();
+      expect(lastReply().ok).toBe(false);
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    it("does not weaken the OTHER ops for anyone: an ordinary agent can still rename itself", async () => {
+      fire({ reqId: "t6", op: "rename_agent", callerAgentId: callerId, payload: { name: "Still Fine" } });
+      await flush();
+      expect(lastReply()).toEqual({ ok: true });
+    });
   });
 });
 
