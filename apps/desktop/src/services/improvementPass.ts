@@ -199,6 +199,53 @@ export function isHourlySlotDue(lastRunAt: number, now: number): boolean {
   return now - lastRunAt >= IMPROVEMENT_INTERVAL_MS;
 }
 
+/** How far `hourlySlotStamp` may rewind the stamp to undo a late tick.
+ *
+ *  Two ticks. One tick is the floor for honest lateness (the scheduler cannot see a slot sooner
+ *  than its next tick); the second absorbs a tick that was itself throttled while the window sat
+ *  in the background. Anything beyond that is a sleep or a restart, not lateness, and the doc on
+ *  `hourlySlotStamp` explains why those must NOT be snapped. Raising this directly lowers the
+ *  guaranteed spacing between passes, which is `IMPROVEMENT_INTERVAL_MS` minus this value. */
+export const MAX_SNAP_BACK_MS = 2 * IMPROVEMENT_TICK_MS;
+
+/** What to record as the slot's start, given the clock the gate just weighed.
+ *
+ *  STAMPING `now` MAKES THE HOURLY SCHEDULE DRIFT, AND THE DRIFT COMPOUNDS. The scheduler only
+ *  notices a due slot on a tick, so it always fires some δ late — δ is small when the app is
+ *  focused and large when the window is backgrounded and the timer is throttled. Recording the
+ *  tick time folds that δ permanently into the phase, and the next slot inherits it, so the pass
+ *  walks later and later around the clock. Measured over one 30-hour stretch of session logs the
+ *  phase moved ~40 minutes (a run at :33:07 became a run at :13:44), and an hour whose tick landed
+ *  past the next boundary was simply skipped — a whole pass lost, with nothing in the logs naming
+ *  why. Anchoring instead means a late tick costs that ONE slot its punctuality and nothing more.
+ *
+ *  So: snap back to the most recent slot boundary at or before `now`, which is the boundary this
+ *  run belongs to — but only far enough to undo real tick lateness. THE SNAP-BACK IS BOUNDED, and
+ *  that bound is load-bearing rather than tidy: stamping an arbitrary boundary in the past also
+ *  moves the NEXT one closer, and the gap it leaves is whatever the remainder happens to be. A
+ *  machine that sleeps 6h55m wakes with a remainder of 55 minutes, so an unbounded snap would
+ *  stamp 55 minutes ago and let the next tick fire a SECOND full pass five minutes after the
+ *  catch-up one. Sleep and restart gaps are near-uniform in that remainder, so roughly half of all
+ *  wake-ups would double-spend the user's subscription against a banner that promises once an hour.
+ *
+ *  `MAX_SNAP_BACK_MS` is what separates the two cases: a remainder inside it is a late tick and is
+ *  corrected, a remainder past it is a sleep/restart gap and keeps `now`. Consecutive attempts are
+ *  therefore never closer than `IMPROVEMENT_INTERVAL_MS - MAX_SNAP_BACK_MS`. The price is that a
+ *  long gap re-phases the grid once — which is the pre-existing behavior, not a new cost, and it
+ *  happens per sleep rather than per hour.
+ *
+ *  Returns `now` unchanged when the slot is NOT due, which is the connectivity re-attempt: that
+ *  run is off-grid by construction (it exists precisely because its slot's pass never happened),
+ *  and there is no boundary of its own to snap to. Same disposition for a `lastRunAt` in the
+ *  future, which a backwards clock adjustment can produce — a negative remainder would push the
+ *  stamp forward and suppress real slots. */
+export function hourlySlotStamp(lastRunAt: number, now: number): number {
+  const elapsed = now - lastRunAt;
+  if (elapsed < IMPROVEMENT_INTERVAL_MS) return now;
+  const remainder = elapsed % IMPROVEMENT_INTERVAL_MS;
+  return remainder <= MAX_SNAP_BACK_MS ? now - remainder : now;
+}
+
 /** Pure gate: is an hourly pass due right now? (bead sparkle-4xwk.2) */
 export function shouldRunImprovementPass(gate: PassGate): boolean {
   if (gate.consent === "never") return false;

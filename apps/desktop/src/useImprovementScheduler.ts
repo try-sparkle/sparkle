@@ -5,6 +5,7 @@
 // stores inside the tick, so consent changes take effect on the next tick without re-mounting.
 import { useEffect } from "react";
 import {
+  hourlySlotStamp,
   IMPROVEMENT_TICK_MS,
   isHourlySlotDue,
   isPassRunning,
@@ -52,7 +53,11 @@ export function useImprovementScheduler(enabled: boolean) {
       // Stamp at ATTEMPT time (not completion) so a slow or failing pass still waits a full
       // hour before the next one — no hot-looping a broken setup. Same `now` the gate weighed,
       // so the reading above and the stamp can't straddle a clock tick.
-      settings.setImprovementLastRunAt(now);
+      //
+      // The stamp is the slot BOUNDARY, not this tick: ticks are always a little late (and a lot
+      // late when the window is backgrounded and timers throttle), and recording the tick time
+      // folds that lateness into the phase forever. See `hourlySlotStamp` for the measurement.
+      settings.setImprovementLastRunAt(hourlySlotStamp(settings.improvementLastRunAt, now));
       void runImprovementPass(consent, freshSlot);
     };
     // A short first check (not immediate — let startup I/O settle), then the slow tick.

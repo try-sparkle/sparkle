@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   hourlyMissionPrompt,
+  hourlySlotStamp,
   IMPROVEMENT_INTERVAL_MS,
+  IMPROVEMENT_TICK_MS,
+  isHourlySlotDue,
+  MAX_SNAP_BACK_MS,
   isTransientPassFailure,
   PASS_BUDGET_MINUTES,
   PASS_TIMEOUT_MS,
@@ -234,5 +238,64 @@ describe("hourlyMissionPrompt", () => {
     expect(hourlyMissionPrompt("always")).toContain(
       `about ${PASS_TIMEOUT_MS / 60000} minutes`,
     );
+  });
+});
+
+describe("hourlySlotStamp", () => {
+  it("snaps a late tick back to its slot boundary, so lateness is not inherited", () => {
+    // The tick noticed the slot 9s after it came due. Recording HOUR + 9_000 would move every
+    // later boundary by 9s as well; the boundary itself is HOUR.
+    expect(hourlySlotStamp(0, HOUR + 9_000)).toBe(HOUR);
+  });
+
+  it("does not drift across many slots, however late each tick lands", () => {
+    // The regression this exists for: measured session logs showed the pass walking ~40 minutes
+    // later over 30 hours. Replay 30 slots, each noticed a (varying) moment late, and the phase
+    // must still be exactly the starting phase.
+    let stamp = 0;
+    for (let slot = 1; slot <= 30; slot++) {
+      const lateBy = (slot % 7) * 20_000; // 0–120s late, inside the snap-back window
+      stamp = hourlySlotStamp(stamp, stamp + HOUR + lateBy);
+    }
+    expect(stamp).toBe(30 * HOUR);
+  });
+
+  it("catches up to the LATEST missed boundary, not the first, after a short sleep", () => {
+    // Six slots elapsed while the machine slept, and the wake tick landed within the snap-back
+    // window. Stamping the FIRST missed boundary would leave five still due and fire five
+    // back-to-back passes.
+    expect(hourlySlotStamp(0, 6 * HOUR + 30_000)).toBe(6 * HOUR);
+  });
+
+  it("never rewinds far enough to let a second pass follow the first", () => {
+    // The regression the bound exists for: a 6h55m sleep leaves a 55-minute remainder, and an
+    // unbounded snap would stamp 55 minutes ago — so the very next tick sees a due slot and
+    // launches a second full pass minutes after the catch-up one.
+    const stamp = hourlySlotStamp(0, 6 * HOUR + 55 * 60_000);
+    expect(stamp).toBe(6 * HOUR + 55 * 60_000); // kept `now`, not snapped
+    expect(isHourlySlotDue(stamp, stamp + IMPROVEMENT_TICK_MS)).toBe(false);
+  });
+
+  it("keeps consecutive attempts at least an interval minus the snap-back apart", () => {
+    // The guarantee stated on MAX_SNAP_BACK_MS, checked across every remainder at tick
+    // granularity rather than at a few hand-picked points.
+    for (let extra = 0; extra < HOUR; extra += 60_000) {
+      const now = 3 * HOUR + extra;
+      const stamp = hourlySlotStamp(0, now);
+      expect(now - stamp).toBeLessThanOrEqual(MAX_SNAP_BACK_MS);
+    }
+  });
+
+  it("leaves an off-grid re-attempt alone", () => {
+    // The connectivity retry runs before its slot is due; it has no boundary of its own to snap
+    // to, so the tick time stands.
+    const midHour = HOUR / 2;
+    expect(hourlySlotStamp(0, midHour)).toBe(midHour);
+  });
+
+  it("does not push the stamp forward when the clock moves backwards", () => {
+    // A backwards clock adjustment makes `lastRunAt` sit in the future. A negative remainder
+    // would stamp LATER than now and suppress real slots; `now` is the safe floor.
+    expect(hourlySlotStamp(10 * HOUR, 2 * HOUR)).toBe(2 * HOUR);
   });
 });
