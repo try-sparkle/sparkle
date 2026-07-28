@@ -1,12 +1,11 @@
 // @vitest-environment jsdom
 //
 // The compose box's attachment surface (parity row #21, bead sparkle-4562.3): staged files render
-// as removable chips, an attachment alone is a sendable message, and the box exposes the drop
-// target the host hit-tests. The box owns none of this state — it renders what it is given.
+// as removable chips, an attachment alone is a sendable message, and the box paints the drag
+// affordance. The box owns none of this state — it renders what it is given.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
-import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment } from "./types";
 
 afterEach(() => cleanup());
@@ -87,21 +86,24 @@ describe("ComposeBox — sending with attachments", () => {
   });
 });
 
-describe("ComposeBox — drop target", () => {
-  it("marks itself so the host's window-global drag listener can hit-test it", () => {
-    setup();
-    const target = document.querySelector("[data-dnd-target]");
-    expect(target?.getAttribute("data-dnd-target")).toBe(CONCIERGE_COMPOSE_DND_TARGET);
-  });
-
-  it("paints a drop affordance only while a drag is over it", () => {
+// The hit-test marker lives on the COLUMN around this box (ConciergeColumn), not on the box: a
+// file dropped anywhere over the concierge attaches, and this ~90px strip is not what a cursor
+// aims at. What the box still owns is the AFFORDANCE — the only signal a native OS drag gives the
+// user that the file has somewhere to land.
+describe("ComposeBox — drop affordance", () => {
+  it("paints a drop affordance only while a drag is over the concierge", () => {
     const { unmount } = renderWith(false);
-    const calm = document.querySelector("[data-dnd-target]") as HTMLElement;
+    const calm = screen.getByTestId("concierge-compose");
     expect(calm.style.outline).toBe("none");
     unmount();
     renderWith(true);
-    const lit = document.querySelector("[data-dnd-target]") as HTMLElement;
+    const lit = screen.getByTestId("concierge-compose");
     expect(lit.style.outline).toContain("dashed");
+  });
+
+  it("does not claim the drag hit-test itself — the column owns it", () => {
+    setup();
+    expect(document.querySelector("[data-dnd-target]")).toBeNull();
   });
 });
 

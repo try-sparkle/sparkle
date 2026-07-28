@@ -15,6 +15,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { ConciergeMessage } from "../components/Concierge/types";
+import type { Attachment } from "../components/composer/attachments";
 
 // Keep the thread bounded so localStorage can't grow without limit, exactly as
 // promptHistoryStore.PROMPT_HISTORY_MAX does. 200 messages is far more than anyone scrolls back
@@ -53,8 +54,90 @@ const PERSISTED_KINDS = ["you", "sparkle"] as const;
 
 type PersistedKind = (typeof PERSISTED_KINDS)[number];
 
-function isConversation(m: ConciergeMessage): m is Extract<ConciergeMessage, { kind: PersistedKind }> {
+type Conversation = Extract<ConciergeMessage, { kind: PersistedKind }>;
+
+function isConversation(m: ConciergeMessage): m is Conversation {
   return (PERSISTED_KINDS as readonly string[]).includes(m.kind);
+}
+
+/**
+ * Drop each attachment's `dataUrl` before the thread is written to disk, keeping the record itself.
+ *
+ * A sent message now carries the files that rode with it so the bubble can show them (PRD §8), and
+ * an image attachment's `dataUrl` is base64 — a single retina screenshot is routinely 1–4 MB, which
+ * is the whole ~5MB localStorage quota in one bubble. That is the exact failure {@link CONCIERGE_MSG_MAX_LEN}
+ * exists to prevent, arriving through a field the text cap cannot see: the persist write throws,
+ * zustand silently stops persisting the WHOLE store, and the symptom ("my thread stopped surviving
+ * restarts") shows up long after the screenshot that caused it.
+ *
+ * The name/path/kind survive, so a restored bubble still says WHAT was sent — it renders as a chip
+ * instead of a thumbnail (MessageAttachments falls back on a missing `dataUrl`). Re-reading the
+ * pixels back off disk isn't an option worth the quota: the paths are temp files that may be gone.
+ */
+function stripDataUrls(m: Conversation): Conversation {
+  if (m.kind !== "you" || !m.attachments?.length) return m;
+  return {
+    ...m,
+    attachments: m.attachments.map(withoutPreview),
+  };
+}
+
+/** Strip one attachment's preview, keeping the record that names it. Shared by the persistence cap
+ *  and the live-retention cap below so the two can't disagree about what "a stripped attachment" is. */
+function withoutPreview(a: Attachment): Attachment {
+  return { id: a.id, kind: a.kind, path: a.path, name: a.name };
+}
+
+/** How many of the newest attachment-carrying messages keep their previews in MEMORY. Older bubbles
+ *  degrade to chips, exactly as a restored one does. Six is well past what fits on screen in a column
+ *  this narrow, so the thumbnail is still there for anything the reader can plausibly scroll back to. */
+export const LIVE_THUMBNAIL_MESSAGES = 6;
+
+/** …and how big any ONE retained preview may be, in base64 characters (~3 MB of string). */
+export const LIVE_THUMBNAIL_MAX_CHARS = 4 * 1024 * 1024;
+
+/**
+ * Bound what the LIVE thread retains in memory, which is a different axis from the localStorage cap.
+ *
+ * `chat` is never trimmed while the session runs — {@link CONCIERGE_THREAD_MAX} and
+ * {@link persistableThread} apply only in `partialize` — so once a sent message carries its own
+ * attachments (PRD §8) every `you` bubble pins its base64 for the life of the process. Before that
+ * change the string was released at send time, when `takeAttachments` cleared it and the composer
+ * row unmounted.
+ *
+ * Two caps, because either alone leaves the failure reachable. Screenshots are downscaled in Rust
+ * (`screenshot.rs` PREVIEW_MAX_DIM = 1600), but a PICKED or DROPPED image is not: `attachments.rs`
+ * emits a `data_url` for any image up to `MAX_PREVIEW_BYTES` = 40 MB, i.e. a ~53 MB base64 string —
+ * so a count cap alone still admits hundreds of MB, and a size cap alone still grows without bound.
+ * The retained bitmap matters as much as the string: the browser decodes at full resolution to draw
+ * a 72 px thumbnail.
+ *
+ * Runs on every write, and returns the INPUT ARRAY UNCHANGED when nothing needed stripping — the
+ * common case by far. Bubbles are memoized on identity, so rebuilding the array (or an untouched
+ * message inside it) on every keystroke-driven write would re-render the whole thread.
+ */
+export function boundLiveThumbnails(chat: ConciergeMessage[]): ConciergeMessage[] {
+  let budget = LIVE_THUMBNAIL_MESSAGES;
+  let out: ConciergeMessage[] | null = null;
+  // Newest first: the budget is spent on the messages the reader is nearest to.
+  for (let i = chat.length - 1; i >= 0; i--) {
+    const m = chat[i]!;
+    if (m.kind !== "you" || !m.attachments?.length) continue;
+    // An already-stripped message costs nothing and must not consume the budget, or the cap would
+    // ratchet down a message at a time across a long session.
+    if (!m.attachments.some((a) => a.dataUrl !== undefined)) continue;
+    const withinCount = budget > 0;
+    budget -= 1;
+    const next = m.attachments.map((a) =>
+      a.dataUrl !== undefined && (!withinCount || a.dataUrl.length > LIVE_THUMBNAIL_MAX_CHARS)
+        ? withoutPreview(a)
+        : a,
+    );
+    if (next.every((a, j) => a === m.attachments![j])) continue;
+    out ??= chat.slice();
+    out[i] = { ...m, attachments: next };
+  }
+  return out ?? chat;
 }
 
 /** Clip one message to the length cap, preserving its identity and kind. */
@@ -65,7 +148,8 @@ function clip<T extends { text: string }>(m: T): T {
 
 /**
  * Reduce a live thread to what belongs in localStorage: conversation only, newest
- * {@link CONCIERGE_THREAD_MAX} kept, each clipped to {@link CONCIERGE_MSG_MAX_LEN}.
+ * {@link CONCIERGE_THREAD_MAX} kept, each clipped to {@link CONCIERGE_MSG_MAX_LEN} and with every
+ * attachment's base64 dropped (see {@link stripDataUrls} — the second, larger size axis).
  *
  * Exported so the caps are testable without going through zustand's persist middleware, and so the
  * ordering guarantee is pinned in one place: the result stays OLDEST-FIRST, matching
@@ -73,7 +157,7 @@ function clip<T extends { text: string }>(m: T): T {
  * this is a transcript, and reversing it would render the conversation backwards.)
  */
 export function persistableThread(chat: ConciergeMessage[]): ConciergeMessage[] {
-  const conversation = chat.filter(isConversation).map(clip);
+  const conversation = chat.filter(isConversation).map(clip).map(stripDataUrls);
   // Trim from the FRONT: drop the oldest turns, keep the tail the user is actually looking at.
   return conversation.length > CONCIERGE_THREAD_MAX
     ? conversation.slice(conversation.length - CONCIERGE_THREAD_MAX)
@@ -133,8 +217,13 @@ export const useConciergeThreadStore = create<ConciergeThreadState>()(
   persist(
     (set) => ({
       chat: [],
+      // Every write goes through the live-retention cap (see boundLiveThumbnails): the store is the
+      // one place all of them converge — the host's append, the receipt rewrite, a seeded test —
+      // so bounding here is what makes the guarantee hold rather than depending on each call site.
       setChat: (next) =>
-        set((s) => ({ chat: typeof next === "function" ? next(s.chat) : next })),
+        set((s) => ({
+          chat: boundLiveThumbnails(typeof next === "function" ? next(s.chat) : next),
+        })),
       clearChat: () => set({ chat: [] }),
     }),
     {

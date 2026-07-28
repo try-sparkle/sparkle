@@ -14,7 +14,9 @@
 // independently and were each patched shut (PRD/sparkle/hide-worker-agents-from-sidebar.md); the
 // suppression approach was then abandoned, because a worker with no row is both unreachable and
 // unattributable — `projectStore.addAgent` moves selection to a freshly-spawned worker, so a spawn
-// left the terminal showing an agent that NO row was highlighting.
+// left the terminal showing an agent that NO row was highlighting. That guarantee is now carried by
+// the SELECTION-reveal rule ("a selected worker always has a row", below) rather than by the subtree
+// opening on spawn — subtrees open only when a worker needs you.
 //
 // The structural constraint these tests defend: children are rendered inside the head's own section
 // wrapper, NOT fed through the ladder. `groupAgentsByStage` buckets per row by workflow stage, so a
@@ -88,6 +90,17 @@ function liveProject() {
   const p = useProjectStore.getState().projects[0];
   if (!p) throw new Error("project p1 is gone from the store");
   return p;
+}
+
+/** Re-render with `next` as the live project, exactly as a store update would. */
+function advance(
+  rerender: ReturnType<typeof render>["rerender"],
+  next: Project,
+  status?: Record<string, AgentTabStatus>,
+) {
+  useProjectStore.setState({ projects: [next] } as never);
+  if (status) useRuntimeStore.setState({ status } as never);
+  rerender(<AgentSidebar project={next} />);
 }
 
 /** Expanded is the non-default state, so most tests need this. Set directly rather than by clicking
@@ -274,17 +287,19 @@ describe("AgentSidebar — pane attribution follows the selected row", () => {
   });
 });
 
-describe("AgentSidebar — a spawned worker auto-expands its parent", () => {
-  // THE case the auto-expand exists for, and the one the first cut got wrong (roborev 53672-High):
-  // every orchestrator starts with zero workers, so if the snapshot only records parents that
-  // ALREADY have workers, the first spawn looks like a first sighting and stays collapsed. Only the
-  // second worker onward would expand — while addAgent has already moved selection to the new
-  // worker, reproducing the exact "terminal shows an agent no row is highlighting" bug this whole
-  // change is meant to kill.
-  it("expands a parent that had NO workers when its first one spawns", () => {
+// Subtrees default CLOSED and open by themselves for exactly ONE reason: a worker under them enters
+// the needs_you band. They used to open on GROWTH — every spawn popped the subtree — which is the
+// behavior these cases now invert. Nothing is hidden by a subtree that stays shut: a collapsed
+// orchestrator whose worker is red already shows that red on its own head row (see
+// AgentSidebar.redWorker.test.tsx).
+describe("AgentSidebar — a subtree opens when a worker needs you, not when one spawns", () => {
+  // The inversion. A spawn is not an event that requires the user, so it must leave the parent
+  // exactly as the user left it — closed.
+  /** A one-orchestrator project, seeded with whatever selection the case is about. */
+  function seedSolo(selectedAgentId: string | null): Project {
     const solo: Project = {
       id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
-      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      createdAt: new Date(0).toISOString(), selectedAgentId,
       agents: [mkAgent("a1", "Alpha")],
     };
     useProjectStore.setState({ projects: [solo] } as never);
@@ -292,6 +307,34 @@ describe("AgentSidebar — a spawned worker auto-expands its parent", () => {
       branchStatus: {}, workflowStage: {}, status: {},
       openAgentIds: ["a1"], open, pollBranchStatus: vi.fn(() => Promise.resolve()),
     } as never);
+    return solo;
+  }
+
+  it("does NOT expand a parent when its first worker spawns", () => {
+    // The user is reading the orchestrator that's about to fan out.
+    const solo = seedSolo("a1");
+    const { rerender } = render(<AgentSidebar project={solo} />);
+
+    // What the store ACTUALLY looks like after spawnWorker: the worker is appended and the
+    // selection is untouched — services/workerSpawn passes `select: false`, which never moves it.
+    const grown: Project = {
+      ...solo,
+      agents: [...solo.agents, mkAgent("w1", "First Worker", {
+        kind: "worker", parentId: "a1", baseBranch: "main",
+      })],
+    };
+    advance(rerender, grown, { w1: "working" });
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(queryRow("First Worker")).toBeNull();
+  });
+
+  // The null-selection variant, which is where `select: false` used to invert itself: the store
+  // backfilled the empty slot with the new worker, and a SELECTED worker trips the selection-reveal
+  // effect below, forcing the subtree open. `select: false` is absolute now, so a null selection
+  // survives the spawn and nothing reveals anything.
+  it("does NOT expand a parent when a worker spawns into a project with nothing selected", () => {
+    const solo = seedSolo(null);
     const { rerender } = render(<AgentSidebar project={solo} />);
 
     const grown: Project = {
@@ -300,40 +343,88 @@ describe("AgentSidebar — a spawned worker auto-expands its parent", () => {
         kind: "worker", parentId: "a1", baseBranch: "main",
       })],
     };
-    useProjectStore.setState({ projects: [grown] } as never);
-    rerender(<AgentSidebar project={grown} />);
+    advance(rerender, grown, { w1: "working" });
 
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-    expect(queryRow("First Worker")).toBeTruthy();
+    expect(liveProject().selectedAgentId).toBeNull();
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(queryRow("First Worker")).toBeNull();
   });
 
-  it("expands a collapsed parent when a worker appears", async () => {
-    const project = seed(); // collapsed by default
+  it("does NOT expand a collapsed parent when another (calm) worker appears", () => {
+    const project = seed({ w1: "working", w2: "working" }); // collapsed by default
     const { rerender } = render(<AgentSidebar project={project} />);
     expect(queryRow("Parser Worker")).toBeNull();
 
-    // Spawn: a third worker joins a1. This is what spawnWorker's addAgent does to the store.
+    // Spawn: a third worker joins a1, with the user's tab restored to the orchestrator — the exact
+    // store shape services/workerSpawn leaves behind.
     const grown: Project = {
       ...project,
+      selectedAgentId: "a1",
       agents: [...project.agents, mkAgent("w3", "Codegen Worker", {
         kind: "worker", parentId: "a1", baseBranch: "main",
       })],
     };
-    useProjectStore.setState({ projects: [grown] } as never);
-    rerender(<AgentSidebar project={grown} />);
+    advance(rerender, grown, { w1: "working", w2: "working", w3: "working" });
 
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-    expect(queryRow("Codegen Worker")).toBeTruthy();
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(queryRow("Codegen Worker")).toBeNull();
   });
 
-  // The counterpart, and the reason expandOnGrowth skips a parent's first sighting: a mount must
-  // not be read as growth, or every relaunch would blow open every subtree the user collapsed.
-  it("does not expand on first render, so a persisted collapse survives relaunch", () => {
+  // THE case the auto-expand now exists for.
+  it("expands a collapsed parent when one of its workers goes red", () => {
+    const project = seed({ w1: "working", w2: "working" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+    expect(queryRow("Parser Worker")).toBeNull();
+
+    advance(rerender, project, { w1: "waiting", w2: "working" });
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    expect(queryRow("Parser Worker")).toBeTruthy();
+  });
+
+  // TRANSITION, NOT STATE. The effect re-runs on every status/agents change, so a worker that merely
+  // STAYS red must not re-assert the expansion — otherwise collapsing a subtree with a red worker in
+  // it would undo itself on the next render and the chevron would read as broken.
+  it("does not re-expand after the user collapses a subtree whose worker is still red", () => {
+    const project = seed({ w1: "working", w2: "working" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    advance(rerender, project, { w1: "errored", w2: "working" });
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+
+    toggleAlpha(); // the user shuts it again, red and all
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+
+    // w1 is still errored; an unrelated change ticks the effect.
+    advance(rerender, project, { w1: "errored", w2: "idle" });
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+    expect(queryRow("Parser Worker")).toBeNull();
+  });
+
+  // The counterpart, and the reason the helper skips a parent's first sighting: a mount must not be
+  // read as a transition, or every relaunch would blow open every subtree the user collapsed. The
+  // red is not lost — the head row carries it.
+  it("does not expand on first render even when a worker is ALREADY red", () => {
     useUiStore.setState({ collapsedOrchestrators: { a1: true } } as never);
-    const project = seed();
+    const project = seed({ w1: "errored" });
     render(<AgentSidebar project={project} />);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
     expect(queryRow("Parser Worker")).toBeNull();
+  });
+
+  // Expansion is automatic; COLLAPSING stays the user's gesture — never yank a subtree shut while
+  // they are reading it.
+  it("does not collapse the subtree when the red clears", () => {
+    const project = seed({ w1: "errored" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+    advance(rerender, project, { w1: "idle" });
+    // The red never triggered an expand (first sighting), so open it as the user would.
+    toggleAlpha();
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+
+    advance(rerender, project, { w1: "working" });
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    expect(queryRow("Parser Worker")).toBeTruthy();
   });
 
   it("does not re-expand a parent the user collapsed while its workers spin down", () => {
@@ -343,9 +434,148 @@ describe("AgentSidebar — a spawned worker auto-expands its parent", () => {
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     const shrunk: Project = { ...project, agents: project.agents.filter((a) => a.id !== "w2") };
-    useProjectStore.setState({ projects: [shrunk] } as never);
-    rerender(<AgentSidebar project={shrunk} />);
+    advance(rerender, shrunk);
 
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+  });
+
+  // A STRAND — worktree cut, never mounted, no live status — is painted red by
+  // withUnstartedWorkerAttention. That red is synthetic and its open/evict ping-pong can toggle many
+  // times a second, so it must not drive the subtree. The signal is not lost: the orchestrator's own
+  // head row goes red (AgentSidebar.redWorker.test.tsx pins that).
+  it("does not expand for a stranded worker's SYNTHETIC red", () => {
+    const project = seed({ w1: "working", w2: "working" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    const strandParent: Project = {
+      ...project,
+      agents: [...project.agents, mkAgent("w3", "Stranded Worker", {
+        kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w3",
+      })],
+    };
+    // w3 has a worktree, is NOT in openAgentIds and has no status → isUnstartedWorker → synthetic
+    // `approval`. Its parent a1 is open, which is the other half of the strand condition.
+    advance(rerender, strandParent, { w1: "working", w2: "working" });
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(queryRow("Stranded Worker")).toBeNull();
+  });
+
+  // effectiveStatus (not the raw map) is the status source, so an alarm the user DISMISSED is
+  // already de-escalated out of the red tier by the time the rule sees it.
+  it("does not expand for a red the user has DISMISSED", () => {
+    const project = seed({ w1: "working", w2: "working" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    const dismissed: Project = {
+      ...project,
+      agents: project.agents.map((a) =>
+        a.id === "w1" ? { ...a, alert: { seq: 1, lastRed: "errored" as const, dismissedSeq: 1 } } : a,
+      ),
+    };
+    advance(rerender, dismissed, { w1: "errored", w2: "working" });
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(queryRow("Parser Worker")).toBeNull();
+  });
+});
+
+// Orthogonal to attention, and what makes dropping auto-expand-on-spawn safe: `addAgent` moves
+// selection to the freshly-spawned worker, so a selected worker inside a collapsed subtree would
+// leave the terminal showing an agent that NO row is highlighting — the bug that made workers get
+// rows in the first place.
+describe("AgentSidebar — a selected worker always has a row", () => {
+  it("expands the parent when selection moves to a worker in a collapsed subtree", () => {
+    const project = seed({ w1: "working", w2: "working" }); // collapsed by default
+    const { rerender } = render(<AgentSidebar project={project} />);
+    expect(queryRow("Parser Worker")).toBeNull();
+
+    // What projectStore.addAgent does at the end of a spawn.
+    const selected: Project = { ...project, selectedAgentId: "w1" };
+    useProjectStore.setState({ projects: [selected] } as never);
+    rerender(<AgentSidebar project={selected} />);
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    expect(queryRow("Parser Worker")).toBeTruthy();
+  });
+
+  it("renders the row on a relaunch that restores a worker selection", () => {
+    useUiStore.setState({ collapsedOrchestrators: { a1: true } } as never);
+    const project = { ...seed({ w1: "working" }), selectedAgentId: "w1" };
+    useProjectStore.setState({ projects: [project] } as never);
+    render(<AgentSidebar project={project} />);
+    expect(queryRow("Parser Worker")).toBeTruthy();
+  });
+
+  // Selection is a CHANGE trigger, not a state one: having selected a worker must not stop the user
+  // from shutting the subtree afterwards.
+  it("stays collapsed after the user closes a subtree holding the selected worker", () => {
+    const project = seedExpanded({ w1: "working", w2: "working" });
+    const selected: Project = { ...project, selectedAgentId: "w1" };
+    useProjectStore.setState({ projects: [selected] } as never);
+    const { rerender } = render(<AgentSidebar project={selected} />);
+
+    toggleAlpha();
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+
+    // An unrelated tick, selection unchanged.
+    useRuntimeStore.setState({ status: { w1: "working", w2: "idle" } } as never);
+    rerender(<AgentSidebar project={selected} />);
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+  });
+
+  it("leaves subtrees alone when the selection is a top-level agent", () => {
+    const project = seed({ w1: "working" });
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    const selected: Project = { ...project, selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [selected] } as never);
+    rerender(<AgentSidebar project={selected} />);
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+  });
+
+  // ONE AgentSidebar stays mounted across project switches (Workspace renders it once with `project`
+  // as a prop), so a last-seen-id ref would read a round trip as two selection changes and re-open a
+  // subtree the user shut — even though this project's selection never moved.
+  it("does not re-expand after a project switch away and back", () => {
+    const project = seedExpanded({ w1: "working", w2: "working" });
+    const a: Project = { ...project, selectedAgentId: "w1" };
+    const b: Project = {
+      id: "p2", name: "Other", rootPath: "/tmp/other", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: "b1",
+      agents: [mkAgent("b1", "Bravo")],
+    };
+    useProjectStore.setState({ projects: [a, b] } as never);
+    const { rerender } = render(<AgentSidebar project={a} />);
+
+    toggleAlpha();
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+
+    rerender(<AgentSidebar project={b} />); // switch away…
+    rerender(<AgentSidebar project={a} />); // …and back
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+  });
+
+  // A selection can name an id before its record lands (a cross-window adopt). Dropping the reveal
+  // then would strand it permanently, because every later agents-array update looks unchanged.
+  it("reveals a selection whose agent record arrives late", () => {
+    const project = seed({ w1: "working", w2: "working" });
+    const pending: Project = { ...project, selectedAgentId: "w9" };
+    useProjectStore.setState({ projects: [pending] } as never);
+    const { rerender } = render(<AgentSidebar project={pending} />);
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+
+    const adopted: Project = {
+      ...pending,
+      agents: [...pending.agents, mkAgent("w9", "Adopted Worker", {
+        kind: "worker", parentId: "a1", baseBranch: "main",
+      })],
+    };
+    advance(rerender, adopted);
+
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    expect(queryRow("Adopted Worker")).toBeTruthy();
   });
 });

@@ -26,6 +26,8 @@ export function useSpawnBuildAgent(project: Project | null): () => string | null
   const setAgentBeadId = useProjectStore((s) => s.setAgentBeadId);
   const open = useRuntimeStore((s) => s.open);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+  const requestRevealAgent = useUiStore((s) => s.requestRevealAgent);
+  const requestComposeFocus = useUiStore((s) => s.requestComposeFocus);
   return () => {
     if (!project) return null;
     const proj = project;
@@ -41,6 +43,23 @@ export function useSpawnBuildAgent(project: Project | null): () => string | null
     perfStart(id, "spawn", { kind: "build" });
     selectAgent(proj.id, id);
     open(id);
+    // …and LAND the user in it (§13). Selecting the agent only decides which pane renders; it does
+    // not put the new row where the eye is, nor the caret where the hands are. Both halves matter
+    // and both are reached through existing seams:
+    //   • reveal — the new row can be below the fold in a long column, so ask it to scroll itself
+    //     into view (AgentSidebar's AgentRow consumes this and clears it).
+    //   • focus — the ONE compose surface is the concierge box (CM-U7 removed the per-pane
+    //     composer), and it is already mounted beside every pane, so the existing focus-request
+    //     token is all it takes. That box is also the right target while the workspace spins up:
+    //     the preparing pane literally invites "start typing now and I'll send it when it's ready".
+    //     Once the PTY is live AgentPane hands the caret on to the terminal — but only if the user
+    //     hasn't started typing here (isTypingInProgress), so this never costs a keystroke.
+    // Deliberately AFTER the `!id` guard: the two no-agent paths (no project open, and a project
+    // closed in another window mid-click, roborev 46278) must not scroll or steal the caret for a
+    // create that didn't happen. The cloud path never reaches here at all — useNewAgent returns
+    // before calling us, because no agent exists until the server starts the session.
+    requestRevealAgent(id);
+    requestComposeFocus();
     // Title the bead with the agent's (default) name so beads stay distinguishable on the board
     // rather than a row of identical placeholders. Note: if the user removes the agent within the
     // sub-second `bd create` window, the bead is orphaned — an accepted best-effort tradeoff that

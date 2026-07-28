@@ -4,6 +4,7 @@ import { C, FONT, ON_GOLD_FILL } from "../theme/colors";
 import { useHintMode } from "../keyboardHints/useHintMode";
 import {
   AGENT_HINT,
+  PROJECT_TAB_HINT,
   RECENT_HINT,
   RECENT_SWITCH_HINT,
   RECENT_TRIGGER_HINT,
@@ -112,17 +113,26 @@ function collectChiclets(): Chiclet[] {
   const agents = nodes
     .filter((el) => el.dataset.hint === AGENT_HINT)
     .sort(byVisualOrder);
+  // Project tabs read left to right along one row, which byVisualOrder gives us for free (equal
+  // tops → compare lefts).
+  const tabs = nodes
+    .filter((el) => el.dataset.hint === PROJECT_TAB_HINT)
+    .sort(byVisualOrder);
   // A Switch button only exists inside a Recent row, so if we got here there are none — but filter
   // it out anyway so it can never leak into the chrome bucket and resolve to a null label.
   const chrome = nodes.filter(
     (el) =>
       el.dataset.hint !== AGENT_HINT &&
+      el.dataset.hint !== PROJECT_TAB_HINT &&
       el.dataset.hint !== RECENT_HINT &&
       el.dataset.hint !== RECENT_SWITCH_HINT,
   );
 
-  // Agents first so they consume the 1..9 numbering in visual order; chrome keeps fixed keys.
-  return place([...agents, ...chrome]);
+  // Tabs first, then agents, then chrome: tabs claim the head of the shared overflow pool in
+  // left-to-right order, agents take 1..9 in visual order and resume the pool after the tabs, and
+  // chrome keeps its fixed keys. (assignLabels counts the tabs up front, so this order is for
+  // readable, stable placement rather than something the labels depend on.)
+  return place([...tabs, ...agents, ...chrome]);
 }
 
 // The keyboard-hint overlay. Mounted once at the app root; renders nothing until a clean ⌘ tap opens

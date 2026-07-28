@@ -10,6 +10,7 @@ const setHelperBounds = vi.fn();
 const hideHelper = vi.fn();
 const showHelper = vi.fn();
 const showMainWindow = vi.fn();
+const setHelperMenuState = vi.fn();
 
 // Two REAL displays, so the placement path runs for real instead of the degenerate zero-rect
 // fallback jsdom otherwise forces (availableMonitors rejects there, and every test then exercises
@@ -43,6 +44,10 @@ let fireCaptureSend: (() => void) | null = null;
 // …and the frontmost transitions, so a test can play the real send ordering: closed (frontmost
 // still false, the takeover is excluded from the policy) THEN the raise at the end of the dispatch.
 let fireFrontmost: ((f: boolean) => void) | null = null;
+// The native menu bar's "View → Hide/Show Helper", which Rust forwards as a payload-free
+// `helper://toggle-requested`. It is the guaranteed way back for a dismissed island, so a test has
+// to be able to play it — nothing else in the webview can re-enable the helper.
+let fireMenuToggle: (() => void) | null = null;
 // The seed. Mirrors getFrontmost/getHelperVitals; a test overrides it to mount the helper under an
 // already-open takeover, or to hand the recovery re-poll a "the takeover is gone" answer.
 const getTakeoverOpen = vi.fn(async (): Promise<boolean | null> => false);
@@ -71,6 +76,11 @@ vi.mock("../services/helper", () => ({
   showHelper: (...a: unknown[]) => showHelper(...a),
   hideHelper: (...a: unknown[]) => hideHelper(...a),
   showMainWindow: (...a: unknown[]) => showMainWindow(...a),
+  onHelperToggleRequested: async (cb: () => void) => {
+    fireMenuToggle = cb;
+    return () => {};
+  },
+  setHelperMenuState: (...a: unknown[]) => setHelperMenuState(...a),
 }));
 
 import { availableMonitors } from "@tauri-apps/api/window";
@@ -92,6 +102,7 @@ describe("HelperApp", () => {
     fireCaptureClosed = null;
     fireCaptureSend = null;
     fireFrontmost = null;
+    fireMenuToggle = null;
     // Same restore-a-default pattern as availableMonitors below: mockReset drains any *Once queue a
     // previous case left behind, and the explicit default NAMES what an unseeded test gets — no
     // takeover on screen, which is the ordinary mount.
@@ -115,6 +126,14 @@ describe("HelperApp", () => {
     render(<HelperApp />);
     await waitFor(() => expect(screen.getByTestId("helper-needs-you").textContent).toContain("3"));
     expect(screen.getByTestId("helper-running").textContent).toContain("7");
+  });
+
+  it("renders nothing while Sparkle is frontmost", async () => {
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    await waitFor(() => expect(fireFrontmost).toBeTypeOf("function"));
+    fireFrontmost!(true);
+    await waitFor(() => expect(screen.queryByTestId("helper-root")).toBeNull());
   });
 
   it("renders nothing while the helper is disabled", () => {
@@ -293,22 +312,31 @@ describe("HelperApp", () => {
 
   it("the global shortcut still captures while the island is hidden", async () => {
     // The helper webview stays mounted (and subscribed) when hidden, which is why Rust no longer
-    // shows the island before emitting — capture must work either way.
+    // shows the island before emitting — capture must work either way. Driven by the PERSISTED
+    // hide rather than frontmost: that is the state that outlives the session, so it is the one
+    // where a webview that stopped listening while hidden would break the shortcut for good.
     useHelperPrefs.setState({ ...DEFAULTS, enabled: false } as never);
     const shot = { path: "/tmp/a.png" };
     captureScreenRegion.mockResolvedValue(shot);
     render(<HelperApp />);
+    await waitFor(() => expect(screen.queryByTestId("helper-root")).toBeNull());
     await waitFor(() => expect(fireCaptureShortcut).toBeTypeOf("function"));
     fireCaptureShortcut!();
     await waitFor(() => expect(showCaptureWindow).toHaveBeenCalledWith(shot));
   });
 
   it("a failed shortcut capture does not resurrect a hidden island", async () => {
-    // Hide Helper is persisted, so an unconditional showHelper() in the error path would put back
-    // an island the user had deliberately dismissed.
-    useHelperPrefs.setState({ ...DEFAULTS, enabled: false } as never);
+    // The error path must never call showHelper() itself: clearing captureBusy re-runs the
+    // visibility effect, which re-shows the island only if it SHOULD be visible. An unconditional
+    // show would paint it over a frontmost Sparkle, where the rule says it has no business being.
     captureScreenRegion.mockRejectedValue(new Error("TCC denied"));
     render(<HelperApp />);
+    await waitFor(() => expect(fireFrontmost).toBeTypeOf("function"));
+    fireFrontmost!(true);
+    // The mount, before frontmost arrived, legitimately showed it once. Only what happens AFTER the
+    // island is hidden is under test, so drop that first show rather than assert around it.
+    await waitFor(() => expect(hideHelper).toHaveBeenCalled());
+    showHelper.mockClear();
     await waitFor(() => expect(fireCaptureShortcut).toBeTypeOf("function"));
     fireCaptureShortcut!();
     await waitFor(() => expect(captureScreenRegion).toHaveBeenCalled());
@@ -691,12 +719,70 @@ describe("HelperApp", () => {
     expect(emitFocusTier).toHaveBeenCalledWith({ band: "running" });
   });
 
+  // §6 inverted this into "offers NO Hide Helper". It is BACK, and the inversion is undone: an
+  // always-on-top panel floating over every other app has to be dismissable. What makes the
+  // persisted hide safe this time is the native menu bar, covered by the two tests below.
   it("right-click → Hide Helper disables it and persists the choice", async () => {
     render(<HelperApp />);
     await screen.findByTestId("helper-needs-you");
     fireEvent.contextMenu(screen.getByTestId("helper-root"));
-    fireEvent.click(await screen.findByRole("button", { name: /hide helper/i }));
+    // The menu really is open, so the item found below is the one in it.
+    expect(await screen.findByRole("menu")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /hide helper/i }));
     expect(useHelperPrefs.getState().enabled).toBe(false);
+    // …and it actually goes away, rather than only recording a preference nothing reads.
+    await waitFor(() => expect(screen.queryByTestId("helper-root")).toBeNull());
+    await waitFor(() => expect(hideHelper).toHaveBeenCalled());
+  });
+
+  it("the three context-menu items are all present", async () => {
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    fireEvent.contextMenu(screen.getByTestId("helper-root"));
+    expect(await screen.findByRole("menu")).toBeTruthy();
+    // MENU_H is sized for THREE items (helperGeometry.ts); the window would clip a fourth.
+    expect(screen.getByRole("button", { name: /open sparkle/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /hide helper/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /quit sparkle/i })).toBeTruthy();
+  });
+
+  // THE WAY BACK. This is the whole reason the persisted hide is allowed to exist again: the item
+  // lives in the native menu bar, which cannot itself be hidden. Nothing inside the helper webview
+  // can re-enable the island — it is not rendered — so if this bridge breaks, Hide Helper is a
+  // one-way door once more.
+  it("the native View menu toggles the island back on and off", async () => {
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    await waitFor(() => expect(fireMenuToggle).toBeTypeOf("function"));
+
+    fireMenuToggle!();
+    await waitFor(() => expect(screen.queryByTestId("helper-root")).toBeNull());
+    expect(useHelperPrefs.getState().enabled).toBe(false);
+
+    // …and back, from a menu item that is the ONLY affordance still reachable at this point.
+    fireMenuToggle!();
+    expect(await screen.findByTestId("helper-root")).toBeTruthy();
+    expect(useHelperPrefs.getState().enabled).toBe(true);
+  });
+
+  // The item's LABEL is derived in Rust from this value (app_menu::helper_label), so the menu can
+  // never offer "Hide Helper" for an island that is already hidden. That only holds if the webview
+  // keeps pushing the state — including after a hide made from the island's OWN menu, which Rust
+  // has no other way to learn about.
+  it("pushes the current preference to the native menu on mount and on every change", async () => {
+    render(<HelperApp />);
+    await screen.findByTestId("helper-needs-you");
+    // Mount: corrects the default-labelled item for a hydrated preference.
+    await waitFor(() => expect(setHelperMenuState).toHaveBeenCalledWith(true));
+
+    setHelperMenuState.mockClear();
+    fireEvent.contextMenu(screen.getByTestId("helper-root"));
+    fireEvent.click(await screen.findByRole("button", { name: /hide helper/i }));
+    await waitFor(() => expect(setHelperMenuState).toHaveBeenCalledWith(false));
+
+    setHelperMenuState.mockClear();
+    fireMenuToggle!();
+    await waitFor(() => expect(setHelperMenuState).toHaveBeenCalledWith(true));
   });
 
   it("right-click → Quit Sparkle exits the app", async () => {

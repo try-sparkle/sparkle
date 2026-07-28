@@ -64,7 +64,7 @@ import { useUiStore } from "../stores/uiStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import {
-  CONCIERGE_COMPOSE_DND_TARGET,
+  CONCIERGE_COLUMN_DND_TARGET,
   NEW_BUILD_AGENT_DND_TARGET,
 } from "../services/dndTargets";
 
@@ -73,7 +73,7 @@ import {
 const button = document.createElement("button");
 button.setAttribute("data-dnd-target", NEW_BUILD_AGENT_DND_TARGET);
 const conciergeBox = document.createElement("div");
-conciergeBox.setAttribute("data-dnd-target", CONCIERGE_COMPOSE_DND_TARGET);
+conciergeBox.setAttribute("data-dnd-target", CONCIERGE_COLUMN_DND_TARGET);
 let overButton = false;
 let overConciergeBox = false;
 document.elementFromPoint = vi.fn(() =>

@@ -33,33 +33,54 @@ export async function spawnWorker(args: {
   if (!parent) throw new Error(`unknown parent agent ${args.parentAgentId}`);
   if (!parent.branch) throw new Error("parent agent has no branch yet — open it first");
 
-  // Capture the active tab before addAgent shifts selection to the new worker, so a failed
-  // worktree cut can restore the user to where they were instead of landing on agents[0].
-  const prevSelectedId = project.selectedAgentId;
-
+  // DON'T STEAL THE TAB. `select: false` — a spawn is MCP-driven, so moving the user's terminal to
+  // an agent they never asked for is disruptive on its own, several times a minute in a fan-out.
+  // Nothing downstream needs the selection: the worker's PTY mounts because runSpawn calls
+  // runtime.open(workerId), not because it is selected (Workspace renders a pane per OPEN id and
+  // paints exactly one `visible`), and nothing between here and the return reads selection.
+  //
+  // It is also what lets orchestrator subtrees stay CLOSED on spawn (§14): a selected worker must
+  // always have a visible row — see the selection-reveal effect in AgentSidebar — so a spawn that
+  // left the new worker selected would force its subtree open and reproduce the old expand-on-spawn
+  // behavior through the back door. Suppressed at the STORE rather than selected-then-restored, so
+  // there is no intermediate state a render could observe (no dependence on React batching the two
+  // writes) and no phantom `switch:` perf waterfall from a selection that never painted.
   const workerId = store.addAgent(args.projectId, {
     kind: "worker",
     parentId: args.parentAgentId,
     task: args.task,
     parentBranch: parent.branch,
     beadId: args.beadId,
+    select: false,
   });
   // Null means "no such project" — already rejected above; keep the check so the rollback/worktree
   // machinery below can never run against a phantom worker id.
   if (!workerId) throw new Error(`unknown project ${args.projectId}`);
 
-  // Fail-closed rollback (sparkle-a670): drop the orphan tab, restore the user's previously-active
-  // tab (removeAgent recomputes selection to agents[0], which may not be where the user was), and —
-  // when the worktree was already cut — remove it from disk so no half-registered worktree leaks.
+  // Fail-closed rollback (sparkle-a670): drop the orphan tab and — when the worktree was already
+  // cut — remove it from disk so no half-registered worktree leaks.
+  //
+  // Selection is restored ONLY when the doomed worker is the one selected, which with `select: false`
+  // can now happen just one way: the user CLICKED the new worker's row during the awaits below (a
+  // real `git worktree` cut, seconds), and it is about to vanish under them. removeAgent's own
+  // fallback for a disappearing selection is `agents[0]` — the first tab in insertion order, not
+  // anywhere the user has been — so hand them the orchestrator that owns the failed spawn instead.
+  //
+  // Unconditional is wrong, and was the previous shape: re-asserting a tab captured before the spawn
+  // would yank back a user who had navigated elsewhere during those same awaits, on the failure
+  // path — the exact behavior `select: false` exists to prevent.
   const rollback = async (removeWorktree: boolean): Promise<void> => {
     if (removeWorktree) {
       await removeAgentWorkspace(project.rootPath, args.projectId, workerId).catch((e) =>
         console.warn("spawnWorker rollback: removeAgentWorkspace failed", e),
       );
     }
+    const selectedWasDoomed =
+      useProjectStore.getState().projects.find((p) => p.id === args.projectId)?.selectedAgentId ===
+      workerId;
     useProjectStore.getState().removeAgent(args.projectId, workerId);
-    if (prevSelectedId) {
-      useProjectStore.getState().selectAgent(args.projectId, prevSelectedId);
+    if (selectedWasDoomed) {
+      useProjectStore.getState().selectAgent(args.projectId, args.parentAgentId);
     }
   };
 

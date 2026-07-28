@@ -11,10 +11,13 @@
 // than in components/Concierge, which is a Tauri-free presentational directory.
 //
 // DROP SCOPING. The webview drag event is window-global and there are two other listeners live
-// (useNewBuildAgentDrop, and the Sparkle pane's Composer), so this one hit-tests the compose box
-// itself (CONCIERGE_COMPOSE_DND_TARGET) and ignores everything else. That is what keeps a drop on
+// (useNewBuildAgentDrop, and the Sparkle pane's Composer), so this one hit-tests the concierge
+// COLUMN (CONCIERGE_COLUMN_DND_TARGET) and ignores everything else. That is what keeps a drop on
 // "+ New Build Agent" going to the new agent, and a drop anywhere else going to the Sparkle pane's
-// composer, with no listener-ordering assumption on either side.
+// composer, with no listener-ordering assumption on either side. The target is the whole column
+// rather than the compose box because that is what a user aims at — the box is a ~90px strip and
+// missing it used to do nothing at all. The box still paints the affordance, so a drop at the top
+// of the column visibly shows where the files are headed.
 //
 // `take()` reads through a REF, not state: a send has to remove exactly the files it is about to
 // deliver, in the same tick it reads them, and React state would still hold the pre-clear value.
@@ -25,7 +28,7 @@ import {
   pickAttachments,
 } from "../services/conciergeAttach";
 import {
-  CONCIERGE_COMPOSE_DND_TARGET,
+  CONCIERGE_COLUMN_DND_TARGET,
   isOverDndTarget,
 } from "../services/dndTargets";
 import { useTerminalDropStore } from "../stores/terminalDropStore";
@@ -145,12 +148,12 @@ export function useConciergeAttachments(): ConciergeAttachments {
         .onDragDropEvent((event) => {
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            setDropActive(isOverDndTarget(p.position, CONCIERGE_COMPOSE_DND_TARGET));
+            setDropActive(isOverDndTarget(p.position, CONCIERGE_COLUMN_DND_TARGET));
           } else if (p.type === "leave") {
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
-            if (!isOverDndTarget(p.position, CONCIERGE_COMPOSE_DND_TARGET)) return;
+            if (!isOverDndTarget(p.position, CONCIERGE_COLUMN_DND_TARGET)) return;
             const paths = p.paths ?? [];
             if (paths.length === 0) return;
             log.info("composer", `dropped ${paths.length} file(s) on the concierge box`, paths);

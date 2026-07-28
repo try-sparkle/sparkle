@@ -1,5 +1,8 @@
 mod accounts;
 mod ai;
+/// The native menu bar. Carries "View → Hide/Show Helper", which is the guaranteed way back for a
+/// dismissed helper island — the menu bar is the one surface that cannot itself be hidden.
+mod app_menu;
 mod attachments;
 mod attention;
 mod attention_summary;
@@ -84,6 +87,11 @@ fn notify_frontend_shown() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // The app menu. `app_menu::build` starts from Tauri's platform default and only INSERTS
+        // into it — setting any menu here REPLACES the default outright, and a hand-rolled one that
+        // forgot the Edit submenu would silently take ⌘X/⌘C/⌘V/⌘A away from the whole app.
+        .menu(app_menu::build)
+        .on_menu_event(app_menu::on_menu_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -580,6 +588,9 @@ pub fn run() {
             helper::show_helper,
             helper::hide_helper,
             helper::set_helper_bounds,
+            // Pushes the island's persisted `enabled` back onto the native View menu's label. The
+            // flag lives in localStorage, which Rust cannot read — the webview is the authority.
+            app_menu::set_helper_menu_state,
             frontmost::get_frontmost,
             capture_window::show_capture_window,
             capture_window::hide_capture_window,

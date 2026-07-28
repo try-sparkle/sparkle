@@ -15,6 +15,7 @@ vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 
 import { ConciergeColumn } from "./ConciergeColumn";
+import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
 
 afterEach(() => cleanup());
@@ -33,7 +34,7 @@ const model: ConciergeViewModel = {
   scope: {},
   vitals: { needs_you: 1, running: 2, done: 0 },
   messages: [
-    { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project.", speakable: true },
+    { id: "m1", kind: "sparkle", text: "Morning — I'm watching every open project." },
     { id: "m2", kind: "you", text: "Thanks, keep me posted." },
     { id: "m3", kind: "batch", text: "All projects calm · nothing needs you" },
     nudge,
@@ -93,3 +94,27 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     expect(screen.getByLabelText("Sparkle is typing")).toBeTruthy();
   });
 });
+
+// A file dropped ANYWHERE over the concierge attaches to the next prompt, so the hit-test marker
+// the host's window-global drag listener resolves against has to be on the column ROOT — not on
+// the compose box, which is a ~90px strip a real cursor misses. The listener (and the Sparkle
+// pane's Composer, which stands down over this target) both find it by attribute, so a marker
+// that moved or vanished breaks drag-and-drop silently and with nothing logged.
+describe("drop target", () => {
+  it("marks the whole column, and the compose box does not compete for it", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    const marked = document.querySelectorAll("[data-dnd-target]");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]!.getAttribute("data-dnd-target")).toBe(CONCIERGE_COLUMN_DND_TARGET);
+    expect(marked[0]!.getAttribute("aria-label")).toBe("Sparkle concierge");
+  });
+
+  it("contains the compose box, so the affordance is inside the surface being dropped on", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    const column = document.querySelector(`[data-dnd-target="${CONCIERGE_COLUMN_DND_TARGET}"]`);
+    expect(column!.contains(screen.getByTestId("concierge-compose"))).toBe(true);
+  });
+});
+
+// The `deriveWordmarkMode` block that stood here is gone: `main` removed the star-field wordmark
+// (and with it that helper) independently of this branch's §4. Nothing to re-test.

@@ -5,9 +5,11 @@
 //
 // ATTACHMENTS (parity row #21). The attach buttons report a KIND; the host runs the picker and owns
 // the resulting list, which comes back as `attachments` and renders as removable chips. The box
-// stays Tauri-free — it never opens a dialog, reads a file, or listens for a drop. It only marks
-// itself `data-dnd-target` so the host's window-global drag listener can hit-test it, and paints
-// `dropActive`. With something attached, an EMPTY message is still sendable (an image alone is a
+// stays Tauri-free — it never opens a dialog, reads a file, or listens for a drop. It only paints
+// `dropActive`; the drag hit-test itself is on the COLUMN around it (CONCIERGE_COLUMN_DND_TARGET,
+// services/dndTargets), because a drop anywhere over the concierge belongs here and this box is a
+// ~90px strip that a real cursor misses. With something attached, an EMPTY message is still
+// sendable (an image alone is a
 // message), which is the one place attachments change the submit rule.
 //
 // SEND TARGET — NOT HERE ANY MORE. This box used to carry an explicit "→ Sparkle" / "→ <agent>"
@@ -68,7 +70,6 @@ import {
 } from "react";
 import { FiCamera, FiFile, FiImage, FiMic, FiPaperclip, FiX } from "react-icons/fi";
 import { C, COMPOSE_SCRIM, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
-import { CONCIERGE_COMPOSE_DND_TARGET } from "../../services/dndTargets";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
 import { PresenceSlider } from "./PresenceSlider";
@@ -431,8 +432,7 @@ export function ComposeBox({
   return (
     <div
       ref={rootRef}
-      // The hit-test handle for the host's window-global drag listener (services/dndTargets).
-      data-dnd-target={CONCIERGE_COMPOSE_DND_TARGET}
+      data-testid="concierge-compose"
       style={{
         flex: "none",
         borderTop: `1px solid ${line}`,

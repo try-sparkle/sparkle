@@ -1,110 +1,105 @@
 // When an orchestrator's worker subtree should pop open on its own.
 //
-// `uiStore.collapsedOrchestrators` treats a MISSING entry as collapsed, so a freshly-spawned worker
-// would land in a subtree nobody can see — the spawn would look like it did nothing. The rule is
-// "expand a parent the moment it gains a worker", and it has to be derived from a COMPARISON rather
-// than from a spawn callback: workers also arrive from reconcileWorkersFromDisk and from a
-// cross-window adopt, and those paths never run through spawnWorker.
+// The default is CLOSED — `uiStore.collapsedOrchestrators` reads a MISSING entry as collapsed — and
+// that is deliberate: a fleet of orchestrators each showing its workers is a wall of rows nobody
+// asked for. The subtree opens by itself for exactly one reason: a worker under it needs YOU. The
+// signal is the `needs_you` status band (waiting / approval / blocked / errored), the same band the
+// filter chips and the row dots use.
 //
-// The subtlety that makes this a module instead of an inline `>` is first observation. On boot the
-// previous snapshot is empty, so every parent looks like it gained its workers — expanding all of
-// them and making the persisted collapse choice worthless on every relaunch. An id absent from the
-// previous snapshot is therefore a BASELINE, never growth.
-import { bandOfStatus } from "./buildSections";
+// This used to be "expand a parent the moment it GAINS a worker", which popped every subtree open on
+// every spawn — the behavior this replaced. Attention, not growth: a spawn is not an event that
+// requires the user, and a collapsed orchestrator whose worker goes red ALREADY shows red on its own
+// head row (the head rolls its workers up — see AgentSidebar's headStageOf + the red-worker overlays
+// in engine/workerAttention.ts), so nothing is hidden by a subtree that stays shut.
+//
+// TWO disciplines this module exists to hold, both of which cost a bug to learn:
+//
+//  1. TRANSITION, NOT STATE. Expand when a parent goes from "no red worker" to "has a red worker",
+//     never on every render while a worker merely REMAINS red — that would re-open a subtree the
+//     user just deliberately collapsed, on the very next render, and make the chevron feel broken.
+//     Which is also why this is a module rather than an inline check: it needs a previous snapshot.
+//
+//  2. FIRST SIGHTING IS A BASELINE, NEVER A TRIGGER. On boot the previous snapshot is empty, so
+//     without this every parent looks like it just changed and they ALL blow open, making the
+//     persisted collapse choice worthless on every relaunch. An id absent from the previous snapshot
+//     is therefore recorded and skipped. (This is also why a boot-time "expand everything currently
+//     red" pass is NOT wanted: it would fight the persisted choice, and the red head row already
+//     tells the user where to look.)
+//
+// And one deliberate ASYMMETRY: there is no auto-COLLAPSE when the red clears. Yanking a subtree
+// shut while the user is reading it is worse than leaving it open. Expansion is automatic;
+// collapsing stays the user's gesture.
+//
+// Derived from a COMPARISON rather than from a status callback because workers change state through
+// several paths — the live PTY status map, reconcileWorkersFromDisk, a cross-window adopt, and the
+// synthetic overlays in engine/workerAttention.ts — and none of them is a single hook to subscribe
+// to. Pure and DOM-free so it can be unit-tested directly.
 import type { AgentKind, AgentTabStatus } from "../types";
+import { bandOfStatus } from "./buildSections";
 
-/** Worker count per orchestrator id.
+/** Per-orchestrator: does this parent have a worker in the `needs_you` band right now?
  *
- *  EVERY build agent gets an entry, explicitly `0` when it has no workers. That zero is the load-
- *  bearing part, not noise: `expandOnGrowth` reads a MISSING id as "never observed" and skips it, so
- *  if childless parents were omitted, an orchestrator's FIRST worker would arrive against an absent
- *  baseline and be classified as a first sighting rather than growth. The subtree would stay
- *  collapsed for the one spawn that most needs to be seen, and only the second worker onward would
- *  expand. (That was the first cut of this module — roborev 53672.)
+ *  EVERY build agent gets an entry, explicitly `false` when no worker of its needs you. That false
+ *  is the load-bearing part, not noise: {@link expandOnWorkerAttention} reads a MISSING id as "never
+ *  observed" and skips it, so if calm parents were omitted, an orchestrator's first red worker would
+ *  arrive against an absent baseline and be classified as a first sighting rather than a transition.
+ *  The subtree would stay collapsed for the one alarm that most needs to be seen, and only a SECOND
+ *  red would open it. (That was the shape of the growth rule's first cut — roborev 53672.)
  *
- *  Only `kind: "worker"` children are COUNTED: they are the only agents that render as child rows,
- *  so counting anything else would expand a parent for a row the subtree never shows. */
-export function workerCounts<T extends { id: string; kind: AgentKind; parentId: string | null }>(
-  agents: readonly T[],
-): Record<string, number> {
-  const out: Record<string, number> = {};
-  // Two passes: a build agent can appear after its own worker in the array (disk reconcile adopts
-  // in no guaranteed order), and seeding in one pass would let `out[parent] = 0` clobber a count
-  // already accumulated for it.
-  for (const a of agents) {
-    if (a.kind === "build") out[a.id] = 0;
-  }
-  for (const a of agents) {
-    if (a.kind !== "worker" || !a.parentId) continue;
-    out[a.parentId] = (out[a.parentId] ?? 0) + 1;
-  }
-  return out;
-}
-
-/** The orchestrator ids that just GAINED a worker, and so should be expanded.
+ *  `statusOf` is the sidebar's `effectiveStatus` accessor, so a DISMISSED alarm is already
+ *  de-escalated by the time it reaches here and correctly does not re-open anything.
  *
- *  Growth only — a spin-down (count falling) leaves the user's collapse choice alone, and so does a
- *  steady count, so a collapsed orchestrator stays collapsed while it churns. Ids not present in
- *  `prev` are skipped: see the note above about boot. */
-export function expandOnGrowth(
-  prev: Record<string, number>,
-  next: Record<string, number>,
-): string[] {
-  const grown: string[] = [];
-  for (const [id, count] of Object.entries(next)) {
-    const before = prev[id];
-    if (before === undefined) continue; // first sighting is a baseline, not growth
-    if (count > before) grown.push(id);
-  }
-  return grown;
-}
-
-/** RED workers per orchestrator id — the same shape and the same explicit-zero discipline as
- *  {@link workerCounts}, and for the same reason: {@link expandOnRedWorker} reads a missing id as
- *  "never observed" and skips it, so a parent omitted while calm would have its FIRST red worker
- *  classified as a first sighting and stay folded — the one case the expansion exists for.
+ *  `isLive` is "does this worker have a live PTY status of its own", and a worker without one is
+ *  treated as CALM however red `statusOf` paints it. That is not an optimization, it is the second
+ *  half of discipline 1. `withUnstartedWorkerAttention` synthesizes a red `approval` for a worker
+ *  whose worktree is cut but whose pane never mounted — a condition produced by an internal
+ *  open/evict race (orchestrationListener.ensureWorkersOpen has observed the same worker re-opened
+ *  ~10 times in a sub-millisecond burst), not by anything the user did. Each evict→re-open cycle is
+ *  a falling edge followed by a fresh RISING one, so honoring it would let invisible machinery
+ *  re-open a subtree the user just collapsed, over and over — the exact failure "transition, not
+ *  state" exists to prevent, reached through the falling edge instead of the steady one. Nothing is
+ *  lost: the strand still bubbles its red to the orchestrator's own head row, which is where the
+ *  user looks and clicks.
  *
- *  "Red" here is the DOT color (waiting | approval | blocked | errored), asked via `bandOfStatus`
- *  so this can't drift from the taxonomy. Deliberately not `needsAttention`, which excludes
- *  `blocked` — reaching for it in this exact situation is the bug that shipped twice. */
-export function redWorkerCounts<T extends { id: string; kind: AgentKind; parentId: string | null }>(
+ *  Only `kind: "worker"` children are considered: they are the only agents that render as child
+ *  rows, so anything else would expand a parent for a row the subtree never shows. And the band
+ *  comes from the shared `bandOfStatus` rather than a local "is it red" list — the app collapses
+ *  nine statuses to three bands in ONE place on purpose (packages/ui/tokens.ts). */
+export function workerAttention<T extends { id: string; kind: AgentKind; parentId: string | null }>(
   agents: readonly T[],
   statusOf: (id: string) => AgentTabStatus,
-): Record<string, number> {
-  const out: Record<string, number> = {};
+  isLive: (id: string) => boolean,
+): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  // Two passes: a build agent can appear after its own worker in the array (disk reconcile adopts in
+  // no guaranteed order), and seeding in one pass would let `out[parent] = false` clobber a flag
+  // already recorded for it.
   for (const a of agents) {
-    if (a.kind === "build") out[a.id] = 0;
+    if (a.kind === "build") out[a.id] = false;
   }
   for (const a of agents) {
     if (a.kind !== "worker" || !a.parentId) continue;
+    if (!isLive(a.id)) continue; // a never-live worker's red is synthetic — see above
     if (bandOfStatus(statusOf(a.id)) !== "needs_you") continue;
-    out[a.parentId] = (out[a.parentId] ?? 0) + 1;
+    out[a.parentId] = true;
   }
   return out;
 }
 
-/** The orchestrator ids whose subtree just went from NO red workers to at least one, and so should
- *  pop open to show the worker that needs you.
+/** The orchestrator ids that just went from "no red worker" to "has a red worker", and so should be
+ *  expanded.
  *
- *  Fires on the TRANSITION, exactly once, and never again while the worker stays red. That is the
- *  whole design: a subtree the user deliberately folded after seeing the problem must stay folded,
- *  or the control fights them every render for as long as the agent is stuck. What keeps the signal
- *  alive afterwards is the head's own disc, which rolls its workers up (engine/workerRollup) and
- *  goes red or orange regardless of the fold.
- *
- *  Ids absent from `prev` are skipped for the same reason as `expandOnGrowth`: on boot the previous
- *  snapshot is empty, so every parent with an already-red worker would look like a fresh
- *  transition, blowing open every such subtree on every relaunch and making the persisted collapse
- *  choice worthless. */
-export function expandOnRedWorker(
-  prev: Record<string, number>,
-  next: Record<string, number>,
+ *  Rising edge only. A steady `true` reports nothing (discipline 1 above), a falling edge reports
+ *  nothing (we never auto-collapse), and ids absent from `prev` report nothing (discipline 2). */
+export function expandOnWorkerAttention(
+  prev: Record<string, boolean>,
+  next: Record<string, boolean>,
 ): string[] {
-  const turned: string[] = [];
-  for (const [id, count] of Object.entries(next)) {
+  const attention: string[] = [];
+  for (const [id, red] of Object.entries(next)) {
     const before = prev[id];
     if (before === undefined) continue; // first sighting is a baseline, not a transition
-    if (before === 0 && count > 0) turned.push(id);
+    if (red && !before) attention.push(id);
   }
-  return turned;
+  return attention;
 }

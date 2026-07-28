@@ -115,6 +115,36 @@ export function showMainWindow(): void {
   void invoke("show_main_window").catch((e) => console.debug("show_main_window failed", e));
 }
 
+/** Must match `HELPER_TOGGLE_EVENT` in src-tauri/src/app_menu.rs — asserted by a test there
+ *  (`the_typescript_listener_uses_the_same_event_name`), not merely by this comment. */
+const HELPER_TOGGLE_REQUESTED = "helper://toggle-requested";
+
+/** The native "View → Hide/Show Helper" item was picked.
+ *
+ *  PAYLOAD-FREE, and the listener must TOGGLE rather than set: the menu handler runs in Rust, which
+ *  cannot read the localStorage-backed `helperPrefs` store, so it can only ask for a flip. The store
+ *  stays the single authority on the value.
+ *
+ *  Emitted app-wide, so exactly ONE listener may act on it — HelperApp, the webview that owns the
+ *  island. A second subscriber would flip the flag twice and the menu item would look dead. */
+export function onHelperToggleRequested(cb: () => void): Promise<UnlistenFn> {
+  if (!hasTauri) return Promise.resolve(noopUnlisten);
+  return listen(HELPER_TOGGLE_REQUESTED, () => cb());
+}
+
+/** Push the current preference onto the native menu item's label ("Hide Helper" ⇄ "Show Helper").
+ *
+ *  The other half of the bridge above. Called on mount and on every change, so the menu also follows
+ *  a hide made from the island's OWN right-click menu — otherwise the menu bar would keep offering
+ *  "Hide Helper" for an island that was already gone, which is the exact confusion the item exists
+ *  to prevent. */
+export function setHelperMenuState(enabled: boolean): void {
+  if (!hasTauri) return;
+  void invoke("set_helper_menu_state", { enabled }).catch((e) =>
+    console.debug("set_helper_menu_state failed", e),
+  );
+}
+
 export function showHelper(): void {
   if (!hasTauri) return;
   void invoke("show_helper").catch((e) => console.debug("show_helper failed", e));

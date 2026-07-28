@@ -17,7 +17,7 @@ import {
 import {
   getHelperVitals, onHelperVitalsChanged, getFrontmost, onFrontmostChanged, onCaptureRequested,
   onCaptureClosed, onCaptureSend, getTakeoverOpen, setHelperBounds, showHelper, hideHelper,
-  showMainWindow, type Vitals,
+  showMainWindow, onHelperToggleRequested, setHelperMenuState, type Vitals,
 } from "../services/helper";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { emitFocusTier, quitApp } from "../services/attention";
@@ -75,7 +75,9 @@ async function readScreens(): Promise<{ screens: Rect[]; current: Rect | null }>
 }
 
 export function HelperApp() {
-  const { enabled, mode, x, y, edge, setEnabled, setMode, setPosition, setEdge } = useHelperPrefs();
+  const {
+    enabled, mode, x, y, edge, setEnabled, toggleEnabled, setMode, setPosition, setEdge,
+  } = useHelperPrefs();
   const [vitals, setVitals] = useState<Vitals>(ZERO);
   const [frontmost, setFrontmost] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -93,8 +95,8 @@ export function HelperApp() {
   // reload at any point in the session. The event-only version broke both ways — a helper mounting
   // under an open takeover started `false` and painted over it, and a close edge that never arrived
   // (⌘W destroying the key window, a failed `win.hide()`, a webview crash) suppressed the island for
-  // the whole session with no route back: it is hidden, so its context menu is unreachable, and
-  // re-enabling it from the main window hits this same suppression (roborev 53341-M2).
+  // the whole session with no route back: it is hidden, so its context menu is unreachable, and no
+  // affordance anywhere else re-shows it (roborev 53341-M2).
   const [takeoverOpen, setTakeoverOpen] = useState(false);
   // A real takeover edge has been observed here (opened by this webview, or `capture://closed`), so
   // the mount seed's in-flight round-trip must no longer overwrite it. Same staleness guard the
@@ -124,8 +126,8 @@ export function HelperApp() {
   // True once the geometry effect has pushed a real position. The island must not be SHOWN before
   // it has been PLACED: `init_helper_window` builds the window with no `.position(...)`, so it
   // appears at whatever origin the OS assigned and then jumps. The visibility effect wins the race
-  // by default — `frontmost` initialises false and `enabled` hydrates synchronously true — so on
-  // every launch showHelper() fired while setHelperBounds was still behind `await readScreens()`.
+  // by default — `frontmost` initialises false, so the rule says "show" from the first render — so
+  // on every launch showHelper() fired while setHelperBounds was still behind `await readScreens()`.
   //
   // A ref would not do: this has to re-run the visibility effect once placement lands.
   const [placed, setPlaced] = useState(false);
@@ -243,6 +245,26 @@ export function HelperApp() {
     return () => { alive = false; void safeUnlisten(un); };
   }, []);
 
+  // The native menu bar's "View → Hide/Show Helper", forwarded from Rust. THE way back for a
+  // dismissed island, and the reason the dismissal is allowed to persist at all: the menu bar is
+  // the one surface that cannot itself be hidden, which is what the deleted sidebar button never
+  // was. A toggle, not a setter — Rust cannot read the localStorage-backed store, so it only asks
+  // for a flip and the store stays authoritative (services/helper.ts).
+  //
+  // Wired ONLY here. The event is app-wide; a second webview acting on it would flip the flag twice
+  // and the menu item would appear to do nothing.
+  useEffect(() => {
+    const un = onHelperToggleRequested(() => toggleEnabled());
+    return () => { void safeUnlisten(un); };
+  }, [toggleEnabled]);
+
+  // …and the return path, so the item's label follows the state whichever affordance changed it —
+  // including the island's own right-click Hide. Runs on mount too: the menu is built showing the
+  // default (visible) label, and this is what corrects it for a hydrated `enabled: false`.
+  useEffect(() => {
+    setHelperMenuState(enabled);
+  }, [enabled]);
+
   // Capture: hide FIRST so the island isn't in the shot. null = the user pressed Esc at the
   // crosshairs, which is a silent, successful no-op — not an error.
   // Auto-dismiss the failure notice. Nothing else clears it, and it inflates the window while it
@@ -280,7 +302,8 @@ export function HelperApp() {
       );
       // No showHelper() here on purpose. Clearing captureBusy below re-runs the visibility effect,
       // which re-shows the island only if it SHOULD be visible. Calling showHelper() directly would
-      // resurrect an island the user had hidden — the shortcut can trigger this path too.
+      // paint the island over a frontmost Sparkle — the shortcut can trigger this path from inside
+      // the app too, where the rule says the island has no business being on screen.
     } finally {
       captureBusyRef.current = false;
       setCaptureBusy(false);
@@ -579,6 +602,12 @@ export function HelperApp() {
           <button style={menuItem} onClick={() => { setMenuOpen(false); showMainWindow(); }}>
             Open Sparkle
           </button>
+          {/* A real dismiss for an always-on-top panel that floats over every other app.
+              This persists, and that is only safe because the way back is the NATIVE MENU BAR
+              (View → Hide/Show Helper), which cannot itself be hidden. It was removed in §6 when
+              the only route back was a "Show Helper" button in a DIFFERENT webview — one click
+              into a state the island could not leave. Do not re-delete the menu item and leave
+              this one standing; that reopens the one-way door. */}
           <button style={menuItem} onClick={() => { setMenuOpen(false); setEnabled(false); }}>
             Hide Helper
           </button>

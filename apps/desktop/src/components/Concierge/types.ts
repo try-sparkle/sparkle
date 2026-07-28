@@ -53,6 +53,19 @@ export interface ConciergeUserMessage {
   kind: "you";
   text: string;
   receipt?: ConciergeReceipt;
+  /** What rode along with THIS message — a SNAPSHOT taken at send time, not a live list.
+   *
+   *  The staged attachments live on the view model (`ConciergeViewModel.attachments`) and are
+   *  consumed by the send, so without a copy on the message record the thread has nothing left to
+   *  draw and the user never sees what they sent (PRD §8). `text` already carries a compact count
+   *  ("look · 1 image"); this is what turns that count into the actual picture.
+   *
+   *  The same `Attachment` record the composer stages — reused, not re-declared, so a bubble and
+   *  the chip it was staged as cannot disagree about what a file is. `dataUrl` is what a thumbnail
+   *  draws from; it is deliberately STRIPPED before the thread is persisted (see
+   *  stores/conciergeThreadStore), so a restored message renders its files as chips rather than
+   *  blowing the localStorage quota with base64. */
+  attachments?: Attachment[];
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */
@@ -60,16 +73,6 @@ export interface ConciergeSparkleMessage {
   id: string;
   kind: "sparkle";
   text: string;
-  /** A BRAIN REPLY, i.e. something worth reading aloud — only these get a speaker button.
-   *  The host posts plenty of other `sparkle` lines that are bookkeeping, not speech ("Sent to
-   *  CI Hardening.", "…terminal has closed — that didn't send.", the deferred-outcome
-   *  reconciliations): offering to read those aloud, and letting `speakingMessageId` point at
-   *  one, is not what "exactly one REPLY reads as active" meant (roborev 48172).
-   *
-   *  REQUIRED, not optional (roborev 52363): defaulting to "not a reply" would let a future
-   *  brain-reply producer forget the flag and silently lose the speaker button — a missing
-   *  affordance, the hardest kind of regression to notice. Every construction site must decide. */
-  speakable: boolean;
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */
@@ -200,9 +203,6 @@ export interface ConciergeController {
   onNudgeClick(nudge: ConciergeNudge): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
   onNudgeAction(nudge: ConciergeNudge, actionId: string): void;
-  /** The speaker button on a Sparkle reply: speak it now, or stop if it is the one playing.
-   *  Optional — omit it and no reply renders a speaker at all (voice is an opt-in surface). */
-  onSpeak?(message: ConciergeSparkleMessage): void;
 }
 
 export interface ConciergeColumnProps {
@@ -220,8 +220,6 @@ export interface ConciergeColumnProps {
   /** Handed straight to the compose box so the integration layer can receive committed segments.
    *  Must be referentially stable. */
   registerInsert?: (append: ((text: string) => void) | null) => void;
-  /** The id of the reply currently being spoken, so exactly one speaker button reads as active. */
-  speakingMessageId?: string | null;
   /** The user typed or deleted in the compose box (not a dictated segment, not the send clear). */
   onTextEdit?: (text: string) => void;
   /** The last FINISHED line for the thread's hidden live region — a completed reply, a status

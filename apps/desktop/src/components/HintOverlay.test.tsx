@@ -3,6 +3,7 @@ import { useState } from "react";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HintOverlay } from "./HintOverlay";
+import { AGENT_OVERFLOW_POOL } from "../keyboardHints/hintTargets";
 
 // jsdom gives every element a 0×0 rect and a null offsetParent, which our visibility filter would
 // reject. Stub both so tagged controls count as on-screen during the test.
@@ -64,6 +65,32 @@ describe("HintOverlay", () => {
     expect(onFirst).not.toHaveBeenCalled();
     // Overlay dismisses after activation.
     await waitFor(() => expect(screen.queryByText("2")).toBeNull());
+  });
+
+  it("letters project tabs and hands the agent overflow the NEXT letters, not the same ones", async () => {
+    const onTabA = vi.fn();
+    const onTabB = vi.fn();
+    render(
+      <>
+        <div data-hint="project-tab" onClick={onTabA}>amforge</div>
+        <div data-hint="project-tab" onClick={onTabB}>sparkle-desktop</div>
+        {Array.from({ length: 10 }, (_, i) => (
+          <div key={i} data-hint="agent" onClick={() => {}}>{`Agent ${i + 1}`}</div>
+        ))}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    // Two tabs take the first two pool letters; the 10th agent — the first to spill past 1..9 —
+    // resumes at the THIRD, so no key is claimed twice and every badge is reachable.
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[0]!)).toBeTruthy();
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[1]!)).toBeTruthy();
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[2]!)).toBeTruthy();
+    expect(screen.getByText("9")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: AGENT_OVERFLOW_POOL[1]! });
+    await waitFor(() => expect(onTabB).toHaveBeenCalledTimes(1));
+    expect(onTabA).not.toHaveBeenCalled();
   });
 
   it("a second Control tap dismisses without activating anything", () => {

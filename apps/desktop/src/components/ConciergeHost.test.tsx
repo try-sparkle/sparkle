@@ -62,6 +62,12 @@ const h = vi.hoisted(() => ({
       }
     | undefined,
   deferred: undefined as ((r: DeferredOutcome) => void) | undefined,
+  // The append the host hands the dictation hook — i.e. the ONLY way a spoken segment reaches the
+  // compose box. Captured so a row can drive a dictated segment the way the mic does, rather than
+  // through the textarea's onChange (which is the HAND-edit path and reports to `onTextEdit`).
+  // The distinction is the whole point of the row that uses it: see "a DICTATED segment does not
+  // retire the Sparkle aim".
+  dictationInsert: null as ((text: string) => void) | null,
   // Stands in for the Rust round trip behind a dropped file. Returns a real-shaped Attachment so a
   // staged drop renders a chip the way it does in the app.
   loadAttachmentPaths: vi.fn(async (paths: string[]) =>
@@ -158,23 +164,20 @@ vi.mock("./Concierge/ConciergeSuggestions", async () => {
     },
   };
 });
-// The voice stack (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
-// the host imports it unconditionally, so without this the base tests run the real dictation hook
-// and the real stopVoice() on every simulated send — mutating global dictation state and coupling
-// these tests to the mic pipeline.
+// The dictation hook (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
+// the host imports it unconditionally, so without this the base tests run the real hook on every
+// simulated send — mutating global dictation state and coupling these tests to the mic pipeline.
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
     micLive: false,
     interim: "",
     toggleMic: vi.fn(),
-    registerInsert: vi.fn(),
+    // Keep the append the host registers, so a row can put a spoken segment in the box through the
+    // real seam. `null` on deregistration, exactly as the app does.
+    registerInsert: (append: ((text: string) => void) | null) => {
+      h.dictationInsert = append;
+    },
   }),
-}));
-vi.mock("../services/conciergeVoice", () => ({
-  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
-  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
-  stopConciergeVoice: vi.fn(),
-  shouldSpeakConciergeReply: vi.fn(() => true),
 }));
 vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("../stores/sparklePrefsStore", () => ({
@@ -2109,8 +2112,16 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     expect(h.routeMessage).toHaveBeenCalled();
   });
 
-  // Emptying the box by hand retires the aim, exactly as it retires the dictated-origin latch —
-  // the message typed next has nothing to do with the screenshot the user just discarded.
+  // ── THE AIM'S RETIREMENT RULE ────────────────────────────────────────────────────────────────
+  // `onTextEdit` is the ONE signal that retires `forceSparkleRef`, and these two rows are why the
+  // host must keep passing it. It looked like pure text-to-speech plumbing when voice OUTPUT was
+  // removed (§5) — on the older tree it only cleared a dictated-origin latch that fed TTS — but it
+  // had since become the capture-Chat aim's only off switch. Dropping it leaves a latch that never
+  // clears, so every message the user types after a discarded Chat capture is silently force-aimed
+  // at Sparkle. Nothing else in the suite fails when that happens: hence these.
+
+  // Emptying the box by hand retires the aim — the message typed next has nothing to do with the
+  // screenshot the user just discarded.
   it("clearing the box by hand retires the Sparkle aim", async () => {
     act(() => dispatchChat({ mode: "chat", projectId: "p1", text: "never mind", attachments: [] }));
     render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
@@ -2120,6 +2131,30 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     fireEvent.click(screen.getByText("Send"));
     await settle();
     expect(h.routeMessage).toHaveBeenCalled();
+  });
+
+  // The other half of the rule, and the one a naive "just clear it whenever the text is empty"
+  // implementation gets wrong: a DICTATED segment is not a hand edit. It arrives through the
+  // dictation append (`registerInsert`), never through the textarea's onChange, so it must not
+  // report to `onTextEdit` and must not touch the aim. Speaking a follow-up onto a Chat capture is
+  // the user continuing that thought — losing the aim there would hand their words to the router
+  // and, if a build agent happens to be in view, type them into a live PTY.
+  it("a DICTATED segment does not retire the Sparkle aim", async () => {
+    act(() => dispatchChat({ mode: "chat", projectId: "p1", text: "about this shot", attachments: [] }));
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(box().value).toContain("about this shot"));
+
+    // The mic, for real: the host's registered append is what the dictation hook calls.
+    expect(h.dictationInsert).toBeTruthy();
+    act(() => h.dictationInsert!("and what should I do about it"));
+    await waitFor(() => expect(box().value).toContain("and what should I do about it"));
+
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // Still the user's own choice of destination — the router was never consulted.
+    expect(h.routeMessage).not.toHaveBeenCalled();
+    expect(h.startConciergeTurn).toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
 
   // A FRESH COLUMN STARTS WITH NO AIM. Both the draft and the latch that aims it are per-instance,

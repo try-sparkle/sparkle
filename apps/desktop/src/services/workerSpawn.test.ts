@@ -23,6 +23,7 @@ vi.mock("./worktree", async (orig) => ({
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
+import { __resetTracesForTest, openTraceKinds } from "../perfTrace";
 
 describe("spawnWorker", () => {
   beforeEach(() => {
@@ -35,6 +36,10 @@ describe("spawnWorker", () => {
     // Default: AI enhancements locked (anonymous) so the auto-name path stays dormant and these
     // tests assert spawn mechanics without a second (generate_agent_name) invoke.
     useAuthStore.setState({ me: null });
+    // perfTrace's keyed traces are module-scoped and are only emptied by a mounted pane settling its
+    // own waterfall, which never happens here — so without this, one case's `close:`/`switch:` trace
+    // leaks into the next one's openTraceKinds().
+    __resetTracesForTest();
   });
 
   it("creates a worker tab under the parent, cuts a worktree from the parent branch, and persists it", async () => {
@@ -84,8 +89,116 @@ describe("spawnWorker", () => {
     expect(worker.task).toBe("Build login");
     expect(worker.worktreePath).toBe("/wt/worker");
     expect(worker.branch).toBe("sparkle/agent-w");
-    // Successful spawn selects the new worker tab (drives PTY launch in AgentPane).
-    expect(proj.selectedAgentId).toBe(workerId);
+    // A spawn NEVER MOVES THE TAB. addAgent selects whatever it creates by default, but a spawn is
+    // MCP-driven — the user never asked to be moved — so it passes `select: false`. The worker still
+    // launches: runSpawn open()s it, and Workspace mounts a pane per OPEN id (only one is `visible`),
+    // so nothing about the PTY depends on selection. Leaving it selected would also force its
+    // orchestrator's subtree open (the sidebar reveals a selected worker), reproducing
+    // expand-on-spawn — see engine/workerExpansion.
+    expect(proj.selectedAgentId).toBe(buildId);
+    expect(proj.selectedAgentId).not.toBe(workerId);
+  });
+
+  // A selection that never happens can't open a `switch:<id>` waterfall. Selecting the worker and
+  // restoring afterwards DID open one: the restored pane's `visible` never flips (both writes land
+  // in one render), so AgentPane's settleSwitchTrace never runs and the trace dangles — reported by
+  // openTraceKinds() as an in-flight interaction on every later jank warning, several times a minute
+  // during a fan-out. Suppressing the selection in the store leaves no trace to settle.
+  it("opens no dangling switch trace (the selection never moves)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined);
+    });
+
+    await spawnWorker({ projectId, parentAgentId: buildId, task: "Build login" });
+
+    // Narrowed to the kind under test: openTraceKinds() is global, and other spawn machinery may
+    // legitimately open traces of other kinds.
+    expect(openTraceKinds() ?? "").not.toContain("switch");
+  });
+
+  it("leaves the user on the tab they were reading, even when it isn't the orchestrator", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    // The user is reading a DIFFERENT agent while the orchestrator fans out.
+    const otherId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined);
+    });
+
+    await spawnWorker({ projectId, parentAgentId: buildId, task: "Build login" });
+
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.selectedAgentId).toBe(otherId);
+  });
+
+  // A null selection is NOT a hole for the spawn to fill. It is produced deliberately — Workspace's
+  // ladder pick and closeAgent's selectionAfterClose both yield it (e.g. every row hidden by the
+  // status filter), and mergePreservingLiveWorkers treats a live null as authoritative. `select:
+  // false` briefly self-cancelled here, which handed the user's terminal to a machine-created worker
+  // in exactly that state — and because the sidebar's selection-reveal effect expands the parent of
+  // a SELECTED worker, it also forced the orchestrator's subtree open, reproducing expand-on-spawn
+  // through the back door (§14). The worker must stay unselected, so the reveal effect never fires.
+  it("does not steal the tab (or open the subtree) when nothing is selected", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    useProjectStore.getState().selectAgent(projectId, null);
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined);
+    });
+
+    const { workerId } = await spawnWorker({ projectId, parentAgentId: buildId, task: "x" });
+
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.agents.some((a) => a.id === workerId)).toBe(true); // the worker IS created…
+    expect(proj.selectedAgentId).toBeNull(); // …it just isn't selected
+    expect(proj.selectedAgentId).not.toBe(workerId);
+  });
+
+  // Same rule for an ABSENT key, not just an explicit null — a persisted/merged project record can
+  // arrive with no `selectedAgentId` at all, and the old guard's strict `!== null` let that case
+  // through to "select it".
+  it("does not steal the tab when the selection key is absent (undefined)", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    useProjectStore.setState({
+      projects: useProjectStore.getState().projects.map((p) => {
+        if (p.id !== projectId) return p;
+        const { selectedAgentId: _drop, ...rest } = p;
+        return rest as typeof p;
+      }),
+    });
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_worker_worktree")
+        return Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" });
+      return Promise.resolve(undefined);
+    });
+
+    const { workerId } = await spawnWorker({ projectId, parentAgentId: buildId, task: "x" });
+
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.agents.some((a) => a.id === workerId)).toBe(true);
+    expect(proj.selectedAgentId).toBeUndefined();
+    expect(proj.selectedAgentId).not.toBe(workerId);
   });
 
   it("auto-names the worker from its task when the autoRename feature is unlocked", async () => {
@@ -163,15 +276,78 @@ describe("spawnWorker", () => {
     store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
     const before = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.length;
 
-    invokeMock.mockRejectedValueOnce(new Error("git failed"));
+    // Keyed on the command name, not on call ORDER: a queued `...Once` is brittle to any incidental
+    // invoke landing first (anything that logs goes through invoke) and fails as a confusing
+    // "cannot read properties of undefined" from create_worker_worktree rather than as itself. Same
+    // reasoning as the auto-name test above.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.reject(new Error("git failed"))
+        : Promise.resolve(undefined),
+    );
     await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
       .rejects.toThrow(/git failed/);
 
     const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
     expect(proj.agents.length).toBe(before); // orphan worker tab was removed
     expect(proj.agents.some((a) => a.kind === "worker")).toBe(false);
-    // Selection is restored to the build agent the user was on before the spawn attempt.
+    // The user was never moved off the build agent in the first place.
     expect(proj.selectedAgentId).toBe(buildId);
+  });
+
+  // The rollback must not re-assert a selection either. It used to restore the tab captured before
+  // addAgent, which — now that the spawn never moves the user — can only fire when the user
+  // navigated somewhere else DURING the awaits, yanking them back to a tab they deliberately left.
+  it("leaves a tab the user switched to mid-spawn alone when the spawn fails", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const otherId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    useProjectStore.getState().selectAgent(projectId, buildId);
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd !== "create_worker_worktree") return Promise.resolve(undefined);
+      // The user wanders off while the worktree cut is in flight, then it fails.
+      useProjectStore.getState().selectAgent(projectId, otherId);
+      return Promise.reject(new Error("git failed"));
+    });
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
+      .rejects.toThrow(/git failed/);
+
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.selectedAgentId).toBe(otherId);
+  });
+
+  // The other side of that guard. The worker's ROW exists from addAgent onward, so with the
+  // orchestrator's subtree open the user can click it during the (seconds-long) worktree cut. When
+  // the spawn then fails, the selected agent disappears and removeAgent's own fallback is
+  // `agents[0]` — the first tab in insertion order, somewhere the user has never been. Hand them the
+  // orchestrator that owns the failed spawn instead.
+  it("hands the user the orchestrator if they were ON the worker when the spawn failed", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    // agents[0] is a DIFFERENT agent, so "fell back to agents[0]" can't masquerade as a pass.
+    const firstId = store.addAgent(projectId, { kind: "build" })!;
+    const buildId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    useProjectStore.getState().setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-b");
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd !== "create_worker_worktree") return Promise.resolve(undefined);
+      // The user clicks the freshly-appeared worker row while the cut is in flight.
+      const p = useProjectStore.getState().projects.find((x) => x.id === projectId)!;
+      const worker = p.agents.find((a) => a.kind === "worker")!;
+      useProjectStore.getState().selectAgent(projectId, worker.id);
+      return Promise.reject(new Error("git failed"));
+    });
+
+    await expect(spawnWorker({ projectId, parentAgentId: buildId, task: "x" }))
+      .rejects.toThrow(/git failed/);
+
+    const proj = useProjectStore.getState().projects.find((p) => p.id === projectId)!;
+    expect(proj.selectedAgentId).toBe(buildId);
+    expect(proj.selectedAgentId).not.toBe(firstId);
   });
 
   it("rolls back the just-cut worktree AND the tab if the manifest write fails (fail-closed, a670)", async () => {

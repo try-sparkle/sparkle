@@ -38,6 +38,7 @@ const TRANSIENT_UI_KEYS = [
   "boardFocusBeadId",
   "settingsRequest",
   "composeFocusSeq",
+  "revealAgentId",
   "newAgentRuntime",
   "cloudCreateOpen",
   "zeroCreditBannerDismissed",
@@ -187,10 +188,10 @@ interface UiState {
   collapsedOrchestrators: Record<string, boolean>;
   isOrchestratorCollapsed: (id: string) => boolean;
   toggleOrchestratorCollapsed: (id: string) => void;
-  /** Force these orchestrators expanded (auto-expand on spawn — see engine/workerExpansion). Batch,
-   *  because a fan-out can add workers to several parents in one tick and N separate set() calls
-   *  would be N renders. A no-op when they are all already expanded, so it can be called from an
-   *  effect on every tick without churning the store. */
+  /** Force these orchestrators expanded (auto-expand when a worker needs you — see
+   *  engine/workerExpansion). Batch, because one tick can turn workers under several parents red and
+   *  N separate set() calls would be N renders. A no-op when they are all already expanded, so it
+   *  can be called from an effect on every tick without churning the store. */
   expandOrchestrators: (ids: readonly string[]) => void;
   // Deep-open request for the ⋯ settings dialog: a component anywhere (e.g. BalanceBadge) asks
   // for a category; the shell's kebab menu (which owns the dialog) opens it there and clears the
@@ -203,6 +204,16 @@ interface UiState {
   // so repeat requests re-focus. Transient — NOT persisted.
   composeFocusSeq: number;
   requestComposeFocus: () => void;
+  // Reveal request for the agent list: "scroll THIS agent's row into view". Set when a brand-new
+  // build agent is spawned (§13 — selecting it was never enough; the row could be below the fold,
+  // so the user had to go hunting for the thing they just created). ONE-SHOT: the row that matches
+  // scrolls itself in and clears the id, so a later remount of the list can't yank the column back.
+  // A request naming a row that isn't mounted (a filtered status band, a collapsed parent) simply
+  // stays pending until that row appears or the next spawn replaces it. Transient — NOT persisted;
+  // a scroll intent from a previous launch is meaningless.
+  revealAgentId: string | null;
+  requestRevealAgent: (id: string) => void;
+  clearRevealAgent: (id: string) => void;
   // Concierge pin scope (CM-U7): the project tab whose pin is lit. Pinning scopes the concierge to
   // that project ("disregard all other project alerts so you can focus"); null = following all
   // projects. ONE pin at a time — pinning a project replaces any previous pin, pinning the pinned
@@ -301,6 +312,11 @@ export const useUiStore = create<UiState>()(
       clearSettingsRequest: () => set({ settingsRequest: null }),
       composeFocusSeq: 0,
       requestComposeFocus: () => set((s) => ({ composeFocusSeq: s.composeFocusSeq + 1 })),
+      revealAgentId: null,
+      requestRevealAgent: (id) => set({ revealAgentId: id }),
+      // Id-guarded so a row can only retire ITS OWN request: without the check, a stale effect from
+      // a row unmounting mid-spawn would swallow the request that named a different row.
+      clearRevealAgent: (id) => set((s) => (s.revealAgentId === id ? { revealAgentId: null } : s)),
       pinnedProjectId: null,
       togglePinnedProject: (id) =>
         set((s) => ({ pinnedProjectId: s.pinnedProjectId === id ? null : id })),

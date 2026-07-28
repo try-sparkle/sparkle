@@ -472,6 +472,14 @@ export function __resetRenderTraceForTest(): void {
   renderLogEnabled = readPerfRenderFlag();
 }
 
+/** Drop every open keyed trace. `traces` is module-scoped and only ever emptied by perfEnd/perfCancel
+ *  — which in the app means a mounted pane settling its own waterfall — so under test any earlier
+ *  case that opened one (removeAgent's `close:<id>`, selectAgent's `switch:<id>`) leaks into
+ *  {@link openTraceKinds} for the rest of the file. Reset in beforeEach when asserting on it. */
+export function __resetTracesForTest(): void {
+  traces.clear();
+}
+
 // ── Global main-thread stall (jank) monitor ─────────────────────────────────────────────────────
 let jankRunning = false;
 

@@ -90,12 +90,6 @@ vi.mock("../useConciergeDictation", () => ({
     registerInsert: vi.fn(),
   }),
 }));
-vi.mock("../services/conciergeVoice", () => ({
-  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
-  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
-  stopConciergeVoice: vi.fn(),
-  shouldSpeakConciergeReply: vi.fn(() => true),
-}));
 vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: h.setInterruptPreference }) },

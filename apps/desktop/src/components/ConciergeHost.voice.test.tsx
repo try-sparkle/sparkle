@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 //
-// The host wiring for the voice pass (CM-U9): who gets spoken to, and when. The leaf modules
-// (the quiet gate, the dictation-target borrow) have their own tests — these cover the seams
-// BETWEEN them, which is where the behavior is easy to break without failing anything else.
+// The host wiring for the voice pass (CM-U9) — INPUT ONLY. Voice output was removed whole
+// (PRD/feat/ui-refresh-2026-07-27 §5): the mic, dictation and the wake-word flow stay, and nothing
+// in this app speaks. What is left here is the mic seam plus the turn-token guard, which used to be
+// observed through "which reply gets spoken" and is now observed through the thread itself.
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -25,10 +26,6 @@ const h = vi.hoisted(() => ({
     toggleMic: vi.fn(),
     registerInsert: vi.fn(),
   },
-  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
-  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
-  stopConciergeVoice: vi.fn(),
-  shouldSpeakConciergeReply: vi.fn(() => true),
   maybePauseOnSubmit: vi.fn(),
   route: vi.fn(async () => ({ target: "sparkle" as "sparkle" | "agent", reason: "test", source: "heuristic" as const })),
 }));
@@ -74,20 +71,14 @@ vi.mock("../services/conciergeDispatch", () => ({
   onDeferredSendOutcome: () => () => {},
 }));
 // The user no longer PICKS a destination — the host routes (PRD/sparkle/concierge-auto-routing).
-// A knob here: what these rows care about is whether the reply is spoken, which turns on which
-// destination a send reached, not on how that decision was reached.
+// A knob here: these rows care about which destination a send reached, not how that decision was
+// reached.
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.route }));
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: vi.fn() }) },
 }));
 vi.mock("../useConciergeDictation", () => ({ useConciergeDictation: () => h.dictation }));
-vi.mock("../services/conciergeVoice", () => ({
-  speakConciergeReply: h.speakConciergeReply,
-  speakOnDemand: h.speakOnDemand,
-  stopConciergeVoice: h.stopConciergeVoice,
-  shouldSpeakConciergeReply: h.shouldSpeakConciergeReply,
-}));
 vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: h.maybePauseOnSubmit }));
 
 import { ConciergeHost } from "./ConciergeHost";
@@ -214,268 +205,142 @@ const thread = () => screen.getByTestId("concierge-thread");
 const inThread = (re: RegExp | string) => within(thread()).getByText(re);
 const findInThread = (re: RegExp | string) => within(thread()).findByText(re);
 
-describe("ConciergeHost — spoken replies", () => {
-  it("a TYPED turn is never spoken", async () => {
+// The turn-token guard (roborev 53004). Ids like "t1" are not tokens — they take the "not a number
+// → always surface" escape hatch, so the numeric branch would be dead in tests while being the
+// thing that decides which reply the thread ends up showing.
+//
+// These rows USED to observe the guard through "which reply gets spoken". With voice output gone
+// they observe it through the thread's own text, which is the same guard from the other side:
+// a straggler that must not corrupt the live turn's reply must also not corrupt its bubble.
+describe("ConciergeHost — turn tokens (a superseded turn keeps talking — concierge.rs gates the reap)", () => {
+  const delta = (id: string, text: string) => act(() => h.brain.delta?.({ id, text }));
+  const done = (id: string, text: string) =>
+    act(() => h.brain.done?.({ id, sessionId: "s1", text }));
+
+  it("a straggler from the OLD turn can't corrupt the new turn's reply", async () => {
     const c = mount();
-    c.type("approve the deploy");
+    c.type("first question");
     await c.send();
-    c.reply("Approved.");
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
+    delta("7", "part of the OLD answer");
+    // The user asks again: the backend kills turn 7 and spawns turn 8.
+    c.type("second question");
+    await c.send();
+    delta("7", " …and more of it"); // turn 7's reader flushing its buffer, post-kill
+    delta("8", "The new answer.");
+    done("8", "");
+    expect(inThread("The new answer.")).toBeTruthy();
+    expect(within(thread()).queryByText(/and more of it/)).toBeNull();
   });
 
-  it("a DICTATED turn is spoken back, even though the mic went quiet before Send", async () => {
+  it("a DONE from the retired turn adds nothing and leaves the new turn intact", async () => {
+    const c = mount();
+    c.type("first question");
+    await c.send();
+    delta("7", "the old answer");
+    c.type("second question");
+    await c.send();
+    done("7", "the old answer, finished"); // races the new send
+    expect(within(thread()).queryByText(/finished/)).toBeNull();
+
+    delta("8", "The new answer.");
+    done("8", "");
+    expect(inThread("The new answer.")).toBeTruthy();
+  });
+
+  it("an ERROR from the retired turn posts no bubble", async () => {
+    const c = mount();
+    c.type("first question");
+    await c.send();
+    delta("7", "partial");
+    c.type("second question");
+    await c.send();
+    act(() => h.brain.error?.({ id: "7", detail: "killed" }));
+    expect(within(thread()).queryByText(/couldn't reach my brain/i)).toBeNull();
+  });
+
+  it("a turn killed BEFORE it said anything can't strand a bubble — once the token lands", async () => {
+    // The floor ("retire everything I have SEEN") cannot cover this: turn 8 is spawned and killed
+    // without emitting, so the frontend has only ever seen turn 7. Its stragglers carry an id
+    // NEWER than anything seen. The returned token retires them — AFTER it arrives (roborev
+    // 53051); the case below is the same race with the ordering production actually delivers.
+    const c = mount();
+    c.type("first");
+    await c.send();
+    delta("7", "the first answer");
+    h.startConciergeTurn.mockResolvedValueOnce("9");
+    c.type("second");
+    await c.send();
+    await act(async () => {}); // the token lands
+    delta("8", "the dead turn's buffered output");
+    expect(within(thread()).queryByText(/dead turn/)).toBeNull();
+  });
+
+  it("…and once the token lands, a dead turn stays shut out", async () => {
+    // The ordering production delivers (roborev 53088/53105): a killed child's buffered deltas
+    // are emitted BEFORE concierge_turn returns the new token, and Tauri gives no ordering
+    // guarantee between the event channel and an invoke response — so the frontend alone cannot
+    // win this race. That is why the gate lives in concierge.rs (`drain_stream`, which stops
+    // emitting the moment the user sends). This case pins the one guarantee THIS layer owes:
+    // once the token has landed, nothing further from the retired turn gets through.
+    //
+    // Deliberately does NOT assert what happens to a straggler that beats the token: that is a
+    // property of the backend gate, and pinning today's residue here would make a future
+    // frontend hardening read as a regression (roborev 53105).
+    const c = mount();
+    c.type("first");
+    await c.send();
+    delta("7", "the first answer");
+
+    let settle!: (id: string | null) => void;
+    h.startConciergeTurn.mockImplementationOnce(
+      () => new Promise<string | null>((res) => { settle = res; }),
+    );
+    c.type("second");
+    await c.send();
+    await act(async () => {
+      settle("9"); // the send that spawned turn 9 — registered AFTER the first send consumed none
+    });
+
+    delta("8", "the dead turn's buffered output");
+    expect(within(thread()).queryByText(/dead turn/)).toBeNull();
+  });
+
+  it("a LOCAL error id (not a token) always surfaces", async () => {
+    const c = mount();
+    c.type("anything");
+    await c.send();
+    act(() => h.brain.error?.({ id: "local", detail: "invoke rejected" }));
+    expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
+  });
+});
+
+// Voice INPUT reaches the brain exactly as typed text does. This is the one row that pins the
+// dictation seam end to end — the host wraps the compose box's insert target and hands it to
+// useConciergeDictation, and a break there silently costs the mic its destination.
+describe("ConciergeHost — dictated input", () => {
+  it("a DICTATED turn reaches the brain like any other", async () => {
     const c = mount();
     c.dictate("approve the deploy"); // the stop word then drops the mic; micLive stays false
     await c.send();
+    expect(h.startConciergeTurn).toHaveBeenCalledWith(expect.stringContaining("approve the deploy"));
     c.reply("Approved.");
-    expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
+    expect(inThread("Approved.")).toBeTruthy();
   });
 
-  it("a turn sent while the mic is still live is spoken back too", async () => {
-    h.dictation.micLive = true;
-    const c = mount();
-    c.type("approve the deploy");
-    await c.send();
-    c.reply("Approved.");
-    expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
-  });
-
-  // roborev 46922: the latch was set by dictated content arriving and cleared only on send, so
-  // content that LEFT the box without being sent kept it armed — the exact inverse of the bug the
-  // latch exists to fix, and Concierge v1's rule is that typing must never make the app speak.
-  it("emptying the box by hand retires the dictated-origin latch", async () => {
-    const c = mount();
-    c.dictate("scratch that");
-    c.type(""); // select-all + delete
-    c.type("a completely typed message");
-    await c.send();
-    c.reply("Done.");
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
-  });
-
-  it("editing dictated text without clearing it keeps the turn a VOICE turn", async () => {
-    // Only an EMPTY box retires the latch — fixing a transcription typo must not silence the reply.
-    const c = mount();
-    c.dictate("approve the deply");
-    c.type("approve the deploy");
-    await c.send();
-    c.reply("Approved.");
-    expect(h.speakConciergeReply).toHaveBeenCalledWith("Approved.", { voiceTurn: true });
-  });
-
-  it("the voice origin does not leak into the NEXT turn", async () => {
-    const c = mount();
-    c.dictate("approve the deploy");
-    await c.send();
-    c.reply("Approved.");
-    h.speakConciergeReply.mockClear();
-
-    c.type("and now this one");
-    await c.send();
-    c.reply("Done.");
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
-  });
-
-  it("speaks the WHOLE streamed reply, not just the final chunk", async () => {
-    const c = mount();
-    c.dictate("status?");
-    await c.send();
-    act(() => {
-      h.brain.delta?.({ id: "t1", text: "All " });
-      h.brain.delta?.({ id: "t1", text: "calm." });
-    });
-    act(() => {
-      h.brain.done?.({ id: "t1", sessionId: "s1", text: "" });
-    });
-    expect(h.speakConciergeReply).toHaveBeenCalledWith("All calm.", { voiceTurn: true });
-  });
-
-  it("a suppressed autoplay never reaches the TTS service", async () => {
-    h.shouldSpeakConciergeReply.mockReturnValueOnce(false);
-    const c = mount();
-    c.dictate("status?");
-    await c.send();
-    c.reply("All calm.");
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
-  });
-
-  // roborev 48172/48171: the ONE thing the CM-U9 merge had to hand-reconcile — the voice origin is
-  // read before anything clears, then DISCARDED on the agent branch and applied only on the brain
-  // branch — had no test at all. Every other case in this file goes down the brain path.
-  it("a DICTATED prompt aimed at an agent speaks nothing", async () => {
+  it("a DICTATED prompt aimed at an agent goes to its terminal, not the brain", async () => {
     const c = mount({ aimable: true });
     c.aim();
     c.dictate("rebase onto main");
     await c.send();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalled();
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
   });
 
-  it("…and does not leave the flag set for the NEXT brain turn", async () => {
-    const c = mount({ aimable: true });
-    c.aim();
-    c.dictate("rebase onto main");
-    await c.send();
-    c.unaim(); // back to Sparkle
-    c.type("and what about the docs?");
-    await c.send();
-    c.reply("They're fine.");
-    expect(h.speakConciergeReply).not.toHaveBeenCalled();
-  });
-
-  it("a FAILED agent send hands the voice origin back with the draft (roborev 48172)", async () => {
-    // The box restores the draft on a failed send; a restored dictated draft that reads as typed
-    // would silently never be spoken once the user re-aims it at Sparkle.
-    h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path: "pty-gone" });
-    const c = mount({ aimable: true });
-    c.aim();
-    c.dictate("rebase onto main");
-    await c.send();
-    c.unaim(); // back to Sparkle, with the restored draft still in the box
-    await c.send();
-    c.reply("Rebasing.");
-    expect(h.speakConciergeReply).toHaveBeenCalledWith("Rebasing.", { voiceTurn: true });
-  });
-
-  // The turn-token guard (roborev 53004). Every OTHER case in this file uses the id "t1", which is
-  // not a token — it takes the "not a number → always surface" escape hatch, so the numeric branch
-  // was dead in tests while being the thing that decides which reply is spoken.
-  describe("turn tokens (a superseded turn keeps talking — concierge.rs only gates the reap)", () => {
-    const delta = (id: string, text: string) => act(() => h.brain.delta?.({ id, text }));
-    const done = (id: string, text: string) =>
-      act(() => h.brain.done?.({ id, sessionId: "s1", text }));
-
-    it("a straggler from the OLD turn can't corrupt the new turn's spoken reply", async () => {
-      const c = mount();
-      c.dictate("first question");
-      await c.send();
-      delta("7", "part of the OLD answer");
-      // The user asks again: the backend kills turn 7 and spawns turn 8.
-      c.dictate("second question");
-      await c.send();
-      delta("7", " …and more of it"); // turn 7's reader flushing its buffer, post-kill
-      delta("8", "The new answer.");
-      done("8", "");
-      expect(h.speakConciergeReply).toHaveBeenCalledWith("The new answer.", { voiceTurn: true });
-    });
-
-    it("a DONE from the retired turn neither speaks nor steals the new turn's voice flag", async () => {
-      const c = mount();
-      c.dictate("first question");
-      await c.send();
-      delta("7", "the old answer");
-      c.dictate("second question");
-      await c.send();
-      done("7", "the old answer, finished"); // races the new send
-      expect(h.speakConciergeReply).not.toHaveBeenCalled();
-
-      delta("8", "The new answer.");
-      done("8", "");
-      expect(h.speakConciergeReply).toHaveBeenCalledWith("The new answer.", { voiceTurn: true });
-    });
-
-    it("an ERROR from the retired turn posts no bubble", async () => {
-      const c = mount();
-      c.type("first question");
-      await c.send();
-      delta("7", "partial");
-      c.type("second question");
-      await c.send();
-      act(() => h.brain.error?.({ id: "7", detail: "killed" }));
-      expect(within(thread()).queryByText(/couldn't reach my brain/i)).toBeNull();
-    });
-
-    it("a turn killed BEFORE it said anything can't strand a bubble — once the token lands", async () => {
-      // The floor ("retire everything I have SEEN") cannot cover this: turn 8 is spawned and killed
-      // without emitting, so the frontend has only ever seen turn 7. Its stragglers carry an id
-      // NEWER than anything seen. The returned token retires them — AFTER it arrives (roborev
-      // 53051); the case below is the same race with the ordering production actually delivers.
-      const c = mount();
-      c.type("first");
-      await c.send();
-      delta("7", "the first answer");
-      h.startConciergeTurn.mockResolvedValueOnce("9");
-      c.type("second");
-      await c.send();
-      await act(async () => {}); // the token lands
-      delta("8", "the dead turn's buffered output");
-      expect(within(thread()).queryByText(/dead turn/)).toBeNull();
-    });
-
-    it("…and once the token lands, a dead turn stays shut out", async () => {
-      // The ordering production delivers (roborev 53088/53105): a killed child's buffered deltas
-      // are emitted BEFORE concierge_turn returns the new token, and Tauri gives no ordering
-      // guarantee between the event channel and an invoke response — so the frontend alone cannot
-      // win this race. That is why the gate lives in concierge.rs (`drain_stream`, which stops
-      // emitting the moment the user sends). This case pins the one guarantee THIS layer owes:
-      // once the token has landed, nothing further from the retired turn gets through.
-      //
-      // Deliberately does NOT assert what happens to a straggler that beats the token: that is a
-      // property of the backend gate, and pinning today's residue here would make a future
-      // frontend hardening read as a regression (roborev 53105).
-      const c = mount();
-      c.type("first");
-      await c.send();
-      delta("7", "the first answer");
-
-      let settle!: (id: string | null) => void;
-      h.startConciergeTurn.mockImplementationOnce(
-        () => new Promise<string | null>((res) => { settle = res; }),
-      );
-      c.type("second");
-      await c.send();
-      await act(async () => {
-        settle("9"); // the send that spawned turn 9 — registered AFTER the first send consumed none
-      });
-
-      delta("8", "the dead turn's buffered output");
-      expect(within(thread()).queryByText(/dead turn/)).toBeNull();
-    });
-
-    it("a LOCAL error id (not a token) always surfaces", async () => {
-      const c = mount();
-      c.type("anything");
-      await c.send();
-      act(() => h.brain.error?.({ id: "local", detail: "invoke rejected" }));
-      expect(await findInThread(/couldn't reach my brain/i)).toBeTruthy();
-    });
-  });
-
-  it("sending stops whatever Sparkle was already saying", async () => {
+  it("submitting honors the pause-on-submit voice setting", async () => {
     const c = mount();
-    c.type("stop talking");
+    c.dictate("status?");
     await c.send();
-    expect(h.stopConciergeVoice).toHaveBeenCalled();
-  });
-});
-
-describe("ConciergeHost — speak on demand", () => {
-  it("the speaker button reads a reply aloud", async () => {
-    const c = mount();
-    c.type("status?");
-    await c.send();
-    c.reply("All calm.");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Speak this reply" }));
-    });
-    expect(h.speakOnDemand).toHaveBeenCalledWith("All calm.");
-  });
-
-  it("clicking the speaker of the clip that is playing stops it instead of restarting", async () => {
-    // A speak that never resolves keeps the reply in the "playing" state for the second click.
-    h.speakOnDemand.mockImplementationOnce(() => new Promise(() => {}));
-    const c = mount();
-    c.type("status?");
-    await c.send();
-    c.reply("All calm.");
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Speak this reply" }));
-    });
-    h.stopConciergeVoice.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Stop speaking" }));
-    expect(h.stopConciergeVoice).toHaveBeenCalledTimes(1);
-    expect(h.speakOnDemand).toHaveBeenCalledTimes(1);
+    expect(h.maybePauseOnSubmit).toHaveBeenCalled();
   });
 });
 

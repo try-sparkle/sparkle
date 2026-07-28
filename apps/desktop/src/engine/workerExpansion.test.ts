@@ -1,175 +1,192 @@
 import { describe, expect, it } from "vitest";
-import {
-  expandOnGrowth,
-  expandOnRedWorker,
-  redWorkerCounts,
-  workerCounts,
-} from "./workerExpansion";
-import type { AgentTabStatus } from "../types";
+import { expandOnWorkerAttention, workerAttention } from "./workerExpansion";
+import type { AgentKind, AgentTabStatus } from "../types";
 
-describe("expandOnGrowth — which orchestrators auto-expand", () => {
-  it("expands a parent that gained a worker", () => {
-    expect(expandOnGrowth({ p1: 1 }, { p1: 2 })).toEqual(["p1"]);
+interface Node {
+  id: string;
+  kind: AgentKind;
+  parentId: string | null;
+}
+
+/** `workerAttention` driven by ONE status map, the way the sidebar drives it: an id PRESENT in the
+ *  map has a live PTY status and carries it; an id ABSENT has no live status of its own and reads
+ *  `stopped`, exactly as the sidebar's `effectiveStatus[id] ?? "stopped"` does. Cases about the
+ *  synthetic strand red — red in `statusOf` but NOT live — call `workerAttention` directly. */
+const attentionFrom = (agents: readonly Node[], map: Record<string, AgentTabStatus>) =>
+  workerAttention(
+    agents,
+    (id) => map[id] ?? "stopped",
+    (id) => map[id] !== undefined,
+  );
+
+describe("expandOnWorkerAttention — which orchestrators auto-expand", () => {
+  it("expands a parent whose worker just went red", () => {
+    expect(expandOnWorkerAttention({ p1: false }, { p1: true })).toEqual(["p1"]);
   });
 
-  it("expands a parent that gained its FIRST worker", () => {
-    expect(expandOnGrowth({ p1: 0 }, { p1: 1 })).toEqual(["p1"]);
+  // TRANSITION, NOT STATE. A worker that merely REMAINS red must not re-expand: the effect runs on
+  // every status/agents change, so re-asserting on a steady red would re-open a subtree the user had
+  // just deliberately collapsed, on the very next render, and make the chevron feel broken.
+  it("does NOT re-expand while a worker merely stays red", () => {
+    expect(expandOnWorkerAttention({ p1: true }, { p1: true })).toEqual([]);
   });
 
-  // The load-bearing case. On boot the previous counts are empty, so EVERY parent would look like
-  // it "gained" workers — which would silently expand every orchestrator on every relaunch and make
-  // the persisted collapse choice worthless. First sighting is a baseline, not growth.
+  // The load-bearing case, inherited from the growth rule this replaced. On boot the previous
+  // snapshot is empty, so EVERY parent would look like it just went red — silently expanding every
+  // orchestrator with a red worker on every relaunch and making the persisted collapse choice
+  // worthless. First sighting is a baseline, not a transition.
   it("does NOT expand on first observation, so a relaunch respects the persisted collapse", () => {
-    expect(expandOnGrowth({}, { p1: 3, p2: 1 })).toEqual([]);
+    expect(expandOnWorkerAttention({}, { p1: true, p2: true })).toEqual([]);
   });
 
-  it("does not expand on spin-down", () => {
-    expect(expandOnGrowth({ p1: 2 }, { p1: 1 })).toEqual([]);
+  // Expansion is automatic; COLLAPSING stays the user's gesture — see the module header.
+  it("does not collapse (reports nothing) when the red clears", () => {
+    expect(expandOnWorkerAttention({ p1: true }, { p1: false })).toEqual([]);
   });
 
-  it("does not expand when nothing changed", () => {
-    expect(expandOnGrowth({ p1: 2 }, { p1: 2 })).toEqual([]);
+  it("does not expand while a parent stays quiet", () => {
+    expect(expandOnWorkerAttention({ p1: false }, { p1: false })).toEqual([]);
   });
 
-  // A user who collapsed a busy orchestrator must stay collapsed while it churns, or a fan-out
-  // would fight them on every tick.
-  it("expands only the parent that grew, leaving its siblings alone", () => {
-    expect(expandOnGrowth({ p1: 1, p2: 1, p3: 1 }, { p1: 1, p2: 2, p3: 1 })).toEqual(["p2"]);
+  it("expands only the parent that went red, leaving its siblings alone", () => {
+    expect(
+      expandOnWorkerAttention({ p1: false, p2: false, p3: true }, { p1: false, p2: true, p3: true }),
+    ).toEqual(["p2"]);
   });
 
-  it("expands several parents when several grew", () => {
-    expect(expandOnGrowth({ p1: 0, p2: 0 }, { p1: 1, p2: 1 }).sort()).toEqual(["p1", "p2"]);
+  it("expands several parents when several went red at once", () => {
+    expect(
+      expandOnWorkerAttention({ p1: false, p2: false }, { p1: true, p2: true }).sort(),
+    ).toEqual(["p1", "p2"]);
   });
 
   // A parent that disappears (closed) must not throw or report anything.
   it("ignores a parent present only in the previous snapshot", () => {
-    expect(expandOnGrowth({ p1: 2 }, {})).toEqual([]);
+    expect(expandOnWorkerAttention({ p1: true }, {})).toEqual([]);
   });
 });
 
-describe("workerCounts — the snapshot expandOnGrowth compares", () => {
-  it("counts workers by parent, and records a childless orchestrator as 0", () => {
-    const agents = [
-      { id: "p1", kind: "build" as const, parentId: null },
-      { id: "w1", kind: "worker" as const, parentId: "p1" },
-      { id: "w2", kind: "worker" as const, parentId: "p1" },
-      { id: "p2", kind: "build" as const, parentId: null },
+describe("workerAttention — the snapshot expandOnWorkerAttention compares", () => {
+  const p1w1: readonly Node[] = [
+    { id: "p1", kind: "build", parentId: null },
+    { id: "w1", kind: "worker", parentId: "p1" },
+  ];
+
+  it("flags a parent with a red worker and records a calm orchestrator as false", () => {
+    const agents: Node[] = [
+      { id: "p1", kind: "build", parentId: null },
+      { id: "w1", kind: "worker", parentId: "p1" },
+      { id: "p2", kind: "build", parentId: null },
+      { id: "w2", kind: "worker", parentId: "p2" },
     ];
-    // p2's explicit 0 is what lets its FIRST worker read as growth later. Omitting it is roborev
-    // 53672-High: the first spawn under any parent would be misread as a first sighting.
-    expect(workerCounts(agents)).toEqual({ p1: 2, p2: 0 });
+    // p2's explicit `false` is what lets its worker's LATER red read as a transition. Omitting a
+    // calm parent is the shape of roborev 53672-High: the signal's first appearance under a parent
+    // would arrive against an absent baseline and be misclassified as a first sighting.
+    expect(attentionFrom(agents, { w1: "errored", w2: "working" })).toEqual({ p1: true, p2: false });
   });
 
   // The regression above, stated end-to-end through both functions rather than as a shape.
-  it("makes a parent's FIRST worker read as growth", () => {
-    const before = workerCounts([{ id: "p1", kind: "build" as const, parentId: null }]);
-    const after = workerCounts([
-      { id: "p1", kind: "build" as const, parentId: null },
-      { id: "w1", kind: "worker" as const, parentId: "p1" },
-    ]);
-    expect(expandOnGrowth(before, after)).toEqual(["p1"]);
+  it("makes the FIRST red under a previously-calm parent read as a transition", () => {
+    const before = attentionFrom(p1w1, { w1: "working" });
+    const after = attentionFrom(p1w1, { w1: "waiting" });
+    expect(expandOnWorkerAttention(before, after)).toEqual(["p1"]);
+  });
+
+  // A parent that has NEVER had a worker still gets an entry, so its first worker arriving ALREADY
+  // red is a transition rather than a first sighting.
+  it("gives a childless orchestrator an explicit false", () => {
+    expect(attentionFrom([{ id: "p1", kind: "build", parentId: null }], {})).toEqual({ p1: false });
+  });
+
+  // A SPAWN is not an attention event. This is the whole point of the change: gaining a (calm)
+  // worker leaves the parent exactly as the user left it.
+  it("spawning a calm worker does not flag the parent", () => {
+    const before = attentionFrom([{ id: "p1", kind: "build", parentId: null }], {});
+    const after = attentionFrom(p1w1, { w1: "working" });
+    expect(expandOnWorkerAttention(before, after)).toEqual([]);
+  });
+
+  // Every red-tier status counts, because the band — not a second hand-rolled "is it red" — is what
+  // decides. `blocked` is the one that separates the tier from the narrower needs-you-now set, and
+  // getting that wrong is a documented past bug (engine/workerAttention.ts).
+  it.each<AgentTabStatus>(["waiting", "approval", "blocked", "errored"])(
+    "treats a %s worker as attention",
+    (st) => {
+      expect(attentionFrom(p1w1, { w1: st })).toEqual({ p1: true });
+    },
+  );
+
+  it.each<AgentTabStatus>(["working", "idle", "done", "stopped", "unmerged"])(
+    "treats a %s worker as calm",
+    (st) => {
+      expect(attentionFrom(p1w1, { w1: st })).toEqual({ p1: false });
+    },
+  );
+
+  it("flags a parent when ANY one of its workers is red", () => {
+    const agents: Node[] = [
+      { id: "p1", kind: "build", parentId: null },
+      { id: "w1", kind: "worker", parentId: "p1" },
+      { id: "w2", kind: "worker", parentId: "p1" },
+    ];
+    expect(attentionFrom(agents, { w1: "working", w2: "errored" })).toEqual({ p1: true });
   });
 
   // Order is not guaranteed — the disk reconcile can adopt a worker before its parent — so seeding
-  // the zeros must not clobber a count already accumulated.
-  it("survives a worker appearing before its parent in the array", () => {
-    const agents = [
-      { id: "w1", kind: "worker" as const, parentId: "p1" },
-      { id: "p1", kind: "build" as const, parentId: null },
+  // the `false`s must not clobber a flag already accumulated.
+  it("survives a red worker appearing before its parent in the array", () => {
+    const agents: Node[] = [
+      { id: "w1", kind: "worker", parentId: "p1" },
+      { id: "p1", kind: "build", parentId: null },
     ];
-    expect(workerCounts(agents)).toEqual({ p1: 1 });
+    expect(attentionFrom(agents, { w1: "errored" })).toEqual({ p1: true });
   });
 
-  // A shell nested under a build is not a worker and must not inflate the count — otherwise its
-  // parent would auto-expand for something the subtree never renders as a worker row.
-  it("does not count a non-worker child", () => {
-    const agents = [
-      { id: "p1", kind: "build" as const, parentId: null },
-      { id: "s1", kind: "shell" as const, parentId: "p1" },
+  // A shell nested under a build is not a worker and must not flag its parent — otherwise the
+  // subtree would pop open for a row it never renders as a worker row.
+  it("does not count a non-worker child, however red", () => {
+    const agents: Node[] = [
+      { id: "p1", kind: "build", parentId: null },
+      { id: "s1", kind: "shell", parentId: "p1" },
     ];
-    expect(workerCounts(agents)).toEqual({ p1: 0 });
+    expect(attentionFrom(agents, { s1: "errored" })).toEqual({ p1: false });
   });
 
   it("gives a parentless worker no entry rather than an 'undefined' bucket", () => {
-    const agents = [{ id: "w1", kind: "worker" as const, parentId: null }];
-    expect(workerCounts(agents)).toEqual({});
+    expect(attentionFrom([{ id: "w1", kind: "worker", parentId: null }], { w1: "errored" })).toEqual(
+      {},
+    );
   });
 
   it("is empty for no agents", () => {
-    expect(workerCounts([])).toEqual({});
-  });
-});
-
-describe("redWorkerCounts — how many workers under each parent are painted red", () => {
-  const agents = [
-    { id: "p1", kind: "build" as const, parentId: null },
-    { id: "w1", kind: "worker" as const, parentId: "p1" },
-    { id: "w2", kind: "worker" as const, parentId: "p1" },
-    { id: "p2", kind: "build" as const, parentId: null },
-  ];
-  const statuses = (m: Record<string, AgentTabStatus>) => (id: string) => m[id] ?? "stopped";
-
-  it("counts only the red ones", () => {
-    expect(redWorkerCounts(agents, statuses({ w1: "waiting", w2: "working" }))).toEqual({
-      p1: 1,
-      p2: 0,
-    });
+    expect(attentionFrom([], {})).toEqual({});
   });
 
-  // The explicit zero is load-bearing: expandOnRedWorker skips ids it has never seen, so a parent
-  // omitted while calm would have its FIRST red worker read as a first sighting and stay folded —
-  // the one case the whole expansion exists for.
-  it("gives a calm parent an explicit zero rather than no entry", () => {
-    expect(redWorkerCounts(agents, statuses({ w1: "working", w2: "idle" }))).toEqual({
-      p1: 0,
-      p2: 0,
-    });
-  });
-
-  // `blocked` is RED in AGENT_STATUS but is NOT in `needsAttention` — asking the wrong predicate
-  // here is the bug that shipped twice, leaving a blocked worker unable to surface on its parent.
-  it("counts a BLOCKED worker, which needsAttention would have missed", () => {
-    expect(redWorkerCounts(agents, statuses({ w1: "blocked" }))).toEqual({ p1: 1, p2: 0 });
-  });
-
-  // `unmerged` is GRAY on purpose — a landing state, not an alarm. It went gray after 27 of 51
-  // agents sat in that band and made red meaningless; re-escalating it here would rebuild that.
-  it("does not count an unmerged worker as red", () => {
-    expect(redWorkerCounts(agents, statuses({ w1: "unmerged", w2: "done" }))).toEqual({
-      p1: 0,
-      p2: 0,
-    });
-  });
-});
-
-describe("expandOnRedWorker — a worker going red pops its parent open, ONCE", () => {
-  it("fires on the transition from no reds to one", () => {
-    expect(expandOnRedWorker({ p1: 0 }, { p1: 1 })).toEqual(["p1"]);
-  });
-
-  // Already open-worthy and still is: re-firing every render would re-expand a subtree the user
-  // folded on purpose, which is the behavior the transition gate exists to avoid.
-  it("does not fire again while the count merely grows", () => {
-    expect(expandOnRedWorker({ p1: 1 }, { p1: 2 })).toEqual([]);
-  });
-
-  it("does not fire while the count holds steady", () => {
-    expect(expandOnRedWorker({ p1: 2 }, { p1: 2 })).toEqual([]);
-  });
-
-  it("does not fire when reds clear", () => {
-    expect(expandOnRedWorker({ p1: 2 }, { p1: 0 })).toEqual([]);
-  });
-
-  // On boot the previous snapshot is empty. Without this, every parent with an already-red worker
-  // would look like a fresh transition and blow open on every relaunch.
-  it("treats a first sighting as a baseline, not a transition", () => {
-    expect(expandOnRedWorker({}, { p1: 3 })).toEqual([]);
-  });
-
-  it("reports each parent that turned, and only those", () => {
+  // The SYNTHETIC strand red. withUnstartedWorkerAttention paints a never-mounted worker `approval`,
+  // and the open/evict ping-pong that produces that state can toggle it many times a second — each
+  // cycle a fresh rising edge that would re-open a subtree the user just collapsed. A worker with no
+  // live PTY status of its own is therefore calm here, however red the overlaid map paints it.
+  it("ignores a red status on a worker that was never live (the synthetic strand red)", () => {
     expect(
-      expandOnRedWorker({ p1: 0, p2: 1, p3: 0 }, { p1: 1, p2: 2, p3: 0 }),
-    ).toEqual(["p1"]);
+      workerAttention(
+        p1w1,
+        () => "approval",
+        () => false,
+      ),
+    ).toEqual({ p1: false });
+  });
+
+  it("honors the SAME red once that worker comes live", () => {
+    const stranded = workerAttention(
+      p1w1,
+      () => "approval",
+      () => false,
+    );
+    const live = workerAttention(
+      p1w1,
+      () => "approval",
+      () => true,
+    );
+    expect(expandOnWorkerAttention(stranded, live)).toEqual(["p1"]);
   });
 });

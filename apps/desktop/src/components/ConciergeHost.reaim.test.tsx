@@ -63,12 +63,6 @@ vi.mock("../useConciergeDictation", () => ({
     registerInsert: vi.fn(),
   }),
 }));
-vi.mock("../services/conciergeVoice", () => ({
-  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
-  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
-  stopConciergeVoice: vi.fn(),
-  shouldSpeakConciergeReply: vi.fn(() => true),
-}));
 vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 
 // The suggestion engine's leaves — everything BELOW useSuggestions. The hook itself is REAL.

@@ -137,12 +137,17 @@ describe("Build column — header clears the project tab bar", () => {
 
   // The helper row already contributes 14px of its own top padding, so stacking the gap on top of
   // it would double-space only that configuration.
-  it("does not add the gap when the helper row is already there", () => {
+  // The "helper row is already there" case is GONE, not merely untested: §6 deleted the Show Helper
+  // button and the row that carried it, so the strip no longer has a neighbour above it to avoid
+  // double-spacing against. The gap is now unconditional, which is what the test above pins. Hiding
+  // the helper island (still possible — §15 put Hide back on the island and in the View menu) does
+  // not bring a sidebar row back, so it cannot change this spacing either.
+  it("keeps the gap even when the helper island is hidden — no sidebar row rides on that flag", () => {
     useHelperPrefs.setState({ enabled: false } as never);
     const project = seed();
     render(<AgentSidebar project={project} />);
     const strip = document.querySelector<HTMLElement>('[data-hint="build"]')?.parentElement;
-    expect(strip!.style.marginTop).toBe("0px");
+    expect(strip!.style.marginTop).toBe("20px");
   });
 });
 

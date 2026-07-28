@@ -65,7 +65,9 @@ export interface SparkleOverlayProps {
   controllerRef?: Ref<SparkleOverlayController>;
   /** Live mic level 0..1 (sampled per frame while listening). Default: synthetic sine. */
   micLevelSource?: LevelSource;
-  /** Live TTS output level 0..1 (sampled while speaking). Default: synthetic sine. */
+  /** Drive for the "speaking" (= Sparkle is typing a reply) pulse, 0..1. Defaults to — and in
+   *  practice always is — the synthetic sine: there is no audio to sample, since voice OUTPUT was
+   *  removed (PRD/feat/ui-refresh-2026-07-27 §5). Kept as an injectable source only for tests. */
   voiceLevelSource?: LevelSource;
   /** Where the galaxy home sits. Default: top-center of the window (prototype slot). */
   getPerchRect?: () => Rect | null;

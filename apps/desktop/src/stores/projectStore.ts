@@ -75,6 +75,25 @@ export interface AddAgentOpts {
   /** Execution runtime. Defaults to "local" (today's behavior). "cloud" tabs are created after a
    *  successful POST /sessions/start and rely on W4's CloudTransport to attach. */
   runtime?: Runtime;
+  /** Whether creating this agent also SELECTS it. Defaults to true — a tab the user asked for should
+   *  be the one they land on. Pass `false` for a MACHINE-created agent (spawnWorker, driven by an
+   *  MCP request from an orchestrator): yanking the user's terminal to an agent they never asked for
+   *  is disruptive on its own, and a selected worker forces its orchestrator's subtree open (the
+   *  sidebar reveals a selected worker), which is how "subtrees open only on attention" was defeated
+   *  once already. Suppressing the selection HERE rather than selecting-then-restoring is what keeps
+   *  it invisible: there is no intermediate state for a render to observe, so nothing depends on
+   *  React batching the two writes, and no phantom `switch:` perf waterfall is opened.
+   *
+   *  `false` is ABSOLUTE — it means "never select", with no condition the caller can't see. It used
+   *  to self-cancel when nothing was selected ("fill the empty slot"), which quietly made the flag
+   *  mean two different things depending on invisible state: a null selection is NOT a hole to
+   *  backfill, it is DELIBERATE (Workspace's ladder pick and closeAgent's selectionAfterClose both
+   *  produce it — e.g. every row hidden by the status filter — and mergePreservingLiveWorkers
+   *  documents a live null as authoritative intent, not "no opinion"). Backfilling it handed the
+   *  user's terminal to a machine-created worker and, through the sidebar's selection-reveal effect,
+   *  forced its orchestrator's subtree open — the exact expand-on-spawn behavior §14 removed. The
+   *  pane-less case belongs to whoever PRODUCED the deselect, not to a spawn. */
+  select?: boolean;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -1054,7 +1073,12 @@ export const useProjectStore = create<ProjectState>()(
             // is single-occupancy). Only build agents claim it; opening a worker/think agent must
             // not steal the top build slot, so leave freshBuildAgentId untouched for those.
             const freshBuildAgentId = kind === "build" ? id : p.freshBuildAgentId;
-            return { ...p, agents: [...p.agents, agent], selectedAgentId: id, freshBuildAgentId };
+            // opts.select === false leaves the selection EXACTLY as it was — including a null (or
+            // absent) one, which is a deliberate deselect and not a hole for a machine-created agent
+            // to fill. No condition, so the flag can't invert itself under state the caller can't
+            // see. See AddAgentOpts.select.
+            const selectedAgentId = opts?.select === false ? p.selectedAgentId : id;
+            return { ...p, agents: [...p.agents, agent], selectedAgentId, freshBuildAgentId };
           }),
         }));
         // Anonymous funnel telemetry — every agent/worker tab creation flows through here.

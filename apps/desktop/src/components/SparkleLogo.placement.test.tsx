@@ -109,9 +109,10 @@ function controller(): ConciergeController {
 
 beforeEach(() => {
   useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
-  // The helper island's shipped default, restored per test: it decides whether the builder's
-  // leftover top row renders at all (see the last describe).
-  useHelperPrefs.setState({ enabled: true });
+  // The island's shipped default, restored per test. Nothing in the sidebar reads these prefs any
+  // more (see "the builder sidebar's brand row is gone"); this keeps the last describe's deliberate
+  // stale-key write from being the ambient state every other test runs under.
+  useHelperPrefs.setState({ mode: "island", enabled: undefined } as never);
   seedBalance();
 });
 afterEach(cleanup);
@@ -206,25 +207,31 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
   });
 });
 
-// What's left of the builder's old brand row, once the logo/waveform/badge moved out.
-describe("the builder sidebar's brand row is gone unless it has something to hold", () => {
-  it("renders no row at all in the default case — helper island enabled", () => {
-    useHelperPrefs.setState({ enabled: true });
+// What's left of the builder's old brand row, once the logo/waveform/badge moved out: nothing.
+//
+// The row's last child was "Show Helper", which existed only to undo the island's right-click →
+// Hide Helper. Both were deleted together (§6) — deleting the button alone would have stranded
+// anyone already in the hidden state with no way back. This used to be a PAIR of tests, the second
+// asserting the row came back when the island was hidden; there is no longer a hidden state to
+// bring it back for, so what is left is the unconditional absence of both.
+describe("the builder sidebar's brand row is gone", () => {
+  it("renders no row and no Show Helper button, in any state", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    // ShowHelperButton is the row's only remaining child and returns null while the island is
-    // enabled, which is the DEFAULT. An always-rendered row would be an empty <div> charging
-    // "14px 14px 6px" of padding above the Plan/Build toggle.
     expect(screen.queryByTestId("show-helper")).toBeNull();
     expect(screen.queryByTestId("builder-helper-row")).toBeNull();
   });
 
-  it("brings the row back when the island is hidden, so Show Helper has somewhere to live", () => {
-    useHelperPrefs.setState({ enabled: false });
+  // `enabled` is back in the store (§15 — the island is dismissable again, with the native menu
+  // bar as the guaranteed way back), but the SIDEBAR row is gone for good: the way back must live
+  // somewhere that cannot itself be hidden, which a sidebar button never was. If any of that were
+  // still wired up here, a hidden island would resurrect the row.
+  it("stays gone even with a stale `enabled: false` left in the persisted prefs", () => {
+    useHelperPrefs.setState({ enabled: false } as never);
     const project = seed();
     render(<AgentSidebar project={project} />);
-    const row = screen.getByTestId("builder-helper-row");
-    expect(row.contains(screen.getByTestId("show-helper"))).toBe(true);
+    expect(screen.queryByTestId("builder-helper-row")).toBeNull();
+    expect(screen.queryByTestId("show-helper")).toBeNull();
   });
 });
 

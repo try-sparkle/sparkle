@@ -2,8 +2,9 @@
 //
 // A clean ⌘ tap toggles a layer of gold "chiclets" over the app's primary controls; pressing a
 // chiclet's label key activates that control. Agent rows are numbered (1–9, then overflow letters);
-// every other control gets a fixed mnemonic letter. This module is the single source of truth for
-// that mapping and is intentionally DOM-free so it can be unit-tested in isolation.
+// project tabs are lettered from the front of that same overflow pool; every other control gets a
+// fixed mnemonic letter. This module is the single source of truth for that mapping and is
+// intentionally DOM-free so it can be unit-tested in isolation.
 
 // The data-hint attribute value used by agent rows. Agents are numbered by their on-screen order
 // (top to bottom), NOT by a fixed key, so they share one id and the labels are assigned positionally.
@@ -27,6 +28,17 @@ export const RECENT_SWITCH_HINT = "recent-switch";
 // Its mnemonic lives in CHROME_HINTS.recent below; exported so HintOverlay compares against the
 // constant instead of a magic "recent" string that could drift if that key is renamed.
 export const RECENT_TRIGGER_HINT = "recent";
+
+// The data-hint value used by each PROJECT TAB in the concierge tab bar. Tabs are lettered, not
+// numbered, because the builder's agent rows own 1–9 (the founder's call: "number builder rows
+// numerically and the project tabs alphabetically") and both layers are on screen at once.
+//
+// Their letters come from AGENT_OVERFLOW_POOL — the SAME stream the 10th-and-later agent rows draw
+// from — with tabs allocated FIRST and agent overflow continuing after (see assignLabels). That is
+// the RECENT_HINT / RECENT_SWITCH_HINT trick: one counter, so a tab letter and an agent-overflow
+// letter can never be the same character. A second, parallel pool would be free to drift into the
+// first the moment either list grew.
+export const PROJECT_TAB_HINT = "project-tab";
 
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
 // (The "." for the ⋯ overflow menu is a deliberate pun: three dots → the period key.)
@@ -57,9 +69,20 @@ export const AGENT_OVERFLOW_POOL = "abcdefghijklmnopqrstuvwxyz"
 
 // The label for the Nth agent (0-based) in display order: "1".."9" then the overflow pool.
 // Returns null once we run out of distinct labels (more than 9 + pool.length agents on screen).
-export function agentLabel(index: number): string | null {
+//
+// `overflowOffset` is how many pool letters the PROJECT TABS have already claimed, so the agent
+// overflow resumes after them instead of restarting at the top of the pool and colliding. It is a
+// count, not a position: the first nine agents keep 1..9 either way.
+export function agentLabel(index: number, overflowOffset = 0): string | null {
   if (index < 9) return String(index + 1);
-  return AGENT_OVERFLOW_POOL[index - 9] ?? null;
+  return AGENT_OVERFLOW_POOL[index - 9 + overflowOffset] ?? null;
+}
+
+// The label for the Nth project tab (0-based, left to right): the head of AGENT_OVERFLOW_POOL, which
+// is the alphabet minus the reserved chrome mnemonics — so a tab letter can't shadow a chrome control
+// either. Returns null past the pool (a tab with no label simply gets no badge; see agentLabel).
+export function projectTabLabel(index: number): string | null {
+  return AGENT_OVERFLOW_POOL[index] ?? null;
 }
 
 // Labels for Recent-dropdown rows: the full a–z, one per row in list order. Returns null past the
@@ -78,10 +101,21 @@ export type LabeledHint<T extends HintInput> = T & { label: string | null };
 export function assignLabels<T extends HintInput>(targets: T[]): LabeledHint<T>[] {
   let agentIndex = 0;
   let recentIndex = 0;
+  let tabIndex = 0;
+  // Project tabs and agent OVERFLOW share one walk through AGENT_OVERFLOW_POOL, tabs first. Counted
+  // up front rather than relying on tabs appearing before agents in `targets`: the overlay sorts each
+  // bucket by visual order and tabs sit above the sidebar, so an ordering assumption here would be a
+  // silent collision waiting on the day someone reorders the buckets.
+  const tabCount = targets.filter((t) => t.hintId === PROJECT_TAB_HINT).length;
   return targets.map((t) => {
     if (t.hintId === AGENT_HINT) {
-      const label = agentLabel(agentIndex);
+      const label = agentLabel(agentIndex, tabCount);
       agentIndex += 1;
+      return { ...t, label };
+    }
+    if (t.hintId === PROJECT_TAB_HINT) {
+      const label = projectTabLabel(tabIndex);
+      tabIndex += 1;
       return { ...t, label };
     }
     // Rows and their Switch buttons share ONE sequential stream so their letters can't collide.

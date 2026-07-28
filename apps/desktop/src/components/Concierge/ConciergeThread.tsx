@@ -2,20 +2,17 @@
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
 import { useEffect, useRef } from "react";
-import { FiVolume2, FiVolumeX } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
+// The read-only strip a SENT message's files draw as, plus the one lightbox they open. It lives in
+// components/composer beside that lightbox rather than here — see its header for why.
+import { MessageAttachments } from "../composer/MessageAttachments";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
-import type {
-  ConciergeDigestMessage,
-  ConciergeMessage,
-  ConciergeNudge,
-  ConciergeSparkleMessage,
-} from "./types";
+import type { ConciergeDigestMessage, ConciergeMessage, ConciergeNudge } from "./types";
 
 /** How close to the bottom still counts as "following", measured when the READER scrolls.
  *
@@ -35,8 +32,6 @@ export function ConciergeThread({
   onNudgeAction,
   onRedirect,
   onDigestClick,
-  onSpeak,
-  speakingMessageId = null,
 }: {
   messages: ConciergeMessage[];
   typing?: boolean;
@@ -46,9 +41,6 @@ export function ConciergeThread({
   onRedirect?: (messageId: string) => void;
   /** A digest line was clicked: open that project and reveal its lead agent. */
   onDigestClick?: (digest: ConciergeDigestMessage) => void;
-  /** Speak-on-demand for a Sparkle reply. Absent = no speaker buttons (voice is opt-in). */
-  onSpeak?: (message: ConciergeSparkleMessage) => void;
-  speakingMessageId?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
@@ -172,6 +164,10 @@ export function ConciergeThread({
                   padding: "9px 12px",
                 }}
               >
+                {/* ABOVE the words, the way every chat client shows what was sent with them. The
+                    text still carries the compact count ("look · 1 image"), which is what a
+                    restored bubble falls back to once its base64 has been stripped. */}
+                <MessageAttachments attachments={m.attachments ?? []} />
                 {m.text}
               </div>
               {m.receipt && (
@@ -246,46 +242,16 @@ export function ConciergeThread({
               {m.text}
             </div>
           );
-        // kind === "sparkle" — no bubble, RENDERED MARKDOWN, with the speaker button after it.
+        // kind === "sparkle" — no bubble, RENDERED MARKDOWN.
         //
         // The brain's persona tells it to answer in GitHub-flavored markdown, and this used to
         // print the raw string — so every reply arrived as a wall of "**bold**" and "- " bullets
         // run together on one line. Reuses the app's shared renderer (components/Markdown), which
         // already owns the GFM styling and the link/image scheme allow-lists, rather than growing
         // a second one here.
-        //
-        // The speaker is only rendered when the integration layer supplied onSpeak AND the line is
-        // a brain REPLY (`speakable`). The host's transactional notices arrive as `sparkle` too —
-        // "Sent to X.", "…that didn't send." — and offering to read those aloud was never the
-        // intent (roborev 48172). It sits AFTER the markdown block rather than inline inside it:
-        // Markdown emits block-level children, so an inline button spliced into that flow would be
-        // pushed onto its own line by the last paragraph anyway.
-        const speaking = speakingMessageId === m.id;
-        const speakThis = onSpeak && m.text && m.speakable ? onSpeak : null;
         return (
           <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
             <Markdown text={m.text} />
-            {speakThis ? (
-              <button
-                type="button"
-                onClick={() => speakThis(m)}
-                aria-label={speaking ? "Stop speaking" : "Speak this reply"}
-                aria-pressed={speaking}
-                title={speaking ? "Stop speaking" : "Speak this reply"}
-                style={{
-                  marginLeft: 2,
-                  verticalAlign: "middle",
-                  background: "transparent",
-                  border: "none",
-                  padding: 2,
-                  cursor: "pointer",
-                  color: speaking ? C.amber : C.muted,
-                  lineHeight: 0,
-                }}
-              >
-                {speaking ? <FiVolumeX size={13} aria-hidden /> : <FiVolume2 size={13} aria-hidden />}
-              </button>
-            ) : null}
           </div>
         );
       })}

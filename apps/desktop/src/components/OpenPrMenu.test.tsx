@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => h.invoke(...a) }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => h.openUrl(u) }));
 
-import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
+import { OpenPrMenu, agentLinkForBranch, panelShiftX, type PrAgentLink } from "./OpenPrMenu";
 import type { PrRow } from "../services/openPrs";
 import type { AgentTab, Project } from "../types";
 
@@ -125,6 +125,147 @@ describe("OpenPrMenu", () => {
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("open-agent-1"));
     expect(onOpen).toHaveBeenCalledWith(link);
+  });
+});
+
+describe("panelShiftX", () => {
+  it("leaves a panel that already fits alone", () => {
+    expect(panelShiftX({ left: 420, right: 880 }, 900)).toBe(0);
+  });
+
+  it("pulls a panel that overhangs the RIGHT edge back inside", () => {
+    // right edge 60px past the window → nudge left far enough to clear the 8px margin too.
+    expect(panelShiftX({ left: 500, right: 960 }, 900)).toBe(-68);
+  });
+
+  it("pushes a panel that overhangs the LEFT edge back inside", () => {
+    expect(panelShiftX({ left: -4, right: 280 }, 300)).toBe(12);
+  });
+
+  it("keeps the left edge visible when the panel is wider than the window (no fit possible)", () => {
+    // Nothing can satisfy both edges here; the left edge wins so the header stays readable.
+    expect(panelShiftX({ left: -100, right: 400 }, 300)).toBe(108);
+  });
+});
+
+/** The badge cluster's own geometry in the model below: flush right, 20px of chrome beyond it. */
+const BADGE_RIGHT_INSET = 20;
+const BADGE_WIDTH = 110;
+
+/**
+ * A deliberately small layout model for jsdom, which computes no geometry of its own. The badge sits
+ * flush right in the tab bar; the panel hangs off whichever badge edge its own style anchors it to
+ * (so a regression back to `left: 0` really does move the rect), with the CSS width clamp
+ * `min(460px, 100vw - 16px)` applied. Transform-aware, so the component's measure → shift →
+ * re-measure path converges exactly as it does in a real browser.
+ */
+function stubLayout(innerWidth: number) {
+  const real = HTMLElement.prototype.getBoundingClientRect;
+  Object.defineProperty(window, "innerWidth", { value: innerWidth, configurable: true });
+  HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+    if (this.dataset.testid !== "open-pr-panel") return real.call(this);
+    const m = /translateX\((-?[\d.]+)px\)/.exec(this.style.transform || "");
+    const dx = m ? Number(m[1]) : 0;
+    const width = Math.min(460, innerWidth - 16);
+    const badgeRight = innerWidth - BADGE_RIGHT_INSET;
+    // Right-anchored: the panel's right edge meets the badge's. Left-anchored (the bug): its left
+    // edge meets the badge's left, and the panel runs off the window from there.
+    const left = this.style.right === "0px" ? badgeRight - width : badgeRight - BADGE_WIDTH;
+    return {
+      left: left + dx,
+      right: left + width + dx,
+      width,
+      top: 40,
+      bottom: 40 + 420,
+      height: 420,
+      x: left + dx,
+      y: 40,
+    } as DOMRect;
+  };
+  return () => {
+    HTMLElement.prototype.getBoundingClientRect = real;
+  };
+}
+
+/** The rendered panel's real horizontal extent = its stubbed rect (already transform-aware). */
+function panelRect(el: HTMLElement) {
+  return el.getBoundingClientRect();
+}
+
+describe("OpenPrMenu (containment — §12a)", () => {
+  it("anchors the panel to the badge's RIGHT edge, never its left", async () => {
+    stubList([PASS]);
+    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const panel = await screen.findByTestId("open-pr-panel");
+    expect(panel.style.right).toBe("0px");
+    // `left: 0` is what pushed a 340–460px panel off the window when the badge sits flush right.
+    expect(panel.style.left).toBe("");
+  });
+
+  it("keeps the panel's right edge within window.innerWidth at a roomy width", async () => {
+    const restore = stubLayout(1200);
+    try {
+      stubList([PASS, FAILING]);
+      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+      fireEvent.click(await screen.findByTestId("open-pr-badge"));
+      const r = panelRect(await screen.findByTestId("open-pr-panel"));
+      expect(r.right).toBeLessThanOrEqual(window.innerWidth);
+      expect(r.left).toBeGreaterThanOrEqual(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps BOTH edges inside the window when it is narrower than the panel wants to be", async () => {
+    // 300px stands in for a heavily zoomed window: the CSS width clamp alone still leaves the panel
+    // hanging 4px off the LEFT edge, so the measured nudge has to finish the job.
+    const restore = stubLayout(300);
+    try {
+      stubList([PASS, FAILING]);
+      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+      fireEvent.click(await screen.findByTestId("open-pr-badge"));
+      const panel = await screen.findByTestId("open-pr-panel");
+      await waitFor(() => expect(panel.style.transform).toContain("translateX"));
+      const r = panelRect(panel);
+      expect(r.right).toBeLessThanOrEqual(window.innerWidth);
+      expect(r.left).toBeGreaterThanOrEqual(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("re-measures on window resize, so a shrink can't strand the panel off-window", async () => {
+    const restore = stubLayout(1200);
+    try {
+      stubList([PASS]);
+      render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+      fireEvent.click(await screen.findByTestId("open-pr-badge"));
+      const panel = await screen.findByTestId("open-pr-panel");
+      restore();
+      const restoreNarrow = stubLayout(300);
+      try {
+        fireEvent(window, new Event("resize"));
+        await waitFor(() => expect(panel.style.transform).toContain("translateX"));
+        const r = panelRect(panel);
+        expect(r.right).toBeLessThanOrEqual(window.innerWidth);
+        expect(r.left).toBeGreaterThanOrEqual(0);
+      } finally {
+        restoreNarrow();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it("stays scrollable at small window heights (the list can never outgrow the window)", async () => {
+    stubList([PASS, FAILING]);
+    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const panel = await screen.findByTestId("open-pr-panel");
+    expect(panel.style.overflowY).toBe("auto");
+    // The cap is the smaller of the design height and what the window actually has.
+    expect(panel.getAttribute("style")).toContain("min(420px, calc(100vh - 80px))");
   });
 });
 

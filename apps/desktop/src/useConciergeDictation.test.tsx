@@ -6,8 +6,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./services/conciergeVoice", () => ({ stopConciergeVoice: vi.fn() }));
-
 import { useConciergeDictation } from "./useConciergeDictation";
 import { useAuthStore } from "./stores/authStore";
 import { useDictationStore } from "./stores/dictationStore";

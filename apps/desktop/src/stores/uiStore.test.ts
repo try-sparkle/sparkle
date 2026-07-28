@@ -302,9 +302,9 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     "zoom",
   ];
 
-  // Restore everything this block touches, not just themePref: it writes ten transient non-defaults
-  // into a module-level singleton, and vitest's per-file isolation does not help a test appended
-  // after it.
+  // Restore everything this block touches, not just themePref: it writes every transient key as a
+  // non-default into a module-level singleton, and vitest's per-file isolation does not help a test
+  // appended after it.
   afterEach(() => {
     localStorage.clear();
     useUiStore.setState({
@@ -313,6 +313,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       boardFocusBeadId: null,
       settingsRequest: null,
       composeFocusSeq: 0,
+      revealAgentId: null,
       newAgentRuntime: "local",
       cloudCreateOpen: false,
       zeroCreditBannerDismissed: false,
@@ -331,6 +332,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       boardFocusBeadId: "epic-42",
       settingsRequest: "accounts",
       composeFocusSeq: 7,
+      revealAgentId: "a-42",
       newAgentRuntime: "cloud",
       cloudCreateOpen: true,
       zeroCreditBannerDismissed: true,
@@ -361,6 +363,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
       boardFocusBeadId: null,
       settingsRequest: null,
       composeFocusSeq: 0,
+      revealAgentId: null,
       newAgentRuntime: "local",
       cloudCreateOpen: false,
       zeroCreditBannerDismissed: false,
@@ -370,8 +373,8 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
   });
 
   it("ignores every transient key present in a stored blob", async () => {
-    // All ten, mirroring the write-path block: a key stripped on write but forgotten in `merge`
-    // would otherwise stay green here for the six the earlier version didn't name.
+    // Every transient key, mirroring the write-path block: a key stripped on write but forgotten in
+    // `merge` would otherwise stay green here for the six the earlier version didn't name.
     localStorage.setItem(
       "sparkle-ui",
       JSON.stringify({
@@ -383,6 +386,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
           boardFocusBeadId: "epic-42",
           settingsRequest: "accounts",
           composeFocusSeq: 7,
+          revealAgentId: "a-42",
           newAgentRuntime: "cloud",
           cloudCreateOpen: true,
           zeroCreditBannerDismissed: true,
@@ -402,6 +406,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.boardFocusBeadId).toBeNull();
     expect(s.settingsRequest).toBeNull();
     expect(s.composeFocusSeq).toBe(0);
+    expect(s.revealAgentId).toBeNull();
     expect(s.newAgentRuntime).toBe("local");
     expect(s.cloudCreateOpen).toBe(false);
     expect(s.zeroCreditBannerDismissed).toBe(false);

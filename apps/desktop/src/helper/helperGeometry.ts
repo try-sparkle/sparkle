@@ -41,7 +41,18 @@ export const ISLAND_H = 38;
 export const TAB_W = 36;
 export const TAB_H = 36;
 
-/** Right-click menu ("Hide Helper" / "Quit Sparkle") and the capture-failure notice. */
+/**
+ * Right-click menu ("Open Sparkle" / "Hide Helper" / "Quit Sparkle") and the capture-failure notice.
+ *
+ * MENU_H is how much the WINDOW grows, not the menu's measured height — a webview composites
+ * nothing outside its native bounds, so this only has to be an upper bound with a little room. The
+ * 68 was sized for THREE items and is correct again now that Hide Helper is back: the menu is a
+ * 4px-padded, 1px-bordered column of three `menuItem` buttons (12px text, 5px vertical padding,
+ * 2px gaps) offset 4px from the top, so it occupies roughly 4 + 2 + 8 + 4 + 3×26 ≈ 96px against the
+ * ISLAND_H + MENU_H = 112px the window grows to. It was left unchanged when §6 dropped the menu to
+ * two items, which is the ~26px of dead always-on-top window roborev 53791 flagged; restoring the
+ * third item spends it rather than trimming the constant.
+ */
 export const MENU_W = 168;
 export const MENU_H = 68;
 /** The failure notice is a line of prose, so it needs its OWN width floor — it can no longer

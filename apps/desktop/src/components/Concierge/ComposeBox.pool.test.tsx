@@ -86,7 +86,7 @@ function renderColumn({ columnH, chrome }: { columnH: number; chrome: number }) 
   const thread = view.container.querySelector<HTMLElement>(
     `[data-testid="${CONCIERGE_THREAD_TESTID}"]`,
   )!;
-  const root = box().closest("div[data-dnd-target]") as HTMLElement;
+  const root = box().closest("div[data-testid='concierge-compose']") as HTMLElement;
   const textareaH = () => px(box().style.height || "0");
   // The root is the textarea PLUS the attach row, chips, interim line and handle.
   Object.defineProperty(root, "offsetHeight", {
@@ -164,7 +164,7 @@ describe("the drag ceiling is measured, not assumed", () => {
     // A standalone ComposeBox (as other tests render it) must still work rather than clamp to zero.
     window.innerHeight = 900;
     render(<ComposeBox onSend={vi.fn()} onMicToggle={vi.fn()} onAttach={vi.fn()} />);
-    const root = box().closest("div[data-dnd-target]") as HTMLElement;
+    const root = box().closest("div[data-testid='concierge-compose']") as HTMLElement;
     fireResize(root);
     // DISCRIMINATING: the old assertion (`> 0`) could not fail for any pool, since composeRenderH
     // floors at COMPOSE_MIN_H. Drag greedily and pin the ceiling to the WINDOW, which is what the

@@ -317,7 +317,9 @@ export function syntheticMicLevel(t: number): number {
   );
 }
 
-/** Synthetic voice level for speaking/typing — replaced by the real TTS analyser later. */
+/** Synthetic level for the "speaking" mode, which now means SPARKLE IS TYPING A REPLY, not making
+ *  a sound: text-to-speech was removed whole (PRD/feat/ui-refresh-2026-07-27 §5), so this sine IS
+ *  the source — it is not a placeholder for a TTS analyser that arrives later. */
 export function syntheticVoiceLevel(t: number): number {
   return 0.35 + 0.3 * Math.abs(Math.sin(t * 6.4) * Math.sin(t * 3.1));
 }

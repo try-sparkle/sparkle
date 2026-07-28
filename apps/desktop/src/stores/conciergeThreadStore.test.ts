@@ -14,6 +14,9 @@ import {
   CONCIERGE_THREAD_MAX,
   CONCIERGE_MSG_MAX_LEN,
   CONCIERGE_TRUNCATION_SUFFIX,
+  boundLiveThumbnails,
+  LIVE_THUMBNAIL_MESSAGES,
+  LIVE_THUMBNAIL_MAX_CHARS,
 } from "./conciergeThreadStore";
 import type { ConciergeMessage } from "../components/Concierge/types";
 
@@ -23,7 +26,7 @@ function you(id: string, text = `msg ${id}`): ConciergeMessage {
   return { id, kind: "you", text };
 }
 function sparkle(id: string, text = `reply ${id}`): ConciergeMessage {
-  return { id, kind: "sparkle", text, speakable: true };
+  return { id, kind: "sparkle", text };
 }
 
 /** The text of a message that has one. `ConciergeMessage` is a union and the recap variant carries no
@@ -170,6 +173,115 @@ describe("conciergeThreadStore", () => {
       const raw = localStorage.getItem(STORAGE_KEY) ?? "";
       // 200 × ~4KB ≈ 800KB — comfortably inside a ~5MB budget shared with every other store.
       expect(raw.length).toBeLessThan(1_500_000);
+    });
+
+    // A sent message now carries the files that rode with it, so the bubble can show them (PRD §8).
+    // `dataUrl` is base64 — one retina screenshot is routinely 1–4MB, i.e. the entire quota in a
+    // single bubble, and it arrives through a field the TEXT cap above cannot see. When the persist
+    // write throws, zustand stops persisting the whole store silently.
+    it("strips an attachment's base64 on the way out, keeping the record that names it", () => {
+      const big = `data:image/png;base64,${"A".repeat(200_000)}`;
+      setChat([
+        {
+          id: "you-1",
+          kind: "you",
+          text: "look · 1 image",
+          attachments: [
+            { id: "s1", kind: "image", path: "/tmp/shot.png", name: "shot.png", dataUrl: big },
+          ],
+        },
+      ]);
+      const raw = localStorage.getItem(STORAGE_KEY) ?? "";
+      expect(raw).not.toContain("base64");
+      expect(raw.length).toBeLessThan(2_000);
+
+      // The record itself survives, so a restored bubble still names what was sent (it renders as a
+      // chip rather than a thumbnail — MessageAttachments falls back on a missing dataUrl).
+      const out = persisted()[0];
+      const atts = out?.kind === "you" ? out.attachments : undefined;
+      expect(atts).toEqual([
+        { id: "s1", kind: "image", path: "/tmp/shot.png", name: "shot.png" },
+      ]);
+
+      // LIVE state is untouched — the session that took the screenshot must keep showing it.
+      const live = useConciergeThreadStore.getState().chat[0];
+      expect(live?.kind === "you" ? live.attachments?.[0]?.dataUrl : undefined).toBe(big);
+    });
+  });
+
+  // The second size axis, and a DIFFERENT one from the caps above (roborev 53760). `chat` is never
+  // trimmed while the session runs — CONCIERGE_THREAD_MAX applies only in `partialize` — so once a
+  // sent message carries its own attachments, every `you` bubble pins its base64 for the life of the
+  // process. Before that it was released at send time, when the composer row unmounted.
+  describe("live retention (memory, not localStorage)", () => {
+    /** A `you` message carrying one image preview of `chars` base64 characters. */
+    const withImage = (id: string, chars = 100): ConciergeMessage => ({
+      id,
+      kind: "you",
+      text: `msg ${id}`,
+      attachments: [
+        {
+          id: `a-${id}`,
+          kind: "image",
+          path: `/tmp/${id}.png`,
+          name: `${id}.png`,
+          dataUrl: `data:image/png;base64,${"A".repeat(chars)}`,
+        },
+      ],
+    });
+    const previewOf = (m: ConciergeMessage | undefined): string | undefined =>
+      m?.kind === "you" ? m.attachments?.[0]?.dataUrl : undefined;
+
+    it("keeps previews on the newest N bubbles and strips the rest", () => {
+      const many = Array.from({ length: LIVE_THUMBNAIL_MESSAGES + 3 }, (_, i) =>
+        withImage(String(i)),
+      );
+      setChat(many);
+      const live = useConciergeThreadStore.getState().chat;
+      // Oldest three lost their previews…
+      expect(live.slice(0, 3).map(previewOf)).toEqual([undefined, undefined, undefined]);
+      // …the newest N kept theirs, and the naming record survives either way.
+      expect(live.slice(3).every((m) => previewOf(m) !== undefined)).toBe(true);
+      const oldest = live[0];
+      expect(oldest?.kind === "you" ? oldest.attachments?.[0]?.name : "").toBe("0.png");
+    });
+
+    it("strips an oversized preview even when it is the NEWEST message", () => {
+      // A count cap alone is not enough: screenshots are downscaled in Rust, but a picked or dropped
+      // image is not — attachments.rs emits a data_url for anything up to 40MB.
+      setChat([withImage("huge", LIVE_THUMBNAIL_MAX_CHARS + 1)]);
+      expect(previewOf(useConciergeThreadStore.getState().chat[0])).toBeUndefined();
+    });
+
+    it("does not let an already-stripped bubble consume the budget", () => {
+      // Otherwise the cap would ratchet down one message at a time over a long session, and the
+      // newest bubble would eventually lose its thumbnail too.
+      const older = Array.from({ length: LIVE_THUMBNAIL_MESSAGES * 2 }, (_, i) =>
+        withImage(`old${i}`),
+      );
+      setChat(older);
+      // Write again, appending one more: the survivors must still be the newest N.
+      useConciergeThreadStore.getState().setChat((prev) => [...prev, withImage("new")]);
+      const live = useConciergeThreadStore.getState().chat;
+      expect(live.filter((m) => previewOf(m) !== undefined)).toHaveLength(LIVE_THUMBNAIL_MESSAGES);
+      expect(previewOf(live.at(-1))).toBeDefined();
+    });
+
+    it("returns the very same array when nothing needs stripping", () => {
+      // Bubbles are memoized on identity: rebuilding the array on every write would re-render the
+      // whole thread on each keystroke-driven update.
+      const chat = [you("1"), sparkle("2"), withImage("3")];
+      expect(boundLiveThumbnails(chat)).toBe(chat);
+    });
+
+    it("leaves untouched messages referentially identical when it does strip one", () => {
+      const chat = Array.from({ length: LIVE_THUMBNAIL_MESSAGES + 1 }, (_, i) =>
+        withImage(String(i)),
+      );
+      const out = boundLiveThumbnails(chat);
+      expect(out).not.toBe(chat);
+      expect(out[0]).not.toBe(chat[0]); // the one that lost its preview
+      expect(out.slice(1).every((m, i) => m === chat[i + 1])).toBe(true);
     });
   });
 

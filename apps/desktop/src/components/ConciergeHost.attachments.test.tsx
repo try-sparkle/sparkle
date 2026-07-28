@@ -72,10 +72,9 @@ vi.mock("../services/conciergeDispatch", () => ({
 // not about how the decision is made (that is services/conciergeRouter.test.ts).
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.route }));
 vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () => null }));
-// The voice stack (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
-// the host imports it unconditionally, so without this the base tests run the real dictation hook
-// and the real stopVoice() on every simulated send — mutating global dictation state and coupling
-// these tests to the mic pipeline.
+// The dictation hook (CM-U9) is mocked in EVERY host test, not just the voice one (roborev 48171):
+// the host imports it unconditionally, so without this the base tests run the real hook on every
+// simulated send — mutating global dictation state and coupling these tests to the mic pipeline.
 vi.mock("../useConciergeDictation", () => ({
   useConciergeDictation: () => ({
     micLive: false,
@@ -83,12 +82,6 @@ vi.mock("../useConciergeDictation", () => ({
     toggleMic: vi.fn(),
     registerInsert: vi.fn(),
   }),
-}));
-vi.mock("../services/conciergeVoice", () => ({
-  speakConciergeReply: vi.fn(async () => "elevenlabs" as const),
-  speakOnDemand: vi.fn(async () => "elevenlabs" as const),
-  stopConciergeVoice: vi.fn(),
-  shouldSpeakConciergeReply: vi.fn(() => true),
 }));
 vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 vi.mock("../services/conciergeAttach", async (orig) => {
@@ -429,6 +422,62 @@ describe("ConciergeHost — the thread, and clearing", () => {
       h.deferred?.({ ok: true, path: "free-text", agentId: "ag1", sent: "x", display: "look · 1 image" });
     });
     expect(screen.queryByTestId("concierge-attachment-chips")).toBeNull();
+  });
+});
+
+// §8 of PRD/feat/ui-refresh-2026-07-27-plan.md. The counts row above proves the temp path never
+// leaks into the transcript; it does NOT prove the user can see WHAT they sent. Before this, a
+// screenshot reached the model correctly and left no trace in the column at all — the staged
+// attachments live on the view model and are cleared on send, so the bubble had nothing to render.
+// The message record now carries its own snapshot, which is what makes it survive scrollback.
+describe("ConciergeHost — the sent attachment stays visible in the bubble", () => {
+  it("renders the image inline, and it is still there after a later message", async () => {
+    mount();
+    await attachImage();
+    type("look");
+    await clickSend();
+
+    const img = within(threadEl()).getByRole("img", { name: "shot.png" });
+    expect(img.getAttribute("src")).toBe(shot.dataUrl);
+
+    // The point of snapshotting onto the MESSAGE rather than reading the staged list: a second send
+    // clears the staging area, and the first bubble must not go blank when it does.
+    type("and again");
+    await clickSend();
+
+    const still = within(threadEl()).getByRole("img", { name: "shot.png" });
+    expect(still.getAttribute("src")).toBe(shot.dataUrl);
+    // …and exactly one: the later message carried nothing, so nothing duplicates.
+    expect(within(threadEl()).getAllByRole("img")).toHaveLength(1);
+  });
+
+  it("shows a non-image as a named chip, never as a thumbnail", async () => {
+    // The picker is a knob in this suite (see the mock): what it returns is what gets staged, so a
+    // `file` record here exercises the non-image arm without needing a second attach button.
+    h.pick.mockResolvedValue([
+      { id: "f1", kind: "file", path: "/tmp/notes.pdf", name: "notes.pdf" } satisfies Attachment,
+    ]);
+    mount();
+    await attachImage();
+    type("read this");
+    await clickSend();
+
+    const strip = within(threadEl()).getByTestId("concierge-message-attachments");
+    expect(strip.textContent).toContain("notes.pdf");
+    expect(within(strip).queryByRole("img")).toBeNull();
+  });
+
+  it("clicking the thumbnail opens the full-size lightbox", async () => {
+    mount();
+    await attachImage();
+    type("look");
+    await clickSend();
+
+    fireEvent.click(within(threadEl()).getByRole("button", { name: /shot\.png/ }));
+    // The lightbox is a modal outside the thread, so the document now holds two renderings of the
+    // same image and the lightbox's own download affordance.
+    expect(screen.getByTitle("Download…")).toBeTruthy();
+    expect(screen.getAllByRole("img", { name: "shot.png" })).toHaveLength(2);
   });
 });
 

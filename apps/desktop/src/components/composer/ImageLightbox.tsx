@@ -12,24 +12,35 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
   // Transient confirmation label on the copy button ("Copied!"), reset by the next open.
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** The last failure, SHOWN — not only logged (roborev 53760).
+   *
+   *  Both actions read `att.path` off disk, and since a sent message keeps its attachments in the
+   *  transcript (PRD §8) that path can be a temp file the OS has since reaped. Logging alone meant
+   *  the user picked a save location and then nothing happened, with no way to tell a slow copy from
+   *  a dead one — a modal whose only action fails silently. */
+  const [failed, setFailed] = useState<string | null>(null);
 
   const onCopy = async () => {
+    setFailed(null);
     try {
       await copyImageToClipboard(att.path);
       setCopied(true);
       setTimeout(() => setCopied(false), 1400);
     } catch (e) {
       log.error("composer", "copy image failed", e);
+      setFailed("Couldn't copy that image — the file may no longer be on disk.");
     }
   };
 
   const onDownload = async () => {
     if (busy) return;
     setBusy(true);
+    setFailed(null);
     try {
       await downloadAttachment(att);
     } catch (e) {
       log.error("composer", "download attachment failed", e);
+      setFailed("Couldn't save that file — it may no longer be on disk.");
     } finally {
       setBusy(false);
     }
@@ -111,6 +122,22 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
           </span>
         )}
       </div>
+
+      {failed && (
+        <div
+          role="alert"
+          style={{
+            flex: "0 0 auto",
+            padding: "8px 12px",
+            borderTop: `1px solid ${C.hairline}`,
+            color: C.sienna,
+            fontFamily: '"IBM Plex Sans", sans-serif',
+            fontSize: 12.5,
+          }}
+        >
+          {failed}
+        </div>
+      )}
     </ModalOverlay>
   );
 }

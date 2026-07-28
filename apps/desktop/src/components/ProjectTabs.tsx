@@ -13,6 +13,7 @@ import { FiPlus, FiX } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { C } from "../theme/colors";
+import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 
 export interface ProjectTabItem {
   id: string;
@@ -154,6 +155,10 @@ export function ProjectTabs({
             aria-selected={active}
             tabIndex={0}
             data-testid={`tab-${p.id}`}
+            // Keyboard-hint target: a clean Ctrl tap badges each tab with a letter, and the overlay
+            // activates it by firing this element's own onClick — so hint selection and mouse
+            // selection are the same code path (see keyboardHints/hintTargets.ts).
+            data-hint={PROJECT_TAB_HINT}
             title={`${p.name}${onOpenSettings ? " — double-click for project settings" : ""}`}
             onClick={() => onSelect(p.id)}
             onDoubleClick={() => onOpenSettings?.(p.id)}

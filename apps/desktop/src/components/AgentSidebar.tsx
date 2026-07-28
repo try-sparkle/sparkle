@@ -24,7 +24,6 @@ import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { useHelperPrefs } from "../helper/helperPrefs";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -72,12 +71,7 @@ import {
 import { StageSectionHeader } from "./StageSectionHeader";
 import { StatusFilterBar } from "./StatusFilterBar";
 import { withUnstartedWorkerAttention, withRedWorkerAttention } from "../engine/workerAttention";
-import {
-  expandOnGrowth,
-  expandOnRedWorker,
-  redWorkerCounts,
-  workerCounts,
-} from "../engine/workerExpansion";
+import { expandOnWorkerAttention, workerAttention } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { isInMotion } from "../engine/inMotion";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
@@ -1017,40 +1011,82 @@ export function AgentSidebar({ project }: { project: Project | null }) {
   }, [project?.agents, collapsedRecord]);
   const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
 
-  // AUTO-EXPAND ON SPAWN. collapsedOrchestrators reads a missing entry as COLLAPSED, so without
-  // this a freshly-spawned worker would land in a subtree nobody can see and the spawn would look
-  // like it did nothing. Driven off a count COMPARISON rather than a spawn callback because workers
-  // also arrive via reconcileWorkersFromDisk and cross-window adopt, neither of which runs through
-  // spawnWorker. expandOnGrowth deliberately ignores a parent's first sighting, so boot does not
-  // blow open every subtree the user had collapsed — see engine/workerExpansion.
-  // Starts EMPTY, and that is the whole first-mount story: expandOnGrowth skips any id absent from
-  // the previous snapshot, so the first pass records a baseline and expands nothing. There is
-  // deliberately no second `first render?` guard here — one rule, in the tested pure helper, rather
-  // than two that can drift.
-  const prevWorkerCounts = useRef<Record<string, number>>({});
-  useEffect(() => {
-    const next = workerCounts(project?.agents ?? []);
-    const grown = expandOnGrowth(prevWorkerCounts.current, next);
-    prevWorkerCounts.current = next;
-    if (grown.length > 0) useUiStore.getState().expandOrchestrators(grown);
-  }, [project?.agents]);
-
-  // AUTO-EXPAND WHEN A WORKER GOES RED. The head's disc already rolls its workers up, so a folded
-  // parent with a blocked worker isn't silent — but the disc says "something under here needs you"
-  // without saying WHICH, and the row that can answer that is one fold away. Opening it puts the
-  // question on screen at the moment it appears.
+  // AUTO-EXPAND ON ATTENTION. collapsedOrchestrators reads a missing entry as COLLAPSED, and that
+  // stays the default: a subtree opens by itself only when a worker under it enters the `needs_you`
+  // band, and at no other time. It does NOT open on spawn — gaining a worker is not something that
+  // requires the user, and popping every subtree on every spawn is what this replaced.
   //
-  // Fires on the TRANSITION only (0 → ≥1 red), exactly once. Holding the subtree open for as long
-  // as the worker stays red would re-expand it every render after the user folded it, which turns a
-  // helpful reveal into a control that won't take no for an answer. Same first-sighting baseline as
-  // the effect above, for the same reason — see engine/workerExpansion.
-  const prevRedCounts = useRef<Record<string, number>>({});
+  // Never auto-COLLAPSES when the red clears: yanking a subtree shut while the user is reading it is
+  // worse than leaving it open. Expansion is automatic; collapsing stays the user's gesture.
+  //
+  // Driven off a snapshot COMPARISON rather than a status callback because a worker can turn red via
+  // several paths (the live PTY map, reconcileWorkersFromDisk, cross-window adopt, the synthetic
+  // overlays in engine/workerAttention), and because only a comparison can distinguish "just went
+  // red" from "is still red" — re-asserting on a steady red would re-open a subtree the user just
+  // collapsed. `effectiveStatus` is the status source, so a DISMISSED alarm is already de-escalated
+  // and correctly re-opens nothing.
+  // Starts EMPTY, and that is the whole first-mount story: expandOnWorkerAttention skips any id
+  // absent from the previous snapshot, so the first pass records a baseline and expands nothing —
+  // a relaunch with an already-red worker respects the persisted collapse (the head row shows that
+  // red on its own). There is deliberately no second `first render?` guard here — one rule, in the
+  // tested pure helper, rather than two that can drift. See engine/workerExpansion.
+  const prevWorkerAttention = useRef<Record<string, boolean>>({});
   useEffect(() => {
-    const next = redWorkerCounts(project?.agents ?? [], (id) => effectiveStatus[id] ?? "stopped");
-    const turned = expandOnRedWorker(prevRedCounts.current, next);
-    prevRedCounts.current = next;
-    if (turned.length > 0) useUiStore.getState().expandOrchestrators(turned);
-  }, [project?.agents, effectiveStatus]);
+    const next = workerAttention(
+      project?.agents ?? [],
+      (id) => effectiveStatus[id] ?? "stopped",
+      (id) => liveStatus[id] !== undefined,
+    );
+    const attention = expandOnWorkerAttention(prevWorkerAttention.current, next);
+    prevWorkerAttention.current = next;
+    if (attention.length > 0) useUiStore.getState().expandOrchestrators(attention);
+  }, [project?.agents, effectiveStatus, liveStatus]);
+
+  // REVEAL THE SELECTION. Orthogonal to attention above: a SELECTED worker must always have a
+  // visible row, or the terminal shows an agent that no row is highlighting — the original bug that
+  // made workers get rows at all (see the header of AgentSidebar.workerRows.test.tsx). Spawning no
+  // longer trips this, because spawnWorker's `select: false` never selects the new worker — under
+  // ANY prior selection, including a null one (that flag is absolute; see AddAgentOpts.select, which
+  // it briefly wasn't). This is the guard for every other way selection reaches a worker.
+  //
+  // Fires on a CHANGE of selection, not on the state of it, for the same reason as the attention
+  // rule: a user who selects a worker and then collapses its subtree must stay collapsed, and
+  // re-asserting every render would undo that gesture immediately. The first observation DOES count
+  // here (unlike the attention baseline) — a relaunch that restores a worker selection must render
+  // its row, and this opens the ONE subtree that holds it rather than all of them.
+  //
+  // Remembered PER PROJECT, not as one last-seen id, because exactly one AgentSidebar stays mounted
+  // across project switches (Workspace renders it once with `project` as a prop). With a single ref,
+  // leaving project A and coming back reads as two selection changes and the return trip re-expands
+  // a subtree the user had deliberately collapsed — even though A's selection never moved. A map
+  // keyed by project id makes "did THIS project's selection change" the actual question. It is
+  // bounded by the number of projects.
+  //
+  // The entry is written only once the agent RESOLVES, so a selection naming an id not yet in
+  // `project.agents` (a cross-window adopt landing after the selection) is still revealed when its
+  // record arrives, instead of being dropped for good.
+  const selectedAgentId = project?.selectedAgentId ?? null;
+  const revealedSelection = useRef(new Map<string, string | null>());
+  useEffect(() => {
+    if (!project) return;
+    const seen = revealedSelection.current;
+    if (seen.has(project.id) && seen.get(project.id) === selectedAgentId) return;
+    const sel = project.agents.find((a) => a.id === selectedAgentId);
+    // Not resolvable yet — leave the map alone so the arriving record still gets its reveal.
+    if (selectedAgentId !== null && !sel) return;
+    seen.set(project.id, selectedAgentId);
+    if (sel?.kind === "worker" && sel.parentId) {
+      useUiStore.getState().expandOrchestrators([sel.parentId]);
+    }
+  }, [selectedAgentId, project]);
+
+  // NOTE: `main` grew its own red-expansion effect here (redWorkerCounts / expandOnRedWorker) while
+  // this branch was building §14. Both solved the same problem; this branch's version won the merge
+  // and lives in the single effect above. The difference is not cosmetic: main kept `expandOnGrowth`
+  // alongside it, so a subtree there still pops open on every spawn — the exact behavior §14 exists
+  // to remove ("default to a closed not open state, and only open when the underlying worker needs
+  // something and is red"). Keeping both effects would have re-armed spawn-expansion through the
+  // back door. See engine/workerExpansion.workerAttention.
 
   // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
   // `project.agents` order within each section (that order is the user's own drag arrangement), with
@@ -1183,13 +1219,6 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       </>
     ) : null;
 
-  // Gates the top row below. It is the SAME condition ShowHelperButton applies to itself — lifted
-  // up because that button is now the row's only child, so when it returns null the row is an empty
-  // <div> still charging 14px+6px of padding: ~20px of dead space above the Plan/Build toggle, in
-  // the DEFAULT case (helper islands are enabled out of the box). The button keeps its own guard;
-  // this only decides whether the row that would hold it exists at all.
-  const helperHidden = !useHelperPrefs((s) => s.enabled);
-
   return (
     <SidebarScrollContext.Provider value={sidebarScroll}>
     <div
@@ -1211,27 +1240,10 @@ export function AgentSidebar({ project }: { project: Project | null }) {
       {/* The brand chrome that used to top this column — the Sparkle.ai logo, the voice waveform
           under it, and the remaining-credit badge — now tops column ①, the concierge, which is
           mounted for the life of the app rather than only while a project is open
-          (PRD/sparkle/concierge-chrome-and-credits.md). What's left is the builder's own control:
-          the helper-island button, right-aligned as it was. There is no longer a voice orb painting
-          underneath, so the position:relative/zIndex lift that protected this row from its glow
-          went with the waveform.
-          The row renders only when that button will: with nothing else in it, an always-rendered
-          row is 20px of padding around nothing, pushing the Plan/Build toggle down for no reason
-          in the case that is the DEFAULT (helper enabled). */}
-      {helperHidden && (
-        <div
-          data-testid="builder-helper-row"
-          style={{
-            padding: "14px 14px 6px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "flex-end",
-            gap: 8,
-          }}
-        >
-          <ShowHelperButton />
-        </div>
-      )}
+          (PRD/sparkle/concierge-chrome-and-credits.md). The last thing left in that row was a
+          "Show Helper" button, deleted along with the island's Hide Helper (§6); with nothing to
+          hold, the row itself is gone rather than conditional, and the Plan/Build toggle is now
+          the top of this column. */}
 
       {/* Column-2 header (PRD §3): the Plan / Build segmented toggle. Build keeps its two-stage
           behavior here — a second click on the active chevron spawns a fresh build agent.
@@ -1247,7 +1259,8 @@ export function AgentSidebar({ project }: { project: Project | null }) {
           beadsEnabled={beadsEnabled}
           onPickPlan={onPickPlan}
           onPickBuild={onPickBuild}
-          style={{ marginTop: helperHidden ? 0 : 20 }}
+          // §6 removed the Show Helper row, so the "a row is above me" spacing case is gone.
+          style={{ marginTop: 20 }}
         />
       )}
 
@@ -2025,6 +2038,19 @@ const AgentRow = memo(function AgentRow({
   const detailRef = useRef<HTMLDivElement>(null);
   // One-shot guard so the reveal fires once per hover-open, not on every reposition during the scroll.
   const didReveal = useRef(false);
+
+  // Scroll-into-view on request (§13): the spawn hook sets uiStore.revealAgentId to a brand-new
+  // agent, and the row that matches brings itself on screen so the user lands in the thing they just
+  // created instead of hunting for it below the fold. `block: "nearest"` is the house pattern
+  // (PinnedPrompt.tsx) — an already-visible row doesn't move. Clearing makes it one-shot, so a
+  // remount of the list later can't yank the column away from where the user put it. Optional call:
+  // jsdom has no layout and no scrollIntoView.
+  const revealAgentId = useUiStore((s) => s.revealAgentId);
+  useEffect(() => {
+    if (revealAgentId !== a.id) return;
+    rowRef.current?.scrollIntoView?.({ block: "nearest" });
+    useUiStore.getState().clearRevealAgent(a.id);
+  }, [revealAgentId, a.id]);
 
   // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
   // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.
@@ -3743,35 +3769,9 @@ function SparkleRowProgress({ state }: { state: SparkleBarState }) {
   );
 }
 
-/** "Show Helper" — the ONLY way back after right-click → Hide Helper on the floating island.
- *  Renders only while the helper is hidden, so it costs nothing in the normal case. Its caller
- *  gates the ROW on the same condition (see `helperHidden`) so the layout costs nothing either;
- *  this guard stays because whether the button shows is the button's own contract. The helper
- *  webview is a different JS context, but both share this localStorage-backed store by origin,
- *  so flipping `enabled` here is seen there. */
-function ShowHelperButton() {
-  const enabled = useHelperPrefs((s) => s.enabled);
-  const setEnabled = useHelperPrefs((s) => s.setEnabled);
-  if (enabled) return null;
-  return (
-    <button
-      data-testid="show-helper"
-      title="Show the floating helper island"
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        fontFamily: '"IBM Plex Sans", sans-serif',
-        fontSize: 11,
-        color: C.cream,
-        border: `1px solid ${C.muted}`,
-        borderRadius: 6,
-        padding: "3px 8px",
-        whiteSpace: "nowrap",
-      }}
-      onClick={() => setEnabled(true)}
-    >
-      Show Helper
-    </button>
-  );
-}
+// "Show Helper" lived here. It rendered ONLY while the floating island was hidden, and it was the
+// only way back from right-click → Hide Helper — so it could not be deleted on its own without
+// stranding anyone already in that state. Hide Helper went with it (helper/HelperApp.tsx), which is
+// what made the removal safe. Its literal chrome, recorded because a later stream reuses the value:
+// borderRadius 6, padding "3px 8px", fontSize 11, border `1px solid ${C.muted}`.
 

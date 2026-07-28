@@ -37,7 +37,7 @@ vi.mock("../logger", () => ({
 }));
 
 import { useConciergeAttachments, type ConciergeAttachments } from "./useConciergeAttachments";
-import { CONCIERGE_COMPOSE_DND_TARGET, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
+import { CONCIERGE_COLUMN_DND_TARGET, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import { useTerminalDropStore } from "../stores/terminalDropStore";
 import type { Attachment } from "../components/composer/attachments";
 
@@ -56,7 +56,7 @@ function Host() {
 
 // The hit test uses document.elementFromPoint (unimplemented in jsdom).
 const boxEl = document.createElement("div");
-boxEl.setAttribute("data-dnd-target", CONCIERGE_COMPOSE_DND_TARGET);
+boxEl.setAttribute("data-dnd-target", CONCIERGE_COLUMN_DND_TARGET);
 const buttonEl = document.createElement("button");
 buttonEl.setAttribute("data-dnd-target", NEW_BUILD_AGENT_DND_TARGET);
 let cursorOver: "box" | "button" | "elsewhere" = "elsewhere";
@@ -188,13 +188,24 @@ describe("drag and drop onto the compose box", () => {
     expect(api.dropActive).toBe(false);
   });
 
-  it("attaches files dropped ON the box", async () => {
+  it("attaches files dropped anywhere on the column", async () => {
     captured.loadPaths.mockResolvedValue([file("a"), file("b")]);
     cursorOver = "box";
     await fire({ type: "drop", position: at, paths: ["/tmp/a", "/tmp/b"] });
     expect(captured.loadPaths).toHaveBeenCalledWith(["/tmp/a", "/tmp/b"]);
     expect(api.attachments.map((x) => x.id)).toEqual(["a", "b"]);
     expect(api.dropActive).toBe(false);
+  });
+
+  it("attaches EVERY file in one multi-file drop, not just the first", async () => {
+    // Finder hands the whole selection over in a single drop payload; taking paths[0] (or
+    // otherwise losing the tail) would silently drop files the user watched themselves select.
+    const many = ["/tmp/a.png", "/tmp/b.png", "/tmp/c.log", "/tmp/d.csv"];
+    captured.loadPaths.mockResolvedValue(many.map((p, i) => file(String.fromCharCode(97 + i))));
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: many });
+    expect(captured.loadPaths).toHaveBeenCalledWith(many);
+    expect(api.attachments.map((x) => x.id)).toEqual(["a", "b", "c", "d"]);
   });
 });
 

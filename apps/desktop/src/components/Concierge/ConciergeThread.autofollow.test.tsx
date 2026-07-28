@@ -22,7 +22,6 @@ function msgs(n: number): ConciergeMessage[] {
     id: `m${i}`,
     kind: "sparkle" as const,
     text: `message ${i}`,
-    speakable: true,
   }));
 }
 
@@ -139,7 +138,7 @@ describe("ConciergeThread — auto-follow", () => {
   it("follows a reply that grows in place while it streams", () => {
     const growing = (text: string): ConciergeMessage[] => [
       ...msgs(2),
-      { id: "brain-1", kind: "sparkle" as const, text, speakable: true },
+      { id: "brain-1", kind: "sparkle" as const, text },
     ];
     const { rerender } = render(
       <ConciergeThread messages={growing("Look")} onNudgeClick={noop} onNudgeAction={noop} />,
@@ -171,7 +170,7 @@ describe("ConciergeThread — auto-follow", () => {
     };
     const withReply = (text: string): ConciergeMessage[] => [
       ...msgs(2),
-      { id: "brain-1", kind: "sparkle" as const, text, speakable: true },
+      { id: "brain-1", kind: "sparkle" as const, text },
       nudge,
     ];
 

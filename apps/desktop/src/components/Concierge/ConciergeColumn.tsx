@@ -12,6 +12,7 @@
 // exactly as they did there. Routing them through the view-model would have meant teaching the
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
+import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { C } from "../../theme/colors";
 import { BalanceBadge } from "../BalanceBadge";
 import { LogoWaveform } from "../LogoWaveform";
@@ -37,7 +38,6 @@ export function ConciergeColumn({
   searchSlot,
   interim = "",
   registerInsert,
-  speakingMessageId = null,
   onTextEdit,
   announcement = EMPTY_ANNOUNCEMENT,
   countdownSlot,
@@ -45,6 +45,11 @@ export function ConciergeColumn({
   return (
     <section
       aria-label="Sparkle concierge"
+      // The hit-test handle for the host's window-global drag listener (services/dndTargets). It
+      // sits on the WHOLE column, not on the compose box: a file dropped anywhere over the
+      // concierge attaches to the next prompt, and the box below paints the affordance showing
+      // where it will land.
+      data-dnd-target={CONCIERGE_COLUMN_DND_TARGET}
       style={{
         position: "relative",
         flex: "0 0 auto",
@@ -106,8 +111,6 @@ export function ConciergeColumn({
         typing={model.typing}
         onNudgeClick={controller.onNudgeClick}
         onNudgeAction={controller.onNudgeAction}
-        onSpeak={controller.onSpeak}
-        speakingMessageId={speakingMessageId}
         onRedirect={controller.onRedirect}
         onDigestClick={controller.onDigestClick}
       />

@@ -78,12 +78,30 @@ describe("useNewBuildAgentDrop", () => {
     expect(useUiStore.getState().buildAgentHover).toBe(false);
   });
 
-  it("converts physical drop coordinates to logical ones (devicePixelRatio)", () => {
-    const prev = window.devicePixelRatio;
-    Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
-    fire({ type: "over", position: { x: 100, y: 60 } });
-    expect(elementFromPoint).toHaveBeenLastCalledWith(50, 30);
-    Object.defineProperty(window, "devicePixelRatio", { value: prev, configurable: true });
+  // This case used to assert an unconditional /devicePixelRatio, which is what BROKE every drop
+  // target in the app: only the Windows webview reports physical pixels. macOS hands back AppKit
+  // points and Linux raw GTK coordinates — both already CSS pixels — so halving them hit-tested a
+  // point in the top-left quadrant of the window and no drop ever landed. See dragPositionScale.
+  describe("the drag position reaches elementFromPoint in CSS pixels", () => {
+    const prevDpr = window.devicePixelRatio;
+    const prevUa = navigator.userAgent;
+    const asPlatform = (ua: string, dpr: number) => {
+      Object.defineProperty(navigator, "userAgent", { value: ua, configurable: true });
+      Object.defineProperty(window, "devicePixelRatio", { value: dpr, configurable: true });
+    };
+    afterEach(() => asPlatform(prevUa, prevDpr));
+
+    it("passes a 2x Retina macOS position through UNSCALED", () => {
+      asPlatform("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", 2);
+      fire({ type: "over", position: { x: 100, y: 60 } });
+      expect(elementFromPoint).toHaveBeenLastCalledWith(100, 60);
+    });
+
+    it("scales a 2x Windows position down, where the position really is physical", () => {
+      asPlatform("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/120.0", 2);
+      fire({ type: "over", position: { x: 100, y: 60 } });
+      expect(elementFromPoint).toHaveBeenLastCalledWith(50, 30);
+    });
   });
 
   it("drop on the button spawns a build agent and queues the paths for its composer", () => {

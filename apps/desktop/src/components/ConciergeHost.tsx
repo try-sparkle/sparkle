@@ -9,11 +9,10 @@
 // Workspace (it drives the tab badges too) and passed in, so there is a single subscription, a
 // single tray-roster fetch, and no chance of the tab counts and the vitals line disagreeing.
 //
-// The voice pass (bead sparkle-4562.2 / CM-U9) is wired here too, both directions: the mic borrows
-// the app-wide dictation target (useConciergeDictation) while the user talks, and a finished brain
-// reply is spoken back through services/conciergeVoice. Autoplay is narrow ON PURPOSE — only a turn
-// the user STARTED by voice is spoken, and only while the do-not-interrupt store allows it. Every
-// reply also carries a speaker button, which is how a typed turn gets read aloud.
+// The voice pass (bead sparkle-4562.2 / CM-U9) is wired here too, but INPUT ONLY: the mic borrows
+// the app-wide dictation target (useConciergeDictation) while the user talks. Sparkle never talks
+// back — text-to-speech was removed whole (PRD/feat/ui-refresh-2026-07-27 §5), so there is no
+// autoplay gate, no speaker button, and no reason for this file to know a turn was dictated.
 //
 // AUTO-ROUTING (PRD/sparkle/concierge-auto-routing.md). The compose box no longer carries a target
 // toggle: this host decides, per message, whether it goes to the selected agent's terminal or to
@@ -93,12 +92,6 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
-import {
-  shouldSpeakConciergeReply,
-  speakConciergeReply,
-  speakOnDemand,
-  stopConciergeVoice,
-} from "../services/conciergeVoice";
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
@@ -511,41 +504,21 @@ export function ConciergeHost({
   // target and the live interim transcript, so there is no local micLive to keep in sync.
   const dictation = useConciergeDictation();
   const { micLive, toggleMic, registerInsert: dictationRegisterInsert } = dictation;
-  // Read at send time by the (memoised) controller, which must not be rebuilt on every mic flip.
-  const micLiveRef = useRef(micLive);
-  useEffect(() => {
-    micLiveRef.current = micLive;
-  }, [micLive]);
-
-  // The reply currently being spoken, so exactly one speaker button reads as active.
-  const [speakingId, setSpeakingId] = useState<string | null>(null);
-  const speakingIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    speakingIdRef.current = speakingId;
-  }, [speakingId]);
 
   // The brain text accumulated for the in-flight turn, keyed by turn id. Kept in a ref rather than
-  // re-derived from the rendered thread so the done handler can hand TTS the WHOLE reply.
+  // re-derived from the rendered thread so the done handler can announce the WHOLE reply into the
+  // column's live region at once, rather than per streamed delta.
   const brainTextRef = useRef<Record<string, string>>({});
   // The newest turn id seen from the brain stream, as a number (see supersededTurn below).
   const latestTurnRef = useRef(-1);
   // Every turn up to and including this id has been superseded by a send. See supersededTurn.
   const retireThroughRef = useRef(-1);
-  // Was the turn in flight started by voice? Only such a turn is spoken back unprompted.
-  const voiceTurnRef = useRef(false);
-  // Set when a dictated segment reaches the compose box, and NOT cleared until the turn is sent.
-  // Reading micLive at submit time would misclassify the common path: the stop word (and
-  // pause-on-submit, and focus loss) drops the mic out of the routing state, so a fully dictated
-  // turn would look typed and its reply would silently never be spoken.
-  const dictatedRef = useRef(false);
   // Set when a handoff that CHOSE Sparkle lands in the box (the capture window's Chat ❯), and
   // consumed by the next submit. The user already answered the question the auto-router exists to
   // guess at, so the router is skipped rather than allowed to overrule them — see `deliver`.
-  // Retired by `onTextEdit` when the box is emptied by hand, exactly like `dictatedRef`: a latch
-  // that outlived the words that set it would aim an unrelated typed message.
+  // Retired by `onTextEdit` when the box is emptied by hand: a latch that outlived the words that
+  // set it would aim an unrelated typed message.
   const forceSparkleRef = useRef(false);
-  // Monotonic send counter: lets an async send outcome know whether it is still the latest turn.
-  const sendSeqRef = useRef(0);
 
   // The compose box's own insert fn, kept so a send that dies AFTER the box already cleared can put
   // the user's words back. See `restoreDraft`.
@@ -571,62 +544,27 @@ export function ConciergeHost({
   const registerInsert = useCallback(
     (append: ((text: string) => void) | null) => {
       insertRef.current = append;
-      // A box going away takes the latch with it (roborev 46922): the ComposeBox resets its own
-      // `text` on remount, and a latch that outlived the words that set it would make the next
-      // TYPED turn look dictated.
+      // NOT the place to retire `forceSparkleRef`, tempting as a null-append looks (roborev 53836).
+      // `null` here does NOT mean "the box unmounted" — ComposeBox's effect re-runs on any identity
+      // change of this callback, and its cleanup fires first, so a LIVE re-registration arrives as
+      // null → non-null (see useConciergeDictation.registerInsert, which documents exactly that
+      // sequence). The capture-Chat aim is set ONCE and never again, so clearing it here silently
+      // broke Chat mode outright. It is retired from `onTextEdit` instead — the one signal that
+      // fires on a real hand edit and not on a re-registration.
       //
-      // NOT the place to retire `forceSparkleRef` as well, though the two are the same stale-latch
-      // class (roborev 53836). `null` here does NOT mean "the box unmounted" — ComposeBox's effect
-      // re-runs on any identity change of this callback, and its cleanup fires first, so a LIVE
-      // re-registration arrives as null → non-null (see useConciergeDictation.registerInsert, which
-      // documents exactly that sequence). `dictatedRef` tolerates a spurious clear because every
-      // dictated segment re-sets it; the capture-Chat aim is set ONCE and never again, so clearing
-      // it here silently broke Chat mode outright. The aim is retired from `onTextEdit` instead —
-      // the one signal that fires on a real mount and not on a re-registration.
-      if (append === null) dictatedRef.current = false;
-      dictationRegisterInsert(
-        append === null
-          ? null
-          : (text: string) => {
-              dictatedRef.current = true;
-              append(text);
-            },
-      );
+      // The dictated-origin latch that used to be cleared here went with voice OUTPUT in §5: with
+      // nothing speaking replies back, this host has no reason to know a turn was dictated.
+      dictationRegisterInsert(append);
     },
     [dictationRegisterInsert],
   );
 
-  // The dictated-origin latch is retired the moment the user empties the box by hand — otherwise
-  // dictating a segment, deleting it, and typing a fresh message would speak the reply to a turn
-  // the user typed, which is the exact inverse of the misclassification the latch exists to fix
-  // (roborev 46922). Only hand edits report here; a dictated segment does not.
+  // The capture-Chat aim is retired the moment the user empties the box BY HAND. Emptying it is the
+  // user starting over, and the message they type next has nothing to do with the screenshot they
+  // discarded — routing it to Sparkle on the strength of a retired handoff would aim a message the
+  // user never aimed. Only hand edits report here; a dictated segment does not (see registerInsert).
   const onTextEdit = useCallback((text: string) => {
-    if (text.trim() === "") {
-      dictatedRef.current = false;
-      // The capture-Chat aim goes with the words it belonged to. Emptying the box by hand is the
-      // user starting over, and the message they type next has nothing to do with the screenshot
-      // they discarded — routing it to Sparkle on the strength of a retired handoff would be the
-      // same class of stale-latch bug as speaking the reply to a typed turn.
-      forceSparkleRef.current = false;
-    }
-  }, []);
-
-  const play = useCallback(async (id: string, text: string, mode: "auto" | "demand") => {
-    // Pre-check the same pure gate speakConciergeReply applies, so a suppressed autoplay never
-    // flashes the speaker button active for a reply that is not going to be spoken.
-    if (mode === "auto" && !shouldSpeakConciergeReply({ voiceTurn: true })) return;
-    // A new clip always supersedes the old one. Required, not defensive: the system-voice fallback
-    // QUEUES utterances rather than replacing them, so without this, clicking the speaker on a
-    // second reply would talk about the first one while the UI showed the second as active.
-    stopConciergeVoice();
-    setSpeakingId(id);
-    try {
-      if (mode === "auto") await speakConciergeReply(text, { voiceTurn: true });
-      else await speakOnDemand(text);
-    } finally {
-      // Only clear if we are still the clip that is playing — a newer speak has already taken over.
-      setSpeakingId((cur) => (cur === id ? null : cur));
-    }
+    if (text.trim() === "") forceSparkleRef.current = false;
   }, []);
 
   // Files staged for the NEXT send (parity row #21): the compose box's attach buttons, and a file
@@ -851,9 +789,8 @@ export function ConciergeHost({
     //
     // Turn ids ARE the backend's monotonic token (`token.to_string()`), so "newer" is a numeric
     // comparison, not a guess. A straggler from an older turn is dropped whole: it must not
-    // accumulate, must not wipe the live turn's text, and above all must not consume the live
-    // turn's `voiceTurnRef` or clear its typing indicator. Ids that aren't numbers are local
-    // errors (CONCIERGE_LOCAL_ERROR_ID) and always surface.
+    // accumulate, must not wipe the live turn's text, and must not clear its typing indicator.
+    // Ids that aren't numbers are local errors (CONCIERGE_LOCAL_ERROR_ID) and always surface.
     const supersededTurn = (id: string): boolean => {
       // Strictly a token, not "anything Number() will swallow" (roborev 53004): Number("") is 0 and
       // Number(" 5 ") is 5, so a malformed id would quietly become a turn number instead of taking
@@ -872,7 +809,7 @@ export function ConciergeHost({
         latestTurnRef.current = n;
         // A genuinely newer turn retires its predecessors' accumulated text. Doing it HERE rather
         // than at send time is what keeps a turn that is still streaming from being truncated
-        // into TTS (roborev 49293/49294).
+        // before it is announced (roborev 49293/49294).
         for (const k of Object.keys(brainTextRef.current)) if (k !== id) delete brainTextRef.current[k];
       }
       return false;
@@ -883,7 +820,7 @@ export function ConciergeHost({
       setChat((prev) => {
         const k = key(id);
         const i = prev.findIndex((m) => m.id === k);
-        if (i === -1) return [...prev, { id: k, kind: "sparkle", text, speakable: true }];
+        if (i === -1) return [...prev, { id: k, kind: "sparkle", text }];
         const next = prev.slice();
         const cur = next[i]!;
         next[i] = {
@@ -893,7 +830,6 @@ export function ConciergeHost({
           // but the union now contains a variant with no `text` at all (the recap card), so the
           // narrowing has to be explicit rather than a defensive `?? ""`.
           text: replace ? text : (cur.kind === "sparkle" ? cur.text : "") + text,
-          speakable: true,
         };
         return next;
       });
@@ -912,11 +848,8 @@ export function ConciergeHost({
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
       // The reply is FINISHED here — announce it once, rather than per delta. Via `announce`, so
-      // the SAME reply twice in a row is still spoken twice (roborev 53392).
+      // the SAME reply twice in a row is still announced twice (roborev 53392).
       if (full) announce(full);
-      const startedByVoice = voiceTurnRef.current;
-      voiceTurnRef.current = false;
-      if (startedByVoice && full) void play(key(e.id), full, "auto");
     });
     const offError = onConciergeError((e) => {
       if (supersededTurn(e.id)) {
@@ -937,7 +870,6 @@ export function ConciergeHost({
         return;
       }
       setTyping(false);
-      voiceTurnRef.current = false;
       // A failed turn never reaches the done handler, so drop its partial text here rather than
       // retaining every failed reply for the life of the session.
       delete brainTextRef.current[e.id];
@@ -947,7 +879,6 @@ export function ConciergeHost({
           id: nextId("err"),
           kind: "sparkle",
           text: "I couldn't reach my brain just now — try me again in a moment.",
-          speakable: false,
         },
       ]);
     });
@@ -956,7 +887,7 @@ export function ConciergeHost({
       offDone();
       offError();
     };
-  }, [announce, play]);
+  }, [announce]);
 
   const resolveAgent = useCallback(
     (id: string) => allAgents(feedRef.current).find((a) => a.id === id) ?? null,
@@ -1042,12 +973,9 @@ export function ConciergeHost({
   }, []);
 
   // Every postSparkle line is BOOKKEEPING — a send outcome, a refusal, a deferred reconciliation —
-  // never a brain reply, so none of them offer to be read aloud (speakable: false, roborev 48172).
+  // never a brain reply.
   const postSparkle = useCallback((text: string) => {
-    setChat((prev) => [
-      ...prev,
-      { id: nextId("sparkle"), kind: "sparkle", text, speakable: false },
-    ]);
+    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text }]);
     // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
     // sends to the same pinned agent produce the same line twice; both must be announced.
     announce(text);
@@ -1324,15 +1252,8 @@ export function ConciergeHost({
     [postSparkle, takeHeldAttachments, restoreAttachments],
   );
 
-  /**
-   * Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
-   *
-   * `spokenTurn` decides whether the reply is read back: a voice-started turn earns a spoken
-   * reply, a typed one stays silent (text-first v1). It is passed in rather than read here because
-   * it is captured at SUBMIT, and routing can queue this call for seconds behind another send.
-   */
-  const askSparkle = useCallback((text: string, spokenTurn: boolean) => {
-    voiceTurnRef.current = spokenTurn;
+  /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome. */
+  const askSparkle = useCallback((text: string) => {
     setTyping(true);
     // SENDING retires every turn seen so far, here as well as in the backend (see
     // supersededTurn). Their accumulated text is dropped as those events are rejected, not
@@ -1397,10 +1318,6 @@ export function ConciergeHost({
       submitted: ConciergePromptTarget | null,
       /** The files that rode this send, so a refusal can hand them back. */
       staged: Attachment[],
-      /** Whether the user SPOKE this turn, captured at submit (see askSparkle). */
-      spokenTurn: boolean,
-      /** This send's ordinal, so a late failure can tell "still mine" from "superseded". */
-      mySend: number,
       /** The user already CHOSE Sparkle for this message — they pressed Chat ❯ in the capture
        *  window rather than Build ❯ — so the router is skipped rather than allowed to overrule
        *  them. Captured at submit like every other aim (see send).
@@ -1436,10 +1353,6 @@ export function ConciergeHost({
       // says to take the safe direction.
       const stillThere = !!aim && agentStillExists(aim.agentId);
       if (decision.target === "agent" && aim && stillThere) {
-        // A prompt into an agent's terminal produces no brain reply, so nothing is queued to be
-        // spoken — leaving the flag set would autoplay the NEXT brain turn the user typed.
-        voiceTurnRef.current = false;
-
         // ══ THE FORWARDING-BUG FIX ══════════════════════════════════════════════════════════════
         // This used to dispatch, right here, on the router's verdict alone — an agent with a live
         // prompt plus terse concierge-aimed text matched `looksLikeAnswer` and the user's words went
@@ -1486,7 +1399,6 @@ export function ConciergeHost({
                 postSparkle(`${aim.name} isn't open any more, so I didn't send that.`);
                 restoreDraft(text);
                 restoreAttachments(staged);
-                if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
                 return false;
               }
               // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
@@ -1509,15 +1421,10 @@ export function ConciergeHost({
                 });
                 return true;
               }
-              // A failed delivery must not cost the user their files any more than their words —
-              // nor the fact that they SPOKE them (roborev 46922/48172/49293).
+              // A failed delivery must not cost the user their files any more than their words
+              // (roborev 46922/48172/49293).
               restoreDraft(text);
               restoreAttachments(staged);
-              // RE-ARM only — never clear (roborev 52363): the user may have dictated fresh speech
-              // while this send was in flight, and `spokenTurn === false` would wipe a latch that
-              // belongs to those newer words. And only while THIS send is still the latest
-              // (roborev 52362).
-              if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
               return false;
             }, false);
           },
@@ -1542,12 +1449,11 @@ export function ConciergeHost({
             announce(countdownAnnouncement(intent, Date.now()));
           },
           onCancel: () => {
-            // Everything the send was carrying comes back — the draft, the files, and the
-            // spoken-turn latch — for exactly the reasons the failure path above restores them.
-            // Cancelling must cost the user nothing, or they learn not to use the button.
+            // Everything the send was carrying comes back — the draft and the files — for exactly
+            // the reasons the failure path above restores them. Cancelling must cost the user
+            // nothing, or they learn not to use the button.
             restoreDraft(text);
             restoreAttachments(staged);
-            if (spokenTurn && sendSeqRef.current === mySend) dictatedRef.current = true;
             postSparkle(`Okay — I didn't send that to ${aim.name}.`);
           },
         });
@@ -1565,7 +1471,7 @@ export function ConciergeHost({
       // stripping them here would hand Sparkle a question about a screenshot it cannot see. Only
       // the ROUTER is given the clean text — "/var/folders/…/shot.png add retry logic" is not what
       // the user said, and classifying it as if it were is a real misroute.
-      askSparkle(payload, spokenTurn);
+      askSparkle(payload);
       const here = stillThere ? aim : null;
       setReceipt(id, {
         target: "sparkle",
@@ -1592,7 +1498,7 @@ export function ConciergeHost({
    * The compose box's entry point.
    *
    * Everything that must reflect SUBMIT happens synchronously here — the user's bubble, the
-   * remembered text, the staged files, the dictated-origin latch, and the AIM. Only routing and
+   * remembered text, the staged files, the capture-Chat aim, and the AIM. Only routing and
    * delivery are queued.
    *
    * Both halves are load-bearing. Queuing the bubble left a second rapid send with no visible state
@@ -1603,18 +1509,11 @@ export function ConciergeHost({
    */
   const send = useCallback(
     (text: string): Promise<boolean> => {
-      // Was this turn SPOKEN? Decided before anything clears (the latch is consumed here).
-      const spokenTurn = dictatedRef.current || micLiveRef.current;
-      dictatedRef.current = false;
       // The capture-Chat aim, consumed HERE for the same reason the aim itself is: everything that
       // must reflect SUBMIT happens synchronously, so a handoff landing while this send is still
       // queued cannot retroactively redirect it.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
-      // Which send this is, so a late async outcome can tell "still mine" from "superseded".
-      const mySend = ++sendSeqRef.current;
-      // Sending supersedes whatever Sparkle was saying.
-      stopConciergeVoice();
       // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
       // mic does not keep transcribing the room while the send is handled.
       maybePauseOnSubmit();
@@ -1645,14 +1544,22 @@ export function ConciergeHost({
       // The temp paths must never reach any of them but the first (roborev 46911/46925).
       const payload = attachedPayload(text, staged);
       const display = attachedDisplay(text, staged);
-      setChat((prev) => [...prev, { id, kind: "you" as const, text: display }]);
+      // SNAPSHOT the staged files onto the message itself, in the same tick they are taken. They are
+      // gone from the view model a line later (`takeAttachments` above), so a bubble that read the
+      // live list would show the picture for one frame and then go blank — which is the state the
+      // column shipped in: the screenshot reached the model and left no trace the user could see
+      // (PRD §8). `undefined` rather than `[]` for a file-less send, so the persisted thread doesn't
+      // grow an empty array on every message.
+      setChat((prev) => [
+        ...prev,
+        { id, kind: "you" as const, text: display, attachments: staged.length ? staged : undefined },
+      ]);
       // Remember BOTH: a redirect to the agent must replay the payload (paths included), a redirect
       // to Sparkle must replay the plain text.
       rememberSentText(sentTextRef.current, id, text);
       rememberSentText(sentPayloadRef.current, id, payload);
       return enqueue(
-        () =>
-          deliver(id, text, payload, display, submitted, staged, spokenTurn, mySend, forceSparkle),
+        () => deliver(id, text, payload, display, submitted, staged, forceSparkle),
         false,
       );
     },
@@ -1680,9 +1587,7 @@ export function ConciergeHost({
       redirectingRef.current.add(messageId);
       try {
         if (receipt.target === "agent") {
-          // Redirecting INTO chat starts a typed turn: the user clicked a button, they did not
-          // speak it, so the reply is not read back.
-          askSparkle(replay, false);
+          askSparkle(replay);
           setReceipt(messageId, { ...receipt, alsoSentTo: "sparkle", redirectable: false });
           return;
         }
@@ -1733,14 +1638,6 @@ export function ConciergeHost({
       onSend: send,
       onRedirect: (messageId: string) => void redirect(messageId),
       onMicToggle: toggleMic,
-      onSpeak: (m: ConciergeSparkleMessage) => {
-        if (speakingIdRef.current === m.id) {
-          stopConciergeVoice();
-          setSpeakingId(null);
-          return;
-        }
-        void play(m.id, m.text, "demand");
-      },
       onAttach: attach,
       onRemoveAttachment: removeAttachment,
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
@@ -1835,7 +1732,9 @@ export function ConciergeHost({
         }
       },
     }),
-    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment, toggleMic, play],
+    // `play` is absent on purpose: voice OUTPUT (TTS) was removed in §5, so main's `play` dep does
+    // not survive the merge. `revealAgent` is main's, and stays.
+    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment, toggleMic],
   );
 
   const pinnedProjectName = useMemo(() => {
@@ -1916,7 +1815,6 @@ export function ConciergeHost({
         }
         interim={dictation.interim}
         registerInsert={registerInsert}
-        speakingMessageId={speakingId}
         onTextEdit={onTextEdit}
         announcement={announcement}
       />

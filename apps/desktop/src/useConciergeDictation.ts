@@ -23,7 +23,6 @@ import {
   type DictationTargetStore,
   type InsertFn,
 } from "./services/conciergeDictationTarget";
-import { stopConciergeVoice } from "./services/conciergeVoice";
 import { useDictationStore } from "./stores/dictationStore";
 
 export interface ConciergeDictation {
@@ -126,8 +125,6 @@ export function useConciergeDictation(
       release();
       return;
     }
-    // Barge-in: the user is talking, so Sparkle stops mid-sentence.
-    stopConciergeVoice();
     // Refused (notice shown, nothing armed) on an empty balance, so only claim the app-wide
     // target once the store actually reports a live routing state.
     setActive();
