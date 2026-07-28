@@ -219,6 +219,18 @@ if is_fixture_repo "$top" || is_fixture_repo "$owner"; then
     exit 0
 fi
 
+# Skip enqueue for PRD-only commits. PRD/ holds progress narrative (CLAUDE.md: "narrative + concerns
+# + context only"), never code — reviewing it spends a worker and the shared Claude quota for zero
+# gate value, and the agent fleet commits these constantly (a progress-doc update rides most commits).
+# Skip ONLY when EVERY changed path is under PRD/: a commit that also touches code is still reviewed.
+# Same never-skip-on-ambiguity posture as the guards above — an empty file list (root commit, a merge
+# that diff-tree shows nothing for, or an unreadable tree) falls through and IS enqueued. `grep -qv`
+# exits 0 iff some line is NOT under PRD/; negating it means "every changed path is PRD/". POSIX sh.
+_changed=$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)
+if [ -n "$_changed" ] && ! printf '%s\n' "$_changed" | grep -qvE '^PRD/'; then
+    exit 0
+fi
+
 # NOTE: `roborev install-hook --force` (e.g. a roborev self-update) does NOT replace
 # this file — it SPLICES its unguarded stub in below the shebang and leaves this
 # wrapper underneath, which makes every guard above dead code while the file still
