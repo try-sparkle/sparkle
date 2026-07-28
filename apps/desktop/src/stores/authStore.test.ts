@@ -12,12 +12,17 @@ vi.mock("../services/sparkleApi", () => ({
   fetchMe: vi.fn(),
 }));
 
+vi.mock("../dev/devBypassAuth", () => ({ devBypassAuthEnabled: vi.fn(() => false) }));
+
 import { hasToken, fetchMe } from "../services/sparkleApi";
+import { devBypassAuthEnabled } from "../dev/devBypassAuth";
 import { useAuthStore } from "./authStore";
 import { useUiStore } from "./uiStore";
+import { useTrialStore } from "./trialStore";
 
 const mockHasToken = vi.mocked(hasToken);
 const mockFetchMe = vi.mocked(fetchMe);
+const mockBypass = vi.mocked(devBypassAuthEnabled);
 
 const me = (over: Partial<Me> = {}): Me => ({
   clerkUserId: "u1",
@@ -43,6 +48,7 @@ function resetStore() {
 beforeEach(() => {
   mockHasToken.mockReset();
   mockFetchMe.mockReset();
+  mockBypass.mockReturnValue(false);
   resetStore();
 });
 afterEach(() => {
@@ -342,5 +348,34 @@ describe("authStore hydration — optimistic cold launch", () => {
     expect(s.me).toBeNull();
     expect(s.cachedAt).toBeNull();
     expect(s.loading).toBe(true); // falls back to the normal (non-optimistic) load path
+  });
+});
+
+describe("authStore.refresh — DEV auth bypass (screenshot / E2E harness)", () => {
+  it("short-circuits BEFORE hasToken() to an entitled state so the workspace renders", async () => {
+    mockBypass.mockReturnValue(true);
+    await useAuthStore.getState().refresh();
+    const s = useAuthStore.getState();
+    expect(s.tokenPresent).toBe(true);
+    expect(s.me?.entitled).toBe(true);
+    expect(s.loading).toBe(false);
+    // The keychain is never consulted — a headless browser has none. That is the whole point.
+    expect(mockHasToken).not.toHaveBeenCalled();
+    expect(mockFetchMe).not.toHaveBeenCalled();
+  });
+
+  it("resolves the trial store loading flag so deriveAuthView never pins on loading", async () => {
+    useTrialStore.setState({ loading: true });
+    mockBypass.mockReturnValue(true);
+    await useAuthStore.getState().refresh();
+    expect(useTrialStore.getState().loading).toBe(false);
+  });
+
+  it("is inert when the flag is off — refresh takes the real keychain path", async () => {
+    mockBypass.mockReturnValue(false);
+    mockHasToken.mockResolvedValue(false);
+    await useAuthStore.getState().refresh();
+    expect(mockHasToken).toHaveBeenCalled();
+    expect(useAuthStore.getState().me).toBeNull();
   });
 });

@@ -41,6 +41,7 @@
 //     control is a trap, and `setAway` drops it outright.
 import { create } from "zustand";
 import { getFrontmost, onFrontmostChanged } from "../services/helper";
+import { safeUnlisten } from "../services/safeUnlisten";
 
 export type PresenceMode = "here" | "away";
 
@@ -289,7 +290,10 @@ export function startPresenceTracking(): () => void {
   const unlistenPromise = onFrontmostChanged((f) => usePresenceStore.getState().setFocused(f));
   unlistenPromise.then((u) => {
     // Disposed before the listener resolved — drop it immediately or it outlives the tracker.
-    if (refCount === 0) void u();
+    // Through safeUnlisten: this IS race #2 from its header (the listen promise resolving after
+    // teardown), so a raw call here rejects with the "handlerId" TypeError and, being un-awaited,
+    // surfaces as an app-level unhandled rejection rather than anything this .catch can see.
+    if (refCount === 0) void safeUnlisten(u);
     else unlisten = u;
   }).catch((e) => console.debug("presence: frontmost subscribe failed", e));
   ticker = setInterval(() => usePresenceStore.getState().evaluate(), PRESENCE_TICK_MS);
@@ -310,7 +314,10 @@ function makeDisposer(): () => void {
     if (refCount > 0) return;
     if (ticker !== null) clearInterval(ticker);
     ticker = null;
-    unlisten?.();
+    // Race #1 from safeUnlisten's header: the last disposer commonly runs while the window is
+    // closing, after Tauri has torn its listeners map down. Tauri's unlisten is async, so a raw
+    // call returns a REJECTED PROMISE nobody holds — an unhandled rejection, not a throw.
+    void safeUnlisten(unlisten);
     unlisten = null;
   };
 }

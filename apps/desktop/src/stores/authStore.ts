@@ -17,6 +17,8 @@ import { isEntitlementCacheValid, type Me } from "../services/entitlement";
 import { useUiStore } from "./uiStore";
 import { shouldRearmZeroCreditBanner } from "../services/zeroCreditBanner";
 import { fetchMe, hasToken } from "../services/sparkleApi";
+import { useTrialStore } from "./trialStore";
+import { devBypassAuthEnabled } from "../dev/devBypassAuth";
 
 interface AuthStore {
   me: Me | null;
@@ -148,6 +150,29 @@ export const useAuthStore = create<AuthStore>()(
         syncZeroCreditBanner(get().me);
       },
       refresh: async () => {
+        // DEV/TEST-ONLY auth bypass (screenshot / E2E harness, plan 3b). devBypassAuthEnabled is
+        // gated on import.meta.env.DEV, so this can NEVER run in a release bundle. Short-circuits
+        // BEFORE hasToken() (the keychain a headless browser cannot reach) to an entitled state, so
+        // deriveAuthView returns "entitled" and AuthGate renders the workspace. Also clears the trial
+        // store loading flag so the gate never pins on "loading" while the browser trial read fails.
+        if (devBypassAuthEnabled()) {
+          useTrialStore.setState({ loading: false });
+          set({
+            tokenPresent: true,
+            me: {
+              clerkUserId: "dev-bypass",
+              entitled: true,
+              balanceCents: 20000,
+              tokenVersion: 1,
+              email: "dev@sparkle.local",
+              name: "Dev Bypass",
+            },
+            loading: false,
+            cachedAt: Date.now(),
+            creditFloorCents: 0,
+          });
+          return;
+        }
         const tokenPresent = await hasToken();
         if (!tokenPresent) {
           // No stored token → genuinely signed out (or never signed in). Clear the optimistic cache
