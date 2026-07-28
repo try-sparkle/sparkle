@@ -5,28 +5,27 @@
 // the window whose label === findWindowForProject(projectId) owns the project; an orphan
 // project (no registered window) falls to the main window. routeCaptureSend is the pure
 // decision; the capture://send listener (wired in App.tsx via CaptureSendController) applies it
-// via shouldHandleCaptureSend and dispatches by mode (Build / Plan).
+// via shouldHandleCaptureSend and dispatches by mode (Build / Chat).
+//
+// BOTH MODES END IN THE SAME PLACE: a draft in the concierge compose box (stores/
+// composeHandoffStore → ConciergeHost). They differ only in what they do BEFORE that — Build
+// selects (or creates) the build agent the capture named, so the concierge's auto-router aims
+// there; Chat marks the draft for Sparkle and touches no agent.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { CaptureSendPayload } from "../capture/types";
+import { normalizeCaptureMode, type CaptureSendPayload } from "../capture/types";
 import { clearWindowProject, findWindowForProject } from "./windowRegistry";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useHandoffStore } from "../stores/handoffStore";
+import { useComposeHandoffStore } from "../stores/composeHandoffStore";
 import { useUiStore } from "../stores/uiStore";
-import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
-import { sendCaptureToPlan, copyCaptureAsset } from "./capturePlan";
-import { synthesizePrd, writePrd } from "./prd";
-import { generateTasks, createBeadFull, beadDepAdd } from "./tasks";
-import { structuredJson } from "./anthropic";
 import {
   routeToOwningWindow,
   shouldHandleInThisWindow,
   type WindowRouteDeps,
   type WindowDispatchDeps,
 } from "./windowOwnership";
-import { startChat, pollForResponse } from "./chief";
 import { log } from "../logger";
 
 // The single-owner election itself now lives in windowOwnership.ts — it is not capture-specific
@@ -63,7 +62,7 @@ export interface CaptureSendCtx {
   replace: (id: string | null) => void;
 }
 
-/** Bring this window forward so the routed result (Build composer / Plan board) is
+/** Bring this window forward so the routed result (the concierge compose box, holding the draft) is
  *  visible even if the window was hidden/minimized while the capture modal had focus. */
 async function focusThisWindow(): Promise<void> {
   const win = getCurrentWindow();
@@ -72,8 +71,22 @@ async function focusThisWindow(): Promise<void> {
   await win.setFocus().catch(() => {});
 }
 
-/** Build: route the capture into a build agent per the payload's Build-menu selection, set the
- *  Build composer draft (consumed on mount/focus, NOT auto-sent), and switch to Build.
+/** Build: route the capture into a build agent per the payload's Build-menu selection, then hand
+ *  the text + shots to the concierge compose box as a DRAFT (not auto-sent) and switch to Build.
+ *
+ *  WHERE THE DRAFT GOES, and why it moved. This used to call `handoffStore.setBuildDraft`, read by
+ *  the terminal composer inside AgentPane. That composer was deleted in db29f0a48 and the concierge
+ *  box became the input surface for a build agent — so the draft was writing to a store with no
+ *  reader, and every island capture since has created an agent and dropped the user's words and
+ *  screenshot on the floor without so much as a log line. The handoff now goes to
+ *  composeHandoffStore, which ConciergeHost consumes AND LOGS.
+ *
+ *  THE ORDER OF THE LAST TWO STEPS IS THE RACE HANDLING. The agent may be created in this very
+ *  tick, so it cannot be waited for; instead `selectAgent` + `open` run BEFORE the handoff is
+ *  queued, all three synchronously. React therefore renders the concierge with the new agent
+ *  already selected in the same commit that first sees the handoff, so the auto-router's aim is the
+ *  agent this capture named. Queue the handoff first and the box could be prefilled a frame before
+ *  the selection lands, aiming the user's Enter at whatever they were looking at before.
  *
  *  Agent selection (the Build options menu in CaptureApp drives which branch fires):
  *   - `forceNewAgent` → ALWAYS spawn a fresh build agent (the "New build agent" entry). This is
@@ -84,54 +97,94 @@ async function focusThisWindow(): Promise<void> {
 export function dispatchBuild(payload: CaptureSendPayload): void {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === payload.projectId);
-  if (!project) return;
+  // ── THE TWO DROPS, NOW AUDIBLE ──────────────────────────────────────────────────────────────
+  // Both of these are real losses of user work: the narration and the screenshot go nowhere and
+  // the user is never told. They were bare `return`s, which is the same class of silence as the
+  // orphaned store this whole change exists to fix — the bug survived for days precisely because
+  // nothing in this path ever wrote a log line. Anything that discards a capture says so.
+  if (!project) {
+    log.error("capture", "capture→build dropped: no such project in this window", {
+      projectId: payload.projectId,
+      chars: payload.text.length,
+      attachments: payload.attachments.length,
+    });
+    return;
+  }
   const picked =
     !payload.forceNewAgent && payload.targetAgentId
       ? project.agents.find((a) => a.id === payload.targetAgentId && a.kind === "build")
       : undefined;
   const existing = payload.forceNewAgent ? undefined : picked ?? project.agents.find((a) => a.kind === "build");
   const agentId = existing ? existing.id : store.addAgent(payload.projectId, { kind: "build" });
-  if (!agentId) return; // project vanished between the lookup and the create — drop the send
+  if (!agentId) {
+    // The project vanished between the lookup above and the create (another window closed it).
+    log.error("capture", "capture→build dropped: could not create a build agent", {
+      projectId: payload.projectId,
+      chars: payload.text.length,
+      attachments: payload.attachments.length,
+    });
+    return;
+  }
+  // The user asked for a SPECIFIC existing agent and it was gone by the time the send arrived, so
+  // this capture is about to land somewhere they did not choose. Not fatal — the fallback is a
+  // build agent in the right project, and it is still a draft they have to send — but it is a
+  // silent re-aim, and re-aiming without a trace is how the wrong-agent class of bug hides.
+  if (payload.targetAgentId && !payload.forceNewAgent && !picked) {
+    log.warn("capture", "capture→build: the picked build agent is gone — falling back", {
+      projectId: payload.projectId,
+      requestedAgentId: payload.targetAgentId,
+      fallbackAgentId: agentId,
+    });
+  }
   useUiStore.getState().setActiveSpecial(null);
   store.selectAgent(payload.projectId, agentId);
   useRuntimeStore.getState().open(agentId);
-  useHandoffStore.getState().setBuildDraft({
+  useComposeHandoffStore.getState().set({
+    origin: "capture-build",
+    projectId: payload.projectId,
+    agentId,
+    text: payload.text,
+    attachments: payload.attachments,
+    // No `route`: Build wants the concierge's ordinary aim, which the selection above has just
+    // pointed at this agent.
+  });
+  useUiStore.getState().setWorkMode("build");
+  log.info("capture", "capture→build handed off to the concierge compose box", {
+    projectId: payload.projectId,
+    agentId,
+    createdAgent: !existing,
+    chars: payload.text.length,
+    attachments: payload.attachments.length,
+  });
+}
+
+/** Chat: hand the capture to the SPARKLE CONCIERGE as a draft. No agent is selected, created or
+ *  touched — the point of this mode is that the user wants to talk to Sparkle about what they
+ *  captured, not to set a builder off.
+ *
+ *  REPLACES THE OLD "Plan" ROUTE, which ran a Chief round trip (copy asset → synthesize a PRD →
+ *  decompose into beads) straight off the button. That pipeline could only work for a project with
+ *  a Chief PAT and a mapped Chief project, and threw for everyone else; capture is a two-second
+ *  gesture and had no business fronting it. `services/capturePlan.ts` went with it (this route was
+ *  its only caller). `prd.ts` / `tasks.ts` are UNTOUCHED — the Plan board and sendToBuild still use
+ *  them.
+ *
+ *  `route: "sparkle"` is what makes the mode mean anything. Without it the concierge's auto-router
+ *  would classify the draft like any other message and could aim it at whatever build agent happens
+ *  to be on screen — which is precisely the destination the user declined by not pressing Build. */
+export function dispatchChat(payload: CaptureSendPayload): void {
+  useComposeHandoffStore.getState().set({
+    origin: "capture-chat",
     projectId: payload.projectId,
     text: payload.text,
     attachments: payload.attachments,
+    route: "sparkle",
   });
-  useUiStore.getState().setWorkMode("build");
-}
-
-/** Plan: run the capture→Plan pipeline (copy shot → PRD synth → decompose), then switch to the
- *  Plan board. Throws on a missing project / unconfigured Chief so the caller logs it; the
- *  pipeline is atomic (spec §9) so a failure leaves nothing half-decomposed. */
-async function dispatchPlan(payload: CaptureSendPayload): Promise<void> {
-  const project = useProjectStore.getState().projects.find((p) => p.id === payload.projectId);
-  if (!project) throw new Error(`capture→plan: unknown project ${payload.projectId}`);
-  const s = useSettingsStore.getState();
-  const pat = effectiveChiefPat(s.chiefPat, s.runtimeChiefPat);
-  const chiefProjectId = s.chiefProjectByProject[payload.projectId];
-  if (!pat || !chiefProjectId) {
-    throw new Error("capture→plan: Chief is not configured for this project (no PAT or Chief project)");
-  }
-  await sendCaptureToPlan(
-    {
-      copyCaptureAsset,
-      synthesize: (a) => synthesizePrd({ startChat, pollForResponse, writePrd }, a),
-      generate: (a) => generateTasks({ structuredJson, createBeadFull, beadDepAdd, writePrd }, a),
-    },
-    {
-      pat,
-      chiefProjectId,
-      projectPath: project.rootPath,
-      text: payload.text,
-      attachments: payload.attachments,
-    },
-  );
-  const ui = useUiStore.getState();
-  ui.setWorkMode("plan");
-  ui.setActiveSpecial("board");
+  log.info("capture", "capture→chat handed off to the concierge compose box", {
+    projectId: payload.projectId,
+    chars: payload.text.length,
+    attachments: payload.attachments.length,
+  });
 }
 
 /** Handle one capture://send in THIS window: decide ownership (with main's stale-owner self-heal),
@@ -159,18 +212,22 @@ export async function handleCaptureSend(payload: CaptureSendPayload, ctx: Captur
   // switch to it so the routed result is visible in this window.
   if (ctx.projectId !== payload.projectId) ctx.replace(payload.projectId);
 
+  // Normalized, never switched on raw: a capture window that hasn't reloaded since the upgrade
+  // still emits the retired "plan", and an unmatched arm here is a silent drop (see
+  // normalizeCaptureMode).
+  const mode = normalizeCaptureMode(payload.mode);
   try {
-    switch (payload.mode) {
+    switch (mode) {
       case "build":
         dispatchBuild(payload);
         break;
-      case "plan":
-        await dispatchPlan(payload);
+      case "chat":
+        dispatchChat(payload);
         break;
     }
     await focusThisWindow();
   } catch (e) {
-    log.error("capture", `capture://send ${payload.mode} dispatch failed`, e);
+    log.error("capture", `capture://send ${mode} dispatch failed`, e);
   }
 }
 

@@ -248,3 +248,73 @@ describe("ComposeBox — focus-on-request seam (roborev 46485-M)", () => {
     expect(document.activeElement).not.toBe(box());
   });
 });
+
+// ── The initial-text report (roborev 53836) ────────────────────────────────────────────────────
+//
+// The box tells the host what it STARTS WITH, once, on mount. That report is the only signal that
+// distinguishes A NEW BOX from a re-registration of the insert callback, and ConciergeHost needs
+// the difference: it holds latches that aim the NEXT send (the capture window's Chat ❯ forces the
+// message to Sparkle, skipping the auto-router), and a latch belongs to the words that set it. A
+// remount resets `text` — those words are gone — so the latch has to go with them, or the next
+// thing the user types is aimed somewhere they never chose.
+//
+// `registerInsert(null)` cannot carry that signal: the registration effect re-runs on any identity
+// change of `registerInsert` and its cleanup fires first, so a LIVE re-registration is also a null.
+// Clearing the aim there silently broke capture-Chat outright.
+describe("ComposeBox — the initial-text report", () => {
+  it("reports its starting text on mount, so a fresh box reads as empty", () => {
+    const onTextEdit = vi.fn();
+    render(
+      <ComposeBox
+        onSend={vi.fn()}
+        onMicToggle={vi.fn()}
+        onAttach={vi.fn()}
+        onTextEdit={onTextEdit}
+      />,
+    );
+    expect(onTextEdit).toHaveBeenCalledWith("");
+  });
+
+  it("reports once per mount, not on every edit or re-render", () => {
+    const onTextEdit = vi.fn();
+    const { rerender } = render(
+      <ComposeBox
+        onSend={vi.fn()}
+        onMicToggle={vi.fn()}
+        onAttach={vi.fn()}
+        onTextEdit={onTextEdit}
+      />,
+    );
+    expect(onTextEdit).toHaveBeenCalledTimes(1);
+    // A re-render is not a new box — the words in it are still the user's.
+    rerender(
+      <ComposeBox
+        onSend={vi.fn()}
+        onMicToggle={vi.fn()}
+        onAttach={vi.fn()}
+        onTextEdit={onTextEdit}
+      />,
+    );
+    expect(onTextEdit).toHaveBeenCalledTimes(1);
+    // A hand edit still reports, through the textarea's own onChange.
+    fireEvent.change(box(), { target: { value: "typed" } });
+    expect(onTextEdit).toHaveBeenLastCalledWith("typed");
+  });
+
+  it("a REMOUNT reports again — that is the signal a stale aim is retired by", () => {
+    const onTextEdit = vi.fn();
+    const props = {
+      onSend: vi.fn(),
+      onMicToggle: vi.fn(),
+      onAttach: vi.fn(),
+      onTextEdit,
+    };
+    render(<ComposeBox {...props} />);
+    fireEvent.change(box(), { target: { value: "a draft" } });
+    onTextEdit.mockClear();
+    cleanup();
+    render(<ComposeBox {...props} />);
+    // The new box is empty, and says so — which is what retires the latch aimed at the old words.
+    expect(onTextEdit).toHaveBeenCalledWith("");
+  });
+});

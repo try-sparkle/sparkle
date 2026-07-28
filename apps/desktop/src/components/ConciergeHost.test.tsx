@@ -62,6 +62,16 @@ const h = vi.hoisted(() => ({
       }
     | undefined,
   deferred: undefined as ((r: DeferredOutcome) => void) | undefined,
+  // Stands in for the Rust round trip behind a dropped file. Returns a real-shaped Attachment so a
+  // staged drop renders a chip the way it does in the app.
+  loadAttachmentPaths: vi.fn(async (paths: string[]) =>
+    paths.map((path) => ({
+      id: `att-${path}`,
+      kind: "file" as const,
+      path,
+      name: path.split("/").pop()!,
+    })),
+  ),
   brain: {} as {
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; text: string }) => void;
@@ -111,6 +121,18 @@ vi.mock("../services/conciergeDispatch", () => ({
   },
 }));
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.routeMessage }));
+// Only the DISK READ is stubbed; `attachedDisplay`/`attachedPayload` stay real (the spread), because
+// the send rows below assert on the payload they build. Without this, `loadAttachmentPaths` hits
+// Tauri, rejects under jsdom, and a dropped file silently never becomes a chip — which would let the
+// re-homed "+ New Build Agent" drain be asserted only by its queue emptying. Draining without
+// staging is precisely the silent loss this change exists to remove (roborev 53836).
+vi.mock("../services/conciergeAttach", async (orig) => {
+  const real = (await orig()) as Record<string, unknown>;
+  return {
+    ...real,
+    loadAttachmentPaths: h.loadAttachmentPaths,
+  };
+});
 // The recommended-action row is a keyed child (Concierge/ConciergeSuggestions) with its own
 // per-agent hook. Mock it to record the agentId it was mounted with — the HIGH finding in roborev
 // 53043 was precisely that this identity was shared across agents.
@@ -179,6 +201,19 @@ import {
   fireIntent,
   queuedIntents,
 } from "../services/dispatchIntent";
+// The capture handoff rows at the bottom of this file drive the REAL dispatch entry points against
+// the REAL stores. That is the point: the bug being fixed was a producer writing to a store with no
+// reader, so a suite that hand-built the store write would have gone green against the broken code.
+// Only the whole chain — dispatchBuild/dispatchChat → composeHandoffStore → this host → the box —
+// can tell the two apart.
+import { dispatchBuild, dispatchChat } from "../services/captureSends";
+import { useProjectStore } from "../stores/projectStore";
+import { useComposeHandoffStore } from "../stores/composeHandoffStore";
+import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
+// The LOGGER, not `console`: logger.ts binds its `realConsole` at module load, so a console spy
+// installed later never sees these lines — a row asserting on one would pass against silent code.
+import { log } from "../logger";
+import type { Project } from "../types";
 
 const EMPTY_COUNTS: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
 
@@ -231,6 +266,16 @@ afterEach(() => {
   h.dispatchConciergeAnswer.mockResolvedValue({ ok: true });
   h.startConciergeTurn.mockResolvedValue(null);
   h.agentCanAcceptInput.mockReturnValue(true);
+  // resetAllMocks above strips this one's implementation too, and an undefined return here is not a
+  // quiet no-op: `attachPaths` calls `.then` on it and the whole passive effect throws.
+  h.loadAttachmentPaths.mockImplementation(async (paths: string[]) =>
+    paths.map((path) => ({
+      id: `att-${path}`,
+      kind: "file" as const,
+      path,
+      name: path.split("/").pop()!,
+    })),
+  );
 });
 
 /** Point the router at the agent for the next send(s). The router itself is exhaustively tested in
@@ -1770,5 +1815,434 @@ describe("ConciergeHost — Away → Here recap", () => {
     const card = within(thread()).getByTestId("concierge-recap");
     expect(card.textContent).toContain("1 finished");
     expect(within(card).getByTestId("recap-change").getAttribute("data-status")).toBe("done");
+  });
+});
+
+// ══ CAPTURE / ISLAND HANDOFFS INTO THE COMPOSE BOX ═════════════════════════════════════════════
+//
+// THE BUG THESE ROWS EXIST FOR. The helper island's capture takeover sends `capture://send`; the
+// owning window's router (services/captureSends) created or selected the build agent and then wrote
+// the narration + screenshot into `handoffStore.buildDraft`. That store's ONLY reader was the
+// per-agent terminal Composer inside AgentPane, which db29f0a48 deleted when the concierge box
+// became a build agent's input surface. So the agent got spawned and the user's words and shot were
+// dropped — no error, no receipt, and (the reason it survived) zero log output. Confirmed against
+// the app logs and the history DB: the spawned agent received no prompt at all.
+//
+// These drive the REAL dispatch functions, not a hand-built store write, so the whole chain is
+// covered: island → dispatchBuild/dispatchChat → composeHandoffStore → this host → the box.
+describe("ConciergeHost — capture handoffs land in the compose box", () => {
+  const SHOT = { path: "/tmp/sparkle-shot-1753.png", dataUrl: "data:image/png;base64,AAAA" };
+
+  const projects = () =>
+    [
+      {
+        id: "p1",
+        name: "sparkle",
+        rootPath: "/tmp/sparkle",
+        defaultBranch: "main",
+        createdAt: "2026-01-01",
+        selectedAgentId: null,
+        agents: [],
+      },
+    ] as unknown as Project[];
+
+  beforeEach(() => {
+    useProjectStore.setState({ projects: projects() });
+    useComposeHandoffStore.setState({ handoff: null });
+    usePendingAttachmentsStore.setState({ pending: {} });
+    h.feed = feedWith("idle", "running");
+  });
+
+  afterEach(() => {
+    useComposeHandoffStore.setState({ handoff: null });
+    usePendingAttachmentsStore.setState({ pending: {} });
+  });
+
+  /** The box itself. `aria-label="Message"` is its accessible name — see ComposeBox. */
+  const box = () => screen.getByRole("textbox") as HTMLTextAreaElement;
+  const chips = () => screen.queryByTestId("concierge-attachment-chips");
+
+  /** The agents in whatever feed `h.feed` currently holds — so a row can resolve its prompt target
+   *  out of the feed the way Workspace does, instead of asserting against a literal it wrote. */
+  const allFeedAgents = () =>
+    (h.feed as ConciergeFeed).projects.flatMap((p) => p.agents);
+
+  /** A feed carrying SEVERAL build agents in one project — the shape the wrong-agent race needs.
+   *  `deliver` treats absence from the feed as "this agent is gone" and falls back to Sparkle, so a
+   *  freshly created agent has to appear here before a send can be routed at it. */
+  function feedWithAgents(ids: string[]) {
+    const agents = ids.map((id) => ({
+      id,
+      name: id === "ag1" ? "CI Hardening" : "New Build",
+      projectId: "p1",
+      projectName: "sparkle",
+      kind: "build" as const,
+      status: "idle",
+      statusColor: "#e0533f",
+      statusLabel: "Approve?",
+      band: "needs_you" as StatusBand,
+      inScope: true,
+      muted: false,
+      topLevel: true,
+      representedElsewhere: false,
+    }));
+    const counts = { needs_you: agents.length, running: 0, done: 0 };
+    return {
+      projects: [{ id: "p1", name: "sparkle", inScope: true, counts, agents }],
+      counts,
+      scopedCounts: counts,
+      pinnedProjectId: null,
+    };
+  }
+
+  /** The island's Build ❯ → "New build agent", for real. Returns the id it spawned. */
+  function captureToNewBuildAgent(text: string) {
+    act(() =>
+      dispatchBuild({
+        mode: "build",
+        projectId: "p1",
+        text,
+        attachments: [SHOT],
+        forceNewAgent: true,
+      }),
+    );
+    const created = useProjectStore
+      .getState()
+      .projects[0]!.agents.find((a) => a.kind === "build");
+    expect(created).toBeTruthy();
+    return created!.id;
+  }
+
+  // ── THE HEADLINE ROW ─────────────────────────────────────────────────────────────────────────
+  it("a Build send to a NEWLY CREATED agent prefills the box AND stages the screenshot", async () => {
+    const created = captureToNewBuildAgent("the header is misaligned on narrow windows");
+    expect(created).toBeTruthy();
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+    // The text the user narrated into the capture window is in the box they will press Enter in.
+    await waitFor(() =>
+      expect(box().value).toContain("the header is misaligned on narrow windows"),
+    );
+    // …and the shot rides along as a removable chip, not as a temp path pasted into the text.
+    const chipRow = screen.getByTestId("concierge-attachment-chips");
+    expect(within(chipRow).getByText("sparkle-shot-1753.png")).toBeTruthy();
+    expect(box().value).not.toContain("/tmp/");
+  });
+
+  // The contract the capture flow has always had, and the one thing that must not change while
+  // re-homing it: this is a DRAFT. The user reviews it and hits Enter.
+  it("does NOT auto-send — nothing reaches an agent or the brain", async () => {
+    captureToNewBuildAgent("look at this");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(box().value).toContain("look at this"));
+    await settle();
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(h.routeMessage).not.toHaveBeenCalled();
+    expect(queryInThread("look at this")).toBeNull(); // no "you" bubble
+  });
+
+  it("a handoff arriving while the column is already up lands just the same", async () => {
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    expect(box().value).toBe("");
+    captureToNewBuildAgent("this button does nothing");
+    await waitFor(() => expect(box().value).toContain("this button does nothing"));
+    expect(chips()).toBeTruthy();
+  });
+
+  // The guard the deleted Composer consumer carried (roborev 25174), preserved: `take()` reads AND
+  // clears, so a replay of the effect cannot paste the narration twice.
+  it("consumes the handoff exactly once — the store is emptied on delivery", async () => {
+    captureToNewBuildAgent("only once please");
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(box().value).toContain("only once please"));
+    expect(useComposeHandoffStore.getState().handoff).toBeNull();
+    rerender(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await flush();
+    expect(box().value.match(/only once please/g)).toHaveLength(1);
+  });
+
+  it("a screenshot with NO narration still stages — an image alone is a message", async () => {
+    act(() =>
+      dispatchBuild({
+        mode: "build",
+        projectId: "p1",
+        text: "",
+        attachments: [SHOT],
+        forceNewAgent: true,
+      }),
+    );
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(chips()).toBeTruthy());
+    expect(box().value).toBe("");
+    // canSend treats an attachment alone as sendable, so the user can just press Send.
+    expect(screen.getByLabelText("Send").hasAttribute("disabled")).toBe(false);
+  });
+
+  // ── CHAT MODE (replaces Plan) ────────────────────────────────────────────────────────────────
+  it("a Chat send prefills the same box and goes to SPARKLE, bypassing the router", async () => {
+    act(() =>
+      dispatchChat({
+        mode: "chat",
+        projectId: "p1",
+        text: "what is this error telling me?",
+        attachments: [SHOT],
+      }),
+    );
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(box().value).toContain("what is this error telling me?"));
+    expect(chips()).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // The user CHOSE the concierge by pressing Chat rather than Build, so the router is not asked
+    // to guess — even though a build agent is in view and would otherwise be a candidate.
+    expect(h.routeMessage).not.toHaveBeenCalled();
+    expect(h.startConciergeTurn).toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
+  it("the Sparkle aim is consumed by ONE send — the next message routes normally", async () => {
+    act(() =>
+      dispatchChat({ mode: "chat", projectId: "p1", text: "first", attachments: [] }),
+    );
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(box().value).toContain("first"));
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.routeMessage).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "add retry logic" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // A latch that outlived its own message would silently divert every later send to chat.
+    expect(h.routeMessage).toHaveBeenCalled();
+  });
+
+  it("a Build handoff leaves the aim to the router — it is not forced to Sparkle", async () => {
+    captureToNewBuildAgent("add a retry here");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(box().value).toContain("add a retry here"));
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.routeMessage).toHaveBeenCalled();
+  });
+
+  // Emptying the box by hand retires the aim, exactly as it retires the dictated-origin latch —
+  // the message typed next has nothing to do with the screenshot the user just discarded.
+  it("clearing the box by hand retires the Sparkle aim", async () => {
+    act(() => dispatchChat({ mode: "chat", projectId: "p1", text: "never mind", attachments: [] }));
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(box().value).toContain("never mind"));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "add retry logic" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.routeMessage).toHaveBeenCalled();
+  });
+
+  // A FRESH COLUMN STARTS WITH NO AIM. Both the draft and the latch that aims it are per-instance,
+  // so a new host must not inherit either. (The stronger property — a box remounting UNDER a
+  // surviving host — is pinned in ComposeBox.test.tsx, "reports its starting text on mount"; it
+  // cannot be driven from here, because unmounting this host resets the very ref under test.)
+  it("a fresh column starts with no draft and no Sparkle aim", async () => {
+    act(() => dispatchChat({ mode: "chat", projectId: "p1", text: "about this shot", attachments: [] }));
+    const { unmount } = render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }}
+      />,
+    );
+    await waitFor(() => expect(box().value).toContain("about this shot"));
+    unmount();
+
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }}
+      />,
+    );
+    expect(box().value).toBe("");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "add retry logic" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.routeMessage).toHaveBeenCalled();
+  });
+
+  // ── THE WRONG-AGENT RACE ─────────────────────────────────────────────────────────────────────
+  // The deleted Composer's guard matched on PROJECT + KIND and never on agentId, so with two build
+  // agents in one project a draft meant for the newly created one could be consumed against the
+  // other — whichever composer activated first won. The aim is enforced at the DISPATCH end
+  // (dispatchBuild selects the named agent synchronously before queueing the draft); this end
+  // asserts the invariant loudly rather than silently disagreeing, because `target` is resolved
+  // live at send time on purpose and a `forceAgent` latch is ruled out by conciergeRouter.
+  // The aim is DERIVED FROM THE STORE here, not handed in as a prop. Passing
+  // `promptTarget={{ agentId: created }}` directly would only re-prove that the box delivers to the
+  // target it was given, which is not the property at issue (roborev 53843) — the property is that
+  // `dispatchBuild`'s synchronous `selectAgent` is what decides that target. So the row asserts the
+  // selection first, then builds `promptTarget` out of it, the way Workspace does in the app.
+  it("a Build draft aims at the agent dispatchBuild SELECTED, not at whoever was selected before", async () => {
+    // Pre-existing build agent, selected before the capture arrives — the "whoever" in the title.
+    act(() => useProjectStore.getState().selectAgent("p1", "ag1"));
+    const created = captureToNewBuildAgent("fix this crash");
+    routeToAgent();
+
+    // THE LINK UNDER TEST: dispatching the capture moved the project's selection onto the agent it
+    // named, synchronously, in the same tick it queued the draft.
+    const selected = useProjectStore.getState().projects[0]!.selectedAgentId;
+    expect(selected).toBe(created);
+    expect(selected).not.toBe("ag1");
+
+    // TWO build agents in one project — the shape a project+kind aim could not tell apart.
+    h.feed = feedWithAgents(["ag1", created]);
+    const live = allFeedAgents().find((a) => a.id === selected)!;
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: live.projectId, agentId: live.id, name: live.name }}
+      />,
+    );
+    await waitFor(() => expect(box().value).toContain("fix this crash"));
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // …and the send follows that selection, so the capture's words reach the agent it was for.
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(created);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).not.toBe("ag1");
+  });
+
+  it("warns when the box's live aim is a DIFFERENT agent than the handoff named", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const created = captureToNewBuildAgent("this belongs to the new agent");
+    // BOTH agents are in the feed, so `target` resolves and the guard reaches its id comparison —
+    // the aim is genuinely a different LIVE agent, not merely an absent one.
+    h.feed = feedWithAgents(["ag1", created]);
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }}
+      />,
+    );
+    await waitFor(() => expect(box().value).toContain("this belongs to the new agent"));
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/aim disagrees with the compose box/i);
+    warn.mockRestore();
+  });
+
+  // The emptier failure, and the likelier one: the handoff names a LOCAL, promptable agent that
+  // dispatchBuild selected, and the box still has no aim at it — so the draft goes to the
+  // auto-router with nothing recording that its target went missing.
+  it("warns when the handoff names a local agent but the box has no live aim", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    captureToNewBuildAgent("nobody is aimed at");
+    // Default feed — it holds only `ag1`, so the created agent is absent and `target` is null.
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(box().value).toContain("nobody is aimed at"));
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/no live aim/i);
+    warn.mockRestore();
+  });
+
+  // …but a missing aim is NOT always a fault, and a guard that cries wolf gets scrolled past.
+  // `decidePromptTarget` returns null for a CLOUD build agent by design — no local PTY, so the box
+  // is deliberately Sparkle-only for it — and cloud agents are `kind: "build"`, so both the capture
+  // menu and dispatchBuild's reuse branch can land on one. Nothing is wrong there (roborev 53856).
+  it("logs the cloud case as INFO instead of warning — that null aim is by design", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    // The INFO is asserted POSITIVELY, not just the absence of the warnings. A negative-only row
+    // cannot tell a quiet branch from a DELETED one — emptying the cloud arm would leave a cloud
+    // capture traceless in the very guard this exists to make truthful — nor from the guard never
+    // being reached at all (roborev 53874).
+    const info = vi.spyOn(log, "info").mockImplementation(() => {});
+    act(() =>
+      useProjectStore.setState({
+        projects: [
+          {
+            ...useProjectStore.getState().projects[0]!,
+            agents: [{ id: "cloud1", name: "Cloud Build", kind: "build", runtime: "cloud" }],
+          },
+        ] as unknown as Project[],
+      }),
+    );
+    act(() =>
+      dispatchBuild({
+        mode: "build",
+        projectId: "p1",
+        text: "look at this in the cloud",
+        attachments: [SHOT],
+        targetAgentId: "cloud1",
+      }),
+    );
+    // No promptTarget: exactly what Workspace passes for a cloud selection.
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(box().value).toContain("look at this in the cloud"));
+    // The branch SPOKE, and named the agent — so deleting it turns this row red.
+    const cloudLine = info.mock.calls.find((c) => /cloud agent/i.test(String(c[1])));
+    expect(cloudLine).toBeTruthy();
+    expect(cloudLine![2]).toMatchObject({ handoffAgentId: "cloud1", projectId: "p1" });
+    // …and it did so INSTEAD of any of the three warnings.
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/no live aim|aim disagrees|no longer has/i);
+    info.mockRestore();
+    warn.mockRestore();
+  });
+
+  // The other genuinely faulty shape, kept distinct from the cloud case above: the named agent is
+  // not in this window's project at all, so there is nothing for the draft to be aimed at.
+  it("warns when the handoff names an agent this window no longer has", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    act(() =>
+      useComposeHandoffStore.getState().set({
+        origin: "capture-build",
+        projectId: "p1",
+        agentId: "vanished",
+        text: "its agent is gone",
+        attachments: [],
+      }),
+    );
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    await waitFor(() => expect(box().value).toContain("its agent is gone"));
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/no longer has/i);
+    warn.mockRestore();
+  });
+
+  it("stays quiet when the aim agrees — the guard is not noise on the happy path", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const created = captureToNewBuildAgent("aimed correctly");
+    // The created agent must be IN THE FEED, or `target` is null and the guard short-circuits
+    // before ever comparing ids — the agreeing branch would go unexercised and an inverted
+    // comparison would survive this row untouched (roborev 53843).
+    h.feed = feedWithAgents(["ag1", created]);
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: created, name: "New Build" }}
+      />,
+    );
+    await waitFor(() => expect(box().value).toContain("aimed correctly"));
+    // Neither branch may fire: not the mismatch, and not the no-live-aim one either.
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/aim disagrees|no live aim/i);
+    warn.mockRestore();
+  });
+
+  // ── THE OTHER ORPHANED HANDOFF ───────────────────────────────────────────────────────────────
+  // Files dropped on "+ New Build Agent" (hooks/useNewBuildAgentDrop) were queued for an agent
+  // whose composer no longer exists. Same drop, same silence — re-homed to the same box.
+  it("drains files dropped on '+ New Build Agent' onto the box", async () => {
+    usePendingAttachmentsStore.getState().add("ag1", ["/tmp/dropped.png"]);
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await waitFor(() => expect(usePendingAttachmentsStore.getState().pending).toEqual({}));
+    // DRAINED IS NOT DELIVERED. Emptying the queue and then failing to stage the file is the same
+    // silent loss this whole change removes, just one surface along — the old Composer test asserted
+    // the chip and gave that up when the behaviour moved here, so this row has to carry it.
+    expect(h.loadAttachmentPaths).toHaveBeenCalledWith(["/tmp/dropped.png"]);
+    const chipRow = await screen.findByTestId("concierge-attachment-chips");
+    expect(within(chipRow).getByText("dropped.png")).toBeTruthy();
+  });
+
+  it("leaves another agent's queued drop alone", async () => {
+    usePendingAttachmentsStore.getState().add("someone-else", ["/tmp/theirs.png"]);
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);
+    await flush();
+    expect(usePendingAttachmentsStore.getState().drain("someone-else")).toEqual([
+      "/tmp/theirs.png",
+    ]);
   });
 });

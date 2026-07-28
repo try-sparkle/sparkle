@@ -168,7 +168,7 @@ export interface GenerateResult {
   /** Every epic bead created for this PRD, in plan order. */
   epicIds: string[];
   /** = epicIds[0]. Kept for backward compatibility with the many consumers that read a single
-   *  epic id (sendToBuild, capturePlan, the Plan view). */
+   *  epic id (sendToBuild, the Plan view). */
   epicId: string;
   /** All child task ids across every epic, flattened in epic order. */
   taskIds: string[];
@@ -345,8 +345,8 @@ export async function generateTasks(
 
 // ── decomposeEpic — child tasks for an EXISTING epic (spec §7 auto-decompose) ──────────────────
 
-/** Pull the `PRD file: <relPath>` back-link out of an epic body (written by generateTasks /
- *  capturePlan). Returns the repo-relative path plus the bare filename (what the read_prd /
+/** Pull the `PRD file: <relPath>` back-link out of an epic body (written by generateTasks).
+ *  Returns the repo-relative path plus the bare filename (what the read_prd /
  *  write_prd commands take), or null when the epic carries no PRD reference. Pure. */
 export function parsePrdRef(body: string): { relPath: string; filename: string } | null {
   // Capture to end of line, not \S+ — PRD paths may contain spaces (write_prd allows them).

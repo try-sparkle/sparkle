@@ -3,10 +3,11 @@
 // The composer's side of the "+ New Build Agent" drop target (see useNewBuildAgentDrop):
 // drags/drops over the button are the button's — the composer suppresses its drop outline
 // and must NOT attach the files — while drops anywhere else keep attaching here. Plus the
-// pending-attachments drain: paths queued for this agent before its composer mounted become
-// tiles on activation. Boundary mocks mirror Composer.insertPrompt.test.tsx.
+// negative half of the pending-attachments queue: this composer must NOT drain it. The drain
+// moved to the concierge compose box (ConciergeHost) when db29f0a48 removed the per-agent
+// composer; see the comment on that row. Boundary mocks mirror Composer.insertPrompt.test.tsx.
 import { createRef } from "react";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const captured = vi.hoisted(() => ({
@@ -161,18 +162,20 @@ describe("Composer — new-build-agent drop target", () => {
     expect(dropHint()).toBe(true); // dragging back off the button re-arms the composer
   });
 
-  it("drains paths queued for its agentId into attachment tiles on mount", async () => {
+  // THE DRAIN ITSELF NO LONGER LIVES HERE. Files queued by a "+ New Build Agent" drop are staged on
+  // the CONCIERGE compose box now — that is the input surface for a build agent since db29f0a48
+  // removed the per-agent composer, and this Composer only ever renders for the Sparkle self-improve
+  // agent, which no drop can key to. Coverage moved with the behaviour, to
+  // ConciergeHost.test.tsx ("capture handoffs land in the compose box"). What stays here is the
+  // half that is still this file's job: this composer must keep its hands OFF the queue, so a drop
+  // can't be consumed by a surface that will never show it.
+  it("never drains the new-build-agent queue — that belongs to the concierge box now", () => {
     usePendingAttachmentsStore.getState().add("a1", ["/tmp/handoff.txt"]);
-    renderComposer("a1");
-    await waitFor(() => expect(loadAttachment).toHaveBeenCalledWith("/tmp/handoff.txt"));
-    expect(await screen.findByText("handoff.txt")).toBeTruthy();
-    expect(usePendingAttachmentsStore.getState().pending).toEqual({});
-  });
-
-  it("leaves other agents' queued paths alone", () => {
     usePendingAttachmentsStore.getState().add("someone-else", ["/tmp/theirs.txt"]);
     renderComposer("a1");
     expect(loadAttachment).not.toHaveBeenCalled();
+    // Both entries survive, its own included — untouched, not merely un-rendered.
+    expect(usePendingAttachmentsStore.getState().drain("a1")).toEqual(["/tmp/handoff.txt"]);
     expect(usePendingAttachmentsStore.getState().drain("someone-else")).toEqual([
       "/tmp/theirs.txt",
     ]);

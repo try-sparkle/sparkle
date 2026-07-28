@@ -83,6 +83,16 @@ import { useUiStore } from "../stores/uiStore";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
 import type { Attachment } from "./composer/attachments";
+import { screenshotAttachment } from "./composer/attachmentsApi";
+import { useComposeHandoffStore } from "../stores/composeHandoffStore";
+import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
+// Read imperatively (getState) inside the handoff effect only, to tell a cloud build agent — whose
+// null prompt target is BY DESIGN — from an agent that genuinely went missing. Not subscribed: this
+// host renders from the feed, and a project-store subscription would re-render it on every unrelated
+// agent write.
+import { useProjectStore } from "../stores/projectStore";
+import { describePaths } from "../services/logSafePaths";
+import { log } from "../logger";
 import {
   shouldSpeakConciergeReply,
   speakConciergeReply,
@@ -518,6 +528,12 @@ export function ConciergeHost({
   // pause-on-submit, and focus loss) drops the mic out of the routing state, so a fully dictated
   // turn would look typed and its reply would silently never be spoken.
   const dictatedRef = useRef(false);
+  // Set when a handoff that CHOSE Sparkle lands in the box (the capture window's Chat ❯), and
+  // consumed by the next submit. The user already answered the question the auto-router exists to
+  // guess at, so the router is skipped rather than allowed to overrule them — see `deliver`.
+  // Retired by `onTextEdit` when the box is emptied by hand, exactly like `dictatedRef`: a latch
+  // that outlived the words that set it would aim an unrelated typed message.
+  const forceSparkleRef = useRef(false);
   // Monotonic send counter: lets an async send outcome know whether it is still the latest turn.
   const sendSeqRef = useRef(0);
 
@@ -548,6 +564,15 @@ export function ConciergeHost({
       // A box going away takes the latch with it (roborev 46922): the ComposeBox resets its own
       // `text` on remount, and a latch that outlived the words that set it would make the next
       // TYPED turn look dictated.
+      //
+      // NOT the place to retire `forceSparkleRef` as well, though the two are the same stale-latch
+      // class (roborev 53836). `null` here does NOT mean "the box unmounted" — ComposeBox's effect
+      // re-runs on any identity change of this callback, and its cleanup fires first, so a LIVE
+      // re-registration arrives as null → non-null (see useConciergeDictation.registerInsert, which
+      // documents exactly that sequence). `dictatedRef` tolerates a spurious clear because every
+      // dictated segment re-sets it; the capture-Chat aim is set ONCE and never again, so clearing
+      // it here silently broke Chat mode outright. The aim is retired from `onTextEdit` instead —
+      // the one signal that fires on a real mount and not on a re-registration.
       if (append === null) dictatedRef.current = false;
       dictationRegisterInsert(
         append === null
@@ -566,7 +591,14 @@ export function ConciergeHost({
   // the user typed, which is the exact inverse of the misclassification the latch exists to fix
   // (roborev 46922). Only hand edits report here; a dictated segment does not.
   const onTextEdit = useCallback((text: string) => {
-    if (text.trim() === "") dictatedRef.current = false;
+    if (text.trim() === "") {
+      dictatedRef.current = false;
+      // The capture-Chat aim goes with the words it belonged to. Emptying the box by hand is the
+      // user starting over, and the message they type next has nothing to do with the screenshot
+      // they discarded — routing it to Sparkle on the strength of a retired handoff would be the
+      // same class of stale-latch bug as speaking the reply to a typed turn.
+      forceSparkleRef.current = false;
+    }
   }, []);
 
   const play = useCallback(async (id: string, text: string, mode: "auto" | "demand") => {
@@ -594,6 +626,8 @@ export function ConciergeHost({
     attachments,
     dropActive,
     attach,
+    attachPaths,
+    attachReady,
     remove: removeAttachment,
     take: takeAttachments,
     restore: restoreAttachments,
@@ -625,6 +659,142 @@ export function ConciergeHost({
   useEffect(() => {
     targetRef.current = routingTarget;
   }, [routingTarget]);
+
+  // ══ HANDOFFS INTO THIS BOX ═══════════════════════════════════════════════════════════════════
+  //
+  // Drafts and files produced somewhere that ISN'T the compose box — the capture takeover's
+  // Build ❯ / Chat ❯, and a file drop on "+ New Build Agent". Both used to be consumed by the
+  // terminal Composer inside AgentPane. That composer was deleted in db29f0a48 and this box became
+  // the input surface for a build agent, but neither handoff followed it here, so both wrote into
+  // stores with no reader: an island capture created the agent and then threw the user's words and
+  // screenshot away, silently, with no log output whatsoever. That silence is the reason it
+  // survived — so both consumers below LOG what they delivered, and the compose-handoff one logs
+  // an ERROR in the single remaining case where it cannot.
+  //
+  // This host is the right home for them precisely because the concierge column is always mounted:
+  // the old consumer had to wait for a specific agent's composer to exist, which is what made the
+  // handoff droppable in the first place.
+
+  // Files dropped on "+ New Build Agent" were queued for the agent that drop SPAWNED, before any
+  // surface existed to hold them (hooks/useNewBuildAgentDrop). The drop also selects that agent, so
+  // it arrives here as the target; drain its entry and stage the files. Keyed on `target`, not
+  // `routingTarget`, so glancing at the Plan board doesn't strand them. Draining is idempotent (the
+  // entry empties), so re-running on a target change is harmless.
+  const dropTargetAgentId = target?.agentId ?? null;
+  useEffect(() => {
+    if (!dropTargetAgentId) return;
+    const paths = usePendingAttachmentsStore.getState().drain(dropTargetAgentId);
+    if (paths.length === 0) return;
+    // Kinds, never paths — this log ships with support tickets (services/logSafePaths).
+    log.info("composer", `staging ${paths.length} handed-off file(s) on the compose box`, {
+      agentId: dropTargetAgentId,
+      ...describePaths(paths),
+    });
+    attachPaths(paths);
+  }, [dropTargetAgentId, attachPaths]);
+
+  // The capture takeover's draft: text plus the shot, staged as chips, NEVER auto-sent.
+  const composeHandoff = useComposeHandoffStore((s) => s.handoff);
+  useEffect(() => {
+    if (!composeHandoff) return;
+    // Re-read through `take()`, which reads AND CLEARS. That is the idempotency guard, not a
+    // stylistic re-read: a StrictMode double-mount or an HMR replay runs this body twice, and the
+    // second run gets null instead of pasting the narration twice and staging the screenshot
+    // twice. The subscribed value above serves only as the trigger.
+    const h = useComposeHandoffStore.getState().take();
+    if (!h) return;
+    // Already resolved by the capture window — no disk read, so the chip cannot arrive late (or
+    // not at all) after the text has already landed. See useConciergeAttachments.attachReady.
+    const staged = h.attachments.map((a) => screenshotAttachment(a.path, a.dataUrl));
+    if (staged.length > 0) attachReady(staged);
+    const insert = insertRef.current;
+    if (h.text.trim()) {
+      if (insert) insert(h.text);
+      else {
+        // The one way this can still lose text, and it is now LOUD. Nothing in the shipping app
+        // unmounts the compose box while the column is up, so this firing means that changed.
+        log.error("composer", "capture handoff arrived with no compose box mounted — text dropped", {
+          origin: h.origin,
+          projectId: h.projectId,
+          chars: h.text.length,
+        });
+      }
+    }
+    // Chat named its destination; Build leaves the aim to the router, which the dispatch has
+    // already pointed at the agent it selected.
+    forceSparkleRef.current = h.route === "sparkle";
+    // ══ THE WRONG-AGENT GUARD ═══════════════════════════════════════════════════════════════════
+    // A Build handoff NAMES the agent the capture was for, and `dispatchBuild` selects that agent
+    // synchronously before queueing the draft — so by the time this effect runs, the box's live aim
+    // should already BE that agent. The predecessor's guard matched on project + kind and not on
+    // agentId at all, which is exactly how a draft meant for a freshly created agent could be
+    // delivered against a different build agent in the same project.
+    //
+    // This does NOT override the aim, and must not. `target` is resolved live at send time on
+    // purpose (see the memo above), and conciergeRouter's header rules out a `forceAgent` latch —
+    // typing a paragraph into a live PTY on the strength of a stale flag is a worse failure than
+    // the one being guarded. So the enforcement lives where it can be enforced (dispatchBuild's
+    // explicit select) and this end asserts the invariant LOUDLY instead of silently disagreeing.
+    // BOTH failure shapes are reported, because the quieter one is the more likely (roborev 53843).
+    // An earlier cut only compared ids, which said nothing in the state that most reliably means
+    // "the selection did not land": no live target at all. In that state a Build draft carrying an
+    // agentId goes to the auto-router with no trace whatsoever.
+    //
+    // …but "no live aim" is NOT always a fault, and a guard that cries wolf is a guard people learn
+    // to scroll past (roborev 53856). `decidePromptTarget` returns null for a CLOUD build agent BY
+    // DESIGN — it has no local PTY, so the box is deliberately Sparkle-only for it — and a cloud
+    // agent is `kind: "build"`, so both the capture menu and dispatchBuild's reuse branch can land
+    // on one. There the selection did land and nothing is wrong, so it is an INFO. The warnings are
+    // kept for the two states that really are faults: the named agent is gone from this window's
+    // project, or a local, promptable agent somehow isn't the aim.
+    if (h.agentId) {
+      const live = targetRef.current;
+      const named = useProjectStore
+        .getState()
+        .projects.find((p) => p.id === h.projectId)
+        ?.agents.find((a) => a.id === h.agentId);
+      if (live && live.agentId === h.agentId) {
+        // Agreed — the ordinary path. Say nothing.
+      } else if (live) {
+        log.warn("composer", "capture handoff aim disagrees with the compose box's live target", {
+          origin: h.origin,
+          projectId: h.projectId,
+          handoffAgentId: h.agentId,
+          liveAgentId: live.agentId,
+        });
+      } else if (!named) {
+        log.warn("composer", "capture handoff names an agent this window no longer has", {
+          origin: h.origin,
+          projectId: h.projectId,
+          handoffAgentId: h.agentId,
+        });
+      } else if (named.runtime === "cloud") {
+        log.info("composer", "capture handoff targeted a cloud agent — the draft stays with Sparkle", {
+          origin: h.origin,
+          projectId: h.projectId,
+          handoffAgentId: h.agentId,
+        });
+      } else {
+        // A local, promptable agent that dispatchBuild selected — and yet the box has no aim at it.
+        // That IS the drift: the selection did not reach the compose box, and the next Enter will
+        // be routed at whatever the router decides rather than at this capture's agent.
+        log.warn("composer", "capture handoff names a local agent but the compose box has no live aim", {
+          origin: h.origin,
+          projectId: h.projectId,
+          handoffAgentId: h.agentId,
+        });
+      }
+    }
+    // Put the caret where the draft is, so Enter is the only thing left to do.
+    useUiStore.getState().requestComposeFocus();
+    log.info("composer", `capture handoff staged in the compose box (${h.origin})`, {
+      projectId: h.projectId,
+      agentId: h.agentId,
+      chars: h.text.length,
+      attachments: staged.length,
+      route: h.route ?? "auto",
+    });
+  }, [composeHandoff, attachReady]);
   // Latest thread, for redirect (which needs a message's current receipt without re-memoizing the
   // controller on every streamed delta).
   const chatRef = useRef(chat);
@@ -1221,6 +1391,15 @@ export function ConciergeHost({
       spokenTurn: boolean,
       /** This send's ordinal, so a late failure can tell "still mine" from "superseded". */
       mySend: number,
+      /** The user already CHOSE Sparkle for this message — they pressed Chat ❯ in the capture
+       *  window rather than Build ❯ — so the router is skipped rather than allowed to overrule
+       *  them. Captured at submit like every other aim (see send).
+       *
+       *  Safe to short-circuit in this direction ONLY. `sparkle` is the reversible destination:
+       *  the receipt still names where it went and still offers the one-tap redirect into the
+       *  agent. A `forceAgent` twin would type a paragraph into a live PTY on the strength of a
+       *  latch, which conciergeRouter's header rules out — do not add one. */
+      forceSparkle: boolean,
     ): Promise<boolean> => {
       // An agent that has since LEFT the feed is gone (closed, deleted, project unloaded), and
       // routing at it would report a delivery that cannot happen. Gone → the safe direction.
@@ -1230,9 +1409,17 @@ export function ConciergeHost({
       // telling the router turns a guaranteed delivery failure into a useful chat answer. One
       // shared predicate rather than a copy here, so the two can't drift.
       const canAcceptInput = aim ? agentCanAcceptInput(aim.agentId) : false;
-      const decision = await routeMessage(text, {
-        agent: aim ? { id: aim.agentId, name: aim.name, status, canAcceptInput } : null,
-      });
+      const decision = forceSparkle
+        ? ({
+            target: "sparkle",
+            reason: "you sent this from the capture window's Chat",
+            // "heuristic", not "classified"/"fallback": no model was asked and nothing failed —
+            // this is a deterministic, zero-cost decision, which is exactly what tier 1 is.
+            source: "heuristic",
+          } as const)
+        : await routeMessage(text, {
+            agent: aim ? { id: aim.agentId, name: aim.name, status, canAcceptInput } : null,
+          });
 
       // Re-check AFTER the (network) route call too: the agent can be closed while we classify,
       // and dispatching at a corpse surfaces as a pty-gone error where the router's own design
@@ -1409,6 +1596,11 @@ export function ConciergeHost({
       // Was this turn SPOKEN? Decided before anything clears (the latch is consumed here).
       const spokenTurn = dictatedRef.current || micLiveRef.current;
       dictatedRef.current = false;
+      // The capture-Chat aim, consumed HERE for the same reason the aim itself is: everything that
+      // must reflect SUBMIT happens synchronously, so a handoff landing while this send is still
+      // queued cannot retroactively redirect it.
+      const forceSparkle = forceSparkleRef.current;
+      forceSparkleRef.current = false;
       // Which send this is, so a late async outcome can tell "still mine" from "superseded".
       const mySend = ++sendSeqRef.current;
       // Sending supersedes whatever Sparkle was saying.
@@ -1449,7 +1641,8 @@ export function ConciergeHost({
       rememberSentText(sentTextRef.current, id, text);
       rememberSentText(sentPayloadRef.current, id, payload);
       return enqueue(
-        () => deliver(id, text, payload, display, submitted, staged, spokenTurn, mySend),
+        () =>
+          deliver(id, text, payload, display, submitted, staged, spokenTurn, mySend, forceSparkle),
         false,
       );
     },

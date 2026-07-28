@@ -1,6 +1,6 @@
 // The capture takeover (spec §3): rendered in the dedicated transparent `capture` window, so the
 // full-viewport scrim IS the window dressing. A shot arrives over `capture://shot`, the user
-// narrates (dictation) or types, picks a project, and routes it to Plan / Build — which
+// narrates (dictation) or types, picks a project, and routes it to Chat / Build — which
 // just broadcasts `capture://send` and hides; the owning project window does the work (Task 4).
 import { useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, THEME_HEX } from "../theme/colors";
@@ -29,8 +29,12 @@ const NAVY_DEEP = THEME_HEX.dark.deepForest;
 const CREAM = THEME_HEX.dark.cream;
 const MUTED = THEME_HEX.dark.muted;
 
+// The two destinations, in the order they are laid out. "Chat" sits where "Plan" used to — same
+// slot, same one-click send — but it hands the shot and the narration to the Sparkle concierge's
+// compose box instead of running a Chief PRD-synthesis pipeline that only worked for projects with
+// Chief configured. See CaptureSendMode.
 const MODES: Array<{ mode: CaptureSendMode; label: string }> = [
-  { mode: "plan", label: "Plan" },
+  { mode: "chat", label: "Chat" },
   { mode: "build", label: "Build" },
 ];
 
@@ -175,8 +179,7 @@ export function CaptureApp() {
       projectId,
       text,
       attachments: captures.map((c) => ({ path: c.path, dataUrl: c.dataUrl })),
-      // Build-only routing (see the Build menu below); omitted for plan so its payload
-      // stays byte-for-byte as before.
+      // Build-only routing (see the Build menu below); omitted for chat, which names no agent.
       ...(buildOpts?.forceNewAgent ? { forceNewAgent: true } : {}),
       ...(buildOpts?.targetAgentId ? { targetAgentId: buildOpts.targetAgentId } : {}),
     };
@@ -406,7 +409,7 @@ export function CaptureApp() {
                 const primary = mode === "build";
                 const hovered = hoveredMode === mode && sendEnabled;
                 // Build no longer sends on click — it opens an options menu (New vs. an existing
-                // build agent). Think/Plan keep sending immediately, exactly as before.
+                // build agent). Chat keeps sending immediately, exactly as Plan did.
                 const isBuild = mode === "build";
                 return (
                   <button

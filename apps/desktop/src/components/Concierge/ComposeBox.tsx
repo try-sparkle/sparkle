@@ -220,6 +220,30 @@ export function ComposeBox({
     return () => registerInsert(null);
   }, [registerInsert]);
 
+  // Report what this box STARTS WITH, once, on mount — which for a fresh box is "" (`text` is
+  // component state, so a remount resets it).
+  //
+  // This is the only signal the integration layer gets that distinguishes A NEW BOX from a mere
+  // re-registration of the insert callback, and the difference is load-bearing (roborev 53836).
+  // ConciergeHost holds latches that aim the NEXT send — the capture window's Chat ❯ routes to
+  // Sparkle, bypassing the auto-router — and a latch belongs to the words that set it. When this
+  // box remounts, those words are gone but the latch would survive, so the next message the user
+  // types gets aimed at a destination they never chose for it. `registerInsert(null)` cannot carry
+  // that signal: ComposeBox's effect above re-runs on any identity change of `registerInsert` and
+  // its cleanup fires first, so a LIVE re-registration is also a null. A mount is not.
+  //
+  // Routed through `onTextEdit` rather than a new prop because the host already retires those
+  // latches on an empty edit, and this is the same statement of the same fact: the box is empty.
+  const reportedInitialText = useRef(false);
+  useEffect(() => {
+    if (reportedInitialText.current) return;
+    reportedInitialText.current = true;
+    onTextEdit?.(text);
+    // Mount only — `text` is read once for the initial report and must NOT re-run this on edits
+    // (the textarea's own onChange already reports those).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── Height: auto-grow to a ten-line cap, or whatever the user dragged to ────────────────────
   // The box was a fixed 42px with `resize: none`, so a paragraph scrolled invisibly above the
   // caret. Policy (cap, floor, drag arithmetic) lives in engine/composeBoxHeight; this half just

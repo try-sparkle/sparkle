@@ -70,7 +70,7 @@ describe("CaptureApp", () => {
     }
   });
 
-  it("renders nothing until a shot arrives, then scrim + the three send buttons", async () => {
+  it("renders nothing until a shot arrives, then scrim + the two send buttons", async () => {
     render(<CaptureApp />);
     expect(screen.queryByTestId("capture-scrim")).toBeNull();
 
@@ -78,7 +78,10 @@ describe("CaptureApp", () => {
 
     expect(screen.getByTestId("capture-scrim")).toBeTruthy();
     expect(screen.getByAltText("Captured screenshot")).toBeTruthy();
-    expect(screen.getByText("Plan ❯")).toBeTruthy();
+    expect(screen.getByText("Chat ❯")).toBeTruthy();
+    // "Plan" is RETIRED, not renamed away from a still-live route — the Chief PRD pipeline
+    // behind it is gone (see CaptureSendMode). Pinned so a revert has to be deliberate.
+    expect(screen.queryByText("Plan ❯")).toBeNull();
     // Build now opens an options menu, so it's badged with a ▾ affordance, not the ❯ send glyph.
     expect(screen.getByText("Build ▾")).toBeTruthy();
   });
@@ -93,14 +96,14 @@ describe("CaptureApp", () => {
     expect((screen.getByLabelText("Project") as HTMLSelectElement).value).toBe("proj-2");
   });
 
-  it("Plan sends the full payload (text may be empty) and hides the window", () => {
+  it("Chat sends the full payload (text may be empty) and hides the window", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Plan ❯"));
+    fireEvent.click(screen.getByText("Chat ❯"));
 
     expect(emitCaptureSend).toHaveBeenCalledWith({
-      mode: "plan",
+      mode: "chat",
       projectId: "proj-1", // no last-focused record → first project
       text: "",
       attachments: [{ path: SHOT.path, dataUrl: SHOT.dataUrl }],

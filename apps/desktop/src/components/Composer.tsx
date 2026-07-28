@@ -37,8 +37,6 @@ import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { isOverFileDropTarget } from "../services/dndTargets";
-import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
-import { useHandoffStore } from "../stores/handoffStore";
 import { useProjectStore } from "../stores/projectStore";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
@@ -815,53 +813,20 @@ export function Composer({
     };
   }, [active, attachPaths, overOtherTarget]);
 
-  // Files dropped on the "+ New Build Agent" button were queued for this agent BEFORE this
-  // composer existed (the drop spawned the agent — see useNewBuildAgentDrop). Drain our entry
-  // once we're the active pane and attach the paths exactly like a direct drop. Draining is
-  // idempotent (the entry empties), so re-running on activation is harmless.
-  useEffect(() => {
-    if (!active) return;
-    const paths = usePendingAttachmentsStore.getState().drain(agentId);
-    if (paths.length === 0) return;
-    log.info("composer", `attaching ${paths.length} handed-off file(s)`, describePaths(paths));
-    attachPaths(paths);
-  }, [active, agentId, attachPaths]);
-
-  // A capture-modal "Build ❯" queued a draft (text + screenshots) for this project's build
-  // agent (handoffStore.buildDraft — same handoff shape as pendingAttachmentsStore, but keyed
-  // by project since the router may create the agent in the same tick). Consume it when this
-  // composer is the active pane of a build agent in that project: attachment tiles + draft
-  // text, then clear. NEVER auto-sent — the user reviews and hits Enter.
-  const buildDraft = useHandoffStore((s) => s.buildDraft);
-  useEffect(() => {
-    if (!active || disabled || !buildDraft) return;
-    // Re-read the draft from the store inside the effect (roborev 25174): the first consumer's
-    // clearBuildDraft() below makes any replay of this effect (HMR / StrictMode double-mount)
-    // a no-op, so the text/attachments can never be double-applied. The subscribed `buildDraft`
-    // above serves only as the trigger.
-    const draft = useHandoffStore.getState().buildDraft;
-    if (!draft) return;
-    const project = useProjectStore
-      .getState()
-      .projects.find((p) => p.agents.some((a) => a.id === agentId));
-    if (!project || project.id !== draft.projectId) return;
-    if (project.agents.find((a) => a.id === agentId)?.kind !== "build") return;
-    useHandoffStore.getState().clearBuildDraft();
-    if (draft.attachments.length > 0) {
-      setAttachments((prev) => [
-        ...prev,
-        ...draft.attachments.map((a) => screenshotAttachment(a.path, a.dataUrl)),
-      ]);
-    }
-    if (draft.text.trim()) {
-      // Same replace-if-empty/append-on-new-line rule as insertPrompt, so an in-progress
-      // draft is never clobbered.
-      setValue((v) => (v.trim() ? `${v}${v.endsWith("\n") ? "" : "\n"}${draft.text}` : draft.text));
-      setGhostDismissed(true);
-    }
-    setMinimized(false);
-    requestAnimationFrame(() => inputRef?.current?.focus());
-  }, [active, disabled, agentId, buildDraft, inputRef, setMinimized]);
+  // NO HANDOFF CONSUMERS HERE ANY MORE — they moved to ConciergeHost, and this note is a fence.
+  //
+  // This composer used to drain `pendingAttachmentsStore` (files dropped on "+ New Build Agent")
+  // and `handoffStore.buildDraft` (the capture takeover's Build ❯). Both were written for the era
+  // when AgentPane rendered a Composer per build agent. Since db29f0a48 removed that composer, the
+  // ONLY Composer left in the tree is SparkleAgentPane's — whose agent is the Sparkle self-improve
+  // agent, in SPARKLE_PROJECT_ID. Neither handoff can ever key to it: the drop store is keyed by
+  // the id of the build agent the drop spawned, and the draft's own guards required a `build`-kind
+  // agent in the capture's project. So both effects were unreachable code that nonetheless read as
+  // working wiring — which is exactly why the drop went unnoticed for as long as it did.
+  //
+  // Both now live in ConciergeHost, against the concierge compose box (the real input surface for a
+  // build agent). Ownership is deliberately SINGULAR: re-adding a consumer here would race the one
+  // there for the same single-use `take()`, and whichever lost would look like the original bug.
 
   // Open the native macOS crosshair picker and stash the result as a thumbnail.
   // Esc (cancel) resolves null — a quiet no-op. While the picker is up the call

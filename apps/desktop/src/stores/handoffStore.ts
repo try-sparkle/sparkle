@@ -1,8 +1,12 @@
-// Ephemeral hand-offs into the Think panel and the Build composer: `pending` carries the
-// initial prompt (and whether to auto-send it) for the project's singleton think agent;
-// `buildDraft` prefills the Build composer (text + capture attachments), consumed on
-// mount/focus and NEVER auto-sent. Deliberately NOT persisted — each is consumed on the
-// next render and cleared.
+// Ephemeral hand-off into the Think panel: `pending` carries the initial prompt (and whether to
+// auto-send it) for the project's singleton think agent. Deliberately NOT persisted — it is
+// consumed on the next render and cleared.
+//
+// `buildDraft` USED TO LIVE HERE and does not any more. It prefilled the per-agent Build composer,
+// which db29f0a48 deleted; the field outlived its only reader and quietly swallowed every capture
+// sent from the helper island. Capture drafts now go to stores/composeHandoffStore, whose `take()`
+// is a clearing read and whose consumer (ConciergeHost) logs each delivery — both directly because
+// of how this one failed. Do not reintroduce a draft field here.
 import { create } from "zustand";
 import type { CaptureAttachment } from "../capture/types";
 
@@ -14,26 +18,14 @@ export interface ThinkHandoff {
   attachments?: CaptureAttachment[];
 }
 
-export interface BuildDraft {
-  projectId: string;
-  text: string;
-  attachments: CaptureAttachment[];
-}
-
 interface HandoffState {
   pending: ThinkHandoff | null;
   setPending: (h: ThinkHandoff) => void;
   clear: () => void;
-  buildDraft: BuildDraft | null;
-  setBuildDraft: (d: BuildDraft) => void;
-  clearBuildDraft: () => void;
 }
 
 export const useHandoffStore = create<HandoffState>((set) => ({
   pending: null,
   setPending: (h) => set({ pending: h }),
   clear: () => set({ pending: null }),
-  buildDraft: null,
-  setBuildDraft: (d) => set({ buildDraft: d }),
-  clearBuildDraft: () => set({ buildDraft: null }),
 }));

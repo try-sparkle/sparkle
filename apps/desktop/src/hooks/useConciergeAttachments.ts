@@ -1,9 +1,10 @@
 // Attachment state for the concierge compose box (parity row #21, bead sparkle-4562.3 / CM-U10).
 //
-// Owns the files staged for the NEXT send. THREE producers land here — the attach buttons
-// (screenshot / image / files), a native file drop ON the compose box, and a file drop on the
-// visible agent's TERMINAL (hooks/useTerminalDrop, handed over via stores/terminalDropStore) — and
-// ConciergeHost drains the list at send time. That is the point of routing the terminal drop
+// Owns the files staged for the NEXT send. FOUR producers land here — the attach buttons
+// (screenshot / image / files), a native file drop ON the compose box, a file drop on the visible
+// agent's TERMINAL (hooks/useTerminalDrop, handed over via stores/terminalDropStore), and the
+// capture takeover's handoff (stores/composeHandoffStore, via `attachReady`) — and ConciergeHost
+// drains the list at send time. That is the point of routing the terminal drop
 // through this hook rather than giving it a list of its own: there is exactly ONE way an
 // attachment appears on the box, so removal, the send drain, and the restore-on-failed-send all
 // work for a dropped file without being written twice. Lives beside useNewBuildAgentDrop rather
@@ -42,6 +43,14 @@ export interface ConciergeAttachments {
   attach: (kind: ConciergeAttachKind) => void;
   /** Stage already-resolved paths (the drop path, and any future handoff). */
   attachPaths: (paths: string[]) => void;
+  /** Stage attachments the caller has ALREADY built, with no disk read at all.
+   *
+   *  For the capture takeover's handoff (stores/composeHandoffStore): the shot arrives over
+   *  `capture://shot` carrying its own dataUrl, so it is already in memory by the time the send is
+   *  routed. Putting it through `attachPaths` would re-read and re-encode a file we are holding —
+   *  and, worse, would make the chip's appearance depend on an async IPC that can fail after the
+   *  draft text has already landed, i.e. words on screen with the screenshot silently missing. */
+  attachReady: (atts: Attachment[]) => void;
   /** Drop one staged file. */
   remove: (id: string) => void;
   /** Read AND clear the staged list — what a send does, so the next message starts empty. */
@@ -168,6 +177,7 @@ export function useConciergeAttachments(): ConciergeAttachments {
     dropActive,
     attach,
     attachPaths,
+    attachReady: add,
     remove,
     take,
     restore,
