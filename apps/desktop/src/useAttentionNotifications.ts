@@ -583,9 +583,10 @@ export function useAttentionNotifications(): void {
       selectAndOpen(p.projectId, p.agentId);
       jumpToPrompt();
     };
-    // "Show me this project" from another webview (e.g. capture): select the tab and raise the window,
-    // and NOTHING else — no agent is mounted, no PTY spawned, no workMode flip. That is the whole
-    // difference from focus-agent, and the reason this is its own event (see services/attention).
+    // "Show me this project" from the tray/capture webview: select the tab, raise the window, and
+    // drop the app-global Improve Sparkle overlay (with the workMode that pairs with it, see
+    // services/openProjectTab) — nothing agent- or PTY-related. NO agent is mounted and no PTY is
+    // spawned: that is the whole difference from focus-agent, and the reason this is its own event.
     const handleSelectProject = (p: SelectProjectPayload) => {
       // Raise + select together, deferring briefly if the project was just added in another
       // webview and hasn't rehydrated here yet (roborev 46328-M2 / 46485-L).

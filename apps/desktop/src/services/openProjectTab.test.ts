@@ -120,6 +120,29 @@ describe("openProjectTab", () => {
     expect(useUiStore.getState().workMode).toBe("plan");
   });
 
+  it("clears the overlay even for a project that is ALREADY selected", () => {
+    // The add/clone paths call in with an id addProject has already selected, and every
+    // cross-context caller (tray, notification, palette) means "take me there" whether or not it
+    // is current. Inferring "same tab, do nothing" from equal ids here would strand the user on
+    // the Sparkle pane in exactly those cases; the tab bar owns that decision instead.
+    useUiStore.getState().setActiveSpecial("sparkle");
+    useUiStore.getState().setWorkMode("plan");
+    openProjectTab("p1"); // p1 is the selected project
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useUiStore.getState().workMode).toBe("build");
+  });
+
+  it("reveals an agent in the project you are ALREADY on", () => {
+    // The commonest reveal in the app (a nudge or a PR for an agent in the current project), and
+    // the case any future "same id → do nothing" shortcut would silently break.
+    useUiStore.getState().setActiveSpecial("sparkle");
+    openProjectTab("p1", "a1"); // p1 is the selected project
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useRuntimeStore.getState().isOpen("a1")).toBe(true);
+    expect(useProjectStore.getState().projects.find((p) => p.id === "p1")?.selectedAgentId).toBe("a1");
+  });
+
   it("bumps the project's recency so tab ordering stays honest", () => {
     const before = useProjectStore.getState().projects.find((p) => p.id === "p2")?.lastOpenedAt;
     openProjectTab("p2");

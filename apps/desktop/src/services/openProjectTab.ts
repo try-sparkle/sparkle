@@ -61,6 +61,13 @@ export function openProjectTab(projectId: string, agentId?: string | null): void
   // The two states have to move together: `boardActive` requires `activeSpecial === "board"`, so
   // dropping the Sparkle pane while `workMode` is still "plan" would leave Plan selected with a
   // Build pane on screen — a chevron that lies about what you are looking at (roborev 46291-L).
+  //
+  // UNCONDITIONAL, including when `projectId` is already selected. "Am I already on that tab?" is
+  // not answerable from an id here: `addProject` selects the project it creates, so the add/clone
+  // paths arrive with the ids already equal, and every cross-context caller (tray row, attention
+  // notification, ⌘K, history search) means "take me to project X" whether or not X is current.
+  // The one caller for which a re-click means "do nothing" is the tab bar itself, and it decides
+  // that before calling in (components/ProjectTabsBar).
   const ui = useUiStore.getState();
   if (ui.activeSpecial === "sparkle") {
     ui.setActiveSpecial(null);

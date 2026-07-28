@@ -120,7 +120,14 @@ export function ProjectTabsBar({
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}
-        onSelect={(id) => openProjectTab(id)}
+        // Re-clicking the tab you are ALREADY on is not a navigation, so it does nothing — in
+        // particular it must not dismiss the Improve Sparkle pane out from under the user. The
+        // check lives here, not in openProjectTab: this is the only caller where equal ids mean
+        // "nothing to do" (a freshly added project is already selected, and every cross-context
+        // caller means "take me there" regardless of what is current).
+        onSelect={(id) => {
+          if (id !== selectedProjectId) openProjectTab(id);
+        }}
         onTogglePin={togglePinnedProject}
         onOpenSettings={(id) => {
           const p = projects.find((x) => x.id === id);

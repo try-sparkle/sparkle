@@ -120,6 +120,20 @@ describe("ProjectTabsBar", () => {
     expect(openProjectTab).not.toHaveBeenCalled();
   });
 
+  it("selects another project's tab through the one open path", () => {
+    render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-p2"));
+    expect(openProjectTab).toHaveBeenCalledWith("p2");
+  });
+
+  it("does NOTHING when the already-selected tab is clicked", () => {
+    // A re-click isn't a navigation: routing it through openProjectTab would clear the app-global
+    // Improve Sparkle pane, closing what the user is working in for no reason (roborev 46280-M).
+    render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-p1")); // p1 is the selected project
+    expect(openProjectTab).not.toHaveBeenCalled();
+  });
+
   it("double-clicking a tab opens that project's settings (TopBar's old entry point)", () => {
     const onOpenProjectSettings = vi.fn();
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={onOpenProjectSettings} />);

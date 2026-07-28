@@ -53,6 +53,9 @@
 // PTY exists. Rather than dropping the prompt as `pty-gone` (what the composer's queue-and-flush
 // prevented), a send aimed at an agent that IS open but not yet ready is QUEUED — bounded, per
 // agent — and flushed by the pane on ptyReady (see services/pendingSends + flushPendingSends).
+// A send that overflows that bound is refused as `queue-full`: "too many prompts are already
+// waiting" is a different fact from "the terminal is gone", and only one of them asks the user to
+// restart anything.
 
 import { PtyGoneError, submitPrompt, writePty } from "../pty";
 import { describeAuthority, isDispatchAuthority, type DispatchAuthority } from "./dispatchAuthority";
@@ -75,6 +78,7 @@ export type ConciergeDispatchPath =
   | "picker-option" // matched a live prompt option → sent that option's keystroke
   | "free-text" // no live prompt → sent the text as a prompt to the agent
   | "queued" // the agent's PTY isn't up yet → held, flushed when the pane reports ready
+  | "queue-full" // the agent is starting but its hold queue is full (refused, NOT delivered)
   | "ambiguous-picker" // a prompt is live but the answer didn't map to any option (refused)
   | "empty" // nothing to dispatch (blank/whitespace answer)
   | "trial-spent" // the server says the free trial is spent (refused BEFORE delivery)
@@ -382,10 +386,9 @@ export async function dispatchConciergeAnswer(
       // (the remedy is Retry / installing Claude, not "start it again").
       const nowState = paneState(agentId);
       if (nowState === "failed") return { ok: false, path: "agent-failed", agentId };
-      if (
-        wasStarting &&
-        (nowState === "starting" || nowState === "ready") &&
-        queuePendingSend(
+      if (wasStarting && (nowState === "starting" || nowState === "ready")) {
+        if (
+          queuePendingSend(
           {
             agentId,
             text,
@@ -410,12 +413,17 @@ export async function dispatchConciergeAnswer(
               });
             }
           },
-        )
-      ) {
-        // If the pane became ready while we were in flight, its own flush effect has already run
-        // against an empty queue — drain here or this entry would sit until the TTL swept it.
-        if (paneState(agentId) === "ready") void flushPendingSends(agentId);
-        return { ok: true, path: "queued", agentId, sent: text, display };
+          )
+        ) {
+          // If the pane became ready while we were in flight, its own flush effect has already run
+          // against an empty queue — drain here or this entry would sit until the TTL swept it.
+          if (paneState(agentId) === "ready") void flushPendingSends(agentId);
+          return { ok: true, path: "queued", agentId, sent: text, display };
+        }
+        // A FULL queue is its own refusal, not a dead PTY: the agent is starting normally, there
+        // are simply already MAX_PER_AGENT prompts waiting on it. Falling through to `pty-gone`
+        // would tell the user to restart a terminal that is coming up fine (roborev 46280).
+        return { ok: false, path: "queue-full", agentId };
       }
       return { ok: false, path: "pty-gone", agentId };
     }

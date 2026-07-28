@@ -513,6 +513,10 @@ describe("ConciergeHost", () => {
     ["cloud-agent", /relay the approval/],
     ["pty-gone", /I couldn't send the approval\./],
     ["ambiguous-picker", /open it to choose/],
+    // PATH-unique ("prompts waiting to start") AND voice-unique ("then approve again") together:
+    // the tail alone is not enough here, because agent-failed's PROMPT copy also ends "then send
+    // again", so a bare tail would pin the voice without pinning path→copy (roborev 54042).
+    ["queue-full", /prompts waiting to start.*then approve again/],
   ] as const)("an Approve refused as %s speaks in the APPROVAL voice", async (path, remedy) => {
     h.feed = feedWith("approval");
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
@@ -865,6 +869,11 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     // /didn't send/ is voice-unique but appears in THREE prompt-side branches, so it pins the voice
     // without pinning the path→copy mapping. "pass it along" is pty-gone's alone (roborev 53018).
     ["pty-gone", /pass it along/],
+    // Same reasoning as the approval table: "then send again" is shared with agent-failed, so the
+    // path-unique phrase is paired with it. This row also pins that a full hold queue KEEPS THE
+    // DRAFT — the behaviour a queue-full refusal most needs to guarantee, since the send is
+    // retryable the moment the queue drains (roborev 54042).
+    ["queue-full", /prompts waiting to start.*then send again/],
   ] as const)("a prompt refused as %s speaks in the PROMPT voice and keeps the draft", async (path, remedy) => {
     routeToAgent();
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });

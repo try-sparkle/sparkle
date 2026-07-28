@@ -41,7 +41,7 @@ import {
   onDeferredSendOutcome,
 } from "./conciergeDispatch";
 import { registerPromptMarker, resetPromptMarkers } from "./terminalMarkers";
-import { pendingSendCount, queuePendingSend, resetPendingSends } from "./pendingSends";
+import { pendingSendCount, queuePendingSend, resetPendingSends, MAX_PER_AGENT } from "./pendingSends";
 import { resetPaneReadiness, setPaneFailed, setPaneReady } from "./paneReadiness";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -322,6 +322,60 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     expect(promptsOf("a1").map((h) => h.text)).toContain("start on the docs");
     expect(recordTrialSend).toHaveBeenCalledTimes(1);
     expect(pendingSendCount("a1")).toBe(0);
+  });
+
+  it("refuses with 'queue-full' — not 'pty-gone' — once the hold queue is at its cap", async () => {
+    setPaneReady("a1", false);
+    for (let i = 0; i < MAX_PER_AGENT; i++) {
+      await rejectPtyGoneOnce();
+      expect((await dispatchConciergeAnswer("a1", `hold ${i}`, { authority: TEST_AUTHORITY, userPrompt: true })).path).toBe("queued");
+    }
+    await rejectPtyGoneOnce();
+    const r = await dispatchConciergeAnswer("a1", "one too many", { authority: TEST_AUTHORITY, userPrompt: true });
+    // Its OWN outcome: "the terminal has closed — start it again" would point the user at an
+    // agent that is starting perfectly well (roborev 46280).
+    expect(r.ok).toBe(false);
+    expect(r.path).toBe("queue-full");
+    // The refused prompt is not held — the queue is exactly what it was before the attempt.
+    expect(pendingSendCount("a1")).toBe(MAX_PER_AGENT);
+  });
+
+  it("refuses a MACHINE-authored relay the same way at the cap (the queue isn't userPrompt-gated)", async () => {
+    setPaneReady("a1", false);
+    for (let i = 0; i < MAX_PER_AGENT; i++) {
+      await rejectPtyGoneOnce();
+      await dispatchConciergeAnswer("a1", `hold ${i}`, { authority: TEST_AUTHORITY, userPrompt: true });
+    }
+    await rejectPtyGoneOnce();
+    // The nudge card's "approve" fallback: not a user prompt, but it still competes for the hold
+    // queue, so it must get the same honest refusal.
+    const r = await dispatchConciergeAnswer("a1", "approve", { authority: { kind: "nudge-approve", agentId: "a1" }, userPrompt: false });
+    expect(r.ok).toBe(false);
+    expect(r.path).toBe("queue-full");
+    expect(pendingSendCount("a1")).toBe(MAX_PER_AGENT);
+  });
+
+  it("HOLDS a machine-authored relay below the cap (what the Approve card's 'as soon as it's ready' promises)", async () => {
+    setPaneReady("a1", false);
+    await rejectPtyGoneOnce();
+    const r = await dispatchConciergeAnswer("a1", "approve", { authority: { kind: "nudge-approve", agentId: "a1" }, userPrompt: false });
+    expect(r.ok).toBe(true);
+    expect(r.path).toBe("queued");
+    expect(pendingSendCount("a1")).toBe(1);
+    // Held, but still not a prompt: no history entry, no trial debit.
+    expect(promptsOf("a1")).toHaveLength(0);
+    expect(recordTrialSend).not.toHaveBeenCalled();
+    // …and DELIVERY is where the suppression actually has to hold: the flush re-applies the
+    // side-effects decision the entry was queued with, so a relay that waited out a boot must
+    // still not enter the history, debit the trial, or become the agent's name.
+    expect((await flushPendingSends("a1")).map((x) => x.path)).toEqual(["free-text"]);
+    // The COUNT is what separates "delivered uncharged" from "silently dropped": every
+    // suppression assertion below is negative and a dropped entry would satisfy them all.
+    expect(submitPrompt).toHaveBeenCalledTimes(2); // the rejected attempt, then the flush
+    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "approve");
+    expect(promptsOf("a1")).toHaveLength(0);
+    expect(recordTrialSend).not.toHaveBeenCalled();
+    expect(maybeAutoName).not.toHaveBeenCalled();
   });
 
   it("still reports pty-gone for an agent with no pane at all", async () => {

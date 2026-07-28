@@ -232,6 +232,16 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
       return approving
         ? `Something went wrong on my side, so I didn't send the approval to ${name}.`
         : `Something went wrong on my side, so I didn't send that to ${name}. Try again.`;
+    case "queue-full":
+      // A full hold queue is NOT a dead terminal — the agent is starting normally, there are simply
+      // already MAX_PER_AGENT prompts waiting on it. Falling through to the generic line (or worse,
+      // to the "terminal has closed" one) would send the user to restart something that is coming
+      // up fine (roborev 46280). Both voices name the action that was refused, because these
+      // ladders otherwise only say what did NOT happen, leaving the user unsure whether theirs
+      // went through.
+      return approving
+        ? `${name} already has a few prompts waiting to start — let those land first, then approve again.`
+        : `${name} already has a few prompts waiting to start — let those land first, then send again.`;
     // No bespoke line: "empty" is a blank answer the UI already swallows, and "expired"/"abandoned"
     // are DEFERRED outcomes reported by the onDeferredSendOutcome effect below, never returned to a
     // caller synchronously. They are listed rather than folded into `default` on purpose — `default`
