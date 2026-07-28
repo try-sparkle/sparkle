@@ -33,6 +33,7 @@ mod delivery;
 mod deps_bootstrap;
 mod dev_identity;
 mod dictation;
+mod display_span;
 mod folder_picker;
 mod frontmost;
 mod github;
@@ -179,6 +180,9 @@ pub fn run() {
             // best-effort — it only writes to the user's own disk here; upload is consent-gated in
             // the `flush_crash_reports` command.
             crash::install(app.handle());
+            // Watch for monitors being plugged/unplugged so a window spanned across displays can be
+            // re-fitted instead of stranded at a geometry no remaining display can show.
+            display_span::start_display_watch(app.handle().clone());
             // Auth hand-off: forward an incoming sparkle://auth?code=… deep link to the webview
             // as a "deep-link" event; AuthGate redeems the one-time code (spec §3.1, §8).
             {
@@ -427,6 +431,11 @@ pub fn run() {
             claude::claude_latest_session_id,
             claude::agent_session_title,
             model_catalog::list_claude_models,
+            // Multi-display window spanning (Appearance → Window).
+            display_span::display_layout,
+            display_span::span_window,
+            display_span::fit_window_to_current_display,
+            display_span::reset_window_size,
             screenshot::capture_screen_region,
             attachments::load_attachment,
             attachments::copy_image_to_clipboard,

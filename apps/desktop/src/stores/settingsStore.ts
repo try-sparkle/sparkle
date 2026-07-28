@@ -13,6 +13,9 @@ import type { AgentTabStatus } from "../types";
 // Type-only import: erased at compile time, so the store stays free of the Tauri runtime dep
 // (services/config pulls in @tauri-apps) and remains testable under jsdom.
 import type { EffectiveConfig } from "../services/config";
+// Type-only for the same reason as EffectiveConfig above: services/displaySpan imports
+// @tauri-apps, and this store must stay loadable under jsdom.
+import type { SpanMode } from "../services/displaySpan";
 // Type-only for a SECOND reason on top of the Tauri one above: policy.ts imports the concierge tool
 // domains, and services/conciergeTools/lifecycle.ts imports THIS store. A value import would close
 // that loop; `import type` is erased, so it can't.
@@ -370,6 +373,23 @@ interface SettingsState {
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
    *  updaterService. */
   autoApplyUpdates: boolean;
+  /** Which rectangle "Span all displays" targets (Appearance → Window). "safe" (default) uses the
+   *  largest fully-covered rectangle so no UI lands in a region no display shows; "full" uses the
+   *  union bounding box, trading dead corners for area. Persisted — it's a UI preference, not a
+   *  workflow rule, so it belongs here rather than in config.toml. */
+  windowSpanMode: SpanMode;
+  /** Re-apply the current span when a display is plugged in or unplugged (default on). This is a
+   *  safety default more than a convenience one: unplugging while spanned otherwise leaves the
+   *  window at a geometry no remaining display can show. Persisted. */
+  windowAutoRespan: boolean;
+  /** Is the window currently spanned across displays? Set when the user spans, cleared when they
+   *  fit-to-display or reset.
+   *
+   *  UI-only and NEVER persisted, and both halves of that matter. It gates auto-respan, which must
+   *  fire only for a window the user actually spanned — otherwise plugging in a monitor would
+   *  stretch a window they had deliberately sized small. And not persisting it means a relaunch
+   *  never silently re-spans; restoring a span across restarts was left out of scope. */
+  windowIsSpanned: boolean;
   /** Which agent statuses fire a Notification Center banner on the transition INTO them. See
    *  DEFAULT_NOTIFY_STATUSES. Persisted; merged over the defaults on read so a status added later
    *  inherits its default rather than reading undefined. */
@@ -494,6 +514,12 @@ interface SettingsState {
   setAutoApplyUpdates: (on: boolean) => void;
   /** Toggle deleting a shipped agent's merged branch on close (optimistic; configActions persists). */
   setDeleteMergedBranch: (on: boolean) => void;
+  /** Pick the span rectangle used by Appearance → Window. */
+  setWindowSpanMode: (mode: SpanMode) => void;
+  /** Toggle re-spanning when displays are connected/disconnected. */
+  setWindowAutoRespan: (on: boolean) => void;
+  /** Record whether the window is currently spanned (gates auto-respan). */
+  setWindowIsSpanned: (on: boolean) => void;
   /** Toggle notifications for one agent status. */
   setNotifyStatus: (status: AgentTabStatus, on: boolean) => void;
   /** Toggle one AI feature; the master segment re-derives automatically (aiFeatureMode). */
@@ -583,6 +609,9 @@ export const useSettingsStore = create<SettingsState>()(
       conciergeToolPolicyHydrated: false,
       resumeRule: DEFAULT_RESUME_RULE,
       autoApplyUpdates: true,
+      windowSpanMode: "safe",
+      windowAutoRespan: true,
+      windowIsSpanned: false,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
       improvementLastRunAt: null,
@@ -624,6 +653,9 @@ export const useSettingsStore = create<SettingsState>()(
       setKeychainChiefPat: (pat) => set({ keychainChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
+      setWindowSpanMode: (mode) => set({ windowSpanMode: mode }),
+      setWindowAutoRespan: (on) => set({ windowAutoRespan: on }),
+      setWindowIsSpanned: (on) => set({ windowIsSpanned: on }),
       setDeleteMergedBranch: (on) => set({ deleteMergedBranch: on }),
       setNotifyStatus: (status, on) =>
         set((s) => ({ notifyStatuses: { ...s.notifyStatuses, [status]: on } })),
@@ -838,6 +870,8 @@ export const useSettingsStore = create<SettingsState>()(
         aiAutoApprove: s.aiAutoApprove,
         aiConcierge: s.aiConcierge,
         autoApplyUpdates: s.autoApplyUpdates,
+        windowSpanMode: s.windowSpanMode,
+        windowAutoRespan: s.windowAutoRespan,
         notifyStatuses: s.notifyStatuses,
         sparkleImprovementConsent: s.sparkleImprovementConsent,
         improvementLastRunAt: s.improvementLastRunAt,

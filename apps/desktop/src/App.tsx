@@ -25,6 +25,7 @@ import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
 import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 import { useLimitSync } from "./hooks/useLimitSync";
+import { useDisplayRespan } from "./hooks/useDisplayRespan";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
@@ -82,6 +83,14 @@ function RosterPublisher() {
 // an ACCOUNT, so one poller serves every open agent. Paints no UI.
 function LimitSync() {
   useLimitSync();
+  return null;
+}
+
+// Re-fits a window spanned across displays when one is plugged in or unplugged. App-wide because
+// the Settings pane that offers the span is almost never open when a cable actually moves, and a
+// window left at a multi-display geometry after an unplug can end up unreachable. Paints no UI.
+function DisplayRespan() {
+  useDisplayRespan();
   return null;
 }
 
@@ -262,6 +271,7 @@ export function App() {
     <AppBoot>
       <RosterPublisher />
       <LimitSync />
+      <DisplayRespan />
       <LastFocusedProjectTracker />
       {/* Historical: WindowSessionCapture recorded per-window geometry so a cold start could
           reopen every project WINDOW (bead ). The single-window shell restores the
