@@ -136,7 +136,7 @@ export function RichPlaceholderOverlay({
  *  overlay exists. Used for the wake phrase ("Hey Sparkle") and the stop phrase. (The cyan→blue
  *  gradient fade was dropped per design feedback.) */
 export function PlaceholderEmphasis({ phrase }: { phrase: string }) {
-  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{phrase}</span>;
+  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}>{phrase}</span>;
 }
 
 /** The one-time voice-model download, shown in the placeholder slot. Deliberately quiet (the same
@@ -150,7 +150,7 @@ export function PreparingNotice({ pct }: { pct: number | null }) {
       <span>
         {PREPARING_PREFIX}
         {pct !== null ? (
-          <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}> ({pct}%)</span>
+          <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}> ({pct}%)</span>
         ) : (
           "…"
         )}
@@ -172,7 +172,7 @@ const VOICE_ERROR_ACTION: CSSProperties = {
   cursor: "pointer",
   font: "inherit",
   fontWeight: FONT_WEIGHT.bold,
-  color: C.teal,
+  color: C.tealInk,
 };
 
 /** A dictation failure, rendered in a composer's placeholder slot — beside the mic the user

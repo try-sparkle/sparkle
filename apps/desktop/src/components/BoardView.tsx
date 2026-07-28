@@ -461,7 +461,7 @@ function Card({
           {bead.id}
         </div>
         {workers.length > 0 && (
-          <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>
+          <div style={{ color: C.tealInk, fontSize: 11, lineHeight: 1.4 }}>
             <FiUsers size={11} style={{ verticalAlign: "-2px", marginRight: 3 }} aria-hidden />
             {workers.length === 1 ? "1 worker" : `${workers.length} workers`}: {workers.join(", ")}
           </div>
@@ -697,7 +697,7 @@ function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] 
       </div>
       <WorkflowLine stage={stage} height={3} />
       {workers.length > 0 && (
-        <div style={{ color: C.teal, fontSize: 11, lineHeight: 1.4 }}>{workers.join(", ")}</div>
+        <div style={{ color: C.tealInk, fontSize: 11, lineHeight: 1.4 }}>{workers.join(", ")}</div>
       )}
     </div>
   );
@@ -903,7 +903,7 @@ function DetailOverlay({
                 title={`Claim and build all ${prdEpics.length} epics that share this PRD`}
                 style={{
                   background: "transparent",
-                  color: C.teal,
+                  color: C.tealInk,
                   border: `1px solid ${C.teal}`,
                   borderRadius: 8,
                   padding: "6px 16px",
@@ -977,7 +977,7 @@ function DetailOverlay({
         {workers.length > 0 && (
           <div style={{ display: "flex", gap: 8, fontSize: 13 }}>
             <span style={{ color: C.muted, minWidth: 90 }}>Workers</span>
-            <span style={{ color: C.teal }}>{workers.join(", ")}</span>
+            <span style={{ color: C.tealInk }}>{workers.join(", ")}</span>
           </div>
         )}
       </div>

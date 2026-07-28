@@ -21,6 +21,7 @@
 import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
+import { C } from "../theme/colors";
 import { asRgb } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -716,6 +717,30 @@ describe("Build column — the tree owns only rows", () => {
     expect(tree).toBeTruthy();
     expect(tree.querySelector('[data-testid="status-filter-bar"]')).toBeNull();
     expect(tree.textContent).not.toContain("New Build Agent");
+  });
+
+  // ── THE "+ NEW BUILD AGENT" ROW'S HOVER IS AN INK, AND ITS ICON IS NOT TEXT ───────────────────
+  // Both were one-word reverts away from the defects they fixed (roborev 54019). `hoverColor` lands
+  // on `color` and `borderColor`, so handing it the chevron's FILL token puts a 3:1-floor colour on
+  // a 13px label — ≈3.2:1 in light mode. And an emoji-font glyph ignores `color` outright, so the
+  // icon could not follow the hover ink at all. chromeContrast measures the TOKENS; nothing tied
+  // this row to the right one, which is what these two pin.
+  it("lights the + New Build Agent row in the gold INK, not the chevron's fill", () => {
+    render(<AgentSidebar project={seed()} />);
+    const row = screen.getByText("+ New Build Agent").closest("button")!;
+    expect(row.style.color).toBe(C.muted);
+    fireEvent.mouseEnter(row);
+    expect(row.style.color).toBe(C.goldInk);
+    expect(row.style.borderColor).toBe(C.goldInk);
+    // Stated as a failing pairing so the revert is what goes red, not just a value change.
+    expect(row.style.color).not.toBe(C.goldFill);
+  });
+
+  it("draws that row's icon as an SVG, so it can take the hover ink", () => {
+    render(<AgentSidebar project={seed()} />);
+    const row = screen.getByText("+ New Build Agent").closest("button")!;
+    expect(row.querySelector("svg")).toBeTruthy();
+    expect(row.textContent).toBe("+ New Build Agent"); // no ⚒ riding along as text
   });
 
   // The head's aria-expanded has to own something structurally.

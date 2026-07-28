@@ -166,7 +166,7 @@ export function SelectionPopup({
         animation: "sparkle-tooltip-in 90ms ease-out",
       }}
     >
-      <div style={{ color: C.teal, fontSize: 11.5, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px", display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ color: C.tealInk, fontSize: 11.5, fontWeight: FONT_WEIGHT.semibold, margin: "2px 12px", display: "flex", alignItems: "center", gap: 4 }}>
         <FiCheck size={13} /> Copied to clipboard
       </div>
       <div

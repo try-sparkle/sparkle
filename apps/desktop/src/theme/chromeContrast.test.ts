@@ -28,7 +28,9 @@ import { C as BRAND } from "@sparkle/ui";
 import {
   CHROME_MIN_CONTRAST,
   CONTROL_MIN_CONTRAST,
+  DANGER,
   INK_MIN_CONTRAST,
+  PLANE_MIN_SPLIT,
   RAMP_MIN_SPLIT,
   THEME_HEX,
 } from "./colors";
@@ -455,6 +457,43 @@ describe("chrome separation — the shell's edges and fills", () => {
     expect(new Set(ramp).size).toBe(PLANES.length);
   });
 
+  // ── LIGHT'S THREE COLUMNS ─────────────────────────────────────────────────────────────────────
+  // The founder's report was "a mishmash of shades … gray-on-gray", and light's planes were the
+  // literal cause: terminal → concierge measured 1.162:1 and concierge → builder 1.184:1, i.e. BOTH
+  // under RAMP_MIN_SPLIT — the floor this file already applies to two chrome tokens that no
+  // component ever paints on top of each other. Three panes side by side had less separation than
+  // the palette demands of two values that never meet.
+  //
+  // DARK IS NOT SWEPT, and the asymmetry is the point rather than an omission: dark's four planes
+  // are the prototype's near-blacks and the section at the top of colors.ts spends a paragraph on
+  // why that ramp is SUPPOSED to collapse. Light has a white content plane and no such excuse.
+  //
+  // The pair is also bounded from ABOVE by the assertion two tests down ("the row's FILL step is
+  // below the chrome floor"), which pins `forest`↔`deepForest` under CHROME_MIN_CONTRAST in both
+  // themes. Contrast multiplies along a ramp, so these two steps have a hard ceiling of 1.5
+  // BETWEEN THEM — that ceiling, not taste, is why PLANE_MIN_SPLIT is where it is, and asserting
+  // both directions here keeps the next reader from "fixing" one by quietly deleting the other.
+  it("LIGHT's three column planes are far enough apart to read as three planes", () => {
+    const hex = THEME_HEX.light;
+    // Ordered outward from the content plane: terminal (white) → concierge column → builder column.
+    const COLUMNS = ["forest", "conciergeSurface", "deepForest"] as const;
+    for (let i = 0; i < COLUMNS.length - 1; i++) {
+      const [a, b] = [COLUMNS[i]!, COLUMNS[i + 1]!];
+      expect(
+        contrast(hex[a], hex[b]),
+        `light: ${a} (${hex[a]}) beside ${b} (${hex[b]})`,
+      ).toBeGreaterThanOrEqual(PLANE_MIN_SPLIT);
+    }
+    // The ceiling, restated as a number so the box is visible in one place: two steps at the floor
+    // must still fit under the chrome floor end to end, or the two guards cannot both hold.
+    expect(PLANE_MIN_SPLIT ** 2).toBeLessThan(CHROME_MIN_CONTRAST);
+    // And the FLOOR is boxed from below too (roborev 53986). A plane split may not be laxer than
+    // the bar applied to two chrome tokens that never touch — at 1.18 this guard passed the very
+    // spacing it was written to reject (`conciergeSurface`↔`deepForest` measured 1.184 before the
+    // re-space), which is a guard that records a decision without enforcing it.
+    expect(PLANE_MIN_SPLIT).toBeGreaterThanOrEqual(RAMP_MIN_SPLIT);
+  });
+
   it("the concierge column stays a distinct plane from the builder column, in both themes", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
@@ -635,6 +674,47 @@ describe("`mixedInk` — the orchestrator's mixed-workers disc", () => {
   });
 });
 
+// ── THE REST OF THE ACCENT FAMILY, THEMED ───────────────────────────────────────────────────────
+// `accent`, `success`, `amber` and `sienna` each already had an ink twin; `teal` and `violet` did not, and
+// passed through as brand literals on every plane in both themes. That is the same defect the four
+// existing splits were each created to fix, so it is measured the same way rather than argued.
+describe("`tealInk` / `violetInk` — the two brand accents that had no ink twin", () => {
+  const NEW_INKS = ["tealInk", "violetInk"] as const;
+  /** The brand literal each ink replaced, so a regression records WHAT it regressed to. */
+  const BRAND_OF = { tealInk: BRAND.teal, violetInk: BRAND.violet } as const;
+
+  it("each new ink clears AA on EVERY plane, in both themes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const ink of NEW_INKS) {
+        for (const plane of PLANES) {
+          expect(
+            contrast(hex[ink], hex[plane]),
+            `${mode}: ${ink} (${hex[ink]}) on ${plane} (${hex[plane]})`,
+          ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+        }
+      }
+    }
+  });
+
+  it("the brand literals they replaced do NOT — which is why both tokens exist", () => {
+    // Asserted as a FAILING measurement, in both themes, so neither token can be reverted to "the
+    // brand colour is fine here". Note this is not a light-mode-only story the way `goldFill` was:
+    // the black-and-gold repaint took dark's `forest` to near-black, and a saturated mid blue is
+    // under the floor against THAT too.
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const ink of NEW_INKS) {
+        const worst = Math.min(...PLANES.map((p) => contrast(BRAND_OF[ink], hex[p])));
+        expect(
+          worst,
+          `${mode}: brand ${ink.replace("Ink", "")} (${BRAND_OF[ink]}) at its worst plane`,
+        ).toBeLessThan(INK_MIN_CONTRAST);
+      }
+    }
+  });
+});
+
 describe("opaque gold is a themed PAIR — fill and the ink that sits on it", () => {
   it("`goldFill` clears the non-text control floor on every plane, in both themes", () => {
     // The Send button has no border; this contrast IS its edge. Held to WCAG 1.4.11's 3:1 rather
@@ -657,6 +737,94 @@ describe("opaque gold is a themed PAIR — fill and the ink that sits on it", ()
         contrast(hex.onGoldFill, hex.goldFill),
         `${mode}: onGoldFill (${hex.onGoldFill}) on goldFill (${hex.goldFill})`,
       ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+    }
+  });
+
+  // ── THE INACTIVE CHEVRON IS A SECOND FILL, AND IT WAS UNMEASURED ────────────────────────────────
+  // PlanBuildToggle paints ONE `goldFill` and desaturates the inactive mode with `filter:
+  // grayscale(1)`. The pair above measures the ACTIVE fill only, so the state the user is looking at
+  // half the time had no floor at all (roborev 54002) — and the 0.9 opacity that used to ride along
+  // with the filter made it worse, because opacity composites the label too: 5.17:1 became 4.28:1 in
+  // light. The opacity is gone; this is the guard that keeps it gone.
+  //
+  // `grayscale(1)` is the CSS filter's own luminance matrix, not an average of the channels — the
+  // difference is large enough here (#6d6d6d vs #567a7f-ish) that averaging would measure a colour
+  // the browser never paints.
+  //
+  // BOTH SIDES GO THROUGH IT, because `filter` applies to the whole button — the LABEL as much as
+  // the fill. It happens not to matter today (light's ink is #ffffff and dark's #090b14, both
+  // near-neutral), but measuring an unfiltered ink against a filtered fill would be the exact
+  // failure the paragraph above warns about, one token edit away (roborev 54025).
+  const grayscale = (h: string) => {
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)) as [number, number, number];
+    const y = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    return `#${[y, y, y].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+  };
+
+  it("the GRAYSCALED chevron still clears AA against its label, in both themes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      const inactive = grayscale(hex.goldFill);
+      const ink = grayscale(hex.onGoldFill);
+      expect(
+        contrast(ink, inactive),
+        `${mode}: the grayscaled label (${ink}) on the grayscaled chevron (${inactive})`,
+      ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+    }
+  });
+
+  // ── `DANGER` IS A SHAPE COLOUR, AND THIS IS WHERE THAT IS WRITTEN DOWN ───────────────────────────
+  // The unthemed brand red is the default reach for alert TEXT across the app — a dozen sites still
+  // pass it to `color:` — and it does not clear AA on light's planes (roborev 54025). Nothing said
+  // so: `chromeContrast` had never mentioned the constant, so every one of those sites looked like
+  // a considered choice. This asserts the failure, so that using it as ink is a documented defect
+  // rather than a discovery each reviewer makes again. `C.dangerInk` is the themed ink twin, and it
+  // is swept WHERE IT IS READ — the concierge column above, the modal and settings planes below —
+  // not on every plane. Precisely: `barSurface` carries no `dangerInk` measurement at all, and
+  // `DANGER` is pinned there only as a light-mode ink FAILURE (the loop below sweeps all four
+  // planes for that), so re-derive against the surface you are painting on before reaching for
+  // either. Sweeping the remaining `color: DANGER` call sites is bead sparkle-wqqg.
+  it("`DANGER` fails the INK floor on every light plane — it is a shape colour, not text", () => {
+    const hex = THEME_HEX.light;
+    for (const plane of PLANES) {
+      expect(
+        contrast(DANGER, hex[plane]),
+        `light: DANGER (${DANGER}) used as INK on ${plane} (${hex[plane]})`,
+      ).toBeLessThan(INK_MIN_CONTRAST);
+    }
+  });
+
+  it("`DANGER` clears the SHAPE floor on the white modal it borders — and only just", () => {
+    // Where it survives, and how narrowly. The DefineStageModal banner sits on `forest`, which is
+    // white in light mode, and its 1px edge clears the 3:1 control floor there (3.91). It does NOT
+    // clear it on `deepForest` (2.69), so this is not a licence to draw the constant anywhere — the
+    // plane is part of the claim, which is exactly what the un-swept `color: DANGER` sites forgot.
+    expect(contrast(DANGER, THEME_HEX.light.forest)).toBeGreaterThanOrEqual(CONTROL_MIN_CONTRAST);
+    expect(contrast(DANGER, THEME_HEX.light.deepForest)).toBeLessThan(CONTROL_MIN_CONTRAST);
+  });
+
+  // `dangerInk`'s own floor is NOT restated here. It is already swept — deliberately scoped to the
+  // surface it is read on by "the concierge column's themed INKS" above, whose comment explains at
+  // length why an all-planes sweep for those tokens would assert a contract they were never given.
+  // A second, broader copy here would supersede that decision silently and leave its rationale
+  // paragraph standing as the stale advice the next reader acts on (roborev 54038). The modal
+  // banner this pass repointed sits on `forest`, and OnePasswordPane's status pill and 12px error
+  // text sit on `deepForest` — two planes that sweep does not reach (it is also read on
+  // `conciergeSurface`, by NudgeCard, which is exactly what that sweep covers). Those two are measured
+  // below, by the same rule it follows: the surfaces the ink is actually READ on, named. `forest`
+  // alone would leave `deepForest` — the tightest of the four at 5.33:1 light — guarded nowhere
+  // (roborev 54045), which is how a re-point that keeps the white modal comfortable slides the
+  // settings dialog under the floor with the suite green.
+
+  it("`dangerInk` clears AA on the two planes the concierge sweep does not reach", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const plane of ["forest", "deepForest"] as const) {
+        expect(
+          contrast(hex.dangerInk, hex[plane]),
+          `${mode}: dangerInk (${hex.dangerInk}) on ${plane} (${hex[plane]})`,
+        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+      }
     }
   });
 

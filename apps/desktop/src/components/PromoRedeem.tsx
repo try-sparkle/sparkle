@@ -129,7 +129,7 @@ export function PromoRedeem({ refresh }: { refresh: () => Promise<void> }) {
         </button>
       </div>
       {error && <p style={{ color: DANGER, fontSize: 12, margin: 0 }}>{error}</p>}
-      {notice && <p style={{ color: C.teal, fontSize: 12, margin: 0 }}>{notice}</p>}
+      {notice && <p style={{ color: C.tealInk, fontSize: 12, margin: 0 }}>{notice}</p>}
     </div>
   );
 }

@@ -150,7 +150,7 @@ export function TerminalDropPill({
       </button>
 
       <div style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingRight: 18 }}>
-        <FiPaperclip size={16} style={{ flex: "none", color: C.teal, marginTop: 1 }} aria-hidden />
+        <FiPaperclip size={16} style={{ flex: "none", color: C.tealInk, marginTop: 1 }} aria-hidden />
         <div style={{ fontSize: 12.5, lineHeight: 1.4 }}>
           Attached {describeDrop(count, images)} to <strong>{agentName}</strong>. Nothing has been
           sent yet — say what you want done with it in the Sparkle box and hit Send.

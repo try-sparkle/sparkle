@@ -9,8 +9,27 @@ export const C = {
   forest: "#0a1a3f", // primary app background (deep navy)
   deepForest: "#0f2350", // sidebar, modals, cards (lifted navy)
 
+  // ── ONE PRIMARY, AND THE REST HAVE TO EARN THEIR PLACE ────────────────────────────────────────
+  // Eight accent hues live in this file, and for a long time nothing decided between them: the
+  // shell painted a cyan wordmark above a gold Send button beside a blue→cyan mode selector, which
+  // is what "a mishmash of shades and colours" was describing. GOLD (below) is the primary accent
+  // and that is now ENFORCED rather than asserted — the wordmark and the Plan/Build strip, the two
+  // largest decorative uses of `accent` and `teal`, both take gold.
+  //
+  // The rule the remaining accents are held to: an accent has to be SEMANTIC — it must be saying
+  // something about state that the user acts on — not decorative. `amber` (waiting), `sienna`
+  // (error/danger), `success` (running), `violet` (blocked externally) each pass that test.
+  // `teal`/`accent` survive as CTA/approve fills and as the workflow line's progress gradient,
+  // where the colour IS the reading. Anything else reaching for one of them should reach for gold.
+  //
+  // NOTE THE FILL/INK SPLIT BEFORE USING ANY OF THEM AS TEXT. Every value in this file is a
+  // literal, constant across themes, and most of them are legible as TEXT on only one of the two.
+  // The desktop theme layer carries the themed twin — accentInk, successInk, amberInk, dangerInk,
+  // goldInk, tealInk, violetInk — and apps/desktop/src/theme/chromeContrast.test.ts measures each
+  // one on the surface it is actually read on.
+
   // Interactive
-  teal: "#2f6bff", // PRIMARY brand blue — CTAs, approve, active indicator
+  teal: "#2f6bff", // brand blue — CTA/approve FILLS, active indicator (as ink: use tealInk)
   amber: "#e0982f", // caution / progress / waiting (kept warm for legibility)
   sienna: "#e0533f", // dangerous actions / error / deny (kept red for legibility)
 
@@ -79,6 +98,21 @@ export const C = {
  * (waiting/approval/errored only) — `blocked` recolors the dot and surfaces cross-project but
  * deliberately does NOT add to the badge count or fire a banner (it's "needs you eventually", not
  * "answer this now"). Notifications stay user-configurable per status (settingsStore).
+ *
+ * ── RED IS ASKED TO DO TWO JOBS, AND THE ANSWER IS TREATMENT, NOT A SECOND HUE ──────────────────
+ * The 2026-07-27 UI refresh asked that red stop meaning both "needs you" and "error". It was
+ * NOT split, deliberately, and this is the record of why: the nine-states-to-three-colors collapse
+ * documented above is the design, and the whole app reads the tier (windowStatus.isRedStatus, the
+ * cross-project banding, the filter chips, the tab badges). Adding a fourth colour re-opens that
+ * settled decision and costs the glance-readability it bought — a user does not act differently on
+ * "it crashed" than on "it is asking you something": both mean go look.
+ *
+ * The distinction the request actually wants is available WITHOUT a hue. `StatusFilterBar` already
+ * differentiates state by FILL — a solid dot when a band is showing, a hollow ring when it is not —
+ * and that treatment is what carries the difference wherever one is needed, including on the shared
+ * `BandBadge`. Same red, different shape.
+ *
+ * If the founder wants the hue split anyway, this is the paragraph to overrule.
  *
  * THE TWO SETS ARE DIFFERENT ON PURPOSE, AND THAT IS A TRAP. Code that means "is this row red?"
  * must call windowStatus.isRedStatus; code that means "is this agent asking me something right

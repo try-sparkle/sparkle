@@ -13,7 +13,7 @@
 // world and writes stage definitions; Unit 5 wires the open trigger + passes props.
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { FiCheck } from "react-icons/fi";
-import { C, CHAT_USER_BUBBLE, ROW_ACTIVE_BUBBLE } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, DANGER, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { ModalShell } from "./ModalShell";
 import { getConfig } from "../services/config";
@@ -670,8 +670,15 @@ const errorBanner: CSSProperties = {
   justifyContent: "space-between",
   gap: 10,
   fontSize: 12.5,
-  color: "#e5484d",
-  border: "1px solid #e5484d",
+  // The shared alert red, not a second copy of its hex — this banner and the trial/redeem alerts
+  // were drifting apart one literal at a time. It is the PAIR, though, not one value used twice
+  // (roborev 54002): `DANGER` is an unthemed brand constant that measures 3.91:1 on light's white
+  // modal — under AA for this 12.5px text — so the INK is the themed `dangerInk` (7.77:1 there,
+  // and swept on this plane and the settings dialog's by theme/chromeContrast.test.ts) and the
+  // constant stays on the border, which is a shape and clears the 3:1 control floor on `forest`.
+  // Same split OnePasswordPane took.
+  color: C.dangerInk,
+  border: `1px solid ${DANGER}`,
   borderRadius: 8,
   padding: "8px 10px",
   marginBottom: 10,

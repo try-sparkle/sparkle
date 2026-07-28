@@ -64,29 +64,33 @@
   --c-gold-fill: #f5c26b;
   --c-on-gold-fill: #090b14;
   --c-mixed-ink: #ecb968;
+  --c-teal-ink: #6f9bff;
+  --c-violet-ink: #a084f5;
 }
 :root[data-theme="light"] {
   --c-forest: #ffffff;
-  --c-deep-forest: #d9dce1;
-  --c-concierge-surface: #eceef2;
-  --c-concierge-muted: #536280;
+  --c-deep-forest: #d3d6db;
+  --c-concierge-surface: #e7eaef;
+  --c-concierge-muted: #4e5c79;
   --c-bar-surface: #f1f4fa;
   --c-hairline: #6e7a93;
   --c-pill-fill: #929bad;
   --c-cream: #0a1a3f;
-  --c-muted: #5b6b8c;
+  --c-muted: #586885;
   --c-chat-bubble: #92ade5;
   --c-chat-bubble-active: #5f87e0;
   --c-accent-ink: #0a1a3f;
   --c-agent-idle: #3f4e6b;
   --c-success-ink: #15803d;
   --c-amber-ink: #664200;
-  --c-danger-ink: #aa241d;
+  --c-danger-ink: #a01f18;
   --c-gold-ink: #7a5205;
   --c-gold-hot-ink: #5c3f05;
   --c-gold-fill: #9a6a00;
   --c-on-gold-fill: #ffffff;
   --c-mixed-ink: #b45309;
+  --c-teal-ink: #1c47bd;
+  --c-violet-ink: #5636b8;
 }
 
 * {

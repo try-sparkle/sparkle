@@ -7,17 +7,40 @@
 //
 // Presentational + prop-driven: the callers own what a click DOES (AgentSidebar keeps its
 // two-stage Build chevron, which spawns a fresh build agent on a second click).
-import { C, ON_BRAND_FILL, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C, ON_GOLD_FILL } from "../theme/colors";
 import { FaTasks } from "react-icons/fa";
+import { FiTool } from "react-icons/fi";
 import type { WorkMode } from "../stores/uiStore";
 
-// The two mode buttons (Plan / Build) form one continuous Sparkle blue→cyan fade. These are the
-// fade boundaries: the cyan "S" accent on the far left of Plan, the primary brand blue on the far
-// right of Build, and an interpolated stop at the Plan→Build seam so each button paints exactly its
-// slice of the SAME overall gradient.
-const FADE_0 = C.accent; // #34e0f0 — logo cyan, far-left edge of Plan
-const FADE_2 = "#3192fa"; // Plan→Build seam
-export const FADE_3 = C.teal; // #2f6bff — primary brand blue, far-right edge of Build
+// ── THE STRIP IS GOLD NOW, AND FLAT ─────────────────────────────────────────────────────────────
+// It used to paint one continuous cyan→blue fade across Plan and Build, with an interpolated
+// literal (#3192fa) at the seam. That made the second-largest coloured surface in the shell a hue
+// `packages/ui/tokens.ts` classifies as DECORATIVE, directly beside a gold Send button and a gold
+// wordmark — the "mishmash of shades and colours" this pass exists to end. Gold is the declared
+// primary accent; the mode selector is the app's most prominent control, so it is the thing that
+// should be carrying it.
+//
+// The FADE IS GONE rather than re-tinted, and the reason is a floor, not taste. A themed gold
+// gradient needs two themed stops, and every candidate for the lighter end came in around 3.5:1
+// against white ink in LIGHT mode — under AA for 13px labels. One themed fill has the pairing the
+// palette already guarantees (`onGoldFill` on `goldFill`, asserted in theme/chromeContrast.test.ts)
+// and the strip loses nothing legible: the chevron tessellation, the seam hairline and the
+// grayscale-on-inactive treatment are what actually separate the two modes.
+//
+// The chevron's FILL, and nothing else's. It used to be exported because AgentSidebar read it for
+// the "+ New Build Agent" hover tint — that is exactly the mix-up BUILD_INK below fixed, so the
+// export is gone with it: a fill token reachable from outside this file is an invitation to paint
+// text with it again. It pairs with ON_GOLD_FILL, which the palette guarantees (chromeContrast).
+const BUILD_FILL = C.goldFill;
+
+// The SAME gold as ink, and the distinction is a floor rather than a shade preference (roborev
+// 53986). `goldFill` is a FILL: it is held to CONTROL_MIN_CONTRAST (3:1) because the Send button's
+// own edge is the only thing it has to survive. `NewAgentRow` applies its `hoverColor` to `color`
+// and `borderColor` — a 13px label, i.e. TEXT — and light's `goldFill` (#9a6a00) measures ≈3.2:1 on
+// the sidebar's `deepForest` plane, under the AA ink floor. `goldInk` (#7a5205) measures ≈4.75:1 on
+// the same plane and is already swept there by theme/chromeContrast.test.ts. Fill for the chevron,
+// ink for the label; they are one gold with two floors, not two golds.
+export const BUILD_INK = C.goldInk;
 
 // Depth (px) of the chevron point/notch carved into a button's vertical edge.
 const CHEVRON = 11;
@@ -44,18 +67,14 @@ function chevronClip(leftNotch: boolean, rightPoint: boolean): string {
   return `polygon(${pts.join(", ")})`;
 }
 
-// Shared style for a chevron in the mode strip: a solid gradient slice with NO border/stroke,
-// clipped to its chevron shape. `fillText` is the per-chevron ink chosen for contrast on that fill.
-// The strip's rounded outer corners come from the wrapper (overflow:hidden + borderRadius), so the
-// chevrons themselves are square; `leftNotch` chevrons overlap the previous one by CHEVRON px
-// (negative margin) so the point tessellates exactly into the notch. `active` is the currently
-// selected mode: the active chevron keeps its brand color; the inactive one renders grayscale.
-// `justify` places the glyph+label: Plan is left-justified (its flat-left, wrapper-rounded edge
-// reads like the old Think tab), Build stays centered.
+// Shared style for a chevron in the mode strip: one solid fill with NO border/stroke, clipped to
+// its chevron shape. The strip's rounded outer corners come from the wrapper (overflow:hidden +
+// borderRadius), so the chevrons themselves are square; `leftNotch` chevrons overlap the previous
+// one by CHEVRON px (negative margin) so the point tessellates exactly into the notch. `active` is
+// the currently selected mode: the active chevron keeps its gold; the inactive one renders
+// grayscale. `justify` places the glyph+label: Plan is left-justified (its flat-left,
+// wrapper-rounded edge reads like the old Think tab), Build stays centered.
 function createBtnStyle(
-  from: string,
-  to: string,
-  fillText: string,
   leftNotch: boolean,
   rightPoint: boolean,
   active: boolean,
@@ -74,12 +93,19 @@ function createBtnStyle(
     fontFamily: '"IBM Plex Sans", sans-serif',
     fontSize: 13,
     whiteSpace: "nowrap",
-    background: `linear-gradient(90deg, ${from}, ${to})`,
-    color: fillText,
+    background: BUILD_FILL,
+    color: ON_GOLD_FILL,
     // The active mode shows its brand color; the inactive one desaturates to grayscale.
+    //
+    // GRAYSCALE ONLY — the 0.9 opacity that used to ride with it is gone (roborev 54002). Opacity
+    // composites the whole button, LABEL INCLUDED, over the plane behind it, so it lightened the
+    // fill and dimmed the white ink at the same time: in light mode the desaturated #9a6a00 (gray
+    // #6d6d6d) went from 5.17:1 against `onGoldFill` to 4.28:1 at 0.9 over `deepForest` — under AA
+    // for a 13px label, on the app's most prominent control. Desaturation alone is what says
+    // "inactive"; it costs no contrast, and theme/chromeContrast.test.ts measures the grayscaled
+    // fill against the ink now rather than only the active pair.
     filter: active ? "none" : "grayscale(1)",
-    opacity: active ? 1 : 0.9,
-    transition: "filter 120ms ease, opacity 120ms ease",
+    transition: "filter 120ms ease",
     // Flex-align the (enlarged, line-height-0) glyph against the label so the
     // icon sits on the label's vertical center rather than its text baseline.
     display: "flex",
@@ -118,18 +144,16 @@ export function PlanBuildToggle({
         ...style,
       }}
     >
-      {/* Plan / Build form one chevron strip painting a single blue→cyan fade. It's a MODE
-          SELECTOR: the active chevron keeps its color, the other goes grayscale. Plan leads with
-          the logo cyan, left-justified, and its flat-left edge is rounded by the wrapper. Build
-          points-notch tessellates onto it. */}
+      {/* Plan / Build form one chevron strip in the shell's primary gold. It's a MODE SELECTOR:
+          the active chevron keeps its colour, the other goes grayscale. Plan's flat-left edge is
+          rounded by the wrapper; Build's point-notch tessellates onto it. */}
       {beadsEnabled && (
         <button
           data-hint="plan"
           onClick={onPickPlan}
           title="Plan mode — this project's read-only Tasks board"
-          // First in the strip: flat, wrapper-rounded left; points right into Build. Cyan leads,
-          // dark ink, left-justified content.
-          style={createBtnStyle(FADE_0, FADE_2, ON_BRAND_FILL_DARK, false, true, mode === "plan", "flex-start")}
+          // First in the strip: flat, wrapper-rounded left; points right into Build.
+          style={createBtnStyle(false, true, mode === "plan", "flex-start")}
         >
           <FaTasks size={14} style={{ flexShrink: 0 }} />
           <span>Plan</span>
@@ -140,9 +164,12 @@ export function PlanBuildToggle({
         onClick={onPickBuild}
         title="Build mode — your Build orchestrator agents"
         // Last in the strip: notched left when Plan precedes it, flat right.
-        style={createBtnStyle(FADE_2, FADE_3, ON_BRAND_FILL, beadsEnabled, false, mode === "build")}
+        style={createBtnStyle(beadsEnabled, false, mode === "build")}
       >
-        <span style={{ fontSize: 26, lineHeight: 0, transform: "translateY(-3.5px)" }}>⚒</span>
+        {/* A react-icon, not the ⚒ character it replaced: this repo bans emoji-as-icons, and a
+            glyph that renders from the system emoji font also ignores `color`, so it was the one
+            mark on the strip that could not follow the gold ink. */}
+        <FiTool size={15} style={{ flexShrink: 0 }} />
         <span>Build</span>
       </button>
     </div>

@@ -27,6 +27,9 @@ import { CaptureApp } from "./CaptureApp";
 import { useProjectStore } from "../stores/projectStore";
 import { useAuthStore } from "../stores/authStore";
 import { LAST_FOCUSED_PROJECT_KEY } from "./lastFocusedProject";
+import { LOGO_SRC } from "../components/SparkleWordmark";
+import { THEME_HEX } from "../theme/colors";
+import { asRgb, prefixedStyle } from "../components/statusDotTestUtils";
 import type { Project } from "../types";
 
 const SHOT: CaptureShot = { path: "/tmp/shot.png", dataUrl: "data:image/png;base64,AAAA" };
@@ -84,6 +87,28 @@ describe("CaptureApp", () => {
     expect(screen.queryByText("Plan ❯")).toBeNull();
     // Build now opens an options menu, so it's badged with a ▾ affordance, not the ❯ send glyph.
     expect(screen.getByText("Build ▾")).toBeTruthy();
+  });
+
+  it("paints the SAME masked wordmark the rest of the app does, not the raw cyan asset", () => {
+    // The takeover kept its own `<img src="/sparkle-logo.svg">` when the concierge column's mark
+    // became an alpha mask over gold, so the app showed two wordmarks that disagreed (roborev
+    // 53986). Both windows now render `SparkleWordmark`; the raw asset must not come back as an
+    // image, because an `<img>` here paints the asset's own cyan→blue gradient.
+    render(<CaptureApp />);
+    fireShot();
+    const mark = screen.getByRole("img", { name: "Sparkle" });
+    expect(mark.tagName).toBe("SPAN");
+    // The mask that is actually applied, and the dark literal behind it — this window pins
+    // data-theme=dark, so the themed var would be the wrong paint here.
+    expect(mark.style.maskImage).toBe(`url(${LOGO_SRC})`);
+    // The prefixed spellings too: the shipped WebView is WebKit-based, so those are the ones that
+    // actually paint (roborev 54033). Same pair the concierge column's mark pins, read through the
+    // shared `prefixedStyle` helper, which records where jsdom keeps them.
+    expect(prefixedStyle(mark, "WebkitMaskImage")).toBe(`url(${LOGO_SRC})`);
+    expect(mark.style.maskSize).toBe("contain");
+    expect(prefixedStyle(mark, "WebkitMaskSize")).toBe("contain");
+    expect(mark.style.background).toBe(asRgb(THEME_HEX.dark.goldInk));
+    expect(document.querySelector('img[src="/sparkle-logo.svg"]')).toBeNull();
   });
 
   it("defaults the project switcher to the last-focused project", () => {

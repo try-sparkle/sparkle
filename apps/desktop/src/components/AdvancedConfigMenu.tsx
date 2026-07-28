@@ -243,7 +243,7 @@ export function AdvancedConfigMenu() {
         </div>
       )}
       {status && !error && (
-        <div style={{ color: C.teal, fontSize: 12.5, marginTop: 6 }}>{status}</div>
+        <div style={{ color: C.tealInk, fontSize: 12.5, marginTop: 6 }}>{status}</div>
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>

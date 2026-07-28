@@ -270,8 +270,11 @@ export function rollupStages(stages: WorkflowStageId[]): WorkflowRollup | null {
 // to the deep blue of the "i" (its dotted eye) on the right. It fills left→right as work advances
 // through the ten stages, so a glance reads "how far toward shipped" from BOTH the fill length and
 // its color deepening from teal to blue. These are the literal stops of the logo's linearGradient.
-export const LINE_FROM = "#34e0f0"; // the "S" — teal/cyan, left end of the logo gradient
-export const LINE_TO = "#2f6bff"; //   the "i"/eye — deepest blue, right end of the logo gradient
+// Spelled as the brand TOKENS, not as copies of their hex. Both are literals at runtime (the
+// theme layer only var()-ifies the themed tokens), so the lerp below can still parse them — but a
+// retune of the brand palette now moves the line with it instead of leaving two stale strings.
+export const LINE_FROM = C.accent; // the "S" — teal/cyan, left end of the logo gradient
+export const LINE_TO = C.teal; //    the "i"/eye — deepest blue, right end of the logo gradient
 
 // Fraction of the bar filled at a given stage. Stage 1 (Thought) shows a short stub (1/10) so a
 // brand-new idea reads as "started", and Shipped fills the whole bar (10/10).

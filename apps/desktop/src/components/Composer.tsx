@@ -111,7 +111,7 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
  *  (C.teal #2f6bff), matching the wake phrase. (The cyan→blue gradient fade was dropped per
  *  design feedback.) */
 function StopPhrase({ phrase = STOP_PHRASE }: { phrase?: string }) {
-  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{phrase}</span>;
+  return <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}>{phrase}</span>;
 }
 
 /** The one-time voice-model download, shown in the composer's placeholder slot. Deliberately quiet
@@ -125,7 +125,7 @@ function ComposerPreparingNotice({ pct }: { pct: number | null }) {
       <span>
         {PREPARING_PREFIX}
         {pct !== null ? (
-          <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}> ({pct}%)</span>
+          <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}> ({pct}%)</span>
         ) : (
           "…"
         )}
@@ -153,7 +153,7 @@ const VOICE_ERROR_ACTION: React.CSSProperties = {
   cursor: "pointer",
   font: "inherit",
   fontWeight: FONT_WEIGHT.bold,
-  color: C.teal,
+  color: C.tealInk,
 };
 
 function ComposerVoiceError({ notice }: { notice: VoiceErrorNotice }) {
@@ -1722,7 +1722,7 @@ export function Composer({
                 // the typing hint, so like the mic-hot copy it stays put on focus.
                 <>
                   {WAKE_PREFIX}
-                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.teal }}>{wakeWord}</span>
+                  <span style={{ fontWeight: FONT_WEIGHT.bold, color: C.tealInk }}>{wakeWord}</span>
                   {WAKE_SUFFIX}
                 </>
               ) : micPresentation === "focusPaused" ? (

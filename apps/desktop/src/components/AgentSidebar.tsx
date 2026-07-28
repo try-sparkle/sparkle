@@ -15,8 +15,8 @@ import {
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
-// FiChevronsLeft/Right are §10's two pull tabs.
-import { FiCloud, FiChevronsLeft, FiChevronsRight } from "react-icons/fi";
+// FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
+import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
@@ -87,7 +87,7 @@ import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
-import { PlanBuildToggle, FADE_3 } from "./PlanBuildToggle";
+import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { FittedAgentName } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
@@ -173,8 +173,11 @@ type SidebarScrollApi = {
 const SidebarScrollContext = createContext<SidebarScrollApi | null>(null);
 
 // The "+ New <kind> Agent" button. On hover the dotted outline becomes a solid stroke and the
-// icon + label light up in the mode's brand color — the same blue/cyan as that mode's chevron
-// (Build → FADE_3 brand blue, Think → FADE_0 logo cyan). The background is left unchanged.
+// icon + label light up in the mode's accent — the same gold as that mode's chevron, now that the
+// strip stopped painting a decorative cyan→blue fade. It takes the INK twin of that gold
+// (`BUILD_INK`), not the chevron's fill: `hoverColor` lands on `color` and `borderColor` here, and
+// a fill token is only held to the 3:1 control floor — see the note on PlanBuildToggle.BUILD_INK.
+// The background is left unchanged.
 // `sharedHover`/`onHoverChange` let a SECOND instance of the button elsewhere (the Workspace
 // empty-state start button) drive this one blue too, so hovering either lights up both.
 function NewAgentRow({
@@ -250,9 +253,12 @@ export function NewBuildAgentButton({
   useEffect(() => () => setBuildAgentHover(false), [setBuildAgentHover]);
   return (
     <NewAgentRow
-      icon={<span style={{ fontSize: 20, lineHeight: 0 }}>⚒</span>}
+      // A react-icon, not the ⚒ character it replaced — the same swap PlanBuildToggle's Build
+      // chevron made, and for the second reason stated there as well as the emoji ban: an
+      // emoji-font glyph ignores `color`, so the ⚒ could not follow the gold hover ink below.
+      icon={<FiTool size={18} style={{ flexShrink: 0 }} />}
       label="+ New Build Agent"
-      hoverColor={FADE_3}
+      hoverColor={BUILD_INK}
       onClick={onClick}
       sharedHover={buildAgentHover}
       onHoverChange={setBuildAgentHover}

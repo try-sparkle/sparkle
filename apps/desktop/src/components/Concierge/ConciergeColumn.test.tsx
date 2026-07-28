@@ -56,7 +56,11 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
     // The mark is the Sparkle.ai LOGO, sharing the header's one row with the credit pill — see
     // SparkleLogo.placement.test for the one-mark contract and the corner-to-corner placement.
-    expect(screen.getByAltText("Sparkle")).toBeTruthy();
+    // Queried by ROLE, not alt: §1 made the mark an alpha mask over C.goldInk rather than a painted
+    // <img> (the asset's own cyan gradient was the largest decorative non-gold patch on screen), so
+    // the accessible name moved from `alt` to `role="img"` + `aria-label`. Same name, no longer an
+    // image element.
+    expect(screen.getByRole("img", { name: "Sparkle" })).toBeTruthy();
     expect(screen.getByText("Following all projects")).toBeTruthy();
     expect(container.textContent).toContain("1 Needs you · 2 Running");
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();

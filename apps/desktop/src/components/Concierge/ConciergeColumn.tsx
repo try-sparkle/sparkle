@@ -60,7 +60,14 @@ export function ConciergeColumn({
         // Depth layer ① — the LIGHTEST of the shell's three planes (PRD §3: Sparkle lightest →
         // builder → terminal darkest). See theme/colors THEME_HEX.conciergeSurface.
         background: C.conciergeSurface,
-        borderRight: `1px solid color-mix(in srgb, ${C.muted} 25%, transparent)`,
+        // THE COLUMN'S EDGE, not a wash of one. This was `color-mix(muted 25%, transparent)` — a
+        // quarter-strength tint, which on light mode's near-white planes is very nearly nothing.
+        // Light's plane ramp is capped (see PLANE_MIN_SPLIT in theme/colors: `forest`↔`deepForest`
+        // is pinned BELOW the chrome floor by another guard, so the three columns cannot be spaced
+        // more than ~1.46:1 apart end to end), which means the boundary has to come from an EDGE
+        // rather than a bigger step in fill. `hairline` is the token whose whole job is a 1px rule
+        // that must be SEEN, and it is held to that floor on every plane in both themes.
+        borderRight: `1px solid ${C.hairline}`,
         color: C.cream,
         fontFamily: "Verdana, Geneva, sans-serif",
         fontSize: 14,

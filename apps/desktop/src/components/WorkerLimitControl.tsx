@@ -91,7 +91,7 @@ export function WorkerLimitControl() {
         // per-agent budget), and 0 is already the minimum — so there is nothing to lower. The Rust
         // warning was corrected for exactly this (config.rs, "Set a positive agent_heap_mb…");
         // the UI says the same thing rather than contradicting it.
-        <div style={{ ...hint, color: C.teal }}>
+        <div style={{ ...hint, color: C.tealInk }}>
           This Mac's memory only fits {effective} at once, so that's the limit in effect. Set a
           smaller (positive) agent_heap_mb in config.toml to fit more.
         </div>

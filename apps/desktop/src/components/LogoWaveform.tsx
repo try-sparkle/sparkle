@@ -508,7 +508,7 @@ export function LogoWaveform() {
                 cursor: "pointer",
                 font: "inherit",
                 fontWeight: FONT_WEIGHT.semibold,
-                color: C.teal,
+                color: C.tealInk,
               }}
             >
               Open System Settings
@@ -554,7 +554,7 @@ export function LogoWaveform() {
                 fontWeight: 600,
                 // Solid brand blue (C.teal #2f6bff) — no gradient fade (matches the composer's
                 // "Hey Sparkle"). The cyan→blue fade was dropped per design feedback.
-                color: C.teal,
+                color: C.tealInk,
               }}
             >
               {phase === "passive" ? wakeWord : stopWord}

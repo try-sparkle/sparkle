@@ -1,6 +1,6 @@
 import { type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useApprovalsStore } from "../stores/approvalsStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -281,7 +281,9 @@ const warnPill: CSSProperties = {
 function btn(active: boolean): CSSProperties {
   return {
     background: active ? C.teal : "transparent",
-    color: active ? "#ffffff" : C.cream,
+    // Text ON a brand-teal fill: the token for exactly that, which stays light in BOTH themes
+    // (the themed `cream` flips to navy in light and would go low-contrast on teal).
+    color: active ? ON_BRAND_FILL : C.cream,
     border: `1px solid ${active ? C.teal : C.muted}`,
     borderRadius: 7,
     padding: "5px 9px",

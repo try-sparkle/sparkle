@@ -101,9 +101,31 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // PLANE ink. Surfaces that carry it belong on a plane — which is why the sidebar's hover card
 // moved to `barSurface`, and why the three 10px secondary lines on AgentPane's selected account
 // row take `cream` there instead. See theme/chromeContrast.test.ts for the measurement.
+//
+// ── LIGHT'S THREE COLUMNS ARE A RAMP TOO, AND IT WAS TOO FLAT TO READ ─────────────────────────
+// The founder's complaint about light mode was "a mishmash of shades … gray-on-gray": the concierge
+// column, the builder column and the terminal are three planes, and light spaced them 1.16:1 and
+// 1.18:1 apart — under RAMP_MIN_SPLIT, i.e. below the bar this file already sets for two CHROME
+// tokens that merely coexist. They are now re-spaced to PLANE_MIN_SPLIT (see below).
+//
+// THE CEILING IS NOT A PREFERENCE, IT IS ANOTHER GUARD. `forest`↔`deepForest` must stay BELOW
+// CHROME_MIN_CONTRAST in both themes — chromeContrast.test.ts records that step as insufficient,
+// which is the whole justification for the Improve-Sparkle row's gold rail. Contrast ratios
+// MULTIPLY along a ramp, so forest→concierge→builder is capped at 1.5 END TO END and each of the
+// two steps at √1.5 ≈ 1.2247. That is why the light planes land where they do (≈1.206 / ≈1.208,
+// ≈1.457 end to end) rather than somewhere more emphatic: there is no more room, and taking it
+// would mean deleting a guard to make a colour pass. The rest of light's column separation comes
+// from EDGES instead — the concierge column's right border is `hairline` now, not a 25% wash of
+// `muted` — which is the same division of labour the dark ramp already documents above.
+//
+// FOUR INKS MOVED WITH THE PLANES, because their floors are measured ON them: `muted` (AA on the
+// concierge column), `conciergeMuted` (AA on the nudge-card gradient AND the bounded residual on the
+// composer plate — amberInk.test.ts pins it from both sides), and `dangerInk` (AA on the nudge
+// badge's own sienna fill). Each was re-derived against the NEW surface, not nudged until a test
+// went quiet.
 export const THEME_HEX = {
-  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14", amberInk: "#ecb968", mixedInk: "#ecb968" },
-  light: { forest: "#ffffff", deepForest: "#d9dce1", conciergeSurface: "#eceef2", conciergeMuted: "#536280", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#5b6b8c", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#aa241d", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff", amberInk: "#664200", mixedInk: "#b45309" },
+  dark: { forest: "#05070d", deepForest: "#0f1220", conciergeSurface: "#191d2d", conciergeMuted: "#8b90a6", barSurface: "#161a2b", hairline: "#63698c", pillFill: "#454d71", cream: "#ece7da", muted: "#8b90a6", chatBubble: "#354065", chatBubbleActive: "#4e5a90", accentInk: "#34e0f0", agentIdle: "#8b90a6", successInk: "#34c759", dangerInk: "#e87b7b", goldInk: "#f5c26b", goldHotInk: "#ffe9b8", goldFill: "#f5c26b", onGoldFill: "#090b14", amberInk: "#ecb968", mixedInk: "#ecb968", tealInk: "#6f9bff", violetInk: "#a084f5" },
+  light: { forest: "#ffffff", deepForest: "#d3d6db", conciergeSurface: "#e7eaef", conciergeMuted: "#4e5c79", barSurface: "#f1f4fa", hairline: "#6e7a93", pillFill: "#929bad", cream: "#0a1a3f", muted: "#586885", chatBubble: "#92ade5", chatBubbleActive: "#5f87e0", accentInk: "#0a1a3f", agentIdle: "#3f4e6b", successInk: "#15803d", dangerInk: "#a01f18", goldInk: "#7a5205", goldHotInk: "#5c3f05", goldFill: "#9a6a00", onGoldFill: "#ffffff", amberInk: "#664200", mixedInk: "#b45309", tealInk: "#1c47bd", violetInk: "#5636b8" },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -194,6 +216,27 @@ export const C = {
   // amber belongs (everywhere else in the app it is a fill behind dark ink, not ink itself).
   // Measured, not asserted: theme/amberInk.test.ts.
   amberInk: "var(--c-amber-ink)",
+  // Brand BLUE as TEXT — the same split as accent/accentInk, and the one the family was missing.
+  // BRAND.teal (#2f6bff) is the CTA/fill colour and stays constant wherever it is a SHAPE; as an
+  // INK it clears AA in NEITHER theme on the surfaces it is actually read on. It is a saturated mid
+  // blue, so it is too dark on light's near-white planes (3.09:1 at worst) AND too dark on dark's
+  // near-black ones (3.72:1) — the black-and-gold repaint took `forest` to #05070d and pulled it
+  // under there too, which is exactly the accentInk story one hue over. Eighteen `color: C.teal`
+  // sites are text or a glyph — the wake-word phrase in the composer placeholder, BoardView's
+  // worker lists, the drop pill's clip, SelectionPopup's header — and take this instead. TWO are
+  // deliberately still on the brand literal: `WORKFLOW_STAGES`' stage colours, which are a fill in
+  // WorkflowLine before they are ever an ink, and one label in `AgentSidebar` that belongs to a
+  // concurrent worker's file this pass.
+  tealInk: "var(--c-teal-ink)",
+  // Brand VIOLET as TEXT, completing the same family. `violet` is the "blocked / stalled on
+  // something external" hue and, like teal, only clears AA as a fill (2.60:1 light / 4.42:1 dark).
+  //
+  // ITS TEXT CONSUMERS ARE NOT REPOINTED YET, stated rather than left to be discovered. The two
+  // live ones are `OpenPrMenu.tsx`'s PR chip and its per-PR link, and that file is owned by a
+  // concurrent worker this pass, so touching it would just be a merge conflict. The token is added
+  // now because the palette merge is the expensive part — cssMirror.test.ts holds both halves in
+  // sync from here — and repointing those two `color:` values is a one-line follow-up.
+  violetInk: "var(--c-violet-ink)",
   // ALARM RED as TEXT — the fourth instance of the accent/ink split, and the one that was missing.
   // BRAND.sienna is the fill/rail/tint colour and passes through unthemed everywhere it is a
   // SHAPE; as an INK it does not clear the floor at either end. That value paints the nudge card's
@@ -276,6 +319,38 @@ export const CHROME_MIN_CONTRAST = 1.5;
  *  measured a whisker over 1.0 while every per-pair floor someone had remembered to write still
  *  reported green, so the guard sweeps the whole ladder rather than a list of remembered pairs. */
 export const RAMP_MIN_SPLIT = 1.2;
+/** Floor between the THREE COLUMN PLANES in LIGHT mode — terminal (`forest`), concierge column
+ *  (`conciergeSurface`), builder column (`deepForest`).
+ *
+ *  DARK IS DELIBERATELY EXEMPT and that is not an oversight: dark's planes are the prototype's four
+ *  near-blacks, a recession ramp that is MEANT to collapse, and `forest` there is also the terminal
+ *  background every calm ink is measured against. Light is the opposite case — `forest` is WHITE,
+ *  the columns are the only thing telling the eye where one pane ends and the next begins, and the
+ *  old spacing (1.16 and 1.18) sat under even RAMP_MIN_SPLIT, the bar this file sets for two chrome
+ *  tokens no component ever paints together. That is what "gray-on-gray" was.
+ *
+ *  IT IS BOXED IN FROM ABOVE, WHICH IS WHY IT IS THIS NUMBER AND NOT A ROUNDER ONE. Contrast
+ *  multiplies along a ramp and `forest`↔`deepForest` is pinned BELOW CHROME_MIN_CONTRAST by the
+ *  guard that justifies the Improve-Sparkle rail, so the two steps together cannot reach 1.5 and
+ *  neither can exceed √1.5 ≈ 1.2247. A floor much above this would make the two guards
+ *  unsatisfiable together, i.e. it would force one of them to be deleted — which is the move this
+ *  whole file exists to prevent.
+ *
+ *  IT IS `RAMP_MIN_SPLIT`, NOT A HAIR UNDER IT (roborev 53986). It shipped at 1.18 for one round,
+ *  which is BELOW the defect it was written to catch: the old `conciergeSurface`↔`deepForest` step
+ *  measured 1.184, so a revert to the exact gray-on-gray spacing stayed green — and 1.18 was also
+ *  weaker than the bar this file already applies to two chrome tokens no component composites.
+ *
+ *  THE CORRIDOR IS NARROW, AND THE REAL NUMBERS ARE HERE RATHER THAN THE WORD "room" (roborev
+ *  54019). Light measures 1.2060 (`forest`↔`conciergeSurface`) and 1.2083
+ *  (`conciergeSurface`↔`deepForest`) against this 1.2 floor — 0.5% and 0.7% of headroom — and
+ *  1.4572 end to end against the 1.5 ceiling, ~2.9%. So light's three planes are pinned to within
+ *  about 1% and MUST BE CHANGED AS A SET: nudging one of them alone will go red on the floor below
+ *  or the ceiling above, and the fix for one is a violation of the other. That is the intended
+ *  state — the box is what stops "make it pop" from quietly deleting a guard — but it is a box, not
+ *  a comfortable margin, and anyone re-spacing these should re-derive all three plus the four inks
+ *  measured on them. */
+export const PLANE_MIN_SPLIT = 1.2;
 /** The stricter floor, for a shape that is a control boundary rather than a divider. */
 export const CONTROL_MIN_CONTRAST = 3;
 /** Floor for any themed INK against the surface it is read on — WCAG AA for normal text. The

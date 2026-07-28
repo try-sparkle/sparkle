@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FiX, FiCheck, FiChevronDown, FiArrowUpRight } from "react-icons/fi";
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import type { SuggestionButton } from "../../services/suggestions/types";
 
 // The recommended one-click action, shown when an agent is waiting on the user and the composer
@@ -112,7 +112,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "
   // Close is a kind:"control" app action. Keying on kind would leave Land/Push looking like an
   // ordinary suggestion.
   const isCta = b.source === "control";
-  const fg = isCta ? "#ffffff" : C.cream;
+  const fg = isCta ? ON_BRAND_FILL : C.cream;
 
   const runButton = (btn: SuggestionButton) => {
     setOpen(false);

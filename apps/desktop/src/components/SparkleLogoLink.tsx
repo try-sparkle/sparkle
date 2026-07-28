@@ -5,10 +5,15 @@
 // two reasons: the column is a pure renderer driven by its view-model, and the accessibility
 // contract below is the kind of thing that quietly regresses when it is one anonymous <a> nested
 // three levels inside a layout block.
+//
+// The MARK itself is `SparkleWordmark` — see that file for why it is an alpha mask over `goldInk`
+// rather than the shipped cyan→blue asset. This file is only the link around it, which is the split
+// that let the capture takeover stop painting a second, disagreeing wordmark.
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { SparkleWordmark } from "./SparkleWordmark";
 
 /**
- * An ANCHOR wrapping the mark — never a bare clickable `<img>` — so the logo is reachable by
+ * An ANCHOR wrapping the mark — never a bare clickable element — so the logo is reachable by
  * keyboard and announced as a link, with the destination in its accessible name.
  *
  * We're in a WebView, so a real navigation would replace the app; the system browser is opened via
@@ -29,7 +34,7 @@ export function SparkleLogoLink({ height = 25 }: { height?: number }) {
       }}
       style={{ display: "inline-flex", cursor: "pointer" }}
     >
-      <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height }} />
+      <SparkleWordmark height={height} />
     </a>
   );
 }

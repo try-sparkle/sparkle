@@ -4,6 +4,10 @@
 // just broadcasts `capture://send` and hides; the owning project window does the work (Task 4).
 import { useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, THEME_HEX } from "../theme/colors";
+
+/** The primary button's hover: brand teal lifted toward white, DERIVED from the token rather
+ *  than a second literal a nudge to `C.teal` would leave behind. */
+const TEAL_HOVER = `color-mix(in srgb, #ffffff 16%, ${C.teal})`;
 import { LogoWaveform } from "../components/LogoWaveform";
 import { useAmbientVoice } from "../useDictation";
 import { useDictationStore } from "../stores/dictationStore";
@@ -11,6 +15,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useAuthStore } from "../stores/authStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { StatusDot } from "../components/StatusDot";
+import { SparkleWordmark } from "../components/SparkleWordmark";
 import { micHotPlaceholder, wakePlaceholder } from "../voice/dictationCopy";
 import { useSettingsStore } from "../stores/settingsStore";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
@@ -300,7 +305,11 @@ export function CaptureApp() {
         {/* Composer block: logo + waveform + narration + project + the three sends */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10, width: 420, maxWidth: "88vw" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <img src="/sparkle-logo.svg" alt="Sparkle" style={{ height: 28 }} />
+            {/* The same masked mark the concierge column paints, not the raw asset: the shipped SVG
+                carries a cyan→blue gradient, and a second window painting THAT is how the app ended
+                up with two wordmarks that disagreed (roborev 53986). The dark literal, because this
+                takeover is dark regardless of the app theme — same reasoning as NAVY/CREAM above. */}
+            <SparkleWordmark height={28} fill={THEME_HEX.dark.goldInk} />
             <div style={{ flex: 1 }}>
               <LogoWaveform />
             </div>
@@ -431,7 +440,7 @@ export function CaptureApp() {
                       background: primary
                         ? sendEnabled
                           ? hovered
-                            ? "#4a80ff"
+                            ? TEAL_HOVER
                             : C.teal
                           : NAVY_DEEP
                         : hovered

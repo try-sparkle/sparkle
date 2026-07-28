@@ -20,6 +20,9 @@
 // absence is asserted here rather than in a test of its own, because "the component is gone" and
 // "the canvas it mounted is gone" are separable failures and this file's whole subject is the
 // half-landed move.
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -52,6 +55,9 @@ import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { LOGO_SRC } from "./SparkleWordmark";
+import { C } from "../theme/colors";
+import { prefixedStyle } from "./statusDotTestUtils";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
 function mkAgent(id: string, name: string): AgentTab {
@@ -120,8 +126,36 @@ afterEach(cleanup);
 describe("the Sparkle.ai logo lives in column one, the concierge", () => {
   it("renders the mark in the concierge column header", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
-    const logo = screen.getByAltText("Sparkle") as HTMLImageElement;
-    expect(logo.getAttribute("src")).toBe("/sparkle-logo.svg");
+    // The mark is a MASKED box, not an <img> — the wordmark asset carries its own cyan→blue
+    // gradient and is used as an alpha mask over the themed gold ink (see SparkleWordmark). The
+    // ACCESSIBLE NAME, which is the part that must not change, comes through the img role; the
+    // asset is read off the mask that is ACTUALLY APPLIED rather than a data- mirror of it, since a
+    // mask that doesn't load paints a solid gold rectangle with no fallback (roborev 54019).
+    const logo = screen.getByRole("img", { name: "Sparkle" });
+    expect(logo.style.maskImage).toBe(`url(${LOGO_SRC})`);
+    // BOTH spellings, and the size with them (roborev 54033). The shipped WebView is WebKit-based,
+    // so `-webkit-mask-image` is the property that actually paints in production — asserting only
+    // the unprefixed one lets its deletion through, and a mask with no `contain` size degrades to
+    // the same solid block. `prefixedStyle` records where jsdom actually keeps those two.
+    expect(prefixedStyle(logo, "WebkitMaskImage")).toBe(`url(${LOGO_SRC})`);
+    expect(logo.style.maskSize).toBe("contain");
+    expect(prefixedStyle(logo, "WebkitMaskSize")).toBe("contain");
+    expect(logo.style.background).toBe(C.goldInk);
+  });
+
+  it("ships the asset the mask points at — the one thing the mask itself cannot prove", () => {
+    // Reading the applied `maskImage` fixed the data- MIRROR problem; it did not fix the PATH
+    // problem, since both the component and the assertion resolve the same constant. Rename or move
+    // the file and every DOM assertion stays green while both windows paint a solid gold rectangle
+    // with no fallback. This is the only check that fails on that (roborev 54033).
+    // Built with path.resolve rather than `new URL(..., import.meta.url)`: Vite rewrites that
+    // pattern as an ASSET reference at transform time, and a template it cannot statically resolve
+    // comes out `undefined`, i.e. a check that passes for the wrong reason.
+    const asset = resolve(dirname(fileURLToPath(import.meta.url)), "../../public", LOGO_SRC.slice(1));
+    expect(
+      existsSync(asset),
+      `${asset} is missing — the wordmark mask has nothing to mask`,
+    ).toBe(true);
   });
 
   it("keeps it a focusable LINK to sparkle.ai, not a bare clickable image", () => {
@@ -130,7 +164,7 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     // is the whole point of the assertion.
     const link = screen.getByRole("link", { name: "Sparkle" });
     expect(link.getAttribute("href")).toBe("https://sparkle.ai");
-    expect(link.contains(screen.getByAltText("Sparkle"))).toBe(true);
+    expect(link.contains(screen.getByRole("img", { name: "Sparkle" }))).toBe(true);
   });
 
   // THE OTHER HALF OF THE CONTRACT SparkleLogoLink EXISTS FOR (roborev 53557).
@@ -171,7 +205,7 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
   it("does NOT render it in the builder sidebar any more", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    expect(screen.queryByAltText("Sparkle")).toBeNull();
+    expect(screen.queryByRole("img", { name: "Sparkle" })).toBeNull();
     expect(screen.queryByRole("link", { name: "Sparkle" })).toBeNull();
   });
 
@@ -180,13 +214,16 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     // The star field used to paint the literal word "Sparkle" directly beneath the logo: two brand
     // marks inside ~80px, left-aligned above centered, two neighbors both named "Sparkle".
     expect(screen.queryAllByText("Sparkle")).toHaveLength(0);
-    expect(screen.getAllByAltText("Sparkle")).toHaveLength(1);
+    expect(screen.getAllByRole("img", { name: "Sparkle" })).toHaveLength(1);
   });
 
   it("shares the credit pill's row, hard left, with the pill hard right", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
     const row = screen.getByTestId("concierge-brand-row");
-    const logo = screen.getByAltText("Sparkle");
+    // By role rather than alt — §1 turned the mark into an alpha-masked box (`role="img"` +
+    // `aria-label`) instead of a painted <img>, so the accessible name survives but the element
+    // is no longer an image. The placement contract this file guards is unchanged.
+    const logo = screen.getByRole("img", { name: "Sparkle" });
     const pill = screen.getByRole("button", { name: "Open credits" });
     // ONE row holding both, not two stacked blocks.
     expect(row.contains(logo)).toBe(true);
@@ -241,7 +278,7 @@ describe("the voice waveform followed the logo into column one", () => {
     const wave = screen.getByTestId("logo-waveform");
     // "Directly under the mark", asserted as document order rather than as pixels: the logo's row
     // must precede the waveform. DOCUMENT_POSITION_FOLLOWING is set on b when b comes after a.
-    const logo = screen.getByAltText("Sparkle");
+    const logo = screen.getByRole("img", { name: "Sparkle" });
     expect(logo.compareDocumentPosition(wave) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // …and both are inside the header block, not stranded further down the column.
     expect(container.querySelector("section")?.contains(wave)).toBe(true);

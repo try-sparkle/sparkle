@@ -1,8 +1,9 @@
 import { memo } from "react";
 import { IoFilter } from "react-icons/io5";
-import { C, FONT, FONT_WEIGHT, statusInk } from "../theme/colors";
+import { C, FONT, FONT_WEIGHT } from "../theme/colors";
 import { STATUS_BANDS, type StatusBand } from "../engine/buildSections";
 import { bandCountLabel, bandColor } from "../engine/statusBandLabels";
+import { BandBadge } from "./BandBadge";
 
 /**
  * The three status chips above the Build column's stage ladder: [filter] ●2 ●3 ●0 … Reset.
@@ -100,30 +101,33 @@ export const StatusFilterBar = memo(function StatusFilterBar({
               // plane below the sidebar has no shape left to keep under the near-black palette.
               borderColor: on ? dot : C.hairline,
               background: on ? `${dot}1f` : "transparent",
-              color: on ? statusInk(dot) : C.muted,
               fontFamily: FONT.ui,
               fontSize: 11,
               fontWeight: FONT_WEIGHT.semibold,
               cursor: "pointer",
-              opacity: on ? 1 : 0.65,
-              transition: "opacity .15s, background .15s, border-color .15s",
+              // NO OPACITY on the OFF chip, for the same reason the Plan/Build strip lost its 0.9
+              // (roborev 54038): opacity composites the CONTENT over the plane, so it was quietly
+              // multiplying against the count's ink — light `muted` went 3.86:1 → 2.24:1 on the
+              // sidebar, dark 5.89 → 3.18. OFF-ness is already carried three other ways that cost
+              // no contrast: the muted ink, the hollow dot and the neutral `hairline` border. (The
+              // residual 3.86:1 is `muted` on the light sidebar, the pre-existing gap named in
+              // chromeContrast.test.ts — not this chip's to close, and not made worse here.)
+              transition: "background .15s, border-color .15s",
             }}
           >
-            <span
-              aria-hidden
-              style={{
-                flex: "0 0 auto",
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                // Filled when showing, hollow when hidden — the state is legible without relying on
-                // color alone, which matters for the red/green pair specifically.
-                background: on ? dot : "transparent",
-                boxShadow: on ? "none" : `inset 0 0 0 1.5px ${dot}`,
-              }}
+            {/* ● N, from the SHARED badge rather than a local dot+span. The chip and the badge had
+                grown identical markup with subtly different colour rules, which is the drift
+                BandBadge exists to end — the dot is filled when the band is showing and a hollow
+                ring when it is hidden, so the state survives for anyone who can't separate the
+                red/green pair. `silent`: the button already announces the phrase AND the toggle
+                state, so a second accessible name here would say the count twice. */}
+            <BandBadge
+              band={band.id}
+              count={n}
+              filled={on}
+              silent
+              ink={on ? undefined : C.muted}
             />
-            {/* Count only. The band's name is on aria-label/title above. */}
-            <span>{n}</span>
           </button>
         );
       })}

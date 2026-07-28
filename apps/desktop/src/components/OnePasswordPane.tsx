@@ -24,8 +24,11 @@ const INTEGRATION_DOCS = "https://developer.1password.com/docs/cli/app-integrati
 /** Human label + tone for each drift state. */
 const STATUS_META: Record<EnvFileStatus, { label: string; color: string }> = {
   "in-sync": { label: "Backed up", color: C.muted },
-  drifted: { label: "Changed", color: "#e0a33a" },
-  "not-backed-up": { label: "Not backed up", color: "#e0703a" },
+  // The two tones are the THEMED inks, not the warm literals they used to be: this pane paints
+  // them as text on `deepForest`, where a light-mode literal picked against the dark shell is a
+  // washed-out orange. `amberInk` = caution, `dangerInk` = something is wrong.
+  drifted: { label: "Changed", color: C.amberInk },
+  "not-backed-up": { label: "Not backed up", color: C.dangerInk },
   "missing-locally": { label: "Only in vault", color: C.muted },
 };
 
@@ -306,7 +309,7 @@ export function OnePasswordPane() {
                       // two losers matched each other, and "N files have different contents" reads
                       // as different FROM EACH OTHER, which is false in that same case. Name the
                       // referent: they differ from the one that will be backed up.
-                      <div style={{ ...hintStyle, color: "#e0a33a" }}>
+                      <div style={{ ...hintStyle, color: C.amberInk }}>
                         <FiAlertTriangle size={11} />{" "}
                         {row.conflicts === 1
                           ? "1 other file with this name differs from the one that will be backed up"
@@ -476,6 +479,6 @@ const checkRow: CSSProperties = {
 };
 const errorStyle: CSSProperties = {
   fontSize: 12,
-  color: "#e0703a",
+  color: C.dangerInk,
   lineHeight: 1.45,
 };
