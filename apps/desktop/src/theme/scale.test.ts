@@ -113,44 +113,51 @@ function offScale(prop: string, allowed: readonly number[]): { file: string; val
 // `"50%"` is the idiomatic circle, the same shape `PILL` and `0` are exempt for, and listing `50`
 // as a value to migrate would have sent someone swapping ellipses for capsules.
 //
-// ── 139 → 140 AND 60 → 61: THE COST OF EXACT EQUALITY, PAID ONCE AND STATED ───────────────────
-// The ratchet shipped recording 139/60 and landed on a `main` that had already reached 140/61 —
-// other branches merged off-scale values in the window between the counts being taken and the
-// merge completing. Nobody did anything wrong, and `main` went red on a test neither change touched.
+// ── 139 → 140 AND 60 → 61: WHY THIS IS A ONE-DIRECTIONAL RATCHET NOW ───────────────────────────
+// This ratchet shipped as EXACT equality and it cost a release. It recorded 139/60, then landed on a
+// `main` that had reached 140/61; and the v0.55.0 release commit (1a21f95dd) carried a constant of
+// 140/61 while reality was 139/60. Under `===`, reality-BELOW-the-ceiling is just as red as
+// reality-above it: a concurrent merge, or a migration that removed a value, flips green to a
+// fleet-wide red on a test the merging branch never touched. That red tagged v0.55.0 — a DMG built
+// from a commit its own suite rejects.
 //
-// That is the flip side of the equality the note below argues for, and it belongs in the record
-// rather than being quietly absorbed: `<=` cannot detect its own staleness, `===` cannot tolerate a
-// concurrent merge. Equality is still the right trade — a bound that silently accrues budget stops
-// being a ratchet at all — and this failure is loud, one line to resolve, and the message says
-// which way to move. But a long-lived branch should expect to re-take this number just before it
-// merges, the way a lockfile gets refreshed.
+// So the gate is `<=`, not `===`: it fails ONLY when the count RISES above the recorded ceiling
+// (someone added off-scale sprawl) and tolerates a count at or below it (a migration, or a concurrent
+// merge that lowered reality). An improvement can never red the fleet.
+//
+// The `===` note below argued the opposite, and its point is real — a `<=` bound can sit ABOVE
+// reality and silently carry budget for fresh sprawl. The answer is to keep the ceiling TIGHT: when
+// you migrate values away, lower the constant to the new count in the SAME PR (auto-record the drop).
+// The count and the constant still move together on the way DOWN; `<=` only removes the fleet-red for
+// the window where they briefly disagree. A branch holding a stale-high ceiling should re-take it
+// before merging, the way a lockfile gets refreshed.
 const MAX_OFF_SCALE_TYPE = 0;
 const MAX_OFF_SCALE_RADIUS = 0;
 
-// EXACT, not `<=` (roborev 54238). The file told the next person to lower the ceiling when they
-// migrated, and then used a bound that cannot tell whether they did: remove twenty literals without
-// touching the constant and the ratchet silently carries twenty units of budget for fresh sprawl,
-// green the whole time. It also made violations fungible — delete a component, earn room to be
-// careless somewhere else. Equality means the count and the constant move together or CI says so.
+// `<=`, not EXACT (supersedes roborev 54238). The original intent — force a migration to update the
+// constant — is preserved on the way DOWN by convention (lower the ceiling in the migrating PR), but
+// the GATE no longer reds when reality dips below the ceiling, because that "failure" was almost
+// always a concurrent merge or an improvement, not new sprawl. New sprawl (count RISES above the
+// ceiling) still fails loudly and is the only thing this gate blocks on.
 describe("the type and radius scales are a ratchet", () => {
-  it("the off-scale fontSize count is EXACTLY the recorded ceiling", () => {
+  it("the off-scale fontSize count never rises above the recorded ceiling", () => {
     const hits = offScale("fontSize", ALLOWED_TYPE);
     const byValue = [...new Set(hits.map((h) => h.value))].sort((a, b) => a - b);
     expect(
       hits.length,
-      `${hits.length} off-scale fontSize values (${byValue.join(", ")}) vs recorded ${MAX_OFF_SCALE_TYPE}. ` +
-        `HIGHER: you added one — use TYPE. LOWER: you migrated some — set the constant to ${hits.length}.`,
-    ).toBe(MAX_OFF_SCALE_TYPE);
+      `${hits.length} off-scale fontSize values (${byValue.join(", ")}) vs recorded ceiling ${MAX_OFF_SCALE_TYPE}. ` +
+        `You added off-scale sprawl — use TYPE. (If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)`,
+    ).toBeLessThanOrEqual(MAX_OFF_SCALE_TYPE);
   });
 
-  it("the off-scale borderRadius count is EXACTLY the recorded ceiling", () => {
+  it("the off-scale borderRadius count never rises above the recorded ceiling", () => {
     const hits = offScale("borderRadius", ALLOWED_RADIUS);
     const byValue = [...new Set(hits.map((h) => h.value))].sort((a, b) => a - b);
     expect(
       hits.length,
-      `${hits.length} off-scale borderRadius values (${byValue.join(", ")}) vs recorded ${MAX_OFF_SCALE_RADIUS}. ` +
-        `HIGHER: you added one — use RADIUS/PILL. LOWER: you migrated some — set the constant to ${hits.length}.`,
-    ).toBe(MAX_OFF_SCALE_RADIUS);
+      `${hits.length} off-scale borderRadius values (${byValue.join(", ")}) vs recorded ceiling ${MAX_OFF_SCALE_RADIUS}. ` +
+        `You added off-scale sprawl — use RADIUS/PILL. (If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)`,
+    ).toBeLessThanOrEqual(MAX_OFF_SCALE_RADIUS);
   });
 
   // The scales have to stay scales. Duplicated values, or steps that collapse into each other, are
