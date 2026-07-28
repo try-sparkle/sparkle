@@ -37,6 +37,55 @@ import { openProjectTab } from "../services/openProjectTab";
 import { closeProjectTab, closedProjects } from "../services/projectTabs";
 import { openProjectsOf } from "../engine/openProjects";
 import type { ConciergeFeed } from "../services/conciergeFeed";
+import { tearOffTopLeft } from "./tabDrag";
+import { clampToScreen, hitTestPoint, monitorToRect, screenFor, type Rect } from "../helper/helperGeometry";
+import {
+  SATELLITE_SIZE,
+  focusSatellite,
+  tearOffErrorMessage,
+  tearOffProject,
+} from "../services/satelliteWindows";
+import { useTornOutProjects } from "../hooks/useTornOutProjects";
+import { C } from "../theme/colors";
+
+/**
+ * Where to put a satellite torn out at `screenPoint`.
+ *
+ * Centre it on the cursor so it appears where the user let go, then decide which DISPLAY that lands
+ * on and keep it fully inside — the whole point of the feature is a second monitor, so the drop
+ * point is routinely on a display whose origin is not (0,0) and may be negative.
+ *
+ * `hitTestPoint(..., fresh: true, ...)` is required here and not a style choice: a freshly proposed
+ * position carries none of the on-screen guarantees a persisted one does, so the display has to be
+ * chosen from the window's CENTRE. Asking about the top-left of a 1000×720 window dropped near the
+ * left edge of the right-hand monitor would resolve to the LEFT monitor and clamp it back there.
+ *
+ * Exported for test: the monitor list is the one thing that cannot be produced in jsdom.
+ */
+export function satellitePosition(
+  screenPoint: { x: number; y: number },
+  screens: Rect[],
+): { x: number; y: number } {
+  const size = { width: SATELLITE_SIZE.width, height: SATELLITE_SIZE.height };
+  const want = tearOffTopLeft(screenPoint, size);
+  const screen = screenFor(hitTestPoint(want, true, size), screens);
+  return clampToScreen(want, size, screen);
+}
+
+/** Read the monitor layout in LOGICAL pixels, or `[]` when there is no Tauri (dev preview, tests).
+ *  An empty list makes `screenFor` return a zero rect and `clampToScreen` pin at the origin, which
+ *  is a worse position but never a crash — and Rust falls back to its own centring when we pass a
+ *  degenerate one. */
+async function readScreens(): Promise<Rect[]> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return [];
+  try {
+    const { availableMonitors } = await import("@tauri-apps/api/window");
+    return (await availableMonitors()).map(monitorToRect);
+  } catch (e) {
+    console.debug("tear-off: monitor query failed; placing without screen clamp", e);
+    return [];
+  }
+}
 
 /** Per-project status-band totals, keyed by project id — the tab glow + count badge (ProjectTabs). */
 export function countsFromFeed(feed: ConciergeFeed): Record<string, ProjectTabCounts> {
@@ -57,6 +106,11 @@ export function ProjectTabsBar({
   const projects = useProjectStore((s) => s.projects);
   const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
   const addProject = useProjectStore((s) => s.addProject);
+  const reorderProject = useProjectStore((s) => s.reorderProject);
+  const tornOut = useTornOutProjects();
+  // Pool exhaustion (all four `project-N` labels taken) is the one tear-off failure a user can
+  // actually act on, so it gets a sentence rather than a console line.
+  const [tearOffError, setTearOffError] = useState<string | null>(null);
   const pinnedProjectId = useUiStore((s) => s.pinnedProjectId);
   const togglePinnedProject = useUiStore((s) => s.togglePinnedProject);
   const openProjectIds = useUiStore((s) => s.openProjectIds);
@@ -113,6 +167,27 @@ export function ProjectTabsBar({
     openProjectTab(id);
   };
 
+  // Pull a tab clear of the strip → that project gets its own OS window showing columns ② + ③
+  // (src-tauri/src/project_window.rs). Already torn out? Then the gesture means "show me that
+  // window", not "make a second one" — two webviews mounting the same agent is the one thing the
+  // ownership map exists to prevent (services/satelliteWindows).
+  const handleTearOff = async (projectId: string, screenPoint: { x: number; y: number }) => {
+    if (tornOut.has(projectId)) {
+      await focusSatellite(projectId);
+      return;
+    }
+    setTearOffError(null);
+    const pos = satellitePosition(screenPoint, await readScreens());
+    try {
+      await tearOffProject(projectId, pos);
+    } catch (e) {
+      // tearOffProject already rolled its claim back, so the project is main's again and its panes
+      // remount — the user loses a respawn, not the project.
+      console.error("tear-off failed", projectId, e);
+      setTearOffError(tearOffErrorMessage(e));
+    }
+  };
+
   return (
     <>
       <ProjectTabs
@@ -120,12 +195,25 @@ export function ProjectTabsBar({
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}
+        tornOutProjectIds={tornOut}
+        onReorder={reorderProject}
+        onTearOff={(id, at) => void handleTearOff(id, at)}
         // Re-clicking the tab you are ALREADY on is not a navigation, so it does nothing — in
         // particular it must not dismiss the Improve Sparkle pane out from under the user. The
         // check lives here, not in openProjectTab: this is the only caller where equal ids mean
         // "nothing to do" (a freshly added project is already selected, and every cross-context
         // caller means "take me there" regardless of what is current).
+        //
+        // A TORN-OUT project's tab does BOTH: it raises that window AND selects the tab. Raising
+        // alone was the obvious reading ("show me that project") and it was wrong — main's
+        // placeholder, with "Bring it back here" on it, is reachable only while that project is
+        // SELECTED. Skipping the selection meant that once you navigated away, the only way to
+        // re-dock was the satellite's own red button, which is no help at all in the case the
+        // placeholder exists for: a satellite stranded on a monitor that is no longer plugged in.
+        // Doing both costs nothing — the window comes forward, and the recovery stays reachable
+        // behind it.
         onSelect={(id) => {
+          if (tornOut.has(id)) void focusSatellite(id);
           if (id !== selectedProjectId) openProjectTab(id);
         }}
         onTogglePin={togglePinnedProject}
@@ -154,6 +242,25 @@ export function ProjectTabsBar({
           </>
         }
       />
+
+      {tearOffError && (
+        <div
+          role="status"
+          data-testid="tear-off-error"
+          onClick={() => setTearOffError(null)}
+          style={{
+            padding: "6px 12px",
+            fontSize: 12,
+            color: C.cream,
+            background: C.deepForest,
+            borderBottom: `1px solid ${C.muted}`,
+            cursor: "pointer",
+          }}
+          title="Dismiss"
+        >
+          {tearOffError}
+        </div>
+      )}
 
       {newProjectOpen && (
         <NewProjectDialog

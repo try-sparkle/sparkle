@@ -268,7 +268,17 @@ export function NewBuildAgentButton({
   );
 }
 
-export function AgentSidebar({ project }: { project: Project | null }) {
+export function AgentSidebar({
+  project,
+  showSparkleRow = true,
+}: {
+  project: Project | null;
+  /** Hide the pinned Improve-Sparkle row. Only a SATELLITE window passes false, and it must: the
+   *  Sparkle agent's id is keyed to the window label (`sparkleAgentIdFor`), and a satellite would
+   *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
+   *  tear-off ownership split exists to prevent. Defaults to true so the main window is untouched. */
+  showSparkleRow?: boolean;
+}) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
   const removeAgent = useProjectStore((s) => s.removeAgent);
   const open = useRuntimeStore((s) => s.open);
@@ -1798,11 +1808,13 @@ export function AgentSidebar({ project }: { project: Project | null }) {
 
       {/* Pinned above the footer: the Sparkle self-improvement agent. Always present (even with
           no project open), can't be closed — it works on Sparkle itself, not the user's project. */}
-      <SparkleAgentRow
-        active={activeSpecial === "sparkle"}
-        status={status[sparkleAgentId] ?? "stopped"}
-        onSelect={onSelectSparkle}
-      />
+      {showSparkleRow && (
+        <SparkleAgentRow
+          active={activeSpecial === "sparkle"}
+          status={status[sparkleAgentId] ?? "stopped"}
+          onSelect={onSelectSparkle}
+        />
+      )}
 
       {/* Support-ticket status banner: shows the user's OPEN tickets (Submitted / Responded).
           Renders nothing when there are none. Sits between Improve Sparkle and the footer. */}

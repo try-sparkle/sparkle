@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { App } from "./App";
 import { HelperApp } from "./helper/HelperApp";
 import { CaptureApp } from "./capture/CaptureApp";
+import { SatelliteApp } from "./satellite/SatelliteApp";
+import { freezeUiPersistence } from "./satellite/uiPersistence";
 import { ErrorBoundary, AppErrorFallback } from "./components/ErrorBoundary";
 import { initLogger } from "./logger";
 import { startJankMonitor, installPerfDevtools } from "./perfTrace";
@@ -15,6 +17,7 @@ import { resolveThemeFromStorage } from "./theme/theme";
 import { useHistoryStore } from "./stores/historyStore";
 import { refreshModelCatalog } from "./services/models";
 import {
+  parseSatelliteProjectId,
   parseSuppressSelfFocus,
   parseViewFromSearch,
   isAppWindowSearch,
@@ -52,6 +55,11 @@ const isCapture = view === "capture";
 // The floating helper island: another tiny, always-alive webview.
 const isHelper = view === "helper";
 const isAppWindow = isAppWindowSearch(search);
+// A torn-out project tab (src-tauri/src/project_window.rs). Returns the PROJECT ID, not a boolean,
+// so a `?view=project` with no project is `null` and falls through to <App/> rather than mounting a
+// satellite with nothing to render — see parseSatelliteProjectId's note on why the pair is asserted
+// in one place.
+const satelliteProjectId = parseSatelliteProjectId(search);
 
 // Main-thread stall detector (perfTrace): logs every frame gap > threshold as a "jank stall" so a
 // reproduction of the slowness surfaces exactly when the app froze and for how long, to correlate
@@ -109,24 +117,33 @@ if (isHelper) {
   document.documentElement.dataset.theme = "dark";
   document.body.style.background = "transparent";
 }
+// A satellite inherits the user's persisted UI preferences but must never write `sparkle-ui` back —
+// that blob is the MAIN window's, and zustand republishes the whole partialized state on every
+// change (see satellite/uiPersistence for the clobber this prevents). Must run before the tree
+// mounts, since the sidebar writes uiStore as soon as it renders.
+if (satelliteProjectId) freezeUiPersistence();
+
 // Wrap the main app root in a top-level ErrorBoundary so an uncaught render exception degrades to a
 // recoverable "Something broke — Reload UI" card (with a Report path into the existing support/crash
 // pipeline) instead of unmounting the whole tree into a blank window. The helper and capture
 // webviews are tiny, single-purpose surfaces — left unwrapped so their minimal render paths stay
 // untouched.
 //
-// KNOWN GAP — `view === "project"` still falls through to <App/>. The boot side effects above no
-// longer run for a satellite, but the SHELL it would mount is still the full app: tab strip,
-// concierge, and AppBoot's resetWindowRegistry()/resetWindowStatus(). The satellite renderer
-// (columns ② + ③ only) is the next unit of this feature, together with the live-pane handoff.
-// Until it lands, NOTHING may invoke `open_project_window` — and nothing does: the command is
-// registered in lib.rs but has no frontend caller, which is what keeps this gap latent rather than
-// live. Wire the caller and the renderer in the same change.
+// The SATELLITE (`?view=project&project=<id>`) IS wrapped: it is a full workspace column pair with
+// agent panes in it, so an uncaught render exception there deserves the same recoverable card the
+// main window gets rather than a blank second monitor. It resolves its own pool label (INSIDE the
+// boundary — reading `getCurrentWindow().label` at module scope is what the jank-monitor note above
+// refuses to do, because a malformed `__TAURI_INTERNALS__` would throw before createRoot and blank
+// the window with no card to recover from).
 ReactDOM.createRoot(document.getElementById("root")!).render(
   isHelper ? (
     <HelperApp />
   ) : isCapture ? (
     <CaptureApp />
+  ) : satelliteProjectId ? (
+    <ErrorBoundary scope="app-root" fallback={(p) => <AppErrorFallback {...p} />}>
+      <SatelliteApp projectId={satelliteProjectId} />
+    </ErrorBoundary>
   ) : (
     <ErrorBoundary scope="app-root" fallback={(p) => <AppErrorFallback {...p} />}>
       <App />

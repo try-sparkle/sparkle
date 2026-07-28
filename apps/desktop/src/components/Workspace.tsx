@@ -46,6 +46,8 @@ import {
   wasProjectVisited,
 } from "../services/sessionProjects";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
+import { useTornOutProjects } from "../hooks/useTornOutProjects";
+import { focusSatellite, reclaimProject, reconcileSatellites } from "../services/satelliteWindows";
 import { startPresenceTracking } from "../stores/presenceStore";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
@@ -407,6 +409,15 @@ export function Workspace() {
   // tab is unioned in at render time below, so its panes still mount in the same commit.
   useEffect(() => markProjectVisited(currentProjectId), [currentProjectId]);
 
+  // Projects that have been pulled out into their own window (services/satelliteWindows). This is
+  // the ONE subscription that has to be synchronous: the claim lands before the satellite window is
+  // built, and main must drop those panes in the same commit — a Terminal unmount KILLS its PTY, so
+  // if main were still holding them when the satellite mounts, both webviews would spawn an xterm
+  // against the same agent id and `pty_spawn`'s `sessions.insert` would orphan one of the two child
+  // processes. useSyncExternalStore (hooks/useTornOutProjects) gives that; a useEffect poll would
+  // not.
+  const tornOut = useTornOutProjects();
+
   const live: Array<{ project: Project; agent: AgentTab }> = useMemo(() => {
     const out: Array<{ project: Project; agent: AgentTab }> = [];
     // One Set for the whole nested loop: this memo re-runs on EVERY projectStore write (the file's
@@ -414,6 +425,10 @@ export function Workspace() {
     // inner `includes` was a linear search per agent.
     const open = new Set(openAgentIds);
     for (const p of projects) {
+      // Torn out → NOT ours to mount, even though it is visited and even when it is the selected
+      // tab. This `continue` is the entire pane-ownership gate; see `tornOut` above for why letting
+      // it slip costs a duplicated PTY rather than a duplicated pixel.
+      if (tornOut.has(p.id)) continue;
       if (!wasProjectVisited(p.id) && p.id !== currentProjectId) continue;
       for (const a of p.agents) {
         if (open.has(a.id)) out.push({ project: p, agent: a });
@@ -422,7 +437,47 @@ export function Workspace() {
     return out;
     // visitedVersion is the subscription token for the module set read via wasProjectVisited.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projects, openAgentIds, visitedVersion, currentProjectId]);
+  }, [projects, openAgentIds, visitedVersion, currentProjectId, tornOut]);
+
+  // Is the tab the user is looking at one whose columns now live in another window?
+  const selectedIsTornOut = !!project && tornOut.has(project.id);
+  // WHICH projects have a re-dock in flight (the ask-then-force handshake in
+  // services/satelliteWindows). A SET, not a bare boolean and not a single slot — both simpler
+  // shapes are wrong with up to four satellites. A boolean disabled "Bring it back here" on every
+  // other torn-out tab, blocking the only recovery path for a project whose reclaim was not even
+  // running. A single slot was bypassable the other way: start p1, start p2, then p1 settles (or
+  // times out after REDOCK_TIMEOUT_MS) and clears the slot, re-enabling p2's button while p2's
+  // reclaim is still in flight — a second click then starts a second reclaim, which is the double
+  // force this state exists to prevent.
+  const [reclaimingIds, setReclaimingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const startReclaim = (id: string) => {
+    if (reclaimingIds.has(id)) return;
+    setReclaimingIds((prev) => new Set(prev).add(id));
+    void reclaimProject(id).finally(() =>
+      setReclaimingIds((prev) => {
+        // Remove only the id that finished — never replace the whole set.
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      }),
+    );
+  };
+  // Columns ② + ③ belong to the satellite while it holds the project, so the sidebar renders EMPTY
+  // rather than listing agents whose panes are somewhere else — clicking one here would select an
+  // agent that this window has no terminal for.
+  const sidebarProject = selectedIsTornOut ? null : project;
+
+  // Crash/force-quit backstop. A satellite that died without releasing leaves its project owned by
+  // a window that no longer exists, and nothing would ever render it again. Reconcile when main
+  // regains focus — the moment a user who just force-quit a satellite comes back to look for it.
+  // Also once at mount, for the case where the crash happened while main was already focused.
+  useEffect(() => {
+    void reconcileSatellites();
+    const onFocus = () => void reconcileSatellites();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
   const activeIsOpen = activeAgentId !== null && openAgentIds.includes(activeAgentId);
   // Improve Sparkle keeps its own pane slot (activeSpecial lives in uiStore, the pane is keyed by
   // this window's sparkleAgentId).
@@ -586,7 +641,7 @@ export function Workspace() {
             tear the panes down (and display:none would zero their measured size). */}
         <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
           {/* ② Builder agents (the sidebar owns the Plan/Build toggle as its header). */}
-          <AgentSidebar project={project} />
+          <AgentSidebar project={sidebarProject} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
               paints in C.forest too, so the join is seamless).
 
@@ -664,7 +719,60 @@ export function Workspace() {
                 Mac to start building.
               </Hint>
             )}
-            {!sparkleActive && !boardActive && project && project.agents.length === 0 && (
+            {/* The project is in its own window. Say so plainly and offer both ways out — raise
+                that window, or take it back — because otherwise a torn-out tab looks like a project
+                that lost its agents. "Bring it back here" is also the ONLY recovery path when the
+                satellite has ended up on a monitor that is no longer plugged in. */}
+            {!sparkleActive && !boardActive && selectedIsTornOut && project && (
+              <Hint title={project.name}>
+                <div style={{ marginBottom: 18 }}>
+                  This project is open in its own window.
+                </div>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                  <button
+                    data-testid="focus-satellite"
+                    onClick={() => void focusSatellite(project.id)}
+                    style={{
+                      background: C.teal,
+                      color: ON_BRAND_FILL,
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "10px 20px",
+                      fontWeight: FONT_WEIGHT.semibold,
+                      cursor: "pointer",
+                      fontFamily: '"IBM Plex Sans", sans-serif',
+                    }}
+                  >
+                    Show that window
+                  </button>
+                  {/* Re-docking is a HANDSHAKE, so it can take up to REDOCK_TIMEOUT_MS when the
+                      satellite is slow to answer. Without a pending state the button looks inert
+                      and gets clicked repeatedly, and each click emits another request and can
+                      eventually force another window close. */}
+                  <button
+                    data-testid="reclaim-satellite"
+                    disabled={reclaimingIds.has(project.id)}
+                    // The guard lives in startReclaim, not only in `disabled`: a disabled button is
+                    // a rendering detail, and this handler is also what the keyboard path reaches.
+                    onClick={() => startReclaim(project.id)}
+                    style={{
+                      background: "transparent",
+                      color: C.cream,
+                      border: `1px solid ${C.muted}`,
+                      borderRadius: 8,
+                      padding: "10px 20px",
+                      fontWeight: FONT_WEIGHT.semibold,
+                      cursor: reclaimingIds.has(project.id) ? "default" : "pointer",
+                      opacity: reclaimingIds.has(project.id) ? 0.6 : 1,
+                      fontFamily: '"IBM Plex Sans", sans-serif',
+                    }}
+                  >
+                    {reclaimingIds.has(project.id) ? "Bringing it back…" : "Bring it back here"}
+                  </button>
+                </div>
+              </Hint>
+            )}
+            {!sparkleActive && !boardActive && !selectedIsTornOut && project && project.agents.length === 0 && (
               <Hint title={project.name}>
                 {/* The same "+ New Build Agent" button as the sidebar, so the user can start a build
                     agent right here. Hovering it also lights up the sidebar's copy blue (shared
@@ -687,10 +795,10 @@ export function Workspace() {
                 </div>
               </Hint>
             )}
-            {!sparkleActive && !boardActive && project && project.agents.length > 0 && !activeAgentId && (
+            {!sparkleActive && !boardActive && !selectedIsTornOut && project && project.agents.length > 0 && !activeAgentId && (
               <Hint title={project.name}>Pick an agent on the left.</Hint>
             )}
-            {!sparkleActive && !boardActive && project && activeAgentId && !activeIsOpen && (
+            {!sparkleActive && !boardActive && !selectedIsTornOut && project && activeAgentId && !activeIsOpen && (
               <Hint title={project.name}>
                 <button
                   onClick={() => open(activeAgentId)}

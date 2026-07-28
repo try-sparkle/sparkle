@@ -73,9 +73,39 @@ export function clearWindowProject(label: string, store: KV = defaultStore()): v
 }
 
 /** Wipe the whole registry. Used by the main window at cold start to drop stale cross-session
- *  entries (the blob outlives the process, but windows don't). */
+ *  entries (the blob outlives the process, but windows don't).
+ *
+ *  Prefer `pruneWindowRegistry` from anything that can run more than once per process — see its
+ *  doc for what a mid-session wipe now costs. */
 export function resetWindowRegistry(store: KV = defaultStore()): void {
   write(store, {}); // via write() so same-window subscribers (onWindowRegistryChange) are notified
+}
+
+/**
+ * Drop rows whose window no longer exists, keeping the live ones. Returns true when it changed
+ * anything.
+ *
+ * This exists because a WIPE stopped being harmless once satellites started writing this map.
+ * `AppBoot`'s effect runs on every mount of `<App/>` — the error card's "Reload UI" remounts the
+ * tree, and so does HMR — and a satellite only writes its row on ITS OWN mount, which a main-window
+ * reload does not trigger. So the wipe erased the row for a window that was still on screen showing
+ * that project, `findWindowForProject` started returning null, and capture-sends and orchestration
+ * events for a torn-out project "fell through" to main: main would adopt the send and navigate onto
+ * the re-dock placeholder while the satellite sat there rendering the project the user meant.
+ * Checking the real window list cannot make that mistake.
+ */
+export function pruneWindowRegistry(liveLabels: readonly string[], store: KV = defaultStore()): boolean {
+  const map = read(store);
+  const live = new Set(liveLabels);
+  const out: Record<string, string> = {};
+  let changed = false;
+  for (const [label, projectId] of Object.entries(map)) {
+    if (live.has(label)) out[label] = projectId;
+    else changed = true;
+  }
+  if (!changed) return false;
+  write(store, out);
+  return true;
 }
 
 

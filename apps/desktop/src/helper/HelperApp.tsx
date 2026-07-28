@@ -12,7 +12,7 @@ import { useHelperPrefs, type HelperMode } from "./helperPrefs";
 import { shouldShowHelper } from "./helperVisibility";
 import {
   clampToScreen, snapTabToEdge, screenFor, windowSize, hitTestPoint, pillSize,
-  usableContentSize, sameSize, type Rect, type Size,
+  usableContentSize, sameSize, monitorToRect, type Rect, type Size,
 } from "./helperGeometry";
 import {
   getHelperVitals, onHelperVitalsChanged, getFrontmost, onFrontmostChanged, onCaptureRequested,
@@ -38,21 +38,10 @@ const CLOSE_SETTLE_MS = 250;
  *  throw) cannot suppress the island forever. */
 const SEND_RAISE_GRACE_MS = 3000;
 
-/** Read the monitor layout in LOGICAL pixels. Tauri reports monitor geometry in PHYSICAL pixels,
- *  so everything is divided by the scale factor — helperGeometry works in logical space, and
- *  mixing the two silently doubles every coordinate on a retina display. */
-function toRect(m: {
-  position: { x: number; y: number };
-  size: { width: number; height: number };
-  scaleFactor: number;
-}): Rect {
-  return {
-    x: m.position.x / m.scaleFactor,
-    y: m.position.y / m.scaleFactor,
-    width: m.size.width / m.scaleFactor,
-    height: m.size.height / m.scaleFactor,
-  };
-}
+// Read the monitor layout in LOGICAL pixels. The PHYSICAL→logical conversion moved into
+// helperGeometry as `monitorToRect` when the project-tab tear-off started placing its satellite
+// through the same screenFor/clampToScreen pair — one copy, so retina handling can't diverge.
+const toRect = monitorToRect;
 
 async function readScreens(): Promise<{ screens: Rect[]; current: Rect | null }> {
   try {

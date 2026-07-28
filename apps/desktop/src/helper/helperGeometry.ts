@@ -60,6 +60,31 @@ export const MENU_H = 68;
 export const ERROR_W = 268;
 export const ERROR_H = 48;
 
+/**
+ * Tauri's `Monitor` → the LOGICAL rect everything in this module works in.
+ *
+ * Tauri reports monitor `position`/`size` in PHYSICAL pixels, so on a Retina display they are twice
+ * the numbers `PointerEvent.screenX/screenY` reports. Feeding a physical rect to `screenFor` puts
+ * every point on the first display and a window torn out over the second monitor jumps back to the
+ * first — which is exactly the bug this one-line conversion exists to prevent.
+ *
+ * It lives HERE rather than in the helper's component because it is now shared: the project-tab
+ * tear-off (components/ProjectTabsBar) places its satellite through the same screenFor/clampToScreen
+ * pair, and a second hand-rolled copy of the division is how the two would drift.
+ */
+export function monitorToRect(m: {
+  position: { x: number; y: number };
+  size: { width: number; height: number };
+  scaleFactor: number;
+}): Rect {
+  return {
+    x: m.position.x / m.scaleFactor,
+    y: m.position.y / m.scaleFactor,
+    width: m.size.width / m.scaleFactor,
+    height: m.size.height / m.scaleFactor,
+  };
+}
+
 /** A measured box in whatever units the caller measured it in (a DOMRect, in practice). */
 export interface Size {
   width: number;

@@ -7,13 +7,23 @@
 // (Workspace) supplies the projects, selection, pin state, and per-project status-band counts (from
 // the concierge feed), plus the callbacks.
 
-import { type CSSProperties, type KeyboardEvent, type ReactNode, useEffect } from "react";
+import {
+  Fragment,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { MdOutlinePushPin } from "react-icons/md";
-import { FiPlus, FiX } from "react-icons/fi";
+import { FiPlus, FiX, FiExternalLink } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import { C } from "../theme/colors";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
+import { resolveTabDrag, type TabDragResult, type TabRect } from "./tabDrag";
 
 export interface ProjectTabItem {
   id: string;
@@ -41,6 +51,43 @@ export interface ProjectTabsProps {
   onAddProject?: () => void;
   /** Top-right cluster (kebab menu + avatar) rendered flush-right in the tab bar. */
   topRight?: ReactNode;
+  /** Drop a dragged tab into a new slot. `beforeId` is the tab to insert before; null = append.
+   *  Omit it and tabs are not reorderable (the gesture still tears off). */
+  onReorder?: (projectId: string, beforeId: string | null) => void;
+  /** The tab was dragged clear of the strip and released — put it in its own window at that GLOBAL
+   *  SCREEN point (`PointerEvent.screenX/screenY`, i.e. Tauri's logical desktop space, NOT client
+   *  coordinates). Omit it and dragging out is inert. */
+  onTearOff?: (projectId: string, screenPoint: { x: number; y: number }) => void;
+  /** Projects currently living in their own window. Their tab stays in the strip — it is how you
+   *  get back to that window — but it is dimmed and badged, because its columns are elsewhere. */
+  tornOutProjectIds?: ReadonlySet<string>;
+}
+
+/** Movement below this is still a click, so a tab with a slightly shaky press still just selects. */
+const DRAG_SLOP = 5;
+/**
+ * How far past the strip the pointer must go before the drag means "give this its own window".
+ *
+ * Roughly a tab's own height. Small enough that a deliberate pull-down reads as a tear-off on the
+ * first try, large enough that ordinary horizontal reordering — which drifts vertically by a few
+ * pixels as the hand moves — never accidentally spawns a window. Below ~24 the strip's own top edge
+ * is close enough to the menu bar that a high drag would tear off; above ~80 the gesture stops
+ * feeling connected to the cursor.
+ */
+const TEAR_MARGIN = 48;
+
+/** An in-flight press. Lives in a ref, not state: it updates on every pointermove and re-rendering
+ *  the whole strip at pointer rate would drop frames. Only the VISUAL summary goes to state. */
+interface TabGesture {
+  projectId: string;
+  pointerId: number;
+  /** Press origin in CLIENT space — the same space the strip and tab rects are measured in. */
+  origin: { x: number; y: number };
+  /** Latches true on the first non-idle result and never clears (tabDrag's module header). */
+  dragging: boolean;
+  last: TabDragResult;
+  /** Last pointer position in GLOBAL SCREEN space — where a tear-off would place the window. */
+  lastScreen: { x: number; y: number };
 }
 
 /** The close button's accessible name. Names the PROJECT, so a screen reader hears "Close Alpha"
@@ -48,6 +95,23 @@ export interface ProjectTabsProps {
  *  a project is otherwise easy to read as "delete this project". */
 export function closeTitle(projectName: string): string {
   return `Close ${projectName} — the project and its agents are kept`;
+}
+
+/**
+ * The tab's hover tooltip. It is the ONLY place the drag gesture is discoverable — a tab that can be
+ * pulled onto a second monitor looks exactly like one that cannot, and a feature nobody knows the
+ * gesture for may as well not ship. Torn-out tabs say what clicking does instead, because for those
+ * the answer changed: it raises another window rather than switching this one.
+ */
+export function tabTitle(
+  projectName: string,
+  o: { hasSettings: boolean; tornOut: boolean; canTearOff: boolean },
+): string {
+  if (o.tornOut) return `${projectName} — open in its own window; click to bring that window forward`;
+  const parts = [projectName];
+  if (o.hasSettings) parts.push("double-click for project settings");
+  if (o.canTearOff) parts.push("drag out for its own window");
+  return parts.join(" — ");
 }
 
 /** The pin tooltip describes what pinning DOES — asymmetric copy for pin vs unpin. */
@@ -125,6 +189,24 @@ function activateOnKey(e: KeyboardEvent, fn: () => void): void {
   }
 }
 
+/** The insertion caret shown between tabs during a reorder — a thin accent bar in the gap. */
+function DropCaret() {
+  return (
+    <div
+      data-testid="tab-drop-caret"
+      aria-hidden
+      style={{
+        flex: "none",
+        alignSelf: "stretch",
+        width: 2,
+        marginBottom: 2,
+        borderRadius: 1,
+        background: C.teal,
+      }}
+    />
+  );
+}
+
 export function ProjectTabs({
   projects,
   selectedProjectId,
@@ -136,31 +218,176 @@ export function ProjectTabs({
   onClose,
   onAddProject,
   topRight,
+  onReorder,
+  onTearOff,
+  tornOutProjectIds,
 }: ProjectTabsProps) {
   useEffect(ensureTabStyles, []);
 
+  const barRef = useRef<HTMLDivElement | null>(null);
+  const tabEls = useRef(new Map<string, HTMLDivElement>());
+  const gesture = useRef<TabGesture | null>(null);
+  // A real drag must not also fire the tab's onClick. `click` is dispatched after `pointerup`, so
+  // the flag is SET on release and consumed by the click that follows — not cleared on pointerup,
+  // which would race the very event it exists to suppress.
+  const suppressClick = useRef(false);
+  // Only what the render needs: which tab is being dragged, and where it would land.
+  const [drag, setDrag] = useState<{
+    projectId: string;
+    kind: "reorder" | "tearoff";
+    beforeId: string | null;
+  } | null>(null);
+
+  /** Measure the strip and every rendered tab in CLIENT space — the space `clientX/clientY` reports,
+   *  so the resolver's inputs are all consistent (its header only requires ONE space, not a
+   *  particular one). Screen space is used solely for the tear-off's window position. */
+  function measure(): { strip: TabRect & { y: number; height: number }; tabs: TabRect[] } | null {
+    const bar = barRef.current;
+    if (!bar) return null;
+    const b = bar.getBoundingClientRect();
+    const tabs: TabRect[] = [];
+    // Iterate `projects`, not the ref Map: the resolver's insertion rule walks tabs in RENDER order,
+    // and a Map's iteration order is insertion order, which after a reorder is no longer the same.
+    for (const p of projects) {
+      const el = tabEls.current.get(p.id);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      tabs.push({ id: p.id, x: r.x, width: r.width });
+    }
+    return { strip: { id: "strip", x: b.x, y: b.y, width: b.width, height: b.height }, tabs };
+  }
+
+  function onTabPointerDown(projectId: string, e: ReactPointerEvent<HTMLDivElement>): void {
+    // Left button only, and never from the pin or the × — those are their own controls, and a press
+    // that starts on one must not drag the tab out from under it.
+    if (e.button !== 0) return;
+    if (e.target instanceof Element && e.target.closest("button")) return;
+    if (!onReorder && !onTearOff) return;
+    suppressClick.current = false;
+    gesture.current = {
+      projectId,
+      pointerId: e.pointerId,
+      origin: { x: e.clientX, y: e.clientY },
+      dragging: false,
+      last: { kind: "idle" },
+      lastScreen: { x: e.screenX, y: e.screenY },
+    };
+    // Capture so the drag keeps reporting once the pointer leaves the tab — which it does
+    // immediately, since leaving is the whole gesture.
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // jsdom and some synthetic pointers have no capture; the gesture still works from the
+      // document-level bubbling, it just stops tracking outside the window.
+    }
+  }
+
+  function onTabPointerMove(e: ReactPointerEvent<HTMLDivElement>): void {
+    const g = gesture.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    const m = measure();
+    if (!m) return;
+    const res = resolveTabDrag(
+      {
+        pointer: { x: e.clientX, y: e.clientY },
+        origin: g.origin,
+        strip: { x: m.strip.x, y: m.strip.y, width: m.strip.width, height: m.strip.height },
+        tabs: m.tabs,
+        draggedId: g.projectId,
+        dragging: g.dragging,
+      },
+      { slop: DRAG_SLOP, tearMargin: TEAR_MARGIN },
+    );
+    g.last = res;
+    g.lastScreen = { x: e.screenX, y: e.screenY };
+    if (res.kind === "idle") return;
+    g.dragging = true;
+    setDrag({
+      projectId: g.projectId,
+      kind: res.kind,
+      beforeId: res.kind === "reorder" ? res.beforeId : null,
+    });
+  }
+
+  function endGesture(e: ReactPointerEvent<HTMLDivElement>, commit: boolean): void {
+    const g = gesture.current;
+    gesture.current = null;
+    setDrag(null);
+    try {
+      if (g && e.currentTarget.hasPointerCapture(g.pointerId)) {
+        e.currentTarget.releasePointerCapture(g.pointerId);
+      }
+    } catch {
+      // Already released (or never captured) — nothing to undo.
+    }
+    if (!g || !g.dragging) return;
+    if (!commit) return;
+    // Set ONLY on the commit path. A cancelled pointer (or a lost capture) produces no `click` for
+    // the flag to consume, and it is strip-wide and cleared only by the next pointerdown/click — so
+    // latching it here would silently swallow the next keyboard-hint activation, which fires a tab's
+    // onClick with no pointerdown before it (keyboardHints/hintTargets).
+    suppressClick.current = true;
+    if (g.last.kind === "tearoff") {
+      onTearOff?.(g.projectId, g.lastScreen);
+    } else if (g.last.kind === "reorder" && g.last.beforeId !== g.projectId) {
+      // beforeId === draggedId means "held over its own slot" — the resolver reports it rather than
+      // filtering it (see insertionBefore), and swallowing it here keeps a no-op out of the store.
+      onReorder?.(g.projectId, g.last.beforeId);
+    }
+  }
+
   return (
-    <div style={barStyle} role="tablist" aria-label="Projects">
+    <div style={barStyle} role="tablist" aria-label="Projects" ref={barRef}>
       {projects.map((p) => {
         const active = p.id === selectedProjectId;
         const pinned = p.id === pinnedProjectId;
         const counts = countsByProject[p.id];
         const band = tabBand(counts);
         const glow = band ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29` : undefined;
+        const tornOut = tornOutProjectIds?.has(p.id) ?? false;
+        const isDragged = drag?.projectId === p.id;
+        const caret = drag?.kind === "reorder" && drag.beforeId === p.id;
         return (
+          <Fragment key={p.id}>
+          {caret && <DropCaret />}
           <div
-            key={p.id}
+            ref={(el) => {
+              // A plain Map of live elements. Deleting on unmount matters: a closed project whose
+              // node lingered here would contribute a stale rect to `measure` and shift every
+              // insertion decision after it.
+              if (el) tabEls.current.set(p.id, el);
+              else tabEls.current.delete(p.id);
+            }}
             className="concierge-tab"
             role="tab"
             aria-selected={active}
             tabIndex={0}
             data-testid={`tab-${p.id}`}
+            data-torn-out={tornOut || undefined}
+            onPointerDown={(e) => onTabPointerDown(p.id, e)}
+            onPointerMove={onTabPointerMove}
+            onPointerUp={(e) => endGesture(e, true)}
+            // A cancelled pointer (the OS took it, a touch was interrupted) must NOT commit — it
+            // would tear a window off at whatever coordinate the gesture died at.
+            onPointerCancel={(e) => endGesture(e, false)}
+            // …and neither must a capture that simply goes away (the element unmounts mid-drag, or
+            // the platform revokes it). Without this the gesture ref and the insertion caret stay
+            // set until the next press, leaving a caret painted in the strip over nothing.
+            onLostPointerCapture={(e) => endGesture(e, false)}
             // Keyboard-hint target: a clean Ctrl tap badges each tab with a letter, and the overlay
             // activates it by firing this element's own onClick — so hint selection and mouse
             // selection are the same code path (see keyboardHints/hintTargets.ts).
             data-hint={PROJECT_TAB_HINT}
-            title={`${p.name}${onOpenSettings ? " — double-click for project settings" : ""}`}
-            onClick={() => onSelect(p.id)}
+            title={tabTitle(p.name, { hasSettings: !!onOpenSettings, tornOut, canTearOff: !!onTearOff })}
+            onClick={() => {
+              // Consume the click a completed drag generated. Cleared here rather than on pointerup
+              // so the very next real click still selects.
+              if (suppressClick.current) {
+                suppressClick.current = false;
+                return;
+              }
+              onSelect(p.id);
+            }}
             onDoubleClick={() => onOpenSettings?.(p.id)}
             onKeyDown={(e) => activateOnKey(e, () => onSelect(p.id))}
             style={{
@@ -168,6 +395,13 @@ export function ProjectTabs({
               alignItems: "center",
               gap: 8,
               padding: "8px 12px",
+              // The tab being dragged fades so the caret (or the empty gap, when the drag has left
+              // the strip) is what the eye follows.
+              opacity: isDragged ? (drag?.kind === "tearoff" ? 0.35 : 0.55) : tornOut ? 0.6 : 1,
+              // Suppress the browser's own text selection + native drag while a tab is being pulled;
+              // without it the project name highlights blue under the cursor mid-drag.
+              userSelect: "none",
+              WebkitUserSelect: "none",
               // A flex item defaults to `min-width: auto`, which floors it at its content's
               // min-content width. With the label now `nowrap`, that floor is the WHOLE label —
               // so a bar full of long names would push past its container and squeeze the "+" and
@@ -229,6 +463,17 @@ export function ProjectTabs({
             >
               {p.name}
             </span>
+            {tornOut && (
+              // An icon, not a glyph or an emoji — this repo renders every icon from react-icons.
+              // It says WHERE the project is, which the dimmed tab alone cannot: the tab is still
+              // here (clicking it raises that window), but its columns are on another screen.
+              <FiExternalLink
+                size={11}
+                data-testid={`torn-out-${p.id}`}
+                aria-label="Open in its own window"
+                style={{ flex: "none", opacity: 0.9 }}
+              />
+            )}
             {band && (
               <span
                 data-testid={`count-${p.id}`}
@@ -245,7 +490,12 @@ export function ProjectTabs({
                 {bandCountLabel(band, counts![band])}
               </span>
             )}
-            {onClose && (
+            {/* NO close button while the project is torn out. Closing the tab hides it and nothing
+                else — but the tab is also the ONLY doorway to that satellite ("Show that window" /
+                "Bring it back here" live behind it), so closing it would leave a live window owning
+                a project with no way to reach it, and `reconcileSatellites` would never prune the
+                row because the window is genuinely alive. Re-dock first, then close. */}
+            {onClose && !tornOut && (
               <button
                 type="button"
                 className="concierge-tab-close"
@@ -281,8 +531,12 @@ export function ProjectTabs({
               </button>
             )}
           </div>
+          </Fragment>
         );
       })}
+      {/* Append-to-end caret. `beforeId === null` means "past every tab", which has no tab to
+          precede — so it renders here rather than inside the map. */}
+      {drag?.kind === "reorder" && drag.beforeId === null && <DropCaret />}
       {onAddProject && (
         <button
           type="button"

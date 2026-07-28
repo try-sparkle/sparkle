@@ -4,15 +4,27 @@
 // The hooks keep their original names because they still answer the same questions — the answers
 // are just global now. `AppBoot` carries the two boot-time jobs the old provider did (cold-start
 // hygiene + boot selection/deep-link landing) without providing any context.
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useSyncExternalStore, type ReactNode } from "react";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useUiStore } from "./stores/uiStore";
 import { useDictationStore } from "./stores/dictationStore";
 import { bootSelection } from "./engine/openProjects";
 import { markProjectOpen } from "./services/projectTabs";
-import { setWindowProject, clearWindowProject, resetWindowRegistry } from "./services/windowRegistry";
+import {
+  setWindowProject,
+  clearWindowProject,
+  resetWindowRegistry,
+  pruneWindowRegistry,
+} from "./services/windowRegistry";
 import { resetWindowStatus } from "./services/windowStatus";
+import {
+  isTornOutIn,
+  onSatellitesChange,
+  parseSnapshot,
+  reconcileSatellites,
+  satellitesSnapshot,
+} from "./services/satelliteWindows";
 import { parseAgentIdFromSearch, parseProjectIdFromSearch } from "./services/windowIdentity";
 
 /** The one window's fixed label. Kept exported for the persistence keys (per-window Sparkle agent
@@ -50,7 +62,44 @@ function openDeepLinkAgent(projectId: string, agentId: string | null): void {
  */
 export function AppBoot({ children }: { children: ReactNode }) {
   useEffect(() => {
-    resetWindowRegistry();
+    // The label→project map. PRUNE against the live window list rather than wiping, for exactly the
+    // reason spelled out below for the satellite map — satellites write this one too
+    // (`setWindowProject`), and only on their OWN mount, which a main-window reload does not
+    // trigger. A wipe erased a live satellite's row, `findWindowForProject` started answering null,
+    // and capture-sends / orchestration events for that project "fell through" to main: main adopted
+    // the send and navigated onto the re-dock placeholder while the satellite was the window
+    // actually showing the project. The wipe is kept only as the no-Tauri fallback, where there is
+    // no window list to check and nothing but main can have written the map.
+    if (!("__TAURI_INTERNALS__" in window)) {
+      // No window list to ask and nothing but main can have written the map, so the wipe is still
+      // right here — and it must run SYNCHRONOUSLY, before the boot-selection effect below writes
+      // `setWindowProject(APP_WINDOW_LABEL, …)`. Deferring it into a microtask made it erase main's
+      // own freshly-written row, which nothing rewrites until the selection next changes.
+      resetWindowRegistry();
+    } else {
+      void (async () => {
+        try {
+          const { getAllWindows } = await import("@tauri-apps/api/window");
+          pruneWindowRegistry((await getAllWindows()).map((w) => w.label));
+        } catch (e) {
+          // LEAVE THE MAP ALONE. Falling back to the wipe here would silently reinstate the exact
+          // erase-a-live-satellite's-row bug this replaced, on every remount, for any transient
+          // failure. An unanswerable liveness question is not evidence that nothing is live — the
+          // same rule `windowExists` applies in satelliteWindows.
+          console.debug("window-registry prune skipped; leaving the map as-is", e);
+        }
+      })();
+    }
+    // Satellite ownership is durable and the windows are not, so a crash while a project was torn
+    // out would leave it owned by a `project-N` label that will never exist again — main's pane gate
+    // would skip it forever and the tab would render the re-dock placeholder with no window behind
+    // it. RECONCILE rather than wipe: this effect runs on every mount of `<App/>`, not only at
+    // process start (the error card's "Reload UI" remounts the tree, as does an HMR update), and a
+    // wipe would hand a LIVE satellite's project back to main while its panes were still on screen —
+    // both webviews then mount the same agent and race its PTY. Checking against the real window
+    // list cannot make that mistake. `boot: true` additionally clears rows stuck mid-tear-off, but
+    // only when no satellite window exists at all.
+    void reconcileSatellites({ boot: true });
     // One-time cleanups: the multi-window era left two durable blobs with no writer and no reader
     // since CM-U7 part 2 — the per-window status channel (resetWindowStatus, which sweeps its own
     // keys) and the per-window session snapshot below. Both can go a release or two from now.
@@ -173,11 +222,29 @@ export function AppBoot({ children }: { children: ReactNode }) {
 
   // Keep the (single-entry) window registry pointing at the selected project, so the surfaces
   // that still ask "which window owns this project?" — the capture hand-off — stay truthful.
+  //
+  // A TORN-OUT project is the exception, and it is not hypothetical: selecting its tab is now an
+  // ordinary click (the tab both raises the satellite and selects, so main's re-dock placeholder
+  // stays reachable). Writing main's row here would make TWO labels map to that project, and
+  // `findWindowForProject` returns the FIRST match in insertion order — which is `main`, since main
+  // writes its row at boot and an update keeps a key's original position. The election would then
+  // name main as the owner of a project main renders nothing but a placeholder for: main adopts the
+  // capture-send, navigates onto that placeholder, and the satellite — the window actually showing
+  // the project — declines it. Clearing instead of writing leaves the satellite's row as the only
+  // match, which is the truth.
+  //
+  // Subscribed to the ownership map, not just to the selection, so this corrects itself the moment a
+  // project is torn out or re-docked while it is the selected tab — both of which happen without the
+  // selection changing at all.
   const projectId = useProjectStore((s) => s.selectedProjectId);
+  const satellites = useSyncExternalStore(onSatellitesChange, satellitesSnapshot, () => "");
   useEffect(() => {
-    if (projectId) setWindowProject(APP_WINDOW_LABEL, projectId);
-    else clearWindowProject(APP_WINDOW_LABEL);
-  }, [projectId]);
+    if (projectId && !isTornOutIn(parseSnapshot(satellites), projectId)) {
+      setWindowProject(APP_WINDOW_LABEL, projectId);
+    } else {
+      clearWindowProject(APP_WINDOW_LABEL);
+    }
+  }, [projectId, satellites]);
 
   return <>{children}</>;
 }
