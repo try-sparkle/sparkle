@@ -7,7 +7,7 @@
 //!
 //! Dependency-free: we shell out to the system `git` via std::process::Command.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1568,6 +1568,49 @@ fn tooling_churn_to_restore(porcelain: &str) -> Option<Vec<String>> {
     Some(restore)
 }
 
+/// Summarise a `git status --porcelain` tree by STATUS CODE ONLY, for the log line that accompanies
+/// a `dirty` decline.
+///
+/// WHY CODES AND NOT PATHS. A decline currently reports the single word `dirty`, which says a park
+/// was refused but nothing about what refused it — and the two causes want opposite fixes. Dirt that
+/// is entirely ` M` on tracked files is a leftover EDIT from a pass that died before it could commit
+/// or set its work aside; dirt that is `??` is untracked residue (a scratch file, a half-written
+/// build artifact) that no pass will ever claim. Told apart, the first is a bug in how a killed pass
+/// unwinds and the second is a file somebody forgot to ignore. Told only as `dirty`, neither is
+/// actionable, and the episode is unreconstructable after the fact because the tree has moved on.
+///
+/// Paths are deliberately NOT included. This runs for every agent worktree, including ones cut from
+/// a user's own repository, where a filename is their content — and the codes alone carry the whole
+/// distinction above. `??` is reported separately from the rest for the same reason
+/// [`tooling_churn_to_restore`] excludes it: it is the one class that a restore could never undo.
+///
+/// A line this cannot parse is counted under `?` rather than dropped, so the total always equals the
+/// number of non-blank porcelain lines and a garbled status can never read as a smaller tree.
+fn describe_blocking_dirt(porcelain: &str) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total = 0usize;
+    for line in porcelain.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        let code = match split_status_line(line) {
+            Some((code, _)) => code,
+            None => "?".to_string(),
+        };
+        *counts.entry(code).or_insert(0) += 1;
+    }
+    if total == 0 {
+        return "0 entries".to_string();
+    }
+    let breakdown = counts
+        .iter()
+        .map(|(code, n)| format!("{n}×'{code}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{total} entries: {breakdown}")
+}
+
 /// Core (AppHandle-free, testable): park an UNATTENDED, app-owned agent worktree back on a fresh
 /// `origin/<base>` so the next headless run starts from an up-to-date base instead of inheriting
 /// whatever branch the previous run left checked out.
@@ -1631,9 +1674,21 @@ pub fn park_worktree_on_base_at(
     //
     // The one exception is dirt the AGENT'S OWN TOOLING writes: see `tooling_churn_to_restore` for
     // why a bare emptiness check made this decline PERMANENTLY on the recurring headless worktree.
-    let churn = match tooling_churn_to_restore(&git(&wt_str, &["status", "--porcelain"])?) {
+    let porcelain = git(&wt_str, &["status", "--porcelain"])?;
+    let churn = match tooling_churn_to_restore(&porcelain) {
         Some(paths) => paths,
-        None => return Ok(ParkOutcome::declined("dirty")),
+        None => {
+            // The decline itself is routine; being unable to say WHY is what made the recurring
+            // stale-base episodes unfixable. `describe_blocking_dirt` reports status codes only —
+            // see its doc comment for why that is both sufficient and the most this may say.
+            tracing::warn!(
+                agent_id = %agent_id,
+                blocking = %describe_blocking_dirt(&porcelain),
+                "park declined: the worktree has uncommitted changes, so the next run starts from \
+                 whatever branch the last one left behind"
+            );
+            return Ok(ParkOutcome::declined("dirty"));
+        }
     };
 
     // Containment check: refuse if ANY commit reachable from HEAD or from the agent's own branch is
@@ -5026,6 +5081,48 @@ mod tests {
             );
             assert!(!scope.contains('/'), "scope {scope:?} carried part of the value");
         }
+    }
+
+    /// The `dirty` decline's diagnostic must tell an unfinished EDIT apart from untracked residue —
+    /// they want opposite fixes — while never naming a file, because this runs over user repos too.
+    #[test]
+    fn blocking_dirt_summarises_by_code_and_never_leaks_a_path() {
+        // A leftover edit from a pass that died before committing: all tracked modifications.
+        let edits = " M apps/desktop/src/services/improvementPass.ts\n M PRD/topic.md\n";
+        assert_eq!(describe_blocking_dirt(edits), "2 entries: 2×' M'");
+
+        // Untracked residue: nothing a restore could ever undo, so it reads differently.
+        assert_eq!(describe_blocking_dirt("?? scratch.log\n"), "1 entries: 1×'??'");
+
+        // Mixed trees keep every class visible rather than collapsing to the loudest one. The
+        // breakdown is sorted by code (BTreeMap), so the same tree always renders the same string —
+        // which is what makes these lines greppable across sessions.
+        let mixed = "?? scratch.log\n M src/a.rs\nM  src/b.rs\n";
+        assert_eq!(describe_blocking_dirt(mixed), "3 entries: 1×' M' 1×'??' 1×'M '");
+
+        // No filename from any of the above may reach the log line.
+        for sample in [edits, "?? scratch.log\n", mixed] {
+            let out = describe_blocking_dirt(sample);
+            for token in ["improvementPass", "PRD", "scratch", "src/", ".ts", ".rs"] {
+                assert!(!out.contains(token), "summary leaked {token:?}: {out}");
+            }
+        }
+
+        // `git` trims its output, so the FIRST line arrives with its leading space eaten — the same
+        // shape `split_status_line` exists to re-pad. A one-file status is the common case here.
+        assert_eq!(describe_blocking_dirt("M src/a.rs\n"), "1 entries: 1×' M'");
+
+        // An unparsable line is COUNTED, not dropped: the total must never understate the tree.
+        let garbled = "M src/a.rs\nxx\n";
+        assert!(
+            describe_blocking_dirt(garbled).starts_with("2 entries:"),
+            "a garbled line must still be counted: {}",
+            describe_blocking_dirt(garbled)
+        );
+
+        // Blank lines are not entries, and a clean tree never reaches this path but must not panic.
+        assert_eq!(describe_blocking_dirt("\n\n"), "0 entries");
+        assert_eq!(describe_blocking_dirt(""), "0 entries");
     }
 
     /// `core.hooksPath` is frequently set GLOBALLY, which silently redirects git away from the
