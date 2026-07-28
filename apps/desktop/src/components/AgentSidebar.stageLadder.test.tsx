@@ -193,8 +193,14 @@ describe("AgentSidebar — the status filter", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
     setStatuses({ a1: "working", a2: "idle" });
     render(<AgentSidebar project={project} />);
-    // Nothing is filtered yet, so a Reset link would be a permanently dead control.
-    expect(screen.queryByTestId("status-filter-reset")).toBeNull();
+    // Nothing is filtered yet, so Reset is not OFFERED — but it stays MOUNTED, invisible and
+    // disabled. Unmounting it re-flows the row and, worse, blurs it on the very click that
+    // succeeds, which is what stranded keyboard focus on <body> (see StatusFilterBar's slot
+    // comment). So "not offered" is asserted as the state a user can actually perceive, rather
+    // than as absence from the DOM.
+    const resetBtn = () => screen.getByTestId("status-filter-reset") as HTMLButtonElement;
+    expect(resetBtn().style.visibility).toBe("hidden");
+    expect(resetBtn().disabled).toBe(true);
 
     fireEvent.click(screen.getByTestId("status-chip-running"));
     expect(screen.queryByText("Alpha")).toBeNull();
@@ -205,7 +211,9 @@ describe("AgentSidebar — the status filter", () => {
       expect(screen.getByTestId(`status-chip-${b}`).getAttribute("data-on")).toBe("true");
     }
     // And it retires itself again — there is nothing left to reset.
-    expect(screen.queryByTestId("status-filter-reset")).toBeNull();
+    // And it retires itself again — there is nothing left to reset.
+    expect(resetBtn().style.visibility).toBe("hidden");
+    expect(resetBtn().disabled).toBe(true);
   });
 
   it("hides a section the filter emptied, header and all", () => {
