@@ -17,50 +17,105 @@ export interface Rect {
 
 export type Edge = "left" | "right";
 
-/** Island: wide enough for the sparkle glyph, two count chiclets, Capture, and the collapse
- *  handle without wrapping at the 13px base font. */
-export const ISLAND_W = 268;
-export const ISLAND_H = 44;
+/**
+ * The island's FALLBACK footprint — what to use for the frame or two before the DOM has been
+ * measured, and in jsdom, where every box measures 0.
+ *
+ * It is not a reserved width. The island used to be a hard 268×44 with a `flex: 1` spacer holding
+ * its right-hand controls out to that edge, which left ~88px of bare C.deepForest (#0f2350) across
+ * the middle — the "big block of blue space" in the founder's report. The island now sizes to its
+ * content (`width: max-content`) and the MEASURED box drives the window; these numbers are just a
+ * close estimate of that content so the first painted frame is not visibly wrong.
+ */
+export const ISLAND_W = 196;
+export const ISLAND_H = 38;
 
-/** Pull tab: a thin vertical sliver, tall enough to be an easy click target at a screen edge. */
-export const TAB_W = 16;
-export const TAB_H = 64;
+/**
+ * Minimized: the sparkle mark alone, docked at a screen edge. SQUARE, because the thing inside it
+ * is a square icon.
+ *
+ * This was a 16×64 sliver holding three grip dots, and it read as a squashed flat pancake with
+ * nothing recognisable in it. A mark cannot keep its aspect ratio inside a 16px-wide window, so the
+ * shape of the window is the fix, not the artwork.
+ */
+export const TAB_W = 36;
+export const TAB_H = 36;
 
 /** Right-click menu ("Hide Helper" / "Quit Sparkle") and the capture-failure notice. */
 export const MENU_W = 168;
 export const MENU_H = 68;
+/** The failure notice is a line of prose, so it needs its OWN width floor — it can no longer
+ *  borrow the island's, which is now only as wide as two counts and two buttons happen to need. */
+export const ERROR_W = 268;
 export const ERROR_H = 48;
+
+/** A measured box in whatever units the caller measured it in (a DOMRect, in practice). */
+export interface Size {
+  width: number;
+  height: number;
+}
+
+/**
+ * A measurement worth acting on, rounded UP to whole pixels — or null.
+ *
+ * Two things are rejected, and both are real: a non-positive box (jsdom reports 0×0, and so does
+ * any frame before layout — sizing the OS window to it makes the island invisible), and a
+ * non-finite one (`set_size` would take NaN straight to the platform). Callers fall back to the
+ * constants above. The ceil matters because `getBoundingClientRect` returns sub-pixel floats:
+ * flooring 195.2 to 195 clips the last glyph of the collapse chevron.
+ */
+export function usableContentSize(m: Size | null | undefined): Size | null {
+  if (!m) return null;
+  if (!Number.isFinite(m.width) || !Number.isFinite(m.height)) return null;
+  if (m.width <= 0 || m.height <= 0) return null;
+  return { width: Math.ceil(m.width), height: Math.ceil(m.height) };
+}
+
+/** Whole-pixel equality. The resize path is a main-thread IPC round-trip, so it must fire when the
+ *  content genuinely changes — a menu opening, a count going from 9 to 10 — and not on every
+ *  render or every sub-pixel re-layout. */
+export function sameSize(a: Size, b: Size): boolean {
+  return a.width === b.width && a.height === b.height;
+}
 
 /**
  * The OS window size needed to actually SHOW what is rendered.
  *
- * This exists because a webview composites nothing outside its native window. The island is only
- * 268×44 (and the tab 16×64), so an absolutely-positioned context menu or error notice is simply
- * invisible — which is how "Quit Sparkle" ended up unclickable and the one user-facing error
- * string ("check Screen Recording") could never be read. Overlays must grow the window, not just
- * the DOM.
+ * This exists because a webview composites nothing outside its native window. The pill is small,
+ * so an absolutely-positioned context menu or error notice is simply invisible — which is how
+ * "Quit Sparkle" ended up unclickable and the one user-facing error string ("check Screen
+ * Recording") could never be read. Overlays must grow the window, not just the DOM.
+ *
+ * `content` is the measured pill box. Passing it is what makes the window HUG the island instead of
+ * reserving a fixed width: shrinking only the DOM would have moved the same empty region into the
+ * window's own background, which on a transparent always-on-top panel is just as visible.
  */
 export function windowSize(
   mode: "island" | "tab",
   overlays: { menuOpen: boolean; hasError: boolean },
+  content?: Size | null,
 ): { width: number; height: number } {
-  let width = mode === "island" ? ISLAND_W : TAB_W;
-  let height = mode === "island" ? ISLAND_H : TAB_H;
+  const base = pillSize(mode, content);
+  let width = base.width;
+  let height = base.height;
   if (overlays.menuOpen) {
     width = Math.max(width, MENU_W);
     height += MENU_H;
   }
   if (overlays.hasError) {
-    // The notice is full-width prose; a 16px-wide tab could never show it.
-    width = Math.max(width, ISLAND_W);
+    // The notice is full-width prose; neither a 36px tab nor a content-hugged island could show it.
+    width = Math.max(width, ERROR_W);
     height += ERROR_H;
   }
   return { width, height };
 }
 
-/** The pill's footprint for a mode. One definition, used by both the render and the hit-test —
- *  duplicating it is what let the two drift apart. */
-export function pillSize(mode: "island" | "tab"): { width: number; height: number } {
+/** The pill's footprint for a mode: the measured box when there is a usable one, else the fallback
+ *  constant. One definition, used by the render, the placement and the hit-test — duplicating it is
+ *  what let those drift apart. */
+export function pillSize(mode: "island" | "tab", content?: Size | null): Size {
+  const measured = usableContentSize(content);
+  if (measured) return measured;
   return mode === "island"
     ? { width: ISLAND_W, height: ISLAND_H }
     : { width: TAB_W, height: TAB_H };
@@ -121,8 +176,9 @@ export function nearerEdge(
  *
  * `size` is the size of the WINDOW being placed, which is not always the bare tab: an open context
  * menu or a capture-failure notice inflates it (see `windowSize`). Anchoring a 168px-wide window at
- * `screenRight - TAB_W` would push 152px of it — including the menu — off the screen, which is how
- * "Quit Sparkle" stayed unreachable for a right-docked tab even after the window started growing.
+ * `screenRight - TAB_W` would push everything past the tab's own 36px — the menu included — off the
+ * screen, which is how "Quit Sparkle" stayed unreachable for a right-docked tab even after the
+ * window started growing.
  * Which EDGE it snaps to is still decided by the tab's own footprint, so an overlay opening cannot
  * make it jump sides.
  */

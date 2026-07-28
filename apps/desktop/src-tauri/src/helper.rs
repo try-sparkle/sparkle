@@ -19,10 +19,16 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 
 use crate::frontmost::HELPER_LABEL;
 
-/// Must match ISLAND_W/ISLAND_H in src/helper/helperGeometry.ts — the window is built at island
-/// size and resized by the frontend when it collapses to a tab.
-const ISLAND_W: f64 = 268.0;
-const ISLAND_H: f64 = 44.0;
+/// Must match ISLAND_W/ISLAND_H in src/helper/helperGeometry.ts — the size the window is BUILT at,
+/// before the webview has measured anything.
+///
+/// These are a fallback, not the island's real footprint. The island sizes itself to its content
+/// (`width: max-content`) and the frontend pushes the measured box back through `set_helper_bounds`
+/// on the first layout, so this only has to be close enough that the very first frame is not
+/// visibly wrong. It used to be a hard 268x44, of which ~88px was a flex spacer painting bare
+/// C.deepForest across the middle of the pill.
+const ISLAND_W: f64 = 196.0;
+const ISLAND_H: f64 = 38.0;
 
 /// The two status bands the island shows. `done` is deliberately absent: on a resting fleet it is
 /// nearly every agent, so a permanent large number would drown the two counts that actually move.
@@ -166,9 +172,19 @@ mod tests {
 
     #[test]
     fn island_size_matches_the_frontend_constants() {
-        // helperGeometry.ts is the source of truth for these; the window is built at that size.
-        // If you change one, change the other.
-        assert_eq!(ISLAND_W, 268.0);
-        assert_eq!(ISLAND_H, 44.0);
+        // helperGeometry.ts is the source of truth for these; the window is built at that size and
+        // then resized to the measured content. If you change one, change the other.
+        assert_eq!(ISLAND_W, 196.0);
+        assert_eq!(ISLAND_H, 38.0);
+    }
+
+    #[test]
+    fn the_built_window_is_no_wider_than_the_island_it_paints() {
+        // The build size is a FALLBACK for the frame before the webview reports its own box. It
+        // must not reserve space the island does not use: on a transparent, always-on-top panel a
+        // window wider than its content is not empty, it is a click-swallowing rectangle the user
+        // can see the desktop through. 268.0 is the width that produced the reported "big block of
+        // blue space in the middle" and is the specific value this guards against.
+        assert!(ISLAND_W < 268.0);
     }
 }

@@ -3,7 +3,7 @@
 // This file owns the wiring — drag, visibility, capture, context menu — while the two
 // presentational components own the pixels. Position math lives in helperGeometry (pure) and the
 // show/hide rule in helperVisibility (pure), so what is left here is genuinely just plumbing.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { availableMonitors, currentMonitor } from "@tauri-apps/api/window";
 import { C } from "@sparkle/ui";
 import { HelperIsland, type Tier } from "./HelperIsland";
@@ -11,7 +11,8 @@ import { HelperTab } from "./HelperTab";
 import { useHelperPrefs, type HelperMode } from "./helperPrefs";
 import { shouldShowHelper } from "./helperVisibility";
 import {
-  clampToScreen, snapTabToEdge, screenFor, windowSize, hitTestPoint, pillSize, type Rect,
+  clampToScreen, snapTabToEdge, screenFor, windowSize, hitTestPoint, pillSize,
+  usableContentSize, sameSize, type Rect, type Size,
 } from "./helperGeometry";
 import {
   getHelperVitals, onHelperVitalsChanged, getFrontmost, onFrontmostChanged, onCaptureRequested,
@@ -137,9 +138,29 @@ export function HelperApp() {
   // {0,0} in the meantime would reproduce the same teleport in a narrower window, since the island
   // becomes clickable at first paint — before the IPC round-trip completes.
   const posRef = useRef<{ x: number; y: number } | null>(null);
-  // A drag of the pull tab ends with pointerup on the same <button>, which synthesizes a click —
-  // so without this the tab would expand into the island every time you tried to reposition it.
+  // The press has travelled far enough to be a DRAG rather than a click. Two things read it: the
+  // tab's onExpand (a drag ends with pointerup on the same <button>, which synthesizes a click, so
+  // without this repositioning the tab would always un-collapse it), and the release handler, which
+  // must not clamp-and-persist a position the user never moved.
   const draggedRef = useRef(false);
+
+  // The pill's REAL painted box, per mode, and the element it is measured from.
+  //
+  // This is what lets the island hug its content (item 1). The island is a real OS window, so
+  // `width: max-content` on the DOM alone would only have relocated the empty space into the
+  // window's background — on a transparent always-on-top panel that is exactly as visible. So the
+  // measurement drives `set_size` as well as the layout.
+  //
+  // Keyed BY MODE rather than held as one value: an island→tab collapse changes the box, and
+  // remembering each mode's own measurement means switching back is right on the first frame
+  // instead of flashing the fallback constant. `null` until measured — jsdom, and any frame before
+  // layout, report 0×0, which `usableContentSize` rejects (a zero-size window is an invisible
+  // island).
+  const pillRef = useRef<HTMLDivElement | null>(null);
+  const [measured, setMeasured] = useState<Record<HelperMode, Size | null>>({
+    island: null,
+    tab: null,
+  });
 
   // Only the island renders the capture-failure notice, so a failure while collapsed must display
   // as an island. DERIVED, never persisted: writing `mode` for a transient notice would undo a
@@ -147,14 +168,54 @@ export function HelperApp() {
   // the temporary value to the main window through the storage bridge.
   const renderMode: HelperMode = captureError ? "island" : mode;
 
+  // Rust hides the OS window, but the React tree stays mounted so subscriptions survive; the render
+  // below bails while hidden so a stray frame can't paint. Computed HERE, above the effects, because
+  // the measuring effect has to re-attach when the pill comes back.
+  const visible = shouldShowHelper({ enabled, sparkleFrontmost: frontmost });
+
+  const content = measured[renderMode];
   // The OS window must be big enough to COMPOSITE the overlays, not just to contain the pill —
   // a webview draws nothing outside its native bounds. See windowSize.
-  const { width, height } = windowSize(renderMode, { menuOpen, hasError: captureError !== null });
-  // The PILL's own footprint, independent of any overlay. It drives the wrapper's layout and the
-  // FRESH default origin — it is deliberately NOT used to place a position that was already
-  // persisted; see hitTestPoint for why measuring a stored coordinate by any footprint is what
-  // kept teleporting the window to the wrong monitor.
-  const { width: pillW, height: pillH } = pillSize(renderMode);
+  const { width, height } = windowSize(
+    renderMode,
+    { menuOpen, hasError: captureError !== null },
+    content,
+  );
+  // The PILL's own footprint, independent of any overlay. It drives the FRESH default origin — it
+  // is deliberately NOT used to place a position that was already persisted; see hitTestPoint for
+  // why measuring a stored coordinate by any footprint is what kept teleporting the window to the
+  // wrong monitor.
+  const { width: pillW, height: pillH } = pillSize(renderMode, content);
+
+  // Measure the pill and keep the window's size on it.
+  //
+  // Deliberately NOT run on every render: a ResizeObserver fires when the painted box actually
+  // changes — a count going from 9 to 10, the capture button appearing busy — and `sameSize` drops
+  // anything that rounds to the same whole pixels, so `setHelperBounds` (a main-thread IPC
+  // round-trip) is not re-issued for a re-render that changed nothing. Outside a browser
+  // (jsdom) there is no ResizeObserver, so this degrades to the one-shot measure above it.
+  useLayoutEffect(() => {
+    const el = pillRef.current;
+    if (!el) return;
+    // Captured, not read from the render closure: the effect re-runs on a mode change, and the
+    // measurement it takes belongs to the mode that was rendered when it attached.
+    const forMode = renderMode;
+    const measure = () => {
+      const next = usableContentSize(el.getBoundingClientRect());
+      if (!next) return;
+      setMeasured((cur) => {
+        const prev = cur[forMode];
+        // Returning `cur` unchanged is the point: it keeps the object identity, so React bails out
+        // of the re-render and the geometry effect below does not re-fire.
+        return prev && sameSize(prev, next) ? cur : { ...cur, [forMode]: next };
+      });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [renderMode, visible]);
   // NOTE: `x`/`y` are always the PILL's top-left, never the window's. They are only written while
   // no overlay is open (a drag cannot coexist with the menu — the scrim swallows the pointerdown),
   // so the two coincide at write time.
@@ -379,22 +440,34 @@ export function HelperApp() {
     };
     const DRAG_SLOP = 3; // px of travel before a press counts as a drag rather than a click
     const onMove = (ev: PointerEvent) => {
-      lastX = originX + (ev.screenX - startX);
-      lastY = originY + (ev.screenY - startY);
-      if (Math.abs(ev.screenX - startX) > DRAG_SLOP || Math.abs(ev.screenY - startY) > DRAG_SLOP) {
-        draggedRef.current = true;
-      }
+      const dx = ev.screenX - startX;
+      const dy = ev.screenY - startY;
+      // Under the slop this is still a CLICK, so move nothing at all. Committing sub-slop frames
+      // would twitch the window under a user who only meant to press the sparkle mark, and leave
+      // the window a couple of px away from the position that is actually persisted.
+      if (!draggedRef.current && Math.abs(dx) <= DRAG_SLOP && Math.abs(dy) <= DRAG_SLOP) return;
+      draggedRef.current = true;
+      lastX = originX + dx;
+      lastY = originY + dy;
       // Move live and unclamped for a responsive feel; the clamp/snap happens once on release.
       if (!raf) raf = requestAnimationFrame(commit);
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      // A gesture the OS took away from us (a native drag, a system swipe) ends in pointercancel
+      // and NO pointerup — without this the move listener would outlive the drag.
+      window.removeEventListener("pointercancel", onUp);
       // Drop any frame still pending so it can't land AFTER the clamp/snap below and undo it.
       if (raf) {
         cancelAnimationFrame(raf);
         raf = 0;
       }
+      // A press that never travelled is a CLICK — the sparkle mark, or any bare part of the strip.
+      // There is nothing to clamp, snap or persist: bailing here is what keeps a click from
+      // writing an x/y (and re-running the placement effect) every single time the user taps the
+      // island.
+      if (!draggedRef.current) return;
       void (async () => {
         const { screens, current } = await readScreens();
         const fallback = current ?? screens[0] ?? FALLBACK_SCREEN;
@@ -418,15 +491,13 @@ export function HelperApp() {
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   }, [renderMode, width, height, pillW, pillH, setPosition, setEdge]);
 
   const onChiclet = useCallback((band: Tier) => {
     emitFocusTier({ band });
   }, []);
 
-  const visible = shouldShowHelper({ enabled, sparkleFrontmost: frontmost });
-  // Rust hides the OS window, but the React tree stays mounted so subscriptions survive; render
-  // nothing while hidden so a stray frame can't paint.
   if (!visible) return null;
 
   return (
@@ -436,13 +507,19 @@ export function HelperApp() {
       onContextMenu={(e) => { e.preventDefault(); setMenuOpen(true); }}
     >
       <div
+        ref={pillRef}
         style={{
           position: "absolute",
           top: 0,
-          // Explicit footprint. Without it the wrapper shrink-to-fits, the island's flex spacer
-          // collapses, Capture and the chevron stop being right-aligned, and the painted pill
-          // ends up narrower than the window the user positioned.
-          width: pillW,
+          // Shrink-to-fit, and MEASURED — this box is what the OS window is sized to. It used to
+          // carry an explicit `width: pillW` because the island reserved a fixed width and used a
+          // flex spacer to right-align Capture; with the spacer gone, hugging is the whole point.
+          //
+          // `max-content`, not the `fit-content` an absolutely-positioned box defaults to: fit
+          // -content is capped by the containing block (100vw — the window), so a frame where the
+          // window is narrower than the strip would measure short, shrink the window, and measure
+          // shorter still.
+          width: "max-content",
           // The window grows inward from the docked edge when an overlay opens. Anchoring the pill
           // to that same edge keeps it visually still; laying it out at the window's left instead
           // made a right-docked tab jump 152px inward on every right-click, out from under the
@@ -467,7 +544,17 @@ export function HelperApp() {
           edge={edge}
           // Suppress the click synthesized at the end of a drag, or repositioning the tab would
           // always un-collapse it.
-          onExpand={() => { if (!draggedRef.current) setMode("island"); }}
+          //
+          // ONE-SHOT: the latch is consumed here rather than left standing until the next
+          // pointerdown clears it. A <button> also fires `click` from Enter/Space, with no
+          // pointerdown before it — so a latch that survived its own click left the tab
+          // permanently dead to keyboard activation after any drag, which is the only documented
+          // way back out of the minimized state for anyone not using a mouse.
+          onExpand={() => {
+            const wasDrag = draggedRef.current;
+            draggedRef.current = false;
+            if (!wasDrag) setMode("island");
+          }}
           onDragStart={onDragStart}
         />
       )}

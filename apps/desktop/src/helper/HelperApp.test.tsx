@@ -78,7 +78,7 @@ import { HelperApp } from "./HelperApp";
 import { useHelperPrefs } from "./helperPrefs";
 // Derived, never hand-copied: a change to TAB_W in helperGeometry moves this test with it. The
 // invariant it relies on is stated once, at STRADDLE_INSET below.
-import { TAB_W, TAB_H, ISLAND_W } from "./helperGeometry";
+import { TAB_W, TAB_H, ISLAND_W, ISLAND_H, ERROR_W } from "./helperGeometry";
 
 const DEFAULTS = { enabled: true, mode: "island", x: null, y: null, edge: "right" };
 
@@ -396,11 +396,13 @@ describe("HelperApp", () => {
     await waitFor(() => {
       expect(setHelperBounds).toHaveBeenCalled();
       const [bx, , bw] = lastBounds();
-      // Width proves this really is the island placement, not a leftover tab one.
-      expect(bw).toBe(ISLAND_W);
+      // ERROR_W, not the island's own width: the island hugs its content now, so the window is
+      // widened to the notice's floor whenever the notice is up. Either way the width proves this
+      // is the island-with-notice placement and not a leftover tab one — the tab is 36 wide.
+      expect(bw).toBe(ERROR_W);
       // Exact, not a half-plane: resolving the right DISPLAY but clamping against the wrong rect
       // would still satisfy "somewhere on the secondary screen".
-      expect(bx).toBe(SECOND.position.x + SECOND.size.width - ISLAND_W);
+      expect(bx).toBe(SECOND.position.x + SECOND.size.width - ERROR_W);
     });
   });
 
@@ -452,6 +454,220 @@ describe("HelperApp", () => {
     vi.mocked(availableMonitors).mockRejectedValue(new Error("no monitors"));
     render(<HelperApp />);
     await waitFor(() => expect(showHelper).toHaveBeenCalled());
+  });
+
+  // ---- item 1: the WINDOW hugs the island, not just the DOM ----
+  //
+  // The island is a real OS window, so `width: max-content` on the strip alone would only have
+  // moved the founder's "big block of blue space" from the pill into the window background — on a
+  // transparent always-on-top panel that is equally visible, and it still swallows clicks. These
+  // pin the measurement actually reaching set_size.
+
+  /** A stubbed layout box. jsdom measures everything as 0×0, which `usableContentSize` rejects, so
+   *  a test that wants to exercise the measured path has to supply one. */
+  const stubBox = (width: number, height: number) =>
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      width, height, x: 0, y: 0, top: 0, left: 0, right: width, bottom: height,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+  it("sizes the window to the MEASURED island, not to a reserved constant", async () => {
+    const box = stubBox(150, 30);
+    try {
+      render(<HelperApp />);
+      await waitFor(() => expect(lastBounds().slice(2)).toEqual([150, 30]));
+    } finally {
+      box.mockRestore();
+    }
+  });
+
+  it("falls back to the constants when the box cannot be measured", async () => {
+    // jsdom's 0×0 — and, in the app, any frame before layout. Sizing the window to zero would make
+    // the island invisible, which is a worse bug than a slightly-wrong first frame.
+    render(<HelperApp />);
+    await waitFor(() => expect(lastBounds().slice(2)).toEqual([ISLAND_W, ISLAND_H]));
+  });
+
+  it("sizes the MINIMIZED window to the icon, so a small mark cannot sit in a wide window", async () => {
+    useHelperPrefs.setState({ ...DEFAULTS, mode: "tab" } as never);
+    render(<HelperApp />);
+    await waitFor(() => expect(lastBounds().slice(2)).toEqual([TAB_W, TAB_H]));
+    // Square: the "flat pancake" was a 16x64 window, and no DOM inside one can look otherwise.
+    const [, , w, h] = lastBounds();
+    expect(w).toBe(h);
+  });
+
+  it("does not re-issue the resize IPC when a re-measure reports the same box", async () => {
+    // Every setHelperBounds is a main-thread Tauri round-trip. The window must resize when the
+    // content GENUINELY changes, not whenever the observer happens to fire.
+    const box = stubBox(150, 30);
+    let remeasure: (() => void) | null = null;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) { remeasure = cb; }
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
+    );
+    try {
+      render(<HelperApp />);
+      await waitFor(() => expect(lastBounds().slice(2)).toEqual([150, 30]));
+      await waitFor(() => expect(remeasure).toBeTypeOf("function"));
+      const before = setHelperBounds.mock.calls.length;
+      remeasure!();
+      remeasure!();
+      remeasure!();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(setHelperBounds.mock.calls.length).toBe(before);
+    } finally {
+      vi.unstubAllGlobals();
+      box.mockRestore();
+    }
+  });
+
+  // ---- item 2: press-and-drag on the sparkle mark moves the island; a click does not ----
+
+  it("drags the island by the sparkle mark and persists where it lands", async () => {
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    const [originX, originY] = lastBounds();
+
+    // Down on the MARK — the handle the founder reaches for — then move well past DRAG_SLOP.
+    // Left and down, so the destination is comfortably inside PRIMARY and the release clamp has
+    // nothing to correct; a drag that merely hit the clamp would prove nothing about the drag.
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 200, screenY: 700 });
+    fireEvent.pointerUp(window, { screenX: 200, screenY: 700 });
+
+    await waitFor(() => {
+      const { x, y } = useHelperPrefs.getState();
+      expect(x).toBe(originX - 300);
+      expect(y).toBe(originY + 200);
+    });
+  });
+
+  it("moves the WINDOW as the pointer moves, not only on release", async () => {
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    const [originX, originY] = lastBounds();
+    setHelperBounds.mockClear();
+
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 200, screenY: 700 });
+
+    // The live frame lands before pointerup — the island has to follow the cursor, not teleport
+    // when the button comes back up.
+    await waitFor(() => {
+      expect(setHelperBounds).toHaveBeenCalled();
+      expect(lastBounds().slice(0, 2)).toEqual([originX - 300, originY + 200]);
+    });
+
+    // FINISH the gesture. The drag listeners live on `window`, which outlives both the component
+    // and RTL's cleanup — a test that leaves a drag open leaks its handlers into the NEXT test,
+    // where they answer that test's pointer events from this test's closure. (Found the hard way:
+    // it made the click-vs-drag case below persist a 2px "drag" that nothing in it performed.)
+    fireEvent.pointerUp(window, { screenX: 200, screenY: 700 });
+  });
+
+  it("treats a press-and-release with no travel as a CLICK, persisting nothing", async () => {
+    // The two gestures share a pointerdown, so they must be told apart by TRAVEL. Before this, the
+    // release handler clamped and persisted an x/y on every click of the island — writing a
+    // position the user never chose, and re-running the placement effect to do it.
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    // Inside DRAG_SLOP: the hand-tremor every real click has.
+    fireEvent.pointerMove(window, { screenX: 502, screenY: 501 });
+    fireEvent.pointerUp(window, { screenX: 502, screenY: 501 });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(useHelperPrefs.getState().x).toBeNull();
+    expect(useHelperPrefs.getState().y).toBeNull();
+  });
+
+  it("does not twitch the window for a sub-slop press", async () => {
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    setHelperBounds.mockClear();
+
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 502, screenY: 501 });
+    fireEvent.pointerUp(window, { screenX: 502, screenY: 501 });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(setHelperBounds).not.toHaveBeenCalled();
+  });
+
+  it("stops listening when the OS takes the gesture away (pointercancel, no pointerup)", async () => {
+    // A native drag or a system swipe ends the gesture with pointercancel and NO pointerup. Without
+    // a listener for it the move handler outlives the drag, and the island then follows the cursor
+    // around with no button held down.
+    render(<HelperApp />);
+    const mark = await screen.findByAltText("Sparkle");
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+    const [originX, originY] = lastBounds();
+
+    fireEvent.pointerDown(mark, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerCancel(window, { screenX: 500, screenY: 500 });
+    setHelperBounds.mockClear();
+    fireEvent.pointerMove(window, { screenX: 900, screenY: 900 });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(setHelperBounds).not.toHaveBeenCalled();
+    // …and nothing was persisted from a gesture the user never completed.
+    expect(useHelperPrefs.getState().x).toBeNull();
+    expect(originX).toBeTypeOf("number");
+    expect(originY).toBeTypeOf("number");
+  });
+
+  // ---- the drag latch is ONE-SHOT: it suppresses the drag's own click, and nothing after it ----
+
+  it("repositioning the tab does not un-collapse it", async () => {
+    // The gesture ends with pointerup on the same <button>, which synthesizes a click. Without the
+    // latch, every attempt to move the tab would expand it into the island instead.
+    useHelperPrefs.setState({ ...DEFAULTS, mode: "tab" } as never);
+    render(<HelperApp />);
+    const tab = await screen.findByRole("button", { name: /show sparkle helper/i });
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+
+    fireEvent.pointerDown(tab, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 500, screenY: 700 });
+    fireEvent.pointerUp(window, { screenX: 500, screenY: 700 });
+    fireEvent.click(tab); // the click the browser synthesizes at the end of that drag
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(useHelperPrefs.getState().mode).toBe("tab");
+  });
+
+  it("still restores the island from the KEYBOARD after the tab has been dragged", async () => {
+    // A <button> fires `click` from Enter/Space with NO pointerdown before it. The latch is cleared
+    // on pointerdown, so a latch left standing after a drag had nothing to clear it: the tab went
+    // permanently dead to keyboard activation, and the only documented way back out of the
+    // minimized state stopped working for anyone not using a mouse. Same failure shape as the
+    // takeover latch in e5504f7fc — a latch that can strand is a latch that will.
+    useHelperPrefs.setState({ ...DEFAULTS, mode: "tab" } as never);
+    render(<HelperApp />);
+    const tab = await screen.findByRole("button", { name: /show sparkle helper/i });
+    await waitFor(() => expect(setHelperBounds).toHaveBeenCalled());
+
+    // Drag it somewhere, which arms the latch and consumes it on the synthesized click.
+    fireEvent.pointerDown(tab, { button: 0, screenX: 500, screenY: 500 });
+    fireEvent.pointerMove(window, { screenX: 500, screenY: 700 });
+    fireEvent.pointerUp(window, { screenX: 500, screenY: 700 });
+    fireEvent.click(tab);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(useHelperPrefs.getState().mode).toBe("tab");
+
+    // Now activate it by keyboard: a bare click, no pointer gesture at all.
+    fireEvent.click(tab);
+    await waitFor(() => expect(useHelperPrefs.getState().mode).toBe("island"));
   });
 
   it("right-click → Open Sparkle reveals the main window", async () => {

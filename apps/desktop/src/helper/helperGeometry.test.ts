@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   clampToScreen, nearerEdge, snapTabToEdge, screenFor, windowSize, hitTestPoint, pillSize,
-  ISLAND_W, ISLAND_H, TAB_W, TAB_H, MENU_W, MENU_H, ERROR_H,
+  usableContentSize, sameSize,
+  ISLAND_W, ISLAND_H, TAB_W, TAB_H, MENU_W, MENU_H, ERROR_W, ERROR_H,
 } from "./helperGeometry";
 
 // A 1440x900 primary display at the origin, and a second display to its right.
@@ -119,8 +120,10 @@ describe("windowSize", () => {
   });
 
   it("grows for the capture-failure notice, widening even in tab mode", () => {
+    // ERROR_W, not the island's own width: the island now HUGS its content, so its width is
+    // whatever the chiclets happen to need — which is no longer enough room for a line of prose.
     const s = windowSize("tab", { menuOpen: false, hasError: true });
-    expect(s.width).toBe(ISLAND_W);
+    expect(s.width).toBe(ERROR_W);
     expect(s.height).toBe(TAB_H + ERROR_H);
   });
 
@@ -232,5 +235,115 @@ describe("pillSize", () => {
   it("returns the island and tab footprints", () => {
     expect(pillSize("island")).toEqual({ width: ISLAND_W, height: ISLAND_H });
     expect(pillSize("tab")).toEqual({ width: TAB_W, height: TAB_H });
+  });
+
+  it("prefers a usable measurement over the fallback constant", () => {
+    expect(pillSize("island", { width: 150, height: 30 })).toEqual({ width: 150, height: 30 });
+    expect(pillSize("tab", { width: 44, height: 44 })).toEqual({ width: 44, height: 44 });
+  });
+
+  it("falls back to the constant when the measurement is unusable", () => {
+    expect(pillSize("island", { width: 0, height: 0 })).toEqual({ width: ISLAND_W, height: ISLAND_H });
+    expect(pillSize("tab", null)).toEqual({ width: TAB_W, height: TAB_H });
+  });
+});
+
+// ---- the island must HUG its content (item 1: "that big block of blue space in the middle") ----
+//
+// The island reserved a fixed 268px and pushed its right-hand controls out with a `flex: 1`
+// spacer, so its middle was ~88px of bare C.deepForest (#0f2350 — the navy the founder reads as
+// blue). Shrinking the DOM alone would not have fixed it: the island is a real OS window, so the
+// same empty space would simply have moved into the window's own background. The measured content
+// box is therefore what drives `windowSize`, and these pin that wiring.
+describe("usableContentSize", () => {
+  it("accepts a real measurement, rounding UP so the last glyph is never clipped", () => {
+    expect(usableContentSize({ width: 195.2, height: 37.4 })).toEqual({ width: 196, height: 38 });
+  });
+
+  it("rejects a 0x0 box — jsdom and any pre-layout frame report one, and a zero-size window is "
+    + "an invisible island", () => {
+    expect(usableContentSize({ width: 0, height: 0 })).toBeNull();
+    expect(usableContentSize({ width: 120, height: 0 })).toBeNull();
+  });
+
+  it("rejects a negative or non-finite box rather than passing it to set_size", () => {
+    expect(usableContentSize({ width: -10, height: 20 })).toBeNull();
+    expect(usableContentSize({ width: Number.NaN, height: 20 })).toBeNull();
+    expect(usableContentSize({ width: Number.POSITIVE_INFINITY, height: 20 })).toBeNull();
+  });
+
+  it("rejects nothing at all", () => {
+    expect(usableContentSize(null)).toBeNull();
+    expect(usableContentSize(undefined)).toBeNull();
+  });
+});
+
+// The resize is an IPC round-trip on the main thread, so it must fire when the content GENUINELY
+// changes (a menu opening, a capture-failure notice) and not on every render or every sub-pixel
+// re-layout. Whole-pixel equality is the gate.
+describe("sameSize", () => {
+  it("is true for an identical box", () => {
+    expect(sameSize({ width: 196, height: 38 }, { width: 196, height: 38 })).toBe(true);
+  });
+
+  it("is false as soon as either axis moves a whole pixel", () => {
+    expect(sameSize({ width: 196, height: 38 }, { width: 197, height: 38 })).toBe(false);
+    expect(sameSize({ width: 196, height: 38 }, { width: 196, height: 39 })).toBe(false);
+  });
+});
+
+describe("windowSize with a measured content box", () => {
+  const none = { menuOpen: false, hasError: false };
+
+  it("sizes the window to the measured content, not to the fallback constant", () => {
+    expect(windowSize("island", none, { width: 150, height: 30 }))
+      .toEqual({ width: 150, height: 30 });
+  });
+
+  it("rounds a sub-pixel measurement up", () => {
+    expect(windowSize("island", none, { width: 195.2, height: 37.4 }))
+      .toEqual({ width: 196, height: 38 });
+  });
+
+  it("falls back to the constants for an unusable measurement", () => {
+    expect(windowSize("island", none, { width: 0, height: 0 }))
+      .toEqual({ width: ISLAND_W, height: ISLAND_H });
+    expect(windowSize("tab", none, null)).toEqual({ width: TAB_W, height: TAB_H });
+  });
+
+  it("measures the MINIMIZED window too, so a small icon cannot sit in a wide window", () => {
+    expect(windowSize("tab", none, { width: 36, height: 36 }))
+      .toEqual({ width: 36, height: 36 });
+  });
+
+  it("still stacks the overlays on top of a measured island", () => {
+    const s = windowSize("island", { menuOpen: true, hasError: true }, { width: 150, height: 30 });
+    expect(s.height).toBe(30 + MENU_H + ERROR_H);
+    expect(s.width).toBe(Math.max(MENU_W, ERROR_W));
+  });
+
+  it("keeps the failure notice readable when the hugged island is narrower than the prose", () => {
+    const s = windowSize("island", { menuOpen: false, hasError: true }, { width: 150, height: 30 });
+    expect(s.width).toBe(ERROR_W);
+    expect(s.width).toBeGreaterThan(150);
+  });
+
+  it("never shrinks below the measurement when an overlay's floor is narrower", () => {
+    // A wide island (two three-digit counts) with the menu open must not be squeezed to MENU_W.
+    const s = windowSize("island", { menuOpen: true, hasError: false }, { width: 240, height: 38 });
+    expect(s.width).toBe(240);
+  });
+});
+
+// ---- the minimized state is the sparkle MARK, not a sliver (item 3: "a flat pancake") ----
+describe("the minimized tab is icon-shaped", () => {
+  it("is square, so the mark inside it keeps its aspect ratio", () => {
+    expect(TAB_W).toBe(TAB_H);
+  });
+
+  it("is a real click target rather than a 16px sliver", () => {
+    // The old tab was 16x64. Anything that thin has no proportion an icon can live in — the mark
+    // had to be squashed to fit, which is exactly what the founder saw.
+    expect(TAB_W).toBeGreaterThanOrEqual(28);
   });
 });

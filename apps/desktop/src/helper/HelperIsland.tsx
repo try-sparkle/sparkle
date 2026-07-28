@@ -5,15 +5,18 @@
 //
 // CURSORS FOLLOW ONE RULE, because the island is the rare surface that both drags and clicks:
 // what you DRAG gets `grab`, what you CLICK gets `pointer`. The island BODY is the drag handle
-// (onDragStart), so it keeps `grab`; the sparkle mark is decoration sitting on that same drag
-// surface and deliberately inherits it. Every control — both chiclets, Capture, the collapse
-// handle — is a click and says `pointer`. Capture's busy state is the one exception (`default`),
+// (onDragStart), so it keeps `grab`; the sparkle mark sits on that same drag surface and says
+// `grab` EXPLICITLY rather than inheriting, because it is the handle users actually reach for and
+// the rule should be visible where the thing is defined. Every control — both chiclets, Capture,
+// the collapse handle — is a click and says `pointer`. Capture's busy state is the one exception
+// (`default`),
 // which is honest: while a capture is in flight the button is disabled and clicking does nothing.
 // helperIsland cursor coverage is pinned by test, because a missing `pointer` is invisible in
 // review and reads to the user as "this panel isn't interactive".
 import { C } from "@sparkle/ui";
 import { CaptureIcon } from "./CaptureIcon";
-import { ISLAND_H, type Edge } from "./helperGeometry";
+import { SparkleMark } from "./SparkleMark";
+import { ERROR_W, type Edge } from "./helperGeometry";
 import type { Vitals } from "../services/helper";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import type { StatusBand } from "../engine/buildSections";
@@ -61,8 +64,9 @@ function Dot({ color }: { color: string }) {
  * A band chiclet: a colored dot and a bare count, nothing else.
  *
  * The prose ("3 Need you") was dropped because two labelled counts plus a wordmark plus Capture
- * do not fit a 268px island without crowding — the dot already carries the band, so the words
- * were saying it twice. But a bare "3" is meaningless to a screen reader, and `Dot` is
+ * crowded the island — and now that the island sizes to its content, every extra word is extra
+ * window sitting over the user's screen. The dot already carries the band, so the words were
+ * saying it twice. But a bare "3" is meaningless to a screen reader, and `Dot` is
  * aria-hidden, so the visible text is ALL the semantics there used to be. The meaning is moved,
  * not deleted: `bandCountLabel` — the same helper the sidebar and ScopeVitals use, so singular
  * agreement ("1 Needs you" vs "3 Need you") stays consistent — now feeds the aria-label and the
@@ -123,35 +127,53 @@ export function HelperIsland({
   return (
     <div
       style={{
-        height: ISLAND_H,
+        // NO fixed width or height. The island HUGS what it renders: `max-content` sizes it to the
+        // mark, the two chiclets and the two buttons and nothing more, and the height falls out of
+        // the padding. It used to be a hard 268×44 with a `flex: 1` spacer holding Capture out to
+        // the right edge, which left ~88px of bare C.deepForest across the middle — the "big block
+        // of blue space" in the report. HelperApp measures this box and resizes the OS WINDOW to
+        // it, which is the other half of the fix: on a transparent always-on-top panel, empty space
+        // left in the window is exactly as visible as empty space left in the pill.
+        //
+        // `max-content` rather than `fit-content`: fit-content is capped by the available width, so
+        // a frame where the window is momentarily narrower than the strip would shrink the content,
+        // which would shrink the measurement, which would shrink the window — a resize loop.
+        width: "max-content",
+        flexShrink: 0,
         display: "flex",
         alignItems: "center",
+        flexWrap: "nowrap",
+        whiteSpace: "nowrap",
         gap: 4,
-        padding: "0 6px 0 10px",
+        padding: "6px 8px 6px 10px",
         background: C.deepForest,
         // Matches HELPER_CORNER_RADIUS in mac_panel.rs — if these drift you get a visible seam
         // where the square webview corner meets the rounded window edge.
         borderRadius: 12,
         boxSizing: "border-box",
+        // The capture-failure notice hangs off the bottom of THIS box, so it must be the
+        // positioning context — otherwise it anchors to the wrapper and needs a hardcoded offset
+        // that goes stale the moment the island's height stops being a constant.
+        position: "relative",
         // The strip itself is the drag surface; each control stops propagation on pointerdown so
         // reaching for Capture never starts a drag.
         cursor: "grab",
+        // A drag across the strip must not paint a text selection over the counts.
+        userSelect: "none",
       }}
       onPointerDown={onDragStart}
     >
       {/*
         The SQUARE mark, not the "sparkle.ai" wordmark. The wordmark is 850×188, so at 16px tall
-        it ate ~72px — over a quarter of the 268px island — to repeat branding the user already
-        knows. The mark is the same brand asset at a square footprint (~18px), and the space it
-        gives back is what makes room for the collapse handle to be legible.
+        it ate ~72px to repeat branding the user already knows. The mark is the same brand asset at
+        a square footprint (~18px), and the space it gives back is what makes room for the collapse
+        handle to be legible.
+
+        It is also the island's DRAG HANDLE — the one the user reaches for first. It deliberately
+        does NOT stop propagation on pointerdown (every control around it does), so pressing it
+        starts the same drag the strip does; see SparkleMark for why a plain <img> could not.
       */}
-      <img
-        src="/sparkle-mark.svg"
-        alt="Sparkle"
-        width={18}
-        height={18}
-        style={{ width: 18, height: 18, flex: "0 0 auto" }}
-      />
+      <SparkleMark size={18} cursor="grab" />
 
       <BandChiclet
         band="needs_you"
@@ -167,8 +189,10 @@ export function HelperIsland({
         onSelect={() => onChiclet("running")}
       />
 
-      <div style={{ flex: 1 }} />
-
+      {/* No flex spacer here. It was `<div style={{ flex: 1 }} />`, and against a fixed 268px
+          island it WAS the block of empty navy — a spacer's whole job is to manufacture dead space.
+          The controls now sit directly after the counts; the 6px margin below is a deliberate
+          grouping gap between "what is happening" and "what you can do about it", not filler. */}
       <button
         aria-label="Capture"
         title="Capture a screen region"
@@ -183,6 +207,7 @@ export function HelperIsland({
           background: C.teal,
           borderRadius: 6,
           padding: "6px 9px",
+          marginLeft: 6,
           opacity: captureBusy ? 0.55 : 1,
         }}
         onPointerDown={(e) => e.stopPropagation()}
@@ -247,9 +272,16 @@ export function HelperIsland({
           role="alert"
           style={{
             position: "absolute",
-            top: ISLAND_H + 4,
+            // Hangs off the bottom of the island, whatever height the island turned out to be —
+            // a constant offset here would go stale now that the island sizes to its content.
+            top: "100%",
+            marginTop: 4,
             left: 0,
-            right: 0,
+            // Its OWN width, not the island's: this is a line of prose and the hugged island is
+            // only as wide as two counts and two buttons. windowSize widens the window to ERROR_W
+            // whenever this is up, so the two agree by construction.
+            width: ERROR_W,
+            boxSizing: "border-box",
             color: C.cream,
             background: C.sienna,
             fontSize: 11,
