@@ -5044,6 +5044,53 @@ quit_app = 42
         assert_eq!(before, std::fs::read_to_string(global_path(ad)).unwrap());
     }
 
+    /// The settings pane's "Reset all to defaults" clears every per-tool rule with ONE
+    /// `unset_value("concierge.tools")` rather than N unsets of its keys — each write emits a
+    /// `config-changed`, so key-by-key lets a hydrate land mid-clear and revert the rest. That only
+    /// works if unsetting a dotted path can remove a whole TABLE, which nothing pinned before.
+    #[test]
+    fn unset_value_removes_a_whole_table_and_leaves_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        reset(ad).unwrap();
+        set_values(
+            ad,
+            &[
+                ("concierge.tools.merge_pr".to_string(), serde_json::json!("deny")),
+                ("concierge.tools.quit_app".to_string(), serde_json::json!("allow")),
+                // A hand-edited key naming no tool. "Reset to defaults" has to take this too, or the
+                // pane still shows an "unreadable" warning on a row the user just reset.
+                ("concierge.tools.not_a_tool".to_string(), serde_json::json!("allwo")),
+                // A SIBLING section that must survive.
+                ("ai.composer".to_string(), serde_json::json!(false)),
+            ],
+        )
+        .unwrap();
+        let (before, _, _) = effective(Some(&std::fs::read_to_string(global_path(ad)).unwrap()), None);
+        assert_eq!(before.concierge.tools.len(), 3);
+
+        unset_value(ad, "concierge.tools").unwrap();
+
+        let text = std::fs::read_to_string(global_path(ad)).unwrap();
+        let (cfg, _, hard) = effective(Some(&text), None);
+        assert!(!hard, "the file must still be valid TOML after the table is removed");
+        assert!(cfg.concierge.tools.is_empty(), "every rule is gone: {:?}", cfg.concierge.tools);
+        // Only the policy went. The rest of the file is untouched.
+        assert!(!cfg.ai.composer);
+    }
+
+    #[test]
+    fn unset_value_on_an_absent_table_is_a_no_op() {
+        // Pressing "Reset all to defaults" on a machine that never wrote a rule must not fail, and
+        // must not rewrite the file into some other shape.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        reset(ad).unwrap();
+        let before = std::fs::read_to_string(global_path(ad)).unwrap();
+        unset_value(ad, "concierge.tools").unwrap();
+        assert_eq!(before, std::fs::read_to_string(global_path(ad)).unwrap());
+    }
+
     #[test]
     fn load_document_falls_back_to_template_on_unparseable_toml() {
         // FIX 2 regression: a corrupt on-disk config.toml must not panic load_document — it falls

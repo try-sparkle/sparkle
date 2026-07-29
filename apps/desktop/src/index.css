@@ -357,3 +357,24 @@ body {
 .shell[data-wired="right"] .pair[data-side="right"] .paircols > [data-testid="agent-sidebar-column"] {
   border-left-color: transparent;
 }
+
+/* Settings → Concierge tools: the per-row "Reset" and the pane's "Reset all to defaults" are text
+   LINKS, not buttons — no border, no fill, muted until hover. They are the undo for a decision, not
+   a fourth thing to decide, and drawing them in the same bordered box as Allow / Ask first / Never
+   both said otherwise and consumed the row width that made the option segment wrap.
+
+   The hover state lives here rather than in the component because the pane styles inline, and an
+   inline style cannot express `:hover`. The alternative — per-row React hover state across 62 rows
+   — is a re-render per mouse move to change one colour. */
+.settings-link-btn {
+  color: var(--c-muted);
+  text-decoration: none;
+}
+.settings-link-btn:hover:not(:disabled) {
+  color: var(--c-cream);
+  text-decoration: underline;
+}
+.settings-link-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

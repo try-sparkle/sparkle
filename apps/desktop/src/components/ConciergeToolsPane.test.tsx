@@ -11,8 +11,12 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const setConciergeToolPolicy = vi.fn();
+const allowAllConciergeTools = vi.fn();
+const resetAllConciergeTools = vi.fn();
 vi.mock("../services/configActions", () => ({
   setConciergeToolPolicy: (...a: unknown[]) => setConciergeToolPolicy(...a),
+  allowAllConciergeTools: () => allowAllConciergeTools(),
+  resetAllConciergeTools: () => resetAllConciergeTools(),
 }));
 
 // The AI-enhancements gate is its own seam with its own rule tests (services/conciergeAiAccess);
@@ -38,12 +42,23 @@ let aiAccess: ConciergeAiAccess = { enabled: true, remedy: null };
 
 beforeEach(() => {
   setConciergeToolPolicy.mockClear();
+  allowAllConciergeTools.mockClear();
+  resetAllConciergeTools.mockClear();
   turnOnConciergeAi.mockClear();
   aiAccess = { enabled: true, remedy: null };
   useSettingsStore.setState({ conciergeToolPolicy: {} });
   useUiStore.setState({ settingsRequest: null, conciergeCopyOnSelection: true });
 });
 afterEach(cleanup);
+
+/** Any `border…: <n>px …` declaration on the element's inline style, or null if it draws no box.
+ *
+ *  Reads the serialized attribute rather than `style.border` on purpose: jsdom's CSSOM drops
+ *  `border: none` to an empty string, so `style.border === ""` is true both for a link and for a
+ *  button that simply never set the shorthand. The width is the tell that survives. */
+function borderRule(el: Element): string | null {
+  return (el.getAttribute("style") ?? "").match(/border[\w-]*:\s*[^;]*\d+px[^;]*/)?.[0] ?? null;
+}
 
 /** The row block for one tool, found by its (monospace) tool name. */
 function rowFor(tool: string): HTMLElement {
@@ -341,5 +356,232 @@ describe("the auto-send tuner has a real switch", () => {
 
     fireEvent.click(sw);
     expect(useUiStore.getState().conciergeAutoSendTuner).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// LAYOUT. jsdom has no layout engine, so nothing here can measure a pixel — what it CAN pin is the
+// structure that makes the pixels come out right, and every assertion below fails against the
+// pane as it was: the options used to sit in a `flexWrap: "wrap"` bag with no reserved width, which
+// dropped "Never" onto a second line on 38 of 62 rows in the running app and left "Allow" starting
+// at three different x-positions down the page. The measurement itself is a browser job
+// (scripts/visual) — this is the contract that measurement verifies.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("the three options are ONE segmented control, on one line", () => {
+  const segmentIn = (tool: string) =>
+    within(rowFor(tool)).getByTestId("concierge-tool-segment") as HTMLElement;
+
+  it("puts all three options inside a single control that cannot wrap", () => {
+    render(<ConciergeToolsPane />);
+    const seg = segmentIn("merge_pr");
+    expect(seg.style.flexWrap).toBe("nowrap");
+    // Every option is INSIDE it — an option outside the segment is an option that can wrap away.
+    const labels = [...seg.querySelectorAll("button")].map((b) => b.textContent?.trim());
+    expect(labels).toEqual(["Allow", "Ask first", "Never"]);
+  });
+
+  it("reserves a FIXED width for the segment, so it can't be squeezed by a long summary", () => {
+    render(<ConciergeToolsPane />);
+    const seg = segmentIn("delete_agent_branch_if_merged");
+    // A fixed px basis, not `auto` — auto is what let the description column win the argument.
+    expect(seg.style.flex).toMatch(/^0 0 \d+px$/);
+    expect(seg.style.width).toMatch(/^\d+px$/);
+  });
+
+  it("keeps the row itself from wrapping the controls onto their own line", () => {
+    render(<ConciergeToolsPane />);
+    expect((rowFor("merge_pr").style as CSSStyleDeclaration).flexWrap).toBe("nowrap");
+  });
+
+  it("gives every row the SAME control width — with a Reset and without one", () => {
+    // This is the vertical-alignment requirement stated structurally: a row that carries a Reset
+    // must not push its segment left. The slot is reserved either way.
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    render(<ConciergeToolsPane />);
+    const withReset = within(rowFor("merge_pr")).getByTestId("concierge-tool-control");
+    const without = within(rowFor("quit_app")).getByTestId("concierge-tool-control");
+    expect(within(withReset).queryByRole("button", { name: /^Reset merge_pr/ })).toBeTruthy();
+    expect(within(without).queryByRole("button", { name: /Reset/ })).toBeNull();
+    expect(withReset.style.flex).toMatch(/^0 0 \d+px$/);
+    expect(without.style.flex).toBe(withReset.style.flex);
+  });
+
+  it("keeps the gated read-only glyph OUT of the reserved control column", () => {
+    // Inside it, the glyph would eat the Reset slot on every gated row and shift the segment —
+    // the same alignment bug in a smaller costume.
+    aiAccess = { enabled: false, remedy: "enable-setting" };
+    render(<ConciergeToolsPane />);
+    const row = rowFor("merge_pr");
+    const control = within(row).getByTestId("concierge-tool-control");
+    expect(within(row).getByTestId("concierge-tool-readonly")).toBeTruthy();
+    expect(within(control).queryByTestId("concierge-tool-readonly")).toBeNull();
+  });
+});
+
+describe("Reset is a link, not a fourth button", () => {
+  it("carries no border and no fill, and sits inline with the segment", () => {
+    useSettingsStore.setState({ conciergeToolPolicy: { quit_app: "allow" } });
+    render(<ConciergeToolsPane />);
+    const row = rowFor("quit_app");
+    const reset = within(row).getByRole("button", { name: /^Reset quit_app/ }) as HTMLButtonElement;
+    // It used to be drawn with the very same bordered box as Allow / Ask first / Never — i.e. with
+    // a `1px solid …` rule around it. Asserted on the serialized declaration rather than
+    // `style.border`, which jsdom normalizes `none` away to "" and so cannot distinguish "no
+    // border" from "no border property".
+    expect(borderRule(reset)).toBeNull();
+    expect(reset.style.background).toBe("transparent");
+    expect(reset.style.padding).toBe("0px");
+    // Muted-until-hover can't be an inline style; the class is where that lives (index.css).
+    expect(reset.className).toContain("settings-link-btn");
+    // Inline with the segment: same control cell, but not one of the three options.
+    const control = within(row).getByTestId("concierge-tool-control");
+    expect(control.contains(reset)).toBe(true);
+    expect(within(row).getByTestId("concierge-tool-segment").contains(reset)).toBe(false);
+  });
+
+  it("still resets by CLEARING the rule", () => {
+    useSettingsStore.setState({ conciergeToolPolicy: { quit_app: "allow" } });
+    render(<ConciergeToolsPane />);
+    fireEvent.click(within(rowFor("quit_app")).getByRole("button", { name: /^Reset quit_app/ }));
+    expect(setConciergeToolPolicy).toHaveBeenCalledWith("quit_app", null);
+  });
+});
+
+describe("the one bulk control at the top", () => {
+  const allowBtn = () =>
+    within(screen.getByTestId("concierge-bulk-bar")).getByRole("button", {
+      name: "Allow everything",
+    }) as HTMLButtonElement;
+  const resetAllBtn = () =>
+    within(screen.getByTestId("concierge-bulk-bar")).getByRole("button", {
+      name: "Reset all to defaults",
+    }) as HTMLButtonElement;
+  const confirm = () => screen.getByTestId("concierge-bulk-confirm");
+
+  it("offers exactly one allow-everything control — no routine/everything variants", () => {
+    // A second variant hands back the decision the button exists to skip.
+    render(<ConciergeToolsPane />);
+    const bar = screen.getByTestId("concierge-bulk-bar");
+    const labels = [...bar.querySelectorAll("button")].map((b) => b.textContent?.trim());
+    expect(labels).toEqual(["Reset all to defaults", "Allow everything"]);
+  });
+
+  it("does NOT apply until the confirmation is accepted", () => {
+    render(<ConciergeToolsPane />);
+    fireEvent.click(allowBtn());
+    expect(allowAllConciergeTools).not.toHaveBeenCalled();
+    expect(confirm()).toBeTruthy();
+  });
+
+  it("names the real count of IRREVERSIBLE tools, derived from the catalog", () => {
+    // The count is what the taxonomy is FOR: telling someone what they are about to hand over
+    // silently. A number typed into the copy would go stale the first time a tool is reclassified.
+    render(<ConciergeToolsPane />);
+    fireEvent.click(allowBtn());
+    const irreversible = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "irreversible");
+    const text = confirm().textContent ?? "";
+    expect(text).toContain(`${irreversible.length} irreversible tools`);
+    expect(text).toContain(`All ${CONCIERGE_TOOL_CATALOG.length} tools`);
+    // And it names some of them: a bare statistic is easy to click past.
+    expect(irreversible.some((t) => text.includes(t.name))).toBe(true);
+  });
+
+  it("cancelling changes nothing", () => {
+    render(<ConciergeToolsPane />);
+    fireEvent.click(allowBtn());
+    fireEvent.click(within(confirm()).getByRole("button", { name: "Cancel" }));
+    expect(allowAllConciergeTools).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("concierge-bulk-confirm")).toBeNull();
+  });
+
+  it("confirming applies it once and closes", () => {
+    render(<ConciergeToolsPane />);
+    fireEvent.click(allowBtn());
+    fireEvent.click(within(confirm()).getByRole("button", { name: "Allow everything" }));
+    expect(allowAllConciergeTools).toHaveBeenCalledTimes(1);
+    expect(resetAllConciergeTools).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("concierge-bulk-confirm")).toBeNull();
+  });
+
+  it("offers Reset all to defaults as a link, disabled when there is nothing to reset", () => {
+    render(<ConciergeToolsPane />);
+    expect(resetAllBtn().disabled).toBe(true);
+    expect(resetAllBtn().className).toContain("settings-link-btn");
+    expect(borderRule(resetAllBtn())).toBeNull();
+  });
+
+  it("enables Reset all once rules exist, and says how many it would clear", () => {
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny", quit_app: "allow" } });
+    render(<ConciergeToolsPane />);
+    expect(resetAllBtn().disabled).toBe(false);
+    fireEvent.click(resetAllBtn());
+    expect(confirm().textContent).toContain("all 2 rules");
+    fireEvent.click(within(confirm()).getByRole("button", { name: "Reset all" }));
+    expect(resetAllConciergeTools).toHaveBeenCalledTimes(1);
+    expect(allowAllConciergeTools).not.toHaveBeenCalled();
+  });
+
+  it("is gated with the rows — the concierge that can't act can't be granted everything", () => {
+    aiAccess = { enabled: false, remedy: "enable-setting" };
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    render(<ConciergeToolsPane />);
+    expect(allowBtn().disabled).toBe(true);
+    expect(resetAllBtn().disabled).toBe(true);
+    fireEvent.click(allowBtn());
+    expect(screen.queryByTestId("concierge-bulk-confirm")).toBeNull();
+    expect(allowAllConciergeTools).not.toHaveBeenCalled();
+  });
+
+  it("leaves EVERY row legible and undoable after a bulk grant", () => {
+    // The PRD's requirement, read off the rendered pane: a bulk apply writes an explicit rule per
+    // tool, so no row is left saying "default" with no way back.
+    useSettingsStore.setState({
+      conciergeToolPolicy: Object.fromEntries(
+        CONCIERGE_TOOL_CATALOG.map((t) => [t.name, "allow" as const]),
+      ),
+    });
+    render(<ConciergeToolsPane />);
+    expect(screen.getAllByText("set by you").length).toBe(CONCIERGE_TOOL_CATALOG.length);
+    expect(screen.queryAllByText("default").length).toBe(0);
+    const resets = screen
+      .getAllByTestId("concierge-tool-row")
+      .filter((r) => within(r).queryByRole("button", { name: /^Reset \w+ to its default$/ }));
+    expect(resets.length).toBe(CONCIERGE_TOOL_CATALOG.length);
+  });
+});
+
+describe("the gate closing CANCELS a pending bulk confirmation", () => {
+  // `gated` is a live read — the AI-features flag, entitlement, and a credit balance a background
+  // `me` refresh can move — so it flips on its own while a dialog is up.
+  it("takes the confirmation down, and does NOT bring it back when credit returns", () => {
+    const view = render(<ConciergeToolsPane />);
+    fireEvent.click(
+      within(screen.getByTestId("concierge-bulk-bar")).getByRole("button", {
+        name: "Allow everything",
+      }),
+    );
+    expect(screen.getByTestId("concierge-bulk-confirm")).toBeTruthy();
+
+    // A balance poll drops them under the credit floor. The scrim vanishes, which the human reads
+    // as "cancelled".
+    aiAccess = { enabled: false, remedy: "top-up" };
+    view.rerender(<ConciergeToolsPane />);
+    expect(screen.queryByTestId("concierge-bulk-confirm")).toBeNull();
+    expect(screen.getByTestId("concierge-ai-gate")).toBeTruthy();
+
+    // The next poll restores it. THE INTENT MUST BE GONE TOO: hiding the dialog without clearing
+    // `pending` resurrects a destructive 62-rule confirmation over the pane, primary button live,
+    // from a gesture nobody re-initiated — one stray Enter from granting every irreversible tool.
+    aiAccess = { enabled: true, remedy: null };
+    view.rerender(<ConciergeToolsPane />);
+    expect(screen.queryByTestId("concierge-bulk-confirm")).toBeNull();
+    // And the pane really is live again — otherwise the line above would pass for the wrong reason.
+    expect(
+      (
+        within(screen.getByTestId("concierge-bulk-bar")).getByRole("button", {
+          name: "Allow everything",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
   });
 });

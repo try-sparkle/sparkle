@@ -592,6 +592,20 @@ interface SettingsState {
    *  the key instead of writing a "default" sentinel. configActions persists to
    *  [concierge.tools].<tool>. */
   setConciergeToolPolicy: (tool: string, decision: PolicyDecision | null) => void;
+  /** Optimistically set MANY tools' rules in one commit — the settings pane's "Allow everything".
+   *
+   *  MERGES rather than replaces, and that is the load-bearing half: the map can hold keys naming
+   *  no tool (the file is hand-editable), and a bulk apply over the tool catalog has no business
+   *  discarding one of those silently. Null clears a key, exactly as the single-tool setter does. */
+  setConciergeToolPolicies: (patch: Readonly<Record<string, PolicyDecision | null>>) => void;
+  /** REPLACE the whole rule map, rather than merging into it.
+   *
+   *  Two callers, both needing the wholesale form. `{}` is the pane's "Reset all to defaults" —
+   *  distinct from a `setConciergeToolPolicies` of nulls because it also drops keys the catalog does
+   *  not name, matching the unset of the whole [concierge.tools] table. And configActions restores a
+   *  pre-bulk snapshot through here when a bulk write fails, which a merge cannot express: undoing a
+   *  bulk means the keys it ADDED have to go, not just change value. */
+  replaceConciergeToolPolicies: (next: ToolPolicyOverrides) => void;
   /** Mark the concierge policy as SETTLED without a successful config read.
    *
    *  Called only from the launch path's `getConfig` failure branch. The policy layer holds back
@@ -754,6 +768,16 @@ export const useSettingsStore = create<SettingsState>()(
           else delete next[tool];
           return { conciergeToolPolicy: next };
         }),
+      setConciergeToolPolicies: (patch) =>
+        set((s) => {
+          const next = { ...s.conciergeToolPolicy };
+          for (const [tool, decision] of Object.entries(patch)) {
+            if (decision) next[tool] = decision;
+            else delete next[tool];
+          }
+          return { conciergeToolPolicy: next };
+        }),
+      replaceConciergeToolPolicies: (next) => set({ conciergeToolPolicy: { ...next } }),
       setGlobalResume: (rule) => set({ resumeRule: asResumeRule(rule) }),
       setWakeWord: (wakeWord) => set({ wakeWord }),
       setStopWord: (stopWord) => set({ stopWord }),

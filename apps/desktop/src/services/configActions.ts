@@ -43,7 +43,13 @@ import {
   type ResumeRule,
 } from "./suggestions/approvalCategories";
 import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
-import { conciergeToolConfigPath, type PolicyDecision } from "./conciergeTools/policy";
+import {
+  conciergeToolConfigPath,
+  CONCIERGE_TOOL_NAMES,
+  CONCIERGE_TOOLS_CONFIG_TABLE,
+  type PolicyDecision,
+  type ToolPolicyOverrides,
+} from "./conciergeTools/policy";
 import {
   DEFAULT_WAKE_WORD,
   DEFAULT_STOP_WORD,
@@ -258,6 +264,99 @@ export async function setConciergeToolPolicy(
   } catch (e) {
     console.warn("config write failed (concierge tool policy)", e);
   }
+}
+
+/**
+ * Set EVERY concierge tool to `allow` — the pane's one bulk grant.
+ *
+ * WRITES AN EXPLICIT RULE FOR EVERY TOOL, including the 41 whose derived default is already
+ * `allow`. That looks redundant and is not. The point of a bulk grant is that the resulting state
+ * is legible and undoable per row: a tool left implicit would read "default" rather than "set by
+ * you" and offer no Reset, so a user who had just granted everything would be looking at a pane
+ * that says two thirds of it was decided for them. It is also the only reading that stays true
+ * later — a tool reclassified from `routine` to `irreversible` would otherwise have its default
+ * flip to `ask` and silently withdraw a grant the human made deliberately.
+ *
+ * ONE atomic `set_values`, never 62 writes. Each write emits a `config-changed`, and a hydrate
+ * landing mid-bulk would read a partially-written file and revert the keys not yet written.
+ *
+ * Undone in one gesture by `resetAllConciergeTools`.
+ */
+export async function allowAllConciergeTools(): Promise<void> {
+  const applied = Object.fromEntries(CONCIERGE_TOOL_NAMES.map((n) => [n, "allow" as const]));
+  await applyConciergeBulk(
+    (s) => s.setConciergeToolPolicies(applied),
+    () =>
+      setConfigValues(
+        Object.fromEntries(CONCIERGE_TOOL_NAMES.map((n) => [conciergeToolConfigPath(n), "allow"])),
+      ),
+    "allow all concierge tools",
+  );
+}
+
+/**
+ * Drop every explicit rule, returning every tool to the default its risk class derives.
+ *
+ * Unsets the `[concierge.tools]` TABLE rather than its keys one by one — one write, one event, and
+ * it also takes hand-edited keys naming no tool with it (see CONCIERGE_TOOLS_CONFIG_TABLE). A
+ * "reset to defaults" that left an unreadable rule behind would be a reset the pane still shows a
+ * warning pill for.
+ */
+export async function resetAllConciergeTools(): Promise<void> {
+  await applyConciergeBulk(
+    (s) => s.replaceConciergeToolPolicies({}),
+    () => unsetConfigValue(CONCIERGE_TOOLS_CONFIG_TABLE),
+    "reset all concierge tools",
+  );
+}
+
+/**
+ * The shared optimistic-then-persist shape for the two bulk gestures — and, unlike every other
+ * write in this file, ONE THAT ROLLS BACK.
+ *
+ * The house style here is "update optimistically, warn on failure, let the next hydrate reconcile
+ * with the file". That is fine for a single row, and WRONG for these two, because the reconciling
+ * hydrate never comes: `config-changed` is emitted by a successful write, so a rejected one leaves
+ * no event behind and the optimistic state stands until the app restarts.
+ *
+ * For the reset that fails OPEN, which is the unacceptable direction. The store would already read
+ * `{}` — every row rendering "default", the pane reporting a whole-pane revocation — while
+ * config.toml still holds up to 62 `allow` rules including the 8 irreversible ones. The user
+ * believes they took the authority back; the concierge still has it; and a restart quietly restores
+ * the grants they think they removed.
+ *
+ * Rolling back is also the user-visible signal, which is why this does not additionally raise a
+ * notice: the rows snap back to what the file still says, so "I pressed reset and nothing changed"
+ * is a true report of the situation rather than a lie plus a toast.
+ *
+ * THE GUARD MATTERS. A rollback is only correct if nothing has moved since — if the human set one
+ * row while the bulk write was in flight, that edit carried its own (likely successful) write, and
+ * restoring the pre-bulk snapshot over it would discard a rule the file now holds, trading one
+ * mismatch for another. So the snapshot is restored only while the store still reads exactly what
+ * this call put there; otherwise the newer writer owns it.
+ */
+async function applyConciergeBulk(
+  optimistic: (s: ReturnType<typeof useSettingsStore.getState>) => void,
+  persist: () => Promise<void>,
+  what: string,
+): Promise<void> {
+  const before = useSettingsStore.getState().conciergeToolPolicy;
+  optimistic(useSettingsStore.getState());
+  const applied = useSettingsStore.getState().conciergeToolPolicy;
+  try {
+    await persist();
+  } catch (e) {
+    console.warn(`config write failed (${what})`, e);
+    if (sameToolPolicy(useSettingsStore.getState().conciergeToolPolicy, applied)) {
+      useSettingsStore.getState().replaceConciergeToolPolicies(before);
+    }
+  }
+}
+
+/** Shallow equality over the rule maps — the values are strings, so this is the whole comparison. */
+function sameToolPolicy(a: ToolPolicyOverrides, b: ToolPolicyOverrides): boolean {
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => a[k] === b[k]);
 }
 
 /** Toggle one AI feature: optimistic store update, then persist to config.toml. */

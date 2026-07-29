@@ -529,9 +529,20 @@ export interface ConciergeToolEntry {
   configPath: string;
 }
 
+/** The dotted `config.toml` path of the TABLE every per-tool rule lives in.
+ *
+ *  Named separately from the per-tool paths below because clearing every rule at once is one
+ *  `unset` of this table rather than N unsets of its keys — and that difference is not cosmetic.
+ *  Each write emits a `config-changed`, so N unsets would let a mid-bulk hydrate read a
+ *  half-cleared file and revert the keys not yet written (the same flicker `set_values` exists to
+ *  avoid). Removing the table also takes hand-edited keys naming no tool with it, which is what
+ *  "reset everything to defaults" has to mean if it is to be believed. `[concierge]` holds nothing
+ *  else — see ConciergeConfig in config.rs — so this removes exactly the policy and nothing more. */
+export const CONCIERGE_TOOLS_CONFIG_TABLE = "concierge.tools";
+
 /** The dotted `config.toml` path for one tool's rule (`[concierge.tools]`). */
 export function conciergeToolConfigPath(tool: string): string {
-  return `concierge.tools.${tool}`;
+  return `${CONCIERGE_TOOLS_CONFIG_TABLE}.${tool}`;
 }
 
 function entryFor(name: ConciergeToolName, domain: ConciergeToolDomain): ConciergeToolEntry {

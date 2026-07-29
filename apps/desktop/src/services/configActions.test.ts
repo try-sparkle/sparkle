@@ -58,7 +58,13 @@ import {
   setBuilderIndexEnabled,
   setOnePasswordVault,
   setOnePasswordSeedWorktrees,
+  allowAllConciergeTools,
+  resetAllConciergeTools,
 } from "./configActions";
+import {
+  CONCIERGE_TOOL_NAMES,
+  CONCIERGE_TOOLS_CONFIG_TABLE,
+} from "./conciergeTools/policy";
 import { APPROVAL_CATEGORIES } from "./suggestions/approvalCategories";
 import { useApprovalsStore } from "../stores/approvalsStore";
 import {
@@ -713,5 +719,104 @@ describe("setBuilderIndexEnabled", () => {
     expect(setConfigValue).toHaveBeenCalledWith("tools.builder_index", false);
     expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
     expect(useSettingsStore.getState().builderIndexModalOpen).toBe(false);
+  });
+});
+
+// The Concierge tools pane's two bulk gestures. What these pin is that each is ONE write — a
+// permissions bulk applied key-by-key lets a config-changed hydrate land mid-bulk and revert the
+// keys not yet written — and that the resulting state is legible per row afterwards.
+describe("the concierge tool bulk actions", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({ conciergeToolPolicy: {} });
+  });
+
+  it("allowAllConciergeTools writes an explicit allow for EVERY tool, in one atomic call", async () => {
+    await allowAllConciergeTools();
+
+    // One write, not 62 — and not the single-key setter.
+    expect(setConfigValues).toHaveBeenCalledTimes(1);
+    expect(setConfigValue).not.toHaveBeenCalled();
+    expect(unsetConfigValue).not.toHaveBeenCalled();
+
+    const written = vi.mocked(setConfigValues).mock.calls[0]![0];
+    expect(Object.keys(written).length).toBe(CONCIERGE_TOOL_NAMES.length);
+    for (const name of CONCIERGE_TOOL_NAMES) {
+      expect(written[`${CONCIERGE_TOOLS_CONFIG_TABLE}.${name}`], name).toBe("allow");
+    }
+  });
+
+  it("leaves EVERY row explicitly set, including the ones whose default was already allow", async () => {
+    // The bulk grant's whole promise is that the result is undoable per row. A tool left implicit
+    // because its derived default already said "allow" would render as "default" with no Reset —
+    // two thirds of the pane telling the user it was decided for them right after they decided it.
+    await allowAllConciergeTools();
+    const policy = useSettingsStore.getState().conciergeToolPolicy;
+    expect(Object.keys(policy).length).toBe(CONCIERGE_TOOL_NAMES.length);
+    expect(new Set(Object.values(policy))).toEqual(new Set(["allow"]));
+  });
+
+  it("MERGES over a hand-edited key rather than dropping it", async () => {
+    // config.toml is hand-editable, so the map can hold a key naming no tool. A bulk apply over the
+    // catalog has no business silently discarding one.
+    useSettingsStore.setState({ conciergeToolPolicy: { not_a_real_tool: "deny" } });
+    await allowAllConciergeTools();
+    expect(useSettingsStore.getState().conciergeToolPolicy.not_a_real_tool).toBe("deny");
+  });
+
+  it("resetAllConciergeTools clears the store and unsets the whole [concierge.tools] table", async () => {
+    useSettingsStore.setState({
+      conciergeToolPolicy: { merge_pr: "deny", quit_app: "allow", not_a_real_tool: "allwo" },
+    });
+    await resetAllConciergeTools();
+
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({});
+    // ONE unset of the table — not three unsets of its keys. Removing the table is also what takes
+    // the unreadable hand-edited key with it; a "reset to defaults" that left a warning pill on a
+    // row would not be a reset.
+    expect(unsetConfigValue).toHaveBeenCalledTimes(1);
+    expect(unsetConfigValue).toHaveBeenCalledWith(CONCIERGE_TOOLS_CONFIG_TABLE);
+    expect(setConfigValue).not.toHaveBeenCalled();
+    expect(setConfigValues).not.toHaveBeenCalled();
+  });
+
+  it("round-trips: allow everything, then reset, lands back on no rules at all", async () => {
+    await allowAllConciergeTools();
+    expect(Object.keys(useSettingsStore.getState().conciergeToolPolicy).length).toBeGreaterThan(0);
+    await resetAllConciergeTools();
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({});
+  });
+
+  it("ROLLS BACK a failed reset rather than reporting a revocation that didn't happen", async () => {
+    // The unacceptable direction. Leaving the optimistic `{}` in place would render every row as
+    // "default" — the pane reporting that authority was taken back — while config.toml still holds
+    // the allow rules, including the irreversible ones. No config-changed fires on a rejected
+    // write, so nothing would ever reconcile it; the grants come back silently on restart.
+    const rules = { merge_pr: "allow", discard_agent: "allow" };
+    useSettingsStore.setState({ conciergeToolPolicy: rules });
+    vi.mocked(unsetConfigValue).mockRejectedValueOnce(new Error("read-only config"));
+
+    await expect(resetAllConciergeTools()).resolves.toBeUndefined();
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual(rules);
+  });
+
+  it("rolls back a failed grant too, so no row claims a rule the file doesn't hold", async () => {
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    vi.mocked(setConfigValues).mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(allowAllConciergeTools()).resolves.toBeUndefined();
+    expect(useSettingsStore.getState().conciergeToolPolicy).toEqual({ merge_pr: "deny" });
+  });
+
+  it("does NOT roll back over an edit made while the bulk write was in flight", async () => {
+    // That edit carried its own (successful) write, so restoring the pre-bulk snapshot over it
+    // would discard a rule the file now holds — trading one mismatch for another.
+    useSettingsStore.setState({ conciergeToolPolicy: {} });
+    vi.mocked(setConfigValues).mockImplementationOnce(async () => {
+      useSettingsStore.getState().setConciergeToolPolicy("merge_pr", "deny");
+      throw new Error("disk full");
+    });
+
+    await allowAllConciergeTools();
+    expect(useSettingsStore.getState().conciergeToolPolicy.merge_pr).toBe("deny");
   });
 });
