@@ -141,8 +141,15 @@ describe("AgentSidebar — the status filter", () => {
     render(<AgentSidebar project={project} />);
     // The words never fit at sidebar width ("2 Needs you" truncated to "2 Need…"), so the chip is
     // dot + count. If a label creeps back into the chip body it truncates again.
+    //
+    // DONE READS 2, NOT 1, AND THAT IS THE POINT. The three project agents contribute one per band;
+    // the second Done is the pinned "Improve Sparkle" row, which has no live status here and so
+    // falls back to `stopped`. It counts in the tally like any other row — a red Improve Sparkle
+    // that left the red chip on 0 would be the same defect as a collapsed worker that doesn't
+    // count: the number would claim nothing needs you while something did.
+    const expected: Record<string, string> = { needs_you: "1", running: "1", done: "2" };
     for (const b of ["needs_you", "running", "done"]) {
-      expect(screen.getByTestId(`status-chip-${b}`).textContent).toBe("1");
+      expect(screen.getByTestId(`status-chip-${b}`).textContent).toBe(expected[b]);
     }
     // ...but the band must still be NAMED somewhere, or three bare dots are unidentifiable.
     expect(screen.getByTestId("status-chip-needs_you").getAttribute("aria-label")).toContain(
@@ -151,7 +158,7 @@ describe("AgentSidebar — the status filter", () => {
     expect(screen.getByTestId("status-chip-running").getAttribute("aria-label")).toContain(
       "1 Running",
     );
-    expect(screen.getByTestId("status-chip-done").getAttribute("aria-label")).toContain("1 Done");
+    expect(screen.getByTestId("status-chip-done").getAttribute("aria-label")).toContain("2 Done");
   });
 
   it("pluralizes the verb in the accessible name: '1 Needs you' but '2 Need you'", () => {

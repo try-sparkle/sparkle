@@ -13,6 +13,7 @@ import {
   submitBlockedReason,
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
+import { useInteractionStore } from "../stores/interactionStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
@@ -240,7 +241,17 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             // send instead, stranding anything queued by a restart.
             preparing={!ptyReady}
             inputRef={composerInputRef}
-            onSubmitPrompt={(t) => setLastPrompt(t)}
+            onSubmitPrompt={(t) => {
+              setLastPrompt(t);
+              // THE COMPOSER SEND HAS TO COUNT AS AN INTERACTION, and for this pane it only does
+              // if we say so. The sidebar's elapsed timer reads
+              // `max(lastPrompt.at, interactionStore.lastAt[id])`; a project agent's Send lands in
+              // its tab's `promptHistory`, but Improve Sparkle has no AgentTab and therefore no
+              // promptHistory, so without this its timer would reset on raw terminal typing
+              // (Terminal.onData touches the store) and NOT on a Send from the box right below it —
+              // i.e. the timer would keep climbing while you were actively prompting the agent.
+              useInteractionStore.getState().touch(agentId);
+            }}
             // Same self-heal as AgentPane: a send that finds the PTY gone respawns the agent and
             // the queued prompt lands on the new PTY.
             onRestartAgent={() => {

@@ -592,9 +592,11 @@ describe("AgentSidebar — the chrome tokens the hover card and its chips reach 
 // under a comment claiming it matched the agent rows' selected treatment, which takes `C.forest`.
 // That made it the fourth consumer of a chrome fill carrying PLANE inks, and made the ladder's own
 // recorded claim ("what is left on this token is chat bubbles and row fills, carrying `cream`")
-// false for the second time. Everything the row carries is a plane ink: a `statusInk(...)` label, a
-// `muted`/`teal` consent pill, and the StatusDot the row is actually read by — which measured
-// 4.56/1.01 (dark/light) for green on the bubble, i.e. invisible in light mode.
+// false for the second time. Everything the row carries is a plane ink — a `cream` title, `muted`
+// badges, and the StatusDot the row is actually read by, which measured 4.56/1.01 (dark/light) for
+// green on the bubble, i.e. invisible in light mode. (Those inks are now the BUILD ROWS' inks, since
+// the row shares their anatomy; the measurement that picked `forest` is unaffected — if anything the
+// neutral title is a strictly easier case than the `statusInk(...)` one it replaced.)
 describe("AgentSidebar — the Improve Sparkle row is a plane when active, never a chrome fill", () => {
   const sparkleRow = (container: HTMLElement) =>
     container.querySelector<HTMLElement>('[data-hint="improve"]')!;
@@ -614,40 +616,69 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
     expect(sparkleRow(container).style.background).toBe("transparent");
   });
 
-  // THE GOLD RAIL IS GONE — a deliberate product call in the build-column cleanup: the column is a
-  // quiet list and the rail was the last colored decoration in it. This pair used to assert the
-  // rail, and now asserts what replaced it.
+  // THE SELECTED STATE IS THE BUILD ROW'S GEOMETRY NOW, and these tests are the third version of
+  // this contract. The history is worth keeping because the CONSTRAINT survived all three:
   //
-  // It could not simply be deleted. `forest` on the `deepForest` column measures 1.082 (dark) /
-  // 1.375 (light), so the active FILL on this row is not visible, and this row has none of the
-  // geometry an agent row uses instead (square right edge, concave fillets, the open card's
-  // outline). Landing it fill-only would have shipped a control with no perceivable selected state
-  // — WCAG 1.4.11, not a taste question (roborev 53814).
+  //   v1: a `3px solid C.goldFill` rail — cut, because the column is a quiet list and the rail was
+  //       the last colored decoration in it.
+  //   v2: a neutral `hairline` outline. It could not just be deleted: `forest` on the `deepForest`
+  //       column measures 1.082 (dark) / 1.375 (light), so the active FILL is not visible, and
+  //       fill-only would be a control with NO perceivable selected state — WCAG 1.4.11, not a
+  //       taste question (roborev 53814). The outline was the cheapest thing that satisfied it.
+  //   v3 (here): the row took the BUILD ROW's geometry instead — square right edge (`6px 0 0 6px`)
+  //       plus the two concave fillets that flare it open into the terminal. That is what carries
+  //       selection on every agent row, and it is exactly what v2's comment said this row lacked.
+  //       With the geometry present the bespoke outline has nothing left to compensate for, so it
+  //       went — one less piece of private vocabulary on the one row that had any.
   //
-  // So the state is a NEUTRAL hairline outline: `hairline` is the token whose whole job is to be a
-  // line visible on any plane, and it carries no color, which is what was actually being cut. Do
-  // NOT restore `3px solid C.goldFill`, and do not drop the outline to "simplify" — that is the
-  // regression these two exist to catch, in both directions.
-  it("marks the active row with a neutral hairline outline, not a gold rail", () => {
+  // The constraint is unchanged: this row may never be fill-only. Do not restore the gold rail, do
+  // not reinstate the hairline, and do NOT drop the fillets to "simplify" — that last one silently
+  // reintroduces the 1.08:1 no-selected-state failure the whole history is about.
+  it("marks the active row with the build rows' square edge, not a rail or an outline", () => {
     useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const row = sparkleRow(container);
-    expect(row.style.borderLeft).toBe("1px solid var(--c-hairline)");
+    expect(row.style.borderRadius).toBe("6px 0 0 6px");
+    expect(row.style.borderLeft).toBe(""); // no bespoke outline
     expect(row.style.borderLeft).not.toContain("gold");
   });
 
-  it("keeps the outline's width when inactive, so selecting a row shifts nothing", () => {
+  it("rounds fully when inactive, like an unselected build row", () => {
     useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    expect(sparkleRow(container).style.borderLeft).toBe("1px solid transparent");
+    expect(sparkleRow(container).style.borderRadius).toBe("6px");
   });
 
-  // The separator between this row and the agent list above it is a HAIRLINE, not a color treatment,
-  // so it stayed. Pinned so "remove the decoration" doesn't quietly take the structure with it.
-  it("keeps the hairline that separates it from the agent list", () => {
+  // The half of the selected state that is actually VISIBLE, given the 1.08:1 fill step. Two
+  // absolutely-positioned quarter-discs, one above the right edge and one below, painting the
+  // terminal color everywhere except a concave cut — the same pair a selected agent row draws.
+  it("draws the concave fillets that make the selection perceivable", () => {
+    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+    const fillets = sparkleRow(container).querySelectorAll<HTMLElement>('[aria-hidden][style*="radial-gradient"]');
+    expect(fillets).toHaveLength(2);
+    for (const f of fillets) expect(f.style.position).toBe("absolute");
+  });
+
+  it("draws no fillets when it is not the selected row", () => {
     useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    expect(sparkleRow(container).style.borderTop).toBe("1px solid var(--c-hairline)");
+    expect(
+      sparkleRow(container).querySelectorAll('[aria-hidden][style*="radial-gradient"]'),
+    ).toHaveLength(0);
+  });
+
+  // THE DIVIDER ABOVE THE ROW IS GONE, and unlike the outline it was not replaced by anything. It
+  // was the only horizontal rule in the whole column, and what it said — "this row is separate" —
+  // is already said by position: the row is pinned below the scroll container, outside every stage
+  // group. Two renderings of one fact, the smaller one in a vocabulary nothing else uses.
+  it("draws no divider rule above itself, active or not", () => {
+    for (const activeSpecial of ["sparkle", null]) {
+      useUiStore.setState({ workMode: "build", activeSpecial } as never);
+      const { container, unmount } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
+      expect(sparkleRow(container).style.borderTop).toBe("");
+      unmount();
+    }
   });
 });
 

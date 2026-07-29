@@ -6,7 +6,11 @@
 import { type MouseEvent as ReactMouseEvent } from "react";
 import { FONT_WEIGHT } from "../theme/colors";
 
-const FONT_SIZE = 13;
+/** The size EVERY row title in the Build column is set at. Exported because the pinned "Improve
+ *  Sparkle" row can't use this component (it has no AgentTab and never renames) but must not be a
+ *  different size from the rows above it — which is exactly what it had drifted into. */
+export const AGENT_NAME_FONT_SIZE = 13;
+const FONT_SIZE = AGENT_NAME_FONT_SIZE;
 
 export function FittedAgentName({
   title,

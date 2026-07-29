@@ -48,7 +48,7 @@ import {
 } from "../services/agentNaming";
 import { sparkleAgentIdFor } from "../services/sparkleAgent";
 import { handleImproveSparkleClick } from "../services/sparkleReveal";
-import { consentPillLabel, sparkleBarState, type SparkleBarState } from "./sparkleRowStatus";
+import { consentPillLabel } from "./sparkleRowStatus";
 import { useBeadsStore } from "../stores/beadsStore";
 import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
 import { type Bead } from "../services/beads";
@@ -97,11 +97,11 @@ import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
 import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
-import { FittedAgentName } from "./FittedAgentName";
+import { FittedAgentName, AGENT_NAME_FONT_SIZE } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
-import { resolveStage, rollupStages, stageFraction, stageIndex, stageMeta, LINE_FROM, LINE_TO } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageFraction, stageIndex, stageMeta } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { useNewAgent } from "../hooks/useNewAgent";
 import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
@@ -1478,10 +1478,57 @@ export function AgentSidebar({
     return renderedRowIds[0] ?? null;
   }, [project?.selectedAgentId, renderedRowIds]);
 
+  // ── THE PINNED IMPROVE SPARKLE ROW'S VIEW MODEL ────────────────────────────────────────────────
+  //
+  // ONE PIPELINE, NOT TWO — and note that every line below is COPIED FROM `renderRow`, verbatim,
+  // with `a.id` replaced by `sparkleAgentId`. That is deliberate and it is the whole requirement:
+  //   `effectiveStatus[id] ?? "stopped"`                     → the row's status (`st`)
+  //   `rollupOf(id)`                                         → the disc, via engine/workerRollup
+  //   `bandOfRollup(...)` vs `bandOfStatus(ownStatus[id])`   → does the rollup override the label
+  //   `bandOfRollup(...)`                                    → which filter chip finds it
+  // The row used to hold its own copy of this logic, so a fix to status derivation — the
+  // picker/approval-footer detection, say — landed on every build row and silently missed this one.
+  // That is how it came to render GREEN while sitting on an unanswered four-option picker. Sharing
+  // the pipeline means it inherits such fixes by construction; do NOT reintroduce a local
+  // derivation here or in SparkleAgentRow.
+  //
+  // Both maps work for an id that is not in `project.agents`. `effectiveStatus`'s overlays only
+  // rewrite ids they find in the agent list and pass every other key through, and `ownStatus` (from
+  // rollupViewFor) is the same chain minus the worker bubbles — so this id resolves to its live PTY
+  // status with or without a project open, and `?? "stopped"` is the row's pre-spawn state.
+  //
+  // `ownStatus`, NOT `sparkleStatus`, on the override line. They differ exactly when a worker's red
+  // has been bubbled onto this row, which is the case the override exists to describe — comparing
+  // the bubbled status against itself makes the two bands agree by construction and the override
+  // never fires. rollupDotAccessor's `ownStatusOf` note documents this trap at length; it is easy to
+  // write the wrong one and nothing else goes red when you do.
+  //
+  // Workers: the same `kind === "worker" && parentId` rule the column uses — `rollupOf` buckets them
+  // itself, so this list is only for the `+N` badge. The improvement pass runs a single agent today,
+  // so it is empty; derived rather than hardcoded so a future subtree needs nothing added here.
+  const sparkleWorkerCount = useMemo(
+    () =>
+      (project?.agents ?? []).filter(
+        (a) => a.kind === "worker" && a.parentId === sparkleAgentId,
+      ).length,
+    [project?.agents, sparkleAgentId],
+  );
+  const sparkleStatus = effectiveStatus[sparkleAgentId] ?? "stopped";
+  const sparkleRollup = rollupOf(sparkleAgentId);
+  const sparkleBand = bandOfRollup(sparkleRollup);
+  const sparkleRollupOverrides =
+    sparkleBand !== bandOfStatus(ownStatus[sparkleAgentId] ?? "stopped");
+
   // Per-band counts for the filter chips. Counted over the UNFILTERED top-level rows on purpose: a
   // chip must keep showing how many rows it would reveal while it is toggled OFF, otherwise a
   // hidden band reads "0" and the user has no idea anything is behind it.
-  const bandCounts = useMemo(() => {
+  //
+  // TWO COUNTS, because they answer two different questions. `agentBandCounts` is the project's own
+  // rows and is what the empty-state logic below reasons about; `bandCounts` adds the pinned
+  // Improve Sparkle row and is what the chips render. Folding Improve Sparkle into the first would
+  // make a project with no agents report "All agents are hidden by the status filter" — a way back
+  // from a filter nobody applied.
+  const agentBandCounts = useMemo(() => {
     const counts: Record<StatusBand, number> = { needs_you: 0, running: 0, done: 0 };
     if (!project) return counts;
     for (const a of topLevelOf(project.agents, mode)) {
@@ -1491,9 +1538,23 @@ export function AgentSidebar({
     }
     return counts;
   }, [project, mode, rowBandOf]);
+  // A RED IMPROVE SPARKLE HAS TO INCREMENT THE RED CHIP. The chips are the column's summary of
+  // "what wants me" — the header tally people read instead of scanning — so a row that can go red
+  // while the tally says 0 is the same defect as a collapsed worker that doesn't count: the number
+  // claims nothing needs you when something does.
+  //
+  // The row is counted but NEVER HIDDEN by the filter. Every other row a chip hides is reachable
+  // again by turning the chip back on; this one is the only way into the improvement agent, and it
+  // is pinned precisely so it is always there. A chip that counts a row it cannot hide is a small
+  // inconsistency; a filter that can make the Improve Sparkle agent unreachable is a bigger one.
+  const bandCounts = useMemo(() => {
+    if (!showSparkleRow) return agentBandCounts;
+    return { ...agentBandCounts, [sparkleBand]: agentBandCounts[sparkleBand] + 1 };
+  }, [agentBandCounts, showSparkleRow, sparkleBand]);
   // Did the FILTER (rather than an empty project) hide everything? Drives which empty state shows —
   // "you filtered everything out, here's the way back" vs "you have no agents yet".
-  const hiddenByFilter = ordered.length === 0 && Object.values(bandCounts).some((n) => n > 0);
+  const hiddenByFilter =
+    ordered.length === 0 && Object.values(agentBandCounts).some((n) => n > 0);
 
   // NOTE: a SECOND filter used to live here — the helper island's P0/P1 `attentionTierFocus`,
   // which narrowed this same list by `conciergePriority`. It was removed when the island's chiclets
@@ -2023,12 +2084,20 @@ export function AgentSidebar({
         )}
       </div>
 
-      {/* Pinned above the footer: the Sparkle self-improvement agent. Always present (even with
-          no project open), can't be closed — it works on Sparkle itself, not the user's project. */}
+      {/* THE VERY BOTTOM OF THE COLUMN, and deliberately outside the scroll container that closes
+          just above. The row therefore sits below every stage group AND below "+ New Build Agent"
+          (which lives inside that container, either pinned at its top or after its last row), takes
+          no group header of its own, and does not scroll away with the list.
+          That position is the ENTIRE expression of "this one is different" — it works on Sparkle
+          itself, not the user's project, and it can't be closed. Everything else about it is a
+          build row (see SparkleAgentRow), including the status derivation feeding it here. */}
       {showSparkleRow && (
         <SparkleAgentRow
           active={activeSpecial === "sparkle"}
-          status={status[sparkleAgentId] ?? "stopped"}
+          status={sparkleStatus}
+          dotColor={sparkleRollupOverrides ? ROLLUP_DOT_COLOR[sparkleRollup] : undefined}
+          dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : undefined}
+          workerCount={sparkleWorkerCount}
           onSelect={onSelectSparkle}
         />
       )}
@@ -2226,6 +2295,20 @@ const subtreeDomId = (headId: string) => `agent-subtree-${headId}`;
 const ROW_PAD_Y = 4;
 const ROW_PAD_X = 10;
 
+// ── THE ROW ANATOMY, SHARED WITH THE PINNED IMPROVE SPARKLE ROW ───────────────────────────────
+// Improve Sparkle is not a project agent — it has no AgentTab, so it cannot go through AgentRow —
+// but it IS a row in this column and has to read as one. It used to be styled by hand, and drifted:
+// a bigger disc, a different left inset, its own font size, its own progress bar. These constants
+// are the contract. AgentSidebar.sparkleRow.test.tsx asserts the two rows agree on every one of
+// them by measuring BOTH rows in a rendered sidebar, so a change here that lands in only one of
+// the two call sites goes red.
+//
+// Width of the leading disc slot on a build/worker row (a shell row's ▶ takes a narrower one). The
+// disc is CENTERED in it, so this — not the padding alone — is what fixes the disc's left edge.
+const DOT_SLOT_W = 24;
+// Diameter of the status disc on a row (StatusDot's own default 9 is for the TopBar cluster).
+const DOT_SIZE = 12;
+
 // The agent list's own horizontal padding (`agent-list-scroll`), and therefore exactly how far a
 // row has to reach BACK to touch the column's edge. Named rather than typed twice because the
 // row's margin and its compensating padding both depend on it and must move together.
@@ -2263,6 +2346,84 @@ const ROW_PAD_RIGHT = ROW_PAD_X + LIST_PAD_X;
 // same 9px rise — only the run is longer. 26 is `--grid-step`; the mock records that 38 reads melty.
 const ACTIVE_FILLET = 9;
 const ACTIVE_FILLET_RUN = 26;
+
+// ── THE SELECTED ROW'S GEOMETRY, IN ONE PLACE ─────────────────────────────────────────────────
+// The active row's corners: square on the PANE side (it opens into the terminal — the mouth below
+// does that work) and rounded on the concierge side; fully rounded when it isn't selected.
+//
+// Named, because two rows draw it: a build/worker row and the pinned Improve Sparkle row. They were
+// literals in both for one commit, which is the one-sided-drift hazard the rest of the row anatomy
+// was consolidated to remove — changing one leaves the other on the old geometry with every test
+// green. AgentSidebar.sparkleRow.test.tsx compares the two rows' computed radius and mouth paint
+// directly, so a change has to land here to satisfy both.
+//
+// `RADIUS.modal`, not a literal: a stray `10` is both off-scale (theme/scale.test.ts is a ratchet at
+// 0) and the kind of local re-derivation blueprintSpec.ts exists to end. The mock's leading radius
+// is `--r-lead: 10px` and RADIUS tops out at 6 (`modal`); this holds at the token and the missing
+// step is reported rather than hard-coded.
+const ACTIVE_ROW_RADIUS = `${RADIUS.modal}px 0 0 ${RADIUS.modal}px`;
+const IDLE_ROW_RADIUS = RADIUS.modal;
+
+/** THE MOUTH: a concave fillet where a selected row opens into the pane — NOT a corner.
+ *
+ *  A `border-radius` curves the corner IN. It cuts material away, so the row NECKS DOWN as it
+ *  reaches the pane — the exact opposite of what a junction should do. A mouth curves OUT, the way a
+ *  river opens into a delta: the channel widens and the bank sweeps away from it. NO radius value
+ *  produces that at any size; it is a different construction, and the distinction cost ~20 review
+ *  rounds (MAPPING.md, "Geometry vocabulary"). If a review says "rounded the wrong way / backwards",
+ *  changing the number is not converging.
+ *
+ *  The construction, straight from the mock's `--m-tr` / `--m-br`: an `--m-run` × `--r-delta` box
+ *  sitting just above / below the row at its pane-side end, filled with the PANE's colour, with an
+ *  ELLIPTICAL quadrant bitten out of the corner FURTHEST from the junction — `radial-gradient(ellipse
+ *  farthest-side at <far corner>, transparent 0 calc(100% - .5px), <pane> 100%)`. Read it as "inside
+ *  the ellipse → transparent, so the build column shows through; outside → pane colour". It rounds
+ *  the BUILD COLUMN's corner away from the row, never the row's own.
+ *
+ *  `farthest-side` is what makes the box's own dimensions the radii, so the 26 × 9 shape falls out of
+ *  `width`/`height` rather than being restated. The `-0.5px` is the mock's antialias feather: without
+ *  it the gradient's hard stop lands on a pixel boundary and the arc renders as a stair.
+ *
+ *  The two documented ways to make a CORRECT mouth invisible, so neither is re-diagnosed as bad
+ *  geometry: an ancestor `overflow:hidden` clipping the overhang, and the pane painting over it
+ *  because it is later in the DOM (needs z-index on the columns). Both live outside this file — see
+ *  PRD/sparkle/blueprint-agent-sidebar.md.
+ *
+ *  `pointerEvents:none` so they never eat clicks; `aria-hidden` since they are pure chrome. The
+ *  caller positions them by making its own box `position: relative`, and is responsible for any
+ *  suppression rule of its own (the build row hides them behind its open hover card). */
+function ActiveFillets() {
+  return (
+    <>
+      <div
+        aria-hidden
+        data-testid="row-mouth-top"
+        style={{
+          position: "absolute",
+          top: -ACTIVE_FILLET,
+          right: 0,
+          width: ACTIVE_FILLET_RUN,
+          height: ACTIVE_FILLET,
+          background: `radial-gradient(ellipse farthest-side at top left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
+          pointerEvents: "none",
+        }}
+      />
+      <div
+        aria-hidden
+        data-testid="row-mouth-bottom"
+        style={{
+          position: "absolute",
+          bottom: -ACTIVE_FILLET,
+          right: 0,
+          width: ACTIVE_FILLET_RUN,
+          height: ACTIVE_FILLET,
+          background: `radial-gradient(ellipse farthest-side at bottom left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
+          pointerEvents: "none",
+        }}
+      />
+    </>
+  );
+}
 
 // What a rolled-up disc is painted. The three definite marks reuse the AGENT_STATUS tier colors
 // straight (NOT statusInk — that resolves a color to a legible TEXT ink, and this is a filled
@@ -2993,7 +3154,7 @@ const AgentRow = memo(function AgentRow({
   // name never shifts horizontally when the row expands. Workers size with build rows now: they
   // carry the same disc, and a narrower slot would make the child dots visibly smaller than their
   // parent's for no reason.
-  const glyphWidth = a.kind === "shell" ? 12 : 24;
+  const glyphWidth = a.kind === "shell" ? 12 : DOT_SLOT_W;
   // EVERY row's text is neutral ink; the status is carried ENTIRELY by the leading disc.
   //
   // Build rows went neutral first, because colouring the name turned a column of working agents
@@ -3236,7 +3397,7 @@ const AgentRow = memo(function AgentRow({
             // this slot. It no longer PULSES: with the row stripped to a disc and a title, a column
             // of running agents was a column of blinking dots, and motion that is always on stops
             // reading as "look here". The color already separates running from done.
-            <StatusDot status={st} size={12} color={dotColor} label={dotLabel} />
+            <StatusDot status={st} size={DOT_SIZE} color={dotColor} label={dotLabel} />
           )}
         </div>
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
@@ -3669,18 +3830,11 @@ const AgentRow = memo(function AgentRow({
           // fill step against the column, which is ~1.08:1 and never was the signal.
           // PAINT, not layout: a radius on a transparent box draws nothing, so this may key off
           // selection where the margin below may not. The leading (concierge-side) end takes a
-          // radius; the pane-side end is SQUARE here and is opened by the concave fillets below —
+          // radius; the pane-side end is SQUARE here and is opened by the concave mouth below —
           // a radius there would neck the row DOWN as it reaches the pane, which is the opposite
-          // operation (MAPPING.md, "Geometry vocabulary").
-          //
-          // The mock's leading radius is `--r-lead: 10px`. `theme/scale.ts` RADIUS tops out at 6
-          // (`modal`) and adding a step there is another agent's file, so this holds at
-          // RADIUS.modal and the missing token is reported rather than hard-coded — a stray `10`
-          // here is both off-scale (theme/scale.test.ts is a ratchet at 0) and the kind of local
-          // re-derivation blueprintSpec.ts exists to end.
-          borderRadius: isActive
-            ? `${RADIUS.modal}px 0 0 ${RADIUS.modal}px`
-            : RADIUS.modal,
+          // operation (MAPPING.md, "Geometry vocabulary"). Both values are shared with the pinned
+          // Improve Sparkle row — see ACTIVE_ROW_RADIUS, which carries the `RADIUS.modal` rationale.
+          borderRadius: isActive ? ACTIVE_ROW_RADIUS : IDLE_ROW_RADIUS,
           // EVERY ROW, unconditionally. See ROW_PAD_RIGHT: making this conditional on `isActive`
           // is the list-twitch bug, not a saving.
           marginRight: -LIST_PAD_X,
@@ -3712,65 +3866,11 @@ const AgentRow = memo(function AgentRow({
             from its representative worker) and its single rollup progress bar summarizing every worker.
             The individual workers — and the bead/epic detail — are revealed on CLICK, in the detail
             card (see CardDetail); they no longer render inline here. */}
-        {/* ── THE MOUTH: A CONCAVE FILLET, NOT A CORNER ─────────────────────────────────────────
-            A `border-radius` curves the corner IN. It cuts material away, so the row NECKS DOWN as
-            it reaches the pane — the exact opposite of what a junction should do. A mouth curves
-            OUT, the way a river opens into a delta: the channel widens and the bank sweeps away
-            from it. NO radius value produces that at any size; it is a different construction, and
-            the distinction cost ~20 review rounds (MAPPING.md, "Geometry vocabulary"). If a review
-            says "rounded the wrong way / backwards", changing the number is not converging.
-
-            The construction, straight from the mock's `--m-tr` / `--m-br`: an `--m-run` ×
-            `--r-delta` box sitting just above / below the row at its pane-side end, filled with the
-            PANE's colour, with an ELLIPTICAL quadrant bitten out of the corner FURTHEST from the
-            junction — `radial-gradient(ellipse farthest-side at <far corner>, transparent 0
-            calc(100% - .5px), <pane> 100%)`. Read it as "inside the ellipse → transparent, so the
-            build column shows through; outside → pane colour". It rounds the BUILD COLUMN's corner
-            away from the row, never the row's own.
-
-            `farthest-side` is what makes the box's own dimensions the radii, so the 26 × 9 shape
-            falls out of `width`/`height` rather than being restated. The `-0.5px` is the mock's
-            antialias feather: without it the gradient's hard stop lands on a pixel boundary and the
-            arc renders as a stair.
-
-            The two documented ways to make a CORRECT fillet invisible, so neither is re-diagnosed
-            as bad geometry: an ancestor `overflow:hidden` clipping the overhang, and the pane
-            painting over it because it is later in the DOM (needs z-index on the columns). Both
-            live outside this file — see PRD/sparkle/blueprint-agent-sidebar.md.
-
-            pointerEvents:none so they never eat clicks. Suppressed while the card is open
-            (showOverlay): the row is no longer visibility:hidden, so these would otherwise show
-            through beside the stand-in card. */}
-        {isActive && !showOverlay && (
-          <>
-            <div
-              aria-hidden
-              data-testid="row-mouth-top"
-              style={{
-                position: "absolute",
-                top: -ACTIVE_FILLET,
-                right: 0,
-                width: ACTIVE_FILLET_RUN,
-                height: ACTIVE_FILLET,
-                background: `radial-gradient(ellipse farthest-side at top left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-                pointerEvents: "none",
-              }}
-            />
-            <div
-              aria-hidden
-              data-testid="row-mouth-bottom"
-              style={{
-                position: "absolute",
-                bottom: -ACTIVE_FILLET,
-                right: 0,
-                width: ACTIVE_FILLET_RUN,
-                height: ACTIVE_FILLET,
-                background: `radial-gradient(ellipse farthest-side at bottom left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-                pointerEvents: "none",
-              }}
-            />
-          </>
-        )}
+        {/* The mouth where the active tab opens into the pane — see ActiveFillets, which the
+            pinned Improve Sparkle row draws from too, so the two can never drift apart. Suppressed
+            HERE while the card is open (showOverlay): the row is no longer visibility:hidden, so
+            these would otherwise show through beside the stand-in card. */}
+        {isActive && !showOverlay && <ActiveFillets />}
         {/* Drop target — live only while a drag is in flight, only on top-level rows, and only when
             the drag STARTED in this row's own section. Moving a row between sections is not a thing
             the user can do: a row's section is derived from its git state, so "drag it into Merged"
@@ -4157,24 +4257,57 @@ function CloseAgentButton({ onClose, width }: { onClose: () => void; width: numb
   );
 }
 
-/** The pinned, always-present Sparkle self-improvement agent row. Distinct from project agents:
- *  no emoji and no close button — it reads "Improve Sparkle" + a consent pill (Always | Manual |
- *  Off) and a status-driven progress bar, and works on Sparkle itself, not the user's project.
+/** The pinned, always-present Sparkle self-improvement agent row.
+ *
+ *  IT IS A BUILD ROW THAT HAPPENS TO BE PINNED, and everything below is about keeping it that way.
+ *  It had drifted into a special case with its own vocabulary — a larger disc, its own left inset,
+ *  its own font size, a sweeping gradient progress bar, a divider rule above it and a bordered
+ *  consent pill — none of which any other row in the column had. The whole point of the column is
+ *  that it is scannable straight down; a row with its own dialect is a row you have to stop and
+ *  read.
+ *
+ *  So: same disc slot (DOT_SLOT_W / DOT_SIZE), same box (ROW_PAD_*, LIST_PAD_X), same title size
+ *  (AGENT_NAME_FONT_SIZE) and neutral ink, same leading ElapsedTimer, same `+N` treatment for both
+ *  the worker count and the consent word. It is separate from the project agents by POSITION only
+ *  — pinned below the list, outside every stage group — and by nothing else.
+ *
+ *  What it still does NOT have, and shouldn't: a close button (it can't be closed), a rename (its
+ *  name is the product's), and a stage section (it never lands work on the user's branch).
+ *
+ *  `st` / `dotColor` / `dotLabel` come from the caller, which derives them with the SAME
+ *  effectiveStatus + rollupDot pipeline every build row goes through — see the `sparkleRow` memo in
+ *  AgentSidebar. Do NOT re-derive status here; a second derivation is how the row ended up green
+ *  while sitting on an unanswered picker.
+ *
  *  `React.memo`'d (sparkle-alrm.3) with primitive props + a stable `onSelect`, so a project agent's
  *  status flip re-renders only that agent's row, never this pinned footer row. */
 const SparkleAgentRow = memo(function SparkleAgentRow({
   active,
   status,
+  dotColor,
+  dotLabel,
+  workerCount,
   onSelect,
 }: {
   active: boolean;
   status: AgentTabStatus;
+  /** Rolled-up disc paint, when this row's workers disagree with its own status. Same override the
+   *  build rows take; `undefined` means "use the status taxonomy". */
+  dotColor?: string;
+  dotLabel?: string;
+  /** Workers folded under this row. 0 today (the improvement pass runs a single agent), wired to
+   *  the same rule build rows use so a future subtree gets the same badge for free. */
+  workerCount: number;
   onSelect: () => void;
 }) {
-  const color = statusInk(AGENT_STATUS[status].color);
   const consent = useSettingsStore((s) => s.sparkleImprovementConsent);
   const pill = consentPillLabel(consent);
-  const barState = sparkleBarState(status, consent);
+  // The SAME "elapsed since the user last touched this agent" the build rows show — read from the
+  // same interactionStore, formatted by the same ElapsedTimer, ticked by the same useRowClock.
+  // `undefined` until the first interaction, so a never-touched row shows no timer at all rather
+  // than an ever-growing number (see this row's note in PRD/sparkle/improve--parity.md).
+  const lastTouchAt = useInteractionStore((s) => s.lastAt[sparkleAgentIdFor(APP_WINDOW_LABEL)]);
+  const clockNow = useRowClock(lastTouchAt);
   return (
     <div
       data-hint="improve"
@@ -4182,68 +4315,98 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
       title="Improve Sparkle — reviews your usage to propose improvements to the open-source app"
       style={{
         flex: "0 0 auto",
+        // The active fill's concave fillets are absolutely positioned against this box.
+        position: "relative",
         display: "flex",
-        alignItems: "center",
+        alignItems: "flex-start",
         gap: 8,
-        margin: "0 8px 6px",
-        padding: "8px 10px",
-        borderRadius: 6,
-        cursor: "pointer",
-        // THE FILL IS A PLANE, AND THE PLANE IS NOT THE SIGNAL. Both halves matter.
+        // LIST_PAD_X as a LEFT margin, because this row is pinned OUTSIDE the padded scroll
+        // container — that inset plus ROW_PAD_X plus the centered disc slot is what puts the disc on
+        // the same vertical line as every build row's.
         //
-        // Plane, because this row's contents are all PLANE inks — the label is
-        // `statusInk(AGENT_STATUS[...].color)` and the consent pill is `muted`/`teal` — plus a
-        // StatusDot, and a chrome fill cannot carry any of them (THE NEUTRAL LADDER, theme/colors:
-        // every fill far enough from the planes to read as a fill is already past what a plane ink
-        // can be read on). On CHAT_USER_BUBBLE, which this row painted until roborev 53613, the
-        // label measured 3.20/3.71 (dark/light), the Off pill 3.20/2.38, and the status DOT
-        // 2.64/1.70 red and 4.56/1.01 green — the dot the whole row reads by, invisible in light.
-        // On `forest` those become 6.37/8.36, 6.37/5.35, 5.25/3.83 and 9.07/2.22, better at both
-        // ends than the sidebar's own `deepForest` plane, so the active fill stays here.
+        // NOTHING HERE IS CONDITIONAL ON `active`, and that is the same rule the build rows follow:
+        // geometry belongs to every row, never only the selected one. A `marginRight: active ? …`
+        // narrows the row's CONTENT BOX the instant you select it, so the title under the pointer
+        // jumps — the list-twitch the build rows were just fixed for. This row is outside the
+        // padded container, so it already reaches the seam at margin-right 0; it pays the inset back
+        // through ROW_PAD_RIGHT exactly as a build row does, leaving the ink at the identical
+        // distance from the column's pane-side edge in every state.
+        //
+        // The trailing 6 is the gap to the footer, not a separator.
+        margin: `0 0 6px ${LIST_PAD_X}px`,
+        padding: `${ROW_PAD_Y}px ${ROW_PAD_RIGHT}px ${ROW_PAD_Y}px ${ROW_PAD_X}px`,
+        cursor: "pointer",
+        // THE SELECTED STATE IS THE BUILD ROW'S, NOT A BESPOKE ONE — and that resolves the long
+        // argument this comment used to record.
+        //
+        // The history, kept because the measurements are still the reason the fill is `forest`:
+        // this row painted CHAT_USER_BUBBLE until roborev 53613, where its label measured 3.20/3.71
+        // (dark/light), its consent pill 3.20/2.38, and the status DOT 2.64/1.70 red and 4.56/1.01
+        // green — the dot the whole row reads by, invisible in light. On `forest` those become
+        // 6.37/8.36, 6.37/5.35, 5.25/3.83 and 9.07/2.22, better at both ends than the sidebar's own
+        // `deepForest` plane. So the active fill is `forest`, and stays.
         //
         // But `forest` on a `deepForest` column is 1.08/1.38 — the fill step is not visible and
-        // never was (roborev 53662). On an AGENT row that is fine: what carries selection there is
-        // the square right edge plus the concave fillets shaping it into an opening onto the
-        // terminal, and the card's `hairline` outline once open. THIS row has none of that
-        // geometry, so moving it onto `forest` left it with no selected state at all.
+        // never was (roborev 53662). On a BUILD row that is fine, because what actually carries
+        // selection there is the SQUARE RIGHT EDGE plus the concave fillets shaping it into an
+        // opening onto the terminal. This row used to have none of that geometry, which is why it
+        // needed a `hairline` outline of its own to avoid being a WCAG 1.4.11 failure (roborev
+        // 53814) — and that outline was the row's last piece of private vocabulary.
         //
-        // THE GOLD RAIL IS GONE, and this is the one place the build-column cleanup costs something
-        // measurable rather than just removing noise. Read the note above before restoring it.
+        // It now takes the geometry instead: same square right edge, same fillets, same fill. The
+        // outline is gone because the thing it was compensating for is gone. Do NOT reintroduce it,
+        // and do NOT restore the older `3px solid C.goldFill` rail either — the colored version is
+        // the decoration the column cleanup deliberately cut.
         //
-        // The rail was `3px solid C.goldFill` when active — the app's established selected-row
-        // vocabulary (CommandPalette's selected result uses the same), and per the measurements
-        // above the ONLY selected signal this row had: the fill step behind it is 1.08 (dark) /
-        // 1.38 (light), i.e. not visible, and this row has none of the geometry an agent row uses
-        // instead (square right edge, concave fillets, the open card's hairline outline).
-        //
-        // It was removed on an explicit product call: the column is a quiet list and this was the
-        // last colored decoration in it. But "no perceivable selected state" is a WCAG 1.4.11
-        // failure, not a taste call, and shipping the fill alone would have been exactly that
-        // (roborev 53814). So the state is carried by a HAIRLINE OUTLINE instead — `hairline` is the
-        // token whose whole job is to be a line visible on any plane, it clears the chrome floor on
-        // both `forest` and `deepForest` in both themes (theme/chromeContrast.test.ts), and it is
-        // neutral: it satisfies "no color shading, no background treatment" while still saying
-        // which row you are on. Transparent when inactive rather than absent, so selecting shifts
-        // nothing. Do NOT restore the gold rail — the colored version is the thing that was cut.
-        // Longhands, not the `border` shorthand: a shorthand carrying a var() is dropped whole by
-        // jsdom's CSSOM, so the outline would be untestable (and the test that caught this would
-        // have "passed" by measuring an empty string). The top edge is always drawn — it is the
-        // separator from the agent list, not part of the selected state.
+        // NO borderTop. It was a divider rule marking this row off from the list above, and it was
+        // the only horizontal rule anywhere in the column. Position already says the row is
+        // separate — it is pinned below the scroll container, outside every stage group — so the
+        // rule was saying it a second time, in the one vocabulary no other row uses.
         background: active ? C.forest : "transparent",
-        borderLeft: `1px solid ${active ? C.hairline : "transparent"}`,
-        borderRight: `1px solid ${active ? C.hairline : "transparent"}`,
-        borderBottom: `1px solid ${active ? C.hairline : "transparent"}`,
-        borderTop: `1px solid ${C.hairline}`,
+        borderRadius: active ? ACTIVE_ROW_RADIUS : IDLE_ROW_RADIUS,
       }}
     >
-      <StatusDot status={status} />
-      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+      {/* The disc, in the SAME fixed slot a build row gives it: fixed height so the title beside it
+          sits on the glyph's line, fixed width with the disc CENTERED so its left edge lands on the
+          column's one vertical line of discs. */}
+      <div
+        style={{
+          flex: "0 0 auto",
+          width: DOT_SLOT_W,
+          height: GLYPH_SLOT_H,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <StatusDot status={status} size={DOT_SIZE} color={dotColor} label={dotLabel} />
+      </div>
+      {/* Timer, then title, then badges — the collapsed build row's strip, element for element. */}
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          height: GLYPH_SLOT_H,
+        }}
+      >
+        {lastTouchAt != null && (
+          <ElapsedTimer since={lastTouchAt} now={clockNow} color={C.muted} />
+        )}
+        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
           <span
             style={{
-              color,
-              fontSize: 13,
-              fontWeight: active ? FONT_WEIGHT.semibold : FONT_WEIGHT.medium,
+              flex: "0 1 auto",
+              minWidth: 0,
+              // NEUTRAL INK, like every other row's title. It used to be
+              // `statusInk(AGENT_STATUS[status].color)`, which made this the one row in the column
+              // whose text changed color with its status — the exact thing build and worker rows
+              // were taken off years of ago. Color lives in the disc.
+              color: C.cream,
+              fontSize: AGENT_NAME_FONT_SIZE,
+              fontWeight: active ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
@@ -4251,10 +4414,23 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
           >
             Improve Sparkle
           </span>
-          <SparkleConsentPill label={pill} />
+          {/* Same `+N` a collapsed orchestrator shows. 0 today; see the prop's note. */}
+          {workerCount > 0 && (
+            <span
+              aria-label={`${workerCount} ${workerCount === 1 ? "worker" : "workers"}`}
+              title={`${workerCount} ${workerCount === 1 ? "worker" : "workers"}`}
+              style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1 }}
+            >
+              +{workerCount}
+            </span>
+          )}
+          <SparkleConsentBadge label={pill} />
         </div>
-        <SparkleRowProgress state={barState} />
       </div>
+      {/* THE SAME COMPONENT a selected build row draws, not a copy of it — they are what makes the
+          1.08:1 fill step legible as selection, so they are not decoration and must not be dropped.
+          No `showOverlay` condition here: this row has no hover card to be stood in for. */}
+      {active && <ActiveFillets />}
     </div>
   );
 });
@@ -4493,74 +4669,38 @@ const SupportTicketRow = memo(function SupportTicketRow() {
 });
 
 /** The Always / Manual / Off badge on the Improve Sparkle row — reflects the consent mode. */
-function SparkleConsentPill({ label }: { label: string }) {
-  // "Off" reads as muted/inactive; Always + Manual share the brand-teal outline (active modes).
-  const off = label === "Off";
+/** The consent mode (Always | Manual | Off) beside the Improve Sparkle title.
+ *
+ *  IT IS THE `+N` BADGE'S TWIN, not a pill. It used to be a 10px semibold capsule with a teal
+ *  outline and a letter-spaced label — the only bordered chip in the column, on the only row that
+ *  had one, which made a piece of ordinary row metadata read as a status announcement. It is the
+ *  same class of fact as "+2 workers": a small muted note about the row, sitting in the same slot
+ *  the `+N` occupies. So it takes the same ink, size and weight, and no box at all.
+ *
+ *  It keeps its `title`, because unlike "+2" the word alone doesn't say what it modifies. */
+function SparkleConsentBadge({ label }: { label: string }) {
   return (
     <span
-      style={{
-        flex: "0 0 auto",
-        fontSize: 10,
-        lineHeight: 1.4,
-        fontWeight: FONT_WEIGHT.semibold,
-        letterSpacing: 0.2,
-        padding: "1px 6px",
-        borderRadius: 4,
-        color: off ? C.muted : C.teal,
-        border: `1px solid ${off ? C.muted : C.teal}`,
-        opacity: off ? 0.7 : 1,
-        whiteSpace: "nowrap",
-      }}
+      title={`Improvement PRs: ${label}`}
+      style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1, whiteSpace: "nowrap" }}
     >
       {label}
     </span>
   );
 }
 
-/**
- * The Improve Sparkle row's progress bar. Like every other row's WorkflowLine it shows PROGRESS in
- * the sparkle.ai cyan→blue logo gradient — NOT status color. Red/green/gray status (including
- * "needs you": waiting/approval/errored) is carried by the row's StatusDot, not the bar. States
- * (see sparkleBarState):
- *   - building → the cyan→blue gradient sweeps left→right (agent is actively working a cycle)
- *   - idle     → faint gray rail (not running / finished a cycle — no on-main ✓ terminal, since
- *                this agent issues PRs and the backend handles merges for most users)
- *   - off      → faint gray rail, dimmed (consent is Never)
- */
-function SparkleRowProgress({ state }: { state: SparkleBarState }) {
-  const TRACK = "rgba(138,160,196,0.22)";
-  const barLabel = state === "off" ? "Off" : state === "building" ? "Working" : "Idle";
-  return (
-    <div
-      role="img"
-      aria-label={`Improve Sparkle: ${barLabel}`}
-      style={{
-        position: "relative",
-        height: 3,
-        borderRadius: 999,
-        background: TRACK,
-        overflow: "hidden",
-        opacity: state === "off" ? 0.5 : 1,
-      }}
-    >
-      {state === "building" && (
-        <div
-          className="sparkle-build"
-          style={{
-            position: "absolute",
-            top: 0,
-            bottom: 0,
-            left: 0,
-            width: "40%",
-            borderRadius: 999,
-            // The same cyan "S" → blue "i" logo gradient the WorkflowLine rows build in.
-            background: `linear-gradient(90deg, ${LINE_FROM}, ${LINE_TO})`,
-          }}
-        />
-      )}
-    </div>
-  );
-}
+// `SparkleRowProgress` LIVED HERE AND IS GONE. It was a 3px rail under the Improve Sparkle title
+// with the sparkle.ai cyan→blue gradient sweeping across it (the `.sparkle-build` animation) while
+// the agent worked.
+//
+// It was deleted, not hidden, for the same reason the per-row WorkflowLine left the collapsed build
+// rows: the column is a quiet list, and this was the only moving thing in it — a permanent
+// animation on a permanently-present row, which is motion that stops reading as "look here" and
+// becomes the background. It also had nothing to report that the disc didn't: the bar's three
+// states were off / idle / building, and green-vs-gray already carries running-vs-not.
+//
+// If a progress affordance is ever wanted here again, the answer is the shared WorkflowLine on the
+// detail card, not a second bar rendered inline on this one row.
 
 // "Show Helper" lived here. It rendered ONLY while the floating island was hidden, and it was the
 // only way back from right-click → Hide Helper — so it could not be deleted on its own without

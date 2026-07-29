@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { consentPillLabel, sparkleBarState } from "./sparkleRowStatus";
+import { consentPillLabel } from "./sparkleRowStatus";
 
 describe("consentPillLabel", () => {
   it("maps each consent mode to its product wording", () => {
@@ -9,22 +9,7 @@ describe("consentPillLabel", () => {
   });
 });
 
-describe("sparkleBarState", () => {
-  it("is 'off' whenever consent is Never, regardless of status", () => {
-    expect(sparkleBarState("working", "never")).toBe("off");
-    expect(sparkleBarState("approval", "never")).toBe("off");
-    expect(sparkleBarState("idle", "never")).toBe("off");
-  });
-
-  it("builds (cyan→blue gradient) while working", () => {
-    expect(sparkleBarState("working", "always")).toBe("building");
-    expect(sparkleBarState("working", "case_by_case")).toBe("building");
-  });
-
-  it("is idle (gray rail) when not working — needs-you status is carried by the dot, not the bar", () => {
-    for (const s of ["idle", "done", "stopped", "blocked", "waiting", "approval", "errored"] as const) {
-      expect(sparkleBarState(s, "always")).toBe("idle");
-      expect(sparkleBarState(s, "case_by_case")).toBe("idle");
-    }
-  });
-});
+// `sparkleBarState` and its suite are GONE with the row's progress bar. The bar was the row's own
+// three-state machine (off / idle / building) sitting beside the effectiveStatus → rollupDot → band
+// pipeline every other row in the column uses; the row now takes that pipeline directly, and its
+// disc is asserted against a real build row's in AgentSidebar.sparkleRow.test.tsx.
