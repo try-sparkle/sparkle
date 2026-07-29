@@ -1008,9 +1008,35 @@ fn gitfile_common_dir(repo_root: &str) -> Option<PathBuf> {
 /// Repos we have already warned about an inert `core.hooksPath` for. `install_repo_hooks` runs on
 /// every project open (and on the Enable sweep), so without this the same unactionable-once warning
 /// would repeat hundreds of times a session and drown the log.
+///
+/// Keyed by the RESOLVED hooks dir, not by `repo_root` — see `hooks_warn_key`.
 fn hooks_path_warned() -> &'static Mutex<HashSet<String>> {
     static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The dedupe key for the inert-hooks warning: the hooks dir git would actually read, not the
+/// `repo_root` we were handed.
+///
+/// Those two differ for exactly the case this app generates most. `install_repo_hooks` is called
+/// with an agent WORKTREE as `repo_root`, and `hooks_dir_for` resolves every worktree of a repo to
+/// the same shared `--git-common-dir` hooks. Keying on `repo_root` therefore made each worktree its
+/// own "repo": the same unactionable warning re-fired on every agent spawn — in bursts of several
+/// within a few seconds — while the doc comment promised once per repo. Keying on the resolved dir
+/// collapses a repo and all of its worktrees to the single warning that was intended, because that
+/// dir is precisely what the message is about (it is reported as `installed_into`, and it is the
+/// path `core.hooksPath` is being compared against).
+///
+/// Canonicalized so that a symlinked or `..`-laden spelling of one dir is not two keys — the same
+/// normalization `hooks_are_inert` compares with. An unresolvable path (configured but not yet
+/// created) falls back to the literal spelling, which is still stable per worktree family and so
+/// still strictly better than the old key. Pure, for testing.
+fn hooks_warn_key(hooks_dir: &Path) -> String {
+    hooks_dir
+        .canonicalize()
+        .unwrap_or_else(|_| hooks_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Which git config SCOPE sets `core.hooksPath`, from `git config --show-scope --get` output
@@ -1133,14 +1159,16 @@ pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String
 
     // The install above succeeded, but succeeding is not the same as taking effect: if
     // `core.hooksPath` points elsewhere, git will never run what we just wrote. Say so ONCE per
-    // repo, rather than letting roborev appear enabled while silently reviewing nothing. This is
+    // repo — counting all of its agent worktrees as that one repo, since they share the hooks dir
+    // this warns about (`hooks_warn_key`) — rather than letting roborev appear enabled while
+    // silently reviewing nothing. This is
     // deliberately only a warning — writing into a (usually global) shared hooksPath would affect
     // repos the user never opened here; see `hooks_dir_for`.
     let configured = git(repo_root, &["config", "--get", "core.hooksPath"]).ok();
     if hooks_are_inert(repo_root, &hooks_dir, configured.as_deref()) {
         let first_time = hooks_path_warned()
             .lock()
-            .map(|mut w| w.insert(repo_root.to_string()))
+            .map(|mut w| w.insert(hooks_warn_key(&hooks_dir)))
             .unwrap_or(true);
         if first_time {
             // Which scope set it decides what the user should actually DO — see `hooks_path_scope`.
@@ -5456,6 +5484,53 @@ mod tests {
             !hooks_are_inert(&root, &installed, Some(".git/./hooks")),
             "a `.`-laden spelling of our own hooks dir → effective, must not warn"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The inert-hooks warning is documented as firing ONCE per repo, but the set it dedupes
+    /// against used to be keyed by the `repo_root` string it was handed. This app hands it an agent
+    /// WORKTREE on every spawn, and `hooks_dir_for` resolves all of a repo's worktrees to one shared
+    /// `--git-common-dir` hooks dir — so each worktree registered as a separate repo and re-fired
+    /// the same unactionable ~700-char warning, several within a few seconds of one another during a
+    /// spawn burst. Keying on the resolved hooks dir is what makes "once per repo" true: distinct
+    /// worktree roots that share a hooks dir must collapse to ONE key, while genuinely different
+    /// repos must stay distinct (or the second repo's warning would be swallowed).
+    #[test]
+    fn hooks_warn_key_is_shared_across_a_repos_worktrees() {
+        let tmp = std::env::temp_dir().join(format!("sparkle-hookskey-{}", std::process::id()));
+        let shared = tmp.join("repo-a").join(".git").join("hooks");
+        let other = tmp.join("repo-b").join(".git").join("hooks");
+        std::fs::create_dir_all(&shared).expect("create shared hooks dir");
+        std::fs::create_dir_all(&other).expect("create other hooks dir");
+
+        // Every worktree of one repo resolves to the SAME hooks dir → one key, one warning.
+        assert_eq!(
+            hooks_warn_key(&shared),
+            hooks_warn_key(&shared),
+            "the same hooks dir must key identically"
+        );
+
+        // A noisier spelling of that same dir is still that dir — canonicalized, as `hooks_are_inert`
+        // does, so a `..`/`.`-laden worktree path can't sneak a second warning through.
+        assert_eq!(
+            hooks_warn_key(&shared),
+            hooks_warn_key(&tmp.join("repo-a").join(".git").join(".").join("hooks")),
+            "a `.`-laden spelling of one hooks dir must not become a second key"
+        );
+
+        // Two different repos must NOT collide, or opening the second one would warn about nothing.
+        assert_ne!(
+            hooks_warn_key(&shared),
+            hooks_warn_key(&other),
+            "different repos must keep distinct keys"
+        );
+
+        // An unresolvable path (configured but never created) still yields a stable key rather than
+        // panicking or degrading to a value that collides with a real dir.
+        let missing = tmp.join("repo-c").join(".git").join("hooks");
+        assert_eq!(hooks_warn_key(&missing), hooks_warn_key(&missing), "stable when unresolvable");
+        assert_ne!(hooks_warn_key(&missing), hooks_warn_key(&shared), "and still distinct");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
