@@ -3,11 +3,13 @@
 // The thinking indicator. The founder asked for more than three dots; the constraint on "more" is
 // that every word of it be something the app OBSERVED. These tests are mostly about the cases where
 // it must say less: no turn, no activity, or activity that belongs to a different turn.
-import { cleanup, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { act, cleanup, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  NO_ANSWER_YET_LABEL,
   THINKING_ACTIVITY_TESTID,
+  THINKING_ELAPSED_TESTID,
   THINKING_INDICATOR_TESTID,
   ThinkingIndicator,
 } from "./ThinkingIndicator";
@@ -15,11 +17,23 @@ import {
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
 } from "../../services/conciergeActivity";
+import {
+  ELAPSED_COUNTER_AFTER_MS,
+  OFFLINE_AFTER_MS,
+} from "../../engine/conciergeLiveness";
+import {
+  _resetConciergeLivenessForTests,
+  noteConciergeSent,
+  noteConciergeSettled,
+} from "../../services/conciergeLiveness";
 import { useProjectStore } from "../../stores/projectStore";
 
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
   _resetConciergeActivityForTests();
+  // The row now reads the liveness detector too, and that store is a module singleton that outlives
+  // render() — without this, one case's outstanding turn is the next case's elapsed counter.
+  _resetConciergeLivenessForTests();
 });
 afterEach(() => cleanup());
 
@@ -134,5 +148,98 @@ describe("ThinkingIndicator", () => {
     rerender(<ThinkingIndicator typing />);
     expect(activityText()).toBeNull();
     expect(indicator()?.querySelector(".sparkle-pulse")).not.toBeNull();
+  });
+});
+
+// ── HOW LONG YOU HAVE BEEN WAITING ──────────────────────────────────────────────────────────────
+//
+// The pulse alone could not tell "thinking hard" from "this turn died and nothing will ever arrive",
+// and on 2026-07-29 the second case happened 149 times without the column changing at all. These
+// rows are the timing half; the thresholds themselves are argued and tested in
+// engine/conciergeLiveness.
+describe("ThinkingIndicator — the wait", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  function elapsedText(): string | null {
+    return document.querySelector(`[data-testid="${THINKING_ELAPSED_TESTID}"]`)?.textContent ?? null;
+  }
+
+  /** Let the liveness ticker run, which is what advances both the clock and the escalation. */
+  function wait(ms: number, rerender: (ui: React.ReactElement) => void) {
+    act(() => {
+      vi.advanceTimersByTime(ms);
+    });
+    rerender(<ThinkingIndicator typing />);
+  }
+
+  it("says nothing about time for the first few seconds", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(ELAPSED_COUNTER_AFTER_MS - 1_000, rerender);
+    expect(elapsedText()).toBeNull();
+  });
+
+  // FACTUAL, NOT A CLAIM. A counter cannot be wrong, so it may appear early — which is what the
+  // "show me something within a few seconds" instinct actually wants. Asserting a status that early
+  // would be a guess, and the measured median turn is ~54s.
+  it("states the elapsed time once there is some", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(ELAPSED_COUNTER_AFTER_MS + 2_000, rerender);
+    expect(elapsedText()).toContain("7s");
+    // Still just waiting — no alarm, no claim about the brain.
+    expect(indicator()?.textContent).not.toContain(NO_ANSWER_YET_LABEL);
+    expect(indicator()?.getAttribute("data-liveness")).toBe("waiting");
+  });
+
+  it("says plainly that nothing has come back once the silence is long enough", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(OFFLINE_AFTER_MS, rerender);
+    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
+    expect(indicator()?.getAttribute("data-liveness")).toBe("offline");
+    // Announced: it changes at most twice a turn, and it is the only notice a non-sighted user gets
+    // that their question has gone nowhere. (The bare counter is NOT — it changes every second.)
+    expect(indicator()?.getAttribute("aria-live")).toBe("polite");
+    expect(indicator()?.getAttribute("aria-label")).toContain(NO_ANSWER_YET_LABEL);
+  });
+
+  // A tool call RESETS the silence clock, so a stale activity line beside "No answer yet" would read
+  // as work still in progress — the one thing we have just established we cannot vouch for.
+  it("drops the stale activity line once it goes silent", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    // AFTER the first render: the row snapshots an activity floor when a turn starts, so a call
+    // recorded before it mounted belongs to the previous turn and is correctly ignored.
+    act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" }));
+    rerender(<ThinkingIndicator typing />);
+    expect(activityText()).toBe("Reading an agent's terminal");
+
+    // Measured from the TOOL CALL, which reset the silence clock — that reset is the whole reason a
+    // 20s threshold is safe for turns whose median duration is ~54s.
+    wait(OFFLINE_AFTER_MS, rerender);
+    expect(activityText()).toBeNull();
+    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
+  });
+
+  // "Recovering must clear the state promptly" — in the same commit, not on the next tick.
+  it("goes back to normal the instant the turn answers", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(OFFLINE_AFTER_MS, rerender);
+    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
+
+    act(() => noteConciergeSettled());
+    rerender(<ThinkingIndicator typing />);
+    expect(indicator()?.textContent).not.toContain(NO_ANSWER_YET_LABEL);
+    expect(elapsedText()).toBeNull();
+  });
+
+  // The name several suites outside this file identify the row by, kept EXACTLY while there is
+  // nothing else to say.
+  it("keeps its original accessible name when nothing has happened yet", () => {
+    render(<ThinkingIndicator typing />);
+    expect(indicator()?.getAttribute("aria-label")).toBe("Sparkle is typing");
   });
 });

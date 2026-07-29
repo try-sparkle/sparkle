@@ -15,6 +15,7 @@
 // store. The phrasing (which is a pure decision about English) lives in engine/conciergeActivityLine.
 import { create } from "zustand";
 
+import { noteConciergeProgress } from "./conciergeLiveness";
 import { useProjectStore } from "../stores/projectStore";
 import {
   conciergeActivitySubject,
@@ -81,6 +82,14 @@ export function noteConciergeToolCall(
   op: string,
   args: unknown,
 ): (ok: boolean) => void {
+  // A DISPATCHED TOOL CALL IS A SIGN OF LIFE, and for some turns it is the only one. A turn can
+  // spend a minute reading terminals and checking PRs without emitting a word of assistant text, so
+  // a liveness detector fed on deltas alone would call a visibly working concierge offline — the
+  // one false claim it must not make. Recorded here rather than in the liveness module because this
+  // is already the single place every `concierge_tool` call passes through.
+  // "tool", not "text": the brain is alive, but it has not said a word to the user yet. The
+  // unanswered-message receipt turns on exactly that difference.
+  noteConciergeProgress("tool");
   seq += 1;
   const mySeq = seq;
   useConciergeActivityStore.setState({

@@ -24,6 +24,12 @@ function place(target: ConciergeReceipt["target"], agentName?: string): string {
 /** The receipt's sentence. Pure: the redirect wording is a correctness concern (see the header),
  *  so it is unit-tested directly rather than asserted through a rendered tree. */
 export function receiptText(r: ConciergeReceipt): string {
+  // AN UNANSWERED MESSAGE NEVER CLAIMS TO HAVE BEEN ANSWERED. "Answered here" is the sparkle-target
+  // wording, and it is exactly the sentence that was sitting under 149 questions the brain never
+  // replied to on 2026-07-29. So the unanswered case REPLACES the phrase rather than appending a
+  // qualifier to it — a line reading "Answered here — never answered" is a contradiction the reader
+  // has to resolve, and half of them will resolve it wrong.
+  if (r.unanswered) return "→ Replaced by your next message — never answered";
   const first = r.target === "sparkle" ? "Answered here" : `Sent to ${place(r.target, r.agentName)}`;
   if (!r.alsoSentTo) return `→ ${first}`;
   // "then" — strictly sequential, so it cannot be read as a correction of the first delivery.

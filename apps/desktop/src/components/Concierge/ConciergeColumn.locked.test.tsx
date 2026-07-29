@@ -28,6 +28,12 @@ vi.mock("../../services/creditsMenuApi", () => ({
 
 import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_AI_PITCH } from "./ConciergeAiLocked";
+import { CONCIERGE_UNAVAILABLE_TESTID } from "./ConciergeUnavailable";
+import { UNAVAILABLE_FAILURE_RUN } from "../../engine/conciergeLiveness";
+import {
+  _resetConciergeLivenessForTests,
+  noteConciergeFailed,
+} from "../../services/conciergeLiveness";
 import { switchLabel } from "./ScopeVitals";
 import { useAuthStore } from "../../stores/authStore";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
@@ -60,8 +66,19 @@ function shutTheGate() {
   useAuthStore.setState({ me: null, creditFloorCents: 0 });
 }
 
-beforeEach(() => shutTheGate());
+beforeEach(() => {
+  shutTheGate();
+  _resetConciergeLivenessForTests();
+});
 afterEach(() => cleanup());
+
+/** Drive the liveness detector into its sticky UNAVAILABLE state, the way a run of quota rejections
+ *  does. No timers needed: every failure observed in a day of logs was a fast, loud error. */
+function makeConciergeUnavailable() {
+  for (let i = 0; i < UNAVAILABLE_FAILURE_RUN; i += 1) {
+    noteConciergeFailed("You've hit your session limit · resets 8:40am (America/Bogota)");
+  }
+}
 
 describe("ConciergeColumn with AI enhancements locked — the FREE half stays live", () => {
   it("still renders the status readout: the scope line and the needs-you count", () => {
@@ -146,5 +163,34 @@ describe("ConciergeColumn with AI enhancements ON — nothing changed", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect(c.onSend).toHaveBeenCalledWith("approve it");
+  });
+});
+
+// ── THE LIVENESS STRIP'S MOUNT POINT ────────────────────────────────────────────────────────────
+//
+// roborev 55442-M5. The strip had thorough component-level tests and NO test of the one line that
+// puts it on screen — deleting `{!aiLock && <ConciergeUnavailable />}` left the whole suite green
+// with the feature's primary surface gone. These two rows are about the mount and the gate, not
+// about the strip's contents (ConciergeUnavailable.test owns those).
+describe("ConciergeColumn — the concierge-unavailable strip", () => {
+  it("mounts the strip when the concierge has stopped answering", () => {
+    useAuthStore.setState({
+      me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+      creditFloorCents: 0,
+    });
+    makeConciergeUnavailable();
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.getByTestId(CONCIERGE_UNAVAILABLE_TESTID)).toBeTruthy();
+  });
+
+  // A DELIBERATE COPY DECISION, not an oversight. With the paid half locked there is no brain to be
+  // unresponsive, and ConciergeAiLocked already owns the true explanation — a second, vaguer
+  // "your concierge isn't answering" stacked under it would contradict it.
+  it("stays out of the way when the AI gate is shut — that half is already explained", () => {
+    shutTheGate();
+    makeConciergeUnavailable();
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.getByTestId("concierge-ai-locked")).toBeTruthy();
+    expect(screen.queryByTestId(CONCIERGE_UNAVAILABLE_TESTID)).toBeNull();
   });
 });

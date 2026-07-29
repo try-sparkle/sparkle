@@ -112,3 +112,30 @@ describe("RoutingReceipt — rendering", () => {
     expect(screen.queryByTestId("routing-redirect")).toBeNull();
   });
 });
+
+// A message the brain never got round to answering, because the user's next one displaced its turn.
+// 149 of 378 turns died this way on 2026-07-29 and every one of them kept a receipt reading
+// "Answered here".
+describe("receiptText — a message that was never answered", () => {
+  it("does not claim the message was answered", () => {
+    const line = receiptText({ target: "sparkle", unanswered: true });
+    expect(line).not.toContain("Answered here");
+    expect(line).toBe("→ Replaced by your next message — never answered");
+  });
+
+  // REPLACES the phrase rather than qualifying it. "Answered here — never answered" is a
+  // contradiction the reader has to resolve, and half of them will resolve it wrong.
+  it("says the same thing whichever way the message was routed", () => {
+    expect(receiptText({ target: "agent", agentName: "Kraken Auth", unanswered: true })).toBe(
+      receiptText({ target: "sparkle", unanswered: true }),
+    );
+  });
+
+  // The same no-retraction rule the rest of this file is tripwired against: the message WAS
+  // delivered — the brain read it and was working on it — so nothing here may imply it was unsent.
+  it("never implies the message itself was retracted", () => {
+    expect(receiptText({ target: "sparkle", unanswered: true })).not.toMatch(
+      /instead|moved|undone|unsent|cancell?ed|not sent/i,
+    );
+  });
+});

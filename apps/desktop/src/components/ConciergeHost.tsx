@@ -60,6 +60,14 @@ import {
   isSupersededDetail,
 } from "../services/concierge";
 import {
+  conciergeSawAnswerText,
+  noteConciergeFailed,
+  noteConciergeProgress,
+  noteConciergeSent,
+  noteConciergeSettled,
+} from "../services/conciergeLiveness";
+import { conciergeFailureNotice } from "../engine/conciergeFailureNotice";
+import {
   accountedNeedsYou,
   createProactiveScheduler,
   markStaleProactive,
@@ -1113,6 +1121,10 @@ export function ConciergeHost({
     };
     const offDelta = onConciergeDelta((e) => {
       if (supersededTurn(e.id)) return;
+      // A SIGN OF LIFE, and specifically the kind that ANSWERS the user. Recorded before the text
+      // lands, and only for a turn that passed the supersede gate above — a straggler from a turn
+      // the user already displaced proves nothing about the one they are waiting on now.
+      noteConciergeProgress("text");
       upsert(e.id, e.text, false);
     });
     const offDone = onConciergeDone((e) => {
@@ -1123,7 +1135,17 @@ export function ConciergeHost({
       // A push owns no typing indicator — nobody is waiting on it. The Rust command stands down
       // for any user turn so the two should never overlap, but if that ever changes, clearing here
       // would take the indicator away from the reply the user IS waiting on.
-      if (!isProactiveTurn(e.id)) setTyping(false);
+      if (!isProactiveTurn(e.id)) {
+        setTyping(false);
+        // The turn is over and it answered. Clears every liveness escalation, including a latched
+        // UNAVAILABLE — "recovering must clear the state promptly", and this is the recovery.
+        // A push is excluded for the same reason it does not own the typing indicator: it is not
+        // the thing anyone is waiting on.
+        noteConciergeSettled();
+        // This bubble got its answer, so the NEXT send has nothing to orphan. Without this, every
+        // message would be stamped "never answered" by whatever the user typed after it.
+        awaitingBubbleRef.current = null;
+      }
       if (e.text) upsert(e.id, e.text, true);
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
@@ -1153,14 +1175,42 @@ export function ConciergeHost({
       // A failed turn never reaches the done handler, so drop its partial text here rather than
       // retaining every failed reply for the life of the session.
       delete brainTextRef.current[e.id];
+      // THE SWALLOW THIS FIXES. `e.detail` used to die on this line: every failure there has ever
+      // been rendered the same fixed sentence, and on 2026-07-29 that sentence stood in for fifteen
+      // quota rejections carrying a reset time and a settings URL — "You've hit your session limit ·
+      // resets 8:40am (America/Bogota)". The human spent the day assuming a 529 overload, and the
+      // advice they were given ("try me again in a moment") is the one thing that could not work.
+      //
+      // `conciergeFailureNotice` is TOTAL and always carries the evidence, including for a failure
+      // it cannot classify — a classifier that only spoke for recognised errors would re-create this
+      // exact bug one unknown failure at a time.
+      // NOT FOR A PUSH (roborev 55442-M2). `offDone` above already stands down for the proactive
+      // channel and this must match it: nobody asked for that turn, so its failure is not a question
+      // that went unanswered, and three failed pushes must not raise a sticky "your concierge isn't
+      // answering" strip over a conversation the user never started. services/concierge filters
+      // pushes before the fan-out today, so this is defence in depth rather than a live bug — but
+      // engine/conciergeLiveness's header states the property as an invariant of THIS call site, and
+      // a header that asserts what the code does not enforce is how the last three rounds of
+      // findings happened.
+      if (isProactiveTurn(e.id)) return;
+      noteConciergeFailed(e.detail);
+      // A failure is an ANSWER — the user was told what happened. Not an orphan, so the next send
+      // must not stamp this bubble "never answered" on top of the error it already carries.
+      awaitingBubbleRef.current = null;
+      const notice = conciergeFailureNotice(e.detail);
       setChat((prev) => [
         ...prev,
         {
           id: nextId("err"),
-          kind: "sparkle",
-          text: "I couldn't reach my brain just now — try me again in a moment.",
+          kind: "failure",
+          headline: notice.headline,
+          evidence: notice.evidence,
         },
       ]);
+      // Through the column's ONE live region, like every other bookkeeping line. The HEADLINE only:
+      // the evidence can be a multi-line stderr dump, and a screen reader reading forty lines of
+      // warnings aloud buries the sentence that says what to do.
+      announce(notice.headline);
     });
     return () => {
       offDelta();
@@ -1584,8 +1634,46 @@ export function ConciergeHost({
     [postSparkle, takeHeldAttachments, restoreAttachments],
   );
 
-  /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome. */
-  const askSparkle = useCallback((text: string) => {
+  /** The `you` bubble whose answer is currently outstanding, or null. Paired with the liveness
+   *  detector's `sawOutput` to decide whether a message the next send is about to displace was ever
+   *  answered — see {@link askSparkle}. A ref, not state: it is read inside a callback and must be
+   *  the value as of NOW, not as of the last commit. */
+  const awaitingBubbleRef = useRef<string | null>(null);
+
+  /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
+   *
+   *  `bubbleId` is the user bubble this turn answers. It is what lets a displaced message say so —
+   *  see the orphan stamp below. Optional because the proactive-relay and redirect paths call this
+   *  with text that has no bubble of its own. */
+  const askSparkle = useCallback((text: string, bubbleId?: string) => {
+    // THE DROPPED-MESSAGE BUG, made visible (Concierge/types ConciergeReceipt.unanswered).
+    //
+    // Sending KILLS whatever turn is in flight: concierge.rs kills the old child and its reader goes
+    // silent — no `done`, no `error`, no log line. So the previous question simply never gets an
+    // answer, and its bubble sits in the thread looking answered-by-silence. On 2026-07-29 that
+    // happened to 149 of 378 turns, and to 12 of the 14 in the 20:18-20:31 burst.
+    //
+    // Detected LOCALLY, before the new turn starts: nothing arrives to detect it with. The condition
+    // is "a bubble was awaiting an answer and the brain never said a WORD for it" — a turn that
+    // streamed a partial answer the user then interrupted is not this, and is left alone.
+    //
+    // `conciergeSawAnswerText`, never the liveness flag: a tool call is a sign of life but not an
+    // answer, and reading a terminal before replying is the concierge's normal first move — so the
+    // liveness flag would exempt the most common shape of a dropped question (roborev 55442-M1).
+    const orphan = awaitingBubbleRef.current;
+    if (orphan && !conciergeSawAnswerText()) {
+      setChat((prev) =>
+        prev.map((m) =>
+          m.kind === "you" && m.id === orphan && m.receipt
+            ? { ...m, receipt: { ...m.receipt, unanswered: true, redirectable: false } }
+            : m,
+        ),
+      );
+    }
+    awaitingBubbleRef.current = bubbleId ?? null;
+    // The send itself, for the liveness clock. AFTER the orphan check, which reads the state this
+    // call is about to reset.
+    noteConciergeSent();
     setTyping(true);
     // SENDING retires every turn seen so far, here as well as in the backend (see
     // supersededTurn). Their accumulated text is dropped as those events are rejected, not
@@ -1875,7 +1963,9 @@ export function ConciergeHost({
       // stripping them here would hand Sparkle a question about a screenshot it cannot see. Only
       // the ROUTER is given the clean text — "/var/folders/…/shot.png add retry logic" is not what
       // the user said, and classifying it as if it were is a real misroute.
-      askSparkle(payload);
+      // WITH THE BUBBLE ID: this turn answers `id`, and if the user's next message displaces it
+      // before a single byte comes back, that bubble is the one that has to say so.
+      askSparkle(payload, id);
       const here = stillThere ? aim : null;
       setReceipt(id, {
         target: "sparkle",

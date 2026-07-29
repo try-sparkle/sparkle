@@ -24,6 +24,7 @@ import { LogoWaveform } from "../LogoWaveform";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
+import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
 import { ConciergeTopRight } from "./KebabMenu";
@@ -414,6 +415,17 @@ export function ConciergeColumn({
           precedes "this is about to go out", and an unanswered approval is the one thing here that
           has already halted a call. A slot, like the countdown, and for the same reason — it reads
           the pending-approval ledger and this column renders only what it is handed. */}
+      {/* "Your concierge isn't answering" — sticky, and above the approval prompt because it is the
+          precondition for it: an approval the brain will never come back to collect is not the next
+          thing to read. Mounted DIRECTLY rather than through a slot (unlike `approvalSlot` and
+          `countdownSlot`) because it takes no data from the host at all — it subscribes to
+          services/conciergeLiveness itself, the way PresenceSlider and ConciergeSuggestions read
+          their own stores. It renders null in every state but the sticky one.
+
+          GATED ON THE AI LOCK for the same reason the thread is: when the paid half is switched off,
+          unbought, or out of credits, there is no brain to be unresponsive and ConciergeAiLocked has
+          already said the true thing about why. */}
+      {!aiLock && <ConciergeUnavailable />}
       {approvalSlot}
       {/* Armed sends counting down (Concierge/CountdownBanner), directly above the box — the last
           thing between the user's words and an agent's terminal, so it sits where the eye already

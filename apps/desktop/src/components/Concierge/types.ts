@@ -150,9 +150,27 @@ export interface ConciergeDigestMessage {
 export type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 
+/** A turn that failed, said in the user's terms with the machine's own words attached.
+ *
+ *  ITS OWN KIND, rather than the plain `sparkle` bubble failures used to borrow, for two reasons.
+ *  The evidence must render VERBATIM — a quota line goes through `<Markdown>` in a sparkle bubble,
+ *  where `_` and `*` in a stderr dump are formatting instructions. And a failure must NOT be
+ *  persisted: `conciergeThreadStore.PERSISTED_KINDS` is an allow-list, so a kind that is not on it
+ *  is dropped at save time, and "You've hit your session limit · resets 8:40am" restored from
+ *  localStorage tomorrow morning is a lie the app would be telling on its own initiative. */
+export interface ConciergeFailureMessage {
+  id: string;
+  kind: "failure";
+  /** Our sentence: what went wrong and what to do. From engine/conciergeFailureNotice. */
+  headline: string;
+  /** The concierge's own words, unedited. Rendered as plain text, never as markdown. */
+  evidence: string;
+}
+
 export type ConciergeMessage =
   | ConciergeUserMessage
   | ConciergeSparkleMessage
+  | ConciergeFailureMessage
   | ConciergeBatchMessage
   | ConciergeDigestMessage
   | ConciergeRecapMessage
@@ -197,6 +215,21 @@ export interface ConciergeReceipt {
   alsoSentTo?: ConciergeSendTarget;
   /** Whether to offer the one-tap redirect (latest receipt only). */
   redirectable?: boolean;
+  /**
+   * This message reached the brain, and the brain never answered it: the turn was still running with
+   * nothing emitted when the user's NEXT message displaced it (`concierge.rs` kills the old child
+   * and its reader goes silent — no event, no log, nothing).
+   *
+   * WHY THIS FIELD EXISTS. On 2026-07-29, 149 of 378 turns (39.4%) died this way, and 12 of the 14
+   * turns in the 20:18-20:31 burst. Every one of those questions is still sitting in the thread
+   * looking asked-and-answered-by-silence, which is the single most misleading thing this column
+   * can render: the user cannot tell a question nobody answered from one they simply scrolled past.
+   *
+   * NOT a health claim. A displaced turn says nothing about whether the concierge is well — the
+   * user's own next message is what killed it — so this never feeds the liveness detector
+   * (engine/conciergeLiveness). It is a fact about ONE message, stated on that message.
+   */
+  unanswered?: true;
 }
 
 /** Everything the column renders, supplied by the integration layer. */

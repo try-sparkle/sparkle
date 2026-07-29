@@ -12,6 +12,13 @@
 // fabricated preview of the model's thoughts would look livelier and be worth nothing; this is the
 // one signal the app can vouch for.
 //
+// WHAT IT ALSO SHOWS NOW: HOW LONG YOU HAVE BEEN WAITING (engine/conciergeLiveness). The pulse
+// alone could not distinguish "thinking hard" from "this turn died twelve seconds ago and nothing
+// will ever arrive" — and on 2026-07-29 the second case happened 149 times without the column ever
+// changing. So from 5s the line states the elapsed time, and from 20s it says plainly that nothing
+// has come back. Both are OBSERVED facts, which is why they are allowed here at all: rule 1 below
+// forbids inventing a status, and a clock is not an invention.
+//
 // THREE RULES IT DEGRADES BY:
 //
 //   1. NO ACTIVITY, NO CLAIM. A turn that thinks for thirty seconds and calls nothing shows exactly
@@ -31,11 +38,13 @@
 // buys nothing — the host would only forward what this subscribes to — and would collide with the
 // @-mention work landing in that file.
 import { useState } from "react";
-import { FiFolder, FiGitBranch, FiTerminal, FiUsers } from "react-icons/fi";
+import { FiAlertCircle, FiFolder, FiGitBranch, FiTerminal, FiUsers } from "react-icons/fi";
 import type { IconType } from "react-icons";
 
 import { C } from "../../theme/colors";
 import { useConciergeActivityStore } from "../../services/conciergeActivity";
+import { useConciergeLiveness } from "../../services/conciergeLiveness";
+import { elapsedLabel } from "../../engine/conciergeLiveness";
 import {
   conciergeActivityLine,
   type ConciergeActivityIcon,
@@ -52,9 +61,20 @@ const ICONS: Record<ConciergeActivityIcon, IconType> = {
 
 export const THINKING_INDICATOR_TESTID = "concierge-thinking";
 export const THINKING_ACTIVITY_TESTID = "concierge-thinking-activity";
+export const THINKING_ELAPSED_TESTID = "concierge-thinking-elapsed";
+
+/** What the row says once nothing has come back for {@link OFFLINE_AFTER_MS}.
+ *
+ *  "yet" is doing real work: this is a report of what we have NOT received, not a diagnosis of the
+ *  brain. The turn may still be alive and about to answer — 26% of turns are still running at 60s —
+ *  and a line that said "your concierge is offline" would be a claim the app cannot support. What it
+ *  CAN support, and what the human needs at exactly this moment, is "I asked 24 seconds ago and
+ *  nothing has arrived". */
+export const NO_ANSWER_YET_LABEL = "No answer yet";
 
 export function ThinkingIndicator({ typing }: { typing: boolean }) {
   const latest = useConciergeActivityStore((s) => s.latest);
+  const { liveness, silentMs, showsElapsed } = useConciergeLiveness();
   /** The turn boundary: `floor` is the activity counter as it stood when this turn began, so
    *  anything at or below it belongs to an earlier one. -1 rather than 0 so the very first call of
    *  an app run (seq 1) still clears it.
@@ -85,7 +105,24 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
 
   const fresh = latest && latest.seq > turn.floor ? latest : null;
   const line = fresh ? conciergeActivityLine(fresh) : null;
-  const Icon = line ? ICONS[line.icon] : null;
+  // SILENT, not merely slow. `offline` and `unavailable` both mean nothing has come back; the
+  // stronger of the two is stated by the sticky strip above the compose box (ConciergeUnavailable),
+  // so this row says the same modest thing in both — it is the *waiting* surface, not the verdict.
+  const silent = liveness === "offline" || liveness === "unavailable";
+  // The elapsed time rides on whichever line is showing. It is the one thing the column can always
+  // say truthfully, so it survives when there is no tool activity to report.
+  const elapsed = showsElapsed && silentMs !== null ? elapsedLabel(silentMs) : null;
+  const Icon = silent ? FiAlertCircle : line ? ICONS[line.icon] : null;
+  // What a screen reader is given, in the same order of preference a sighted user reads it.
+  const spoken = silent
+    ? `${NO_ANSWER_YET_LABEL}${elapsed ? ` · ${elapsed}` : ""}`
+    : line
+      ? `${line.text}${elapsed ? ` · ${elapsed}` : ""}`
+      : // The name this row has always carried, kept EXACTLY when there is nothing else to say —
+        // several suites outside this file identify the indicator by it.
+        elapsed
+        ? `Sparkle is typing · ${elapsed}`
+        : "Sparkle is typing";
 
   return (
     <div
@@ -93,20 +130,28 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
       // a screen reader gains nothing from; "Read Kraken Auth's terminal" is the same information a
       // sighted user is getting, and it changes at most once per tool call rather than per token —
       // so it can be announced without the flooding that kept the thread itself off a live region.
-      aria-hidden={line ? undefined : true}
-      aria-live={line ? "polite" : undefined}
+      //
+      // The SILENT state is announced for the same reason and a stronger one: it changes at most
+      // twice in a turn, and it is the only notice a non-sighted user gets that their question has
+      // gone nowhere. The bare elapsed counter is NOT — it changes every second, which is exactly
+      // the flooding the thread itself is kept off a live region to avoid.
+      aria-hidden={line || silent ? undefined : true}
+      aria-live={line || silent ? "polite" : undefined}
       // The accessible name is the LINE when there is one, so what gets announced is the same thing
       // the sighted user is reading rather than the generic "typing" underneath it. It falls back to
       // the name this row has always carried, which several suites identify the indicator by.
-      aria-label={line ? line.text : "Sparkle is typing"}
+      aria-label={spoken}
       data-testid={THINKING_INDICATOR_TESTID}
+      data-liveness={liveness}
       style={{
         alignSelf: "flex-start",
         display: "flex",
         alignItems: "center",
         gap: 6,
         fontSize: 13,
-        color: C.conciergeMuted,
+        // The alarm colour is the app's ONE red (see PRD/sparkle/concierge-status-bands — the second
+        // alarm colour was deleted because a gold card and a red card both meant "go look").
+        color: silent ? C.sienna : C.conciergeMuted,
         // The column is 360px wide and an agent name can be long, so the line truncates rather than
         // wrapping to three lines and shoving the conversation up on every tool call.
         maxWidth: "92%",
@@ -114,12 +159,28 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
       }}
     >
       {Icon && <Icon size={12} aria-hidden style={{ flexShrink: 0 }} />}
-      {line && (
+      {silent && (
+        <span style={{ whiteSpace: "nowrap" }}>{NO_ANSWER_YET_LABEL}</span>
+      )}
+      {/* SUPPRESSED WHILE SILENT, deliberately. A tool call resets the silence clock, so if we have
+          gone quiet for 20s the newest activity line is at least that stale — and "Reading Kraken
+          Auth's terminal" beside "No answer yet" reads as work still in progress, which is the one
+          thing we have just established we cannot vouch for. */}
+      {!silent && line && (
         <span
           data-testid={THINKING_ACTIVITY_TESTID}
           style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
         >
           {line.text}
+        </span>
+      )}
+      {elapsed && (
+        <span
+          data-testid={THINKING_ELAPSED_TESTID}
+          // Tabular figures so a counter ticking 9s → 10s does not shove the pulse sideways.
+          style={{ flexShrink: 0, fontVariantNumeric: "tabular-nums", opacity: silent ? 1 : 0.75 }}
+        >
+          · {elapsed}
         </span>
       )}
       {/* index.css's existing "working on it" opacity breathe — no motion, reduced-motion safe.

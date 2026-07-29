@@ -2,7 +2,7 @@
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
 import { useCallback, useEffect, useRef } from "react";
-import { FiBell, FiCheck } from "react-icons/fi";
+import { FiAlertCircle, FiBell, FiCheck } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { Markdown } from "../Markdown";
@@ -35,6 +35,9 @@ import type {
  *  clientHeight/scrollHeight under non-integral zoom can leave a genuinely-bottomed container a few
  *  px off, and each such miss silently costs the reader the follow. Both sides are tested. */
 const FOLLOW_THRESHOLD_PX = 24;
+
+export const FAILURE_BUBBLE_TESTID = "concierge-failure";
+export const FAILURE_EVIDENCE_TESTID = "concierge-failure-evidence";
 
 /** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
  *
@@ -404,6 +407,45 @@ export function ConciergeThread({
                 }}
               >
                 {m.text}
+              </div>
+            );
+          // A TURN THAT FAILED, with the concierge's own words attached (engine/conciergeFailureNotice).
+          //
+          // The evidence is rendered as PLAIN TEXT, never through <Markdown>. It is a verbatim
+          // machine string — a stderr dump full of `_` and `*` is not a formatting instruction, and
+          // running it through a renderer would silently eat the characters that make it readable.
+          // That is the whole contract: whatever the concierge said, the user sees.
+          if (m.kind === "failure")
+            return (
+              <div
+                key={m.id}
+                data-testid={FAILURE_BUBBLE_TESTID}
+                style={{ maxWidth: "92%", alignSelf: "flex-start" }}
+              >
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
+                  <FiAlertCircle
+                    size={12}
+                    aria-hidden
+                    style={{ flexShrink: 0, marginTop: 4, color: C.sienna }}
+                  />
+                  <div style={{ minWidth: 0 }}>
+                    <div>{m.headline}</div>
+                    {m.evidence && (
+                      <p
+                        data-testid={FAILURE_EVIDENCE_TESTID}
+                        style={{
+                          margin: "4px 0 0",
+                          color: C.conciergeMuted,
+                          fontSize: 12,
+                          whiteSpace: "pre-wrap",
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        {m.evidence}
+                      </p>
+                    )}
+                  </div>
+                </div>
               </div>
             );
           // kind === "sparkle" — no bubble, RENDERED MARKDOWN.

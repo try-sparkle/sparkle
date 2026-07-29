@@ -1119,11 +1119,27 @@ fn drain_turn(
 
 /// Emit the terminal event for a decided (owned) turn: `concierge:done` on success or
 /// `concierge:error` (with a specific detail) on failure.
-fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome) {
+///
+/// `elapsed` is the wall time since the child was spawned — see the `info!` below for why it is
+/// logged on BOTH arms.
+fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome, elapsed: std::time::Duration) {
+    let elapsed_ms = elapsed.as_millis();
     if outcome.ok {
         if outcome.text.trim().is_empty() {
             tracing::debug!(id = %id, "concierge: successful turn produced no assistant text");
         }
+        // HOW LONG A TURN ACTUALLY TAKES — the one thing these logs could not answer.
+        //
+        // The success path used to log NOTHING, so of 378 turns on 2026-07-29 only the 15 that
+        // FAILED left any terminal line at all. Turn duration had to be reconstructed by censoring
+        // on the supersede marker (a turn was still running iff the next spawn logged one), which
+        // yields a distribution but no individual timings — and the liveness thresholds in
+        // engine/conciergeLiveness are set from exactly that number. One line per turn means the
+        // next person to argue about those thresholds can measure instead of infer.
+        //
+        // No prompt and no reply text, only the duration and the id: the built script embeds the
+        // prompt and is never logged, and that rule is not relaxed here.
+        tracing::info!(id = %id, elapsed_ms, "concierge turn ok");
         let _ = app.emit(
             "concierge:done",
             ConciergeDone { id: id.to_string(), session_id: outcome.session_id, text: outcome.text },
@@ -1138,7 +1154,7 @@ fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome) {
         );
         // The detail is claude's error reason / exit code — no prompt, no secret — safe to log
         // (the built script, which embeds the prompt, is never logged).
-        tracing::warn!(id = %id, exit_code = ?outcome.exit_code, "concierge turn failed: {detail}");
+        tracing::warn!(id = %id, exit_code = ?outcome.exit_code, elapsed_ms, "concierge turn failed: {detail}");
         let _ = app.emit("concierge:error", ConciergeError { id: id.to_string(), detail });
     }
 }
@@ -1282,6 +1298,11 @@ pub async fn concierge_turn(
 
     let started_id = token.to_string();
     let read_app = app.clone();
+    // The clock the `elapsed_ms` fields report against. Taken here rather than inside the thread so
+    // it covers the spawn itself, which is part of what the user waits for — and a RETRY is
+    // deliberately measured from this same point, because the wait it reports is the one the human
+    // actually sat through, not the second attempt's alone.
+    let started_at = std::time::Instant::now();
     std::thread::spawn(move || {
         let id = token.to_string();
         let stderr_handle = drain_stderr(stderr);
@@ -1323,7 +1344,7 @@ pub async fn concierge_turn(
                     if !retry.owned {
                         return;
                     }
-                    emit_outcome(&read_app, &id, retry);
+                    emit_outcome(&read_app, &id, retry, started_at.elapsed());
                 }
                 Err(e) => {
                     // REFUSED at the install site, rather than broken: stay silent, exactly as the
@@ -1352,11 +1373,11 @@ pub async fn concierge_turn(
                     if original.stderr.trim().is_empty() && original.error_detail.is_none() {
                         original.stderr = e;
                     }
-                    emit_outcome(&read_app, &id, original);
+                    emit_outcome(&read_app, &id, original, started_at.elapsed());
                 }
             }
         } else {
-            emit_outcome(&read_app, &id, outcome);
+            emit_outcome(&read_app, &id, outcome, started_at.elapsed());
         }
     });
 
@@ -1459,6 +1480,7 @@ pub async fn concierge_proactive_turn(
 
     let started_id = token.to_string();
     let read_app = app.clone();
+    let started_at = std::time::Instant::now();
     std::thread::spawn(move || {
         let id = token.to_string();
         let stderr_handle = drain_stderr(stderr);
@@ -1467,7 +1489,7 @@ pub async fn concierge_proactive_turn(
         if !outcome.owned {
             return;
         }
-        emit_outcome(&read_app, &id, outcome);
+        emit_outcome(&read_app, &id, outcome, started_at.elapsed());
     });
 
     Ok(started_id)
