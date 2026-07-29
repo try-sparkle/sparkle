@@ -21,6 +21,8 @@ import type { ConciergeToolDomain, TerminalOp } from "../services/conciergeTools
 import type { LifecycleOp } from "../services/conciergeTools/lifecycle";
 import type { WorkflowOperation } from "../services/conciergeTools/workflow";
 import type { WorkspaceOp } from "../services/conciergeTools/workspace";
+import type { BoardOp } from "../services/conciergeTools/board";
+import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
  *  indicator maps these onto react-icons/fi (this repo uses Feather; no emoji as icons). */
@@ -165,8 +167,34 @@ const WORKSPACE_PHRASES: Record<WorkspaceOp, OpPhrase> = {
   quit_app: phrase("Quitting Sparkle", "Quit Sparkle"),
 };
 
-/** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a fifth
- *  domain cannot be added without deciding how the column describes it. */
+/** The work-graph ops. `%s` is never used here: a bead id is not a name the human recognises, and
+ *  resolving it would need a `bd` round-trip on the render path.
+ *
+ *  Typed over the domain's own op union — like every other table here — so a new board op is a
+ *  COMPILE error rather than a silent fall through to the un-phrased "Using board · …" default. */
+const BOARD_PHRASES: Record<BoardOp, OpPhrase> = {
+  list_items: phrase("Reading your task list", "Read your task list"),
+  get_item: phrase("Looking up a task", "Looked up a task"),
+  get_board: phrase("Reading your board", "Read your board"),
+  ready_items: phrase("Checking what's ready to start", "Checked what's ready to start"),
+  blocked_items: phrase("Checking what's blocked", "Checked what's blocked"),
+  create_item: phrase("Filing a task", "Filed a task"),
+  update_item: phrase("Updating a task", "Updated a task"),
+  delete_item: phrase("Deleting a task", "Deleted a task"),
+};
+
+/** The approval-visibility ops — how the concierge checks on something it asked YOU for. */
+const APPROVALS_PHRASES: Record<ApprovalsOp, OpPhrase> = {
+  list_pending_approvals: phrase("Checking what's waiting on you", "Checked what's waiting on you"),
+  get_approval: phrase("Checking an approval", "Checked an approval"),
+};
+
+/** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
+ *  domain cannot be added without deciding how the column describes it.
+ *
+ *  `board` and `approvals` reuse existing glyphs rather than introducing their own: the icon union
+ *  is consumed by the indicator's renderer, and a new value there is a UI change with no bearing on
+ *  what these ops DO. Worth revisiting if the column ever grows a real board glyph. */
 const DOMAINS: Record<
   ConciergeToolDomain,
   { icon: ConciergeActivityIcon; phrases: Record<string, OpPhrase | undefined> }
@@ -175,6 +203,8 @@ const DOMAINS: Record<
   terminal: { icon: "terminal", phrases: TERMINAL_PHRASES },
   workflow: { icon: "workflow", phrases: WORKFLOW_PHRASES },
   workspace: { icon: "workspace", phrases: WORKSPACE_PHRASES },
+  board: { icon: "workspace", phrases: BOARD_PHRASES },
+  approvals: { icon: "agents", phrases: APPROVALS_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

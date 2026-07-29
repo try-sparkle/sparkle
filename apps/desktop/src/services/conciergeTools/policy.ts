@@ -70,6 +70,8 @@ import {
   type RiskClass as WorkspaceRiskClass,
   type WorkspaceOp,
 } from "./workspace";
+import { BOARD_OPS, BOARD_RISK, type BoardOp } from "./board";
+import { APPROVALS_OPS, APPROVALS_RISK, type ApprovalsOp } from "./approvals";
 
 // ---------------------------------------------------------------------------------------------
 // The three values
@@ -138,12 +140,20 @@ export const CONCIERGE_RISK_NOTE: Record<ConciergeRiskClass, string> = {
   irreversible: "Permanently destroys something that cannot be recovered.",
 };
 
-/** Which tool domain a tool belongs to — the grouping the settings pane renders. */
+/** Which tool domain a tool belongs to — the grouping the settings pane renders.
+ *
+ *  DELIBERATELY NOT the registry's wire union: this one also carries `app` (the original
+ *  sparkle-control ops, which are not dispatched through `concierge_tool` at all). It is the
+ *  SETTINGS vocabulary, not the wire vocabulary, and the two are kept separate on purpose. A new
+ *  dispatched domain therefore has to be added here as well — which is a typecheck failure until it
+ *  is, via `DOMAIN_BY_TOOL` and `NAMES_BY_DOMAIN` below. */
 export type ConciergeToolDomain =
   | "lifecycle"
   | "terminal"
   | "workflow"
   | "workspace"
+  | "board"
+  | "approvals"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -152,6 +162,8 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "terminal", label: "Terminal" },
   { id: "workflow", label: "Git & pull requests" },
   { id: "workspace", label: "Projects & window" },
+  { id: "board", label: "Tasks & work graph" },
+  { id: "approvals", label: "Approvals" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -343,6 +355,8 @@ export type ConciergeToolName =
   | TerminalToolName
   | WorkflowOperation
   | WorkspaceOp
+  | BoardOp
+  | ApprovalsOp
   | AppToolName;
 
 /**
@@ -383,6 +397,10 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...translateRisk(LIFECYCLE_RISK, LIFECYCLE_RISK_TO_CLASS),
   ...translateRisk(WORKSPACE_OP_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(WORKFLOW_OP_RISK, WORKFLOW_RISK_TO_CLASS),
+  // The board domain publishes the SAME four risk words as workspace, so it reuses that
+  // translation rather than declaring a second identical one.
+  ...translateRisk(BOARD_RISK, WORKSPACE_RISK_TO_CLASS),
+  ...translateRisk(APPROVALS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
   ...APP_TOOL_RISK,
   // LAST, so a cross-domain correction wins over the domain's own word. See RISK_OVERRIDES.
@@ -395,6 +413,8 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(WORKSPACE_OP_RISK, "workspace" as const),
   ...constantOver(WORKFLOW_OP_RISK, "workflow" as const),
   ...constantOver(TERMINAL_TOOL_RISK, "terminal" as const),
+  ...constantOver(BOARD_RISK, "board" as const),
+  ...constantOver(APPROVALS_RISK, "approvals" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -414,6 +434,8 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   terminal: TERMINAL_TOOL_NAMES,
   workflow: WORKFLOW_OPERATIONS,
   workspace: WORKSPACE_OPS,
+  board: BOARD_OPS,
+  approvals: APPROVALS_OPS,
   app: APP_TOOL_NAMES,
 };
 

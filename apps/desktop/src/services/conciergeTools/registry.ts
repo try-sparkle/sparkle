@@ -141,6 +141,28 @@ import {
 // name the exact config key the human would edit, and a second copy of `concierge.tools.${op}`
 // spelled out here is the copy that goes stale. This file still routes and classifies entirely on
 // its own — the policy DECISION arrives through the `policy` seam, never by importing an evaluator.
+import {
+  BOARD_OPS,
+  BOARD_RISK,
+  listItems,
+  getItem,
+  getBoard,
+  readyItems,
+  blockedItems,
+  createItem,
+  updateItem,
+  deleteItem,
+  type BoardOp,
+  type BoardResult,
+} from "./board";
+import {
+  APPROVALS_OPS,
+  APPROVALS_RISK,
+  listPendingApprovals,
+  getApproval,
+  type ApprovalsOp,
+  type ApprovalsResult,
+} from "./approvals";
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
@@ -152,8 +174,15 @@ import type { HistoryHit } from "../history";
 // The wire shapes
 // ---------------------------------------------------------------------------------------------
 
-/** The four tool domains, exactly as they appear on the wire. */
-export const CONCIERGE_TOOL_DOMAINS = ["lifecycle", "terminal", "workflow", "workspace"] as const;
+/** The tool domains, exactly as they appear on the wire. */
+export const CONCIERGE_TOOL_DOMAINS = [
+  "lifecycle",
+  "terminal",
+  "workflow",
+  "workspace",
+  "board",
+  "approvals",
+] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
 
@@ -353,9 +382,22 @@ function fromWorkflow<T>(ctx: OpContext, r: WorkflowResult<T>): ConciergeToolRep
 }
 
 /** workspace: `{ ok, op, risk, value }` | `{ ok: false, …, reason, message }`. Note `value`, not
- *  `data` — the one place the four conventions differ in the SUCCESS arm too. */
+ *  `data` — the one place the conventions differ in the SUCCESS arm too. */
 function fromWorkspace<T>(ctx: OpContext, r: WorkspaceResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.value) : err(ctx, r.reason, r.message);
+}
+
+/** board: `{ ok, op, risk, data }` | `{ ok: false, …, reason, message }` — the lifecycle convention.
+ *  `beads-unavailable` passes through as the code, so a project with no `bd` database is reported as
+ *  the supported state it is rather than as a failure. */
+function fromBoard<T>(ctx: OpContext, r: BoardResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** approvals: same convention as board. Read-only throughout — see approvals.ts's header for why
+ *  there is deliberately no `approve` op for this to normalize. */
+function fromApprovals<T>(ctx: OpContext, r: ApprovalsResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -809,6 +851,120 @@ const WORKSPACE_ROUTES: Record<WorkspaceOp, Handler> = {
 // The domain table
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// BOARD — the work graph (beads). See board.ts for why this answers both the "board" and "beads"
+// shapes the PRD asks for as separate surfaces.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * READS may default their project; WRITES must name one. The asymmetry is deliberate.
+ *
+ * On the read side, the board is the surface the human is looking at while they talk to the
+ * concierge, so "what's on my board" must not need an id the human doesn't know. The fallback
+ * resolves through the STORE, never through anything the model supplied, so it cannot be used to
+ * reach an unopened project.
+ *
+ * On the write side that same fallback is a hole, and `delete_item` shows it most sharply. It is
+ * `irreversible` → `ask`, and an approval is fingerprinted over the model's RAW ARGS — so an
+ * approval minted for `{id: "x"}` with no project binds no project. The target would be resolved
+ * from `selectedProjectId` on the RETRY turn, up to a grant TTL later, and the selection can move
+ * in between — the concierge can move it itself with `workspace.select_project`. The human would
+ * also be shown a card naming a bead but not whose board it is on. Requiring the id makes the
+ * approved call and the performed call the same call, which is the property the ledger rests on.
+ */
+const boardScope = z.object({ projectId: z.string().min(1).optional() }).strict();
+const boardItem = boardScope.extend({ id: z.string().min(1, "an item id is required") });
+
+/** The write scope: `projectId` REQUIRED. See the note above. */
+const boardWriteScope = z.object({ projectId: projectIdArg }).strict();
+const boardWriteItem = boardWriteScope.extend({ id: z.string().min(1, "an item id is required") });
+
+const createItemArgs = boardWriteScope.extend({
+  title: z.string().min(1, "a title is required"),
+  body: z.string().optional(),
+});
+
+/** At least one field must actually change — `.refine` rather than all-optional, so an empty update
+ *  is a `bad-args` error naming the problem instead of a success that did nothing. */
+const updateItemArgs = boardWriteItem
+  .extend({
+    status: z.enum(["in_progress", "closed"]).optional(),
+    addLabels: z.array(z.string().min(1)).optional(),
+    removeLabels: z.array(z.string().min(1)).optional(),
+  })
+  .refine(
+    (a) => a.status !== undefined || a.addLabels?.length || a.removeLabels?.length,
+    "nothing to update — pass `status`, `addLabels`, or `removeLabels`",
+  );
+
+/** Resolve the board's project: the named one, or the selected one when the name is omitted. */
+async function withBoardProject(
+  ctx: OpContext,
+  projectId: string | undefined,
+  fn: (p: Project) => Promise<ConciergeToolReply>,
+): Promise<ConciergeToolReply> {
+  const state = useProjectStore.getState();
+  const id = projectId ?? state.selectedProjectId;
+  if (!id) {
+    return err(
+      ctx,
+      REGISTRY_CODES.unknownProject,
+      "No project is selected, so I don't know whose board to read. Pass a `projectId`.",
+    );
+  }
+  return withProject(ctx, id, fn);
+}
+
+const BOARD_ROUTES: Record<BoardOp, Handler> = {
+  list_items: route(boardScope, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await listItems(p.rootPath))),
+  ),
+  get_item: route(boardItem, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await getItem(p.rootPath, a.id))),
+  ),
+  get_board: route(boardScope, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await getBoard(p.rootPath))),
+  ),
+  ready_items: route(boardScope, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await readyItems(p.rootPath))),
+  ),
+  blocked_items: route(boardScope, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await blockedItems(p.rootPath))),
+  ),
+  // The writes resolve through `withProject` — no store fallback. See boardWriteScope.
+  create_item: route(createItemArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromBoard(ctx, await createItem(p.rootPath, a.title, a.body ?? "")),
+    ),
+  ),
+  update_item: route(updateItemArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromBoard(
+        ctx,
+        await updateItem(p.rootPath, a.id, {
+          status: a.status,
+          addLabels: a.addLabels,
+          removeLabels: a.removeLabels,
+        }),
+      ),
+    ),
+  ),
+  delete_item: route(boardWriteItem, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) => fromBoard(ctx, await deleteItem(p.rootPath, a.id))),
+  ),
+};
+
+// ---------------------------------------------------------------------------------------------
+// APPROVALS — read-only visibility into the concierge's own pending requests.
+// ---------------------------------------------------------------------------------------------
+
+const approvalIdArgs = z.object({ id: z.string().min(1, "an approval id is required") }).strict();
+
+const APPROVALS_ROUTES: Record<ApprovalsOp, Handler> = {
+  list_pending_approvals: route(noArgs, (_a, ctx) => fromApprovals(ctx, listPendingApprovals())),
+  get_approval: route(approvalIdArgs, (a, ctx) => fromApprovals(ctx, getApproval(a.id))),
+};
+
 interface DomainEntry {
   routes: Record<string, Handler>;
   /** Whether an op changes the world — asked of the DOMAIN's own classification wherever it has one
@@ -841,6 +997,19 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => WORKSPACE_OP_RISK[op as WorkspaceOp] !== "read-only",
     ops: WORKSPACE_OPS,
   },
+  board: {
+    routes: BOARD_ROUTES,
+    write: (op) => BOARD_RISK[op as BoardOp] !== "read-only",
+    ops: BOARD_OPS,
+  },
+  approvals: {
+    // Every op is read-only by construction (see approvals.ts), so this is a constant rather than a
+    // map lookup. It is written as one anyway — `APPROVALS_RISK` is the classification, and reading
+    // it here means a future write-tier op cannot be added without this line noticing.
+    routes: APPROVALS_ROUTES,
+    write: (op) => APPROVALS_RISK[op as ApprovalsOp] !== "read-only",
+    ops: APPROVALS_OPS,
+  },
 };
 
 /** Every domain's op list, for the MCP layer's enums and for tests that assert the two agree. */
@@ -849,6 +1018,8 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   terminal: DOMAINS.terminal.ops,
   workflow: DOMAINS.workflow.ops,
   workspace: DOMAINS.workspace.ops,
+  board: DOMAINS.board.ops,
+  approvals: DOMAINS.approvals.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

@@ -766,3 +766,110 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     expect(dispatchAnswerMock).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// 6. The board / approvals domains — the wiring layer, not the domain modules
+// ---------------------------------------------------------------------------------------------
+//
+// board.test.ts and approvals.test.ts cover the modules themselves. What lives ONLY here is what
+// the registry adds: the read-side store fallback for `projectId`, the write side's refusal to use
+// it, and that an unknown project is refused rather than silently resolved. That gap is not
+// hypothetical — a whole class of wiring bug (the settings catalog missing both domains) shipped
+// precisely because no test exercised these two domains at this layer.
+
+describe("board — the registry's project resolution", () => {
+  /** `bd` is not present in a unit test; drive the Rust edge directly. */
+  function beadsReturn(rows: unknown[]): void {
+    invoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "list_beads") return JSON.stringify(rows);
+      if (cmd === "blocked_beads") return JSON.stringify([]);
+      return undefined;
+    }) as never);
+  }
+
+  it("READS fall back to the selected project when projectId is omitted", async () => {
+    const projectId = seedProject("Demo", "/tmp/demo");
+    useProjectStore.setState({ selectedProjectId: projectId } as never);
+    beadsReturn([{ id: "a", title: "one", status: "open" }]);
+
+    const r = await dispatchConciergeTool(call({ domain: "board", op: "list_items", args: {} }));
+    expect(r.ok).toBe(true);
+    // Resolved through the STORE — the root path is never something the model supplied.
+    expect(invoke).toHaveBeenCalledWith("list_beads", { projectPath: "/tmp/demo" });
+  });
+
+  it("refuses a read with no projectId and nothing selected, instead of guessing", async () => {
+    const r = await dispatchConciergeTool(call({ domain: "board", op: "list_items", args: {} }));
+    expect(refusal(r).code).toBe(REGISTRY_CODES.unknownProject);
+    expect(refusal(r).message).toMatch(/projectId/);
+  });
+
+  it("refuses a projectId no open project holds", async () => {
+    seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "board", op: "list_items", args: { projectId: "nope" } }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.unknownProject);
+  });
+
+  // The write side deliberately does NOT inherit the read side's fallback: an approval is
+  // fingerprinted over the model's raw args, so a delete approved as `{id}` with no project would
+  // be performed against whatever is selected on the retry turn.
+  it("WRITES require an explicit projectId — the selected-project fallback does not apply", async () => {
+    const projectId = seedProject();
+    useProjectStore.setState({ selectedProjectId: projectId } as never);
+
+    for (const [op, args] of [
+      ["create_item", { title: "x" }],
+      ["update_item", { id: "a", status: "closed" }],
+      ["delete_item", { id: "a" }],
+    ] as const) {
+      const r = await dispatchConciergeTool(call({ domain: "board", op, args }));
+      expect(refusal(r).code, op).toBe(REGISTRY_CODES.badArgs);
+      expect(refusal(r).message, op).toMatch(/projectId/);
+    }
+  });
+
+  it("an update that changes nothing is refused rather than reported as a no-op success", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "board", op: "update_item", args: { projectId, id: "a" } }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+  });
+
+  it("delete_item is ask-tier end to end, and nothing is destroyed without approval", async () => {
+    const projectId = seedProject();
+    const policy: ConciergeToolPolicy = () => ({ tier: "ask", approvedByUser: false });
+    const r = await dispatchConciergeTool(
+      call({ domain: "board", op: "delete_item", args: { projectId, id: "a" } }),
+      { policy },
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+    expect(invoke).not.toHaveBeenCalledWith("delete_bead", expect.anything());
+  });
+});
+
+describe("approvals — routed and read-only", () => {
+  it("routes list_pending_approvals and returns a list", async () => {
+    const r = await dispatchConciergeTool(
+      call({ domain: "approvals", op: "list_pending_approvals", args: {} }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.ok && Array.isArray(r.data)).toBe(true);
+  });
+
+  it("refuses an approval id it does not hold", async () => {
+    const r = await dispatchConciergeTool(
+      call({ domain: "approvals", op: "get_approval", args: { id: "ghost" } }),
+    );
+    expect(refusal(r).code).toBe("unknown-approval");
+  });
+
+  it("has no approve/deny op to route", async () => {
+    for (const op of ["approve", "approve_approval", "deny_approval"]) {
+      const r = await dispatchConciergeTool(call({ domain: "approvals", op, args: { id: "x" } }));
+      expect(refusal(r).code, op).toBe(REGISTRY_CODES.unknownOp);
+    }
+  });
+});

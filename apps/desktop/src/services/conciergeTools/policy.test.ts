@@ -43,6 +43,8 @@ import { CONCIERGE_TERMINAL_TOOLS } from "./terminal";
 import { LIFECYCLE_OPS } from "./lifecycle";
 import { WORKFLOW_OPERATIONS } from "./workflow";
 import { WORKSPACE_OPS } from "./workspace";
+import { BOARD_OPS } from "./board";
+import { APPROVALS_OPS } from "./approvals";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -199,13 +201,17 @@ describe("explicit rules — the three values", () => {
 });
 
 describe("the tool set is derived from the domains", () => {
-  it("covers all five domains and nothing else", () => {
+  it("covers every domain and nothing else", () => {
     // `app` is the ORIGINAL sparkle-control ops, brought under the same policy (roborev 54226).
+    // `board` and `approvals` are dispatched domains that the settings pane must also list — this
+    // module's domain union is the SETTINGS vocabulary, deliberately wider than the wire one.
     expect(CONCIERGE_TOOL_GROUPS.map((g) => g.domain)).toEqual([
       "lifecycle",
       "terminal",
       "workflow",
       "workspace",
+      "board",
+      "approvals",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -249,6 +255,8 @@ describe("the tool set is derived from the domains", () => {
         TERMINAL_TOOL_NAMES.length +
         WORKFLOW_OPERATIONS.length +
         WORKSPACE_OPS.length +
+        BOARD_OPS.length +
+        APPROVALS_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });
