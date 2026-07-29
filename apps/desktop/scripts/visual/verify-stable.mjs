@@ -50,6 +50,29 @@ export function compareDirs(dirA, dirB, { filter = (f) => f.endsWith(".png") } =
   };
 }
 
+/**
+ * Keep the capture directories, or delete them?
+ *
+ * Extracted as a pure function because it is the whole subject of this script's failure path and was
+ * previously inline in a `finally`, where it could only be exercised by provoking a real determinism
+ * failure — i.e. never, in practice. The regression it guards (evidence deleted at the one moment it
+ * matters) is silent by construction, so it needs a test that does not spawn Chrome. (roborev 55089)
+ *
+ * @param keepArg  `args.keep`: `undefined` when unset, `"false"` for an explicit `--keep=false`,
+ *                 anything else for an explicit keep.
+ * @param outcome  `"stable"` | `"unstable"` | `"threw"`.
+ * @param hasOutput Did either run actually write anything? A run-1 `execFileSync` failure (the
+ *                 documented missing-Chrome case) throws with both directories still empty, and
+ *                 announcing "artifacts kept for inspection" above a stack trace points the reader
+ *                 at two empty directories and leaks them permanently.
+ */
+export function shouldKeep({ keepArg, outcome, hasOutput = true }) {
+  // An explicit --keep is the user's call and wins even with nothing to show.
+  if (keepArg !== undefined && keepArg !== "false") return true;
+  if (outcome === "stable") return false;
+  return hasOutput;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const passthrough = process.argv.slice(2).filter((a) => !a.startsWith("--out="));
@@ -57,12 +80,10 @@ async function main() {
     mkdtempSync(join(tmpdir(), "visual-stable-a-")),
     mkdtempSync(join(tmpdir(), "visual-stable-b-")),
   ];
-  // `!== undefined`, not `Boolean(...)`: `--keep=false` parses to the STRING "false", which is
-  // truthy, so Boolean() made the flag impossible to turn off once given.
-  const keepRequested = args.keep !== undefined && args.keep !== "false";
-  // Set when we have something worth looking at. The `finally` reads this rather than deciding
-  // for itself, so the keep/clean rule lives next to the outcome that justifies it.
-  let keepForEvidence = false;
+  // The `finally` records only WHAT HAPPENED and defers the keep/clean rule to `shouldKeep`, so the
+  // rule is testable without provoking a real failure. Starts at "threw": the only way out of the
+  // try block without setting it is an exception.
+  let outcome = "threw";
 
   try {
     for (const [i, dir] of dirs.entries()) {
@@ -93,19 +114,26 @@ async function main() {
       // and a determinism failure is precisely the class of result that may not reproduce on the
       // next run. That inverted the normal convention (keep on failure, clean on success) in the
       // one script whose output is only interesting when it fails (roborev 54844).
-      keepForEvidence = true;
+      outcome = "unstable";
       return 1;
     }
     console.log("[verify-stable] deterministic ✓");
+    outcome = "stable";
     return 0;
-  } catch (err) {
-    // A capture that THREW leaves partial output, and that is evidence too — it is the difference
-    // between "run 2 never started" and "run 2 produced different pixels".
-    keepForEvidence = true;
-    throw err;
   } finally {
-    if (keepRequested || keepForEvidence) {
-      console.log(`[verify-stable] artifacts kept for inspection: ${dirs.join(" ")}`);
+    // Per-directory counts, not a bare boolean: "run 2 never started" and "run 2 produced different
+    // pixels" are different diagnoses, and the counts are what tell them apart at a glance.
+    const counts = dirs.map((d) => {
+      try {
+        return readdirSync(d).length;
+      } catch {
+        return 0;
+      }
+    });
+    if (shouldKeep({ keepArg: args.keep, outcome, hasOutput: counts.some((n) => n > 0) })) {
+      const detail = dirs.map((d, i) => `${d} (${counts[i]} files)`).join(" ");
+      console.log(`[verify-stable] artifacts kept for inspection: ${detail}`);
+      console.log("[verify-stable] remove them when you are done — nothing else will.");
     } else {
       for (const d of dirs) rmSync(d, { recursive: true, force: true });
     }

@@ -202,10 +202,19 @@ describe("seeding never reaches disk", () => {
       useProjectStore.setState((st) => ({ ...st }));
       vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS * 4);
       flushProjectsPersist();
-      expect(
-        localStorage.getItem(PROJECTS_PERSIST_KEY),
-        "control failed: the debounced backend never wrote, so the assertion below proves nothing",
-      ).not.toBe(REAL);
+      // `.not.toBe(REAL)` ALONE IS NOT A CONTROL: `null` satisfies it as readily as a successful
+      // write, and `debouncedProjectsStorage` has both a `removeItem` path and a write-elision
+      // branch. A regression into removing the key rather than writing it would leave this green
+      // and the real assertion below green too — the same vacuousness this test exists to end
+      // (roborev 55089). So assert the write POSITIVELY: a value is present, and it is the
+      // persisted store shape rather than whatever else might have landed there.
+      const wrote = localStorage.getItem(PROJECTS_PERSIST_KEY);
+      const why = "control failed: the debounced backend never wrote, so the assertion below proves nothing";
+      expect(wrote, why).not.toBeNull();
+      expect(JSON.parse(wrote as string), why).toMatchObject({
+        state: { projects: expect.any(Array) },
+      });
+      expect(wrote, why).not.toBe(REAL);
 
       // THE ACTUAL CLAIM: with fixtures on, persistence is detached and the blob survives.
       localStorage.setItem(PROJECTS_PERSIST_KEY, REAL);

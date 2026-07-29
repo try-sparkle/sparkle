@@ -26,33 +26,36 @@ export const MOCK_REL = "PRD/sparkle/ui-directions/rev4-standalone.html";
 /**
  * Where the approved mock lives.
  *
- * It is NOT on every branch. rev4-standalone.html was authored on `sparkle/blueprint-cockpit` and
- * has not landed on main, so an instrument that only reads the working tree would be unusable on
- * exactly the branches that most need it. Resolution order:
+ * `rev4-standalone.html` HAS LANDED ON MAIN (it went in with the cockpit port), so step 2 is the
+ * normal path and wins on every branch cut from main. Resolution order:
  *   1. --mock=<path>
- *   2. the working tree
- *   3. `git show <ref>:<path>` over a list of candidate refs (SPARKLE_VISUAL_MOCK_REF, then the
- *      branch that authored it, then main)
- * Once the mock lands on main, step 2 always wins and the fallback goes quiet on its own.
+ *   2. SPARKLE_VISUAL_MOCK_REF, if set — an explicitly named ref beats the tree
+ *   3. the working tree
+ *   4. `git show <ref>:<path>` over the remaining candidate refs (the branch that authored it,
+ *      then main)
+ *
+ * SPARKLE_VISUAL_MOCK_REF OUTRANKS THE WORKING TREE, and that is a behaviour change (roborev
+ * 55137). It used to sit in the candidate list at step 4, which was consulted only *after* the tree
+ * lookup failed — so once the mock landed on main the variable became unreachable on any normal
+ * checkout: setting it had no effect and produced no diagnostic, and the run silently scored
+ * against the tree copy instead of the revision the operator named. An explicitly named ref is an
+ * explicit instruction, so it now wins, and a named ref that does NOT carry the mock is a hard
+ * error rather than a silent fall-through to the tree.
+ *
+ * Step 4 is a COMPATIBILITY path, not the load-bearing one: it covers a detached or sparse
+ * checkout. `sparkle/blueprint-cockpit` stays in the candidate list only so an old worktree still
+ * parked on it keeps resolving; nothing depends on that branch existing.
+ *
+ * To compare against a revision other than the tree's, either set SPARKLE_VISUAL_MOCK_REF=<ref> or
+ * pass `--mock=<path>` — note `--mock` takes a PATH, not a ref, so the two are different inputs.
  */
-export function resolveMock(explicitPath, { repoRoot = REPO_ROOT, refs } = {}) {
-  if (explicitPath) {
-    const p = resolve(explicitPath);
-    if (!existsSync(p)) throw new Error(`--mock path does not exist: ${p}`);
-    return { html: readFileSync(p, "utf8"), source: p };
-  }
-  const inTree = join(repoRoot, MOCK_REL);
-  if (existsSync(inTree)) return { html: readFileSync(inTree, "utf8"), source: MOCK_REL };
-
-  const candidates = refs ?? [
-    process.env.SPARKLE_VISUAL_MOCK_REF,
-    "sparkle/blueprint-cockpit",
-    "origin/sparkle/blueprint-cockpit",
-    "main",
-    "origin/main",
-  ].filter(Boolean);
-
-  for (const ref of candidates) {
+export function resolveMock(
+  explicitPath,
+  { repoRoot = REPO_ROOT, refs, mockRef = process.env.SPARKLE_VISUAL_MOCK_REF } = {},
+) {
+  // `git show '<ref>:<path>'` as ONE argv element. Quoting-sensitive: the ref may carry `~`, `^` or
+  // `@{…}`, which a shell would mangle — execFileSync passes it through literally.
+  const fromRef = (ref) => {
     try {
       const html = execFileSync("git", ["show", `${ref}:${MOCK_REL}`], {
         cwd: repoRoot,
@@ -60,10 +63,43 @@ export function resolveMock(explicitPath, { repoRoot = REPO_ROOT, refs } = {}) {
         stdio: ["ignore", "pipe", "ignore"],
         maxBuffer: 32 * 1024 * 1024,
       });
-      if (html) return { html, source: `git:${ref}:${MOCK_REL}` };
+      return html ? { html, source: `git:${ref}:${MOCK_REL}` } : null;
     } catch {
-      // ref missing, or the file is not in it — try the next
+      return null; // ref missing, or the file is not in it
     }
+  };
+
+  if (explicitPath) {
+    const p = resolve(explicitPath);
+    if (!existsSync(p)) throw new Error(`--mock path does not exist: ${p}`);
+    return { html: readFileSync(p, "utf8"), source: p };
+  }
+
+  // An explicitly named ref beats the working tree, and MISSES LOUDLY. Falling through to the tree
+  // here would score the run against a revision the operator did not ask for and say nothing.
+  if (mockRef) {
+    const found = fromRef(mockRef);
+    if (found) return found;
+    throw new Error(
+      `SPARKLE_VISUAL_MOCK_REF=${mockRef} does not carry ${MOCK_REL}.\n` +
+        `Refusing to fall back to the working tree: that would silently compare against a different ` +
+        `revision than the one you named. Fix the ref, or unset it to use the tree.`,
+    );
+  }
+
+  const inTree = join(repoRoot, MOCK_REL);
+  if (existsSync(inTree)) return { html: readFileSync(inTree, "utf8"), source: MOCK_REL };
+
+  const candidates = refs ?? [
+    "sparkle/blueprint-cockpit",
+    "origin/sparkle/blueprint-cockpit",
+    "main",
+    "origin/main",
+  ];
+
+  for (const ref of candidates) {
+    const found = fromRef(ref);
+    if (found) return found;
   }
   throw new Error(
     `Could not find ${MOCK_REL} in the working tree or in any of: ${candidates.join(", ")}.\n` +

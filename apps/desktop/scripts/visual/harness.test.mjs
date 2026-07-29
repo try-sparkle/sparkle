@@ -8,9 +8,10 @@
 
 import { describe, expect, it } from "vitest";
 import { deflateSync } from "node:zlib";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { decodePng, encodePng } from "./png.mjs";
 import { blank, blit, compareImages, diffImage, sideBySide } from "./diff.mjs";
 import {
@@ -22,8 +23,8 @@ import {
   surfaceByName,
 } from "./surfaces.mjs";
 import { numericArg, parseArgs } from "./capture.mjs";
-import { mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
-import { compareDirs } from "./verify-stable.mjs";
+import { MOCK_REL, mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
+import { compareDirs, shouldKeep } from "./verify-stable.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -428,7 +429,13 @@ describe("mock resolution", () => {
     // no signal in it. (roborev 54744)
     const emptyRoot = mkdtempSync(join(tmpdir(), "visual-empty-root-"));
     expect(() =>
-      resolveMock(undefined, { repoRoot: emptyRoot, refs: ["definitely-not-a-ref"] }),
+      // `mockRef: undefined` explicitly, so an ambient SPARKLE_VISUAL_MOCK_REF in the developer's
+      // shell cannot change which error this test observes.
+      resolveMock(undefined, {
+        repoRoot: emptyRoot,
+        refs: ["definitely-not-a-ref"],
+        mockRef: undefined,
+      }),
     ).toThrow(/Could not find .*rev4-standalone\.html/);
   });
 
@@ -438,12 +445,149 @@ describe("mock resolution", () => {
   // now only ever hide a real breakage in the tree lookup. The soft form outliving its premise is
   // the same shape as the assertion above, which passed only because the mock was absent.
   it("locates the approved mock", () => {
-    const found = resolveMock();
+    const found = resolveMock(undefined, { mockRef: undefined });
     expect(found.html).toContain('class="shell"');
     expect(found.html).toContain("data-wired");
   });
 
   it("rejects an explicit --mock path that does not exist", () => {
     expect(() => resolveMock("/tmp/nope-does-not-exist.html")).toThrow(/does not exist/);
+  });
+
+  // SUCCESS-PATH coverage for the `git show <ref>:<path>` fallback. The only other fallback test
+  // drives it to failure against a bogus ref, which cannot catch the way this actually breaks: the
+  // `ref:path` argument is quoting-sensitive through execFileSync, and a break is silent everywhere
+  // except a checkout without the mock in its tree — precisely when the fallback is the only thing
+  // standing. Built as a real repo (committed, then removed from the working tree) so step 2 misses
+  // and step 3 is forced. (roborev 55085)
+  it("falls back to `git show <ref>:<path>` when the working tree lacks the mock", () => {
+    const repo = mkdtempSync(join(tmpdir(), "visual-mock-repo-"));
+    const git = (...a) => execFileSync("git", a, { cwd: repo, stdio: "ignore" });
+    git("init", "-q", "-b", "main");
+    // Never let a test repo pick up a global core.hooksPath — that is how temp repos have flooded
+    // the review DB before.
+    git("config", "core.hooksPath", "/dev/null");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    mkdirSync(dirname(join(repo, MOCK_REL)), { recursive: true });
+    writeFileSync(join(repo, MOCK_REL), '<div class="shell" data-wired="off"></div>');
+    git("add", "-A");
+    git("commit", "-qm", "mock");
+    // Remove it from the WORKING TREE only; the commit still carries it.
+    rmSync(join(repo, MOCK_REL));
+
+    const { html, source } = resolveMock(undefined, {
+      repoRoot: repo,
+      refs: ["main"],
+      mockRef: undefined,
+    });
+    expect(source).toBe(`git:main:${MOCK_REL}`);
+    expect(html).toContain('class="shell"');
+  });
+
+  // SPARKLE_VISUAL_MOCK_REF OUTRANKS THE TREE. It used to sit in the candidate list, consulted only
+  // after the tree lookup failed — so once the mock landed on main the variable became unreachable
+  // on a normal checkout: no effect, no diagnostic, and the run silently scored against the tree
+  // copy instead of the named revision. (roborev 55137)
+  describe("an explicitly named ref", () => {
+    /** A repo whose COMMITTED mock differs from the one in its working tree, so precedence shows. */
+    const repoWithBoth = () => {
+      const repo = mkdtempSync(join(tmpdir(), "visual-mock-ref-"));
+      const git = (...a) => execFileSync("git", a, { cwd: repo, stdio: "ignore" });
+      git("init", "-q", "-b", "main");
+      git("config", "core.hooksPath", "/dev/null");
+      git("config", "user.email", "test@example.com");
+      git("config", "user.name", "Test");
+      mkdirSync(dirname(join(repo, MOCK_REL)), { recursive: true });
+      writeFileSync(join(repo, MOCK_REL), '<div class="shell" data-from="the-ref"></div>');
+      git("add", "-A");
+      git("commit", "-qm", "mock");
+      // The working tree now says something DIFFERENT from the commit.
+      writeFileSync(join(repo, MOCK_REL), '<div class="shell" data-from="the-tree"></div>');
+      return repo;
+    };
+
+    it("wins over the working tree", () => {
+      const { html, source } = resolveMock(undefined, {
+        repoRoot: repoWithBoth(),
+        mockRef: "main",
+      });
+      expect(source).toBe(`git:main:${MOCK_REL}`);
+      expect(html).toContain("the-ref");
+      expect(html).not.toContain("the-tree");
+    });
+
+    it("fails loudly rather than silently scoring against the tree", () => {
+      // The whole point: a typo'd ref must NOT quietly resolve to the tree copy, because the report
+      // would then be a confident number against a revision nobody asked for.
+      expect(() =>
+        resolveMock(undefined, { repoRoot: repoWithBoth(), mockRef: "no-such-ref" }),
+      ).toThrow(/SPARKLE_VISUAL_MOCK_REF=no-such-ref does not carry/);
+    });
+
+    // THE PRODUCTION WIRING, not just the branch. Every other test here passes `mockRef` as an
+    // option — deliberately, so an ambient value cannot perturb them — which leaves the
+    // `= process.env.SPARKLE_VISUAL_MOCK_REF` default parameter as the one line that makes the
+    // feature exist for a real caller (`compare.mjs` calls `resolveMock(args.mock)` with no
+    // options) and the one line nothing exercised. Deleting it would revert the variable to having
+    // no effect and no diagnostic, with the whole suite still green. (roborev 55140)
+    it("reads SPARKLE_VISUAL_MOCK_REF from the environment", () => {
+      const prev = process.env.SPARKLE_VISUAL_MOCK_REF;
+      process.env.SPARKLE_VISUAL_MOCK_REF = "main";
+      try {
+        const { source, html } = resolveMock(undefined, { repoRoot: repoWithBoth() });
+        expect(source).toBe(`git:main:${MOCK_REL}`);
+        expect(html).toContain("the-ref");
+      } finally {
+        if (prev === undefined) delete process.env.SPARKLE_VISUAL_MOCK_REF;
+        else process.env.SPARKLE_VISUAL_MOCK_REF = prev;
+      }
+    });
+
+    it("still yields to an explicit --mock path", () => {
+      const dir = mkdtempSync(join(tmpdir(), "visual-mock-explicit-"));
+      const p = join(dir, "rev4-standalone.html");
+      writeFileSync(p, '<div class="shell" data-from="the-flag"></div>');
+      const { html, source } = resolveMock(p, { repoRoot: repoWithBoth(), mockRef: "main" });
+      expect(source).toBe(p);
+      expect(html).toContain("the-flag");
+    });
+  });
+});
+
+describe("keep-or-clean rule for the determinism check", () => {
+  // The three behaviours the keep/clean rule exists to guarantee. Previously unreachable without
+  // provoking a real determinism failure, so a refactor could reintroduce "evidence deleted on
+  // failure" — the exact regression this rule was written for — with every test still green.
+  it("keeps the captures when the runs disagree", () => {
+    expect(shouldKeep({ keepArg: undefined, outcome: "unstable" })).toBe(true);
+  });
+
+  it("keeps the captures when a run threw and left partial output", () => {
+    expect(shouldKeep({ keepArg: undefined, outcome: "threw", hasOutput: true })).toBe(true);
+  });
+
+  it("cleans up after a stable run", () => {
+    expect(shouldKeep({ keepArg: undefined, outcome: "stable" })).toBe(false);
+  });
+
+  // The missing-Chrome case: run 1 fails outright, so BOTH directories are empty. Announcing
+  // "artifacts kept for inspection" above the stack trace points the reader at two empty
+  // directories and leaks them permanently.
+  it("does not keep two empty directories when run 1 never produced anything", () => {
+    expect(shouldKeep({ keepArg: undefined, outcome: "threw", hasOutput: false })).toBe(false);
+  });
+
+  it("honours an explicit --keep even with nothing to show", () => {
+    expect(shouldKeep({ keepArg: "true", outcome: "stable", hasOutput: false })).toBe(true);
+  });
+
+  // `--keep=false` parses to the STRING "false", which is truthy — the bug that made the flag
+  // impossible to turn off once given.
+  it("treats --keep=false as a request to clean", () => {
+    expect(shouldKeep({ keepArg: "false", outcome: "stable" })).toBe(false);
+    // …but an explicit --keep=false must NOT override the failure path, which is what the
+    // evidence rule is for.
+    expect(shouldKeep({ keepArg: "false", outcome: "unstable" })).toBe(true);
   });
 });

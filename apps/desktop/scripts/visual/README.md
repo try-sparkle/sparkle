@@ -150,10 +150,31 @@ the list above has regressed — that is the first thing to check, before trusti
 
 ### Where the reference comes from
 
-`rev4-standalone.html` has **not landed on main**. `compare.mjs` looks in `--mock`, then the
-working tree, then `git show <ref>:<path>` over candidate refs
-(`$SPARKLE_VISUAL_MOCK_REF`, `sparkle/blueprint-cockpit`, `main`). Once the mock lands, the working
-tree always wins and the fallback goes quiet on its own.
+`rev4-standalone.html` **is on main** — it landed with the cockpit port — so it is in the working
+tree on every branch cut from main, and that is the normal path. `compare.mjs` resolves in this
+order:
+
+1. `--mock=<path>` — a PATH, not a ref.
+2. `$SPARKLE_VISUAL_MOCK_REF` — a ref. **Outranks the working tree**, because naming a ref is an
+   explicit instruction. If that ref does not carry the mock, the run **fails** rather than quietly
+   falling back to the tree; otherwise it would report a confident number scored against a revision
+   you did not ask for.
+3. the working tree.
+4. `git show <ref>:<path>` over `sparkle/blueprint-cockpit`, then `main` — a compatibility path for
+   a detached or sparse checkout. Nothing depends on that branch still existing.
+
+To score against a revision other than the tree's, set `SPARKLE_VISUAL_MOCK_REF=<ref>`, or extract
+it yourself: `git show '<ref>:PRD/sparkle/ui-directions/rev4-standalone.html' > /tmp/mock.html` and
+pass `--mock=/tmp/mock.html`.
+
+### Kept capture directories
+
+`visual:verify-stable` **keeps** both capture directories when the two runs disagree or a run
+throws — the differing PNGs are the entire reason to run it, and deleting them was the bug
+(roborev 54844). It prints the paths and their file counts, and **nothing else removes them**: they
+are `visual-stable-a-*` / `visual-stable-b-*` under your temp dir, and repeated local failures
+accumulate. Delete them when you are done. A clean run cleans up after itself; `--keep` forces a
+keep, `--keep=false` forces a clean on the success path only.
 
 ## Tests
 
