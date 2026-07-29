@@ -867,8 +867,11 @@ fn ensure_project_repo_inner(path: String) -> Result<(), String> {
         git(&path, &["commit", "--allow-empty", "-m", "Sparkle: initialize project"])?;
     }
 
-    // 4. Make sure the hidden worktrees dir is never tracked.
+    // 4. Make sure the hidden worktrees dir is never tracked. Both halves matter: the tracked
+    //    `.gitignore` is the durable record, and `info/exclude` is what makes the scratch-worktree
+    //    patterns effective on a worktree ALREADY pinned to a branch that predates them.
     ensure_gitignore(&path)?;
+    ensure_worktree_excludes(&path)?;
 
     // Mark ready so subsequent agents on this root skip the checks above.
     if let Ok(mut set) = ready_repos().lock() {
@@ -965,16 +968,25 @@ fn may_write_hook(exists: bool, contents: Option<&str>, marker: &str) -> bool {
 /// a bare ENOTDIR. We read the gitlink ourselves first via [`gitfile_common_dir`], and only use
 /// `<root>/.git` when `.git` really is a directory — correct for the normal-clone majority.
 fn hooks_dir_for(repo_root: &str) -> PathBuf {
+    common_dir_for(repo_root).join("hooks")
+}
+
+/// The SHARED (common) gitdir for `repo_root` — `hooks/` and `info/exclude` both live under it.
+///
+/// Extracted from [`hooks_dir_for`] so `info/exclude` resolves through exactly the same
+/// battle-tested fallback chain rather than a second, thinner copy of it. See `hooks_dir_for`'s doc
+/// comment for why each branch exists (gitlink files, relative answers, and the ENOTDIR trap when
+/// git cannot answer at all).
+fn common_dir_for(repo_root: &str) -> PathBuf {
     let common = git(repo_root, &["rev-parse", "--git-common-dir"])
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     match common {
-        Some(dir) if dir.is_absolute() => dir.join("hooks"),
-        Some(dir) => Path::new(repo_root).join(dir).join("hooks"),
+        Some(dir) if dir.is_absolute() => dir,
+        Some(dir) => Path::new(repo_root).join(dir),
         None => gitfile_common_dir(repo_root)
-            .unwrap_or_else(|| Path::new(repo_root).join(".git"))
-            .join("hooks"),
+            .unwrap_or_else(|| Path::new(repo_root).join(".git")),
     }
 }
 
@@ -1233,25 +1245,99 @@ pub async fn remove_repo_hooks_cmd(path: String) -> Result<(), String> {
 }
 
 /// Append `.sparkle/` to `<root>/.gitignore` if not already ignored. Idempotent.
+/// The scratch-worktree paths that must never read as untracked dirt.
+///
+/// `park_worktree_on_base_at` declines on ANY `??` entry and nothing ever claims a scratch worktree,
+/// so one left behind pins the app-owned worktree to its branch permanently — every later hourly
+/// pass then starts from a base drifting further behind `origin/main`. These are the two locations
+/// agents are told to cut them (AGENTS.md); the `.wt-` dot prefix is load-bearing, keeping the glob
+/// from matching real source directories like `wt-real.ts` or `src/wt-foo/`.
+const AGENT_WORKTREE_IGNORES: [&str; 2] = [".claude/worktrees/", ".wt-*/"];
+
+/// Append any of `patterns` missing from the newline-delimited `existing`, or `None` when all are
+/// already present. Pure so the idempotency rule is unit-testable without a filesystem.
+///
+/// Matching trims each line and also accepts a pattern's slashless form, so a hand-written
+/// `.sparkle` counts as `.sparkle/` and we never append a near-duplicate to a user's own file.
+fn append_missing_ignores(existing: &str, patterns: &[&str]) -> Option<String> {
+    let present: Vec<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = patterns
+        .iter()
+        .copied()
+        .filter(|p| {
+            let bare = p.trim_end_matches('/');
+            !present.iter().any(|l| *l == *p || *l == bare)
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for p in missing {
+        out.push_str(p);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Seed the project's tracked `.gitignore` with `.sparkle/`.
+///
+/// DELIBERATELY ONLY `.sparkle/` — the scratch-worktree patterns are carried by
+/// [`ensure_worktree_excludes`] instead, and that is not an oversight (roborev 55374). Adding them
+/// here regressed two things:
+///
+///   * it appended to a TRACKED file in every already-provisioned user project on the next open, an
+///     unrequested modification that shows up in the user's `git status`/`git diff` and can be swept
+///     into a `git commit -a`; and
+///   * it turned a path that previously returned `Ok(())` without touching the filesystem into one
+///     that writes, and the error propagates via `?` from `ensure_project_repo_inner` — so a
+///     read-only project root that opened fine before would fail to open.
+///
+/// Neither cost bought anything: `park_worktree_on_base` never runs on user projects (its only
+/// caller is the improvement pass, against the app-owned Sparkle clone), and `info/exclude` — shared
+/// and untracked — already covers the hygiene goal without dirtying a tree. This repo's own
+/// checked-in `.gitignore` remains the durable record for the patterns, pinned by
+/// `scripts/tests/ignore-agent-worktrees.test.sh`.
 fn ensure_gitignore(root: &str) -> Result<(), String> {
     let gitignore: PathBuf = Path::new(root).join(".gitignore");
     let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
 
-    let already = existing
-        .lines()
-        .map(|l| l.trim())
-        .any(|l| l == ".sparkle/" || l == ".sparkle");
-    if already {
+    match append_missing_ignores(&existing, &[".sparkle/"]) {
+        None => Ok(()),
+        Some(contents) => std::fs::write(&gitignore, contents)
+            .map_err(|e| format!("failed to write .gitignore: {e}")),
+    }
+}
+
+/// Seed the scratch-worktree patterns into `$GIT_COMMON_DIR/info/exclude` as well.
+///
+/// A TRACKED `.gitignore` rule is inert in exactly the state it is meant to fix (roborev 54865). The
+/// park reads `git status --porcelain` inside the app-owned worktree, which honours the `.gitignore`
+/// of *whatever branch is checked out there* — and a wedged worktree is pinned to an old branch that
+/// predates the rule. So the `??` entry still appears, the park still declines `dirty`, and the
+/// worktree never advances to a branch containing the fix: self-perpetuating.
+///
+/// `info/exclude` breaks that loop because it lives in the COMMON gitdir, shared by every linked
+/// worktree and independent of the checked-out branch and of any commit. It is also untracked, so
+/// this never dirties the user's tree — which matters given the caller runs on repo prep.
+///
+/// Best-effort by design: this is a hygiene measure on a path whose failure must not block opening a
+/// project, so an unwritable gitdir returns Ok. The tracked `.gitignore` entry remains the durable
+/// record for repo hygiene; this is what makes it effective on an already-pinned worktree.
+fn ensure_worktree_excludes(root: &str) -> Result<(), String> {
+    let info = common_dir_for(root).join("info");
+    if std::fs::create_dir_all(&info).is_err() {
         return Ok(());
     }
-
-    let mut contents = existing;
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
+    let exclude = info.join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if let Some(contents) = append_missing_ignores(&existing, &AGENT_WORKTREE_IGNORES) {
+        let _ = std::fs::write(&exclude, contents);
     }
-    contents.push_str(".sparkle/\n");
-    std::fs::write(&gitignore, contents)
-        .map_err(|e| format!("failed to write .gitignore: {e}"))
+    Ok(())
 }
 
 /// Core (AppHandle-free, testable): create or reuse an agent's worktree under `app_data`,
@@ -1914,6 +2000,19 @@ pub fn park_worktree_on_base_at(
     //
     // The one exception is dirt the AGENT'S OWN TOOLING writes: see `tooling_churn_to_restore` for
     // why a bare emptiness check made this decline PERMANENTLY on the recurring headless worktree.
+    // Seed the scratch-worktree excludes HERE, immediately before the status read they exist to
+    // change (roborev 55374). Wiring this only into project-open provisioning was the wrong place:
+    // `park_worktree_on_base` runs exclusively against the app-owned Sparkle clone
+    // (`improvementPass.ts` → `ensureSparkleRepo`), which `ensure_sparkle_repo_at` builds with a bare
+    // `git clone` and never routes through `ensure_project_repo_inner`. So the seeding landed on user
+    // projects — where the park never runs — and never on the one repo that wedges. Calling it at the
+    // decision point makes that class of gap impossible: whatever repo the park is about to judge is
+    // the repo that just got seeded.
+    //
+    // Cheap and idempotent (one small read, and a write only when a pattern is genuinely absent), and
+    // best-effort by construction — its Ok(()) return means a failure here can never convert a
+    // parkable worktree into an error.
+    let _ = ensure_worktree_excludes(&wt_str);
     let porcelain = git(&wt_str, &["status", "--porcelain"])?;
     // How much was set aside, for the log. A COUNT, never the paths — see `describe_blocking_dirt`.
     let dirt_entries = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
@@ -6232,6 +6331,60 @@ mod tests {
         assert!(!head_is_at_risk(Some("sparkle/agent-a10"), "sparkle/agent-a1"));
     }
 
+    // THE TEST THAT MATTERS, and the one whose absence hid a wiring gap (roborev 55374).
+    //
+    // The previous round asserted the ignore MECHANISM (`check-ignore` in a synthetic repo) but never
+    // the park's DECISION. Both passed while the feature did not reach its target: the seeding was
+    // wired into project-open provisioning, and the park only ever runs against the app-owned Sparkle
+    // clone, which is built by a bare `git clone` that never goes through that path. A green suite
+    // over a feature that cannot fire is exactly the vacuous-test shape AGENTS.md warns about — so
+    // this asserts the outcome (`parked`, not `declined("dirty")`), which is the thing that was false.
+    #[test]
+    fn park_ignores_a_scratch_worktree_left_at_the_repo_root() {
+        let (r, wt, app_data) = init_repo_with_origin("park-scratch-wt");
+        // A scratch worktree an agent cut and never cleaned up. Nothing claims it, so before this fix
+        // it made every subsequent park decline forever.
+        std::fs::create_dir_all(format!("{wt}/.wt-leftover")).unwrap();
+        std::fs::write(format!("{wt}/.wt-leftover/file.txt"), "scratch").unwrap();
+        advance_origin_main(&r, "up1");
+
+        // DirtyPolicy::Decline deliberately — the STRICTEST policy, and the one the improvement
+        // pass's reap-precondition probe uses (`improvementPass.ts:399` passes "decline"). That probe
+        // is exactly where a scratch worktree still wedges even now that `Stash` exists, so proving
+        // the fix under `Decline` proves it without leaning on the stash escape hatch.
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+        assert!(out.parked, "a stray scratch worktree must no longer wedge the park: {out:?}");
+        // Nothing was set aside: an ignored path is not dirt, so it must not cost a stash entry.
+        assert!(!out.stashed, "an ignored scratch worktree must not be stashed: {out:?}");
+        // The park must IGNORE it, not delete it — this is somebody's scratch space, and silently
+        // destroying it would be a far worse bug than the decline.
+        assert!(
+            Path::new(&wt).join(".wt-leftover/file.txt").exists(),
+            "the scratch worktree's contents must survive the park",
+        );
+    }
+
+    // The dot prefix, asserted at the PARK level rather than only via check-ignore: a bare `wt-*`
+    // would make the park silently carry on over real untracked source, which is the opposite of what
+    // the guard is for. An undotted directory must still decline.
+    #[test]
+    fn park_still_declines_on_an_undotted_directory_that_only_looks_like_scratch() {
+        let (r, wt, app_data) = init_repo_with_origin("park-undotted-wt");
+        std::fs::create_dir_all(format!("{wt}/wt-real")).unwrap();
+        std::fs::write(format!("{wt}/wt-real/src.ts"), "real source").unwrap();
+        advance_origin_main(&r, "up1");
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+        assert_eq!(
+            out,
+            ParkOutcome::declined("dirty"),
+            "an undotted dir is real work — the park must still refuse to touch it",
+        );
+        assert!(Path::new(&wt).join("wt-real/src.ts").exists(), "real work must survive");
+    }
+
     // Uncommitted work is even more fragile than a commit — `checkout -B` would carry or clobber it.
     #[test]
     fn park_declines_on_a_dirty_worktree() {
@@ -7388,6 +7541,142 @@ mod tests {
         assert_eq!(classify_checks(&[json!({ "state": "PENDING" })]), "pending");
         assert_eq!(classify_checks(&[json!({ "state": "FAILURE" })]), "failing");
         assert_eq!(classify_checks(&[json!({ "state": "ERROR" })]), "failing");
+    }
+
+    /// A throwaway repo with one commit — enough for `git status --porcelain` to be meaningful.
+    fn scratch_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        git(&root, &["init"]).unwrap();
+        git(&root, &["config", "user.email", "t@t.local"]).unwrap();
+        git(&root, &["config", "user.name", "T"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+        d
+    }
+
+    #[test]
+    fn append_missing_ignores_is_idempotent_and_accepts_the_slashless_form() {
+        // Nothing to add → None, so the caller never rewrites an untouched file.
+        assert!(append_missing_ignores(".sparkle/\n.wt-*/\n", &[".sparkle/", ".wt-*/"]).is_none());
+        // A hand-written slashless entry still counts — we must not append a near-duplicate.
+        assert!(append_missing_ignores(".sparkle\n", &[".sparkle/"]).is_none());
+        // Only the genuinely missing pattern is appended.
+        let out = append_missing_ignores(".sparkle/\n", &[".sparkle/", ".wt-*/"]).unwrap();
+        assert_eq!(out, ".sparkle/\n.wt-*/\n");
+        // A file with no trailing newline gets one rather than a glued-on pattern.
+        assert_eq!(append_missing_ignores("x", &[".wt-*/"]).unwrap(), "x\n.wt-*/\n");
+    }
+
+    #[test]
+    fn ensure_gitignore_leaves_an_already_provisioned_project_byte_for_byte_alone() {
+        // roborev 55374: this must NOT append the scratch-worktree patterns. A project whose
+        // .gitignore already has `.sparkle/` is fully provisioned, and appending to a TRACKED file on
+        // every open is an unrequested edit to the user's repo — it lands in their `git status` and
+        // can be swept into a `git commit -a`. The patterns belong in info/exclude, which is
+        // untracked. Byte-for-byte so any future append fails this immediately.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        let before = "node_modules/\n.sparkle/\n*.log\n";
+        std::fs::write(d.path().join(".gitignore"), before).unwrap();
+        ensure_gitignore(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join(".gitignore")).unwrap(),
+            before,
+            "dirtied a tracked file in an already-provisioned project",
+        );
+    }
+
+    #[test]
+    fn ensure_gitignore_still_seeds_sparkle_and_preserves_existing_rules() {
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        std::fs::write(d.path().join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+        ensure_gitignore(&root).unwrap();
+        let written = std::fs::read_to_string(d.path().join(".gitignore")).unwrap();
+        assert!(written.contains("node_modules/"), "clobbered the user's rules: {written:?}");
+        assert!(written.contains("*.log"));
+        assert!(written.lines().any(|l| l.trim() == ".sparkle/"), "{written:?}");
+    }
+
+    #[test]
+    fn scratch_worktrees_stop_reading_as_untracked_dirt_via_info_exclude() {
+        // THE SIDE EFFECT, not the precondition: a `.wt-*` directory must actually disappear from
+        // `git status --porcelain`, because that is the exact string the park declines on. Asserting
+        // only that a line was written to a file would pass even if the pattern never matched.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(d.path().join(".wt-ci-node")).unwrap();
+        std::fs::write(d.path().join(".wt-ci-node/f"), "x").unwrap();
+        std::fs::create_dir_all(d.path().join(".claude/worktrees/x")).unwrap();
+        std::fs::write(d.path().join(".claude/worktrees/x/f"), "x").unwrap();
+
+        // Baseline: without the fix this repo IS dirty — proves the assertion below can fail.
+        let before = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(before.contains(".wt-ci-node"), "expected dirt to start with: {before:?}");
+
+        // Deliberately NOT ensure_gitignore: info/exclude alone must do it, since that is the half
+        // that works on a worktree pinned to a branch predating the tracked rule.
+        ensure_worktree_excludes(&root).unwrap();
+        let after = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(!after.contains(".wt-ci-node"), "scratch worktree still dirty: {after:?}");
+        assert!(!after.contains(".claude/worktrees"), "still dirty: {after:?}");
+        assert!(after.trim().is_empty(), "expected a clean tree, got {after:?}");
+    }
+
+    #[test]
+    fn the_dot_prefix_keeps_the_glob_off_real_source_directories() {
+        // The commit calls the dot prefix load-bearing; this is what holds it to that. A bare `wt-*`
+        // would swallow `wt-real.ts` and `src/wt-foo/`, silently un-tracking real source.
+        //
+        // `check-ignore` rather than `status --porcelain`: status collapses an untracked directory to
+        // its parent (`?? src/`), so it cannot distinguish "src/wt-foo is ignored" from "src/ is
+        // simply reported one level up". check-ignore answers the actual question per path.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        ensure_worktree_excludes(&root).unwrap();
+        let ignored = |p: &str| git(&root, &["check-ignore", "-q", "--no-index", p]).is_ok();
+
+        // Ignored — the two paths agents are told to use.
+        assert!(ignored(".wt-ci-node/"), ".wt-*/ should be ignored");
+        assert!(ignored(".claude/worktrees/x/"), ".claude/worktrees/ should be ignored");
+        // NOT ignored — real source that a bare `wt-*` would have swallowed.
+        assert!(!ignored("wt-real.ts"), "a real source FILE must not be ignored");
+        assert!(!ignored("src/wt-foo/"), "a real source DIRECTORY must not be ignored");
+        assert!(!ignored("wt-foo/"), "an undotted top-level dir must not be ignored");
+    }
+
+    #[test]
+    fn ensure_worktree_excludes_is_idempotent_and_keeps_existing_excludes() {
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        let exclude = common_dir_for(&root).join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "# user's own\nscratch.txt\n").unwrap();
+
+        ensure_worktree_excludes(&root).unwrap();
+        let once = std::fs::read_to_string(&exclude).unwrap();
+        ensure_worktree_excludes(&root).unwrap();
+        let twice = std::fs::read_to_string(&exclude).unwrap();
+
+        assert_eq!(once, twice, "second call appended duplicates");
+        assert!(once.contains("scratch.txt"), "clobbered the user's excludes: {once:?}");
+        assert_eq!(once.lines().filter(|l| l.trim() == ".wt-*/").count(), 1);
+    }
+
+    #[test]
+    fn common_dir_for_resolves_a_linked_worktree_to_the_shared_gitdir() {
+        // The whole point of using info/exclude: it must be the COMMON dir, shared by every linked
+        // worktree, so seeding it once covers a wedged worktree too. A per-worktree gitdir would not.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+        let wt = d.path().join("linked");
+        git(&root, &["worktree", "add", "--detach", &wt.to_string_lossy(), "HEAD"]).unwrap();
+        let wt_str = wt.to_string_lossy().to_string();
+        assert_eq!(
+            std::fs::canonicalize(common_dir_for(&wt_str)).unwrap(),
+            std::fs::canonicalize(common_dir_for(&root)).unwrap(),
+            "a linked worktree must resolve to the same shared gitdir as its parent",
+        );
     }
 
     #[test]
