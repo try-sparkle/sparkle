@@ -188,6 +188,18 @@ describe("hourlyMissionPrompt", () => {
     }
   });
 
+  // The auto-feedback-on-merge loop files merged workers' retros into the `agent-feedback` beads
+  // inbox; the hourly pass must drain it FIRST, before mining logs — the same order the persona
+  // uses. Named here too because this prompt is the LAST thing the model reads.
+  it("both modes name the agent-feedback inbox and drain it before mining logs", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain("bd list --label agent-feedback");
+      // Ordered ahead of the log-mining sentence.
+      expect(p.indexOf("agent-feedback")).toBeLessThan(p.indexOf("session logs"));
+    }
+  });
+
   // The mission prompt is the LAST thing the model reads, so it must not contradict the persona's
   // propose-only override on the one instruction that cannot succeed.
   it("drops the submit instruction entirely when this machine cannot open PRs", () => {

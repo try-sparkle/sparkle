@@ -96,6 +96,37 @@ export function guardrailsProtocol(): string {
   ].join("\n");
 }
 
+/** One friction finding in a worker's retrospective. Mirrors a pain point in
+ *  docs/schemas/worker-retro.schema.json. Values MUST be anonymized/aggregated — never raw log
+ *  lines, PII, secrets, or code. */
+export interface WorkerRetroPainPoint {
+  /** Anonymized description of the friction/error/slow-path. */
+  summary: string;
+  /** SEV1 (minor/cosmetic) .. SEV3 (blocked/expensive/repeated). */
+  severity: 1 | 2 | 3;
+  /** The concrete proposed fix (files/subsystem to touch, approach). Anonymized. */
+  recommendation: string;
+  /** Coarse area hint (e.g. "orchestrator-mcp", "ci") used to cluster/dedupe. Optional. */
+  subsystem?: string;
+  /** Optional extra evidence a future agent needs to act. Anonymized; NO raw log lines or PII. */
+  context?: string;
+}
+
+/** A worker's structured retrospective, emitted as an OPTIONAL `retro` key in .sparkle/result.json.
+ *  Shape = docs/schemas/worker-retro.schema.json. The capture hook reads `result.json.retro` and
+ *  forwards each pain point into the durable `agent-feedback` beads inbox, which the Improvement
+ *  Agent drains — the retro humans have been pasting by hand ("From PR #NNN retro (SEV<n>) …"). */
+export interface WorkerRetro {
+  /** One or two anonymized sentences: what this worker built and the headline friction. */
+  tldr: string;
+  /** Zero or more discrete friction findings; each becomes (or enriches) one agent-feedback bead. */
+  painPoints: WorkerRetroPainPoint[];
+  /** Orchestrator-stamped provenance (optional; the worker usually omits these). */
+  schemaVersion?: 1;
+  prNumber?: number | null;
+  mergedSha?: string | null;
+}
+
 export interface WorkerResult {
   schemaVersion: 1;
   taskId: string;
@@ -104,9 +135,69 @@ export interface WorkerResult {
   filesChanged: string[];
   summary: string;
   notes?: string;
+  /** OPTIONAL structured retrospective (missing is fine). Strict-when-present: a malformed retro
+   *  throws, which is caught at the AgentPane call site (same as the rest of parseWorkerResult). */
+  retro?: WorkerRetro;
 }
 
 const STATUSES = ["success", "failed", "partial"] as const;
+
+/** Validate a worker's retro when present. Strict-when-present, mirroring
+ *  docs/schemas/worker-retro.schema.json: `tldr` + `painPoints` are required, and every pain point
+ *  needs `summary` + `severity` (1-3) + `recommendation`. Optional fields are type-checked when
+ *  present and dropped when null/absent. Throws Error naming the first offending field. */
+function parseWorkerRetro(raw: unknown): WorkerRetro {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("retro must be an object");
+  }
+  const r = raw as Record<string, unknown>;
+  if (typeof r.tldr !== "string" || !r.tldr) throw new Error("retro.tldr is required");
+  if (!Array.isArray(r.painPoints)) throw new Error("retro.painPoints must be an array");
+  const painPoints: WorkerRetroPainPoint[] = r.painPoints.map((p, i) => {
+    if (p === null || typeof p !== "object" || Array.isArray(p)) {
+      throw new Error(`retro.painPoints[${i}] must be an object`);
+    }
+    const pp = p as Record<string, unknown>;
+    if (typeof pp.summary !== "string" || !pp.summary) {
+      throw new Error(`retro.painPoints[${i}].summary is required`);
+    }
+    if (pp.severity !== 1 && pp.severity !== 2 && pp.severity !== 3) {
+      throw new Error(`retro.painPoints[${i}].severity must be 1, 2, or 3`);
+    }
+    if (typeof pp.recommendation !== "string" || !pp.recommendation) {
+      throw new Error(`retro.painPoints[${i}].recommendation is required`);
+    }
+    if (pp.subsystem != null && typeof pp.subsystem !== "string") {
+      throw new Error(`retro.painPoints[${i}].subsystem must be a string`);
+    }
+    if (pp.context != null && typeof pp.context !== "string") {
+      throw new Error(`retro.painPoints[${i}].context must be a string`);
+    }
+    return {
+      summary: pp.summary,
+      severity: pp.severity,
+      recommendation: pp.recommendation,
+      ...(typeof pp.subsystem === "string" ? { subsystem: pp.subsystem } : {}),
+      ...(typeof pp.context === "string" ? { context: pp.context } : {}),
+    };
+  });
+  if (r.schemaVersion !== undefined && r.schemaVersion !== 1) {
+    throw new Error("retro.schemaVersion must be 1");
+  }
+  if (r.prNumber != null && typeof r.prNumber !== "number") {
+    throw new Error("retro.prNumber must be a number");
+  }
+  if (r.mergedSha != null && typeof r.mergedSha !== "string") {
+    throw new Error("retro.mergedSha must be a string");
+  }
+  return {
+    tldr: r.tldr,
+    painPoints,
+    ...(r.schemaVersion === 1 ? { schemaVersion: 1 as const } : {}),
+    ...(typeof r.prNumber === "number" ? { prNumber: r.prNumber } : {}),
+    ...(typeof r.mergedSha === "string" ? { mergedSha: r.mergedSha } : {}),
+  };
+}
 
 /** Parse + validate a worker's result.json. Throws Error naming the first offending field. */
 export function parseWorkerResult(raw: string): WorkerResult {
@@ -126,6 +217,7 @@ export function parseWorkerResult(raw: string): WorkerResult {
   }
   if (typeof obj.summary !== "string" || !obj.summary) throw new Error("summary is required");
   if (obj.notes !== undefined && typeof obj.notes !== "string") throw new Error("notes must be a string");
+  const retro = obj.retro !== undefined ? parseWorkerRetro(obj.retro) : undefined;
   return {
     schemaVersion: 1,
     taskId: obj.taskId,
@@ -134,6 +226,7 @@ export function parseWorkerResult(raw: string): WorkerResult {
     filesChanged: obj.filesChanged as string[],
     summary: obj.summary,
     ...(obj.notes !== undefined ? { notes: obj.notes as string } : {}),
+    ...(retro !== undefined ? { retro } : {}),
   };
 }
 
@@ -171,7 +264,15 @@ export function workerPersona(opts: {
     '  { "schemaVersion": 1, "taskId": "<the id from the Task <id>: line of your first message>",',
     '    "branch": "<your git branch>", "status": "success" | "failed" | "partial",',
     '    "filesChanged": ["path", ...], "summary": "<one-paragraph what you did>",',
-    '    "notes": "<optional caveats / follow-ups>" }',
+    '    "notes": "<optional caveats / follow-ups>",',
+    '    "retro": { "tldr": "<1-2 anonymized sentences: what you built + the headline friction>",',
+    '      "painPoints": [ { "summary": "<a friction/error/slow-path you hit>", "severity": 1|2|3,',
+    '        "recommendation": "<the concrete fix>", "subsystem": "<coarse area, optional>" } ] } }',
+    "The `retro` key is OPTIONAL but expected: as the final act, capture the pain points from doing",
+    "this task — the friction, errors, wrong turns, and slow paths — each with a severity (1 minor .. 3",
+    "blocked/expensive/repeated) and a concrete recommendation. This is the retrospective humans have",
+    "been pasting into the tracker by hand; emitting it here closes that loop. Keep it ANONYMIZED — no",
+    "PII, secrets, or raw log lines. Omit `retro` entirely only if the task was genuinely frictionless.",
     "Create the .sparkle directory if needed. Then stop.",
     "",
     sparkleControlProtocol(),

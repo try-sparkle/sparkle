@@ -147,6 +147,71 @@ describe("parseWorkerResult", () => {
     const bad = JSON.stringify({ ...JSON.parse(valid), summary: "" });
     expect(() => parseWorkerResult(bad)).toThrow(/summary/);
   });
+
+  // The `retro` key is OPTIONAL (missing → fine) but STRICT-when-present: a malformed retro throws,
+  // and that throw is caught at the one AgentPane call site. The capture hook reads result.json.retro
+  // and forwards each pain point into the agent-feedback beads inbox, so its shape must be validated
+  // to docs/schemas/worker-retro.schema.json.
+  describe("retro", () => {
+    const withRetro = (retro: unknown) => JSON.stringify({ ...JSON.parse(valid), retro });
+
+    it("is absent by default — a worker that emits no retro still parses", () => {
+      expect(parseWorkerResult(valid).retro).toBeUndefined();
+    });
+
+    it("parses a valid retro with pain points", () => {
+      const r = parseWorkerResult(
+        withRetro({
+          tldr: "Built X; the worktree step was slow.",
+          painPoints: [
+            { summary: "worktree add took minutes", severity: 2, recommendation: "warm a pool", subsystem: "worktree" },
+          ],
+        }),
+      );
+      expect(r.retro?.tldr).toContain("Built X");
+      expect(r.retro?.painPoints).toHaveLength(1);
+      expect(r.retro?.painPoints[0]?.severity).toBe(2);
+      expect(r.retro?.painPoints[0]?.subsystem).toBe("worktree");
+      // Unset optionals are dropped, not carried as undefined-valued keys.
+      expect(r.retro?.painPoints[0]?.context).toBeUndefined();
+    });
+
+    it("accepts an empty painPoints array (a frictionless task)", () => {
+      const r = parseWorkerResult(withRetro({ tldr: "smooth", painPoints: [] }));
+      expect(r.retro?.painPoints).toEqual([]);
+    });
+
+    it("throws when tldr is missing", () => {
+      expect(() => parseWorkerResult(withRetro({ painPoints: [] }))).toThrow(/retro\.tldr/);
+    });
+
+    it("throws when painPoints is not an array", () => {
+      expect(() => parseWorkerResult(withRetro({ tldr: "t", painPoints: "nope" }))).toThrow(
+        /retro\.painPoints/,
+      );
+    });
+
+    it("throws on a severity outside 1-3", () => {
+      const bad = withRetro({
+        tldr: "t",
+        painPoints: [{ summary: "s", severity: 4, recommendation: "r" }],
+      });
+      expect(() => parseWorkerResult(bad)).toThrow(/severity/);
+    });
+
+    it("throws when a pain point is missing its recommendation", () => {
+      const bad = withRetro({ tldr: "t", painPoints: [{ summary: "s", severity: 1 }] });
+      expect(() => parseWorkerResult(bad)).toThrow(/recommendation/);
+    });
+
+    it("carries orchestrator-stamped provenance through when present", () => {
+      const r = parseWorkerResult(
+        withRetro({ tldr: "t", painPoints: [], prNumber: 42, mergedSha: "abc123" }),
+      );
+      expect(r.retro?.prNumber).toBe(42);
+      expect(r.retro?.mergedSha).toBe("abc123");
+    });
+  });
 });
 
 describe("workerPersona", () => {
@@ -170,6 +235,18 @@ describe("workerPersona", () => {
     expect(p).toMatch(/security/);
     expect(p).toContain("ai.sparkle.desktop");
     expect(p).toMatch(/never/i);
+  });
+  it("asks the worker to emit an optional structured retro (pain points + severity + recommendation)", () => {
+    // The retro is the worker's own experience of the task, forwarded (via the capture hook) into
+    // the agent-feedback beads inbox that the Improvement Agent drains — the retro humans used to
+    // paste by hand. Optional so a frictionless task can omit it, but named in the FINISHING block.
+    expect(p).toContain('"retro"');
+    expect(p).toMatch(/painPoints/);
+    expect(p).toMatch(/severity/);
+    expect(p).toMatch(/recommendation/);
+    expect(p).toMatch(/OPTIONAL/i);
+    // Anonymized — the retro leaves the worktree, so it carries the same no-PII rule as everything else.
+    expect(p).toMatch(/ANONYMIZED|no.*PII/i);
   });
 });
 

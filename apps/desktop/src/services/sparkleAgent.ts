@@ -215,6 +215,26 @@ export const GH_ASK_NO_ANSWER =
 export const GH_SETUP_GIT_AFTER_LOGIN =
   "- If they confirm the login and the push STILL fails on credentials, run `gh auth setup-git`";
 
+/** The beads label the auto-feedback-on-merge loop writes into and the Improvement Agent drains.
+ *  A merged worker's structured retro (docs/schemas/worker-retro.schema.json) is forwarded — one
+ *  pain point per bead — by the capture hook onto this label; the persona below tells the agent to
+ *  empty that inbox before it mines any logs. Exported so the persona and its tests name the SAME
+ *  string, and so the one canonical label lives in code rather than being retyped. */
+export const AGENT_FEEDBACK_LABEL = "agent-feedback";
+
+/** Header of the agent-feedback drain section. Exported (like the auth-advice headers above) so
+ *  tests assert its PRESENCE/ABSENCE structurally — a `toContain` on the header survives a reword
+ *  of the body, and its absence in the "never" (chat-only) arm is asserted the same way. */
+export const AGENT_FEEDBACK_DRAIN_HEADER =
+  "AGENT-FEEDBACK INBOX — DRAIN THIS FIRST, BEFORE LOG-MINING";
+
+/** The one-line step, injected into each log-mining whatYouDo arm, that points at the drain
+ *  section. Exported so the test can prove the arms REFERENCE the section (not just that the
+ *  section exists somewhere in the prompt) and that it is ordered ahead of the log-review step. */
+export const AGENT_FEEDBACK_DRAIN_STEP =
+  "FIRST drain the agent-feedback inbox (see the AGENT-FEEDBACK INBOX section below) — file new " +
+  "beads, enrich/bump recurring ones, and fix the highest-value item — before mining any logs.";
+
 function submitBlockedSection(
   verdict: SubmitVerdict,
   attended: boolean,
@@ -436,18 +456,19 @@ export function sparklePersona(
     case "always":
       whatYouDo = [
         "WHAT YOU DO",
-        "1. Review the logs and the current state of the codebase to find concrete, high-value",
+        `1. ${AGENT_FEEDBACK_DRAIN_STEP}`,
+        "2. Review the logs and the current state of the codebase to find concrete, high-value",
         "   improvements: recurring errors, confusing flows, crashes, slow paths, missing affordances.",
-        "2. Run the DEDUPE GATE below on every candidate before going further. Anything already",
+        "3. Run the DEDUPE GATE below on every candidate before going further. Anything already",
         "   covered by an open or recently-merged PR is dropped here, not re-specced.",
-        "3. For each surviving idea, write a short, well-scoped spec (problem, evidence,",
+        "4. For each surviving idea, write a short, well-scoped spec (problem, evidence,",
         "   proposed change, acceptance criteria) before touching code.",
-        "4. Implement focused changes on your own branch, commit, and — after the PR text passes the",
+        "5. Implement focused changes on your own branch, commit, and — after the PR text passes the",
         "   PII SCRUB GATE below — submit the PR yourself with `gh pr create --base main`. The user",
         "   chose \"Always\" consent, so no per-PR approval is needed: submit automatically. Keep PRs",
         "   small and single-purpose.",
         ...(blocked ? [] : ghAuthAdvice(attended, "   ")),
-        "5. Prefer opening a spec/issue first for larger or ambiguous changes; ship a PR directly only",
+        "6. Prefer opening a spec/issue first for larger or ambiguous changes; ship a PR directly only",
         "   for clear, low-risk improvements.",
       ];
       break;
@@ -470,17 +491,18 @@ export function sparklePersona(
     default:
       whatYouDo = [
         "WHAT YOU DO",
-        "1. Review the logs and the current state of the codebase to find concrete, high-value",
+        `1. ${AGENT_FEEDBACK_DRAIN_STEP}`,
+        "2. Review the logs and the current state of the codebase to find concrete, high-value",
         "   improvements: recurring errors, confusing flows, crashes, slow paths, missing affordances.",
-        "2. Run the DEDUPE GATE below on every candidate before going further. Anything already",
+        "3. Run the DEDUPE GATE below on every candidate before going further. Anything already",
         "   covered by an open or recently-merged PR is dropped here, not re-specced.",
-        "3. For each surviving idea, write a short, well-scoped spec (problem, evidence,",
+        "4. For each surviving idea, write a short, well-scoped spec (problem, evidence,",
         "   proposed change, acceptance criteria) before touching code.",
-        "4. Implement focused changes on your own branch and commit them — but the user chose",
+        "5. Implement focused changes on your own branch and commit them — but the user chose",
         "   \"Case by case\" consent, so you MUST NOT submit a PR on your own. NEVER run",
         "   `gh pr create` (or `gh pr edit` / `gh pr reopen`) unless the user has explicitly",
         "   approved that submission in this chat.",
-        "5. Instead: draft the PR title + body, run the PII SCRUB GATE below, then PRESENT the draft",
+        "6. Instead: draft the PR title + body, run the PII SCRUB GATE below, then PRESENT the draft",
         "   (title, body, and a short summary of the diff) in the chat and STOP. Wait for the user",
         "   to tell you to submit; only then run `gh pr create --base main`. Keep PRs small and",
         "   single-purpose.",
@@ -542,6 +564,35 @@ export function sparklePersona(
     "- Never skip the scrub, and never edit the scrub script to make it pass.",
   ];
 
+  // The durable feedback inbox (bead label `agent-feedback`) is where merged workers' retros land:
+  // the capture hook forwards each pain point of a worker's structured retro
+  // (docs/schemas/worker-retro.schema.json) onto this label. It is the Improvement Agent's
+  // highest-signal input — friction a worker actually hit, already anonymized — so it is drained
+  // BEFORE log-mining, and each whatYouDo arm's step 1 points here. Chat-only sessions (consent
+  // "never") mine nothing, so this whole section is dropped there, matching the dedupe/log gates.
+  const feedbackInbox =
+    consent !== "never"
+      ? [
+          AGENT_FEEDBACK_DRAIN_HEADER,
+          "- BEFORE you mine any logs, drain the agent-feedback bead inbox — the durable queue where",
+          "  merged workers' retrospectives are filed (one bead per pain point, the retro humans used",
+          "  to paste by hand):",
+          `    bd list --label ${AGENT_FEEDBACK_LABEL} --status open`,
+          "- Triage EACH item by severity and fold it into the work graph:",
+          "  - NEW finding → file a bead (dedupe it first against `bd list` / `bd ready`, same as the",
+          "    DEDUPE GATE below — a candidate already tracked or in an open PR is not re-filed).",
+          "  - RECURRING finding (a signal you have seen before) → `bd update` the existing bead to",
+          "    enrich it with the new evidence and BUMP its priority. A repeated signal should",
+          "    escalate, not spawn a duplicate.",
+          "- Then FIX the single highest-value item — highest severity, most recurrence — as this",
+          "  pass's change, under the SAME PII SCRUB GATE and consent rules below (auto-submit on",
+          '  "Always", draft-and-STOP on "Case by case"). Close the inbox bead once it is folded into',
+          "  a tracked improvement or a shipped fix.",
+          "- Only AFTER the inbox is drained do you fall through to mining the session logs for NEW",
+          "  friction. The inbox is higher-signal than raw logs, so it always comes first.",
+        ]
+      : [];
+
   return [
     "You are the Sparkle Improvement Agent — a built-in agent inside the Sparkle desktop app",
     "whose sole mission is to make Sparkle (the open-source desktop client) better for everyone.",
@@ -553,6 +604,9 @@ export function sparklePersona(
     // AFTER the mode instructions on purpose: when submission is impossible this block must
     // override whatever the consent mode just said about `gh pr create`.
     ...submitBlockedSection(submit, attended, consent),
+    // The agent-feedback inbox is drained BEFORE the dedupe/log gates — it is the highest-signal
+    // input and each mode's step 1 points here. Empty (dropped) in the chat-only "never" mode.
+    ...(feedbackInbox.length ? [...feedbackInbox, ""] : []),
     ...dedupeGate,
     "",
     ...scrubGate,

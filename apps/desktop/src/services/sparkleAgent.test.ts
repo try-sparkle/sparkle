@@ -16,6 +16,9 @@ import {
   PROPOSE_ONLY_AFTER_ASKING,
   PROPOSE_ONLY_UNCONDITIONAL,
   RETRY_STILL_FAILS_EXIT,
+  AGENT_FEEDBACK_LABEL,
+  AGENT_FEEDBACK_DRAIN_HEADER,
+  AGENT_FEEDBACK_DRAIN_STEP,
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
@@ -309,6 +312,59 @@ describe("sparklePersona — consent branching", () => {
 // that can never succeed and had no instruction for what to do instead. Every mode that can reach
 // a remote must therefore name the interactive `gh auth login` as the real remedy AND give the
 // unattended agent a terminal action, so the guidance can't silently regress to the retry loop.
+// The auto-feedback-on-merge loop (docs/schemas/worker-retro.schema.json) forwards merged workers'
+// retros into a durable beads inbox on the `agent-feedback` label; the Improvement Agent's job is to
+// DRAIN it. The persona must (a) carry the drain section in every log-mining mode, (b) order it
+// BEFORE log-mining, both as a whatYouDo step and as the section itself, and (c) drop it entirely in
+// the chat-only "never" mode, which mines nothing.
+describe("sparklePersona — agent-feedback inbox drain", () => {
+  const MINING_MODES = ["always", "case_by_case"] as const;
+
+  it("the label constant is the one the capture hook writes to", () => {
+    expect(AGENT_FEEDBACK_LABEL).toBe("agent-feedback");
+  });
+
+  it.each(MINING_MODES)("%s: carries the drain section naming the bd label query", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toContain(AGENT_FEEDBACK_DRAIN_HEADER);
+    expect(p).toContain(`bd list --label ${AGENT_FEEDBACK_LABEL}`);
+    // It must instruct the full drain behavior: file NEW, enrich/bump RECURRING, triage by severity,
+    // fix the top item — not merely "look at the inbox".
+    expect(p).toContain("file a bead");
+    expect(p).toContain("bd update");
+    expect(p).toMatch(/BUMP its priority|bump.*priority/i);
+    expect(p).toMatch(/severity/i);
+  });
+
+  it.each(MINING_MODES)("%s: each arm's step 1 references the drain, ordered before log review", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    // The whatYouDo arm names the drain STEP (not just the section), so the ordered numbered list
+    // puts it first — a section that exists but is never pointed at from the steps is easy to skip.
+    expect(p).toContain(AGENT_FEEDBACK_DRAIN_STEP);
+    const drainStep = p.indexOf(AGENT_FEEDBACK_DRAIN_STEP);
+    const logReview = p.indexOf("Review the logs and the current state");
+    expect(drainStep).toBeGreaterThan(-1);
+    expect(drainStep).toBeLessThan(logReview);
+  });
+
+  it.each(MINING_MODES)("%s: the drain SECTION precedes the dedupe-gate SECTION", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    // Anchor on the dedupe SECTION's unique header, not the bare substring "DEDUPE GATE" — that also
+    // appears in the whatYouDo steps (and in this section's own "same as the DEDUPE GATE below"), so
+    // it would match earlier text and mis-measure. The drain section body sits right before the gate.
+    const gateHeader = "DEDUPE GATE — REQUIRED BEFORE YOU WRITE ANY SPEC OR TOUCH ANY CODE";
+    expect(p).toContain(gateHeader);
+    expect(p.indexOf(AGENT_FEEDBACK_DRAIN_HEADER)).toBeLessThan(p.indexOf(gateHeader));
+  });
+
+  it("never: the chat-only session mines nothing, so the drain section is dropped", () => {
+    const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: false });
+    expect(p).not.toContain(AGENT_FEEDBACK_DRAIN_HEADER);
+    expect(p).not.toContain(AGENT_FEEDBACK_DRAIN_STEP);
+    expect(p).not.toContain(`bd list --label ${AGENT_FEEDBACK_LABEL}`);
+  });
+});
+
 describe("sparklePersona — gh auth failure advice", () => {
   const REMOTE_MODES = ["always", "case_by_case", "never"] as const;
 

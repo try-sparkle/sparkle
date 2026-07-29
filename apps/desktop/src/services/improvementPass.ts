@@ -153,7 +153,13 @@ export function hourlyMissionPrompt(
         "approve it when they open this conversation.";
   return [
     "Hourly improvement pass (unattended — no user is watching; never wait for input except as",
-    "your final state). Review the most recent entries in the Sparkle session logs you were",
+    "your final state).",
+    "FIRST, before mining any logs, drain the agent-feedback bead inbox — the durable queue where",
+    "merged workers' retrospectives are filed, one bead per pain point:",
+    "`bd list --label agent-feedback --status open`. For each item, file a new bead or enrich an",
+    "existing one (bumping its priority on recurrence), and PREFER fixing the highest-value item as",
+    "this pass's change. Only if the inbox is empty do you fall through to the logs:",
+    "review the most recent entries in the Sparkle session logs you were",
     "given access to, looking for failures, recurring errors, or clear performance problems.",
     "Pick AT MOST ONE concrete, high-value, privacy-safe improvement and implement it as a",
     "small, focused change on a fresh branch in this worktree. If nothing meets that bar, make",
