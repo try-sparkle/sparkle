@@ -12,10 +12,25 @@
 // shape of the attachment temp-path leak (roborev 46911/46925), which reached three surfaces before
 // anyone noticed. So a user mention is DERIVED from the literal `@Name`, never encoded.
 //
-// A CONCIERGE message has exactly ONE consumer: `ConciergeThread` renders `kind: "sparkle"` text
-// through `<Markdown>`, and nothing else reads it — not the PTY, not the router, not the
-// notification body. (Verified by grep; re-verify before adding a second consumer, because doing so
-// is what would make this the bug the other header describes.)
+// A CONCIERGE message has exactly TWO consumers, and the second one arrived exactly as this
+// paragraph warned it would:
+//
+//   1. `ConciergeThread` renders `kind: "sparkle"` text through `<Markdown>`, which turns a
+//      reference into a pill.
+//   2. THE CLIPBOARD. `CopyAnswerButton` copies the markdown SOURCE — that is the whole point of
+//      it, so tables and code blocks survive a paste — and it landed on this branch while the
+//      pills landed on main, so neither side's tests could see the combination. An answer naming
+//      an agent copied as `[@Kraken Auth](sparkle-agent:9f3c…)`: a dead link carrying an internal
+//      uuid, pasted into a PR or a Slack thread, where the reader wanted the answer.
+//
+// Consumer 2 is HANDLED, by `stripAgentRefs` below, which every copy path must run first. That is
+// the price this design charges per consumer, and it is why the count is written down here. A
+// THIRD consumer — a notification body, a router payload, an export — pays it again or reintroduces
+// the bug `mentions.ts`'s header describes. Re-verify before adding one.
+//
+// The SELECTION path needs no stripping: `sel.toString()` reads the rendered DOM, so it already
+// yields `@Kraken Auth`. That asymmetry is the reason this is easy to miss — two copy affordances
+// over the same words, one correct by construction and one not.
 //
 // The derive-from-text rule cannot be used here anyway, and that is the positive reason for this
 // module rather than merely an absence of objections. Deriving means matching a NAME against the
@@ -90,4 +105,27 @@ export function agentRefHref(agentId: string): string {
 export function stripMentionSigil(text: string): string {
   const t = text.trim();
   return t.startsWith("@") ? t.slice(1).trim() : t;
+}
+
+/** Any markdown inline link, so the stripper below can ask the PARSER whether each one is ours
+ *  rather than carrying a second spelling of the scheme (see `AGENT_REF_SCHEME`'s note). */
+const MD_LINK_RE = /\[([^\]]*)\]\(([^)]*)\)/g;
+
+/**
+ * Flatten agent references to the words a reader sees, for consumers that are not the renderer.
+ *
+ * THE CLIPBOARD IS THE CALLER. `CopyAnswerButton` copies the markdown SOURCE on purpose — that is
+ * what keeps a table a table on paste — but the source of an answer that names an agent contains
+ * `[@Kraken Auth](sparkle-agent:9f3c…)`, and pasting an internal uuid as a dead link is not what
+ * "copy this answer" means. The rendered pill reads `@Kraken Auth`, the selection path already
+ * yields `@Kraken Auth`, and this makes the third path agree with the other two.
+ *
+ * Ordinary links are LEFT ALONE — a real `[docs](https://…)` is part of the answer and belongs in
+ * the paste. The test for "ours" is `parseAgentRefHref`, the same function the renderer asks, so a
+ * malformed reference is flattened by neither and stays literal in both. One parser, no drift.
+ */
+export function stripAgentRefs(text: string): string {
+  return text.replace(MD_LINK_RE, (whole, label: string, href: string) =>
+    parseAgentRefHref(href) === null ? whole : `@${stripMentionSigil(label)}`,
+  );
 }

@@ -615,6 +615,41 @@ describe("multi-window level/speaking gate (background windows must not animate 
   });
 });
 
+describe("dictation://speech-end (the auto-send rail's silence signal)", () => {
+  beforeEach(() => {
+    useDictationStore.setState({ speechEndSeq: 0, speaking: false });
+  });
+
+  it("bumps speechEndSeq once per utterance, so two identical endings are two signals", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
+    emit("dictation://speech-end", null);
+    expect(useDictationStore.getState().speechEndSeq).toBe(1);
+    // A COUNTER, not a flag: the second utterance ends exactly like the first, and a boolean that
+    // was already true would be a state change nothing could subscribe to — the rail would arm on
+    // the first sentence of a session and never again.
+    emit("dictation://speech-end", null);
+    expect(useDictationStore.getState().speechEndSeq).toBe(2);
+    ctrl.cleanup();
+  });
+
+  it("a background window ignores it — a countdown there would press Send on another window's words", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => false });
+    emit("dictation://speech-end", null);
+    expect(useDictationStore.getState().speechEndSeq).toBe(0);
+    ctrl.cleanup();
+  });
+
+  it("is NOT inferable from dictation://speaking, which the cloud path pins true", async () => {
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
+    // The whole reason this event exists: on the cloud path dictation.rs holds `speaking` true for
+    // the entire stream, so its edges say nothing about when a sentence ended.
+    emit("dictation://speaking", true);
+    emit("dictation://speaking", false);
+    expect(useDictationStore.getState().speechEndSeq).toBe(0);
+    ctrl.cleanup();
+  });
+});
+
 describe("cloudStreamCommandFor (local gate, then stream)", () => {
   it("opens the cloud stream when transitioning to ACTIVE (wake word)", () => {
     expect(cloudStreamCommandFor({ phase: "active", insert: null, transitioned: true })).toBe(

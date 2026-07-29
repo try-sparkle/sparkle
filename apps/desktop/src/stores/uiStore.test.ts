@@ -388,6 +388,20 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     "composerHeight",
     "composerMinimized",
     "composerUserSized",
+    // "Copy on selection" (PRD 1 §1). Persisted DELIBERATELY: a preference someone turned off has
+    // to stay off, or the app quietly resumes writing their clipboard on every drag after the next
+    // relaunch — a setting that un-sets itself is worse than no setting.
+    "conciergeCopyOnSelection",
+    // The auto-send rail's armed state (PRD 1 §4). Persisted DELIBERATELY, and note it is the
+    // mirror of the line above rather than a copy of it: this one defaults to OFF, because a
+    // preference that makes the app dispatch irreversible instructions on your behalf has to be
+    // switched on by hand — but once someone HAS switched it on, silently disarming it every
+    // relaunch would be its own broken promise. Persisted either way; only the default differs.
+    "conciergeAutoSend",
+    // Opt-in for the background Haiku grader (PRD §4e). Persisted so a deliberate opt-in is not
+    // re-asked every launch — and it is a SEPARATE switch from the rail above on purpose: arming
+    // auto-send costs nothing, while this spends the user's own Claude subscription quota.
+    "conciergeAutoSendTuner",
     // Closable project tabs: which projects have a tab MUST survive a relaunch, or every close
     // would silently undo itself on the next launch. Its default is `null` (never seeded = every
     // project open), which is serializable, so it shows up in the blob from the very first write.

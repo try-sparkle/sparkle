@@ -20,6 +20,7 @@ export type {
   ConciergeDigestMessage,
   ConciergeColumnProps,
   ConciergeController,
+  ConciergeCopyKind,
   ConciergeMessage,
   ConciergeNudge,
   ConciergeNudgeAction,

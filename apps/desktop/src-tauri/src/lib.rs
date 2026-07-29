@@ -8,6 +8,7 @@ mod attention;
 mod attention_summary;
 mod audio;
 mod auth;
+mod auto_send_tuner;
 mod beads_cmd;
 /// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
 mod builder_index;
@@ -537,6 +538,10 @@ pub fn run() {
             beads_cmd::beads_comment,
             ai::anthropic_chat,
             judge::judge_turn_followup,
+            // OUT OF BAND: called AFTER an auto-send has already gone, purely to record what Haiku
+            // would have graded the utterance. It never gates a send — see auto_send_tuner's header
+            // for the measured 15–27s that settles that.
+            auto_send_tuner::auto_send_tuner_classify,
             history::history_record,
             history::history_search,
             history::history_prune,

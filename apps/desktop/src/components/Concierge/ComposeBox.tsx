@@ -76,7 +76,11 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
-import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+// `C` ALONE, and the three tokens that left are the two halves of this merge, not an oversight:
+// FONT_WEIGHT / ON_GOLD_FILL went with the Send button when it moved into ./SendRail (the gold
+// rect's styling travelled verbatim, so SendRail imports them itself), and COMPOSE_SCRIM went with
+// the scrim when `.cmp` became a box on `--k-input` — see the long note on the root's `background`.
+import { C } from "../../theme/colors";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { useResolvedTheme } from "../../theme/theme";
 import type { Attachment, ConciergeAttachKind } from "./types";
@@ -110,8 +114,19 @@ import {
   type ConciergeMention,
   type MentionAgent,
 } from "./mentions";
+import { SendRail, type SendRailModel } from "./SendRail";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
+
+/** The rail a box mounted WITHOUT auto-send wiring draws: off, aimed nowhere, nothing counting.
+ *  Module-level so it is the same object every render — the rail is memo-friendly and a fresh
+ *  literal per render would defeat that for no gain. */
+const DISARMED_RAIL: SendRailModel = {
+  phase: "disarmed",
+  targetName: "",
+  tier: "verylow",
+  remainingFraction: 1,
+};
 
 /** A module-level empty roster, so a box mounted without `mentionAgents` gets the SAME array every
  *  render. A `= []` default would mint a new one per render, and this list feeds the memo that
@@ -392,6 +407,10 @@ export function ComposeBox({
   wired = false,
   mentionAgents = EMPTY_MENTION_AGENTS,
   preferredAgentId = null,
+  autoSend,
+  onToggleAutoSend,
+  onComposedText,
+  registerSubmit,
 }: {
   /** Reports the trimmed text (empty only when something is attached), plus the agents that text
    *  ADDRESSES by name — `undefined` when it addresses none.
@@ -433,6 +452,38 @@ export function ComposeBox({
   /** The agent a send would reach WITHOUT a mention — the selected build agent. Sorts to the top of
    *  the picker, so "@" then Enter aims at the thing already in front of you. */
   preferredAgentId?: string | null;
+  /** The auto-send rail's live state (PRD §4), supplied by the host from voice/autoSendTimer.
+   *
+   *  OPTIONAL, and its absence means DISARMED rather than absent: the rail is where the Send button
+   *  lives now, so it renders either way. A host that has not wired auto-send up yet gets a Send
+   *  button with an inert off-switch beside it, which is exactly what a disarmed rail is. */
+  autoSend?: SendRailModel;
+  /** The user flipped the rail's arming switch. Absent → the switch is inert (see `autoSend`). */
+  onToggleAutoSend?: (armed: boolean) => void;
+  /**
+   * The box's contents changed, WHATEVER put them there — typed, dictated, or restored after a
+   * failed send.
+   *
+   * Deliberately NOT `onTextEdit`, which is narrower on purpose: that one fires only for the user's
+   * own edits, because the host uses it to retire routing latches ("this box was emptied by hand").
+   * Auto-send needs the opposite — it has to see DICTATED text above all, since that is the only
+   * kind it ever fires on. Folding the two together would either break the latch semantics or leave
+   * the rail blind to speech (PRD §4).
+   */
+  onComposedText?: (text: string) => void;
+  /**
+   * Hand the host this box's submit, so the auto-send rail can fire the SAME path the button does.
+   *
+   * Mirrors `registerInsert`, and for the same reason: the host owns the countdown but the box owns
+   * the text, the mention resolution and the clear-on-send. A host that sent the text itself would
+   * leave the words sitting in the textarea behind the message it just sent.
+   *
+   * Must be referentially STABLE (useCallback upstream) — see `registerInsert`.
+   *
+   * The registered fn RETURNS whether a message actually went out. An empty box early-returns
+   * `false`, which is the difference between the rail announcing a send and staying quiet.
+   */
+  registerSubmit?: (submit: (() => boolean) | null) => void;
 }) {
   const [text, setText] = useState("");
   // Concrete hex for the two spec tokens that have no CSS var of their own (see
@@ -790,8 +841,12 @@ export function ComposeBox({
   // An attachment alone IS a message — the removed composer allowed attachments-only sends — so the
   // gate is "text or attachments", not "text".
   const canSend = text.trim().length > 0 || attachments.length > 0;
-  const submit = () => {
-    if (!canSend) return;
+  // RETURNS WHETHER A MESSAGE WENT OUT, for the auto-send rail (see `registerSubmit`). The button
+  // ignores it; the rail cannot, because "I called submit" and "a message was sent" differ exactly
+  // here — an empty box early-returns, and the rail would otherwise announce "Sent to …" and record
+  // a tuning sample for a send that never happened.
+  const submit = (): boolean => {
+    if (!canSend) return false;
     const v = text.trim();
     // Resolved HERE, at submit, off the trimmed text that is actually going out — never carried
     // along in state. That is the whole point of deriving mentions (see ./mentions): what the user
@@ -812,7 +867,35 @@ export function ComposeBox({
         if (!ok && v) setText((cur) => (cur === "" ? v : cur));
       });
     }
+    // TRUE means the message left this box, not that it arrived. A send that fails asynchronously
+    // restores the draft above, and no synchronous return can know that yet — see the caller's doc
+    // for why the rail treats the dispatch, not the delivery, as the thing it announces.
+    return true;
   };
+
+  // ══ THE AUTO-SEND SEAM ═══════════════════════════════════════════════════════════════════════
+  // Two callbacks, both optional, both inert unless the host wires the rail up.
+
+  // Report the contents on EVERY change — typed, dictated, cleared, or restored after a failed
+  // send. This is the rail's ONLY view of what it would be sending, and dictated text is the case
+  // it exists for, which is why this cannot be `onTextEdit` (see that prop's doc).
+  useEffect(() => {
+    onComposedText?.(text);
+  }, [text, onComposedText]);
+
+  // Hand the host something stable that always runs the CURRENT submit.
+  //
+  // `submit` closes over `text` and is rebuilt every render, so registering it directly would
+  // either re-register on every keystroke or — worse — leave the host holding a closure over an
+  // empty box and firing sends that do nothing.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useEffect(() => {
+    if (!registerSubmit) return;
+    registerSubmit(() => submitRef.current());
+    return () => registerSubmit(null);
+  }, [registerSubmit]);
+
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // ── The picker owns these keys while it is open ────────────────────────────────────────────
     // Ahead of the ⌘↩ submit check on purpose: none of them collide with it (the picker never
@@ -1222,39 +1305,23 @@ export function ComposeBox({
             </RichPlaceholderOverlay>
           )}
         </div>
-        <button
-          type="button"
-          onClick={submit}
-          disabled={!canSend}
-          aria-label="Send"
-          // Carries the shortcut the placeholder no longer spends its text on — without this the
-          // keybinding would have no on-screen discoverability at all. A tooltip alone would hide
-          // it from keyboard and touch users entirely, so it is also declared to assistive tech,
-          // which announces it without anyone having to hover.
-          title="Send (⌘↩)"
-          aria-keyshortcuts="Meta+Enter Control+Enter"
-          style={{
-            fontSize: 13,
-            fontWeight: FONT_WEIGHT.bold,
-            // Prototype `.composer .send { color: var(--ink); background: var(--gold) }` — the
-            // single loudest gold in the shell, and the reason the gold token exists. `goldFill`,
-            // not BRAND.gold: this button has no border, so the fill's contrast with the column
-            // behind it IS its edge, and the literal is a cross-theme constant that disappears on
-            // light mode's concierge surface. The themed pair keeps the prototype's gold in dark
-            // and goes deep gold + light ink in light, so the button reads as a button in both.
-            color: ON_GOLD_FILL,
-            background: C.goldFill,
-            border: "none",
-            borderRadius: 6,
-            padding: "10px 15px",
-            cursor: canSend ? "pointer" : "default",
-            opacity: canSend ? 1 : 0.45,
-            height: 42,
-          }}
-        >
-          Send
-        </button>
       </div>
+      {/* THE SEND RAIL — its own full-width row BENEATH the textarea, carrying the Send button.
+          Send used to sit to the RIGHT of the textarea in the row above; it moved because the rail
+          cannot fit beside the box. The concierge column's minimum is 320px, and a ~190px rail
+          there would leave ~120px of typing room. Nothing about the button changed but its
+          position: same gold rect, same 42px, same `aria-label="Send"` and same ⌘↩ shortcut, so
+          every existing query and keybinding still finds it.
+
+          Rendered ALWAYS, armed or not. The rail is where Send lives now, so it is not conditional
+          on the auto-send feature being on — a disarmed rail is just a Send button with an off
+          switch beside it (see ./SendRail). */}
+      <SendRail
+        model={autoSend ?? DISARMED_RAIL}
+        onToggleArmed={(next) => onToggleAutoSend?.(next)}
+        onSend={submit}
+        canSend={canSend}
+      />
     </div>
   );
 }

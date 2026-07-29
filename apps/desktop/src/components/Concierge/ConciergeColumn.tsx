@@ -140,6 +140,11 @@ export function ConciergeColumn({
   wired = "off",
   mentionAgents,
   preferredAgentId,
+  copyOnSelection = true,
+  autoSend,
+  onToggleAutoSend,
+  onComposedText,
+  registerSubmit,
   onOpenAgent,
 }: ConciergeColumnProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
@@ -391,6 +396,10 @@ export function ConciergeColumn({
             onNudgeAction={controller.onNudgeAction}
             onRedirect={controller.onRedirect}
             onDigestClick={controller.onDigestClick}
+            copyOnSelection={copyOnSelection}
+            // Straight through to the host, which speaks it into the ONE live region below. The
+            // thread deliberately owns no announcer of its own.
+            onCopied={controller.onCopied}
           />
         </AgentPillProvider>
       )}
@@ -456,6 +465,10 @@ export function ConciergeColumn({
           onTextEdit={onTextEdit}
           mentionAgents={mentionAgents}
           preferredAgentId={preferredAgentId}
+          autoSend={autoSend}
+          onToggleAutoSend={onToggleAutoSend}
+          onComposedText={onComposedText}
+          registerSubmit={registerSubmit}
         />
       )}
     </section>

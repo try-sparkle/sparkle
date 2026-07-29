@@ -35,6 +35,7 @@ import {
   ConciergeColumn,
   receiptText,
   type ConciergeAnnouncement,
+  type ConciergeCopyKind,
   type ConciergeDigestMessage,
   type ConciergeMessage,
   type ConciergeNudge,
@@ -108,6 +109,7 @@ import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
+import { useAutoSend, notifyManualSend } from "../voice/useAutoSend";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { usePresenceStore, type PresenceMode } from "../stores/presenceStore";
@@ -607,6 +609,20 @@ export function ConciergeHost({
   const announce = useCallback((text: string) => {
     setAnnouncement((prev) => ({ seq: prev.seq + 1, text }));
   }, []);
+  // "Copy on selection" (PRD 1 §1) — a PRESENTATION preference, so it lives in uiStore rather than
+  // config.toml, and is READ HERE rather than in the column: nothing under components/Concierge
+  // touches a store (see Concierge/types' header).
+  const copyOnSelection = useUiStore((s) => s.conciergeCopyOnSelection);
+  /** A copy landed. Spoken through `announce` — the column's ONE live region — and never from a
+   *  second `aria-live` node inside the thread (roborev 52648/53010/53088). Through `announce`
+   *  specifically, not `setAnnouncement`, because copying twice in a row is the ordinary case and
+   *  an identical repeat must still be a distinct write (roborev 53392). */
+  const onCopied = useCallback(
+    (what: ConciergeCopyKind) => {
+      announce(what === "answer" ? "Answer copied to clipboard." : "Selection copied to clipboard.");
+    },
+    [announce],
+  );
   const [typing, setTyping] = useState(false);
   // The mic is the dictation hook's now (CM-U9) — it owns armed state, the app-wide dictation
   // target and the live interim transcript, so there is no local micLive to keep in sync.
@@ -721,6 +737,86 @@ export function ConciergeHost({
   useEffect(() => {
     targetRef.current = routingTarget;
   }, [routingTarget]);
+
+  // ══ THE AUTO-SEND RAIL (PRD 1 §4) ════════════════════════════════════════════════════════════
+  // Armed state is a persisted PRESENTATION preference, read here rather than in the column for the
+  // same reason `copyOnSelection` is: nothing under components/Concierge touches a store.
+  const autoSendArmed = useUiStore((s) => s.conciergeAutoSend);
+  const setAutoSendArmed = useUiStore((s) => s.setConciergeAutoSend);
+  // What the compose box currently holds, whatever wrote it. The box owns the text; the rail needs
+  // to see it to pick a tier, and dictated text is the only kind it ever fires on.
+  const [composedText, setComposedText] = useState("");
+  const onComposedText = useCallback((t: string) => setComposedText(t), []);
+
+  // The compose box hands us its own submit, so an expired countdown fires the SAME path the button
+  // does — clearing the box, resolving mentions, restoring the draft on failure. Sending the text
+  // from out here instead would leave the words sitting in the textarea behind the message.
+  const composerSubmitRef = useRef<(() => boolean) | null>(null);
+  const registerSubmit = useCallback((fn: (() => boolean) | null) => {
+    composerSubmitRef.current = fn;
+  }, []);
+
+  /**
+   * True only for the instants inside an auto-fire.
+   *
+   * Both paths reach `send` through the box's submit, so without this the rail's own fire would
+   * look like a manual press and cancel the countdown it is currently completing. Set and cleared
+   * synchronously around the call — `submit` invokes `onSend` synchronously, so nothing else can
+   * interleave.
+   */
+  const autoFiringRef = useRef(false);
+
+  const autoSendRail = useAutoSend({
+    armed: autoSendArmed,
+    // OWNERSHIP GATE, and it is load-bearing rather than defensive. `speechEndSeq` is GLOBAL —
+    // bumped for every utterance in the focused window whichever surface owns the mic — while the
+    // cancel signal is not: `useConciergeDictation` returns interim `""` unless the concierge owns
+    // dictation. Ungated, the rail counts down on speech dictated into an AGENT composer, with a
+    // "keep talking and it waits" cancel that can never arrive, and three seconds later dispatches
+    // whatever half-finished draft happens to be sitting in this box (roborev, High).
+    micLive: dictation.micLive,
+    composedText,
+    interim: dictation.interim,
+    // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
+    // countdown is also the moment you can notice you are about to dictate into the wrong agent.
+    // Same source the send itself routes on, never a second guess.
+    targetName: routingTarget?.name ?? "Concierge",
+    // Returns whether a send actually went out (see UseAutoSendArgs.onFire), and BOTH ways of not
+    // sending are reported rather than just the first:
+    //
+    //  • no submit registered — the compose box renders only when `!aiLock`, so a lock engaging
+    //    mid-countdown unmounts it and `registerSubmit(null)` leaves nothing to call;
+    //  • the box was empty when the clock expired — `submit()` early-returns `false`.
+    //
+    // Both used to return `true` here, which the rail announced as "Sent to …" and recorded as a
+    // tuning sample. A phantom sample does not merely miscount: it trains the thresholds.
+    //
+    // HOW NARROW THE SECOND CASE IS, since the next reader will look for a test of it and not find
+    // one: `evaluate` already refuses to fire on an empty transcript (autoSendTimer — it drops back
+    // to `listening` instead), and the rail's transcript IS this box's text, so the ordinary
+    // "cleared mid-countdown" story never reaches `submit()` at all. What is left is the one-commit
+    // gap between the box's `text` changing and `onComposedText` reporting it from an effect: a
+    // fire landing inside that window sees a stale non-empty transcript and an already-empty box.
+    // That is not reproducible from the host's public surface without faking the lag, so the guard
+    // is pinned where it IS observable — `ComposeBox.autoSendSeam.test.tsx` asserts submit's own
+    // return, both ways. Do not "fix" this by writing a host row that empties the composer and
+    // watches for silence: it passes on `evaluate`'s guard and proves nothing about this line.
+    onFire: useCallback(() => {
+      const submit = composerSubmitRef.current;
+      if (!submit) return false;
+      autoFiringRef.current = true;
+      try {
+        return submit();
+      } finally {
+        autoFiringRef.current = false;
+      }
+    }, []),
+    // The rail's fill is aria-hidden and the toggle's accessible name never changes, so without
+    // this the whole feature is SILENT to a screen reader: no notice that a countdown started, none
+    // that a message went, and the target name — the mis-route safety net the design rests on —
+    // never spoken. Through `announce`, the column's ONE live region, exactly like onCopied.
+    onAnnounce: announce,
+  });
 
   // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
   // Who the compose box's "@" picker may offer, and — the same list, which is the point — the roster
@@ -1834,7 +1930,16 @@ export function ConciergeHost({
         : undefined;
       // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
       // mic does not keep transcribing the room while the send is handled.
-      maybePauseOnSubmit();
+      //
+      // NOT ON AN AUTO-FIRE, and this is a decision rather than an oversight. The rail reaches
+      // `send` through the composer's own submit, so it would inherit a path that until now only
+      // ever ran behind a deliberate button press. `DEFAULT_PAUSE_ON_SUBMIT` is true, so every
+      // auto-send would drop dictation active → passive, clear the interim and close the Deepgram
+      // stream — making the user re-say the wake word after each one, on the shipped defaults. That
+      // is precisely the hands-free loop the rail exists to create, so pausing here would have the
+      // feature undo itself. A MANUAL press still pauses: the user took their hands to the keyboard,
+      // which is the gesture the setting was written for.
+      if (!autoFiringRef.current) maybePauseOnSubmit();
       const id = nextId("you");
       // A named agent OVERRIDES what happens to be selected — that is the whole point of naming one.
       const submitted: ConciergePromptTarget | null = mentionedAgent
@@ -1997,12 +2102,28 @@ export function ConciergeHost({
     [askSparkle, promptAgent, postSparkle, setReceipt, agentStillExists, enqueue],
   );
 
+  /**
+   * Every send the COMPOSE BOX initiates — which is both the button and an expired countdown.
+   *
+   * MANUAL SEND ALWAYS OVERRIDES (PRD §4c): a press is better information than the heuristic has,
+   * so it cancels the countdown rather than racing it. The rail's own fire reaches the same submit,
+   * hence the flag — without it the rail would cancel itself at the instant it fired.
+   */
+  const sendFromComposer = useCallback(
+    (text: string, mentions?: ConciergeMention[]): Promise<boolean> => {
+      if (!autoFiringRef.current) notifyManualSend();
+      return send(text, mentions);
+    },
+    [send],
+  );
+
   const controller = useMemo(
     () => ({
-      onSend: send,
+      onSend: sendFromComposer,
       onRedirect: (messageId: string) => void redirect(messageId),
       onAttach: attach,
       onRemoveAttachment: removeAttachment,
+      onCopied,
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
       // switches to Build, and selects the referenced agent". openProjectTab does all three — the
       // tab select plus the shared reveal — so a nudge from a background project lands correctly.
@@ -2121,7 +2242,16 @@ export function ConciergeHost({
     }),
     // `play` is absent on purpose: voice OUTPUT (TTS) was removed in §5, so main's `play` dep does
     // not survive the merge. `revealAgent` is main's, and stays.
-    [resolveAgent, revealAgent, approve, send, redirect, attach, removeAttachment],
+    [
+      resolveAgent,
+      revealAgent,
+      approve,
+      sendFromComposer,
+      redirect,
+      attach,
+      removeAttachment,
+      onCopied,
+    ],
   );
 
   const pinnedProjectName = useMemo(() => {
@@ -2246,10 +2376,18 @@ export function ConciergeHost({
         registerInsert={registerInsert}
         onTextEdit={onTextEdit}
         announcement={announcement}
+        copyOnSelection={copyOnSelection}
         // The "@" picker's list, and the roster a typed mention resolves against — relevance-
         // ordered, because that order is what breaks a duplicate-name tie (see the memo).
         mentionAgents={mentionAgents}
         preferredAgentId={routingTarget?.agentId ?? null}
+        // ── THE AUTO-SEND RAIL (PRD §4) ──────────────────────────────────────────────────────
+        // The model is DATA, not a slot, and carries no live region of its own: the rail's arm and
+        // fire lines go through `announcement` above like everything else in this column.
+        autoSend={autoSendRail}
+        onToggleAutoSend={setAutoSendArmed}
+        onComposedText={onComposedText}
+        registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME
         // reveal the notifications and the command palette use — `openProjectTab` opens the owning
         // project's tab, selects it, clears the Sparkle overlay and reveals the agent. Partial

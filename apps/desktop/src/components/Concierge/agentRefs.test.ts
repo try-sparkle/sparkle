@@ -3,6 +3,7 @@ import {
   AGENT_REF_SCHEME,
   agentRefHref,
   parseAgentRefHref,
+  stripAgentRefs,
   stripMentionSigil,
 } from "./agentRefs";
 
@@ -77,4 +78,41 @@ describe("stripMentionSigil", () => {
 
   it("trims surrounding whitespace", () =>
     expect(stripMentionSigil("  @Kraken Auth  ")).toBe("Kraken Auth"));
+});
+
+describe("stripAgentRefs — the clipboard is the second consumer", () => {
+  it("flattens a reference to the words the pill shows", () =>
+    expect(stripAgentRefs("Ask [@Kraken Auth](sparkle-agent:9f3c1d2e) about it.")).toBe(
+      "Ask @Kraken Auth about it.",
+    ));
+
+  it("flattens EVERY reference in a message, not just the first", () =>
+    expect(
+      stripAgentRefs("[@A](sparkle-agent:a1) and [@B](sparkle-agent:b2) both replied."),
+    ).toBe("@A and @B both replied."));
+
+  it("emits exactly one sigil whether or not the model wrote one", () => {
+    // The persona ASKS for `[@Name](…)`, but it is a request to a language model, not a schema —
+    // the pill strips the sigil and draws its own for exactly this reason, and so does this.
+    expect(stripAgentRefs("[@Kraken Auth](sparkle-agent:a1)")).toBe("@Kraken Auth");
+    expect(stripAgentRefs("[Kraken Auth](sparkle-agent:a1)")).toBe("@Kraken Auth");
+  });
+
+  it("leaves an ORDINARY link alone — it is part of the answer", () =>
+    expect(stripAgentRefs("See [the runbook](https://example.com/r) first.")).toBe(
+      "See [the runbook](https://example.com/r) first.",
+    ));
+
+  it("leaves a MALFORMED reference literal, exactly as the renderer does", () =>
+    // Same test for "ours" as the renderer (`parseAgentRefHref`), so the two cannot disagree about
+    // which links are references: an id that fails the trust boundary is flattened by neither.
+    expect(stripAgentRefs("[@x](sparkle-agent:bad id)")).toBe("[@x](sparkle-agent:bad id)"));
+
+  it("leaves ordinary markdown structure untouched — the reason this button copies source", () => {
+    const md = "| a | b |\n| - | - |\n\n```ts\nconst x = 1;\n```";
+    expect(stripAgentRefs(md)).toBe(md);
+  });
+
+  it("is a no-op on text with no links at all", () =>
+    expect(stripAgentRefs("just words")).toBe("just words"));
 });

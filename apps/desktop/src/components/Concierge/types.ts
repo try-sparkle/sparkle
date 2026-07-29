@@ -23,9 +23,14 @@ import type { ProjectNeedsYou } from "./ScopeVitals";
 // declaration, so the composer that produces a mention and the bubble that draws it cannot drift
 // about what one is.
 import type { ConciergeMention, MentionAgent } from "./mentions";
+// The rail's view-model lives with the component that RENDERS it, for the same reason `Attachment`
+// lives with the composer's model and the mention shapes live with ./mentions: one declaration, so
+// the host that builds a rail state and the strip that draws it cannot drift about what one is.
+import type { SendRailModel } from "./SendRail";
 
 export type { ProjectNeedsYou };
 export type { ConciergeMention, MentionAgent };
+export type { SendRailModel };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
 // than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
@@ -227,6 +232,10 @@ export interface ConciergeViewModel {
   needsYouFilter?: boolean;
 }
 
+/** WHICH copy affordance fired (PRD 1). The two are deliberately different operations — a selection
+ *  copies the RENDERED words, an answer copies its MARKDOWN SOURCE — so the confirmation says which
+ *  one happened rather than one vague "Copied". */
+export type ConciergeCopyKind = "selection" | "answer";
 /** Which side of the shell holds the live cable, or `off` for none.
  *
  *  ONE VALUE, and every visual consequence follows from it — the flood, the dropped lift, the
@@ -267,6 +276,15 @@ export interface ConciergeController {
    *  `sparkle-vohh` fixed the mirror-image bug (a nudge selected an agent without switching
    *  project); this must not reintroduce its other half. */
   onProjectClick?(projectId: string): void;
+  /** Something in the thread reached the clipboard: the user's own selection, or a whole answer via
+   *  its copy button (PRD 1 §1/§2).
+   *
+   *  A CALLBACK RATHER THAN A LOCAL ANNOUNCEMENT, and that is load-bearing. This column has exactly
+   *  ONE `aria-live` region (see {@link ConciergeColumnProps.announcement}); a confirmation spoken
+   *  from a second one is how a screen reader ends up reading every event twice, which is what
+   *  roborev 52648/53010/53088 were. The integration layer owns the region, so it owns this line
+   *  too. */
+  onCopied?(what: ConciergeCopyKind): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
   /** The header's 8-dot grip was used: move the concierge to the OTHER side of the shell. Optional,
@@ -288,6 +306,13 @@ export interface ConciergeColumnProps {
   controller: ConciergeController;
   /** Column width in px (the shell is fixed-width; the workspace owns resizing). */
   width?: number;
+  /** Whether releasing a text selection in the thread copies it (Settings → Concierge → "Copy on
+   *  selection", PRD 1 §1). Defaults to ON.
+   *
+   *  HANDED IN, not read. It is a `uiStore` preference, and nothing in this directory reads a store
+   *  (see this file's header). It governs the SELECTION affordance only — the per-answer copy button
+   *  is an explicit click and always copies, whatever this says. */
+  copyOnSelection?: boolean;
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette
    *  trigger here (PRD §4: history search lives in the concierge). */
   searchSlot?: ReactNode;
@@ -349,6 +374,28 @@ export interface ConciergeColumnProps {
    *  Like the countdown it must carry NO live region of its own: `announcement` above is the
    *  column's only one, and a second `aria-live` node would double-announce. */
   approvalSlot?: ReactNode;
+  /** The auto-send rail's live state (PRD §4), handed to the compose box.
+   *
+   *  DATA, not a slot — unlike `countdownSlot`/`approvalSlot` above. Those are slots because their
+   *  contents subscribe to module-level registries; the rail is drawn from a plain view-model the
+   *  host already holds, and it has to sit INSIDE the compose box (it carries the Send button), so
+   *  a slot would mean handing the box a node it cannot lay out.
+   *
+   *  Absent → the rail renders disarmed. Like the two slots it carries NO live region: the arm and
+   *  fire lines go through `announcement` above. */
+  autoSend?: SendRailModel;
+  /** The user flipped the rail's arming switch. Absent → the switch is inert. */
+  onToggleAutoSend?: (armed: boolean) => void;
+  /** The compose box's contents changed, whatever wrote them — the rail's only view of what it
+   *  would send. Distinct from `onTextEdit`, which is narrower on purpose; see ComposeBox. */
+  onComposedText?: (text: string) => void;
+  /** Receives the compose box's submit, so an expired countdown fires the SAME path the button
+   *  does — clearing the box and resolving mentions exactly as a manual send would.
+   *  Must be referentially stable.
+   *
+   *  The registered fn RETURNS whether a message went out: `false` when the box was empty, which is
+   *  what stops the rail announcing "Sent to …" and recording a tuning sample for a no-op. */
+  registerSubmit?: (submit: (() => boolean) | null) => void;
   /** Which side of the shell holds the live cable (see {@link ConciergeWired}). Defaults to `off`,
    *  which is the LIFTED state: a soft shadow, no colour change, reading as a layer above the
    *  pairs. Patched, the column drops flush and takes the terminal's colour. */

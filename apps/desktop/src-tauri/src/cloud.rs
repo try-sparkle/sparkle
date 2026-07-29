@@ -39,7 +39,9 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use crate::dictation::{emit_cloud_balance, emit_cloud_ended, emit_interim, emit_partial};
+use crate::dictation::{
+    emit_cloud_balance, emit_cloud_ended, emit_interim, emit_partial, emit_speech_end,
+};
 
 /// The capture pipeline always hands us 16 kHz mono (downmix_resample target), so that's the
 /// rate we declare (via the `?sample_rate=` query the relay reads). Kept as a constant rather than
@@ -434,11 +436,22 @@ pub(crate) struct DeepgramResult {
     pub transcript: String,
     /// True once Deepgram has finalized this segment (commit it); false for a live interim.
     pub is_final: bool,
+    /// Deepgram believes the SPEAKER has stopped, not merely that this segment closed.
+    ///
+    /// Distinct from `is_final` and the distinction is the whole point (PRD §4's auto-send rail):
+    /// `is_final` closes a segment on every between-clause pause, so a silence timer keyed off it
+    /// restarts mid-sentence. `speech_final` is Deepgram's endpoint decision — it rides along on a
+    /// `Results` frame we are already parsing, so reading it costs nothing, and it arrives BEFORE
+    /// the separate `UtteranceEnd` frame (which needs `utterance_end_ms` on the URL and lands
+    /// `utterance_end_ms` after the last word). Either one is a legitimate speech-end signal; this
+    /// is the cheap one.
+    pub speech_final: bool,
 }
 
 /// Parse a Deepgram WebSocket text frame into a transcript update. Returns None for non-`Results`
-/// messages (Metadata, UtteranceEnd, SpeechStarted) and for empty transcripts (silence between
-/// words still produces empty interim frames we don't want to surface).
+/// messages (Metadata, UtteranceEnd, SpeechStarted — `UtteranceEnd` is handled separately by
+/// [`parse_deepgram_utterance_end`]) and for empty transcripts (silence between words still
+/// produces empty interim frames we don't want to surface).
 pub(crate) fn parse_deepgram_message(json: &str) -> Option<DeepgramResult> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("Results") {
@@ -454,7 +467,26 @@ pub(crate) fn parse_deepgram_message(json: &str) -> Option<DeepgramResult> {
         return None;
     }
     let is_final = v.get("is_final").and_then(|b| b.as_bool()).unwrap_or(false);
-    Some(DeepgramResult { transcript, is_final })
+    let speech_final = v.get("speech_final").and_then(|b| b.as_bool()).unwrap_or(false);
+    Some(DeepgramResult { transcript, is_final, speech_final })
+}
+
+/// True when this frame is Deepgram's standalone `UtteranceEnd` — "the speaker has been silent for
+/// `utterance_end_ms`".
+///
+/// A frame of its own rather than a flag on a transcript, because by construction there IS no
+/// transcript: it is emitted from word timings after the audio went quiet, which is exactly why the
+/// rail keys off it. A silence clock started when transcript updates stop is really measuring
+/// transcription LAG, and under load that lag begins while the user is still speaking.
+///
+/// `SpeechStarted` (the other frame `vad_events=true` turns on) is deliberately NOT surfaced: the
+/// rail cancels its countdown on the next transcript chunk anyway, which arrives on the same
+/// speech, so a second cancel signal would buy nothing and could cancel on a cough.
+pub(crate) fn parse_deepgram_utterance_end(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "UtteranceEnd"))
+        .unwrap_or(false)
 }
 
 /// A relay control frame — the relay's own billing/lifecycle signals, distinct from the Deepgram
@@ -498,24 +530,51 @@ pub(crate) fn parse_relay_control(json: &str) -> Option<RelayControl> {
 /// transcript vs ignorable) so the dispatch is unit-testable without a socket.
 #[derive(Debug, PartialEq)]
 pub(crate) enum RelayFrame {
-    /// A committed (final) transcript segment — emit as a partial.
-    Partial(String),
-    /// A live interim transcript — emit as the volatile preview.
+    /// A committed (final) transcript segment — emit as a partial. The flag says whether Deepgram
+    /// ALSO called the end of speech on this frame (`speech_final`), which the auto-send rail keys
+    /// its silence clock off. Carried on the variant rather than emitted as a separate frame so the
+    /// worker cannot emit the transcript and its speech-end out of order.
+    Partial(String, SpeechEnd),
+    /// A live interim transcript — emit as the volatile preview. An interim never ends speech.
     Interim(String),
+    /// Deepgram's standalone `UtteranceEnd`: the speaker went quiet, with no transcript attached.
+    UtteranceEnd,
     /// A relay control frame.
     Control(RelayControl),
-    /// Nothing actionable (Deepgram Metadata/UtteranceEnd, an empty transcript, or unparseable text).
+    /// Nothing actionable (Deepgram Metadata/SpeechStarted, an empty transcript, or unparseable
+    /// text).
     Ignore,
 }
 
-/// Classify a relay text frame: a relay control frame wins; otherwise a Deepgram `Results` frame
-/// becomes an interim/final transcript; anything else is ignored.
+/// Whether a committed transcript also ended the utterance. A named type rather than a bare `bool`
+/// on the tuple variant: `RelayFrame::Partial(t, true)` at a call site says nothing about what is
+/// true, and this frame's two booleans (`is_final`, `speech_final`) are exactly the pair that is
+/// easy to confuse.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SpeechEnd {
+    /// Deepgram set `speech_final` — the speaker stopped.
+    Ended,
+    /// A segment boundary only (a pause between clauses); more speech is expected.
+    Continuing,
+}
+
+/// Classify a relay text frame: a relay control frame wins; then Deepgram's standalone `UtteranceEnd`;
+/// otherwise a `Results` frame becomes an interim/final transcript; anything else is ignored.
 pub(crate) fn classify_relay_frame(json: &str) -> RelayFrame {
     if let Some(ctrl) = parse_relay_control(json) {
         return RelayFrame::Control(ctrl);
     }
+    // BEFORE the transcript parse: `UtteranceEnd` carries no transcript, so `parse_deepgram_message`
+    // returns None for it and it would fall through to Ignore — which is exactly the old behaviour
+    // this arm replaces.
+    if parse_deepgram_utterance_end(json) {
+        return RelayFrame::UtteranceEnd;
+    }
     match parse_deepgram_message(json) {
-        Some(r) if r.is_final => RelayFrame::Partial(r.transcript),
+        Some(r) if r.is_final => RelayFrame::Partial(
+            r.transcript,
+            if r.speech_final { SpeechEnd::Ended } else { SpeechEnd::Continuing },
+        ),
         Some(r) => RelayFrame::Interim(r.transcript),
         None => RelayFrame::Ignore,
     }
@@ -663,6 +722,42 @@ fn warm_expired(elapsed: Duration, window: Duration) -> bool {
 /// timeout/`closing`-drain/pre-ready-buffer state machine is NOT exercised hermetically — doing so
 /// would require abstracting the socket behind a transport trait, which we judged not worth the
 /// indirection for this single call site.
+/// What a frame means for the once-per-utterance speech-end signal.
+///
+/// Split out of `run_session` so the rule is testable without a socket: the loop it lives in needs a
+/// live Deepgram connection, and this is the part with an actual invariant to prove.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SpeechEndAction {
+    /// Emit `dictation://speech-end` and remember that this utterance has now reported.
+    Emit,
+    /// Say nothing — either speech is in progress, or this utterance already reported.
+    Hold,
+}
+
+/// Decide whether a frame should emit a speech-end, given whether this utterance already did.
+///
+/// `sent` is updated in place, and clearing it is as load-bearing as suppressing the duplicate:
+/// without the clear, the FIRST utterance would signal and every one after it would be silent.
+pub(crate) fn speech_end_action(frame: &RelayFrame, sent: &mut bool) -> SpeechEndAction {
+    match frame {
+        // A finished transcript: the ~200ms `endpointing` half of Deepgram's pair.
+        RelayFrame::Partial(_, SpeechEnd::Ended) | RelayFrame::UtteranceEnd => {
+            if *sent {
+                SpeechEndAction::Hold
+            } else {
+                *sent = true;
+                SpeechEndAction::Emit
+            }
+        }
+        // Speech is in progress again — the next ending belongs to a new utterance.
+        RelayFrame::Partial(_, _) | RelayFrame::Interim(_) => {
+            *sent = false;
+            SpeechEndAction::Hold
+        }
+        _ => SpeechEndAction::Hold,
+    }
+}
+
 fn run_session(
     app: AppHandle,
     mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -688,6 +783,24 @@ fn run_session(
     // Set when the relay tells us the user ran out of credits, so the cloud-ended emit on exit can
     // tell the frontend to refresh the (now-depleted) balance rather than treat it as a clean close.
     let mut exhausted = false;
+
+    // ONE speech-end per utterance, which is what `dictation://speech-end` promises and what
+    // `dictationStore.speechEndSeq` is documented to count.
+    //
+    // With `endpointing=200` AND `utterance_end_ms=1000` both enabled, Deepgram reports the SAME
+    // silence twice: `speech_final=true` rides a Results frame ~200ms after the last word, and the
+    // standalone `UtteranceEnd` frame follows ~800ms later for the same gap. Deepgram's own guidance
+    // is to remember that a `speech_final` was seen and drop the trailing `UtteranceEnd`; without
+    // that, every ordinary utterance emits two.
+    //
+    // Today the auto-send rail absorbs the double by accident — `noteSpeechEnd` early-returns while
+    // a clock is already running — but the contract is what future consumers will code against, and
+    // anything that COUNTS utterances, announces, or re-anchors on the signal would get two.
+    // Deduped here, at the source, so there is one true statement rather than one guard per reader.
+    //
+    // Cleared by any frame that shows speech in progress again (an interim, or a non-final
+    // transcript), which is what makes the next utterance's end a fresh signal.
+    let mut speech_end_sent = false;
 
     'session: loop {
         // 0) Warm-standby expiry: paused with no resume for the whole window → close cleanly (well
@@ -778,17 +891,39 @@ fn run_session(
         // 2) Read one message (bounded by the read timeout), acting on the transcript/control it
         // carries.
         match socket.read() {
-            Ok(Message::Text(txt)) => match classify_relay_frame(txt.as_str()) {
+            Ok(Message::Text(txt)) => {
+              let frame = classify_relay_frame(txt.as_str());
+              // Decided BEFORE the match, from one rule, so the two frame types that can report the
+              // same silence cannot drift apart (see speech_end_action).
+              let speech_end = speech_end_action(&frame, &mut speech_end_sent);
+              match frame {
                 // Muted (a discarded session draining alongside its successor) → drop the transcript
                 // rather than emit it into whatever session is live now.
-                RelayFrame::Partial(t) => {
+                RelayFrame::Partial(t, _) => {
                     if !muted.load(Ordering::Relaxed) {
-                        emit_partial(&app, "deepgram", t)
+                        emit_partial(&app, "deepgram", t);
+                        // AFTER the transcript, never before: the rail recomputes its confidence
+                        // threshold from the text and then measures accumulated silence against it,
+                        // so a speech-end that arrived first would be evaluated against the
+                        // PREVIOUS sentence. Same thread, same order the frames were parsed in.
+                        if speech_end == SpeechEndAction::Emit {
+                            emit_speech_end(&app);
+                        }
                     }
                 }
                 RelayFrame::Interim(t) => {
                     if !muted.load(Ordering::Relaxed) {
                         emit_interim(&app, t)
+                    }
+                }
+                // The speaker went quiet with no transcript attached (`utterance_end_ms` elapsed).
+                // Muted sessions stay silent for the same reason they drop transcripts: a discarded
+                // session draining alongside its successor must not arm anything in the live one.
+                RelayFrame::UtteranceEnd => {
+                    // Only when `speech_final` did NOT already report this same silence. This is the
+                    // trailing half of Deepgram's pair, ~800ms behind (see speech_end_action).
+                    if !muted.load(Ordering::Relaxed) && speech_end == SpeechEndAction::Emit {
+                        emit_speech_end(&app);
                     }
                 }
                 RelayFrame::Control(RelayControl::Ready) => {
@@ -826,7 +961,8 @@ fn run_session(
                     break;
                 }
                 RelayFrame::Ignore => {}
-            },
+              }
+            }
             Ok(Message::Close(_)) => break,
             Ok(_) => {} // Ping/Pong/Binary — ignore (pongs are auto-queued and flushed above)
             Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => {
@@ -854,6 +990,63 @@ fn run_session(
     // orphan (see silence_now()), whose event would otherwise stop the current session.
     if !suppress_ended.load(Ordering::Relaxed) {
         emit_cloud_ended(&app, exhausted);
+    }
+}
+
+#[cfg(test)]
+mod speech_end_dedupe {
+    use super::*;
+
+    fn partial(final_: bool) -> RelayFrame {
+        RelayFrame::Partial(
+            "ship it".to_string(),
+            if final_ { SpeechEnd::Ended } else { SpeechEnd::Continuing },
+        )
+    }
+
+    /// THE BUG. With `endpointing=200` AND `utterance_end_ms=1000` both on, Deepgram reports the
+    /// SAME silence twice — `speech_final` on a Results frame ~200ms after the last word, then a
+    /// standalone `UtteranceEnd` ~800ms later. Emitting both makes `speechEndSeq` count two
+    /// utterances where the user spoke one, contradicting what both doc comments promise.
+    #[test]
+    fn the_trailing_utterance_end_does_not_re_report_the_same_silence() {
+        let mut sent = false;
+        assert_eq!(speech_end_action(&partial(true), &mut sent), SpeechEndAction::Emit);
+        assert_eq!(
+            speech_end_action(&RelayFrame::UtteranceEnd, &mut sent),
+            SpeechEndAction::Hold,
+            "the ~800ms-later UtteranceEnd describes the silence speech_final already reported"
+        );
+    }
+
+    /// The mirror failure, and the reason the flag must be CLEARED rather than merely set: suppress
+    /// without clearing and only the first utterance of a session ever signals.
+    #[test]
+    fn the_next_utterance_signals_again() {
+        let mut sent = false;
+        assert_eq!(speech_end_action(&partial(true), &mut sent), SpeechEndAction::Emit);
+        // The user starts talking again.
+        assert_eq!(
+            speech_end_action(&RelayFrame::Interim("and also".into()), &mut sent),
+            SpeechEndAction::Hold
+        );
+        assert_eq!(speech_end_action(&partial(true), &mut sent), SpeechEndAction::Emit);
+    }
+
+    #[test]
+    fn a_non_final_transcript_also_reopens_the_utterance() {
+        let mut sent = false;
+        assert_eq!(speech_end_action(&RelayFrame::UtteranceEnd, &mut sent), SpeechEndAction::Emit);
+        assert_eq!(speech_end_action(&partial(false), &mut sent), SpeechEndAction::Hold);
+        assert_eq!(speech_end_action(&partial(true), &mut sent), SpeechEndAction::Emit);
+    }
+
+    /// UtteranceEnd alone is the whole signal when no transcript carried one — the case
+    /// `utterance_end_ms` exists for (the speaker trailed off with nothing transcribable).
+    #[test]
+    fn an_utterance_end_with_no_preceding_speech_final_still_reports() {
+        let mut sent = false;
+        assert_eq!(speech_end_action(&RelayFrame::UtteranceEnd, &mut sent), SpeechEndAction::Emit);
     }
 }
 
@@ -1090,8 +1283,31 @@ mod tests {
             "channel":{"alternatives":[{"transcript":"hello world","confidence":0.99}]}}"#;
         assert_eq!(
             parse_deepgram_message(msg),
-            Some(DeepgramResult { transcript: "hello world".into(), is_final: true })
+            Some(DeepgramResult {
+                transcript: "hello world".into(),
+                is_final: true,
+                speech_final: true
+            })
         );
+    }
+
+    /// `is_final` and `speech_final` are INDEPENDENT, and the auto-send rail lives on the gap
+    /// between them: a pause between clauses closes a segment (`is_final`) without ending the
+    /// utterance (`speech_final`). A rail that read `is_final` as speech-end would restart its
+    /// silence clock mid-sentence and fire while the user is still talking.
+    #[test]
+    fn a_final_segment_is_not_by_itself_the_end_of_speech() {
+        let msg = r#"{"type":"Results","is_final":true,"speech_final":false,
+            "channel":{"alternatives":[{"transcript":"first clause"}]}}"#;
+        let r = parse_deepgram_message(msg).expect("final segment should parse");
+        assert!(r.is_final);
+        assert!(!r.speech_final, "a mid-utterance segment boundary must not read as speech end");
+
+        // Absent (older frames, or a relay that strips it) is the SAFE reading: not speech end. The
+        // rail then waits for the standalone UtteranceEnd rather than sending on a clause break.
+        let no_flag = r#"{"type":"Results","is_final":true,
+            "channel":{"alternatives":[{"transcript":"x"}]}}"#;
+        assert!(!parse_deepgram_message(no_flag).expect("parses").speech_final);
     }
 
     #[test]
@@ -1103,10 +1319,33 @@ mod tests {
         assert!(!r.is_final);
     }
 
+    /// The standalone `UtteranceEnd` frame (`utterance_end_ms` on the relay URL). It carries NO
+    /// transcript, so `parse_deepgram_message` still declines it — the speech-end reading lives in
+    /// its own predicate and, above it, in `classify_relay_frame`.
+    #[test]
+    fn recognises_the_standalone_utterance_end_frame() {
+        assert!(parse_deepgram_utterance_end(
+            r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":3.62}"#
+        ));
+        // Everything else on the wire is not an utterance end — including the VAD's other frame.
+        assert!(!parse_deepgram_utterance_end(r#"{"type":"SpeechStarted","timestamp":1.0}"#));
+        assert!(!parse_deepgram_utterance_end(r#"{"type":"Metadata"}"#));
+        assert!(!parse_deepgram_utterance_end(
+            r#"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"x"}]}}"#
+        ));
+        // Garbage must be a quiet `false`, never a panic or a spurious send.
+        assert!(!parse_deepgram_utterance_end("not json"));
+        assert!(!parse_deepgram_utterance_end("{}"));
+    }
+
     #[test]
     fn ignores_non_results_and_empty_transcripts() {
         // Non-Results control messages carry no transcript to surface.
         assert_eq!(parse_deepgram_message(r#"{"type":"Metadata","duration":1.0}"#), None);
+        // UtteranceEnd still yields no TRANSCRIPT — it is a speech-end signal, not a segment, and
+        // is routed by `classify_relay_frame` (see `classifies_the_utterance_end_frame`). This
+        // assertion used to stand for "UtteranceEnd is ignored entirely"; that is no longer true,
+        // and the classifier test is where the current behaviour is pinned.
         assert_eq!(parse_deepgram_message(r#"{"type":"UtteranceEnd","last_word_end":1.0}"#), None);
         // A Results frame with an empty/whitespace transcript (silence) is dropped, not emitted
         // as a blank segment.
@@ -1172,10 +1411,11 @@ mod tests {
             RelayFrame::Control(RelayControl::Balance { balance_cents: Some(10), debited_cents: 6 })
         );
         assert_eq!(classify_relay_frame(r#"{"type":"exhausted"}"#), RelayFrame::Control(RelayControl::Exhausted));
-        // Deepgram transcripts map to Partial (final) / Interim (not final).
+        // Deepgram transcripts map to Partial (final) / Interim (not final). A final segment with
+        // no `speech_final` is Continuing — the clause ended, the sentence did not.
         assert_eq!(
             classify_relay_frame(r#"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"done"}]}}"#),
-            RelayFrame::Partial("done".into())
+            RelayFrame::Partial("done".into(), SpeechEnd::Continuing)
         );
         assert_eq!(
             classify_relay_frame(r#"{"type":"Results","is_final":false,"channel":{"alternatives":[{"transcript":"typing"}]}}"#),
@@ -1184,5 +1424,42 @@ mod tests {
         // Metadata / empty / garbage → Ignore.
         assert_eq!(classify_relay_frame(r#"{"type":"Metadata"}"#), RelayFrame::Ignore);
         assert_eq!(classify_relay_frame("not json"), RelayFrame::Ignore);
+    }
+
+    /// The auto-send rail's two speech-end paths through the classifier. This test REPLACES the
+    /// half of `ignores_non_results_and_empty_transcripts` that asserted `UtteranceEnd → None` as
+    /// the last word on the frame: that pinned the old behaviour, in which the desktop had no
+    /// speech-end signal at all and the relay never even asked Deepgram for one.
+    #[test]
+    fn classifies_the_speech_end_frames() {
+        // Path 1 — the standalone frame, which carries no transcript at all.
+        assert_eq!(
+            classify_relay_frame(r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":3.62}"#),
+            RelayFrame::UtteranceEnd
+        );
+        // Path 2 — the cheap one: `speech_final` riding along on a committed transcript. The
+        // transcript still comes out, with the speech-end attached, so the worker cannot emit the
+        // two out of order.
+        assert_eq!(
+            classify_relay_frame(
+                r#"{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"ship it"}]}}"#
+            ),
+            RelayFrame::Partial("ship it".into(), SpeechEnd::Ended)
+        );
+        // An INTERIM never ends speech, whatever flags ride on it — it is by definition the middle
+        // of something.
+        assert_eq!(
+            classify_relay_frame(
+                r#"{"type":"Results","is_final":false,"speech_final":true,"channel":{"alternatives":[{"transcript":"ship"}]}}"#
+            ),
+            RelayFrame::Interim("ship".into())
+        );
+        // `vad_events=true` also turns on SpeechStarted, which is deliberately NOT surfaced: the
+        // rail already cancels on the next transcript chunk, and a cough would otherwise cancel a
+        // countdown the user meant to let run.
+        assert_eq!(
+            classify_relay_frame(r#"{"type":"SpeechStarted","timestamp":1.0}"#),
+            RelayFrame::Ignore
+        );
     }
 }

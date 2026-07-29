@@ -27,6 +27,7 @@ import { ConciergeToolsPane, CONCIERGE_TOOLS_SEARCH_TERMS } from "./ConciergeToo
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { ConciergeAiAccess } from "../services/conciergeAiAccess";
+import { matchesAny } from "../engine/settingsSearch";
 import {
   CONCIERGE_TOOL_CATALOG,
   CONCIERGE_TOOL_GROUPS,
@@ -40,7 +41,7 @@ beforeEach(() => {
   turnOnConciergeAi.mockClear();
   aiAccess = { enabled: true, remedy: null };
   useSettingsStore.setState({ conciergeToolPolicy: {} });
-  useUiStore.setState({ settingsRequest: null });
+  useUiStore.setState({ settingsRequest: null, conciergeCopyOnSelection: true });
 });
 afterEach(cleanup);
 
@@ -282,5 +283,63 @@ describe("a hand-edited config value the policy layer can't read", () => {
     expect(within(row).getByText(/asking first until it's fixed/)).toBeTruthy();
     // Still recoverable in one click.
     expect(within(row).getByRole("button", { name: /Reset/ })).toBeTruthy();
+  });
+});
+
+describe("the 'Copy on selection' preference (PRD 1 §1)", () => {
+  const checkbox = () => screen.getByRole("checkbox", { name: "Copy on selection" });
+
+  it("is ON by default and toggles the uiStore preference", () => {
+    render(<ConciergeToolsPane />);
+    // Default ON: an affordance nobody switches on is one nobody has.
+    expect(checkbox().getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(checkbox());
+    expect(useUiStore.getState().conciergeCopyOnSelection).toBe(false);
+    expect(checkbox().getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(checkbox());
+    expect(useUiStore.getState().conciergeCopyOnSelection).toBe(true);
+  });
+
+  it("does NOT round-trip through configActions — it is a presentation preference", () => {
+    // The codebase's split: behavioral / billable / agent-facing flags go to config.toml via
+    // configActions; presentation flags live in the `sparkle-ui` blob. This one changes what a
+    // gesture in one column does and nothing else.
+    render(<ConciergeToolsPane />);
+    fireEvent.click(checkbox());
+    expect(setConciergeToolPolicy).not.toHaveBeenCalled();
+  });
+
+  it("stays usable when AI enhancements are off", () => {
+    // Every tool row below is read-only while the concierge can't act. This control isn't about
+    // what the concierge may do, so the gate has no business over it.
+    aiAccess = { enabled: false, remedy: "enable-setting" };
+    render(<ConciergeToolsPane />);
+    fireEvent.click(checkbox());
+    expect(useUiStore.getState().conciergeCopyOnSelection).toBe(false);
+  });
+
+  it("is findable from the ⋯ settings search", () => {
+    // The rail matches a query against these entries (engine/settingsSearch); a setting nobody can
+    // search for is a setting nobody finds.
+    for (const query of ["copy on selection", "clipboard", "copy answer markdown"]) {
+      expect(matchesAny(CONCIERGE_TOOLS_SEARCH_TERMS, query), query).toBe(true);
+    }
+  });
+});
+
+describe("the auto-send tuner has a real switch", () => {
+  it("renders a toggle, so the default-off flag is opt-in rather than unreachable", () => {
+    // Without this row the flag has no setter call anywhere in the app: it ships false and nothing
+    // can flip it, which retires the entire §4e path into code that can never run. A gate with no
+    // switch is not consent, it is deletion.
+    useUiStore.setState({ conciergeAutoSendTuner: false });
+    render(<ConciergeToolsPane />);
+    const sw = screen.getByRole("checkbox", { name: /Help tune auto-send/i });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(sw);
+    expect(useUiStore.getState().conciergeAutoSendTuner).toBe(true);
   });
 });

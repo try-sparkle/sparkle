@@ -2,6 +2,8 @@ import { type CSSProperties } from "react";
 import { FiAlertTriangle, FiRotateCcw, FiSlash } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useUiStore } from "../stores/uiStore";
+import { SettingCheckbox } from "./SettingCheckbox";
 import { setConciergeToolPolicy } from "../services/configActions";
 import {
   useConciergeAiAccess,
@@ -59,10 +61,53 @@ export function ConciergeToolsPane() {
   // ONE fact, from the one seam that also knows WHICH of the three remedies this user needs.
   const access = useConciergeAiAccess();
   const gated = !access.enabled;
+  // The one PRESENTATION preference on this pane, and the only control here that is NOT gated by AI
+  // enhancements: it governs a gesture in the concierge column, not anything the concierge may do.
+  // Hence uiStore rather than settingsStore + config.toml — see the store's own note on the split.
+  const copyOnSelection = useUiStore((s) => s.conciergeCopyOnSelection);
+  const setCopyOnSelection = useUiStore((s) => s.setConciergeCopyOnSelection);
+  const autoSendTuner = useUiStore((s) => s.conciergeAutoSendTuner);
+  const setAutoSendTuner = useUiStore((s) => s.setConciergeAutoSendTuner);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       {gated && <AiEnhancementsGate remedy={access.remedy} />}
+      {/* ABOVE the tool rows, and outside the gated block on purpose. Everything below this asks
+          "what may the concierge do on its own"; this asks "what does MY selection do", which is
+          true whether or not the paid half is running. */}
+      <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <h3 style={groupHeading}>Copying</h3>
+        <SettingCheckbox
+          label="Copy on selection"
+          checked={copyOnSelection}
+          onToggle={() => setCopyOnSelection(!copyOnSelection)}
+        />
+        <p style={settingBlurb}>
+          Highlight anything Sparkle said and it goes straight to your clipboard. The copy button
+          under each answer works either way — and copies the original markdown, so tables and code
+          blocks paste intact.
+        </p>
+      </section>
+      {/* THE TUNER'S ONLY SWITCH. Without a row here the default-off flag is not "opt-in", it is
+          unreachable — and an unreachable flag retires the whole §4e path (the classify command,
+          its timeout, the argv/env hardening, the comparison log) into code that can never run and
+          a tuning corpus that can never gain a row. Outside the gated block for the same reason as
+          Copying above: it spends the user's OWN Claude subscription, not Sparkle credits, so it
+          does not depend on the paid half being on. */}
+      <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <h3 style={groupHeading}>Dictation tuning</h3>
+        <SettingCheckbox
+          label="Help tune auto-send"
+          checked={autoSendTuner}
+          onToggle={() => setAutoSendTuner(!autoSendTuner)}
+        />
+        <p style={settingBlurb}>
+          After each auto-send, grade the sentence with a background Haiku call and record it beside
+          what the built-in heuristic guessed — the only way to find out when auto-send fired too
+          early. It runs on your own Claude subscription rather than Sparkle credits, one call at a
+          time, well after the message has gone. Off by default; auto-send itself works either way.
+        </p>
+      </section>
       <div style={noticeBox}>
         Each tool is set on its own. Anything left on its default is decided by how risky it is —
         reading and other reversible work happens silently, while anything irreversible,
@@ -254,7 +299,14 @@ function statusText(tool: ConciergeToolEntry, evaluation: ToolPolicyEvaluation):
 /** Exported for the ⋯-dialog rail's keyword set, so the rail advertises the same words the pane
  *  actually contains rather than an approximation someone maintains by hand. */
 export const CONCIERGE_TOOLS_SEARCH_TERMS: readonly string[] = [
+  "auto-send",
+  "dictation tuning",
+  "tune auto-send",
+  "haiku",
   "concierge autonomy per-tool permission allow ask deny approve silently risk irreversible",
+  // The copy affordances (PRD 1). Searched for by what people call it, not by the label alone —
+  // "clipboard" and "select" are what someone types when they can't find the switch.
+  "copy on selection clipboard copying select highlight copy answer markdown paste",
   ...CONCIERGE_TOOL_GROUPS.map((g) => `${g.label} ${g.tools.map((t) => t.name).join(" ")}`),
 ];
 
@@ -270,6 +322,14 @@ const row: CSSProperties = {
 };
 
 const groupHeading: CSSProperties = { ...SECTION_LABEL, margin: 0 };
+
+/** The sentence under a checkbox row — same muted 12px the tool rows' summaries use. */
+const settingBlurb: CSSProperties = {
+  margin: "0 0 0 28px",
+  fontSize: TYPE.small,
+  lineHeight: 1.45,
+  color: C.muted,
+};
 
 const toolName: CSSProperties = {
   color: C.cream,

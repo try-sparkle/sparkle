@@ -86,10 +86,28 @@ interface DictationState {
    *  composer's own mic. Runtime only (never persisted): a relaunch should come back pointing at
    *  the always-present ring, not at whichever pane happened to be focused last session. */
   voiceSurface: VoiceSurface;
+  /**
+   * Monotonic count of SPEECH-END signals (`dictation://speech-end`) — the auto-send rail's silence
+   * clock (PRD §4). Bumped once per utterance the engine believes has ended.
+   *
+   * A COUNTER, not a boolean, and for the same reason `ConciergeAnnouncement.seq` is one: two
+   * consecutive utterances end identically, and a `speechEnded: true` that is already true is a
+   * state change nothing can subscribe to. The rail arms its clock on each increment.
+   *
+   * Deliberately NOT derived from {@link speaking}. That flag is the on-device Silero VAD's edge; on
+   * the CLOUD path dictation.rs holds it `true` for the whole stream, so it never falls and a rail
+   * watching it would arm and never count. Nor is it "no partial for a while" — that measures
+   * transcription LAG, which under load starts ticking while the user is still mid-sentence.
+   *
+   * Runtime only (see `partialize`): a relaunch must not resurrect a stale utterance boundary.
+   */
+  speechEndSeq: number;
 
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
   setSpeaking: (v: boolean) => void;
+  /** The engine says the speaker stopped — bump {@link speechEndSeq}. */
+  noteSpeechEnd: () => void;
   /** Replace the live interim preview (cloud path). Pass "" to clear it. */
   setInterim: (text: string) => void;
   /** Setting a non-null value also transitions status to "error". Clearing with
@@ -130,10 +148,12 @@ export const useDictationStore = create<DictationState>()(
       outOfCreditsNotice: false,
       insertTarget: null,
       voiceSurface: "concierge",
+      speechEndSeq: 0,
 
       setStatus: (status) => set({ status }),
       setLevel: (level) => set({ level }),
       setSpeaking: (speaking) => set({ speaking }),
+      noteSpeechEnd: () => set((s) => ({ speechEndSeq: s.speechEndSeq + 1 })),
       setInterim: (interim) => set({ interim }),
       setError: (error) =>
         set((s) => ({

@@ -91,6 +91,8 @@ import { ConciergeHost } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { armedIntents, clearAllIntents, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { useUiStore } from "../stores/uiStore";
+import { useDictationStore } from "../stores/dictationStore";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -355,6 +357,37 @@ describe("ConciergeHost — dictated input", () => {
     c.dictate("status?");
     await c.send();
     expect(h.maybePauseOnSubmit).toHaveBeenCalled();
+  });
+
+  it("an AUTO-send does NOT pause the mic — that would end the hands-free loop it exists for", async () => {
+    // The guard is one word (`if (!autoFiringRef.current) maybePauseOnSubmit()`), and without a row
+    // here deleting it leaves the whole suite green: the case above passes either way, because a
+    // MANUAL press pauses in both versions. What breaks silently is the flagship path — the rail
+    // fires, the mic pauses itself, and the next sentence goes nowhere because nothing is listening.
+    // "Auto-send" that stops listening after one message is not hands-free.
+    vi.useFakeTimers();
+    try {
+      useUiStore.setState({ conciergeAutoSend: true });
+      useDictationStore.setState({ speechEndSeq: 0 });
+      h.dictation.micLive = true;
+      const c = mount();
+      c.dictate("Deploy the staging branch."); // a finished sentence → `high` → a 1s threshold
+      act(() => {
+        useDictationStore.getState().noteSpeechEnd();
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1_500);
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+
+      // It really did send — otherwise "did not pause" would pass for the wrong reason.
+      expect(h.startConciergeTurn).toHaveBeenCalled();
+      expect(h.maybePauseOnSubmit).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      useUiStore.setState({ conciergeAutoSend: false });
+      useDictationStore.setState({ speechEndSeq: 0 });
+    }
   });
 });
 

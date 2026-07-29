@@ -1,11 +1,14 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useEffect, useRef } from "react";
-import { FiBell } from "react-icons/fi";
+import { useCallback, useEffect, useRef } from "react";
+import { FiBell, FiCheck } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
+import { TYPE } from "../../theme/scale";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
+import { CopyAnswerButton } from "./CopyAnswerButton";
+import { useCopyOnSelection } from "./useCopyOnSelection";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
@@ -15,7 +18,12 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
 import { MessageAttachments } from "../composer/MessageAttachments";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import { splitMentionText, type ConciergeMention } from "./mentions";
-import type { ConciergeDigestMessage, ConciergeMessage, ConciergeNudge } from "./types";
+import type {
+  ConciergeCopyKind,
+  ConciergeDigestMessage,
+  ConciergeMessage,
+  ConciergeNudge,
+} from "./types";
 
 /** How close to the bottom still counts as "following", measured when the READER scrolls.
  *
@@ -100,6 +108,8 @@ export function ConciergeThread({
   onNudgeAction,
   onRedirect,
   onDigestClick,
+  copyOnSelection = true,
+  onCopied,
   wired = false,
 }: {
   messages: ConciergeMessage[];
@@ -115,8 +125,20 @@ export function ConciergeThread({
   onRedirect?: (messageId: string) => void;
   /** A digest line was clicked: open that project and reveal its lead agent. */
   onDigestClick?: (digest: ConciergeDigestMessage) => void;
+  /** The user's "Copy on selection" preference — the SELECTION affordance only. Defaults ON. */
+  copyOnSelection?: boolean;
+  /** Something was copied. Routed up so the integration layer announces it through the column's ONE
+   *  live region; this component adds no `aria-live` node (see ./types ConciergeController). */
+  onCopied?: (what: ConciergeCopyKind) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Copy-on-selection, mounted ONCE on the scroll container — never per message. See the hook's
+  // header for why the selection path copies plain text while the per-answer button copies source.
+  const selectionCopied = useCopyOnSelection(scrollRef, {
+    enabled: copyOnSelection,
+    onCopied: useCallback(() => onCopied?.("selection"), [onCopied]),
+  });
+  const onAnswerCopied = useCallback(() => onCopied?.("answer"), [onCopied]);
   // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
   // its newest message) and only changes when the READER scrolls — never as a side effect of new
   // content.
@@ -200,232 +222,285 @@ export function ConciergeThread({
   }, [contentKey, typing, userMessageId]);
 
   return (
+    // THE POSITIONED ANCESTOR THE TOAST HANGS OFF, and the reason there is a wrapper at all. The
+    // confirmation must not shift the layout by a pixel (PRD 1 §1), which rules out a flow element;
+    // an absolutely-positioned one needs a positioned ancestor, and it must NOT be the scroller
+    // itself or the toast would slide away with the content. This div is a pure box: it takes the
+    // `flex: 1` the scroller used to have and hands it straight back, so the column's geometry — and
+    // ComposeBox's measurement of it, which finds the thread by testid from the section — is
+    // unchanged.
     <div
-      ref={scrollRef}
-      data-testid={CONCIERGE_THREAD_TESTID}
-      onScroll={(e) => {
-        const el = e.currentTarget;
-        const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= FOLLOW_THRESHOLD_PX;
-        // A CLAMP — the browser firing `scroll` because the viewport shrank or content was removed
-        // — leaves scrollTop exactly where it was while the distance from the bottom grows, and it
-        // always comes with a geometry change. Treating that as "the reader scrolled away" would
-        // silently stop the follow for something they never did, the same class of bug as measuring
-        // after layout. Reaching the bottom re-arms, whatever caused it.
-        // ONE test: did this event actually move the scroll position? Every browser re-fit is
-        // already covered without a second term, which is why there isn't one —
-        //   • viewport shrinks (window resize, panel opens): scrollTop is untouched while the
-        //     distance from the bottom grows. `readerMoved` is false, so nothing happens.
-        //   • content removed below the fold: the browser clamps scrollTop to the new maximum,
-        //     which IS the bottom, so `atBottom` re-arms the follow.
-        //   • a scroll event that changed nothing (horizontal scroll on this element, an anchoring
-        //     adjustment that nets zero, a synthetic event): `readerMoved` is false.
-        // Two earlier attempts added a geometry-based "was this a clamp?" term instead. Both were
-        // worse: keyed on any geometry change it swallowed real scroll-aways during streaming
-        // growth, and keyed on a shrinking range it depended on a baseline that a resize with no
-        // scroll event leaves stale. Neither could be given a test that reached it — every shape
-        // they claimed to guard lands on `atBottom` first.
-        const readerMoved = el.scrollTop !== lastTopRef.current;
-        if (atBottom) followRef.current = true;
-        else if (readerMoved) followRef.current = false;
-        lastTopRef.current = el.scrollTop;
-      }}
-      // NOT a live region (roborev 53010). Putting one here looked right — `role="log"` is the
-      // standard for an append-only transcript — but this transcript is not append-only: the host
-      // appends each brain delta into the LAST message's text, so a polite region over the thread
-      // re-announces the growing reply on every chunk. That is the same flooding the interim
-      // dictation preview was silenced for, moved one component over. The announcements live in
-      // the hidden status node below, which only ever receives FINISHED lines.
-      aria-label="Conversation with Sparkle"
-      style={{
-        flex: 1,
-        overflowY: "auto",
-        padding: "8px 16px",
-        display: "flex",
-        flexDirection: "column",
-        gap: 12,
-      }}
+      style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}
     >
-      {messages.map((m) => {
-        if (m.kind === "nudge")
-          return (
-            <NudgeCard
-              key={m.id}
-              nudge={m}
-              onNudgeClick={onNudgeClick}
-              onNudgeAction={onNudgeAction}
-            />
-          );
-        if (m.kind === "recap") return <RecapCard key={m.id} recap={m} />;
-        if (m.kind === "you")
-          return (
-            <div
-              key={m.id}
-              style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}
-            >
+      <div
+        ref={scrollRef}
+        data-testid={CONCIERGE_THREAD_TESTID}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= FOLLOW_THRESHOLD_PX;
+          // A CLAMP — the browser firing `scroll` because the viewport shrank or content was removed
+          // — leaves scrollTop exactly where it was while the distance from the bottom grows, and it
+          // always comes with a geometry change. Treating that as "the reader scrolled away" would
+          // silently stop the follow for something they never did, the same class of bug as measuring
+          // after layout. Reaching the bottom re-arms, whatever caused it.
+          // ONE test: did this event actually move the scroll position? Every browser re-fit is
+          // already covered without a second term, which is why there isn't one —
+          //   • viewport shrinks (window resize, panel opens): scrollTop is untouched while the
+          //     distance from the bottom grows. `readerMoved` is false, so nothing happens.
+          //   • content removed below the fold: the browser clamps scrollTop to the new maximum,
+          //     which IS the bottom, so `atBottom` re-arms the follow.
+          //   • a scroll event that changed nothing (horizontal scroll on this element, an anchoring
+          //     adjustment that nets zero, a synthetic event): `readerMoved` is false.
+          // Two earlier attempts added a geometry-based "was this a clamp?" term instead. Both were
+          // worse: keyed on any geometry change it swallowed real scroll-aways during streaming
+          // growth, and keyed on a shrinking range it depended on a baseline that a resize with no
+          // scroll event leaves stale. Neither could be given a test that reached it — every shape
+          // they claimed to guard lands on `atBottom` first.
+          const readerMoved = el.scrollTop !== lastTopRef.current;
+          if (atBottom) followRef.current = true;
+          else if (readerMoved) followRef.current = false;
+          lastTopRef.current = el.scrollTop;
+        }}
+        // NOT a live region (roborev 53010). Putting one here looked right — `role="log"` is the
+        // standard for an append-only transcript — but this transcript is not append-only: the host
+        // appends each brain delta into the LAST message's text, so a polite region over the thread
+        // re-announces the growing reply on every chunk. That is the same flooding the interim
+        // dictation preview was silenced for, moved one component over. The announcements live in
+        // the hidden status node below, which only ever receives FINISHED lines.
+        aria-label="Conversation with Sparkle"
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          padding: "8px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+        }}
+      >
+        {messages.map((m) => {
+          if (m.kind === "nudge")
+            return (
+              <NudgeCard
+                key={m.id}
+                nudge={m}
+                onNudgeClick={onNudgeClick}
+                onNudgeAction={onNudgeAction}
+              />
+            );
+          if (m.kind === "recap") return <RecapCard key={m.id} recap={m} />;
+          if (m.kind === "you")
+            return (
               <div
-                data-testid="you-bubble"
-                data-wired={wired ? "yes" : "no"}
-                style={{
-                  display: "inline-block",
-                  textAlign: "left",
-                  fontSize: 13,
-                  // WIRED: a wash of the terminal's OWN ink over the flood, not `--k-bubble`.
-                  //
-                  // The mock writes this as `rgba(255,255,255,.08)`, which is a dark-mode idiom —
-                  // on light's terminal plane (#d9e3f3) a white wash is very nearly invisible, so
-                  // copying the literal would give the bubble a fill in one theme and none in the
-                  // other. A wash of `termInk` is the themed equivalent: it moves AWAY from the
-                  // plane in both directions, so the bubble reads as a bubble at both ends, and it
-                  // stays inside the terminal's own register rather than reaching back into the
-                  // shell's for a colour the flood just replaced.
-                  background: wired
-                    ? `color-mix(in srgb, currentColor 10%, transparent)`
-                    : CHAT_USER_BUBBLE,
-                  // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it
-                  // says the same thing twice and, at a 25% wash of `muted`, said it faintly. The
-                  // founder called this out directly: the bubble should read as one solid object,
-                  // not a tinted box inside a hairline.
-                  //
-                  // The tail corner is what identifies it as YOURS (14/14/4/14 — square-ish into
-                  // the bottom-right, where the column's own edge is), which is the same
-                  // shape-not-hue reasoning the status dots and the palette badges use.
-                  // 4px corners with a HARD tail (0), per the spec's `--r-bubble: 4px`. This was 14/14/4/14 — a
-                  // pill. The direction draws boxes rather than filling lozenges, so the bubble is a
-                  // tight rectangle whose square bottom-right corner points at the column edge.
-                  borderRadius: "4px 4px 0 4px",
-                  padding: "9px 12px",
-                }}
+                key={m.id}
+                style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}
               >
-                {/* ABOVE the words, the way every chat client shows what was sent with them. The
-                    text still carries the compact count ("look · 1 image"), which is what a
-                    restored bubble falls back to once its base64 has been stripped. */}
-                <MessageAttachments attachments={m.attachments ?? []} />
-                <MentionedText text={m.text} mentions={m.mentions} />
+                <div
+                  data-testid="you-bubble"
+                  data-wired={wired ? "yes" : "no"}
+                  style={{
+                    display: "inline-block",
+                    textAlign: "left",
+                    fontSize: 13,
+                    // WIRED: a wash of the terminal's OWN ink over the flood, not `--k-bubble`.
+                    //
+                    // The mock writes this as `rgba(255,255,255,.08)`, which is a dark-mode idiom —
+                    // on light's terminal plane (#d9e3f3) a white wash is very nearly invisible, so
+                    // copying the literal would give the bubble a fill in one theme and none in the
+                    // other. A wash of `termInk` is the themed equivalent: it moves AWAY from the
+                    // plane in both directions, so the bubble reads as a bubble at both ends, and it
+                    // stays inside the terminal's own register rather than reaching back into the
+                    // shell's for a colour the flood just replaced.
+                    background: wired
+                      ? `color-mix(in srgb, currentColor 10%, transparent)`
+                      : CHAT_USER_BUBBLE,
+                    // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it
+                    // says the same thing twice and, at a 25% wash of `muted`, said it faintly. The
+                    // founder called this out directly: the bubble should read as one solid object,
+                    // not a tinted box inside a hairline.
+                    //
+                    // The tail corner is what identifies it as YOURS (14/14/4/14 — square-ish into
+                    // the bottom-right, where the column's own edge is), which is the same
+                    // shape-not-hue reasoning the status dots and the palette badges use.
+                    // 4px corners with a HARD tail (0), per the spec's `--r-bubble: 4px`. This was 14/14/4/14 — a
+                    // pill. The direction draws boxes rather than filling lozenges, so the bubble is a
+                    // tight rectangle whose square bottom-right corner points at the column edge.
+                    borderRadius: "4px 4px 0 4px",
+                    padding: "9px 12px",
+                  }}
+                >
+                  {/* ABOVE the words, the way every chat client shows what was sent with them. The
+                      text still carries the compact count ("look · 1 image"), which is what a
+                      restored bubble falls back to once its base64 has been stripped. */}
+                  <MessageAttachments attachments={m.attachments ?? []} />
+                  <MentionedText text={m.text} mentions={m.mentions} />
+                </div>
+                {m.receipt && (
+                  <RoutingReceipt
+                    receipt={m.receipt}
+                    onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
+                  />
+                )}
               </div>
-              {m.receipt && (
-                <RoutingReceipt
-                  receipt={m.receipt}
-                  onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
-                />
-              )}
-            </div>
-          );
-        if (m.kind === "digest") {
-          // The digest LINE, not a card. Deliberately quiet chrome — a coloured edge and a count,
-          // the width of a sentence — because the whole point is that N items stop occupying N
-          // cards' worth of the column (bead sparkle-4562.4). The click hands off to column two.
-          //
-          // Paint and label BOTH come from the shared band helpers, the same source NudgeCard reads,
-          // so a digest line and the cards it stands in for can never speak two vocabularies. It is
-          // `bandColor(m.band)` rather than NudgeCard's `nudgeAccent()` because a digest is not
-          // necessarily a nudge: the grouping is keyed by band, and a future surfaced band would
-          // otherwise be painted in the nudge's sienna regardless of what it means.
-          //
-          // THE TWO VARIANTS GET TWO TEST IDS, deliberately. A "rows" line's number is a promise
-          // that its click leaves exactly that many rows standing in column two, and the guards for
-          // that invariant read the DOM by this id (ConciergeHost.digestFilter.test.tsx). A
-          // "rowless" line stands for agents that have no row at all, so folding it under the same
-          // id would hand those guards a number they would then check against rows — and the
-          // honest answer would look like a regression. Same chrome, same band vocabulary,
-          // different promise.
-          const tint = bandColor(m.band);
-          return (
-            <button
-              key={m.id}
-              type="button"
-              data-testid={m.variant === "rowless" ? "concierge-rowless-digest" : "concierge-digest"}
-              data-band={m.band}
-              onClick={() => onDigestClick?.(m)}
-              style={{
-                alignSelf: "stretch",
-                textAlign: "left",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontSize: 12,
-                fontFamily: "inherit",
-                color: C.cream,
-                background: `color-mix(in srgb, ${tint} 8%, transparent)`,
-                border: `1px solid color-mix(in srgb, ${tint} 30%, transparent)`,
-                borderLeft: `3px solid ${tint}`,
-                borderRadius: 6,
-                padding: "7px 10px",
-                cursor: "pointer",
-              }}
-            >
-              {m.text}
-            </button>
-          );
-        }
-        if (m.kind === "batch")
-          return (
-            <div
-              key={m.id}
-              style={{
-                alignSelf: "stretch",
-                fontSize: 12,
-                color: C.conciergeMuted,
-                textAlign: "center",
-                padding: "6px 0",
-                borderTop: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
-                borderBottom: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
-              }}
-            >
-              {m.text}
-            </div>
-          );
-        // kind === "sparkle" — no bubble, RENDERED MARKDOWN.
-        //
-        // The brain's persona tells it to answer in GitHub-flavored markdown, and this used to
-        // print the raw string — so every reply arrived as a wall of "**bold**" and "- " bullets
-        // run together on one line. Reuses the app's shared renderer (components/Markdown), which
-        // already owns the GFM styling and the link/image scheme allow-lists, rather than growing
-        // a second one here.
-        //
-        // A PUSH IS NOT A REPLY, and it has to look like it isn't (services/conciergeProactive,
-        // PRD §2a). Two things a plain sparkle bubble cannot say:
-        //
-        //   • WHO STARTED THIS. Every other left-aligned line in the thread answers something the
-        //     user said. A push doesn't, and a paragraph that appears with no question above it
-        //     reads as the app having lost track of the conversation unless it is labelled.
-        //   • WHETHER IT IS STILL TRUE. A thread entry is append-only, so "3 need you" keeps
-        //     asserting a resolved count forever. `markStaleProactive` decides that from the digest
-        //     the push was authored against; this is where the decision becomes visible. Dimmed and
-        //     relabelled rather than struck through or removed: the founder may well be reading it
-        //     as it goes stale, and a line that vanishes mid-read is its own bug.
-        if (m.proactive)
-          return (
-            <div
-              key={m.id}
-              data-testid="concierge-push"
-              data-stale={m.stale ? "true" : "false"}
-              style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1 }}
-            >
-              <div
+            );
+          if (m.kind === "digest") {
+            // The digest LINE, not a card. Deliberately quiet chrome — a coloured edge and a count,
+            // the width of a sentence — because the whole point is that N items stop occupying N
+            // cards' worth of the column (bead sparkle-4562.4). The click hands off to column two.
+            //
+            // Paint and label BOTH come from the shared band helpers, the same source NudgeCard reads,
+            // so a digest line and the cards it stands in for can never speak two vocabularies. It is
+            // `bandColor(m.band)` rather than NudgeCard's `nudgeAccent()` because a digest is not
+            // necessarily a nudge: the grouping is keyed by band, and a future surfaced band would
+            // otherwise be painted in the nudge's sienna regardless of what it means.
+            //
+            // THE TWO VARIANTS GET TWO TEST IDS, deliberately. A "rows" line's number is a promise
+            // that its click leaves exactly that many rows standing in column two, and the guards for
+            // that invariant read the DOM by this id (ConciergeHost.digestFilter.test.tsx). A
+            // "rowless" line stands for agents that have no row at all, so folding it under the same
+            // id would hand those guards a number they would then check against rows — and the
+            // honest answer would look like a regression. Same chrome, same band vocabulary,
+            // different promise.
+            const tint = bandColor(m.band);
+            return (
+              <button
+                key={m.id}
+                type="button"
+                data-testid={m.variant === "rowless" ? "concierge-rowless-digest" : "concierge-digest"}
+                data-band={m.band}
+                onClick={() => onDigestClick?.(m)}
                 style={{
+                  alignSelf: "stretch",
+                  textAlign: "left",
                   display: "flex",
                   alignItems: "center",
-                  gap: 5,
+                  gap: 8,
                   fontSize: 12,
-                  color: C.conciergeMuted,
-                  marginBottom: 3,
+                  fontFamily: "inherit",
+                  color: C.cream,
+                  background: `color-mix(in srgb, ${tint} 8%, transparent)`,
+                  border: `1px solid color-mix(in srgb, ${tint} 30%, transparent)`,
+                  borderLeft: `3px solid ${tint}`,
+                  borderRadius: 6,
+                  padding: "7px 10px",
+                  cursor: "pointer",
                 }}
               >
-                <FiBell size={11} aria-hidden />
-                <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
+                {m.text}
+              </button>
+            );
+          }
+          if (m.kind === "batch")
+            return (
+              <div
+                key={m.id}
+                style={{
+                  alignSelf: "stretch",
+                  fontSize: 12,
+                  color: C.conciergeMuted,
+                  textAlign: "center",
+                  padding: "6px 0",
+                  borderTop: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
+                  borderBottom: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
+                }}
+              >
+                {m.text}
               </div>
+            );
+          // kind === "sparkle" — no bubble, RENDERED MARKDOWN.
+          //
+          // The brain's persona tells it to answer in GitHub-flavored markdown, and this used to
+          // print the raw string — so every reply arrived as a wall of "**bold**" and "- " bullets
+          // run together on one line. Reuses the app's shared renderer (components/Markdown), which
+          // already owns the GFM styling and the link/image scheme allow-lists, rather than growing
+          // a second one here.
+          //
+          // A PUSH IS NOT A REPLY, and it has to look like it isn't (services/conciergeProactive,
+          // PRD §2a). Two things a plain sparkle bubble cannot say:
+          //
+          //   • WHO STARTED THIS. Every other left-aligned line in the thread answers something the
+          //     user said. A push doesn't, and a paragraph that appears with no question above it
+          //     reads as the app having lost track of the conversation unless it is labelled.
+          //   • WHETHER IT IS STILL TRUE. A thread entry is append-only, so "3 need you" keeps
+          //     asserting a resolved count forever. `markStaleProactive` decides that from the digest
+          //     the push was authored against; this is where the decision becomes visible. Dimmed and
+          //     relabelled rather than struck through or removed: the founder may well be reading it
+          //     as it goes stale, and a line that vanishes mid-read is its own bug.
+          if (m.proactive)
+            return (
+              <div
+                key={m.id}
+                data-testid="concierge-push"
+                data-stale={m.stale ? "true" : "false"}
+                style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1 }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 5,
+                    fontSize: 12,
+                    color: C.conciergeMuted,
+                    marginBottom: 3,
+                  }}
+                >
+                  <FiBell size={11} aria-hidden />
+                  <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
+                </div>
+                <Markdown text={m.text} />
+                {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same
+                    copy affordance. Copying its markdown source, like the branch below. */}
+                <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
+              </div>
+            );
+          return (
+            <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
               <Markdown text={m.text} />
+              {/* ANSWERS ONLY. Not the user's own bubbles (they wrote it), and not the nudge, recap,
+                  digest or batch cards above — those are chrome the app generated about state, not
+                  prose anyone wants in a doc. Copies `m.text`, the markdown SOURCE, so a table stays
+                  a table on paste (see CopyAnswerButton). */}
+              <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
             </div>
           );
-        return (
-          <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
-            <Markdown text={m.text} />
-          </div>
-        );
-      })}
-      {/* The pulse, plus what the concierge is actually doing when it is doing something the app
-          observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
-      <ThinkingIndicator typing={typing} />
+        })}
+        {/* The pulse, plus what the concierge is actually doing when it is doing something the app
+            observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
+        <ThinkingIndicator typing={typing} />
+      </div>
+      {/* "It's on your clipboard." A check mark, no words, gone in ~1.2s.
+          THREE THINGS IT MUST NOT DO, all of them structural rather than stylistic:
+            • shift the layout — hence `position: absolute` against the wrapper above, not a flow
+              element in the scroller;
+            • take focus — it is a `<div>` with nothing focusable in it and nothing calls focus() on
+              it, so the caret stays wherever the user left it;
+            • speak — it is `aria-hidden`. The confirmation reaches a screen reader through the
+              column's ONE live region, via `onCopied` (see ./types). A second `aria-live` node here
+              is exactly the double-announcement roborev 52648/53010/53088 were about.
+          `pointerEvents: none` so it can never eat the click that lands under it. */}
+      {selectionCopied && (
+        <div
+          data-testid="concierge-copy-toast"
+          aria-hidden
+          style={{
+            position: "absolute",
+            right: 14,
+            bottom: 10,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            pointerEvents: "none",
+            background: `color-mix(in srgb, ${C.teal} 20%, ${C.conciergeSurface})`,
+            border: `1px solid color-mix(in srgb, ${C.teal} 45%, transparent)`,
+            borderRadius: 6,
+            padding: "3px 7px",
+            fontSize: TYPE.small,
+            color: C.cream,
+          }}
+        >
+          <FiCheck size={12} />
+          Copied
+        </div>
+      )}
     </div>
   );
 }

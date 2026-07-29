@@ -296,6 +296,49 @@ interface UiState {
   // transient `fetchMe()` failure (which nulls `me` without changing anyone's balance) does not
   // resurrect a banner this user already dismissed. Transient alongside the flag itself.
   zeroCreditBannerDismissedFor: string | null;
+  // Settings → Concierge tools → "Copy on selection" (PRD 1 §1): releasing a text selection in the
+  // concierge thread puts it on the clipboard. DEFAULT ON — the affordance is the feature, and one
+  // nobody switches on is one nobody has.
+  //
+  // IT LIVES HERE, not in settingsStore + config.toml, and the split is deliberate: behavioral,
+  // billable and agent-facing flags round-trip through services/configActions because an agent or a
+  // bill depends on them; this one changes nothing but what a gesture in one column does. A pure
+  // presentation preference belongs in the `sparkle-ui` blob with the composer height and the theme.
+  //
+  // It governs the SELECTION path ONLY. The per-answer copy button is an explicit click and copies
+  // regardless — turning this off means "stop copying things I merely highlighted", not "take the
+  // button away".
+  conciergeCopyOnSelection: boolean;
+  setConciergeCopyOnSelection: (v: boolean) => void;
+  /**
+   * The auto-send rail is armed: speech ending starts a countdown that SENDS on its own (PRD §4).
+   *
+   * DEFAULT OFF, unlike the copy preference above, and the asymmetry is the point. Copying something
+   * you highlighted is recoverable — the worst case is a clipboard you did not want. An auto-send is
+   * not: it delivers an irreversible instruction to an agent with no undo, no hold and no post-send
+   * countdown, which is exactly what §4 specifies ("when it sends, it sends"). A feature that can
+   * dispatch work on your behalf has to be switched on deliberately, once, by you.
+   *
+   * Persisted so arming survives a relaunch — someone who dictates this way wants it every session,
+   * and the rail states its own state plainly whenever it is armed.
+   */
+  conciergeAutoSend: boolean;
+  setConciergeAutoSend: (v: boolean) => void;
+  /**
+   * Grade each auto-send with a background Haiku call, to tune the heuristics (PRD §4e).
+   *
+   * DEFAULT OFF and opt-in, because it spends the USER'S OWN Claude subscription: the classify runs
+   * through their local `claude` binary with the API-key vars stripped, so BYOK cannot pay for it
+   * and every call bills a message against their quota. The output is a diagnostic only this
+   * codebase's future tuning ever reads. Spending someone else's quota to improve our heuristics is
+   * not a default — same posture as `builder_index`, which is documented as default-off and
+   * consent-gated for the same reason.
+   *
+   * With this off, auto-send still works exactly as specified: the heuristics were always the
+   * in-loop path, and this only ever recorded a second opinion after the fact.
+   */
+  conciergeAutoSendTuner: boolean;
+  setConciergeAutoSendTuner: (v: boolean) => void;
   // `userId` is REQUIRED, not `string | null`: a dismissal latched with no owner can only ever be
   // cleared by credits arriving — a different user signing in at $0 would inherit the silence, which
   // is precisely what recording the owner exists to prevent. (roborev 51700/51712)
@@ -433,6 +476,14 @@ export const useUiStore = create<UiState>()(
       setOpenProjectIds: (ids) => set({ openProjectIds: ids }),
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
+      conciergeCopyOnSelection: true,
+      setConciergeCopyOnSelection: (v) => set({ conciergeCopyOnSelection: v }),
+      // OFF by default — see the field's doc for why this one is not symmetric with the above.
+      conciergeAutoSend: false,
+      setConciergeAutoSend: (v) => set({ conciergeAutoSend: v }),
+      // OFF by default — it spends the user's own Claude subscription. See the field's doc.
+      conciergeAutoSendTuner: false,
+      setConciergeAutoSendTuner: (v) => set({ conciergeAutoSendTuner: v }),
       dismissZeroCreditBanner: (userId) =>
         set({ zeroCreditBannerDismissed: true, zeroCreditBannerDismissedFor: userId }),
       // Idempotent on purpose: authStore calls this on every `me` write, so it must be a no-op

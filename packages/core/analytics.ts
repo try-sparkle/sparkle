@@ -52,6 +52,21 @@ export const ANALYTICS_EVENTS = {
   AGENT_NAMING_OUTCOME: "agent_naming_outcome",
   /** What supplied a needs-you notification body (self-report vs paid Haiku vs generic). */
   ATTENTION_BODY_SOURCE: "attention_body_source",
+
+  // ── Auto-send tuning (PRD 1 §4f) ──────────────────────────────────────────
+  // The auto-send rail picks how long to wait from a HEURISTIC read of whether a
+  // dictated thought sounds finished. There is no way to tune that read without
+  // knowing when it was wrong, and the only honest signal for "wrong" is what the
+  // user did next — kept talking, pressed Send rather than waiting, or sent a
+  // correction seconds later.
+  //
+  // Same privacy rule as the block above, and it binds harder here because the
+  // subject matter IS the user's speech: every prop is an enum, a bucket or a
+  // boolean. The transcript, the tier Haiku assigned it, and the two verdicts
+  // side by side stay in the LOCAL log (voice/autoSendTelemetry) and never reach
+  // PostHog — see that module's header.
+  /** An armed rail fired on its own, and what happened around it. */
+  AUTO_SEND_FIRED: "auto_send_fired",
 } as const;
 
 export type AnalyticsEvent =

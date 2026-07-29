@@ -64,6 +64,27 @@ pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
     let _ = app.emit("dictation://interim", seg);
 }
 
+/// THE SPEAKER STOPPED — the auto-send rail's silence signal (PRD §4).
+///
+/// Deliberately NOT `dictation://speaking`. That event is the Silero VAD's edge on the ON-DEVICE
+/// path, and on the cloud path it is hard-coded `true` for the whole stream (see the capture
+/// callback below), so it can never fall — a rail keyed off it would arm and never count.
+///
+/// Nor is it inferable from `dictation://partial` going quiet: that measures how long the
+/// TRANSCRIPT has been idle, which under network or model load starts ticking while the user is
+/// still mid-sentence. This event carries Deepgram's own endpoint decision (`speech_final`, or the
+/// standalone `UtteranceEnd` frame), taken from word timings in the audio.
+///
+/// Payload-free: the only thing it asserts is "as of now, speech has ended". The frontend already
+/// holds the transcript, and it holds a fresher one than any payload here could carry.
+///
+/// Privacy: nothing is logged. This fires once per utterance and carries no text, but a per-
+/// utterance timestamp trail is still a record of when someone was talking, and the transcript
+/// emitters above deliberately keep only a fingerprint.
+pub(crate) fn emit_speech_end(app: &AppHandle) {
+    let _ = app.emit("dictation://speech-end", ());
+}
+
 /// Signal that the cloud (relay) worker has exited — whether a clean close, a mid-stream failure, or
 /// the relay signalling out-of-credits. The frontend handles this by clearing the interim preview and
 /// calling stop_cloud_stream, which flips `cloud_active` back to false so the capture callback resumes

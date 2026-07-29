@@ -215,6 +215,22 @@ export async function createDictationController(
       setSpeaking(e.payload);
     }),
 
+    // THE SPEAKER STOPPED — Deepgram's own endpoint decision (`speech_final`, or the standalone
+    // `UtteranceEnd` frame), which is what the auto-send rail measures its silence against.
+    //
+    // Registered next to the partial/interim handlers on purpose: it belongs to the same utterance
+    // they carry, and it must ride the SAME multi-window focus gate. Without that gate a background
+    // window would count down and fire a send off a phrase that was typed into another window's
+    // composer — the same "one phrase, every window" bug the partial gate exists to stop
+    // (sparkle-ozvr), except this one presses Send.
+    //
+    // No payload: the event asserts only "as of now, speech has ended". The frontend already holds
+    // a fresher transcript than any payload could carry.
+    listen<null>("dictation://speech-end", () => {
+      if (!isWindowActive()) return;
+      useDictationStore.getState().noteSpeechEnd();
+    }),
+
     listen<string>("dictation://error", (e) => {
       setModelProgress(null);
       setError(e.payload);
