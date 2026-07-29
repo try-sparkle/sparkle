@@ -69,8 +69,13 @@ import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAut
 import { searchHistory } from "../history";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { isRedStatus } from "../windowStatus";
+import { isObserved, livenessOf, type AgentLiveness } from "../agentLiveness";
 import { useProjectStore } from "../../stores/projectStore";
-import { useRuntimeStore } from "../../stores/runtimeStore";
+import {
+  useRuntimeStore,
+  mergeOpenAgentIds,
+  readPersistedOpenAgentIds,
+} from "../../stores/runtimeStore";
 import type { AgentTabStatus } from "../../types";
 import type { SuggestionButton } from "../suggestions/types";
 
@@ -185,8 +190,20 @@ export interface AgentStatusReport {
   runtime: "local" | "cloud" | "unknown";
   /** Can it take input RIGHT NOW? Straight from `agentCanAcceptInput` — see the note there. */
   canAcceptInput: boolean;
-  /** Is it in a red state (waiting/approval/blocked/errored) — i.e. stuck until the human acts? */
+  /**
+   * Is it in a red state (waiting/approval/blocked/errored) — i.e. stuck until the human acts?
+   *
+   * ONLY MEANINGFUL WHEN `observed` IS TRUE. `false` here means "no red status was seen", which
+   * covers both "it is calm" and "this window never had a status for it". Branch on `observed`
+   * first; `detail` says which case you are in, in a sentence you can relay.
+   */
   needsYou: boolean;
+  /** Whether `status` (and therefore `needsYou`) was READ or merely defaulted — see AgentLiveness. */
+  liveness: AgentLiveness;
+  /** `liveness === "local"`. The one flag a caller needs before treating `needsYou` as a fact. */
+  observed: boolean;
+  /** One sentence explaining what this report does and does not establish. Always present. */
+  detail: string;
 }
 
 /** Where a tool send ended up. The dispatcher's own taxonomy plus the one refusal this layer makes
@@ -491,6 +508,33 @@ function findAgent(agentId: string) {
     .find((a) => a.id === agentId);
 }
 
+/** The sentence that goes with each report, so an LLM reading this result does not have to infer
+ *  what a `false` establishes. Kept beside the report it describes. Pure. */
+function statusDetail(
+  known: boolean,
+  liveness: AgentLiveness,
+  status: AgentTabStatus | undefined,
+  needsYou: boolean,
+): string {
+  if (!known) {
+    return (
+      "No agent with this id is open. It was closed, or the id is stale — a roster read taken " +
+      "even a moment earlier can legitimately list an agent that has since been closed, so this " +
+      "is not the app contradicting itself. Re-read the roster before treating it as missing."
+    );
+  }
+  if (liveness !== "local") {
+    return (
+      "This window has no live status for this agent" +
+      (liveness === "other-window" ? " (its pane is open elsewhere)" : "") +
+      ", so needsYou:false means NOT OBSERVED — not 'nothing needs you'. Do not report it as calm."
+    );
+  }
+  return needsYou
+    ? `Read live: status '${status}' — it is stuck until the human acts.`
+    : `Read live: status '${status}' — nothing is waiting on the human.`;
+}
+
 /**
  * The agent's live status and whether it can take input right now.
  *
@@ -499,19 +543,44 @@ function findAgent(agentId: string) {
  * store has never heard of answers `false`, because that is when delivery is least likely to work —
  * and a tool surface wants precisely that bias. Re-deriving it here would be the exact duplication
  * that conciergeDispatch.predicates.test.ts exists to warn about.
+ *
+ * `needsYou` USED TO BE REPORTED AS A FACT even when there was nothing to read. `runtimeStore.status`
+ * is window-local, so an agent with no entry produced `isRedStatus(undefined) === false` — the same
+ * value a calm agent produces. A concierge polling its fleet one agent at a time got `false` from
+ * every row and told the human nothing needed them while the sidebar had one painted red. `status`
+ * was already honest ("unknown"); the derived boolean was the lie, and the boolean is what gets
+ * branched on. `liveness`/`observed`/`detail` are that fix, and they reuse services/agentLiveness so
+ * this cannot drift from the identical correction already made to `get_state`.
+ *
+ * The open-pane set is built EXACTLY as `handleGetState` builds it — in-memory merged with the
+ * persisted set on every call. `runtimeStore.openAgentIds` is merged with what is on disk only at
+ * open()/close() time, so a window's in-memory copy goes stale between those events; re-reading the
+ * persisted set each call is what `get_state` does to avoid that (roborev 53406 / ).
+ * Skipping it here would have made this surface answer "unknown" for an agent `get_state` was
+ * calling "other-window" at the same moment — two views contradicting each other about the very
+ * field added to stop that. (roborev 54546.)
  */
 export function getAgentStatus(agentId: string): AgentStatusReport {
   const agent = findAgent(agentId);
-  const status = useRuntimeStore.getState().status[agentId];
+  const rt = useRuntimeStore.getState();
+  const status = rt.status[agentId];
+  const openIds = new Set(
+    mergeOpenAgentIds(rt.openAgentIds ?? [], readPersistedOpenAgentIds()),
+  );
+  const liveness = livenessOf(agentId, rt.status, openIds);
+  // The red-COLOR tier (waiting|approval|blocked|errored), asked of the shared predicate so this
+  // can't drift from what the sidebar paints.
+  const needsYou = isRedStatus(status);
   return {
     agentId,
     known: agent !== undefined,
     status: status ?? "unknown",
     runtime: agent === undefined ? "unknown" : agent.runtime === "cloud" ? "cloud" : "local",
     canAcceptInput: agentCanAcceptInput(agentId),
-    // The red-COLOR tier (waiting|approval|blocked|errored), asked of the shared predicate so this
-    // can't drift from what the sidebar paints.
-    needsYou: isRedStatus(status),
+    needsYou,
+    liveness,
+    observed: isObserved(liveness),
+    detail: statusDetail(agent !== undefined, liveness, status, needsYou),
   };
 }
 
@@ -700,7 +769,7 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "get_agent_status",
     description:
-      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Read-only.",
+      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Check `observed` first: when it is false there was no live status to read, so `needsYou: false` means NOT OBSERVED rather than calm — relay `detail` instead of reporting the agent as fine. Read-only.",
     write: false,
   },
   {

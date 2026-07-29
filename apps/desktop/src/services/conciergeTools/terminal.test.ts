@@ -35,14 +35,21 @@ vi.mock("../history", () => ({ searchHistory: vi.fn(async () => []) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "") }));
 // The attention screen lives on the runtime store, whose real module drags in beads/chief/branch
 // polling. Only one field matters here.
+// `getAgentStatus` also builds the open-pane set the way `handleGetState` does (in-memory merged
+// with the persisted copy), so the two liveness answers cannot diverge — both helpers are stubbed
+// here rather than left undefined.
 vi.mock("../../stores/runtimeStore", () => ({
   useRuntimeStore: { getState: vi.fn(() => ({ attentionScreen: {}, status: {} })) },
+  mergeOpenAgentIds: (inMemory: string[], persisted: string[]) => [
+    ...new Set([...inMemory, ...persisted]),
+  ],
+  readPersistedOpenAgentIds: vi.fn((): string[] => []),
 }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { submitPrompt, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
-import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useRuntimeStore, readPersistedOpenAgentIds } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useProjectStore } from "../../stores/projectStore";
 import {
@@ -626,6 +633,73 @@ describe("getAgentStatus", () => {
     expect(s.known).toBe(true);
     expect(s.status).toBe("unknown");
     expect(s.needsYou).toBe(false);
+  });
+
+  // ── The observation gap (the bug the concierge hit) ─────────────────────────────────────────
+  //
+  // `runtimeStore.status` is window-local. An agent with no entry in it read as `needsYou: false`,
+  // which is not a reading — it is the ABSENCE of one, reported in the shape of an answer. Asked
+  // agent-by-agent, a concierge got `needsYou: false` from every row and told the human nothing
+  // needed them, while the sidebar was painting one of those rows red. `status` was already honest
+  // here ("unknown"); the derived boolean was not, and a boolean is what a caller branches on.
+
+  it("marks a status it actually read as observed", () => {
+    seedAgent("local", "waiting");
+    const s = getAgentStatus(AGENT);
+    expect(s.liveness).toBe("local");
+    expect(s.observed).toBe(true);
+    expect(s.needsYou).toBe(true);
+  });
+
+  it("does NOT claim needsYou:false for an agent whose status it never observed", () => {
+    seedAgent("local"); // in the store, but nothing has published a status
+    const s = getAgentStatus(AGENT);
+    expect(s.observed).toBe(false);
+    expect(s.liveness).toBe("unknown");
+    // The boolean stays false (nothing red was seen) but the report must say, in words a model
+    // reads, that this is an unobserved default and not a clean bill of health.
+    expect(s.needsYou).toBe(false);
+    expect(s.detail).toMatch(/not observ|no .*status/i);
+  });
+
+  it("reports an agent open in another window as unobserved rather than calm", () => {
+    seedAgent("local");
+    runtimeStateMock.mockReturnValue({
+      attentionScreen: {},
+      status: {},
+      openAgentIds: [AGENT],
+    } as never);
+    const s = getAgentStatus(AGENT);
+    expect(s.liveness).toBe("other-window");
+    expect(s.observed).toBe(false);
+  });
+
+  // The in-memory openAgentIds copy only re-reads disk on open()/close(), so it goes stale between
+  // those events — which is why get_state merges the persisted set on EVERY call. If this surface
+  // skipped that merge the two would label the same agent differently at the same moment.
+  it("sees an open pane recorded only in the PERSISTED set, exactly as get_state does", () => {
+    seedAgent("local");
+    vi.mocked(readPersistedOpenAgentIds).mockReturnValue([AGENT]);
+    const s = getAgentStatus(AGENT);
+    expect(s.liveness).toBe("other-window");
+    expect(s.detail).toMatch(/open elsewhere/);
+  });
+
+  // The ghost: a roster read (project_agents_status) listed an agent that get_agent_status then
+  // reported `known:false` for, because it had been closed in between. Both answers were right at
+  // the moment they were given; with nothing but the two booleans to go on it read as the app
+  // contradicting itself. The detail sentence is what makes the reconciliation possible.
+  it("explains an unknown id instead of leaving two views to look contradictory", () => {
+    const s = getAgentStatus("ghost-agent");
+    expect(s.known).toBe(false);
+    expect(s.observed).toBe(false);
+    expect(s.detail).toMatch(/closed|no longer|not open/i);
+  });
+
+  it("always gives a detail sentence the concierge can relay verbatim", () => {
+    seedAgent("local", "working");
+    expect(getAgentStatus(AGENT).detail.length).toBeGreaterThan(0);
+    expect(getAgentStatus("ghost-agent").detail.length).toBeGreaterThan(0);
   });
 });
 

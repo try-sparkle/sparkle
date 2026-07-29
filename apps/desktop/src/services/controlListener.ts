@@ -35,6 +35,7 @@ import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 import { reportControlOp } from "./selfReportObservability";
+import { livenessOf } from "./agentLiveness";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab } from "../types";
 
@@ -281,33 +282,13 @@ const OMITTED_IDS_CAP = 20;
  *  — the same value workerAttention paints RED — and could reasonably conclude it died and respawn
  *  it. `liveness` is the field that tells the two apart. Found by roborev 53476.
  *
- *    local        — this window has a runtime status entry; `status` is authoritative.
- *    other-window — no local entry, but a pane for this agent is open in SOME window (openAgentIds
- *                   is persisted and merged app-wide). This window CANNOT OBSERVE its status: the
- *                   agent may be running or may have finished. `status` here is a default, not a
- *                   reading.
- *    unknown      — no local entry and no open pane this window can see. Genuinely stopped, OR a
- *                   just-spawned worker whose pane has not mounted yet.
- *
- *  NEITHER non-local label is a liveness ASSERTION — they mark the absence of an observation, and
- *  that asymmetry is deliberate. `openAgentIds` is cleared only by runtimeStore.close() (tab close /
- *  window close / worker despawn) and is persisted across relaunch, so a worker whose process has
- *  exited keeps its id in the set. Reading "other-window" as "alive" would flip the original bug
- *  into a worse one: instead of falsely respawning a live worker, a caller would never observe one
- *  die and would wait on it forever. If you need a real death signal, ask something that observes
- *  the process — an orchestrator has wait_for_workers and the worker's own result file; get_state
- *  is a UI-roster read, not a process monitor. (roborev 53476 added the field, 53552 corrected what
- *  it is allowed to claim.) */
-export type AgentLiveness = "local" | "other-window" | "unknown";
-
-function livenessOf(
-  id: string,
-  status: Record<string, unknown>,
-  openIds: ReadonlySet<string>,
-): AgentLiveness {
-  if (status[id] !== undefined) return "local";
-  return openIds.has(id) ? "other-window" : "unknown";
-}
+ *  THE TYPE AND THE RULE NOW LIVE IN `services/agentLiveness`, re-exported here so existing importers
+ *  and the doc trail above keep working. They moved because the same mistake was live in a second
+ *  place — `conciergeTools/terminal.getAgentStatus` was reporting `needsYou: false` for agents it had
+ *  never observed — and a rule stated in one handler cannot be inherited by another surface. Read
+ *  that module for the vocabulary and for why neither non-local label is a liveness assertion.
+ *  (roborev 53476 added the field, 53552 corrected what it is allowed to claim.) */
+export type { AgentLiveness } from "./agentLiveness";
 
 /** Whether a caller may run PRIVILEGED ops (set_theme / set_config). Fails CLOSED: the caller must
  *  resolve to a known, NON-worker (interactive) agent. Workers run unattended and auto-approve every

@@ -490,11 +490,23 @@ fn build_concierge_exec(
 /// Serialize the concierge's `mcpServers` map. Pure so the shape is unit-testable without an
 /// AppHandle, a live bridge, or a filesystem.
 ///
-/// Mirrors `claudeSpawn.ts`'s `controlMcpServers`, with ONE deliberate difference: no
-/// `SPARKLE_AGENT_ID`. An agent's control identity is a claimed env var the server stamps onto
-/// each request; the concierge's is STRUCTURAL — the Rust listener stamps
-/// `CONCIERGE_CALLER_AGENT_ID` on everything arriving on this socket, whatever the client sends.
-/// Passing an id here would be inert at best and misleading at worst.
+/// Mirrors `claudeSpawn.ts`'s `controlMcpServers`, with TWO deliberate differences.
+///
+/// 1. No `SPARKLE_AGENT_ID`. An agent's control identity is a claimed env var the server stamps
+///    onto each request; the concierge's is STRUCTURAL — the Rust listener stamps
+///    `CONCIERGE_CALLER_AGENT_ID` on everything arriving on this socket, whatever the client sends.
+///    Passing an id here would be inert at best and misleading at worst.
+///
+/// 2. `SPARKLE_CONTROL_NO_SELF=1`, which is the POSITIVE marker for "this caller has no agent row
+///    of its own". The MCP server uses it to decide whether the per-agent tools may advertise a
+///    self-default (`rename_agent` with no `targetAgentId` = "me"). It must be a marker rather than
+///    an inference from `SPARKLE_AGENT_ID` being empty, because ABSENCE HERE DOES NOT MEAN ABSENCE
+///    IN THE CHILD: this `env` map is merged onto the inherited environment, the concierge is
+///    spawned through `Command::new(SHELL)` with the app's full environment, and Claude Code passes
+///    its own environment through to stdio MCP children. Launch the app from an agent's PTY — the
+///    repo's own dev workflow, where `claudeSpawn.ts` has already exported `SPARKLE_AGENT_ID` — and
+///    the concierge's control child would inherit a non-empty id, conclude it was an agent, and go
+///    back to promising a self-default the app refuses with `target_required`. (roborev 54546.)
 fn concierge_mcp_config_json(
     node_path: &str,
     server_path: &str,
@@ -509,6 +521,10 @@ fn concierge_mcp_config_json(
                 "env": {
                     "SPARKLE_CONTROL_SOCKET": socket_path,
                     "SPARKLE_CONTROL_TOKEN": token,
+                    // Also blanks any INHERITED id, so the server sees an empty string even if the
+                    // marker were ever dropped — belt and braces on the same fact.
+                    "SPARKLE_AGENT_ID": "",
+                    "SPARKLE_CONTROL_NO_SELF": "1",
                 },
             }
         }
@@ -1491,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_json_wires_the_socket_and_omits_any_claimed_agent_id() {
+    fn mcp_config_json_wires_the_socket_and_claims_no_agent_id() {
         let json = concierge_mcp_config_json("/usr/bin/node", "/app/server.js", "/tmp/c.sock", "tok");
         let v: Value = serde_json::from_str(&json).unwrap();
         let srv = &v["mcpServers"]["sparkle-control"];
@@ -1499,9 +1515,24 @@ mod tests {
         assert_eq!(srv["args"][0], "/app/server.js");
         assert_eq!(srv["env"]["SPARKLE_CONTROL_SOCKET"], "/tmp/c.sock");
         assert_eq!(srv["env"]["SPARKLE_CONTROL_TOKEN"], "tok");
-        // Identity is STRUCTURAL (stamped by the Rust listener from the socket), never claimed
-        // by the client — so no SPARKLE_AGENT_ID here, unlike a build agent's control config.
-        assert!(srv["env"].get("SPARKLE_AGENT_ID").is_none());
+        // Identity is STRUCTURAL (stamped by the Rust listener from the socket), never claimed by
+        // the client — so no usable SPARKLE_AGENT_ID, unlike a build agent's control config. It is
+        // set EMPTY rather than omitted: omitting it leaves whatever the app inherited from the
+        // shell that launched it, and an agent's PTY exports one.
+        assert_eq!(srv["env"]["SPARKLE_AGENT_ID"], "");
+    }
+
+    // The MCP server decides whether to advertise a self-default ("omit targetAgentId to rename
+    // YOURSELF") from this marker. Asserting on the POSITIVE marker rather than on the absence of
+    // an id is the whole point: absence in this map is not absence in the child process.
+    #[test]
+    fn mcp_config_json_marks_the_concierge_as_having_no_agent_row_of_its_own() {
+        let json = concierge_mcp_config_json("/usr/bin/node", "/app/server.js", "/tmp/c.sock", "tok");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["mcpServers"]["sparkle-control"]["env"]["SPARKLE_CONTROL_NO_SELF"], "1",
+            "without this the per-agent tools promise a self-default the app refuses"
+        );
     }
 
     #[cfg(unix)]
