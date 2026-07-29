@@ -160,12 +160,22 @@ function dragSeamBy(dx: number, from = 500) {
  *
  *   • the default    — read off the column at mount;
  *   • the storage key — discovered as the key the drag actually writes;
- *   • the max clamp   — proven by IDEMPOTENCE (a bigger drag lands on the same width), which needs
- *                       no number at all;
- *   • out-of-clamp    — seeded as a value orders of magnitude past any plausible bound.
+ *   • the bounds      — LEARNED, by dragging past each end and reading where the column stops;
+ *   • the drag deltas — a FRACTION of the learned headroom, never a fixed number of pixels;
+ *   • out-of-clamp    — seeded ONE PAST a learned bound, so the seed pins that bound exactly.
  *
- * The tests therefore survive a re-tune of any of the four, and still fail if the width stops
- * arriving — which is the only thing they are here to watch.
+ * The last three are corrections, and the reasons are worth keeping (roborev 55393):
+ *
+ *   • A fixed `dragSeamBy(40)` trades a hardcoded WIDTH for a hardcoded DELTA — the same coupling.
+ *     It silently assumes ≥40px of headroom between the default and the max; re-tune the default
+ *     upward and the commit clamps, so the assertion fails as "the width didn't arrive" — precisely
+ *     the misleading failure this observation strategy exists to avoid.
+ *   • Seeding a magic extreme (`1`, `1000000`) pins only `MIN > 1` and `MAX < 1000000`. Weakening the
+ *     initializer to `saved >= 50` restores a stale 50 and wedges the column to a sliver, while both
+ *     extreme seeds still fall through to the default and stay green. One past the LEARNED bound
+ *     pins the bound itself, and still without a literal in this file.
+ *   • The movement guard cannot be unconditional: if the default ever coincides with a bound, a
+ *     perfectly working clamp reads as "the drag registers but nothing moves".
  */
 const mountAndReadDefault = () => {
   render(<Workspace />);
@@ -189,16 +199,45 @@ function keyWrittenBy(action: () => void): string {
   return added[0] as string;
 }
 
+/** Mount, drag far past one end, and read where the column came to rest. A fresh mount + cleared
+ *  storage each time, so the value is the CLAMP and not a leftover from an earlier phase. */
+function learnBound(direction: -1 | 1): number {
+  cleanup();
+  localStorage.clear();
+  const start = Number(mountAndReadDefault());
+  dragSeamBy(direction * 9000);
+  const bound = Number(conciergeWidth());
+  cleanup();
+  localStorage.clear();
+  return bound === start ? start : bound;
+}
+
+/** The default, and the real clamp either side of it — all read out of the running component. */
+function learnGeometry() {
+  const start = Number(mountAndReadDefault());
+  cleanup();
+  localStorage.clear();
+  return { start, min: learnBound(-1), max: learnBound(1) };
+}
+
+/** A drag that is guaranteed to land strictly INSIDE the clamp — a quarter of the headroom above
+ *  the default, so it never silently collides with the max the way a fixed +40 can. */
+function safeDelta(start: number, max: number): number {
+  return Math.max(1, Math.floor((max - start) / 4));
+}
+
 describe("dragging the concierge seam moves the column", () => {
   it("delivers the dragged width to the column, not just to the handler", () => {
-    const start = Number(mountAndReadDefault());
-    expect(start).toBeGreaterThan(0);
+    const { start, max } = learnGeometry();
+    const dx = safeDelta(start, max);
 
-    dragSeamBy(40);
+    render(<Workspace />);
+    expect(Number(conciergeWidth())).toBe(start);
+    dragSeamBy(dx);
 
-    // Derived from what the column actually mounted at — a re-tuned default stays green here, while
-    // a width that fails to arrive still fails.
-    expect(conciergeWidth()).toBe(String(start + 40));
+    // Both the base and the delta come from the running component, so a re-tuned default or a
+    // narrowed range stays green while a width that fails to arrive still fails.
+    expect(conciergeWidth()).toBe(String(start + dx));
   });
 
   /**
@@ -214,10 +253,11 @@ describe("dragging the concierge seam moves the column", () => {
    * clear phase 2 mounts already at the bound and its "bigger" drag never travels from the default.
    */
   function twoDragsPastBound(first: number, second: number) {
+    cleanup();
+    localStorage.clear();
     const start = Number(mountAndReadDefault());
     dragSeamBy(first);
     const bound = conciergeWidth();
-    expect(Number(bound)).not.toBe(start); // it actually moved
     cleanup();
     localStorage.clear();
 
@@ -234,14 +274,19 @@ describe("dragging the concierge seam moves the column", () => {
     // Asserted by IDEMPOTENCE rather than against the bound's value: whatever the max is, dragging
     // further must not move the column past it. That is the property, and it needs no literal.
     const { start, bound, again } = twoDragsPastBound(4000, 9000);
-    expect(Number(bound)).toBeGreaterThan(start);
+    // Guarded, not unconditional: were the default ever re-tuned ONTO the max, a working clamp would
+    // legitimately not move, and asserting movement would turn that into a false "nothing arrived".
+    if (Number(bound) !== start) expect(Number(bound)).toBeGreaterThan(start);
     expect(again).toBe(bound);
   });
 
   it("persists the dragged width AND reads it back on the next launch", () => {
-    const start = Number(mountAndReadDefault());
-    const key = keyWrittenBy(() => dragSeamBy(60));
-    const dragged = String(start + 60);
+    const { start, max } = learnGeometry();
+    const dx = safeDelta(start, max);
+
+    render(<Workspace />);
+    const key = keyWrittenBy(() => dragSeamBy(dx));
+    const dragged = String(start + dx);
     expect(localStorage.getItem(key)).toBe(dragged);
 
     // THE ROUND TRIP, not just the write. Asserting only the localStorage value leaves the
@@ -258,30 +303,34 @@ describe("dragging the concierge seam moves the column", () => {
     // BOTH ends, not just the max. A min bypass between handler and column is a different edit from
     // a max bypass, and asserting only the upper bound leaves the lower one unguarded.
     const { start, bound, again } = twoDragsPastBound(-4000, -9000);
-    expect(Number(bound)).toBeLessThan(start);
+    if (Number(bound) !== start) expect(Number(bound)).toBeLessThan(start);
     expect(again).toBe(bound);
     // And it must be a real floor, not a collapse to nothing.
     expect(Number(bound)).toBeGreaterThan(0);
   });
 
-  // BOTH HALVES of the read-back validation, seeded ABOVE and BELOW.
+  // BOTH HALVES of the read-back validation, seeded ONE PAST each LEARNED bound.
   //
-  // The initializer is `saved >= MIN && saved <= MAX ? saved : DEFAULT`, and an out-of-clamp seed
-  // only ever exercises the side it is on. Seeding high alone let the LOWER bound be weakened to
-  // `saved >= 1` with every test still green — while a stale "50" from an older clamp is restored
-  // and wedges the column to a 50px sliver, which is precisely the guarantee the source comment
-  // claims (roborev 55387). Empty storage cannot catch it either: `Number(null) === 0` falls to the
-  // default through the same branch.
+  // The initializer is `saved >= MIN && saved <= MAX ? saved : DEFAULT`, and a seed only ever
+  // exercises the side it is on — so both sides are needed. But the seed must also sit exactly one
+  // step outside the real bound: a magic extreme (`1`, `1000000`) pins only `MIN > 1` and
+  // `MAX < 1000000`, so weakening the initializer to `saved >= 50` would restore a stale 50 and
+  // wedge the column to a sliver while both extremes still fell through to the default
+  // (roborev 55387 found the missing half, 55393 found the seeds too loose to pin it).
+  //
+  // Empty storage cannot substitute for either case: `Number(null) === 0` reaches the default
+  // through the same branch without testing a bound at all.
   it.each([
-    ["above the maximum", "1000000"],
-    ["below the minimum", "1"],
-  ])("ignores a persisted width %s rather than restoring it", (_label, seeded) => {
-    const start = mountAndReadDefault();
-    const key = keyWrittenBy(() => dragSeamBy(40));
+    ["above the maximum", (g: { min: number; max: number }) => g.max + 1],
+    ["below the minimum", (g: { min: number; max: number }) => g.min - 1],
+  ])("ignores a persisted width %s rather than restoring it", (_label, seedFor) => {
+    const geo = learnGeometry();
+    render(<Workspace />);
+    const key = keyWrittenBy(() => dragSeamBy(safeDelta(geo.start, geo.max)));
     cleanup();
-    localStorage.setItem(key, seeded);
+    localStorage.setItem(key, String(seedFor(geo)));
 
     render(<Workspace />);
-    expect(conciergeWidth()).toBe(start);
+    expect(Number(conciergeWidth())).toBe(geo.start);
   });
 });
