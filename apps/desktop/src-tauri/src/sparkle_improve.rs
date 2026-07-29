@@ -78,15 +78,81 @@ pub struct SparkleImproveManager {
     pass: Mutex<Option<RunningPass>>,
 }
 
-/// Best-effort cleanup on app teardown: a still-running pass must not outlive the app as a
-/// detached `--dangerously-skip-permissions` process holding the agent worktree. (On a hard
-/// kill this never runs — the stale reclaim covers the next launch.)
-impl Drop for SparkleImproveManager {
-    fn drop(&mut self) {
-        if let Some(mut pass) = lock_pass(&self.pass).take() {
-            kill_pass_group(&mut pass.child);
+impl SparkleImproveManager {
+    /// Kill and RECORD an in-flight pass because the app is going away. Idempotent: it `take()`s
+    /// the slot, so a second call (or a call after the pass already ended) is a cheap no-op.
+    ///
+    /// This is the app-teardown entry point wired from `RunEvent::Exit` in `lib.rs`, NOT `Drop`.
+    /// On macOS the ordinary Cmd+Q path never drops managed state: tao's event loop ends in
+    /// `process::exit()` and never returns, so `App` (and this manager) leak at exit rather than
+    /// being dropped — the same reason dictation stops its capture from `RunEvent::Exit`. Driving
+    /// the record from there is what makes the `app-teardown` log line actually appear on quit,
+    /// which is the entire point of recording it. `Drop` stays as an idempotent backstop for the
+    /// paths that DO drop (tests, and any non-macOS runtime that unwinds the state).
+    pub fn end_in_flight_pass(&self) {
+        if let Some(pass) = lock_pass(&self.pass).take() {
+            end_pass_early(pass, PassEnd::AppTeardown);
         }
     }
+}
+
+/// Best-effort backstop: a still-running pass must not outlive the app as a detached
+/// `--dangerously-skip-permissions` process holding the agent worktree. The live quit path is
+/// `end_in_flight_pass` via `RunEvent::Exit` (see there for why macOS never runs this `Drop`); on
+/// a hard kill neither runs and the stale reclaim covers the next launch.
+impl Drop for SparkleImproveManager {
+    fn drop(&mut self) {
+        self.end_in_flight_pass();
+    }
+}
+
+/// Why a pass ended before it could report its own result. Each variant is a different actor
+/// taking the slot; all of them kill the process group, and WHICH one it was is the fact you
+/// need when reading back a pass that produced no outcome.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PassEnd {
+    /// The frontend cancelled — its 30-minute timeout, or the user opening the interactive pane.
+    Cancelled,
+    /// A later run presumed this one hung and reclaimed the slot (see `STALE_PASS_MAX`).
+    Reclaimed,
+    /// The app itself is going away and is taking the pass with it.
+    AppTeardown,
+}
+
+impl PassEnd {
+    fn reason(self) -> &'static str {
+        match self {
+            PassEnd::Cancelled => "cancelled",
+            PassEnd::Reclaimed => "stale-reclaim",
+            PassEnd::AppTeardown => "app-teardown",
+        }
+    }
+
+    /// A reclaim means a pass sat past `STALE_PASS_MAX` without finishing — anomalous, so WARN.
+    /// Cancel and app teardown are routine, so they stay at INFO and don't cry wolf.
+    fn is_anomalous(self) -> bool {
+        self == PassEnd::Reclaimed
+    }
+}
+
+/// Kill a pass that was taken over mid-flight, and RECORD that it happened.
+///
+/// The reader thread only reports an outcome when the slot still holds its token, so on every
+/// one of these paths the pass dies silently as far as `pass finished` / `pass failed` are
+/// concerned. App teardown used to be silent in the log too, which makes an interrupted pass
+/// indistinguishable from one that is still running: it logs `starting hourly pass` and then
+/// simply never logs an end, and dating the interruption means noticing the missing line and
+/// correlating it against the next `Sparkle starting`. One line here closes that, and
+/// `elapsed_ms` says how much of the pass's ~30-minute budget it got through first.
+fn end_pass_early(mut pass: RunningPass, end: PassEnd) {
+    let elapsed_ms = pass.started.elapsed().as_millis() as u64;
+    let reason = end.reason();
+    if end.is_anomalous() {
+        tracing::warn!(reason, elapsed_ms, "sparkle_improve: pass ended before it reported a result (group killed)");
+    } else {
+        tracing::info!(reason, elapsed_ms, "sparkle_improve: pass ended before it reported a result (group killed)");
+    }
+    kill_pass_group(&mut pass.child);
 }
 
 fn lock_pass(m: &Mutex<Option<RunningPass>>) -> MutexGuard<'_, Option<RunningPass>> {
@@ -232,8 +298,8 @@ pub fn sparkle_improve_run(
             // event race accepted as-is (roborev #25141); don't add an emit back here, and if
             // that race ever matters, the fix is token-tagging the done/error payloads.
             tracing::warn!("sparkle_improve_run: reclaiming a stale pass (older than {STALE_PASS_MAX:?})");
-            if let Some(mut stale) = slot.take() {
-                kill_pass_group(&mut stale.child);
+            if let Some(stale) = slot.take() {
+                end_pass_early(stale, PassEnd::Reclaimed);
             }
         }
         let mut child = cmd
@@ -316,21 +382,24 @@ pub fn sparkle_improve_run(
             // Reap — but only if the slot still holds OUR pass (token match). A cancel or a
             // stale reclaim takes the pass first (and kills/reaps it); in both cases the
             // teardown was initiated elsewhere, so we stay silent and leave the slot alone.
-            let child = {
+            let taken = {
                 let manager = read_app.state::<SparkleImproveManager>();
                 let mut slot = lock_pass(&manager.pass);
                 match slot.as_ref() {
-                    Some(p) if p.token == token => slot.take().map(|p| p.child),
+                    Some(p) if p.token == token => slot.take().map(|p| (p.child, p.started)),
                     _ => None,
                 }
             };
-            let Some(mut child) = child else { return };
+            let Some((mut child, started)) = taken else { return };
             let wait_result = child.wait();
             let ok = matches!(wait_result, Ok(ref status) if status.success());
             let text = if !final_text.is_empty() { final_text } else { acc };
+            // Same field the early-teardown paths log, so "how long did that pass run" is one
+            // question with one answer however the pass ended.
+            let elapsed_ms = started.elapsed().as_millis() as u64;
 
             if ok {
-                tracing::info!(chars = text.len(), "sparkle_improve: pass finished");
+                tracing::info!(chars = text.len(), elapsed_ms, "sparkle_improve: pass finished");
                 let _ = read_app.emit("sparkle_improve:done", ImproveDone { session_id, text });
             } else {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
@@ -342,7 +411,7 @@ pub fn sparkle_improve_run(
                     &plain_stdout,
                     &wait_result,
                 );
-                tracing::warn!(%message, "sparkle_improve: pass failed");
+                tracing::warn!(%message, elapsed_ms, "sparkle_improve: pass failed");
                 let _ = read_app.emit("sparkle_improve:error", ImproveError { message });
             }
         });
@@ -359,9 +428,8 @@ pub fn sparkle_improve_run(
 #[tauri::command]
 pub fn sparkle_improve_cancel(manager: State<SparkleImproveManager>) -> Result<(), String> {
     let pass = lock_pass(&manager.pass).take();
-    if let Some(mut pass) = pass {
-        tracing::info!("sparkle_improve_cancel: killing in-flight pass (group)");
-        kill_pass_group(&mut pass.child);
+    if let Some(pass) = pass {
+        end_pass_early(pass, PassEnd::Cancelled);
     }
     Ok(())
 }
@@ -467,6 +535,111 @@ fn failure_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real, killable stand-in for an in-flight pass: its own process group, like the spawn
+    /// path gives a live one, so `kill_pass_group`'s negative-pid signal has a group to land on.
+    #[cfg(unix)]
+    fn spawn_sleeper() -> RunningPass {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 60"]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.process_group(0);
+        let child = cmd.spawn().expect("spawn sleeper");
+        RunningPass { child, started: Instant::now(), token: 0 }
+    }
+
+    /// `kill(pid, 0)` probes for existence without signalling. `end_pass_early` reaps (via
+    /// `kill_process_group`'s `wait`), so a killed child is GONE here, not left as a zombie.
+    #[cfg(unix)]
+    fn is_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn every_early_end_names_itself_and_only_a_reclaim_is_anomalous() {
+        // The reason strings are the whole point of the field — a log that can't tell teardown
+        // from a cancel can't date an interrupted pass, which is what this exists to fix.
+        let all = [PassEnd::Cancelled, PassEnd::Reclaimed, PassEnd::AppTeardown];
+        let reasons: Vec<&str> = all.iter().map(|e| e.reason()).collect();
+        assert_eq!(reasons, ["cancelled", "stale-reclaim", "app-teardown"]);
+        // A hung pass is the only anomaly; routine endings must not log at WARN and cry wolf.
+        assert!(PassEnd::Reclaimed.is_anomalous());
+        assert!(!PassEnd::Cancelled.is_anomalous());
+        assert!(!PassEnd::AppTeardown.is_anomalous());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_pass_early_still_kills_the_group_it_reports_on() {
+        // Recording the end must not have cost us the kill: an unattended
+        // --dangerously-skip-permissions child outliving its slot would keep mutating the
+        // agent worktree with nothing holding a handle to stop it.
+        let pass = spawn_sleeper();
+        let pid = pass.child.id() as i32;
+        end_pass_early(pass, PassEnd::Cancelled);
+        assert!(!is_alive(pid), "cancelled pass survived the group kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_in_flight_pass_kills_records_and_is_idempotent() {
+        // This is the entry point `RunEvent::Exit` calls on quit — the path that actually runs on
+        // macOS, where `Drop` does not. It must kill the group (so a detached pass can't outlive
+        // the app) and tolerate a second call: `RunEvent::Exit` firing and a later `Drop` both
+        // reach it, and after the first `take()` the rest are no-ops.
+        let manager = SparkleImproveManager::default();
+        let pass = spawn_sleeper();
+        let pid = pass.child.id() as i32;
+        *lock_pass(&manager.pass) = Some(pass);
+        assert!(is_alive(pid));
+        manager.end_in_flight_pass();
+        assert!(!is_alive(pid), "quit path did not kill the in-flight pass");
+        // Idempotent: no pass in the slot now, so this neither panics nor signals anything.
+        manager.end_in_flight_pass();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_manager_takes_the_in_flight_pass_with_it() {
+        // App teardown was the one path that killed the pass without leaving any record. It
+        // still has to kill it — the record is additive.
+        let manager = SparkleImproveManager::default();
+        let pass = spawn_sleeper();
+        let pid = pass.child.id() as i32;
+        *lock_pass(&manager.pass) = Some(pass);
+        assert!(is_alive(pid));
+        drop(manager);
+        assert!(!is_alive(pid), "pass outlived the app that spawned it");
+    }
+
+    /// The app-teardown record and group kill only actually happen if `RunEvent::Exit` calls
+    /// `end_in_flight_pass` — `Drop` does not run on the macOS Cmd+Q path (tao ends in
+    /// `process::exit()`). The unit tests above drive `end_in_flight_pass` directly, so they pass
+    /// whether or not that one line in `lib.rs` exists — which is exactly the blind spot that let
+    /// the parent commit hang the record off a never-run `Drop` with a green suite. Pin the wiring
+    /// in source the same way `accounts.rs`, `app_menu.rs`, and `beads_cmd.rs` pin theirs: the bug
+    /// is one deleted line away, and this is the only test that catches that deletion.
+    #[test]
+    fn lib_rs_drives_teardown_from_run_event_exit() {
+        let lib_rs = include_str!("lib.rs");
+        assert!(
+            lib_rs.contains("SparkleImproveManager>().end_in_flight_pass()"),
+            "RunEvent::Exit must call end_in_flight_pass — Drop does not run on the macOS quit \
+             path, so without this line the app-teardown record and the group kill silently stop"
+        );
+        // And it must live in the Exit arm, next to the dictation stop that is there for the same
+        // before-exit() reason — a call floated out of that arm would not fire on quit.
+        let exit_arm = lib_rs
+            .split("RunEvent::Exit =>")
+            .nth(1)
+            .expect("lib.rs must have a RunEvent::Exit arm");
+        let arm_body = &exit_arm[..exit_arm.find("\n            }").unwrap_or(exit_arm.len())];
+        assert!(
+            arm_body.contains("stop_capture()") && arm_body.contains("end_in_flight_pass()"),
+            "end_in_flight_pass must be called from within the RunEvent::Exit arm"
+        );
+    }
 
     /// A temp base dir with a real worktree-ish child dir inside it, for validation tests.
     fn test_base(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {

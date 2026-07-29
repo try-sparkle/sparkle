@@ -15,6 +15,14 @@ import { isInMotion } from "../../engine/inMotion";
 import { resolveStage } from "../../engine/workflowStage";
 import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
 import { detectPendingQuestion } from "./pendingQuestion";
+import {
+  NO_OUTAGE,
+  isOutageOpen,
+  noteFailure as noteOutageFailure,
+  noteSuccess as noteOutageSuccess,
+  outageCooldownRemainingMs,
+  type OutageState,
+} from "./vendorOutage";
 import { log } from "../../logger";
 import type { AgentTabStatus } from "../../types";
 import type { SuggestionButton } from "./types";
@@ -158,6 +166,18 @@ export const RETRY_BACKOFF_MS = 700;
  *  first failure). Grows exponentially and is capped so it never stalls the UI. Pure, for testing. */
 export function retryBackoffMs(failures: number): number {
   return Math.min(RETRY_BACKOFF_MS * 2 ** Math.max(0, failures - 1), 4000);
+}
+
+// Vendor-outage breaker state, deliberately MODULE-level rather than a ref: its entire job is to
+// carry "the vendor is down" ACROSS agents and across settled states, which is exactly the scope
+// the per-state retry budget (`fail`, a ref) cannot reach. One hook instance per agent, one shared
+// breaker for the vendor they all call. See ./vendorOutage for the policy and why 5xx only.
+let outage: OutageState = NO_OUTAGE;
+
+/** Reset the shared breaker. Tests only — module state outlives a render, so a test that opens the
+ *  breaker would otherwise leak a cooldown into every test that runs after it. */
+export function __resetVendorOutageForTest(): void {
+  outage = NO_OUTAGE;
 }
 
 // How often the settle-watcher re-hashes the scrollback while the agent is blocked on the user.
@@ -312,6 +332,14 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // Pending failure-retry timer (see retryBackoffMs). Held in a ref so the effect cleanup can cancel
   // it when the state moves on before the backoff fires, and so we never stack overlapping timers.
   const retryTimer = useRef<number | null>(null);
+  // Wake timer for the vendor-outage breaker, kept SEPARATE from retryTimer: the breaker skips
+  // before a compute is issued, so there is no failed compute to back off, and reusing that ref
+  // would let the two clobber each other's pending timer. Deferring is only safe when something
+  // re-runs the effect on the flip (see computeDeferralReason — offline has `isOnline`, credits has
+  // `learnedOn`); this breaker's flip is the passage of time, which has no dep, so this timer IS
+  // the dep. Without it, a state skipped during an outage would strand until the agent's scrollback
+  // or status happened to change.
+  const outageTimer = useRef<number | null>(null);
   // Consecutive-failure counter (+ the hash it's failing on) to bound retries per failing state.
   const fail = useRef<FailState>(NO_FAILURES);
   // Whether we last pushed a NON-empty set to the phone — so retiring only emits a clearing push
@@ -573,6 +601,30 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       log.debug("suggestions", "memo hit", { agentId, buttons: hit.buttons.length });
       return;
     }
+    // The vendor is currently returning 5xx to everyone — don't buy this call. Placed AFTER the
+    // memo hit above (that path spends nothing and is still correct during an outage) and BEFORE
+    // the in-flight guard is claimed, so an open breaker costs one probe per cooldown instead of
+    // one paid call per settled state. This is the case the per-state retry budget structurally
+    // cannot see: 87% of the rejected computes in a measured episode were FIRST attempts on states
+    // the budget had never seen.
+    //
+    // Commit NOTHING here — not `lastHash`, not the retry budget. The skipped state must stay
+    // `shouldRecompute`-eligible so the wake below actually recomputes it, and charging it a
+    // budget it never spent would exhaust the state before the vendor came back.
+    if (isOutageOpen(outage, Date.now())) {
+      // Schedule the wake exactly once per cooldown. The settle watcher bumps retryTick every
+      // ~1.2s while the agent stays blocked, so this branch re-runs many times per cooldown;
+      // without the null check each pass would stack another timer and they'd all fire at once.
+      if (outageTimer.current === null) {
+        const wait = outageCooldownRemainingMs(outage, Date.now());
+        log.debug("suggestions", "compute deferred", { agentId, reason: "vendor-outage", wait });
+        outageTimer.current = window.setTimeout(() => {
+          outageTimer.current = null;
+          setRetryTick((t) => t + 1);
+        }, wait);
+      }
+      return;
+    }
     computing.current = true;
     // This compute's claim on the guard above. Only the owner may release it — see the `.finally`.
     const myToken = (computeToken.current += 1);
@@ -593,6 +645,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // mid-compute (alive === false), drop the result, leave lastHash unchanged, and bump
         // retryTick so the state we're actually in now recomputes — otherwise the suggestions for
         // that blocked state would be lost until the scrollback or status changed.
+        // A round-trip that RESOLVED proves the vendor is reachable, so close the breaker even on
+        // the superseded path below — the call still landed, and holding a cooldown open past
+        // proof of recovery would keep declining computes for no reason.
+        outage = noteOutageSuccess();
         if (!alive) {
           retryAfter = true;
           return;
@@ -711,6 +767,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // them from this branch — not how transient the condition feels.
         const unavailable = err instanceof AiUnavailableError;
         const message = err instanceof Error ? err.message : String(err);
+        // Fold this rejection into the SHARED breaker before the per-state budget below. Only a
+        // deferred rejection is excluded (it returned above): offline and out-of-credits are local
+        // gates, not evidence about the vendor's health. A run of 5xx opens the cooldown that the
+        // gate above then reads on every agent.
+        outage = noteOutageFailure(outage, message, Date.now());
         // A permanent rejection can't be retried into a success, so burn the whole budget at once:
         // the retry branch below then falls through to the terminal path, and the effect's own
         // budget guard refuses any later re-trigger for this same hash. Two disjoint shapes are
@@ -772,6 +833,10 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       if (retryTimer.current !== null) {
         window.clearTimeout(retryTimer.current);
         retryTimer.current = null;
+      }
+      if (outageTimer.current !== null) {
+        window.clearTimeout(outageTimer.current);
+        outageTimer.current = null;
       }
     };
   }, [agentId, isYourTurn, composerEmpty, learnedOn, retryTick, retire, isOnline]);

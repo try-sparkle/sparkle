@@ -197,8 +197,35 @@ pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
         // per-request failure, so it maps onto the same sentinel as 503: no amount of retrying the
         // same call will make the route appear.
         404 | 503 => "ai_unconfigured".to_string(),
+        // A 502 is the proxy's envelope for "the VENDOR call failed", and the route puts the
+        // vendor's own status in the body (`{"error":"vendor_error","status":<n>}`). Reporting the
+        // envelope's 502 instead of that inner status loses the only bit callers branch on: the JS
+        // retry classifier treats a 4xx as terminal and a 5xx as worth retrying, so a vendor 400
+        // (malformed request, over the context window, unknown model — permanently doomed) arrived
+        // looking like a transient gateway hiccup and was re-issued until the retry budget ran out.
+        // Surface the inner status so it classifies as what it is. Only the NUMBER is taken; the
+        // body is never echoed, and a 502 with no readable status falls through to the generic
+        // message (`vendor_timeout`/`vendor_unreachable` have none, and both are genuinely
+        // retryable, so the 502 they keep is correct).
+        502 => match vendor_status(body) {
+            Some(status) => format!("ai request failed (HTTP {status})"),
+            None => format!("ai request failed (HTTP {code})"),
+        },
         _ => format!("ai request failed (HTTP {code})"),
     }
+}
+
+/// The vendor's own HTTP status out of the proxy's `vendor_error` body, when there is one. Bounded
+/// to a plausible error status so a malformed/hostile `status` can't be pasted into a message that
+/// the JS side then parses as an HTTP code. Pure; separate from `classify_proxy_error` so the
+/// parsing contract is testable on its own.
+fn vendor_status(body: &str) -> Option<u16> {
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if v.get("error").and_then(serde_json::Value::as_str)? != "vendor_error" {
+        return None;
+    }
+    let status = v.get("status").and_then(serde_json::Value::as_u64)?;
+    (400..600).contains(&status).then_some(status as u16)
 }
 
 /// Map a ureq TRANSPORT failure (the request never reached the proxy at all — no HTTP status was
@@ -426,12 +453,49 @@ mod tests {
             "ai_unconfigured"
         );
         assert_eq!(classify_proxy_error(500, "boom"), "ai request failed (HTTP 500)");
-        // 502 (the route's own vendor-failure status) stays generic + retryable: unlike a 404 it can
-        // be a transient vendor blip, so it must keep drawing on the caller's retry budget.
+        // A 502 whose body carries no readable vendor status stays generic + retryable: unlike a 404
+        // it can be a transient vendor blip, so it must keep drawing on the caller's retry budget.
+        // (A 502 that DOES carry a status is unwrapped to that status — see the test below.)
         assert_eq!(
             classify_proxy_error(502, r#"{"error":"vendor_error"}"#),
             "ai request failed (HTTP 502)"
         );
+    }
+
+    #[test]
+    fn classify_proxy_error_reports_the_vendors_status_not_the_502_envelope() {
+        // The bug this pins: a vendor 400 is permanently doomed, but wearing the 502 envelope it
+        // read as a retryable gateway blip and got re-issued until the retry budget was spent.
+        assert_eq!(
+            classify_proxy_error(502, r#"{"error":"vendor_error","status":400}"#),
+            "ai request failed (HTTP 400)"
+        );
+        // A vendor 429 is genuinely retryable — the callers' own classifier exempts it, which only
+        // works if the real status reaches them.
+        assert_eq!(
+            classify_proxy_error(502, r#"{"error":"vendor_error","status":429}"#),
+            "ai request failed (HTTP 429)"
+        );
+        // A vendor 5xx passes through as a 5xx: still retryable, just honestly labelled.
+        assert_eq!(
+            classify_proxy_error(502, r#"{"error":"vendor_error","status":529}"#),
+            "ai request failed (HTTP 529)"
+        );
+    }
+
+    #[test]
+    fn vendor_status_reads_only_a_well_formed_in_range_vendor_error() {
+        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":404}"#), Some(404));
+        // The other 502 shapes the route emits carry no status; they must not be invented.
+        assert_eq!(vendor_status(r#"{"error":"vendor_unreachable"}"#), None);
+        assert_eq!(vendor_status(r#"{"error":"vendor_bad_response"}"#), None);
+        assert_eq!(vendor_status(r#"{"error":"vendor_error"}"#), None);
+        // Out-of-range / wrong-typed / unparseable statuses fall back rather than being pasted into
+        // a message the JS side parses as an HTTP code.
+        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":200}"#), None);
+        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":600}"#), None);
+        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":"400"}"#), None);
+        assert_eq!(vendor_status("not json at all"), None);
     }
 
     #[test]

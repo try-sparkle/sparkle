@@ -653,6 +653,12 @@ pub fn run() {
             // no-active-capture exit is a cheap no-op.
             tauri::RunEvent::Exit => {
                 app.state::<dictation::DictationState>().stop_capture();
+                // Record + kill any in-flight improve pass here rather than in `Drop`: on macOS
+                // this arm fires before `process::exit()`, whereas managed state is leaked (never
+                // dropped) on the ordinary Cmd+Q path, so the `app-teardown` log line — and the
+                // group kill that stops a detached pass from outliving the app — only actually
+                // happen when driven from here. `Drop` remains an idempotent backstop.
+                app.state::<sparkle_improve::SparkleImproveManager>().end_in_flight_pass();
             }
             _ => {}
         });
