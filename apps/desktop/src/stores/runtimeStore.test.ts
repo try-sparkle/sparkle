@@ -835,6 +835,78 @@ describe("runtimeStore — setStatus ref stability (sparkle-f2uz)", () => {
   });
 });
 
+describe("runtimeStore — lastObserved (persist a closed agent's status, sparkle-w340)", () => {
+  it("close() captures the deleted status into lastObserved", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus, close } = useRuntimeStore.getState();
+    setStatus("a", "idle");
+    close("a");
+    const lo = useRuntimeStore.getState().lastObserved["a"];
+    expect(lo?.status).toBe("idle");
+    expect(typeof lo?.at).toBe("number");
+    // …and the live status entry is gone, as before.
+    expect(useRuntimeStore.getState().status["a"]).toBeUndefined();
+  });
+
+  it("close() DEMOTES a red-tier status to `stopped` (a question dies with its PTY)", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus, close } = useRuntimeStore.getState();
+    for (const red of ["waiting", "approval", "blocked", "errored"] as const) {
+      setStatus("a", red);
+      close("a");
+      expect(useRuntimeStore.getState().lastObserved["a"]?.status).toBe("stopped");
+    }
+  });
+
+  it("close() preserves a NON-red status unchanged", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus, close } = useRuntimeStore.getState();
+    setStatus("a", "working");
+    close("a");
+    expect(useRuntimeStore.getState().lastObserved["a"]?.status).toBe("working");
+  });
+
+  it("close() writes NOTHING when the agent was never observed (no manufactured `stopped`)", async () => {
+    const useRuntimeStore = await freshStore();
+    useRuntimeStore.getState().open("a"); // opened but no status ever reported
+    useRuntimeStore.getState().close("a");
+    expect(useRuntimeStore.getState().lastObserved["a"]).toBeUndefined();
+  });
+
+  it("lastObserved is PERSISTED (survives a store reload)", async () => {
+    let useRuntimeStore = await freshStore();
+    useRuntimeStore.getState().setStatus("a", "idle");
+    useRuntimeStore.getState().close("a");
+    // A relaunch: re-import the module so it hydrates from the same localStorage blob.
+    useRuntimeStore = (await import("./runtimeStore")).useRuntimeStore;
+    // Force a rehydrate against the persisted blob (the module cache may hold the pre-reload instance).
+    const persisted = JSON.parse(localStorage.getItem(STORE_KEY) as string);
+    expect(persisted.state.lastObserved?.a?.status).toBe("idle");
+  });
+
+  it("reconcile() prunes lastObserved for agents that no longer exist", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus, close, reconcile } = useRuntimeStore.getState();
+    setStatus("a", "idle");
+    close("a");
+    setStatus("b", "working");
+    close("b");
+    reconcile(["b"]); // a is gone, b survives
+    expect(useRuntimeStore.getState().lastObserved["a"]).toBeUndefined();
+    expect(useRuntimeStore.getState().lastObserved["b"]?.status).toBe("working");
+  });
+
+  it("resetProgress() clears lastObserved so a reused slot doesn't inherit it", async () => {
+    const useRuntimeStore = await freshStore();
+    const { setStatus, close, resetProgress } = useRuntimeStore.getState();
+    setStatus("a", "idle");
+    close("a");
+    expect(useRuntimeStore.getState().lastObserved["a"]).toBeDefined();
+    resetProgress("a");
+    expect(useRuntimeStore.getState().lastObserved["a"]).toBeUndefined();
+  });
+});
+
 describe("runtimeStore — one-time roborev consent trigger", () => {
   // Seed the settings store to a known baseline (roborev on, not yet prompted, modal closed) from
   // the SAME post-reset module graph maybePromptRoborevConsent reads.

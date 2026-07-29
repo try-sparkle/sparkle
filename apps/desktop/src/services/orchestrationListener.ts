@@ -721,7 +721,7 @@ function ensureWorkersOpen(): void {
   const openIds = new Set(rt.openAgentIds);
   const stranded: string[] = [];
   for (const project of projects) {
-    for (const worker of workersNeedingOpen(project.agents, rt.status, openIds)) {
+    for (const worker of workersNeedingOpen(project.agents, rt.status, openIds, rt.lastObserved)) {
       // A worker the user just closed can momentarily still look "stranded" — in a stale snapshot's
       // roster, not open, no status — before the removal propagates. Re-opening it here would
       // resurrect the just-closed row, so skip any id tombstoned as locally-removed (the merge

@@ -583,6 +583,7 @@ export function Workspace() {
       project.agents,
       useRuntimeStore.getState().status,
       new Set(useRuntimeStore.getState().openAgentIds),
+      useRuntimeStore.getState().lastObserved,
       stageFor,
     );
     const next =

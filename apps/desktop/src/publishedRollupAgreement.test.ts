@@ -75,8 +75,8 @@ describe("the column and the published map band identically", () => {
       const openIds = new Set(c.agents.map((a) => a.id));
       const stageOf = () => "building" as never;
 
-      const published = publishedStatusFor(c.agents, status, openIds, stageOf);
-      const { dotOf } = rollupViewFor(c.agents, status, openIds, stageOf);
+      const published = publishedStatusFor(c.agents, status, openIds, {}, stageOf);
+      const { dotOf } = rollupViewFor(c.agents, status, openIds, {}, stageOf);
 
       const feedBand = bandOfStatus(published["p1"]!);
       const columnBand = bandOfRollup(dotOf("p1"));
@@ -99,6 +99,7 @@ describe("the promotion does not destroy the status it writes over", () => {
       agents,
       { p1: "idle", w1: "working" },
       openIds,
+      {},
       // Committed-but-unlanded: what withUnmergedWork escalates on.
       () => "building_saved" as never,
     );
@@ -110,6 +111,7 @@ describe("the promotion does not destroy the status it writes over", () => {
       agents,
       { p1: "idle", w1: "working" },
       openIds,
+      {},
       () => "merged" as never,
     );
     expect(published["p1"]).toBe("working");
@@ -119,13 +121,13 @@ describe("the promotion does not destroy the status it writes over", () => {
   // genuinely working, or the recap reports it as having finished a job it never started.
   it("reports which heads were promoted, and only those", () => {
     const promoted = new Set<string>();
-    publishedStatusFor(agents, { p1: "idle", w1: "working" }, openIds, () => "merged" as never, promoted);
+    publishedStatusFor(agents, { p1: "idle", w1: "working" }, openIds, {}, () => "merged" as never, promoted);
     expect([...promoted]).toEqual(["p1"]);
   });
 
   it("reports nothing when the head is working under its own steam", () => {
     const promoted = new Set<string>();
-    publishedStatusFor(agents, { p1: "working", w1: "working" }, openIds, () => "merged" as never, promoted);
+    publishedStatusFor(agents, { p1: "working", w1: "working" }, openIds, {}, () => "merged" as never, promoted);
     expect(promoted.size).toBe(0);
   });
 });

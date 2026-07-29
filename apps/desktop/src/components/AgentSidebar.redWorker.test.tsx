@@ -43,7 +43,10 @@ function seed(
 ): { project: Project; open: ReturnType<typeof vi.fn> } {
   const orchestrator = mkAgent("a1", "Alpha", { namePinned: true });
   const worker = mkAgent("w1", "Fix The Parser", {
-    kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1",
+    // createdAt: 1 (distant past) so an UNSTARTED w1 clears the unstarted-worker dwell and reads as a
+    // genuine strand; harmless when the case gives w1 a live status, which wins liveness anyway
+    // (engine/workerAttention, sparkle-w340).
+    kind: "worker", parentId: "a1", baseBranch: "main", worktreePath: "/wt/w1", createdAt: 1,
   });
   const project: Project = {
     id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",

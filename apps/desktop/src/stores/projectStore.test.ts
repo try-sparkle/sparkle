@@ -300,6 +300,23 @@ describe("projectStore shell agent", () => {
     expect(agent.namePinned).toBe(true); // explicit name → pinned, won't auto-rename
   });
 
+  it("addAgent stamps createdAt (drives the unstarted-worker dwell, sparkle-w340)", () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const before = Date.now();
+    const aid = useProjectStore.getState().addAgent(pid, { kind: "worker", parentId: "b1" })!;
+    const after = Date.now();
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
+    // Default: a real epoch-ms stamp in [before, after] — previously the field was left undefined,
+    // which made the dwell inert.
+    expect(typeof agent.createdAt).toBe("number");
+    expect(agent.createdAt).toBeGreaterThanOrEqual(before);
+    expect(agent.createdAt).toBeLessThanOrEqual(after);
+    // An explicit createdAt (used to backdate a worker past the dwell in strand tests) is honored.
+    const aid2 = useProjectStore.getState().addAgent(pid, { kind: "worker", parentId: "b1", createdAt: 1 })!;
+    const agent2 = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid2)!;
+    expect(agent2.createdAt).toBe(1);
+  });
+
   it("migrate normalizes a PR #62 v4-collision record (shellCommand but no autoNameVariants)", () => {
     // PR #62 shipped shellCommand as v4 on its own branch; main used v4=autoNameVariants. A store
     // saved under #62's v4 reports version 4, so the version-gated `< 4` block is skipped. The

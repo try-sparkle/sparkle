@@ -9,7 +9,12 @@ import {
   workersNeedingOpen,
   withUnstartedWorkerAttention,
   withRedWorkerAttention,
+  UNSTARTED_WORKER_DWELL_MS,
+  type LastObservedMap,
 } from "./workerAttention";
+
+// No prior observation for anyone unless a case says otherwise — the common case.
+const NONE_RAN: LastObservedMap = {};
 
 // Minimal factory — workerAttention only reads id/kind/parentId/worktreePath.
 function agent(over: Partial<AgentTab> & { id: string }): AgentTab {
@@ -18,6 +23,9 @@ function agent(over: Partial<AgentTab> & { id: string }): AgentTab {
     parentId: "build1",
     worktreePath: "/wt/" + over.id,
     name: over.id,
+    // Epoch ms — 0 is always past UNSTARTED_WORKER_DWELL_MS, so the dwell clause is satisfied by
+    // default and a case that wants to probe the dwell sets its own recent createdAt.
+    createdAt: 0,
     ...over,
   } as AgentTab;
 }
@@ -27,30 +35,76 @@ const parentOpen: ReadonlySet<string> = new Set<string>(["build1"]);
 
 describe("isUnstartedWorker", () => {
   it("is true for a materialized worker that isn't open and has no live status", () => {
-    expect(isUnstartedWorker(agent({ id: "w" }), {}, parentOpen)).toBe(true);
+    expect(isUnstartedWorker(agent({ id: "w" }), {}, parentOpen, NONE_RAN)).toBe(true);
   });
 
   it("is false once the worker is open (its pane mounts → it will launch)", () => {
-    expect(isUnstartedWorker(agent({ id: "w" }), {}, new Set(["build1", "w"]))).toBe(false);
+    expect(isUnstartedWorker(agent({ id: "w" }), {}, new Set(["build1", "w"]), NONE_RAN)).toBe(false);
   });
 
   it("is false once the worker has a live PTY status (already running)", () => {
-    expect(isUnstartedWorker(agent({ id: "w" }), { w: "working" }, parentOpen)).toBe(false);
+    expect(isUnstartedWorker(agent({ id: "w" }), { w: "working" }, parentOpen, NONE_RAN)).toBe(false);
   });
 
   it("is false before the worktree is cut (queued / mid-spawn — don't force it open)", () => {
-    expect(isUnstartedWorker(agent({ id: "w", worktreePath: null }), {}, parentOpen)).toBe(false);
+    expect(isUnstartedWorker(agent({ id: "w", worktreePath: null }), {}, parentOpen, NONE_RAN)).toBe(
+      false,
+    );
   });
 
   it("is false when the ORCHESTRATOR isn't live (e.g. deliberately closed / relocating)", () => {
-    expect(isUnstartedWorker(agent({ id: "w" }), {}, new Set<string>())).toBe(false);
+    expect(isUnstartedWorker(agent({ id: "w" }), {}, new Set<string>(), NONE_RAN)).toBe(false);
   });
 
   it("is false for non-workers and for parentless workers", () => {
-    expect(isUnstartedWorker(agent({ id: "b", kind: "build", parentId: null }), {}, parentOpen)).toBe(
+    expect(
+      isUnstartedWorker(agent({ id: "b", kind: "build", parentId: null }), {}, parentOpen, NONE_RAN),
+    ).toBe(false);
+    expect(isUnstartedWorker(agent({ id: "w", parentId: null }), {}, parentOpen, NONE_RAN)).toBe(false);
+  });
+
+  // ── NEVER-RUN (sparkle-w340): a CLOSED worker must not read as an unstarted strand ──────────────
+  // This is the founder's phantom-red bug. close() persists lastObserved from the status it deletes,
+  // so a worker that RAN and was closed carries proof it ran — and must NOT be painted red under a
+  // still-open orchestrator, even though its live status is now gone (same shape as the true case).
+  it("is FALSE for a closed worker that has a lastObserved entry (ran, then stopped)", () => {
+    const ranThenClosed: LastObservedMap = { w: { status: "stopped", at: 1 } };
+    // Identical to the very first `true` case EXCEPT the lastObserved entry — so this pins the
+    // never-run clause specifically, not some other guard.
+    expect(isUnstartedWorker(agent({ id: "w" }), {}, parentOpen, NONE_RAN)).toBe(true);
+    expect(isUnstartedWorker(agent({ id: "w" }), {}, parentOpen, ranThenClosed)).toBe(false);
+  });
+
+  // ── DWELL (sparkle-w340): a just-cut worker whose pane hasn't mounted yet is a race, not a strand ─
+  it("is FALSE within the dwell window off createdAt, TRUE once it elapses", () => {
+    const now = 10 * UNSTARTED_WORKER_DWELL_MS;
+    const justCut = agent({ id: "w", createdAt: now - 1_000 }); // 1s old → inside the dwell
+    const stale = agent({ id: "w", createdAt: now - UNSTARTED_WORKER_DWELL_MS - 1 }); // past it
+    expect(isUnstartedWorker(justCut, {}, parentOpen, NONE_RAN, now)).toBe(false);
+    expect(isUnstartedWorker(stale, {}, parentOpen, NONE_RAN, now)).toBe(true);
+  });
+
+  // The exact boundary: `>=` the dwell counts as elapsed.
+  it("is TRUE exactly at the dwell boundary", () => {
+    const now = 10 * UNSTARTED_WORKER_DWELL_MS;
+    const atBoundary = agent({ id: "w", createdAt: now - UNSTARTED_WORKER_DWELL_MS });
+    expect(isUnstartedWorker(atBoundary, {}, parentOpen, NONE_RAN, now)).toBe(true);
+  });
+
+  // A legacy record with no createdAt can't prove the dwell, so we decline to manufacture red.
+  it("is FALSE for a worker with no createdAt (can't prove the dwell)", () => {
+    expect(isUnstartedWorker(agent({ id: "w", createdAt: undefined }), {}, parentOpen, NONE_RAN)).toBe(
       false,
     );
-    expect(isUnstartedWorker(agent({ id: "w", parentId: null }), {}, parentOpen)).toBe(false);
+  });
+
+  // THE HOVER RACE (sparkle-w340 note): hovering a row ~90ms opens the pane, which gives the worker a
+  // live status and dissolves the red. Model that here — a strand that was true becomes false the
+  // instant a live status appears, so the only rows that survive to be red are ones NOT hovered.
+  it("dissolves (→ false) the instant a live status appears, as a ~90ms hover would produce", () => {
+    const w = agent({ id: "w" });
+    expect(isUnstartedWorker(w, {}, parentOpen, NONE_RAN)).toBe(true);
+    expect(isUnstartedWorker(w, { w: "working" }, parentOpen, NONE_RAN)).toBe(false);
   });
 });
 
@@ -63,8 +117,19 @@ describe("workersNeedingOpen", () => {
       agent({ id: "w3" }), // running → skip
       agent({ id: "w4" }), // unstarted
     ];
-    const out = workersNeedingOpen(agents, { w3: "working" }, new Set(["build1", "w2"]));
+    const out = workersNeedingOpen(agents, { w3: "working" }, new Set(["build1", "w2"]), NONE_RAN);
     expect(out.map((a) => a.id)).toEqual(["w1", "w4"]);
+  });
+
+  // The self-heal must NOT try to re-open a worker the user closed (sparkle-w340): a lastObserved
+  // entry excludes it, so `ensureWorkersOpen` leaves it stopped instead of resurrecting the row.
+  it("excludes a closed worker (has lastObserved) so the self-heal doesn't resurrect it", () => {
+    const agents = [agent({ id: "build1", kind: "build", parentId: null }), agent({ id: "w1" })];
+    expect(workersNeedingOpen(agents, {}, new Set(["build1"]), NONE_RAN).map((a) => a.id)).toEqual([
+      "w1",
+    ]);
+    const closed: LastObservedMap = { w1: { status: "stopped", at: 1 } };
+    expect(workersNeedingOpen(agents, {}, new Set(["build1"]), closed)).toEqual([]);
   });
 });
 
@@ -80,13 +145,13 @@ describe("withUnstartedWorkerAttention — parent guard", () => {
   const liveParent: ReadonlySet<string> = new Set<string>(["build1"]);
 
   it("overwrites a parent that is merely BLOCKED (an ask is not shadowed by a stall)", () => {
-    const out = withUnstartedWorkerAttention(parentAgents, { build1: "blocked" }, liveParent);
+    const out = withUnstartedWorkerAttention(parentAgents, { build1: "blocked" }, liveParent, NONE_RAN);
     expect(out.w1).toBe("approval");
     expect(out.build1).toBe("approval");
   });
 
   it("leaves a parent that is asking on its own behalf", () => {
-    const out = withUnstartedWorkerAttention(parentAgents, { build1: "waiting" }, liveParent);
+    const out = withUnstartedWorkerAttention(parentAgents, { build1: "waiting" }, liveParent, NONE_RAN);
     expect(out.build1).toBe("waiting");
   });
 });
@@ -98,7 +163,7 @@ describe("withUnstartedWorkerAttention", () => {
       agent({ id: "w1" }),
     ];
     const status: Record<string, AgentTabStatus> = { build1: "working" };
-    const eff = withUnstartedWorkerAttention(agents, status, parentOpen);
+    const eff = withUnstartedWorkerAttention(agents, status, parentOpen, NONE_RAN);
     expect(eff.w1).toBe("approval");
     expect(eff.build1).toBe("approval"); // working orchestrator → red, because it's blocked
   });
@@ -106,22 +171,38 @@ describe("withUnstartedWorkerAttention", () => {
   it("does not mutate the input status map", () => {
     const agents = [agent({ id: "build1", kind: "build", parentId: null }), agent({ id: "w1" })];
     const status: Record<string, AgentTabStatus> = { build1: "working" };
-    withUnstartedWorkerAttention(agents, status, parentOpen);
+    withUnstartedWorkerAttention(agents, status, parentOpen, NONE_RAN);
     expect(status).toEqual({ build1: "working" });
   });
 
   it("returns the same reference when nothing is unstarted (cheap no-op)", () => {
     const agents = [agent({ id: "build1", kind: "build", parentId: null }), agent({ id: "w1" })];
     const status: Record<string, AgentTabStatus> = { build1: "working", w1: "working" };
-    expect(withUnstartedWorkerAttention(agents, status, parentOpen)).toBe(status);
+    expect(withUnstartedWorkerAttention(agents, status, parentOpen, NONE_RAN)).toBe(status);
   });
 
   it("does not downgrade an orchestrator that is already RED for its own reason", () => {
     const agents = [agent({ id: "build1", kind: "build", parentId: null }), agent({ id: "w1" })];
     const status: Record<string, AgentTabStatus> = { build1: "errored" };
-    const eff = withUnstartedWorkerAttention(agents, status, parentOpen);
+    const eff = withUnstartedWorkerAttention(agents, status, parentOpen, NONE_RAN);
     expect(eff.w1).toBe("approval");
     expect(eff.build1).toBe("errored"); // keep the more specific red
+  });
+
+  // The end-to-end shape of the founder's bug (sparkle-w340): a worker whose pane was CLOSED (no live
+  // status, orchestrator still open) must NOT get a synthetic red — neither on itself nor bubbled to
+  // its orchestrator. The same inputs without the lastObserved entry DO redden, so this pins that the
+  // never-run signal is what makes the difference, not some unrelated guard.
+  it("does NOT synthesize red for a closed worker under an open orchestrator", () => {
+    const agents = [agent({ id: "build1", kind: "build", parentId: null }), agent({ id: "w1" })];
+    const status: Record<string, AgentTabStatus> = { build1: "working" };
+    // Without lastObserved: the strand overlay fires (the old, buggy reading).
+    const red = withUnstartedWorkerAttention(agents, status, parentOpen, NONE_RAN);
+    expect(red.w1).toBe("approval");
+    // With lastObserved (the worker ran and was closed): no synthetic red, same reference back.
+    const closed: LastObservedMap = { w1: { status: "stopped", at: 1 } };
+    const eff = withUnstartedWorkerAttention(agents, status, parentOpen, closed);
+    expect(eff).toBe(status); // no unstarted worker → cheap no-op, unchanged map
   });
 });
 

@@ -11,7 +11,8 @@
 //   1. self-healing auto-open (workersNeedingOpen) — re-assert open() so the strand can't persist;
 //   2. a RED overlay (withUnstartedWorkerAttention) — when a strand DOES linger, paint the worker
 //      and its orchestrator red so it surfaces at the top instead of hiding in gray.
-import type { AgentTab } from "../types";
+import type { AgentTab, LastObserved } from "../types";
+import { livenessOf } from "../services/agentLiveness";
 import { needsAttention, type StatusMap } from "./attention";
 import { isInMotion } from "./inMotion";
 import { isRedStatus } from "../services/windowStatus";
@@ -32,6 +33,17 @@ import { isRedStatus } from "../services/windowStatus";
 // return one line and hid the very coupling the comment exists to advertise (roborev on 4b3ede48,
 // flagged independently by both reviewers).
 
+/** How much SETTLING time a freshly-cut worker gets before an absent live status counts as a
+ *  STRAND rather than "its pane just hasn't mounted yet". A hover opens the pane in ~90ms and a
+ *  normal spawn mounts in well under a second, so anything still un-launched this long after
+ *  creation is a genuine "Start this agent" strand — not a race. Kept generous on purpose: the cost
+ *  of waiting is a brief gray row, the cost of firing early is the phantom red this bug is about. */
+export const UNSTARTED_WORKER_DWELL_MS = 60_000;
+
+/** The `lastObserved` shape {@link isUnstartedWorker} reads — only the KEYS matter to it (presence =
+ *  "this worker ran at least once"), but the store passes its whole map straight through. */
+export type LastObservedMap = Readonly<Record<string, LastObserved>>;
+
 /** A worker whose worktree was cut but which has NO live PTY `status` yet — regardless of whether it
  *  is in `openIds` this instant. This is the part of the strand condition that a re-open does NOT
  *  change: `open()` only mounts the pane, and the worker isn't actually live until its PTY reports a
@@ -50,27 +62,55 @@ export function isNotYetLiveWorker(agent: AgentTab, statusMap: StatusMap): boole
   );
 }
 
-/** A worker whose worktree was cut but which never went live — not in `openIds`, no PTY `status` —
- *  WHILE its orchestrator is live (`openIds.has(parentId)`). A running worker has a status entry; a
- *  mid-spawn/queued one has no worktree yet; a spun-down one is gone from `agents`. So this matches
- *  exactly the spawned-but-idle "Start this agent" strand.
+/** A worker whose worktree was cut but which never went live — no observation anywhere, never ran
+ *  before, and past its settling dwell — WHILE its orchestrator is live. This is the ONE predicate
+ *  behind every "spawned-but-unstarted" surface (the red "Approve?" overlay, the self-heal auto-open,
+ *  and the auto-collapse "still expecting a status" check), so narrowing it here fixes all of them at
+ *  once. Five conjuncts, each pruning a way the old three-clause version manufactured a phantom red:
  *
- *  The parent-is-open clause is what keeps "a worker should be live iff its orchestrator is live": it
- *  excludes a worker whose orchestrator the user deliberately closed (e.g. project relocation closes
- *  every agent — clearing each one's status — so a relocated worker would otherwise look identical to
- *  a fresh strand and get force-reopened mid-move). In the real strand the orchestrator is running
- *  (it just called spawn_worker), so it's open and the clause holds. */
+ *   1. it's a materialized worker (kind=worker, has a parent, worktree cut) — a mid-spawn/queued
+ *      worker has no worktree yet; a non-worker never strands here.
+ *   2. AgentLiveness is "unknown" — no live PTY status this window AND no open pane app-wide. The old
+ *      code spelled this as two separate checks; reusing `livenessOf` keeps the one definition.
+ *   3. NEVER-RUN — no `lastObserved` entry. close() writes lastObserved from the status it deletes,
+ *      so a CLOSED worker now carries proof it ran and is excluded. This is the core sparkle-w340 fix:
+ *      before it, a closed worker read as statusless and got a synthetic red under an open orchestrator.
+ *   4. the orchestrator is live (`openIds.has(parentId)`) — keeps "a worker is live iff its
+ *      orchestrator is". Excludes a worker whose orchestrator the user deliberately closed (project
+ *      relocation closes every agent), which would otherwise look identical to a fresh strand.
+ *   5. DWELL past {@link UNSTARTED_WORKER_DWELL_MS} off `createdAt` — a just-cut worker whose pane
+ *      hasn't mounted yet is a race, not a strand (and a ~90ms hover would open it and dissolve the
+ *      red regardless). Only a worker still un-launched after the dwell is real. */
 export function isUnstartedWorker(
   agent: AgentTab,
   statusMap: StatusMap,
   openIds: ReadonlySet<string>,
+  lastObserved: LastObservedMap,
+  now: number = Date.now(),
 ): boolean {
-  return (
-    isNotYetLiveWorker(agent, statusMap) &&
-    agent.parentId !== null &&
-    openIds.has(agent.parentId) &&
-    !openIds.has(agent.id)
-  );
+  if (agent.kind !== "worker" || agent.parentId === null || agent.worktreePath === null) {
+    return false;
+  }
+  // NEVER-OBSERVED. Reuse AgentLiveness rather than restate the two checks it already owns:
+  // "unknown" is the ONLY liveness that means no live PTY status in this window AND no open pane
+  // app-wide, i.e. the old `statusMap[id] === undefined && !openIds.has(id)` pair. "local"/
+  // "other-window" both mean the worker is (or is being) run somewhere — not a strand.
+  if (livenessOf(agent.id, statusMap, openIds) !== "unknown") return false;
+  // NEVER-RUN. A worker with a persisted lastObserved entry RAN once and its pane was closed — a
+  // stopped pane, not a never-started strand. This is the root fix for the founder's phantom
+  // "Approve?" dots (sparkle-w340): close() deletes `status`, so a closed worker read as statusless
+  // and — while its orchestrator was still open — got a synthetic red. Its question died with the PTY.
+  if (lastObserved[agent.id] !== undefined) return false;
+  // The orchestrator that spawned it must be live (see header). Non-null asserted by the guard above.
+  if (!openIds.has(agent.parentId)) return false;
+  // DWELL. A worker cut moments ago may simply not have mounted its pane yet, so a reading taken
+  // inside the settling window is a race, not a strand. Note the interaction with the hover path: a
+  // ~90ms hover opens the pane, which gives the worker a live status and DISSOLVES this red — so the
+  // only rows that survive to be painted red are ones the user has NOT touched and that have sat
+  // un-launched past the dwell. A legacy record with no `createdAt` can't prove the dwell, so we
+  // decline to manufacture red for it rather than guess.
+  if (agent.createdAt === undefined) return false;
+  return now - agent.createdAt >= UNSTARTED_WORKER_DWELL_MS;
 }
 
 /** The materialized-but-unstarted workers among `agents`, in array order. The self-healing
@@ -79,8 +119,10 @@ export function workersNeedingOpen(
   agents: readonly AgentTab[],
   statusMap: StatusMap,
   openIds: ReadonlySet<string>,
+  lastObserved: LastObservedMap,
+  now: number = Date.now(),
 ): AgentTab[] {
-  return agents.filter((a) => isUnstartedWorker(a, statusMap, openIds));
+  return agents.filter((a) => isUnstartedWorker(a, statusMap, openIds, lastObserved, now));
 }
 
 /** Overlay the RED `approval` ("Approve?" — i.e. "approve starting this agent") status onto every
@@ -97,11 +139,13 @@ export function withUnstartedWorkerAttention(
   agents: readonly AgentTab[],
   statusMap: StatusMap,
   openIds: ReadonlySet<string>,
+  lastObserved: LastObservedMap,
+  now: number = Date.now(),
 ): StatusMap {
   let out: StatusMap | null = null;
   const ensure = (): StatusMap => (out ??= { ...statusMap });
   for (const a of agents) {
-    if (!isUnstartedWorker(a, statusMap, openIds)) continue;
+    if (!isUnstartedWorker(a, statusMap, openIds, lastObserved, now)) continue;
     ensure()[a.id] = "approval";
     // a.parentId is non-null here (isUnstartedWorker guarantees it). Same asymmetric rule as
     // withRedWorkerAttention below, and for the same reason: this synthesized `approval` IS a

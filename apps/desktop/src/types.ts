@@ -158,3 +158,18 @@ export interface Project {
 }
 
 export type { AgentTabStatus };
+
+/** A closed agent's final KNOWN status + when it was captured (epoch ms). Written by
+ *  runtimeStore.close() from the `status` entry it is about to delete, and PERSISTED, so a surface
+ *  can tell "this agent RAN and its pane was closed" from "this agent NEVER started". Those two were
+ *  indistinguishable while the live-only `status` map was the only signal — close() dropped the
+ *  entry, a closed worker read as statusless, and the unstarted-worker overlay synthesized a phantom
+ *  red "Approve?" under a still-open orchestrator (sparkle-w340).
+ *
+ *  A RED-TIER status (waiting/approval/blocked/errored) is DEMOTED to `stopped` on capture: a
+ *  question or approval prompt lives only as long as its PTY, so a closed pane must never read back
+ *  as still asking. The `at` timestamp is retained for future "stopped N ago" affordances. */
+export interface LastObserved {
+  status: AgentTabStatus;
+  at: number;
+}

@@ -340,6 +340,10 @@ describe("AgentSidebar — a subtree is never closed on a status we haven't read
       parentId,
       baseBranch: "main",
       worktreePath: `/tmp/demo/${id}`,
+      // createdAt in the distant past so it clears the unstarted-worker dwell — this fixture models a
+      // worker that HAS sat un-launched, i.e. a genuine strand, not one still inside its settling
+      // window (engine/workerAttention.UNSTARTED_WORKER_DWELL_MS, sparkle-w340).
+      createdAt: 1,
     });
 
   it("collapses a head whose workers are closed panes under a closed orchestrator", () => {

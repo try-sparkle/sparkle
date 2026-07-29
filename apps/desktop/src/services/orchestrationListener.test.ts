@@ -189,7 +189,7 @@ describe("orchestrationListener", () => {
     // orchestrator must be live for the heal to apply (a worker is live iff its orchestrator is).
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId, createdAt: 1 })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/heal", "sparkle/agent-heal");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
@@ -198,7 +198,7 @@ describe("orchestrationListener", () => {
   it("self-heals after an EVICTION: re-opens a worker removed from openAgentIds", async () => {
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId, createdAt: 1 })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/evict", "sparkle/agent-evict");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
@@ -217,7 +217,7 @@ describe("orchestrationListener", () => {
     // that writes persisted, cross-window state every round. The heal must bound its own attempts.
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId, createdAt: 1 })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/pingpong", "sparkle/agent-pingpong");
     await flush();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -248,7 +248,7 @@ describe("orchestrationListener", () => {
     // eventually stop healing a worker whose every previous strand the heal resolved.
     useRuntimeStore.getState().open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId, createdAt: 1 })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/fresh", "sparkle/agent-fresh");
     await flush();
     const evictThenHeal = async (): Promise<boolean> => {
@@ -277,7 +277,7 @@ describe("orchestrationListener", () => {
     const rt = useRuntimeStore.getState();
     rt.open(buildId);
     const ps = useProjectStore.getState();
-    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    const workerId = ps.addAgent(projectId, { kind: "worker", parentId: buildId, createdAt: 1 })!;
     ps.setAgentWorktree(projectId, workerId, "/wt/td", "sparkle/agent-td");
     await flush();
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);

@@ -94,6 +94,10 @@ export interface AddAgentOpts {
    *  forced its orchestrator's subtree open — the exact expand-on-spawn behavior §14 removed. The
    *  pane-less case belongs to whoever PRODUCED the deselect, not to a spawn. */
   select?: boolean;
+  /** Epoch ms this row was created (AgentTab.createdAt). Defaults to Date.now(). Exposed mainly so a
+   *  test can BACKDATE a worker past the unstarted-worker dwell (engine/workerAttention) to exercise a
+   *  genuine strand; production callers omit it. */
+  createdAt?: number;
 }
 
 // Default display name for a freshly created agent, numbered within its kind so you get
@@ -1067,6 +1071,11 @@ export const useProjectStore = create<ProjectState>()(
               // records have ONE canonical form and consumers can compare raw values safely (the
               // "default" sentinel stays a UI-only dropdown value).
               model: isDefaultModel(opts?.model) ? undefined : opts?.model,
+              // Stamp creation time so the unstarted-worker dwell (engine/workerAttention) has a real
+              // basis: a just-cut worker isn't treated as a "Start this agent" strand until it has
+              // sat un-launched past the dwell (sparkle-w340). Previously unset, which left the field
+              // dead and the dwell inert.
+              createdAt: opts?.createdAt ?? Date.now(),
             };
             // A freshly-opened BUILD agent floats to the top of the non-alerting sidebar rows
             // until a newer build agent is opened ("until you open a newer one" — the fresh slot

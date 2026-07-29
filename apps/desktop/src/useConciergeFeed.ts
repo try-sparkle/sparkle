@@ -46,6 +46,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  const lastObserved = useRuntimeStore((s) => s.lastObserved);
   const interaction = useInteractionStore((s) => s.lastAt);
 
   // The store's shouldInterrupt is a STABLE function reference, so subscribing to it alone would
@@ -83,6 +84,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         workflowStage,
         branchStatus,
         openAgentIds,
+        lastObserved,
         interaction,
         roster,
         shouldInterrupt,
@@ -94,6 +96,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       workflowStage,
       branchStatus,
       openAgentIds,
+      lastObserved,
       interaction,
       roster,
       shouldInterrupt,

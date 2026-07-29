@@ -287,6 +287,7 @@ export function AgentSidebar({
   const close = useRuntimeStore((s) => s.close);
   const liveStatus = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  const lastObserved = useRuntimeStore((s) => s.lastObserved);
   // The open set, built once: the strand overlay below and `expectsLiveStatus` further down both
   // ask it, and two Sets from one array is two allocations per render for the same answer.
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
@@ -301,9 +302,9 @@ export function AgentSidebar({
     // services/windowStatus.isRedStatus) — bubbles its own red to its orchestrator so the
     // orchestrator floats up and shows red. Order matters — run (2) after
     // (1) so a strand's synthetic red also bubbles.
-    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, openIds);
+    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, openIds, lastObserved);
     return withRedWorkerAttention(project.agents, s1);
-  }, [project, liveStatus, openIds]);
+  }, [project, liveStatus, openIds, lastObserved]);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
   // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
@@ -691,7 +692,7 @@ export function AgentSidebar({
         const rollup = rollupStages(kids.map((w) => stageFor(w.id)));
         return rollup ? rollup.stage : stageFor(id);
       };
-      const published = publishedStatusFor(agents, rt.status, new Set(rt.openAgentIds), stageFor);
+      const published = publishedStatusFor(agents, rt.status, new Set(rt.openAgentIds), rt.lastObserved, stageFor);
       return firstLadderRowId(
         agents,
         forMode,
@@ -1248,8 +1249,8 @@ export function AgentSidebar({
   // that red row is the one the user has to click. If the self-heal exhausts its budget the subtree
   // stays open showing red, rather than filing a broken worker away out of sight (roborev 54031).
   const expectsLiveStatus = useCallback(
-    (w: AgentTab) => openIds.has(w.id) || isUnstartedWorker(w, liveStatus, openIds),
-    [openIds, liveStatus],
+    (w: AgentTab) => openIds.has(w.id) || isUnstartedWorker(w, liveStatus, openIds, lastObserved),
+    [openIds, liveStatus, lastObserved],
   );
 
   const prevWorkerAttention = useRef(new Map<string, Record<string, WorkerAttention>>());
@@ -1390,10 +1391,10 @@ export function AgentSidebar({
   // have made the column band differently from every other surface with no test failing.
   const { own: ownStatus, dotOf: rollupOf } = useMemo(
     () =>
-      rollupViewFor(project?.agents ?? [], liveStatus, new Set(openAgentIds), (id) =>
+      rollupViewFor(project?.agents ?? [], liveStatus, new Set(openAgentIds), lastObserved, (id) =>
         resolveStage(branchStatus[id], workflowStage[id]),
       ),
-    [project?.agents, liveStatus, openAgentIds, branchStatus, workflowStage],
+    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage],
   );
   const rowBandOf = useCallback((id: string) => bandOfRollup(rollupOf(id)), [rollupOf]);
 

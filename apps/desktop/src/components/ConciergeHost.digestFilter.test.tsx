@@ -162,7 +162,7 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
  * it is visible at all.
  */
 function sidebarRows(project: Project, status: Record<string, AgentTabStatus>, band: StatusBand) {
-  const eff = publishedStatusFor(project.agents, status, new Set(openIds([project])), () =>
+  const eff = publishedStatusFor(project.agents, status, new Set(openIds([project])), {}, () =>
     resolveStage(undefined, undefined),
   );
   return flattenSections(

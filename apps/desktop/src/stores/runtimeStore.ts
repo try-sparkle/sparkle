@@ -5,7 +5,8 @@
 // Claude session resumes via `claude --continue` (bead ).
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import type { AgentTabStatus } from "../types";
+import type { AgentTabStatus, LastObserved } from "../types";
+import { isRedStatus } from "../services/windowStatus";
 import type { BranchStatus, WorkflowState, AgentStatusResult } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
@@ -496,6 +497,11 @@ function sameStringOrder(a: string[], b: string[]): boolean {
 
 interface RuntimeState {
   status: Record<string, AgentTabStatus>; // agentId -> status (live-only, never persisted)
+  // agentId -> the LAST status this window observed for the agent + when, captured by close() from
+  // the entry it deletes and DEMOTED from any red tier to `stopped` (a question dies with its PTY).
+  // PERSISTED. Its whole job is to let a surface tell "ran, then closed" from "never started": a
+  // closed worker used to read as statusless and get a synthetic red "Approve?" overlay (sparkle-w340).
+  lastObserved: Record<string, LastObserved>;
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
   // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
   // persisted, like `status`); cleared whenever `status` is cleared for an agent.
@@ -581,6 +587,7 @@ export const useRuntimeStore = create<RuntimeState>()(
   persist(
     (set, get) => ({
       status: {},
+      lastObserved: {},
       attentionScreen: {},
       openAgentIds: [],
       branchStatus: {},
@@ -601,6 +608,22 @@ export const useRuntimeStore = create<RuntimeState>()(
           forgetBeadLifecycle(agentId); // drop module-level bead bookkeeping for this agent
           useInteractionStore.getState().forget(agentId); // …and its last-interaction timestamp
           const { [agentId]: _removed, ...status } = s.status;
+          // Persist the agent's LAST observed status before we drop it, so surfaces can tell a
+          // ran-then-closed pane from a never-started one (sparkle-w340). A red-tier value is demoted
+          // to `stopped`: an approval/question can't be answered against a dead PTY, so a closed pane
+          // must never read back as still asking. Only written when we actually had an observation —
+          // closing an agent this window never saw leaves lastObserved untouched (an unknown stays
+          // unknown, not a manufactured `stopped`).
+          const lastObserved =
+            _removed === undefined
+              ? s.lastObserved
+              : {
+                  ...s.lastObserved,
+                  [agentId]: {
+                    status: isRedStatus(_removed) ? ("stopped" as AgentTabStatus) : _removed,
+                    at: Date.now(),
+                  },
+                };
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
@@ -613,6 +636,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           return {
             openAgentIds: mergedOpen.filter((id) => id !== agentId),
             status,
+            lastObserved,
             attentionScreen,
             branchStatus,
             workflowStage,
@@ -627,6 +651,10 @@ export const useRuntimeStore = create<RuntimeState>()(
           // prior occupant's lifecycle state (esp. now that workflowShipped is persisted).
           forgetBeadLifecycle(agentId);
           const { [agentId]: _st, ...status } = s.status;
+          // Forget the prior occupant's last-observed too: a fresh run in a reused slot must not
+          // inherit a stale "ran, then closed" reading (sparkle-w340). The pane stays mounted, so the
+          // new session repopulates a LIVE status within a tick regardless.
+          const { [agentId]: _lo, ...lastObserved } = s.lastObserved;
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
@@ -635,6 +663,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           // Note: openAgentIds is intentionally untouched — the pane stays mounted for the new run.
           return {
             status,
+            lastObserved,
             attentionScreen,
             branchStatus,
             workflowStage,
@@ -791,12 +820,16 @@ export const useRuntimeStore = create<RuntimeState>()(
           };
           const stagePruned = Object.keys(s.workflowStage).some((id) => !valid.has(id));
           const shipPruned = Object.keys(s.workflowShipped).some((id) => !valid.has(id));
+          // lastObserved is persisted too (sparkle-w340), so a deleted agent's stale reading must be
+          // pruned or it lingers in localStorage forever (and could resurface if the id is reused).
+          const lastObservedPruned = Object.keys(s.lastObserved).some((id) => !valid.has(id));
           const openChanged = openAgentIds.length !== s.openAgentIds.length;
-          if (!openChanged && !stagePruned && !shipPruned) return s;
+          if (!openChanged && !stagePruned && !shipPruned && !lastObservedPruned) return s;
           return {
             ...(openChanged ? { openAgentIds } : {}),
             ...(stagePruned ? { workflowStage: pruneMap(s.workflowStage) } : {}),
             ...(shipPruned ? { workflowShipped: pruneMap(s.workflowShipped) } : {}),
+            ...(lastObservedPruned ? { lastObserved: pruneMap(s.lastObserved) } : {}),
           };
         }),
     }),
@@ -811,6 +844,9 @@ export const useRuntimeStore = create<RuntimeState>()(
         openAgentIds: s.openAgentIds,
         workflowStage: s.workflowStage,
         workflowShipped: s.workflowShipped,
+        // Persisted so a closed worker still reads as "ran, then stopped" after a relaunch, rather
+        // than reverting to statusless and re-manufacturing a synthetic red (sparkle-w340).
+        lastObserved: s.lastObserved,
       }),
     },
   ),

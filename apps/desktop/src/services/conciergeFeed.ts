@@ -34,7 +34,7 @@ import { resolveStage, type WorkflowStageId } from "../engine/workflowStage";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
-import type { AgentKind, Project } from "../types";
+import type { AgentKind, LastObserved, Project } from "../types";
 
 export interface ConciergeAgent {
   id: string;
@@ -176,6 +176,9 @@ export interface ConciergeFeedInput {
   branchStatus?: Record<string, BranchStatus>;
   /** Live agent ids (runtimeStore.openAgentIds) for the unstarted-worker red overlay. */
   openAgentIds?: readonly string[];
+  /** runtimeStore.lastObserved — a worker with an entry RAN and was closed, so the unstarted-worker
+   *  overlay must not synthesize a red for it (sparkle-w340). Omit in tests for no such demotion. */
+  lastObserved?: Record<string, LastObserved>;
   /** Agent id → epoch ms of last user touch (interactionStore.lastAt). */
   interaction?: Record<string, number>;
   /** The merged cross-window fleet (getRoster/onRosterChanged). Fills statuses for agents
@@ -310,6 +313,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     workflowStage = {},
     branchStatus = {},
     openAgentIds = [],
+    lastObserved = {},
     interaction = {},
     shouldInterrupt = () => true,
   } = input;
@@ -333,6 +337,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     allAgents,
     mergedStatus,
     new Set(openAgentIds),
+    lastObserved,
     (id) => resolveStage(branchStatus[id], workflowStage[id]),
     rolledUpGreen,
   );

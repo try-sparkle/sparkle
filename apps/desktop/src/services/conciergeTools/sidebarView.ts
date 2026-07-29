@@ -302,9 +302,9 @@ function columnView(project: Project): ColumnView {
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
 
-  const { dotOf } = rollupViewFor(agents, rt.status, openIds, stageOf);
+  const { dotOf } = rollupViewFor(agents, rt.status, openIds, rt.lastObserved, stageOf);
   const bandOf = (id: string): StatusBand => bandOfRollup(dotOf(id));
-  const status = publishedStatusFor(agents, rt.status, openIds, stageOf);
+  const status = publishedStatusFor(agents, rt.status, openIds, rt.lastObserved, stageOf);
 
   const kids = childrenByParent(agents);
   // A delegating head reports its CHILDREN's least-advanced stage, not its own git state — the same

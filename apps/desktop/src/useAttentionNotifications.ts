@@ -59,7 +59,11 @@ import {
   type RollupDot,
 } from "./engine/workerRollup";
 import { withUnmergedWork } from "./engine/unmergedAttention";
-import { withRedWorkerAttention, withUnstartedWorkerAttention } from "./engine/workerAttention";
+import {
+  withRedWorkerAttention,
+  withUnstartedWorkerAttention,
+  type LastObservedMap,
+} from "./engine/workerAttention";
 import { resolveStage } from "./engine/workflowStage";
 import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
@@ -98,12 +102,15 @@ export function publishedStatusFor(
   agents: readonly AgentTab[],
   status: StatusMap,
   openIds: ReadonlySet<string>,
+  /** runtimeStore.lastObserved — lets the unstarted-worker overlay tell a closed pane (ran, then
+   *  stopped) from a never-started strand, so a closed worker no longer synthesizes red (sparkle-w340). */
+  lastObserved: LastObservedMap,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
   /** Optional out-param: receives the ids step (5) promoted from calm to `working`. Only the
    *  away-recap needs it — see withWorkerRollupGreen. Everything else ignores it. */
   promoted?: Set<string>,
 ): StatusMap {
-  const { published, dotOf } = composeRollup(agents, status, openIds, stageOf);
+  const { published, dotOf } = composeRollup(agents, status, openIds, lastObserved, stageOf);
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
 
@@ -120,9 +127,10 @@ export function rollupViewFor(
   agents: readonly AgentTab[],
   status: StatusMap,
   openIds: ReadonlySet<string>,
+  lastObserved: LastObservedMap,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
-  const { own, dotOf } = composeRollup(agents, status, openIds, stageOf);
+  const { own, dotOf } = composeRollup(agents, status, openIds, lastObserved, stageOf);
   return { own, dotOf };
 }
 
@@ -131,6 +139,7 @@ function composeRollup(
   agents: readonly AgentTab[],
   status: StatusMap,
   openIds: ReadonlySet<string>,
+  lastObserved: LastObservedMap,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
@@ -138,7 +147,7 @@ function composeRollup(
   // "which reds has the user dismissed?".
   const bubbled = withRedWorkerAttention(
     agents,
-    withUnstartedWorkerAttention(agents, status, openIds),
+    withUnstartedWorkerAttention(agents, status, openIds, lastObserved),
   );
   // (3)+(4) over the bubbled map: the published chain as it has always been.
   const published = withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf));
