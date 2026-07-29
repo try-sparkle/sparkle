@@ -1112,6 +1112,30 @@ describe("controlListener", () => {
       expect(agents.find((a) => a.id === otherId)!.goal?.metAt).toBeUndefined();
     });
 
+    it("lets the CONCIERGE name a target — the stall sweep's whole point", async () => {
+      // Removing the target entirely stranded the concierge: it has no agent row to default to, so
+      // every call failed with "unknown agent sparkle:concierge", blaming a target it never named,
+      // while the tool stayed advertised to it. Agent-to-agent spoofing is the threat; the bridge
+      // stamps the concierge's reserved id server-side, so this is not a hole an agent can use.
+      useProjectStore.getState().setAgentGoal(projectId, otherId, "theirs");
+      fire({
+        reqId: "g5",
+        op: "set_agent_goal_met",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { met: true, targetAgentId: otherId },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      const agents = useProjectStore.getState().projects.flatMap((p) => p.agents);
+      expect(agents.find((a) => a.id === otherId)!.goal?.metAt).toBeDefined();
+    });
+
+    it("refuses target_required for the concierge when it names nobody", async () => {
+      fire({ reqId: "g6", op: "set_agent_goal_met", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "target_required" });
+    });
+
     it("REFUSES when there is no goal to mark, rather than reporting a bare success", async () => {
       // `setAgentGoalMet` early-returns unchanged with no goal record, so `{ ok: true }` would tell
       // the caller it is done while the concierge goes on reading `goal: null`.

@@ -121,15 +121,18 @@ const PER_AGENT_OPS = new Set<ControlOp>([
   "rename_agent",
   "set_agent_activity",
   "set_agent_goal",
-  "set_agent_goal_met",
   "pin_agent",
   "unpin_agent",
   "set_agent_model",
 ]);
-// NOTE: `claim_pr`/`release_pr` are deliberately NOT here. Every other per-agent op can name a
+// NOTE: `claim_pr`, `release_pr` and `set_agent_goal_met` are deliberately NOT here. Every other per-agent op can name a
 // target; a claim cannot. The claimant IS the caller, stamped by the bridge — letting a payload
 // name it would let one agent claim a PR "as" another, which is exactly the confused-deputy hole
-// the bridge closes by construction for every other identity on this surface.
+// the bridge closes by construction for every other identity on this surface. `set_agent_goal_met`
+// is the same shape: an agent may only mark its OWN goal (only the reserved concierge id may name a
+// target), so `targetKind` must mirror the CALLER. Leaving it in this set made
+// `reportControlOpSuccess` resolve the ignored payload target instead, tallying a self-report
+// against another agent's kind.
 
 /**
  * The safety tier for EVERY control op — the single, explicit gate table (PRD §10/§11: the bridge
@@ -773,13 +776,22 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
  * genuinely finished keeps being auto-continued, and the concierge keeps reading it as outstanding.
  */
 function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
-  // CALLER-STAMPED, no `targetAgentId` — the same rule as `claim_pr`, and for a sharper reason.
-  // Marking a DIFFERENT, live agent met latches its `metAt`, which makes `hasUnmetGoal` false so
-  // auto-continue never restarts it and `agentStall` renders it "done". That is a false "done" on a
-  // stalled agent — exactly the failure the goal feature was built to end — reachable by one wrong
-  // id in a payload.
-  const targetId = (req.callerAgentId || "").trim();
-  if (!targetId) return { ok: false, error: "set_agent_goal_met needs an identifiable caller" };
+  // CALLER-STAMPED FOR AGENTS, TARGETABLE ONLY BY THE CONCIERGE.
+  //
+  // Agent-to-agent spoofing is the threat: marking a DIFFERENT live agent met latches its `metAt`,
+  // so auto-continue never restarts it and `agentStall` renders it "done" — a false "done" on a
+  // stalled agent, which is the failure the goal feature exists to end. So an agent may only mark
+  // its OWN goal, and a `targetAgentId` in its payload is ignored rather than honoured.
+  //
+  // The concierge is the exception, and it has to be: it is the human-driven surface that sweeps
+  // for stalls, it has no agent row to default to, and closing out a finished agent's goal is the
+  // action that sweep exists to enable. The bridge stamps its reserved id server-side, so this is
+  // not a hole an agent can climb through. Without this branch the tool was still advertised to it
+  // and always failed with "unknown agent sparkle:concierge" — blaming a target it never named.
+  const isConcierge = req.callerAgentId === CONCIERGE_CALLER_AGENT_ID;
+  const asked = typeof req.payload.targetAgentId === "string" ? req.payload.targetAgentId.trim() : "";
+  const targetId = isConcierge ? asked : (req.callerAgentId || "").trim();
+  if (!targetId) return targetRequired("set_agent_goal_met", req);
   const met = req.payload.met;
   if (typeof met !== "boolean") return { ok: false, error: "met must be a boolean" };
   const found = findAgent(targetId);
@@ -788,8 +800,7 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // goal record, so a bare `{ ok: true }` would tell the caller it is done while the concierge goes
   // on reading `goal: null` — false assurance, on the one field that decides whether an idle agent
   // is finished or stalled.
-  const before = found.agent?.goal;
-  if (!before) {
+  if (!found.agent?.goal) {
     return { ok: false, error: "no goal to mark — set one with set_agent_goal first." };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);

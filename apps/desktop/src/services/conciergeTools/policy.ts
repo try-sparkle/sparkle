@@ -276,7 +276,7 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   append_communication_guideline: "Save a rule about how Sparkle should talk to you.",
   set_config: "Write Sparkle's machine-wide configuration.",
   set_agent_goal: "Set an agent's current objective (what it is trying to finish).",
-  set_agent_goal_met: "Mark an agent's goal met — the only thing that makes an idle agent finished.",
+  set_agent_goal_met: "Mark a stalled-but-finished agent's goal met — the only thing that makes an idle agent count as done.",
   claim_pr: "Record that you will land a pull request yourself, so nothing merges around you.",
   release_pr: "Give up your claim on a pull request.",
 };
