@@ -5,13 +5,20 @@ import {
   RECENT_HINT,
   RECENT_SWITCH_HINT,
   CHROME_HINTS,
+  ATTACH_ACTION_HINTS,
   AGENT_OVERFLOW_POOL,
   RECENT_POOL,
+  PAIR_PREFIX,
+  PAIR_SECONDS,
   agentLabel,
   projectTabLabel,
   recentLabel,
+  isPairLabel,
   assignLabels,
 } from "./hintTargets";
+
+// Every slot a pool can hand out before it truly runs dry: its single characters, then the pairs.
+const CAPACITY = (pool: string[]) => pool.length + PAIR_SECONDS.length;
 
 describe("agentLabel", () => {
   it("numbers the first nine agents 1..9", () => {
@@ -23,18 +30,28 @@ describe("agentLabel", () => {
     expect(agentLabel(10)).toBe(AGENT_OVERFLOW_POOL[1]);
   });
 
-  it("returns null once labels are exhausted", () => {
-    expect(agentLabel(9 + AGENT_OVERFLOW_POOL.length)).toBeNull();
+  it("continues into PAIR_PREFIX pairs once the single characters run out", () => {
+    const firstPair = 9 + AGENT_OVERFLOW_POOL.length;
+    expect(agentLabel(firstPair)).toBe(`${PAIR_PREFIX}a`);
+    expect(agentLabel(firstPair + 1)).toBe(`${PAIR_PREFIX}b`);
+  });
+
+  it("returns null only once the pairs are exhausted too", () => {
+    expect(agentLabel(9 + CAPACITY(AGENT_OVERFLOW_POOL) - 1)).toBe(`${PAIR_PREFIX}z`);
+    expect(agentLabel(9 + CAPACITY(AGENT_OVERFLOW_POOL))).toBeNull();
   });
 });
 
 describe("recentLabel", () => {
-  it("labels recent-dropdown rows a..z by list order", () => {
-    expect([0, 1, 25].map(recentLabel)).toEqual(["a", "b", "z"]);
+  it("labels recent-dropdown rows a..y by list order, skipping the pair prefix", () => {
+    expect([0, 1, 24].map(recentLabel)).toEqual(["a", "b", "y"]);
+    expect(RECENT_POOL).not.toContain(PAIR_PREFIX);
   });
 
-  it("returns null past the 26th row (more projects than letters)", () => {
-    expect(recentLabel(RECENT_POOL.length)).toBeNull();
+  it("continues into pairs past the single characters instead of dropping the badge", () => {
+    expect(recentLabel(RECENT_POOL.length)).toBe(`${PAIR_PREFIX}a`);
+    expect(recentLabel(CAPACITY(RECENT_POOL) - 1)).toBe(`${PAIR_PREFIX}z`);
+    expect(recentLabel(CAPACITY(RECENT_POOL))).toBeNull();
   });
 });
 
@@ -43,16 +60,64 @@ describe("projectTabLabel", () => {
     expect([0, 1, 2].map(projectTabLabel)).toEqual(AGENT_OVERFLOW_POOL.slice(0, 3));
   });
 
-  it("returns null past the pool — a tab with no label just gets no badge", () => {
-    expect(projectTabLabel(AGENT_OVERFLOW_POOL.length)).toBeNull();
-    expect(projectTabLabel(AGENT_OVERFLOW_POOL.length + 5)).toBeNull();
+  it("continues into pairs past the single characters, and only then gives up", () => {
+    expect(projectTabLabel(AGENT_OVERFLOW_POOL.length)).toBe(`${PAIR_PREFIX}a`);
+    expect(projectTabLabel(CAPACITY(AGENT_OVERFLOW_POOL) - 1)).toBe(`${PAIR_PREFIX}z`);
+    expect(projectTabLabel(CAPACITY(AGENT_OVERFLOW_POOL))).toBeNull();
   });
 
-  it("never hands a tab a reserved chrome mnemonic", () => {
+  it("never hands a tab a reserved chrome mnemonic, single or paired", () => {
     const reserved = new Set(Object.values(CHROME_HINTS));
-    for (let i = 0; i < AGENT_OVERFLOW_POOL.length; i += 1) {
+    for (let i = 0; i < CAPACITY(AGENT_OVERFLOW_POOL); i += 1) {
       expect(reserved.has(projectTabLabel(i)!)).toBe(false);
     }
+  });
+});
+
+describe("the pair prefix", () => {
+  // THE FOUNDER'S RULE, and the whole reason a two-character label is safe: pressing PAIR_PREFIX has
+  // to mean "open the pair layer" unambiguously, which it cannot if something is also labelled "z".
+  it("is never a label on its own, in any pool", () => {
+    expect(AGENT_OVERFLOW_POOL).not.toContain(PAIR_PREFIX);
+    expect(RECENT_POOL).not.toContain(PAIR_PREFIX);
+    expect(Object.values(CHROME_HINTS)).not.toContain(PAIR_PREFIX);
+    expect(Object.values(ATTACH_ACTION_HINTS)).not.toContain(PAIR_PREFIX);
+  });
+
+  it("recognises pair labels and only pair labels", () => {
+    expect(isPairLabel(`${PAIR_PREFIX}a`)).toBe(true);
+    expect(isPairLabel(`${PAIR_PREFIX}${PAIR_PREFIX}`)).toBe(true);
+    expect(isPairLabel("a")).toBe(false);
+    expect(isPairLabel("1")).toBe(false);
+    expect(isPairLabel("ab")).toBe(false); // a two-character label that isn't prefixed isn't ours
+  });
+
+  it("keeps zz usable as a real label — the prefix layer is left by Escape, not by a second z", () => {
+    expect(PAIR_SECONDS).toContain(PAIR_PREFIX);
+    expect(recentLabel(CAPACITY(RECENT_POOL) - 1)).toBe("zz");
+  });
+});
+
+describe("the concierge compose-box mnemonics", () => {
+  it("gives the prompt box, presence slider and paperclip their approved characters", () => {
+    expect(CHROME_HINTS.prompt).toBe("/");
+    expect(CHROME_HINTS.presence).toBe("h");
+    expect(CHROME_HINTS.attach).toBe("k");
+  });
+
+  // "s" is deliberately shared with CHROME_HINTS.screenshot (the agent-pane composer's button); it is
+  // legal ONLY because the overlay scopes the attach chain to these two badges. Keeping them out of
+  // CHROME_HINTS is what preserves that map's own no-duplicates invariant.
+  it("keeps the attach actions out of the chrome map so their letters can be reused", () => {
+    expect(ATTACH_ACTION_HINTS["attach-screenshot"]).toBe("s");
+    expect(ATTACH_ACTION_HINTS["attach-upload"]).toBe("u");
+    expect(Object.keys(CHROME_HINTS)).not.toContain("attach-screenshot");
+    expect(Object.keys(CHROME_HINTS)).not.toContain("attach-upload");
+  });
+
+  it("still hands out a distinct character for every chrome control", () => {
+    const chars = Object.values(CHROME_HINTS);
+    expect(new Set(chars).size).toBe(chars.length);
   });
 });
 
@@ -67,7 +132,8 @@ describe("overflow pool", () => {
     // THIRD pool letter, not the first.
     expect(agentLabel(9, 2)).toBe(AGENT_OVERFLOW_POOL[2]);
     expect(agentLabel(8, 2)).toBe("9"); // the numbered nine are unaffected by the offset
-    expect(agentLabel(9 + AGENT_OVERFLOW_POOL.length - 2, 2)).toBeNull(); // exhausted two letters early
+    // ...and it runs dry two slots early, now at the end of the PAIRS rather than the letters.
+    expect(agentLabel(9 + CAPACITY(AGENT_OVERFLOW_POOL) - 2, 2)).toBeNull();
   });
 });
 
@@ -133,8 +199,10 @@ describe("assignLabels", () => {
   // the top, builder rows down the sidebar. If they drew from two independent pools, the 10th agent
   // and the 1st tab would both be "e" and one of the two keys would be unreachable.
   it("never gives a project tab and an agent-overflow row the same letter", () => {
-    for (let tabs = 0; tabs <= AGENT_OVERFLOW_POOL.length + 2; tabs += 1) {
-      for (let agents = 0; agents <= 9 + AGENT_OVERFLOW_POOL.length + 2; agents += 1) {
+    // Ranged past the single characters and into the PAIRS: the shared-stream invariant has to hold
+    // across the seam too, which is exactly where an off-by-one in poolLabel would show up.
+    for (let tabs = 0; tabs <= CAPACITY(AGENT_OVERFLOW_POOL) + 2; tabs += 1) {
+      for (let agents = 0; agents <= 9 + CAPACITY(AGENT_OVERFLOW_POOL) + 2; agents += 1) {
         const out = assignLabels([
           ...Array.from({ length: tabs }, () => ({ hintId: PROJECT_TAB_HINT })),
           ...Array.from({ length: agents }, () => ({ hintId: AGENT_HINT })),
@@ -163,12 +231,22 @@ describe("assignLabels", () => {
     ]);
   });
 
-  it("gives tabs past the pool no badge instead of wrapping", () => {
+  it("carries tabs past the single characters into pairs, and gives up only at the very end", () => {
     const out = assignLabels(
-      Array.from({ length: AGENT_OVERFLOW_POOL.length + 2 }, () => ({ hintId: PROJECT_TAB_HINT })),
+      Array.from({ length: CAPACITY(AGENT_OVERFLOW_POOL) + 2 }, () => ({ hintId: PROJECT_TAB_HINT })),
     );
+    expect(out[AGENT_OVERFLOW_POOL.length - 1]!.label).toBe(AGENT_OVERFLOW_POOL.at(-1));
+    expect(out[AGENT_OVERFLOW_POOL.length]!.label).toBe(`${PAIR_PREFIX}a`); // straight across the seam
     expect(out.slice(-2).map((t) => t.label)).toEqual([null, null]);
-    expect(out.at(-3)!.label).toBe(AGENT_OVERFLOW_POOL.at(-1));
+    expect(out.at(-3)!.label).toBe(`${PAIR_PREFIX}z`);
+  });
+
+  it("labels the paperclip's two actions from their own map", () => {
+    const out = assignLabels([
+      { hintId: "attach-screenshot" },
+      { hintId: "attach-upload" },
+    ]);
+    expect(out.map((t) => t.label)).toEqual(["s", "u"]);
   });
 
   it("yields null for an unknown chrome id", () => {

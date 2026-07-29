@@ -40,6 +40,30 @@ export const RECENT_TRIGGER_HINT = "recent";
 // first the moment either list grew.
 export const PROJECT_TAB_HINT = "project-tab";
 
+// The data-hint value of the PAPERCLIP in the concierge compose box. Like RECENT_TRIGGER_HINT this is
+// a chaining trigger, not a leaf action: the paperclip's own click only EXPANDS a group holding the
+// two things it can actually do, so selecting it keeps hint mode alive and re-collects (HintOverlay).
+export const ATTACH_TRIGGER_HINT = "attach";
+
+// The two actions behind the paperclip, with their own mnemonics — deliberately NOT in CHROME_HINTS.
+//
+// "s" is ALREADY CHROME_HINTS.screenshot, the agent-pane composer's screenshot button, and both
+// surfaces can be on screen at once. Keeping these out of the chrome map is what lets that letter be
+// reused without breaking the "every chrome mnemonic is distinct" invariant: they are only ever
+// labelled inside the scoped attach chain, where they are the ONLY badges on screen (the same trick
+// the Recent dropdown uses for its a–z rows). collectChiclets drops them in every other mode — which
+// matters, because the group also expands on plain HOVER, so they can be in the DOM unbidden.
+export const ATTACH_ACTION_HINTS: Record<string, string> = {
+  "attach-screenshot": "s",
+  "attach-upload": "u",
+};
+
+/** That hint id's attach-action mnemonic, or null if it isn't one. The overlay uses this to bucket
+ *  the chain's members; assignLabels uses it to label them. */
+export function attachActionLabel(hintId: string): string | null {
+  return Object.hasOwn(ATTACH_ACTION_HINTS, hintId) ? ATTACH_ACTION_HINTS[hintId]! : null;
+}
+
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
 // (The "." for the ⋯ overflow menu is a deliberate pun: three dots → the period key.)
 export const CHROME_HINTS: Record<string, string> = {
@@ -57,39 +81,79 @@ export const CHROME_HINTS: Record<string, string> = {
   changelog: "c",
   account: "a",
   credits: "d", // the balance pill in the builder header — d for "Dollars" (opens the Credits pane).
+  // The concierge compose box. "/" is the Slack/Discord "start typing here" convention AND, being
+  // punctuation, it costs AGENT_OVERFLOW_POOL nothing — every LETTER promoted to a chrome mnemonic is
+  // one fewer project tab / overflow agent that can be reached at all.
+  prompt: "/",
+  presence: "h", // the Here | Away slider. One key that TOGGLES, not two that set.
+  attach: "k", // the paperclip — "klip", since a/c/d/p/s are all taken.
 };
 
-// Letters available to agents beyond the 9th, with the reserved chrome letters removed so an
-// overflow agent can never collide with a chrome control. Reserved: a b c d g i m n o p r s t →
-// pool = e f h j k l q u v w x y z (13 letters; with 1–9 that's 22 addressable agents).
-const RESERVED = new Set(Object.values(CHROME_HINTS));
-export const AGENT_OVERFLOW_POOL = "abcdefghijklmnopqrstuvwxyz"
-  .split("")
-  .filter((ch) => !RESERVED.has(ch));
+// The prefix character for TWO-character labels. It is never a label on its own, anywhere: press it
+// and the overlay enters a prefix layer where only the pair labels are live, showing their second
+// character (see HintOverlay). That is the founder's rule — spend one character so the single-key
+// labels keep working for as long as possible, and get 26 more slots behind it instead of a cliff.
+//
+// The cliff was real: before this, a target past the end of its pool got `label: null` and the
+// renderer silently dropped its badge, leaving it unreachable by keyboard with nothing on screen
+// saying so.
+export const PAIR_PREFIX = "z";
+
+const ALPHABET = "abcdefghijklmnopqrstuvwxyz".split("");
+
+// Second characters of a pair — the FULL alphabet, including the prefix itself ("zz" is a valid
+// label). Inside the prefix layer nothing but pairs is selectable, so no letter here can collide.
+export const PAIR_SECONDS = ALPHABET;
+
+// Letters available to agents beyond the 9th, with the reserved chrome letters AND the pair prefix
+// removed so an overflow agent can never collide with a chrome control or shadow the prefix.
+// Reserved: a b c d g i m n o p r s t (+ h k from the concierge controls, "/" is not a letter), plus
+// z → pool = e f j l q u v w x y (10 letters, then 26 pairs; with 1–9 that's 45 addressable agents).
+const RESERVED = new Set([...Object.values(CHROME_HINTS), PAIR_PREFIX]);
+export const AGENT_OVERFLOW_POOL = ALPHABET.filter((ch) => !RESERVED.has(ch));
+
+/** The Nth slot (0-based) of a label pool: its single characters first, then PAIR_PREFIX pairs.
+ *
+ *  Returns null only once BOTH are exhausted (pool.length + 26 slots), which is far enough out that
+ *  a dropped badge is no longer a routine occurrence. */
+function poolLabel(pool: string[], index: number): string | null {
+  if (index < 0) return null;
+  if (index < pool.length) return pool[index]!;
+  const second = PAIR_SECONDS[index - pool.length];
+  return second === undefined ? null : PAIR_PREFIX + second;
+}
+
+/** True for a two-character (prefix + second) label. The overlay uses this to split the badge set
+ *  into the single-key layer and the layer behind PAIR_PREFIX. */
+export function isPairLabel(label: string): boolean {
+  return label.length === 2 && label[0] === PAIR_PREFIX;
+}
 
 // The label for the Nth agent (0-based) in display order: "1".."9" then the overflow pool.
-// Returns null once we run out of distinct labels (more than 9 + pool.length agents on screen).
+// Returns null once we run out of distinct labels (more than 9 + pool.length + 26 agents on screen).
 //
 // `overflowOffset` is how many pool letters the PROJECT TABS have already claimed, so the agent
 // overflow resumes after them instead of restarting at the top of the pool and colliding. It is a
 // count, not a position: the first nine agents keep 1..9 either way.
 export function agentLabel(index: number, overflowOffset = 0): string | null {
   if (index < 9) return String(index + 1);
-  return AGENT_OVERFLOW_POOL[index - 9 + overflowOffset] ?? null;
+  return poolLabel(AGENT_OVERFLOW_POOL, index - 9 + overflowOffset);
 }
 
 // The label for the Nth project tab (0-based, left to right): the head of AGENT_OVERFLOW_POOL, which
 // is the alphabet minus the reserved chrome mnemonics — so a tab letter can't shadow a chrome control
-// either. Returns null past the pool (a tab with no label simply gets no badge; see agentLabel).
+// either. Past the single characters it continues into the pair labels (see poolLabel).
 export function projectTabLabel(index: number): string | null {
-  return AGENT_OVERFLOW_POOL[index] ?? null;
+  return poolLabel(AGENT_OVERFLOW_POOL, index);
 }
 
-// Labels for Recent-dropdown rows: the full a–z, one per row in list order. Returns null past the
-// 26th row (more distinct projects than letters — the tail simply gets no badge, matching agentLabel).
-export const RECENT_POOL = "abcdefghijklmnopqrstuvwxyz".split("");
+// Labels for Recent-dropdown rows: a–y (the alphabet minus the pair prefix, which is never a label on
+// its own), one per row in list order, then za.. for the tail. The dropdown gets the whole alphabet
+// rather than the overflow pool because while it is open the overlay shows ONLY these rows, so their
+// letters can never collide with a chrome mnemonic.
+export const RECENT_POOL = ALPHABET.filter((ch) => ch !== PAIR_PREFIX);
 export function recentLabel(index: number): string | null {
-  return RECENT_POOL[index] ?? null;
+  return poolLabel(RECENT_POOL, index);
 }
 
 export type HintInput = { hintId: string };
@@ -125,7 +189,15 @@ export function assignLabels<T extends HintInput>(targets: T[]): LabeledHint<T>[
       recentIndex += 1;
       return { ...t, label };
     }
-    return { ...t, label: CHROME_HINTS[t.hintId] ?? null };
+    // ATTACH_ACTION_HINTS is consulted second and kept out of CHROME_HINTS on purpose: its "s"
+    // duplicates CHROME_HINTS.screenshot, which is safe only because the overlay shows these two in
+    // a scope of their own. See the constant's header.
+    //
+    // hasOwn, not a plain index: `hintId` comes off a DOM attribute, so an element tagged
+    // data-hint="constructor" would otherwise resolve through Object.prototype and yield a FUNCTION
+    // where a label string belongs.
+    const chrome = Object.hasOwn(CHROME_HINTS, t.hintId) ? CHROME_HINTS[t.hintId]! : null;
+    return { ...t, label: chrome ?? attachActionLabel(t.hintId) };
   });
 }
 

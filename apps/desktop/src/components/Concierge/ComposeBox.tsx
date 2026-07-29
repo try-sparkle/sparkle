@@ -190,9 +190,25 @@ const ATTACH_ACTIONS: {
   label: string;
   Icon: typeof FiCamera;
   title: string;
+  // The keyboard-hint id, carried here rather than derived from `kind`: the ids are named for what
+  // the user sees ("upload") while the kind is named for the service call it makes ("files"), and a
+  // derived id would silently break the hint the day either name changes for its own reasons.
+  hint: string;
 }[] = [
-  { kind: "screenshot", label: "Screenshot", Icon: FiCamera, title: "Capture a screen region" },
-  { kind: "files", label: "Upload", Icon: FiUpload, title: "Upload a file from your desktop" },
+  {
+    kind: "screenshot",
+    label: "Screenshot",
+    Icon: FiCamera,
+    title: "Capture a screen region",
+    hint: "attach-screenshot",
+  },
+  {
+    kind: "files",
+    label: "Upload",
+    Icon: FiUpload,
+    title: "Upload a file from your desktop",
+    hint: "attach-upload",
+  },
 ];
 
 /**
@@ -274,11 +290,17 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
       data-testid="concierge-attach"
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      onFocus={() => {
+      onFocus={(e) => {
         if (reclaimingFocus.current) {
           reclaimingFocus.current = false;
           return;
         }
+        // A PROGRAMMATIC focus is not the user arriving here, so it must not pin the group open.
+        // The keyboard-hint overlay hands focus back to the paperclip when it abandons a chain
+        // (HintOverlay.leaveChain → focusQuietly), and re-pinning on that would re-expand the very
+        // group the same gesture just collapsed — leaving it stranded with its badges scoped away.
+        // Genuine focus still pins, and chain ENTRY uses a plain focus() precisely so that it does.
+        if (isProgrammaticFocus(e.target as HTMLElement)) return;
         setPinned(true);
       }}
       onBlur={(e) => {
@@ -304,6 +326,10 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
         aria-expanded={open}
         aria-controls={ATTACH_ACTIONS_ID}
         title="Attach a screenshot or a file"
+        // A CHAINING hint, like the Recent-projects trigger: this click only EXPANDS the group, so
+        // the overlay keeps hint mode alive and badges the two actions rather than closing on a
+        // menu the keyboard then can't reach.
+        data-hint="attach"
         onClick={() => setPinned(true)}
         style={{
           ...attachStyle,
@@ -320,11 +346,14 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
         hidden={!open}
         style={{ display: open ? "inline-flex" : "none", gap: 6, alignItems: "center" }}
       >
-        {ATTACH_ACTIONS.map(({ kind, label, Icon, title }) => (
+        {ATTACH_ACTIONS.map(({ kind, label, Icon, title, hint }) => (
           <button
             key={kind}
             type="button"
             title={title}
+            // Only badged while the overlay's attach chain is open — the group expands on hover too,
+            // and "s" is also the agent-pane composer's screenshot mnemonic. See HintLayer.
+            data-hint={hint}
             onClick={() => {
               onAttach(kind);
               close();
@@ -996,6 +1025,12 @@ export function ComposeBox({
             // Nothing here names a destination either way (PRD/sparkle/concierge-auto-routing.md §1),
             // and the ⌘↩ hint stays on the Send button below rather than in this text.
             placeholder=""
+            // The keyboard hint puts the CARET here — the overlay focuses a text field rather than
+            // clicking it, since click() on a textarea moves nothing and the badge would look inert.
+            // Anchored to the top edge because this box is ten lines tall when it's working hard,
+            // and a centred badge would sit halfway down an otherwise empty left edge.
+            data-hint="prompt"
+            data-hint-anchor="top"
             value={text}
             // The mention picker's aria wiring. The list is a SIBLING that never takes focus (the
             // query is the text still being typed), so the textarea is what has to announce it:

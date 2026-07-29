@@ -15,10 +15,26 @@ import { useKeybindingsStore } from "../stores/keybindingsStore";
 //
 // Label-key SELECTION (pressing "t", "1", … to activate a control) is handled by the overlay, which
 // owns the label→element map. This hook only owns open/close.
-export function useHintMode(): { active: boolean; close: () => void } {
+//
+// ESCAPE IS DELEGATED, via `onEscape`. The overlay has inner layers to unwind before the whole thing
+// should close — the z prefix layer, the paperclip's action chain — and it cannot do that by
+// intercepting the key itself: BOTH listeners are capture-phase on `window`, so dispatch order is
+// registration order, this hook's effect runs first, and by the time the overlay sees Escape the
+// overlay is already closing. stopPropagation cannot reach backwards. Handing the decision down is
+// the alternative that does not depend on which effect happened to register first — a dependency
+// that would break silently the day someone changed a useEffect to a useLayoutEffect.
+//
+// Contract: return true to say "I consumed this Escape"; the overlay stays open. Return false (or
+// pass nothing) and Escape dismisses, as it always has.
+export function useHintMode(onEscape?: () => boolean): { active: boolean; close: () => void } {
   const [active, setActive] = useState(false);
   const trigger = useRef<TriggerState>(INITIAL_TRIGGER);
   const binding = useKeybindingsStore((s) => s.bindings.toggleHints);
+
+  // Read through a ref so a caller passing an inline arrow doesn't tear down and rebind the window
+  // listeners on every render — the same stale-listener hazard HintOverlay documents for chiclets.
+  const escapeRef = useRef(onEscape);
+  escapeRef.current = onEscape;
 
   useEffect(() => {
     // A fresh binding starts the tap machine clean (a half-pressed old modifier can't leak across).
@@ -36,8 +52,33 @@ export function useHintMode(): { active: boolean; close: () => void } {
         e.stopPropagation();
         if (!e.repeat) setActive((v) => !v);
       }
-      // Escape always dismisses (cheap to handle here; the overlay also intercepts label keys).
-      if (e.key === "Escape") setActive(false);
+      // Escape dismisses unless the overlay claims it to unwind an inner layer first (see header).
+      //
+      // A CLAIMED Escape is SUPPRESSED, or the press would unwind two things at once. The key keeps
+      // travelling after we handle it, and half the app dismisses on Escape — the ⋯ kebab menu and
+      // the status strip from `document`, the model pill and the selection popup as they bubble,
+      // and the composer lightbox, the shortcuts menu and the command palette from `window` in the
+      // CAPTURE phase, same as us. With any of those open, backing out of a hint sub-layer would
+      // also close the thing underneath: two layers per press, the exact behaviour this delegation
+      // exists to prevent.
+      //
+      // stopIMMEDIATEPropagation, not stopPropagation. The plain one does not stop other listeners
+      // on the SAME NODE, which is where the window/capture cohort above lives — it would have
+      // covered only the document/bubble half, and registration order has no bearing on it either
+      // way. The immediate form does stop same-node listeners registered after ours, and ours is
+      // registered at mount while those surfaces register theirs when they open.
+      //
+      // preventDefault stays alongside it for the cohort that checks `defaultPrevented` rather than
+      // relying on propagation (ModelPill already does; it is the tell that the app expects a
+      // consumer to mark this event).
+      if (e.key === "Escape") {
+        if (escapeRef.current?.()) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        } else {
+          setActive(false);
+        }
+      }
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (!modifier) return;

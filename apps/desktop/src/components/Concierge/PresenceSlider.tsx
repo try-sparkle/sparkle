@@ -28,6 +28,7 @@ import { useRef, type MouseEvent } from "react";
 import { FiMapPin } from "react-icons/fi";
 import { C, FONT_WEIGHT, PRESENCE_SEGMENT_TINT_PCT } from "../../theme/colors";
 import { usePresenceStore, type PresenceMode } from "../../stores/presenceStore";
+import { HINT_JUMP_ATTR } from "../../keyboardHints/hintTargets";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
@@ -162,7 +163,35 @@ export function PresenceSlider() {
                 ? "Here — Sparkle checks with you before acting"
                 : "Away — Sparkle may act on its own"
             }
-            onClick={seg === "here" ? setHere : setAway}
+            // THE KEYBOARD HINT RIDES THE AWAY SEGMENT, and that is placement rather than meaning:
+            // badges anchor to their element's LEFT edge, and Away's left edge is the Here|Away seam
+            // — where the founder asked for it. On the group it would land over the pin icon at the
+            // far left, reading as a hint for the pin.
+            //
+            // One key that TOGGLES, not two that set, because the control has exactly two positions.
+            data-hint={seg === "away" ? "presence" : undefined}
+            onClick={(e) => {
+              // A hint jump means "flip this", a real click means the segment it landed on. That is
+              // what HINT_JUMP_ATTR is for — the overlay sets it on the element for the duration of
+              // its synthetic click precisely so a handler can tell the two apart, and sniffing
+              // `detail === 0` instead would misread VoiceOver / Switch Control activations as
+              // jumps and silently toggle on someone who asked for Away.
+              if (seg === "away" && e.currentTarget.hasAttribute(HINT_JUMP_ATTR)) {
+                // READ THE STORE, not the `mode` this render closed over — the same reason
+                // `rememberPin` above does. Presence is written from non-React code on the dispatch
+                // path (blur, the idle timer), so the rendered value can be one commit behind the
+                // truth, and a toggle resolved against a stale value flips to where we already are.
+                //
+                // The SEGMENTS' own actions, not a reimplementation of the flip: setHere also PINS
+                // Here, and a hint that quietly skipped that would be a second, subtly different
+                // presence control wearing the same clothes.
+                if (usePresenceStore.getState().mode === "here") setAway();
+                else setHere();
+                return;
+              }
+              if (seg === "here") setHere();
+              else setAway();
+            }}
             // AWAY OPTS OUT OF THE DOUBLE-CLICK GESTURE. Everywhere else on the control a
             // double-click toggles the pin; on this segment it would pin HERE moments after the
             // user twice said the opposite. Two clicks on Away mean Away.

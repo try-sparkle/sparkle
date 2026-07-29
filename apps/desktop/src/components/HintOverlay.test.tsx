@@ -3,7 +3,7 @@ import { useState } from "react";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HintOverlay } from "./HintOverlay";
-import { AGENT_OVERFLOW_POOL } from "../keyboardHints/hintTargets";
+import { AGENT_OVERFLOW_POOL, PAIR_PREFIX } from "../keyboardHints/hintTargets";
 import { configure } from "@testing-library/dom";
 
 // This suite drove PR #633's coverage-only flake: RTL waitFor on REAL timers, whose 1000ms
@@ -397,7 +397,314 @@ describe("HintOverlay", () => {
       </>,
     );
     controlTap();
-    fireEvent.keyDown(window, { key: "z" }); // no chiclet uses "z"
+    // "q" is a pool letter, so nothing on screen claims it while only "t" is tagged. ("z" would be
+    // the pair prefix, which is a different no-op — see the pair-layer suite.)
+    fireEvent.keyDown(window, { key: "q" });
     expect(screen.getByText("t")).toBeTruthy(); // still open
+  });
+
+  it("the pair prefix alone does nothing when there is no pair label on screen", () => {
+    render(
+      <>
+        <button data-hint="think" onClick={() => {}}>Think</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    // Still the ordinary layer: had it opened an EMPTY pair layer, "t" would have vanished and the
+    // key would read as having killed the overlay.
+    expect(screen.getByText("t")).toBeTruthy();
+  });
+});
+
+// Enough project tabs to run the shared pool past its single characters and into the pairs. The
+// LAST one is the first pair label, "za".
+function tabsPastThePool(onLast: () => void) {
+  return Array.from({ length: AGENT_OVERFLOW_POOL.length + 1 }, (_, i) => (
+    <div
+      key={i}
+      data-hint="project-tab"
+      onClick={i === AGENT_OVERFLOW_POOL.length ? onLast : () => {}}
+    >
+      {`Project ${i}`}
+    </div>
+  ));
+}
+
+describe("HintOverlay — the pair layer", () => {
+  it("labels targets past the single characters za.. instead of dropping their badge", () => {
+    render(
+      <>
+        {tabsPastThePool(() => {})}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    // Before the Z rule this tab had NO badge at all and was unreachable by keyboard.
+    expect(screen.getByText(`${PAIR_PREFIX}a`)).toBeTruthy();
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[0]!)).toBeTruthy();
+  });
+
+  it("the prefix key hides the single-character badges and shows only the second characters", () => {
+    render(
+      <>
+        {tabsPastThePool(() => {})}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    // Only the pairs survive, each shown WITHOUT the prefix it has already spent.
+    expect(screen.queryByText(AGENT_OVERFLOW_POOL[0]!)).toBeNull();
+    expect(screen.queryByText(`${PAIR_PREFIX}a`)).toBeNull();
+    expect(screen.getByText("a")).toBeTruthy();
+  });
+
+  it("the second character activates the pair's target", async () => {
+    const onLast = vi.fn();
+    render(
+      <>
+        {tabsPastThePool(onLast)}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    fireEvent.keyDown(window, { key: "a" });
+    await waitFor(() => expect(onLast).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
+  });
+
+  it("an unmatched second character stays IN the layer rather than falling back out of it", () => {
+    render(
+      <>
+        {tabsPastThePool(() => {})}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    fireEvent.keyDown(window, { key: "q" }); // no "zq" on screen
+    expect(screen.getByText("a")).toBeTruthy(); // still the pair layer
+    expect(screen.queryByText(AGENT_OVERFLOW_POOL[0]!)).toBeNull();
+  });
+
+  // The founder's ask: Escape unwinds a layer at a time. It cannot be done by intercepting the key
+  // in this component — useHintMode's window listener is registered first and would already have
+  // closed — so the hook delegates the decision here. This is that contract.
+  it("Escape backs out to the ordinary layer first, and only then dismisses", () => {
+    render(
+      <>
+        {tabsPastThePool(() => {})}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    expect(screen.getByText("a")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[0]!)).toBeTruthy(); // back, still open
+    expect(screen.getByText(`${PAIR_PREFIX}a`)).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByText(AGENT_OVERFLOW_POOL[0]!)).toBeNull(); // now dismissed
+  });
+
+  it("reopening starts at the ordinary layer, never inside a stale pair layer", () => {
+    render(
+      <>
+        {tabsPastThePool(() => {})}
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: PAIR_PREFIX });
+    controlTap(); // close from INSIDE the pair layer
+    controlTap(); // and reopen
+    expect(screen.getByText(AGENT_OVERFLOW_POOL[0]!)).toBeTruthy();
+  });
+});
+
+describe("HintOverlay — activation shapes", () => {
+  it("FOCUSES a text field instead of clicking it, caret at the end", async () => {
+    const onClick = vi.fn();
+    render(
+      <>
+        <textarea data-hint="prompt" defaultValue="half a draft" onClick={onClick} />
+        <HintOverlay />
+      </>,
+    );
+    const box = document.querySelector("textarea")!;
+    controlTap();
+    expect(screen.getByText("/")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "/" });
+    // click() on a textarea does not move the caret into it, so the hint would appear inert.
+    await waitFor(() => expect(document.activeElement).toBe(box));
+    expect(onClick).not.toHaveBeenCalled();
+    expect(box.selectionStart).toBe("half a draft".length);
+  });
+
+  it("anchors a badge to the TOP edge when the target asks for it", () => {
+    // A tall target — a ten-line compose box — is the case centring reads wrong on.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 10, y: 10, top: 10, left: 10, right: 50, bottom: 210, width: 40, height: 200,
+      toJSON: () => ({}),
+    } as DOMRect);
+    render(
+      <>
+        <textarea data-hint="prompt" data-hint-anchor="top" />
+        <button data-hint="build" onClick={() => {}}>Build</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    const topAnchored = screen.getByText("/").style.top;
+    const centred = screen.getByText("b").style.top;
+    expect(topAnchored).toBe("12px"); // hugging the top edge
+    expect(parseFloat(centred)).toBeGreaterThan(90); // halfway down the same 200px box
+  });
+});
+
+describe("HintOverlay — the paperclip chain", () => {
+  // A stand-in for AttachControl: one resting trigger whose click expands the two real actions.
+  function Paperclip({ onScreenshot }: { onScreenshot: () => void }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <div>
+        <button data-hint="attach" onClick={() => setOpen(true)}>Attach</button>
+        {open ? (
+          <>
+            <button data-hint="attach-screenshot" onClick={onScreenshot}>Screenshot</button>
+            <button data-hint="attach-upload" onClick={() => {}}>Upload</button>
+          </>
+        ) : null}
+      </div>
+    );
+  }
+
+  it("k expands the group and chains into its two actions", async () => {
+    const onScreenshot = vi.fn();
+    render(
+      <>
+        <Paperclip onScreenshot={onScreenshot} />
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    expect(screen.getByText("k")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "k" });
+    await waitFor(() => expect(screen.getByText("s")).toBeTruthy());
+    expect(screen.getByText("u")).toBeTruthy();
+    // Scoped: the trigger's own badge is gone, so the layer reads as "pick one of these two".
+    expect(screen.queryByText("k")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "s" });
+    await waitFor(() => expect(onScreenshot).toHaveBeenCalledTimes(1));
+  });
+
+  // THE REASON THE CHAIN IS SCOPED. "s" is also the agent-pane composer's screenshot mnemonic, and
+  // both surfaces are on screen together — unscoped, one of the two "s" badges would be dead.
+  it("suppresses every other badge while the chain is open, and restores them on Escape", async () => {
+    const onComposerShot = vi.fn();
+    render(
+      <>
+        <Paperclip onScreenshot={() => {}} />
+        <button data-hint="screenshot" onClick={onComposerShot}>Composer screenshot</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    expect(screen.getAllByText("s")).toHaveLength(1); // only the composer's, while collapsed
+
+    fireEvent.keyDown(window, { key: "k" });
+    // Gate on "u", which exists ONLY inside the chain. Waiting on "s" proves nothing here: there is
+    // exactly one of those in both layers, so the wait resolves before the chain has opened and the
+    // next keystroke lands on the composer's button instead.
+    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
+    expect(screen.getAllByText("s")).toHaveLength(1); // the chain's, and only the chain's
+    fireEvent.keyDown(window, { key: "s" });
+    await waitFor(() => expect(screen.queryByText("u")).toBeNull());
+    expect(onComposerShot).not.toHaveBeenCalled();
+  });
+
+  // The group ALSO expands on hover, so its actions can be in the DOM with no chain open. If they
+  // were labelled there, two live "s" badges would collide and one would be unreachable.
+  it("never badges the actions outside the chain, even when the group is already expanded", () => {
+    render(
+      <>
+        <button data-hint="attach-screenshot" onClick={() => {}}>Screenshot</button>
+        <button data-hint="attach-upload" onClick={() => {}}>Upload</button>
+        <button data-hint="screenshot" onClick={() => {}}>Composer screenshot</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    expect(screen.getAllByText("s")).toHaveLength(1);
+    expect(screen.queryByText("u")).toBeNull();
+  });
+
+  // THE FAILURE BRANCH. If the group never expands there is nothing to badge, so the overlay closes
+  // rather than stranding the user on an empty layer — but the trigger has already been focused and
+  // clicked by then, so closing must ALSO hand focus back out or the disclosure it just latched is
+  // left open with no overlay at all to explain it.
+  it("hands focus back out when the group fails to expand", async () => {
+    render(
+      <>
+        <button data-hint="attach" onClick={() => {}}>Attach that never opens</button>
+        <button data-hint="build" onClick={() => {}}>Build</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: "k" });
+    await waitFor(() => expect(screen.queryByText("b")).toBeNull()); // overlay closed
+    expect(document.activeElement).not.toBe(screen.getByText("Attach that never opens"));
+  });
+
+  // A DISMISSAL INSIDE THE TWO-FRAME WINDOW MUST WIN. The chain commits its layer from a double
+  // rAF, so an overlay dismissed while that is in flight would otherwise have the layer re-set
+  // underneath it — and the next time it opened it would collect against a chain whose group is
+  // long collapsed, yielding an ACTIVE overlay with no badges at all, whose first Escape gets
+  // swallowed unwinding the phantom layer instead of dismissing.
+  it("a dismissal mid-flight is not undone by the chain's deferred commit", async () => {
+    render(
+      <>
+        <Paperclip onScreenshot={() => {}} />
+        <button data-hint="build" onClick={() => {}}>Build</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: "k" });
+    controlTap(); // dismiss before the rAFs resolve
+    // Let the in-flight callback run.
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null))));
+
+    controlTap(); // reopen
+    // The ordinary layer, not a phantom chain that would show nothing.
+    expect(screen.getByText("b")).toBeTruthy();
+    expect(screen.getByText("k")).toBeTruthy();
+  });
+
+  it("Escape leaves the chain and brings the rest of the badges back", async () => {
+    render(
+      <>
+        <Paperclip onScreenshot={() => {}} />
+        <button data-hint="build" onClick={() => {}}>Build</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    fireEvent.keyDown(window, { key: "k" });
+    await waitFor(() => expect(screen.getByText("u")).toBeTruthy());
+    expect(screen.queryByText("b")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("b")).toBeTruthy(); // ordinary layer, still open
+    expect(screen.queryByText("u")).toBeNull();
   });
 });
