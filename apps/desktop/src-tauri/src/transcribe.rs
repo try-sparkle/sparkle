@@ -153,6 +153,34 @@ impl ParakeetTdt {
         self.drain_segment_samples()
     }
 
+    /// Feed the VAD exactly as [`accept_segments`] does, but THROW AWAY any closed segment instead
+    /// of copying its samples out. Returns how many were discarded (for logging/tests).
+    ///
+    /// For the cloud path, where Deepgram owns the transcription and the samples would be allocated
+    /// only to be dropped. That copy is not free on the caller's thread — it is the CoreAudio IO
+    /// thread, and a segment runs to `max_speech_duration` (8 s × 16 kHz × 4 B ≈ 512 KB), so
+    /// `accept_segments` there adds an unbounded allocator round-trip per utterance to a callback
+    /// that otherwise goes out of its way to stay realtime-safe (roborev 55300).
+    ///
+    /// NOT the same as simply not feeding the VAD: the windowing is what produces the `speaking()`
+    /// flag the waveform reads on the cloud path, and skipping the drain instead would let the
+    /// VAD's internal queue grow for the whole stream and then flush at the transition.
+    pub fn discard_segments(&mut self, frame: &[f32]) -> usize {
+        for w in self.window.push(frame) {
+            self.vad.lock().unwrap_or_else(|p| p.into_inner()).accept_waveform(&w);
+        }
+        let vad = self.vad.lock().unwrap_or_else(|p| p.into_inner());
+        let mut n = 0;
+        // Same C-destructor ordering rule as `drain_segment_samples` — drop the SpeechSegment
+        // before pop() — minus the `samples().to_vec()` that is the whole point of avoiding.
+        while let Some(seg) = vad.front() {
+            drop(seg);
+            vad.pop();
+            n += 1;
+        }
+        n
+    }
+
     /// Pull the samples of any VAD segments that have closed, WITHOUT decoding them (the heavy
     /// decode runs on the worker / at finalize). Kept off the transcribe path so the realtime
     /// callback never pays the transducer cost.

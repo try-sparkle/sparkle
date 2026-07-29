@@ -18,7 +18,11 @@ import {
   BACKEND_MIC_DENIED,
   BACKEND_MIC_RESTRICTED,
   BACKEND_MIC_NOT_ANSWERED,
+  BACKEND_NO_AUDIO_PREFIX,
 } from "./backendVoiceErrors";
+// The advanced opt-in's own label, imported rather than retyped: the no-device remedy tells the user
+// to turn it on, and an instruction naming a control by a stale label is worse than none.
+import { ALLOW_VIRTUAL_LABEL } from "../services/audioInputs";
 
 describe("dictationCopy — dynamic placeholders", () => {
   it("called with no arg reproduces the default constants (back-compat)", () => {
@@ -84,8 +88,24 @@ describe("modelPercent / preparing copy — the first-run download", () => {
 // mic permissions they'd already granted. These cases pin that each distinct backend failure gets
 // its OWN honest remedy, and — most important — that an unrecognized error surfaces the raw string
 // instead of guessing a cause.
+/** The frame-liveness watchdog's message as the backend assembles it: a fixed noun phrase wrapped
+ *  around the OS-reported DEVICE NAME. Built via a helper because the device name is the variable —
+ *  it is both the thing that makes the notice actionable and the thing that can carry hostile text
+ *  into the classifier, so the tests below exercise it in both roles.
+ *
+ *  Built FROM `BACKEND_NO_AUDIO_PREFIX` rather than re-typing it, so this fixture cannot drift from
+ *  the constant the classifier and the device-name parser are both pinned to. (That constant is
+ *  only half a pin until the Rust watchdog asserts it too — see backendVoiceErrors.ts.) */
+const noAudioError = (device: string) =>
+  `${BACKEND_NO_AUDIO_PREFIX}${device}". Another app (a screen recorder or virtual audio device) ` +
+  `may be holding the microphone. Pick a different input in the mic menu, or turn the mic off and on.`;
+
 describe("classifyVoiceError — bucket the raw backend error string", () => {
   const cases: [VoiceErrorKind, string][] = [
+    // The frame-liveness watchdog: capture is LIVE, zero frames arriving. The real 2026-07-29
+    // incident — a screen recorder's CoreAudio HAL plug-in held the mic for nine minutes while the
+    // UI painted a normal idle waveform.
+    ["no-audio", noAudioError("MacBook Pro Microphone")],
     // cpal: no microphone hardware at all.
     ["no-device", "no input device available"],
     ["no-device", "No default input device"],
@@ -134,6 +154,20 @@ describe("classifyVoiceError — bucket the raw backend error string", () => {
 
   it("is case-insensitive and tolerant of surrounding wrapper text", () => {
     expect(classifyVoiceError("Error: NO INPUT DEVICE AVAILABLE (cpal)")).toBe("no-device");
+  });
+
+  // Why `no-audio` is matched FIRST. The device name inside the message is an arbitrary
+  // third-party string — and the drivers that CAUSE this fault (loopback/virtual-audio devices)
+  // are the ones naming themselves. Each name below contains another bucket's noun phrase, so if
+  // the pattern were checked later, the watchdog's positive observation would be demoted into a
+  // guess: "plug in a microphone" to someone whose microphone is plugged in and selected.
+  it.each([
+    ["no-device — a virtual device named after the missing-hardware phrase", "No Input Device (Loopback)"],
+    ["disk-space — a device whose name quotes a size", "Recorder 2 GB Free"],
+    ["download — a device named after the network bucket's vocabulary", "Downloads Monitor Audio"],
+    ["unsupported-format — a device that names a sample format", "Unsupported Sample Format Bridge"],
+  ])("a device name that reads like %s still classifies as no-audio", (_label, device) => {
+    expect(classifyVoiceError(noAudioError(device))).toBe("no-audio");
   });
 });
 
@@ -263,8 +297,95 @@ describe("voiceErrorNotice — the rendered copy for each bucket", () => {
     expect(n.detail).not.toContain("os error 28");
   });
 
+  // ---------------------------------------------------------------------------
+  // The dead microphone (2026-07-29): a screen recorder's CoreAudio HAL plug-in held the mic while
+  // capture stayed "live" and delivered ZERO frames for nine minutes. The UI painted a normal idle
+  // waveform the whole time, so the user talked to a dead mic believing it was listening. A dead
+  // mic must never look like a quiet room — these pin the copy that makes it look like neither.
+  // ---------------------------------------------------------------------------
+  it("names the SPECIFIC dead device, which is the only thing that makes the remedy followable", () => {
+    const n = voiceErrorNotice(noAudioError("MacBook Pro Microphone"))!;
+    expect(n.kind).toBe("no-audio");
+    // THE assertion. "Pick a different input" is unfollowable until the user knows which input to
+    // pick a different one FROM, and the backend's string is the only place that name exists — a
+    // notice that classified correctly but flattened the detail to generic prose would still leave
+    // the user guessing, so asserting `kind` alone would prove nothing.
+    expect(n.detail).toContain("MacBook Pro Microphone");
+    // And it survives per-device, not because some fixed sentence happens to mention a Mac.
+    expect(voiceErrorNotice(noAudioError("Krisp Microphone"))!.detail).toContain("Krisp Microphone");
+  });
+
+  it("the headline says the mic isn't being HEARD, not that it is missing or never started", () => {
+    const n = voiceErrorNotice(noAudioError("MacBook Pro Microphone"))!;
+    // The device exists, is selected, and is open — that is exactly what made this invisible. Both
+    // of the wrong stories send the user to fix something that isn't broken.
+    expect(n.headline).toMatch(/hearing/i);
+    expect(n.headline).not.toMatch(/no microphone found|couldn't start/i);
+  });
+
+  it("sends the user to the control that actually REBINDS capture — the mic menu's picker", () => {
+    // A remedy string is an instruction the user will follow, so it gets the same scrutiny as the
+    // code path it replaces. This assertion used to demand the opposite, and both halves of that
+    // reasoning have since flipped in one change:
+    //
+    //  1. The mic menu was a three-mode pill (listening / muted / off) with no device list, so the
+    //     backend's "pick a different input in the mic menu" named a control that did not exist.
+    //     `AudioInputPicker` now lives in that menu — it does.
+    //  2. System Settings became actively WRONG. Capture no longer follows the system default:
+    //     automatic selection prefers a physical input over it, and a pinned UID ignores it
+    //     (audio_devices::select_device). Changing the OS default can leave capture on the exact
+    //     device this notice just named — a remedy that does nothing.
+    const n = voiceErrorNotice(noAudioError("MacBook Pro Microphone"))!;
+    expect(n.detail).toMatch(/hover the mic and pick a different input/i);
+    expect(n.detail).not.toContain("System Settings");
+    // The other half of the advice is still followable (the pill has off/on), so it survives.
+    expect(n.detail).toMatch(/off and on/i);
+  });
+
+  it("the no-device remedy names BOTH real ways out of a virtual-only machine", () => {
+    // roborev 55360. Driven by the ACTUAL audio.rs Refuse sentence, not a hand-written fixture,
+    // because the point is what the real backend produces. This fires precisely BECAUSE inputs were
+    // enumerated and they were all virtual — so "pick an input device in System Settings → Sound"
+    // does nothing: only virtual inputs exist, and select_device refuses a virtual device
+    // regardless of the OS default. The backend's own sentence names both options and this bucket
+    // used to discard the second one.
+    const REFUSE = // verbatim from audio.rs's Resolution::Refuse arm
+      "No microphone found — only virtual audio devices are available. Connect a microphone, or " +
+      "allow non-microphone input in the mic menu if you really want to transcribe system audio.";
+    expect(classifyVoiceError(REFUSE)).toBe("no-device");
+    const n = voiceErrorNotice(REFUSE)!;
+    // Option one: get real hardware.
+    expect(n.detail).toMatch(/connect a microphone/i);
+    // Option two: the advanced opt-in — the ONLY in-app control that resolves this state. Named by
+    // its exact label so a rename in audioInputs.ts cannot silently orphan this instruction.
+    expect(n.detail).toContain(ALLOW_VIRTUAL_LABEL);
+    // And not the remedy that cannot work here.
+    expect(n.detail).not.toContain("System Settings");
+  });
+
+  it("falls back to the RAW string when the device name can't be parsed out", () => {
+    // If the backend rewords past the quoted-device shape, the parse fails. Show the raw sentence
+    // rather than authoring a confident remedy that omits the only detail that mattered — the same
+    // fail-soft principle as the `unknown` bucket. Still classified no-audio (the noun phrase held),
+    // which is what keeps dictation://audio-recovered able to retract it.
+    const raw = "No audio from the selected input for 9s — capture is live but no frames arrived.";
+    const n = voiceErrorNotice(raw)!;
+    expect(n.kind).toBe("no-audio");
+    expect(n.detail).toBe(raw);
+  });
+
+  it("does NOT send the user to the Privacy pane — nothing was denied", () => {
+    // The message is full of mic vocabulary, which is what `permission` matches on. Sending a user
+    // whose permission is already granted to a pane where Sparkle is already switched on is the
+    // misattribution this whole module exists to kill.
+    const n = voiceErrorNotice(noAudioError("MacBook Pro Microphone"))!;
+    expect(n.kind).not.toBe("permission");
+    expect(n.detail).not.toContain("Privacy");
+  });
+
   it("every bucket yields a non-empty headline AND remedy", () => {
     for (const raw of [
+      noAudioError("MacBook Pro Microphone"),
       "no input device available",
       "unsupported sample format: F64",
       "Dns Failed",

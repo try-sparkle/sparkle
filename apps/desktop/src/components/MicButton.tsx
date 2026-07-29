@@ -8,6 +8,7 @@ import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
 import type { Phase } from "../voice/wakeMachine";
 import { RADIUS } from "../theme/scale";
+import { AudioInputPicker } from "./AudioInputPicker";
 
 /** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends
  *  credits, so arming (turning the mic on / setting a listening intent) with an empty balance is
@@ -364,6 +365,7 @@ const MIC_OPTIONS: {
  *  like a click on the mic itself does — see dictationStore.voiceSurface. */
 export function MicMenu({
   placement = "up",
+  align = "center",
   surface,
   surfaceColor = C.deepForest,
   glyphSize = 18,
@@ -371,6 +373,13 @@ export function MicMenu({
   hoverProps,
 }: {
   placement?: "up" | "down";
+  /** Horizontal anchoring. `center` suits a mic sitting in the middle of its container (the
+   *  concierge ring). `left` is for a mic pinned to a container's LEFT EDGE: this menu carries a
+   *  ~242px device list, and centering that on the 32px composer mic — which sits at the composer's
+   *  left edge — puts its left edge ~105px OUTSIDE the pane, where it either paints over the
+   *  neighbouring column or is clipped by an `overflow: hidden` ancestor, cutting off the device
+   *  names. Centering was safe only while this was a 40px column of glyphs. */
+  align?: "center" | "left";
   surface: VoiceSurface;
   surfaceColor?: string;
   glyphSize?: number;
@@ -383,11 +392,11 @@ export function MicMenu({
     <div
       role="menu"
       aria-label="Microphone mode"
+      data-align={align}
       {...hoverProps}
       style={{
         position: "absolute",
-        left: "50%",
-        transform: "translateX(-50%)",
+        ...(align === "left" ? { left: 0 } : { left: "50%", transform: "translateX(-50%)" }),
         ...(placement === "up"
           ? { bottom: "calc(100% + 6px)" }
           : { top: "calc(100% + 6px)" }),
@@ -404,6 +413,11 @@ export function MicMenu({
         WebkitBackdropFilter: "blur(6px)",
       }}
     >
+      {/* The three mode glyphs, now a ROW rather than a column: the menu also carries the input-
+          device picker below, which is a text list ~250px wide, and a vertical stack of three 30px
+          circles floating beside it read as an unrelated widget. The option set, click mapping and
+          selected-state contract are unchanged — only the axis they lay out on. */}
+      <div style={{ display: "flex", flexDirection: "row", gap: 4, justifyContent: "center" }}>
       {MIC_OPTIONS.map((opt) => {
         const selected = intent === opt.key;
         return (
@@ -437,6 +451,12 @@ export function MicMenu({
           </button>
         );
       })}
+      </div>
+      {/* WHAT the mic listens to, directly under HOW it listens. These belong in one menu: "the mic
+          is on" and "the mic is pointed at a loopback device that hears your Zoom call" are the two
+          halves of one question, and separating them is how a user ends up with a live mic bound to
+          something they never chose. See AudioInputPicker / services/audioInputs. */}
+      <AudioInputPicker />
     </div>
   );
 }
@@ -512,6 +532,9 @@ export function ComposerMic({
         // the app-wide insert target on that path as well. MicMenu records the surface itself.
         <MicMenu
           placement="up"
+          // This mic is pinned to the composer's LEFT EDGE, so the menu grows rightward from it
+          // rather than centering off-pane. See MicMenu's `align` doc.
+          align="left"
           surface="agent"
           onChoose={() => {
             onArm?.();

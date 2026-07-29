@@ -122,6 +122,23 @@ mac-notification-sys = "=0.6.15"
 # (roborev 37736).
 objc2 = "0.6"
 block2 = "0.6"
+
+# CoreAudio device enumeration + change notification (audio_devices.rs). Both crates are ALREADY in
+# the tree transitively via cpal — declared here so audio_devices.rs can use them directly, adding
+# zero packages to Cargo.lock.
+#
+# Needed because cpal cannot answer the two questions this fix depends on. It exposes devices by
+# NAME only (its `Device` keeps the `AudioDeviceID` private), so there is no way to ask it for a
+# device's stable `kAudioDevicePropertyDeviceUID` — and the numeric AudioDeviceID is NOT stable, it
+# is reassigned as HAL plug-ins load and unload, which is precisely the event we must survive.
+# cpal also has no device-change notification at all.
+#
+# Caret, not `=`-pinned: we call the stable C AudioObject API (Get/Add/RemovePropertyListener) and
+# a handful of FourCC selector constants, not a hand-written ABI coupling like the
+# mac-notification-sys category. Cargo unifies these with cpal's own requirement, so there is one
+# coreaudio-sys and one core-foundation-sys in the graph by construction.
+coreaudio-sys = "0.2"
+core-foundation-sys = "0.8"
 objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "block2",

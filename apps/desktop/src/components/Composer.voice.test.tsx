@@ -166,6 +166,31 @@ describe("Composer — voice errors surface where the user's mic is", () => {
     expect(useDictationStore.getState().error).toBeNull();
   });
 
+  it("dismissing a DEAD-MIC notice must not claim the mic is listening again", () => {
+    // Regression guard for a bug that shipped and was caught in review. Dismiss means "I've read
+    // this", NOT "frames are flowing again" — the user may be clicking the X precisely because they
+    // plan to quit the screen recorder later. An intermediate version routed this button through a
+    // store action that restored "listening" whenever the dismissed notice was `no-audio` and the
+    // mic was armed, which set a listening (in phase "active", a fully live) mic over a microphone
+    // still delivering zero frames: the 2026-07-29 incident state, rebuilt by the likelier gesture,
+    // and unrecoverable from the frontend since the notice is gone and audio-recovered then
+    // early-returns on a null error.
+    //
+    // Only dictation://audio-recovered carries evidence that frames resumed, so only it may claim
+    // listening. "idle" here understates a mic that did recover — the safe direction, and the
+    // focus/recovery handlers correct it the moment there is real evidence.
+    useDictationStore.setState({
+      error: 'No audio from "MacBook Pro Microphone". Another app may be holding the microphone.',
+      status: "error",
+      enabled: true,
+    });
+    renderComposer();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss voice error" }));
+    expect(useDictationStore.getState().error).toBeNull();
+    expect(useDictationStore.getState().status).not.toBe("listening");
+    expect(useDictationStore.getState().status).toBe("idle");
+  });
+
   it("the error outranks the download progress (a failed download isn't still downloading)", () => {
     useDictationStore.setState({
       error: "No space left on device (os error 28)",

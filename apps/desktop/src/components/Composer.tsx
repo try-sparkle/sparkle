@@ -194,6 +194,12 @@ function ComposerVoiceError({ notice }: { notice: VoiceErrorNotice }) {
         <button
           type="button"
           aria-label="Dismiss voice error"
+          // A bare clear, deliberately. Dismiss means "I've read this", NOT "the mic works again" —
+          // the user may be clicking the X precisely because they intend to quit the screen recorder
+          // later. Only `dictation://audio-recovered` carries evidence that frames resumed, so only
+          // that path restores "listening". Landing here on "idle" (a paused-looking mic) understates
+          // a mic that did recover; claiming "listening" over one that didn't would rebuild the
+          // nine-minute dead-mic incident, by the likelier gesture. Understating is the safe side.
           onClick={() => useDictationStore.getState().setError(null)}
           style={VOICE_ERROR_ACTION}
         >

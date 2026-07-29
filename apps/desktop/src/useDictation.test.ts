@@ -175,6 +175,7 @@ describe("createDictationController (hook logic without renderHook)", () => {
     expect(listeners["dictation://partial"]).toBeDefined();
     expect(listeners["dictation://level"]).toBeDefined();
     expect(listeners["dictation://error"]).toBeDefined();
+    expect(listeners["dictation://audio-recovered"]).toBeDefined();
     expect(listeners["dictation://model-progress"]).toBeDefined();
   });
 
@@ -183,6 +184,7 @@ describe("createDictationController (hook logic without renderHook)", () => {
     expect(listeners["dictation://partial"]).toBeUndefined();
     expect(listeners["dictation://level"]).toBeUndefined();
     expect(listeners["dictation://error"]).toBeUndefined();
+    expect(listeners["dictation://audio-recovered"]).toBeUndefined();
     expect(listeners["dictation://model-progress"]).toBeUndefined();
   });
 
@@ -359,6 +361,151 @@ describe("createDictationController (hook logic without renderHook)", () => {
     });
     await ctrl.toggle();
     expect(useDictationStore.getState().modelProgress).toBeNull();
+  });
+});
+
+describe("dictation://audio-recovered (the frame-liveness watchdog's all-clear)", () => {
+  // The 2026-07-29 incident: a screen recorder's CoreAudio HAL plug-in left capture "live" while
+  // ZERO frames arrived for nine minutes, and the UI painted a normal idle waveform throughout. The
+  // backend watchdog now reports that as a dictation://error and takes it back with this event when
+  // frames resume. Taking it back must be SURGICAL — see the discriminating test below.
+  const NO_AUDIO_ERROR =
+    `No audio from "MacBook Pro Microphone". Another app (a screen recorder or virtual audio ` +
+    `device) may be holding the microphone. Pick a different input in the mic menu, or turn the ` +
+    `mic off and on.`;
+  /** A failure that is STILL TRUE when frames resume — audio flowing again says nothing about a
+   *  half-downloaded voice model, so this notice must survive the all-clear. */
+  const UNRELATED_ERROR = "model download completed but expected files are missing";
+
+  let ctrl: Awaited<ReturnType<typeof createDictationController>>;
+
+  beforeEach(async () => {
+    // `enabled: true` is the real shape of this fault: the watchdog fires MID-SESSION, so the mic is
+    // armed and capturing throughout — it is only the frames that stopped.
+    useDictationStore.setState({
+      status: "idle",
+      level: 0,
+      error: null,
+      modelProgress: null,
+      enabled: true,
+      deadMicSilent: false,
+    });
+    ctrl = await createDictationController({ onSegment: vi.fn() });
+  });
+
+  afterEach(() => ctrl?.cleanup());
+
+  it("still restores listening when the user DISMISSED the notice before fixing the mic", () => {
+    // The ordinary sequence, and the one an earlier version got wrong: read the warning, close it,
+    // THEN quit the screen recorder. Gating recovery on the visible `error` meant this arrived with
+    // error === null and early-returned, leaving a live capturing mic drawn as PAUSED for as long
+    // as the user stayed in the window. The fault is not dismissible; only the notice is — so the
+    // fault is tracked separately and this is what proves the two are not the same thing.
+    emit("dictation://error", NO_AUDIO_ERROR);
+    expect(useDictationStore.getState().deadMicSilent).toBe(true);
+
+    useDictationStore.getState().setError(null); // what the Dismiss button does
+    expect(useDictationStore.getState().status).toBe("idle");
+
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().status).toBe("listening");
+    expect(useDictationStore.getState().deadMicSilent).toBe(false);
+  });
+
+  it("an unrelated error arriving after the fault does NOT get wiped by the all-clear", () => {
+    // The all-clear says frames are flowing. That is no evidence at all about a failed model
+    // download or a denied permission, so an unrelated notice must survive it — otherwise we trade
+    // the bug where the UI hid a dead mic for the bug where it hides a denied one.
+    emit("dictation://error", NO_AUDIO_ERROR);
+    emit("dictation://error", UNRELATED_ERROR);
+
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().error).toBe(UNRELATED_ERROR);
+    expect(useDictationStore.getState().status).toBe("error");
+  });
+
+  it("an unrelated error does not ERASE the dead-mic fault (roborev 55351)", () => {
+    // The fault used to be ASSIGNED on every error, so an unrelated failure landing between the
+    // fault and its all-clear erased it. The recovery event then early-returned, and once the user
+    // dismissed that unrelated notice — status "error" → "idle" with capture still live —
+    // deriveMicState drew a PAUSED mic over a working one. The same incident, one route across.
+    emit("dictation://error", NO_AUDIO_ERROR);
+    emit("dictation://error", UNRELATED_ERROR);
+    expect(useDictationStore.getState().deadMicSilent).toBe(true);
+
+    useDictationStore.getState().setError(null); // the user dismisses the unrelated notice
+    emit("dictation://audio-recovered", null);
+    // The fault survived long enough to be retracted by real evidence, and the mic is drawn live.
+    expect(useDictationStore.getState().deadMicSilent).toBe(false);
+    expect(useDictationStore.getState().status).toBe("listening");
+  });
+
+  it("clears the dead-mic notice AND puts the still-armed mic back to listening", () => {
+    emit("dictation://error", NO_AUDIO_ERROR);
+    expect(useDictationStore.getState().error).toBe(NO_AUDIO_ERROR);
+    expect(useDictationStore.getState().status).toBe("error");
+
+    emit("dictation://audio-recovered", null);
+    // The fault is over, so the notice must go — a stale "Sparkle isn't hearing your microphone"
+    // over a working mic is the same lie in the other direction.
+    expect(useDictationStore.getState().error).toBeNull();
+    // And status must not be left at "idle". setError(null) lands there on its way out of "error",
+    // but capture never stopped: deriveMicState(enabled=true, "idle", …) draws a PAUSED mic, so a
+    // demonstrably recovered mic would keep rendering as not-listening until the user cycled it by
+    // hand. Asserting only `error === null` would have shipped exactly that.
+    expect(useDictationStore.getState().status).toBe("listening");
+  });
+
+  it("does NOT claim listening while Sparkle is UNFOCUSED (nothing is being captured there)", async () => {
+    // The sequence this notice's own remedy invites: it tells the user to go to System Settings →
+    // Sound, which blurs Sparkle. An unfocused app is not capturing — dictation://focus(false)
+    // parks status at "idle" on purpose — so frames resuming while we're away must not paint a
+    // listening mic over a session that isn't running. The focus handler restores it on return.
+    ctrl.cleanup(); // drop the block's focused controller so only this one sees the broadcast
+    const bg = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    emit("dictation://error", NO_AUDIO_ERROR);
+    emit("dictation://audio-recovered", null);
+    // The notice is stale either way, so it still goes.
+    expect(useDictationStore.getState().error).toBeNull();
+    expect(useDictationStore.getState().status).toBe("idle");
+    bg.cleanup();
+  });
+
+  it("does NOT un-mute a mic the user muted while the fault was showing", () => {
+    emit("dictation://error", NO_AUDIO_ERROR);
+    useDictationStore.setState({ enabled: false }); // user gave up and muted
+    emit("dictation://audio-recovered", null);
+    // The notice is stale either way, so it goes; but "listening" would contradict the mute and
+    // re-arm the UI behind the user's back.
+    expect(useDictationStore.getState().error).toBeNull();
+    expect(useDictationStore.getState().status).toBe("idle");
+  });
+
+  it("clears ONLY the dead-mic notice — an unrelated failure showing at the time survives", () => {
+    // THE test. A blanket setError(null) here would pass the case above while silently erasing a
+    // model-download failure or a permission denial that is still true and still needs the user.
+    emit("dictation://error", UNRELATED_ERROR);
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().error).toBe(UNRELATED_ERROR);
+    expect(useDictationStore.getState().status).toBe("error");
+
+    // Same controller, same event, immediately after: proves the listener really is live, so the
+    // assertion above is a guard doing its job rather than "nothing happened because nothing is
+    // wired up" — which is how this test would otherwise pass against a version with no listener.
+    emit("dictation://error", NO_AUDIO_ERROR);
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().error).toBeNull();
+  });
+
+  it("is a no-op when no error is showing (recovery can arrive without a preceding fault)", () => {
+    useDictationStore.setState({ status: "listening", error: null });
+    emit("dictation://audio-recovered", null);
+    // Must not knock a healthy live session out of "listening" on its way through setError(null).
+    expect(useDictationStore.getState().status).toBe("listening");
+    expect(useDictationStore.getState().error).toBeNull();
   });
 });
 

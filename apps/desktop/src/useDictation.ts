@@ -9,6 +9,7 @@ import { advance, type Advance } from "./voice/wakeMachine";
 import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDictation";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
+import { classifyVoiceError } from "./voice/dictationCopy";
 
 /**
  * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
@@ -234,6 +235,69 @@ export async function createDictationController(
     listen<string>("dictation://error", (e) => {
       setModelProgress(null);
       setError(e.payload);
+      // Record the dead-mic FAULT alongside the notice that reports it. STICKY, not assigned: an
+      // earlier version wrote the boolean unconditionally, so any unrelated error landing between
+      // the fault and its all-clear erased the fault, the recovery handler early-returned, and once
+      // the user dismissed THAT notice the mic was drawn as paused over a live capture — the same
+      // incident by a different route (roborev 55351). Only the recovery event, which is the only
+      // positive evidence frames resumed, may clear it.
+      if (classifyVoiceError(e.payload) === "no-audio") {
+        useDictationStore.getState().setDeadMicSilent(true);
+      }
+    }),
+
+    // The frame-liveness watchdog's all-clear: audio frames are arriving again after a stretch of
+    // none. No payload — the event asserts only "as of now, frames are flowing".
+    //
+    // It clears the error ONLY when the notice currently on screen is the watchdog's own. The
+    // backend emits this whenever frames resume, which includes resuming while some UNRELATED
+    // failure is showing (a model-download error, a permission denial). A blanket `setError(null)`
+    // there would wipe a failure that is still true and still needs the user — trading the bug
+    // where the UI hid a dead mic for the bug where it hides a denied one. `classifyVoiceError` is
+    // the same bucketing the notice itself renders from, so what we clear is exactly what the user
+    // is looking at, and it stays correct if the backend rewords the watchdog sentence.
+    listen<null>("dictation://audio-recovered", () => {
+      const store = useDictationStore.getState();
+      // Gate on the FAULT, not on the visible notice. Keying off `store.error` discarded the very
+      // evidence this handler exists for whenever the user dismissed the notice first — and
+      // dismiss-then-fix is the ordinary sequence: read the warning, close it, quit the screen
+      // recorder, frames resume. That arrived here with `error === null`, early-returned, and left
+      // a live capturing mic drawn as PAUSED for as long as the user stayed in the window (only an
+      // app blur/refocus would have corrected it). The fault is not dismissible; the notice is.
+      if (!store.deadMicSilent) return;
+      store.setDeadMicSilent(false);
+      // Clear the notice only if it is still up AND still the watchdog's own. With the fault now
+      // sticky, this check is what keeps an UNRELATED failure on screen: the all-clear says frames
+      // are flowing, which is no evidence at all about a failed model download or a denied
+      // permission. Trading the bug where the UI hid a dead mic for the bug where it hides a denied
+      // one would be no trade at all.
+      if (store.error && classifyVoiceError(store.error) === "no-audio") setError(null);
+      // Clearing the notice is only half the retraction. `setError(null)` moves status "error" →
+      // "idle", but the mic never actually stopped: the watchdog fires MID-SESSION, so capture is
+      // still live and `enabled` is still true. Left at idle, deriveMicState(enabled=true, "idle",
+      // …) renders "paused" (MicButton.tsx) — a mic that has demonstrably recovered, drawn as if it
+      // weren't listening, until the user cycles it by hand.
+      //
+      // THIS is the only place allowed to make that claim: the event is the sole positive evidence
+      // that frames resumed. The notice's Dismiss buttons deliberately do NOT restore listening —
+      // dismissing means "I've read this", not "the mic works again", and claiming it there would
+      // paint a live mic over a still-dead one. Understating (paused) is the safe direction;
+      // overstating rebuilds the incident.
+      //
+      // Gated on `enabled` so recovery can never un-mute a mic the user muted while the fault was
+      // showing, and on focus because this notice's own remedy sends the user to System Settings →
+      // Sound, which BLURS Sparkle: frames can resume while we are unfocused and not capturing, and
+      // the dictation://focus(true) handler below already restores listening on refocus.
+      // …and only when NO notice is left standing. Reading the store fresh, because setError above
+      // just wrote to it. A surviving unrelated error means some other thing is still broken, and
+      // "listening" would paint over it — the same overstatement, one failure across.
+      if (
+        useDictationStore.getState().error === null &&
+        store.enabled &&
+        isWindowActive()
+      ) {
+        store.setStatus("listening");
+      }
     }),
 
     // App-level window focus changed (sparkle-9oz6). The backend has already released or rebuilt the
@@ -303,6 +367,10 @@ export async function createDictationController(
       // stop_dictation tears down any live relay stream in Rust, which stops server-side metering.
       await invoke("stop_dictation");
       state.setModelProgress(null);
+      // The capture the fault described is gone, so the fault goes with it — otherwise a stale
+      // `deadMicSilent` could let a later recovery event claim "listening" for a session that
+      // no longer exists.
+      state.setDeadMicSilent(false);
       state.setStatus("idle");
       state.setLevel(0);
       state.setSpeaking(false);
@@ -476,6 +544,9 @@ export function useAmbientVoice(): void {
       store.setPhase("passive");
       store.setInterim("");
       store.setModelProgress(null);
+      // Muting tears the capture down, so the dead-mic fault it described is over too. Left set, a
+      // later recovery event could re-assert "listening" against a session that no longer exists.
+      store.setDeadMicSilent(false);
     }
     return () => { activeRun = false; };
   }, [enabled]);

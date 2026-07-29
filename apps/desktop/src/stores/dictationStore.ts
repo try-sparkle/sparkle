@@ -68,6 +68,21 @@ interface DictationState {
    *  surfaces (composer + top-left bar) subscribe to it, so the message shows in both at once. Runtime
    *  only — never persisted (partialize keeps just `enabled`), so it can't survive a relaunch. */
   outOfCreditsNotice: boolean;
+  /** The FAULT, tracked separately from the NOTICE that reports it: the frame-liveness watchdog has
+   *  said audio stopped arriving and has not yet said it resumed.
+   *
+   *  Why this is not just `classifyVoiceError(error) === "no-audio"`. The notice is dismissible, the
+   *  fault is not — the mic does not start working because the user clicked an X. Deriving the fault
+   *  from the visible string means a dismissed notice erases the app's memory that the mic is dead,
+   *  and the `dictation://audio-recovered` event then arrives with nothing to act on: capture is
+   *  live and frames are flowing, but status stays "idle", which `deriveMicState` draws as a PAUSED
+   *  mic over a working one, indefinitely, for a user who never leaves the window. Keeping the fact
+   *  here lets Dismiss clear only what is on screen while real positive evidence can still land.
+   *
+   *  Set when a `no-audio` error arrives and cleared by the recovery event; also cleared wherever a
+   *  session is torn down, so a stale fault can't outlive the capture it described. Runtime only
+   *  (see `partialize`) — a relaunch starts a new capture and knows nothing about the old one. */
+  deadMicSilent: boolean;
   /** The active composer's append fn, or null. Set via registerInsert. */
   insertTarget: ((text: string) => void) | null;
   /** WHICH mic surface the user last operated, and therefore where dictated speech belongs.
@@ -114,6 +129,8 @@ interface DictationState {
    *  null only returns to "idle" if we were in the "error" state — an active
    *  "listening" session is left untouched. */
   setError: (e: string | null) => void;
+  /** Record (or clear) the dead-mic fault — see {@link deadMicSilent}. */
+  setDeadMicSilent: (v: boolean) => void;
   setModelProgress: (p: ModelProgress | null) => void;
 
   setEnabled: (v: boolean) => void;
@@ -146,6 +163,7 @@ export const useDictationStore = create<DictationState>()(
       enabled: false, // opt-in: no mic-permission prompt / model load on a fresh cold start
       phase: "passive",
       outOfCreditsNotice: false,
+      deadMicSilent: false,
       insertTarget: null,
       voiceSurface: "concierge",
       speechEndSeq: 0,
@@ -160,6 +178,7 @@ export const useDictationStore = create<DictationState>()(
           error,
           status: error ? "error" : s.status === "error" ? "idle" : s.status,
         })),
+      setDeadMicSilent: (deadMicSilent) => set({ deadMicSilent }),
       setModelProgress: (modelProgress) => set({ modelProgress }),
 
       setEnabled: (enabled) => set({ enabled }),

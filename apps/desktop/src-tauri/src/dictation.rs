@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
-use crate::audio::{rms_level, Capture};
+use crate::audio::{assess_capture_health, rms_level, AudioHealth, Capture};
+use crate::audio_devices::DeviceChoice;
 use crate::cloud::{CloudAudioSender, DeepgramSession};
 use crate::model;
 use crate::transcribe::{Decoder, ParakeetTdt, Transcriber};
@@ -146,6 +147,67 @@ pub(crate) fn should_install_cloud(
     already_active: bool,
 ) -> bool {
     same_generation && still_current && capture_present && !already_active
+}
+
+/// What to do with a relay socket whose blocking handshake was raced by a stop/restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RacedStream {
+    /// Intent is still current — install it and start routing audio.
+    InstallLive,
+    /// A stop landed while we were connecting, but this session generation is still the live one
+    /// and its slot is empty. PARK it in warm standby instead of throwing it away.
+    ParkWarm,
+    /// The session generation moved on (a stop_dictation + start_dictation swapped fresh Arcs), so
+    /// this socket is an orphan against state nobody holds. It must be silenced and closed.
+    Discard,
+}
+
+/// Decide the fate of a socket that finished handshaking into a stop/again race.
+///
+/// Every one of these used to be thrown away — the `discarding cloud stream opened during a
+/// stop/again race` line appears repeatedly in the 2026-07-29 log, and each occurrence cost a full
+/// TLS+WS handshake AND an up-front `firstMinuteCents` debit for a connection that carried no audio
+/// at all. The user was paying real money for the churn.
+///
+/// Most of those races are survivable. The common trigger is a window blur (capture paused) or a
+/// stop word landing mid-handshake — neither of which invalidates the SESSION, only the routing. If
+/// the generation is unchanged and nothing else has claimed the slot, parking the socket makes the
+/// next utterance reuse it via `cloud_reuse`'s `Resume` path: no second handshake, and the minute
+/// already paid for gets used instead of discarded.
+///
+/// `Discard` remains for the cases that genuinely cannot be salvaged — a different session
+/// generation, whose Arcs this socket is no longer attached to, and a MUTED mic (see `armed`).
+pub(crate) fn raced_stream_disposition(
+    install: bool,
+    same_generation: bool,
+    armed: bool,
+    slot_empty: bool,
+    already_active: bool,
+) -> RacedStream {
+    if install {
+        return RacedStream::InstallLive;
+    }
+    // Four conditions, and `armed` is the subtle one.
+    //
+    // `same_generation` alone does NOT mean the session is still live: `stop_dictation` (the mute)
+    // disarms and empties the slot but does NOT rotate the cloud Arcs — only a fresh `start_dictation`
+    // arm does that. So a handshake landing just after a mute sees an unchanged generation and an
+    // empty slot, and without this guard would park a live socket against a MUTED microphone.
+    //
+    // That is not merely wasteful. If the user un-mutes inside the 8s warm window, the arm installs
+    // fresh Arcs and the old `Arc<Mutex<Option<DeepgramSession>>>` drops with the parked session
+    // still inside it — and `Drop for DeepgramSession` only signals Close: it does NOT `silence_now()`,
+    // so the worker drains and forwards its trailing transcripts and then emits `cloud-ended` into
+    // the generation that just armed. That is exactly the speak-into-the-successor hazard the discard
+    // path silences against (roborev 50498/52646/53024): a stray final lands in the new composer, and
+    // the stray `cloud-ended` drives the frontend to stop the successor's stream.
+    //
+    // A blur — the race this whole path exists for — keeps `armed` true (it drops the capture, not
+    // the session), so parking still happens where it pays.
+    if same_generation && armed && slot_empty && !already_active {
+        return RacedStream::ParkWarm;
+    }
+    RacedStream::Discard
 }
 
 /// What `cloud_reuse` was told about the socket sitting in the slot. NAMED fields, not a bool pair:
@@ -310,15 +372,52 @@ pub(crate) fn choose_engine(setting_enabled: bool, signed_in: bool, credits_ok: 
     }
 }
 
-/// The waveform's "is the user speaking right now?" signal for one captured frame — the source
-/// of the edge-triggered `dictation://speaking` events. On the on-device path it's the Silero
-/// VAD's real-time detection (`vad_detected`). While the cloud stream owns the audio the on-device
-/// VAD isn't fed, so we report speaking unconditionally: the user is actively dictating to the
-/// cloud by definition, so the meter should stay live. Pure so the cloud/local branch — and the
-/// rising/falling edges it produces, including the cloud→on-device transition — are unit-testable
-/// without a CoreAudio callback or a loaded VAD model.
-pub(crate) fn frame_speaking(cloud_active: bool, vad_detected: bool) -> bool {
-    cloud_active || vad_detected
+/// The waveform's "is the user speaking right now?" signal for one captured frame — the source of
+/// the edge-triggered `dictation://speaking` events.
+///
+/// It is the Silero VAD's real-time detection on BOTH paths, and the cloud path is the fix: this
+/// used to return `cloud_active || vad_detected`, so for the entire life of a cloud stream the
+/// waveform animated unconditionally, whether or not anyone was speaking.
+///
+/// That is not merely distracting, it is DISHONEST, and it is a direct cause of the 2026-07-29
+/// incident. A waveform moving on ambient noise (or on nothing at all) looks exactly like one
+/// capturing your voice — so the user talked for nine minutes at a microphone that was delivering
+/// digital silence, reassured by a meter that was animating for reasons unrelated to their speech.
+///
+/// A STILL waveform is now a feature: motion means the engine is actually hearing speech, so
+/// stillness while you talk is a glance-level symptom that something is wrong, and the
+/// "no audio from <device>" notice names the cause. Deliberately the VAD and NOT raw input level —
+/// gating on level alone would let a noisy room animate it again, which is the bug in a new hat.
+///
+/// The capture callback therefore feeds the VAD on the cloud path too (discarding the segments,
+/// since Deepgram is doing the transcribing) — the cheap windowing it already ran on-device.
+pub(crate) fn frame_speaking(_cloud_active: bool, vad_detected: bool) -> bool {
+    vad_detected
+}
+
+/// Advance the "has this VAD segment touched the cloud path?" latch by one captured frame.
+///
+/// Returns `(latch_for_the_next_frame, this_segment_is_the_relay's)`. When the second is true the
+/// closed segment must be DROPPED, never handed to the on-device decoder.
+///
+/// A segment spans many frames but is only handed over when it CLOSES, so asking "is the cloud
+/// active?" at close time answers the wrong question. A segment that opened while Deepgram was
+/// streaming and closed just after `cloud_active` flipped false — a mid-stream disconnect or a
+/// credits-exhausted teardown, both supported fallbacks — would be decoded on-device and emitted as
+/// a `dictation://partial`, which the frontend commits as text. The relay already transcribed and
+/// typed that audio, so the user gets the tail of their own sentence a second time, up to
+/// `max_speech_duration` (8 s) of it. Latching across the whole span is what makes "the relay owns
+/// this audio" true for the segment rather than for one frame (roborev 55300).
+///
+/// Pure so the straddle is testable: the real thing needs a CoreAudio callback and a loaded VAD.
+fn segment_cloud_latch(touched: bool, cloud_now: bool, segment_closed: bool) -> (bool, bool) {
+    let touched = touched || cloud_now;
+    if segment_closed {
+        // The next segment starts from wherever we are NOW, not from this segment's history.
+        (cloud_now, touched)
+    } else {
+        (touched, false)
+    }
 }
 
 /// Whether the cpal mic capture should currently be live. Two conditions, both required:
@@ -514,6 +613,29 @@ pub struct DictationSession {
     /// the sampled epoch rather than a bare bool is what keeps a LATER intent (mute, then unmute
     /// again) from being coalesced away into an earlier one. Guarded by the session Mutex.
     start_in_flight: Option<u64>,
+    /// Watchdog latch: we have already spent this capture's one free automatic re-acquire.
+    /// Reset whenever a capture is installed, so every rebuild gets exactly one silent recovery
+    /// attempt and a permanently dead device escalates to the user instead of looping forever.
+    audio_reacquired: bool,
+    /// WHEN the currently-running `build_capture` started (set by `take_reconcile_step`, cleared by
+    /// `install_capture` or its error path). Builds happen OFF the session lock and CoreAudio init
+    /// blocks on the main thread, so without this the watchdog cannot tell a slow build from a
+    /// failed one and would emit a false "couldn't open a microphone" (roborev 55286).
+    ///
+    /// An `Instant` rather than a bool, because a bool was itself a way to go silent forever: a
+    /// build that HANGS (a wedged main thread — the thing this file documents happening for
+    /// seconds) never reaches either clear site, so the flag stayed set, every tick returned "no
+    /// fault", and the liveness watch was off for the rest of the session. That is the nine-minute
+    /// silence re-entered through the fix for the false positive (roborev 55300). Past
+    /// `BUILD_STALL_GRACE` we stop believing it.
+    build_started_at: Option<std::time::Instant>,
+    /// Consecutive watchdog ticks where the mic SHOULD be capturing but no capture exists.
+    /// Debounces the ordinary in-flight-rebuild window so only a genuinely stuck state escalates.
+    audio_missing_ticks: u8,
+    /// Watchdog latch: we have already told the user this capture is not hearing anything.
+    /// Prevents an error per poll, and gates the "audio is back" retraction so we never retract a
+    /// notice we never showed.
+    audio_reported: bool,
 }
 
 /// `.0` is the session; `.1` is a monotonic focus generation used to coalesce window-to-window
@@ -606,6 +728,61 @@ fn park_cloud_for_blur(cloud: &Mutex<Option<DeepgramSession>>, cloud_active: &At
     session.pause();
 }
 
+/// Bank a socket that finished handshaking into a survivable stop/again race (see
+/// [`raced_stream_disposition`]) in the session's warm-standby slot.
+///
+/// Extracted from `start_cloud_stream` so the SIDE EFFECTS are testable without an `AppHandle`, a
+/// relay, or a `State` — a table test over the disposition booleans cannot see which session states
+/// they are reachable from, which is exactly how the missing `armed` guard hid (roborev 55291).
+///
+/// Three writes, and all three matter:
+///   * `pause()` — stops the worker forwarding anything and starts OUR warm timer, so the socket
+///     closes on our schedule rather than idling until the relay's upstream timeout.
+///   * `cloud_tx` — installed alongside, exactly as warm standby leaves it, so the slot and the
+///     sender stay faithful mirrors of each other.
+///   * the slot itself — where `cloud_reuse`'s `Resume` path finds it on the next utterance.
+///
+/// `cloud_active` is deliberately NOT touched: parked is not routing, and the caller must not meter.
+fn park_raced_stream(
+    cloud: &Mutex<Option<DeepgramSession>>,
+    cloud_tx: &Mutex<Option<CloudAudioSender>>,
+    session: DeepgramSession,
+) {
+    session.pause();
+    *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.audio_sender());
+    *cloud.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+}
+
+/// Install a freshly handshaked socket as the LIVE cloud stream and start routing audio at it.
+///
+/// Returns any session it displaced, already SILENCED — the caller must close it (off-thread; the
+/// close is bounded but blocking). Extracted alongside [`park_raced_stream`] so this pair of
+/// mutations is testable without an `AppHandle` or a relay.
+///
+/// The displacement is not hypothetical. Parking made "the slot is empty at install time" false:
+/// two starts can overlap one handshake window — start A races a stop and PARKS into the slot,
+/// while start B, holding the current epoch, is still connecting. Assigning over A would drop it
+/// through `Drop for DeepgramSession`, which only signals Close: A's worker would then drain its
+/// transcripts into B's composer and emit a `cloud-ended` that drives the frontend to stop B. That
+/// is the speak-into-the-successor hazard `silence_now()` exists for (roborev 50498/52646/53024).
+fn install_live_stream(
+    cloud: &Mutex<Option<DeepgramSession>>,
+    cloud_tx: &Mutex<Option<CloudAudioSender>>,
+    cloud_active: &AtomicBool,
+    session: DeepgramSession,
+) -> Option<crate::cloud::SilencedSession> {
+    let mut slot = cloud.lock().unwrap_or_else(|p| p.into_inner());
+    let displaced = slot.take().map(DeepgramSession::silence_now);
+    // Publish the detached audio sender BEFORE flipping cloud_active true, so the first frame the
+    // callback routes on the cloud path finds a live sender in the slot (mirrors `cloud`; cleared
+    // when the session is taken on stop). Set it while the session is still owned here
+    // (audio_sender() only clones the tx).
+    *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.audio_sender());
+    *slot = Some(session);
+    cloud_active.store(true, Ordering::Relaxed); // callback now routes to Deepgram
+    displaced
+}
+
 /// Resume a cloud session parked by `park_cloud_for_blur` when focus returns inside the warm
 /// window — no handshake, the whole point of the standby. A session that expired while we were
 /// away fails the `is_alive` gate and is left alone (see `should_resume_on_focus`).
@@ -672,6 +849,9 @@ impl DictationState {
                     Ok((cap, worker)) => {
                         sess.capture = Some(cap);
                         sess.decode_worker = Some(worker);
+                        // Fresh capture → fresh liveness verdict (see install_capture).
+                        sess.build_started_at = None;
+                        sess.clear_audio_fault();
                         // Refocus inside the warm window resumes the parked socket rather than
                         // re-handshaking. Only once the capture is actually installed: resuming a
                         // session we then failed to feed would leave it live but silent.
@@ -743,8 +923,11 @@ impl DictationState {
             // install under the lock only if the arm intent is still current.
             ReconcileStep::Build { transcriber, cloud_active, cloud_tx } => {
                 match build_capture(app.clone(), transcriber.clone(), cloud_active, cloud_tx) {
-                    Ok((capture, worker)) => self.install_capture(&transcriber, capture, worker),
+                    Ok((capture, worker)) => self.install_capture(app, &transcriber, capture, worker),
                     Err(e) => {
+                        // The build FAILED — clear the in-flight marker so the watchdog stops
+                        // treating this as a build still running and can escalate/retry.
+                        self.0.lock().unwrap_or_else(|p| p.into_inner()).build_started_at = None;
                         let _ = app.emit("dictation://error", e);
                     }
                 }
@@ -770,11 +953,16 @@ impl DictationState {
             // `transcriber` is always Some while armed; the guard mirrors reconcile_locked's
             // belt-and-suspenders — a Build with nothing to build from is simply Idle.
             CapturePlan::Build => match sess.transcriber.clone() {
-                Some(transcriber) => ReconcileStep::Build {
-                    transcriber,
-                    cloud_active: sess.cloud_active.clone(),
-                    cloud_tx: sess.cloud_tx.clone(),
-                },
+                Some(transcriber) => {
+                    // Mark the build as genuinely in flight so the watchdog does not mistake the
+                    // (off-lock, main-thread-blocking) build window for a failure.
+                    sess.build_started_at = Some(std::time::Instant::now());
+                    ReconcileStep::Build {
+                        transcriber,
+                        cloud_active: sess.cloud_active.clone(),
+                        cloud_tx: sess.cloud_tx.clone(),
+                    }
+                }
                 None => ReconcileStep::Idle,
             },
             CapturePlan::Teardown => {
@@ -804,15 +992,32 @@ impl DictationState {
     /// capture was built against; an `Arc::ptr_eq` mismatch means a stop+start swapped in a fresh
     /// session generation, so this capture is stale and is dropped (outside the lock) rather than
     /// installed against the new one.
-    fn install_capture(&self, built_for: &Arc<Mutex<ParakeetTdt>>, capture: Capture, worker: DecodeWorker) {
+    fn install_capture(
+        &self,
+        app: &AppHandle,
+        built_for: &Arc<Mutex<ParakeetTdt>>,
+        capture: Capture,
+        worker: DecodeWorker,
+    ) {
+        // Whether a user-visible audio fault was standing when this capture landed. Installing
+        // clears the latches, so without capturing it first the `Recovered` retraction could never
+        // fire for the missing-capture path — leaving the (sticky) frontend error latched on a
+        // microphone that is working again (roborev 55286).
+        let mut retract = false;
         let discard = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            sess.build_started_at = None;
             let still_current = capture_should_be_live(sess.armed, sess.focused)
                 && sess.capture.is_none()
                 && sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false);
             if still_current {
                 sess.capture = Some(capture);
                 sess.decode_worker = Some(worker);
+                // Fresh capture → fresh liveness verdict. Carrying the latches over would let a
+                // rebuild inherit "already reported", silently suppressing the notice for a mic
+                // that is still dead.
+                retract = sess.audio_reported;
+                sess.clear_audio_fault();
                 // Resume a socket parked by the blur that preceded this rebuild — only on the
                 // still_current path, so a capture discarded by a stop/blur race never revives the
                 // cloud session it raced.
@@ -829,6 +1034,12 @@ impl DictationState {
             tracing::info!(target: "dictation", "discarding a capture built during a stop/blur race");
             drop(capture);
             drop(worker);
+        }
+        if retract {
+            // The mic is back. Retract the notice we showed, or the frontend's sticky error state
+            // keeps the cloud relay from resuming on a capture that is now healthy.
+            tracing::info!(target: "dictation", "capture rebuilt after an audio fault; retracting the notice");
+            let _ = app.emit("dictation://audio-recovered", ());
         }
     }
 
@@ -926,6 +1137,16 @@ fn build_capture(
     // rising/falling EDGE rather than ~60×/sec. Fresh per capture (starts false), so a newly
     // (re)built capture begins "silent" and the waveform stays flat until real speech lands.
     let mut last_speaking = false;
+    // Has the CURRENTLY OPEN VAD segment overlapped the cloud path at any point? Lives OUT here,
+    // across frames, because that is the whole point: a segment spans many frames but is only
+    // handed over when it CLOSES, so sampling `cloud_active` at close time asks the wrong question.
+    // A segment that opened while Deepgram was streaming and closed just after `cloud_active`
+    // flipped false — a mid-stream disconnect or a credits-exhausted teardown, both documented
+    // fallbacks below — would be decoded on-device and emitted as a partial, re-typing up to
+    // `max_speech_duration` (8 s) of speech the relay ALREADY typed. Latching across the segment is
+    // what makes "Deepgram owns this audio" hold for the whole span, not for one frame
+    // (roborev 55300). Fresh per capture, like `last_speaking`.
+    let mut segment_touched_cloud = false;
     // NOTE: the transcriber is locked on every CoreAudio callback frame, but ONLY for the cheap VAD
     // windowing / segment extraction (`accept_segments`) — the hundreds-of-ms transducer decode runs
     // on the decode worker, never here. finalize() is always called *after* Capture (and the worker)
@@ -939,7 +1160,7 @@ fn build_capture(
     // underflow; this can't underflow on macOS uptime clocks, but the idiom is the robust one).
     let now0 = std::time::Instant::now();
     let mut last_level_emit = now0.checked_sub(LEVEL_EMIT_INTERVAL).unwrap_or(now0);
-    let capture = Capture::start(move |frame: Vec<f32>| {
+    let capture = Capture::start(&current_device_choice(), move |frame: Vec<f32>| {
         let now = std::time::Instant::now();
         if now.duration_since(last_level_emit) >= LEVEL_EMIT_INTERVAL {
             last_level_emit = now;
@@ -956,12 +1177,52 @@ fn build_capture(
         // and flips cloud_active back. Accepted: the window is tens of ms on a rare disconnect.
         //
         // `speaking` drives the waveform animation (frontend `dictation://speaking` listener); see
-        // frame_speaking for how the cloud/on-device branch maps to it. On the on-device path we
-        // read the Silero VAD's real-time flag; on the cloud path the VAD isn't fed (frame_speaking
-        // ignores `vad_detected` there), so what we pass is moot.
+        // frame_speaking. The VAD runs on EVERY frame, cloud or not — that is what makes the
+        // waveform honest on the cloud path, where it previously had nothing real to report and
+        // animated the meter for the whole stream.
         let cloud = cloud_active.load(Ordering::Relaxed);
-        let vad_detected = if cloud {
-            // #2: route to the relay WITHOUT locking the `cloud` teardown mutex. `try_lock` on the
+        let vad_detected = {
+            let mut guard = transcriber.lock().unwrap_or_else(|p| p.into_inner());
+            // On the cloud path drop closed segments WITHOUT copying their samples out: that copy
+            // is ~512 KB of alloc + memcpy + free on the CoreAudio IO thread, per utterance, for a
+            // Vec dropped one line later. `discard_segments` still feeds the VAD, which is what
+            // produces the `speaking()` flag the waveform needs.
+            let (segs, closed) = if cloud {
+                let n = guard.discard_segments(&frame);
+                (Vec::new(), n > 0)
+            } else {
+                let segs = guard.accept_segments(&frame);
+                let closed = !segs.is_empty();
+                (segs, closed)
+            };
+            let spk = guard.speaking();
+            drop(guard);
+            let (latch, relays_audio) = segment_cloud_latch(segment_touched_cloud, cloud, closed);
+            segment_touched_cloud = latch;
+            if relays_audio {
+                tracing::debug!(
+                    target: "dictation",
+                    "dropping a segment that straddled the cloud→on-device switch; the relay already transcribed it"
+                );
+            } else {
+                for samples in segs {
+                    // Non-blocking, drop-on-full: the audio thread must never block. A full queue
+                    // (worker fell behind) drops the newest segment; a disconnected channel (worker
+                    // gone during teardown) is a silent no-op.
+                    match decode_tx.try_send(samples) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => tracing::warn!(
+                            target: "dictation",
+                            "decode queue full; dropping a segment (decoder fell behind)"
+                        ),
+                        Err(TrySendError::Disconnected(_)) => {}
+                    }
+                }
+            }
+            spk
+        };
+        if cloud {
+            // Route to the relay WITHOUT locking the `cloud` teardown mutex. `try_lock` on the
             // dedicated sender slot NEVER blocks the audio thread: if a start/stop is mid-swap we
             // simply drop this frame (the same tens-of-ms transition window that already drops
             // frames), rather than contend with start/stop_cloud_stream/stop_dictation.
@@ -970,31 +1231,6 @@ fn build_capture(
                     s.send_audio(&frame);
                 }
             }
-            false // unused when cloud == true
-        } else {
-            // #1: on the audio thread do ONLY the cheap VAD windowing / segment detection. Closed
-            // segments are shipped to the decode worker over a bounded channel; the transducer
-            // decode + `dictation://partial` emit happen there, off `com.apple.audio.IOThread`.
-            let mut guard = transcriber.lock().unwrap_or_else(|p| p.into_inner());
-            let segs = guard.accept_segments(&frame);
-            // Read the VAD flag while we still hold the transcriber lock (cheap, no I/O), then
-            // release before touching the channel.
-            let spk = guard.speaking();
-            drop(guard);
-            for samples in segs {
-                // Non-blocking, drop-on-full: the audio thread must never block. A full queue
-                // (worker fell behind) drops the newest segment; a disconnected channel (worker
-                // gone during teardown) is a silent no-op.
-                match decode_tx.try_send(samples) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => tracing::warn!(
-                        target: "dictation",
-                        "decode queue full; dropping a segment (decoder fell behind)"
-                    ),
-                    Err(TrySendError::Disconnected(_)) => {}
-                }
-            }
-            spk
         };
         let speaking = frame_speaking(cloud, vad_detected);
         if speaking != last_speaking {
@@ -1005,7 +1241,453 @@ fn build_capture(
     .inspect_err(|e| {
         let _ = app.emit("dictation://error", e.clone());
     })?;
+    // Tell the UI WHAT we are listening to. Before this, nothing in the app — log or screen — ever
+    // named the input device, which is why a capture bound to a device delivering nothing looked
+    // identical to a quiet room for nine minutes, and why a device carrying system audio went
+    // unnoticed for a day. The device name is the fact that makes both self-evident.
+    let _ = app.emit("dictation://device", capture.device().clone());
     Ok((capture, worker))
+}
+
+/// The input device the user has chosen (or automatic), read fresh from config on every build so
+/// changing it in the picker takes effect on the next capture without an app restart.
+fn current_device_choice() -> DeviceChoice {
+    let voice = crate::config::current_effective().config.voice;
+    DeviceChoice::from_config(voice.input_device_uid.as_deref(), voice.allow_virtual_input)
+}
+
+// ── Audio liveness watchdog ────────────────────────────────────────────────────────────────────
+//
+// The 2026-07-29 incident in one line: capture ran for NINE MINUTES receiving nothing while the UI
+// showed an idle waveform, and the user sat there talking to it. Nothing in the app was watching
+// whether audio actually arrived — only whether the stream had been *created*. This is that watch.
+
+/// How often to check that audio is still arriving. Cheap (two atomic loads under a short lock),
+/// so the interval is set by how long a user should ever spend talking to a dead mic, not by cost.
+const WATCHDOG_POLL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// How long a freshly built capture gets before its silence counts as a fault. Long enough to
+/// cover CoreAudio's first-buffer latency and a device reconfiguration, short enough that the user
+/// finds out inside one sentence rather than nine minutes.
+const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How many consecutive ticks the mic may be armed-but-uncaptured before that counts as a fault.
+/// `reconcile_capture` builds outside the session lock, so a tick can legitimately land in that
+/// window; three seconds is far longer than a rebuild and far shorter than a user's patience.
+const MISSING_CAPTURE_TICKS: u8 = 3;
+
+/// Advance the missing-capture debounce for one tick.
+///
+/// Returns `(new_tick_count, is_a_fault)`. Pure, so the whole increment/reset matrix is covered by
+/// a test — the sampling around it needs a live `AppHandle` and a real audio device, and an earlier
+/// version tested only the threshold constant while leaving the logic that actually changed
+/// uncovered (roborev 55286).
+///
+/// `building` is the load-bearing input. `MISSING_CAPTURE_TICKS` alone is a wall-clock guess, and
+/// `Capture::start`'s CoreAudio init blocks on the main thread — a thread this file documents as
+/// being blocked for seconds elsewhere. Without it, a build that merely takes longer than the
+/// threshold is indistinguishable from one that failed, and the user gets a false "couldn't open a
+/// microphone". Note it is a BOUNDED belief, computed by [`build_suppresses_watch`] — see there for
+/// why an unbounded one silences the watchdog for the rest of the session.
+fn missing_tick(has_capture: bool, should_be_live: bool, building: bool, ticks: u8) -> (u8, bool) {
+    if has_capture || !should_be_live || building {
+        return (0, false);
+    }
+    let ticks = ticks.saturating_add(1);
+    (ticks, ticks >= MISSING_CAPTURE_TICKS)
+}
+
+/// How long a running `build_capture` may suppress the missing-capture watch. Far above a normal
+/// build (CoreAudio init is milliseconds, and even a badly contended main thread is ~seconds) and
+/// far below the user's patience.
+const BUILD_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a build that started `since` ago should still be believed to be making progress.
+///
+/// The bound is the point. `build_started_at` is cleared by `install_capture` and by the build's
+/// error arm — neither of which a HUNG build ever reaches. Treating "a build is running" as
+/// permanently true therefore turned the watchdog off for the rest of the session on an armed
+/// session with no capture: exactly the nine-minute silent failure this watchdog exists to end,
+/// re-entered through the fix for its false positive (roborev 55300). Past the grace we stop
+/// believing the marker and let the tick escalation through.
+fn build_suppresses_watch(since: Option<std::time::Duration>) -> bool {
+    matches!(since, Some(elapsed) if elapsed < BUILD_STALL_GRACE)
+}
+
+/// What the watchdog should do about the current reading.
+///
+/// Pure (see [`fault_action`]) so the escalation order is unit-tested: we always try to RECOVER
+/// before we complain, and we complain exactly once per capture rather than every poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultAction {
+    /// Nothing to do.
+    Idle,
+    /// Rebuild the capture — re-enumerates devices and re-binds. Fixes the ordinary case
+    /// (a device changed under us) without the user ever seeing an error.
+    Reacquire,
+    /// Re-acquiring did not help. Tell the user, naming the device.
+    Report,
+    /// Audio came back after we had reported a fault — retract the notice.
+    Recovered,
+}
+
+/// Escalation policy for a liveness reading.
+///
+/// `reacquired` / `reported` are per-capture latches: they reset when a new capture is installed,
+/// so each rebuild gets one silent recovery attempt and at most one user-visible message. Without
+/// the latches a dead mic would either re-acquire in a tight loop or emit an error every second.
+///
+/// `muted` is the device's own `kAudioDevicePropertyMute` reading, and it short-circuits the
+/// recovery attempt: rebuilding a stream cannot unmute hardware, so re-acquiring a muted device is
+/// pure churn that delays telling the user the one thing they need to hear.
+fn fault_action(
+    health: AudioHealth,
+    muted: bool,
+    reacquired: bool,
+    reported: bool,
+) -> FaultAction {
+    match health {
+        // Too early to judge — a just-built stream has not necessarily delivered a buffer yet.
+        AudioHealth::Warming => FaultAction::Idle,
+        // Audio is flowing. Retract a previous complaint, but only if we actually made one.
+        AudioHealth::Live => {
+            if reported {
+                FaultAction::Recovered
+            } else {
+                FaultAction::Idle
+            }
+        }
+        // No frames at all, or frames that are all digital silence. Both mean "not hearing you";
+        // both are worth one automatic recovery attempt before bothering the user — UNLESS the
+        // device says it is muted, in which case there is nothing to recover and the honest thing
+        // is to say so straight away.
+        AudioHealth::NoFrames | AudioHealth::Silent => {
+            if reported {
+                FaultAction::Idle
+            } else if muted || reacquired {
+                FaultAction::Report
+            } else {
+                FaultAction::Reacquire
+            }
+        }
+    }
+}
+
+/// What we tell the user when the re-acquire could not rebuild a capture AT ALL, so there is no
+/// device to name. A constant rather than an inline literal so the test that audits the remedy is
+/// asserting the exact bytes the Report arm emits (roborev 55360).
+///
+/// Same remedy rule as [`no_audio_message`]: it must name a control that exists AND works. This arm
+/// was missed on the first audit pass and still said "check System Settings → Sound → Input", which
+/// cannot rebind Sparkle — capture no longer follows the system default. It is also the one message
+/// here that matches no bucket in `dictationCopy`, so it reaches the user verbatim.
+const NO_CAPTURE_MESSAGE: &str =
+    "Sparkle couldn't open a microphone. Connect one, then pick it in Sparkle's mic menu \
+     (hover the mic).";
+
+/// The user-facing message for a capture that is not hearing anything.
+///
+/// Naming the device is the whole point: "no audio" sends someone hunting through System Settings,
+/// while "no audio from ZoomAudioDevice" tells them instantly that capture landed on a virtual
+/// device and roughly which app put it there. The remedy differs for the two cases, so the copy
+/// does too — a virtual device is a WRONG-DEVICE problem, a physical one is a taken-over-mic
+/// problem, and telling someone to pick a different input when they are already on their built-in
+/// mic would be useless advice.
+fn no_audio_message(device: &crate::audio::BoundDevice, muted: bool) -> String {
+    // AGENTS.md: "a remedy message is an instruction the user will follow", so it must name an
+    // action that EXISTS — and one that WORKS. An earlier draft said "pick your microphone in the
+    // mic menu" while that menu was still a three-option mode pill with no device list (roborev
+    // 55277), so it was swung to System Settings → Sound → Input, true on every macOS install.
+    //
+    // The mic menu now carries a real device picker (`AudioInputPicker`), which changes the answer
+    // BACK for the wrong-device case — and not merely as a convenience. This branch deliberately
+    // stopped following `kAudioHardwarePropertyDefaultInputDevice`: automatic selection prefers a
+    // physical input over the default, and a pinned UID ignores the default outright. So "change
+    // your input in System Settings" is now advice that can leave capture on exactly the device the
+    // user was just told about — a remedy that does nothing is worse than none. Sparkle's own
+    // picker is the control that actually rebinds (`set_audio_input` re-acquires immediately).
+    //
+    // System Settings stays for MUTE, where it is still the truth: no in-app picker can unmute
+    // hardware.
+    if muted {
+        // The device told us it is muted. Accusing it of being broken — or telling the user to go
+        // pick a different microphone — would send them chasing a fault that does not exist.
+        return format!(
+            "\"{}\" is muted. Unmute it (check the hardware mute switch, or System Settings → \
+             Sound → Input) to start dictating.",
+            device.name
+        );
+    }
+    if device.is_virtual {
+        format!(
+            "No audio from \"{}\". That is a virtual audio device, not a microphone — pick your \
+             microphone in Sparkle's mic menu (hover the mic) to rebind capture.",
+            device.name
+        )
+    } else {
+        format!(
+            "No audio from \"{}\". Another app (a screen recorder or virtual audio device) may be \
+             holding the microphone. Turn the mic off and on, or pick a different input in \
+             Sparkle's mic menu (hover the mic).",
+            device.name
+        )
+    }
+}
+
+impl DictationSession {
+    /// Clear every per-capture audio-fault latch.
+    ///
+    /// BOTH latches, not just the report one (roborev 55277). Leaving `audio_reacquired` set would
+    /// make the NEXT fault on this capture skip straight to complaining — inverting "recover before
+    /// you complain" exactly in the flapping-device case (USB unplug/replug, plug-in load/unload)
+    /// where a rebind is the thing that fixes it.
+    fn clear_audio_fault(&mut self) {
+        self.audio_reported = false;
+        self.audio_reacquired = false;
+        self.audio_missing_ticks = 0;
+    }
+}
+
+impl DictationState {
+    /// Tear the capture down and rebuild it, re-enumerating devices on the way.
+    ///
+    /// Reuses `reconcile_capture` for the rebuild rather than open-coding one: that path already
+    /// re-validates the arm intent under the lock before installing, so a stop or blur landing in
+    /// the gap is handled exactly as it is everywhere else. All we do here is remove the capture so
+    /// `plan_capture` sees `Build`.
+    pub fn reacquire_capture(&self, app: &AppHandle) {
+        let taken = {
+            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            if !sess.armed {
+                return; // muted — nothing to re-acquire, and reconciling would fight the mute
+            }
+            // NO `capture.is_none()` early-return. That guard made this a NO-OP on the path it
+            // matters most: an armed session whose rebuild already failed has no capture, which is
+            // exactly when we must try to BUILD one (roborev 55286). With nothing to tear down we
+            // simply fall through to the reconcile below, which sees `CapturePlan::Build`.
+            if let Some(w) = sess.decode_worker.as_ref() {
+                // Abort the decode backlog first so the join (outside the lock) is near-instant.
+                w.abort();
+            }
+            (sess.capture.take(), sess.decode_worker.take())
+        }; // release the lock BEFORE dropping: the cpal teardown touches CoreAudio (sparkle-sfxu).
+        // Tuple fields drop in declaration order, so the Capture (sole decode-channel Sender) goes
+        // first and the worker's join follows a closed channel.
+        drop(taken);
+        self.reconcile_capture(app);
+    }
+
+    /// One watchdog tick. Returns the action taken, so the polling loop stays trivial and this is
+    /// the only thing with logic in it.
+    fn watchdog_tick(&self, app: &AppHandle) -> FaultAction {
+        // Set when this tick should attempt another BUILD, independently of whether it also has
+        // something to say to the user. The two must be separate: `fault_action` short-circuits on
+        // `reported`, so routing the retry through it meant that after the single report the
+        // session stopped trying — a microphone plugged back in recovered only if the device LIST
+        // happened to change, and a build that failed for any other reason (transient CoreAudio
+        // error, a wedged main thread) left the session silent forever. Report once, keep retrying
+        // (roborev 55300).
+        let mut retry_build = false;
+        // Sample under the lock, then RELEASE before doing anything that emits or touches audio.
+        let sampled = {
+            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            let should_be_live = capture_should_be_live(sess.armed, sess.focused);
+            match sess.capture.as_ref() {
+                Some(c) => {
+                    let health = assess_capture_health(
+                        c.uptime(),
+                        c.health().frames(),
+                        c.health().voiced_frames(),
+                        WATCHDOG_GRACE,
+                    );
+                    let device = c.device().clone();
+                    // Ends the borrow of `sess.capture` before the counter reset below.
+                    sess.audio_missing_ticks = 0;
+                    Some((health, Some(device), sess.audio_reacquired, sess.audio_reported))
+                }
+                // The mic SHOULD be capturing but there is no capture. That is what a FAILED
+                // re-acquire looks like — `build_capture` returning Err is the likely outcome when
+                // the device really is gone, i.e. exactly the fault case — and it must not be
+                // invisible, or the nine-minute silent failure is reachable through the recovery
+                // path itself (roborev 55277). Debounced against a genuine in-flight build.
+                None => {
+                    let building =
+                        build_suppresses_watch(sess.build_started_at.map(|t| t.elapsed()));
+                    let (ticks, fault) =
+                        missing_tick(false, should_be_live, building, sess.audio_missing_ticks);
+                    sess.audio_missing_ticks = ticks;
+                    // Keep RETRYING rather than latching silent: on this cadence we attempt another
+                    // build, so a microphone plugged back in — or a build that failed transiently —
+                    // recovers on its own instead of waiting for a user toggle. Driven from HERE,
+                    // not from `fault_action`, because that returns Idle once `reported` is set
+                    // (roborev 55286/55300). `install_capture` clears the latches and emits the
+                    // retraction when one of these finally succeeds.
+                    retry_build = fault && !building && ticks % MISSING_CAPTURE_TICKS == 0;
+                    fault.then_some((
+                        AudioHealth::NoFrames,
+                        None,
+                        sess.audio_reacquired,
+                        sess.audio_reported,
+                    ))
+                }
+            }
+        };
+        // Off the lock (reacquire_capture builds, which touches CoreAudio) and BEFORE the early
+        // return, so the retry still runs on the ticks that have nothing new to tell the user.
+        if retry_build {
+            tracing::info!(
+                target: "dictation",
+                "armed with no capture; retrying the build (the device may have come back)"
+            );
+            self.reacquire_capture(app);
+        }
+        let Some((health, device, reacquired, reported)) = sampled else {
+            return FaultAction::Idle;
+        };
+
+        // Ask the device whether it is muted before accusing it of anything. `None` means the
+        // device does not implement the property (common — many hardware mute switches are
+        // invisible to the host), which is "don't know", not "not muted"; we treat it as
+        // not-muted here because the ordinary remedies still apply, and the copy stays honest by
+        // never claiming the device IS unmuted.
+        let muted = device
+            .as_ref()
+            .and_then(|d| d.uid.as_deref())
+            .and_then(crate::audio_devices::is_muted)
+            .unwrap_or(false);
+
+        let action = fault_action(health, muted, reacquired, reported);
+        match action {
+            FaultAction::Idle => {}
+            FaultAction::Reacquire => {
+                tracing::warn!(
+                    target: "dictation",
+                    device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"), ?health,
+                    "dictation is armed but no audio is arriving; re-acquiring the input device"
+                );
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reacquired = true;
+                self.reacquire_capture(app);
+                // reacquire_capture installs a FRESH capture, which resets the per-capture latches
+                // (see install_capture). Re-set the flag afterwards so the new capture is not
+                // granted a second free recovery attempt — otherwise a permanently dead device
+                // would re-acquire forever and never surface.
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reacquired = true;
+            }
+            FaultAction::Report => {
+                tracing::error!(
+                    target: "dictation",
+                    device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
+                    uid = device.as_ref().and_then(|d| d.uid.as_deref()).unwrap_or("<none>"),
+                    is_virtual = device.as_ref().map(|d| d.is_virtual).unwrap_or(false),
+                    muted, ?health,
+                    "no audio from the bound input device; telling the user"
+                );
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reported = true;
+                let message = match &device {
+                    Some(d) => no_audio_message(d, muted),
+                    // The re-acquire could not rebuild a capture at all, so there is no device to
+                    // name. Say exactly that rather than inventing one.
+                    //
+                    // Same remedy rule as `no_audio_message`, and this arm was missed on the first
+                    // pass (roborev 55360): it said "check System Settings → Sound → Input", which
+                    // provably cannot rebind Sparkle — this branch stopped following the system
+                    // default. Worse, the string matches no frontend bucket in `dictationCopy`, so
+                    // it falls to `unknown` and is rendered to the user VERBATIM.
+                    None => NO_CAPTURE_MESSAGE.to_string(),
+                };
+                let _ = app.emit("dictation://error", message);
+            }
+            FaultAction::Recovered => {
+                tracing::info!(
+                    target: "dictation",
+                    device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
+                    "audio is arriving again"
+                );
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).clear_audio_fault();
+                let _ = app.emit("dictation://audio-recovered", ());
+            }
+        }
+        action
+    }
+}
+
+/// Start the background loop that watches for a capture that has stopped hearing, and for input
+/// devices appearing or disappearing.
+///
+/// One thread serves both: the CoreAudio property listener runs on CoreAudio's own dispatch queue,
+/// where doing real work is forbidden, so it only sets a flag that this loop picks up on its next
+/// tick. That also collapses the burst of notifications a plug-in load produces into a single
+/// re-acquire.
+pub fn start_audio_watchdog(app: AppHandle) {
+    let devices_changed = Arc::new(AtomicBool::new(false));
+    let flag = devices_changed.clone();
+    // Held for the life of the process; dropping it would unregister the listeners.
+    let watcher = crate::audio_devices::DeviceChangeWatcher::start(move || {
+        flag.store(true, Ordering::Release);
+    });
+
+    std::thread::Builder::new()
+        .name("audio-watchdog".into())
+        .spawn(move || {
+            let _watcher = watcher; // keep the listeners registered for the loop's lifetime
+            loop {
+                std::thread::sleep(WATCHDOG_POLL);
+                // `try_state` (not `state`): during shutdown the DictationState is removed and
+                // `state()` PANICS — the same teardown window note_focus_event documents.
+                let Some(state) = app.try_state::<DictationState>() else { return };
+
+                if devices_changed.swap(false, Ordering::Acquire) {
+                    state.on_device_list_changed(&app);
+                }
+                state.watchdog_tick(&app);
+            }
+        })
+        .expect("spawn audio-watchdog thread");
+}
+
+impl DictationState {
+    /// The set of audio devices changed (a plug-in loaded, a headset was plugged in).
+    ///
+    /// Re-acquire only if the change actually moves us: recompute the selection against the NEW
+    /// device list and compare it to what we are bound to now. An unconditional rebuild would drop
+    /// audio mid-sentence every time any unrelated device appeared, and on a machine with eight HAL
+    /// plug-ins that is not rare.
+    fn on_device_list_changed(&self, app: &AppHandle) {
+        let bound = {
+            let sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            match sess.capture.as_ref() {
+                Some(c) => c.device().name.clone(),
+                // No capture. If the mic SHOULD be live, a device appearing is exactly the event
+                // that can fix it — plugging the microphone back in after a failed build must
+                // recover on its own rather than waiting for a user toggle (roborev 55286).
+                None => {
+                    let should_be_live = capture_should_be_live(sess.armed, sess.focused);
+                    drop(sess);
+                    if should_be_live {
+                        self.reacquire_capture(app);
+                    }
+                    return;
+                }
+            }
+        };
+        let devices = crate::audio_devices::list_input_devices();
+        // Only an `Open` names a device we can compare against. A `Refuse` (no safe input) or a
+        // `SystemDefault` (nothing enumerated) has no name to diff, so leave those to the liveness
+        // watchdog rather than guessing at a rebuild.
+        let crate::audio_devices::Resolution::Open { name: want, .. } =
+            crate::audio_devices::select_device(&current_device_choice(), &devices)
+        else {
+            return;
+        };
+        if want == bound {
+            return;
+        }
+        tracing::info!(
+            target: "dictation", from = %bound, to = %want,
+            "the audio device list changed and a different input should now be used; re-acquiring"
+        );
+        self.reacquire_capture(app);
+    }
 }
 
 // SAFETY: cpal::Stream on CoreAudio is !Send, guarded behind a Mutex.
@@ -1429,28 +2111,65 @@ pub async fn start_cloud_stream(
             //   - epoch unchanged: no stop_cloud_stream / stop_dictation / racing start happened on
             //     THIS session since we claimed our attempt (those all bump the epoch).
             //   - capture present & not already active: belt-and-suspenders for the same intent.
+            let mut parked = false;
+            let mut displaced: Option<crate::cloud::SilencedSession> = None;
             let reject = {
                 let sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+                let same_generation = Arc::ptr_eq(&cloud_active, &sess.cloud_active);
+                let already_active = cloud_active.load(Ordering::Relaxed);
                 let install = should_install_cloud(
-                    Arc::ptr_eq(&cloud_active, &sess.cloud_active),
+                    same_generation,
                     cloud_epoch.load(Ordering::Relaxed) == my_epoch,
                     sess.capture.is_some(),
-                    cloud_active.load(Ordering::Relaxed),
+                    already_active,
                 );
-                if install {
-                    // Publish the detached audio sender BEFORE flipping cloud_active true, so the
-                    // first frame the callback routes on the cloud path finds a live sender in the
-                    // slot (mirrors `cloud`; cleared when the session is taken on stop). Set it
-                    // while the session is still owned here (audio_sender() only clones the tx).
-                    *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.audio_sender());
-                    *cloud_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
-                    cloud_active.store(true, Ordering::Relaxed); // callback now routes to Deepgram
-                    None
-                } else {
-                    Some(session) // stopped/restarted during the handshake — don't install it
+                let slot_empty =
+                    sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).is_none();
+                match raced_stream_disposition(
+                    install,
+                    same_generation,
+                    sess.armed, // a mute leaves the generation intact — see raced_stream_disposition
+                    slot_empty,
+                    already_active,
+                ) {
+                    RacedStream::ParkWarm => {
+                        // A stop/blur raced the handshake, but this generation is still live and
+                        // its slot is empty. Park rather than burn the connection: the next
+                        // start_cloud_stream reuses it through cloud_reuse's Resume path — no
+                        // second handshake, and the first minute already debited gets used.
+                        park_raced_stream(&sess.cloud, &cloud_tx, session);
+                        // cloud_active deliberately left FALSE: parked, not routing.
+                        parked = true;
+                        None
+                    }
+                    RacedStream::Discard => Some(session),
+                    RacedStream::InstallLive => {
+                        // Any occupant it displaces comes back SILENCED and must still be closed —
+                        // see install_live_stream for why a bare assignment is unsafe now that a
+                        // raced socket can be parked into this slot.
+                        displaced =
+                            install_live_stream(&cloud_slot, &cloud_tx, &cloud_active, session);
+                        None
+                    }
                 }
             };
+            if let Some(d) = displaced {
+                // Bounded (~2 s) but blocking, and already silenced above — hand it off exactly as
+                // the Discard arm does rather than stalling an async-runtime worker on it.
+                tracing::info!(target: "dictation", "a parked stream was displaced by a live install; closing it");
+                tauri::async_runtime::spawn_blocking(move || d.finish());
+            }
             match reject {
+                // Parked, not routing: the caller must NOT start metering (nothing is streaming),
+                // but the socket is banked for the next utterance rather than thrown away.
+                None if parked => {
+                    tracing::info!(
+                        target: "dictation",
+                        "a stop raced the handshake; parking the stream in warm standby instead \
+                         of discarding it"
+                    );
+                    Ok(false)
+                }
                 None => Ok(true), // installed a live cloud socket → caller may start metering
                 Some(s) => {
                     tracing::info!(target: "dictation", "discarding cloud stream opened during a stop/again race");
@@ -1519,6 +2238,79 @@ pub fn stop_cloud_stream(state: State<DictationState>) {
     }
 }
 
+// ── Input device picker commands ───────────────────────────────────────────────────────────────
+
+/// The persisted input-device settings, for the picker UI.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInputSettings {
+    /// `None` = automatic (prefer real hardware — see `audio_devices::select_device`).
+    pub chosen_uid: Option<String>,
+    /// The advanced opt-in that lets automatic selection accept a virtual (system-audio) input.
+    pub allow_virtual: bool,
+}
+
+/// Every input device CoreAudio can see, so the user can choose one explicitly rather than living
+/// with whatever the OS calls the default.
+#[tauri::command]
+pub fn list_audio_inputs() -> Vec<crate::audio_devices::InputDevice> {
+    crate::audio_devices::list_input_devices()
+}
+
+#[tauri::command]
+pub fn get_audio_input_settings() -> AudioInputSettings {
+    let voice = crate::config::current_effective().config.voice;
+    AudioInputSettings {
+        chosen_uid: voice.input_device_uid,
+        allow_virtual: voice.allow_virtual_input,
+    }
+}
+
+/// Choose the microphone to capture from, by stable UID. `None` returns to automatic.
+///
+/// Applies immediately: the capture is re-acquired rather than waiting for the next mute/unmute,
+/// because a user who has just been transcribing the wrong audio source wants it to stop NOW.
+#[tauri::command]
+pub fn set_audio_input(
+    app: AppHandle,
+    state: State<DictationState>,
+    uid: Option<String>,
+) -> Result<(), String> {
+    // An empty string from the UI means "automatic" — normalize here so the stored config never
+    // holds a UID that can't match a device (mirrors DeviceChoice::from_config).
+    let uid = uid.filter(|u| !u.trim().is_empty());
+    crate::config::set_config_value(
+        app.clone(),
+        "voice.input_device_uid".into(),
+        match &uid {
+            Some(u) => serde_json::Value::String(u.clone()),
+            None => serde_json::Value::String(String::new()),
+        },
+    )?;
+    state.reacquire_capture(&app);
+    Ok(())
+}
+
+/// Toggle the advanced "allow a non-microphone input" opt-in.
+///
+/// Off by default and deliberately not bundled into the picker: a virtual input can carry anything
+/// playing on the machine — a call, a video, a stream, someone else's voice — into the transcript.
+/// See the privacy note on `config::VoiceConfig::allow_virtual_input`.
+#[tauri::command]
+pub fn set_allow_virtual_input(
+    app: AppHandle,
+    state: State<DictationState>,
+    allow: bool,
+) -> Result<(), String> {
+    crate::config::set_config_value(
+        app.clone(),
+        "voice.allow_virtual_input".into(),
+        serde_json::Value::Bool(allow),
+    )?;
+    state.reacquire_capture(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     let (transcriber, cloud_session, worker) = {
@@ -1566,27 +2358,345 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppHandle, State,
-        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, park_cloud_for_blur, plan_capture,
+    use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
+        missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, NO_CAPTURE_MESSAGE,
+        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
+        raced_stream_disposition, RacedStream, park_raced_stream, install_live_stream, CloudAudioSender,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // ---- audio liveness watchdog ----------------------------------------------------------
+    // Guards the 2026-07-29 incident: capture ran for nine minutes receiving nothing while the UI
+    // showed an idle waveform and the user talked to a dead mic.
+
     #[test]
-    fn frame_speaking_mirrors_vad_on_device_and_forces_true_on_cloud() {
-        // On-device path (cloud off): the waveform's speaking signal is exactly the VAD flag, so
-        // the meter freezes the instant the VAD stops hearing speech.
+    fn a_capture_that_hears_nothing_is_re_acquired_before_the_user_is_bothered() {
+        // Escalation order matters. Most device changes are recoverable by rebinding, and a user
+        // who never sees an error is better served than one who sees an error they must act on.
+        // So: silent recovery FIRST, complain only if that failed.
+        for health in [AudioHealth::NoFrames, AudioHealth::Silent] {
+            assert_eq!(
+                fault_action(health, false, false, false),
+                FaultAction::Reacquire,
+                "{health:?} must first try to recover silently"
+            );
+            assert_eq!(
+                fault_action(health, false, true, false),
+                FaultAction::Report,
+                "{health:?} that survived a re-acquire must reach the user"
+            );
+        }
+    }
+
+    #[test]
+    fn the_user_is_told_once_per_capture_not_once_per_poll() {
+        // The watchdog ticks every second. Without the `reported` latch a dead mic would emit an
+        // error 540 times over the nine minutes this bug actually lasted.
+        assert_eq!(fault_action(AudioHealth::Silent, false, true, true), FaultAction::Idle);
+        assert_eq!(fault_action(AudioHealth::NoFrames, false, true, true), FaultAction::Idle);
+    }
+
+    #[test]
+    fn a_permanently_dead_device_does_not_re_acquire_forever() {
+        // The failure mode of a naive retry loop: rebuild, still dead, rebuild… never surfacing.
+        // Once we have spent the one free attempt, the next verdict must escalate, not retry.
+        assert_ne!(fault_action(AudioHealth::Silent, false, true, false), FaultAction::Reacquire);
+    }
+
+    #[test]
+    fn recovery_is_announced_only_if_something_was_announced_first() {
+        // Retracting a notice nobody saw would clear an UNRELATED error the user does need — the
+        // frontend keys its "audio is back" handling off this event.
+        assert_eq!(fault_action(AudioHealth::Live, false, true, true), FaultAction::Recovered);
+        assert_eq!(
+            fault_action(AudioHealth::Live, false, true, false),
+            FaultAction::Idle,
+            "healthy audio with no complaint outstanding must not emit a retraction"
+        );
+    }
+
+    #[test]
+    fn a_warming_capture_is_never_condemned_or_recovered() {
+        // Before the grace window expires we have no evidence either way; acting on it would emit
+        // a spurious fault on every single rebuild.
+        for (reacquired, reported) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(fault_action(AudioHealth::Warming, false, reacquired, reported), FaultAction::Idle);
+        }
+    }
+
+    #[test]
+    fn the_no_audio_message_names_the_device_and_matches_the_remedy_to_it() {
+        // Naming the device is what makes the notice actionable — "no audio" sends someone hunting
+        // through System Settings. And the remedy must FIT: telling a user on their built-in mic to
+        // "pick your microphone" is useless advice, while telling a user stuck on a loopback that
+        // another app took the mic misdiagnoses it. See AGENTS.md on remedy strings being code.
+        let virt = crate::audio::BoundDevice {
+            name: "ZoomAudioDevice".into(),
+            uid: Some("zoom.us.zoomaudiodevice.001".into()),
+            is_virtual: true,
+            was_default: true,
+        };
+        let msg = no_audio_message(&virt, false);
+        assert!(msg.contains("ZoomAudioDevice"), "must name the device: {msg}");
+        assert!(
+            msg.contains("not a microphone"),
+            "a virtual device is a WRONG-DEVICE problem, and the copy must say so: {msg}"
+        );
+
+        let physical = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: Some("BuiltInMicrophoneDevice".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let msg = no_audio_message(&physical, false);
+        assert!(msg.contains("MacBook Pro Microphone"), "must name the device: {msg}");
+        assert!(
+            !msg.contains("not a microphone"),
+            "a real mic must NOT be described as the wrong kind of device: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_build_is_never_mistaken_for_a_failed_one() {
+        // roborev 55286. MISSING_CAPTURE_TICKS alone is a wall-clock guess, and Capture::start's
+        // CoreAudio init blocks on the MAIN thread — which this file documents as being blocked for
+        // seconds elsewhere. A build that is merely slow must not produce "Sparkle couldn't open a
+        // microphone". The marker is what distinguishes them, so no number of ticks may escalate
+        // while a build is genuinely running.
+        let mut ticks = 0;
+        for _ in 0..(MISSING_CAPTURE_TICKS as u16 * 4) {
+            let (next, fault) = missing_tick(false, true, true, ticks);
+            assert!(!fault, "a build in flight must never escalate while it is still plausible");
+            ticks = next;
+        }
+        assert_eq!(ticks, 0, "ticks must not accumulate behind an in-flight build");
+    }
+
+    #[test]
+    fn a_segment_that_straddles_the_cloud_switch_is_never_typed_twice() {
+        // roborev 55300. Deepgram transcribes and TYPES as it goes, so any audio that reached the
+        // relay must never also be decoded on-device — the user would see the tail of their own
+        // sentence a second time. The segment, not the frame, is the unit that matters.
+
+        // The straddle: opens on the cloud path, the relay drops mid-utterance (cloud_active goes
+        // false), the segment closes on-device a few frames later.
+        let (l, drop_now) = segment_cloud_latch(false, true, false); // opening frame, cloud live
+        assert!(l && !drop_now, "still open — nothing to decide yet");
+        let (l, drop_now) = segment_cloud_latch(l, false, false); // the relay just died
+        assert!(l && !drop_now, "the latch must SURVIVE the flip; the audio still went to the relay");
+        let (next, drop_now) = segment_cloud_latch(l, false, true); // segment closes on-device
+        assert!(drop_now, "the relay already typed this — decoding it on-device types it twice");
+        assert!(!next, "and the NEXT segment starts clean: it is genuinely ours to transcribe");
+
+        // The ordinary on-device utterance is untouched — this must not eat normal dictation.
+        let (l, drop_now) = segment_cloud_latch(false, false, false);
+        assert!(!l && !drop_now);
+        assert_eq!(segment_cloud_latch(l, false, true), (false, false), "decode it, as always");
+
+        // And a segment wholly inside a cloud stream is the relay's too (it is discarded without
+        // ever being copied, but the latch must agree, or the first on-device segment after the
+        // stream ends would be judged by a stale `false`).
+        let (l, _) = segment_cloud_latch(false, true, false);
+        assert_eq!(segment_cloud_latch(l, true, true), (true, true));
+    }
+
+    #[test]
+    fn a_build_that_hangs_stops_being_believed_instead_of_silencing_the_watch_forever() {
+        // roborev 55300. `build_started_at` is cleared by install_capture and by the build's error
+        // arm — neither of which a HUNG build ever reaches. An unbounded "a build is running"
+        // therefore turns the liveness watch OFF for the rest of the session on an armed session
+        // with no capture: the nine-minute silence, re-entered through the fix for the false
+        // positive. So the belief has to expire.
+        use std::time::Duration;
+        assert!(!build_suppresses_watch(None), "no build running → nothing to suppress");
+        assert!(
+            build_suppresses_watch(Some(Duration::ZERO)),
+            "a build that just started is plausible"
+        );
+        assert!(
+            build_suppresses_watch(Some(BUILD_STALL_GRACE - Duration::from_millis(1))),
+            "still inside the grace → still believed"
+        );
+        assert!(
+            !build_suppresses_watch(Some(BUILD_STALL_GRACE)),
+            "AT the grace we stop believing it — a hung build must not silence the watch"
+        );
+        assert!(
+            !build_suppresses_watch(Some(BUILD_STALL_GRACE * 60)),
+            "and a marker left set for minutes certainly must not"
+        );
+        // And once disbelieved, the ordinary escalation runs: the user hears about it.
+        let (_, fault) = missing_tick(false, true, false, MISSING_CAPTURE_TICKS - 1);
+        assert!(fault, "a stale in-flight marker must fall through to the escalation");
+    }
+
+    #[test]
+    fn an_armed_mic_with_no_capture_escalates_once_the_build_is_no_longer_running() {
+        // The failure this path exists for: a re-acquire whose build ERRORED leaves no capture and
+        // no build in flight. That must reach the user rather than returning Idle forever.
+        let mut ticks = 0;
+        for _ in 1..MISSING_CAPTURE_TICKS {
+            let (next, fault) = missing_tick(false, true, false, ticks);
+            assert!(!fault, "must debounce briefly before accusing anything");
+            ticks = next;
+        }
+        let (ticks, fault) = missing_tick(false, true, false, ticks);
+        assert_eq!(ticks, MISSING_CAPTURE_TICKS);
+        assert!(fault, "an armed mic with no capture and no build running must reach the user");
+    }
+
+    #[test]
+    fn the_missing_capture_counter_resets_whenever_there_is_nothing_wrong() {
+        // Both non-fault cases, so a stale count can't carry into a later, unrelated window.
+        assert_eq!(missing_tick(true, true, false, 7), (0, false), "capture present → reset");
+        assert_eq!(missing_tick(false, false, false, 7), (0, false), "muted/unfocused → reset");
+    }
+
+    #[test]
+    fn clearing_an_audio_fault_clears_every_latch_not_just_the_reported_one() {
+        // roborev 55286 called the previous version of this test VACUOUS and was right: it asserted
+        // `fault_action` outcomes that the commit never changed, so it passed against the old code.
+        // This asserts the actual SIDE EFFECT — the session state the Recovered arm mutates.
+        //
+        // It matters because leaving `audio_reacquired` set makes the NEXT fault skip the silent
+        // recovery attempt and go straight to complaining, inverting "recover before you complain"
+        // exactly in the flapping-device case where a rebind is the fix.
+        let mut sess = DictationSession {
+            audio_reported: true,
+            audio_reacquired: true,
+            audio_missing_ticks: 9,
+            ..Default::default()
+        };
+        sess.clear_audio_fault();
+        assert!(!sess.audio_reported, "the user-visible notice must be retractable again");
+        assert!(!sess.audio_reacquired, "the next fault must get its own recovery attempt");
+        assert_eq!(sess.audio_missing_ticks, 0, "a stale count must not survive a recovery");
+    }
+
+    #[test]
+    fn the_remedy_copy_names_an_action_that_actually_exists() {
+        // AGENTS.md: a remedy message is an instruction the user will follow, so it must name a
+        // control that EXISTS and that WORKS. Both halves have bitten this string. It once sent
+        // users to "the mic menu" when that menu was a three-option mode pill with no device list
+        // (roborev 55277), so it was swung to System Settings.
+        //
+        // The picker now lives in that menu — and System Settings became the WRONG answer for the
+        // wrong-device case in the same stroke, because this branch stopped following the system
+        // default: automatic selection prefers a physical input over it, and a pinned UID ignores
+        // it. Telling someone to change the OS default can therefore leave capture on the exact
+        // device the message just complained about. A remedy that does nothing is worse than none.
+        let virt = crate::audio::BoundDevice {
+            name: "ZoomAudioDevice".into(),
+            uid: None,
+            is_virtual: true,
+            was_default: true,
+        };
+        let physical = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: None,
+            is_virtual: false,
+            was_default: true,
+        };
+        for msg in [no_audio_message(&virt, false), no_audio_message(&physical, false)] {
+            assert!(
+                msg.contains("mic menu"),
+                "the wrong-device remedy must point at the picker that actually rebinds: {msg}"
+            );
+            assert!(
+                !msg.contains("System Settings"),
+                "changing the OS default no longer changes what Sparkle binds to: {msg}"
+            );
+        }
+        // MUTE is the exception, and stays: no in-app picker can unmute hardware.
+        let muted = no_audio_message(&physical, true);
+        assert!(muted.contains("System Settings"), "unmuting is genuinely an OS control: {muted}");
+    }
+
+    #[test]
+    fn the_no_device_bound_report_names_the_picker_too() {
+        // roborev 55360: the audit stopped one arm short. When the re-acquire cannot rebuild a
+        // capture at all there is no device to name, and THAT message still said "check System
+        // Settings → Sound → Input" — advice that provably cannot rebind Sparkle, on the very path
+        // where nothing could be opened. It is also the one string that matches no bucket in
+        // dictationCopy (`no-audio` needs "no audio from", `no-device` needs a literal "no
+        // microphone"), so it falls through to `unknown` and is shown to the user VERBATIM.
+        //
+        // Asserted against the constant the Report arm actually emits, so the two cannot drift.
+        let msg = NO_CAPTURE_MESSAGE;
+        assert!(
+            msg.contains("mic menu"),
+            "the no-device report must point at the picker that can actually rebind: {msg}"
+        );
+        assert!(
+            !msg.contains("System Settings"),
+            "changing the OS default cannot rebind Sparkle: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_muted_microphone_is_named_as_muted_not_accused_of_being_broken() {
+        // roborev 55275. A hardware mute switch (Jabra/Poly), kAudioDevicePropertyMute, and several
+        // Bluetooth/USB drivers all deliver EXACT 0.0 — same signature as the dead virtual device.
+        // Without this split the watchdog tells a user their microphone is dead every time they
+        // mute it themselves, and points them at a remedy for a fault that does not exist.
+        let device = crate::audio::BoundDevice {
+            name: "Jabra Evolve2".into(),
+            uid: Some("Jabra_UID".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let msg = no_audio_message(&device, true);
+        assert!(msg.contains("Jabra Evolve2"), "must name the device: {msg}");
+        assert!(msg.contains("muted"), "must say it is MUTED: {msg}");
+        assert!(
+            !msg.contains("holding the microphone"),
+            "a muted mic must not be blamed on another app stealing it: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_muted_device_is_reported_immediately_instead_of_being_re_acquired() {
+        // Rebuilding a stream cannot unmute hardware, so the recovery attempt is pure churn that
+        // only delays the one message the user needs. Same inputs as the un-muted case below, so
+        // the ONLY difference is the mute flag — which is what proves the flag does the work.
+        assert_eq!(
+            fault_action(AudioHealth::Silent, true, false, false),
+            FaultAction::Report,
+            "a muted device must skip the pointless re-acquire"
+        );
+        assert_eq!(
+            fault_action(AudioHealth::Silent, false, false, false),
+            FaultAction::Reacquire,
+            "an un-muted device still gets its silent recovery attempt first"
+        );
+        // Still exactly once, muted or not.
+        assert_eq!(fault_action(AudioHealth::Silent, true, false, true), FaultAction::Idle);
+    }
+
+    #[test]
+    fn the_waveform_moves_only_on_real_speech_on_both_paths() {
+        // On-device path: the waveform's speaking signal is exactly the VAD flag, so the meter
+        // freezes the instant the VAD stops hearing speech.
         assert!(!frame_speaking(false, false), "on-device + VAD silent → not speaking");
         assert!(frame_speaking(false, true), "on-device + VAD speech → speaking");
-        // Cloud path: the on-device VAD isn't fed, so we report speaking regardless (the user is
-        // actively dictating to the cloud). This also pins the edges around mode transitions: e.g.
-        // a cloud→on-device switch while silent yields true→false (a falling edge that freezes the
-        // meter), and on-device→cloud yields false→true (rising edge), via the != last_speaking diff.
-        assert!(frame_speaking(true, false), "cloud → speaking even when the (unfed) VAD reads false");
-        assert!(frame_speaking(true, true), "cloud → speaking");
+        // Cloud path — THE FIX. This used to return `cloud_active || vad_detected`, so the meter
+        // animated for the entire life of a cloud stream whether or not anyone was speaking. That
+        // is not merely distracting, it is DISHONEST: on 2026-07-29 a user talked for nine minutes
+        // at a microphone delivering digital silence, reassured by a waveform that was moving for
+        // reasons unrelated to their voice. A still waveform is now a glance-level symptom.
+        assert!(
+            !frame_speaking(true, false),
+            "cloud + VAD silent → STILL; a moving meter must mean the engine hears speech"
+        );
+        assert!(frame_speaking(true, true), "cloud + VAD speech → speaking");
+        // The capture callback is what makes that assertion meaningful: it now feeds the VAD on the
+        // cloud path too (discarding the segments, since Deepgram does the transcribing), so
+        // `vad_detected` carries real information there instead of being a moot `false`.
     }
 
     #[test]
@@ -1879,6 +2989,160 @@ mod tests {
         assert_eq!(cloud_reuse(true, None), CloudReuse::AlreadyRouting);
         assert_eq!(cloud_reuse(true, Some(DEAD_OURS)), CloudReuse::AlreadyRouting);
         assert_eq!(cloud_reuse(true, Some(DEAD_OTHER)), CloudReuse::AlreadyRouting);
+    }
+
+    /// `raced_stream_disposition` takes five bools; at the call sites below that would read as
+    /// `(false, true, true, true, false)` and be unreviewable. This names them once.
+    #[derive(Clone, Copy)]
+    struct Race {
+        install: bool,
+        same_generation: bool,
+        armed: bool,
+        slot_empty: bool,
+        already_active: bool,
+    }
+    /// The salvageable race: a stop/blur landed mid-handshake on a live, armed, un-claimed session.
+    const SALVAGEABLE: Race = Race {
+        install: false,
+        same_generation: true,
+        armed: true,
+        slot_empty: true,
+        already_active: false,
+    };
+    fn disposition(r: Race) -> RacedStream {
+        raced_stream_disposition(r.install, r.same_generation, r.armed, r.slot_empty, r.already_active)
+    }
+
+    #[test]
+    fn a_stream_raced_by_a_stop_is_parked_for_reuse_not_thrown_away() {
+        // "discarding cloud stream opened during a stop/again race" appears repeatedly in the
+        // 2026-07-29 log, and every occurrence cost a full TLS+WS handshake AND an up-front
+        // firstMinuteCents debit for a connection that carried no audio. The common triggers — a
+        // window blur pausing capture, a stop word landing mid-handshake — do not invalidate the
+        // SESSION, only the routing, so the socket is still worth keeping.
+        assert_eq!(
+            disposition(SALVAGEABLE),
+            RacedStream::ParkWarm,
+            "same generation, still armed, empty slot: park it so the next utterance reuses it"
+        );
+        // cloud_reuse's Resume path is what then picks it up, with no second handshake.
+        assert_eq!(cloud_reuse(false, Some(LIVE_OURS)), CloudReuse::Resume);
+    }
+
+    #[test]
+    fn a_stream_raced_by_a_MUTE_is_discarded_not_parked_against_a_dead_mic() {
+        // The guard that `same_generation` alone does NOT give you. `stop_dictation` (the mute)
+        // disarms and empties the slot but does NOT rotate the cloud Arcs — only a fresh
+        // `start_dictation` arm does — so a handshake landing just after a mute still reads as the
+        // same generation. Parking there holds a live relay socket against a microphone the user
+        // just turned off.
+        //
+        // And it is worse than waste: un-muting inside the 8s warm window installs fresh Arcs, which
+        // DROPS the parked session, and `Drop for DeepgramSession` only signals Close — it does not
+        // `silence_now()`. The worker then forwards its trailing transcripts and emits `cloud-ended`
+        // into the generation that just armed: a stray final in the new composer, and a stray
+        // cloud-ended that stops the successor's stream (roborev 50498/52646/53024).
+        assert_eq!(
+            disposition(Race { armed: false, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "muted: silence and close it — never park a socket against a mic the user turned off"
+        );
+    }
+
+    #[test]
+    fn a_stream_orphaned_by_a_new_session_generation_is_still_discarded() {
+        // The case that genuinely cannot be salvaged: stop_dictation + start_dictation installed
+        // FRESH Arcs, so this socket is attached to state nobody holds. Parking it would strand a
+        // live connection against a dead generation — worse than discarding it.
+        assert_eq!(disposition(Race { same_generation: false, ..SALVAGEABLE }), RacedStream::Discard);
+        // Nor may we park on top of a socket someone else already owns, or while audio is routing.
+        assert_eq!(
+            disposition(Race { slot_empty: false, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "an occupied slot must never be clobbered"
+        );
+        assert_eq!(
+            disposition(Race { already_active: true, ..SALVAGEABLE }),
+            RacedStream::Discard,
+            "never shadow a session that is actively routing"
+        );
+    }
+
+    #[test]
+    fn parking_banks_the_socket_in_the_slot_with_its_sender_and_without_routing() {
+        // The SIDE EFFECTS, which the boolean table above cannot see. roborev 55291 made the point
+        // by example: the missing `armed` guard was invisible to a table test because a table test
+        // cannot say which session states its booleans are reachable from.
+        let (session, rx) = crate::cloud::parkable_session();
+        let cloud: Mutex<Option<DeepgramSession>> = Mutex::new(None);
+        let cloud_tx: Mutex<Option<CloudAudioSender>> = Mutex::new(None);
+        let cloud_active = AtomicBool::new(false);
+
+        park_raced_stream(&cloud, &cloud_tx, session);
+
+        let guard = cloud.lock().unwrap();
+        let parked = guard.as_ref().expect("the socket must be banked in the slot, not dropped");
+        // BOTH halves of pause(), because the flag is the lesser one: the atomic only tells
+        // stop_cloud_stream to keep the socket, while the MESSAGE is what stops the worker
+        // forwarding audio and starts the warm timer (roborev 55315).
+        assert!(parked.is_parked(), "the parked flag must be set, or a stop will close the socket");
+        assert!(rx.took_pause(), "a Pause must REACH the worker, or the socket keeps relaying audio");
+        assert!(
+            cloud_tx.lock().unwrap().is_some(),
+            "cloud_tx must mirror the slot, exactly as warm standby leaves it"
+        );
+        assert!(
+            !cloud_active.load(Ordering::Relaxed),
+            "parked is NOT routing — flipping this would meter a stream carrying no audio"
+        );
+        // And `cloud_reuse` is what picks it up: alive + parked + our project → Resume, no handshake.
+        assert_eq!(
+            cloud_reuse(
+                false,
+                Some(Installed { alive: parked.is_alive(), project_matches: true })
+            ),
+            CloudReuse::Resume
+        );
+    }
+
+    #[test]
+    fn a_live_install_never_drops_a_parked_socket_in_place() {
+        // roborev 55291. Parking broke the invariant that the slot is empty at install time: start A
+        // races a stop and parks, start B (holding the current epoch) then installs. A bare
+        // assignment would drop A through `Drop for DeepgramSession`, which only signals Close — so
+        // A's worker drains its transcripts into B's composer and emits a cloud-ended that stops B.
+        let (parked, _rx_a) = crate::cloud::parkable_session();
+        let (fresh, _rx_b) = crate::cloud::parkable_session();
+        let cloud: Mutex<Option<DeepgramSession>> = Mutex::new(None);
+        let cloud_tx: Mutex<Option<CloudAudioSender>> = Mutex::new(None);
+        let cloud_active = AtomicBool::new(false);
+        park_raced_stream(&cloud, &cloud_tx, parked);
+
+        let displaced = install_live_stream(&cloud, &cloud_tx, &cloud_active, fresh);
+
+        let displaced = displaced.expect("the occupant must be handed back, not dropped in place");
+        assert!(
+            displaced.is_silenced(),
+            "a displaced socket must be muted AND suppressed before its close is handed off"
+        );
+        assert!(cloud.lock().unwrap().is_some(), "the fresh session takes the slot");
+        assert!(cloud_tx.lock().unwrap().is_some(), "cloud_tx mirrors the slot");
+        assert!(
+            cloud_active.load(Ordering::Relaxed),
+            "an installed live stream routes — this is the flag the capture callback reads"
+        );
+        displaced.finish();
+    }
+
+    #[test]
+    fn an_unraced_stream_still_installs_live() {
+        assert_eq!(disposition(Race { install: true, ..SALVAGEABLE }), RacedStream::InstallLive);
+        // `install` wins outright: should_install_cloud already proved the intent is current, so no
+        // combination of the park guards may downgrade a live install to a park.
+        assert_eq!(
+            disposition(Race { install: true, armed: false, slot_empty: false, ..SALVAGEABLE }),
+            RacedStream::InstallLive
+        );
     }
 
     #[test]

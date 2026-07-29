@@ -4445,6 +4445,8 @@ dependencies = [
  "block2",
  "bzip2",
  "cc",
+ "core-foundation-sys",
+ "coreaudio-sys",
  "cpal",
  "hound",
  "keyring",

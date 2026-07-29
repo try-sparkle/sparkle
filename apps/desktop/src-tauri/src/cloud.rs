@@ -304,6 +304,16 @@ impl SilencedSession {
     }
 }
 
+#[cfg(test)]
+impl SilencedSession {
+    /// Both gates the WORKER reads, together — that pair is what "silenced" means, and asserting
+    /// either alone would pass against a session that still leaks the other (`muted` alone still
+    /// emits `cloud-ended`; `suppress_ended` alone still drains transcripts into the successor).
+    pub(crate) fn is_silenced(&self) -> bool {
+        self.0.muted.load(Ordering::Relaxed) && self.0.suppress_ended.load(Ordering::Relaxed)
+    }
+}
+
 impl Drop for DeepgramSession {
     fn drop(&mut self) {
         // Safety net for the path that drops without finish() (e.g. an error teardown): signal
@@ -1050,6 +1060,51 @@ mod speech_end_dedupe {
     }
 }
 
+/// Keeps a test session's audio channel OPEN. Holding it is what makes `pause()`/`resume()` land
+/// in a real channel instead of silently no-opping on a disconnected one — so a test that drops it
+/// early is asserting against a dead session without noticing. Opaque on purpose: `AudioMsg` is
+/// private to this module and should stay that way.
+#[cfg(test)]
+pub(crate) struct ParkedChannel(std::sync::mpsc::Receiver<AudioMsg>);
+
+#[cfg(test)]
+impl ParkedChannel {
+    /// Did a `Pause` actually reach the worker? Non-blocking, and it CONSUMES the message.
+    ///
+    /// This exists because the `parked` atomic is the lesser half of `pause()`. The atomic is just a
+    /// flag `should_keep_warm_on_stop` reads; the MESSAGE is what stops the worker forwarding audio
+    /// and starts the warm timer — the two behaviours the park path actually depends on. A test that
+    /// asserts only `is_parked()` stays green with the `send` deleted, while a parked socket would
+    /// keep relaying audio until the relay's upstream idle close (roborev 55315). Opaque because
+    /// `AudioMsg` is private to this module and should stay that way.
+    pub(crate) fn took_pause(&self) -> bool {
+        matches!(self.0.try_recv(), Ok(AudioMsg::Pause))
+    }
+}
+
+/// A session with no socket and no worker, for tests ANYWHERE in this crate (`dictation.rs` uses it
+/// to exercise the warm-standby slot). `pause`/`resume`/`is_parked`/`audio_sender` only touch the
+/// audio channel and the flags, so this exercises them without a live relay.
+#[cfg(test)]
+pub(crate) fn parkable_session() -> (DeepgramSession, ParkedChannel) {
+    let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
+    let session = DeepgramSession {
+        audio_tx: tx,
+        worker: None,
+        // FALSE, matching `DeepgramSession::start` — and load-bearing for anything asserting
+        // `silence_now()`. A fixture that starts pre-suppressed makes `is_silenced()` prove only its
+        // `muted` half, so deleting the suppress_ended store from `silence_now` would leave the
+        // displaced-socket test green while a torn-down worker emits `cloud-ended` into its
+        // successor: the exact hazard that test guards (roborev 55315).
+        suppress_ended: Arc::new(AtomicBool::new(false)),
+        alive: Arc::new(AtomicBool::new(true)),
+        parked: Arc::new(AtomicBool::new(false)),
+        muted: Arc::new(AtomicBool::new(false)),
+        project: None,
+    };
+    (session, ParkedChannel(rx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,23 +1118,6 @@ mod tests {
         assert!(warm_expired(Duration::from_secs(20), window), "well past the window expires");
     }
 
-    /// A session with no socket and no worker. `pause`/`resume`/`is_parked` only touch the audio
-    /// channel and the flag, so this exercises them without a live relay. The receiver is returned so
-    /// the sends land in a real channel rather than a closed one.
-    fn parkable_session() -> (DeepgramSession, std::sync::mpsc::Receiver<AudioMsg>) {
-        let (tx, rx) = std::sync::mpsc::channel::<AudioMsg>();
-        let session = DeepgramSession {
-            audio_tx: tx,
-            worker: None,
-            suppress_ended: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(true)),
-            parked: Arc::new(AtomicBool::new(false)),
-            muted: Arc::new(AtomicBool::new(false)),
-            project: None,
-        };
-        (session, rx)
-    }
-
     #[test]
     fn silence_now_goes_quiet_on_the_calling_thread_not_in_the_teardown() {
         // The reopen paths tear a session down WHILE its replacement is opening, so both gates must
@@ -1089,7 +1127,6 @@ mod tests {
         // scheduling gap stops the successor outright. Asserted on the flags the WORKER reads, before
         // finish() is ever called. (roborev 50498/53024)
         let (session, _rx) = parkable_session();
-        session.suppress_ended.store(false, Ordering::Relaxed); // the helper starts it suppressed
         let muted = session.muted.clone();
         let suppressed = session.suppress_ended.clone();
         let silenced = session.silence_now();

@@ -220,6 +220,10 @@ export function ComposerVoiceError({ notice }: { notice: VoiceErrorNotice }) {
         <button
           type="button"
           aria-label="Dismiss voice error"
+          // A bare clear, deliberately — same rule as Composer.tsx's Dismiss. Dismiss means "I've
+          // read this", not "the mic works again"; only `dictation://audio-recovered` knows frames
+          // resumed, so only that path restores "listening". Claiming it here would repaint a live
+          // mic over one that is still dead — the very incident this notice exists to surface.
           onClick={() => useDictationStore.getState().setError(null)}
           style={VOICE_ERROR_ACTION}
         >

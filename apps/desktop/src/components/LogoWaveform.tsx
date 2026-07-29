@@ -20,6 +20,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
 import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
+import { useAudioInputSync } from "../services/audioInputs";
+import { BoundDeviceCaption } from "./BoundDeviceCaption";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
@@ -144,6 +146,10 @@ export function LogoWaveform() {
   // operated. An agent composer's own mic sets it the other way — see ComposerMic.
   const setVoiceSurface = useDictationStore((s) => s.setVoiceSurface);
   const ownVoice = useCallback(() => setVoiceSurface("concierge"), [setVoiceSurface]);
+  // Keep audioInputStore.bound current from `dictation://device`. Mounted HERE because this ring is
+  // the app's primary mic control and is always present, so the device line has a live value the
+  // moment anything binds — not only after someone opens the menu.
+  useAudioInputSync();
 
   // Safety net: if the mic is somehow armed while the balance is empty (e.g. credits ran out mid
   // session), force it off so voice detection can't keep running without credits. The primary
@@ -595,6 +601,12 @@ export function LogoWaveform() {
         // captionFor's "Listening paused…" string (non-null because focusPaused ⇒ enabled).
         <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>{caption}</div>
       ) : null /* presentation === "off": disarmed, no caption */}
+
+      {/* WHAT the mic is pointed at, under WHAT IT IS DOING. Gated on `enabled` only — it shows
+          while focus-paused too, on purpose: the device is still the one that will be re-bound when
+          focus returns, and hiding it exactly when the mic looks idle is how a wrong device stays
+          invisible. A disarmed mic hears nothing, so it claims nothing. */}
+      {enabled ? <BoundDeviceCaption /> : null}
     </div>
   );
 }

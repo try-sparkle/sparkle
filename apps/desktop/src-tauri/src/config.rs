@@ -577,6 +577,23 @@ pub struct VoiceConfig {
     /// When a prompt is submitted, drop from active dictation back to passive wake-word listening
     /// (the mic stays on). Default true = pause listening on submit.
     pub pause_on_submit: bool,
+    /// The stable CoreAudio `kAudioDevicePropertyDeviceUID` of the microphone to capture from.
+    /// `None` (the default) = choose automatically, preferring real hardware — see
+    /// `audio_devices::select_device`.
+    ///
+    /// A UID, never a name or a numeric AudioDeviceID: the numeric id is reassigned whenever a HAL
+    /// plug-in loads or unloads, which is exactly the event this setting exists to survive.
+    pub input_device_uid: Option<String>,
+    /// ADVANCED, off by default: allow capture to bind a VIRTUAL input device (a HAL plug-in's
+    /// loopback/aggregate) when choosing automatically.
+    ///
+    /// This is a privacy setting, not a convenience one. Several plug-ins publish system OUTPUT as
+    /// an input device, so a virtual input can carry anything playing on the machine — a call, a
+    /// video, a stream — into the transcript. On 2026-07-29 that put a Twitch stream and third
+    /// parties' voices into the composer. "Sparkle listens to your microphone" and "Sparkle can
+    /// transcribe anything playing on this machine" are materially different promises and users
+    /// assume the first, so this stays opt-in and is surfaced in the UI when on.
+    pub allow_virtual_input: bool,
 }
 
 /// One criterion in a stage definition. `kind` is "auto" (Sparkle observes it via `signal`)
@@ -720,6 +737,8 @@ impl Default for SparkleConfig {
                 wake_word: "Hey Sparkle".into(),
                 stop_word: "Sparkle, stop".into(),
                 pause_on_submit: true,
+                input_device_uid: None,
+                allow_virtual_input: false,
             },
             // Undefined by default: every project starts with no Done/Delivered definition until
             // the user defines one (see the Definable Done & Delivered feature).
@@ -938,6 +957,8 @@ struct PartialVoice {
     wake_word: Option<String>,
     stop_word: Option<String>,
     pause_on_submit: Option<bool>,
+    input_device_uid: Option<String>,
+    allow_virtual_input: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1075,6 +1096,15 @@ fn apply_voice(into: &mut VoiceConfig, p: Option<PartialVoice>) {
     }
     if let Some(v) = p.pause_on_submit {
         into.pause_on_submit = v;
+    }
+    // An empty string in the file means "automatic" — the same normalization
+    // `DeviceChoice::from_config` applies, so a hand-edited config behaves like the picker's
+    // "Automatic" entry rather than trying to bind a device whose UID is "".
+    if let Some(v) = p.input_device_uid {
+        into.input_device_uid = Some(v).filter(|s| !s.trim().is_empty());
+    }
+    if let Some(v) = p.allow_virtual_input {
+        into.allow_virtual_input = v;
     }
 }
 

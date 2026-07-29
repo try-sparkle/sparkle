@@ -11,6 +11,10 @@
 // words shared with the matcher, store, and configActions — so the on-screen copy defaults can
 // never drift from the actually-recognized words.
 import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
+// The advanced opt-in's own label, single-sourced. This module INSTRUCTS the user to turn that
+// control on, and a remedy naming a control by a label it no longer carries is exactly the dead end
+// the no-device branch below exists to fix.
+import { ALLOW_VIRTUAL_LABEL } from "../services/audioInputs";
 export const STOP_PHRASE = DEFAULT_STOP_WORD;
 // ACTIVE phase (the wake word was heard; dictation is live). Only show this when the backend is
 // BOTH capturing (status "listening") AND in the active phase — never while merely waiting for
@@ -83,6 +87,10 @@ export function modelPercent(p: { done: number; total: number | null } | null): 
 /** The distinct failure buckets a dictation error can fall into. `unknown` is not a failure of this
  *  classifier — it is the honest answer, and its copy shows the RAW backend string. */
 export type VoiceErrorKind =
+  // Capture is LIVE but no audio frames are arriving — the frame-liveness watchdog in the backend.
+  // This is the one bucket that describes a mic which looks perfectly healthy: the device is open,
+  // the stream is running, and it delivers silence forever. See the ordering note on PATTERNS.
+  | "no-audio"
   | "no-device"
   | "unsupported-format"
   | "download"
@@ -104,6 +112,21 @@ export interface VoiceErrorNotice {
 // pinning exact sentences, and anything we don't recognize falls through to `unknown` (which shows
 // the raw string) rather than being forced into a bucket that would misattribute the cause.
 const PATTERNS: [VoiceErrorKind, RegExp][] = [
+  // FIRST, and that placement is load-bearing — not stylistic.
+  //
+  // The frame-liveness watchdog's message INTERPOLATES A DEVICE NAME the OS handed us verbatim
+  // (`No audio from "MacBook Pro Microphone". …`). Device names are arbitrary third-party strings:
+  // the very virtual-audio drivers that cause this fault get to name themselves, and nothing stops
+  // one calling itself "No Input Device", "Downloads", or "Disk Full". Worse, the message's own
+  // remedy names the microphone and the mic menu — precisely the vocabulary `no-device` and
+  // `permission` are watching for. Any later position means an arbitrary substring can demote a
+  // POSITIVE, observed report ("we watched frames not arrive from THIS device") into one of the
+  // guesses below, and the user gets told to plug in a microphone that is already plugged in.
+  //
+  // That misdiagnosis is the whole bug this bucket exists to kill: a dead mic must never read as a
+  // quiet room, and it must not read as a missing one either. Matched on the durable noun phrase
+  // only, per this file's convention — the sentence around it is the backend's to reword.
+  ["no-audio", /no audio from/],
   // Order matters. no-device / format / disk / download are checked BEFORE permission because
   // permission's own words ("denied", "authorized") are generic enough to appear in their messages.
   ["no-device", /no (default )?input device|no such device|device not available|no microphone/],
@@ -142,6 +165,20 @@ const DENIAL = /permission|denied|deny|not authoriz|unauthoriz|privacy|\btcc\b/;
 export const MICROPHONE_SETTINGS_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 
+/** Pull the DEVICE NAME out of the watchdog's dead-mic report, where it arrives quoted
+ *  (`No audio from "MacBook Pro Microphone". …`). That name is the one fact only the backend has,
+ *  and the remedy is unfollowable without it — "pick a different input" means nothing until the user
+ *  knows which input to pick a different one FROM.
+ *
+ *  Null when the sentence no longer looks the way we expect, which is the honest signal to fall back
+ *  to showing the raw string rather than authoring a remedy about an unnamed device. The prefix is
+ *  pinned in backendVoiceErrors.ts (BACKEND_NO_AUDIO_PREFIX); see the note there about a backend
+ *  reword failing soft. */
+function noAudioDevice(text: string): string | null {
+  const m = /no audio from\s+"([^"]+)"/i.exec(text);
+  return m?.[1] ?? null;
+}
+
 /** Bucket a raw backend error string. Pure + exported so the mapping is unit-tested directly
  *  (this codebase's convention — cf. deriveMicState / shouldBlockMicArm in MicButton). */
 export function classifyVoiceError(raw: string): VoiceErrorKind {
@@ -160,11 +197,54 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
   if (!text) return null;
   const kind = classifyVoiceError(text);
   switch (kind) {
+    case "no-audio": {
+      // The backend's sentence carries a FACT we cannot reconstruct (which device went silent) and
+      // an INSTRUCTION we must not ship unaudited. Those halves are split here, because they belong
+      // to different owners: the backend knows the device, this module owns where users are sent.
+      //
+      // A remedy string is an instruction the user will follow, so it gets the same scrutiny as the
+      // code path it replaces (AGENTS.md). This one was written when the mic menu was a three-mode
+      // pill (listening / muted / off) with no device list, so the backend's "pick a different
+      // input in the mic menu" was overridden here and pointed at System Settings → Sound instead.
+      //
+      // BOTH halves of that reasoning have since flipped, in the same change. The mic menu now
+      // carries `AudioInputPicker`, so the control exists — and System Settings became actively
+      // WRONG, because capture no longer follows the system default: automatic selection prefers a
+      // physical input over it, and a pinned UID ignores it outright (audio_devices::select_device).
+      // Sending someone to change the OS default can leave capture on the very device this notice
+      // just named. The picker is the only control that actually rebinds.
+      //
+      // `unsupported-format` still points at System Settings: the chosen device cannot be opened at
+      // all, so the picker has nothing better to offer. `no-device` does NOT — see its own branch.
+      const device = noAudioDevice(text);
+      return {
+        kind,
+        // Names the failure the way the user is experiencing it: they have been talking, and
+        // nothing is landing. Not "no microphone" (there is one, it's selected, and it's open) and
+        // not "voice couldn't start" (it started — that's what makes this invisible).
+        headline: "Sparkle isn't hearing your microphone.",
+        // The device name is quoted straight from the backend — same precedent as disk-space
+        // passing "Need ~1.3 GB free…" through, i.e. keep the specifics we cannot reconstruct.
+        // When the sentence no longer parses we show it RAW rather than authoring a remedy about a
+        // device we can't name: a wordy string the user can read and report beats a confident one
+        // that omits the only detail that mattered.
+        detail: device
+          ? `Another app may be holding "${device}" — a screen recorder or a virtual audio device. Hover the mic and pick a different input, or turn the mic off and on.`
+          : text,
+      };
+    }
     case "no-device":
       return {
         kind,
         headline: "No microphone found.",
-        detail: "Connect a microphone (or pick an input device in System Settings → Sound), then turn the mic back on.",
+        // The most reachable producer of this bucket is audio.rs's Refuse: inputs WERE enumerated,
+        // they were all virtual, and capture refused rather than bind a loopback. The backend's own
+        // sentence names the two real ways out — connect a microphone, or turn on the advanced
+        // opt-in — and this branch used to discard the second and substitute System Settings, which
+        // does nothing in that state: only virtual inputs exist, and select_device refuses a virtual
+        // device regardless of the OS default (roborev 55360). Both options, or neither is honest.
+        detail:
+          `Connect a microphone, then turn the mic back on. To transcribe system audio instead, hover the mic and turn on "${ALLOW_VIRTUAL_LABEL}".`,
       };
     case "unsupported-format":
       return {

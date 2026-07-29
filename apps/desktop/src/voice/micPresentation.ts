@@ -55,6 +55,24 @@ export interface MicPresentationInput {
  *    4. preparing    — armed, but the model is still downloading (can't dictate yet).
  *    5. focusPaused  — armed, not capturing: honest "paused", never a wake/active invitation.
  *    6. active/passive — armed AND actually capturing, split by phase. */
+/** Is the mic, as the SURFACES present it, actually hearing the user right now?
+ *
+ *  The device caption's verb hangs off this — "Listening: Yeti" vs "Mic: Yeti". It must not be
+ *  `status === "listening"` read raw, for the reason this module's header already gives: `status`
+ *  is optimistic and per-window, and several presentations leave it at `"listening"` while the
+ *  surface directly above says capture is broken or not yet usable. A mid-session backend failure
+ *  does exactly that (`dictation://error` sets the error and never touches `status`), so the
+ *  waveform rendered its "voice failed, here's the remedy" notice with **"Listening: Yeti Stereo
+ *  Microphone"** asserting a live capture on the very next line — the same contradiction this whole
+ *  branch exists to eliminate, one state over (roborev 55289). `preparing` is the same shape: armed
+ *  and optimistic, model still downloading, nothing being heard.
+ *
+ *  Deriving it from the presentation rather than re-deciding it is the point: one snapshot, one
+ *  answer, for every surface. */
+export function micIsHearing(p: MicPresentation): boolean {
+  return p === "activeListening" || p === "passiveWaiting";
+}
+
 export function deriveMicPresentation(i: MicPresentationInput): MicPresentation {
   if (i.outOfCreditsNotice) return "outOfCredits";
   if (i.hasError) return "error";

@@ -210,6 +210,26 @@ describe("ComposeBox — the failure states take the slot over, never the fallba
       "auto",
     );
   });
+
+  it("dismissing a DEAD-MIC notice must not claim the mic is listening again", () => {
+    // The concierge twin of the Composer guard. This exact seam escaped twice — the audio-recovered
+    // path was fixed while the Dismiss button was missed, and the button itself lives in TWO files —
+    // so both surfaces are pinned. Dismiss means "I've read this", not "frames are flowing again";
+    // only dictation://audio-recovered has that evidence. Claiming "listening" here would paint a
+    // live mic over a still-dead one, which is the incident this notice exists to surface.
+    act(() =>
+      useDictationStore.setState({
+        enabled: true,
+        error: 'No audio from "MacBook Pro Microphone". Another app may be holding the microphone.',
+        status: "error",
+      }),
+    );
+    setup();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss voice error" }));
+    expect(useDictationStore.getState().error).toBeNull();
+    expect(useDictationStore.getState().status).not.toBe("listening");
+    expect(useDictationStore.getState().status).toBe("idle");
+  });
 });
 
 describe("ComposeBox — the overlay's stacking contract", () => {

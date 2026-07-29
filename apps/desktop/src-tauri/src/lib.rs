@@ -7,6 +7,7 @@ mod attachments;
 mod attention;
 mod attention_summary;
 mod audio;
+mod audio_devices;
 mod auth;
 mod auto_send_tuner;
 mod beads_cmd;
@@ -254,6 +255,13 @@ pub fn run() {
             if let Err(e) = config::init_and_watch(app.handle()) {
                 tracing::error!("config init/watch failed: {e}");
             }
+            // Watch that dictation is actually HEARING something, and that the input device list
+            // hasn't shifted under us. On 2026-07-29 a screen recorder's CoreAudio HAL plug-in left
+            // capture running for nine minutes with zero frames arriving while the UI showed a
+            // normal idle waveform — nothing anywhere checked whether audio existed, only whether
+            // the stream had been created. Started unconditionally: it is one sleeping thread, and
+            // it no-ops whenever there is no capture to watch.
+            dictation::start_audio_watchdog(app.handle().clone());
             // Hidden transparent capture window (menu-bar capture flow). Best-effort:
             // a failure only loses the capture feature, never blocks boot.
             if let Err(e) = capture_window::init_capture_window(app.handle()) {
@@ -501,6 +509,10 @@ pub fn run() {
             dictation::stop_dictation,
             dictation::start_cloud_stream,
             dictation::stop_cloud_stream,
+            dictation::list_audio_inputs,
+            dictation::get_audio_input_settings,
+            dictation::set_audio_input,
+            dictation::set_allow_virtual_input,
             logging::app_version,
             logging::log_dir,
             logging::reveal_logs,
