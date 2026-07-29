@@ -22,7 +22,10 @@
 // Fallback when the spinner is never observed (TUI drift / non-Claude program):
 //   output flowing                -> working
 //   quiet > IDLE_MS               -> settle (screen check, as above)
-//   quiet > BLOCKED_MS            -> blocked
+//   quiet > SCREEN_RECHECK_MS     -> re-read the screen; red only if a prompt is NOW on it
+// Note what is NOT in that list: quiet alone never produces a red. It used to produce `blocked`,
+// and that single line was responsible for a fleet of false "needs you" alarms — see
+// SCREEN_RECHECK_MS for the case history.
 //
 // EVERY transition above is logged, once, from `set()` — the single funnel they all pass through.
 // See ./statusTransitionLog for the line format and the one grep that replays an agent's history;
@@ -31,6 +34,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
+import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames, isApiErrorLine } from "./streamFailure";
 import {
   logStatusTransition,
@@ -171,7 +175,26 @@ export function latestSpinnerTokens(chunk: string): number | null {
 }
 
 const IDLE_MS = 2500;
-const BLOCKED_MS = 25000;
+// A LATE SECOND LOOK AT THE SCREEN — not a stall verdict. This used to be BLOCKED_MS: 25s of PTY
+// silence flipped the row to `blocked`, which is RED and captioned "Blocked / stalled — needs you"
+// (engine/attention.notificationFor), bubbled to the parent row (engine/workerAttention) and pushed
+// as a needs-you card by the concierge (services/conciergeRecap). Silence is not evidence of ANY of
+// that. A long `pnpm test`, a `roborev wait`, a CI poll and a model thinking between tool calls are
+// all silent, and so is a finished agent parked at its idle prompt — which is how a fleet of healthy
+// agents came to raise a needs-you alarm apiece (2026-07-28: an agent observed flapping
+// working↔blocked while it was demonstrably running shell commands with an empty prompt on screen,
+// and every alarm cleared the moment the pane was clicked — the reveal resizes the PTY, Claude
+// redraws, and fresh output re-classified the row).
+//
+// The screen-check at settle had ALREADY answered the question 22.5s earlier ("no prompt is on
+// screen → gray"), and nothing new is observed in between, so escalating that same unchanged screen
+// to red was incoherent as well as wrong. What remains worth doing at this mark is re-READING the
+// screen: xterm renders asynchronously, so a prompt that streamed in just before settle can paint
+// after it, and that is a real red this catches late rather than never. `blocked` is therefore no
+// longer inferred here at all — a genuine mid-stream wedge still goes red via the evidence-based
+// StreamFailureDetector (`errored`), which keys off API banners and self-prompt churn rather than
+// off a quiet terminal.
+const SCREEN_RECHECK_MS = 25000;
 // Spinner ticks ~1/s; if we don't see it for this long the turn has ended.
 const SPINNER_GRACE_MS = 2000;
 // How many ingested lines the "the user just submitted a message" echo-suppression window lasts
@@ -199,8 +222,16 @@ export class StatusEngine {
   private partial = "";
   private status: AgentTabStatus = "working";
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
-  private blockedTimer: ReturnType<typeof setTimeout> | null = null;
+  private recheckTimer: ReturnType<typeof setTimeout> | null = null;
+  // Latched by dispose(). A disposed engine must go completely silent: its PTY listener is torn
+  // down over an ASYNC Tauri unlisten, so a `pty:exit` from its own kill can still arrive after the
+  // pane remounted — and this engine's `set()` would then overwrite the LIVE agent's status with a
+  // terminal `done`/`errored`, which opens the destructive-op gate on its own (roborev 55076).
+  private disposed = false;
   private sawRecentRisk = false;
+  // The risk flag as it stood at the LAST settle, kept alive for `recheckScreen` alone — settle
+  // consumes `sawRecentRisk`, so the re-check 22.5s later has nothing left to read. See settle().
+  private settledTurnRisk = false;
   private sawRecentError = false;
   // Sticky: once we've seen Claude's spinner we trust it over the time heuristic.
   private sawSpinner = false;
@@ -240,6 +271,10 @@ export class StatusEngine {
   private notedUserLinesLeft = 0;
 
   constructor(private readonly opts: StatusEngineOpts) {
+    // Start tracking before the first emit: from here this window is driving the agent, and until a
+    // spinner (or a hook, noted by the router) is seen, every settled status it publishes is a GUESS
+    // that destructive gates must not read as "finished". See engine/turnEndAuthority.
+    trackAgent(opts.agentId, this);
     // Log the starting status too: a history that begins at the first FLIP can't tell you what the
     // agent flipped away from, and "spawned green then went red immediately" is itself a finding.
     logStatusTransition({
@@ -277,9 +312,9 @@ export class StatusEngine {
 
   private clearTimers(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (this.blockedTimer) clearTimeout(this.blockedTimer);
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
     this.idleTimer = null;
-    this.blockedTimer = null;
+    this.recheckTimer = null;
   }
 
   // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its
@@ -376,6 +411,12 @@ export class StatusEngine {
     // turn that ends idle must not carry a stale risk into the next turn's question.
     const risky = this.sawRecentRisk;
     this.sawRecentRisk = false;
+    // REMEMBER what we just consumed, for the late screen re-check only (roborev on 95013a2f1).
+    // `recheckScreen` runs 22.5s AFTER this, by which point `sawRecentRisk` is always false — so
+    // reading that flag there made its `approval` branch unreachable, and a dangerous-action prompt
+    // that painted late would be mislabeled a plain question. This copy is scoped to that one use
+    // and is cleared whenever the risk flag itself is re-armed or the re-check consumes it.
+    this.settledTurnRisk = risky;
     this.set(
       awaiting ? (risky ? "approval" : "waiting") : "idle",
       trigger,
@@ -383,16 +424,33 @@ export class StatusEngine {
     );
   }
 
-  // Fallback path only: arm the legacy time-based stall timers (used when Claude's
-  // spinner has never been observed, e.g. a non-Claude program or TUI drift).
+  // A LATE re-read of the rendered screen, armed alongside the settle timer on the fallback path.
+  // Promotes to red ONLY on the same evidence settle uses — a prompt actually on screen — which is
+  // why this can no longer manufacture a needs-you out of a quiet terminal (see SCREEN_RECHECK_MS).
+  // It exists for the async-render race: xterm paints on its own schedule, so a picker that streamed
+  // in just before settle can reach the grid after settle read it. Silence with a calm screen leaves
+  // the status exactly where settle put it.
+  private recheckScreen(): void {
+    this.recheckTimer = null;
+    // Only from the two calm states. Anything else is either already red (nothing to promote) or a
+    // terminal state (done/stopped), and a screen read must not resurrect it.
+    if (this.status !== "working" && this.status !== "idle") return;
+    if (!screenAwaitsInput(this.opts.getScreen?.() ?? "")) return;
+    // `settledTurnRisk`, not `sawRecentRisk`: settle already consumed the live flag, so reading it
+    // here always saw `false` and could never say `approval`. The prompt this re-check exists to
+    // catch is precisely the one that painted late — including a dangerous-action one.
+    const risky = this.sawRecentRisk || this.settledTurnRisk;
+    this.sawRecentRisk = false;
+    this.settledTurnRisk = false;
+    this.set(risky ? "approval" : "waiting", "screen-recheck");
+  }
+
+  // Fallback path only: arm the legacy time-based settle timer plus the late screen re-check (used
+  // when Claude's spinner has never been observed, e.g. a non-Claude program or TUI drift).
   private armLegacyTimers(): void {
     this.clearTimers();
     this.idleTimer = setTimeout(() => this.settle(), IDLE_MS);
-    this.blockedTimer = setTimeout(() => {
-      // Escalate from working OR idle (idle fires first at IDLE_MS, so gating on
-      // "working" alone made `blocked` unreachable).
-      if (this.status === "working" || this.status === "idle") this.set("blocked", "quiet-blocked");
-    }, BLOCKED_MS);
+    this.recheckTimer = setTimeout(() => this.recheckScreen(), SCREEN_RECHECK_MS);
   }
 
   /** Feed a raw PTY chunk. Splits into lines, classifies, updates status. */
@@ -492,7 +550,13 @@ export class StatusEngine {
     // cleaned chunk rather than only completed lines — but FRAME BY FRAME, so the persistent footer
     // bar can't be mistaken for a running turn. See the WORKING_PATTERNS header.
     const hasSpinner = hasSpinnerFrame(clean);
-    if (hasSpinner) this.sawSpinner = true;
+    if (hasSpinner && !this.sawSpinner) {
+      this.sawSpinner = true;
+      // The spinner is now a witness to turn END (its disappearance), so this agent's settled
+      // statuses stop being guesses — which is what re-closes the destructive-op gate's escape
+      // hatch. Published once, on the latch.
+      noteSpinnerSeen(this.opts.agentId);
+    }
 
     // Token-advance recovery (sparkle-pqxh follow-up): after an API BANNER the request that failed
     // generated nothing, so a strictly-higher spinner token count is positive proof the agent is
@@ -581,7 +645,14 @@ export class StatusEngine {
 
   /** Call when the PTY exits. */
   exit(): void {
+    // A late exit from a PTY this engine no longer owns is not this agent's news — see `disposed`.
+    if (this.disposed) return;
     this.clearTimers();
+    // A dead process is the strongest turn-end witness there is: nothing can still be writing the
+    // worktree. Without this, an agent that exited on the fallback path (no hooks, no spinner) would
+    // be refused every destructive op FOREVER — a dead PTY never emits the spinner frame or hook
+    // event that would grant authority (roborev 54815).
+    noteProcessExit(this.opts.agentId, this);
     // A process that dies mid-stream-failure (an API error / self-prompt wedge that never recovered)
     // must read `errored`, not gray `done`: sawStreamFailure counts the same as a pre-exit error
     // marker here, so a wedged-then-killed agent doesn't settle green-gray (roborev 16152).
@@ -589,6 +660,10 @@ export class StatusEngine {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.clearTimers();
+    // This window stops witnessing the agent when its pane goes away, so drop the record rather than
+    // leave a stale "no authority" entry that would keep a destructive gate refusing forever.
+    forgetAgent(this.opts.agentId, this);
   }
 }

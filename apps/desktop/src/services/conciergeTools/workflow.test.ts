@@ -69,6 +69,15 @@ import {
   type AgentWorkflowContext,
   type WorkflowOperation,
 } from "./workflow";
+import {
+  forgetAgent,
+  noteHooksDead,
+  noteHooksLive,
+  noteProcessExit,
+  noteSpinnerSeen,
+  resetTurnEndAuthority,
+  trackAgent,
+} from "../../engine/turnEndAuthority";
 
 const build: AgentWorkflowContext = {
   root: "/repo",
@@ -138,6 +147,151 @@ describe("risk classification", () => {
     const described = describeWorkflowTools();
     expect(described).toHaveLength(WORKFLOW_OPERATIONS.length);
     expect(described.every((d) => d.risk && d.summary)).toBe(true);
+  });
+});
+
+describe("the busy gate reads a GUESSED idle as still-live", () => {
+  // roborev on 95013a2f1. The gate used to prove "quiet mid-turn" from the `blocked` status, which
+  // the engine produced after 25s of PTY silence. That status was removed because it doubled as a
+  // false red alarm — so the gate now asks turnEndAuthority whether anything actually WITNESSED the
+  // turn ending. Without a witness (no hooks, no spinner) `idle` means "quiet", and a six-minute
+  // `pnpm test` looks identical to a finished turn. Landing under that is unrecoverable; refusing
+  // costs one retry, so the ambiguity resolves toward live HERE and toward calm on the alarm path.
+  beforeEach(() => resetTurnEndAuthority());
+
+  it("REFUSES a destructive op on a tracked agent whose idle is only a guess", async () => {
+    m.statuses["a1"] = "idle";
+    trackAgent("a1"); // this window drives it, but nothing has witnessed a turn end
+    const r = await refreshAgentBranchTool(build);
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "agent-working" });
+    expect(m.refreshAgentBranch).not.toHaveBeenCalled();
+  });
+
+  it("ALLOWS it once a witness exists and the turn really is over", async () => {
+    m.statuses["a1"] = "idle";
+    trackAgent("a1");
+    noteHooksLive("a1"); // Claude's Stop event witnesses the end of every turn from here
+    m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+    const r = await refreshAgentBranchTool(build);
+    expect(r).toMatchObject({ ok: true });
+    expect(m.refreshAgentBranch).toHaveBeenCalled();
+  });
+
+  it("the spinner is the other witness — a settled screen-scraped turn is a fact too", async () => {
+    m.statuses["a1"] = "idle";
+    trackAgent("a1");
+    noteSpinnerSeen("a1");
+    m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: true });
+  });
+
+  it("ALLOWS ops on a witness-less agent whose PTY has EXITED", async () => {
+    // roborev 54815 (High). `done`/`errored`/`stopped`/`unmerged` are terminal observations, not
+    // guesses — StatusEngine.exit() sets them on the real exit, and a dead process cannot be writing
+    // the worktree. Overriding them refused every op forever on a fallback-path agent that had
+    // exited, with no escape short of closing the tab.
+    for (const terminal of ["done", "stopped", "unmerged"] as const) {
+      m.refreshAgentBranch.mockReset();
+      m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+      resetTurnEndAuthority();
+      m.statuses["a1"] = terminal;
+      trackAgent("a1"); // deliberately no hook / spinner witness
+      expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: true });
+    }
+  });
+
+  it("REFUSES on `errored` without a witness — a wedged agent is still ALIVE", async () => {
+    // roborev 55041. `errored` sits beside done/stopped/unmerged but is not terminal: statusEngine's
+    // mid-stream failure branch sets it while the process keeps running (an API-error banner it kept
+    // churning under, or a self-prompt loop), and statusRouter lifts that over the hook status. That
+    // agent is still executing tools, so landing or deleting its branch writes a live worktree.
+    m.statuses["a1"] = "errored";
+    trackAgent("a1");
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+    expect(m.refreshAgentBranch).not.toHaveBeenCalled();
+  });
+
+  it("…and ALLOWS `errored` once the PTY has actually exited", async () => {
+    // The recoverable half: stopping the agent kills the PTY, which grants the exit witness, so the
+    // refusal message's "wait for it to finish (or stop it)" is genuinely actionable.
+    m.statuses["a1"] = "errored";
+    trackAgent("a1");
+    noteProcessExit("a1");
+    m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: true });
+  });
+
+  it("a NEW engine does not inherit the previous process's exit witness", async () => {
+    // roborev 55041. A `pty:exit` can land after the old engine's dispose ran forgetAgent, and
+    // noteProcessExit used to CREATE a record — stranding `exited: true` with no owner. The next
+    // engine for the same id ("Start again", or a reopened tab) then inherited it and the busy gate
+    // was silently disabled for the whole new session.
+    const oldEngine = { id: "old" };
+    const newEngine = { id: "new" };
+    trackAgent("a1", oldEngine);
+    forgetAgent("a1", oldEngine);
+    noteProcessExit("a1"); // the late exit event, arriving after teardown
+    trackAgent("a1", newEngine); // a fresh, very much alive process
+    m.statuses["a1"] = "idle";
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+  });
+
+  it("a late pty:exit cannot mark the NEW engine's live process as exited", async () => {
+    // roborev 55076 (High). The likelier teardown ordering: React runs the cleanup (async unlisten +
+    // kill + dispose→forgetAgent) and then re-runs the effect SYNCHRONOUSLY, so the new engine has
+    // already re-tracked the id by the time the old PTY's exit round-trips from Rust. Being merely
+    // non-creating does not help there — the record exists, owned by the new engine — so without an
+    // owner check the dead process's exit marks a live one as finished and the gate stays open for
+    // the whole session.
+    const oldEngine = { id: "old" };
+    const newEngine = { id: "new" };
+    trackAgent("a1", oldEngine);
+    forgetAgent("a1", oldEngine);
+    trackAgent("a1", newEngine); // remount re-tracks BEFORE the old exit arrives
+    noteProcessExit("a1", oldEngine); // the dead PTY's late news
+    m.statuses["a1"] = "idle";
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+  });
+
+  it("counts a PTY exit as a witness in its own right", async () => {
+    m.statuses["a1"] = "idle";
+    trackAgent("a1");
+    noteProcessExit("a1");
+    m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: true });
+  });
+
+  it("REFUSES again once the router declares the hook stream dead", async () => {
+    // roborev 54815 (Medium). noteHooksLive used to latch permanently while statusRouter's watchdog
+    // expires hook authority — so after any hook-stream death the row's statuses came from the time
+    // heuristic again, but the gate still read them as witnessed.
+    m.statuses["a1"] = "idle";
+    trackAgent("a1");
+    noteHooksLive("a1");
+    noteHooksDead("a1");
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+    expect(m.refreshAgentBranch).not.toHaveBeenCalled();
+  });
+
+  it("a STALE engine's dispose cannot untrack an agent a newer engine drives", async () => {
+    // roborev 54815 (Medium). Terminal's cleanup can run AFTER a remount registered a newer engine
+    // for the same id; an unguarded delete wiped the live engine's record, and the gate then fell
+    // back to the status alone — a guessed idle mid-tool-call passing the busy check.
+    const oldEngine = { id: "old" };
+    const newEngine = { id: "new" };
+    trackAgent("a1", oldEngine);
+    trackAgent("a1", newEngine);
+    forgetAgent("a1", oldEngine); // the late cleanup
+    m.statuses["a1"] = "idle";
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+  });
+
+  it("does NOT refuse for an agent this window doesn't drive (pane elsewhere / closed)", async () => {
+    // Answering "live" on an untracked id would refuse every operation forever — the gate must read
+    // absence as "no information", not as evidence.
+    m.statuses["a1"] = "idle";
+    m.refreshAgentBranch.mockResolvedValue({ ok: true, ahead: 0, behind: 0 });
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: true });
   });
 });
 

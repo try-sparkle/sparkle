@@ -51,6 +51,8 @@ import { noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
+import { noteHooksDead, noteHooksLive } from "../engine/turnEndAuthority";
+import { log } from "../logger";
 import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -264,7 +266,24 @@ function AgentPaneInner({
   // until the first hook arrives (and for non-Claude programs that never emit one). The router
   // arbitrates; the watcher feeds the hook engine and activates the router on the first event.
   const routerRef = useRef<StatusRouter | null>(null);
-  if (!routerRef.current) routerRef.current = createStatusRouter((s) => setStatus(agent.id, s));
+  if (!routerRef.current)
+    routerRef.current = createStatusRouter(
+      (s) => setStatus(agent.id, s),
+      undefined,
+      // Every status change, with the input that drove it, on ONE greppable line. A day of false
+      // "needs you" alarms previously left no trace in the log at all — `blocked`, `needs_you` and
+      // `attention_screen` all returned zero hits — so the only diagnosis available was watching the
+      // UI. `info` (not `debug`) deliberately: debug forwarding is off in production builds, and this
+      // is exactly the trail a support capture needs. It fires only on a real change, so a row that
+      // sits still costs nothing.
+      (t) => log.info("agent-status", "transition", { agentId: agent.id, agentName: agent.name, ...t }),
+      // The stream just died; it witnesses nothing from here. Recovery is automatic — the next
+      // main-session event calls activate(), which re-asserts noteHooksLive.
+      () => {
+        log.info("agent-status", "hook stream declared dead", { agentId: agent.id });
+        noteHooksDead(agent.id);
+      },
+    );
   const hookWatcherRef = useRef<HookWatcher | null>(null);
   // Last response text we recorded for this agent, so a redundant Stop emission can't persist a
   // duplicate history row: each Stop re-reads the transcript's *last* assistant turn, so two Stops
@@ -305,9 +324,30 @@ function AgentPaneInner({
       // The real fix is to escalate on a mid-turn signal inside `resolve()` using the VIEWPORT
       // reader (`snapshotScreen`, already what the status engine uses), which is not reachable from
       // here today — tracked as its own bead rather than approximated with history.
-      const needs = await judgeNeedsFollowup({ task, response, project: project.name });
-      if (needs && turnSeqRef.current === turn) {
+      // Metering-only project arg: attributes the judge's debit to this agent's project in Credits.
+      const outcome = await judgeNeedsFollowup({ task, response, project: project.name });
+      const stale = turnSeqRef.current !== turn;
+      log.info("agent-status", "followup judge outcome", {
+        agentId: agent.id,
+        verdict: outcome.verdict,
+        signal: outcome.verdict === "unknown" ? outcome.signal : undefined,
+        applied: outcome.verdict === "followup" && !stale,
+        stale,
+      });
+      // ONLY a judge that actually RAN and said FOLLOWUP may red a row. `unknown` means the judge
+      // could not run (backend down / out of credits / offline): there is no verdict, so we assert
+      // none and leave the hook's own gray `idle` standing. Painting red off an unavailable judge is
+      // what produced the 2026-07-28 false-alarm storm — see turnFollowup's header.
+      if (outcome.verdict === "followup" && !stale) {
         routerRef.current?.fromJudge("waiting");
+      }
+      // The neutral middle state. A turn we could NOT judge keeps a marker so the ask isn't silently
+      // lost to gray; anything we COULD judge clears it, because we now have a real answer. Skipped
+      // entirely when the turn has moved on — the marker would be about work the user already left.
+      if (!stale) {
+        const rt = useRuntimeStore.getState();
+        if (outcome.verdict === "unknown") rt.setUnjudgedAsk(agent.id, outcome.signal);
+        else rt.clearUnjudgedAsk(agent.id);
       }
     } catch {
       // Judge is advisory — never let it disturb status handling.
@@ -334,7 +374,12 @@ function AgentPaneInner({
       });
       // A new user prompt opens a fresh turn — bump the counter the judge guards against (see
       // turnSeqRef). Done before the kind/text checks so EVERY submit advances the turn.
-      if (ev.event === "UserPromptSubmit") turnSeqRef.current++;
+      if (ev.event === "UserPromptSubmit") {
+        turnSeqRef.current++;
+        // A new turn makes any unjudged-ask marker moot: the user has spoken, so whatever the last
+        // turn may have been asking is now answered or abandoned either way.
+        useRuntimeStore.getState().clearUnjudgedAsk(agent.id);
+      }
       if (ev.event === "UserPromptSubmit" && ev.prompt && ev.prompt.trim()) {
         void record({ ...base(), kind: "prompt", text: ev.prompt });
       } else if (ev.event === "Stop" && ev.transcriptPath) {
@@ -508,7 +553,14 @@ function AgentPaneInner({
           // that ordering is tested directly rather than inline here.
           createHookEventHandler({
             engine: hookEngine,
-            activate: () => router.activate(),
+            activate: () => {
+              router.activate();
+              // A real hook event means `Stop` will witness the end of every turn from here, so this
+              // agent's settled statuses are facts rather than time-heuristic guesses. Destructive
+              // gates read that distinction (engine/turnEndAuthority) instead of the `blocked` status
+              // that used to stand in for it.
+              noteHooksLive(agent.id);
+            },
             captureHistory: captureHistoryFromHook,
             // Tier (d) of the concierge's read chain. A REQUIRED dep, so this hand-off cannot be
             // dropped without a compile error — see HookEventHandlerDeps.noteTranscript.

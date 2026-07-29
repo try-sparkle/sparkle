@@ -52,10 +52,40 @@ export interface StatusRouter {
  *  so a longer window would only trade a false green for a false red on healthy sessions. */
 export const HOOK_STALE_MS = 30_000;
 
+/** One status change, with the evidence that drove it. Handed to the optional `onTransition` sink so
+ *  the app can write a diagnosable trail: WHICH source spoke, what it said, and what the arbitration
+ *  resolved to. Before this existed, a whole day of false "needs you" alarms left ZERO trace in the
+ *  log — grepping for `blocked`, `needs_you` or `attention_screen` returned nothing — and the only
+ *  way to tell why a row was red was to watch it happen. */
+export interface StatusTransition {
+  /** Which input spoke: the hook stream, the screen scraper, or the followup judge. */
+  source: "hook" | "screen" | "judge";
+  /** What that source reported, BEFORE arbitration. */
+  input: AgentTabStatus;
+  /** What the row read a moment ago (null before the first emit / after a reset). */
+  from: AgentTabStatus | null;
+  /** What arbitration resolved to — the value actually emitted. */
+  to: AgentTabStatus;
+  /** The other sources' latest readings, so a surprising `to` can be explained from one line. */
+  lastHook: AgentTabStatus | null;
+  lastScreen: AgentTabStatus | null;
+  lastJudge: AgentTabStatus | null;
+  /** False once the hook stream has been declared dead by the watchdog. */
+  hooksLive: boolean;
+}
+
 export function createStatusRouter(
   emit: (s: AgentTabStatus) => void,
   // Injected so tests are deterministic without fake timers.
   now: () => number = () => Date.now(),
+  // Optional diagnostic sink — injected rather than imported so this module stays pure and its tests
+  // stay silent. Called ONLY on a real change (same dedup as `emit`).
+  onTransition?: (t: StatusTransition) => void,
+  // Called when the staleness watchdog below declares the hook stream dead. Injected for the same
+  // reason `onTransition` is — this module stays pure — and REQUIRED in spirit: hook authority is
+  // not a one-way latch, and a consumer that treats it as one reads the time heuristic's guesses as
+  // witnessed facts (roborev 54815).
+  onHooksDead?: () => void,
 ): StatusRouter {
   let hooksLive = false;
   // When the last MAIN-SESSION hook event arrived, for the staleness watchdog in fromScreen.
@@ -115,10 +145,15 @@ export function createStatusRouter(
   // source, so without this an unchanged value (e.g. a repeat idle hook during an active
   // escalation) would re-emit redundantly. `lastEmitted` is cleared by reset().
   let lastEmitted: AgentTabStatus | null = null;
-  const out = (s: AgentTabStatus): void => {
+  // `source`/`input` are what this call is REPORTING; everything else the transition record needs is
+  // router state read at emit time. Threaded as parameters rather than module state so a nested
+  // re-resolve can't attribute a change to the wrong source.
+  const out = (s: AgentTabStatus, source: StatusTransition["source"], input: AgentTabStatus): void => {
     if (s !== lastEmitted) {
+      const from = lastEmitted;
       lastEmitted = s;
       emit(s);
+      onTransition?.({ source, input, from, to: s, lastHook, lastScreen, lastJudge, hooksLive });
     }
   };
 
@@ -144,7 +179,7 @@ export function createStatusRouter(
       // working again, exited, etc. Drop the verdict so it can't escalate a LATER idle (a stale
       // verdict re-redding the next genuinely-done turn). The judge re-runs on each new Stop.
       if (s !== "idle") lastJudge = null;
-      if (hooksLive) out(resolve(s));
+      if (hooksLive) out(resolve(s), "hook", s);
     },
     fromScreen: (s) => {
       lastScreen = s;
@@ -181,9 +216,10 @@ export function createStatusRouter(
         now() - lastHookAt > HOOK_STALE_MS
       ) {
         hooksLive = false;
+        onHooksDead?.();
       }
       if (!hooksLive) {
-        out(s);
+        out(s, "screen", s);
         return;
       }
       // Hooks own the status; the screen can only ESCALATE a hook-idle turn to red. Re-resolving
@@ -193,7 +229,7 @@ export function createStatusRouter(
       // re-red the next genuinely-done turn — the escalation depends on the screen source emitting
       // a terminal non-prompt status to clear, which it does. `resolve` keeps the screen from ever
       // overriding a hook working/done, so this never regresses hook authority.
-      if (lastHook !== null) out(resolve(lastHook));
+      if (lastHook !== null) out(resolve(lastHook), "screen", s);
     },
     fromJudge: (s) => {
       // Symmetric to fromScreen's escalation: record the verdict and re-resolve against the current
@@ -202,7 +238,7 @@ export function createStatusRouter(
       // entirely before hooks are live (a judge can only run off a real Stop event, so this is
       // defensive).
       lastJudge = s;
-      if (hooksLive && lastHook !== null) out(resolve(lastHook));
+      if (hooksLive && lastHook !== null) out(resolve(lastHook), "judge", s);
     },
   };
 }

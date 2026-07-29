@@ -6,9 +6,19 @@
 // Like naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust — not the
 // webview — so the user's Sparkle bearer never ships in the JS bundle. The call goes through the
 // server-side `/ai/anthropic` proxy (`ai::call_anthropic_proxy`); the server holds the vendor key
-// and meters credits. Degrades gracefully: signed out / out of credits / network / parse failure
-// returns Err, and the caller treats any failure as "not a followup" (gray), so the feature is a
-// no-op until the user is signed in with credit rather than a hard error or a false red.
+// and meters credits.
+//
+// FAILURE CONTRACT — read this before changing the caller. Signed out / out of credits / network /
+// parse failure all return Err, and Err means EXACTLY ONE thing: no verdict exists. The caller
+// (services/turnFollowup.ts) maps that to `unknown` and paints NO status from it.
+//
+// This comment used to claim the caller treated any failure as "not a followup" (gray). It had been
+// false since sparkle-blpf, which changed the caller to fail CLOSED to red whenever the turn's text
+// carried a phrase like "want me to" — and on 2026-07-28 the proxy started returning 502 for 99.3%
+// of calls, so that fallback became the only verdict any agent got and paged the human on nearly
+// every finished turn. Two lessons worth keeping: a stale comment about someone else's error
+// handling is worse than none, and neither guess (always-gray or always-red) is available to a
+// component that could not run. Say "unknown" and let the caller decide.
 
 use crate::ai::{call_anthropic_proxy, extract_text, Metering, CLASSIFY_READ_TIMEOUT};
 

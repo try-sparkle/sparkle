@@ -243,7 +243,7 @@ describe("judgeNeedsFollowup (orchestration)", () => {
       task: "Fix the login loop",
       response: "Done. Fixed the loop and verified the suite passes.",
     });
-    expect(result).toBe(false);
+    expect(result).toEqual({ verdict: "done" });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -253,7 +253,7 @@ describe("judgeNeedsFollowup (orchestration)", () => {
       task: "Ship the release",
       response: "All secrets are in. Want me to land it now?",
     });
-    expect(result).toBe(true);
+    expect(result).toEqual({ verdict: "followup" });
     expect(invokeMock).toHaveBeenCalledWith("judge_turn_followup", {
       task: "Ship the release",
       response: "All secrets are in. Want me to land it now?",
@@ -278,39 +278,46 @@ describe("judgeNeedsFollowup (orchestration)", () => {
     });
   });
 
-  it("returns false when the judge says DONE", async () => {
+  it("returns a JUDGED done when the judge says DONE", async () => {
     invokeMock.mockResolvedValueOnce("DONE");
     const result = await judgeNeedsFollowup({
       task: "Ship the release",
       response: "Shipped. Want me to also write release notes?",
     });
-    expect(result).toBe(false);
+    // A real verdict of DONE — distinct from `unknown`, which is the absence of one.
+    expect(result).toEqual({ verdict: "done" });
   });
 
-  it("FAILS CLOSED to waiting when the judge can't run (no key/offline) on an ask (sparkle-blpf)", async () => {
-    // The norm for every user without a BYOK judge key: the judge throws, but the fast-path matched
-    // (the turn ends with a '?'), so we escalate to red rather than silently swallow the ask to gray.
-    invokeMock.mockRejectedValueOnce(new Error("no Anthropic API key"));
+  it("reports UNKNOWN — never a red — when the judge cannot run on a STRONG ask", async () => {
+    // REPLACES the old sparkle-blpf "fail closed to waiting" contract, deliberately. That rule was
+    // written for a user who had simply never configured a judge key, where the cost of guessing was
+    // bounded. On 2026-07-28 the AI proxy began returning 502 for 99.3% of calls and the guess became
+    // the ONLY verdict any agent got — so a fleet of healthy agents paged the human on nearly every
+    // finished turn, oscillating red→clear→red as statusRouter dropped and re-applied it.
+    //
+    // An unavailable judge has no claim to make. `signal` records how ask-like the text looked so the
+    // UI can EXPLAIN the gap ("a possible ask went unjudged"), but the verdict is `unknown` and
+    // AgentPane paints nothing from it.
+    invokeMock.mockRejectedValueOnce(new Error("credit balance is too low"));
     const result = await judgeNeedsFollowup({
       task: "Ship the release",
       response: "Want me to land it now?",
     });
-    expect(result).toBe(true);
+    expect(result).toEqual({ verdict: "unknown", signal: "strong" });
   });
 
-  it("FAILS OPEN to gray when the judge can't run on a WEAK (open-ended '?') recap (real screenshot-1)", async () => {
-    // The user's reported false-red: a finished status recap ending "What would you like to pick up
-    // next?" — a bare '?' with no proposal/gating phrase. mightNeedFollowup still flags it (consult
-    // the judge), but with no key the judge throws, and a WEAK signal must fall OPEN to gray rather
-    // than manufacture a red on a turn the user isn't actually being asked to unblock.
-    invokeMock.mockRejectedValueOnce(new Error("no Anthropic API key"));
+  it("reports UNKNOWN when the judge cannot run on a WEAK open-ended recap too", async () => {
+    // Same outcome by the same rule — the strength no longer changes the VERDICT, only the note that
+    // rides along with it. (Previously strong→red and weak→gray, which is how one dead backend could
+    // produce both a false alarm and a swallowed ask depending on phrasing.)
+    invokeMock.mockRejectedValueOnce(new Error("502 Bad Gateway"));
     const result = await judgeNeedsFollowup({
       task: "Give me a brief status update",
       response:
         "So: nothing in flight, nothing stuck, and no findings waiting on you. What would you like to pick up next?",
     });
-    expect(result).toBe(false);
-    expect(invokeMock).toHaveBeenCalled(); // it DID consult the judge; only the fallback grays it
+    expect(result).toEqual({ verdict: "unknown", signal: "weak" });
+    expect(invokeMock).toHaveBeenCalled(); // it DID consult the judge; only the outcome is honest now
   });
 
   it("still stays gray when the judge can't run on a turn the fast-path did NOT flag", async () => {
@@ -320,7 +327,7 @@ describe("judgeNeedsFollowup (orchestration)", () => {
       task: "Ship the release",
       response: "Done. Shipped and verified the suite passes.",
     });
-    expect(result).toBe(false);
+    expect(result).toEqual({ verdict: "done" });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });
@@ -364,7 +371,7 @@ describe("judgeNeedsFollowup — a live picker outranks the prose pipeline", () 
       response: "Running the command now.",
       screen: APPROVAL_2_1_220,
     });
-    expect(result).toBe(true);
+    expect(result).toEqual({ verdict: "followup" });
     expect(invokeMock).not.toHaveBeenCalled(); // no prose heuristic, no judge call, no model
   });
 
@@ -375,7 +382,7 @@ describe("judgeNeedsFollowup — a live picker outranks the prose pipeline", () 
       response: "All set — anything else you want me to do?",
       screen: ASK_USER_QUESTION_2_1_220,
     });
-    expect(result).toBe(true);
+    expect(result).toEqual({ verdict: "followup" });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -385,7 +392,7 @@ describe("judgeNeedsFollowup — a live picker outranks the prose pipeline", () 
       response: "Kicked off the suite; I'll report when it lands.",
       screen: ["$ pnpm -C apps/desktop test", " RUN  v2.1.9", ""].join("\n"),
     });
-    expect(result).toBe(false);
+    expect(result).toEqual({ verdict: "done" });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -395,7 +402,7 @@ describe("judgeNeedsFollowup — a live picker outranks the prose pipeline", () 
       task: "Ship the release",
       response: "All secrets are in. Want me to land it now?",
     });
-    expect(result).toBe(true);
+    expect(result).toEqual({ verdict: "followup" });
     expect(invokeMock).toHaveBeenCalled();
   });
 });

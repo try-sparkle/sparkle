@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   shouldRecompute,
   hashScrollback,
@@ -9,7 +9,13 @@ import {
   isTerminalComputeError,
   computeDeferralReason,
   RETRY_BACKOFF_MS,
+  isYourTurnFor,
 } from "./useSuggestions";
+import {
+  noteHooksLive,
+  resetTurnEndAuthority,
+  trackAgent,
+} from "../../engine/turnEndAuthority";
 import { SuggestionOfflineError } from "./engine";
 import { AiUnavailableError, AiUnreachableError } from "../anthropic";
 import { OutOfCreditsError } from "../credits";
@@ -135,5 +141,33 @@ describe("hashScrollback", () => {
   });
   it("differs on change", () => {
     expect(hashScrollback("abc")).not.toBe(hashScrollback("abd"));
+  });
+});
+
+describe("isYourTurnFor — a witness-less idle STILL opens the CTA gate", () => {
+  // Regression guard for roborev's finding on the commit that briefly gated this on
+  // turnEndAuthority. On the fallback path `idle` is the TERMINAL resting state, so that gate never
+  // reopened: a finished agent with no hooks and no spinner lost Open Pull Request / Merge PR /
+  // Close Build Agent on desktop AND phone, permanently and silently. These tests fail if the gate
+  // is ever re-added — see isYourTurnFor's doc comment for why the busy gate may do what this must not.
+  beforeEach(() => resetTurnEndAuthority());
+
+  it("offers the CTA to a tracked agent that never got a turn-end witness", () => {
+    trackAgent("a1");
+    expect(isYourTurnFor("a1", "idle")).toBe(true);
+  });
+
+  it("still offers it with a witness present", () => {
+    trackAgent("a1");
+    noteHooksLive("a1");
+    expect(isYourTurnFor("a1", "idle")).toBe(true);
+  });
+
+  it("holds the rest of the your-turn set, and nothing outside it", () => {
+    for (const s of ["waiting", "approval", "errored", "done"] as const) {
+      expect(isYourTurnFor("a1", s)).toBe(true);
+    }
+    expect(isYourTurnFor("a1", "working")).toBe(false);
+    expect(isYourTurnFor("a1", undefined)).toBe(false);
   });
 });

@@ -67,6 +67,7 @@ import {
 import { fetchOpenPrs, mergePr, prMergeEligibility, type PrRow } from "../openPrs";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useProjectStore } from "../../stores/projectStore";
+import { hasTurnEndAuthority, isTracked } from "../../engine/turnEndAuthority";
 import type { AgentTabStatus } from "../../types";
 
 // ---------------------------------------------------------------------------------------------
@@ -392,9 +393,23 @@ export function resolveLandTarget(ctx: AgentWorkflowContext): string {
  * is narrower, and that is defensible there: a human clicking Land can SEE the agent sitting at a
  * prompt. A model cannot, so the gate here has to be the wider one.
  *
- * Deliberately NOT live: `errored` (the process is gone), `idle`/`done`/`unmerged`/`stopped` (turn
- * finished — a landing state is not a busy one). Typed against AgentTabStatus so a new status is a
- * decision someone makes here rather than a silent "not live".
+ * Deliberately NOT live: `idle`/`done`/`unmerged`/`stopped` (turn finished — a landing state is not
+ * a busy one). Typed against AgentTabStatus so a new status is a decision someone makes here rather
+ * than a silent "not live".
+ *
+ * `errored` is ALSO not in this set, but NOT because the process is gone — this comment used to say
+ * exactly that, and it was wrong (roborev 55041/55076). The status engine's mid-stream failure branch
+ * sets `errored` while the PTY is very much ALIVE: an API-error banner the agent kept churning under,
+ * or a self-prompt loop. It is left out of the set because the witness check in `isWorking` below
+ * covers it precisely — a wedged-but-alive agent has no turn-end witness and is refused, while a
+ * genuinely exited one carries the `exited` witness and is allowed. Do not "simplify" that away by
+ * reasoning from this list alone.
+ *
+ * `blocked` is still listed and is still correct to treat as live, but the STATUS ENGINE no longer
+ * produces it: it used to mean "quiet for 25s", which was a guess dressed as a fact and doubled as a
+ * red needs-you alarm. `hasTurnEndAuthority` below is what replaces it for this gate — see there.
+ * (`services/improvementPass` still sets `blocked` for the Sparkle self-improve agent, so the entry
+ * is live code, not a leftover.)
  */
 const LIVE_AGENT_STATUSES = new Set<AgentTabStatus>(["working", "waiting", "approval", "blocked"]);
 
@@ -402,7 +417,37 @@ const LIVE_AGENT_STATUSES = new Set<AgentTabStatus>(["working", "waiting", "appr
 function isWorking(agentId: string): boolean {
   try {
     const status = useRuntimeStore.getState().status[agentId];
-    return status !== undefined && LIVE_AGENT_STATUSES.has(status);
+    if (status !== undefined && LIVE_AGENT_STATUSES.has(status)) return true;
+    // A settled status is only EVIDENCE of a finished turn when something actually witnessed the turn
+    // ending — Claude's hook `Stop`, or the spinner disappearing. On the time-heuristic fallback path
+    // (no hooks, no spinner: TUI drift, or a non-Claude program) there is no witness, and `idle` there
+    // means "the terminal went quiet", which is equally consistent with a six-minute `pnpm test`.
+    //
+    // The two consumers of that ambiguity must resolve it in OPPOSITE directions, which is exactly why
+    // it can't live in the status: an alarm must read a guess as "finished" (paging a human off a quiet
+    // terminal is a false alarm), while this gate must read it as "still live" (landing/rebasing/
+    // deleting a branch under a half-written worktree is unrecoverable, and refusing costs one retry).
+    // So: an agent this window is driving, whose turn-end signal is a guess, counts as live here.
+    //
+    // Scoped to TRACKED agents deliberately. An untracked id — pane in another window, or not open —
+    // tells this module nothing, and answering "live" for it would refuse every operation forever.
+    // Scoped to the statuses that can actually BE a mid-turn guess. `done`/`stopped`/`unmerged` are
+    // terminal OBSERVATIONS — the PTY is gone, and a dead process cannot be writing the worktree.
+    // Applying the override to those refused every op forever on a fallback-path agent that had
+    // exited, with no escape a user or model would ever deduce from the message (roborev 54815).
+    //
+    // `errored` is DELIBERATELY IN THE GUESS SET, though it looks terminal beside them (roborev
+    // 55041). It has a second producer: statusEngine's mid-stream failure branch sets it when the
+    // agent printed an API-error banner and kept churning, or fell into a self-prompt loop — "all
+    // while its process stays alive" — and statusRouter lifts that screen reading over the hook
+    // status. A wedged agent is still executing tools, so landing or deleting its branch is exactly
+    // the unrecoverable write this module exists to prevent. A genuinely EXITED agent is unaffected:
+    // StatusEngine.exit() grants the `exited` witness, so it passes `hasTurnEndAuthority` whatever
+    // its status name. And this refusal is recoverable — stopping the agent kills the PTY, which
+    // grants that witness, so the message's "wait for it to finish (or stop it)" is actionable.
+    const couldBeAGuess = status === undefined || status === "idle" || status === "errored";
+    if (couldBeAGuess && isTracked(agentId) && !hasTurnEndAuthority(agentId)) return true;
+    return false;
   } catch {
     // A store that can't be read is not evidence the agent is idle, but refusing every operation on
     // a store hiccup is worse than the guard being unavailable; the underlying Rust commands have

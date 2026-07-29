@@ -38,6 +38,37 @@ const YOUR_TURN: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "done",
 ]);
 
+/**
+ * Is it the user's turn for THIS agent? Plain `YOUR_TURN` membership.
+ *
+ * DO NOT ADD A TURN-END-WITNESS TEST HERE. It was added (to suppress the CTA when a fallback-path
+ * `idle` is only a guess) and reverted the same day, because it silently deletes the app's primary
+ * action for a whole class of agent — roborev on the commit that introduced it.
+ *
+ * The reasoning, because the gate one layer over (conciergeTools/workflow.isWorking) DOES apply that
+ * test and the asymmetry looks inconsistent until you see it:
+ *
+ *   - On the time-heuristic fallback path, `idle` is not a transient state — it is the TERMINAL
+ *     resting state. `screenAwaitsInput` returns false for a finished turn at the idle input box, so
+ *     an agent with no hooks and no spinner settles to `idle` and stays there forever. No later event
+ *     re-arms authority for an agent that has stopped producing output.
+ *   - So a witness test here is not "wait a bit longer" — it is permanent. `showCta` never renders,
+ *     the compute effect never runs, and the phone relay never fires: no Open Pull Request, no Merge
+ *     PR, no Close Build Agent, on any surface, with no visible reason and no recovery short of
+ *     making the agent run another turn — which is the very thing the CTA exists to avoid.
+ *   - The busy gate can afford the same test because its failure mode is a REFUSAL the caller
+ *     retries, which costs one round trip. Offering versus acting is the difference: suppressing an
+ *     offer is silent and total, refusing an action is loud and cheap. Both resolve the same
+ *     ambiguity, and they are right to resolve it in opposite directions.
+ *
+ * The live-work harm this was meant to address had a different root cause — the spinner matcher
+ * missing Claude's current status line, which painted a WORKING agent gray (fixed in 1f778f293).
+ * That is a false reading to fix at the source, not to paper over by muting the whole surface.
+ */
+export function isYourTurnFor(agentId: string, status: AgentTabStatus | undefined): boolean {
+  return status !== undefined && YOUR_TURN.has(status);
+}
+
 // djb2 — cheap + stable; only the tail matters for identity, so identical terminal state never
 // triggers a recompute (one Haiku call per distinct blocked state, not per render).
 export function hashScrollback(s: string): string {
@@ -366,14 +397,14 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
   // is an effect dep, so the deferred compute for the still-blocked state re-runs on reconnect.
   const isOnline = useConnectionStore((s) => s.isOnline);
   const status = useRuntimeStore((s) => s.status[agentId]);
-  const isYourTurn = status !== undefined && YOUR_TURN.has(status);
+  const isYourTurn = isYourTurnFor(agentId, status);
   /** Is the agent STILL blocked on the user, right now? Reads the store rather than the render-time
    *  `isYourTurn`, which is a snapshot: both the memo hit (effects flush after paint) and the async
    *  compute (`.then` on a microtask) can run after a store write the closure never saw. Typing a
    *  picker answer off a screen the agent has already left is wrong regardless of the de-dupe set,
    *  so both auto-answer sites gate on this (roborev 53203/53248). */
   const isLive = useCallback(
-    () => YOUR_TURN.has(useRuntimeStore.getState().status[agentId] as AgentTabStatus),
+    () => isYourTurnFor(agentId, useRuntimeStore.getState().status[agentId]),
     [agentId],
   );
   // The LIVE stage — deliberately NOT `workflowShipped`, which is a latch-once watermark that trips

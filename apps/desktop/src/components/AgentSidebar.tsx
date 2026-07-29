@@ -16,7 +16,7 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
 // FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
-import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool } from "react-icons/fi";
+import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool, FiHelpCircle } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
@@ -2896,6 +2896,10 @@ const AgentRow = memo(function AgentRow({
   const [rect, setRect] = useState<{ left: number; top: number; width: number } | null>(null);
   // The list's auto-scroll coordinator (see SidebarScrollContext): lets this row nudge the column up
   // so its full hover card fits, then ease back when the cursor leaves.
+  // Subscribed HERE rather than threaded down as a prop: AgentRow is memoized, and a per-agent
+  // boolean read through a selector re-renders only the row it changed for. Narrowed to a boolean so
+  // an unrelated write to the map can't invalidate every row.
+  const unjudgedAsk = useRuntimeStore((s) => s.unjudgedAsk[a.id] !== undefined);
   const sidebarScroll = useContext(SidebarScrollContext);
   // The two halves of the rendered card — measured to decide whether (and how far) to auto-scroll.
   const stripRef = useRef<HTMLDivElement>(null);
@@ -3292,6 +3296,30 @@ const AgentRow = memo(function AgentRow({
       </span>
     ) : null;
 
+  // THE UNJUDGED ASK (the neutral middle state). This agent finished a turn that LOOKED like it was
+  // asking something, and the followup judge — the thing that decides "needs you" vs "done" — could
+  // not run to settle it. Neither colour is honest, so the row shows neither: a muted question glyph
+  // sits beside the name and the status dot keeps saying whatever the deterministic sources say.
+  //
+  // Why it must exist at all: with the judge unavailable (the expected state until AI enhancement
+  // moves onto the user's own `claude` CLI), the safe default of "don't paint red" would otherwise
+  // make a genuine "Want me to land it?" indistinguishable from a finished turn — a silently dropped
+  // ask. This is the difference between "nothing needs you" and "we couldn't tell", said out loud.
+  // Muted, never red: the whole point of the surrounding work is that red means something.
+  const unjudgedAskChip = unjudgedAsk ? (
+    <span
+      data-testid="unjudged-ask"
+      title={
+        "This agent finished with something that reads like a question, and the AI check that " +
+        "decides whether it needs you couldn't run. Open it to see for yourself."
+      }
+      aria-label="Possible question — not checked"
+      style={{ display: "inline-flex", flex: "0 0 auto", lineHeight: 1, color: C.muted }}
+    >
+      <FiHelpCircle size={11} />
+    </span>
+  ) : null;
+
   // The source-epic pill (spec §8): a small 4px-radius chip on orchestrator rows showing the epic
   // title (ellipsized ~18ch). Clicking it (stopPropagation so it doesn't select the agent) jumps to
   // the Plan board and opens that epic's DetailOverlay via the one-shot boardFocusBeadId handoff.
@@ -3529,6 +3557,7 @@ const AgentRow = memo(function AgentRow({
                   }}
                 />
                 {workerCountBadge}
+                {unjudgedAskChip}
                 {epicPill}
                 {cloudChip}
                 {pinChip}

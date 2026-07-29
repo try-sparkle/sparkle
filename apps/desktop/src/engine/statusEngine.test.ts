@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens, isSpinnerFrame } from "./statusEngine";
+// The SAME predicate the concierge tool surface derives `needsYou` from, so the no-false-alarm
+// tests below assert the tier the human is actually paged on rather than a status name.
+import { isRedStatus } from "../services/windowStatus";
 import type { AgentTabStatus } from "../types";
 // The LOGGER, not `console`: logger.ts binds its `realConsole` at module load, so a console spy
 // installed later never sees the line and the transition tests below would pass vacuously against
@@ -121,14 +124,63 @@ describe("StatusEngine", () => {
     expect(last()).toBe("working");
   });
 
-  it("goes idle after a quiet period, then blocked after a long stall", () => {
-    const { engine, last } = makeEngine();
+  it("goes idle after a quiet period and STAYS there — silence is not a needs-you", () => {
+    const { engine, statuses, last } = makeEngine(() => IDLE_SCREEN);
     engine.ingest("doing work\n");
     vi.advanceTimersByTime(2500);
     expect(last()).toBe("idle");
-    // blocked must still be reachable after idle (the bug roborev caught).
+    // This used to escalate to `blocked` here — red, captioned "Blocked / stalled — needs you",
+    // and pushed to the human as a needs-you card — purely because the terminal had gone quiet for
+    // 25s. The screen said the opposite (an idle prompt, no question) both at settle and now.
     vi.advanceTimersByTime(25000);
-    expect(last()).toBe("blocked");
+    expect(last()).toBe("idle");
+    expect(statuses).not.toContain("blocked");
+    // Well past the old escalation, in case a future timer is added on the same silence signal.
+    vi.advanceTimersByTime(120_000);
+    expect(statuses.filter(isRedStatus)).toEqual([]);
+  });
+
+  it("never reports needsYou while a long shell command runs quietly", () => {
+    // The founder-reported repro (2026-07-28): an agent mid-`pnpm test` / `roborev wait` emits
+    // nothing for minutes. `needsYou` on the concierge tool surface is exactly isRedStatus(status)
+    // (conciergeTools/terminal.getAgentStatus), so asserting the red TIER — not one status name —
+    // is what pins the contract the human actually reads.
+    const { engine, statuses } = makeEngine(() => IDLE_SCREEN);
+    engine.ingest("$ pnpm test\n");
+    for (let i = 0; i < 12; i++) vi.advanceTimersByTime(30_000); // 6 minutes of silence
+    expect(statuses.filter(isRedStatus)).toEqual([]);
+    // …and the run finishing is still just a finished turn, not an alarm.
+    engine.ingest("Test Files  518 passed\n");
+    vi.advanceTimersByTime(2500);
+    expect(statuses.filter(isRedStatus)).toEqual([]);
+  });
+
+  it("keeps the approval SUBTYPE on a late-painting dangerous-action prompt", () => {
+    // roborev on 95013a2f1: settle consumes `sawRecentRisk`, so reading that flag 22.5s later made
+    // the re-check's `approval` branch unreachable — a permission box that painted late would be
+    // labeled a plain question for every alert/suggestion surface downstream.
+    let screen = IDLE_SCREEN;
+    const { engine, last } = makeEngine(() => screen);
+    engine.ingest("Bash(rm -rf build/)\n"); // classifies as approval_needed → arms the risk flag
+    vi.advanceTimersByTime(2500);
+    expect(last()).toBe("idle");
+    screen = PERMISSION_SCREEN;
+    vi.advanceTimersByTime(25000);
+    expect(last()).toBe("approval");
+  });
+
+  it("catches a prompt that only PAINTS after settle, on the late screen re-check", () => {
+    // xterm renders asynchronously, so a picker that streamed in just before the settle timer can
+    // reach the grid after settle read it. That race is the one thing the old 25s timer was doing
+    // that was worth keeping — now done by re-reading the screen instead of assuming the worst.
+    let screen = IDLE_SCREEN;
+    const { engine, last } = makeEngine(() => screen);
+    engine.ingest("thinking about it\n");
+    vi.advanceTimersByTime(2500);
+    expect(last()).toBe("idle");
+    screen = PERMISSION_SCREEN; // the menu finally paints
+    vi.advanceTimersByTime(25000);
+    expect(last()).toBe("waiting");
   });
 
   it("shows waiting when the agent asks a plain question", () => {
@@ -1008,5 +1060,23 @@ describe("StatusEngine — transition logging", () => {
     expect(stamps.length).toBeGreaterThanOrEqual(3);
     expect(stamps.every((n) => Number.isFinite(n))).toBe(true);
     expect([...stamps].sort((x, y) => x - y)).toEqual(stamps);
+  });
+});
+
+describe("a disposed engine goes silent", () => {
+  // roborev 55076. The PTY listener is torn down over an ASYNC Tauri unlisten, so a `pty:exit` from
+  // this engine's own kill can arrive after the pane remounted. If `exit()` still ran, its `set()`
+  // would overwrite the LIVE agent's status with a terminal `done`/`errored` — which opens the
+  // destructive-op gate through LIVE_AGENT_STATUSES entirely on its own, independently of the
+  // turn-end-witness path.
+  it("ignores a pty:exit that arrives after dispose", () => {
+    const { engine, statuses } = makeEngine();
+    engine.ingest("doing work\n");
+    const before = statuses.length;
+    engine.dispose();
+    engine.exit();
+    expect(statuses.length).toBe(before);
+    expect(statuses).not.toContain("done");
+    expect(statuses).not.toContain("errored");
   });
 });

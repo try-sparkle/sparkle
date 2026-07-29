@@ -1,10 +1,15 @@
-// END-TO-END: the reported bug, driven through the REAL state machine.
+// END-TO-END: a spawned, un-briefed agent driven through the REAL state machine — the actual
+// StatusEngine producing the actual status, then the actual overlay correcting it.
 //
-// Every other test in this change tests one layer. This one wires the two together — the actual
-// StatusEngine producing the actual status, then the actual overlay correcting it — because the bug
-// only exists at the join. Read on its own, `statusEngine` escalating a silent agent to `blocked` is
-// correct behaviour, and so is `blocked` being red; what was wrong is that a never-briefed agent
-// went down that path at all.
+// This file was written against an EARLIER design in which `statusEngine` escalated a silent agent
+// to red `blocked` at the 25s stall timer, and the `calmNewAgent` overlay corrected that red down to
+// `new` for never-briefed rows. That engine escalation has since been REMOVED — silence is not
+// evidence of anything, so a quiet terminal never produces a red at all now (see statusEngine.ts
+// SCREEN_RECHECK_MS: a long `pnpm test`, a `roborev wait`, a CI poll and a finished agent parked at
+// its idle prompt are all silent). The join this file exercises is therefore now
+// `settle -> idle -> the overlay`, and the invariant it pins is that NOTHING on the silent path
+// reaches the red / needs-you tier — briefed or not. A REAL ask (a permission menu on screen) still
+// goes red immediately; that is evidence, and the permission-menu case below still asserts it.
 //
 // FAKE TIMERS HERE ARE THE PTY CLOCK, NOT THE SPAWN CLOCK. statusEngine's stall timers are real
 // setTimeouts and the whole suite already drives them with vi.advanceTimersByTime (see
@@ -54,12 +59,18 @@ describe("a spawned, un-briefed agent, driven through the real StatusEngine", ()
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("the engine really does escalate it to red `blocked` — the bug is real", () => {
-    // Pinned so this file fails loudly if the underlying behaviour is ever changed at the engine
-    // instead, rather than silently testing nothing.
-    const { last } = run(IDLE_SCREEN);
-    expect(last()).toBe("blocked");
-    expect(isRedStatus(last())).toBe(true);
+  it("the engine leaves a silent agent at `idle` and never reds it — silence is not evidence", () => {
+    // This used to assert the engine escalated to red `blocked` after the 25s stall timer, and was
+    // pinned so the file would fail loudly if that behaviour ever moved. It did move, deliberately:
+    // the escalation was removed at the engine (statusEngine SCREEN_RECHECK_MS). The screen check at
+    // settle already said "no question here -> gray", nothing new is observed in the 25s that follow,
+    // so the status STAYS idle. The pin now guards the opposite invariant — that a quiet terminal
+    // never re-reddens — so a silence-driven red reintroduced at the engine still fails this loudly.
+    const { statuses, last } = run(IDLE_SCREEN);
+    expect(last()).toBe("idle");
+    expect(isRedStatus(last())).toBe(false);
+    expect(statuses).not.toContain("blocked");
+    expect(statuses.filter(isRedStatus)).toEqual([]);
   });
 
   it("…and the overlay turns that into a calm `new` the fleet does not report", () => {
@@ -78,7 +89,8 @@ describe("a spawned, un-briefed agent, driven through the real StatusEngine", ()
     //
     // This case used to assert `needsAttention`, which proved nothing (roborev 54748): that
     // predicate is the narrow badge/relay set {waiting, approval, errored}, and the path here is
-    // `working → idle → blocked`, so it was already false for every RAW status before any
+    // `working → idle` (no longer `→ blocked` — the engine stall escalation was removed), so it
+    // was already false for every RAW status before any
     // correction. The test passed identically with the overlay replaced by the identity function.
     // Assert the corrected VALUE, and assert the notification claim against the set that actually
     // governs it.
@@ -116,12 +128,23 @@ describe("a spawned, un-briefed agent, driven through the real StatusEngine", ()
     expect(needsAttention(corrected)).toBe(true);
   });
 
-  it("STILL goes red for a BRIEFED agent that stalls the same way", () => {
+  it("a BRIEFED agent that stalls the same way is ALSO not red — silence is not evidence for anyone", () => {
+    // Under the earlier design the overlay withheld the grace period from briefed agents, so a
+    // briefed agent that went silent stayed red `blocked` — the engine had reddened it and the
+    // overlay left briefed rows untouched. With the escalation gone at the engine there is no red to
+    // withhold: the briefed agent settles at `idle` (a finished-turn "your turn", NOT a needs-you),
+    // and the overlay still leaves briefed rows untouched, so it stays `idle`. A briefed agent that
+    // draws a REAL question still goes red immediately — that is the permission-menu case above,
+    // which is evidence rather than silence.
     const { last } = run(IDLE_SCREEN);
     const briefed = { ...briefless, lastPrompt: "go build the thing" };
     const corrected = calmNewAgent(last(), briefed, SPAWN + 26_000)!;
 
-    expect(corrected).toBe("blocked");
-    expect(isRedStatus(corrected)).toBe(true);
+    expect(corrected).toBe("idle");
+    expect(isRedStatus(corrected)).toBe(false);
+    // The same raw `idle`, UN-briefed, IS still corrected to `new` — proving this case is about the
+    // brief, not about `idle` being inert, and that the overlay's briefed/un-briefed distinction
+    // survives the engine change (a parallel rebase of this branch pinned exactly this contrast).
+    expect(calmNewAgent(last(), briefless, SPAWN + 26_000)).toBe("new");
   });
 });

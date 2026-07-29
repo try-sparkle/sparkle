@@ -11,10 +11,21 @@
 //
 // Hybrid, to keep it ~free: a pure LOCAL fast-path first skips the obvious "Done." turns with no
 // question/proposal at all (no model call), and the Haiku judge runs only on the ambiguous
-// remainder. The judge is a PRECISION filter over the fast-path, not a gate that can silently fail
-// open: when it can't run (no API key — the norm without a BYOK key —, offline, model hiccup) we
-// FALL BACK to the fast-path's own verdict (→ `waiting`) rather than swallow a real ask to gray
-// (sparkle-blpf). Only a judge that actually RAN and said DONE pulls an ambiguous turn back to gray.
+// remainder. The judge is a PRECISION filter over the fast-path.
+//
+// Provider health is recorded here too — `noteAiProviderFailure`/`noteAiProviderHealthy`, the same
+// chokepoint helpers `chatOnce` uses — so ProviderUnavailableBanner can NAME the outage. That is a
+// separate question from this function's verdict, and deliberately so: the banner says "Sparkle's AI
+// provider is down", while the return value says what this turn means. Letting the second borrow the
+// first's certainty is exactly the bug below.
+//
+// WHEN THE JUDGE CANNOT RUN, THIS MODULE RETURNS `unknown` — it does not answer anyway. That is the
+// whole contract, and it is worth stating twice because the code has been wrong in BOTH directions:
+// failing open to gray silently killed red-on-prose for every keyless user (sparkle-blpf), and the
+// fix for that — failing closed to red on a strong local phrase — turned a dead AI backend into a
+// fleet-wide false-alarm storm on 2026-07-28. Neither guess is defensible: a status is a claim about
+// the agent, and an unavailable judge has no claim to make. Callers decide what to do with `unknown`;
+// what they must not do is paint it red. See `FollowupOutcome`.
 import { invoke } from "@tauri-apps/api/core";
 // The picker detector, NOT a second copy of one. This is the same `detectTerminalPrompts` behind
 // `conciergeDispatch.liveOptionsFor`, whose `options.length > 0` is exactly the condition that
@@ -28,6 +39,7 @@ import {
   noteAiServiceFailure,
   noteAiServiceHealthy,
 } from "./anthropic";
+import { log } from "../logger";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
 // long body of what they did. Scanning the tail keeps a '?' buried in the middle of a report (a
@@ -208,6 +220,23 @@ export function interpretVerdict(raw: string): boolean {
   return v.includes("FOLLOWUP");
 }
 
+/** What a followup judgement can conclude. Three states, not two, because "the judge said this turn
+ *  is done" and "the judge never ran" are different facts and only one of them may drive a status.
+ *
+ *  - `followup` — a judge RAN and said the turn is blocked on the user. The only outcome that reds.
+ *  - `done`     — a real decision that nothing is blocked: either the local fast-path found no ask at
+ *                 all, or a judge ran and said DONE. Both are conclusions, which is what matters.
+ *  - `unknown`  — the judge could not run. NO conclusion exists. Callers must not colour a row from
+ *                 it; `signal` carries how ask-like the text looked, for explanation and logging only.
+ *
+ *  There is deliberately no "did the model run" boolean alongside this. The only question any caller
+ *  has is "is there a conclusion, and what is it", and a second flag that answers something subtly
+ *  different is how `blocked` came to mean two things at once. */
+export type FollowupOutcome =
+  | { verdict: "followup" }
+  | { verdict: "done" }
+  | { verdict: "unknown"; signal: FollowupSignal };
+
 /**
  * Is a picker/menu live on `screen` right now — a numbered option list, a Claude Code permission or
  * AskUserQuestion dialog, a shell `(y/n)`?
@@ -242,20 +271,19 @@ export function screenShowsPicker(screen: string | undefined): boolean {
  * Decide whether a finished turn is blocked on the user. Runs the local fast-path, then (only if it
  * might be an ask) the Haiku judge with the agent's task as context for "the work at hand".
  *
- * A live picker on `screen` pre-empts all of that (see screenShowsPicker) — no prose heuristic, no
- * judge call, no model.
+ * A live picker on `screen` pre-empts all of that (see screenShowsPicker) — it is terminal STATE, an
+ * unambiguous "blocked on you", so it short-circuits to `followup` with no prose heuristic, no judge
+ * call, no model. (No production caller supplies `screen` today — see screenShowsPicker's roborev-54774
+ * note — but the capability is kept and tested for the tracked viewport-based fix.)
  *
- * FAILS CLOSED (sparkle-blpf): the deterministic fast-path is the floor, not the judge. We reach the
- * judge only because `mightNeedFollowup` already matched — the tail had a '?' or a proposal/hand-back
- * phrase — so this turn *looks* blocked on the user. We must distinguish two outcomes the old code
- * conflated:
- *   - the judge RAN and said DONE  → trust it, return false (gray). A real verdict overrides the
- *     fast-path's bias-toward-ask.
- *   - the judge COULD NOT RUN (no API key — the case for every user without a BYOK key today —, or
- *     offline / model hiccup) → we have NO verdict, so we fall back to the fast-path's own answer
- *     (true → `waiting`) rather than swallowing a genuine "needs you" to gray. This is what makes the
- *     prose-question case go red WITHOUT a judge key. The previous behavior (catch → false) made the
- *     whole red-on-prose path silently dead for everyone but the one user with a key.
+ * DEGRADES HONESTLY. Otherwise we reach the judge only because `mightNeedFollowup` already matched —
+ * the tail had a '?' or a proposal/hand-back phrase — so this turn *looks* blocked on the user. Three
+ * outcomes, deliberately distinct:
+ *   - the judge RAN and said DONE  → `done`. A real verdict overrides the fast-path's bias-toward-ask.
+ *   - the judge RAN and said FOLLOWUP → `followup`. The one path that may paint a row red.
+ *   - the judge COULD NOT RUN (backend down, out of credits, signed out, offline) → `unknown`. We
+ *     have no verdict, so we assert none. Guessing here is what turned a dead AI backend into a
+ *     fleet-wide false-alarm storm; see the catch block for the incident.
  *
  * @param task     What the agent was asked to do (its naming basis / name) — lets the judge tell a
  *                 closeout ask (land/verify THIS work → red) from an offer of new work (gray).
@@ -263,19 +291,20 @@ export function screenShowsPicker(screen: string | undefined): boolean {
  * @param project  Metering-only: the project this agent belongs to, so the judge's credit debit is
  *                 attributable in the Credits history. Omitted → the row carries no project.
  * @param screen   The agent's CURRENT terminal text, if the caller can read one. A picker on it is
- *                 an unambiguous "blocked on you" and short-circuits to true.
+ *                 an unambiguous "blocked on you" and short-circuits to `followup`.
  */
 export async function judgeNeedsFollowup(args: {
   task: string;
   response: string;
   project?: string;
   screen?: string;
-}): Promise<boolean> {
+}): Promise<FollowupOutcome> {
   // A menu on screen outranks everything below it — including the judge, which never gets asked.
   // See screenShowsPicker: this is terminal STATE, not turn-end English, so there is nothing for a
-  // model to weigh and nothing to fall back to when it can't run.
-  if (screenShowsPicker(args.screen)) return true;
-  if (!mightNeedFollowup(args.response)) return false;
+  // model to weigh and nothing to fall back to when it can't run. A picker is an unambiguous
+  // "blocked on you", so it resolves straight to `followup`.
+  if (screenShowsPicker(args.screen)) return { verdict: "followup" };
+  if (!mightNeedFollowup(args.response)) return { verdict: "done" };
   // Scope the try to ONLY the judge call, so the catch strictly means "the judge could not run"
   // (never a genuine verdict re-interpreted as an availability failure).
   let raw: string;
@@ -291,19 +320,37 @@ export async function judgeNeedsFollowup(args: {
     noteAiProviderHealthy();
     noteAiServiceHealthy();
   } catch (e) {
+    // Record the provider-health observation FIRST (stores/aiProviderStore, via the shared
+    // chokepoint helper) so ProviderUnavailableBanner can name the cause, then answer honestly
+    // below. Two different questions: "is Sparkle's AI provider usable" and "what is this turn's
+    // verdict". The banner owns the first; this function must not let it colour the second.
     noteAiProviderFailure(e);
     noteAiServiceFailure(e);
-    // The judge could not run (no API key, offline, model hiccup). We can't distinguish done from
-    // blocked, so fall back to the deterministic fast-path — but TIERED, not a blanket red. Only a
-    // STRONG signal (a whole-message gate, or a concrete action-proposal like "want me to land it?")
-    // fails CLOSED to `waiting`: a keyless "Want me to land it now?" must still go red (sparkle-blpf).
-    // A WEAK signal — a bare trailing '?' with no proposal/gating phrase, the shape of an open-ended
-    // "what would you like to pick up next?" recap — falls OPEN to gray rather than manufacturing a
-    // false red on an idle status report the user isn't actually blocking. With a judge key present,
-    // the judge itself grays these (see judge.rs); this floor only governs the keyless path.
-    console.debug("followup judge unavailable; failing closed only on a strong fast-path signal:", e);
-    return classifyFollowupSignal(args.response) === "strong";
+    // THE JUDGE COULD NOT RUN — no verdict exists, so we report exactly that and let the caller
+    // decide. What we must NOT do is answer the question anyway.
+    //
+    // This used to return `classifyFollowupSignal(...) === "strong"`, i.e. a confident RED whenever
+    // the tail carried a phrase like "want me to", "should i", "ready for you" or "once you confirm"
+    // (sparkle-blpf, which was reasoning about a user who had simply never configured a key). The
+    // failure mode that reasoning missed is a backend that dies UNDER A WHOLE FLEET: from 2026-07-28
+    // 16:48 the AI proxy returned 502 for 99.3% of calls, so the judge stopped running everywhere at
+    // once and that fallback became the ONLY verdict any agent got. Agents end turns with "Want me
+    // to open the PR?" constantly, so effectively every finished turn was paged to the human as red
+    // — and it oscillated, because statusRouter drops the verdict on the next screen `working` or
+    // non-idle hook and the next Stop re-asserts it (red → clear → red with no user action).
+    //
+    // The local phrase match is a PRE-FILTER for "is this worth a model call", not a verdict. Its
+    // strength is retained on the outcome so a caller can surface "there may be an ask here, and it
+    // could not be judged" — but as UNKNOWN, never as a confident alarm. This holds whichever
+    // backend the judge is pointed at, which is the property the coming BYOK→subscription move needs.
+    // Feed the app-wide degraded indicator. The judge is often the FIRST AI call to fail after a
+    // backend dies (it runs on every finished turn), so it is the earliest honest witness there is.
+    log.warn("turn-followup", "judge unavailable — reporting UNKNOWN, not a red", {
+      signal: classifyFollowupSignal(args.response),
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { verdict: "unknown", signal: classifyFollowupSignal(args.response) };
   }
   // The judge RAN — trust its verdict. A real DONE pulls the ambiguous turn back to gray.
-  return interpretVerdict(raw);
+  return { verdict: interpretVerdict(raw) ? "followup" : "done" };
 }

@@ -9,6 +9,7 @@ import type { AgentTabStatus, LastObserved } from "../types";
 import { isRedStatus } from "../services/windowStatus";
 import type { BranchStatus, WorkflowState, AgentStatusResult } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import type { FollowupSignal } from "../services/turnFollowup";
 import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
 import { beadLifecycleActions, levelAfter, BEAD_LEVEL } from "../engine/beadLifecycle";
@@ -569,6 +570,17 @@ interface RuntimeState {
   // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
   // persisted, like `status`); cleared whenever `status` is cleared for an agent.
   attentionScreen: Record<string, string>;
+  // agentId -> how ask-like a FINISHED turn looked that we could NOT judge, because the AI backend
+  // was unavailable (services/turnFollowup returns `unknown`). This is the neutral middle state
+  // between "the judge said this needs you" (red) and "the judge said it's done" (gray): we simply
+  // do not know, and the row says so rather than guessing in either direction.
+  //
+  // It exists because the alternative is a silent loss. With the judge dead — the expected state
+  // until AI enhancement moves onto the user's own `claude` CLI — a genuine "Want me to land it?"
+  // would otherwise read exactly like a finished turn, and the user would never learn an ask was
+  // dropped. Live-only, cleared with `status`, and cleared per-agent the moment a new turn opens or
+  // a real verdict arrives (AgentPane) — a stale marker on a turn that has moved on is noise.
+  unjudgedAsk: Record<string, FollowupSignal>;
   openAgentIds: string[]; // agents whose pane is mounted + PTY alive (persisted)
   branchStatus: Record<string, BranchStatus>; // agentId -> live ahead/behind/dirty/size (live-only)
   // agentId -> the furthest workflow stage we KNOW this agent's OWN work has reached. Derived each
@@ -602,6 +614,10 @@ interface RuntimeState {
   /** Store the terminal screen captured when an agent entered an "ask" status, for the notification
    *  summarizer. Live-only (mirrors `status`). */
   setAttentionScreen: (agentId: string, text: string) => void;
+  /** Mark this agent's finished turn as carrying a possible ask nobody could judge. */
+  setUnjudgedAsk: (agentId: string, signal: FollowupSignal) => void;
+  /** Drop the marker — a new turn opened, or a real verdict landed. Safe to call when unset. */
+  clearUnjudgedAsk: (agentId: string) => void;
   setBranchStatus: (agentId: string, s: BranchStatus) => void;
   setWorkflowStage: (agentId: string, stage: WorkflowStageId) => void;
   setWorkflowShipped: (agentId: string, shipped: boolean) => void;
@@ -652,6 +668,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       status: {},
       lastObserved: {},
       attentionScreen: {},
+      unjudgedAsk: {},
       openAgentIds: [],
       branchStatus: {},
       workflowStage: {},
@@ -688,6 +705,10 @@ export const useRuntimeStore = create<RuntimeState>()(
                   },
                 };
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+          // Stripped with the rest of the live-only maps. Its doc says it is cleared with `status`,
+          // and it must be: the marker claims an unanswered question about a turn that is gone once
+          // the pane closes (and about the PREVIOUS occupant on a slot reuse). roborev, 54814.
+          const { [agentId]: _ask, ...unjudgedAsk } = s.unjudgedAsk;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
@@ -708,6 +729,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             status,
             lastObserved,
             attentionScreen,
+            unjudgedAsk,
             branchStatus,
             workflowStage,
             workflowShipped,
@@ -726,6 +748,10 @@ export const useRuntimeStore = create<RuntimeState>()(
           // new session repopulates a LIVE status within a tick regardless.
           const { [agentId]: _lo, ...lastObserved } = s.lastObserved;
           const { [agentId]: _scr, ...attentionScreen } = s.attentionScreen;
+          // Stripped with the rest of the live-only maps. Its doc says it is cleared with `status`,
+          // and it must be: the marker claims an unanswered question about a turn that is gone once
+          // the pane closes (and about the PREVIOUS occupant on a slot reuse). roborev, 54814.
+          const { [agentId]: _ask, ...unjudgedAsk } = s.unjudgedAsk;
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
@@ -739,6 +765,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             status,
             lastObserved,
             attentionScreen,
+            unjudgedAsk,
             branchStatus,
             workflowStage,
             workflowShipped,
@@ -754,6 +781,19 @@ export const useRuntimeStore = create<RuntimeState>()(
 
       setAttentionScreen: (agentId, text) =>
         set((s) => ({ attentionScreen: { ...s.attentionScreen, [agentId]: text } })),
+
+      setUnjudgedAsk: (agentId, signal) =>
+        // Same no-op guard `setStatus` uses and for the same reason: this map has whole-map
+        // subscribers (the sidebar), and re-marking an already-marked agent must not churn a render.
+        set((s) => (s.unjudgedAsk[agentId] === signal ? s : { unjudgedAsk: { ...s.unjudgedAsk, [agentId]: signal } })),
+
+      clearUnjudgedAsk: (agentId) =>
+        set((s) => {
+          if (!(agentId in s.unjudgedAsk)) return s;
+          const next = { ...s.unjudgedAsk };
+          delete next[agentId];
+          return { unjudgedAsk: next };
+        }),
 
       setBranchStatus: (agentId, s) =>
         set((st) => ({ branchStatus: { ...st.branchStatus, [agentId]: s } })),
