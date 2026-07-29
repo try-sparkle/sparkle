@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { detectClaudeCodePicker, detectResumePrompt, detectTerminalPrompts } from "./heuristics";
+import {
+  detectClaudeCodePicker,
+  detectResumePrompt,
+  detectTerminalPrompts,
+  genericMenuRun,
+} from "./heuristics";
 import {
   APPROVAL_2_1_220,
   MODEL_PICKER_2_1_220,
@@ -317,5 +322,58 @@ describe("detectClaudeCodePicker — captured Claude Code 2.1.220 screens", () =
     for (const line of NON_PICKER_HINT_LINES_2_1_220) {
       expect(detectClaudeCodePicker(`  1. Yes\n  2. No\n${line}`), line).toEqual([]);
     }
+  });
+});
+
+// THE SHARED RUN SELECTOR (roborev 55245).
+//
+// `genericMenuRun` is the ONE definition of "which numbered run is the menu", used both to emit the
+// buttons and — by the concierge's fingerprint — to locate the question. When those were two
+// implementations they disagreed: this keeps the LONGEST run, first-wins on ties, while a locator
+// that kept the run nearest the END picked a different block, so the buttons and the fingerprinted
+// question described different menus and nothing could catch it.
+describe("genericMenuRun — the single definition of which run is the menu", () => {
+  // THE LIVE DIALOG, NOT THE BIGGEST LIST. A menu is only a menu when the last line asks a choice,
+  // so the live one is by construction the run nearest that prompt. Keeping the LONGEST run instead
+  // offered a numbered plan's buttons for a menu that does not have them, and — because the
+  // concierge's fingerprint locates its question with this same function — excluded the live
+  // question from the hash, turning a press that should be refused into one that matches
+  // (roborev 55245/55258).
+  it("takes the run NEAREST THE END, even when an earlier run is longer", () => {
+    const run = genericMenuRun([
+      "Plan:",
+      "1. Add the parser",
+      "2. Wire it up",
+      "3. Ship it",
+      "Which should I do first?",
+      "1) Add the parser",
+      "2) Wire it up",
+    ]);
+
+    // The live two-option menu, not the three-item plan above it.
+    expect(run?.numbers).toEqual([1, 2]);
+    expect([run?.first, run?.last]).toEqual([5, 6]);
+  });
+
+  it("takes the LATER of two equal-length runs", () => {
+    const run = genericMenuRun(["A?", "1) a", "2) b", "B?", "1) c", "2) d"]);
+    expect([run?.first, run?.last]).toEqual([4, 5]);
+  });
+
+  it("requires at least two options — one numbered log line is not a menu", () => {
+    expect(genericMenuRun(["[1] 91234", "building…"])).toBeNull();
+    expect(genericMenuRun(["7) x", "9) y"])).toBeNull();
+  });
+
+  it("skips lines between option rows, as the parser always has", () => {
+    const run = genericMenuRun([
+      "Which migration?",
+      "  1) Use the existing one",
+      "     keeps the current schema",
+      "  2) Write a new one",
+    ]);
+
+    expect(run?.numbers).toEqual([1, 2]);
+    expect([run?.first, run?.last]).toEqual([1, 3]);
   });
 });

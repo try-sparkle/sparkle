@@ -1335,250 +1335,50 @@ describe("the send_control_key descriptor states the refusal honestly", () => {
   });
 });
 
-// THE ANCHOR MUST BE THE LIVE DIALOG, NOT THE BIGGEST ONE IN THE BUFFER (roborev 55172).
+// THE BLOCK IS THE LIVE DIALOG, AND BOTH HALVES DESCRIBE IT (roborev 55172, 55245, 55258).
 //
-// Claude Code prints ordinary numbered lists constantly, and an answered menu stays in the
-// scrollback. Anchoring on the earliest-longest run anywhere in the snapshot meant the OPTION SHAPE
-// came from the current dialog while the QUESTION came from stale text hundreds of lines up — so two
-// different live prompts hashed identically. That is the 55166 collision, reopened inside its fix.
-describe("the question block anchors on the live dialog, not on stale numbered output", () => {
-  const STALE = ["Here's the plan:", "1. Read the config", "2. Patch the parser", "3. Run the suite", ""];
+// Two properties, and the second one is why the first is not enough on its own:
+//
+//   PARITY — the option shape and the question must describe the SAME block. If they describe
+//   different ones the fingerprint is incoherent rather than merely stale, and nothing can catch
+//   that. `genericMenuRun` is the single definition, so they cannot diverge.
+//
+//   AND THE RIGHT BLOCK — parity alone is only safe once the shared rule is correct. Adopting a
+//   longest-run rule made both halves describe a numbered PLAN printed above the live menu, which
+//   excluded the live question from the hash entirely: two different prompts then matched, and a
+//   press that had been refused became allowed. A menu is only a menu when the last line asks a
+//   choice, so the live dialog is the run nearest that prompt.
+describe("the fingerprint describes the LIVE menu, not a numbered list above it", () => {
+  const plan = ["Here's the plan:", "1. Read the config", "2. Patch the parser", "3. Run the suite"];
   const live = (q: string) => [q, "  1) Yes", "  2) No", "Enter your choice: "];
 
-  it("distinguishes two live menus that follow an identical earlier numbered block", () => {
-    scrollbackMock.mockReturnValue([...STALE, ...live("Delete the production database?")].join("\n"));
+  it("offers the LIVE menu's options, not the longer list's", () => {
+    scrollbackMock.mockReturnValue([...plan, ...live("Delete the production database?")].join("\n"));
+    const r = readPickerOptions(AGENT);
+
+    // Two options, because the live menu has two — a third would let the caller press "3" into a
+    // prompt that does not have it.
+    expect(r.options.map((o) => o.label)).toEqual(["1", "2"]);
+  });
+
+  it("puts the LIVE question in the fingerprint, so two prompts do not match", () => {
+    scrollbackMock.mockReturnValue([...plan, ...live("Delete the production database?")].join("\n"));
     const danger = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue([...STALE, ...live("Overwrite config.toml?")].join("\n"));
+    scrollbackMock.mockReturnValue([...plan, ...live("Overwrite config.toml?")].join("\n"));
     const benign = readPickerOptions(AGENT);
 
-    expect(danger.present).toBe(true);
-    // A numbered menu's labels are "1"/"2" either way — only the question separates them.
-    expect(benign.options.map((o) => o.label)).toEqual(danger.options.map((o) => o.label));
+    expect(danger.fingerprint).not.toBe("");
     expect(benign.fingerprint).not.toBe(danger.fingerprint);
   });
 
-  // …and the scan is bounded to the region the DETECTOR reasons about (its last-12-non-empty-lines
-  // tail, plus slack). An answered menu far above the live prompt is not the dialog the options came
-  // from, and anchoring on it excludes the live question from the block entirely — at which point
-  // two different y/n confirmations hash identically, because Approve/Deny is a global constant.
-  it("ignores an answered menu that has scrolled out of the detector's window", () => {
-    const answered = ["Pick a strategy:", "  1) Rebase", "  2) Merge", "Enter your choice: "];
-    const filler = Array.from({ length: 26 }, (_, i) => `  applied patch ${i}`);
-    const screen = (q: string) => [...answered, ...filler, q].join("\n");
-
-    scrollbackMock.mockReturnValue(screen("Delete the production database? [y/n] "));
-    const danger = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue(screen("Overwrite config.toml? [y/n] "));
-    const benign = readPickerOptions(AGENT);
-
-    expect(danger.present).toBe(true);
-    expect(benign.options.map((o) => o.label)).toEqual(danger.options.map((o) => o.label));
-    expect(benign.fingerprint).not.toBe(danger.fingerprint);
-  });
-
-  // Run members must be ADJACENT. Two stray numbered log lines far apart used to form a legal
-  // "run" — `[1] 91234` from bash job control and a later `(2) retrying` — and the block spanning
-  // them hashed every line of live log output in between. The fingerprint then moved whenever the
-  // log did, so the press was refused as `changed` and the refusal's remedy ("read them again")
-  // looped forever.
-  it("does not span two far-apart stray numbered lines, so moving log output cannot invalidate it", async () => {
-    const screen = (tick: number) => [
-      "[1] 91234",
-      ...Array.from({ length: 8 }, (_, i) => `  [log] worker ${tick}-${i} idle`),
-      "(2) retrying",
-      "About to overwrite your settings.",
-      "Overwrite config.toml? [y/n] ",
-    ].join("\n");
-
-    scrollbackMock.mockReturnValue(screen(1));
-    const read = readPickerOptions(AGENT);
-    expect(read.present).toBe(true);
-    scrollbackMock.mockReturnValue(screen(2)); // the log between the strays moved; the dialog did not
-
-    expect(readPickerOptions(AGENT).fingerprint).toBe(read.fingerprint);
-    const r = await selectPickerOption(AGENT, 0, read.fingerprint, ALLOWED);
-    expect(r.ok).toBe(true);
-  });
-});
-
-// NORMALISE WHAT MOVES; KEEP WHAT DISTINGUISHES (roborev 55172).
-//
-// Dropping a whole volatile line was worse than the bug it fixed: the patterns match ordinary
-// question text, so a question stating a SIZE lost the only content that identified it.
-describe("a question that states a size or a percentage is still fingerprinted", () => {
-  it("keeps two size-bearing questions apart", () => {
-    scrollbackMock.mockReturnValue("Delete 2.3 GB of build artifacts? [y/n] ");
-    const a = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue("Overwrite 1.1 GB dataset? [y/n] ");
-    const b = readPickerOptions(AGENT);
-
-    expect(a.present).toBe(true);
-    expect(b.fingerprint).not.toBe(a.fingerprint);
-  });
-
-  it("but ignores the size CHANGING inside an otherwise identical question", () => {
-    scrollbackMock.mockReturnValue("Downloading 2.3 GB — continue? [y/n] ");
-    const a = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue("Downloading 2.9 GB — continue? [y/n] ");
-    const b = readPickerOptions(AGENT);
-
-    expect(b.fingerprint).toBe(a.fingerprint);
-  });
-});
-
-// A DEEP DIALOG UNDER A PILE OF CHROME (roborev 55182).
-//
-// The first window was 24 RAW lines, derived from TAIL_LINES — which governs only the GENERIC menu
-// fallback. detectClaudeCodePicker runs first and searches PICKER_WINDOW (50) non-empty lines for
-// the footer with PICKER_SPAN (30) above it, so the detector could return options whose rows sat far
-// outside the window this looked at. When that happened `optionRun` found nothing and control fell
-// into the y/n branch, which hashed the last two lines — the Ink chrome BELOW the dialog. Both
-// failure directions follow: the chrome ticks and the press is refused forever, or the chrome is
-// settled and two different commands share a fingerprint.
-describe("a Bash-approval dialog buried under chrome is still fingerprinted by its question", () => {
-  const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
-  // The option shape is a GLOBAL CONSTANT for this dialog — every Bash approval renders the same
-  // three. Only the command distinguishes one from the next.
-  const dialog = (command: string) => [
-    "Claude wants to run a command:",
-    `  ${command}`,
-    "",
-    "Do you want to proceed?",
-    "  1. Yes",
-    "  2. Yes, and don't ask again for this command",
-    "  3. No, and tell Claude what to do differently",
-    FOOTER,
-  ];
-  // Ink keeps rendering below the dialog: the task checklist, the composer, the hint line.
-  const chrome = Array.from({ length: 25 }, (_, i) => `  ☐ task ${i} pending`);
-
-  it("tells two different commands apart", () => {
-    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
-    const benign = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue([...dialog("rm -rf build/"), ...chrome].join("\n"));
-    const danger = readPickerOptions(AGENT);
-
-    expect(benign.present).toBe(true);
-    expect(danger.options.map((o) => o.label)).toEqual(benign.options.map((o) => o.label));
-    expect(benign.fingerprint).not.toBe(danger.fingerprint);
-    // …and neither is the "cannot fingerprint" sentinel, which would be a refusal rather than a read.
-    expect(benign.fingerprint).not.toBe("");
-  });
-
-  it("refuses to press Yes on rm -rf with a fingerprint read from git status", async () => {
-    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
-    const fromBenign = readPickerOptions(AGENT).fingerprint;
-    scrollbackMock.mockReturnValue([...dialog("rm -rf build/"), ...chrome].join("\n"));
-
-    const r = await selectPickerOption(AGENT, 0, fromBenign, ALLOWED);
-    expect([r.ok, r.reason]).toEqual([false, "changed"]);
-    expect(writePtyChainedStrict).not.toHaveBeenCalled();
-  });
-
-  // …and it stays stable while only the chrome moves, so the press is not refused forever.
-  it("is unchanged when only the chrome below the dialog ticks", () => {
-    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
-    const before = readPickerOptions(AGENT).fingerprint;
-    scrollbackMock.mockReturnValue(
-      [...dialog("git status"), ...chrome.map((c) => c.replace("pending", "running"))].join("\n"),
-    );
-    expect(readPickerOptions(AGENT).fingerprint).toBe(before);
-  });
-});
-
-// THE LOCATOR MUST FOLLOW THE DETECTOR'S OWN DECISION (roborev 55182).
-//
-// A numbered list sitting above a y/n question is a perfectly legal option run. Searching for one
-// independently anchors the block on the LIST while the detector returned Approve/Deny — so two
-// different y/n questions under the same list hash identically. Same collision as 55166, third route.
-describe("a numbered list above a y/n question does not steal the anchor", () => {
-  const list = ["Here's what I found:", "  1. auth.ts is stale", "  2. billing.ts is fine"];
-
-  it("still tells two y/n questions apart", () => {
-    scrollbackMock.mockReturnValue([...list, "Delete the production database? [y/n] "].join("\n"));
-    const danger = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue([...list, "Overwrite config.toml? [y/n] "].join("\n"));
-    const benign = readPickerOptions(AGENT);
-
-    expect(danger.present).toBe(true);
-    // The detector returned the constant Approve/Deny pair for both…
-    expect(danger.options.map((o) => o.label)).toEqual(["Approve", "Deny"]);
-    expect(benign.options.map((o) => o.label)).toEqual(danger.options.map((o) => o.label));
-    // …so only the question can separate them, and it does.
-    expect(benign.fingerprint).not.toBe(danger.fingerprint);
-  });
-
-  it("refuses the press when only the question changed under the same list", async () => {
-    scrollbackMock.mockReturnValue([...list, "Delete the production database? [y/n] "].join("\n"));
+  it("refuses the press when the live question changed under an identical list", async () => {
+    scrollbackMock.mockReturnValue([...plan, ...live("Delete the production database?")].join("\n"));
     const stale = readPickerOptions(AGENT).fingerprint;
-    scrollbackMock.mockReturnValue([...list, "Overwrite config.toml? [y/n] "].join("\n"));
+    scrollbackMock.mockReturnValue([...plan, ...live("Overwrite config.toml?")].join("\n"));
 
     const r = await selectPickerOption(AGENT, 0, stale, ALLOWED);
     expect([r.ok, r.reason]).toEqual([false, "changed"]);
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
-  });
-});
-
-// CANNOT LOCATE IS NOT THE SAME AS NO QUESTION (roborev 55182).
-//
-// The sentinel is defence in depth: `liveRegion` and the detector now search the same region by
-// construction, so reaching it means they have drifted. Producing a fingerprint over the option
-// shape alone would be worse than producing none — for both shapes that get here (numbered menus,
-// and the constant Approve/Deny pair) that shape is a global constant.
-describe("an unlocatable dialog refuses rather than hashing chrome", () => {
-  it("select_picker_option refuses the empty sentinel instead of matching '' to ''", async () => {
-    // A live menu, so the op gets past `no-picker`…
-    scrollbackMock.mockReturnValue(
-      ["Select an option:", "  1) Rebase", "  2) Merge", "Enter your choice: "].join("\n"),
-    );
-    // …but the caller presents the sentinel, which must never satisfy the guard.
-    const r = await selectPickerOption(AGENT, 0, "", ALLOWED);
-    expect([r.ok, r.reason]).toEqual([false, "unreadable-picker"]);
-    expect(writePtyChainedStrict).not.toHaveBeenCalled();
-  });
-});
-
-// THE LOCATOR MUST NOT BE STRICTER THAN THE PARSER THAT PRODUCED ITS INPUT (roborev 55195).
-describe("a picker whose option rows are separated by description lines", () => {
-  const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
-  // `parsePickerOptions` deliberately SKIPS lines between option rows — its own comment says
-  // "Most wrapped description lines don't match PICKER_OPTION and are skipped". A strict adjacency
-  // rule rejected them, so the detector returned options while the locator returned nothing, the
-  // fingerprint became the "" sentinel, and every press refused FOREVER. That is the deadlock the
-  // module's own docblock calls out, and it fires on any soft-wrapped label — routine in a narrow
-  // pane.
-  const dialog = (q: string) => [
-    q,
-    "❯ 1. Use the existing migration",
-    "     keeps the current schema",
-    "  2. Write a new one",
-    "     regenerates from the models",
-    FOOTER,
-  ];
-
-  it("is still answerable — the fingerprint is not the refusal sentinel", () => {
-    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
-    const r = readPickerOptions(AGENT);
-
-    expect(r.present).toBe(true);
-    expect(r.fingerprint).not.toBe("");
-  });
-
-  it("still tells two different questions apart", () => {
-    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
-    const a = readPickerOptions(AGENT);
-    scrollbackMock.mockReturnValue(dialog("Migration strategy for auth?").join("\n"));
-    const b = readPickerOptions(AGENT);
-
-    expect(b.fingerprint).not.toBe(a.fingerprint);
-  });
-
-  it("lets the press through when the menu has not moved", async () => {
-    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
-    const fp = readPickerOptions(AGENT).fingerprint;
-
-    const r = await selectPickerOption(AGENT, 0, fp, ALLOWED);
-    expect(r.ok).toBe(true);
   });
 });
 
@@ -1723,6 +1523,187 @@ describe("a numbered line the detector ignores does not deadlock the menu", () =
 
   it("lets the press through", async () => {
     scrollbackMock.mockReturnValue(menu("Which migration?").join("\n"));
+    const fp = readPickerOptions(AGENT).fingerprint;
+
+    const r = await selectPickerOption(AGENT, 0, fp, ALLOWED);
+    expect(r.ok).toBe(true);
+  });
+});
+
+// A DEEP DIALOG UNDER A PILE OF CHROME (roborev 55182).
+//
+// The first window was 24 RAW lines, derived from TAIL_LINES — which governs only the GENERIC menu
+// fallback. detectClaudeCodePicker runs first and searches PICKER_WINDOW (50) non-empty lines for
+// the footer with PICKER_SPAN (30) above it, so the detector could return options whose rows sat far
+// outside the window this looked at. When that happened `optionRun` found nothing and control fell
+// into the y/n branch, which hashed the last two lines — the Ink chrome BELOW the dialog. Both
+// failure directions follow: the chrome ticks and the press is refused forever, or the chrome is
+// settled and two different commands share a fingerprint.
+describe("a Bash-approval dialog buried under chrome is still fingerprinted by its question", () => {
+  const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
+  // The option shape is a GLOBAL CONSTANT for this dialog — every Bash approval renders the same
+  // three. Only the command distinguishes one from the next.
+  const dialog = (command: string) => [
+    "Claude wants to run a command:",
+    `  ${command}`,
+    "",
+    "Do you want to proceed?",
+    "  1. Yes",
+    "  2. Yes, and don't ask again for this command",
+    "  3. No, and tell Claude what to do differently",
+    FOOTER,
+  ];
+  // Ink keeps rendering below the dialog: the task checklist, the composer, the hint line.
+  const chrome = Array.from({ length: 25 }, (_, i) => `  ☐ task ${i} pending`);
+
+  it("tells two different commands apart", () => {
+    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
+    const benign = readPickerOptions(AGENT);
+    scrollbackMock.mockReturnValue([...dialog("rm -rf build/"), ...chrome].join("\n"));
+    const danger = readPickerOptions(AGENT);
+
+    expect(benign.present).toBe(true);
+    expect(danger.options.map((o) => o.label)).toEqual(benign.options.map((o) => o.label));
+    expect(benign.fingerprint).not.toBe(danger.fingerprint);
+    // …and neither is the "cannot fingerprint" sentinel, which would be a refusal rather than a read.
+    expect(benign.fingerprint).not.toBe("");
+  });
+
+  it("refuses to press Yes on rm -rf with a fingerprint read from git status", async () => {
+    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
+    const fromBenign = readPickerOptions(AGENT).fingerprint;
+    scrollbackMock.mockReturnValue([...dialog("rm -rf build/"), ...chrome].join("\n"));
+
+    const r = await selectPickerOption(AGENT, 0, fromBenign, ALLOWED);
+    expect([r.ok, r.reason]).toEqual([false, "changed"]);
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
+  });
+
+  // …and it stays stable while only the chrome moves, so the press is not refused forever.
+  it("is unchanged when only the chrome below the dialog ticks", () => {
+    scrollbackMock.mockReturnValue([...dialog("git status"), ...chrome].join("\n"));
+    const before = readPickerOptions(AGENT).fingerprint;
+    scrollbackMock.mockReturnValue(
+      [...dialog("git status"), ...chrome.map((c) => c.replace("pending", "running"))].join("\n"),
+    );
+    expect(readPickerOptions(AGENT).fingerprint).toBe(before);
+  });
+});
+
+// NORMALISE WHAT MOVES; KEEP WHAT DISTINGUISHES (roborev 55172).
+//
+// Dropping a whole volatile line was worse than the bug it fixed: the patterns match ordinary
+// question text, so a question stating a SIZE lost the only content that identified it.
+describe("a question that states a size or a percentage is still fingerprinted", () => {
+  it("keeps two size-bearing questions apart", () => {
+    scrollbackMock.mockReturnValue("Delete 2.3 GB of build artifacts? [y/n] ");
+    const a = readPickerOptions(AGENT);
+    scrollbackMock.mockReturnValue("Overwrite 1.1 GB dataset? [y/n] ");
+    const b = readPickerOptions(AGENT);
+
+    expect(a.present).toBe(true);
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
+  it("but ignores the size CHANGING inside an otherwise identical question", () => {
+    scrollbackMock.mockReturnValue("Downloading 2.3 GB — continue? [y/n] ");
+    const a = readPickerOptions(AGENT);
+    scrollbackMock.mockReturnValue("Downloading 2.9 GB — continue? [y/n] ");
+    const b = readPickerOptions(AGENT);
+
+    expect(b.fingerprint).toBe(a.fingerprint);
+  });
+});
+
+// THE LOCATOR MUST FOLLOW THE DETECTOR'S OWN DECISION (roborev 55182).
+//
+// A numbered list sitting above a y/n question is a perfectly legal option run. Searching for one
+// independently anchors the block on the LIST while the detector returned Approve/Deny — so two
+// different y/n questions under the same list hash identically. Same collision as 55166, third route.
+describe("a numbered list above a y/n question does not steal the anchor", () => {
+  const list = ["Here's what I found:", "  1. auth.ts is stale", "  2. billing.ts is fine"];
+
+  it("still tells two y/n questions apart", () => {
+    scrollbackMock.mockReturnValue([...list, "Delete the production database? [y/n] "].join("\n"));
+    const danger = readPickerOptions(AGENT);
+    scrollbackMock.mockReturnValue([...list, "Overwrite config.toml? [y/n] "].join("\n"));
+    const benign = readPickerOptions(AGENT);
+
+    expect(danger.present).toBe(true);
+    // The detector returned the constant Approve/Deny pair for both…
+    expect(danger.options.map((o) => o.label)).toEqual(["Approve", "Deny"]);
+    expect(benign.options.map((o) => o.label)).toEqual(danger.options.map((o) => o.label));
+    // …so only the question can separate them, and it does.
+    expect(benign.fingerprint).not.toBe(danger.fingerprint);
+  });
+
+  it("refuses the press when only the question changed under the same list", async () => {
+    scrollbackMock.mockReturnValue([...list, "Delete the production database? [y/n] "].join("\n"));
+    const stale = readPickerOptions(AGENT).fingerprint;
+    scrollbackMock.mockReturnValue([...list, "Overwrite config.toml? [y/n] "].join("\n"));
+
+    const r = await selectPickerOption(AGENT, 0, stale, ALLOWED);
+    expect([r.ok, r.reason]).toEqual([false, "changed"]);
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
+  });
+});
+
+// CANNOT LOCATE IS NOT THE SAME AS NO QUESTION (roborev 55182).
+//
+// The sentinel is defence in depth: `liveRegion` and the detector now search the same region by
+// construction, so reaching it means they have drifted. Producing a fingerprint over the option
+// shape alone would be worse than producing none — for both shapes that get here (numbered menus,
+// and the constant Approve/Deny pair) that shape is a global constant.
+describe("an unlocatable dialog refuses rather than hashing chrome", () => {
+  it("select_picker_option refuses the empty sentinel instead of matching '' to ''", async () => {
+    // A live menu, so the op gets past `no-picker`…
+    scrollbackMock.mockReturnValue(
+      ["Select an option:", "  1) Rebase", "  2) Merge", "Enter your choice: "].join("\n"),
+    );
+    // …but the caller presents the sentinel, which must never satisfy the guard.
+    const r = await selectPickerOption(AGENT, 0, "", ALLOWED);
+    expect([r.ok, r.reason]).toEqual([false, "unreadable-picker"]);
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
+  });
+});
+
+// THE LOCATOR MUST NOT BE STRICTER THAN THE PARSER THAT PRODUCED ITS INPUT (roborev 55195).
+describe("a picker whose option rows are separated by description lines", () => {
+  const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
+  // `parsePickerOptions` deliberately SKIPS lines between option rows — its own comment says
+  // "Most wrapped description lines don't match PICKER_OPTION and are skipped". A strict adjacency
+  // rule rejected them, so the detector returned options while the locator returned nothing, the
+  // fingerprint became the "" sentinel, and every press refused FOREVER. That is the deadlock the
+  // module's own docblock calls out, and it fires on any soft-wrapped label — routine in a narrow
+  // pane.
+  const dialog = (q: string) => [
+    q,
+    "❯ 1. Use the existing migration",
+    "     keeps the current schema",
+    "  2. Write a new one",
+    "     regenerates from the models",
+    FOOTER,
+  ];
+
+  it("is still answerable — the fingerprint is not the refusal sentinel", () => {
+    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
+    const r = readPickerOptions(AGENT);
+
+    expect(r.present).toBe(true);
+    expect(r.fingerprint).not.toBe("");
+  });
+
+  it("still tells two different questions apart", () => {
+    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
+    const a = readPickerOptions(AGENT);
+    scrollbackMock.mockReturnValue(dialog("Migration strategy for auth?").join("\n"));
+    const b = readPickerOptions(AGENT);
+
+    expect(b.fingerprint).not.toBe(a.fingerprint);
+  });
+
+  it("lets the press through when the menu has not moved", async () => {
+    scrollbackMock.mockReturnValue(dialog("Migration strategy for billing?").join("\n"));
     const fp = readPickerOptions(AGENT).fingerprint;
 
     const r = await selectPickerOption(AGENT, 0, fp, ALLOWED);

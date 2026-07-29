@@ -86,8 +86,9 @@ import {
   pickerBlockBounds,
   pickerWindow,
   MENU_LINE,
+  genericMenuRun,
+  genericMenuWindow,
   YN,
-  TAIL_LINES,
 } from "../suggestions/heuristics";
 import type { SuggestionButton } from "../suggestions/types";
 
@@ -907,47 +908,15 @@ const YN_TAIL = 2;
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 
-/**
- * Where the GENERIC menu's option block is — by the detector's rule, not a stricter one.
- *
- * `heuristics.ts`'s generic path collects `MENU_LINE` numbers across the whole tail and looks for a
- * contiguous run counting 1,2,3… restarting at each "1"; intervening non-matching lines do NOT break
- * it. An earlier version here demanded immediate adjacency, which is stricter — so a menu with a
- * wrapped or described option row returned options from the detector and nothing from this, and the
- * press refused forever. Exactly the deadlock fixed for the Claude Code picker, one path over
- * (roborev 55204). A run of two is still required: a single `[1] 91234` from bash job control, a
- * footnote or an ordinary log line is not a menu.
- */
-function optionRun(lines: readonly string[]): { first: number; last: number } | null {
-  // MENU_LINE, the detector's own — see the note where the old local pattern used to live. Parity
-  // with the parser is the whole property here (roborev 55218).
-  const hits: { index: number; n: number }[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = MENU_LINE.exec(lines[i]!);
-    if (m) hits.push({ index: i, n: parseInt(m[1]!, 10) });
-  }
-  // Walk the HITS (not the lines), so anything between two option rows is skipped the way the
-  // detector skips it. Take the run closest to the end: an answered menu higher in the buffer is
-  // stale, and the live dialog is the one at the bottom.
-  let best: { first: number; last: number } | null = null;
-  let start = -1;
-  let expected = 1;
-  for (const { index, n } of hits) {
-    if (n === 1) {
-      start = index;
-      expected = 2;
-      continue;
-    }
-    if (start >= 0 && n === expected) {
-      expected += 1;
-      best = { first: start, last: index };
-      continue;
-    }
-    start = -1;
-    expected = 1;
-  }
-  return best;
-}
+// NO LOCAL RUN SELECTOR EITHER.
+//
+// Sharing the PATTERN (`MENU_LINE`) closed the deadlock but left the SELECTION RULE as a second
+// definition, and the two disagreed: the detector keeps the LONGEST 1-based run (first-wins on
+// ties) while this kept the run nearest the END. With a numbered plan above a live menu the buttons
+// came from one block and the fingerprinted question from the other — an options/question mismatch
+// the fingerprint cannot catch, because it is hashing the wrong block rather than a stale one
+// (roborev 55245). `genericMenuRun` is now the single definition, indices included.
+
 
 
 /**
@@ -985,14 +954,10 @@ function questionBlock(scrollback: string, yesNo: boolean): string {
       // another, which is the collision everything here exists to prevent (roborev 55204).
       return block.slice(0, QUESTION_BLOCK_MAX_LINES).join("\n");
     }
-    // No Claude Code picker. The GENERIC menu path is the detector's other option source, and it
-    // reads only the last TAIL_LINES with the choice prompt on the final line — so that, and
-    // nothing above it, is where a generic menu's question can be.
-    const generic = clean
-      .split("\n")
-      .filter((l) => l.trim() !== "")
-      .slice(-TAIL_LINES);
-    const run = optionRun(generic);
+    // No Claude Code picker. The GENERIC menu path is the detector's other option source — same
+    // window, same pattern, same run selection, because they are literally the same function.
+    const generic = genericMenuWindow(clean);
+    const run = genericMenuRun(generic);
     if (!run) return "";
     let first = run.first;
     for (let i = run.first - 1; i >= 0; i--) {
