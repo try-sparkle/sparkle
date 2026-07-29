@@ -819,9 +819,10 @@ export function Terminal({
     const offOut = transport.onOutput((e) => {
       // THE LATE-EVENT GUARD, at the source (roborev 55107). Cleanup sets `disposed` and then calls
       // `void safeUnlisten(off)` — genuinely async and fire-and-forget — so these closures survive
-      // the round trip to Rust and can still fire for a PTY this pane no longer owns. On "Start
-      // again" that means dead-PTY bytes setting `gotOutputRef`/`firstOutput`/`spawnFail` for the
-      // NEW attempt, which also defeats the "exited with no output" detection the ref exists for.
+      // the round trip to Rust and can still fire for a PTY this pane no longer owns — dead-PTY
+      // bytes setting `gotOutputRef`/`firstOutput`/`spawnFail`, which also defeats the "exited with
+      // no output" detection the ref exists for. Scope caveat: like the exit handler below, this
+      // only covers an UNMOUNTED effect, not a re-spawn in the same component (roborev 55120).
       // Guarding here closes the whole class in one place, rather than hardening each downstream
       // consumer (engine.ingest, engine.exit, the witness setters) one race at a time.
       if (disposed) return;
@@ -854,11 +855,17 @@ export function Terminal({
     // The transport filters exit to THIS agent's id (pty:exit is a global channel), so no id check
     // is needed here anymore.
     const offExit = transport.onExit(() => {
-      // Same guard, and here it is the user-visible one: without it a stale exit from the PREVIOUS
-      // PTY runs `onExit?.()` (AgentPane reads result.json for a worker that did not exit) and then
-      // trips `setSpawnFail("exited")` on the freshly spawned, healthy agent — `retry()` has just
-      // reset `gotOutputRef.current` and the new PTY has not emitted yet, so the live pane renders
-      // "Agent exited — Start again" and a user who acts on it kills a working session.
+      // Same guard — and it covers LESS than the first version of this comment claimed (roborev
+      // 55120). It stops an UNMOUNTED effect's handler from running `onExit?.()` and
+      // `setSpawnFail("exited")`, which is real and worth closing.
+      //
+      // It does NOT close "Start again". That bumps `attempt`, an effect dep, so React runs the
+      // cleanup and re-runs the effect in this SAME mounted component; the new effect's `disposed`
+      // is false, and `LocalTransport.onExit` filters only on `e.id === this.id` with the agent id
+      // identical across attempts. The dead PTY's late exit is therefore delivered to the NEW
+      // handler and passes this check — still painting "Agent exited — Start again" over a healthy
+      // agent. Closing that needs a spawn epoch echoed back from Rust (see the note on AgentPane's
+      // onExit, roborev 55114). Do not read this guard as making the class safe.
       if (disposed) return;
       engine.exit();
       onExit?.();
