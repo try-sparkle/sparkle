@@ -51,14 +51,27 @@ export const OUTAGE_THRESHOLD = 3;
  *  live affordance, and the state recomputes as soon as the probe succeeds. */
 export const OUTAGE_COOLDOWN_MS = 60_000;
 
+/**
+ * How long a claimed half-open probe holds off the other callers before it is presumed abandoned.
+ *
+ * The claim is normally released by the probe's own settlement (success, failure, or deferral), so
+ * this bound only covers the case where NO settlement ever arrives — the probing pane unmounts
+ * mid-flight, or the request hangs past any server-side timeout. Comfortably longer than a healthy
+ * compute round-trip (so a slow-but-live probe is never double-issued) and well under the cooldown
+ * (so an abandoned claim can't cost more than the cooldown it sits inside).
+ */
+export const OUTAGE_PROBE_TIMEOUT_MS = 30_000;
+
 /** Shared breaker state. `openedAt` is null while closed; `consecutive` counts vendor-outage
- *  rejections since the last success. Kept as one record so the two can't drift apart. */
+ *  rejections since the last success; `probeStartedAt` is when the live half-open probe claimed the
+ *  right to be the only in-flight call (null when none). Kept as one record so they can't drift. */
 export interface OutageState {
   consecutive: number;
   openedAt: number | null;
+  probeStartedAt: number | null;
 }
 
-export const NO_OUTAGE: OutageState = { consecutive: 0, openedAt: null };
+export const NO_OUTAGE: OutageState = { consecutive: 0, openedAt: null, probeStartedAt: null };
 
 /**
  * Whether a rejection looks like the VENDOR being down rather than this request being wrong.
@@ -100,17 +113,76 @@ export function outageCooldownRemainingMs(state: OutageState, now: number): numb
  * failure is not proof of recovery, and only a SUCCESS (or the cooldown) is. Pure, for testing.
  */
 export function noteFailure(state: OutageState, message: string, now: number): OutageState {
-  if (!isVendorOutageError(message)) return { ...state, consecutive: 0 };
+  // Any settlement ends the probe this caller may have been holding, so every branch below clears
+  // `probeStartedAt`: the claim exists to keep two calls from being in flight at once, and once one
+  // has landed the next half-open window is free to issue its own.
+  if (!isVendorOutageError(message)) return { ...state, consecutive: 0, probeStartedAt: null };
   const consecutive = state.consecutive + 1;
   // Already open: hold the ORIGINAL openedAt so a probe that fails can't extend the cooldown
   // indefinitely by re-stamping it. The probe re-opens a CLOSED breaker instead (below).
-  if (isOutageOpen(state, now)) return { ...state, consecutive };
-  if (consecutive < OUTAGE_THRESHOLD) return { consecutive, openedAt: null };
-  return { consecutive, openedAt: now };
+  if (isOutageOpen(state, now)) return { ...state, consecutive, probeStartedAt: null };
+  if (consecutive < OUTAGE_THRESHOLD) return { consecutive, openedAt: null, probeStartedAt: null };
+  return { consecutive, openedAt: now, probeStartedAt: null };
 }
 
 /** A successful compute proves the vendor is reachable — close the breaker and clear the run.
  *  Pure, for testing. */
 export function noteSuccess(): OutageState {
   return NO_OUTAGE;
+}
+
+/**
+ * Release a claimed half-open probe WITHOUT recording a verdict about the vendor.
+ *
+ * The one caller is the deferral path: an offline or out-of-credits rejection returns before
+ * `noteFailure`, on purpose — a shut local gate is not evidence about the vendor's health, so it
+ * must not feed the consecutive run. But the claim it took still has to come back, or the next
+ * cooldown's probe is blocked behind a call that already settled and every pane waits out
+ * `OUTAGE_PROBE_TIMEOUT_MS` for nothing. Pure, for testing.
+ */
+export function releaseProbe(state: OutageState): OutageState {
+  if (state.probeStartedAt === null) return state;
+  return { ...state, probeStartedAt: null };
+}
+
+/**
+ * Claim the right to issue a call while the breaker is HALF-OPEN, so a cooldown expiry admits ONE
+ * probe rather than one call per mounted agent.
+ *
+ * WHY THIS IS NEEDED, given the gate above already exists. `isOutageOpen` is a time check with no
+ * notion of who is asking, so the instant a cooldown elapses it reads CLOSED for every hook instance
+ * at once. Each pane's compute then passes it, and — because nothing is in flight yet from that
+ * pane's point of view — issues its own paid call. The module's stated bargain ("one probe per
+ * cooldown") therefore held only for a single agent; with N panes mounted an outage cost N calls per
+ * cooldown, in a burst, forever. Measured over one sustained 502 episode: bursts of up to ~50
+ * rejections inside a single minute, separated by quiet cooldowns — the sawtooth of a breaker that
+ * opens correctly and then lets the whole herd through on every expiry.
+ *
+ * WHY IT IS SCOPED TO THE HALF-OPEN WINDOW ONLY. A breaker that never tripped (`openedAt === null`)
+ * grants unconditionally: computes for different agents are genuinely independent work, and
+ * serialising them in the healthy case would make suggestions arrive one pane at a time for no
+ * benefit. The herd is only wasteful once we already have evidence the vendor is refusing everyone.
+ *
+ * WHY IT CANNOT STRAND. A denied caller commits nothing and schedules a wake on
+ * `probeWaitMs`, exactly as the open-breaker branch does; the probe itself either closes the
+ * breaker (success) or re-opens it (failure), and an abandoned claim ages out via
+ * `OUTAGE_PROBE_TIMEOUT_MS`. Pure, for testing.
+ */
+export function claimProbe(
+  state: OutageState,
+  now: number,
+): { state: OutageState; granted: boolean } {
+  if (state.openedAt === null) return { state, granted: true };
+  const live =
+    state.probeStartedAt !== null && now - state.probeStartedAt < OUTAGE_PROBE_TIMEOUT_MS;
+  if (live) return { state, granted: false };
+  return { state: { ...state, probeStartedAt: now }, granted: true };
+}
+
+/** How long a caller denied by `claimProbe` should wait before re-checking: the remainder of the
+ *  live probe's timeout. A backstop, not the usual recovery path — the probe's own settlement
+ *  re-triggers the effect sooner. Pure, for testing. */
+export function probeWaitMs(state: OutageState, now: number): number {
+  if (state.probeStartedAt === null) return 0;
+  return Math.max(0, state.probeStartedAt + OUTAGE_PROBE_TIMEOUT_MS - now);
 }

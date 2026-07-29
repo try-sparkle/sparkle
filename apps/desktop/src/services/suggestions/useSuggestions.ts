@@ -17,10 +17,13 @@ import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
 import { detectPendingQuestion } from "./pendingQuestion";
 import {
   NO_OUTAGE,
+  claimProbe as claimOutageProbe,
   isOutageOpen,
   noteFailure as noteOutageFailure,
   noteSuccess as noteOutageSuccess,
   outageCooldownRemainingMs,
+  probeWaitMs as outageProbeWaitMs,
+  releaseProbe as releaseOutageProbe,
   type OutageState,
 } from "./vendorOutage";
 import { log } from "../../logger";
@@ -656,6 +659,24 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       }
       return;
     }
+    // The cooldown has elapsed, so the breaker reads half-open — but that reading is a pure time
+    // check and so flips for EVERY mounted pane at the same instant. Take an exclusive claim so the
+    // expiry admits one probe instead of the whole herd; see `claimProbe` for why the healthy case
+    // (a breaker that never tripped) grants unconditionally. Same discipline as the branch above:
+    // a denied caller commits nothing and schedules a wake, so its state stays recompute-eligible.
+    const probe = claimOutageProbe(outage, Date.now());
+    if (!probe.granted) {
+      if (outageTimer.current === null) {
+        const wait = outageProbeWaitMs(outage, Date.now());
+        log.debug("suggestions", "compute deferred", { agentId, reason: "outage-probe", wait });
+        outageTimer.current = window.setTimeout(() => {
+          outageTimer.current = null;
+          setRetryTick((t) => t + 1);
+        }, wait);
+      }
+      return;
+    }
+    outage = probe.state;
     computing.current = true;
     // This compute's claim on the guard above. Only the owner may release it — see the `.finally`.
     const myToken = (computeToken.current += 1);
@@ -782,6 +803,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // unavailable backend would.
         const deferred = computeDeferralReason(err);
         if (deferred) {
+          // Deliberately NOT noteOutageFailure: a shut local gate is not evidence about the vendor.
+          // But this call may have been holding the half-open probe claim, and returning here skips
+          // the release that noteOutageFailure would have done — so hand it back explicitly, or the
+          // next cooldown's probe waits out OUTAGE_PROBE_TIMEOUT_MS behind a call that has settled.
+          outage = releaseOutageProbe(outage);
           log.debug("suggestions", "compute deferred", { agentId, reason: deferred });
           return;
         }
