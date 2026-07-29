@@ -66,6 +66,30 @@ const dispatchConciergeToolMock = vi.fn(
     data: [{ id: "p1" }],
   }),
 );
+// The PR-claim registry. Mocked so this file tests the HANDLER's decisions — which root it resolves
+// to, and whether it defers to a live holder — rather than the Rust registry, which has its own
+// suite. Asserting the ARGUMENT is the point: a handler that forwards the agent's raw worktree path
+// writes a claim the merge gate can never find, and reports `ok: true` while doing it.
+const setPrClaimMock = vi.fn(async (root: string, number: number, agentId: string) => ({
+  root,
+  number,
+  agentId,
+  note: null,
+  claimedAtMs: 0,
+  expiresAtMs: 0,
+}));
+const releasePrClaimMock = vi.fn(async (_root: string, _number: number, _agentId: string) => true);
+const fetchPrClaimsMock = vi.fn(async (_root: string) => [] as unknown[]);
+vi.mock("./mergeGuard/prClaims", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./mergeGuard/prClaims")>();
+  return {
+    ...actual,
+    setPrClaim: (...a: unknown[]) => setPrClaimMock(...(a as [string, number, string])),
+    releasePrClaim: (...a: unknown[]) => releasePrClaimMock(...(a as [string, number, string])),
+    fetchPrClaims: (...a: unknown[]) => fetchPrClaimsMock(...(a as [string])),
+  };
+});
+
 vi.mock("./conciergeTools/registry", () => ({
   dispatchConciergeTool: (...a: unknown[]) =>
     dispatchConciergeToolMock(...(a as [ToolCallOnTheWire, { policy?: unknown }?])),
@@ -120,6 +144,11 @@ describe("controlListener", () => {
     setConfigCalls.length = 0;
     setConfigValuesCalls.length = 0;
     dispatchConciergeToolMock.mockClear();
+    setPrClaimMock.mockClear();
+    releasePrClaimMock.mockClear();
+    fetchPrClaimsMock.mockClear();
+    fetchPrClaimsMock.mockResolvedValue([]);
+    releasePrClaimMock.mockResolvedValue(true);
     // The audit log is module-level state; without this, entries from an earlier case would make
     // the length assertions below pass or fail on suite ordering.
     _resetConciergeAuditForTests();
@@ -888,6 +917,211 @@ describe("controlListener", () => {
   // `shared_socket_rejects_a_request_claiming_the_reserved_concierge_id`). By the time an event
   // reaches this listener the id is therefore a fact about which socket it arrived on. These tests
   // cover THIS half: given that id, what the frontend gate does with it.
+  describe("claim_pr / release_pr — intent an agent can state and the concierge can read", () => {
+    it("resolves a WORKTREE path to its project root — the likely input, and the silent failure", async () => {
+      // An agent's cwd IS its worktree, and the tool asks for "the project root". Forwarding it raw
+      // writes a claim under a key the merge gate looks up by exact string and never finds: the
+      // agent is told ok, believes the PR is held, and nothing blocks. False assurance is worse
+      // than no claim.
+      const wt = "/tmp/demo-worktrees/agent-1";
+      useProjectStore.setState({
+        projects: [
+          { id: projectId, name: "Demo", rootPath: "/tmp/demo", agents: [{ id: callerId, worktreePath: wt }] },
+        ],
+      } as never);
+      fire({ reqId: "c1", op: "claim_pr", callerAgentId: callerId, payload: { root: wt, number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(setPrClaimMock).toHaveBeenCalled();
+      expect(setPrClaimMock.mock.calls[0]![0]).toBe("/tmp/demo");
+    });
+
+    it("canonicalizes a trailing separator to the registered spelling", async () => {
+      fire({ reqId: "c2", op: "claim_pr", callerAgentId: callerId, payload: { root: "/tmp/demo/", number: 806 } });
+      await flush();
+      expect(setPrClaimMock.mock.calls[0]![0]).toBe("/tmp/demo");
+    });
+
+    it("REFUSES an unknown root instead of writing an unfindable claim", async () => {
+      fire({ reqId: "c3", op: "claim_pr", callerAgentId: callerId, payload: { root: "/nowhere", number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(setPrClaimMock).not.toHaveBeenCalled();
+    });
+
+    it("stamps the CALLER as claimant and ignores an agentId in the payload", async () => {
+      fire({
+        reqId: "c4",
+        op: "claim_pr",
+        callerAgentId: callerId,
+        payload: { root: "/tmp/demo", number: 806, agentId: otherId, targetAgentId: otherId },
+      });
+      await flush();
+      expect(setPrClaimMock.mock.calls[0]![2]).toBe(callerId);
+    });
+
+    it("will not take over a lapsed claim whose holder is STILL RUNNING", async () => {
+      // Rust judges takeover on the clock alone (it has no roster), so past the TTL it would let
+      // anyone overwrite the row — handing ownership to a second agent while the first is alive and
+      // believes it holds the PR. Liveness is knowable here, so the decision is made here.
+      fetchPrClaimsMock.mockResolvedValue([
+        { root: "/tmp/demo", number: 806, agentId: otherId, note: "draining roborev", claimedAtMs: 0, expiresAtMs: 0 },
+      ]);
+      fire({ reqId: "c5", op: "claim_pr", callerAgentId: callerId, payload: { root: "/tmp/demo", number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      // "registered", not "running": the predicate is roster PRESENCE, and a remedy string has to
+      // be true under the conditions that triggered it — telling a caller to wait for the holder to
+      // "stop" points at a transition that may never happen.
+      const err = String((lastReply() as { error: string }).error);
+      expect(err).toContain("still registered");
+      expect(err).not.toContain("still running");
+      expect(err).toContain("grace"); // and it names the ceiling that WILL clear the block
+      expect(setPrClaimMock).not.toHaveBeenCalled();
+    });
+
+    it("DOES take over once the holder has left the roster", async () => {
+      fetchPrClaimsMock.mockResolvedValue([
+        { root: "/tmp/demo", number: 806, agentId: "a-ghost", note: null, claimedAtMs: 0, expiresAtMs: 0 },
+      ]);
+      fire({ reqId: "c6", op: "claim_pr", callerAgentId: callerId, payload: { root: "/tmp/demo", number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(setPrClaimMock).toHaveBeenCalled();
+    });
+
+    it("REFUSES when the registry is unreadable — it will not write over a holder it never saw", async () => {
+      fetchPrClaimsMock.mockResolvedValue(null as never);
+      fire({ reqId: "c7", op: "claim_pr", callerAgentId: callerId, payload: { root: "/tmp/demo", number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(setPrClaimMock).not.toHaveBeenCalled();
+    });
+
+    it("a release aimed at an unknown root does NOT drop the same PR number in another project", async () => {
+      // PR numbers are per-repo, so #806 exists in every project. A blind sweep would release the
+      // caller's still-live claim in project B and report success.
+      const otherProject = useProjectStore.getState().addProject("Other", "/tmp/other");
+      expect(otherProject).toBeTruthy();
+      fetchPrClaimsMock.mockImplementation(async (root: string) =>
+        root === "/tmp/other"
+          ? [{ root: "/tmp/other", number: 806, agentId: "someone-else", note: null, claimedAtMs: 0, expiresAtMs: 0 }]
+          : [],
+      );
+      releasePrClaimMock.mockResolvedValue(false);
+      fire({ reqId: "r3", op: "release_pr", callerAgentId: callerId, payload: { root: "/nowhere", number: 806 } });
+      await flush();
+      // The other project's claim belongs to a DIFFERENT agent, so it must never be touched.
+      expect(releasePrClaimMock).not.toHaveBeenCalledWith("/tmp/other", 806, callerId);
+    });
+
+    it("SWEEPS to the caller's own project when the root does not resolve, and names it", async () => {
+      // The positive path the sweep exists for: a claimant whose root stopped resolving (its cwd is
+      // a subdirectory, the project was re-added) can still let go of its own PR. Without this the
+      // whole block could be deleted with the suite still green.
+      fetchPrClaimsMock.mockImplementation(async (root: string) =>
+        root === "/tmp/demo"
+          ? [{ root: "/tmp/demo", number: 806, agentId: callerId, note: null, claimedAtMs: 0, expiresAtMs: 0 }]
+          : [],
+      );
+      releasePrClaimMock.mockImplementation(async (root: string) => root === "/tmp/demo");
+      fire({
+        reqId: "r4",
+        op: "release_pr",
+        callerAgentId: callerId,
+        payload: { root: "/tmp/demo/apps/desktop", number: 806 },
+      });
+      await flush();
+      expect(releasePrClaimMock).toHaveBeenCalledWith("/tmp/demo", 806, callerId);
+      // The reply must say WHICH root it released — with a sweep in play, `released: true` alone
+      // does not tell the caller what it just let go of.
+      expect(lastReply()).toMatchObject({ ok: true, released: true, root: "/tmp/demo" });
+    });
+
+    it("never sweeps a project the CALLER is not registered under, even for its own claim", async () => {
+      // PR numbers are per-repo, so one agent can legitimately hold #806 in two projects. Walking
+      // every root would release whichever came first — dropping a live claim in a project the
+      // caller never named, and reporting success. Ownership cannot catch it: the caller IS owner.
+      useProjectStore.getState().addProject("Other", "/tmp/other");
+      fetchPrClaimsMock.mockImplementation(async (root: string) => [
+        { root, number: 806, agentId: callerId, note: null, claimedAtMs: 0, expiresAtMs: 0 },
+      ]);
+      releasePrClaimMock.mockResolvedValue(true);
+      fire({ reqId: "r5", op: "release_pr", callerAgentId: callerId, payload: { root: "/nope", number: 806 } });
+      await flush();
+      expect(releasePrClaimMock).not.toHaveBeenCalledWith("/tmp/other", 806, callerId);
+    });
+
+    it("releases against the resolved project root", async () => {
+      fire({ reqId: "r1", op: "release_pr", callerAgentId: callerId, payload: { root: "/tmp/demo/", number: 806 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, released: true });
+      expect(releasePrClaimMock.mock.calls[0]![0]).toBe("/tmp/demo");
+    });
+
+    it("does NOT report a clean no-op when the root was never recognised", async () => {
+      // The claimant would be told there was nothing to release while its claim sits in the
+      // registry, still blocking — the false-assurance shape, on the release side.
+      releasePrClaimMock.mockResolvedValue(false);
+      fire({ reqId: "r2", op: "release_pr", callerAgentId: callerId, payload: { root: "/nowhere", number: 806 } });
+      await flush();
+      const reply = lastReply() as { ok: boolean; error?: string };
+      expect(reply.ok).toBe(false);
+      expect(String(reply.error)).toContain("not a project Sparkle knows");
+    });
+  });
+
+  describe("set_agent_goal / set_agent_goal_met", () => {
+    it("writes the rich goal record with its TTL", async () => {
+      fire({
+        reqId: "g1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "land the guardrails", ttlMs: 900_000 },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      const agent = useProjectStore.getState().projects.flatMap((p) => p.agents).find((a) => a.id === callerId)!;
+      expect(agent.goal?.text).toBe("land the guardrails");
+      expect(agent.goal?.ttlMs).toBe(900_000);
+      expect(agent.goal?.metAt).toBeUndefined();
+    });
+
+    it("reports the goal STATE through get_state, not just a met flag", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "ship it");
+      fire({ reqId: "g2", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      const res = lastReply() as { agents: Array<{ goal?: { text: string; state: string; met: boolean } | null }> };
+      expect(res.agents[0]!.goal).toMatchObject({ text: "ship it", state: "unmet", met: false });
+    });
+
+    it("marks the CALLER's goal met and IGNORES a target in the payload", async () => {
+      // Declaring a different, live agent finished latches its metAt: auto-continue stops and the
+      // stall surface renders it done. One wrong id must not be able to do that.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "mine");
+      useProjectStore.getState().setAgentGoal(projectId, otherId, "theirs");
+      fire({
+        reqId: "g3",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true, targetAgentId: otherId },
+      });
+      await flush();
+      const agents = useProjectStore.getState().projects.flatMap((p) => p.agents);
+      expect(agents.find((a) => a.id === callerId)!.goal?.metAt).toBeDefined();
+      expect(agents.find((a) => a.id === otherId)!.goal?.metAt).toBeUndefined();
+    });
+
+    it("REFUSES when there is no goal to mark, rather than reporting a bare success", async () => {
+      // `setAgentGoalMet` early-returns unchanged with no goal record, so `{ ok: true }` would tell
+      // the caller it is done while the concierge goes on reading `goal: null`.
+      fire({ reqId: "g4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(String((lastReply() as { error: string }).error)).toContain("no goal");
+    });
+  });
+
   describe("concierge caller", () => {
     it("may run a PRIVILEGED op even though it resolves to no agent tab", async () => {
       fire({ reqId: "c1", op: "set_theme", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { theme: "dark" } });

@@ -71,6 +71,21 @@ import {
   prMergeEligibility,
   type PrRow,
 } from "../openPrs";
+import {
+  fetchRoborevProbe,
+  fetchRoborevReview,
+  highestSeverity,
+  parseRoborevFindings,
+  roborevMergeGate,
+  summarizeRoborev,
+} from "../mergeGuard/roborev";
+import { fetchPrClaims, findClaim, viewClaim } from "../mergeGuard/prClaims";
+import type {
+  PrClaimView,
+  RoborevBranchState,
+  RoborevGateVerdict,
+  RoborevJobFindings,
+} from "../mergeGuard/types";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { hasTurnEndAuthority, isTracked } from "../../engine/turnEndAuthority";
@@ -89,6 +104,7 @@ export type WorkflowOperation =
   | "project_open_prs"
   | "pr_owner"
   | "pr_checks_status"
+  | "pr_roborev_status"
   | "agent_landed_check"
   // mutating
   | "refresh_agent_branch"
@@ -199,6 +215,13 @@ export const WORKFLOW_RISK: Record<WorkflowOperation, WorkflowRiskProfile> = {
     requiresConfirmation: false,
     undo: null,
   },
+  pr_roborev_status: {
+    risk: "read-only",
+    summary:
+      "Read the roborev review state for a PR's branch — whether a round is in flight, and the outstanding findings with their severity.",
+    requiresConfirmation: false,
+    undo: null,
+  },
   agent_landed_check: {
     risk: "read-only",
     summary: "Answer, by ancestry, whether an agent's work reached the default branch.",
@@ -261,6 +284,7 @@ export const WORKFLOW_OPERATIONS = [
   "project_open_prs",
   "pr_owner",
   "pr_checks_status",
+  "pr_roborev_status",
   "agent_landed_check",
   "refresh_agent_branch",
   "land_agent_branch",
@@ -313,6 +337,13 @@ export type WorkflowFailureCode =
   | "pr-not-found"
   | "checks-blocked" // red / pending checks, or a conflicting PR — never merge over these
   | "checks-unknown" // we could not READ the checks, so we will not merge blind
+  // The four codes below are the #806 lesson. GitHub's check state is not this project's whole
+  // definition of "clean", and a PR nobody appears to own may in fact be owned — see the header of
+  // services/mergeGuard/types.ts.
+  | "pr-claimed" // a live agent said it will land this itself
+  | "roborev-pending" // a review round is IN FLIGHT — its verdict does not exist yet
+  | "roborev-unresolved" // open FAIL-verdict reviews nobody has read or closed
+  | "roborev-unknown" // roborev IS the gate here and we could not read it
   | "gh-unavailable" // the gh CLI is missing or unusable
   | "auth-failed" // credentials expired / rejected
   | "rejected-non-fast-forward"
@@ -521,6 +552,144 @@ const UNKNOWN_ROOT_MSG = (root: string) =>
   `Refused: "${root}" is not one of the projects added to Sparkle. This tool acts on the user's disk, so it only runs against a registered project root — ask for the project by name and let Sparkle supply its path.`;
 
 // ---------------------------------------------------------------------------------------------
+// The second gate: intent (a PR claim) and review state (roborev)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * IS THE AGENT THAT CLAIMED THIS PR STILL AROUND?
+ *
+ * Deliberately ROSTER PRESENCE, not `useRuntimeStore` status. That status map is window-local and
+ * never persisted — the note in controlListener's `handleGetState` spells this out — so an agent
+ * mounted in another project window reads as "stopped" here. Voiding a claim on that reading would
+ * hand the concierge a merge over a perfectly live owner, which is the exact failure this gate
+ * exists to prevent, so presence in the persisted roster is the signal and the TTL on the claim is
+ * what stops a genuinely dead agent from wedging the PR forever.
+ *
+ * An unreadable store answers TRUE (the claim stands). Unlike `isWorking` and like
+ * `isRegisteredRoot`, the expensive mistake here is proceeding, not pausing.
+ */
+function claimantIsPresent(agentId: string): boolean {
+  const roster = rosterAgents();
+  // COULD NOT READ ⇒ the claim stands. `rosterAgents` returns null (not []) for an unreadable or
+  // half-rehydrated store precisely so this stays reachable: an empty roster and an unknown one
+  // are different facts, and collapsing them made an unreadable store report every claimant as
+  // gone — merging over a live claim through the very guard added to prevent it.
+  if (roster === null) return true;
+  return roster.some((a) => a.id === agentId);
+}
+
+/** Every agent across every project, or `null` when the roster could not be READ — an unreadable
+ *  store, or a persisted project record still rehydrating with no `agents` array. Null is not an
+ *  empty roster, and the difference decides whether a claim blocks. */
+function rosterAgents(): Array<{ id: string; name?: string }> | null {
+  try {
+    const projects = useProjectStore.getState().projects;
+    if (!Array.isArray(projects)) return null;
+    // A project record whose `agents` is missing is a store we cannot fully read, NOT a project
+    // with no agents — treat the whole roster as unknown rather than quietly under-counting it.
+    if (projects.some((p) => !Array.isArray(p.agents))) return null;
+    return projects.flatMap((p) => p.agents);
+  } catch {
+    return null;
+  }
+}
+
+/** A claim on this PR, resolved to the standing it actually carries right now. Never throws: a
+ *  claim registry we cannot read must not take the merge path down with it — but see the caller,
+ *  which does NOT treat an unreadable registry as "unclaimed". */
+async function readPrClaim(root: string, number: number): Promise<PrClaimView | null> {
+  const claims = await fetchPrClaims(root);
+  if (claims === null) return null; // could not look — NOT "nobody claimed it"
+  const claim = findClaim(claims, root, number);
+  const agentName = claim
+    ? ((rosterAgents() ?? []).find((a) => a.id === claim.agentId)?.name ?? null)
+    : null;
+  return viewClaim(
+    claim,
+    Date.now(),
+    claim ? claimantIsPresent(claim.agentId) : false,
+    agentName,
+  );
+}
+
+/** The roborev state of a PR's HEAD branch. */
+async function readRoborevState(root: string, branch: string): Promise<RoborevBranchState> {
+  return summarizeRoborev(await fetchRoborevProbe(root, branch));
+}
+
+/**
+ * Read `roborevOverride` off the wire. Returns `null` for "not supplied", `"invalid"` for a
+ * malformed one, and the parsed value otherwise.
+ *
+ * A MALFORMED OVERRIDE IS AN ERROR, NOT AN ABSENT ONE. The caller is a model sending JSON that
+ * TypeScript never sees; silently ignoring `{ roborevOverride: true }` would refuse the merge with
+ * a findings message while the caller believed it had waived them, and it would keep believing that
+ * on every retry. Say the shape is wrong.
+ */
+function normalizeAck(
+  value: unknown,
+): { acknowledgedJobIds: number[]; reason: string } | "invalid" | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object") return "invalid";
+  const o = value as Record<string, unknown>;
+  const ids = o.acknowledgedJobIds;
+  const reason = o.reason;
+  if (!Array.isArray(ids) || ids.length === 0) return "invalid";
+  if (!ids.every((n) => Number.isInteger(n) && (n as number) > 0)) return "invalid";
+  if (typeof reason !== "string" || reason.trim() === "") return "invalid";
+  return { acknowledgedJobIds: ids as number[], reason: reason.trim() };
+}
+
+/** The gate's own code word, mapped onto this domain's failure codes. Total over
+ *  `RoborevGateCode`, so a new code there is a typecheck failure here rather than a silent
+ *  `unknown-error`. */
+function roborevCode(v: RoborevGateVerdict): WorkflowFailureCode {
+  switch (v.code) {
+    case "roborev-pending":
+      return "roborev-pending";
+    case "roborev-unresolved":
+      return "roborev-unresolved";
+    case "roborev-unknown":
+    case null:
+      return "roborev-unknown";
+    default: {
+      // A REAL exhaustiveness check. This used to be a bare `default:` under a comment claiming a
+      // new `RoborevGateCode` would be a typecheck failure — it would not have been; it would have
+      // silently become "unknown".
+      const _never: never = v.code;
+      void _never;
+      return "roborev-unknown";
+    }
+  }
+}
+
+/** What to TELL the caller — including, for each arm, the thing it can actually do next. A refusal
+ *  that does not name its remedy just gets retried verbatim. */
+function roborevRefusalMessage(
+  v: RoborevGateVerdict,
+  branch: string,
+  acknowledged: boolean,
+): string {
+  const ids = v.jobIds.length ? ` (roborev job${v.jobIds.length > 1 ? "s" : ""} ${v.jobIds.join(", ")})` : "";
+  switch (v.code) {
+    case "roborev-pending":
+      return `Refused: a roborev review round is still IN FLIGHT on ${branch}${ids}. Its verdict does not exist yet, so there is nothing to read and nothing that can be waived — an in-flight round is not acknowledgeable by design. \`roborev wait\` on it, or ask again once it lands. This is the exact state PR #806 was merged in.`;
+    case "roborev-unresolved":
+      return acknowledged
+        ? `Refused: the findings you acknowledged do not cover everything that is open${ids}. Read the remaining ones with pr_roborev_status and either fix them, \`roborev close\` them with a reason, or name them too.`
+        : `Refused: ${branch} has open FAIL-verdict roborev reviews${ids} that nobody has read or closed. This project treats roborev as a required gate, and merging buries the findings on a branch that is about to be deleted. Read them with pr_roborev_status, then fix, \`roborev close\` with a stated reason, or acknowledge them by id.`;
+    default:
+      // TWO different situations share `roborev-unknown`, and telling them apart is the difference
+      // between an actionable message and one that sends the reader to debug a healthy daemon.
+      // When the verdict names job ids, roborev answered fine and THOSE JOBS died; only a verdict
+      // with no ids is "we could not read roborev at all".
+      return v.jobIds.length
+        ? `Refused: roborev job${v.jobIds.length > 1 ? "s" : ""} ${v.jobIds.join(", ")} on ${branch} ended without a readable verdict — the review never finished, so nothing was checked. roborev answered fine; these particular jobs did not. Re-run them, or \`roborev close\` each with a reason once you have judged the commit by hand. They cannot be acknowledged with roborevOverride, which names open FAIL findings only.`
+        : `Refused: roborev is the review gate on this machine and its state for ${branch} could not be read. That is "I could not find out", not "it is clean", and merging on it is merging blind.${v.reason ? ` ${v.reason}` : ""}`;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Mutating operations
 // ---------------------------------------------------------------------------------------------
 
@@ -703,6 +872,19 @@ export interface MergePrRequest {
   auto?: never;
   squash?: never;
   rebase?: never;
+  /**
+   * WAIVE SPECIFIC, NAMED roborev findings — deliberately not a boolean.
+   *
+   * A caller must list the exact open FAIL job ids it is overriding. If the live blocking set is not
+   * a SUBSET of what it named, the merge is refused anyway, so a model cannot blanket-override: it
+   * has to have actually read the findings it is waiving, and a round that appeared since it looked
+   * re-blocks. An IN-FLIGHT round can never be acknowledged at all — you cannot waive a verdict that
+   * does not exist yet, and that is precisely the state PR #806 was merged in.
+   *
+   * `reason` is required and is not decoration: `merge_pr` is `mutates-main`, so it already goes to
+   * the human for confirmation, and this is the sentence they read before saying yes.
+   */
+  roborevOverride?: { acknowledgedJobIds: number[]; reason: string };
 }
 
 /**
@@ -712,6 +894,22 @@ export interface MergePrRequest {
  * answer at all — "wait for checks, then merge" from AGENTS.md, applied to a caller that has no eyes
  * on the PR page. Reuses the UI's own `prMergeEligibility` so the concierge and the PR menu cannot
  * drift apart on what "safe to merge" means.
+ *
+ * GITHUB'S CHECK STATE IS NOT THIS PROJECT'S DEFINITION OF "CLEAN" — the #806 lesson. On
+ * 2026-07-29 this tool merged a PR whose 18 checks were green and whose owning agent was
+ * deliberately holding it for a roborev round it had drained eleven times. Nothing was wrong with
+ * the CI gate; it was answering a narrower question than the one that mattered. So two more gates
+ * run after it, in this order:
+ *
+ *   4. THE CLAIM. A live agent that said "I will land this" wins. Cheaper and far more actionable
+ *      than an inventory of findings — "someone else owns this, go ask them" is the answer that
+ *      would have prevented the incident outright.
+ *   5. ROBOREV. Pending / unresolved / unreadable all refuse. Unreadable refuses for the same
+ *      reason a `null` PR probe does: merging blind is what a gate exists to prevent.
+ *
+ * Both fail CLOSED on an unreadable probe. That can wedge a merge when the roborev daemon is down —
+ * which is the correct trade for a `mutates-main` action, and why the narrow acknowledgement escape
+ * hatch on `MergePrRequest.roborevOverride` exists rather than a blanket force flag.
  */
 export async function mergePrTool(
   req: MergePrRequest,
@@ -738,10 +936,16 @@ export async function mergePrTool(
   // `method`/`auto`/`squash`/`number` were validated defensively above and `root` was not — yet
   // `root` is the one that decides WHICH REPOSITORY gets merged into.
   if (!isRegisteredRoot(req.root)) return refused(op, "invalid-request", UNKNOWN_ROOT_MSG(req.root));
+  // ONE spelling from here down. `isRegisteredRoot` deliberately tolerates a trailing separator and
+  // surrounding whitespace, but the downstream gates compare the root by exact string (the claim
+  // registry) and hand it to a CLI (`--repo`), so `/repo/` used to sail past admission and then
+  // match NO claims and NO reviews — reporting both gates clean. A tolerant check must not feed an
+  // intolerant consumer.
+  const root = normalizeRoot(req.root);
 
   let rows: PrRow[] | null;
   try {
-    rows = await fetchOpenPrs(req.root, req.projectId);
+    rows = await fetchOpenPrs(root, req.projectId);
   } catch (e) {
     return failed(op, "probe-failed", errText(e));
   }
@@ -761,8 +965,36 @@ export async function mergePrTool(
   const gate = prMergeEligibility(pr);
   if (!gate.canMerge) return refused(op, "checks-blocked", `Refused: ${gate.reason}.`);
 
+  // --- Gate 4: does an agent already own this? ------------------------------------------------
+  const claimView = await readPrClaim(root, req.number);
+  if (claimView === null)
+    return refused(
+      op,
+      "checks-unknown",
+      "Refused: could not read the PR claim registry, so whether an agent has said it will land this itself is unknown. An unreadable registry is not an unclaimed PR — that assumption is how #806 was merged out from under its owner.",
+    );
+  if (claimView.blocks)
+    return refused(
+      op,
+      "pr-claimed",
+      `Refused: ${claimView.summary} Merging now would land it against that agent's own gating criteria, which may be stricter than CI. Ask the agent about it instead of merging around it — its own summary above says whether the claim is current or already stale.`,
+    );
+
+  // --- Gate 5: roborev --------------------------------------------------------------------------
+  const roborev = await readRoborevState(root, pr.headRefName);
+  const ack = normalizeAck(raw.roborevOverride);
+  if (ack === "invalid")
+    return refused(
+      op,
+      "invalid-request",
+      "Refused: `roborevOverride` must be `{ acknowledgedJobIds: number[], reason: string }` with at least one job id and a non-empty reason. It is deliberately not a boolean — waiving findings means naming the ones you read.",
+    );
+  const verdict = roborevMergeGate(roborev, ack?.acknowledgedJobIds);
+  if (!verdict.canMerge)
+    return refused(op, roborevCode(verdict), roborevRefusalMessage(verdict, pr.headRefName, ack !== null));
+
   try {
-    await mergePr(req.root, req.number);
+    await mergePr(root, req.number);
     return ok(op, { number: req.number, method: "merge", url: pr.url });
   } catch (e) {
     const msg = errText(e);
@@ -1050,6 +1282,137 @@ export async function prChecksStatusTool(
   } catch (e) {
     return failed(op, "probe-failed", errText(e));
   }
+}
+
+/** How many reviews we will open and parse for one `pr_roborev_status` call. The findings body of a
+ *  thorough review runs to thousands of characters and lands permanently in a concierge's context,
+ *  so the op reads the OPEN blockers newest-first and says plainly when it stopped. A cap that lies
+ *  by omission would be worse than no cap — see `truncated`. */
+const ROBOREV_REVIEW_READ_CAP = 5;
+
+export interface PrRoborevStatus {
+  number: number;
+  branch: string;
+  /** False when roborev is not in play on this machine — the gate does not apply, which is NOT the
+   *  same as the branch being clean. */
+  applicable: boolean;
+  /** False when we could not read roborev at all. Everything below is then empty for lack of an
+   *  answer, not because the answer was zero. */
+  known: boolean;
+  /** True while a round is queued or running. The single most common thing an agent is waiting on,
+   *  and the thing the concierge could not see at all before this op existed. */
+  roundInFlight: boolean;
+  /** Whether `merge_pr` would refuse right now, and why — computed by the SAME gate the merge runs,
+   *  so a concierge cannot read "clean" here and then be refused there. */
+  wouldBlockMerge: boolean;
+  blockedReason: string | null;
+  /** Open FAIL reviews with their findings parsed out. Capped — see `truncated`. */
+  outstanding: RoborevJobFindings[];
+  /** The worst severity across everything in `outstanding`; null when there is nothing to rank. */
+  highestSeverity: string | null;
+  /** How many open blockers exist BEYOND the ones detailed above. Zero means the list is complete. */
+  truncated: number;
+  /** An agent's declared intent to land this PR, if any — read alongside the review state because
+   *  they are the two halves of the same question ("is anyone else on this?"). */
+  claim: PrClaimView | null;
+  counts: { inFlight: number; blocking: number; errored: number; openPassing: number; total: number };
+}
+
+/**
+ * THE READ OP THE CONCIERGE NEVER HAD.
+ *
+ * Agents in this project block on roborev constantly — it is the single most common thing they are
+ * waiting for — and until now nothing in the concierge's tool surface could read review state for a
+ * PR, a branch or a commit. So the concierge's only available reading of "is this ready" was CI, and
+ * on 2026-07-29 it acted on exactly that and merged #806.
+ *
+ * Reports the branch's review state, the outstanding findings WITH severity, whether a round is in
+ * flight, and any claim on the PR. `wouldBlockMerge` is computed by the same `roborevMergeGate` the
+ * merge path runs, so this op and `merge_pr` can never disagree about what "clean" means.
+ */
+export async function prRoborevStatusTool(
+  rawRoot: string,
+  projectId: string,
+  number: number,
+): Promise<WorkflowResult<PrRoborevStatus>> {
+  const op = "pr_roborev_status";
+  if (!isRegisteredRoot(rawRoot)) return refused(op, "invalid-request", UNKNOWN_ROOT_MSG(rawRoot));
+  // ONE spelling, for the same reason `mergePrTool` does it: admission tolerates a trailing
+  // separator, the claim registry matches by exact string, and the roborev CLI's `--repo` does not
+  // match a tolerated spelling. Without this the op reports both gates clean for `/repo/` — and
+  // this is the op a concierge consults BEFORE deciding to merge, so it would disagree with the
+  // merge gate it promises never to disagree with.
+  const root = normalizeRoot(rawRoot);
+  let rows: PrRow[] | null;
+  try {
+    rows = await fetchOpenPrs(root, projectId);
+  } catch (e) {
+    return failed(op, "probe-failed", errText(e));
+  }
+  if (rows === null)
+    return failed(
+      op,
+      "probe-failed",
+      "Could not read the repo's PRs (no gh, unauthed, offline, or no remote), so this PR's branch — and therefore its review state — is unknown.",
+    );
+  const pr = rows.find((r) => r.number === number);
+  if (!pr)
+    return failed(
+      op,
+      "pr-not-found",
+      `PR #${number} is not in the list this probe can see — ${PR_SCOPE}. That is not evidence it is merged or closed; \`gh pr view ${number}\` answers it directly.`,
+    );
+
+  const state = await readRoborevState(root, pr.headRefName);
+  const verdict = roborevMergeGate(state);
+  // Newest first: when the cap bites, the reviews a caller most needs are the recent ones.
+  const ordered = [...state.blocking].sort((a, b) => b.id - a.id);
+  const detailed = ordered.slice(0, ROBOREV_REVIEW_READ_CAP);
+  const outstanding: RoborevJobFindings[] = [];
+  for (const job of detailed) {
+    const body = await fetchRoborevReview(root, job.id);
+    // null body ≠ no findings. `findings: null` says we could not read the review, which is a
+    // different fact from a review that turned out clean, and the caller must be able to tell.
+    outstanding.push({ job, findings: body === null ? null : parseRoborevFindings(body) });
+  }
+  const allFindings = outstanding.flatMap((o) => o.findings ?? []);
+  let claim: PrClaimView | null = null;
+  try {
+    claim = await readPrClaim(root, number);
+  } catch {
+    claim = null; // best-effort here; the MERGE path is where an unreadable registry has to bite
+  }
+
+  return ok(op, {
+    number: pr.number,
+    branch: pr.headRefName,
+    applicable: state.applicable,
+    known: state.known,
+    roundInFlight: state.inFlight.length > 0,
+    wouldBlockMerge: !verdict.canMerge,
+    blockedReason: verdict.canMerge
+      ? null
+      : roborevRefusalMessage(verdict, pr.headRefName, false),
+    outstanding,
+    // An unreadable review body must NOT summarise as "open reviews, nothing serious". `null` here
+    // is reserved for "every body was read and none carried a finding"; a body we could not fetch
+    // ranks as `unknown`, which sorts as high as `high`. Same null-is-not-a-benign-default rule the
+    // probe follows, in the one field a model is most likely to summarise on.
+    highestSeverity: outstanding.some((o) => o.findings === null)
+      ? "unknown"
+      : allFindings.length
+        ? highestSeverity(allFindings)
+        : null,
+    truncated: Math.max(0, ordered.length - detailed.length),
+    claim,
+    counts: {
+      inFlight: state.inFlight.length,
+      blocking: state.blocking.length,
+      errored: state.errored.length,
+      openPassing: state.openPassing,
+      total: state.total,
+    },
+  });
 }
 
 /**

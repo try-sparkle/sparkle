@@ -81,6 +81,9 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // asked for is the most identifying payload on this whole surface, and it is never stored
         // here. Same treatment concierge_tool's inner op gets, for the same reason.
         "append_communication_guideline",
+        // Intent signals (services/mergeGuard). The op NAME only — never the goal text or the
+        // claim note, both of which are free text an agent wrote.
+        "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
       ].sort(),
     );
   });

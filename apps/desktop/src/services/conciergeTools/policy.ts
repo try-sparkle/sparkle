@@ -214,6 +214,10 @@ export const APP_TOOL_NAMES = [
   "set_agent_model",
   "set_config",
   "append_communication_guideline",
+  "set_agent_goal",
+  "set_agent_goal_met",
+  "claim_pr",
+  "release_pr",
 ] as const;
 
 export type AppToolName = (typeof APP_TOOL_NAMES)[number];
@@ -250,6 +254,13 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   // tool to Ask in Settings → Concierge tools; that is what the per-tool policy is for.
   append_communication_guideline: "routine",
   set_config: "irreversible",
+  // ROUTINE. These write one short field about who is doing what: an agent's objective, and a
+  // courtesy claim that expires on its own. Nothing here is destructive and nothing reaches the
+  // repo — the claim only makes `merge_pr` pause and point at the claimant.
+  set_agent_goal: "routine",
+  set_agent_goal_met: "routine",
+  claim_pr: "routine",
+  release_pr: "routine",
 };
 
 const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
@@ -264,6 +275,10 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   set_agent_model: "Change which Claude model an agent runs on.",
   append_communication_guideline: "Save a rule about how Sparkle should talk to you.",
   set_config: "Write Sparkle's machine-wide configuration.",
+  set_agent_goal: "Set an agent's current objective (what it is trying to finish).",
+  set_agent_goal_met: "Mark an agent's goal met — the only thing that makes an idle agent finished.",
+  claim_pr: "Record that you will land a pull request yourself, so nothing merges around you.",
+  release_pr: "Give up your claim on a pull request.",
 };
 
 // ---------------------------------------------------------------------------------------------

@@ -54,12 +54,14 @@ mod model;
 mod model_catalog;
 mod naming;
 mod onepassword;
+mod pr_claims;
 mod pr_owner;
 mod preflight;
 mod proc;
 mod project_window;
 mod pty;
 mod retention;
+mod roborev_probe;
 mod transcribe;
 mod screenshot;
 mod setup;
@@ -126,6 +128,9 @@ pub fn run() {
         .manage(roster::RosterState::default())
         .manage(frontmost::FrontmostState::default())
         .manage(helper::HelperVitals::default())
+        // PR claims live in the Rust process, not a window store, so an agent's "I am landing this
+        // myself" is visible from EVERY window — including whichever one answers the concierge.
+        .manage(pr_claims::PrClaims::default())
         // Every Focused event feeds TWO consumers, both of which need the same blur coalescing
         // because macOS emits the outgoing window's resignKey BEFORE the incoming window's
         // becomeKey:
@@ -498,6 +503,11 @@ pub fn run() {
             worktree::write_worker_manifest,
             worktree::read_worker_manifest,
             worktree::scan_worker_manifests,
+            roborev_probe::roborev_branch_probe,
+            roborev_probe::roborev_job_review,
+            pr_claims::pr_claim_set,
+            pr_claims::pr_claim_release,
+            pr_claims::pr_claims_list,
             sparkle_agent::ensure_sparkle_repo,
             sparkle_agent::reap_secondary_sparkle_worktrees,
             sparkle_agent::sparkle_submit_capability,

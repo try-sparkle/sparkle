@@ -27,6 +27,13 @@ export type ControlOp =
   | "set_zoom"
   | "navigate"
   | "append_communication_guideline"
+  // Intent, made legible to the other actor that can merge. `set_agent_goal` is the readable half
+  // of a field that used to be write-only; claim/release let an agent say "I am landing this
+  // myself" somewhere the concierge can see it. See services/mergeGuard/types.ts for the incident.
+  | "set_agent_goal"
+  | "set_agent_goal_met"
+  | "claim_pr"
+  | "release_pr"
   // The concierge's tool spine (services/conciergeTools/registry). ONE op carrying a
   // { domain, op, args } envelope, so this counter answers "is the concierge actually using its
   // tools?" without recording WHICH tool — the op name is all that is stored, same as every other
@@ -70,6 +77,10 @@ interface SelfReportMetricsState {
 const emptyControlOps = (): Record<ControlOp, number> => ({
   rename_agent: 0,
   set_agent_activity: 0,
+  set_agent_goal: 0,
+  set_agent_goal_met: 0,
+  claim_pr: 0,
+  release_pr: 0,
   append_communication_guideline: 0,
   set_theme: 0,
   get_config: 0,

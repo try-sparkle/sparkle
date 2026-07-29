@@ -94,8 +94,7 @@ export interface AgentTab {
   // mid-task (an app restart ended fourteen build agents' turns at once on 2026-07-29), so the
   // goal has to survive the very event it exists to recover from. Optional, so legacy records need
   // no migration and read as "no goal" — which disables auto-continue for them, the safe default.
-  goal?: AgentGoal;
-  // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
+  goal?: AgentGoal;  // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
   // and proposes before editing. Only ever "plan" — ordinary mode is the ABSENCE of this, so we
   // never override a user who configured a different default in their own Claude Code settings.
   //

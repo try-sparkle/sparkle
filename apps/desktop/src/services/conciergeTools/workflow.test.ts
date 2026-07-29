@@ -15,8 +15,11 @@ const m = vi.hoisted(() => ({
   fetchOpenPrs: vi.fn(),
   fetchPrOwner: vi.fn(),
   mergePr: vi.fn(),
+  fetchRoborevProbe: vi.fn(),
+  fetchRoborevReview: vi.fn(),
+  fetchPrClaims: vi.fn(),
   statuses: {} as Record<string, string>,
-  projects: [] as Array<{ rootPath: string }>,
+  projects: [] as Array<{ rootPath: string; agents?: Array<{ id: string; name: string }> }>,
 }));
 
 vi.mock("../branchStatus", () => ({
@@ -41,6 +44,20 @@ vi.mock("../openPrs", async (importOriginal) => {
   };
 });
 
+// Only the two PROBES are mocked. `summarizeRoborev` / `roborevMergeGate` / `findClaim` /
+// `viewClaim` are the REAL implementations, deliberately: the merge gate's whole job is to reach
+// the same verdict as the read op, and stubbing the verdict would test the stub. What varies per
+// test is what the backend answered, which is exactly what these two probes carry.
+vi.mock("../mergeGuard/roborev", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../mergeGuard/roborev")>();
+  return { ...actual, fetchRoborevProbe: m.fetchRoborevProbe, fetchRoborevReview: m.fetchRoborevReview };
+});
+
+vi.mock("../mergeGuard/prClaims", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../mergeGuard/prClaims")>();
+  return { ...actual, fetchPrClaims: m.fetchPrClaims };
+});
+
 // The busy gate reads LIVE status from the store rather than trusting a caller-supplied flag —
 // the caller here is an LLM, and "is this agent still working" must not be its word to give.
 vi.mock("../../stores/runtimeStore", () => ({
@@ -53,6 +70,7 @@ vi.mock("../../stores/projectStore", () => ({
   useProjectStore: { getState: () => ({ projects: m.projects }) },
 }));
 
+import { PR_CLAIM_GRACE_SECONDS } from "../mergeGuard/types";
 import {
   WORKFLOW_OPERATIONS,
   WORKFLOW_RISK,
@@ -72,6 +90,7 @@ import {
   projectOpenPrsTool,
   prOwnerTool,
   prChecksStatusTool,
+  prRoborevStatusTool,
   agentLandedCheckTool,
   type AgentWorkflowContext,
   type WorkflowOperation,
@@ -108,7 +127,11 @@ beforeEach(() => {
   for (const fn of Object.values(m)) if (typeof fn === "function") (fn as ReturnType<typeof vi.fn>).mockReset();
   for (const k of Object.keys(m.statuses)) delete m.statuses[k];
   m.projects.length = 0;
-  m.projects.push({ rootPath: "/repo" });
+  m.projects.push({ rootPath: "/repo", agents: [] });
+  // Default the two new gates to "answered, and nothing is in the way", so every pre-existing
+  // merge_pr expectation still describes a CI-only decision. Each new gate's own tests override.
+  m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [] });
+  m.fetchPrClaims.mockResolvedValue([]);
 });
 
 describe("risk classification", () => {
@@ -604,6 +627,409 @@ describe("merge_pr", () => {
       kind: "failed",
       code: "checks-blocked",
     });
+  });
+});
+
+/**
+ * THE #806 REGRESSION SUITE.
+ *
+ * Every test here sets up the state the concierge actually saw on 2026-07-29 — a PR with green
+ * checks and a clean mergeable state — and asserts that it is nevertheless NOT merged. The CI gate
+ * was never wrong; it was answering a narrower question than this project's definition of "clean".
+ */
+describe("merge_pr honours roborev, not just CI", () => {
+  const openPr = {
+    number: 806,
+    title: "a build column and terminal on the LEFT of the concierge",
+    headRefName: "sparkle/left-pair",
+    url: "https://github.com/drodio/sparkle/pull/806",
+    // EXACTLY the state that produced the incident: green, mergeable, ready by every GitHub signal.
+    checks: "passing" as const,
+    mergeable: "mergeable" as const,
+  };
+
+  function roborevJob(over: Record<string, unknown> = {}) {
+    return {
+      id: 55235,
+      branch: "sparkle/left-pair",
+      gitRef: "2ead6070",
+      status: "done",
+      verdict: "F",
+      closed: false,
+      commitSubject: "fix(theme): the quote inside ${…} is the signal",
+      finishedAt: null,
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    m.fetchOpenPrs.mockResolvedValue([openPr]);
+    m.mergePr.mockResolvedValue(undefined);
+  });
+
+  it("REFUSES while a roborev round is still in flight, over 18 green checks", async () => {
+    // The literal incident: the agent said "one review still running"; the concierge merged anyway.
+    m.fetchRoborevProbe.mockResolvedValue({
+      enabled: true,
+      jobs: [roborevJob({ status: "running", verdict: null })],
+    });
+    const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 806 });
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "roborev-pending" });
+    expect(m.mergePr).not.toHaveBeenCalled();
+    // The project id must REACH the probe, positionally. Adding `projectId` to the request only to
+    // satisfy the type proves nothing — the mock ignores its arguments, so the test would pass
+    // whether the id is forwarded, dropped, or transposed with the root (both are strings, so a
+    // transposition compiles). A mis-scoped probe silently loses every owner.
+    expect(m.fetchOpenPrs).toHaveBeenCalledWith("/repo", "p1");
+    // It must SAY so, and name what to do — a refusal without a remedy just gets retried verbatim.
+    expect((r as { message: string }).message).toMatch(/in flight/i);
+    expect((r as { message: string }).message).toContain("sparkle/left-pair");
+  });
+
+  it("REFUSES over open FAIL-verdict reviews nobody has read", async () => {
+    m.fetchRoborevProbe.mockResolvedValue({
+      enabled: true,
+      jobs: [roborevJob({ id: 55234 }), roborevJob({ id: 55235 })],
+    });
+    const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 806 });
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "roborev-unresolved" });
+    expect((r as { message: string }).message).toContain("55234");
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES when roborev is the gate and could not be read — unknown is not clean", async () => {
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: null, error: "daemon down" });
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+      ok: false,
+      code: "roborev-unknown",
+    });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("MERGES when roborev is not in play on this machine — the gate is a no-op, not a deadlock", async () => {
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: false, jobs: null });
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806);
+  });
+
+  it("MERGES when a closed FAIL is all that is left — roborev close is somebody's judgement", async () => {
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [roborevJob({ closed: true })] });
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+    expect(m.mergePr).toHaveBeenCalled();
+  });
+
+  it("probes the PR's OWN head branch, not the agent-branch convention", async () => {
+    // #806's branch was `sparkle/left-pair` — no agent id in it — which is the other half of why
+    // nobody could tell who owned it. The gate must follow the PR, not a naming guess.
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [] });
+    await mergePrTool({ root: "/repo", projectId: "p1", number: 806 });
+    expect(m.fetchRoborevProbe).toHaveBeenCalledWith("/repo", "sparkle/left-pair");
+  });
+
+  describe("the acknowledgement escape hatch is narrow by construction", () => {
+    beforeEach(() => {
+      m.fetchRoborevProbe.mockResolvedValue({
+        enabled: true,
+        jobs: [roborevJob({ id: 55234 }), roborevJob({ id: 55235 })],
+      });
+    });
+
+    it("merges only when the caller named EVERY open finding", async () => {
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 806,
+        roborevOverride: { acknowledgedJobIds: [55234, 55235], reason: "both are style nits I closed by hand" },
+      });
+      expect(r).toMatchObject({ ok: true });
+      expect(m.mergePr).toHaveBeenCalled();
+    });
+
+    it("a PARTIAL acknowledgement still refuses, naming what is left", async () => {
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 806,
+        roborevOverride: { acknowledgedJobIds: [55234], reason: "read one of them" },
+      });
+      expect(r).toMatchObject({ ok: false, code: "roborev-unresolved" });
+      expect((r as { message: string }).message).toContain("55235");
+      expect(m.mergePr).not.toHaveBeenCalled();
+    });
+
+    it("CANNOT waive a round that is still in flight, even when it names that job", async () => {
+      // The distinguishing property of the whole design: there is no verdict yet to waive.
+      m.fetchRoborevProbe.mockResolvedValue({
+        enabled: true,
+        jobs: [roborevJob({ id: 55235, status: "running", verdict: null })],
+      });
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 806,
+        roborevOverride: { acknowledgedJobIds: [55235], reason: "I am sure it will pass" },
+      });
+      expect(r).toMatchObject({ ok: false, code: "roborev-pending" });
+      expect(m.mergePr).not.toHaveBeenCalled();
+    });
+
+    it("rejects a BOOLEAN override — waiving means naming the ids you read", async () => {
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 806,
+        roborevOverride: true,
+      } as never);
+      expect(r).toMatchObject({ ok: false, code: "invalid-request" });
+      expect(m.mergePr).not.toHaveBeenCalled();
+    });
+
+    it("rejects an override with no stated reason", async () => {
+      const r = await mergePrTool({
+        root: "/repo",
+        projectId: "p1",
+        number: 806,
+        roborevOverride: { acknowledgedJobIds: [55234, 55235], reason: "  " },
+      } as never);
+      expect(r).toMatchObject({ ok: false, code: "invalid-request" });
+      expect(m.mergePr).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("pr_roborev_status — the read op the concierge never had", () => {
+  const openPr = {
+    number: 806,
+    title: "t",
+    headRefName: "sparkle/left-pair",
+    url: "u",
+    checks: "passing" as const,
+    mergeable: "mergeable" as const,
+  };
+  function job(over: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      branch: "sparkle/left-pair",
+      gitRef: "abc",
+      status: "done",
+      verdict: "F",
+      closed: false,
+      commitSubject: "s",
+      finishedAt: null,
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    m.fetchOpenPrs.mockResolvedValue([openPr]);
+    m.fetchPrClaims.mockResolvedValue([]);
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [] });
+    m.fetchRoborevReview.mockResolvedValue("## Review Findings\n- **Severity**: High\n- **Problem**: x");
+  });
+
+  it("forwards the project id and probes the PR's OWN branch", async () => {
+    await prRoborevStatusTool("/repo", "p1", 806);
+    expect(m.fetchOpenPrs).toHaveBeenCalledWith("/repo", "p1");
+    expect(m.fetchRoborevProbe).toHaveBeenCalledWith("/repo", "sparkle/left-pair");
+  });
+
+  it("canonicalizes the root, so a trailing slash cannot report a clean branch", async () => {
+    await prRoborevStatusTool("/repo/", "p1", 806);
+    expect(m.fetchRoborevProbe).toHaveBeenCalledWith("/repo", "sparkle/left-pair");
+  });
+
+  it("an unreadable PR probe is probe-failed, never a clean read", async () => {
+    m.fetchOpenPrs.mockResolvedValue(null);
+    expect(await prRoborevStatusTool("/repo", "p1", 806)).toMatchObject({
+      ok: false,
+      code: "probe-failed",
+    });
+  });
+
+  it("says pr-not-found rather than inventing an answer", async () => {
+    m.fetchOpenPrs.mockResolvedValue([{ ...openPr, number: 9 }]);
+    expect(await prRoborevStatusTool("/repo", "p1", 806)).toMatchObject({ code: "pr-not-found" });
+  });
+
+  it("AGREES with merge_pr about what clean means — the promise in its docstring", async () => {
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [job({ status: "running", verdict: null })] });
+    const status = await prRoborevStatusTool("/repo", "p1", 806);
+    expect(status).toMatchObject({ ok: true });
+    const data = (status as { data: { wouldBlockMerge: boolean; roundInFlight: boolean } }).data;
+    expect(data.wouldBlockMerge).toBe(true);
+    expect(data.roundInFlight).toBe(true);
+    // …and the merge path refuses on the same state.
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+      code: "roborev-pending",
+    });
+  });
+
+  it("an UNREADABLE review body reports severity 'unknown', not null", async () => {
+    // `null` is documented as "nothing to rank". A body we could not fetch reported as null reads
+    // to a model as "open reviews, nothing serious" — the exact null-is-benign conflation this
+    // module exists to kill, in the field most likely to be summarized on.
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [job()] });
+    m.fetchRoborevReview.mockResolvedValue(null);
+    const r = await prRoborevStatusTool("/repo", "p1", 806);
+    const data = (r as { data: { highestSeverity: string | null; outstanding: Array<{ findings: unknown }> } }).data;
+    expect(data.outstanding[0]!.findings).toBeNull();
+    expect(data.highestSeverity).toBe("unknown");
+  });
+
+  it("caps the reviews it opens, newest first, and SAYS how many it left", async () => {
+    const jobs = [1, 2, 3, 4, 5, 6].map((id) => job({ id }));
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs });
+    const r = await prRoborevStatusTool("/repo", "p1", 806);
+    const data = (r as { data: { outstanding: Array<{ job: { id: number } }>; truncated: number } }).data;
+    expect(data.outstanding.map((o) => o.job.id)).toEqual([6, 5, 4, 3, 2]);
+    expect(data.truncated).toBe(1);
+  });
+
+  it("reports a clean branch as clean", async () => {
+    const r = await prRoborevStatusTool("/repo", "p1", 806);
+    const data = (r as { data: { wouldBlockMerge: boolean; known: boolean } }).data;
+    expect(data.wouldBlockMerge).toBe(false);
+    expect(data.known).toBe(true);
+  });
+
+  it("carries a REAL claim through — who holds it, and whether it blocks", async () => {
+    // `expect(claim).not.toBeNull()` was vacuous: `viewClaim(null, …)` is itself a non-null wrapper,
+    // so it passed with an empty registry. Assert the fields a reader acts on.
+    m.projects.length = 0;
+    m.projects.push({ rootPath: "/repo", agents: [{ id: "a1", name: "Left Pair" }] });
+    m.fetchPrClaims.mockResolvedValue([
+      {
+        root: "/repo",
+        number: 806,
+        agentId: "a1",
+        note: "roborev round 12",
+        claimedAtMs: Date.now() - 1000,
+        expiresAtMs: Date.now() + 600_000,
+      },
+    ]);
+    const r = await prRoborevStatusTool("/repo", "p1", 806);
+    const claim = (r as { data: { claim: { claim: { agentId: string }; blocks: boolean } | null } }).data.claim;
+    expect(claim).not.toBeNull();
+    expect(claim!.claim.agentId).toBe("a1");
+    expect(claim!.blocks).toBe(true);
+  });
+
+  it("an UNREADABLE claim registry reports null, not an unclaimed PR", async () => {
+    m.fetchPrClaims.mockResolvedValue(null);
+    const r = await prRoborevStatusTool("/repo", "p1", 806);
+    expect((r as { data: { claim: unknown } }).data.claim).toBeNull();
+  });
+});
+
+describe("merge_pr defers to an agent that claimed the PR", () => {
+  const openPr = {
+    number: 806,
+    title: "t",
+    headRefName: "sparkle/left-pair",
+    url: "u",
+    checks: "passing" as const,
+    mergeable: "mergeable" as const,
+  };
+  const NOW = Date.now();
+
+  function claim(over: Record<string, unknown> = {}) {
+    return {
+      root: "/repo",
+      number: 806,
+      agentId: "a1",
+      note: "roborev round 12 is still running; I will land it",
+      claimedAtMs: NOW - 60_000,
+      expiresAtMs: NOW + 600_000,
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    m.fetchOpenPrs.mockResolvedValue([openPr]);
+    m.mergePr.mockResolvedValue(undefined);
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: [] });
+    m.projects.length = 0;
+    m.projects.push({ rootPath: "/repo", agents: [{ id: "a1", name: "Left Pair" }] });
+  });
+
+  it("REFUSES when a live agent said it would land this itself", async () => {
+    m.fetchPrClaims.mockResolvedValue([claim()]);
+    const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 806 });
+    expect(r).toMatchObject({ ok: false, kind: "refused", code: "pr-claimed" });
+    // Name the agent and quote its reason — "someone else owns this" is only actionable with a who.
+    expect((r as { message: string }).message).toContain("Left Pair");
+    expect((r as { message: string }).message).toContain("roborev round 12");
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("a merely LAPSED claim still refuses — a live agent mid-turn cannot renew", async () => {
+    // Past its TTL, but the claimant is still on the roster. Merging here is #806 on a timer: the
+    // owner of #806 spent one turn draining eleven roborev rounds, issuing no tool calls the whole
+    // time, which is exactly the window in which its claim would have lapsed.
+    m.fetchPrClaims.mockResolvedValue([claim({ expiresAtMs: NOW - 1 })]);
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+      ok: false,
+      code: "pr-claimed",
+    });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("merges once the claim is past the GRACE CEILING — a claim cannot wedge a PR forever", async () => {
+    m.fetchPrClaims.mockResolvedValue([
+      claim({ expiresAtMs: NOW - PR_CLAIM_GRACE_SECONDS * 1000 - 1 }),
+    ]);
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+    expect(m.mergePr).toHaveBeenCalled();
+  });
+
+  it("merges when the claiming agent is GONE — a dead agent's claim is not a veto", async () => {
+    m.projects.length = 0;
+    m.projects.push({ rootPath: "/repo", agents: [] }); // the claimant left the roster
+    m.fetchPrClaims.mockResolvedValue([claim()]);
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+    expect(m.mergePr).toHaveBeenCalled();
+  });
+
+  it("ignores a live claim on a DIFFERENT PR", async () => {
+    m.fetchPrClaims.mockResolvedValue([claim({ number: 805 })]);
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
+  });
+
+  it("refuses when the ROSTER could not be read — an unknown claimant is not a dead one", async () => {
+    // The fail-closed contract. A half-rehydrated project record (no `agents` array) used to make
+    // every claimant read as gone, so the claim stopped blocking — #806 reached through the very
+    // guard added to prevent it.
+    m.fetchPrClaims.mockResolvedValue([claim()]);
+    m.projects.length = 0;
+    m.projects.push({ rootPath: "/repo" }); // `agents` missing entirely
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+      ok: false,
+      code: "pr-claimed",
+    });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("still refuses when a claim was written with a trailing separator", async () => {
+    // Admission tolerates `/repo/`; the claim reader matches by exact string. Without one canonical
+    // spelling the claim silently does not exist and the gate reports clean.
+    m.fetchPrClaims.mockResolvedValue([claim({ root: "/repo/" })]);
+    expect(await mergePrTool({ root: "/repo/", projectId: "p1", number: 806 })).toMatchObject({ code: "pr-claimed" });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the claim registry could not be read — unreadable is not unclaimed", async () => {
+    m.fetchPrClaims.mockResolvedValue(null);
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({
+      ok: false,
+      code: "checks-unknown",
+    });
+    expect(m.mergePr).not.toHaveBeenCalled();
+  });
+
+  it("checks the CLAIM BEFORE roborev — 'go ask the owner' beats an inventory of findings", async () => {
+    m.fetchPrClaims.mockResolvedValue([claim()]);
+    m.fetchRoborevProbe.mockResolvedValue({ enabled: true, jobs: null });
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ code: "pr-claimed" });
   });
 });
 

@@ -45,6 +45,8 @@ import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBindin
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
+import { goalStateOf } from "../engine/agentGoal";
+import { setPrClaim, releasePrClaim, fetchPrClaims, findClaim } from "./mergeGuard/prClaims";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab } from "../types";
 
@@ -104,6 +106,12 @@ const TALLY: Record<ControlOp, boolean> = {
   // Counts how often the concierge actually reaches for a tool. The op name only — the domain and
   // op INSIDE the payload are not recorded (see selfReportMetrics' privacy note).
   concierge_tool: true,
+  // Intent signals — see the mergeGuard module. Tallied like the rest; the op name only, never the
+  // goal text or the claim note.
+  set_agent_goal: true,
+  set_agent_goal_met: true,
+  claim_pr: true,
+  release_pr: true,
 };
 const TALLIED_OPS = new Set<ControlOp>(
   (Object.keys(TALLY) as ControlOp[]).filter((op) => TALLY[op]),
@@ -112,10 +120,16 @@ const TALLIED_OPS = new Set<ControlOp>(
 const PER_AGENT_OPS = new Set<ControlOp>([
   "rename_agent",
   "set_agent_activity",
+  "set_agent_goal",
+  "set_agent_goal_met",
   "pin_agent",
   "unpin_agent",
   "set_agent_model",
 ]);
+// NOTE: `claim_pr`/`release_pr` are deliberately NOT here. Every other per-agent op can name a
+// target; a claim cannot. The claimant IS the caller, stamped by the bridge — letting a payload
+// name it would let one agent claim a PR "as" another, which is exactly the confused-deputy hole
+// the bridge closes by construction for every other identity on this surface.
 
 /**
  * The safety tier for EVERY control op — the single, explicit gate table (PRD §10/§11: the bridge
@@ -159,6 +173,16 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // caller. Both gates matter — this op reaches agent lifecycle, git, the workspace and a PTY, so a
   // near-miss caller id must not get within reach of it. See the handler.
   concierge_tool: "privileged",
+  // FREE, like `set_agent_activity` and for the same reason: these are an agent's report about its
+  // OWN work. A worker that cannot say "I am landing this myself" is a worker whose intent stays
+  // invisible, which is the failure this whole surface exists to fix — gating it behind
+  // interactive-only would reintroduce #806 for exactly the agents most likely to be holding a PR.
+  // Neither op can touch another agent: the claimant is the bridge-stamped caller, and the registry
+  // refuses a release by anyone else.
+  set_agent_goal: "free",
+  set_agent_goal_met: "free",
+  claim_pr: "free",
+  release_pr: "free",
 };
 
 /**
@@ -205,6 +229,10 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   set_agent_model: true,
   set_zoom: true,
   navigate: true,
+  set_agent_goal: true,
+  set_agent_goal_met: true,
+  claim_pr: true,
+  release_pr: true,
 };
 void _conciergeGateCoverage;
 
@@ -598,6 +626,27 @@ function handleGetState(req: ControlRequest): {
       liveness: livenessOf(a.id, status, openIds),
       parentId: a.parentId,
       activity: a.activity ?? null,
+      // The agent's OBJECTIVE and whether it has been MET — see engine/agentGoal. Readable here
+      // because it was write-only: on 2026-07-29 PR #806's owning agent had the goal "get it
+      // merged", and a concierge able to read that would not have merged the PR out from under it.
+      // Flattened rather than passed whole: `met` is the field every consumer actually branches on,
+      // and the retry counters are engine bookkeeping a caller must not reason about.
+      // `state` and not just `met`. ESCALATED is the one state that cannot be reconstructed from the
+      // other fields — `expired` is derivable from setAt+ttlMs, but a goal auto-continue has GIVEN
+      // UP on and handed to a human reads identically to one still being retried if all you have is
+      // `met: false`. That is the highest-value row for a human and precisely what this surface
+      // exists to let the concierge sweep for. `met` stays for compatibility; the retry counters
+      // really are engine bookkeeping and stay out.
+      goal: a.goal
+        ? {
+            text: a.goal.text,
+            state: goalStateOf(a.goal, Date.now()),
+            met: a.goal.metAt !== undefined,
+            setAt: a.goal.setAt,
+            ttlMs: a.goal.ttlMs,
+            ...(a.goal.escalationReason ? { escalationReason: a.goal.escalationReason } : {}),
+          }
+        : null,
     })),
   );
   const agents = all.filter((a) => {
@@ -689,6 +738,285 @@ function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   useProjectStore.getState().setAgentActivity(found.projectId, targetId, activity);
   return { ok: true };
+}
+
+/**
+ * set_agent_goal → set THAT agent's standing objective (defaults to caller).
+ *
+ * Writes the RICH goal record from engine/agentGoal (text + TTL + met/unmet + retry counters), not
+ * a bare string: that model already exists and already has consumers — goalContinuation decides
+ * whether an idle turn is auto-restarted from it, and agentStall decides whether an idle row reads
+ * "done" or "stalled". A second, flatter goal field here would have given those two a different
+ * answer than the one the concierge reads, which is the whole failure this surface exists to end.
+ *
+ * The op this adds is the READ half's other end: the model was set-able in-app but unreachable from
+ * an agent, and unreadable by the concierge. An empty `goal` clears it, which is the documented
+ * opt-out from auto-continue.
+ */
+function handleSetGoal(req: ControlRequest): Record<string, unknown> {
+  const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("set_agent_goal", req);
+  const goal = req.payload.goal;
+  if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };
+  const ttlMs = typeof req.payload.ttlMs === "number" && req.payload.ttlMs > 0 ? req.payload.ttlMs : undefined;
+  const found = findAgent(targetId);
+  if (!found) return { ok: false, error: `unknown agent ${targetId}` };
+  useProjectStore.getState().setAgentGoal(found.projectId, targetId, goal, ttlMs);
+  return { ok: true };
+}
+
+/**
+ * set_agent_goal_met → the agent's own way to say it is finished.
+ *
+ * Exposed alongside the setter deliberately. `metAt` is the ONLY thing that makes an idle agent
+ * legitimately done — a turn ending does not set it — so without a way to say so an agent that
+ * genuinely finished keeps being auto-continued, and the concierge keeps reading it as outstanding.
+ */
+function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
+  // CALLER-STAMPED, no `targetAgentId` — the same rule as `claim_pr`, and for a sharper reason.
+  // Marking a DIFFERENT, live agent met latches its `metAt`, which makes `hasUnmetGoal` false so
+  // auto-continue never restarts it and `agentStall` renders it "done". That is a false "done" on a
+  // stalled agent — exactly the failure the goal feature was built to end — reachable by one wrong
+  // id in a payload.
+  const targetId = (req.callerAgentId || "").trim();
+  if (!targetId) return { ok: false, error: "set_agent_goal_met needs an identifiable caller" };
+  const met = req.payload.met;
+  if (typeof met !== "boolean") return { ok: false, error: "met must be a boolean" };
+  const found = findAgent(targetId);
+  if (!found) return { ok: false, error: `unknown agent ${targetId}` };
+  // NOTHING TO MARK is not a success. `setAgentGoalMet` early-returns unchanged when there is no
+  // goal record, so a bare `{ ok: true }` would tell the caller it is done while the concierge goes
+  // on reading `goal: null` — false assurance, on the one field that decides whether an idle agent
+  // is finished or stalled.
+  const before = found.agent?.goal;
+  if (!before) {
+    return { ok: false, error: "no goal to mark — set one with set_agent_goal first." };
+  }
+  useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);
+  return { ok: true, met };
+}
+
+/** The claimant of a PR is ALWAYS `req.callerAgentId` — the id the Rust bridge stamped from the
+ *  socket, never anything in the payload.
+ *
+ *  Every other per-agent op on this surface accepts a `targetAgentId`; a claim must not. A claim is
+ *  a statement about who will do the landing, so letting a payload name someone else would let one
+ *  agent speak for another — and the whole value of a claim is that the concierge can trust who
+ *  made it. Same confused-deputy reasoning the bridge already applies to `buildAgentId`. */
+function claimant(req: ControlRequest): string {
+  return (req.callerAgentId || "").trim();
+}
+
+/**
+ * Turn whatever an agent called "the project root" into the spelling the merge gate will look up,
+ * or null if it is not a project we know.
+ *
+ * THIS IS A CORRECTNESS GATE, NOT TIDYING. `merge_pr` finds a claim by exact root string. An agent's
+ * cwd is its WORKTREE (`…/worktrees/<uuid>/…`), not the project root, and the tool description asks
+ * for "the project root path" — so the overwhelmingly likely input is a path the reader can never
+ * match. Storing it anyway returns `{ ok: true }`, the agent believes the PR is held, and nothing
+ * blocks. A claim that reports success but cannot block is worse than no claim: it is exactly the
+ * false assurance that produced #806. So: canonicalize, accept a registered root, map a known
+ * worktree back to its project, and otherwise refuse and say which roots are real.
+ */
+function resolveProjectRoot(input: string): string | null {
+  const want = input.trim().replace(/[/\\]+$/, "");
+  if (!want) return null;
+  const norm = (p: string) => (p || "").trim().replace(/[/\\]+$/, "");
+  try {
+    const { projects } = useProjectStore.getState();
+    const direct = projects.find((p) => norm(p.rootPath) === want);
+    if (direct) return norm(direct.rootPath);
+    const owning = projects.find((p) =>
+      (p.agents ?? []).some((a) => a.worktreePath && norm(a.worktreePath) === want),
+    );
+    return owning ? norm(owning.rootPath) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The only roots a release may search: the project the CALLER is registered under, plus the raw
+ * input. Deliberately NOT every registered root.
+ *
+ * `claim_pr` accepts any registered root, so one agent can legitimately hold #806 in two projects —
+ * and PR numbers are per-repo, so those are different PRs. A sweep over every root walks them in
+ * store order and releases whichever it reaches first, which can drop a still-live claim in a
+ * project the caller never named and report success. The ownership check cannot catch that: the
+ * caller IS the owner. Scoping to the caller's own project is the narrowest thing that still does
+ * what the sweep was added for — let a claimant whose root stopped resolving release its own PR.
+ */
+function candidateRoots(input: string, agentId: string): string[] {
+  const norm = (p: string) => (p || "").trim().replace(/[/\\]+$/, "");
+  try {
+    const mine = useProjectStore
+      .getState()
+      .projects.filter((p) => (p.agents ?? []).some((a) => a.id === agentId));
+    return [...new Set([...mine.map((p) => norm(p.rootPath)), norm(input)])].filter(Boolean);
+  } catch {
+    return [norm(input)].filter(Boolean);
+  }
+}
+
+/**
+ * The claim currently on this PR: the holder, `"unreadable"`, or null for genuinely unclaimed.
+ *
+ * THREE STATES, because `fetchPrClaims` returns null for "could not look" and collapsing that into
+ * "nobody holds this" is the exact conflation its own docstring forbids — and here it would let a
+ * takeover overwrite a live holder we never saw, since Rust permits any takeover past the TTL. Its
+ * sibling `agentIsPresent` already fails closed on an unreadable store; these two must not disagree
+ * about which direction is safe.
+ */
+async function existingClaimHolder(
+  root: string,
+  number: number,
+): Promise<{ agentId: string; note: string | null } | "unreadable" | null> {
+  try {
+    const claims = await fetchPrClaims(root);
+    if (claims === null) return "unreadable";
+    const found = findClaim(claims, root, number);
+    return found ? { agentId: found.agentId, note: found.note } : null;
+  } catch {
+    return "unreadable";
+  }
+}
+
+/** Is this agent still on the roster? Mirrors `claimantIsPresent` in conciergeTools/workflow.ts:
+ *  roster PRESENCE, not runtime status, because the status map is window-local. Unreadable → true,
+ *  so we fail toward protecting the existing holder. */
+function agentIsPresent(agentId: string): boolean {
+  try {
+    const projects = useProjectStore.getState().projects;
+    if (!Array.isArray(projects)) return true;
+    if (projects.some((p) => !Array.isArray(p.agents))) return true;
+    return projects.flatMap((p) => p.agents).some((a) => a.id === agentId);
+  } catch {
+    return true;
+  }
+}
+
+/** The registered project roots, for a refusal that tells the caller what to pass instead. */
+function knownRootsHint(): string {
+  try {
+    const roots = useProjectStore.getState().projects.map((p) => p.rootPath);
+    return roots.length ? ` Known project roots: ${roots.join(", ")}.` : "";
+  } catch {
+    return "";
+  }
+}
+
+/** claim_pr → record "I will land this PR myself" where the concierge's merge gate can read it. */
+async function handleClaimPr(req: ControlRequest): Promise<Record<string, unknown>> {
+  const agentId = claimant(req);
+  if (!agentId) return { ok: false, error: "claim_pr needs an identifiable caller" };
+  const root = req.payload.root;
+  const number = req.payload.number;
+  if (typeof root !== "string" || !root.trim())
+    return { ok: false, error: "root (the project path) is required" };
+  if (typeof number !== "number" || !Number.isInteger(number) || number <= 0)
+    return { ok: false, error: "number must be a positive PR number" };
+  const resolved = resolveProjectRoot(root);
+  if (!resolved)
+    return {
+      ok: false,
+      error: `"${root}" is not a project Sparkle knows, so a claim written against it could never be found by the merge gate. Pass the PROJECT root (not your worktree).${knownRootsHint()}`,
+    };
+  const note = typeof req.payload.note === "string" ? req.payload.note : null;
+  const ttlSeconds =
+    typeof req.payload.ttlSeconds === "number" ? req.payload.ttlSeconds : undefined;
+  // THE TAKEOVER DECISION BELONGS HERE, not in the registry. Rust judges a claim on the clock alone
+  // — it has no roster — so past the TTL it lets anyone overwrite the row. But the TS rule is that a
+  // LAPSED claim still blocks while its claimant is alive (an agent in a long turn cannot renew), so
+  // a clock-only takeover hands PR ownership to a second agent while the first is still working and
+  // believes it holds it: #806 through the new mechanism. Liveness is knowable here, so decide here.
+  const holder = await existingClaimHolder(resolved, number);
+  if (holder === "unreadable") {
+    return {
+      ok: false,
+      error: `Could not read the claim registry, so I cannot tell whether an agent already holds PR #${number}. Refusing rather than writing over a holder I never saw — retry in a moment.`,
+    };
+  }
+  if (holder && holder.agentId !== agentId && agentIsPresent(holder.agentId)) {
+    // "REGISTERED", not "running". `agentIsPresent` is roster PRESENCE by design (the runtime
+    // status map is window-local), so a stopped-but-still-open tab counts as present. Saying "it is
+    // still running, wait for it to stop" would send the caller to wait for a transition that may
+    // never come — a remedy string is an instruction, and it has to be true under the conditions
+    // that triggered the refusal. Name the real ceiling instead.
+    return {
+      ok: false,
+      error: `PR #${number} is held by agent ${holder.agentId}, which is still registered in Sparkle${holder.note ? ` (${holder.note})` : ""}. Ask it to release_pr. Failing that, the claim is dropped automatically once it passes its TTL plus a two-hour grace window — Sparkle does not require the agent to stop first.`,
+    };
+  }
+  try {
+    const claim = await setPrClaim(resolved, number, agentId, note, ttlSeconds);
+    return { ok: true, claim };
+  } catch (e) {
+    // A refusal here is the single most actionable thing this op produces ("someone else holds
+    // it"), so it is surfaced verbatim rather than flattened into a generic failure.
+    return { ok: false, error: errMsg(e) };
+  }
+}
+
+/** release_pr → give up a claim early. Only the claimant can; the registry enforces that. */
+async function handleReleasePr(req: ControlRequest): Promise<Record<string, unknown>> {
+  const agentId = claimant(req);
+  if (!agentId) return { ok: false, error: "release_pr needs an identifiable caller" };
+  const root = req.payload.root;
+  const number = req.payload.number;
+  if (typeof root !== "string" || !root.trim())
+    return { ok: false, error: "root (the project path) is required" };
+  if (typeof number !== "number" || !Number.isInteger(number) || number <= 0)
+    return { ok: false, error: "number must be a positive PR number" };
+  // PERMISSIVE, unlike `claim_pr` — and the asymmetry is the point. A claim that cannot be found is
+  // FALSE ASSURANCE, so writing one under an unresolvable root has to fail. A release that cannot be
+  // found protects nothing; refusing it only prolongs a block, and if the project was closed or the
+  // agent's worktree path was cleared since the claim was written, the claimant would lose the only
+  // way to let go of its own PR for the full TTL + grace. So try the resolved spelling, then the raw
+  // one. This is not an authorization hole: the registry still refuses a release by a non-owner.
+  const resolved = resolveProjectRoot(root);
+  try {
+    // `released: false` is not an error — there was simply nothing to release. Reported as the
+    // observed outcome rather than folded into `ok`, which would claim we tore something down.
+    let released = await releasePrClaim(resolved ?? root.trim(), number, agentId);
+    // Try every registered root before giving up. Rust canonicalizes on both write and read, so the
+    // raw-vs-canonical retry alone could never find anything the first call missed; what DOES go
+    // wrong is a claim written under a root this session can no longer resolve (project closed,
+    // worktree path cleared). The registry still refuses a non-owner, so this is not an
+    // authorization hole — it is the difference between releasing the claim and stranding it.
+    // ONLY sweep when we could not resolve the root, and only release a root that ACTUALLY holds
+    // this agent's claim. PR numbers are per-repo, so #806 exists in every project — a blind sweep
+    // could drop the caller's still-live claim on the same number in a DIFFERENT project and report
+    // success. A recognized root is already the answer; there is nothing to search for.
+    let releasedFrom: string | null = released ? (resolved ?? root.trim()) : null;
+    if (!released && !resolved) {
+      for (const candidate of candidateRoots(root, agentId)) {
+        const claims = await fetchPrClaims(candidate);
+        const mine = claims ? findClaim(claims, candidate, number) : null;
+        if (!mine || mine.agentId !== agentId) continue;
+        released = await releasePrClaim(candidate, number, agentId);
+        if (released) {
+          releasedFrom = candidate;
+          break;
+        }
+      }
+    }
+    if (!released && !resolved) {
+      // Never report a clean no-op for a root we did not recognise: the claimant would be told
+      // there was nothing to release while its claim sits in the registry, still blocking. That is
+      // the false-assurance shape `claim_pr` refuses for, on the release side.
+      return {
+        ok: false,
+        released: false,
+        error: `Nothing was released, and "${root}" is not a project Sparkle knows — so this may not be where your claim lives.${knownRootsHint()}`,
+      };
+    }
+    // Name WHICH root was released: with a sweep in play, "released: true" alone does not tell the
+    // caller what it just let go of.
+    return { ok: true, released, ...(releasedFrom ? { root: releasedFrom } : {}) };
+  } catch (e) {
+    return { ok: false, error: errMsg(e) };
+  }
 }
 
 /** set_theme → the app-wide theme preference (uiStore.setThemePref). Privileged: the tier gate in
@@ -1078,6 +1406,18 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "set_agent_activity":
         result = handleSetActivity(req);
+        break;
+      case "set_agent_goal":
+        result = handleSetGoal(req);
+        break;
+      case "set_agent_goal_met":
+        result = handleSetGoalMet(req);
+        break;
+      case "claim_pr":
+        result = await handleClaimPr(req);
+        break;
+      case "release_pr":
+        result = await handleReleasePr(req);
         break;
       case "set_theme":
         result = handleSetTheme(req);

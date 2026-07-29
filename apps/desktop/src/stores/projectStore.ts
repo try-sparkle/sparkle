@@ -186,8 +186,7 @@ export interface ProjectState {
    *  (a human acting) or a new goal clears it. */
   escalateAgentGoal: (projectId: string, agentId: string, reason: string) => void;
   /** Clear the retry budget and any escalation, because a human acted on this agent. */
-  resetAgentGoalRetries: (projectId: string, agentId: string) => void;
-  /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
+  resetAgentGoalRetries: (projectId: string, agentId: string) => void;  /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
    *  epic pill immediately, before any of its workers bind to a bead). */
   setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
   removeAgent: (projectId: string, agentId: string) => void;
@@ -1256,8 +1255,7 @@ export const useProjectStore = create<ProjectState>()(
       resetAgentGoalRetries: (projectId, agentId) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: resetGoalRetries(a.goal) } : a)),
-          ),
+            mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: resetGoalRetries(a.goal) } : a)),          ),
         })),
 
       setAgentEpicId: (projectId, agentId, epicId) =>

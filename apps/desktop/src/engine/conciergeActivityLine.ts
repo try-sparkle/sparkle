@@ -144,6 +144,9 @@ const WORKFLOW_PHRASES: Record<WorkflowOperation, OpPhrase> = {
   // number was missing.
   pr_checks_status: phrase("Checking %s's checks", "Checked %s's checks", PR),
   pr_owner: phrase("Working out who owns %s", "Worked out who owns %s", PR),
+  // "review" rather than "roborev": the human reading this line cares that the code was reviewed,
+  // not which daemon did it. Same PR subject rule as the line above.
+  pr_roborev_status: phrase("Checking %s's review", "Checked %s's review", PR),
   agent_landed_check: phrase("Checking whether %s's work landed", "Checked whether %s's work landed", AGENT),
   refresh_agent_branch: phrase("Refreshing %s's branch", "Refreshed %s's branch", AGENT),
   land_agent_branch: phrase("Landing %s's branch", "Landed %s's branch", AGENT),

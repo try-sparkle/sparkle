@@ -113,6 +113,7 @@ import {
   mergePrTool,
   openAgentPrTool,
   prChecksStatusTool,
+  prRoborevStatusTool,
   projectAgentsStatusTool,
   projectOpenPrsTool,
   prOwnerTool,
@@ -771,6 +772,10 @@ const mergePrArgs = z
     auto: z.unknown().optional(),
     squash: z.unknown().optional(),
     rebase: z.unknown().optional(),
+    // Forwarded unvalidated for the SAME reason as `method` above: `mergePrTool.normalizeAck` owns
+    // the shape, and its refusal explains that waiving roborev findings means naming the ids you
+    // read — a `bad-args` error naming a field would not.
+    roborevOverride: z.unknown().optional(),
   })
   .strict();
 
@@ -818,6 +823,11 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
       fromWorkflow(ctx, await prChecksStatusTool(p.rootPath, p.id, a.number)),
     ),
   ),
+  pr_roborev_status: route(prNumberArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromWorkflow(ctx, await prRoborevStatusTool(p.rootPath, p.id, a.number)),
+    ),
+  ),
   agent_landed_check: route(agentOnly, (a, ctx) =>
     withAgentContext(ctx, a.agentId, async (c) => fromWorkflow(ctx, await agentLandedCheckTool(c))),
   ),
@@ -850,6 +860,9 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
           ...(a.auto !== undefined ? { auto: a.auto as never } : {}),
           ...(a.squash !== undefined ? { squash: a.squash as never } : {}),
           ...(a.rebase !== undefined ? { rebase: a.rebase as never } : {}),
+          ...(a.roborevOverride !== undefined
+            ? { roborevOverride: a.roborevOverride as { acknowledgedJobIds: number[]; reason: string } }
+            : {}),
         }),
       ),
     ),
