@@ -45,6 +45,21 @@ export interface ClaudeExecOpts {
   /** The Claude model this agent runs (`--model <id>`, a services/models.ts id). Absent or the
    *  "default" sentinel → no flag, so the agent inherits the user's own Claude Code default. */
   model?: string;
+  /**
+   * Start the agent in PLAN mode (`--permission-mode plan`) — it researches and proposes before it
+   * edits anything, the same state a human reaches with shift+tab.
+   *
+   * Only `"plan"` is modelled. "Build" is the ABSENCE of the flag, not a value to pass: the normal
+   * mode is whatever the user's own Claude Code config says, and emitting an explicit
+   * `--permission-mode default` here would override a user who set something else — turning "I
+   * didn't ask for plan mode" into "force everyone back to the stock setting".
+   *
+   * Mutually exclusive with {@link dangerouslySkipPermissions} by construction: skip-permissions
+   * means "approve everything unattended" and plan mode means "change nothing until I say so", so a
+   * spawn asking for both is a caller bug. {@link buildClaudeExec} refuses that combination rather
+   * than silently letting claude's own precedence decide which one wins.
+   */
+  permissionMode?: "plan";
   /** Per-spawn `CLAUDE_CONFIG_DIR` for multi Claude Max account support (design spec
    *  docs/superpowers/specs/2026-06-26-multi-max-account-design.md). When set, the exec exports it
    *  so the child `claude` authenticates from that account's isolated config dir — confined to the
@@ -81,6 +96,28 @@ export function buildClaudeExec(
   // worker is fresh or resumed. A flag (no argument), so it can sit anywhere in the option list.
   if (opts.dangerouslySkipPermissions) {
     cmd += " --dangerously-skip-permissions";
+  }
+  // Plan mode — FRESH SPAWNS ONLY, for the same reason `initialPrompt` is (see below): it is a
+  // request made when the agent was created, not a permanent property of it. The human leaves plan
+  // mode with shift+tab once they have approved the plan, and that happens inside the session, where
+  // this launcher cannot see it. Re-emitting the flag on every relaunch would silently drag the
+  // agent back into plan mode after it had been let out — a "why won't it edit anything" bug whose
+  // cause is invisible from the UI.
+  //
+  // Refused alongside skip-permissions rather than resolved: the two express opposite intentions
+  // ("approve everything unattended" vs "change nothing until I approve"), so a caller asking for
+  // both has a bug, and letting claude's own flag precedence pick a winner would hide it behind
+  // whichever behaviour happened to result. Thrown, not logged — the spawn paths that reach this can
+  // still refuse cleanly, and a WORKER silently launched in plan mode would sit RED forever while
+  // its orchestrator blocks in wait_for_workers.
+  if (opts.permissionMode && opts.dangerouslySkipPermissions) {
+    throw new Error(
+      "buildClaudeExec: permissionMode 'plan' and dangerouslySkipPermissions are mutually " +
+        "exclusive — plan mode waits for approval, skip-permissions grants it automatically.",
+    );
+  }
+  if (!resume && opts.permissionMode) {
+    cmd += ` --permission-mode ${shellQuote(opts.permissionMode)}`;
   }
   // Per-agent model selection (bead sparkle-i6rw). The "default" sentinel means "no flag" so the
   // agent inherits whatever the user's own Claude Code config says — same as before the feature.

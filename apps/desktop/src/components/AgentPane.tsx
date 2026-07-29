@@ -755,6 +755,10 @@ function AgentPaneInner({
               configDir,
               resumeSessionId,
               model: agent.model,
+              // Spawn-time plan-mode request. THIS is the branch build agents take, and build agents
+              // are the only ones that can carry the field — threading it only into the generic
+              // branch below meant the flag was never emitted at all (roborev 55057).
+              permissionMode: agent.permissionMode,
               // Merge the app-level sparkle-control MCP into the SAME --mcp-config as the orchestrator
               // server (never dropping the orchestrator), so a Build agent both fans out workers AND
               // drives its own UI. Omitted when the control bridge was unavailable this spawn.
@@ -783,6 +787,10 @@ function AgentPaneInner({
           configDir,
           resumeSessionId,
           model: agent.model,
+          // Spawn-time plan-mode request. buildClaudeExec applies it only when NOT resuming, so an
+          // agent the human took out of plan mode with shift+tab is not dragged back into it on
+          // every relaunch.
+          permissionMode: agent.permissionMode,
           mcpConfig: controlMcpConfig,
           appendSystemPrompt: controlMcpConfig ? sparkleControlProtocol() : undefined,
         });

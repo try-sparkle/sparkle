@@ -56,6 +56,8 @@ import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
+import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
+import { isTornOut } from "../satelliteWindows";
 import {
   shipAgent as shipAgentWork,
   saveAgent as saveAgentWork,
@@ -142,6 +144,8 @@ export type LifecycleRefusalReason =
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
   | "intent-required" //        discard was called without a well-formed DiscardIntent
   | "intent-mismatch" //        the intent names a different agent than the one targeted
+  | "unknown-model" //          a spawn named a model this app does not offer (never downgraded)
+  | "project-torn-out" //      ANY spawn into a project owned by a satellite (neither window mounts it)
   | "action-failed"; //         the underlying path failed (details in `message`)
 
 export interface LifecycleOk<T> {
@@ -258,6 +262,16 @@ export interface SpawnedBuildAgent {
   name: string;
   /** The capacity reading AFTER the spawn, so the concierge can say "that's 3 of 8". */
   capacity: CapacityReading;
+  /** True when a brief was seeded with the spawn. Reported back so the caller can tell a briefed
+   *  agent from an empty one WITHOUT re-reading the terminal — and so "did my prompt land?" is
+   *  answered by the reply rather than by inference. */
+  briefed: boolean;
+  /** The mode the agent actually started in. Echoed because "build" is represented by the absence
+   *  of a flag, so silence would otherwise be ambiguous between "build" and "not applied". */
+  mode: "plan" | "build";
+  /** The model actually in force — the validated id, or "default" when inheriting the user's own
+   *  Claude Code setting. */
+  model: string;
 }
 
 export interface SpawnBuildAgentInput {
@@ -265,6 +279,25 @@ export interface SpawnBuildAgentInput {
   projectId?: string;
   /** Defaults to "local". "cloud" is refused — see the file header. */
   runtime?: Runtime;
+  /**
+   * The agent's opening brief, delivered ATOMICALLY with the spawn.
+   *
+   * This is the point of the whole input object. Spawning blank and then sending a message is two
+   * operations, and between them the agent is a briefless row — the exact state the attention
+   * engine reads as "needs you", so the workaround for a missing feature manufactured a false red
+   * notification every single time. Omitting it is still legitimate (an empty agent the human will
+   * type into) and is NOT an attention condition.
+   */
+  prompt?: string;
+  /** Human-readable name, set now rather than leaving the row as "Build N" until auto-naming
+   *  catches up — which it may never do if the naming backend is unavailable. */
+  name?: string;
+  /** A services/models.ts id, or "default" to inherit the user's own Claude Code setting. An id
+   *  this app does not offer is REFUSED, never silently downgraded — see below. */
+  model?: string;
+  /** "plan" starts the agent researching and proposing before it edits anything (the state a human
+   *  reaches with shift+tab). "build" is the ordinary mode. */
+  mode?: "plan" | "build";
 }
 
 /**
@@ -293,6 +326,62 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
         : "There's no project open, so there's nothing to start a build agent in.",
     );
   }
+  // NOTHING can be spawned into a torn-out project from this window — briefed or not.
+  //
+  // An earlier version refused only the BRIEFED spawn, on the reasoning that an empty agent was
+  // fine because "the satellite mounts the pane and launches it". That reasoning was WRONG
+  // (roborev 55102). `landInAgent` marks the agent live via `useRuntimeStore.open(agentId)`, and
+  // the runtime store is NOT cross-window synced — `crossWindowSync` wires exactly two stores,
+  // projectStore and dictationStore. So the satellite receives the agent ROW (projectStore is
+  // synced) but never the open flag, and renders its "Start this agent" hint instead of mounting
+  // anything. Main cannot cover for it either: Workspace `continue`s on torn-out before the
+  // visited-or-current check. The agent would exist in no window, with no worktree and no PTY,
+  // while still consuming a `localAgentCapacity()` slot — and the reply would have said it started.
+  //
+  // The brief has its own reason on top: the satellite has its OWN `pendingSends` module instance,
+  // so a brief queued here is drained by nobody and the queue does not self-age (roborev 55095).
+  //
+  // Refused with the honest remedy rather than half-done. Checked BEFORE the capacity gate and
+  // before anything is created, so a refused spawn consumes no slot.
+  //
+  // THE REMEDY NAMES THE ONE THING THAT ACTUALLY WORKS. An earlier draft offered "…or start the
+  // agent from that window", which cannot be done: the satellite renders columns ② + ③ only — no
+  // tab strip, no "+ New Build Agent" — and its own empty state says the opposite ("start one from
+  // the main Sparkle window", satellite/SatelliteApp.tsx). Per this repo's rule that user-facing
+  // remedy text is code, an instruction the user cannot carry out is a bug, not phrasing — and this
+  // one contradicted copy shipped in the very window it pointed at (roborev 55102).
+  if (isTornOut(project.id)) {
+    return refuse(
+      "spawn_build_agent",
+      "project-torn-out",
+      `${project.name} is open in its own window, so I can't start an agent in it from here — it ` +
+        `would end up with no terminal in either window. Re-dock ${project.name} and I'll start it.`,
+    );
+  }
+
+  // ALSO ABOVE THE CAPACITY GATE, for the same reason as the torn-out guard: this depends only on
+  // the caller's input and can never be satisfied by freeing slots. Below it, an at-capacity request
+  // carrying a bad model id was answered with "Close or finish one before starting another" — so the
+  // user destroys an agent on the concierge's instruction, the retry sends the same bad id, and only
+  // then does the real answer surface (roborev 55108). Both invariant-only preconditions now sit
+  // above the one refusal whose remedy is destructive.
+  //
+  // Validate the model BEFORE anything is created, so a bad id leaves the store untouched rather
+  // than producing an agent running the wrong model. Refused rather than silently falling back:
+  // routing cheap mechanical work to a small model is the REASON this argument exists, so quietly
+  // substituting the default would bill the user for the opposite of what they asked for, with
+  // nothing in the reply to say so.
+  if (input.model !== undefined && !isDefaultModel(input.model)) {
+    const known = getModelCatalog().map((m) => m.id);
+    if (!known.includes(input.model)) {
+      return refuse(
+        "spawn_build_agent",
+        "unknown-model",
+        `"${input.model}" isn't a model this app offers. Available: ${known.join(", ")}.`,
+      );
+    }
+  }
+
   // The cap is checked BEFORE anything is created, so an over-cap request leaves the store exactly
   // as it found it. Refused, never queued: a silent queue would leave the human waiting on an agent
   // that has no slot and no ETA.
@@ -321,7 +410,12 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
         `The ceiling is ${capacity.basis}. Close or finish one before starting another.`,
     );
   }
-  const agentId = spawnBuildAgentInProject(project);
+  const agentId = spawnBuildAgentInProject(project, {
+    prompt: input.prompt,
+    name: input.name,
+    model: input.model,
+    mode: input.mode,
+  });
   if (!agentId) {
     return refuse(
       "spawn_build_agent",
@@ -340,6 +434,9 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
     projectId: project.id,
     name,
     capacity: localAgentCapacity(),
+    briefed: Boolean(input.prompt),
+    mode: input.mode === "plan" ? "plan" : "build",
+    model: isDefaultModel(input.model) ? DEFAULT_MODEL_ID : input.model!,
   });
 }
 

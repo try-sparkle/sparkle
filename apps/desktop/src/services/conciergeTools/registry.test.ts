@@ -113,6 +113,12 @@ vi.mock("../attention", async (orig) => ({
   ...(await orig<typeof import("../attention")>()),
   quitApp: () => quitAppNativeMock(),
 }));
+// Satellite ownership: torn-out is a localStorage-backed read, so drive it explicitly.
+const tornOutMock = vi.fn(() => false);
+vi.mock("../satelliteWindows", async (orig) => ({
+  ...(await orig<typeof import("../satelliteWindows")>()),
+  isTornOut: (...a: unknown[]) => tornOutMock(...(a as [])),
+}));
 vi.mock("../helper", async (orig) => ({
   ...(await orig<typeof import("../helper")>()),
   showMainWindow: vi.fn(() => {}),
@@ -132,6 +138,9 @@ import {
 } from "./registry";
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
 import { useProjectStore } from "../../stores/projectStore";
+import { takePendingSends, resetPendingSends } from "../pendingSends";
+import { wasProjectVisited, resetVisitedProjects } from "../sessionProjects";
+import { assembleBuildSpawn } from "../orchestrationLaunch";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
 import type { DispatchAuthority } from "../dispatchAuthority";
@@ -161,6 +170,13 @@ function seedBuild(projectId: string): string {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The pending-send queue is module-level state, so a spawn that queued a brief would otherwise
+  // leak into the next test's assertions about what was (or was not) queued.
+  resetPendingSends();
+  // Visited-project tracking is module-level too, and it is half the pane-mount gate — a project
+  // marked visited by one test would mask a missing mount guarantee in the next.
+  resetVisitedProjects();
+  tornOutMock.mockReturnValue(false);
   useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
   useRuntimeStore.setState({
     status: {},
@@ -871,5 +887,321 @@ describe("approvals — routed and read-only", () => {
       const r = await dispatchConciergeTool(call({ domain: "approvals", op, args: { id: "x" } }));
       expect(refusal(r).code, op).toBe(REGISTRY_CODES.unknownOp);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. spawn_build_agent settles everything in ONE call (PRD section A)
+// ---------------------------------------------------------------------------------------------
+//
+// The bug this closes: spawning blank and then sending a brief is two operations, and BETWEEN them
+// the agent is a briefless row — the state the attention engine reads as "needs you". So the
+// workaround for the missing argument manufactured a false red notification every time.
+
+describe("spawn_build_agent — atomic brief, name, model and mode", () => {
+  function agentsOf(projectId: string) {
+    return useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+  }
+
+  // ASSERTED ON THE DELIVERY QUEUE, NOT THE STORE ROW — this is the whole lesson of roborev 55057.
+  // An earlier version of this test checked `lastPrompt`/`promptHistory`, which `appendPrompt` sets
+  // without writing anything to the PTY. It passed against an implementation that recorded the brief
+  // and never sent it, and because `newAgentAttention.isBriefless` keys off those same two fields,
+  // that implementation would have produced a falsely CALM agent idling at an empty prompt forever —
+  // strictly worse than the false red it was meant to fix. The queue is where a real send lives.
+  it("queues the brief for the PTY, so it is actually delivered and not merely recorded", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, prompt: "Fix the parser" } }),
+    );
+    expect(r.ok).toBe(true);
+
+    const agentId = agentsOf(projectId).find((a) => a.kind === "build")!.id;
+    const { due } = takePendingSends(agentId);
+    expect(due.map((d) => d.text)).toEqual(["Fix the parser"]);
+    // userPrompt drives recordPromptSideEffects on the flush path — that is what writes the store
+    // row, ONCE, on delivery. Seeding the row here as well would double-record it.
+    expect(due[0]!.userPrompt).toBe(true);
+    // …and the reply says so, so the caller need not re-read the terminal to find out.
+    expect(r.ok && (r.data as { briefed: boolean }).briefed).toBe(true);
+  });
+
+  // A queued brief is only ever delivered by an AgentPane's ptyReady flush, and Workspace mounts
+  // panes solely for visited-or-current projects. spawn_build_agent takes an ARBITRARY projectId, so
+  // spawning into a project the user hasn't opened would queue a brief nothing can drain — the queue
+  // does not self-age, so it would sit there with no delivery and no expiry, while the reply claimed
+  // briefed: true (roborev 55088). The spawn therefore has to make the target current.
+  it("makes the target project current, so a pane exists to flush the brief", async () => {
+    const alpha = seedProject("Alpha", "/tmp/alpha");
+    const beta = seedProject("Beta", "/tmp/beta");
+    useProjectStore.setState({ selectedProjectId: alpha } as never);
+
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_build_agent",
+        args: { projectId: beta, prompt: "Fix the parser" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(useProjectStore.getState().selectedProjectId).toBe(beta);
+    expect(wasProjectVisited(beta)).toBe(true);
+
+    const agentId = agentsOf(beta).find((a) => a.kind === "build")!.id;
+    expect(takePendingSends(agentId).due.map((d) => d.text)).toEqual(["Fix the parser"]);
+  });
+
+  // markProjectOpen must be PAIRED with the selection. Selecting a project whose tab is closed
+  // leaves the strip with no tab for it and every tab reading aria-selected="false" — and it
+  // self-heals the wrong way: the next tab close treats a selection with no tab as stale and yanks
+  // the user elsewhere (engine/openProjects.selectionAfterClose). roborev 55095.
+  it("opens the target project's tab, never selecting a tabless project", async () => {
+    const alpha = seedProject("Alpha", "/tmp/alpha");
+    const beta = seedProject("Beta", "/tmp/beta");
+    useProjectStore.setState({ selectedProjectId: alpha } as never);
+    useUiStore.setState({ openProjectIds: [alpha], pinnedProjectId: null } as never);
+
+    await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId: beta, prompt: "go" } }),
+    );
+    expect(useUiStore.getState().openProjectIds).toContain(beta);
+    expect(useProjectStore.getState().selectedProjectId).toBe(beta);
+  });
+
+  // A torn-out project can be spawned into from NEITHER window. Main `continue`s on torn-out before
+  // the visited-or-current check, and the satellite never learns the agent is open because
+  // `openAgentIds` lives in runtimeStore, which crossWindowSync does not wire (only projectStore and
+  // dictationStore are). So the agent would exist in no window — no worktree, no PTY — while still
+  // holding a capacity slot. Briefed spawns have a second reason: the satellite has its own
+  // pendingSends instance, so the brief is drained by nobody. Refused either way (roborev 55102).
+  it.each([
+    ["briefed", { prompt: "go" }],
+    ["unbriefed", {}],
+  ])("refuses a %s spawn into a torn-out project, creating nothing", async (_label, extra) => {
+    const alpha = seedProject("Alpha", "/tmp/alpha");
+    const beta = seedProject("Beta", "/tmp/beta");
+    // addProject selects what it creates, so pin the selection explicitly — otherwise Beta is
+    // already current and the navigation assertion would pass with the guard doing nothing.
+    useProjectStore.setState({ selectedProjectId: alpha } as never);
+    tornOutMock.mockReturnValue(true);
+
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId: beta, ...extra } }),
+    );
+    expect(refusal(r).code).toBe("project-torn-out");
+    expect(refusal(r).message).toMatch(/Beta/);
+    // No agent, no capacity slot consumed…
+    expect(agentsOf(beta).filter((a) => a.kind === "build")).toHaveLength(0);
+    // …and main was not navigated onto the re-dock placeholder, away from the user's work.
+    expect(useProjectStore.getState().selectedProjectId).toBe(alpha);
+    // The remedy must name something the user can actually DO. The satellite renders columns ② + ③
+    // only — no tab strip, no "+ New Build Agent" — and its own empty state says "start one from the
+    // main Sparkle window". Telling them to start it over there is an instruction that cannot be
+    // carried out, and it contradicts copy shipped in that very window (roborev 55102).
+    expect(refusal(r).message).toMatch(/re-dock/i);
+    expect(refusal(r).message).not.toMatch(/from (that|its) window/i);
+  });
+
+  // ORDERING IS THE POINT. The torn-out precondition depends only on the project, and can never be
+  // satisfied by freeing slots — so it must be answered before the capacity gate. Reversed, a user
+  // at the ceiling is told "close or finish one before starting another", closes a build agent on
+  // the concierge's own instruction, retries, and only THEN learns to re-dock: an agent destroyed
+  // for nothing, by a remedy pointing at the wrong problem (roborev 55105).
+  /**
+   * Fill the machine to its ceiling AND PROVE IT.
+   *
+   * Seeding N agents and trusting the cap to be below N is an unpinned precondition: the ceiling
+   * lives in settingsStore, and if it is ever raised past N, `atCapacity` goes false and these
+   * ordering tests degenerate into ordinary refusal tests — still green, because the invariant-only
+   * refusals fire regardless of gate order. The control spawn below asserts the machine really is
+   * full, so a raised ceiling fails HERE with a clear reason instead of silently defanging the
+   * ordering assertions (roborev 55110).
+   */
+  async function fillToCapacity(projectId: string): Promise<void> {
+    const store = useProjectStore.getState();
+    for (let i = 0; i < 64; i++) store.addAgent(projectId, { kind: "build" });
+    const control = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId } }),
+    );
+    expect(
+      refusal(control).code,
+      "precondition: the machine must be at capacity for the ordering assertion to mean anything",
+    ).toBe("at-capacity");
+  }
+
+  it("answers torn-out BEFORE at-capacity, so no agent is closed for nothing", async () => {
+    const alpha = seedProject("Alpha", "/tmp/alpha");
+    const beta = seedProject("Beta", "/tmp/beta");
+    useProjectStore.setState({ selectedProjectId: alpha } as never);
+    await fillToCapacity(alpha);
+    // Marked torn-out only AFTER the control spawn, so the control proves capacity rather than
+    // tripping the torn-out guard itself.
+    tornOutMock.mockReturnValue(true);
+
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId: beta } }),
+    );
+    expect(refusal(r).code).toBe("project-torn-out");
+    // The destructive remedy must NOT be what the user is handed.
+    expect(refusal(r).message).not.toMatch(/close or finish/i);
+  });
+
+  // Same principle, second precondition: an unknown model depends only on the caller's input and is
+  // equally unsatisfiable by freeing slots. Both invariant-only gates belong above the one refusal
+  // whose remedy destroys something (roborev 55108).
+  it("answers unknown-model BEFORE at-capacity, so no agent is closed for nothing", async () => {
+    const projectId = seedProject();
+    await fillToCapacity(projectId);
+
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_build_agent",
+        args: { projectId, model: "claude-opus-4" },
+      }),
+    );
+    expect(refusal(r).code).toBe("unknown-model");
+    expect(refusal(r).message).not.toMatch(/close or finish/i);
+  });
+
+  it("does not pre-write the prompt row — the flush path owns that, exactly once", async () => {
+    const projectId = seedProject();
+    await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, prompt: "Fix the parser" } }),
+    );
+    const agent = agentsOf(projectId).find((a) => a.kind === "build")!;
+    expect(agent.lastPrompt).toBe("");
+    expect(agent.promptHistory).toEqual([]);
+  });
+
+  it("an omitted brief is a legitimate empty agent, not a half-finished one", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId } }),
+    );
+    const agentId = agentsOf(projectId).find((a) => a.kind === "build")!.id;
+    expect(takePendingSends(agentId).due).toEqual([]);
+    expect(r.ok && (r.data as { briefed: boolean }).briefed).toBe(false);
+  });
+
+  // A blank string would create exactly the briefless agent `prompt` exists to prevent, so it is a
+  // bad-args refusal rather than being quietly treated as "no prompt".
+  it("refuses an empty brief instead of silently spawning blank", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, prompt: "" } }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+    expect(agentsOf(projectId).filter((a) => a.kind === "build")).toHaveLength(0);
+  });
+
+  it("sets the name at spawn rather than leaving it as a placeholder", async () => {
+    const projectId = seedProject();
+    await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, name: "Parser Fix" } }),
+    );
+    expect(agentsOf(projectId).find((a) => a.kind === "build")!.name).toBe("Parser Fix");
+  });
+
+  it("records plan mode on the row, and reports the mode it actually started in", async () => {
+    const projectId = seedProject();
+    const planned = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, mode: "plan" } }),
+    );
+    expect(planned.ok && (planned.data as { mode: string }).mode).toBe("plan");
+    expect(agentsOf(projectId).find((a) => a.kind === "build")!.permissionMode).toBe("plan");
+  });
+
+  // "build" is the ordinary mode and is represented by storing NOTHING, so asking for it can never
+  // override a permission default the user configured in their own Claude Code settings.
+  it("stores no permission mode for an ordinary build spawn", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, mode: "build" } }),
+    );
+    expect(r.ok && (r.data as { mode: string }).mode).toBe("build");
+    expect(agentsOf(projectId).find((a) => a.kind === "build")!.permissionMode).toBeUndefined();
+  });
+
+  // Routing cheap mechanical work to a small model is the REASON this argument exists, so a silent
+  // fallback would bill the user for the opposite of what they asked for, with nothing in the reply
+  // to reveal it. Refused BEFORE anything is created, so the store is left untouched.
+  it("refuses an unknown model instead of silently using the default", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_build_agent",
+        args: { projectId, model: "gpt-9-turbo" },
+      }),
+    );
+    expect(refusal(r).code).toBe("unknown-model");
+    expect(refusal(r).message).toMatch(/gpt-9-turbo/);
+    expect(agentsOf(projectId).filter((a) => a.kind === "build")).toHaveLength(0);
+  });
+
+  it("accepts a real model id and puts it on the row", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_build_agent",
+        args: { projectId, model: "claude-haiku-4-5" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(agentsOf(projectId).find((a) => a.kind === "build")!.model).toBe("claude-haiku-4-5");
+  });
+
+  it("settles brief, name, model and mode together in a single call", async () => {
+    const projectId = seedProject();
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spawn_build_agent",
+        args: {
+          projectId,
+          prompt: "Audit the auth flow",
+          name: "Auth Audit",
+          model: "claude-haiku-4-5",
+          mode: "plan",
+        },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    const agent = agentsOf(projectId).find((a) => a.kind === "build")!;
+    expect([agent.name, agent.model, agent.permissionMode]).toEqual([
+      "Auth Audit",
+      "claude-haiku-4-5",
+      "plan",
+    ]);
+    expect(takePendingSends(agent.id).due.map((d) => d.text)).toEqual(["Audit the auth flow"]);
+  });
+
+  // The store field is inert unless the launcher reads it, and build agents take a DIFFERENT spawn
+  // branch (assembleBuildSpawn) from the generic one. Threading the flag into only the generic
+  // branch meant it was never emitted for any agent that could carry it, while the reply still
+  // claimed mode "plan" (roborev 55057). Assert the actual launch command, not the row.
+  it("plan mode reaches the launched command on the branch build agents actually take", () => {
+    const spawn = assembleBuildSpawn({
+      claudePath: "/bin/claude",
+      resume: false,
+      cwd: "/wt",
+      persona: "p",
+      bridge: { socketPath: "/s.sock", token: "t" },
+      paths: { nodePath: "/n", serverPath: "/o.js" },
+      permissionMode: "plan",
+    });
+    expect(spawn.args.join(" ")).toContain("--permission-mode 'plan'");
+
+    const ordinary = assembleBuildSpawn({
+      claudePath: "/bin/claude",
+      resume: false,
+      cwd: "/wt",
+      persona: "p",
+      bridge: { socketPath: "/s.sock", token: "t" },
+      paths: { nodePath: "/n", serverPath: "/o.js" },
+    });
+    expect(ordinary.args.join(" ")).not.toContain("--permission-mode");
   });
 });

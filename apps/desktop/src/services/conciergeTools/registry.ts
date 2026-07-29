@@ -486,6 +486,13 @@ const spawnArgs = z
   .object({
     projectId: z.string().min(1).optional(),
     runtime: z.enum(["local", "cloud"]).optional(),
+    /** The opening brief, delivered with the spawn. Non-empty when present: a blank string would
+     *  create exactly the briefless agent this argument exists to prevent, so it is refused as
+     *  bad-args rather than treated as "no prompt". */
+    prompt: z.string().min(1, "a brief cannot be empty — omit `prompt` for an empty agent").optional(),
+    name: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    mode: z.enum(["plan", "build"]).optional(),
   })
   .strict();
 
@@ -504,7 +511,17 @@ const discardArgs = z
 
 const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   spawn_build_agent: route(spawnArgs, (a, ctx) =>
-    fromLifecycle(ctx, spawnBuildAgent({ projectId: a.projectId, runtime: a.runtime ?? "local" })),
+    fromLifecycle(
+      ctx,
+      spawnBuildAgent({
+        projectId: a.projectId,
+        runtime: a.runtime ?? "local",
+        prompt: a.prompt,
+        name: a.name,
+        model: a.model,
+        mode: a.mode,
+      }),
+    ),
   ),
   // Routed rather than omitted so the model gets lifecycle's honest "this bills per minute and needs
   // a goal up front" refusal instead of an `unknown-op` that reads like a bug.

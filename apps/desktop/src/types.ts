@@ -78,6 +78,15 @@ export interface AgentTab {
   // under the agent name (see AgentSidebar / FittedAgentName). Optional so legacy records need no
   // migration; undefined/empty renders nothing.
   activity?: string;
+  // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
+  // and proposes before editing. Only ever "plan" — ordinary mode is the ABSENCE of this, so we
+  // never override a user who configured a different default in their own Claude Code settings.
+  //
+  // Read ONLY on a fresh launch (see claudeSpawn.buildClaudeExec): the human leaves plan mode with
+  // shift+tab inside the session, which this layer cannot observe, so re-applying it on every
+  // relaunch would drag them back into plan mode after they had left it. Optional, so existing
+  // persisted records need no migration.
+  permissionMode?: "plan";
   task?: string; // for workers: the one-shot task the build agent assigned; drives the worker persona
   parentBranch?: string; // for workers: the parent build agent's branch at spawn time (stable, not re-resolved)
   beadId?: string; // for workers: the bead this worker implements, when spawned from a Plan epic (Think→Plan→Build linkage)

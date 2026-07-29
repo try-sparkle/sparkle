@@ -68,6 +68,10 @@ export interface AddAgentOpts {
   /** Claude model id for this agent (services/models.ts); undefined/"default" → inherit the
    *  user's Claude Code default. */
   model?: string;
+  /** "plan" launches the agent in plan mode (`--permission-mode plan`). Omitted = ordinary mode;
+   *  there is deliberately no "build" value, so a spawn that didn't ask can't override the user's
+   *  own permission default. See AgentTab.permissionMode. */
+  permissionMode?: "plan";
   /** Pre-issued tab id. For a CLOUD agent the server-issued session id IS the tab id (spec
    *  §Identity: server session id = AgentTab id), so the caller passes it here instead of letting
    *  the store mint a uuid. Local agents omit it and get a fresh uuid. */
@@ -1079,6 +1083,10 @@ export const useProjectStore = create<ProjectState>()(
               // records have ONE canonical form and consumers can compare raw values safely (the
               // "default" sentinel stays a UI-only dropdown value).
               model: isDefaultModel(opts?.model) ? undefined : opts?.model,
+              // Spawn-time plan-mode request. Only "plan" is ever stored — ordinary mode is the
+              // absence of the field, so a spawn that didn't ask for it never overrides the user's
+              // own Claude Code permission default. Read on fresh launch only (see AgentTab).
+              permissionMode: opts?.permissionMode,
               // The spawn stamp, now with THREE consumers — it was declared in types.ts since
               // sparkle-pckz and written by nobody, so every one of them read `undefined` and quietly
               // did nothing. (a) the unstarted-worker dwell (engine/workerAttention, sparkle-w340):

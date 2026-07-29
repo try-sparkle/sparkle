@@ -98,6 +98,11 @@ export function assembleBuildSpawn(opts: {
    *  both fan out workers AND drive its own UI. `agentId` (this build agent's AgentTab.id) is the
    *  caller identity injected as SPARKLE_AGENT_ID. Absent → orchestrator-only (prior behavior). */
   control?: { bridge: BridgeInfo; paths: McpPaths; agentId: string };
+  /** Spawn-time plan-mode request (AgentTab.permissionMode). MUST be forwarded: this is the branch
+   *  BUILD agents take, and `spawnBuildAgentInProject` — the only writer of that field — always
+   *  creates `kind: "build"`. Omitting it here meant `--permission-mode plan` was never emitted for
+   *  any agent that could have it, while the spawn reply still claimed mode "plan" (roborev 55057). */
+  permissionMode?: "plan";
 }): { command: string; args: string[]; cwd: string } {
   // Always load the orchestrator server; MERGE the control server in when wired, so BOTH ride in the
   // single --mcp-config claude accepts (dropping either would silently disable those tools).
@@ -128,6 +133,7 @@ export function assembleBuildSpawn(opts: {
     configDir: opts.configDir,
     resumeSessionId: opts.resumeSessionId,
     model: opts.model,
+    permissionMode: opts.permissionMode,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }

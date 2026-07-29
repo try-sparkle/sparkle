@@ -334,3 +334,40 @@ describe("buildMergedMcpConfig (Build agent: orchestrator + control in one --mcp
     expect(servers["sparkle-control"].env.SPARKLE_AGENT_ID).toBe("a1");
   });
 });
+
+describe("plan mode (--permission-mode)", () => {
+  it("emits the flag on a FRESH spawn", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { permissionMode: "plan" });
+    expect(cmd).toContain("--permission-mode 'plan'");
+  });
+
+  // The mode was a request made when the agent was CREATED, not a property of it. A human leaves
+  // plan mode with shift+tab inside the session — invisible from here — so re-emitting the flag on
+  // relaunch would silently drag them back into it, producing a "why won't it edit anything?" bug
+  // with no visible cause.
+  it("does NOT re-apply it on resume", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, { permissionMode: "plan" });
+    expect(cmd).not.toContain("--permission-mode");
+  });
+
+  // "build" is the ABSENCE of the flag, never `--permission-mode default`: emitting an explicit
+  // default would override a user who configured a different one in their own Claude Code settings.
+  it("emits nothing when no mode was asked for", () => {
+    expect(buildClaudeExec("/bin/claude", false, {})).not.toContain("--permission-mode");
+  });
+
+  // Opposite intentions — "approve everything unattended" vs "change nothing until I approve". A
+  // caller asking for both has a bug; letting claude's flag precedence pick a winner would hide it.
+  // Refused loudly because a WORKER launched in plan mode sits RED forever while its orchestrator
+  // blocks in wait_for_workers.
+  it("refuses plan mode combined with skip-permissions, on fresh AND resumed spawns", () => {
+    for (const resume of [false, true]) {
+      expect(() =>
+        buildClaudeExec("/bin/claude", resume, {
+          permissionMode: "plan",
+          dangerouslySkipPermissions: true,
+        }),
+      ).toThrow(/mutually exclusive/);
+    }
+  });
+});
