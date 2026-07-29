@@ -62,6 +62,7 @@ mod socket;
 mod sparkle_agent;
 mod sparkle_improve;
 mod spend;
+mod stale_build;
 mod support;
 mod transcript;
 mod roster;
@@ -565,6 +566,7 @@ pub fn run() {
             crash::flush_crash_reports,
             support::read_recent_logs,
             support::support_metadata,
+            stale_build::stale_build_probe,
             support::support_chat_send,
             support::desktop_create_ticket,
             support::desktop_list_tickets,

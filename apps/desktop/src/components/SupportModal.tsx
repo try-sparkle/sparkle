@@ -25,6 +25,7 @@ import {
   type DocLink,
   type SupportMeta,
 } from "../services/supportApi";
+import { probeStaleBuild } from "../services/staleBuildService";
 
 // ── Inline Feather icons (no emoji — matches the StatusBar icon style) ────────────────────────────
 const ICON = { width: 14, height: 14, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
@@ -156,12 +157,13 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
     setTicketBusy(true);
     setTicketError(null);
     try {
-      const [logs, meta] = await Promise.all([
+      const [logs, meta, staleBuild] = await Promise.all([
         readRecentLogs().catch(() => ""),
         supportMetadata().catch(() => FALLBACK_META),
+        probeStaleBuild().catch(() => null),
       ]);
       const transcript = turns.map((t) => ({ role: t.role, content: t.content }));
-      const payload = buildTicketPayload({ email: emailTrim, transcript, logs, meta });
+      const payload = buildTicketPayload({ email: emailTrim, transcript, logs, meta, staleBuild });
       const ticket = await desktopCreateTicket(payload);
       log.info("support", "ticket created", { id: ticket.id });
       setCreated(ticket);

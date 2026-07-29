@@ -5,6 +5,7 @@
 // (`deriveSubject`, `buildTicketPayload`) live here so they unit-test without any IO.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { StaleBuildProbe } from "./staleBuildService";
 
 /** One turn of the support chat, matching the web `/api/support/chat` contract. */
 export interface ChatMsg {
@@ -140,6 +141,10 @@ export function buildTicketPayload(args: {
   transcript: ChatMsg[];
   logs: string;
   meta: SupportMeta;
+  // Running-vs-installed build facts (bead sparkle-jeen "minimum viable"): attached so a human
+  // triaging a ticket can see whether the reporter was running a STALE process — the "I already
+  // asked for this to be fixed" class. Omitted from metadata when unavailable (non-macOS / dev).
+  staleBuild?: StaleBuildProbe | null;
 }): CreateTicketPayload {
   const firstUser = args.transcript.find((m) => m.role === "user")?.content ?? "";
   return {
@@ -148,7 +153,10 @@ export function buildTicketPayload(args: {
     message: firstUser || "(Opened a support ticket from the Sparkle desktop app.)",
     appVersion: args.meta.appVersion,
     os: args.meta.os,
-    metadata: { arch: args.meta.arch },
+    metadata: {
+      arch: args.meta.arch,
+      ...(args.staleBuild ? { staleBuild: args.staleBuild } : {}),
+    },
     logs: args.logs,
     assistantTranscript: args.transcript.map((m) => ({ role: m.role, body: m.content })),
   };

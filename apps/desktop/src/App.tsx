@@ -29,11 +29,13 @@ import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 import { useLimitSync } from "./hooks/useLimitSync";
 import { useDisplayRespan } from "./hooks/useDisplayRespan";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { StaleBuildBanner } from "./components/StaleBuildBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
 import { startUpdater } from "./services/updaterService";
+import { startStaleBuildWatch } from "./services/staleBuildService";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
 // the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
@@ -217,6 +219,14 @@ export function App() {
     onIdle(() => {
       if (cancelled) return;
       stop = startUpdater();
+      // Also watch for a stale RUNNING build vs the INSTALLED bundle on disk (bead sparkle-jeen).
+      // Same idle defer + packaged/main-window guards; its own teardown is chained onto `stop`.
+      const stopStale = startStaleBuildWatch();
+      const stopUpdater = stop;
+      stop = () => {
+        stopUpdater?.();
+        stopStale();
+      };
     });
     return () => {
       cancelled = true;
@@ -295,6 +305,7 @@ export function App() {
         <AuthGate>
         <AttentionController />
         <UpdateBanner />
+        <StaleBuildBanner />
         <AccountSwitchHost />
         {/* Workspace is code-split (React.lazy); Suspense holds the first frame while its chunk
             loads. fallback={null} keeps the transition invisible — the authed UI paints its own
