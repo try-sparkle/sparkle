@@ -23,6 +23,7 @@ import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
+import { AiServiceBanner } from "./AiServiceBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
 import {
@@ -811,6 +812,11 @@ export function Workspace() {
           alternative — what shipped before — was every AI feature going dark with no explanation
           anywhere for 12 hours. Renders only while an outage is actually recorded. */}
       <ProviderUnavailableBanner />
+      {/* Sibling of ProviderUnavailableBanner for the outage the server does NOT name: a SUSTAINED
+          run of bare gateway/transport failures (the live 12-hour 502 incident). Detector is
+          non-flappy — a lone blip never lights it — and it clears on the first successful call.
+          Dismissible, unlike the provider banner, because the retry path keeps working underneath. */}
+      <AiServiceBanner />
       {/* NO FULL-WIDTH PROJECT TAB STRIP. `main` still renders one here across the whole window.
           The cockpit moves it: tabs belong to the PAIR, because a pair IS one project (build and
           its terminal), and they must never sit above the concierge — which is cross-project by

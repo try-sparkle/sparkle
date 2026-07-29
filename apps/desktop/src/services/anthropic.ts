@@ -9,6 +9,7 @@ import { assertAiCredits } from "./aiGate";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAiProviderStore, type AiProviderOutageReason } from "../stores/aiProviderStore";
+import { useAiServiceHealthStore } from "../stores/aiServiceHealthStore";
 
 /**
  * The request never reached the proxy: no HTTP status came back because this machine has no working
@@ -74,6 +75,23 @@ export function noteAiProviderFailure(err: unknown): void {
   if (reason) useAiProviderStore.getState().noteOutage(reason, Date.now());
 }
 
+/**
+ * Record the SERVICE-level health of a proxied call for the app-shell AiServiceBanner. Distinct from
+ * the provider-account signal above: this is the sustained-gateway-failure detector that surfaces the
+ * bare-502 outage the named-reason banner cannot see (see stores/aiServiceHealthStore). Written from
+ * this same chokepoint so whichever feature calls first lights (or clears) the banner for all of them.
+ */
+export function noteAiServiceHealthy(): void {
+  useAiServiceHealthStore.getState().noteSuccess();
+}
+
+/** Counterpart to {@link noteAiServiceHealthy}. Safe on any rejection: the store classifies the
+ *  string and ignores anything that isn't a sustained-service signal (4xx, or a class another banner
+ *  owns). Non-string rejections carry no proxy sentinel, so they are left untouched. */
+export function noteAiServiceFailure(err: unknown): void {
+  if (typeof err === "string") useAiServiceHealthStore.getState().noteFailure(err);
+}
+
 /** Parse the Rust layer's `ai_unconfigured[:<reason>]` sentinel into its optional reason.
  *  Returns `undefined` when `err` is not that sentinel at all, so the caller can tell "not this
  *  error" from "this error, no reason given". The reason is allow-listed on the Rust side, but it is
@@ -135,9 +153,15 @@ export async function chatOnce(
     // A call that came back proves Sparkle's provider account is usable — clear any recorded outage
     // so the banner retires on its own the moment service is restored, with no restart or dismissal.
     noteAiProviderHealthy();
+    // …and it proves the SERVICE is up, retiring the sustained-failure banner (aiServiceHealthStore).
+    noteAiServiceHealthy();
     return raw.trim();
   } catch (err) {
     if (typeof err === "string") {
+      // Record service-level health FIRST (record-only; changes no control flow below). The store
+      // ignores the sentinels other banners own (insufficient_credits, ai_unconfigured) and only
+      // counts a SUSTAINED run of gateway/transport failures toward the app-shell AiServiceBanner.
+      noteAiServiceFailure(err);
       // Typed server gate: `insufficient_credits:<balanceCents>` → the credits UX path.
       if (err.startsWith("insufficient_credits")) {
         const parsed = Number.parseInt(err.split(":")[1] ?? "", 10);
