@@ -29,6 +29,7 @@ import {
 import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
+import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
 import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools/registry";
 // What the concierge is doing right now, for the thread's thinking indicator. Recorded from the one
@@ -64,23 +65,44 @@ export const CONCIERGE_CALLER_AGENT_ID = "sparkle:concierge";
 
 /** The ops we tally as self-report signals (must match ControlOp). Any op outside this set (an
  *  unknown op → the dispatch default) is never counted. */
-const TALLIED_OPS = new Set<ControlOp>([
-  "rename_agent",
-  "set_agent_activity",
-  "set_theme",
-  "get_config",
-  "set_config",
-  "get_state",
-  "pin_agent",
-  "unpin_agent",
-  "set_agent_model",
-  "set_agent_ordering",
-  "set_zoom",
-  "navigate",
+/**
+ * Which control ops feed the self-report counter — the TABLE, and the Set below is DERIVED from it.
+ *
+ * ══ WHY A TABLE AND NOT A SET LITERAL (roborev 54896, then 55029) ═══════════════════════════════
+ * `append_communication_guideline` reached the `ControlOp` union and the counter's key map but not
+ * the Set, so a successful append tallied zero forever with a green build. The first attempt at a
+ * fix added a parallel `Record<ControlOp, true>` beside the Set and called it an exhaustiveness
+ * check — but nothing tied a key in that record to membership in the Set, so the identical bug
+ * still typechecked: add the op to the record, forget the literal, tally nothing. The reverse drift
+ * was just as silent.
+ *
+ * Deriving the Set from this table is what actually makes it unrepresentable. A new op is a
+ * compile error HERE, and answering it is a boolean — so "not tallied" is a decision someone typed
+ * `false` for, not a line nobody wrote.
+ */
+const TALLY: Record<ControlOp, boolean> = {
+  rename_agent: true,
+  set_agent_activity: true,
+  set_theme: true,
+  get_config: true,
+  set_config: true,
+  get_state: true,
+  pin_agent: true,
+  unpin_agent: true,
+  set_agent_model: true,
+  set_agent_ordering: true,
+  set_zoom: true,
+  navigate: true,
+  // The op NAME only — never the rule text, which is the most identifying payload on this surface
+  // (see selfReportMetrics' privacy note).
+  append_communication_guideline: true,
   // Counts how often the concierge actually reaches for a tool. The op name only — the domain and
   // op INSIDE the payload are not recorded (see selfReportMetrics' privacy note).
-  "concierge_tool",
-]);
+  concierge_tool: true,
+};
+const TALLIED_OPS = new Set<ControlOp>(
+  (Object.keys(TALLY) as ControlOp[]).filter((op) => TALLY[op]),
+);
 /** The per-agent ops whose target may differ from the caller (default to caller when omitted). */
 const PER_AGENT_OPS = new Set<ControlOp>([
   "rename_agent",
@@ -124,6 +146,9 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   set_agent_ordering: "privileged",
   set_zoom: "privileged",
   navigate: "privileged",
+  // Writes the file that shapes how the app speaks to the human, on every turn. Privileged for the
+  // same reason as the rest of this block: an unattended worker must not edit it on its own.
+  append_communication_guideline: "privileged",
   // The concierge's tool spine. PRIVILEGED, and then some: the tier gate here is the ordinary
   // "no unattended workers" check, and `handleConciergeTool` narrows it further to the ONE reserved
   // caller. Both gates matter — this op reaches agent lifecycle, git, the workspace and a PTY, so a
@@ -168,6 +193,7 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   get_config: true,
   rename_agent: true,
   set_agent_activity: true,
+  append_communication_guideline: true,
   set_theme: true,
   set_config: true,
   unpin_agent: true,
@@ -476,6 +502,38 @@ function handleSetTheme(req: ControlRequest): Record<string, unknown> {
   }
   useUiStore.getState().setThemePref(theme);
   return { ok: true };
+}
+
+/**
+ * append_communication_guideline → add one attributed rule to the user's guidelines file.
+ *
+ * THE GROWTH MECHANISM. The file is injected into the concierge's own system prompt every turn, so
+ * this op lets a stated preference ("stop pasting file:line at me") become a durable rule instead
+ * of something the user re-explains next week. The founder chose auto-append-then-announce over an
+ * approval gate: this writes immediately and the concierge says that it did.
+ *
+ * ATTRIBUTION IS MANDATORY AND SERVER-SIDE, not a field the caller fills in freely. With no
+ * approval step, the record of who added a rule is the ONLY thing that makes an unwanted one
+ * findable in the editor afterwards — so the caller does not get to author it, understate it, or
+ * omit it. A rule written through this op always says the concierge wrote it.
+ *
+ * Privileged, like every other write op here: an unattended worker must not be able to edit how the
+ * app talks to the human.
+ */
+async function handleAppendGuideline(req: ControlRequest): Promise<Record<string, unknown>> {
+  const rule = req.payload.rule;
+  if (typeof rule !== "string" || rule.trim() === "") {
+    return { ok: false, error: "rule is required (non-empty)" };
+  }
+  try {
+    const text = await appendConciergeGuideline(rule, "Sparkle");
+    return { ok: true, guidelines: text };
+  } catch (e) {
+    // Rust refused (empty after trimming, or the file would exceed its cap). Report it rather than
+    // resolving ok — the concierge is about to TELL the user it saved a rule, and it must not say
+    // that about a write that did not happen.
+    return { ok: false, error: String(e) };
+  }
 }
 
 /** get_config → the merged effective SparkleConfig (existing get_config Rust command). */
@@ -824,6 +882,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "set_zoom":
         result = handleSetZoom(req);
+        break;
+      case "append_communication_guideline":
+        result = await handleAppendGuideline(req);
         break;
       case "navigate":
         result = handleNavigate(req);

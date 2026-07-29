@@ -755,6 +755,12 @@ const CONTROL_OPS: &[&str] = &[
     "set_agent_ordering",
     "set_zoom",
     "navigate",
+    // The user's communication guidelines file — the concierge's own growth mechanism. One op, and
+    // append-only by construction: there is deliberately no read or overwrite op here, because the
+    // whole file is already injected into the concierge's system prompt every turn (it can SEE the
+    // rules without asking) and rewriting the human's accumulated preferences is the user's job,
+    // done in Settings → "How Sparkle talks to you".
+    "append_communication_guideline",
     // Phase 4 (the concierge tool surface). ONE generic op rather than ~55 named ones: the
     // frontend registry (services/conciergeTools/registry.ts) routes { domain, op, args } to the
     // right domain module. Deliberate — every MCP tool schema is permanently resident in the
@@ -1798,13 +1804,15 @@ mod tests {
             "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
             // Phase 4: the concierge tool surface (one generic op; domain/op ride in the payload).
             "concierge_tool",
+            // The user's communication guidelines — append-only, by construction (see CONTROL_OPS).
+            "append_communication_guideline",
         ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            13,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops"
+            14,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, plus the guidelines append"
         );
     }
 

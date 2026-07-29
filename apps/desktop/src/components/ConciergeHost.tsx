@@ -45,7 +45,8 @@ import {
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
 import type { AgentTabStatus } from "../types";
-import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
+import { bandCountLabel } from "../engine/statusBandLabels";
+import { rosterLine } from "../engine/conciergeRosterLine";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import {
@@ -453,9 +454,10 @@ function buildSnapshot(feed: ConciergeFeed, userText: string): string {
   // right below, and listing only the row-owning half would hand the brain a count it can't see the
   // items behind.
   const surfaced = accountedAgents(feed);
-  const lines = surfaced.map(
-    (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (${bandLabel(a.band)})`,
-  );
+  // The line format — including the trailing `id:<agentId>` the persona's pill syntax depends on —
+  // lives in engine/conciergeRosterLine, shared with buildProactivePrompt. See that module's header
+  // for why a second copy of the template string is not an option.
+  const lines = surfaced.map((a) => rosterLine(a));
   // Keep the project count SCOPED to what's actually surfaced so it can't misstate scope (e.g. say
   // "5 projects" while only counting in-scope agents).
   const scopedProjects = new Set(surfaced.map((a) => a.projectId)).size;
@@ -756,6 +758,24 @@ export function ConciergeHost({
   useEffect(() => {
     mentionAgentsRef.current = mentionAgents;
   }, [mentionAgents]);
+
+  /** A pill in one of the concierge's OWN replies was clicked: reveal that agent.
+   *
+   *  Stable identity (no deps) because it feeds a context value — a fresh closure per render would
+   *  invalidate that context every render and re-render every pill in the thread, defeating the
+   *  point of memoizing it. `openProjectTab` reads the stores itself, so nothing needs closing over.
+   *
+   *  Unlike a MENTION SEND, this is a pure navigation: no intent is armed, no countdown runs, and
+   *  nothing is written to a PTY. Revealing an agent is reversible in a way a delivery is not, so
+   *  it needs no gate. */
+  const openAgentFromPill = useCallback(
+    ({ agentId, projectId }: { agentId: string; projectId: string }) => {
+      // Destructured by NAME on both sides, so the order flip into `openProjectTab(projectId,
+      // agentId)` — two strings, silently swappable — cannot happen here (roborev 54894).
+      openProjectTab(projectId, agentId);
+    },
+    [],
+  );
 
   // ══ HANDOFFS INTO THIS BOX ═══════════════════════════════════════════════════════════════════
   //
@@ -2230,6 +2250,11 @@ export function ConciergeHost({
         // ordered, because that order is what breaks a duplicate-name tie (see the memo).
         mentionAgents={mentionAgents}
         preferredAgentId={routingTarget?.agentId ?? null}
+        // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME
+        // reveal the notifications and the command palette use — `openProjectTab` opens the owning
+        // project's tab, selects it, clears the Sparkle overlay and reveals the agent. Partial
+        // re-implementations of that sequence are what its header warns about.
+        onOpenAgent={openAgentFromPill}
       />
       {/* The recommended-action pill. Mounted HERE — where its delivery wiring lives — but it
           renders over the target agent's terminal, which it reaches by portal (see

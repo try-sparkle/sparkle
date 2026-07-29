@@ -71,6 +71,7 @@ mod trial_remote;
 mod worktree;
 mod notes;
 mod concierge;
+mod concierge_guidelines;
 
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
@@ -602,6 +603,13 @@ pub fn run() {
             config::reset_config,
             config::read_config_text,
             config::set_stage_definition,
+            // The concierge communication guidelines file — same read/write/reveal shape as the
+            // config commands above, because it is the same kind of thing: a user-owned file the
+            // app both edits in-app and injects at runtime.
+            concierge_guidelines::read_concierge_guidelines,
+            concierge_guidelines::write_concierge_guidelines,
+            concierge_guidelines::append_concierge_guideline,
+            concierge_guidelines::concierge_guidelines_path,
             delivery::collect_delivery_evidence,
             delivery::tag_contains_commit,
             roster::publish_window_roster,

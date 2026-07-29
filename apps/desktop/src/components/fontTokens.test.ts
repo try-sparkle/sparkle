@@ -63,7 +63,7 @@ const QUOTED_EXEMPT = new Set(["theme/scale.ts"]);
 /** Lines naming a replaced webfont, outside the exempt path. Lower as branches land. */
 const MAX_BANNED_FAMILY = 3;
 /** `fontFamily:` properties still holding a quoted stack instead of FONT_UI / FONT_MONO. */
-const MAX_QUOTED_STACK = 55;
+const MAX_QUOTED_STACK = 52;
 
 /** Keywords, not stacks. `fontFamily: "inherit"` is a legitimate thing to write. */
 const NOT_A_STACK = new Set(["inherit", "monospace", "initial", "unset", "revert"]);
@@ -219,6 +219,10 @@ describe("font families come from the scale, never from a retyped literal", () =
       "components/CreditsPanel.tsx",
       "components/OpenPrMenu.tsx",
       "helper/HelperApp.tsx",
+      // Migrated by the concierge-guidelines branch (FONT_UI once, FONT_MONO twice). Pinned by NAME
+      // as well as counted, because the ceiling is tradeable in exactly the way this test's header
+      // describes: another file dropping a stack would pay for these three coming back.
+      "components/ConciergeGuidelinesPane.tsx",
     ]) {
       // THE FIXED SCANNER, not a second naive regex (roborev 54781). This assertion is the half the
       // header calls stronger than the ceiling — it blocks the trade of adding drift to a swept

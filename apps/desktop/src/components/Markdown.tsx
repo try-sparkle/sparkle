@@ -3,19 +3,44 @@
 // pre-wrapped text mangled lists, code, and tables — so this component owns a compact,
 // theme-styled GFM render. Styling lives in inline `components={{...}}` overrides (no
 // global CSS) so the component is self-contained and the DOM stays lean.
-import { memo, type CSSProperties, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import { Children, memo, type CSSProperties, type ReactNode } from "react";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C } from "../theme/colors";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { parseAgentRefHref } from "./Concierge/agentRefs";
+import { AgentPill } from "./Concierge/AgentPill";
 
 const MONO = FONT_MONO;
 
 // Hoisted so ReactMarkdown receives a STABLE plugin-array reference across renders (a fresh
 // `[remarkGfm]` literal each render defeats react-markdown's own memoization of the parse).
 const REMARK_PLUGINS = [remarkGfm];
+
+/**
+ * react-markdown sanitizes every href BEFORE our `components.a` override ever sees it, blanking any
+ * scheme outside its own allowlist. That is a security control and it stays on for everything —
+ * this adds ONE narrow exception, for the agent references the concierge emits.
+ *
+ * WHY IT IS SAFE TO WIDEN HERE, specifically:
+ *   • The exception is gated on `parseAgentRefHref`, which accepts only `sparkle-agent:` followed
+ *     by a conservative id class (alphanumeric, `-`, `_`, bounded length). No path, no quotes, no
+ *     second scheme, nothing that survives to become a URL.
+ *   • A surviving reference is never rendered as an anchor. `ExternalLink` intercepts it and
+ *     returns a `<button>` (or inert text); no `href` is ever placed in the DOM for it, so there is
+ *     nothing for a webview, a middle-click or a screen reader to navigate to.
+ *   • Everything else — `javascript:`, `file:`, `vscode:`, and any scheme added tomorrow — still
+ *     goes through `defaultUrlTransform` untouched.
+ *
+ * The tests in Concierge/AgentPill.test.tsx pin both halves: the pill resolves, and the dangerous
+ * schemes stay inert. Do not replace this with `urlTransform={(u) => u}`, which is the "simpler"
+ * version of this line and disables the sanitizer for every link in the app.
+ */
+function urlTransform(url: string): string {
+  return parseAgentRefHref(url) !== null ? url : defaultUrlTransform(url);
+}
 
 // Subtle tint for inline code / blockquote / table chrome, derived from the accent so it
 // reads on both the dark and light themed surfaces without a second themed token.
@@ -62,7 +87,48 @@ export function isSafeImgSrc(src: string | undefined): src is string {
 // Open links externally (Tauri shell) rather than navigating the webview; keep the href +
 // target on the anchor so it degrades gracefully and stays inspectable/testable. Only an
 // allowlisted scheme opens — a disallowed one is inert (no href, click does nothing).
+/**
+ * A link's visible text, flattened to a string — INCLUDING text nested inside elements.
+ *
+ * Used as the fallback name on an agent pill whose id no longer resolves. This used to keep only
+ * direct string children, on the reasoning that a non-plain link text (`[**@Kraken Auth**](…)`) was
+ * "a case the model does not produce" — which is an assumption about an LLM's formatting, and the
+ * two files this feature is built on reject exactly that reasoning ("an instruction to a language
+ * model is a request, not a schema", which is why `stripMentionSigil` exists at all). Emphasis
+ * inside a link is ordinary markdown a model emits unprompted (roborev 54894).
+ *
+ * The consequence was not cosmetic: the fallback became `""`, so an unresolvable
+ * `[**@Kraken Auth**](sparkle-agent:…)` rendered as a bare `@` mid-sentence — "Ask @ about it." —
+ * defeating the whole degradation contract, which is that the reader still sees the name and the
+ * sentence still reads.
+ */
+function linkText(children: ReactNode): string {
+  const out: string[] = [];
+  const walk = (node: ReactNode): void => {
+    Children.forEach(node, (c) => {
+      if (typeof c === "string" || typeof c === "number") {
+        out.push(String(c));
+        return;
+      }
+      // A rendered element: recurse into its children. Guarded structurally rather than by
+      // `isValidElement` alone so a props-less node cannot throw on an untrusted tree.
+      const kids = (c as { props?: { children?: ReactNode } } | null)?.props?.children;
+      if (kids !== undefined) walk(kids);
+    });
+  };
+  walk(children);
+  return out.join("");
+}
+
 function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  // An agent reference is not a link at all — it is a pill. Checked BEFORE the scheme allowlist
+  // because `sparkle-agent:` is deliberately not on it: if this component is ever rendered outside
+  // a provider (SupportModal, an agent's own reply), the reference falls through to the inert-text
+  // path below and reads as `@Name`, which is exactly the intended degradation.
+  const agentId = parseAgentRefHref(href);
+  if (agentId !== null) {
+    return <AgentPill agentId={agentId} fallbackName={linkText(children)} />;
+  }
   const safe = isSafeLinkHref(href);
   return (
     <a
@@ -191,7 +257,11 @@ const components: Components = {
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div style={prose}>
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        components={components}
+        urlTransform={urlTransform}
+      >
         {text}
       </ReactMarkdown>
     </div>

@@ -77,6 +77,10 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
         // The concierge tool spine — the op name only; the domain/op inside its payload is not tallied.
         "concierge_tool",
+        // The guidelines append. The op NAME is tallied and nothing else — the rule text the user
+        // asked for is the most identifying payload on this whole surface, and it is never stored
+        // here. Same treatment concierge_tool's inner op gets, for the same reason.
+        "append_communication_guideline",
       ].sort(),
     );
   });

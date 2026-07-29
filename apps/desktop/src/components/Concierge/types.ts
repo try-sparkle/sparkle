@@ -307,6 +307,18 @@ export interface ConciergeColumnProps {
   mentionAgents?: readonly MentionAgent[];
   /** The agent a send would reach WITHOUT a mention. Sorts to the top of the picker. */
   preferredAgentId?: string | null;
+  /** Open an agent the CONCIERGE named — the click on a `sparkle-agent:` pill in a reply.
+   *
+   *  A callback rather than a call, for the same reason everything else here is: this directory is
+   *  presentational and does not know the fleet exists, let alone how to reveal a row in it. The
+   *  integration layer binds this to `services/openProjectTab`, which is the one path that opens
+   *  the owning project's tab, selects it, clears the Sparkle overlay and reveals the agent — the
+   *  partial re-implementations of that sequence are a documented source of "it's red somewhere but
+   *  I can't find it" bugs.
+   *
+   *  Absent means pills still RENDER (with their live name and status dot) but do nothing when
+   *  clicked, which is the right default for a surface that has not wired the reveal path. */
+  onOpenAgent?: (target: { agentId: string; projectId: string }) => void;
   /** The last FINISHED line for the thread's hidden live region — a completed reply, a status
    *  notice, or a ROUTING RECEIPT ("→ Sent to Kraken Auth"). Never a streaming chunk: the region
    *  would then re-announce on every delta.

@@ -1099,6 +1099,7 @@ export function setAutoApplyUpdates(on: boolean): SettingsResult<{ autoApplyUpda
 const SETTINGS_PANES: Record<CategoryId, true> = {
   ai: true,
   conciergetools: true,
+  conciergevoice: true,
   tools: true,
   credits: true,
   spend: true,

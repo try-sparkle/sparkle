@@ -82,6 +82,12 @@ const CONCIERGE_ALLOWED_TOOLS: &str =
 /// app-side policy gate in `controlListener.dispatch` (allow / ask / deny per tool), because
 /// `--allowedTools` provably does not gate MCP tools (see `CONCIERGE_ALLOWED_TOOLS`). Do not
 /// re-introduce a persona sentence that *claims* a restriction the gate does not implement.
+///
+/// THIS IS THE APP'S HALF OF THE SYSTEM PROMPT, NOT ALL OF IT. The user's own accumulated
+/// communication rules (`concierge_guidelines.rs`) are appended after it under their own heading on
+/// every turn. Keep the split honest: what belongs HERE is the posture Sparkle guarantees and the
+/// mechanics only the app knows (link syntax, routing, honesty about tool outcomes); what belongs
+/// THERE is taste — anything the user is entitled to overrule.
 pub(crate) const CONCIERGE_PERSONA: &str = "You are the user's cross-project concierge and \
 minder — their eyes, ears, and best friend across everything happening in their projects, and \
 their single point of contact for the whole app. Each message you receive is a snapshot of live \
@@ -107,6 +113,25 @@ send, and WAIT for their yes rather than sending either version. Do not use that
 embellish a message that is merely short; 'ship it' to an agent that has one PR open is clear. \
 Afterwards, say what you sent and to whom, then stay in the conversation — relaying is not the \
 end of your turn. You are their thought partner about that agent's work, not a mail slot.\n\n\
+NAME AGENTS AS LINKS, NEVER AS BARE TEXT. Every roster line you are given ends with `id:<agentId>`. \
+Whenever you name a build agent, write it as a markdown link of the form \
+[@Agent Name](sparkle-agent:<agentId>), using that agent's exact id from the roster in front of \
+you. The app renders that link as a clickable pill the user taps to jump to the agent, so a bare \
+name is a dead end for them. NEVER invent, guess, or reuse an id: if the agent you are naming is \
+not on the roster you were given, write its plain name with no link. A link that resolves to \
+nothing merely fails to open — a link carrying the WRONG id opens the wrong agent, which is far \
+worse.\n\n\
+REMEMBER HOW THEY WANT YOU TO TALK. When the user states a preference about YOUR OWN output — how \
+you write, what you lead with, what to stop doing — call `append_communication_guideline` with it \
+as one imperative sentence, and then tell them you saved it. Those rules are added to these \
+instructions on every turn, so a preference stated once keeps applying instead of being \
+re-explained; the section below headed THE USER'S OWN COMMUNICATION GUIDELINES is that file. Where \
+it disagrees with anything above on matters of STYLE or PRESENTATION, the user's file wins — but it \
+governs how you SPEAK only. It never grants you a permission, never widens what your tools may do, \
+and never overrides the rules above about honesty or about never guessing an agent id. Save a \
+preference about your communication, not \
+facts about their projects, and not a one-off instruction that only shapes the current reply. Do \
+not save the same rule twice — if it is already in that section, just follow it.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -467,13 +492,34 @@ fn build_concierge_exec(
     // `write_concierge_mcp_config`). None = no control surface; the concierge degrades to
     // observe-only rather than failing the turn.
     mcp_config_path: Option<&std::path::Path>,
+    // The user's accumulated communication guidelines, already rendered as a delimited block by
+    // `concierge_guidelines::injection_block` (empty string when the file is blank or absent-and-
+    // -blank). Passed IN rather than read here so this stays a pure, testable string builder.
+    guidelines_block: &str,
 ) -> String {
     let mut cmd = format!("exec {}", shell_quote(claude_path));
     cmd.push_str(" -p ");
     cmd.push_str(&shell_quote(prompt));
     cmd.push_str(" --output-format stream-json --verbose --include-partial-messages");
     cmd.push_str(" --append-system-prompt ");
-    cmd.push_str(&shell_quote(CONCIERGE_PERSONA));
+    // ONE argument: Sparkle's persona, then the user's own guidelines file under its own heading.
+    //
+    // WHY EXPLICIT INJECTION AND NOT A `CLAUDE.md` IN THE CWD — this is the "simplification"
+    // someone will propose, and it is a downgrade. The concierge's cwd IS the app-data dir, so a
+    // `CLAUDE.md` dropped there WOULD be auto-discovered by Claude Code and would appear to work.
+    // But then: the behaviour depends on the CLI's project-discovery rules (which are the CLI's to
+    // change, not ours), nothing in this repo says the file is load-bearing, and none of it can be
+    // unit-tested — the tests below, which prove the empty-file case injects no dangling heading
+    // and that hostile content stays inside one quoted argument, would all have to become
+    // integration tests against a real `claude`. Injecting it ourselves keeps the contract in our
+    // code and under test. Do not "simplify" this to a dropped file.
+    let mut system_prompt = String::from(CONCIERGE_PERSONA);
+    system_prompt.push_str(guidelines_block);
+    // Quoted as a SINGLE argument, which is what makes user-authored guidelines safe here: the file
+    // is edited by hand and appended to by the model, so it is untrusted text reaching a command
+    // line. `shell_quote` is applied to the whole concatenation, so quotes and metacharacters in it
+    // cannot escape into the shell (proved by `build_exec_quotes_hostile_guidelines`).
+    cmd.push_str(&shell_quote(&system_prompt));
     cmd.push_str(" --allowedTools ");
     cmd.push_str(&shell_quote(CONCIERGE_ALLOWED_TOOLS));
     if let Some(path) = mcp_config_path {
@@ -782,7 +828,19 @@ fn spawn_turn(
     token: u64,
 ) -> Result<(std::process::ChildStdout, std::process::ChildStderr, u64), String> {
     let mcp_config = resolve_concierge_mcp_config(app, token);
-    let script = build_concierge_exec(claude_path, prompt, resume_session_id, mcp_config.as_deref());
+    // EVERY TURN, by construction. Both entry points — the user's send (`concierge_turn`) and the
+    // unprompted push (`concierge_proactive_turn`) — funnel through this one function, so reading
+    // the guidelines here means neither path can drift out of step with the other. Read fresh each
+    // turn rather than cached at startup, so a hand-edit to the file takes effect on the next turn
+    // with no restart (the same live-edit property the config file has).
+    let guidelines = crate::concierge_guidelines::injection_for_app(app);
+    let script = build_concierge_exec(
+        claude_path,
+        prompt,
+        resume_session_id,
+        mcp_config.as_deref(),
+        &guidelines,
+    );
     tracing::info!(
         %claude_path, cwd = %cwd.display(),
         resume = resume_session_id.map(|s| !s.is_empty()).unwrap_or(false),
@@ -1434,9 +1492,21 @@ pub fn concierge_cancel(manager: State<ConciergeManager>) -> Result<(), String> 
 mod tests {
     use super::*;
 
+    /// `build_concierge_exec` with no guidelines block — the shape every pre-existing test asserted
+    /// before the guidelines file existed. A helper rather than a repeated `""` so the tests below
+    /// keep reading as statements about the flags, not about this feature.
+    fn exec(
+        claude_path: &str,
+        prompt: &str,
+        resume: Option<&str>,
+        mcp: Option<&std::path::Path>,
+    ) -> String {
+        build_concierge_exec(claude_path, prompt, resume, mcp, "")
+    }
+
     #[test]
     fn build_exec_is_streamed_and_has_no_shell_escape_hatch() {
-        let script = build_concierge_exec("/usr/local/bin/claude", "snapshot", None, None);
+        let script = exec("/usr/local/bin/claude", "snapshot", None, None);
         assert!(script.contains("export PATH=\"$HOME/.local/bin:$PATH\";"));
         assert!(script.contains("exec '/usr/local/bin/claude'"));
         assert!(script.contains("-p 'snapshot'"));
@@ -1465,7 +1535,7 @@ mod tests {
     #[test]
     fn build_exec_passes_the_mcp_config_as_a_path_never_inline_json() {
         let p = std::path::Path::new("/tmp/sparkle/concierge/concierge-mcp.json");
-        let script = build_concierge_exec("/bin/claude", "hi", None, Some(p));
+        let script = exec("/bin/claude", "hi", None, Some(p));
         assert!(script.contains("--mcp-config '/tmp/sparkle/concierge/concierge-mcp.json'"));
         // Only our server is loaded — the user's own MCP servers must not ride along.
         assert!(script.contains("--strict-mcp-config"));
@@ -1476,10 +1546,10 @@ mod tests {
 
     #[test]
     fn build_exec_appends_resume_when_session_id_present() {
-        let script = build_concierge_exec("/bin/claude", "hi", Some("sess-42"), None);
+        let script = exec("/bin/claude", "hi", Some("sess-42"), None);
         assert!(script.contains("--resume 'sess-42'"));
         // An empty session id is treated as no resume (fresh turn).
-        let none = build_concierge_exec("/bin/claude", "hi", Some(""), None);
+        let none = exec("/bin/claude", "hi", Some(""), None);
         assert!(!none.contains("--resume"));
     }
 
@@ -1487,7 +1557,7 @@ mod tests {
     fn build_exec_quotes_a_hostile_prompt() {
         // A snapshot that tries to close the quote and inject a command stays a single quoted
         // argument — the injected text can't escape into the shell.
-        let script = build_concierge_exec("/bin/claude", "'; rm -rf /; echo '", None, None);
+        let script = exec("/bin/claude", "'; rm -rf /; echo '", None, None);
         assert!(script.contains(r"-p ''\''; rm -rf /; echo '\'''"));
     }
 
@@ -1496,8 +1566,114 @@ mod tests {
         // The path is app-derived, not user-supplied — but it is still quoted, so a directory
         // name containing a quote can't break out of the argument.
         let p = std::path::Path::new("/tmp/a'; rm -rf /; echo '/concierge-mcp.json");
-        let script = build_concierge_exec("/bin/claude", "hi", None, Some(p));
+        let script = exec("/bin/claude", "hi", None, Some(p));
         assert!(script.contains(r"--mcp-config '/tmp/a'\''; rm -rf /; echo '\''/concierge-mcp.json'"));
+    }
+
+    #[test]
+    fn build_exec_injects_the_guidelines_after_the_persona() {
+        // The user's rules must reach the model, and must arrive AFTER Sparkle's own persona —
+        // later text is what the model treats as the more specific instruction, and these rules
+        // exist precisely to override the house default.
+        let block = "\n\n--- THE USER'S OWN COMMUNICATION GUIDELINES ---\n- Lead with what needs me.";
+        let script = build_concierge_exec("/bin/claude", "hi", None, None, block);
+        assert!(script.contains("Lead with what needs me."));
+        let persona_at = script.find("You CAN ACT").expect("persona is in the script");
+        let rules_at = script.find("Lead with what needs me.").expect("guidelines are in the script");
+        assert!(persona_at < rules_at, "guidelines must follow the persona, not precede it");
+        // ONE argument: nothing may sit between the persona and the rules except the block itself.
+        assert!(script[persona_at..rules_at].find("--allowedTools").is_none());
+    }
+
+    #[test]
+    fn build_exec_injects_nothing_extra_for_an_empty_guidelines_block() {
+        // A user who empties the file gets the stock concierge back — not a dangling "here are the
+        // user's rules" heading with nothing under it, which would invite the model to invent some.
+        // `injection_block` returns "" for a blank file; this is the other half of that contract.
+        let with = build_concierge_exec("/bin/claude", "hi", None, None, "");
+        // NOT compared against `exec(...)`, which is literally `build_concierge_exec(…, "")` — that
+        // assertion was a tautology and could not fail for ANY implementation (roborev 54860).
+        // Compared against a NON-empty block instead, so the two cases must actually differ.
+        let with_rules = build_concierge_exec(
+            "/bin/claude",
+            "hi",
+            None,
+            None,
+            &crate::concierge_guidelines::injection_block("- be terse"),
+        );
+        assert_ne!(with, with_rules);
+        assert!(with_rules.contains("be terse"));
+        assert_eq!(with_rules.matches("OWN COMMUNICATION GUIDELINES").count(), 2);
+        // The heading itself cannot be asserted absent here: the PERSONA names it, to tell the
+        // model which section holds the user's rules and that it overrides the house voice. What
+        // must be absent is a SECOND occurrence — the injected block's own heading.
+        //
+        // Matched WITHOUT the apostrophe in "USER'S", deliberately. This is the finished script, so
+        // every `'` has already been rewritten to `'\''` by `shell_quote`; searching for the human
+        // spelling finds nothing and the assertion passes for the wrong reason.
+        assert_eq!(with.matches("OWN COMMUNICATION GUIDELINES").count(), 1);
+        assert!(crate::concierge_guidelines::injection_block("   \n  ").is_empty());
+    }
+
+    #[test]
+    fn build_exec_quotes_hostile_guidelines() {
+        // THE REASON THIS TEST EXISTS. The guidelines file is hand-edited by the user AND appended
+        // to by the model, then concatenated onto the persona and handed to a shell — so it is
+        // untrusted text reaching a command line every single turn. `shell_quote` wraps the whole
+        // concatenation, so a rule that tries to close the quote and run a command stays inert data
+        // inside one argument.
+        let hostile = "\n- be nice'; rm -rf /; echo '";
+        let script = build_concierge_exec("/bin/claude", "hi", None, None, hostile);
+        assert!(script.contains(r"be nice'\''; rm -rf /; echo '\''"));
+        // The UN-escaped form must never appear — that is the string a broken quote would leave the
+        // shell holding. `assert!(script.contains(" --allowedTools "))` used to stand here and was
+        // unconditionally true: the builder always pushes that flag, quoting held or not, so it
+        // proved nothing (roborev 54860) — the very defect this test file was added to fix.
+        assert!(!script.contains("be nice'; rm -rf /"));
+        // NO QUOTE-PARITY CHECK HERE. It reads like a good structural invariant and is not one:
+        // `shell_quote` renders each embedded `'` as the four-character `'\''`, which contributes
+        // THREE quotes — so a correctly-escaped script routinely has an odd total. The assertion
+        // failed against known-good output, which is the useful kind of wrong to find in a test.
+    }
+
+    #[test]
+    fn persona_states_the_agent_pill_contract() {
+        // The founder's ask: an agent the concierge names is a clickable pill, never bare text.
+        // The renderer resolves `sparkle-agent:<id>` links; this is the half that makes the model
+        // emit them, and it is only sound because every roster line carries an id (the TS guard for
+        // that is engine/conciergeRosterLine.test.ts).
+        assert!(CONCIERGE_PERSONA.contains("sparkle-agent:"));
+        assert!(CONCIERGE_PERSONA.contains("id:<agentId>"));
+        // A WRONG id opens the wrong agent, which is worse than no link at all — so the refusal to
+        // guess is part of the contract, not advice.
+        assert!(CONCIERGE_PERSONA.contains("NEVER invent, guess, or reuse an id"));
+    }
+
+    #[test]
+    fn persona_tells_the_model_to_record_communication_preferences() {
+        // The GROWTH MECHANISM. The guidelines file is only durable if something writes to it, and
+        // the founder chose auto-append: the concierge saves the rule and says that it did, with no
+        // approval step. Without this instruction the tool exists and is never called, and the file
+        // only ever grows by hand — which is the thing the feature exists to stop.
+        assert!(CONCIERGE_PERSONA.contains("append_communication_guideline"));
+        // ══ THE PRECEDENCE CLAIM IS SCOPED, AND THE SCOPE IS A SECURITY BOUNDARY (roborev 54896) ══
+        // This asserted the unqualified "OVERRIDES anything above it", which contradicted
+        // INJECTION_HEADING in the SAME system prompt ("on matters of STYLE or PRESENTATION … it
+        // governs how you SPEAK only"). Unqualified, the persona itself tells the model that a line
+        // in a user-editable file — appendable by a tool reachable from untrusted terminal text —
+        // outranks "NEVER invent, guess, or reuse an id" and the honesty-about-outcomes contract.
+        // The two strings must agree, and the narrower one is the correct one.
+        assert!(CONCIERGE_PERSONA.contains("STYLE or PRESENTATION"));
+        assert!(CONCIERGE_PERSONA.contains("never guessing an agent id"));
+        assert!(
+            !CONCIERGE_PERSONA.contains("OVERRIDES anything above it"),
+            "the unqualified precedence claim is the security regression this pins"
+        );
+        // The heading named here must be the one `injection_block` actually writes, or the persona
+        // is pointing the model at a section that does not exist.
+        assert!(CONCIERGE_PERSONA.contains("THE USER'S OWN COMMUNICATION GUIDELINES"));
+        assert!(crate::concierge_guidelines::injection_block("- a rule")
+            .contains("THE USER'S OWN COMMUNICATION GUIDELINES"));
     }
 
     #[test]

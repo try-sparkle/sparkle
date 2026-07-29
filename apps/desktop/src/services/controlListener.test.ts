@@ -607,12 +607,90 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  // ── The user's communication guidelines (append-only) ──────────────────────────────────────
+  it("append_communication_guideline writes the rule and STAMPS the attribution", async () => {
+    // Attribution is not a parameter. With no approval step in front of this write, the record of
+    // who added a rule is the only thing that makes an unwanted one findable in the editor — so the
+    // caller does not get to author, understate, or omit it.
+    invokeMock.mockClear();
+    fire({
+      reqId: "cg1",
+      op: "append_communication_guideline",
+      callerAgentId: callerId,
+      payload: { rule: "  Be terse.  " },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(invokeMock).toHaveBeenCalledWith("append_concierge_guideline", {
+      rule: "  Be terse.  ",
+      attribution: "Sparkle",
+    });
+  });
+
+  it("append_communication_guideline refuses an empty rule without touching the file", async () => {
+    invokeMock.mockClear();
+    fire({
+      reqId: "cg2",
+      op: "append_communication_guideline",
+      callerAgentId: callerId,
+      payload: { rule: "   " },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+    expect(invokeMock).not.toHaveBeenCalledWith("append_concierge_guideline", expect.anything());
+  });
+
+  it("append_communication_guideline reports a REFUSED write instead of claiming success", async () => {
+    // The concierge is about to tell the user it saved their preference. It must not say that
+    // about a write Rust rejected (over the size cap), or the user will believe a rule is in force
+    // that was never written.
+    invokeMock.mockImplementationOnce(async () => {
+      throw new Error("guidelines file is too large");
+    });
+    fire({
+      reqId: "cg3",
+      op: "append_communication_guideline",
+      callerAgentId: callerId,
+      payload: { rule: "Be terse." },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("append_communication_guideline denies an unattended worker", async () => {
+    // Privileged, like every other write here: a worker must not edit how the app talks to the human.
+    fire({
+      reqId: "cg4",
+      op: "append_communication_guideline",
+      callerAgentId: otherId,
+      payload: { rule: "Be terse." },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+  });
+
   // ── Phase-2c self-report tally (sparkle-rl84) ──────────────────────────────────────────────
   it("tallies a successful control op (rename_agent) as a self-report signal", async () => {
     useSelfReportMetrics.getState().reset();
     fire({ reqId: "m1", op: "rename_agent", callerAgentId: callerId, payload: { targetAgentId: otherId, name: "Sub Task" } });
     await flush();
     expect(useSelfReportMetrics.getState().controlOps.rename_agent).toBe(1);
+  });
+
+  it("tallies a successful guidelines append — the counter the type guard could not prove", async () => {
+    // A RUNTIME assertion, deliberately. This op reached the ControlOp union and the counter's key
+    // map but not TALLIED_OPS, so it tallied zero forever with a green build; the first fix added a
+    // parallel type-level record that did not actually constrain the Set (roborev 54896 → 55029).
+    // A type assertion cannot observe a value — only this can.
+    useSelfReportMetrics.getState().reset();
+    fire({
+      reqId: "m3",
+      op: "append_communication_guideline",
+      callerAgentId: callerId,
+      payload: { rule: "Be terse." },
+    });
+    await flush();
+    expect(useSelfReportMetrics.getState().controlOps.append_communication_guideline).toBe(1);
   });
 
   it("does NOT tally a FAILED op (rejected rename)", async () => {

@@ -24,7 +24,8 @@
 // window publish — every 250ms in practice (useRosterPublisher). Running a Claude turn on that is
 // ~14,400 turns an hour. So the scheduler fires on a CHANGE in a small digest of the state that
 // actually matters, never on a tick, and never on movement that is only a timestamp.
-import { bandCountLabel, bandLabel } from "../engine/statusBandLabels";
+import { bandCountLabel } from "../engine/statusBandLabels";
+import { rosterLine } from "../engine/conciergeRosterLine";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 
@@ -183,9 +184,9 @@ export function surfacedDigest(feed: ConciergeFeed): string {
  */
 export function buildProactivePrompt(feed: ConciergeFeed): string {
   const surfaced = accountedNeedsYou(feed);
-  const lines = surfaced.map(
-    (a) => `- [${a.projectName}] ${a.name}: ${a.statusLabel} (${bandLabel(a.band)})`,
-  );
+  // Shared with buildSnapshot via engine/conciergeRosterLine — the "same lines, same vocabulary"
+  // promise in this function's header is now kept by the type system rather than by prose.
+  const lines = surfaced.map((a) => rosterLine(a));
   const projects = new Set(surfaced.map((a) => a.projectId)).size;
   return [
     // COUNTED FROM THE LINES, not from `feed.scopedCounts.needs_you` (roborev 54166-M1). The two

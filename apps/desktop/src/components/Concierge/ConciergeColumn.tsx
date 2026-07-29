@@ -13,6 +13,7 @@
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
 import { FiGitPullRequest } from "react-icons/fi";
+import { useMemo } from "react";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { C, FONT_WEIGHT } from "../../theme/colors";
@@ -26,6 +27,7 @@ import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
 import { ConciergeTopRight } from "./KebabMenu";
+import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { ScopeVitals } from "./ScopeVitals";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
@@ -138,6 +140,7 @@ export function ConciergeColumn({
   wired = "off",
   mentionAgents,
   preferredAgentId,
+  onOpenAgent,
 }: ConciergeColumnProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
@@ -149,6 +152,14 @@ export function ConciergeColumn({
   const isWired = wired !== "off";
   const needsYou = model.vitals.needs_you;
   const prsReady = model.prsReady ?? 0;
+  // The roster every agent pill in a concierge reply resolves against. MEMOIZED because it is a
+  // context value: a fresh object each render would re-render every pill in the thread on every
+  // keystroke in the compose box, which is the exact cost `<Markdown>`'s memo exists to avoid.
+  // `mentionAgents` is already memoized upstream, so this changes only when the fleet does.
+  const agentPills = useMemo<AgentPillContextValue>(
+    () => ({ agents: mentionAgents ?? [], onOpenAgent: onOpenAgent ?? (() => {}) }),
+    [mentionAgents, onOpenAgent],
+  );
   return (
     <section
       aria-label="Sparkle concierge"
@@ -371,15 +382,17 @@ export function ConciergeColumn({
       {aiLock ? (
         <ConciergeAiLocked reason={aiLock} />
       ) : (
-        <ConciergeThread
-          wired={isWired}
-          messages={model.messages}
-          typing={model.typing}
-          onNudgeClick={controller.onNudgeClick}
-          onNudgeAction={controller.onNudgeAction}
-          onRedirect={controller.onRedirect}
-          onDigestClick={controller.onDigestClick}
-        />
+        <AgentPillProvider value={agentPills}>
+          <ConciergeThread
+            wired={isWired}
+            messages={model.messages}
+            typing={model.typing}
+            onNudgeClick={controller.onNudgeClick}
+            onNudgeAction={controller.onNudgeAction}
+            onRedirect={controller.onRedirect}
+            onDigestClick={controller.onDigestClick}
+          />
+        </AgentPillProvider>
       )}
       {/* NO RECOMMENDED-ACTION ROW HERE any more. It used to sit in a `suggestionsSlot` directly
           above the compose box; it now renders over the terminal itself, pinned bottom-right on the

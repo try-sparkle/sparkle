@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield, FiMessageSquare } from "react-icons/fi";
 import { C, MODAL_SHADOW, ROW_ACTIVE_BUBBLE, SCRIM } from "../theme/colors";
 import { FONT_MONO, FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -24,6 +24,7 @@ import { ToolsPane, TOOLS_SEARCH_ENTRIES } from "./ToolsPane";
 import { categoryEntries, matchesAny, paneQueryFor } from "../engine/settingsSearch";
 import { ApprovalsMenu } from "./ApprovalsMenu";
 import { ConciergeToolsPane, CONCIERGE_TOOLS_SEARCH_TERMS } from "./ConciergeToolsPane";
+import { ConciergeGuidelinesPane } from "./ConciergeGuidelinesPane";
 import { CloudAuthPane } from "./CloudAuthPane";
 import { OnePasswordPane } from "./OnePasswordPane";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
@@ -97,6 +98,7 @@ const CATEGORIES: Category[] = [
   { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: ["wake word stop word dictation microphone"] },
   { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: ["auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue"] },
   { id: "conciergetools", label: "Concierge tools", Icon: FiShield, blurb: "How much the concierge may do on its own — tool by tool.", keywords: CONCIERGE_TOOLS_SEARCH_TERMS },
+  { id: "conciergevoice", label: "How Sparkle talks to you", Icon: FiMessageSquare, blurb: "Rules Sparkle follows when it writes to you. It adds to these itself as you state preferences.", keywords: ["concierge guidelines communication style tone preferences rules markdown how sparkle talks writes voice"] },
   { id: "advanced", label: "Advanced", Icon: FiSliders, blurb: "Edit the configuration file directly.", keywords: ["config toml file raw editor"] },
 ];
 
@@ -290,6 +292,8 @@ function PaneBody({
       return <ApprovalsMenu />;
     case "conciergetools":
       return <ConciergeToolsPane />;
+    case "conciergevoice":
+      return <ConciergeGuidelinesPane />;
     case "advanced":
       return <AdvancedConfigMenu />;
   }

@@ -207,6 +207,7 @@ export const APP_TOOL_NAMES = [
   "unpin_agent",
   "set_agent_model",
   "set_config",
+  "append_communication_guideline",
 ] as const;
 
 export type AppToolName = (typeof APP_TOOL_NAMES)[number];
@@ -234,6 +235,14 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   navigate: "routine",
   unpin_agent: "routine",
   set_agent_model: "routine",
+  // ROUTINE, and that is the founder's explicit call rather than an oversight. Asked whether the
+  // concierge should propose a communication rule for approval or just save it and say so, they
+  // chose save-and-say-so — re-explaining a preference is the exact friction the file exists to
+  // remove, and an approval prompt per preference reintroduces it. It earns `routine` on the
+  // merits too: the write is append-only, visible in the reply that announces it, and undone by
+  // deleting a line in Settings → "How Sparkle talks to you". Anyone who disagrees can set this one
+  // tool to Ask in Settings → Concierge tools; that is what the per-tool policy is for.
+  append_communication_guideline: "routine",
   set_config: "irreversible",
 };
 
@@ -247,6 +256,7 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   navigate: "Move you to a view or open a specific agent.",
   unpin_agent: "Let an agent's name be auto-generated again.",
   set_agent_model: "Change which Claude model an agent runs on.",
+  append_communication_guideline: "Save a rule about how Sparkle should talk to you.",
   set_config: "Write Sparkle's machine-wide configuration.",
 };
 

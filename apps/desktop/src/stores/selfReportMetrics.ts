@@ -26,6 +26,7 @@ export type ControlOp =
   | "set_agent_ordering"
   | "set_zoom"
   | "navigate"
+  | "append_communication_guideline"
   // The concierge's tool spine (services/conciergeTools/registry). ONE op carrying a
   // { domain, op, args } envelope, so this counter answers "is the concierge actually using its
   // tools?" without recording WHICH tool — the op name is all that is stored, same as every other
@@ -69,6 +70,7 @@ interface SelfReportMetricsState {
 const emptyControlOps = (): Record<ControlOp, number> => ({
   rename_agent: 0,
   set_agent_activity: 0,
+  append_communication_guideline: 0,
   set_theme: 0,
   get_config: 0,
   set_config: 0,
