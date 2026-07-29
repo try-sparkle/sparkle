@@ -1,6 +1,27 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { StatusEngine, parseSpinnerTokens, latestSpinnerTokens, isSpinnerFrame } from "./statusEngine";
 import type { AgentTabStatus } from "../types";
+// The LOGGER, not `console`: logger.ts binds its `realConsole` at module load, so a console spy
+// installed later never sees the line and the transition tests below would pass vacuously against
+// silent code — the exact failure they exist to prevent.
+import { log } from "../logger";
+import { STATUS_TRANSITION_MARKER } from "./statusTransitionLog";
+
+// Every transition now emits a log line, so spy for the WHOLE file: the transition suite reads the
+// calls, and every other suite gets a quiet console instead of a line per flip.
+const spyLog = () => vi.spyOn(log, "info").mockImplementation(() => {});
+let logInfo: ReturnType<typeof spyLog>;
+beforeEach(() => {
+  logInfo = spyLog();
+});
+afterEach(() => logInfo.mockRestore());
+
+/** The status-transition lines emitted so far, in order — i.e. what `grep agent-status` would show. */
+function transitionLines(): string[] {
+  return logInfo.mock.calls
+    .map((args) => String(args[1] ?? ""))
+    .filter((line) => line.startsWith(STATUS_TRANSITION_MARKER));
+}
 
 describe("parseSpinnerTokens", () => {
   it("parses k-suffixed and bare token counts from a spinner frame", () => {
@@ -857,5 +878,135 @@ describe("StatusEngine — user-input recovery (Bug B, noteUserInput)", () => {
     // Next tick is just the resuming spinner — with the sticky flag lifted, it classifies working.
     engine.ingest(SPINNER);
     expect(last()).toBe("working");
+  });
+});
+
+// --- Transition logging: the record that makes a status bug diagnosable at all ---
+//
+// Motivating incident: a user reported an agent flapping working↔blocked, and "why did it flip?"
+// had no answer — a full day of app logs contained ZERO lines about status. The engine published
+// only the RESULT of its reasoning. These rows pin the three properties that make the new line
+// worth having: it fires on real transitions with the right TRIGGER, it stays SILENT when nothing
+// changed (this runs per PTY chunk for every agent), and it never carries terminal content.
+
+describe("StatusEngine — transition logging", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)";
+
+  /** An engine with a known agent id, so the assertions read like the grep a human would run. */
+  function logged(agentId: string, getScreen?: () => string) {
+    return new StatusEngine({ agentId, onStatus: () => {}, getScreen });
+  }
+
+  it("records the starting status, so a history never begins mid-story", () => {
+    logged("a1");
+    expect(transitionLines()).toEqual([expect.stringMatching(/^agent-status agent=a1 \(new\)->working trigger=spawn mono=\d+$/)]);
+  });
+
+  it("logs settle-to-idle with the spinner-gone trigger and the CALM screen verdict", () => {
+    const engine = logged("a2", () => IDLE_SCREEN);
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000); // spinner stops re-drawing → settle
+    expect(transitionLines().at(-1)).toMatch(
+      /^agent-status agent=a2 working->idle trigger=spinner-gone-settle screen=calm mono=\d+$/,
+    );
+  });
+
+  it("distinguishes the LEGACY quiet settle from the spinner one — same status, different story", () => {
+    // No spinner is ever observed here, so this settles off the IDLE_MS stall timer. Reading
+    // `trigger=quiet-settle` in the log is how you tell "the turn ended" from "we never saw a
+    // spinner and guessed from silence" — the two produce an identical gray dot.
+    const engine = logged("a3", () => IDLE_SCREEN);
+    engine.ingest("doing work\n");
+    vi.advanceTimersByTime(2500);
+    expect(transitionLines().at(-1)).toMatch(
+      /^agent-status agent=a3 working->idle trigger=quiet-settle screen=calm mono=\d+$/,
+    );
+  });
+
+  it("logs a mid-stream prompt with its own trigger, and no screen verdict (none was read)", () => {
+    const engine = logged("a4");
+    engine.ingest("Do you want to proceed? (y/n)\n");
+    const line = transitionLines().at(-1) ?? "";
+    expect(line).toMatch(/^agent-status agent=a4 working->waiting trigger=prompt-detected-midstream mono=\d+$/);
+    // The verdict field is omitted rather than guessed: this path classified the STREAM, not a
+    // rendered snapshot, so claiming a screen verdict here would be a fabricated datum.
+    expect(line).not.toContain("screen=");
+  });
+
+  it("logs the process exit", () => {
+    const engine = logged("a5");
+    engine.ingest("All tasks complete.\n");
+    engine.exit();
+    expect(transitionLines().at(-1)).toMatch(/^agent-status agent=a5 working->done trigger=process-exit mono=\d+$/);
+  });
+
+  it("logs an exit that is errored, not the status it would have had", () => {
+    const engine = logged("a6");
+    engine.ingest("Error: cannot find module 'foo'\n");
+    engine.exit();
+    expect(transitionLines().at(-1)).toMatch(/^agent-status agent=a6 working->errored trigger=process-exit mono=\d+$/);
+  });
+
+  it("emits NOTHING when chunks arrive and the status does not change", () => {
+    // The hot path. This runs per PTY chunk for every live agent, and the overwhelmingly common
+    // case is "no change" — a line here would be both noise and cost.
+    const engine = logged("a7");
+    logInfo.mockClear(); // drop the spawn line; we're asserting on the chunks alone
+    engine.ingest("compiling module A\n"); // fallback: working → working
+    engine.ingest(SPINNER); // spinner: working → working
+    engine.ingest(SPINNER);
+    engine.ingest("still compiling\n");
+    expect(transitionLines()).toEqual([]);
+  });
+
+  it("logs the screen VERDICT and never the screen text", () => {
+    // Terminal content is user data and can be large. `screen=awaiting` is the whole finding; the
+    // text that convinced the classifier must not reach the log file.
+    const engine = logged("a8", () => PERMISSION_SCREEN);
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    const line = transitionLines().at(-1) ?? "";
+    expect(line).toMatch(/^agent-status agent=a8 working->waiting trigger=spinner-gone-settle screen=awaiting mono=\d+$/);
+    expect(line).not.toContain("Do you want to make this edit");
+    expect(line).not.toContain("❯");
+  });
+
+  it("gives ONE grep an agent's full history, uncontaminated by the other agents", () => {
+    // The acceptance test for the whole feature: `grep "agent-status agent=<id>"` on sparkle.log.
+    const a = logged("alpha", () => IDLE_SCREEN);
+    const b = logged("beta", () => PERMISSION_SCREEN);
+    a.ingest(SPINNER);
+    b.ingest(SPINNER);
+    vi.advanceTimersByTime(2000); // both settle — alpha to gray, beta to red
+    a.ingest("Do you want to proceed? (y/n)\n");
+    a.exit();
+
+    const grep = (id: string) => transitionLines().filter((l) => l.startsWith(`${STATUS_TRANSITION_MARKER} agent=${id} `));
+    expect(grep("alpha").map((l) => l.replace(/ mono=\d+$/, ""))).toEqual([
+      "agent-status agent=alpha (new)->working trigger=spawn",
+      "agent-status agent=alpha working->idle trigger=spinner-gone-settle screen=calm",
+      "agent-status agent=alpha idle->waiting trigger=prompt-detected-midstream",
+      "agent-status agent=alpha waiting->done trigger=process-exit",
+    ]);
+    expect(grep("beta").map((l) => l.replace(/ mono=\d+$/, ""))).toEqual([
+      "agent-status agent=beta (new)->working trigger=spawn",
+      "agent-status agent=beta working->waiting trigger=spinner-gone-settle screen=awaiting",
+    ]);
+  });
+
+  it("stamps a non-decreasing monotonic clock, so gaps between flips are measurable", () => {
+    // Wall-clock stamps can't answer "how long between the flips?" across an NTP correction or a
+    // sleep/wake — which is exactly when a stall-timer bug shows up.
+    const engine = logged("a9", () => IDLE_SCREEN);
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    engine.exit();
+    const stamps = transitionLines().map((l) => Number(/mono=(\d+)$/.exec(l)?.[1]));
+    expect(stamps.length).toBeGreaterThanOrEqual(3);
+    expect(stamps.every((n) => Number.isFinite(n))).toBe(true);
+    expect([...stamps].sort((x, y) => x - y)).toEqual(stamps);
   });
 });

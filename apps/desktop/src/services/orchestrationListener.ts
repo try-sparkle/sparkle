@@ -167,13 +167,15 @@ function usedSlots(projectId: string, buildAgentId: string): number {
 
 /** Every worker on the MACHINE: all projects, all build agents, plus all in-flight reservations.
  *
- *  `effectiveMaxConcurrentWorkers` is derived by dividing the MACHINE's installed RAM
- *  (`config.rs ram_derived_concurrency`: `(total - reserve) / agent_heap_mb`), so it is a
+ *  `effectiveMaxConcurrentWorkers` is derived from the MACHINE's hardware — `min(what its RAM
+ *  holds, cores x AGENTS_PER_CORE)`, see `config.rs auto_concurrency_bound` — so it is a
  *  machine-wide budget and has to be compared against a machine-wide count. Comparing it per
  *  build agent is a dimensional error: every agent sits happily under the cap while N agents put
- *  N x the cap on one machine. On a 32 GiB Mac the derived cap is (32-6)/3 = 8, so three build
- *  agents legally run 24 workers x 3 GiB = 72 GiB budgeted against 32 GiB of RAM — the coalition
- *  blowup in sparkle-hfhs, and the same arithmetic behind the original jetsam incident. */
+ *  N x the cap on one machine. On a 32 GiB Mac the RAM side derives (32-6) GiB / 1.5 GiB = 17, so
+ *  three build agents at a per-agent cap of 8 would legally run 24 workers on a machine budgeted
+ *  for 17 — the coalition blowup in sparkle-hfhs, and the same arithmetic behind the original
+ *  jetsam incident. (The RAM divisor is `agent_ram_budget_mb`, a measured working set, NOT
+ *  `agent_heap_mb`; dividing by the heap ceiling over-reserved by ~6x.) */
 function globalUsedSlots(): number {
   const live = useProjectStore
     .getState()
@@ -198,6 +200,16 @@ function atCapacity(projectId: string, buildAgentId: string): boolean {
  *  `atCapacity` does — if the floor/metric ever changes it changes in one place. */
 function globalGateBinds(): boolean {
   const s = useSettingsStore.getState();
+  // `effectiveMaxConcurrentWorkers` DIRECTLY, and deliberately not `enforcedWorkerCap` — this is the
+  // one gate for which that helper is the wrong input, so the exception is stated rather than left
+  // to look like an oversight (it was audited as one).
+  //
+  // The two settings carry different DIMENSIONS here: `maxConcurrentWorkers` is the user's ceiling
+  // for EACH build agent, `effectiveMaxConcurrentWorkers` is the machine-wide budget. `enforcedWorkerCap`
+  // is their min, which is exactly right for the per-agent branch of `atCapacity` above (a per-agent
+  // cap can never usefully exceed the machine) and exactly wrong here: it would collapse the
+  // machine-wide budget to the per-agent number, so a user who set "2 each" would get 2 on the whole
+  // machine rather than 2 per agent — throttling a big machine for no reason.
   return globalUsedSlots() >= Math.max(1, s.effectiveMaxConcurrentWorkers);
 }
 
@@ -428,7 +440,7 @@ function scheduleGraceFollowup(targetAt: number): void {
  *  leak. `globalUsedSlots` counts every `kind:"worker"` record until `removeAgent`, but a build
  *  agent that crashed, was force-quit, or had its bridge die WITHOUT a clean cascading close
  *  (closeBuildAgent) never spun its workers down, so those records (and their worktrees) occupy cap
- *  slots forever. On a 32 GiB Mac the RAM-derived `effectiveMaxConcurrentWorkers` is ~8, so a
+ *  slots forever. On a 32 GiB Mac the machine-derived `effectiveMaxConcurrentWorkers` is ~17, so a
  *  handful of leaked workers saturate the machine and EVERY build agent's next spawn is refused —
  *  recoverable before this only by a manual cap bump or an app restart (and reconcile even
  *  re-adopts leaked workers across restarts, so the restart didn't reliably help either).

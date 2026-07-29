@@ -26,6 +26,7 @@ import {
   wasProjectVisited,
 } from "./services/sessionProjects";
 import { agentDisplayName } from "./engine/agentDisplayName";
+import { rollupDotAccessor } from "./engine/workerRollup";
 import { calmNewAgent } from "./engine/newAgentAttention";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
 import { composerPrompts } from "./components/promptHistory";
@@ -90,7 +91,15 @@ export function openProjects(
  *  The result is swept by `sanitizeJsonStrings` before it leaves: both consumers cross a JSON
  *  boundary where a single lone surrogate in ANY string rejects the whole payload (see
  *  services/safeText.ts). `displayName`/`recentPrompts` still sanitize at the source — the sweep is
- *  the backstop for the fields nobody thought to guard (project name, ids, workflow stage). */
+ *  the backstop for the fields nobody thought to guard (project name, ids, workflow stage).
+ *
+ *  TWO STATUS FACTS PER ROW, deliberately. `status`/`status_color`/`status_label` stay the agent's
+ *  OWN PTY state — every existing consumer (mobile's STATUS_RANK, the tray island, roster.rs) reads
+ *  them that way and redefining them here would silently change all three at once. `rollup_dot` is
+ *  the ADDED fact: what engine/workerRollup says the row's disc should be once the workers folded
+ *  under it are taken into account. Without it an orchestrator that is `idle` between delegations
+ *  publishes grey while nine workers grind, and publishes grey while a worker sits blocked on a
+ *  question — indistinguishable, on the wire, from a dead row. */
 export function buildRoster(
   projects: Project[],
   status: Record<string, AgentTabStatus>,
@@ -100,6 +109,30 @@ export function buildRoster(
    *  explicitly rather than faking timers (house style — stores/conciergeApprovals.ts). */
   now: number = Date.now(),
 ): RosterPayload {
+  // ONE accessor over EVERY published agent, so a head is rolled up against its own children no
+  // matter which project row we happen to be emitting. `rollupDotAccessor` buckets by `parentId`
+  // itself — the flat list is all it needs.
+  //
+  // `ownStatusOf` is deliberately left at its default (== `statusOf`). That parameter exists for
+  // callers whose status map has already had `withRedWorkerAttention` composited into it, where
+  // feeding the bubbled red back in as the head's "own" status makes own-red-wins swallow every
+  // orange. This map has NOT: `useRosterPublisher` reads `runtimeStore.status` raw.
+  //
+  // CALM FIRST, THEN ROLL UP (roborev 55028, High) — the same ordering `composeRollup` uses, where
+  // `withNewAgentCalm` is applied to the raw map BEFORE anything is bucketed. This map is built
+  // once, over the flat list, and feeds BOTH the accessor and each row's `status` below, so the dot
+  // and the own-status still cannot disagree. Reading raw `status` here instead was a real defect:
+  // a briefless freshly-spawned agent publishes `status: "new"` (grey) while `rollupDot` was
+  // computed from statusEngine's 25s stall-timer `blocked`, and `rollupDot` returns "red" the
+  // instant `ownBand === "needs_you"`. The same raw map feeds `workersByParent`, so an uncalmed
+  // worker's red bubbled into its parent's dot too — reviving, on the phone and tray-island
+  // surfaces that band on `rollup_dot`, exactly the false "needs you" red that
+  // engine/newAgentAttention.ts exists to remove.
+  const allAgents = projects.flatMap((p) => p.agents);
+  const calmedStatus = new Map<string, AgentTabStatus>(
+    allAgents.map((a) => [a.id, calmNewAgent(status[a.id], a, now, interaction[a.id]) ?? DEFAULT_STATUS]),
+  );
+  const dotOf = rollupDotAccessor(allAgents, (id) => calmedStatus.get(id) ?? DEFAULT_STATUS);
   return sanitizeJsonStrings<RosterPayload>({
     projects: projects.map((p) => ({
       id: p.id,
@@ -111,7 +144,9 @@ export function buildRoster(
         // job is a glanceable "what needs me". See engine/newAgentAttention.ts.
         // `interaction` is already a parameter here (it feeds lastActivityAt), so route 4 —
         // "the user has typed into this agent's terminal" — costs nothing to honour.
-        const st = calmNewAgent(status[a.id], a, now, interaction[a.id]) ?? DEFAULT_STATUS;
+        // Read from the SAME pre-calmed map the rollup accessor was built over, so the row's own
+        // status and its `rollup_dot` can never be derived from different inputs (roborev 55028).
+        const st = calmedStatus.get(a.id) ?? DEFAULT_STATUS;
         const tok = AGENT_STATUS[st] ?? AGENT_STATUS[DEFAULT_STATUS];
         return {
           id: a.id,
@@ -120,6 +155,9 @@ export function buildRoster(
           status: st,
           status_color: tok.color,
           status_label: tok.label,
+          // A childless row and a worker row roll up to their own tier (an empty worker list), so
+          // every row in the payload carries the field and no consumer needs a special case.
+          rollup_dot: dotOf(a.id),
           parent_id: a.parentId,
           workflow_stage: workflowStage[a.id] ?? null,
           last_activity_at: lastActivityAt(a, interaction),

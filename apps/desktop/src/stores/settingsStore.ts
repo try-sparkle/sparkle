@@ -12,7 +12,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus } from "../types";
 // Type-only import: erased at compile time, so the store stays free of the Tauri runtime dep
 // (services/config pulls in @tauri-apps) and remains testable under jsdom.
-import type { EffectiveConfig } from "../services/config";
+import type { ConcurrencyBound, EffectiveConfig } from "../services/config";
 // Type-only for the same reason as EffectiveConfig above: services/displaySpan imports
 // @tauri-apps, and this store must stay loadable under jsdom.
 import type { SpanMode } from "../services/displaySpan";
@@ -275,6 +275,27 @@ export function enforcedWorkerCap(s: {
   return Math.max(1, Math.min(s.maxConcurrentWorkers, s.effectiveMaxConcurrentWorkers));
 }
 
+/**
+ * The sentence to show a human when the ceiling is the thing standing in their way, e.g.
+ * `"CPU-bound: 18 cores × 2 agents per core"` or `"pinned to 32 in config.toml…"`.
+ *
+ * Composed in Rust next to the number it explains (`EffectiveConfig.concurrency_basis`) so the two
+ * cannot drift. This reads it back rather than re-deriving anything, because every attempt to
+ * re-derive the cause from the value has been wrong: the concierge's refusal asserted "derived from
+ * installed RAM" unconditionally on a machine that was CPU-bound at 36 and pinned at 32.
+ *
+ * The fallback is deliberately CAUSELESS, not a guess: an older backend that sends no basis gets a
+ * sentence that states the number and nothing about why. Saying nothing beats naming the wrong
+ * dimension — that is the whole bug this field exists to close.
+ */
+export function concurrencyBasis(s: {
+  concurrencyBasis: string;
+  effectiveMaxConcurrentWorkers: number;
+  maxConcurrentWorkers: number;
+}): string {
+  return s.concurrencyBasis.trim() || `${enforcedWorkerCap(s)} at once on this machine`;
+}
+
 // --- Sparkle self-improvement consent --------------------------------------------------------
 // How the built-in Sparkle improvement agent may act on the user's anonymous logs. This gates the
 // hourly log evaluation and whether improvement PRs are auto-submitted to the OSS project:
@@ -327,6 +348,20 @@ interface SettingsState {
    *  exhaust a Mac's RAM and get system daemons jetsam-killed (sparkle-01xv / sparkle-asz5).
    *  Derived, never persisted — recomputed from config on every hydrate. */
   effectiveMaxConcurrentWorkers: number;
+  /** What the MACHINE alone could carry, ignoring any `[workers].max_concurrent` pin. Equal to
+   *  `effectiveMaxConcurrentWorkers` under AUTO. Kept so the UI can say "you pinned this" instead of
+   *  "your Mac is full" — the remedy for the first is a config line, not different hardware.
+   *  Derived, never persisted. */
+  machineMaxConcurrentWorkers: number;
+  /** Which dimension binds the enforced ceiling: cpu | ram | both | pinned | unknown. Mirrored from
+   *  Rust's `Bound`, whose entire documented purpose is to stop the app mis-attributing the limit —
+   *  an attribution that existed in Rust for months without ever reaching a human. Derived, never
+   *  persisted. */
+  concurrencyBound: ConcurrencyBound;
+  /** The ready-to-show sentence for that dimension, with its arithmetic. Read it via
+   *  `concurrencyBasis()` rather than directly, so an older backend's empty value degrades to a
+   *  causeless sentence instead of a wrong one. Derived, never persisted. */
+  concurrencyBasis: string;
   /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
    *  on — the gold-standard path. Falls back to the on-device model automatically when off, when
    *  no key is present, or when offline. The always-listening wake word stays on-device either way.
@@ -602,6 +637,12 @@ export const useSettingsStore = create<SettingsState>()(
       // MIN of this and maxConcurrentWorkers (see enforcedWorkerCap), so a pre-hydrate spawn is
       // still bounded by the user's configured value rather than running unlimited.
       effectiveMaxConcurrentWorkers: 20,
+      machineMaxConcurrentWorkers: 20,
+      // Before the first hydrate we genuinely do not know what bound the number — and "unknown" is
+      // the honest value. Defaulting to "ram" is exactly the assumption that made every at-capacity
+      // message blame memory (see concurrencyBasis).
+      concurrencyBound: "unknown",
+      concurrencyBasis: "",
       cloudDictation: true,
       aiAutoRename: true,
       aiComposer: true,
@@ -772,6 +813,18 @@ export const useSettingsStore = create<SettingsState>()(
           // RAISE the cap above what the user pinned — this store field is what the spawn gate reads.
           effectiveMaxConcurrentWorkers:
             pinnedCeiling === null ? derived : Math.max(1, Math.min(pinnedCeiling, derived)),
+          // What the machine alone could carry. `?? derived` covers a backend predating the field;
+          // the floor keeps it from ever reading BELOW the enforced number, which would make the UI
+          // claim the hardware is the constraint when a pin is.
+          machineMaxConcurrentWorkers: Math.max(
+            1,
+            Math.floor(eff.machine_max_concurrent ?? derived),
+          ),
+          // The provenance, taken VERBATIM from the backend that computed the number. Neither field
+          // is re-derived here: every re-derivation of "why is the cap this?" from the value alone
+          // has been wrong, which is the bug this plumbing closes.
+          concurrencyBound: eff.concurrency_bound ?? "unknown",
+          concurrencyBasis: eff.concurrency_basis ?? "",
           aiAutoRename: config.ai.auto_rename,
           cloudDictation: config.ai.voice_dictation,
           aiComposer: config.ai.composer,

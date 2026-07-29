@@ -23,10 +23,21 @@
 //   output flowing                -> working
 //   quiet > IDLE_MS               -> settle (screen check, as above)
 //   quiet > BLOCKED_MS            -> blocked
+//
+// EVERY transition above is logged, once, from `set()` — the single funnel they all pass through.
+// See ./statusTransitionLog for the line format and the one grep that replays an agent's history;
+// `set` takes the TRIGGER as a required argument, so a transition added here later cannot reach the
+// UI without saying why it fired.
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames, isApiErrorLine } from "./streamFailure";
+import {
+  logStatusTransition,
+  monotonicNow,
+  type ScreenVerdict,
+  type StatusTransitionTrigger,
+} from "./statusTransitionLog";
 
 // Strip ANSI/control sequences before classifying (xterm still renders the raw bytes).
 // Built from a string with \u escapes so the source stays paste-safe (no literal ESC).
@@ -229,14 +240,39 @@ export class StatusEngine {
   private notedUserLinesLeft = 0;
 
   constructor(private readonly opts: StatusEngineOpts) {
+    // Log the starting status too: a history that begins at the first FLIP can't tell you what the
+    // agent flipped away from, and "spawned green then went red immediately" is itself a finding.
+    logStatusTransition({
+      agentId: this.opts.agentId,
+      from: null,
+      to: this.status,
+      trigger: "spawn",
+      monotonicMs: monotonicNow(),
+    });
     this.opts.onStatus(this.status);
   }
 
-  private set(s: AgentTabStatus): void {
-    if (s !== this.status) {
-      this.status = s;
-      this.opts.onStatus(s);
-    }
+  /**
+   * The ONE way the status ever changes — every path in this file funnels through here, which is
+   * why the transition log lives here and not at the call sites: a path added later cannot escape
+   * it, and the compiler makes it name its `trigger`.
+   *
+   * Hot path: this runs per PTY chunk for every live agent, and the overwhelmingly common case is
+   * "no change". That case returns on the first line, before any string is built and before
+   * `monotonicNow()` is read, so instrumentation costs one comparison when nothing happened.
+   *
+   * @param trigger  WHY this fired — a discrete enum, never prose.
+   * @param screen   The verdict `screenAwaitsInput` returned, when a screen classification is what
+   *                 decided this transition. The verdict ONLY: terminal content is user data and
+   *                 never reaches the log.
+   */
+  private set(s: AgentTabStatus, trigger: StatusTransitionTrigger, screen?: ScreenVerdict): void {
+    if (s === this.status) return;
+    const from = this.status;
+    this.status = s;
+    // Logged BEFORE the listener runs, so the record survives a throwing subscriber.
+    logStatusTransition({ agentId: this.opts.agentId, from, to: s, trigger, screen, monotonicMs: monotonicNow() });
+    this.opts.onStatus(s);
   }
 
   private clearTimers(): void {
@@ -315,19 +351,36 @@ export class StatusEngine {
   // user is on the hook (waiting/approval, red); otherwise the turn simply ended (idle,
   // gray). Reaching a calm settle means the session didn't crash — clear the error flag
   // so a later clean exit isn't mislabeled `errored`.
-  private settle(): void {
+  //
+  // `trigger` says WHICH quiet brought us here — the spinner ceasing to re-draw, or the legacy
+  // IDLE_MS stall timer — because in the log those two are very different stories about the same
+  // resulting status. It defaults to the legacy one: `armLegacyTimers` is the only caller that
+  // doesn't pass it, and leaving that line untouched keeps this instrumentation out of the way of
+  // the SCREEN_RECHECK_MS work landing on a sibling branch, which rewrites that method.
+  private settle(trigger: StatusTransitionTrigger = "quiet-settle"): void {
     this.idleTimer = null;
     this.sawRecentError = false;
     // The turn is over; the next one's spinner counter starts from zero, so drop the baseline rather
     // than carry this turn's high-water mark into it (roborev on da7c80c).
     this.resetSpinnerTokens();
-    const screen = this.opts.getScreen?.() ?? "";
-    const awaiting = screenAwaitsInput(screen);
+    // Distinguish "no screen to read" from "screen read, calm" (roborev 54741). `getScreen` is
+    // absent on plenty of constructions, and snapshotScreen returns blank lines for an empty
+    // viewport; screenAwaitsInput short-circuits false on both without examining anything. Reporting
+    // that as `calm` made the log unable to show the very case — a blank snapshot — most likely to
+    // be behind a false GRAY. The STATUS is unchanged (nothing on screen still settles to idle);
+    // only the logged verdict distinguishes them.
+    const snapshot = this.opts.getScreen?.();
+    const blank = snapshot === undefined || !snapshot.trim();
+    const awaiting = blank ? false : screenAwaitsInput(snapshot);
     // Consume the risk flag on every settle, not just the red branch: a non-blocking
     // turn that ends idle must not carry a stale risk into the next turn's question.
     const risky = this.sawRecentRisk;
     this.sawRecentRisk = false;
-    this.set(awaiting ? (risky ? "approval" : "waiting") : "idle");
+    this.set(
+      awaiting ? (risky ? "approval" : "waiting") : "idle",
+      trigger,
+      blank ? "blank" : awaiting ? "awaiting" : "calm",
+    );
   }
 
   // Fallback path only: arm the legacy time-based stall timers (used when Claude's
@@ -338,7 +391,7 @@ export class StatusEngine {
     this.blockedTimer = setTimeout(() => {
       // Escalate from working OR idle (idle fires first at IDLE_MS, so gating on
       // "working" alone made `blocked` unreachable).
-      if (this.status === "working" || this.status === "idle") this.set("blocked");
+      if (this.status === "working" || this.status === "idle") this.set("blocked", "quiet-blocked");
     }, BLOCKED_MS);
   }
 
@@ -479,7 +532,9 @@ export class StatusEngine {
     // 1. An input prompt always wins: the agent is asking for you.
     if (prompt) {
       this.clearTimers();
-      this.set(this.sawRecentRisk ? "approval" : "waiting");
+      // The prompt was detected in the STREAM, not on the rendered screen, so there is no screen
+      // verdict to record here — `screenAwaitsInput` ran against the ingested lines, not a snapshot.
+      this.set(this.sawRecentRisk ? "approval" : "waiting", "prompt-detected-midstream");
       this.sawRecentRisk = false;
       // A calm prompt means the agent recovered and is awaiting you — not a crash or a stall. The
       // token baseline deliberately SURVIVES here: an approval question is asked MID-turn and the
@@ -498,7 +553,7 @@ export class StatusEngine {
     //     even over a hook `working`. Recovery clears it above (a real tool event / a real prompt).
     if (this.sawStreamFailure) {
       this.clearTimers();
-      this.set("errored");
+      this.set("errored", "stream-failure");
       return;
     }
 
@@ -506,8 +561,8 @@ export class StatusEngine {
     //    the turn settles to idle only after the spinner truly stops re-drawing.
     if (hasSpinner) {
       this.clearTimers();
-      this.set("working");
-      this.idleTimer = setTimeout(() => this.settle(), SPINNER_GRACE_MS);
+      this.set("working", "spinner-seen");
+      this.idleTimer = setTimeout(() => this.settle("spinner-gone-settle"), SPINNER_GRACE_MS);
       return;
     }
 
@@ -515,12 +570,12 @@ export class StatusEngine {
     //    post-turn idle screen. Don't force-flip — let the settle timer from the last
     //    spinner sighting decide. If none is pending (idle screen drew first), arm one.
     if (this.sawSpinner) {
-      if (!this.idleTimer) this.idleTimer = setTimeout(() => this.settle(), SPINNER_GRACE_MS);
+      if (!this.idleTimer) this.idleTimer = setTimeout(() => this.settle("spinner-gone-settle"), SPINNER_GRACE_MS);
       return;
     }
 
     // 4. Fallback (spinner never seen): legacy output-flow + stall heuristic.
-    this.set("working");
+    this.set("working", "output-flowing");
     this.armLegacyTimers();
   }
 
@@ -530,7 +585,7 @@ export class StatusEngine {
     // A process that dies mid-stream-failure (an API error / self-prompt wedge that never recovered)
     // must read `errored`, not gray `done`: sawStreamFailure counts the same as a pre-exit error
     // marker here, so a wedged-then-killed agent doesn't settle green-gray (roborev 16152).
-    this.set(this.sawRecentError || this.sawStreamFailure ? "errored" : "done");
+    this.set(this.sawRecentError || this.sawStreamFailure ? "errored" : "done", "process-exit");
   }
 
   dispose(): void {

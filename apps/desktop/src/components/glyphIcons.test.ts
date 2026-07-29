@@ -36,7 +36,16 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
     if (statSync(p).isDirectory()) sourceFiles(p, out);
     // BOTH .ts AND .tsx (roborev 54772), for the reason theme/scale.test.ts already records:
     // hoisting a glyph out of a component into a helper must not lower the count.
-    else if (/\.tsx?$/.test(name) && !name.includes(".test.")) out.push(p);
+    //
+    // `.fixture.` is excluded alongside `.test.`: a fixture is CAPTURED DATA, not an affordance.
+    // `engine/capturedScreens.fixture.ts` holds Claude Code 2.1.220 terminal screens recorded
+    // byte-for-byte through a real PTY and replayed through a headless xterm — its `❯`, `⏺` and `⎿`
+    // ARE what the terminal draws, and the whole point of the file is that they match verbatim.
+    // "Port them to react-icons" is not a possible fix there; changing them would silently break the
+    // screen-classifier tests that exist to catch upstream drift. Scanning it would also make this
+    // ratchet unfixable-by-construction — the count could only be lowered by corrupting the data.
+    else if (/\.tsx?$/.test(name) && !name.includes(".test.") && !name.includes(".fixture."))
+      out.push(p);
   }
   return out;
 }

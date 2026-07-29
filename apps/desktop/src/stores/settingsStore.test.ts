@@ -5,6 +5,7 @@ import {
   migrateSettings,
   useSettingsStore,
   enforcedWorkerCap,
+  concurrencyBasis,
   AI_FEATURE_FIELD,
   type AiFeatureFlags,
 } from "./settingsStore";
@@ -380,6 +381,70 @@ describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
   it("floors at 1 so the orchestrator can always make progress", () => {
     useSettingsStore.getState().hydrateFromConfig(eff(20, 0));
     expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(1);
+  });
+
+  // BUG 2/3 of the agent-ceiling audit. The app told a human "at-capacity: 46 of 32 slots… the
+  // ceiling is derived from installed RAM" on an 18-core machine that was CPU-bound at 36 and
+  // pinned at 32 — three numbers and the wrong reason. The provenance is computed in Rust next to
+  // the number and mirrored VERBATIM; nothing here re-derives it, because every re-derivation of
+  // "why is the cap this?" from the value alone has been wrong.
+  describe("the ceiling's provenance", () => {
+    /** The measured machine from the report, pinned at 32 while its cores derive 36. */
+    const pinned: EffectiveConfig = {
+      ...eff(32, 32),
+      machine_max_concurrent: 36,
+      concurrency_bound: "pinned",
+      concurrency_basis: "pinned to 32 in config.toml ([workers].max_concurrent) — this machine could run 36",
+    };
+
+    it("mirrors the binding dimension and its sentence without reinterpreting either", () => {
+      useSettingsStore.getState().hydrateFromConfig(pinned);
+      const s = useSettingsStore.getState();
+      expect(s.concurrencyBound).toBe("pinned");
+      expect(s.machineMaxConcurrentWorkers).toBe(36);
+      expect(concurrencyBasis(s)).toBe(pinned.concurrency_basis);
+    });
+
+    it("reports the cap it enforces — the two numbers are the same number", () => {
+      useSettingsStore.getState().hydrateFromConfig(pinned);
+      const s = useSettingsStore.getState();
+      expect(enforcedWorkerCap(s)).toBe(32);
+      // The machine's own limit is REPORTED, never enforced: it is context for the human, not a
+      // second cap that some gate could read by mistake.
+      expect(s.machineMaxConcurrentWorkers).toBeGreaterThan(enforcedWorkerCap(s));
+    });
+
+    it("names the CPU bound on a core-bound machine rather than blaming memory", () => {
+      useSettingsStore.getState().hydrateFromConfig({
+        ...eff(null, 36),
+        machine_max_concurrent: 36,
+        concurrency_bound: "cpu",
+        concurrency_basis: "CPU-bound: 18 cores × 2 agents per core",
+      });
+      const s = useSettingsStore.getState();
+      expect(s.concurrencyBound).toBe("cpu");
+      expect(concurrencyBasis(s)).toBe("CPU-bound: 18 cores × 2 agents per core");
+      expect(concurrencyBasis(s)).not.toMatch(/RAM/i);
+    });
+
+    // An older backend sends neither field. The fallback must be CAUSELESS, not a guess — saying
+    // nothing about why beats naming the wrong dimension, which is the entire bug.
+    it("degrades to a causeless sentence rather than assuming RAM", () => {
+      useSettingsStore.getState().hydrateFromConfig(eff(null, 12));
+      const s = useSettingsStore.getState();
+      expect(s.concurrencyBound).toBe("unknown");
+      expect(s.machineMaxConcurrentWorkers).toBe(12);
+      expect(concurrencyBasis(s)).toBe("12 at once on this machine");
+      expect(concurrencyBasis(s)).not.toMatch(/RAM|CPU|pinned/i);
+    });
+
+    it("never reports a machine limit below the cap it enforces", () => {
+      // A backend that omits machine_max_concurrent must not make the UI claim the hardware is the
+      // constraint when the enforced number is higher.
+      useSettingsStore.getState().hydrateFromConfig(eff(null, 20));
+      const s = useSettingsStore.getState();
+      expect(s.machineMaxConcurrentWorkers).toBeGreaterThanOrEqual(enforcedWorkerCap(s));
+    });
   });
 });
 

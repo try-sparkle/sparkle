@@ -28,6 +28,7 @@ import {
 } from "../stores/runtimeStore";
 import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
+import { rollupDotAccessor } from "../engine/workerRollup";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
@@ -370,7 +371,35 @@ function callerMayAdminister(callerAgentId: string): boolean {
  *  That last parenthetical is the trap, so every row also carries `liveness` (see AgentLiveness):
  *  "stopped" + liveness "local" means the agent really is stopped, while "stopped" + "other-window"
  *  or "unknown" means this window simply has no entry for it. Branch on `liveness` before you
- *  conclude an agent is dead. */
+ *  conclude an agent is dead.
+ *
+ *  `status` IS THE AGENT'S OWN PTY STATE AND SAYS NOTHING ABOUT ITS WORKERS. For an orchestrator
+ *  that is the wrong question almost always: a head sits `idle` between delegations, so it reads
+ *  `idle` with nine workers grinding and reads `idle` with a worker blocked on a question — a
+ *  caller had no way to tell either from a head that had genuinely finished. Every row therefore
+ *  also carries `rollupDot`, engine/workerRollup's summary of the subtree:
+ *    green  — work is running under this row (or the row itself is running)
+ *    red    — something under this row needs you (or the row itself does; own-red wins outright)
+ *    orange — the subtree disagrees: some workers running, some needing you
+ *    gray   — nothing running and nothing asking
+ *    null   — WITHHELD: this window cannot see the whole subtree, so it will not claim it is calm.
+ *  A worker row and a childless row report their own tier, so it is safe to read on every row.
+ *  It is computed over the FULL agent list, before the scope filter — a worker omitted from this
+ *  reply still moves its head's dot, which is the point.
+ *
+ *  THE `null` ARM IS THE SAME LESSON AS `liveness`, ONE FIELD OVER (roborev 54742). The dot is
+ *  derived from the SAME window-local `status` map, so a worker mounted in another window — or one
+ *  just spawned, whose pane has not mounted — defaults to "stopped", bands to `done`, and
+ *  contributes NOTHING to its head's roll-up. A head whose whole fleet is invisible from here
+ *  therefore rolled up to `gray`, which the list above defines as "nothing running and nothing
+ *  asking": a missing observation turned into a confident claim of calm. Under `scope: "self"` the
+ *  caller gets no worker rows at all, so it cannot repair that reading from `liveness` either.
+ *
+ *  The withholding is ONE-SIDED, and deliberately so: `red`/`orange` are still reported even when a
+ *  sibling worker is unobserved. Those are EVIDENCE — something under this row was seen asking, and
+ *  a row nobody can see cannot un-ask it. `green` and `gray` are ABSENCE claims ("nothing under here
+ *  needs you"), and an unobserved worker is exactly what falsifies them. Dropping an observed alarm
+ *  to say "unknown" would trade this false negative for a worse one. */
 function handleGetState(req: ControlRequest): {
   agents: unknown[];
   scope: StateScope;
@@ -397,12 +426,77 @@ function handleGetState(req: ControlRequest): {
   const openIds = new Set(
     mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
   );
+  // THE HEAD ROW'S SUBTREE, as one accessor over EVERY agent — deliberately built before the scope
+  // filter below, and from the unfiltered list rather than `agents`. The narrowing is exactly what
+  // makes this field necessary: a caller must never conclude a head is calm because the worker that
+  // disagrees was dropped from the reply (or, in the UI, folded out of sight).
+  //
+  // `ownStatusOf` is left at its default (== `statusOf`) because this map is `runtimeStore.status`
+  // RAW — no `withRedWorkerAttention` has been composited into it, which is the case that parameter
+  // exists to defend against. It is also the same map the `status` field reports below, so a row's
+  // dot and its own-status are always derived from one source and cannot contradict each other.
+  const dotOf = rollupDotAccessor(
+    projects.flatMap((p) => p.agents),
+    (id) => status[id] ?? "stopped",
+  );
+  // DIRECT children per head, `kind === "worker"` ONLY (roborev 54843) — matching
+  // `rollupDotAccessor`'s own rule that only worker rows are folded into a parent's dot. Building
+  // this from every child regardless of kind let a non-worker child (which cannot itself change the
+  // dot) still withhold it.
+  const childrenOf = new Map<string, string[]>();
+  for (const a of projects.flatMap((p) => p.agents)) {
+    if (a.kind !== "worker" || !a.parentId) continue;
+    const kids = childrenOf.get(a.parentId);
+    if (kids) kids.push(a.id);
+    else childrenOf.set(a.parentId, [a.id]);
+  }
+  /** Every worker descendant, at any depth — a nested head's own dot folds into its parent's
+   *  regardless of how deep it sits, so an unobservable grandchild must withhold the same way an
+   *  unobservable direct child does. */
+  const descendantsOf = (id: string): string[] => {
+    const direct = childrenOf.get(id) ?? [];
+    return direct.flatMap((kid) => [kid, ...descendantsOf(kid)]);
+  };
+  const lastObserved = useRuntimeStore.getState().lastObserved;
+  /** Has THIS window ever actually read this agent's status — now, or as a recorded prior reading?
+   *
+   *  `livenessOf(...) === "local"` alone conflates "never observed" with "ran, then closed" — both
+   *  report `"unknown"` once the pane is gone, because `close()` removes the id from both `status`
+   *  and `openAgentIds`. That makes the ordinary terminal state of a settled fleet (workers finish,
+   *  panes close) permanently withhold its dot. `lastObserved` (sparkle-w340) exists precisely to
+   *  keep a "ran, then closed" reading distinguishable from one this window never saw, so a worker
+   *  with an entry there counts as observed even with no live status and no open pane. */
+  const wasObserved = (id: string): boolean =>
+    livenessOf(id, status, openIds) === "local" || lastObserved[id] !== undefined;
+  /** The subtree dot, or `null` when this window cannot see enough of the subtree to claim calm.
+   *
+   *  ONE-SIDED by design (roborev 54742). `red`/`orange` are EVIDENCE — a worker was observed
+   *  asking, and a worker nobody can see cannot un-ask it — so they are reported regardless. `green`
+   *  and `gray` are ABSENCE claims ("nothing under here needs you"), and an unobserved worker is
+   *  precisely what falsifies them: it defaults to "stopped", bands to `done`, and contributes
+   *  nothing, so a head whose whole fleet is invisible rolled up to a confident `gray`. Withholding
+   *  only the absence claims fixes the false negative without trading it for a worse one. */
+  const observableDotOf = (id: string): ReturnType<typeof dotOf> | null => {
+    const dot = dotOf(id);
+    if (dot === "red" || dot === "orange") return dot;
+    const kids = descendantsOf(id);
+    if (!kids.length) return dot; // a childless or worker row speaks only for itself
+    return kids.every(wasObserved) ? dot : null;
+  };
   const all = projects.flatMap((p) =>
     p.agents.map((a) => ({
       id: a.id,
       name: a.name,
       kind: a.kind,
       status: status[a.id] ?? "stopped",
+      // What the row's disc says once its workers are counted — "green" | "red" | "orange" | "gray"
+      // (engine/workerRollup). ADDITIVE: `status` above keeps meaning the agent's OWN PTY state, so
+      // nothing that already branches on it is redefined. Read this one to answer "is anything under
+      // this row asking for me?", which `status` cannot answer for an orchestrator: a head sits
+      // `idle` between delegations whether its nine workers are grinding, blocked, or gone.
+      // Childless and worker rows report their own tier here, so there is no special case.
+      // `null` when the subtree is not fully observable from here — see `observableDotOf`.
+      rollupDot: observableDotOf(a.id),
       // Says whether `status` above is authoritative or merely defaulted — see AgentLiveness. A row
       // kept by scope "active" on evidence other than a live status entry still reads "stopped", so
       // without this the caller cannot tell a dead agent from one this window just cannot see.

@@ -291,7 +291,20 @@ function AgentPaneInner({
       // The "work at hand" the judge weighs a closeout-vs-new-work ask against: the prompt that
       // defined this agent's work, falling back to its name.
       const task = (fresh?.autoNameBasis ?? fresh?.name ?? agent.name ?? "").trim();
-      // Metering-only: attributes the judge's debit to this agent's project in the Credits history.
+      // NO `screen` ARGUMENT (roborev 54774). A picker short-circuit was wired here and removed:
+      //   • It could not fire in the case it was written for. This runs only from the `Stop`-hook
+      //     branch, and the reported bug is a picker rendered MID-turn, where the last hook is
+      //     `PreToolUse` → `working` and no `Stop` ever arrives.
+      //   • The one case it COULD reach — a menu still on screen when `Stop` fires — is already
+      //     handled by `statusRouter`'s `screenAwaits()` escalation (statusRouter.ts:109).
+      //   • And it was fed `getAgentScrollback`, which is scrollback HISTORY, not the viewport. A
+      //     dialog ANSWERED earlier in the same turn still reads as live once its frame scrolls out
+      //     of the viewport (Ink's redraw can never erase it there), so it pinned `waiting` and held
+      //     the row red through the whole idle period — a false RED, the direction that trains a
+      //     human to ignore red.
+      // The real fix is to escalate on a mid-turn signal inside `resolve()` using the VIEWPORT
+      // reader (`snapshotScreen`, already what the status engine uses), which is not reachable from
+      // here today — tracked as its own bead rather than approximated with history.
       const needs = await judgeNeedsFollowup({ task, response, project: project.name });
       if (needs && turnSeqRef.current === turn) {
         routerRef.current?.fromJudge("waiting");

@@ -132,6 +132,10 @@ beforeEach(() => {
   useSettingsStore.setState({
     maxConcurrentWorkers: 8,
     effectiveMaxConcurrentWorkers: 8,
+    // The ceiling's provenance is store state and outlives a test; a leaked basis string would let
+    // one test's copy assertion pass on another test's setup.
+    concurrencyBound: "unknown",
+    concurrencyBasis: "",
     deleteMergedBranch: false,
   });
   // The visited set is MODULE state (services/sessionProjects) and outlives a test, so `live` would
@@ -276,15 +280,21 @@ describe("spawnBuildAgent", () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("at-capacity");
-    // The dormant clause must survive a persisted openAgentIds — it is the honest half.
-    expect(r.message).toMatch(/1 with a process running right now/i);
-    expect(r.message).toMatch(/haven't opened yet/i);
+    // The dormant clause must survive a persisted openAgentIds — it is the honest half. It reports
+    // what `live` MEASURES (rows showing in this window), which is not the same claim as "running".
+    expect(r.message).toMatch(/1 of them showing in this window/i);
+    expect(r.message).toMatch(/aren't open here/i);
   });
 
-  it("does not tell the human that dormant rows are running processes", () => {
+  // BUG 1 of the ceiling audit. The old clause told the human the over-cap agents were ones "you
+  // haven't opened yet, and each one starts as soon as you do". They are ALREADY RUNNING —
+  // closed-tab projects were observed with a running-agent count equal to their full roster — so
+  // the sentence sent a human hunting for processes that would start later when they were already
+  // up. `live` measures "has a mounted pane in THIS window", and the copy may not claim more.
+  it("does not tell the human that off-screen agents have not started yet", () => {
     const pid = seedProject();
     seedBuild(pid);
-    seedBuild(pid); // neither is open ⇒ no pane, no PTY, no RAM
+    seedBuild(pid); // neither has a mounted pane in this window
     useSettingsStore.setState({ maxConcurrentWorkers: 2, effectiveMaxConcurrentWorkers: 2 });
     const r = spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
@@ -292,7 +302,95 @@ describe("spawnBuildAgent", () => {
     expect(r.reason).toBe("at-capacity");
     expect(r.message).not.toMatch(/already running 2/i);
     expect(r.message).toMatch(/2 of its 2/); // the numbers it actually hit
-    expect(r.message).toMatch(/haven't opened yet/i); // …and WHY the dormant ones still count
+    // The retracted claims, both directions: they have not "not started", and opening a tab is not
+    // what starts them.
+    expect(r.message).not.toMatch(/haven't opened yet/i);
+    expect(r.message).not.toMatch(/starts as soon as you do/i);
+    expect(r.message).toMatch(/already running/i);
+  });
+
+  // BUG 2. Rust's `Bound` exists precisely to stop the app mis-attributing the ceiling — its own
+  // comment says routing a tie to the RAM branch gives "advice that cannot work". That attribution
+  // never reached the human: the refusal asserted "derived from installed RAM" unconditionally.
+  it("names the CPU bound rather than blaming RAM on a core-bound machine", () => {
+    const pid = seedProject();
+    seedBuild(pid);
+    // An 18-core / 128 GiB machine: RAM holds 81, cores drive 36. CPU binds — see config.rs
+    // `the_basis_sentence_names_the_cpu_bound_on_a_core_bound_machine`, which produces this string.
+    useSettingsStore.setState({
+      maxConcurrentWorkers: 1,
+      effectiveMaxConcurrentWorkers: 1,
+      concurrencyBound: "cpu",
+      concurrencyBasis: "CPU-bound: 18 cores × 2 agents per core",
+    });
+    const r = spawnBuildAgent({ projectId: pid });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("at-capacity");
+    expect(r.message).toMatch(/CPU-bound: 18 cores × 2 agents per core/);
+    expect(r.message).not.toMatch(/derived from installed RAM/i);
+  });
+
+  it("names the pin, not the hardware, when a config.toml ceiling is what binds", () => {
+    const pid = seedProject();
+    seedBuild(pid);
+    useSettingsStore.setState({
+      maxConcurrentWorkers: 1,
+      effectiveMaxConcurrentWorkers: 1,
+      concurrencyBound: "pinned",
+      concurrencyBasis: "pinned to 32 in config.toml ([workers].max_concurrent)",
+    });
+    const r = spawnBuildAgent({ projectId: pid });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toMatch(/pinned to 32 in config\.toml/);
+    expect(r.message).not.toMatch(/installed RAM/i);
+  });
+
+  // BUG 3: "at-capacity: 46 of 32 slots" while the derivation said 36. A cap that lies about itself
+  // is worse than a wrong cap — the number in the message must BE the number the gate compared
+  // against, for every combination of the two store fields.
+  it("reports exactly the cap it enforces", () => {
+    const pid = seedProject();
+    for (const [request, machine] of [
+      [32, 36], // a pin below what the machine derives — the reported situation
+      [36, 32], // the inverse: the machine is the tighter of the two
+      [8, 8],
+    ] as const) {
+      useProjectStore.setState({ projects: [], selectedProjectId: null });
+      const p = useProjectStore.getState().addProject("Demo", `/tmp/demo-${request}-${machine}`);
+      useSettingsStore.setState({
+        maxConcurrentWorkers: request,
+        effectiveMaxConcurrentWorkers: machine,
+        concurrencyBasis: "",
+      });
+      // min(pin, machine) — the number the gate actually enforces.
+      //
+      // Note the `[32, 36]` row is a MID-DRAG TRANSIENT, not a steady state (roborev 55068): it
+      // violates `effective <= maxConcurrentWorkers`, which `hydrateFromConfig` enforces, and is
+      // reachable only between `setMaxConcurrentWorkers` (which writes `maxConcurrentWorkers`
+      // alone) and the `config-changed` re-hydrate. It is kept because it is the only row where
+      // `enforcedWorkerCap` and `effectiveMaxConcurrentWorkers` differ, so it is the only row with
+      // mutation sensitivity — but it must not be read as "the reported situation", where a
+      // hydrated store holds `{32, 32}`. Whether a pin SHOULD throttle the whole machine is an open
+      // semantic question tracked as a bead; this asserts the behaviour the code has today.
+      const enforced = Math.min(request, machine);
+      // Fill to exactly the enforced cap through the SHARED path, then confirm one more is refused —
+      // i.e. the gate really binds at the number it prints, not one either side of it.
+      for (let i = 0; i < enforced; i++) expect(spawnBuildAgent({ projectId: p }).ok).toBe(true);
+      const r = spawnBuildAgent({ projectId: p });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(localAgentCapacity().limit).toBe(enforced);
+      expect(r.message).toContain(`${enforced} of its ${enforced} agent slots`);
+      // …and never the OTHER of the two numbers. Skipped when they agree: there is no wrong number
+      // to report, and asserting its absence would contradict the line above.
+      const looser = Math.max(request, machine);
+      if (looser !== enforced) {
+        expect(r.message).not.toContain(`of its ${looser} agent slots`);
+      }
+    }
+    expect(pid).toBeTruthy();
   });
 
   it("refuses (typed) when the project vanishes mid-spawn — nothing was created", () => {

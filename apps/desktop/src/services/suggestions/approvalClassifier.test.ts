@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { classifyApproval } from "./approvalClassifier";
+import {
+  APPROVAL_2_1_220,
+  APPROVAL_OPTION_2_2_1_220,
+  MODEL_PICKER_2_1_220,
+  ASK_USER_QUESTION_2_1_220,
+} from "../../engine/capturedScreens.fixture";
 
 // Captured-style Claude Code permission dialogs, one per category. Each mirrors the real Ink render:
 // a header describing the action, the numbered Yes / Yes-and-remember / No options (option 1 is the
@@ -215,5 +221,31 @@ describe("classifyApproval", () => {
       FOOTER,
     ].join("\n");
     expect(classifyApproval(reordered)).toEqual({ category: "skill", approveOption: "2\n" });
+  });
+});
+
+// ── Same shared PICKER_FOOTER, third consumer ──
+// The category is read from the header region ABOVE the footer, so a footer the marker cannot
+// find means no category — and this is the tier that produces an auto-answer keystroke, so the
+// fail-safe direction matters as much as the hit. Verbatim Claude Code 2.1.220 screens.
+describe("classifyApproval — captured Claude Code 2.1.220 screens", () => {
+  it("classifies the real Bash command-approval dialog", () => {
+    expect(classifyApproval(APPROVAL_2_1_220)).toEqual({ category: "bash", approveOption: "1\n" });
+  });
+
+  it("classifies it identically with the cursor parked on 'No'", () => {
+    // The keystroke is read off the parsed options, never off which one is highlighted.
+    expect(classifyApproval(APPROVAL_OPTION_2_2_1_220)).toEqual({
+      category: "bash",
+      approveOption: "1\n",
+    });
+  });
+
+  it("returns null for pickers that are not permission dialogs (fail safe)", () => {
+    // Both are real pickers the footer marker now finds — and neither may ever be auto-answered:
+    // they have no plain Yes / explicit No pair. A regression here types a digit into a menu
+    // whose option 1 is an arbitrary choice.
+    expect(classifyApproval(MODEL_PICKER_2_1_220)).toBeNull();
+    expect(classifyApproval(ASK_USER_QUESTION_2_1_220)).toBeNull();
   });
 });

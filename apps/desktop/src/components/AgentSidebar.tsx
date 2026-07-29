@@ -88,6 +88,7 @@ import {
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
+import { splitStatusPollTargets } from "../engine/statusPollTargets";
 import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
 /** Stable empty list, so the hook below is not handed a fresh `[]` on every render before a project
@@ -430,21 +431,17 @@ export function AgentSidebar({
         const proj = useProjectStore.getState().projects.find((p) => p.id === projectId);
         if (!proj) return;
         const { openAgentIds, status, pollProjectStatus } = useRuntimeStore.getState();
-        const hasWorkflow = (a: (typeof proj.agents)[number]) =>
-          a.kind !== "shell"; // shell agents have no git workflow
-        // Targets: every OPEN agent, PLUS the orchestrator parent of each open worker — even when
-        // that parent's pane is closed — so a worker's "Merged" (which reads its parent's stage)
-        // can still advance. De-duped by id.
-        const targets = new Map<string, (typeof proj.agents)[number]>();
-        for (const a of proj.agents) {
-          if (!openAgentIds.includes(a.id) || !hasWorkflow(a)) continue;
-          targets.set(a.id, a);
-          if (a.kind === "worker" && a.parentId) {
-            const parent = proj.agents.find((p) => p.id === a.parentId);
-            if (parent && hasWorkflow(parent)) targets.set(parent.id, parent);
-          }
-        }
-        const all = [...targets.values()];
+        // EVERY non-shell agent gets asked about, split into two batches by whether anyone is
+        // looking at it. `probed` (open agents + the orchestrator parent of each open worker) keeps
+        // the PR probe; `local` — every CLOSED row — gets pure local git.
+        //
+        // The closed batch is not an optimization, it is the bug fix: a closed pane used to mean
+        // NOTHING ever ran git for that agent, so a branch holding eleven unpushed commits read as an
+        // empty agent. See engine/statusPollTargets for the full account.
+        const { probed, local } = splitStatusPollTargets(proj.agents, openAgentIds);
+        // The naming tiers below still work off the PROBED set, which is what `all` has always
+        // meant to them: they have their own closed-agent backfill a few lines down.
+        const all = probed;
         // Auto-name each agent from Claude Code's own session title (ai-title in the transcript) —
         // the authoritative name once the first turn has summarized. Fire-and-forget, independent
         // of the branch-status poll below; the store action respects pins + de-dupes.
@@ -492,21 +489,28 @@ export function AgentSidebar({
         // `force` recomputes actively-working agents so their dirty/ahead counts stay fresh; the
         // batch applies orchestrators before workers internally so a worker's "Merged" derive still
         // reads its parent's fresh stage this same tick.
-        await pollProjectStatus(
-          proj.rootPath,
-          proj.id,
-          all.map((a) => ({
-            id: a.id,
-            kind: a.kind,
-            baseBranch: a.baseBranch ?? "",
-            parentBranch: a.kind === "worker" && a.parentId ? `sparkle/agent-${a.parentId}` : "",
-            beadId: a.beadId,
-            name: a.name,
-            parentId: a.parentId,
-            force: status[a.id] === "working",
-          })),
-          true,
-        );
+        const toInput = (a: (typeof proj.agents)[number]) => ({
+          id: a.id,
+          kind: a.kind,
+          baseBranch: a.baseBranch ?? "",
+          parentBranch: a.kind === "worker" && a.parentId ? `sparkle/agent-${a.parentId}` : "",
+          beadId: a.beadId,
+          name: a.name,
+          parentId: a.parentId,
+          force: status[a.id] === "working",
+        });
+        await pollProjectStatus(proj.rootPath, proj.id, all.map(toInput), true);
+        // The CLOSED rows, with the PR probe OFF. `probePrState: false` is what keeps this cheap:
+        // Rust skips the origin fetch and the per-agent `gh` call entirely, so this batch is local
+        // ref reads — and after the first tick, fingerprint-unchanged agents are skipped outright.
+        // ahead/dirty is all `hasUnmergedCommittedWork` needs to stop a branch full of commits from
+        // reading as an empty agent; PR state can wait until someone opens the pane.
+        //
+        // Awaited AFTER the probed batch rather than in parallel, so the rows someone is actually
+        // looking at are never queued behind a sweep of the whole fleet.
+        if (local.length > 0) {
+          await pollProjectStatus(proj.rootPath, proj.id, local.map(toInput), false);
+        }
       } finally {
         inFlight = false;
       }

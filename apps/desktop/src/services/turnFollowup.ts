@@ -16,7 +16,18 @@
 // FALL BACK to the fast-path's own verdict (→ `waiting`) rather than swallow a real ask to gray
 // (sparkle-blpf). Only a judge that actually RAN and said DONE pulls an ambiguous turn back to gray.
 import { invoke } from "@tauri-apps/api/core";
-import { noteAiProviderFailure, noteAiProviderHealthy, noteAiServiceFailure, noteAiServiceHealthy } from "./anthropic";
+// The picker detector, NOT a second copy of one. This is the same `detectTerminalPrompts` behind
+// `conciergeDispatch.liveOptionsFor`, whose `options.length > 0` is exactly the condition that
+// refuses a terminal write with `ambiguous-picker` ("the agent has a prompt on screen"). One
+// subsystem already knowing a picker is up while the status system says green is the bug below;
+// two detectors that could disagree later would be the same bug with extra steps.
+import { detectTerminalPrompts } from "./suggestions/heuristics";
+import {
+  noteAiProviderFailure,
+  noteAiProviderHealthy,
+  noteAiServiceFailure,
+  noteAiServiceHealthy,
+} from "./anthropic";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
 // long body of what they did. Scanning the tail keeps a '?' buried in the middle of a report (a
@@ -198,8 +209,41 @@ export function interpretVerdict(raw: string): boolean {
 }
 
 /**
+ * Is a picker/menu live on `screen` right now — a numbered option list, a Claude Code permission or
+ * AskUserQuestion dialog, a shell `(y/n)`?
+ *
+ * This exists because everything else in this module reads turn-end ENGLISH, and English is only
+ * available once a turn has FINISHED. An on-screen picker is not a finished turn: the agent is
+ * mid-turn, rendering a menu into the PTY and waiting. So `mightNeedFollowup` never fired,
+ * `judgeNeedsFollowup` never ran, and the agent kept whatever running state it had — GREEN, for as
+ * long as the user left the menu unanswered. Reported live against agent "Kill BYOK Anthropic Key".
+ *
+ * A menu on screen is not a judgment call. There is no prose to weigh, no "is this rhetorical?",
+ * no model: the terminal is literally blocked until someone picks an option, so this short-circuits
+ * the whole prose pipeline to RED. That also means it does not inherit the judge's failure modes —
+ * with no API key (the norm) the judge cannot run at all, and a picker must go red regardless.
+ *
+ * Undefined/blank screen → false. Nothing on screen is not evidence of a question; the callers that
+ * have no live terminal (an unmounted pane) must fall through to the prose path, not to red.
+ */
+/* NOTE (roborev 54774): NO PRODUCTION CALLER SUPPLIES `screen` TODAY. The one that did — AgentPane's
+ * Stop-hook path — was unwired because it fed scrollback HISTORY, which reads an already-answered
+ * dialog as a live picker and pins the row red for the whole idle period. This predicate itself is
+ * correct and tested; it is kept, rather than deleted and re-added, because the tracked fix
+ * (escalate mid-turn inside statusRouter.resolve, sourced from the VIEWPORT reader) re-uses exactly
+ * this function. Until then `args.screen` is always undefined and the short-circuit below is inert —
+ * which is safe by construction, since a blank/undefined screen returns false. */
+export function screenShowsPicker(screen: string | undefined): boolean {
+  if (!screen?.trim()) return false;
+  return detectTerminalPrompts(screen).length > 0;
+}
+
+/**
  * Decide whether a finished turn is blocked on the user. Runs the local fast-path, then (only if it
  * might be an ask) the Haiku judge with the agent's task as context for "the work at hand".
+ *
+ * A live picker on `screen` pre-empts all of that (see screenShowsPicker) — no prose heuristic, no
+ * judge call, no model.
  *
  * FAILS CLOSED (sparkle-blpf): the deterministic fast-path is the floor, not the judge. We reach the
  * judge only because `mightNeedFollowup` already matched — the tail had a '?' or a proposal/hand-back
@@ -218,12 +262,19 @@ export function interpretVerdict(raw: string): boolean {
  * @param response The finished turn's last assistant message (already read for history capture).
  * @param project  Metering-only: the project this agent belongs to, so the judge's credit debit is
  *                 attributable in the Credits history. Omitted → the row carries no project.
+ * @param screen   The agent's CURRENT terminal text, if the caller can read one. A picker on it is
+ *                 an unambiguous "blocked on you" and short-circuits to true.
  */
 export async function judgeNeedsFollowup(args: {
   task: string;
   response: string;
   project?: string;
+  screen?: string;
 }): Promise<boolean> {
+  // A menu on screen outranks everything below it — including the judge, which never gets asked.
+  // See screenShowsPicker: this is terminal STATE, not turn-end English, so there is nothing for a
+  // model to weigh and nothing to fall back to when it can't run.
+  if (screenShowsPicker(args.screen)) return true;
   if (!mightNeedFollowup(args.response)) return false;
   // Scope the try to ONLY the judge call, so the catch strictly means "the judge could not run"
   // (never a genuine verdict re-interpreted as an availability failure).

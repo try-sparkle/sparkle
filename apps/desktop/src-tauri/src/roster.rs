@@ -27,6 +27,15 @@ pub struct RosterAgentSlice {
     pub status: String,
     pub status_color: String,
     pub status_label: String,
+    /// The row's disc once the workers folded under it are counted — "green" | "red" | "orange" |
+    /// "gray" (engine/workerRollup's `RollupDot`). DISTINCT from `status`, which stays the agent's
+    /// OWN PTY state: an orchestrator idling between delegations while nine workers run publishes
+    /// `status: "idle"` with `rollup_dot: "green"`. Carried through the merge rather than dropped,
+    /// because the consumers of `roster://changed` are exactly the surfaces that show a head row
+    /// standing in for work they cannot see. Optional + defaulted so a window that predates the
+    /// field still deserializes.
+    #[serde(default)]
+    pub rollup_dot: Option<String>,
     pub parent_id: Option<String>,
     pub workflow_stage: Option<String>,
     pub last_activity_at: Option<i64>,
@@ -72,9 +81,31 @@ mod tests {
         RosterAgentSlice {
             id: id.into(), name: id.into(), kind: "build".into(),
             status: status.into(), status_color: "#000".into(), status_label: "x".into(),
+            rollup_dot: None,
             parent_id: None, workflow_stage: None, last_activity_at: None,
             recent_prompts: Vec::new(),
         }
+    }
+
+    /// A slice published by a window that predates `rollup_dot` must still deserialize (windows are
+    /// separate frontends and an in-place update can leave one behind), and one that DOES publish it
+    /// must not have it dropped on the way through the merge.
+    #[test]
+    fn rollup_dot_is_optional_on_the_wire_and_survives_the_merge() {
+        // `r##"…"##`, not `r#"…"#`: the color literal contains `"#`, which would close the latter.
+        let old: RosterAgentSlice = serde_json::from_str(
+            r##"{"id":"a","name":"a","kind":"build","status":"idle","status_color":"#000",
+                 "status_label":"x","parent_id":null,"workflow_stage":null,"last_activity_at":null}"##,
+        )
+        .expect("a pre-rollup_dot slice still deserializes");
+        assert_eq!(old.rollup_dot, None);
+
+        let mut head = agent("head", "idle");
+        head.rollup_dot = Some("green".into());
+        let mut slices = HashMap::new();
+        slices.insert("main".to_string(), vec![proj("p1", vec![head])]);
+        let merged = merge(&slices);
+        assert_eq!(merged[0].agents[0].rollup_dot.as_deref(), Some("green"));
     }
     fn proj(id: &str, agents: Vec<RosterAgentSlice>) -> RosterProjectSlice {
         RosterProjectSlice { id: id.into(), name: id.into(), agents }

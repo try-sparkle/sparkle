@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { detectClaudeCodePicker, detectResumePrompt, detectTerminalPrompts } from "./heuristics";
+import {
+  APPROVAL_2_1_220,
+  MODEL_PICKER_2_1_220,
+  IDLE_AFTER_TURN_2_1_220,
+  NON_PICKER_HINT_LINES_2_1_220,
+} from "../../engine/capturedScreens.fixture";
 
 // The exact rendered screen from the reporting bug (IMG_7383): Claude Code's AskUserQuestion
 // picker with a ❯ pointer on option 1, hard-wrapped option bodies, free-text entry underscores,
@@ -281,5 +287,35 @@ describe("detectTerminalPrompts", () => {
   it("detects a real menu even if a stray numbered line precedes it in the tail", () => {
     const txt = ["3) old log entry", "Select an option:", "  1) a", "  2) b", "Pick one: "].join("\n");
     expect(detectTerminalPrompts(txt).map((b) => b.label)).toEqual(["1", "2"]);
+  });
+});
+
+// ── PICKER_FOOTER is shared with engine/screenClassifier (the red-vs-gray status check) ──
+// The option detector finds the option block by searching for that footer, so a footer marker
+// that misses a real dialog costs BOTH a red dot and the click-to-answer buttons. These run
+// against verbatim Claude Code 2.1.220 screens; see capturedScreens.fixture.ts.
+describe("detectClaudeCodePicker — captured Claude Code 2.1.220 screens", () => {
+  it("parses the Bash command-approval dialog off its footer", () => {
+    expect(detectClaudeCodePicker(APPROVAL_2_1_220).map((b) => b.label)).toEqual([
+      "1 · Yes",
+      "2 · No",
+    ]);
+  });
+
+  it("parses the /model picker, whose footer shares no literal with the approval footer", () => {
+    expect(detectClaudeCodePicker(MODEL_PICKER_2_1_220).map((b) => b.value)).toEqual([
+      "1\n",
+      "2\n",
+      "3\n",
+      "4\n",
+      "5\n",
+    ]);
+  });
+
+  it("offers nothing on a finished turn, or on ambient chrome carrying key hints", () => {
+    expect(detectClaudeCodePicker(IDLE_AFTER_TURN_2_1_220)).toEqual([]);
+    for (const line of NON_PICKER_HINT_LINES_2_1_220) {
+      expect(detectClaudeCodePicker(`  1. Yes\n  2. No\n${line}`), line).toEqual([]);
+    }
   });
 });

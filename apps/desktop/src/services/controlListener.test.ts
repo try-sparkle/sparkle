@@ -211,6 +211,127 @@ describe("controlListener", () => {
     expect(res.omitted).toBe(0);
   });
 
+  // AN ORCHESTRATOR'S ROW MUST NOT READ CALM WHILE ITS WORKERS DO NOT. `status` is the agent's own
+  // PTY state, and a head sits `idle` between delegations — so a concierge (or any caller) reading
+  // this roster was told a head with nine working children was idle, and told a head with a blocked
+  // child was idle too, with nothing on the row to tell either from a dead one. `rollupDot` carries
+  // engine/workerRollup's answer alongside the own-status; `status` is deliberately unchanged.
+  describe("get_state — rollupDot reports the subtree a head stands in for", () => {
+    it("reports green for an idle head whose worker is WORKING", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "working");
+      fire({ reqId: "rd1", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const head = res.agents.find((a) => a.id === callerId)!;
+      // Both facts, neither redefined: the head's own PTY state AND what its subtree says.
+      expect(head.status).toBe("idle");
+      expect(head.rollupDot).toBe("green");
+    });
+
+    it("reports red for an idle head whose worker is BLOCKED", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "blocked");
+      fire({ reqId: "rd2", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const head = res.agents.find((a) => a.id === callerId)!;
+      expect(head.status).toBe("idle");
+      expect(head.rollupDot).toBe("red");
+    });
+
+    it("counts workers the SCOPE dropped — an omitted row still moves its head's dot", async () => {
+      // The whole point: scope "active" narrows what comes back, and a caller must not conclude a
+      // head is calm because the row that disagrees was filtered out of the reply. Here the worker
+      // is `blocked` (so it survives "active" on status) but the head is asked about under "self",
+      // which returns the head alone.
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "blocked");
+      fire({ reqId: "rd3", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents).toHaveLength(1);
+      expect(res.agents[0]!.rollupDot).toBe("red");
+    });
+
+    it("leaves a worker row and a childless row reporting their own tier", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "working");
+      const lone = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+      useRuntimeStore.getState().setStatus(lone, "waiting");
+      fire({ reqId: "rd4", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents.find((a) => a.id === otherId)!.rollupDot).toBe("green");
+      expect(res.agents.find((a) => a.id === lone)!.rollupDot).toBe("red");
+    });
+
+    // roborev 54742: THE MISSING OBSERVATION MUST NOT BECOME A CALM CLAIM. `status` is window-local
+    // and control:request is broadcast, so the window that answers may have no entry for a worker
+    // mounted elsewhere (or one just spawned, whose pane has not mounted). Those workers default to
+    // "stopped", which bands to `done` and contributes NOTHING — so a head whose whole fleet is
+    // invisible from here published `gray`, documented as "nothing running and nothing asking".
+    // That is the same false negative agentLiveness exists to stop, and under scope "self" the
+    // caller gets no worker rows at all, so it cannot repair the reading itself.
+    it("reports null — not gray — for a head whose worker has NO status entry", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      // otherId (worker, parentId = callerId) deliberately has no status entry: liveness "unknown".
+      fire({ reqId: "rd5", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      const head = res.agents.find((a) => a.id === callerId)!;
+      expect(head.status).toBe("idle"); // own PTY state, unchanged
+      expect(head.rollupDot).toBeNull();
+    });
+
+    it("reports null for a head whose worker is open only in ANOTHER window", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.setState({ openAgentIds: [otherId] } as never); // liveness "other-window"
+      fire({ reqId: "rd6", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents).toHaveLength(1);
+      expect(res.agents[0]!.rollupDot).toBeNull();
+    });
+
+    // The suppression is ONE-SIDED on purpose. Withholding an OBSERVED alarm because some OTHER
+    // worker is invisible would trade the false negative for a worse one: an alarm someone actually
+    // saw, dropped. red/orange are evidence ("this row was seen asking"); green/gray are absence
+    // claims, and only an absence claim can be falsified by a row this window cannot see.
+    it("keeps an OBSERVED red even when a sibling worker is unobserved", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "blocked");
+      useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: callerId }); // no status
+      fire({ reqId: "rd7", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents.find((a) => a.id === callerId)!.rollupDot).toBe("red");
+    });
+
+    // GREEN IS AN ABSENCE CLAIM TOO. "work is running under this row" reads as "and nothing under it
+    // is asking" — which the invisible worker may well be doing.
+    it("reports null for a green head when a sibling worker is unobserved", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "working");
+      useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: callerId }); // no status
+      fire({ reqId: "rd8", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents.find((a) => a.id === callerId)!.rollupDot).toBeNull();
+    });
+
+    // …and a FULLY observed subtree still answers. Withholding gray whenever any row is defaulted
+    // would make the field useless in the ordinary single-window case, which is most of them.
+    it("still reports gray when the whole subtree IS observed", async () => {
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      useRuntimeStore.getState().setStatus(otherId, "done");
+      fire({ reqId: "rd9", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const res = lastReply() as { agents: Array<Record<string, unknown>> };
+      expect(res.agents.find((a) => a.id === callerId)!.rollupDot).toBe("gray");
+    });
+  });
+
   // roborev #53441: the caller is definitionally live — it is making the call — but nothing
   // guarantees it a status entry (a different window may answer; a fresh worker's pane has not
   // mounted). Without an explicit clause it could omit ITSELF, which also made "active" inconsistent

@@ -198,7 +198,21 @@ export interface EffectiveConfig {
    *  additionally capped by it. Optional so callers guard: a Rust backend predating machine-aware
    *  concurrency omits it (fall back to `workers.max_concurrent`, or 1 when that is null too). */
   effective_max_concurrent?: number;
+  /** What the MACHINE alone could carry, ignoring any `[workers].max_concurrent` pin. Equal to
+   *  `effective_max_concurrent` under AUTO. Optional for the same back-compat reason as above. */
+  machine_max_concurrent?: number;
+  /** Which dimension binds `effective_max_concurrent`. Surfaced so user-facing copy can NAME it
+   *  instead of asserting RAM unconditionally — which is wrong on every core-bound machine, and is
+   *  what sent a human chasing memory that was 94% free. Optional: an older backend omits it, in
+   *  which case the copy must fall back to saying nothing about the cause rather than guessing. */
+  concurrency_bound?: ConcurrencyBound;
+  /** One sentence naming that dimension with its arithmetic, e.g. `"CPU-bound: 18 cores × 2 agents
+   *  per core"`. Composed in Rust alongside the number it explains so the two cannot disagree. */
+  concurrency_basis?: string;
 }
+
+/** Which dimension binds the enforced concurrency ceiling. Mirrors Rust's `config::Bound`. */
+export type ConcurrencyBound = "cpu" | "ram" | "both" | "pinned" | "unknown";
 export interface ConfigPaths {
   global: string;
   /** Present only when a project root is in context. */

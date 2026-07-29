@@ -81,8 +81,32 @@ const deadWorktrees = new Set<string>();
 // Without this, the first post-reload poll would skip every idle agent and leave branchStatus empty
 // until some ref moves. So we FORCE a full recompute on the first poll after (re)init, which
 // repopulates branchStatus (and refreshes the Rust cache) exactly once; steady-state polls then skip
-// normally. The module-level flag resets whenever the module re-executes, matching the store reset.
-let firstProjectStatusPollDone = false;
+// normally. The module-level state resets whenever the module re-executes, matching the store reset.
+//
+// PER-AGENT, not per-call (roborev 54750, High). This was a single boolean, and the probed/local
+// split introduced by the closed-agent sweep let the PROBED batch consume it before the LOCAL batch
+// ever ran: `pollProjectStatus` set it true as soon as the first call returned, so the second call
+// saw `forceAll === false` and fell back to per-agent `force`, which is false for a quiet CLOSED
+// agent. Because a closed idle agent's refs never move, `branchStatus[id]` then stayed `undefined`
+// FOREVER — `resolveStage(undefined)` falls to `building_unsaved` and `withUnmergedWork` never
+// fires. That is the exact "a branch full of commits reads as an empty agent" symptom the sweep was
+// added to fix, reintroduced on the reload / second-window path (the Rust `status_cache()` is a
+// process-global keyed by worktree path, so it is warm across both).
+//
+// A Set of agent ids is used rather than "capture the flag once per tick" so that a future THIRD
+// batch cannot re-open the same hole.
+const forcedOnce = new Set<string>();
+
+// roborev 54843 (Medium): `driveLifecycle` gates `maybePromptRoborevConsent`, but the stage
+// watermark above it is advanced UNCONDITIONALLY — intentionally, per the sweep's own design (it
+// exists to answer "does this branch hold unmerged work?", and the stage watermark is part of that
+// answer even for a closed pane). `maybePromptRoborevConsent` is edge-triggered on prev < reviewable
+// <= next, so a closed-sweep tick that writes `building_saved` consumes that crossing silently. When
+// the pane is later opened, the probed poll sees `prev === next` (both already at the new stage) and
+// the modal never fires for that agent — the ONE-TIME roborev consent prompt is lost, not merely
+// deferred. This records which agents crossed while un-prompted, so the next `driveLifecycle` poll
+// can still raise the modal even though its own prev/next comparison no longer sees a crossing.
+const pendingRoborevConsent = new Set<string>();
 
 /** Does this git error mean the agent's worktree directory is gone (vs. a transient hiccup)? The
  *  latch is terminal (no re-poll until relaunch), so we match ONLY the structural signatures git
@@ -377,6 +401,24 @@ async function applyWorkflowState(
   rootPath: string,
   agent: { id: string; kind: string; beadId?: string; name?: string; parentId?: string | null },
   ws: WorkflowState,
+  /** Whether this call may drive the bead lifecycle and the roborev consent modal.
+   *
+   *  FALSE for the closed-agent sweep (roborev 54750). Widening the status poll to closed panes also
+   *  widened these side effects to rows nobody is watching, which previously could not reach them:
+   *
+   *   1. `syncBeadLifecycle` emits `create` for any BUILD agent with `hasRealWork` and no `beadId`,
+   *      so the first tick after that change would shell out `bd create` + `claim` for EVERY closed
+   *      build agent holding commits — dozens at once on a 46-agent fleet, with no user action.
+   *   2. `close()` clears `workflowStage`/`workflowShipped` and calls `forgetBeadLifecycle`, so for a
+   *      closed agent `prev` is null and the persisted-shipped re-seed that stops `in_progress` being
+   *      written back onto an already-progressed bead is gone — for exactly the rows this sweep polls.
+   *   3. The same null `prev` lets `maybePromptRoborevConsent` cross into `building_saved` from a
+   *      background sweep rather than from work the user is watching.
+   *
+   *  The sweep exists to answer "does this branch hold unmerged work?" — `branchStatus`,
+   *  `workflowState` and the stage watermark, all of which still update. Mutating beads and raising
+   *  modals is not part of that question, and is left to the probed batch for open panes. */
+  driveLifecycle = true,
 ): Promise<void> {
   const store = useRuntimeStore;
   // Keep the RAW signals for the composer CTA (the monotonic stage watermark below can't tell
@@ -425,16 +467,35 @@ async function applyWorkflowState(
   if (next !== prev) store.getState().setWorkflowStage(agent.id, next);
   // One-time roborev consent: the first time this agent's work reaches a reviewable commit
   // (building_saved or beyond), surface the consent modal — see maybePromptRoborevConsent.
-  maybePromptRoborevConsent(prev, next);
-  // Drive the agent's bead from its current stage (fire-and-forget; monotonic + idempotent).
-  void syncBeadLifecycle(
-    projectId,
-    rootPath,
-    agent,
-    next,
-    store.getState().branchStatus[agent.id],
-    !!store.getState().workflowShipped[agent.id],
-  );
+  if (driveLifecycle) {
+    // A DEFERRED crossing (see `pendingRoborevConsent`) takes priority over the normal prev/next
+    // comparison: prev may already equal next here (the closed sweep already wrote the stage), which
+    // would read as "no crossing" and silently drop the one-time prompt. Passing `null` as `prev`
+    // reproduces the crossing unconditionally; `maybePromptRoborevConsent`'s own settings guard
+    // (already prompted / already open) still applies, so this cannot re-open a resolved modal.
+    if (pendingRoborevConsent.delete(agent.id)) {
+      maybePromptRoborevConsent(null, next);
+    } else {
+      maybePromptRoborevConsent(prev, next);
+    }
+    // Drive the agent's bead from its current stage (fire-and-forget; monotonic + idempotent).
+    void syncBeadLifecycle(
+      projectId,
+      rootPath,
+      agent,
+      next,
+      store.getState().branchStatus[agent.id],
+      !!store.getState().workflowShipped[agent.id],
+    );
+  } else if (
+    stageIndex(next) >= REVIEWABLE_STAGE_INDEX &&
+    (prev == null || stageIndex(prev) < REVIEWABLE_STAGE_INDEX)
+  ) {
+    // The closed sweep just wrote a crossing that `driveLifecycle` prevented it from prompting for.
+    // Remember it so the NEXT poll that is allowed to drive lifecycle (i.e. the pane gets opened,
+    // the probed batch picks it up) still raises the one-time modal.
+    pendingRoborevConsent.add(agent.id);
+  }
   // Sticky "shipped" watermark: latch true the first time work reaches On Main (or beyond).
   // Deliberately compares against `merged` (ORIGIN main), not `merged_local`: this watermark drives
   // the bead lifecycle and the "landed at least once" ✓, which must mean the work is actually on the
@@ -631,6 +692,13 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
           const { [agentId]: _wstate, ...workflowState } = s.workflowState;
+          // `branchStatus` was just dropped above — `forcedOnce` must forget it too (roborev 54843,
+          // High). Otherwise an agent polled once while open (marked forced), then closed, then
+          // reopened has no branchStatus but IS in `forcedOnce`: every poll after that sends
+          // `force: false`, the fingerprint cache reports `changed: false` for a quiet branch, and
+          // `branchStatus[id]` never gets set again — the exact bug this Set was added to fix,
+          // through the door `close()`/`resetProgress()` leave open.
+          forcedOnce.delete(agentId);
           // Read-modify-MERGE the shared persisted set, then drop ONLY this id (): the
           // union retains other live windows' open ids in the persisted write, so closing a3 here
           // can't clobber window B's b1 — while still removing a3 itself.
@@ -662,6 +730,10 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
           const { [agentId]: _wstate, ...workflowState } = s.workflowState;
+          // Same reason as in `close()`: `branchStatus` was just dropped, so `forcedOnce` must
+          // forget the id too, or the reused slot inherits a stale "already forced" mark with no
+          // branchStatus to show for it.
+          forcedOnce.delete(agentId);
           // Note: openAgentIds is intentionally untouched — the pane stays mounted for the new run.
           return {
             status,
@@ -752,8 +824,7 @@ export const useRuntimeStore = create<RuntimeState>()(
         if (!project) return;
         // Force every agent to recompute on the FIRST poll after (re)init so the live-only, boots-empty
         // branchStatus map is repopulated even when the Rust fingerprint cache survived a reload (see
-        // firstProjectStatusPollDone). Steady-state polls honor each agent's own `force`.
-        const forceAll = !firstProjectStatusPollDone;
+        // forcedOnce). Steady-state polls honor each agent's own `force`.
         let results: AgentStatusResult[];
         try {
           results = await projectAgentsStatus(
@@ -764,7 +835,7 @@ export const useRuntimeStore = create<RuntimeState>()(
               baseBranch: a.baseBranch,
               parentBranch: a.parentBranch,
               kind: a.kind,
-              force: a.force || forceAll,
+              force: a.force || !forcedOnce.has(a.id),
             })),
             probePrState,
           );
@@ -772,7 +843,16 @@ export const useRuntimeStore = create<RuntimeState>()(
           console.debug("pollProjectStatus failed for", projectId, e);
           return;
         }
-        firstProjectStatusPollDone = true;
+        // Mark forced only on EVIDENCE the recompute actually landed (roborev 54843): either this
+        // poll produced a fresh read (`r.changed`), or a prior poll already established
+        // `branchStatus` for the agent. Marking the whole batch unconditionally — the previous fix
+        // for this same finding — let a per-agent git error (which `projectAgentsStatus` reports as
+        // `changed: false`, indistinguishable here from a genuine "no diff") spend that agent's one
+        // free recompute on a poll that produced nothing, so it never got a real force again.
+        const branchStatusNow = get().branchStatus;
+        for (const r of results) {
+          if (r.changed || branchStatusNow[r.agentId] !== undefined) forcedOnce.add(r.agentId);
+        }
         const infoById = new Map(live.map((a) => [a.id, a]));
         // Apply orchestrators (build) BEFORE workers so a worker's deriveLiveStage reads its parent's
         // fresh stage this same tick — matching the old parents-first-then-rest poll ordering.
@@ -788,6 +868,10 @@ export const useRuntimeStore = create<RuntimeState>()(
               project.rootPath,
               { id: info.id, kind: info.kind, beadId: info.beadId, name: info.name, parentId: info.parentId },
               r.workflow,
+              // `probePrState` is exactly the open/closed split: the probed batch is the rows with a
+              // mounted pane, the local batch is the closed sweep. Only the former may mutate beads
+              // or raise the consent modal — see `driveLifecycle`.
+              probePrState,
             );
           }
         }
@@ -811,6 +895,11 @@ export const useRuntimeStore = create<RuntimeState>()(
           // Prune the per-agent last-interaction map to live agents too (same unbounded-growth
           // concern as the bead maps; the map only ever grew before).
           useInteractionStore.getState().reconcile(validIds);
+          // `forcedOnce` and `pendingRoborevConsent` are the same unbounded-growth shape
+          // (roborev 54843) — an agent id, once added, was never removed even after the agent
+          // itself is gone.
+          for (const id of forcedOnce) if (!valid.has(id)) forcedOnce.delete(id);
+          for (const id of pendingRoborevConsent) if (!valid.has(id)) pendingRoborevConsent.delete(id);
           const openAgentIds = s.openAgentIds.filter((id) => valid.has(id));
           // Prune the now-PERSISTED workflow maps to agents that still exist, so a deleted agent's
           // stale stage/shipped ✓ can't linger forever in localStorage (and can't resurface if its

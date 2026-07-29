@@ -13,14 +13,35 @@ import { useUiStore } from "../stores/uiStore";
 import { landInAgent } from "./landInAgent";
 import { createBeadFull } from "./tasks";
 import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
+import { localAgentCapacity } from "./agentCapacity";
 import { log } from "../logger";
 import { perfStart } from "../perfTrace";
 import type { Project } from "../types";
 
-/** Create + open a local Build agent in `project`, returning its id — or null when the project is
- *  gone from the store (closed in another window between the caller's read and this call), in which
- *  case NOTHING was created and no UI side-effect fired (roborev 46278). */
+/** Create + open a local Build agent in `project`, returning its id — or null when the spawn did not
+ *  happen: the project is gone from the store (closed in another window between the caller's read
+ *  and this call, roborev 46278), or the machine is at its agent ceiling. Either way NOTHING was
+ *  created and no UI side-effect fired. */
 export function spawnBuildAgentInProject(project: Project): string | null {
+  // THE machine-wide gate, and it lives HERE — in the one shared implementation — rather than in
+  // each caller. It used to sit only in the concierge's `spawn_build_agent`, so the concierge was
+  // refused at capacity while the human's "+ New Build Agent" button called straight through and
+  // kept going: one project was observed growing 4 → 15 agents while the machine-wide count was
+  // already over the ceiling. A cap enforced on one of two paths is not a cap.
+  //
+  // Checked BEFORE anything is created, so an over-cap request leaves the store exactly as it found
+  // it. Refused, never queued: a silent queue would leave a human waiting on an agent with no slot
+  // and no ETA. The concierge checks first too — not redundantly, but so it can REFUSE WITH A
+  // REASON; reaching this line means a path that has no channel for one, so it logs and declines.
+  const capacity = localAgentCapacity();
+  if (capacity.atCapacity) {
+    log.warn("build-agent", "spawn refused: at machine agent capacity", {
+      used: capacity.used,
+      limit: capacity.limit,
+      basis: capacity.basis,
+    });
+    return null;
+  }
   const store = useProjectStore.getState();
   const id = store.addAgent(project.id, { kind: "build" });
   if (!id) return null;

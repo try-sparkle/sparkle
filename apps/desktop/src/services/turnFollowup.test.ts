@@ -8,7 +8,13 @@ import {
   classifyFollowupSignal,
   interpretVerdict,
   judgeNeedsFollowup,
+  screenShowsPicker,
 } from "./turnFollowup";
+import {
+  APPROVAL_2_1_220,
+  ASK_USER_QUESTION_2_1_220,
+  IDLE_AFTER_TURN_2_1_220,
+} from "../engine/capturedScreens.fixture";
 
 describe("mightNeedFollowup (local fast-path)", () => {
   it("skips a plain completion report with no question or proposal", () => {
@@ -316,5 +322,80 @@ describe("judgeNeedsFollowup (orchestration)", () => {
     });
     expect(result).toBe(false);
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── A picker on screen short-circuits the whole prose pipeline ──────────────────────────────
+// Reported live: agent "Kill BYOK Anthropic Key" showed GREEN the entire time it sat on an
+// interactive picker. Nothing here derives from a FINISHED turn — a rendered menu means the agent
+// is mid-turn and blocked, so no turn text exists to judge. Screens are verbatim Claude Code
+// 2.1.220 captures (engine/capturedScreens.fixture.ts).
+describe("screenShowsPicker", () => {
+  it("sees a Claude Code permission dialog and an AskUserQuestion menu", () => {
+    expect(screenShowsPicker(APPROVAL_2_1_220)).toBe(true);
+    expect(screenShowsPicker(ASK_USER_QUESTION_2_1_220)).toBe(true);
+  });
+
+  it("sees a plain shell prompt", () => {
+    expect(screenShowsPicker("Overwrite existing file? [y/n] ")).toBe(true);
+  });
+
+  it("does NOT see one on a finished turn, mid-shell-command output, or no screen at all", () => {
+    expect(screenShowsPicker(IDLE_AFTER_TURN_2_1_220)).toBe(false);
+    expect(
+      screenShowsPicker(
+        ["$ pnpm test", "  ✓ src/engine/statusEngine.test.ts (31 tests) 84ms", ""].join("\n"),
+      ),
+    ).toBe(false);
+    expect(screenShowsPicker(undefined)).toBe(false);
+    expect(screenShowsPicker("   \n  ")).toBe(false);
+  });
+});
+
+describe("judgeNeedsFollowup — a live picker outranks the prose pipeline", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("reports needs-you for an agent sitting on a picker, without calling the judge", async () => {
+    // The reported bug. The turn text is a plain progress report with no '?' and no proposal, so
+    // the fast-path grays it and the judge is never even asked — which is exactly how a blocked
+    // agent stayed green. The screen is the evidence that outranks it.
+    const result = await judgeNeedsFollowup({
+      task: "Kill the BYOK Anthropic key",
+      response: "Running the command now.",
+      screen: APPROVAL_2_1_220,
+    });
+    expect(result).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalled(); // no prose heuristic, no judge call, no model
+  });
+
+  it("reports needs-you on a picker even when the judge would have said DONE", async () => {
+    invokeMock.mockResolvedValue("DONE");
+    const result = await judgeNeedsFollowup({
+      task: "Pick a model",
+      response: "All set — anything else you want me to do?",
+      screen: ASK_USER_QUESTION_2_1_220,
+    });
+    expect(result).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT report needs-you for an agent mid-shell-command with nothing on the prompt", async () => {
+    const result = await judgeNeedsFollowup({
+      task: "Run the suite",
+      response: "Kicked off the suite; I'll report when it lands.",
+      screen: ["$ pnpm -C apps/desktop test", " RUN  v2.1.9", ""].join("\n"),
+    });
+    expect(result).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves the prose path untouched when there is no screen to read", async () => {
+    invokeMock.mockResolvedValueOnce("FOLLOWUP");
+    const result = await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "All secrets are in. Want me to land it now?",
+    });
+    expect(result).toBe(true);
+    expect(invokeMock).toHaveBeenCalled();
   });
 });

@@ -634,19 +634,53 @@ impl Default for SparkleConfig {
 pub struct EffectiveConfig {
     pub config: SparkleConfig,
     pub warnings: Vec<String>,
-    /// The concurrency limit the app ENFORCES: `workers.max_concurrent` narrowed by how many
-    /// agent-sized heaps this machine's RAM can actually hold (see `memory_aware_concurrency`).
-    /// Always ≤ `config.workers.max_concurrent`, always ≥ 1. The frontend's concurrency gate reads
-    /// this, not the raw configured value.
+    /// The concurrency limit the app ENFORCES: `workers.max_concurrent` narrowed by what this
+    /// machine's RAM and cores can carry (see `memory_aware_concurrency`). Always ≤
+    /// `config.workers.max_concurrent`, always ≥ 1. The frontend's concurrency gate reads this, not
+    /// the raw configured value.
     pub effective_max_concurrent: u32,
+    /// What the MACHINE alone could carry, ignoring any pinned ceiling. Equal to
+    /// `effective_max_concurrent` unless a `[workers].max_concurrent` pin is holding it down.
+    /// Reported so the UI can tell "your Mac is full" apart from "you chose this number" — the
+    /// remedy for the second is a config line, not different hardware.
+    pub machine_max_concurrent: u32,
+    /// Which dimension binds `effective_max_concurrent`: `"cpu" | "ram" | "both" | "pinned" |
+    /// "unknown"`. Serialized so the human-facing at-capacity refusal can name it instead of
+    /// asserting RAM unconditionally (which is wrong on every core-bound machine).
+    pub concurrency_bound: Bound,
+    /// One sentence naming that dimension with its arithmetic, e.g.
+    /// `"CPU-bound: 18 cores × 2 agents per core"`. Composed alongside the number it explains so the
+    /// two can never disagree.
+    pub concurrency_basis: String,
 }
 
 impl EffectiveConfig {
-    /// Build an EffectiveConfig, deriving the RAM-aware concurrency and appending the clamp
-    /// warning when installed RAM forces the limit below what the user configured.
-    fn derive(config: SparkleConfig, mut warnings: Vec<String>) -> Self {
-        let (effective_max_concurrent, warn) =
-            memory_aware_concurrency(&config.workers, total_memory_bytes(), cpu_core_count());
+    /// Build an EffectiveConfig, deriving the machine-aware concurrency and appending the clamp
+    /// warning when the hardware forces the limit below what the user configured.
+    fn derive(config: SparkleConfig, warnings: Vec<String>) -> Self {
+        Self::derive_measured(config, warnings, total_memory_bytes(), cpu_core_count())
+    }
+
+    /// The measurement-injected core of `derive`. Split out so tests can pin the machine's RAM and
+    /// core count instead of reading whatever CI runner they land on: a 7 GiB / 3-core macOS runner
+    /// derives only ONE agent, so a pin that a real developer machine would clamp (and label
+    /// `Pinned`) instead reads as `Ram` there — the honest answer for that box, but not the wiring
+    /// the derive-path tests mean to exercise. Production always calls `derive`, which feeds the
+    /// real hardware; only tests reach for a fixed machine.
+    fn derive_measured(
+        config: SparkleConfig,
+        mut warnings: Vec<String>,
+        total_ram: Option<u64>,
+        cores: Option<u32>,
+    ) -> Self {
+        let d = memory_aware_concurrency(&config.workers, total_ram, cores);
+        let ConcurrencyDerivation {
+            effective: effective_max_concurrent,
+            machine: machine_max_concurrent,
+            bound: concurrency_bound,
+            basis: concurrency_basis,
+            warning: warn,
+        } = d;
         if let Some(w) = warn {
             // `for_project` re-derives on top of warnings that already came from the global layer,
             // so guard against showing the user the same clamp twice.
@@ -660,7 +694,14 @@ impl EffectiveConfig {
                 warnings.push(w);
             }
         }
-        Self { config, warnings, effective_max_concurrent }
+        Self {
+            config,
+            warnings,
+            effective_max_concurrent,
+            machine_max_concurrent,
+            concurrency_bound,
+            concurrency_basis,
+        }
     }
 }
 
@@ -1136,11 +1177,51 @@ const V8_DEFAULT_HEAP_MB: u32 = 4096;
 /// the user their machine.
 const MEMORY_RESERVE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
-/// How many agents of `agent_heap_mb` fit in `total_ram_bytes` after `reserve_bytes`.
+/// Measured typical resident set of one AGENT — not one process (roborev 54816). The first
+/// measurement here (2026-07-28, 30 concurrent Claude Code sessions, ~520 MiB each / 15.7 GiB
+/// total) implicitly assumed one process per agent, which is only true when nothing has fanned out
+/// to subagents. A second measurement the next day (2026-07-29, the AGENTS_PER_CORE raise below)
+/// found 37 processes across 19 agent WORKTREES — 1.95 processes per agent, peak 5 when an agent
+/// runs subagents — for 21.1 GiB total, i.e. **1.11 GiB per agent**. That is the number this
+/// constant must divide by: `agent_ram_budget_mb` computes how many AGENTS fit, and a per-process
+/// figure under-counts every agent that has fanned out. 1152 MiB is that measurement rounded up
+/// with headroom for the tail, matching the ~10% margin the original 520→768 rounding used.
+///
+/// This exists because `agent_heap_mb` is the WRONG basis for a RAM budget and budgeting on it
+/// over-reserved by ~6× at the old constant, ~2.7× at this one. A heap ceiling is a per-process
+/// guard against ONE agent running away — it is not an estimate of what an agent resides at, and
+/// dividing installed RAM by it prices every agent as though it were the runaway.
+const AGENT_TYPICAL_RSS_MB: u32 = 1152;
+
+/// How far the SUM of per-agent heap CEILINGS may exceed usable RAM. Ceilings are reached rarely
+/// and not simultaneously, and macOS compresses memory, so some overcommit of ceilings is correct —
+/// but not unbounded. The 2026-07-20 jetsam incident sat at roughly 3× (24 agents × V8's ~4 GiB
+/// default against a machine that could not hold it), so 2× stays under the observed failure point
+/// while still being ~3× more permissive than the measured working set actually needs.
+const PEAK_HEAP_OVERCOMMIT: u32 = 2;
+
+/// RAM to budget per agent, in MiB: the larger of what an agent actually resides at and its
+/// amortized share of the heap ceiling. ONE divisor rather than two competing derivations, so the
+/// user-facing sentence is arithmetic the human can check — `usable ÷ this = the RAM-derived limit`.
+///
+///   • the steady term (`AGENT_TYPICAL_RSS_MB`, itself capped by the ceiling — an agent cannot
+///     reside far above a heap it is not allowed to grow into) sizes the normal case;
+///   • the peak term (`ceiling / PEAK_HEAP_OVERCOMMIT`) keeps a large ceiling from being ignored,
+///     which is what stops "budget on typical RSS" from re-creating the runaway coalition.
+///
+/// Taking the max of the two divisors is exactly `min()` of the two agent counts they would each
+/// derive (same numerator, larger divisor → smaller quotient), stated once instead of twice.
+fn agent_ram_budget_mb(heap_ceiling_mb: u32) -> u32 {
+    let steady = AGENT_TYPICAL_RSS_MB.min(heap_ceiling_mb);
+    let peak_share = heap_ceiling_mb / PEAK_HEAP_OVERCOMMIT;
+    steady.max(peak_share).max(1)
+}
+
+/// How many agents fit in `total_ram_bytes` after `reserve_bytes`, at `agent_ram_budget_mb` each.
 /// Always at least 1: a machine too small for even one agent must still be able to run one
 /// (degraded, possibly swapping) rather than be told it may run zero and deadlock the orchestrator.
-fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, agent_heap_mb: u32) -> u32 {
-    let per_agent = (agent_heap_mb as u64) * 1024 * 1024;
+fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, heap_ceiling_mb: u32) -> u32 {
+    let per_agent = (agent_ram_budget_mb(heap_ceiling_mb) as u64) * 1024 * 1024;
     if per_agent == 0 {
         return 1;
     }
@@ -1151,10 +1232,38 @@ fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, agent_heap_
 
 /// How many agents each CPU core is allowed to carry. Agents are not memory-parked processes: each
 /// one runs a real Claude Code session doing git, builds and test suites, so cores bound throughput
-/// independently of RAM. Two per core keeps every core busy while an agent is blocked on I/O (which
-/// is most of the time) without the context-thrashing that made a big-RAM machine slower, not
-/// faster. This is the one tunable judgement in the derivation — RAM and core count are measured.
-const AGENTS_PER_CORE: u32 = 2;
+/// independently of RAM. This is the one tunable judgement in the derivation — RAM and core count
+/// are measured.
+///
+/// RAISED 2 → 6 on 2026-07-29, deliberately and with a caveat that is NOT to be deleted.
+///
+/// Why raised: at 2, this was the SOLE binding dimension on every large-RAM Mac and it was binding
+/// on a machine that was 90% memory-free with zero swap. Measured on an 18-core / 128 GiB host:
+/// 37 live `claude` processes across 19 agent worktrees held 21.1 GiB — 1.11 GiB per AGENT — while
+/// `by_cpu` held the ceiling at 36 and `by_ram` allowed 81. Nothing in that load suggested core
+/// contention; the 36 came entirely from this multiplier. Agents spend most of their wall-clock
+/// blocked on model round-trips, not saturating a core.
+///
+/// THE CAVEAT, which is real evidence and not a hedge: an earlier note here recorded that a higher
+/// value made a big-RAM machine SLOWER, not faster, via context thrashing. That observation was not
+/// reproduced or refuted before this change — it was overridden by a human decision. Agents' bursts
+/// (cargo builds, full vitest suites, git) genuinely ARE CPU-bound, and 6 × 18 = 108 would let a
+/// hundred of them burst at once on 18 cores.
+///
+/// roborev 54816: an earlier draft of this comment claimed, in the present tense, that runtime
+/// pressure-aware admission and an RSS watchdog make that survivable. NEITHER EXISTS YET. This
+/// raise ships AHEAD OF them — `sparkle-asz5`'s memory-aware half stops at a STATIC prediction (it
+/// samples installed RAM once and memoizes it; it never re-samples available memory or pressure at
+/// admission time), and the RSS watchdog is `sparkle-0bye`, still OPEN. Until both land, this
+/// constant is the ONLY guard, not a ceiling under a governor — do not read this comment as a
+/// description of protection that is already in force. If this constant is ever raised again
+/// WITHOUT that feedback loop landing first, that is a regression to the arithmetic that produced
+/// `sparkle-hfhs` (P0: 32 GiB Macs cannot run Sparkle).
+///
+/// Note this flips which dimension binds on a big-RAM Mac: 18 × 6 = 108 vs `by_ram` 81, so RAM now
+/// binds at 81 and `Bound::Ram` is what the human is told. That is intended — RAM is the dimension
+/// actually measured per agent.
+const AGENTS_PER_CORE: u32 = 6;
 
 /// Logical CPU count, or None when we can't determine it. Memoized (fixed hardware property).
 fn cpu_core_count() -> Option<u32> {
@@ -1173,12 +1282,24 @@ fn cpu_derived_concurrency(cores: u32) -> u32 {
 /// a TIE (both derive the same number), and a tie routed to the RAM branch tells the user to lower
 /// `agent_heap_mb` — advice that cannot work, because raising `by_ram` leaves `min()` unchanged when
 /// cores bind equally. That is exactly the "useless advice" this attribution exists to prevent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Bound {
+///
+/// Serialized to the frontend on `EffectiveConfig` (`concurrency_bound`) because the attribution
+/// existing in Rust was never enough: the at-capacity refusal the concierge shows a human said "the
+/// ceiling is derived from installed RAM" unconditionally, which on a core-bound machine is the
+/// exact mis-attribution this enum was written to prevent — it just wasn't reaching the human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bound {
     Ram,
     Cpu,
     /// Both dimensions derive the same limit — neither remedy alone raises it.
     Both,
+    /// Neither dimension binds: the user's `[workers].max_concurrent` pin is below what the machine
+    /// could carry, so the ceiling is a CHOICE, not a hardware fact. Telling the human about RAM or
+    /// cores here would send them to tune hardware that is not the constraint.
+    Pinned,
+    /// Nothing measurable (unsupported platform / sysctl failure) and no pin either.
+    Unknown,
 }
 
 /// The limit the MACHINE can carry (ignoring any configured ceiling) and the dimension that bound
@@ -1212,8 +1333,34 @@ fn auto_concurrency_bound(
     }
 }
 
-/// The concurrency the app will actually enforce, plus an optional warning when the machine forced
-/// it below what the user configured. `total_ram` / `cores` are None when we can't measure them.
+/// Everything the app knows about the concurrency ceiling, derived ONCE and carried together so the
+/// number the app ENFORCES, the number it REPORTS, and the sentence explaining it cannot drift
+/// apart. A cap that lies about itself is worse than a wrong cap: the concierge refused a spawn with
+/// "at-capacity: 46 of 32 slots… the ceiling is derived from installed RAM" on a machine that was
+/// CPU-bound at 36 and pinned at 32 — three different numbers and the wrong reason, which sent a
+/// human chasing memory that was 94% free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConcurrencyDerivation {
+    /// The number the app enforces. Every concurrency gate reads this (via
+    /// `EffectiveConfig::effective_max_concurrent`, mirrored into the frontend's `enforcedWorkerCap`).
+    pub effective: u32,
+    /// What the MACHINE alone could carry, ignoring any pinned ceiling. Equal to `effective` unless
+    /// a pin is holding the number down — which is precisely the case the human needs told apart
+    /// from a hardware limit, because the remedy is a config line, not a bigger Mac.
+    pub machine: u32,
+    /// Which dimension binds `effective`.
+    pub bound: Bound,
+    /// One human sentence naming that dimension WITH its arithmetic, for the at-capacity refusal and
+    /// the ⋯-menu hint. Never speculative: it reports the dimension the derivation returned.
+    pub basis: String,
+    /// The config warning, when the situation is worth surfacing in the warnings list. Not part of
+    /// the serialized payload — `EffectiveConfig::derive` folds it into `warnings`.
+    #[serde(skip)]
+    pub warning: Option<String>,
+}
+
+/// The concurrency the app will actually enforce, with its provenance. `total_ram` / `cores` are
+/// None when we can't measure them.
 ///
 /// Two cases:
 ///   - `max_concurrent = None` (AUTO, the default) → the machine-derived value, no warning. There is
@@ -1225,73 +1372,166 @@ fn memory_aware_concurrency(
     w: &WorkersConfig,
     total_ram: Option<u64>,
     cores: Option<u32>,
-) -> (u32, Option<String>) {
+) -> ConcurrencyDerivation {
     let derived = auto_concurrency_bound(w, total_ram, cores);
+    let heap_mb = if w.agent_heap_mb > 0 { w.agent_heap_mb } else { V8_DEFAULT_HEAP_MB };
+    let budget_mb = agent_ram_budget_mb(heap_mb);
+    let gib = |b: u64| b / (1024 * 1024 * 1024);
+    // The per-agent RAM figure, stated so a human can check the division AND see where it came from.
+    // It is deliberately NOT `agent_heap_mb`: that is a heap ceiling, ~2.7× what an agent resides at
+    // (AGENT_TYPICAL_RSS_MB), and quoting it was how "lower agent_heap_mb" became the standing (and
+    // useless) advice.
+    // `agent_ram_budget_mb` is the max of the two divisors, so a budget ABOVE the steady term means
+    // the heap ceiling's amortized share is what won.
+    let per_agent = if budget_mb > AGENT_TYPICAL_RSS_MB.min(heap_mb) {
+        format!("{budget_mb} MiB per agent (half the {heap_mb} MiB heap ceiling)")
+    } else {
+        format!("{budget_mb} MiB per agent (measured typical working set)")
+    };
+    // Telling a user to "lower" a value that is already 0 is impossible advice — 0 maps to the
+    // LARGEST budget, so the fix there is to set a positive one (roborev 40311).
+    //
+    // And it is bounded advice: below `AGENT_TYPICAL_RSS_MB * PEAK_HEAP_OVERCOMMIT` the measured
+    // working set becomes the floor, so lowering further buys nothing. Saying "lower it" without
+    // that bound is how a human ends up tuning a knob that has stopped moving the number.
+    let heap_floor = AGENT_TYPICAL_RSS_MB * PEAK_HEAP_OVERCOMMIT;
+    let ram_remedy = if w.agent_heap_mb == 0 {
+        format!("Set a positive agent_heap_mb (below {heap_mb}) to allow more.")
+    } else if heap_mb > heap_floor {
+        format!(
+            "Lower agent_heap_mb to allow more, down to about {heap_floor} — below that the \
+             measured per-agent working set is the floor and lowering it further changes nothing."
+        )
+    } else {
+        "agent_heap_mb is already at the measured per-agent working set, so lowering it further \
+         will not allow more; this machine simply has this much RAM."
+            .to_string()
+    };
+    // The sentence for each MEASURED dimension, phrased to stand alone inside a user-facing refusal.
+    let ram_basis = || {
+        format!(
+            "RAM-bound: {} GiB installed − {} GiB reserved, ÷ {}",
+            total_ram.map_or(0, gib),
+            gib(MEMORY_RESERVE_BYTES),
+            per_agent,
+        )
+    };
+    let cpu_basis =
+        || format!("CPU-bound: {} cores × {} agents per core", cores.unwrap_or(0), AGENTS_PER_CORE);
+
     let Some(configured) = w.max_concurrent else {
         // AUTO. With nothing measurable, fall back to a single agent rather than inventing a number:
         // one always works, and the alternative is guessing on hardware we know nothing about.
-        return (derived.map_or(1, |(n, _)| n), None);
+        let Some((auto, bound)) = derived else {
+            return ConcurrencyDerivation {
+                effective: 1,
+                machine: 1,
+                bound: Bound::Unknown,
+                basis: "no measurable CPU or RAM on this machine, so one agent at a time".into(),
+                warning: None,
+            };
+        };
+        let basis = match bound {
+            Bound::Ram => ram_basis(),
+            Bound::Cpu => cpu_basis(),
+            _ => format!("{}, and equally {}", cpu_basis(), ram_basis()),
+        };
+        return ConcurrencyDerivation { effective: auto, machine: auto, bound, basis, warning: None };
     };
     // No measurement means no basis to narrow anything — honor the configured value rather than
     // inventing a limit that could throttle a big machine to nothing.
     let Some((auto, bound)) = derived else {
-        return (configured, None);
+        return ConcurrencyDerivation {
+            effective: configured,
+            machine: configured,
+            bound: Bound::Pinned,
+            basis: format!(
+                "pinned to {configured} by [workers].max_concurrent (this machine's CPU and RAM \
+                 could not be measured)"
+            ),
+            warning: None,
+        };
     };
     if auto >= configured {
-        // The pin HOLDS — but say so when it is costing the user real capacity. A ceiling set on
-        // older/smaller hardware (or as a workaround, long since fixed) otherwise throttles the
-        // machine forever in complete silence: the clamp warning below only ever fires the other
-        // way. `>` not `>=`, so a pin that merely matches the machine says nothing.
+        // The pin BINDS (or exactly matches). Either way the ceiling is a CHOICE, and naming RAM or
+        // cores here would point the human at hardware that is not the constraint.
+        //
+        // Say so as a warning when it is costing real capacity. A ceiling set on older/smaller
+        // hardware (or as a workaround, long since fixed) otherwise throttles the machine forever in
+        // complete silence: the clamp warning below only ever fires the other way. `>` not `>=`, so
+        // a pin that merely matches the machine says nothing.
         let warning = (auto > configured).then(|| {
             format!(
                 "[workers].max_concurrent is pinned to {configured}, but this machine can run \
                  {auto}. Remove the line from config.toml to size automatically."
             )
         });
-        return (configured, warning);
+        let basis = if auto > configured {
+            format!(
+                "pinned to {configured} in config.toml ([workers].max_concurrent) — this machine \
+                 could run {auto} ({})",
+                match bound {
+                    Bound::Ram => ram_basis(),
+                    Bound::Cpu => cpu_basis(),
+                    _ => format!("{}, and equally {}", cpu_basis(), ram_basis()),
+                }
+            )
+        } else {
+            format!("pinned to {configured} in config.toml, exactly what this machine can run")
+        };
+        return ConcurrencyDerivation {
+            effective: configured,
+            machine: auto,
+            bound: Bound::Pinned,
+            basis,
+            warning,
+        };
     }
-    let budget_mb = if w.agent_heap_mb > 0 { w.agent_heap_mb } else { V8_DEFAULT_HEAP_MB };
-    // Telling a user to "lower" a value that is already 0 is impossible advice — 0 maps to the
-    // LARGEST budget, so the fix there is to set a positive one (roborev 40311).
-    let (per_agent, ram_remedy) = if w.agent_heap_mb > 0 {
-        (format!("{budget_mb} MiB per agent"), "Lower agent_heap_mb to allow more.".to_string())
-    } else {
-        (
-            format!("{budget_mb} MiB per agent, V8's default since agent_heap_mb = 0"),
-            format!("Set a positive agent_heap_mb below {budget_mb} to allow more."),
-        )
-    };
-    let gib = |b: u64| b / (1024 * 1024 * 1024);
     // Name the dimension that ACTUALLY bound it — "lower agent_heap_mb" is useless advice when the
     // limit is the core count, and on a TIE neither remedy alone raises the value, so say that
     // rather than offering one that cannot work.
-    let cause = match bound {
-        Bound::Ram => format!(
-            "this machine's RAM can hold (total {} GiB − {} GiB reserved, ÷ {}). {}",
-            total_ram.map_or(0, gib),
-            gib(MEMORY_RESERVE_BYTES),
-            per_agent,
-            ram_remedy,
+    let (basis, cause) = match bound {
+        Bound::Ram => (
+            ram_basis(),
+            format!(
+                "this machine's RAM can hold (total {} GiB − {} GiB reserved, ÷ {}). {}",
+                total_ram.map_or(0, gib),
+                gib(MEMORY_RESERVE_BYTES),
+                per_agent,
+                ram_remedy,
+            ),
         ),
-        Bound::Cpu => format!(
-            "this machine's {} CPU cores can drive ({} agents per core).",
-            cores.unwrap_or(0),
-            AGENTS_PER_CORE,
+        Bound::Cpu => (
+            cpu_basis(),
+            format!(
+                "this machine's {} CPU cores can drive ({} agents per core).",
+                cores.unwrap_or(0),
+                AGENTS_PER_CORE,
+            ),
         ),
-        Bound::Both => format!(
-            "this machine can run — its RAM (÷ {}) and its {} CPU cores ({} per core) both cap it \
-             at {}, so raising either one alone changes nothing.",
-            per_agent,
-            cores.unwrap_or(0),
-            AGENTS_PER_CORE,
-            auto,
+        _ => (
+            format!("{}, and equally {}", cpu_basis(), ram_basis()),
+            format!(
+                "this machine can run — its RAM (÷ {}) and its {} CPU cores ({} per core) both cap \
+                 it at {}, so raising either one alone changes nothing.",
+                per_agent,
+                cores.unwrap_or(0),
+                AGENTS_PER_CORE,
+                auto,
+            ),
         ),
     };
     let warning = format!(
         "[workers].max_concurrent ({configured}) is more than {cause} Using {auto}. \
          Remove max_concurrent to size automatically."
     );
-    (auto, Some(warning))
+    ConcurrencyDerivation {
+        effective: auto,
+        machine: auto,
+        bound,
+        basis,
+        warning: Some(warning),
+    }
 }
 
 /// Installed physical RAM in bytes, or None when we can't determine it (in which case the caller
@@ -1579,7 +1819,17 @@ pub fn reload_global(app_data: &Path) -> EffectiveConfig {
             // "why is Sparkle only running N agents?" question to be answerable from it.
             cpu_cores = ?cpu_core_count(),
             agents_per_core = AGENTS_PER_CORE,
+            agent_ram_budget_mb = agent_ram_budget_mb(if guard.config.workers.agent_heap_mb > 0 {
+                guard.config.workers.agent_heap_mb
+            } else {
+                V8_DEFAULT_HEAP_MB
+            }),
             effective_max_concurrent = guard.effective_max_concurrent,
+            // The two fields that make the log ANSWER the question rather than just restate the
+            // number: which dimension bound it, and what the machine could have done without a pin.
+            machine_max_concurrent = guard.machine_max_concurrent,
+            concurrency_bound = ?guard.concurrency_bound,
+            concurrency_basis = %guard.concurrency_basis,
             "resolved machine-aware worker concurrency"
         );
     }
@@ -1736,24 +1986,37 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 #
 # LEFT OUT ON PURPOSE — with no value here, Sparkle sizes itself to YOUR machine, which is almost
 # always what you want. It takes the smaller of two real limits:
-#   by RAM   (installed_RAM - 6 GiB reserved for the OS and Sparkle) / agent_heap_mb
-#   by CPU   logical_cores x 2      (agents run builds and test suites; cores bound throughput too)
-# So a 16 GB laptop gets ~3, while a 128 GB machine gets up to ~40 depending on its core count,
-# instead of being held to a number picked for someone else's hardware. Whichever of the two limits
-# is smaller wins, and the resolved value (with both inputs) is logged at startup.
+#   by RAM   (installed_RAM - 6 GiB reserved for the OS and Sparkle) / per-agent RAM budget
+#   by CPU   logical_cores x 6      (agents run builds and test suites; cores bound throughput too)
+# The per-agent RAM budget is NOT agent_heap_mb. That is a heap CEILING — a guard against one
+# runaway agent — and agents actually reside at ~1.1 GiB (accounting for the subagent processes one
+# agent can fan out to). Budgeting on the ceiling over-reserved by ~2.7x at the default heap size.
+# The budget is the larger of the measured working set (1152 MiB) and half the heap ceiling, which
+# keeps a big ceiling from being ignored without pricing every agent as the runaway.
+# So a 16 GB laptop gets ~6, while a 128 GB machine is usually held by its RAM (e.g. 128 GiB / 1.5
+# GiB ~= 81), not its cores. Whichever of the two limits is smaller wins, and the resolved value —
+# with both inputs AND which dimension bound it — is logged at startup and shown in the app.
+#
+# The x6 core multiplier and the ~1.1 GiB RAM figure are BOTH recent changes (2026-07-29) shipping
+# ahead of runtime memory-pressure sampling and an RSS watchdog (bead sparkle-0bye, still open) —
+# until those land, this derivation is a static prediction, not a governed ceiling.
 #
 # Uncomment to pin your own CEILING. It only ever lowers the automatic value — setting 40 on a 16 GB
-# Mac still gets you ~3, because the point of the clamp is to keep the kernel from killing your
-# machine. To go back to automatic, delete the line rather than guessing a number.
+# Mac still gets you ~6, because the point of the clamp is to keep the kernel from killing your
+# machine. A pin is reported AS a pin (the app says "pinned to N in config.toml", not "your RAM is
+# full"), so it never masquerades as a hardware limit. To go back to automatic, delete the line
+# rather than guessing a number.
 # max_concurrent = 8
 # Memory ceiling per agent, in MiB, applied as NODE_OPTIONS=--max-old-space-size. Agents are
 # Node processes, and Node's OWN default ceiling is ~4 GiB — high enough that a handful of
 # runaway agents can exhaust a Mac's RAM and get system daemons killed by the kernel. This caps
-# each agent well below that. Raise it if agents hit out-of-memory errors on huge repos; lower it
-# to run more agents at once. Set 0 to opt out entirely (agents then use Node's ~4 GiB default —
-# not recommended; the RAM-based max_concurrent clamp above stays in force either way, and simply
-# budgets 4 GiB per agent instead). If you set your own NODE_OPTIONS, yours is preserved and merged
-# with this; an explicit --max-old-space-size of your own always wins.
+# each agent well below that. Raise it if agents hit out-of-memory errors on huge repos. NOTE this
+# is a ceiling, not a reservation: lowering it only raises max_concurrent once it drops below
+# ~1.5 GiB, and it does nothing at all on a machine whose CORES are the binding limit. Set 0 to opt
+# out entirely (agents then use Node's ~4 GiB default — not recommended; the RAM-based
+# max_concurrent clamp above stays in force either way, and simply budgets from 4 GiB instead). If
+# you set your own NODE_OPTIONS, yours is preserved and merged with this; an explicit
+# --max-old-space-size of your own always wins.
 agent_heap_mb = 3072
 
 # --- AI features (per-machine; each degrades to a non-AI baseline when off) ------------
@@ -3086,12 +3349,71 @@ quit_app = 42
     }
 
     #[test]
-    fn ram_derived_concurrency_divides_usable_ram_by_the_heap_cap() {
-        // 64 GiB − 6 GiB reserve = 58 GiB usable ÷ 3 GiB per agent = 19.
-        assert_eq!(ram_derived_concurrency(64 * GIB, 6 * GIB, 3072), 19);
-        // 16 GiB − 6 = 10 ÷ 3 = 3. (The machine that died would have allowed 3, not 20.)
-        assert_eq!(ram_derived_concurrency(16 * GIB, 6 * GIB, 3072), 3);
-        assert_eq!(ram_derived_concurrency(128 * GIB, 6 * GIB, 3072), 40);
+    fn ram_derived_concurrency_divides_usable_ram_by_the_agent_ram_budget() {
+        // At the default 3072 MiB ceiling the budget is 1536 MiB (half the ceiling — above the
+        // 768 MiB measured working set), NOT the 3072 the old derivation used.
+        // 64 GiB − 6 GiB reserve = 59392 MiB usable ÷ 1536 = 38.
+        assert_eq!(ram_derived_concurrency(64 * GIB, 6 * GIB, 3072), 38);
+        // 16 GiB − 6 = 10240 ÷ 1536 = 6. (The old basis said 3 — a 6x over-reserve against a
+        // measured ~520 MiB RSS.)
+        assert_eq!(ram_derived_concurrency(16 * GIB, 6 * GIB, 3072), 6);
+        // 128 GiB − 6 = 124928 ÷ 1536 = 81.
+        assert_eq!(ram_derived_concurrency(128 * GIB, 6 * GIB, 3072), 81);
+    }
+
+    // THE point of the new basis: `agent_heap_mb` is a heap CEILING, not a working-set estimate, and
+    // pricing every agent at the ceiling was the ~6x over-reserve. The budget is the larger of the
+    // measured working set and the ceiling's amortized share, so it neither over-reserves nor lets a
+    // huge ceiling be ignored.
+    #[test]
+    fn the_ram_budget_is_a_working_set_not_the_heap_ceiling() {
+        // Default ceiling: half of it (1536) exceeds the measured working set (1152 — roborev
+        // 54816 corrected this from a per-PROCESS figure to the per-AGENT one), so it wins — still
+        // ~2.7x more permissive than dividing by the whole ceiling would be.
+        assert_eq!(agent_ram_budget_mb(3072), 1536);
+        // A ceiling at or below ~1.33x the working set: the MEASURED number takes over, and the
+        // budget stops tracking the ceiling downward past what an agent actually needs.
+        assert_eq!(agent_ram_budget_mb(1536), 1152);
+        assert_eq!(agent_ram_budget_mb(1024), 1024);
+        // ...but never above the ceiling itself: an agent cannot reside far past a heap it may not
+        // grow into, so a deliberately tiny ceiling does raise concurrency.
+        assert_eq!(agent_ram_budget_mb(512), 512);
+        // The opt-out (V8's own ~4 GiB) is still budgeted, not ignored — 2048, not 4096.
+        assert_eq!(agent_ram_budget_mb(V8_DEFAULT_HEAP_MB), 2048);
+    }
+
+    // Roborev 54816: every existing fixture used 3072, 1024 (asserted on warning text only), or 0 —
+    // none exercised the regime where the RAM budget FLOORS at the measured working set and CPU
+    // becomes the sole bound, which is exactly where a stale AGENT_TYPICAL_RSS_MB would silently
+    // over-admit. This machine, this constant: 128 GiB, 18 cores, agent_heap_mb pushed low enough
+    // that RAM would otherwise be the generous side.
+    #[test]
+    fn a_low_agent_heap_mb_floors_the_ram_budget_at_the_measured_working_set() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 900 };
+        // budget = max(steady=min(1152,900)=900, peak=900/2=450) = 900.
+        // by_ram = 124928 / 900 = 138; by_cpu = 18 * 6 = 108. CPU binds.
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(18));
+        assert_eq!((d.effective, d.bound), (108, Bound::Cpu));
+    }
+
+    // The guard that keeps "budget on typical RSS" from re-creating the 2026-07-20 coalition: the
+    // SUM of heap ceilings across the derived count may exceed usable RAM, but only by
+    // PEAK_HEAP_OVERCOMMIT. The incident sat at roughly 3x; this holds the line at 2x.
+    #[test]
+    fn the_sum_of_heap_ceilings_never_exceeds_usable_ram_by_more_than_the_overcommit_factor() {
+        for (total_gib, heap_mb) in [(16u64, 3072u32), (64, 3072), (128, 3072), (32, 4096), (192, 512)] {
+            let n = ram_derived_concurrency(total_gib * GIB, 6 * GIB, heap_mb);
+            let usable_mb = (total_gib * GIB).saturating_sub(6 * GIB) / (1024 * 1024);
+            // n == 1 is the floor for a machine too small to hold even one agent; it is allowed to
+            // exceed the factor because refusing to run at all is worse.
+            if n > 1 {
+                assert!(
+                    (n as u64) * (heap_mb as u64) <= usable_mb * (PEAK_HEAP_OVERCOMMIT as u64),
+                    "{n} agents x {heap_mb} MiB overcommits {usable_mb} MiB usable by more than \
+                     {PEAK_HEAP_OVERCOMMIT}x on a {total_gib} GiB machine",
+                );
+            }
+        }
     }
 
     #[test]
@@ -3108,9 +3430,9 @@ quit_app = 42
         let mut w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 3072 };
         // RAM allows fewer than configured → RAM wins, and the clamp is surfaced as a warning.
         // Cores are plentiful here so RAM is unambiguously the binding dimension.
-        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
-        assert_eq!(n, 3);
-        let warn = warn.expect("a clamp must be diagnosable as a config warning");
+        let d = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
+        assert_eq!(d.effective, 6);
+        let warn = d.warning.expect("a clamp must be diagnosable as a config warning");
         assert!(warn.contains("max_concurrent"), "warning names the key: {warn}");
         assert!(warn.contains("RAM"), "warning names the binding dimension: {warn}");
 
@@ -3118,9 +3440,9 @@ quit_app = 42
         // but the user is now TOLD they are leaving capacity on the table (see
         // `a_pin_below_what_the_machine_can_run_is_diagnosable`) rather than throttled in silence.
         w.max_concurrent = Some(4);
-        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
-        assert_eq!(n, 4, "an explicit max_concurrent must never be raised by spare RAM");
-        assert!(warn.expect("an under-pin is advisory, not silent").contains("pinned to 4"));
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
+        assert_eq!(d.effective, 4, "an explicit max_concurrent must never be raised by spare RAM");
+        assert!(d.warning.expect("an under-pin is advisory, not silent").contains("pinned to 4"));
     }
 
     // THE regression this change exists to prevent: the old code could only ratchet DOWN from a
@@ -3129,23 +3451,29 @@ quit_app = 42
     #[test]
     fn auto_scales_up_with_the_machine_instead_of_capping_at_a_fixed_number() {
         let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
-        // 128 GiB − 6 = 122 ÷ 3 = 40 by RAM; 24 cores × 2 = 48 by CPU. RAM binds → 40.
-        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+        // 128 GiB − 6 = 124928 MiB ÷ 1536 = 81 by RAM; 24 cores × 6 = 144 by CPU. RAM binds → 81.
+        // (Under the OLD heap-ceiling basis RAM derived 40; under the old 2-per-core multiplier CPU
+        // derived 48 and bound instead. Both of those under-reported what the machine can hold.)
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
+        assert_eq!((d.effective, d.bound), (81, Bound::Ram));
+        assert!(d.warning.is_none());
         // The same machine under the OLD hardcoded ceiling would have been held to 20.
-        assert!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)).0 > 20);
-        // And it still scales DOWN: 16 GiB − 6 = 10 ÷ 3 = 3.
-        assert_eq!(memory_aware_concurrency(&w, Some(16 * GIB), Some(24)), (3, None));
+        assert!(d.effective > 20);
+        // And it still scales DOWN: 16 GiB − 6 = 10240 ÷ 1536 = 6.
+        assert_eq!(memory_aware_concurrency(&w, Some(16 * GIB), Some(24)).effective, 6);
         // Auto never warns — the user asked for "whatever fits" and got exactly that.
-        assert!(memory_aware_concurrency(&w, Some(8 * GIB), Some(4)).1.is_none());
+        assert!(memory_aware_concurrency(&w, Some(8 * GIB), Some(4)).warning.is_none());
     }
 
     #[test]
     fn cpu_cores_bound_concurrency_independently_of_ram() {
         let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
-        // 192 GiB − 6 = 186 ÷ 3 = 62 by RAM, but only 8 cores × 2 = 16 by CPU. CPU binds.
-        assert_eq!(memory_aware_concurrency(&w, Some(192 * GIB), Some(8)), (16, None));
-        // Inverted: 64 cores × 2 = 128 by CPU, but 16 GiB holds only 3. RAM binds.
-        assert_eq!(memory_aware_concurrency(&w, Some(16 * GIB), Some(64)), (3, None));
+        // 192 GiB − 6 = 190464 MiB ÷ 1536 = 124 by RAM, but only 8 cores × 6 = 48 by CPU. CPU binds.
+        let d = memory_aware_concurrency(&w, Some(192 * GIB), Some(8));
+        assert_eq!((d.effective, d.bound), (48, Bound::Cpu));
+        // Inverted: 64 cores × 6 = 384 by CPU, but 16 GiB holds only 6. RAM binds.
+        let d = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
+        assert_eq!((d.effective, d.bound), (6, Bound::Ram));
     }
 
     #[test]
@@ -3153,9 +3481,9 @@ quit_app = 42
         // Telling a user to "lower agent_heap_mb" when the limit is their CORE COUNT is useless
         // advice — the remedy must name the dimension that actually bound the value.
         let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
-        let (n, warn) = memory_aware_concurrency(&w, Some(512 * GIB), Some(4));
-        assert_eq!(n, 8, "4 cores × 2 = 8, well under what 512 GiB could hold");
-        let warn = warn.expect("a clamp must be diagnosable");
+        let d = memory_aware_concurrency(&w, Some(512 * GIB), Some(4));
+        assert_eq!(d.effective, 24, "4 cores × 6 = 24, well under what 512 GiB could hold");
+        let warn = d.warning.expect("a clamp must be diagnosable");
         assert!(warn.contains("CPU cores"), "names cores: {warn}");
         assert!(!warn.contains("agent_heap_mb"), "does not offer a RAM remedy: {warn}");
     }
@@ -3164,16 +3492,108 @@ quit_app = 42
     fn memory_aware_concurrency_no_ops_when_it_cannot_measure() {
         let w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 3072 };
         // Unknown RAM *and* cores (unsupported platform / sysctl failure): fall back to the
-        // configured value rather than guessing a number that could throttle a big machine.
-        assert_eq!(memory_aware_concurrency(&w, None, None), (20, None));
+        // configured value rather than guessing a number that could throttle a big machine. The
+        // ceiling is then a CHOICE, not a hardware fact, and is reported as one.
+        let d = memory_aware_concurrency(&w, None, None);
+        assert_eq!((d.effective, d.bound), (20, Bound::Pinned));
+        assert!(d.warning.is_none());
         // One dimension missing still constrains by the other — a measurement we DO have is not
         // discarded just because its partner is absent. Each still clamps (and warns) on its own.
-        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), None);
-        assert_eq!(n, 3, "RAM alone still bounds a pinned ceiling");
-        assert!(warn.expect("clamping a pinned value is diagnosable").contains("RAM"));
-        let (n, warn) = memory_aware_concurrency(&w, None, Some(2));
-        assert_eq!(n, 4, "cores alone still bound a pinned ceiling");
-        assert!(warn.expect("clamping a pinned value is diagnosable").contains("CPU cores"));
+        let d = memory_aware_concurrency(&w, Some(16 * GIB), None);
+        assert_eq!(d.effective, 6, "RAM alone still bounds a pinned ceiling");
+        assert!(d.warning.expect("clamping a pinned value is diagnosable").contains("RAM"));
+        let d = memory_aware_concurrency(&w, None, Some(2));
+        assert_eq!(d.effective, 12, "cores alone still bound a pinned ceiling");
+        assert!(d.warning.expect("clamping a pinned value is diagnosable").contains("CPU cores"));
+    }
+
+    // BUG 2 of the ceiling audit: the `Bound` attribution existed but never reached the human. The
+    // concierge's at-capacity refusal asserted "the ceiling is derived from installed RAM"
+    // unconditionally — the exact mis-attribution `Bound` was written to prevent. It is now carried
+    // as a ready-to-show sentence alongside the number it explains.
+    #[test]
+    fn the_basis_sentence_names_the_cpu_bound_on_a_core_bound_machine() {
+        // A genuinely core-bound machine: 128 GiB but only 8 cores.
+        // by_ram = 124928 ÷ 1536 = 81; by_cpu = 8 × 6 = 48. CPU binds.
+        //
+        // This fixture used to be the 18-core measured host, which WAS core-bound while
+        // AGENTS_PER_CORE was 2. Raising that constant to 6 flipped it to RAM-bound, so the fixture
+        // moved to a machine that is still core-bound rather than the assertion being relaxed —
+        // the sentence under test is "does the CPU basis render correctly", and it needs a CPU
+        // bound to render. The measured host's new behaviour is pinned separately, below.
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(8));
+        assert_eq!((d.effective, d.machine, d.bound), (48, 48, Bound::Cpu));
+        assert_eq!(d.basis, "CPU-bound: 8 cores × 6 agents per core");
+        assert!(!d.basis.contains("RAM"), "must not point at memory that is 94% free: {}", d.basis);
+    }
+
+    /// The measured host (18 logical cores, 128 GiB, 90% memory free, zero swap) after
+    /// AGENTS_PER_CORE was raised 2 → 6 on 2026-07-29.
+    ///
+    /// Both dimensions moved for this machine and the ORDER matters: the per-agent RAM budget
+    /// dropped from the 3072 MiB heap ceiling to a measured 1536 MiB (by_ram 40 → 81), and the core
+    /// multiplier went 2 → 6 (by_cpu 36 → 108). The ceiling therefore rose 36 → 81 and the binding
+    /// dimension flipped CPU → RAM. RAM binding is the intended end state: it is the dimension we
+    /// actually measure per agent (1.11 GiB observed across 19 agents / 37 processes), whereas the
+    /// core multiplier is a judgement call. If a later change makes CPU bind here again, that is a
+    /// signal the multiplier was lowered — not that this test needs its number updated.
+    #[test]
+    fn the_measured_host_is_ram_bound_at_eighty_one_after_the_per_core_raise() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(18));
+        assert_eq!((d.effective, d.machine, d.bound), (81, 81, Bound::Ram));
+        assert!(
+            d.basis.starts_with("RAM-bound: 128 GiB installed − 6 GiB reserved, ÷ 1536 MiB"),
+            "the arithmetic must be checkable by hand: {}",
+            d.basis
+        );
+        assert!(d.warning.is_none(), "auto never warns — the user asked for whatever fits");
+        // The regression that motivated the raise: 36 was the old ceiling on a machine with 90% of
+        // its memory free. Whatever else changes, this must not fall back to a core-count answer.
+        assert!(d.effective > 36, "must exceed the old core-bound ceiling");
+    }
+
+    #[test]
+    fn the_basis_sentence_names_ram_with_checkable_arithmetic_when_ram_binds() {
+        let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
+        assert_eq!((d.effective, d.bound), (6, Bound::Ram));
+        assert!(
+            d.basis.starts_with("RAM-bound: 16 GiB installed − 6 GiB reserved, ÷ 1536 MiB"),
+            "{}",
+            d.basis
+        );
+        // The DIVISOR is the working-set budget, not the heap ceiling — dividing by 3072 is the ~6x
+        // over-reserve. The ceiling may still be NAMED (it is where 1536 comes from, and the human
+        // needs to be able to check the arithmetic); what it may not be is the number divided by.
+        assert!(!d.basis.contains("÷ 3072"), "must not divide by the heap cap: {}", d.basis);
+        assert!(d.basis.contains("half the 3072 MiB heap ceiling"), "shows its work: {}", d.basis);
+        // 10240 MiB usable ÷ 1536 = 6, and the sentence must describe the number it ships with.
+        assert_eq!(d.effective, (16 - 6) * 1024 / 1536);
+    }
+
+    // BUG 3: the app reported a ceiling of 32 while the machine derived 36 — the difference was a
+    // PIN in config.toml, but the message blamed RAM. A pin must be reported AS a pin, naming the
+    // file, and must still say what the machine could have done.
+    #[test]
+    fn a_pin_is_reported_as_a_pin_not_as_a_hardware_limit() {
+        // The exact reported situation: pinned to 32 on an 18-core / 128 GiB machine. The machine's
+        // own derivation was 36 when this bug was found; after the per-agent RAM basis and the
+        // per-core raise it is 81. The pin is unchanged, which is the whole point — a pin does not
+        // move with the hardware, and the gap it opens is now larger, not smaller.
+        let w = WorkersConfig { max_concurrent: Some(32), agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(18));
+        assert_eq!(d.effective, 32, "the pin is what the app enforces");
+        assert_eq!(d.machine, 81, "and the machine's own limit is still reported");
+        assert_eq!(d.bound, Bound::Pinned);
+        assert!(d.basis.contains("pinned to 32 in config.toml"), "names the real cause: {}", d.basis);
+        assert!(d.basis.contains("81"), "says what the machine could run: {}", d.basis);
+        assert!(
+            !d.basis.starts_with("RAM-bound"),
+            "a pin is never a RAM limit — this attribution sent a human chasing memory: {}",
+            d.basis
+        );
     }
 
     // roborev 53087 (High): the old default was written to disk for users who never chose it, and
@@ -3202,7 +3622,9 @@ quit_app = 42
         assert_eq!(cfg.workers.max_concurrent, None, "loads as AUTO");
         // And the point of it all: the machine's own limit now applies instead of a flat 20.
         let w = WorkersConfig { max_concurrent: cfg.workers.max_concurrent, agent_heap_mb: 3072 };
-        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
+        assert_eq!(d.effective, 81);
+        assert!(d.warning.is_none());
     }
 
     // roborev 53140 (High): migrating on every load is a standing rewrite, not a migration — it
@@ -3412,16 +3834,18 @@ quit_app = 42
     #[test]
     fn a_pin_below_what_the_machine_can_run_is_diagnosable() {
         let w = WorkersConfig { max_concurrent: Some(8), agent_heap_mb: 3072 };
-        // 128 GiB → 40 by RAM, 24 cores → 48 by CPU; auto is 40, well above the pin of 8.
-        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
-        assert_eq!(n, 8, "the pin still holds — this is a notice, not an override");
-        let warn = warn.expect("a pin that costs capacity must be visible");
+        // 128 GiB → 81 by RAM, 24 cores → 144 by CPU; auto is 81, well above the pin of 8.
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
+        assert_eq!(d.effective, 8, "the pin still holds — this is a notice, not an override");
+        let warn = d.warning.expect("a pin that costs capacity must be visible");
         assert!(warn.contains("pinned to 8"), "names the pin: {warn}");
-        assert!(warn.contains("40"), "names what the machine could do: {warn}");
+        assert!(warn.contains("81"), "names what the machine could do: {warn}");
 
         // A pin that exactly matches the machine has nothing to report.
-        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
-        assert_eq!(memory_aware_concurrency(&w, Some(128 * GIB), Some(24)), (40, None));
+        let w = WorkersConfig { max_concurrent: Some(81), agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(24));
+        assert_eq!((d.effective, d.machine), (81, 81));
+        assert!(d.warning.is_none());
     }
 
     // roborev 53087 (Medium): attribution by value-comparison mis-reads a TIE, and routing a tie to
@@ -3429,30 +3853,34 @@ quit_app = 42
     // leaves min() unchanged while cores bind equally.
     #[test]
     fn a_tie_between_ram_and_cores_offers_neither_single_dimension_remedy() {
-        // 4 cores → 8 by CPU; 30 GiB − 6 = 24 ÷ 3 = 8 by RAM. Both bind at 8.
+        // 4 cores → 24 by CPU; 42 GiB − 6 = 36864 MiB ÷ 1536 = 24 by RAM. Both bind at 24.
+        // (Re-tuned when AGENTS_PER_CORE went 2 → 6: the old 8-core/30 GiB fixture tied at 16 under
+        // the 2× multiplier and stopped being a tie under 6×. A tie test needs an actual tie.)
         let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
-        let (n, warn) = memory_aware_concurrency(&w, Some(30 * GIB), Some(4));
-        assert_eq!(n, 8);
-        let warn = warn.expect("a clamp must be diagnosable");
+        let d = memory_aware_concurrency(&w, Some(42 * GIB), Some(4));
+        assert_eq!((d.effective, d.bound), (24, Bound::Both));
+        let warn = d.warning.expect("a clamp must be diagnosable");
         assert!(
             warn.contains("raising either one alone changes nothing"),
             "a tie says neither remedy suffices: {warn}"
         );
         assert!(!warn.contains("Lower agent_heap_mb"), "impossible remedy on a tie: {warn}");
+        // The user-facing sentence says the same thing rather than picking a side.
+        assert!(d.basis.contains("CPU-bound") && d.basis.contains("RAM-bound"), "{}", d.basis);
     }
 
     #[test]
     fn the_binding_dimension_is_reported_by_the_derivation_not_guessed_from_it() {
         let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
-        // RAM 40 vs CPU 48 → RAM binds.
-        assert_eq!(auto_concurrency_bound(&w, Some(128 * GIB), Some(24)), Some((40, Bound::Ram)));
-        // RAM 62 vs CPU 16 → CPU binds.
-        assert_eq!(auto_concurrency_bound(&w, Some(192 * GIB), Some(8)), Some((16, Bound::Cpu)));
+        // RAM 81 vs CPU 144 → RAM binds.
+        assert_eq!(auto_concurrency_bound(&w, Some(128 * GIB), Some(24)), Some((81, Bound::Ram)));
+        // RAM 124 vs CPU 48 → CPU binds.
+        assert_eq!(auto_concurrency_bound(&w, Some(192 * GIB), Some(8)), Some((48, Bound::Cpu)));
         // Equal → neither alone.
-        assert_eq!(auto_concurrency_bound(&w, Some(30 * GIB), Some(4)), Some((8, Bound::Both)));
+        assert_eq!(auto_concurrency_bound(&w, Some(42 * GIB), Some(4)), Some((24, Bound::Both)));
         // A dimension we cannot measure is attributed to the one we can.
-        assert_eq!(auto_concurrency_bound(&w, Some(16 * GIB), None), Some((3, Bound::Ram)));
-        assert_eq!(auto_concurrency_bound(&w, None, Some(2)), Some((4, Bound::Cpu)));
+        assert_eq!(auto_concurrency_bound(&w, Some(16 * GIB), None), Some((6, Bound::Ram)));
+        assert_eq!(auto_concurrency_bound(&w, None, Some(2)), Some((12, Bound::Cpu)));
         assert_eq!(auto_concurrency_bound(&w, None, None), None);
     }
 
@@ -3461,7 +3889,11 @@ quit_app = 42
         // Auto with NOTHING measurable: one agent always works. Inventing a number for hardware we
         // know nothing about is how a small machine gets jetsam-killed.
         let w = WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 };
-        assert_eq!(memory_aware_concurrency(&w, None, None), (1, None));
+        let d = memory_aware_concurrency(&w, None, None);
+        assert_eq!((d.effective, d.machine, d.bound), (1, 1, Bound::Unknown));
+        assert!(d.warning.is_none());
+        // Even here the reason is stated rather than blamed on a dimension we never read.
+        assert!(d.basis.contains("no measurable"), "{}", d.basis);
     }
 
     #[test]
@@ -3471,10 +3903,10 @@ quit_app = 42
         // clamp — restoring the exact 20-agents × uncapped-heap runaway this whole change exists to
         // prevent. With no cap, agents use V8's own default, so that's the budget we divide by.
         let w = WorkersConfig { max_concurrent: Some(20), agent_heap_mb: 0 };
-        // 16 GiB − 6 GiB reserve = 10 GiB ÷ V8's ~4 GiB default = 2.
-        let (n, warn) = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
-        assert_eq!(n, 2);
-        let warn = warn.expect("the clamp must still be diagnosable when the cap is opted out");
+        // 16 GiB − 6 GiB reserve = 10240 MiB ÷ 2048 (half V8's ~4 GiB default) = 5.
+        let d = memory_aware_concurrency(&w, Some(16 * GIB), Some(64));
+        assert_eq!(d.effective, 5);
+        let warn = d.warning.expect("the clamp must still be diagnosable when the cap is opted out");
         // The remedy must be actionable: "lower agent_heap_mb" is impossible at 0, which maps to
         // the LARGEST per-agent budget. The way out is a positive value (roborev 40311).
         assert!(warn.contains("Set a positive agent_heap_mb"), "actionable remedy: {warn}");
@@ -3482,9 +3914,24 @@ quit_app = 42
         // And the configured ceiling still wins when RAM is plentiful (with the advisory that the
         // machine could do more — the pin is honored, not overridden).
         let w = WorkersConfig { max_concurrent: Some(4), agent_heap_mb: 0 };
-        let (n, warn) = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
-        assert_eq!(n, 4);
-        assert!(warn.expect("an under-pin is advisory").contains("pinned to 4"));
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
+        assert_eq!(d.effective, 4);
+        assert!(d.warning.expect("an under-pin is advisory").contains("pinned to 4"));
+    }
+
+    // "Lower agent_heap_mb" stops being true once the ceiling drops to the measured working set —
+    // below that the budget floors and the knob has no effect. Advice that has silently stopped
+    // working is the same failure class as attributing a core limit to RAM.
+    #[test]
+    fn the_ram_remedy_states_where_lowering_the_heap_cap_stops_helping() {
+        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 3072 };
+        let warn = memory_aware_concurrency(&w, Some(16 * GIB), Some(64)).warning.unwrap();
+        assert!(warn.contains("down to about 2304"), "bounds the advice: {warn}");
+        // At/below the floor the advice is withdrawn rather than repeated.
+        let w = WorkersConfig { max_concurrent: Some(40), agent_heap_mb: 1024 };
+        let warn = memory_aware_concurrency(&w, Some(16 * GIB), Some(64)).warning.unwrap();
+        assert!(!warn.contains("Lower agent_heap_mb"), "knob no longer moves the number: {warn}");
+        assert!(warn.contains("already at the measured per-agent working set"), "{warn}");
     }
 
     #[test]
@@ -3495,15 +3942,75 @@ quit_app = 42
         let eff = EffectiveConfig::derive(SparkleConfig::default(), Vec::new());
         assert!(eff.effective_max_concurrent >= 1);
         assert_eq!(eff.config.workers.max_concurrent, None, "ships as auto, not a fixed number");
+        // The provenance travels with the number, so the UI never has to guess it (and never has to
+        // assert "derived from installed RAM" on a machine whose cores are the limit).
+        assert_eq!(eff.machine_max_concurrent, eff.effective_max_concurrent, "auto has no pin");
+        assert!(!eff.concurrency_basis.is_empty(), "the number always comes with its reason");
+        assert_ne!(eff.concurrency_bound, Bound::Pinned, "auto is never a pin");
     }
 
     #[test]
     fn a_pinned_ceiling_still_bounds_the_effective_value() {
         let mut cfg = SparkleConfig::default();
         cfg.workers.max_concurrent = Some(2);
-        let eff = EffectiveConfig::derive(cfg, Vec::new());
+        // Inject a machine that can carry far more than 2 (128 GiB, 64 cores) so the pin is the
+        // binding constraint. Reading the real host here made this flaky: a 7 GiB CI runner holds
+        // only one agent, so its honest bound is `Ram`, not `Pinned` — a true answer for that box
+        // but not the wiring this test means to exercise (that `derive` surfaces `Pinned` and
+        // clamps when a pin binds below machine capacity).
+        let eff = EffectiveConfig::derive_measured(cfg, Vec::new(), Some(128 * GIB), Some(64));
         assert!(eff.effective_max_concurrent <= 2, "a pinned ceiling is never exceeded");
         assert!(eff.effective_max_concurrent >= 1);
+        // Machine INJECTED above (derive_measured), so every output here is DETERMINISTIC and the
+        // assertions are exact rather than environment-tolerant (roborev 55070): `<= 2` / `>= 1`
+        // would still pass if a regression clamped a pinned 2 down to 1, and a bare `>=` on the
+        // machine value would pass if it reported anything above 2.
+        assert_eq!(eff.effective_max_concurrent, 2, "the pin is what gets enforced");
+        // 2 is below what this machine derives, so this must read as a pin — not as RAM.
+        assert_eq!(eff.concurrency_bound, Bound::Pinned);
+        // 128 GiB − 6 reserved = 124928 MiB ÷ 1536 = 81; 64 cores × 6 = 384. RAM binds at 81, which
+        // is what the machine's own limit must report alongside the pin.
+        assert_eq!(eff.machine_max_concurrent, 81, "the machine's own limit is reported too");
+    }
+
+    /// The `auto == configured` TIE, which had no assertion anywhere (roborev 55070).
+    ///
+    /// A comment in the test above once claimed the neighbouring `memory_aware_concurrency` tests
+    /// covered it. They did not: the only two that assert `Bound::Pinned` exercise the
+    /// unmeasurable-hardware branch and the strict `auto > configured` branch. This path — pin
+    /// exactly equal to what the machine derives — has its own basis string and, unlike a clamped
+    /// pin, emits NO warning, because nothing is being taken away from the user. Writing the claim
+    /// without the test was the same "asserts behavior the code lacks" defect this branch has now
+    /// hit three times, so the test is added rather than the claim deleted.
+    #[test]
+    fn a_pin_equal_to_the_machines_own_limit_is_still_reported_as_a_pin() {
+        // 128 GiB / 64 cores derives 81 (RAM-bound); pin exactly 81 so the two tie.
+        let w = WorkersConfig { max_concurrent: Some(81), agent_heap_mb: 3072 };
+        let d = memory_aware_concurrency(&w, Some(128 * GIB), Some(64));
+        assert_eq!((d.effective, d.machine, d.bound), (81, 81, Bound::Pinned));
+        // A tie costs the user nothing, so there is nothing to warn about.
+        assert!(d.warning.is_none(), "a pin that matches the machine takes nothing away");
+        // …and the sentence says so, rather than implying a hardware limit.
+        assert!(
+            d.basis.contains("exactly what this machine can run"),
+            "the tie has its own basis string: {}",
+            d.basis
+        );
+    }
+
+    // The frontend reads `concurrency_bound` as a lowercase string discriminant; a rename here
+    // silently breaks the copy that branches on it.
+    #[test]
+    fn the_bound_serializes_as_the_lowercase_discriminant_the_frontend_reads() {
+        for (b, s) in [
+            (Bound::Cpu, "\"cpu\""),
+            (Bound::Ram, "\"ram\""),
+            (Bound::Both, "\"both\""),
+            (Bound::Pinned, "\"pinned\""),
+            (Bound::Unknown, "\"unknown\""),
+        ] {
+            assert_eq!(serde_json::to_string(&b).unwrap(), s);
+        }
     }
 
     #[test]

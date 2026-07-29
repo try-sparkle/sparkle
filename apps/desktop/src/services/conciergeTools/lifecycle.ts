@@ -52,7 +52,7 @@
 
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { useSettingsStore, enforcedWorkerCap } from "../../stores/settingsStore";
+import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
@@ -64,7 +64,6 @@ import {
   type SaveOutcome,
   type ShipOutcome,
 } from "../closeAgentActions";
-import { wasProjectVisited } from "../sessionProjects";
 import { closeBuildAgent } from "../closeBuildAgent";
 import { spinDownWorker } from "../workerSpawn";
 import { terminateIfCloud } from "../cloudAgents/terminate";
@@ -138,7 +137,7 @@ export type LifecycleRefusalReason =
   | "unknown-agent" //          no such agent in any open project
   | "not-a-worker" //           a worker-only operation aimed at something else
   | "not-a-build-agent" //      ship/save/discard aimed at a worker or a shell (see `requireBuild`)
-  | "at-capacity" //            the machine's RAM-derived agent budget is full (NOT queued)
+  | "at-capacity" //            the machine's agent budget is full (NOT queued); see agentCapacity
   | "cloud-spawn-unsupported" // a cloud spawn bills per minute — refused, not silently spent
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
   | "intent-required" //        discard was called without a well-formed DiscardIntent
@@ -187,75 +186,11 @@ function refuse(
 
 // ── Capacity ────────────────────────────────────────────────────────────────────────────────────
 
-export interface CapacityReading {
-  /**
-   * Slots TAKEN against the machine-wide budget: every local build/worker ROW, in every project —
-   * including rows whose pane isn't mounted right now. NOT a count of live processes; see `live`.
-   */
-  used: number;
-  /**
-   * Of those rows, how many actually have a mounted pane (and therefore a PTY) at this instant.
-   * `live < used` is normal and not a bug: Workspace only mounts panes for agents in `openAgentIds`
-   * that sit in a VISITED project tab, so a row in a tab the user hasn't opened yet holds a slot
-   * without holding any RAM — until they open that tab, at which point it starts.
-   *
-   * BOTH halves of that condition are computed here (roborev 54225). `openAgentIds` alone is not it:
-   * that list is PERSISTED, so on the first render after a restart every previously-open row is in
-   * it while no pane has mounted anywhere — `live` would equal `used` and the refusal below would
-   * drop its dormant clause and implicitly assert N running processes, the exact inaccuracy the
-   * field exists to remove.
-   */
-  live: number;
-  /** The machine-wide ceiling. */
-  limit: number;
-  atCapacity: boolean;
-}
-
-/**
- * The machine-wide budget a new local agent has to fit inside.
- *
- * This is the SAME bound `atCapacity` (services/orchestrationListener) enforces for worker spawns,
- * applied to the other kind of process that costs the same: a build agent runs its own Claude Code
- * with its own V8 heap, so counting only workers would be the dimensional error that gate's comment
- * warns about — N build agents each sitting happily under a per-agent cap while the machine goes to
- * swap (sparkle-hfhs, and the jetsam incident before it). `effectiveMaxConcurrentWorkers` is derived
- * from installed RAM (`config.rs ram_derived_concurrency`), which is a machine-wide number, so it is
- * compared against a machine-wide count of machine-resident agents.
- *
- * CLOUD agents are excluded: they run in a server sandbox and consume none of this machine's RAM.
- * Shell agents are excluded too — a shell is not a model process.
- *
- * IT COUNTS ROWS, NOT RUNNING PROCESSES, and that is deliberate (roborev 54175). A row in a project
- * tab the user hasn't visited has no mounted pane and no PTY yet — but it gets both the moment they
- * click that tab, with no gate in between. Counting only the mounted ones would admit spawns that
- * the machine cannot actually hold one click later, and would put this gate out of step with
- * orchestrationListener's `globalUsedSlots`, which counts worker rows the same way. So `used` stays
- * row-based and `live` reports the mounted subset, letting the refusal be honest about the
- * difference rather than claiming N processes are running when they aren't.
- *
- * `live` mirrors Workspace's `live` memo EXACTLY — in `openAgentIds` AND in a project whose tab has
- * been visited this session (or is the current tab, which Workspace unions in at render time). The
- * project id has to survive the flatten for that, which is why this is a nested loop rather than a
- * flatMap: the visited half is per-PROJECT, and dropping it is what let a persisted `openAgentIds`
- * report every restored row as a running process (roborev 54225).
- */
-export function localAgentCapacity(): CapacityReading {
-  const { projects, selectedProjectId } = useProjectStore.getState();
-  const open = new Set(useRuntimeStore.getState().openAgentIds);
-  let used = 0;
-  let live = 0;
-  for (const p of projects) {
-    // Whether Workspace would mount ANY pane for this project right now.
-    const mounted = p.id === selectedProjectId || wasProjectVisited(p.id);
-    for (const a of p.agents) {
-      if (a.runtime === "cloud" || (a.kind !== "build" && a.kind !== "worker")) continue;
-      used += 1;
-      if (mounted && open.has(a.id)) live += 1;
-    }
-  }
-  const limit = Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
-  return { used, live, limit, atCapacity: used >= limit };
-}
+// The reading itself lives in services/agentCapacity so the human's "+ New Build Agent" path can
+// gate on the SAME number without an import cycle through this module (which already imports
+// buildAgentSpawn). Re-exported here because this is where callers and tests have always found it.
+export type { CapacityReading } from "../agentCapacity";
+export { localAgentCapacity };
 
 // ── Lookup helpers ──────────────────────────────────────────────────────────────────────────────
 
@@ -363,22 +298,27 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
   // that has no slot and no ETA.
   const capacity = localAgentCapacity();
   if (capacity.atCapacity) {
-    // Says what is TRUE: slots are taken by rows, and only some of those rows have a process right
-    // now. Claiming all N are "running" is wrong whenever a project tab hasn't been opened yet, and
-    // the human's uncapped "+ New Build Agent" button would have succeeded — an inconsistency that
-    // reads as a bug unless the reason is stated honestly (roborev 54175). The `live` this reads is
-    // now the mounted-pane count Workspace would actually produce, visited half included, so the
-    // clause below is a checked statement rather than a restatement of `openAgentIds` (54225).
+    // Says what is TRUE: slots are taken by rows, and only some of those rows have a mounted pane in
+    // THIS window right now. Claiming all N are "running" is wrong, and so was the old claim that
+    // the rest "haven't started yet, and each one starts as soon as you do" — closed-tab projects
+    // were observed with a running-agent count equal to their entire roster. A row without a mounted
+    // pane here is a row this window is not DISPLAYING; its process may be running perfectly well,
+    // and that sentence sent a human looking for agents that would start later when they were
+    // already running. So the clause now reports what `live` actually measures and nothing more.
     const dormant =
       capacity.live < capacity.used
-        ? ` (${capacity.live} with a process running right now; the rest are agents in project tabs ` +
-          `you haven't opened yet, and each one starts as soon as you do)`
+        ? ` (${capacity.live} of them showing in this window; the rest are in project tabs that ` +
+          `aren't open here — most are already running, they're just not on screen)`
         : "";
     return refuse(
       "spawn_build_agent",
       "at-capacity",
-      `This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. The ` +
-        `ceiling is derived from installed RAM. Close or finish one before starting another.`,
+      `This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. ` +
+        // NAME the binding dimension instead of asserting RAM. On the machine that reported this the
+        // ceiling was CPU-bound at 36 and pinned at 32 while memory sat 94% free, so "derived from
+        // installed RAM" was wrong twice and sent the human tuning the one knob that could not move
+        // the number. The sentence comes from the Rust derivation that computed the number itself.
+        `The ceiling is ${capacity.basis}. Close or finish one before starting another.`,
     );
   }
   const agentId = spawnBuildAgentInProject(project);

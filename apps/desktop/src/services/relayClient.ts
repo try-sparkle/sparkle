@@ -15,6 +15,7 @@
 // an unauthenticated first-run user never downloads or parses it.
 import type { Socket } from "socket.io-client";
 import type { RelaySocketLike } from "./agentTransport";
+import type { RollupDot } from "../engine/workerRollup";
 import { invoke } from "@tauri-apps/api/core";
 import { onPtyOutput, writePtyChained } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
@@ -76,6 +77,15 @@ export interface RosterAgentPayload {
   status: string;
   status_color: string;
   status_label: string;
+  /** The row's disc once the workers folded under it are taken into account — engine/workerRollup's
+   *  `RollupDot` ("green" | "red" | "orange" | "gray"). DISTINCT from `status`, which stays the
+   *  agent's own PTY state: an orchestrator idling while nine workers run is `status: "idle"` with
+   *  `rollup_dot: "green"`. Childless and worker rows carry their own tier here.
+   *
+   *  `| null` to match the Rust `Option<String>` this mirrors, which has no `skip_serializing_if`
+   *  and therefore emits an explicit `null` for a slice published by an older window
+   *  (roborev 54742) — see the same note in services/rosterTypes.ts. */
+  rollup_dot?: RollupDot | null;
   parent_id: string | null;
   workflow_stage?: string | null;
   last_activity_at?: number | null; // epoch ms of the user's last touch; drives the elapsed timer
