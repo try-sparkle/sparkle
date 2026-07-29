@@ -81,6 +81,18 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // AgentTab.epicId, so it shows immediately — before any worker binds to a bead.
   store.setAgentEpicId(args.projectId, agentId, args.epicId);
 
+  // …and bind that SAME human-filed bead as the orchestrator's `beadId` (bead sparkle-0bhr). This is
+  // the seam that makes the board's "Shipped" column reachable for hand-filed work. Without it, the
+  // ONLY thing that ever set a build agent's beadId was the AUTO path (buildAgentSpawn +
+  // syncBeadLifecycle's `create`), which stamps `sparkle-auto` — telemetry the board deliberately
+  // HIDES. So every delivered bead was a hidden auto-bead, and a bead a human filed by hand, handed
+  // to Build, and shipped had no agent linkage at all: `shipAgent` reads `agent.beadId` and marks it
+  // delivered on land, but that field was empty for the human's bead, so it could never reach
+  // Shipped. Linking the epic here routes the human bead through the exact same ship/lifecycle path
+  // the auto-beads already use — and because the orchestrator now HAS a bead, syncBeadLifecycle's
+  // `create` gate is satisfied, so no redundant `sparkle-auto` duplicate is minted for it either.
+  store.setAgentBeadId(args.projectId, agentId, args.epicId);
+
   // LAND the user in it. "Start"/"Build It" are clicked FROM the Plan board, so `activeSpecial` is
   // "board" and the board owns the pane — this used to call `open()` alone, which mounts the pane
   // behind the board and changes nothing the user can see. On the reuse path it was worse still:

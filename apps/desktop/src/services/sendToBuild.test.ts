@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const addAgentMock = vi.fn();
 const appendPromptMock = vi.fn();
 const setAgentEpicIdMock = vi.fn();
+const setAgentBeadIdMock = vi.fn();
 const selectAgentMock = vi.fn();
 let projects: Array<{ id: string; agents: Array<{ id: string; kind: string; epicId?: string }> }> =
   [];
@@ -17,6 +18,7 @@ vi.mock("../stores/projectStore", () => ({
       addAgent: addAgentMock,
       appendPrompt: appendPromptMock,
       setAgentEpicId: setAgentEpicIdMock,
+      setAgentBeadId: setAgentBeadIdMock,
       selectAgent: selectAgentMock,
     }),
   },
@@ -49,6 +51,7 @@ describe("sendToBuild", () => {
     addAgentMock.mockReset();
     appendPromptMock.mockReset();
     setAgentEpicIdMock.mockReset();
+    setAgentBeadIdMock.mockReset();
     selectAgentMock.mockReset();
     openMock.mockReset();
     setActiveSpecialMock.mockReset();
@@ -71,6 +74,9 @@ describe("sendToBuild", () => {
     expect(openMock).toHaveBeenCalledWith("build-new");
     // Bound the epic to the new orchestrator (drives the sidebar epic pill — spec §8).
     expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build-new", "epic-42");
+    // …and bound that SAME human-filed bead as the orchestrator's beadId (bead sparkle-0bhr) — the
+    // linkage that lets `shipAgent` mark the human bead delivered on land so it reaches "Shipped".
+    expect(setAgentBeadIdMock).toHaveBeenCalledWith("proj1", "build-new", "epic-42");
     // Seeded the orchestrator's first message.
     expect(appendPromptMock).toHaveBeenCalledTimes(1);
     const [projectId, agentId, seed] = appendPromptMock.mock.calls[0]!;
@@ -98,6 +104,8 @@ describe("sendToBuild", () => {
     expect(openMock).toHaveBeenCalledWith("build1");
     expect(appendPromptMock).toHaveBeenCalledWith("proj1", "build1", expect.stringContaining("epic-7"));
     expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
+    // The human bead is linked on the reuse path too, so a re-hit Build It still routes delivery.
+    expect(setAgentBeadIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
   });
 
   // §13 — "Start"/"Build It" must LAND the user in the orchestrator. These four steps are the
@@ -228,12 +236,29 @@ describe("sendToBuild", () => {
     expect(addAgentMock).toHaveBeenCalledTimes(3); // no fourth spawn
   });
 
+  // bead sparkle-0bhr — the "Shipped" column was structurally unreachable for hand-filed beads: a
+  // build agent's beadId was only ever set by the AUTO path (which stamps `sparkle-auto`, HIDDEN
+  // from the board), so a bead a human filed and worked had no agent linkage and `shipAgent` had no
+  // beadId to mark delivered. sendToBuild is the human handoff, so this is where the link is made.
+  it("links the human-filed bead as the orchestrator's beadId in TASK mode (Build this one bead)", () => {
+    projects = [{ id: "proj1", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "human-bead-1", prdPath: null, mode: "task" });
+
+    // The single human bead is bound as the agent's beadId → shipAgent will mark IT delivered on
+    // land (not a hidden auto-bead), so it lands in "Shipped". Removing the setAgentBeadId call in
+    // sendToBuild makes this fail — the human bead would again have no ship-path linkage.
+    expect(setAgentBeadIdMock).toHaveBeenCalledWith("proj1", "build-new", "human-bead-1");
+  });
+
   it("throws for an unknown project", () => {
     projects = [];
     expect(() => sendToBuild({ projectId: "ghost", epicId: "e", prdPath: "p" })).toThrow(/unknown project/);
     expect(addAgentMock).not.toHaveBeenCalled();
     expect(openMock).not.toHaveBeenCalled();
     expect(setAgentEpicIdMock).not.toHaveBeenCalled();
+    expect(setAgentBeadIdMock).not.toHaveBeenCalled();
   });
 
   it("omits the PRD instruction for a PRD-less epic (prdPath null) instead of blocking", () => {
