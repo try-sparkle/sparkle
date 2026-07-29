@@ -12,6 +12,8 @@ import {
   FiExternalLink,
   FiTrendingUp,
   FiLock,
+  FiGitBranch,
+  FiCheckSquare,
 } from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
@@ -116,6 +118,24 @@ export const TOOL_META = {
     name: "Frontend design",
     desc: "Anthropic's official UI-quality skill.",
     keywords: "frontend design ui quality plugin skill anthropic official marketplace",
+  },
+  sparkleGuardrails: {
+    name: "Guardrails skill",
+    desc: "The same discipline as Guardrails above, packaged as an installable skill you can use in plain Claude Code. Off by default — Guardrails already applies it to Sparkle's agents.",
+    keywords:
+      "guardrails quality regression tests typecheck lint build verification sparkle marketplace plugin",
+  },
+  sparkleFreshness: {
+    name: "Branch freshness",
+    desc: "Warn at session start when your branch has fallen far behind the default branch, so agents rebase instead of debugging failures that aren't theirs.",
+    keywords:
+      "freshness stale branch rebase behind main default git session start sparkle marketplace plugin",
+  },
+  sparkleMutationCheck: {
+    name: "Mutation check",
+    desc: "Prove a test can actually fail. Mutates the source under test and flags any test that stays green — vacuous or stale.",
+    keywords:
+      "mutation check test quality vacuous stale prove fail assertion sparkle marketplace plugin",
   },
 } as const satisfies Record<string, { name: string; desc: string; keywords: string }>;
 
@@ -339,6 +359,12 @@ interface ShowcaseTool {
  *  happened. A Rust test (`hooks::tests::the_frontend_learn_more_url_matches_the_repo_we_install_from`)
  *  fails if these two drift apart. */
 const OFFICIAL_MARKETPLACE_REPO = "anthropics/claude-plugins-official";
+/** Sparkle's own public marketplace — the source of the sparkle* plugin rows below. Kept beside the
+ *  official-marketplace constant so a "Learn more" link can never point at a repo we don't install
+ *  from; `every_shipped_plugin_carries_a_source_and_only_foreign_ones_are_declared` pins the Rust
+ *  half of that pair. */
+const SPARKLE_MARKETPLACE_URL = "https://github.com/try-sparkle/marketplace";
+
 const FRONTEND_DESIGN_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tree/main/plugins/frontend-design`;
 
 /** Both plugin rows carry this. Sparkle writes `enabledPlugins` into an agent worktree's
@@ -408,8 +434,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const onepasswordEnabled = useSettingsStore((s) => s.onepasswordEnabled);
   const onepasswordVaultId = useSettingsStore((s) => s.onepasswordVaultId);
   // [plugins] flags — Claude Code marketplace plugins pre-enabled for every agent.
-  const superpowersEnabled = useSettingsStore((s) => s.superpowersEnabled);
-  const frontendDesignEnabled = useSettingsStore((s) => s.frontendDesignEnabled);
+  const pluginsEnabled = useSettingsStore((s) => s.pluginsEnabled);
   // What the installer is doing right now, per row — see `pluginHint`.
   const pluginInstallState = useSettingsStore((s) => s.pluginInstallState);
 
@@ -471,8 +496,8 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       Icon: FiBookOpen,
       url: "https://github.com/obra/superpowers",
       hint: pluginHint(pluginInstallState.superpowers),
-      checked: superpowersEnabled,
-      onToggle: () => void setPluginEnabled("superpowers", !superpowersEnabled),
+      checked: pluginsEnabled.superpowers,
+      onToggle: () => void setPluginEnabled("superpowers", !pluginsEnabled.superpowers),
     },
     {
       ...TOOL_META.frontendDesign,
@@ -480,8 +505,37 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       Icon: FiLayout,
       url: FRONTEND_DESIGN_URL,
       hint: pluginHint(pluginInstallState.frontendDesign),
-      checked: frontendDesignEnabled,
-      onToggle: () => void setPluginEnabled("frontendDesign", !frontendDesignEnabled),
+      checked: pluginsEnabled.frontendDesign,
+      onToggle: () => void setPluginEnabled("frontendDesign", !pluginsEnabled.frontendDesign),
+    },
+    {
+      ...TOOL_META.sparkleGuardrails,
+      key: "sparkleGuardrails",
+      Icon: FiShield,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-guardrails`,
+      hint: pluginHint(pluginInstallState.sparkleGuardrails),
+      checked: pluginsEnabled.sparkleGuardrails,
+      onToggle: () =>
+        void setPluginEnabled("sparkleGuardrails", !pluginsEnabled.sparkleGuardrails),
+    },
+    {
+      ...TOOL_META.sparkleFreshness,
+      key: "sparkleFreshness",
+      Icon: FiGitBranch,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-freshness`,
+      hint: pluginHint(pluginInstallState.sparkleFreshness),
+      checked: pluginsEnabled.sparkleFreshness,
+      onToggle: () => void setPluginEnabled("sparkleFreshness", !pluginsEnabled.sparkleFreshness),
+    },
+    {
+      ...TOOL_META.sparkleMutationCheck,
+      key: "sparkleMutationCheck",
+      Icon: FiCheckSquare,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-mutation-check`,
+      hint: pluginHint(pluginInstallState.sparkleMutationCheck),
+      checked: pluginsEnabled.sparkleMutationCheck,
+      onToggle: () =>
+        void setPluginEnabled("sparkleMutationCheck", !pluginsEnabled.sparkleMutationCheck),
     },
     {
       ...TOOL_META.onepassword,

@@ -288,6 +288,11 @@ pub struct KnownPlugin {
     /// installer runs an idempotent `claude plugin marketplace add <repo>` from this before
     /// installing, which is what makes a fresh machine work (see the field note below).
     pub source: Option<MarketplaceSource>,
+    /// Whether this plugin ships enabled on a new install. The DEFAULT LIVES HERE, in the table
+    /// row, rather than in `SparkleConfig::default()` and `DEFAULT_TEMPLATE` and a struct field —
+    /// three places that previously had to be edited in lockstep and could silently disagree.
+    /// `plugins_default_matches_the_template` asserts the template still agrees with this.
+    pub default_on: bool,
 }
 
 impl KnownPlugin {
@@ -314,9 +319,22 @@ impl KnownPlugin {
 pub const OFFICIAL_MARKETPLACE: &str = "claude-plugins-official";
 pub const OFFICIAL_MARKETPLACE_REPO: &str = "anthropics/claude-plugins-official";
 
+/// Sparkle's OWN marketplace — the public, Apache-2.0 home of the opinionated tooling Sparkle
+/// applies to every agent it runs (<https://github.com/try-sparkle/marketplace>). Unlike the
+/// official one, Claude Code does not know this marketplace exists, so it must be BOTH registered
+/// by the installer (`marketplace add`) AND declared in each worktree's `extraKnownMarketplaces`
+/// — which is exactly what `declared_source()` already arranges by returning `Some` for any
+/// marketplace that is not the official one.
+pub const SPARKLE_MARKETPLACE: &str = "sparkle";
+pub const SPARKLE_MARKETPLACE_REPO: &str = "try-sparkle/marketplace";
+
 /// The official marketplace as a source value, for the rows that live in it.
 const OFFICIAL_SOURCE: MarketplaceSource =
     MarketplaceSource { name: OFFICIAL_MARKETPLACE, repo: OFFICIAL_MARKETPLACE_REPO };
+
+/// Sparkle's own marketplace as a source value.
+const SPARKLE_SOURCE: MarketplaceSource =
+    MarketplaceSource { name: SPARKLE_MARKETPLACE, repo: SPARKLE_MARKETPLACE_REPO };
 
 /// The plugins Sparkle knows how to pre-enable. Both current entries live in the official
 /// marketplace (verified against anthropics/claude-plugins-official's marketplace.json on
@@ -336,12 +354,44 @@ pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
         plugin: "superpowers",
         marketplace: OFFICIAL_MARKETPLACE,
         source: Some(OFFICIAL_SOURCE),
+        default_on: true,
     },
     KnownPlugin {
         toggle: "frontend_design",
         plugin: "frontend-design",
         marketplace: OFFICIAL_MARKETPLACE,
         source: Some(OFFICIAL_SOURCE),
+        default_on: true,
+    },
+    // Sparkle's own published tooling (github.com/try-sparkle/marketplace, Apache-2.0).
+    //
+    // sparkle_guardrails ships OFF, and that is deliberate: it is the PUBLIC copy of
+    // `guardrailsProtocol()` in buildAgent.ts, which `[tools].guardrails` already appends to every
+    // coding agent's system prompt. Turning both on would hand each agent the same discipline
+    // twice. Its value is portability — it is the form you can install into plain Claude Code, or
+    // keep if you turn the built-in off — so it belongs in the catalog but not in the default set.
+    KnownPlugin {
+        toggle: "sparkle_guardrails",
+        plugin: "sparkle-guardrails",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
+    },
+    KnownPlugin {
+        toggle: "sparkle_freshness",
+        plugin: "sparkle-freshness",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: true,
+    },
+    // Off by default: mutation-check is a deliberate, targeted act ("prove THIS test can fail"),
+    // not a background discipline, so it should be reached for rather than always present.
+    KnownPlugin {
+        toggle: "sparkle_mutation_check",
+        plugin: "sparkle-mutation-check",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
     },
 ];
 
@@ -352,24 +402,80 @@ pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
 /// Each bool default true = the plugin ships on for every new install. Off means Sparkle writes
 /// nothing about it into an agent's `.claude/settings.local.json` (and never installs it) — it does
 /// NOT disable a plugin the user enabled themselves.
+/// KEYED BY TOGGLE NAME, not a struct of named bools. The struct form required editing eight
+/// places in lockstep to add one plugin (a `KNOWN_PLUGINS` row, a field, an `is_enabled` arm, a
+/// `PartialPlugins` field, an `apply_plugins` arm, the default, the template, and the TS mirror),
+/// which is why the catalog could not grow. This mirrors the `[concierge.tools]` shape above:
+/// a free-form map with a TOTAL resolution function, so a missing key cannot fall into a hole.
+///
+/// `#[serde(transparent)]` keeps the wire shape the frontend already reads — a flat
+/// `{ "superpowers": true, … }` object — so this is not a breaking change across the Tauri
+/// boundary.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(transparent)]
 pub struct PluginsConfig {
-    /// obra's superpowers — the most-used agent methodology plugin: plan → TDD → review.
-    pub superpowers: bool,
-    /// Anthropic's official frontend-design plugin (UI quality).
-    pub frontend_design: bool,
+    enabled: std::collections::BTreeMap<String, bool>,
 }
 
 impl PluginsConfig {
+    /// Every known plugin at the default declared on its own table row.
+    pub fn defaults() -> Self {
+        Self {
+            enabled: KNOWN_PLUGINS
+                .iter()
+                .map(|p| (p.toggle.to_string(), p.default_on))
+                .collect(),
+        }
+    }
+
+    /// Every known plugin forced to `on`. Derived from the table, so a new `KNOWN_PLUGINS` row is
+    /// covered without touching callers — which is the whole point of the keyed shape.
+    ///
+    /// Test-only: production code builds this layer from [`Self::defaults`] plus the config
+    /// overlay, never by forcing every toggle to one value.
+    #[cfg(test)]
+    pub fn with_all(on: bool) -> Self {
+        Self {
+            enabled: KNOWN_PLUGINS
+                .iter()
+                .map(|p| (p.toggle.to_string(), on))
+                .collect(),
+        }
+    }
+
     /// Is the `[plugins]` toggle named `toggle` on? Unknown names are off (a forward-compatible
     /// key from a newer Sparkle must never resolve to "enabled").
+    ///
+    /// The `KNOWN_PLUGINS` membership check is load-bearing, not belt-and-braces. Unknown keys are
+    /// deliberately KEPT in the map so a config written by a newer Sparkle survives a round-trip
+    /// through an older one — but a bare map lookup would then hand back the `true` that file
+    /// wrote, turning "we don't know what this is" into "it's on". Resolve only what this build
+    /// actually knows how to install.
     pub fn is_enabled(&self, toggle: &str) -> bool {
-        match toggle {
-            "superpowers" => self.superpowers,
-            "frontend_design" => self.frontend_design,
-            _ => false,
+        if !KNOWN_PLUGINS.iter().any(|p| p.toggle == toggle) {
+            return false;
         }
+        self.enabled.get(toggle).copied().unwrap_or(false)
+    }
+
+    /// Set one toggle. Used by the config overlay; kept private-ish in spirit — callers outside
+    /// config go through the dotted-path setter so the write lands in the right layer.
+    fn set(&mut self, toggle: &str, on: bool) {
+        self.enabled.insert(toggle.to_string(), on);
+    }
+
+    /// Keys present in the file that no `KNOWN_PLUGINS` row claims, in sorted order.
+    ///
+    /// Unlike `[concierge.tools]` — whose authoritative name list lives in TypeScript, so Rust
+    /// deliberately does not check it — plugin toggles ARE a closed set right here. That makes a
+    /// typo (`frontend-design` for `frontend_design`) something we can tell the user about instead
+    /// of leaving as a line that parses, applies nothing, and never explains itself.
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.enabled
+            .keys()
+            .filter(|k| !KNOWN_PLUGINS.iter().any(|p| p.toggle == k.as_str()))
+            .map(String::as_str)
+            .collect()
     }
 
     /// The known plugins currently switched on, in table order.
@@ -589,10 +695,11 @@ impl Default for SparkleConfig {
                 builder_index: false,
                 onepassword: false,
             },
-            // Both default-on plugins ship enabled: the July 2026 Builder Index found superpowers in
-            // 11 of the top 15 token maxers' setups and frontend-design in 10 of 15, so on-by-default
+            // Defaults come from the KNOWN_PLUGINS rows themselves, so there is one place to state
+            // them. superpowers and frontend-design ship on because the July 2026 Builder Index
+            // found them in 11 and 10 of the top 15 token maxers' setups respectively — on-by-default
             // is what a new install would otherwise have to discover by hand.
-            plugins: PluginsConfig { superpowers: true, frontend_design: true },
+            plugins: PluginsConfig::defaults(),
             // First-run consent is unresolved until the user answers the one-time modal.
             roborev: RoborevConfig { consent_prompted: false },
             // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
@@ -779,10 +886,17 @@ struct PartialTools {
     onepassword: Option<bool>,
 }
 
+/// `[plugins]` as read from TOML.
+///
+/// `toml::Value`, not `bool`, for the same reason `[concierge.tools]` uses it (see the note on
+/// `PartialConcierge::tools`): with a strongly-typed map, ONE malformed entry — `superpowers = "yes"`
+/// — fails `toml::from_str::<PartialConfig>` for the WHOLE FILE, discarding the entire layer and
+/// silently reverting every unrelated setting to its default. A non-bool value is dropped in
+/// `apply_plugins` and reads as "no opinion" instead.
 #[derive(Debug, Default, Deserialize)]
 struct PartialPlugins {
-    superpowers: Option<bool>,
-    frontend_design: Option<bool>,
+    #[serde(flatten)]
+    toggles: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1071,14 +1185,39 @@ fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
 
 /// Overlay a partial `[plugins]` table. Per-key, like [tools] — so a project can flip
 /// `frontend_design` off without also re-stating `superpowers`.
-fn apply_plugins(into: &mut PluginsConfig, p: Option<PartialPlugins>) {
-    let Some(p) = p else { return };
-    if let Some(v) = p.superpowers {
-        into.superpowers = v;
+///
+/// A non-boolean value is DROPPED rather than coerced or fatal: coercing would make
+/// `superpowers = "no"` mean enabled, and being fatal would cost the user their whole config layer
+/// over one typo. Dropping it leaves the key at whatever the lower layer said.
+///
+/// An UNKNOWN key is kept verbatim. It costs nothing (`is_enabled` only ever consults keys that
+/// `KNOWN_PLUGINS` asks about) and it means a config written by a newer Sparkle survives a
+/// round-trip through an older one instead of being silently erased.
+/// Returns the keys whose value was not a boolean, so the caller can tell the user.
+///
+/// Reporting them is not optional bookkeeping: a rejected value never enters the map, so
+/// `unknown_keys()` cannot see it afterwards. If this function does not hand it back, nothing can.
+#[must_use]
+fn apply_plugins(into: &mut PluginsConfig, p: Option<PartialPlugins>) -> Vec<(String, String)> {
+    let mut rejected = Vec::new();
+    let Some(p) = p else { return rejected };
+    for (key, value) in p.toggles {
+        match value.as_bool() {
+            Some(v) => into.set(&key, v),
+            // Logged AND reported. `apply_concierge` warns on the same shape, and dropping a line
+            // the user deliberately wrote with no trace is how `superpowers = "false"` reads as
+            // "still enabled" forever with nothing anywhere saying the line did nothing.
+            None => {
+                tracing::warn!(
+                    plugin = %key,
+                    kind = value.type_str(),
+                    "[plugins] value is not a boolean; ignoring this toggle"
+                );
+                rejected.push((key, value.type_str().to_string()));
+            }
+        }
     }
-    if let Some(v) = p.frontend_design {
-        into.frontend_design = v;
-    }
+    rejected
 }
 
 fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
@@ -1601,6 +1740,16 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
             ));
         }
     }
+    // A `[plugins]` key no row claims is almost always a typo for one that exists, and it is
+    // otherwise indistinguishable from a working line: it parses, it round-trips, and it does
+    // nothing. The VALUE is kept (a config from a newer Sparkle must survive an older one) — this
+    // only says we didn't act on it.
+    for key in cfg.plugins.unknown_keys() {
+        warnings.push(format!(
+            "[plugins].{key} is not a plugin Sparkle knows about, so it has no effect; check the \
+             spelling against the [plugins] block in your config file"
+        ));
+    }
     // Incoherent if a build would be blocked before staleness is even warned about.
     let f = &cfg.freshness;
     if f.stale_build_block_commits < f.staleness_warn_commits {
@@ -1625,6 +1774,9 @@ fn build_effective(
     let mut cfg = base;
     let mut warnings = Vec::new();
     let mut hard_error = false;
+    // `[plugins]` lines whose value was not a boolean. Collected from BOTH layers, because a
+    // rejected value never enters the config and so cannot be rediscovered from `cfg` afterwards.
+    let mut rejected_plugins: Vec<(String, String)> = Vec::new();
 
     if let Some(text) = global {
         match parse_layer(text) {
@@ -1633,7 +1785,7 @@ fn build_effective(
                 apply_workers(&mut cfg.workers, p.workers);
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_tools(&mut cfg.tools, p.tools);
-                apply_plugins(&mut cfg.plugins, p.plugins);
+                rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
                 apply_roborev(&mut cfg.roborev, p.roborev);
                 apply_improvement(&mut cfg.improvement, p.improvement);
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
@@ -1736,7 +1888,7 @@ fn build_effective(
                 // team. [ai].auto_approve stays global-only (it's the machine-wide master toggle,
                 // ignored per-project like the rest of [ai] above).
                 apply_workflow(&mut cfg.workflow, p.workflow);
-                apply_plugins(&mut cfg.plugins, p.plugins);
+                rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_approvals(&mut cfg.approvals, p.approvals);
@@ -1752,6 +1904,14 @@ fn build_effective(
         }
     }
 
+
+    // Said here rather than in validate(), which never sees the rejected list. A line like
+    // `superpowers = "false"` parses cleanly and does nothing; without this it is invisible.
+    for (key, kind) in &rejected_plugins {
+        warnings.push(format!(
+            "[plugins].{key} is a {kind}, not true or false, so it has no effect"
+        ));
+    }
     validate(&mut cfg, &mut warnings);
     (cfg, warnings, hard_error)
 }
@@ -2110,13 +2270,35 @@ seed_worktrees = false # restore backed-up env files into each newly created age
 # --- Claude Code plugins pre-enabled for every agent (repo-scoped; overridable per project) --
 # Sparkle turns these Claude Code marketplace plugins ON for every agent it spawns: it installs
 # them once (shared, via `claude plugin install`) and writes the marketplace + enabledPlugins
-# entries into each agent worktree's .claude/settings.local.json. Both come from Anthropic's
-# official marketplace, and both default on because the top Claude Code users overwhelmingly run
-# them. Setting one false means Sparkle writes nothing about it and never installs it — it does NOT
-# turn off a plugin you enabled yourself. Toggle these here or in ⋯ Settings → "Tools".
+# entries into each agent worktree's .claude/settings.local.json. Setting one false means Sparkle
+# writes nothing about it and never installs it — it does NOT turn off a plugin you enabled
+# yourself. Toggle these here or in ⋯ Settings → "Tools".
+#
+# The first two come from Anthropic's official marketplace. The sparkle_* ones come from Sparkle's
+# own public marketplace (github.com/try-sparkle/marketplace, Apache-2.0) — the same opinions
+# Sparkle applies internally, published so you can read, fork, or use them without Sparkle.
+#
+# TRUST: a default-on plugin means Sparkle fetches that content and enables it in every agent
+# worktree. Two limits worth knowing, both stated as what is actually true rather than as
+# reassurance:
+#   • Content from SPARKLE'S marketplace is pinned; content from Anthropic's is not pinned by us.
+#     Sparkle's marketplace names each plugin by an exact ref + commit sha, enforced by that repo's
+#     CI, so editing a skill or hook file alone does not reach you. Anthropic's official marketplace
+#     (superpowers, frontend_design) is registered the same way any marketplace is — by repo name —
+#     and what it serves is Anthropic's to decide; Sparkle adds no pin of its own there.
+#     Neither LISTING is pinned either way: Sparkle registers a marketplace by repo name, so a
+#     change to the listing itself (a new row, or a row re-pointed at a different sha) is picked up
+#     on the next fetch.
+#   • A row set false here stops Sparkle for THIS config layer. [plugins] is repo-overridable, so a
+#     .sparkle/config.toml checked into a project you clone can turn a row back on for that project
+#     — the same way it can for [workflow]. If that matters to you, check a cloned repo's
+#     .sparkle/config.toml. Turning a row off also never disables a plugin you installed yourself.
 [plugins]
-superpowers     = true   # the most-used agent methodology plugin: plan → TDD → review
-frontend_design = true   # Anthropic's official UI-quality skill
+superpowers            = true    # the most-used agent methodology plugin: plan → TDD → review
+frontend_design        = true    # Anthropic's official UI-quality skill
+sparkle_guardrails     = false   # public copy of the built-in guardrails; on only if you want it as a skill
+sparkle_freshness      = true    # warn when your branch is far behind the default branch
+sparkle_mutation_check = false   # /mutation-check — prove a given test can actually fail
 
 # --- roborev first-run consent (per-machine; ignored in a project file) -----------------
 # roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
@@ -2963,22 +3145,36 @@ quit_app = 42
     }
 
     #[test]
-    fn plugins_default_on_and_resolve_to_official_marketplace_ids() {
+    fn plugins_default_to_their_table_row_and_resolve_to_exact_marketplace_ids() {
         let (cfg, _, _) = effective(None, None);
-        assert!(cfg.plugins.superpowers);
-        assert!(cfg.plugins.frontend_design);
 
-        // Both defaults are live, and each resolves to the exact `<plugin>@<marketplace>` id Claude
-        // Code keys `enabledPlugins` by. These strings were verified against
-        // anthropics/claude-plugins-official's marketplace.json — a typo here silently produces a
-        // settings file that enables a plugin that does not exist.
+        // The default of every toggle comes from its own KNOWN_PLUGINS row — one place, so the
+        // built-in default, the template, and the frontend can no longer disagree.
+        for kp in KNOWN_PLUGINS {
+            assert_eq!(
+                cfg.plugins.is_enabled(kp.toggle),
+                kp.default_on,
+                "{} must default to its table row",
+                kp.toggle
+            );
+        }
+
+        // Each enabled row resolves to the exact `<plugin>@<marketplace>` id Claude Code keys
+        // `enabledPlugins` by. These strings were verified against the live marketplace.json of
+        // each marketplace — a typo here silently produces a settings file that enables a plugin
+        // that does not exist.
         let ids: Vec<String> = cfg.plugins.enabled().iter().map(|p| p.id()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                "superpowers@claude-plugins-official".to_string(),
-                "frontend-design@claude-plugins-official".to_string(),
-            ]
+        assert!(ids.contains(&"superpowers@claude-plugins-official".to_string()));
+        assert!(ids.contains(&"frontend-design@claude-plugins-official".to_string()));
+        assert!(ids.contains(&"sparkle-freshness@sparkle".to_string()));
+        assert!(
+            !ids.contains(&"sparkle-mutation-check@sparkle".to_string()),
+            "mutation-check ships OFF: it is a deliberate act, not a background discipline"
+        );
+        assert!(
+            !ids.contains(&"sparkle-guardrails@sparkle".to_string()),
+            "the guardrails PLUGIN ships OFF: [tools].guardrails already injects the same prose, \
+             and enabling both would give every agent the identical discipline twice"
         );
     }
 
@@ -3002,7 +3198,7 @@ quit_app = 42
         // The table and PluginsConfig are two halves of one mapping. Adding a row without adding
         // its bool field would leave `is_enabled` falling through to the unknown-name arm, so the
         // plugin could never turn on — and nothing else would fail. This is that guard.
-        let all_on = PluginsConfig { superpowers: true, frontend_design: true };
+        let all_on = PluginsConfig::with_all(true);
         let defaults = SparkleConfig::default();
         for p in KNOWN_PLUGINS {
             assert!(
@@ -3062,12 +3258,17 @@ quit_app = 42
         let (cfg, warns, hard) = effective(Some(g), None);
         assert!(!hard);
         assert!(warns.is_empty());
-        assert!(!cfg.plugins.frontend_design);
-        assert!(cfg.plugins.superpowers, "untouched plugin keeps its default");
-        assert_eq!(
-            cfg.plugins.enabled().iter().map(|p| p.toggle).collect::<Vec<_>>(),
-            vec!["superpowers"]
-        );
+        assert!(!cfg.plugins.is_enabled("frontend_design"));
+        assert!(cfg.plugins.is_enabled("superpowers"), "untouched plugin keeps its default");
+        // Only the one key named in the file moved; every other row still sits at its own default.
+        for kp in KNOWN_PLUGINS.iter().filter(|k| k.toggle != "frontend_design") {
+            assert_eq!(
+                cfg.plugins.is_enabled(kp.toggle),
+                kp.default_on,
+                "{} must be untouched by a file that never mentions it",
+                kp.toggle
+            );
+        }
 
         // [plugins] is repo-scoped (like [workflow]), so a project file overrides the global — and
         // does NOT produce a "machine-wide setting ignored" warning the way [tools] does.
@@ -3078,15 +3279,135 @@ quit_app = 42
             !warns.iter().any(|w| w.contains("[plugins]")),
             "[plugins] is repo-overridable; it must not be warned about: {warns:?}"
         );
-        assert!(!cfg.plugins.superpowers, "project beats global");
-        assert!(cfg.plugins.frontend_design, "project re-enables what global turned off");
+        assert!(!cfg.plugins.is_enabled("superpowers"), "project beats global");
+        assert!(cfg.plugins.is_enabled("frontend_design"), "project re-enables what global turned off");
+    }
+
+    /// The TRUST block is security-relevant prose a user acts on, so it is held to the same
+    /// standard as the code — an overstatement there is a bug, not a typo. Two claims were wrong in
+    /// exactly this way once (roborev 55099): "both marketplaces pin what they serve" (the listing
+    /// is fetched from the default branch, only the entries are pinned) and "set a row false to
+    /// stop Sparkle fetching it at all" (a project layer can turn it back on).
+    ///
+    /// These are substring assertions on purpose. They cannot prove the prose is accurate; what
+    /// they do is make the behavior and its description fail TOGETHER, so anyone who makes a global
+    /// `false` authoritative — or pins the listing — has to come here and find the sentence that
+    /// stopped being true.
+    #[test]
+    fn the_template_trust_block_states_the_limits_it_actually_has() {
+        let t = DEFAULT_TEMPLATE;
+        assert!(
+            t.contains("Neither LISTING is pinned"),
+            "the template must not imply a listing is pinned; only Sparkle's plugin content is"
+        );
+        // KEYED OFF THE TABLE, not a fixed string: the pinning claim is Sparkle-marketplace-only,
+        // and it is only *honest* while some rows come from elsewhere. If a row from a marketplace
+        // Sparkle does not pin exists — and superpowers/frontend_design are exactly that, and are
+        // default-on — the prose must say so out loud. Adding or removing such a row therefore
+        // forces this sentence to be revisited instead of quietly becoming an overstatement.
+        if KNOWN_PLUGINS.iter().any(|p| p.marketplace == OFFICIAL_MARKETPLACE) {
+            assert!(
+                t.contains("content from Anthropic's is not pinned by us"),
+                "rows from a marketplace Sparkle does not pin exist, so the template must not \
+                 claim plugin content is pinned without qualification"
+            );
+        }
+        assert!(
+            t.contains("repo-overridable"),
+            "the template must say a project layer can re-enable a globally disabled row"
+        );
+        // The behavior the second claim describes, pinned right next to it — if this stops holding,
+        // the sentence above is the thing to change.
+        let g = "[plugins]\nsuperpowers = false\n";
+        let p = "[plugins]\nsuperpowers = true\n";
+        let (cfg, _, _) = effective(Some(g), Some(p));
+        assert!(
+            cfg.plugins.is_enabled("superpowers"),
+            "a project layer really can re-enable what the global layer turned off"
+        );
+    }
+
+    #[test]
+    fn a_hyphenated_plugin_toggle_is_reported_rather_than_silently_doing_nothing() {
+        // The reported scenario: a user writes the PLUGIN id (`frontend-design`) where the TOGGLE
+        // name (`frontend_design`) belongs. It parses, it is retained, and it changes nothing — so
+        // without a warning the plugin stays on and no surface anywhere says the line was inert.
+        let g = "[plugins]\nfrontend-design = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(cfg.plugins.is_enabled("frontend_design"), "the real toggle is untouched");
+        assert!(
+            warns.iter().any(|w| w.contains("[plugins].frontend-design")),
+            "the typo must be surfaced, got: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_naming_only_real_toggles_warns_about_nothing() {
+        // The other half: a correct file must stay silent, or the warning becomes noise people
+        // learn to scroll past.
+        let mut g = String::from("[plugins]\n");
+        for kp in KNOWN_PLUGINS {
+            g.push_str(&format!("{} = {}\n", kp.toggle, kp.default_on));
+        }
+        let (_cfg, warns, _hard) = effective(Some(&g), None);
+        assert!(
+            !warns.iter().any(|w| w.contains("[plugins]")),
+            "a valid [plugins] block must produce no warnings, got: {warns:?}"
+        );
     }
 
     #[test]
     fn all_plugins_off_yields_no_enabled_plugins() {
-        let g = "[plugins]\nsuperpowers = false\nfrontend_design = false\n";
-        let (cfg, _, _) = effective(Some(g), None);
+        // Built from the table rather than a hand-listed pair, so this keeps meaning "every toggle
+        // off" as the catalog grows instead of quietly testing a subset.
+        let mut g = String::from("[plugins]\n");
+        for kp in KNOWN_PLUGINS {
+            g.push_str(&format!("{} = false\n", kp.toggle));
+        }
+        let (cfg, _, _) = effective(Some(&g), None);
         assert!(cfg.plugins.enabled().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_plugin_value_is_dropped_without_costing_the_whole_config_layer() {
+        // The [concierge.tools] lesson, applied to [plugins]: a strongly-typed map would fail
+        // `toml::from_str` for the WHOLE FILE on one bad value, discarding every unrelated setting
+        // in it. A non-bool must be dropped per-key instead.
+        let g = "[workflow]\nrequire_pr = false\n\n[plugins]\nsuperpowers = \"yes\"\nframework = 42\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a bad plugin value must not be a hard error");
+        assert!(!cfg.workflow.require_pr, "an unrelated setting must not revert to its default");
+        assert!(
+            cfg.plugins.is_enabled("superpowers"),
+            "a non-bool is no opinion at all, so the row keeps its default rather than reading as off"
+        );
+        // `framework` is a typo for nothing: it parses, round-trips, and does nothing. Say so,
+        // otherwise it is indistinguishable from a line that worked.
+        assert!(
+            warns.iter().any(|w| w.contains("[plugins].framework")),
+            "an unrecognized [plugins] key must be surfaced, got: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_plugin_key_survives_a_round_trip_but_never_reads_as_enabled() {
+        // A config written by a NEWER Sparkle must not be silently erased by an older one, but an
+        // unknown key must never resolve to "enabled" either.
+        let g = "[plugins]\nfrom_the_future = true\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(
+            warns.iter().any(|w| w.contains("[plugins].from_the_future")),
+            "kept verbatim, but the user is still told it had no effect: {warns:?}"
+        );
+        assert!(!cfg.plugins.is_enabled("from_the_future"), "unknown keys are never enabled");
+        assert!(
+            !cfg.plugins.enabled().iter().any(|p| p.toggle == "from_the_future"),
+            "and never reach the installer"
+        );
+        let json = serde_json::to_value(&cfg.plugins).unwrap();
+        assert_eq!(json["from_the_future"], serde_json::json!(true), "but it is kept verbatim");
     }
 
     #[test]

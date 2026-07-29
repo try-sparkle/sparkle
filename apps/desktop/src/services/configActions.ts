@@ -343,6 +343,9 @@ export async function setBuilderIndexEnabled(on: boolean): Promise<void> {
 const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
   superpowers: "plugins.superpowers",
   frontendDesign: "plugins.frontend_design",
+  sparkleGuardrails: "plugins.sparkle_guardrails",
+  sparkleFreshness: "plugins.sparkle_freshness",
+  sparkleMutationCheck: "plugins.sparkle_mutation_check",
 };
 
 /** Store key → the `[plugins]` TOML key Rust reports back in a `PluginInstallOutcome`.

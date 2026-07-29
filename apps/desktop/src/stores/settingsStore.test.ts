@@ -553,8 +553,8 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         .getState()
         .hydrateFromConfig(eff({ superpowers: false, frontend_design: true }));
       const s = useSettingsStore.getState();
-      expect(s.superpowersEnabled).toBe(false);
-      expect(s.frontendDesignEnabled).toBe(true);
+      expect(s.pluginsEnabled.superpowers).toBe(false);
+      expect(s.pluginsEnabled.frontendDesign).toBe(true);
     });
 
     it("treats an absent [plugins] block as on-by-default (older backend)", () => {
@@ -565,8 +565,8 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
         .hydrateFromConfig(eff({ superpowers: false, frontend_design: false }));
       useSettingsStore.getState().hydrateFromConfig(eff());
       const s = useSettingsStore.getState();
-      expect(s.superpowersEnabled).toBe(true);
-      expect(s.frontendDesignEnabled).toBe(true);
+      expect(s.pluginsEnabled.superpowers).toBe(true);
+      expect(s.pluginsEnabled.frontendDesign).toBe(true);
     });
   });
 

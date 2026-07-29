@@ -83,9 +83,17 @@ export interface ToolsConfig {
 }
 /** Claude Code marketplace plugins Sparkle pre-enables for every agent it spawns. Repo-scoped and
  *  per-project overridable (like [workflow]), so a repo can pick the plugins its codebase wants. */
-export interface PluginsConfig {
-  superpowers: boolean;
-  frontend_design: boolean;
+export /** The `[plugins]` table as Rust serializes it.
+ *
+ *  Every key OPTIONAL on purpose: the hydrate already resolves each one through `?? <default>`,
+ *  and a Sparkle frontend can run against an older backend whose `KNOWN_PLUGINS` predates a key.
+ *  Requiring them would make that a type error while the runtime handled it fine. */
+interface PluginsConfig {
+  superpowers?: boolean;
+  frontend_design?: boolean;
+  sparkle_guardrails?: boolean;
+  sparkle_freshness?: boolean;
+  sparkle_mutation_check?: boolean;
 }
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */

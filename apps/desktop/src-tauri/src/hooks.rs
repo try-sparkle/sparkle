@@ -1538,24 +1538,95 @@ mod tests {
             name: "superpowers-marketplace",
             repo: "obra/superpowers-marketplace",
         }),
+        default_on: true,
     };
 
-    fn defaults_on() -> Vec<&'static KnownPlugin> {
-        PluginsConfig { superpowers: true, frontend_design: true }.enabled()
+    /// EVERY catalog row forced on — not the shipped default set. Named for what it does, because
+    /// the previous name (`defaults_on`) was true only while every row happened to default on, and
+    /// it silently stopped being true the moment a row shipped OFF.
+    fn all_on() -> Vec<&'static KnownPlugin> {
+        PluginsConfig::with_all(true).enabled()
+    }
+
+    /// What a real install actually enables — the input that decides what lands in every worktree's
+    /// settings.local.json.
+    fn shipped_defaults() -> Vec<&'static KnownPlugin> {
+        crate::config::SparkleConfig::default().plugins.enabled()
+    }
+
+    /// Exactly two rows, both from the official marketplace.
+    ///
+    /// Used by the tests that exercise the ledger / observation / install-pass MECHANISM rather
+    /// than the catalog itself: "given N enabled plugins, which ones get retried" is the same
+    /// property whether the table holds two rows or twenty, and pinning those tests to the live
+    /// catalog meant every new marketplace row broke a handful of unrelated assertions.
+    fn sample_pair() -> Vec<&'static KnownPlugin> {
+        crate::config::KNOWN_PLUGINS
+            .iter()
+            .filter(|p| p.marketplace == OFFICIAL_MARKETPLACE)
+            .take(2)
+            .collect()
     }
 
     #[test]
-    fn enables_both_default_plugins_with_the_exact_claude_code_key_shape() {
-        let out = merge_plugin_settings(None, &defaults_on());
+    fn enables_every_enabled_plugin_with_the_exact_claude_code_key_shape() {
+        let out = merge_plugin_settings(None, &all_on());
         let v: Value = serde_json::from_str(&out).unwrap();
         // enabledPlugins is an OBJECT keyed by "<plugin>@<marketplace>" → true. Asserting the
         // literal keys (not just "contains superpowers") is the point: a wrong shape or a wrong
         // marketplace half produces a settings file Claude Code silently ignores.
         assert_eq!(v["enabledPlugins"]["superpowers@claude-plugins-official"], json!(true));
         assert_eq!(v["enabledPlugins"]["frontend-design@claude-plugins-official"], json!(true));
-        // The official marketplace is pre-registered, so we must NOT declare it — and with no
-        // third-party plugin on, the key should not be invented at all.
-        assert!(v.get("extraKnownMarketplaces").is_none());
+        assert_eq!(v["enabledPlugins"]["sparkle-guardrails@sparkle"], json!(true));
+        // Every row handed in must be written, whatever the table grows to.
+        for p in all_on() {
+            assert_eq!(v["enabledPlugins"][p.id()], json!(true), "{} not enabled", p.id());
+        }
+        // Claude Code owns the official marketplace and pre-registers it, so we must NOT re-declare
+        // it. Sparkle's own marketplace it has never heard of, so that one MUST be declared or the
+        // per-worktree settings name a marketplace the agent cannot resolve.
+        let mk = v.get("extraKnownMarketplaces").expect("Sparkle's marketplace must be declared");
+        assert_eq!(
+            mk["sparkle"]["source"],
+            json!({ "source": "github", "repo": "try-sparkle/marketplace" })
+        );
+        assert!(
+            mk.get(crate::config::OFFICIAL_MARKETPLACE).is_none(),
+            "never re-declare Claude Code's own marketplace"
+        );
+    }
+
+    /// The shipped default set is the input every real worktree gets, and until now NO hooks test
+    /// exercised it — they all forced every toggle on, which would have stayed green even if a
+    /// plugin meant to ship OFF started being written into every agent's settings.
+    #[test]
+    fn the_shipped_default_set_writes_exactly_the_intended_plugins() {
+        let defaults = shipped_defaults();
+        let out = merge_plugin_settings(None, &defaults);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let enabled = v["enabledPlugins"].as_object().expect("enabledPlugins must be an object");
+
+        let got: std::collections::BTreeSet<&str> = enabled.keys().map(String::as_str).collect();
+        let want: std::collections::BTreeSet<String> =
+            defaults.iter().map(|p| p.id()).collect();
+        assert_eq!(
+            got,
+            want.iter().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            "the settings file must name exactly the shipped default set"
+        );
+
+        // The specific hazard this pins: [tools].guardrails already appends the same prose to every
+        // agent's system prompt, so shipping the PLUGIN on too would deliver it twice.
+        assert!(
+            !got.contains("sparkle-guardrails@sparkle"),
+            "the guardrails plugin must not ship on — [tools].guardrails already injects it"
+        );
+        assert!(
+            !got.contains("sparkle-mutation-check@sparkle"),
+            "mutation-check is a deliberate act, not a default"
+        );
+        assert!(got.contains("superpowers@claude-plugins-official"));
+        assert!(got.contains("sparkle-freshness@sparkle"));
     }
 
     #[test]
@@ -1585,7 +1656,7 @@ mod tests {
               "frontend-design@claude-plugins-official": false
             }
         }"#;
-        let mut plugins = defaults_on();
+        let mut plugins = all_on();
         plugins.push(&THIRD_PARTY);
         let out = merge_plugin_settings(Some(existing), &plugins);
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1615,7 +1686,7 @@ mod tests {
 
     #[test]
     fn all_toggles_off_writes_nothing_and_never_removes_an_entry() {
-        let none: Vec<&KnownPlugin> = PluginsConfig { superpowers: false, frontend_design: false }.enabled();
+        let none: Vec<&KnownPlugin> = PluginsConfig::with_all(false).enabled();
         assert!(none.is_empty());
 
         // A settings file with no plugin keys stays that way — we don't seed empty objects into
@@ -1640,8 +1711,8 @@ mod tests {
         // Every writer's output must survive the others, and a reinstall must not duplicate or drift.
         let after_guard = crate::worktree::merge_guard_settings(None, "node /abs/worktree-guard.mjs /wt/a");
         let after_emitter = merge_event_hooks(Some(&after_guard), "node /abs/sparkle-hook.mjs /log");
-        let once = merge_plugin_settings(Some(&after_emitter), &defaults_on());
-        let twice = merge_plugin_settings(Some(&once), &defaults_on());
+        let once = merge_plugin_settings(Some(&after_emitter), &all_on());
+        let twice = merge_plugin_settings(Some(&once), &all_on());
         assert_eq!(once, twice, "reinstall must be a byte-for-byte no-op");
 
         let v: Value = serde_json::from_str(&twice).unwrap();
@@ -1711,16 +1782,17 @@ mod tests {
 
     #[test]
     fn install_skips_what_the_ledger_already_records() {
-        let enabled = defaults_on();
+        let enabled = sample_pair();
         // Cold: everything needs installing, in table order.
         let todo = plugins_needing_install(&enabled, &[]);
         assert_eq!(
             todo.iter().map(|p| p.id()).collect::<Vec<_>>(),
-            vec![
-                "superpowers@claude-plugins-official".to_string(),
-                "frontend-design@claude-plugins-official".to_string(),
-            ]
+            enabled.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            "cold start installs every enabled plugin, in table order"
         );
+        // Pin a literal id too, so a wrong `<plugin>@<marketplace>` half still fails loudly even
+        // though the list above is derived.
+        assert!(todo.iter().any(|p| p.id() == "superpowers@claude-plugins-official"));
 
         // Partly warm: only the missing one is retried, so a launch doesn't re-hit the network.
         let todo = plugins_needing_install(&enabled, &["superpowers@claude-plugins-official".into()]);
@@ -1733,7 +1805,7 @@ mod tests {
 
         // A stale ledger entry for a plugin that is no longer enabled is simply ignored (we never
         // uninstall — turning a toggle off stops Sparkle enabling it, nothing more).
-        let none: Vec<&KnownPlugin> = PluginsConfig { superpowers: false, frontend_design: false }.enabled();
+        let none: Vec<&KnownPlugin> = PluginsConfig::with_all(false).enabled();
         assert!(plugins_needing_install(&none, &all).is_empty());
     }
 
@@ -1770,11 +1842,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sparkle-plugins-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".sparkle")).unwrap();
-        std::fs::write(
-            root.join(".sparkle/config.toml"),
-            "[plugins]\nsuperpowers = false\nfrontend_design = false\n",
-        )
-        .unwrap();
+        // Generated from the table, not a hand-listed pair: this test means "the repo turned
+        // EVERYTHING off", and a literal list would quietly stop meaning that on the next new row.
+        let mut block = String::from("[plugins]\n");
+        for kp in crate::config::KNOWN_PLUGINS {
+            block.push_str(&format!("{} = false\n", kp.toggle));
+        }
+        std::fs::write(root.join(".sparkle/config.toml"), block).unwrap();
         let cfg = plugins_layer_for(Some(root.to_str().unwrap()));
         assert!(cfg.plugins.enabled().is_empty(), "the repo's own [plugins] block must win");
 
@@ -1802,14 +1876,14 @@ mod tests {
         // THE ledger bug: it is write-only truth. Once an id is recorded, `plugins_needing_install`
         // returns empty forever — so `/plugin uninstall superpowers`, or `rm -rf ~/.claude/plugins`,
         // leaves the plugin gone and Sparkle permanently convinced it's there.
-        let enabled = defaults_on();
+        let enabled = sample_pair();
         let ledger: Vec<String> = enabled.iter().map(|p| p.id()).collect();
 
         // Nothing observable on the machine → the ledger's claims are dropped and both reinstall.
         let already = already_installed(ledger.clone(), Some(Vec::new()));
         assert_eq!(
             plugins_needing_install(&enabled, &already).len(),
-            2,
+            enabled.len(),
             "a wiped plugins dir must make the next pass reinstall, not skip"
         );
 
@@ -2040,7 +2114,7 @@ mod tests {
         let outcomes = run_install_pass(
             &dir,
             PluginTree { config_dir: None, home: Some(&home), is_default: true },
-            &defaults_on(),
+            &sample_pair(),
             &mut attempted,
             None,
             &mut |_| {
@@ -2328,7 +2402,7 @@ mod tests {
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let tree_root = claude_plugins_dir(None, &home);
-        let enabled = defaults_on();
+        let enabled = sample_pair();
         let mut calls: Vec<Vec<String>> = Vec::new();
         let mut attempted = Vec::new();
         // Fail the SECOND plugin's install, so success and failure are both exercised in one pass.
@@ -2461,7 +2535,7 @@ mod tests {
         let outcomes = run_install_pass(
             &dir,
             PluginTree { config_dir: None, home: Some(&home), is_default: true },
-            &defaults_on(),
+            &all_on(),
             &mut attempted,
             None,
             &mut |_| Err("offline".into()),
@@ -2544,20 +2618,36 @@ mod tests {
     }
 
     #[test]
-    fn shipped_plugins_carry_a_source_but_are_never_declared_per_worktree() {
-        // The two halves of the official-marketplace decision, pinned together:
-        //   * `source` IS set, so the installer's idempotent `marketplace add` runs — without it, a
-        //     machine where Claude Code was never launched interactively has no registered official
+    fn every_shipped_plugin_carries_a_source_and_only_foreign_ones_are_declared() {
+        // Two halves of the marketplace decision, pinned together for EVERY row:
+        //   * `source` is always set, so the installer's idempotent `marketplace add` runs — without
+        //     it, a machine where Claude Code was never launched interactively has no registered
         //     marketplace and every install fails (warn-logged only, so silently).
-        //   * `declared_source()` is None, so we do NOT write `extraKnownMarketplaces` for a
-        //     marketplace Claude Code owns into every agent's settings file.
-        for p in defaults_on() {
-            assert_eq!(p.marketplace, OFFICIAL_MARKETPLACE);
+        //   * `declared_source()` is None ONLY for the marketplace Claude Code owns. Sparkle's own
+        //     marketplace must be declared per worktree, or the settings file names a marketplace
+        //     the agent cannot resolve.
+        let mut saw_official = false;
+        let mut saw_sparkle = false;
+        for p in crate::config::KNOWN_PLUGINS {
             let src = p.source.expect("the installer needs a repo to `marketplace add`");
-            assert_eq!(src.name, OFFICIAL_MARKETPLACE);
-            assert_eq!(src.repo, crate::config::OFFICIAL_MARKETPLACE_REPO);
-            assert!(p.declared_source().is_none(), "never re-declare Claude Code's own marketplace");
+            assert_eq!(src.name, p.marketplace, "a row's source must name its own marketplace");
+            if p.marketplace == OFFICIAL_MARKETPLACE {
+                saw_official = true;
+                assert_eq!(src.repo, crate::config::OFFICIAL_MARKETPLACE_REPO);
+                assert!(
+                    p.declared_source().is_none(),
+                    "never re-declare Claude Code's own marketplace"
+                );
+            } else {
+                saw_sparkle = true;
+                assert!(
+                    p.declared_source().is_some(),
+                    "{} lives in a marketplace Claude Code does not know; it MUST be declared",
+                    p.id()
+                );
+            }
         }
+        assert!(saw_official && saw_sparkle, "both marketplace kinds must stay covered");
     }
 
     #[test]

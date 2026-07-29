@@ -36,7 +36,7 @@ import {
   refreshPluginInstallState,
 } from "../services/configActions";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useSettingsStore } from "../stores/settingsStore";
+import { useSettingsStore, type PluginKey } from "../stores/settingsStore";
 import { ToolsPane, TOOLS_CATEGORY_KEYWORDS, TOOL_META } from "./ToolsPane";
 
 /** Seed the store to a known baseline: every AI flag + every tool ON (aiFeatureMode = "all") —
@@ -61,8 +61,11 @@ function seedAllOn() {
     builderIndexModalOpen: false,
     onepasswordEnabled: false,
     onepasswordVaultId: null,
-    superpowersEnabled: true,
-    frontendDesignEnabled: true,
+    pluginsEnabled: {
+      ...useSettingsStore.getState().pluginsEnabled,
+      superpowers: true,
+      frontendDesign: true,
+    },
     // Reset per test: it's a module-level store, so a leftover "installing" from one test would
     // displace the scope hint in whatever test ran next.
     pluginInstallState: {},
@@ -83,8 +86,11 @@ function seedAiOff() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
-    superpowersEnabled: true,
-    frontendDesignEnabled: true,
+    // Every plugin on, derived from the store's own key set — a hand-listed pair would quietly
+    // stop meaning "all on" the next time a plugin is added.
+    pluginsEnabled: Object.fromEntries(
+      Object.keys(useSettingsStore.getState().pluginsEnabled).map((k) => [k, true]),
+    ) as Record<PluginKey, boolean>,
   });
 }
 
@@ -102,8 +108,11 @@ function seedAiSome() {
     githubEnabled: true,
     guardrailsEnabled: true,
     roborevEnabled: true,
-    superpowersEnabled: true,
-    frontendDesignEnabled: true,
+    pluginsEnabled: {
+      ...useSettingsStore.getState().pluginsEnabled,
+      superpowers: true,
+      frontendDesign: true,
+    },
   });
 }
 
@@ -119,10 +128,11 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the ten toggleable tools carry a switch. Superpowers is one of them now: it used
+    // Exactly the thirteen toggleable tools carry a switch. Superpowers is one of them: it used
     // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
     // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
-    expect(screen.getAllByRole("switch")).toHaveLength(10);
+    // The three "sparkle*" rows come from Sparkle's own published marketplace.
+    expect(screen.getAllByRole("switch")).toHaveLength(13);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
@@ -130,6 +140,9 @@ describe("ToolsPane", () => {
       "Builder Index",
       "Superpowers",
       "Frontend design",
+      "Guardrails skill",
+      "Branch freshness",
+      "Mutation check",
       "1Password env backup",
       "Beads",
       "GitHub import",
@@ -179,7 +192,7 @@ describe("ToolsPane", () => {
 
   it("reflects each plugin flag independently and never AI-locks them", () => {
     seedAiOff(); // first — the seed helpers reset every flag, plugins included
-    useSettingsStore.setState({ superpowersEnabled: true, frontendDesignEnabled: false });
+    useSettingsStore.setState({ pluginsEnabled: { ...useSettingsStore.getState().pluginsEnabled, superpowers: true, frontendDesign: false } });
     render(<ToolsPane />);
     const sp = screen.getByRole("switch", { name: "Superpowers" }) as HTMLButtonElement;
     const fd = screen.getByRole("switch", { name: "Frontend design" }) as HTMLButtonElement;
@@ -201,21 +214,27 @@ describe("ToolsPane", () => {
   it("tells the user a plugin toggle only affects agents created from now on", () => {
     render(<ToolsPane />);
     // Sparkle writes enabledPlugins insert-if-absent and never retracts, so toggling OFF leaves
-    // every existing worktree exactly as it was. Both rows must say so — otherwise the switch
-    // reads as broken for every agent already on screen.
-    expect(screen.getAllByText("Applies to agents created from now on.")).toHaveLength(2);
+    // every existing worktree exactly as it was. EVERY plugin row must say so — otherwise the
+    // switch reads as broken for every agent already on screen. Counted against the store's own
+    // key set, so a new plugin that forgets the note fails here instead of shipping silently.
+    const pluginRows = Object.keys(useSettingsStore.getState().pluginsEnabled).length;
+    expect(screen.getAllByText("Applies to agents created from now on.")).toHaveLength(pluginRows);
   });
 
   it("reports the installer's progress and failures on the plugin row", () => {
     // Turning a plugin on shells out to `claude plugin install`, which can take a while or fail
     // (offline, no claude, marketplace outage). That half is invisible to the user unless the row
     // says so — otherwise the switch reads ON while agents never see the plugin.
-    useSettingsStore.setState({
-      pluginInstallState: { superpowers: "installing", frontendDesign: "Sparkle couldn't install" },
-    });
+    // Give EVERY plugin row an install state, so the scope note has nowhere left to render and
+    // "displaced" is proven rather than merely outnumbered by rows that still show it.
+    const keys = Object.keys(useSettingsStore.getState().pluginsEnabled) as PluginKey[];
+    const state = Object.fromEntries(
+      keys.map((k, i) => [k, i === 0 ? "installing" : "Sparkle couldn't install"]),
+    ) as Record<PluginKey, string>;
+    useSettingsStore.setState({ pluginInstallState: state });
     render(<ToolsPane />);
     expect(screen.getByText("Installing…")).toBeTruthy();
-    expect(screen.getByText("Sparkle couldn't install")).toBeTruthy();
+    expect(screen.getAllByText("Sparkle couldn't install")).toHaveLength(keys.length - 1);
     // The scope note is displaced while there's something more urgent to say, and only then.
     expect(screen.queryByText("Applies to agents created from now on.")).toBeNull();
   });

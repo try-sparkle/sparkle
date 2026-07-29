@@ -88,19 +88,19 @@ describe("setPluginEnabled — the [plugins] flags", () => {
   });
 
   it("updates the store optimistically, before the write resolves", () => {
-    useSettingsStore.setState({ superpowersEnabled: true });
+    useSettingsStore.setState({ pluginsEnabled: { ...useSettingsStore.getState().pluginsEnabled, superpowers: true } });
     const pending = setPluginEnabled("superpowers", false);
     // Already flipped — the UI must not wait on IPC to reflect the click.
-    expect(useSettingsStore.getState().superpowersEnabled).toBe(false);
+    expect(useSettingsStore.getState().pluginsEnabled.superpowers).toBe(false);
     return pending;
   });
 
   it("keeps the optimistic store value when the config write fails", async () => {
     vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
-    useSettingsStore.setState({ frontendDesignEnabled: true });
+    useSettingsStore.setState({ pluginsEnabled: { ...useSettingsStore.getState().pluginsEnabled, frontendDesign: true } });
     // Must not throw: a failed persist is warned about, not surfaced as an unhandled rejection.
     await setPluginEnabled("frontendDesign", false);
-    expect(useSettingsStore.getState().frontendDesignEnabled).toBe(false);
+    expect(useSettingsStore.getState().pluginsEnabled.frontendDesign).toBe(false);
   });
 
   it("installs the plugin when toggled ON, so it doesn't wait for the next launch", async () => {
@@ -141,7 +141,7 @@ describe("setPluginEnabled — the [plugins] flags", () => {
       },
     ]);
     await expect(setPluginEnabled("superpowers", true)).resolves.toBeUndefined();
-    expect(useSettingsStore.getState().superpowersEnabled).toBe(true);
+    expect(useSettingsStore.getState().pluginsEnabled.superpowers).toBe(true);
     expect(useSettingsStore.getState().pluginInstallState.superpowers).toMatch(/couldn't install/);
   });
 
@@ -150,7 +150,7 @@ describe("setPluginEnabled — the [plugins] flags", () => {
     // an install that failed, and still not something to render as a working toggle.
     vi.mocked(ensureDefaultPluginsInstalled).mockRejectedValueOnce(new Error("offline"));
     await expect(setPluginEnabled("superpowers", true)).resolves.toBeUndefined();
-    expect(useSettingsStore.getState().superpowersEnabled).toBe(true);
+    expect(useSettingsStore.getState().pluginsEnabled.superpowers).toBe(true);
     expect(useSettingsStore.getState().pluginInstallState.superpowers).toMatch(
       /couldn't run the plugin install/,
     );

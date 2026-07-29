@@ -151,13 +151,30 @@ export const TOOL_FIELD: Record<
 // section ([plugins], repo-overridable) than [tools] (machine-wide), so a single key type would
 // make the wrong dotted path reachable. Same shape and same hydrate/optimistic-write pattern.
 
-/** Stable identifiers for the config-backed [plugins] flags. */
-export type PluginKey = "superpowers" | "frontendDesign";
+/** Stable identifiers for the config-backed [plugins] flags.
+ *
+ *  The `sparkle*` ones come from Sparkle's OWN public marketplace
+ *  (github.com/try-sparkle/marketplace, Apache-2.0) rather than Anthropic's official one — the
+ *  same opinions Sparkle applies internally, published so they can be read, forked, or used
+ *  without Sparkle. */
+export type PluginKey =
+  | "superpowers"
+  | "frontendDesign"
+  | "sparkleGuardrails"
+  | "sparkleFreshness"
+  | "sparkleMutationCheck";
 
-/** Map a plugin key to its settings-store field name (the single source of that relationship). */
-export const PLUGIN_FIELD: Record<PluginKey, "superpowersEnabled" | "frontendDesignEnabled"> = {
-  superpowers: "superpowersEnabled",
-  frontendDesign: "frontendDesignEnabled",
+/** Defaults, mirroring the `default_on` column of Rust's `KNOWN_PLUGINS`. Used only until the
+ *  first config hydrate answers for real; `PLUGIN_DEFAULTS` and the Rust table disagreeing is a
+ *  first-paint flicker, not a correctness bug, because Rust is the authority. */
+export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
+  superpowers: true,
+  frontendDesign: true,
+  // OFF: [tools].guardrails already injects this same prose (see the Rust table).
+  sparkleGuardrails: false,
+  sparkleFreshness: true,
+  // A deliberate, targeted act ("prove THIS test can fail"), not a background discipline.
+  sparkleMutationCheck: false,
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -503,12 +520,14 @@ interface SettingsState {
   /** Whether the Builder Index consent + settings modal is mounted. UI-only, never persisted:
    *  the modal is where consent is given, so it must never be restored as "already open". */
   builderIndexModalOpen: boolean;
-  /** obra's superpowers plugin (plan → TDD → review), pre-enabled in every agent worktree's
-   *  .claude/settings.local.json. Mirrors [plugins].superpowers. Config-backed, NOT persisted. */
-  superpowersEnabled: boolean;
-  /** Anthropic's official frontend-design plugin (UI quality), pre-enabled the same way.
-   *  Mirrors [plugins].frontend_design. Config-backed, NOT persisted. */
-  frontendDesignEnabled: boolean;
+  /** Which Claude Code plugins are pre-enabled in every agent worktree's
+   *  .claude/settings.local.json. Mirrors the `[plugins]` TOML table. Config-backed, NOT persisted.
+   *
+   *  KEYED, not one boolean field per plugin: the field-per-plugin shape meant adding a plugin
+   *  required editing this interface, the defaults, the hydrate, and a key→field map in lockstep,
+   *  which is exactly why the catalog could not grow. Rust's `PluginsConfig` is keyed for the same
+   *  reason. */
+  pluginsEnabled: Record<PluginKey, boolean>;
   /** 1Password `.env*` backup. Mirrors [tools].onepassword. Config-backed, NOT persisted.
    *  Unlike every other tool this defaults OFF — see the hydration note below. */
   onepasswordEnabled: boolean;
@@ -683,8 +702,7 @@ export const useSettingsStore = create<SettingsState>()(
       roborevEnabled: true,
       // Default OFF — nothing is published until the user opts in AND consents.
       builderIndexEnabled: false,
-      superpowersEnabled: true,
-      frontendDesignEnabled: true,
+      pluginsEnabled: { ...PLUGIN_DEFAULTS },
       onepasswordEnabled: false,
       onepasswordVaultId: null,
       onepasswordSeedWorktrees: false,
@@ -741,7 +759,8 @@ export const useSettingsStore = create<SettingsState>()(
       setStopWord: (stopWord) => set({ stopWord }),
       setPauseOnSubmit: (pauseOnSubmit) => set({ pauseOnSubmit }),
       setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
-      setPluginEnabled: (key, on) => set({ [PLUGIN_FIELD[key]]: on } as Partial<SettingsState>),
+      setPluginEnabled: (key, on) =>
+        set((s) => ({ pluginsEnabled: { ...s.pluginsEnabled, [key]: on } })),
       setPluginInstallState: (key, state) =>
         set((s) => {
           const next = { ...s.pluginInstallState };
@@ -871,8 +890,17 @@ export const useSettingsStore = create<SettingsState>()(
           builderIndexEnabled: config.tools?.builder_index ?? false,
           // Plugin flags. Same `?? true` back-compat rule as [tools]: an absent [plugins] block
           // (older backend) means the on-by-default state, matching SparkleConfig::default().
-          superpowersEnabled: config.plugins?.superpowers ?? true,
-          frontendDesignEnabled: config.plugins?.frontend_design ?? true,
+          // An absent [plugins] block (older backend) reads as the on-by-default state, matching
+          // SparkleConfig::default(). Each key maps to its snake_case TOML name.
+          pluginsEnabled: {
+            superpowers: config.plugins?.superpowers ?? PLUGIN_DEFAULTS.superpowers,
+            frontendDesign: config.plugins?.frontend_design ?? PLUGIN_DEFAULTS.frontendDesign,
+            sparkleGuardrails:
+              config.plugins?.sparkle_guardrails ?? PLUGIN_DEFAULTS.sparkleGuardrails,
+            sparkleFreshness: config.plugins?.sparkle_freshness ?? PLUGIN_DEFAULTS.sparkleFreshness,
+            sparkleMutationCheck:
+              config.plugins?.sparkle_mutation_check ?? PLUGIN_DEFAULTS.sparkleMutationCheck,
+          },
           // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
           // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it
           // can do anything, so an absent [tools] block must read as OFF — defaulting it on would
