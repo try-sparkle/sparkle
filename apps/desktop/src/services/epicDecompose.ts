@@ -1,11 +1,18 @@
-// Auto-decompose watcher for Plan epics (spec §7, plan Task 5): any epic that lands on the board
-// with zero child tasks gets decomposed into child beads automatically. Safety rules, in order:
+// Auto-decompose watcher for Plan epics (spec §7, plan Task 5): a childless epic is decomposed
+// into child beads by a PAID AI call — but ONLY when it carries an explicit opt-in label. Safety
+// rules, in order:
 //   1. Single-window election — only the MAIN window ever runs the watcher (no cross-window race).
-//   2. No retroactive backfill — a one-time baseline sweep per project labels every pre-existing
-//      childless epic `decompose-exempt` WITHOUT decomposing it; only epics created after the
-//      baseline auto-decompose. Removing the label opts an epic in manually.
+//   2. EXPLICIT opt-in — the watcher spends iff the epic carries `decompose:requested`. The DEFAULT
+//      state (no such label) is a strict no-op: removing an unrelated label, reopening a childless
+//      epic, or a backlog-cleanup pass can never trigger an AI call. "Label absent" ≠ "please
+//      decompose" (that inverted default was a money/safety landmine — bead sparkle-ynn8).
 //   3. Guard labels — `decomposing` is written BEFORE the AI call (skip the epic if that write
-//      fails), swapped to `decomposed` on success or `decompose-failed` on error.
+//      fails), swapped to `decomposed` on success (and the opt-in label consumed) or
+//      `decompose-failed` on error (opt-in kept, so clearing the failed badge retries).
+//   4. Crash recovery — `decomposing` is transient (written before the call, cleared after), so a
+//      label surviving into a fresh watcher session is stale by definition (crash/quit mid-run) and
+//      is reset. This reclaim runs BEFORE the AI gate: clearing a stale label is a pure `bd` write
+//      that spends nothing, so a crash must be reclaimable even while AI features are off.
 // Pure pickers up top (unit-tested), thin IO sweeps below. The beadsStore calls
 // `maybeRunDecomposeWatcher` after each poll; every guard lives here so the store stays dumb.
 import { childrenOf, labelBead, type Bead, type Board } from "./beads";
@@ -21,18 +28,24 @@ import { aiFeatureMode, useSettingsStore } from "../stores/settingsStore";
 import { isAppWindowSearch } from "./windowIdentity";
 import { log } from "../logger";
 
+/**
+ * The EXPLICIT opt-in signal. A childless epic is decomposed (a paid AI call) ONLY if it carries
+ * this label. Its ABSENCE is the safe default — the watcher never spends on an epic that has not
+ * opted in, so label hygiene and epic reopens are free of spend.
+ */
+export const DECOMPOSE_REQUESTED_LABEL = "decompose:requested";
+
 export const DECOMPOSING_LABEL = "decomposing";
 export const DECOMPOSED_LABEL = "decomposed";
 export const DECOMPOSE_FAILED_LABEL = "decompose-failed";
-export const DECOMPOSE_EXEMPT_LABEL = "decompose-exempt";
 
-/** Any of these labels takes an epic out of the auto-decompose pipeline. */
-const SKIP_LABELS = [
-  DECOMPOSING_LABEL,
-  DECOMPOSED_LABEL,
-  DECOMPOSE_FAILED_LABEL,
-  DECOMPOSE_EXEMPT_LABEL,
-];
+/**
+ * Labels marking an epic that is already somewhere in the decompose pipeline — in-flight
+ * (`decomposing`) or terminal (`decomposed` / `decompose-failed`). Any of them excludes the epic
+ * from a fresh pick, so a requested epic is decomposed at most once. A failed epic re-enters only
+ * when its `decompose-failed` badge is cleared (the retry affordance).
+ */
+const PIPELINE_LABELS = [DECOMPOSING_LABEL, DECOMPOSED_LABEL, DECOMPOSE_FAILED_LABEL];
 
 /** Flatten the four board columns back into one bead list (childrenOf needs the full set). */
 function boardBeads(board: Board): Bead[] {
@@ -40,9 +53,12 @@ function boardBeads(board: Board): Bead[] {
 }
 
 /**
- * The epics the watcher may decompose this cycle: epics (only) that are not closed — finished
- * work never triggers an AI call — with ZERO children (in any column, any status) and NONE of
- * the four pipeline labels. Pure.
+ * The epics the watcher may decompose this cycle. ALL of:
+ *   - it is an epic that is not closed (finished work never triggers an AI call);
+ *   - it carries the EXPLICIT `decompose:requested` opt-in (the spend gate — absent ⇒ never picked);
+ *   - it is not already in the pipeline (no `decomposing` / `decomposed` / `decompose-failed`);
+ *   - it has ZERO children (in any column, any status).
+ * Pure. The opt-in requirement is the money/safety fix: an epic without the label is a no-op.
  */
 export function pickEpicsToDecompose(board: Board): Bead[] {
   const beads = boardBeads(board);
@@ -50,52 +66,23 @@ export function pickEpicsToDecompose(board: Board): Bead[] {
     (b) =>
       b.type === "epic" &&
       b.status !== "closed" &&
-      !b.labels.some((l) => SKIP_LABELS.includes(l)) &&
+      b.labels.includes(DECOMPOSE_REQUESTED_LABEL) &&
+      !b.labels.some((l) => PIPELINE_LABELS.includes(l)) &&
       childrenOf(beads, b.id).length === 0,
   );
 }
 
 /**
- * The epics the one-time baseline sweep exempts: exactly the set that would otherwise
- * auto-decompose. Kept as its own export so the baseline contract is pinned independently.
- */
-export function pickBaselineExemptEpics(board: Board): Bead[] {
-  return pickEpicsToDecompose(board);
-}
-
-/**
- * Boot reclaim: epics still labeled `decomposing` when the watcher starts. Only the main window
- * ever decomposes, so a label surviving into a fresh session is stale by definition (crash or
- * quit mid-run) — the caller clears them so those epics re-enter the pipeline. Pure.
+ * Crash recovery: epics still labeled `decomposing` when the watcher starts. Only the main window
+ * ever decomposes, and the label is written immediately before a synchronous AI call and cleared
+ * right after — so a label surviving into a fresh session is stale by definition (crash or quit
+ * mid-run). The caller clears them; a still-requested epic then re-enters the pipeline on a later
+ * cycle (safe — it opted in), while one whose opt-in was withdrawn simply stays put. Pure.
  */
 export function pickStuckDecomposing(board: Board): Bead[] {
   return boardBeads(board).filter(
     (b) => b.type === "epic" && b.labels.includes(DECOMPOSING_LABEL),
   );
-}
-
-// ── Baseline flag ──────────────────────────────────────────────────────────────────────────────
-// One localStorage flag per project marks "the baseline sweep already ran here". localStorage is
-// per-app-instance, which matches the watcher's main-window election (one instance, one watcher).
-
-function baselineKey(projectId: string): string {
-  return `sparkle-decompose-baseline-${projectId}`;
-}
-
-export function hasDecomposeBaseline(projectId: string): boolean {
-  try {
-    return localStorage.getItem(baselineKey(projectId)) !== null;
-  } catch {
-    return false; // no localStorage (non-DOM env) → treat as un-baselined; the sweep is idempotent
-  }
-}
-
-export function markDecomposeBaseline(projectId: string): void {
-  try {
-    localStorage.setItem(baselineKey(projectId), new Date().toISOString());
-  } catch {
-    // best-effort — worst case the baseline re-runs next session and re-labels (idempotent)
-  }
 }
 
 // ── Sweep IO ───────────────────────────────────────────────────────────────────────────────────
@@ -125,9 +112,11 @@ export interface DecomposeWatcherDeps extends DecomposeSweepDeps {
  * Decompose every picked epic, SERIALLY (each is an AI call — no parallel fan-out). Per epic:
  * write the `decomposing` guard label FIRST (skip the epic entirely if that write fails — an
  * unguarded AI call could race a second window), then decompose, then swap the label to
- * `decomposed` (add before remove, so the epic is never label-less mid-swap). A decomposition
- * error labels `decompose-failed` (visible on the card, retryable) and logs; one epic failing
- * never stops the sweep.
+ * `decomposed` (add before remove, so the epic is never label-less mid-swap) and consume the
+ * `decompose:requested` opt-in so a later manual clear of `decomposed` can't silently re-spend. A
+ * decomposition error labels `decompose-failed` (visible on the card, retryable) and logs, and
+ * KEEPS the opt-in so clearing the failed badge re-picks the epic; one epic failing never stops the
+ * sweep.
  *
  * `aiEnabled` (optional) is re-checked before EACH epic: the sweep is serial with one AI call per
  * epic and can run for minutes, so a master-gate toggle-off mid-sweep must stop further AI calls
@@ -158,7 +147,8 @@ export async function runDecomposeSweep(
     } catch (e) {
       deps.logError?.(`auto-decompose failed for epic ${epic.id}`, e);
       // Best-effort bookkeeping: the failure label is what makes the card badge + retry work,
-      // but bd being down must not throw out of the sweep.
+      // but bd being down must not throw out of the sweep. The opt-in label is deliberately kept
+      // so clearing the `decompose-failed` badge re-picks the epic (retry).
       try {
         await deps.labelBead(projectPath, "add", epic.id, DECOMPOSE_FAILED_LABEL);
         await deps.labelBead(projectPath, "remove", epic.id, DECOMPOSING_LABEL);
@@ -168,12 +158,13 @@ export async function runDecomposeSweep(
       continue;
     }
     // Decomposition succeeded (children created). Swap the guard label to `decomposed` (add
-    // before remove so the epic is never label-less mid-swap). A failure HERE is a bookkeeping
-    // hiccup, not a decompose failure: log it and leave the `decomposing` label for boot reclaim
-    // / the next cycle to resolve — never apply `decompose-failed`.
+    // before remove so the epic is never label-less mid-swap) and consume the opt-in. A failure
+    // HERE is a bookkeeping hiccup, not a decompose failure: log it and leave the `decomposing`
+    // label for crash recovery / the next cycle to resolve — never apply `decompose-failed`.
     try {
       await deps.labelBead(projectPath, "add", epic.id, DECOMPOSED_LABEL);
       await deps.labelBead(projectPath, "remove", epic.id, DECOMPOSING_LABEL);
+      await deps.labelBead(projectPath, "remove", epic.id, DECOMPOSE_REQUESTED_LABEL);
     } catch (labelErr) {
       deps.logError?.(
         `decomposed-label swap failed for ${epic.id} (children created; leaving decomposing for reclaim)`,
@@ -181,28 +172,6 @@ export async function runDecomposeSweep(
       );
     }
   }
-}
-
-/** The one-time baseline (spec §7 safety rule 2): label every pre-existing childless epic
- *  `decompose-exempt` WITHOUT decomposing it. The baseline flag is set only when every label
- *  write succeeded — a partial sweep re-runs next cycle (idempotent; already-labeled epics drop
- *  out of the pick). */
-async function runBaselineExemptSweep(
-  deps: DecomposeSweepDeps,
-  projectId: string,
-  projectPath: string,
-  board: Board,
-): Promise<void> {
-  let allOk = true;
-  for (const epic of pickBaselineExemptEpics(board)) {
-    try {
-      await deps.labelBead(projectPath, "add", epic.id, DECOMPOSE_EXEMPT_LABEL);
-    } catch (e) {
-      allOk = false;
-      deps.logError?.(`baseline exempt-label write failed for ${epic.id}`, e);
-    }
-  }
-  if (allOk) markDecomposeBaseline(projectId);
 }
 
 // Watcher session state, at module scope like beadsStore's timers: which projects have had their
@@ -225,12 +194,12 @@ export interface DecomposeWatcherOpts {
 }
 
 /**
- * The post-poll watcher entry. Guards, in order: main-window election (spec §7 safety rule 1),
- * the master AI gate, per-project re-entrancy. Then, once per session per project, boot-reclaim
- * any `decomposing` label that survived a crash/quit (only main ever decomposes, so a surviving
- * label is stale by definition). Then the one-time baseline exempt sweep — and when the baseline
- * runs, decomposition waits for the NEXT poll (this cycle's snapshot predates the exempt labels).
- * Otherwise, the decompose sweep.
+ * The post-poll watcher entry. Guards, in order: main-window election (spec §7 safety rule 1) and
+ * per-project re-entrancy. Then, once per session per project, crash-recover any `decomposing`
+ * label that survived a crash/quit — this runs BEFORE the AI gate on purpose: clearing a stale
+ * label spends nothing, so a crashed run must be reclaimable even while AI features are off (that
+ * gap left labels stranded — bead sparkle-ynn8). Only THEN, behind the master AI gate, the
+ * decompose sweep, which spends only on epics carrying the explicit `decompose:requested` opt-in.
  */
 export async function maybeRunDecomposeWatcher(
   deps: DecomposeWatcherDeps,
@@ -238,40 +207,30 @@ export async function maybeRunDecomposeWatcher(
 ): Promise<void> {
   const { isMain, projectId, projectPath, board } = opts;
   if (!isMain) return;
-  if (!deps.aiEnabled()) return;
   if (sweepInFlight.has(projectId)) return;
   sweepInFlight.add(projectId);
   try {
+    // Crash recovery FIRST, independent of the AI gate. A `decomposing` label present at watcher
+    // start is stale by definition (only main decomposes, and the label bracket is synchronous),
+    // and clearing it is a pure bookkeeping write that fires no AI call — so this must run even
+    // when AI features are off, or a crash strands the label forever (bead sparkle-ynn8).
     if (!bootReclaimed.has(projectId)) {
-      const stuck = pickStuckDecomposing(board);
-      // Mark the project reclaimed ONLY when every removal succeeded (roborev 25168/25169): the
-      // guard is set-once, so a transient bd failure here would otherwise strand the epic
-      // (SKIP_LABELS excludes a `decomposing`-labeled epic) for the whole session. Idempotent —
-      // retrying next poll is safe.
+      // Mark the project reclaimed ONLY when every removal succeeded: the label is set-once, so a
+      // transient bd failure here would otherwise strand the epic (PIPELINE_LABELS excludes a
+      // `decomposing`-labeled epic) for the whole session. Idempotent — retrying next poll is safe.
       let allCleared = true;
-      for (const epic of stuck) {
+      for (const epic of pickStuckDecomposing(board)) {
         try {
           await deps.labelBead(projectPath, "remove", epic.id, DECOMPOSING_LABEL);
         } catch (e) {
           allCleared = false;
-          deps.logError?.(`boot reclaim of stale decomposing label failed for ${epic.id}`, e);
+          deps.logError?.(`crash recovery of stale decomposing label failed for ${epic.id}`, e);
         }
       }
       if (allCleared) bootReclaimed.add(projectId);
-      // Retroactive-backfill guard (spec §7 rule 2; roborev 25168/25169): on an UN-baselined
-      // project a surviving `decomposing` label means a PRE-EXISTING epic (the label predates
-      // this session — the baseline flag is per-instance localStorage and can be lost on
-      // reinstall / profile clear / a second machine while bd labels persist in the repo). If we
-      // ran the baseline sweep now, it would pick from this same stale snapshot where the epic
-      // still shows `decomposing` and skip it — then mark the baseline, and the NEXT poll (label
-      // gone) would auto-decompose a pre-existing epic. So bail this cycle without marking the
-      // baseline; the next poll's fresh snapshot (labels cleared) exempts it correctly.
-      if (!hasDecomposeBaseline(projectId) && stuck.length > 0) return;
     }
-    if (!hasDecomposeBaseline(projectId)) {
-      await runBaselineExemptSweep(deps, projectId, projectPath, board);
-      return; // decompose next cycle, off a snapshot that reflects the exempt labels
-    }
+    // Spend gate: everything below may fire a PAID AI call.
+    if (!deps.aiEnabled()) return;
     await runDecomposeSweep(deps, projectPath, board, deps.aiEnabled);
   } finally {
     sweepInFlight.delete(projectId);

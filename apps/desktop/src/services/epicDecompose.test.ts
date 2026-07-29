@@ -1,18 +1,17 @@
 // @vitest-environment jsdom
-// Pure picker + baseline-flag tests for the auto-decompose watcher (spec §7, plan Task 5).
+// Pure picker + sweep tests for the auto-decompose watcher (spec §7, plan Task 5).
 // The pickers decide WHICH epics the watcher may touch; every safety exclusion (children,
-// guard labels, closed status, non-epics) is pinned here.
+// pipeline labels, closed status, non-epics) is pinned here — and, above all, the money/safety
+// invariant (bead sparkle-ynn8): the watcher spends ONLY on an epic that carries the EXPLICIT
+// `decompose:requested` opt-in. An epic with NO decompose label is a strict no-op (no paid call).
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { bucketBeads, type Bead, type Board } from "./beads";
 import {
-  DECOMPOSE_EXEMPT_LABEL,
   DECOMPOSE_FAILED_LABEL,
+  DECOMPOSE_REQUESTED_LABEL,
   DECOMPOSED_LABEL,
   DECOMPOSING_LABEL,
-  hasDecomposeBaseline,
-  markDecomposeBaseline,
   maybeRunDecomposeWatcher,
-  pickBaselineExemptEpics,
   pickEpicsToDecompose,
   pickStuckDecomposing,
   runDecomposeSweep,
@@ -31,86 +30,89 @@ function bead(partial: Partial<Bead> & { id: string }): Bead {
   };
 }
 
+/** A childless open epic that has explicitly opted in — the ONLY shape the watcher spends on. */
+function requestedEpic(id: string, over: Partial<Bead> = {}): Bead {
+  return bead({ id, type: "epic", labels: [DECOMPOSE_REQUESTED_LABEL], ...over });
+}
+
 function boardOf(...beads: Bead[]): Board {
   return bucketBeads(beads);
 }
 
 describe("pickEpicsToDecompose", () => {
-  it("includes a virgin childless open epic", () => {
-    const epic = bead({ id: "e1", type: "epic" });
-    expect(pickEpicsToDecompose(boardOf(epic)).map((b) => b.id)).toEqual(["e1"]);
+  it("includes a childless open epic that carries the explicit opt-in", () => {
+    expect(pickEpicsToDecompose(boardOf(requestedEpic("e1"))).map((b) => b.id)).toEqual(["e1"]);
   });
 
-  it("includes a childless in_progress epic", () => {
-    const epic = bead({ id: "e1", type: "epic", status: "in_progress" });
-    expect(pickEpicsToDecompose(boardOf(epic)).map((b) => b.id)).toEqual(["e1"]);
+  it("includes a requested childless in_progress epic", () => {
+    expect(
+      pickEpicsToDecompose(boardOf(requestedEpic("e1", { status: "in_progress" }))).map((b) => b.id),
+    ).toEqual(["e1"]);
   });
 
-  it("excludes an epic with a parent-linked child", () => {
-    const epic = bead({ id: "e1", type: "epic" });
+  it("EXCLUDES a childless epic with NO decompose label (absent opt-in ⇒ no paid call)", () => {
+    // The money/safety invariant (bead sparkle-ynn8): a label-less childless epic must never be
+    // picked — removing a stale label or reopening a childless epic must not trigger AI spend.
+    const virgin = bead({ id: "e1", type: "epic" });
+    expect(pickEpicsToDecompose(boardOf(virgin))).toEqual([]);
+  });
+
+  it("excludes a requested epic with a parent-linked child", () => {
+    const epic = requestedEpic("e1");
     const child = bead({ id: "t1", type: "task", parent: "e1" });
     expect(pickEpicsToDecompose(boardOf(epic, child))).toEqual([]);
   });
 
-  it("excludes an epic with an id-prefixed child (bd hierarchical ids)", () => {
-    const epic = bead({ id: "", type: "epic" });
+  it("excludes a requested epic with an id-prefixed child (bd hierarchical ids)", () => {
+    const epic = requestedEpic("");
     const child = bead({ id: ".1", type: "task" });
     expect(pickEpicsToDecompose(boardOf(epic, child))).toEqual([]);
   });
 
-  it("excludes an epic whose only children are closed", () => {
+  it("excludes a requested epic whose only children are closed", () => {
     // Children in ANY column still count as children — a fully-done epic must not re-decompose.
-    const epic = bead({ id: "e1", type: "epic" });
+    const epic = requestedEpic("e1");
     const child = bead({ id: "t1", type: "task", parent: "e1", status: "closed" });
     expect(pickEpicsToDecompose(boardOf(epic, child))).toEqual([]);
   });
 
-  it.each([
-    DECOMPOSING_LABEL,
-    DECOMPOSED_LABEL,
-    DECOMPOSE_FAILED_LABEL,
-    DECOMPOSE_EXEMPT_LABEL,
-  ])("excludes an epic labeled %s", (label) => {
-    const epic = bead({ id: "e1", type: "epic", labels: [label] });
-    expect(pickEpicsToDecompose(boardOf(epic))).toEqual([]);
-  });
+  it.each([DECOMPOSING_LABEL, DECOMPOSED_LABEL, DECOMPOSE_FAILED_LABEL])(
+    "excludes a requested epic already in the pipeline (labeled %s)",
+    (label) => {
+      const epic = requestedEpic("e1", { labels: [DECOMPOSE_REQUESTED_LABEL, label] });
+      expect(pickEpicsToDecompose(boardOf(epic))).toEqual([]);
+    },
+  );
 
-  it("excludes non-epics and untyped beads", () => {
-    const task = bead({ id: "t1", type: "task" });
-    const untyped = bead({ id: "u1" });
+  it("excludes non-epics and untyped beads even when they carry the opt-in", () => {
+    const task = bead({ id: "t1", type: "task", labels: [DECOMPOSE_REQUESTED_LABEL] });
+    const untyped = bead({ id: "u1", labels: [DECOMPOSE_REQUESTED_LABEL] });
     expect(pickEpicsToDecompose(boardOf(task, untyped))).toEqual([]);
   });
 
-  it("excludes closed epics (finished work never triggers AI calls)", () => {
-    const done = bead({ id: "e1", type: "epic", status: "closed" });
-    const delivered = bead({ id: "e2", type: "epic", status: "closed", labels: ["delivered"] });
+  it("excludes closed epics even when requested (finished work never triggers AI calls)", () => {
+    const done = requestedEpic("e1", { status: "closed" });
+    const delivered = requestedEpic("e2", {
+      status: "closed",
+      labels: [DECOMPOSE_REQUESTED_LABEL, "delivered"],
+    });
     expect(pickEpicsToDecompose(boardOf(done, delivered))).toEqual([]);
   });
 
-  it("picks only the qualifying epics from a mixed board", () => {
-    const virgin = bead({ id: "e1", type: "epic" });
-    const labeled = bead({ id: "e2", type: "epic", labels: [DECOMPOSED_LABEL] });
-    const withChild = bead({ id: "e3", type: "epic" });
-    const child = bead({ id: "t3", type: "task", parent: "e3" });
-    const picked = pickEpicsToDecompose(boardOf(virgin, labeled, withChild, child));
+  it("picks only the qualifying (opted-in) epics from a mixed board", () => {
+    const requested = requestedEpic("e1");
+    const notRequested = bead({ id: "e2", type: "epic" }); // no opt-in → skipped
+    const alreadyDone = requestedEpic("e3", { labels: [DECOMPOSE_REQUESTED_LABEL, DECOMPOSED_LABEL] });
+    const withChild = requestedEpic("e4");
+    const child = bead({ id: "t4", type: "task", parent: "e4" });
+    const picked = pickEpicsToDecompose(
+      boardOf(requested, notRequested, alreadyDone, withChild, child),
+    );
     expect(picked.map((b) => b.id)).toEqual(["e1"]);
   });
 });
 
-describe("pickBaselineExemptEpics", () => {
-  it("targets exactly the epics the sweep would otherwise decompose", () => {
-    // The baseline exempts every epic that WOULD auto-decompose, so the two pickers must agree.
-    const virgin = bead({ id: "e1", type: "epic" });
-    const exempt = bead({ id: "e2", type: "epic", labels: [DECOMPOSE_EXEMPT_LABEL] });
-    const withChild = bead({ id: "e3", type: "epic" });
-    const child = bead({ id: "t3", type: "task", parent: "e3" });
-    const board = boardOf(virgin, exempt, withChild, child);
-    expect(pickBaselineExemptEpics(board).map((b) => b.id)).toEqual(["e1"]);
-    expect(pickBaselineExemptEpics(board)).toEqual(pickEpicsToDecompose(board));
-  });
-});
-
-describe("pickStuckDecomposing (boot reclaim)", () => {
+describe("pickStuckDecomposing (crash recovery)", () => {
   it("picks every epic still carrying the decomposing label, regardless of status or children", () => {
     const stuckOpen = bead({ id: "e1", type: "epic", labels: [DECOMPOSING_LABEL] });
     const stuckClosed = bead({ id: "e2", type: "epic", status: "closed", labels: [DECOMPOSING_LABEL] });
@@ -125,18 +127,6 @@ describe("pickStuckDecomposing (boot reclaim)", () => {
   it("ignores non-epics even when labeled", () => {
     const task = bead({ id: "t1", type: "task", labels: [DECOMPOSING_LABEL] });
     expect(pickStuckDecomposing(boardOf(task))).toEqual([]);
-  });
-});
-
-describe("decompose baseline flag", () => {
-  beforeEach(() => localStorage.clear());
-
-  it("is unset for a fresh project, set after marking, and scoped per project", () => {
-    expect(hasDecomposeBaseline("p1")).toBe(false);
-    markDecomposeBaseline("p1");
-    expect(hasDecomposeBaseline("p1")).toBe(true);
-    expect(hasDecomposeBaseline("p2")).toBe(false);
-    expect(localStorage.getItem("sparkle-decompose-baseline-p1")).not.toBeNull();
   });
 });
 
@@ -159,16 +149,23 @@ function makeSweepDeps(over: Partial<DecomposeSweepDeps> = {}) {
 }
 
 describe("runDecomposeSweep", () => {
-  it("guards each epic with `decomposing` BEFORE the AI call, then swaps to `decomposed`", async () => {
+  it("guards each epic with `decomposing` BEFORE the AI call, then swaps to `decomposed` and consumes the opt-in", async () => {
     const { deps, calls } = makeSweepDeps();
-    const epic = bead({ id: "e1", type: "epic" });
-    await runDecomposeSweep(deps, "/repo", boardOf(epic));
+    await runDecomposeSweep(deps, "/repo", boardOf(requestedEpic("e1")));
     expect(calls).toEqual([
       `label:add:e1:${DECOMPOSING_LABEL}`,
       "decompose:e1",
       `label:add:e1:${DECOMPOSED_LABEL}`,
       `label:remove:e1:${DECOMPOSING_LABEL}`,
+      `label:remove:e1:${DECOMPOSE_REQUESTED_LABEL}`,
     ]);
+  });
+
+  it("does not touch a childless epic that never opted in (no guard label, no AI call)", async () => {
+    const { deps, labelBead, decomposeEpic } = makeSweepDeps();
+    await runDecomposeSweep(deps, "/repo", boardOf(bead({ id: "e1", type: "epic" })));
+    expect(labelBead).not.toHaveBeenCalled();
+    expect(decomposeEpic).not.toHaveBeenCalled();
   });
 
   it("skips an epic (no AI call) when the guard-label write fails, and continues to the next", async () => {
@@ -177,34 +174,30 @@ describe("runDecomposeSweep", () => {
         if (action === "add" && id === "e1") throw new Error("bd down");
       }),
     });
-    const e1 = bead({ id: "e1", type: "epic" });
-    const e2 = bead({ id: "e2", type: "epic" });
-    await runDecomposeSweep(deps, "/repo", boardOf(e1, e2));
+    await runDecomposeSweep(deps, "/repo", boardOf(requestedEpic("e1"), requestedEpic("e2")));
     expect(decomposeEpic).toHaveBeenCalledTimes(1);
     expect(decomposeEpic.mock.calls[0]![0].epic.id).toBe("e2");
   });
 
-  it("labels `decompose-failed` (and logs) when decomposition throws, then continues", async () => {
+  it("labels `decompose-failed` (and logs), KEEPS the opt-in for retry, then continues", async () => {
     const { deps, calls, logError } = makeSweepDeps({
       decomposeEpic: vi.fn(async ({ epic }: { projectPath: string; epic: Bead }) => {
         if (epic.id === "e1") throw new Error("AI unhappy");
         return { taskIds: [] };
       }),
     });
-    const e1 = bead({ id: "e1", type: "epic" });
-    const e2 = bead({ id: "e2", type: "epic" });
-    await runDecomposeSweep(deps, "/repo", boardOf(e1, e2));
+    await runDecomposeSweep(deps, "/repo", boardOf(requestedEpic("e1"), requestedEpic("e2")));
     expect(calls).toContain(`label:add:e1:${DECOMPOSE_FAILED_LABEL}`);
     expect(calls).toContain(`label:remove:e1:${DECOMPOSING_LABEL}`);
+    // The opt-in is deliberately kept on failure so clearing the failed badge re-picks the epic.
+    expect(calls).not.toContain(`label:remove:e1:${DECOMPOSE_REQUESTED_LABEL}`);
     expect(calls).toContain(`label:add:e2:${DECOMPOSED_LABEL}`);
     expect(logError).toHaveBeenCalled();
   });
 
   it("processes epics serially — the second AI call starts only after the first fully settles", async () => {
     const { deps, calls } = makeSweepDeps();
-    const e1 = bead({ id: "e1", type: "epic" });
-    const e2 = bead({ id: "e2", type: "epic" });
-    await runDecomposeSweep(deps, "/repo", boardOf(e1, e2));
+    await runDecomposeSweep(deps, "/repo", boardOf(requestedEpic("e1"), requestedEpic("e2")));
     // e1's full add→decompose→swap sequence completes before e2's guard is even written.
     expect(calls.indexOf(`label:add:e2:${DECOMPOSING_LABEL}`)).toBeGreaterThan(
       calls.indexOf(`label:remove:e1:${DECOMPOSING_LABEL}`),
@@ -221,10 +214,10 @@ describe("runDecomposeSweep", () => {
     });
     const decomposeEpic = vi.fn(async () => ({ taskIds: [] }));
     const deps: DecomposeSweepDeps = { labelBead, decomposeEpic, logError: vi.fn() };
-    await runDecomposeSweep(deps, "/repo", boardOf(bead({ id: "e1", type: "epic" })));
+    await runDecomposeSweep(deps, "/repo", boardOf(requestedEpic("e1")));
     expect(decomposeEpic).toHaveBeenCalledTimes(1);
     expect(calls).not.toContain(`label:add:e1:${DECOMPOSE_FAILED_LABEL}`);
-    // The `decomposing` guard is deliberately left in place for boot reclaim / the next cycle.
+    // The `decomposing` guard is deliberately left in place for crash recovery / the next cycle.
     expect(calls).toContain(`label:add:e1:${DECOMPOSING_LABEL}`);
   });
 
@@ -236,7 +229,7 @@ describe("runDecomposeSweep", () => {
       enabled = false; // flip the master gate off the instant the first epic decomposes
       return { taskIds: [] };
     });
-    const board = boardOf(bead({ id: "e1", type: "epic" }), bead({ id: "e2", type: "epic" }));
+    const board = boardOf(requestedEpic("e1"), requestedEpic("e2"));
     await runDecomposeSweep(deps, "/repo", board, () => enabled);
     expect(decomposeEpic).toHaveBeenCalledTimes(1); // e2 skipped
   });
@@ -258,22 +251,44 @@ describe("maybeRunDecomposeWatcher", () => {
 
   it("does nothing in a non-main window", async () => {
     const { deps, labelBead, decomposeEpic } = makeSweepDeps();
-    const board = boardOf(bead({ id: "e1", type: "epic" }));
+    const board = boardOf(requestedEpic("e1"));
     await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(board, { isMain: false }));
     expect(labelBead).not.toHaveBeenCalled();
     expect(decomposeEpic).not.toHaveBeenCalled();
   });
 
-  it("does nothing while AI features are off", async () => {
-    const { deps, labelBead, decomposeEpic } = makeSweepDeps();
-    const board = boardOf(bead({ id: "e1", type: "epic" }));
-    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => false }, opts(board));
+  it("decomposes a requested epic on a main window", async () => {
+    const { deps, decomposeEpic } = makeSweepDeps();
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(requestedEpic("e1"))));
+    expect(decomposeEpic).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT decompose a childless epic that never opted in (no paid call)", async () => {
+    const { deps, decomposeEpic, labelBead } = makeSweepDeps();
+    const virgin = bead({ id: "e1", type: "epic" });
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(virgin)));
+    expect(decomposeEpic).not.toHaveBeenCalled();
     expect(labelBead).not.toHaveBeenCalled();
+  });
+
+  it("fires no AI call while AI features are off (even for a requested epic)", async () => {
+    const { deps, decomposeEpic } = makeSweepDeps();
+    const board = boardOf(requestedEpic("e1"));
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => false }, opts(board));
     expect(decomposeEpic).not.toHaveBeenCalled();
   });
 
-  it("clears surviving `decomposing` labels on its first run per project (boot reclaim)", async () => {
-    markDecomposeBaseline("p1");
+  it("crash-recovers a stale `decomposing` label EVEN while AI features are off (a free bd write)", async () => {
+    // bead sparkle-ynn8: clearing a stranded label spends nothing, so it must not be gated behind
+    // the master AI switch — the old order (AI gate first) left crashed labels stuck when AI was off.
+    const { deps, calls, decomposeEpic } = makeSweepDeps();
+    const stuck = bead({ id: "e1", type: "epic", labels: [DECOMPOSING_LABEL] });
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => false }, opts(boardOf(stuck)));
+    expect(calls).toContain(`label:remove:e1:${DECOMPOSING_LABEL}`);
+    expect(decomposeEpic).not.toHaveBeenCalled();
+  });
+
+  it("clears surviving `decomposing` labels on its first run per project, not on the second", async () => {
     const { deps, calls } = makeSweepDeps();
     const stuck = bead({ id: "e1", type: "epic", labels: [DECOMPOSING_LABEL] });
     await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(stuck)));
@@ -284,60 +299,23 @@ describe("maybeRunDecomposeWatcher", () => {
     expect(calls).not.toContain(`label:remove:e1:${DECOMPOSING_LABEL}`);
   });
 
-  it("runs the one-time baseline exempt sweep INSTEAD of decomposing on an un-baselined project", async () => {
-    const { deps, calls, decomposeEpic } = makeSweepDeps();
-    const preexisting = bead({ id: "e1", type: "epic" });
-    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(preexisting)));
-    expect(calls).toContain(`label:add:e1:${DECOMPOSE_EXEMPT_LABEL}`);
-    expect(decomposeEpic).not.toHaveBeenCalled();
-    expect(hasDecomposeBaseline("p1")).toBe(true);
-  });
-
-  it("does not mark the baseline when an exempt-label write fails (so it retries next cycle)", async () => {
-    const { deps } = makeSweepDeps({
-      labelBead: vi.fn(async (_p, _a, id) => {
-        if (id === "e1") throw new Error("bd down");
-      }),
+  it("does not mark the project reclaimed when a stale-label removal fails (so it retries next cycle)", async () => {
+    // The failing labelBead throws AND records, so we can see the retry attempt on cycle 2.
+    const labelBead = vi.fn(async (_p: string, action: "add" | "remove", id: string, label: string) => {
+      if (id === "e1") throw new Error("bd down");
+      return `label:${action}:${id}:${label}` as unknown as void;
     });
-    const e1 = bead({ id: "e1", type: "epic" });
-    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(e1)));
-    expect(hasDecomposeBaseline("p1")).toBe(false);
-  });
-
-  it("decomposes on a baselined project", async () => {
-    markDecomposeBaseline("p1");
-    const { deps, decomposeEpic } = makeSweepDeps();
-    const fresh = bead({ id: "e1", type: "epic" });
-    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(fresh)));
-    expect(decomposeEpic).toHaveBeenCalledTimes(1);
-  });
-
-  it("exempts (never decomposes) a pre-existing stuck-`decomposing` epic when the baseline flag was lost", async () => {
-    // roborev 25168/25169 + spec §7 rule 2: the localStorage baseline flag can be lost (reinstall,
-    // profile clear, second machine) while bd labels persist in the repo. A pre-existing epic then
-    // shows up un-baselined AND still carrying `decomposing`. It must be exempted, never
-    // retroactively auto-decomposed.
-    const { deps, decomposeEpic, calls } = makeSweepDeps();
-    // Cycle 1: reclaim clears the stale label, but the watcher bails without marking the baseline.
+    const { deps } = makeSweepDeps({ labelBead });
     const stuck = bead({ id: "e1", type: "epic", labels: [DECOMPOSING_LABEL] });
-    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(boardOf(stuck)));
-    expect(calls).toContain(`label:remove:e1:${DECOMPOSING_LABEL}`);
-    expect(decomposeEpic).not.toHaveBeenCalled();
-    expect(hasDecomposeBaseline("p1")).toBe(false);
-
-    // Cycle 2: the poll now shows e1 without the label → it gets EXEMPTED, not decomposed.
-    calls.length = 0;
-    await maybeRunDecomposeWatcher(
-      { ...deps, aiEnabled: () => true },
-      opts(boardOf(bead({ id: "e1", type: "epic" }))),
-    );
-    expect(calls).toContain(`label:add:e1:${DECOMPOSE_EXEMPT_LABEL}`);
-    expect(decomposeEpic).not.toHaveBeenCalled();
-    expect(hasDecomposeBaseline("p1")).toBe(true);
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => false }, opts(boardOf(stuck)));
+    expect(labelBead).toHaveBeenCalledWith("/repo", "remove", "e1", DECOMPOSING_LABEL);
+    // Second cycle still attempts the removal (reclaim was not marked done).
+    labelBead.mockClear();
+    await maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => false }, opts(boardOf(stuck)));
+    expect(labelBead).toHaveBeenCalledWith("/repo", "remove", "e1", DECOMPOSING_LABEL);
   });
 
   it("is re-entrancy-safe: a poll landing mid-sweep is a no-op for that project", async () => {
-    markDecomposeBaseline("p1");
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     const decomposeEpic = vi.fn(async () => {
@@ -345,7 +323,7 @@ describe("maybeRunDecomposeWatcher", () => {
       return { taskIds: [] };
     });
     const { deps } = makeSweepDeps({ decomposeEpic });
-    const board = boardOf(bead({ id: "e1", type: "epic" }));
+    const board = boardOf(requestedEpic("e1"));
     const first = maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(board));
     const second = maybeRunDecomposeWatcher({ ...deps, aiEnabled: () => true }, opts(board));
     release();
