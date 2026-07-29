@@ -4092,6 +4092,119 @@ pub async fn open_agent_pr(
     .map_err(|e| format!("open_agent_pr task failed: {e}"))?
 }
 
+/// Where an evacuated checkout waits for the slow part of its deletion, once the git lock has
+/// stopped caring about it.
+///
+/// A SIBLING of `worktrees/`, deliberately, not a child. `scan_worker_manifests_at`, `retention.rs`
+/// and `pty.rs` all enumerate under `worktrees/` and read what they find as a project dir or an
+/// agent slot — and a parked checkout still carries its `.sparkle/worker.json`, so a trash dir
+/// placed inside would get a worker re-adopted at a path that is about to be deleted out from under
+/// it. Under `app_data` either way, which is what keeps the rename below on one filesystem.
+pub fn removal_trash_dir(app_data: &Path) -> PathBuf {
+    app_data.join("worktree-trash")
+}
+
+/// A filesystem-safe, collision-free name for a parked checkout.
+///
+/// The ids are already validated by `worktree_path`, so this is defence in depth rather than the
+/// only guard — but this name is joined onto a path we then `remove_dir_all`, and that is not a
+/// place to rely on a check made somewhere else. Anything not `[A-Za-z0-9_-]` becomes `-`.
+///
+/// `.` is NOT in that set, and that is the whole point rather than an oversight: allowing it lets
+/// `..` survive intact, and a tag of `..` turns `trash.join(tag)` into the trash dir's PARENT. The
+/// first version of this permitted `.` and a test caught exactly that.
+///
+/// The pid is not decoration: the sweep below uses it to tell a checkout THIS process is actively
+/// deleting from one a previous run left behind.
+fn trash_tag(project_id: &str, agent_id: &str) -> String {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+            .collect()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}-{}-p{}-{nanos}",
+        safe(project_id),
+        safe(agent_id),
+        std::process::id()
+    )
+}
+
+/// Rename a checkout out of the way so the slow half of a teardown happens off the git lock.
+///
+/// `Some(parked)` means the checkout is GONE from its worktree path — which is the only thing the
+/// lock is protecting — and the caller owns the returned path. `None` means nothing moved and the
+/// caller must fall back to `git worktree remove`: a missing checkout (teardown is idempotent), an
+/// undeletable trash dir, or a rename that failed. That last one is the case worth naming: a rename
+/// across filesystems is `EXDEV`, and while `app_data` puts both paths under one root today, a
+/// bind-mounted or relocated worktrees dir would break that silently. Falling back is exactly the
+/// behavior that shipped before this, so the failure mode is "slow again", never "not removed".
+fn evacuate_checkout(wt: &Path, trash: &Path, tag: &str) -> Option<PathBuf> {
+    if !wt.exists() {
+        return None;
+    }
+    std::fs::create_dir_all(trash).ok()?;
+    let dest = trash.join(tag);
+    std::fs::rename(wt, &dest).ok()?;
+    Some(dest)
+}
+
+/// Delete a parked checkout on a detached thread, and sweep what earlier runs left behind.
+///
+/// Detached because the whole point is that the caller — and the git lock it just released — does
+/// not wait out a multi-second `remove_dir_all`. Nothing downstream depends on the deletion having
+/// finished: the worktree path is already free for a fresh `git worktree add`, and git's admin
+/// record is already pruned.
+///
+/// The sweep bounds what a quit-mid-delete can leave: entries are only reclaimed when their name
+/// does NOT carry this process's pid, so a concurrent teardown's live directory is never raced.
+fn delete_parked_checkout(parked: PathBuf) {
+    let trash = parked.parent().map(Path::to_path_buf);
+    std::thread::spawn(move || {
+        if let Err(e) = std::fs::remove_dir_all(&parked) {
+            // Warned, never escalated: the teardown itself already succeeded and the caller has
+            // long since returned. What is left is reclaimable disk, and the next teardown's sweep
+            // is what reclaims it.
+            tracing::warn!(error = %e, "failed to delete a parked worktree checkout; the next teardown will sweep it");
+        }
+        let Some(trash) = trash else { return };
+        let mine = format!("-p{}-", std::process::id());
+        if let Ok(entries) = std::fs::read_dir(&trash) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains(&mine) {
+                    continue; // another teardown in THIS process still owns it
+                }
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+}
+
+/// Remove a checkout the way this path always has: hand the whole thing to git and let it walk the
+/// tree. Kept as the fallback for when a checkout cannot be parked (see `evacuate_checkout`).
+///
+/// MUST be called with the per-project git lock held — it mutates git's admin records.
+fn remove_via_git(root: &str, wt: &Path, wt_str: &str) -> Result<(), String> {
+    match git(root, &["worktree", "remove", "--force", wt_str]) {
+        // Success is NOT proof the dir is gone. For a path git no longer recognizes as a
+        // worktree it exits 0 having deleted nothing, so a "clean" teardown can still leak the
+        // orphaned dir. Only an absent dir ends the removal; anything left goes through cleanup.
+        Ok(_) if !wt.exists() => Ok(()),
+        Ok(_) => discard_half_deleted_worktree(root, wt),
+        Err(e) => {
+            if removal_error_is_recoverable(&e.to_lowercase(), wt.exists()) {
+                discard_half_deleted_worktree(root, wt)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Core (AppHandle-free, testable): remove an agent's external worktree (force, to discard
 /// any uncommitted changes). The branch is intentionally left in place so reopening the agent
 /// can resume it. Idempotent: a missing worktree is not an error.
@@ -4127,25 +4240,46 @@ pub fn remove_worktree_at(
     // The guard is held across the whole removal — including the half-deleted-checkout recovery
     // below — so the recovery's own prune/delete is serialized against a concurrent add too.
     let gl = repo_git_lock(root);
-    // Timed because the command's own duration clock starts before this point — see
-    // [`log_repo_lock_wait`] for why separating the two is what makes the number actionable.
-    let lock_since = std::time::Instant::now();
-    let _g = gl.lock().unwrap_or_else(|e| e.into_inner());
-    log_repo_lock_wait("remove_agent_worktree", lock_since.elapsed());
-    match git(root, &["worktree", "remove", "--force", &wt_str]) {
-        // Success is NOT proof the dir is gone. For a path git no longer recognizes as a
-        // worktree it exits 0 having deleted nothing, so a "clean" teardown can still leak the
-        // orphaned dir. Only an absent dir ends the removal; anything left goes through cleanup.
-        Ok(_) if !wt.exists() => Ok(()),
-        Ok(_) => discard_half_deleted_worktree(root, &wt),
-        Err(e) => {
-            if removal_error_is_recoverable(&e.to_lowercase(), wt.exists()) {
-                discard_half_deleted_worktree(root, &wt)
-            } else {
-                Err(e)
+    let parked = {
+        // Timed because the command's own duration clock starts before this point — see
+        // [`log_repo_lock_wait`] for why separating the two is what makes the number actionable.
+        let lock_since = std::time::Instant::now();
+        let _g = gl.lock().unwrap_or_else(|e| e.into_inner());
+        log_repo_lock_wait("remove_agent_worktree", lock_since.elapsed());
+        // The expensive half of a teardown is walking the checkout to delete it, and since
+        // dependencies started being installed into every fresh worktree that walk has a populated
+        // `node_modules` in it. Measured on this path: 11–31s per removal, ALL of it with this lock
+        // held — so every prepare and every other remove queued behind it on the same project waits
+        // that long too, which is what `log_worktree_op_duration` had started reporting.
+        //
+        // A rename is O(1), and the only thing the lock actually needs is for the checkout to be
+        // GONE from its worktree path. So park it first, let `prune` retire the admin record — it
+        // acts on precisely the state a rename produces, a record whose checkout is missing, which
+        // is the same reordering `discard_half_deleted_worktree` already relies on — and do the
+        // delete after the lock is released.
+        match evacuate_checkout(
+            &wt,
+            &removal_trash_dir(app_data),
+            &trash_tag(project_id, agent_id),
+        ) {
+            // Nothing moved (already gone, or the rename failed) — remove it the old way, which is
+            // still correct, just as slow as before.
+            None => return remove_via_git(root, &wt, &wt_str),
+            Some(parked) => {
+                if let Err(e) = git(root, &["worktree", "prune"]) {
+                    // Not escalated, for the same reason `discard_half_deleted_worktree` does not:
+                    // the checkout is already gone, and a surviving record is repairable by any
+                    // later `git worktree prune`. Logged because a branch left claimed is otherwise
+                    // indistinguishable from a clean teardown.
+                    tracing::warn!(error = %e, "worktree prune failed after parking a checkout for deletion; a stale admin record may still claim the branch");
+                }
+                parked
             }
         }
-    }
+    };
+    // Lock released. The multi-second delete now stalls nothing.
+    delete_parked_checkout(parked);
+    Ok(())
 }
 
 /// Does a lowercased `git worktree remove --force` failure describe a checkout that our own
@@ -6856,6 +6990,91 @@ mod tests {
         for slot in pools().lock().unwrap().get("pt").unwrap().clone() {
             let _ = git(&r, &["worktree", "remove", "--force", &slot.path.to_string_lossy()]);
         }
+    }
+
+    /// The trash dir must NOT sit under `worktrees/`. `scan_worker_manifests_at`, `retention.rs`
+    /// and `pty.rs` all enumerate that directory and read what they find as a project dir or an
+    /// agent slot — and a parked checkout still carries its `.sparkle/worker.json`, so a trash dir
+    /// placed inside would get a worker re-adopted at a path that is about to be deleted.
+    #[test]
+    fn the_trash_dir_is_not_somewhere_the_worktree_scans_will_find_it() {
+        let app_data = Path::new("/tmp/appdata");
+        let trash = removal_trash_dir(app_data);
+        assert!(!trash.starts_with(app_data.join("worktrees")));
+        assert!(trash.starts_with(app_data), "must stay on one filesystem: {trash:?}");
+    }
+
+    #[test]
+    fn a_trash_name_cannot_escape_the_trash_dir() {
+        // The ids are validated upstream by `worktree_path`, but this name is joined onto a path we
+        // then `remove_dir_all` — not a place to lean on a check made somewhere else.
+        let tag = trash_tag("../../etc", "a/b");
+        assert!(!tag.contains('/'), "no separators: {tag}");
+        assert!(!tag.contains(".."), "no traversal: {tag}");
+        assert!(
+            tag.contains(&format!("-p{}-", std::process::id())),
+            "the sweep needs this process's pid to spot its own live entries: {tag}"
+        );
+    }
+
+    #[test]
+    fn evacuating_frees_the_worktree_path_without_doing_the_slow_delete() {
+        // The whole point: the path the git lock cares about is free IMMEDIATELY, and the bytes are
+        // still there to be deleted later, off the lock.
+        let base = unique_root("evacuate");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), "x").unwrap();
+        let trash = base.join("trash");
+
+        let parked = evacuate_checkout(&wt, &trash, "tag").expect("a present checkout must park");
+
+        assert!(!wt.exists(), "the worktree path must be free for a fresh `git worktree add`");
+        assert!(parked.starts_with(&trash));
+        assert!(
+            parked.join("node_modules/pkg/index.js").exists(),
+            "a rename must MOVE the tree, not delete it — the delete happens off the lock"
+        );
+    }
+
+    #[test]
+    fn evacuating_declines_when_there_is_nothing_to_move() {
+        // Teardown is idempotent, and `None` is what routes an absent checkout back to the
+        // git path that already treats "not a working tree" as success.
+        let base = unique_root("evacuate-missing");
+        assert_eq!(evacuate_checkout(&base.join("gone"), &base.join("trash"), "t"), None);
+    }
+
+    /// End-to-end: a real worktree, removed through the real path, must leave nothing behind at the
+    /// worktree path and nothing claiming it in git's admin records — the two properties the old
+    /// `git worktree remove --force` provided and which the rename-then-prune reordering has to
+    /// keep. The branch must survive, because reopening the agent resumes it.
+    #[test]
+    fn removing_a_worktree_frees_the_path_and_retires_the_admin_record() {
+        let r = init_repo("remove-off-lock");
+        let app_data = unique_root("remove-off-lock-appdata");
+        let wt = worktree_path(&app_data, "proj", "agent").unwrap();
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&r, &["worktree", "add", "-q", "-b", "sparkle/agent-agent", &wt.to_string_lossy()])
+            .unwrap();
+        // The untracked, gitignored tree that made this slow in the first place.
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), "x").unwrap();
+
+        remove_worktree_at(&r, "proj", "agent", &app_data).unwrap();
+
+        assert!(!wt.exists(), "the worktree path must be free");
+        let list = git(&r, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            !list.contains(&wt.to_string_lossy().to_string()),
+            "no admin record may still claim the branch: {list}"
+        );
+        assert!(
+            branch_exists(&r, "sparkle/agent-agent"),
+            "the branch is left in place so reopening the agent resumes it"
+        );
+        // Idempotent: a second teardown of an already-removed agent is not an error.
+        remove_worktree_at(&r, "proj", "agent", &app_data).unwrap();
     }
 
     #[test]
