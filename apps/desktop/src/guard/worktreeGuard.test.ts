@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, callerWorktreeRoot } from "../../src-tauri/resources/worktree-guard.mjs";
+import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, isAllowlistedScratchpad, callerWorktreeRoot } from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -195,6 +195,103 @@ describe("isAllowlistedNoteDir (real dirs on disk)", () => {
     mkdirSync(proj, { recursive: true });
     symlinkSync(outside, join(proj, "memory"));
     expect(isAllowlistedNoteDir(home, join(proj, "memory", "notes.md"))).toBe(false);
+  });
+});
+
+
+// Session-scratchpad carve-out: the Claude Code system prompt designates a per-session scratchpad dir
+// (/private/tmp|/tmp/claude-*/.../scratchpad) for ALL temp files. The containment check blocks it (it
+// is outside every worktree), so the guard permits it explicitly. Critically, agent WORKTREES are also
+// created under /private/tmp/claude-*, so the carve-out anchors `scratchpad` to the documented depth
+// (parts[3]) to admit the temp dir WITHOUT admitting a sibling worktree — the guard's core purpose stays intact.
+describe("isAllowlistedScratchpad (session scratchpad carve-out)", () => {
+  it("allows helper-script / PR-body paths inside a session scratchpad", () => {
+    // The documented shape: /private/tmp/claude-<uid>/<session>/<uuid>/scratchpad/... (paths need not
+    // exist on disk — realResolve accepts not-yet-created trailing segments, like a Write about to run).
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/proj-slug/sess-uuid/scratchpad/helper.sh")).toBe(true);
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/proj-slug/sess-uuid/scratchpad/pr-body.md")).toBe(true);
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/proj/uuid/scratchpad")).toBe(true); // the dir itself
+    // The /tmp form (macOS symlinks it to /private/tmp; Linux keeps it) is allowed too.
+    expect(isAllowlistedScratchpad("/tmp/claude-501/proj/uuid/scratchpad/notes.txt")).toBe(true);
+  });
+
+  // THE mutation-check: without the scratchpad carve-out (predicate returns false / no `scratchpad`
+  // gate), the assertions above flip to false. A sibling worktree under the SAME session root must
+  // still be DENIED, or one agent could edit another agent's worktree.
+  it("still blocks a sibling worktree under the same /private/tmp/claude-* session root", () => {
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/wt-other-agent/src/App.tsx")).toBe(false);
+    // A segment merely CONTAINING "scratchpad" is not the scratchpad dir.
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/scratchpad-decoy/App.tsx")).toBe(false);
+  });
+
+  // Depth-anchoring: `scratchpad` must be the 4th segment (claude-<uid>/<slug>/<uuid>/scratchpad, i.e.
+  // parts[3]). A `scratchpad`-named dir at any OTHER depth is inside a sibling worktree, not a session
+  // scratchpad, and must be DENIED — otherwise an unanchored `includes` scan lets one agent write into
+  // another agent's worktree via a conveniently-named subdir. (roborev 55025/55026.)
+  it("blocks a `scratchpad` segment that is not at the documented depth (sibling-worktree escape)", () => {
+    // A worktree wt-victim with a `scratchpad` dir one level too shallow (parts[2], not parts[3]).
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/wt-victim/scratchpad/x.ts")).toBe(false);
+    // `scratchpad` as a bare dir at a worktree root (parts[2], too shallow).
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/wt-other-agent/scratchpad")).toBe(false);
+    // The documented shape (parts[3]) is still allowed — anchoring did not over-tighten.
+    expect(isAllowlistedScratchpad("/private/tmp/claude-501/proj/uuid/scratchpad/x.ts")).toBe(true);
+  });
+
+  // Depth-3 escape: `scratchpad` can land on parts[3] while sitting two levels inside a sibling git
+  // worktree (…/claude-<uid>/wt-victim/docs/scratchpad). Depth alone can't tell that from a real session
+  // root, so the predicate also rejects the match when any ancestor is a checkout (`.git` at its root).
+  // Real dirs + a `.git` marker are required because the discriminator is a filesystem check. (roborev 55038.)
+  it("blocks a `scratchpad` dir nested inside a sibling git worktree (depth-3, .git ancestor)", () => {
+    const root = realpathSync(mkdtempSync(join("/tmp", "claude-wtguardtest-")));
+    // A sibling worktree: `.git` marker at its root (git worktrees always carry one).
+    const victimWt = join(root, "wt-victim");
+    mkdirSync(join(victimWt, "docs", "scratchpad"), { recursive: true });
+    writeFileSync(join(victimWt, ".git"), "gitdir: /somewhere/.git/worktrees/wt-victim\n");
+    // A real session temp root: <slug>/<uuid>/scratchpad, NO `.git` anywhere in the ancestry.
+    const sessScratch = join(root, "proj-slug", "sess-uuid", "scratchpad");
+    mkdirSync(sessScratch, { recursive: true });
+    try {
+      // `scratchpad` at parts[3] but two levels inside a worktree (root has `.git`) -> DENIED.
+      expect(isAllowlistedScratchpad(join(victimWt, "docs", "scratchpad", "notes.md"))).toBe(false);
+      // The real session scratchpad (no `.git` ancestor) -> allowed.
+      expect(isAllowlistedScratchpad(join(sessScratch, "helper.sh"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks temp paths that are NOT session-scoped (never all of /tmp)", () => {
+    expect(isAllowlistedScratchpad("/tmp/scratchpad/App.tsx")).toBe(false); // no claude-* session root
+    expect(isAllowlistedScratchpad("/tmp/notclaude-501/x/scratchpad/App.tsx")).toBe(false);
+    expect(isAllowlistedScratchpad("/private/tmp/evil/scratchpad/App.tsx")).toBe(false);
+  });
+
+  it("blocks arbitrary other-repo paths and non-string input", () => {
+    expect(isAllowlistedScratchpad("/Users/dev/Projects/myrepo/apps/x.ts")).toBe(false);
+    expect(isAllowlistedScratchpad("")).toBe(false);
+    expect(isAllowlistedScratchpad(undefined)).toBe(false);
+  });
+
+  // Symlink-safety: a symlink planted inside a real scratchpad that points at a sibling worktree must
+  // NOT tunnel a write out. The target is canonicalized FIRST, so it resolves out of the scratchpad.
+  it("blocks a symlink-escape out of a scratchpad dir", () => {
+    // A real session root under /tmp (a symlink to /private/tmp on macOS, a real dir on Linux) matching
+    // the claude-* pattern, with a scratchpad and an outside sibling "worktree".
+    const sessionRoot = realpathSync(mkdtempSync(join("/tmp", "claude-wtguardtest-")));
+    const scratch = join(sessionRoot, "sess", "uuid", "scratchpad");
+    mkdirSync(scratch, { recursive: true });
+    const worktree = join(sessionRoot, "wt-victim");
+    mkdirSync(worktree, { recursive: true });
+    writeFileSync(join(worktree, "App.tsx"), "x");
+    try {
+      // A legit file inside the scratchpad is allowed.
+      expect(isAllowlistedScratchpad(join(scratch, "helper.sh"))).toBe(true);
+      // …but a symlink inside it pointing at the sibling worktree does not tunnel out.
+      symlinkSync(worktree, join(scratch, "escape"));
+      expect(isAllowlistedScratchpad(join(scratch, "escape", "App.tsx"))).toBe(false);
+    } finally {
+      rmSync(sessionRoot, { recursive: true, force: true });
+    }
   });
 });
 

@@ -114,6 +114,75 @@ export function blocksKeychainCommand(command) {
   return genericPassword && appService;
 }
 
+/** True iff `target` resolves into a Claude Code SESSION SCRATCHPAD directory — the harness-sanctioned
+ *  location the Claude Code system prompt designates for ALL temporary files (helper scripts, PR-body
+ *  text, intermediate data). Its shape is `/private/tmp/claude-<uid>/<session>/<uuid>/scratchpad/...`
+ *  (macOS `/tmp` symlinks to `/private/tmp`, so a canonicalized target usually reads `/private/tmp`;
+ *  Linux keeps `/tmp`). Without this carve-out the containment check blocks the scratchpad (it lives
+ *  outside every worktree), forcing agents into clumsy Bash heredocs.
+ *
+ *  Two conditions, BOTH required, keep this from re-opening the very thing the guard exists to stop:
+ *    (a) the resolved path sits under a uid-scoped temp root — `/tmp/claude-*` or
+ *        `/private/tmp/claude-*` — never all of `/tmp`; and
+ *    (b) `scratchpad` sits at the DOCUMENTED depth `claude-<uid>/<slug>/<uuid>/scratchpad` (parts[3])
+ *        AND none of its ancestor segments (parts[0..2]) is a git worktree root (carries a `.git` entry).
+ *  Condition (b) is load-bearing: agent WORKTREES are also created under `/private/tmp/claude-*`
+ *  (e.g. `/private/tmp/claude-501/wt-foo`), so admitting a `scratchpad` segment by depth alone would let
+ *  one agent edit a `scratchpad`-named dir nested inside ANOTHER agent's worktree (…/wt-foo/docs/scratchpad/x,
+ *  which also lands on parts[3]) — precisely the guard's job to prevent. A git worktree always carries a
+ *  `.git` entry at its root and a session temp root never does, so the `.git`-ancestor check is what
+ *  distinguishes the two: it admits the real session scratchpad without admitting any sibling worktree.
+ *
+ *  Scope note: this is uid-scoped, NOT session-scoped — `/private/tmp/claude-<uid>` is shared by every
+ *  concurrent agent under that uid, so the carve-out does not stop one agent writing into another's
+ *  correctly-shaped scratchpad. That is an accepted trade-off: the file header states this is a
+ *  best-effort guardrail against a well-behaved agent ACCIDENTALLY leaving its lane, not a security
+ *  sandbox (Bash bypasses it entirely), and a well-behaved agent only ever targets its OWN scratchpad.
+ *
+ *  Symlink-safe: the target is canonicalized through symlinks FIRST (same realResolve machinery as the
+ *  containment / note-dir checks), so a symlink planted inside a scratchpad that points at a worktree
+ *  resolves OUT of the scratchpad and is rejected. Fails closed (false) on any unresolvable path. */
+export function isAllowlistedScratchpad(target) {
+  if (typeof target !== "string" || target.length === 0) return false;
+  const t = realResolve(isAbsolute(target) ? target : `${process.cwd()}${sep}${target}`);
+  if (t === null) return false;
+  // Canonicalize the temp bases too, so macOS `/tmp` (a symlink to /private/tmp) and the literal
+  // `/private/tmp` both compare against the same resolved root.
+  for (const base of ["/private/tmp", "/tmp"]) {
+    const rb = realResolve(base);
+    if (rb === null) continue;
+    const rel = relative(rb, t);
+    if (rel === "" || rel.startsWith("..")) continue; // target not under this temp base
+    const parts = rel.split(sep);
+    // (a) first segment beneath the temp base must be a uid session root `claude-*` …
+    if (!parts[0].startsWith("claude-")) continue;
+    // … and (b) `scratchpad` must sit at the DOCUMENTED depth — `claude-<uid>/<slug>/<uuid>/scratchpad`,
+    // i.e. EXACTLY parts[3] — never merely present at some deeper segment.
+    if (parts.length >= 4 && parts[3] === "scratchpad") {
+      // Depth ALONE cannot tell a session temp root from a git worktree: a sibling worktree with a
+      // `docs/scratchpad` subdir also lands `scratchpad` on parts[3] (…/claude-501/wt-victim/docs/scratchpad).
+      // A git worktree ALWAYS carries a `.git` entry at its root; a session temp root NEVER does. So reject
+      // the match if any ancestor segment (parts[0..2]) is a checkout root — that admits the real scratchpad
+      // WITHOUT admitting a `scratchpad` dir nested anywhere inside a sibling worktree. An lstat error (a
+      // not-yet-existing ancestor) means "not a worktree here" and is skipped; a real worktree always exists.
+      let acc = rb;
+      let insideWorktree = false;
+      for (let i = 0; i < 3; i++) {
+        acc = `${acc}${sep}${parts[i]}`;
+        try {
+          lstatSync(`${acc}${sep}.git`);
+          insideWorktree = true;
+          break;
+        } catch {
+          // no `.git` at this level (or unreadable) — keep walking down the ancestry.
+        }
+      }
+      if (!insideWorktree) return true;
+    }
+  }
+  return false;
+}
+
 /** True iff target resolves into one of the two NARROW append-only per-agent note dirs we allow
  *  writes to even though they live outside every worktree by design (item 1j):
  *    - $HOME/.claude/plans/                  plan files, and
@@ -230,6 +299,21 @@ async function main() {
     allowedNoteDir = false;
   }
   if (allowedNoteDir) process.exit(0);
+  // Session scratchpad allow-list: the Claude Code system prompt designates a per-session scratchpad
+  // dir (`/private/tmp`|`/tmp`/claude-*/.../scratchpad) for ALL temp files — helper scripts, PR-body
+  // text. It lives outside every worktree, so the containment check above blocks it, pushing agents
+  // into clumsy Bash heredocs. Permit it: a scratchpad is harness-sanctioned and is NOT a repo (see
+  // isAllowlistedScratchpad — `scratchpad` is required at the DOCUMENTED depth parts[3] AND no ancestor
+  // may be a git worktree root (`.git` check), which keeps this from admitting sibling agent worktrees
+  // also created under /private/tmp/claude-*). uid-scoped, not session-scoped (accepted trade-off — see
+  // the predicate docstring). Symlink-safe; fails closed.
+  let allowedScratchpad = false;
+  try {
+    allowedScratchpad = isAllowlistedScratchpad(target);
+  } catch {
+    allowedScratchpad = false;
+  }
+  if (allowedScratchpad) process.exit(0);
   process.stderr.write(
     `Blocked: ${target} is outside this agent's worktree (${callerRoot}). ` +
       `Edit only files inside your worktree.\n`,

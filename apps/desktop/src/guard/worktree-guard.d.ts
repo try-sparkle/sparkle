@@ -9,6 +9,13 @@ declare module "*/worktree-guard.mjs" {
   // $HOME/.claude/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
   // per-agent note dirs the guard permits even though they live outside the worktree).
   export function isAllowlistedNoteDir(homeDir: string, target: string): boolean;
+  // Session-scratchpad allow-list predicate: true iff target resolves into a per-session scratchpad
+  // dir (`/private/tmp`|`/tmp`/claude-*/.../scratchpad), canonicalized through symlinks. The harness
+  // designates this dir for all temp files; `scratchpad` is required at the documented depth parts[3]
+  // (claude-<uid>/<slug>/<uuid>/scratchpad) AND no ancestor may be a git worktree root (`.git` check),
+  // which keeps sibling agent worktrees (also created under /private/tmp/claude-*) blocked. uid-scoped,
+  // not session-scoped (see the .mjs docstring).
+  export function isAllowlistedScratchpad(target: unknown): boolean;
   // Worktree-relative containment helper: the worktree the CALLER is actually operating in.
   // Derives the caller's worktree root from the tool call's `cwd` (via `resolveToplevel`, default
   // `git rev-parse --show-toplevel`), falling back to `installRoot` when cwd isn't in a git work tree.
