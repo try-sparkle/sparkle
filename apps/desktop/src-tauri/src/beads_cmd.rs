@@ -850,6 +850,64 @@ fn child_page(project_path: &str, id: &str, env: ChildEnv<'_>) -> BeadPage {
     }
 }
 
+/// bd's own wording for "there is no such issue", as it arrives in an `{"error": …}` payload from
+/// `bd show`. The ONE bd failure that PROVES a row is absent; every other failure means the probe
+/// itself was broken. Pure.
+fn is_missing_issue(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("no issue") && lower.contains("matching")
+}
+
+/// The error a confirmed write drop produces. Says what was lost, so a caller that already told a
+/// human "filed <id>" can retract it instead of leaving them with an id that names nothing.
+fn write_dropped(id: &str) -> BeadsError {
+    BeadsError::new(
+        BeadsErrorKind::BadOutput,
+        format!(
+            "bd reported creating {id}, but {id} does not read back from the work graph — the write did not land, so nothing was filed"
+        ),
+    )
+}
+
+/// Decide, from a `bd show <id> --json` PROBE, whether the create actually landed.
+///
+/// Pure, and it takes the probe's `Result` rather than running it, so BOTH interesting branches —
+/// a genuine drop and an unreadable probe — are testable without a bd that can lose a write on cue.
+///
+/// The asymmetry is deliberate: only a probe that RAN CLEANLY and found no matching row (or bd's own
+/// no-such-issue payload) is evidence of a drop. A probe that could not run — bd missing, killed on
+/// BD_TIMEOUT, no workspace, unparseable output — proves nothing about the row, and inventing a
+/// failure there would report a create that DID land as lost. Unproven fails OPEN, absent fails LOUD.
+fn confirm_written(probe: Result<String, BeadsError>, id: &str) -> Result<(), BeadsError> {
+    let Ok(body) = probe else { return Ok(()) };
+    if body.trim().is_empty() {
+        return Ok(());
+    }
+    match parse_bead_rows(&body) {
+        Ok(rows) if rows.iter().any(|b| b.id == id) => Ok(()),
+        Ok(_) => Err(write_dropped(id)),
+        Err(e) if is_missing_issue(&e.message) => Err(write_dropped(id)),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Create a bead, and CONFIRM it is in the store before reporting success.
+///
+/// `bd create` echoing back a row is not proof the row persisted. The work graph is one shared
+/// embedded Dolt database — every worktree in this repo resolves `.beads/` through `git-common-dir`
+/// to the same store, and the desktop board re-reads it every 5s — and a create under that
+/// contention has been observed to return an id for a bead that never appeared in `bd list`: a
+/// silent WRITE DROP with no error anywhere. `beads_create`'s callers TELL A HUMAN the item was
+/// filed, so passing that back unverified is the same class of lie `ack_outcome` closed for failed
+/// mutations, just arriving through a bd exit of ZERO instead of non-zero.
+///
+/// Cost is one extra `bd show` per create, which is a cold-Dolt-open candidate with the full
+/// BD_TIMEOUT budget (see `detail_bead`). Creates are user-initiated and rare; silently losing one
+/// is not worth saving that read.
+///
+/// NOT a retry. Re-running `bd create` on a row we cannot see would duplicate the item whenever the
+/// first write actually landed and only the probe was wrong, and a duplicated work item is worse
+/// than an honest refusal — the caller can retry deliberately once it knows nothing was filed.
 fn create_bead(project_path: &str, bead: &NewBead, env: ChildEnv<'_>) -> Result<BeadSummary, BeadsError> {
     if bead.title.trim().is_empty() {
         return Err(BeadsError::new(BeadsErrorKind::InvalidInput, "title must not be empty"));
@@ -858,9 +916,22 @@ fn create_bead(project_path: &str, bead: &NewBead, env: ChildEnv<'_>) -> Result<
         require_id(p)?;
     }
     let rows = parse_bead_rows(&bd_stdout(project_path, &build_create_args(bead), env)?)?;
-    rows.into_iter()
+    let created = rows
+        .into_iter()
         .next()
-        .ok_or_else(|| BeadsError::new(BeadsErrorKind::BadOutput, "bd create returned no bead"))
+        .ok_or_else(|| BeadsError::new(BeadsErrorKind::BadOutput, "bd create returned no bead"))?;
+    // An id we cannot pass back to bd is unusable to the caller AND unprobeable here, so it is a
+    // failed create rather than something to hand on and confirm later.
+    if !valid_bead_id(&created.id) {
+        return Err(BeadsError::new(
+            BeadsErrorKind::BadOutput,
+            format!("bd create returned an unusable bead id: {}", created.id),
+        ));
+    }
+    let probe =
+        bd_stdout(project_path, &["show".into(), created.id.clone(), "--json".into()], env);
+    confirm_written(probe, &created.id)?;
+    Ok(created)
 }
 
 fn update_bead(
@@ -1548,6 +1619,63 @@ mod tests {
         let j = full.join(" ");
         assert!(j.contains("-t bug") && j.contains("-p 1") && j.contains("--parent p-1"));
         assert!(j.contains("-a me") && j.contains("-l a,b") && j.contains("-d body"));
+    }
+
+    /// The write-drop guard's whole point: a create is only successful once the row READS BACK.
+    /// Each case is a probe body bd really emits, and the two that prove absence must FAIL — before
+    /// this guard existed every one of these was reported to the caller as a successful create.
+    #[test]
+    fn a_create_whose_bead_does_not_read_back_is_a_failure() {
+        // bd's no-such-issue payload — `bd show <missing> --json`, verbatim.
+        let missing = r#"{"error":"no issues found matching the provided IDs","schema_version":1}"#;
+        let e = confirm_written(Ok(missing.into()), "").expect_err("drop is reported");
+        assert_eq!(e.kind, BeadsErrorKind::BadOutput);
+        assert!(e.message.contains(""), "names the bead that was lost: {}", e.message);
+        assert!(e.message.contains("did not land"), "says the write was lost: {}", e.message);
+
+        // A clean read that returns rows, none of which is the id bd claimed to have created.
+        let others = r#"[{"id":"","title":"someone else","status":"open"}]"#;
+        assert!(confirm_written(Ok(others.into()), "").is_err());
+
+        // And an empty result set is absence just the same.
+        assert!(confirm_written(Ok("[]".into()), "").is_err());
+    }
+
+    /// The other half of the guard, and the half that keeps it safe to run on every create: an
+    /// UNREADABLE probe is not evidence of a drop. Failing here would report a create that landed
+    /// as lost every time bd was slow, missing, or newer than this parser.
+    #[test]
+    fn a_probe_that_could_not_run_never_condemns_the_create() {
+        let id = "";
+        // The row is there — the ordinary path.
+        let present = r#"{"id":"","title":"filed","status":"open"}"#;
+        assert!(confirm_written(Ok(present.into()), id).is_ok());
+        let in_array = r#"[{"id":"","title":"filed","status":"open"}]"#;
+        assert!(confirm_written(Ok(in_array.into()), id).is_ok());
+
+        // bd never ran / was killed on BD_TIMEOUT / is not installed.
+        for kind in [BeadsErrorKind::BinaryNotFound, BeadsErrorKind::Timeout, BeadsErrorKind::BdFailed]
+        {
+            assert!(confirm_written(Err(BeadsError::new(kind, "bd was killed")), id).is_ok());
+        }
+        // A bd failure that is NOT "no such issue" says nothing about the row.
+        let locked = r#"{"error":"database is locked","schema_version":1}"#;
+        assert!(confirm_written(Ok(locked.into()), id).is_ok());
+        // Nothing readable, or output this parser does not understand (version skew).
+        assert!(confirm_written(Ok("".into()), id).is_ok());
+        assert!(confirm_written(Ok("   ".into()), id).is_ok());
+        assert!(confirm_written(Ok("not json at all".into()), id).is_ok());
+    }
+
+    /// `is_missing_issue` decides which bd failures are allowed to condemn a create, so it must not
+    /// widen: bd's OTHER failures share the word "no" and would fail-closed on a live bead.
+    #[test]
+    fn only_bds_no_such_issue_wording_proves_absence() {
+        assert!(is_missing_issue("no issues found matching the provided IDs"));
+        assert!(is_missing_issue("Error: no issue found matching \"\""));
+        assert!(!is_missing_issue("no beads database found"));
+        assert!(!is_missing_issue("database is locked"));
+        assert!(!is_missing_issue(""));
     }
 
     #[test]
