@@ -219,8 +219,33 @@ export interface EffectiveConfig {
   concurrency_basis?: string;
 }
 
-/** Which dimension binds the enforced concurrency ceiling. Mirrors Rust's `config::Bound`. */
-export type ConcurrencyBound = "cpu" | "ram" | "both" | "pinned" | "unknown";
+/**
+ * Which dimension binds the enforced concurrency ceiling. Mirrors Rust's `config::Bound`.
+ *
+ * The first five are all PREDICTIONS, made once at startup from facts that don't change while the
+ * app runs — installed RAM, core count, a pinned number in config.toml. They answer "what could
+ * this machine carry, in principle". The last two come from a LIVE reading of the machine (see
+ * services/memoryAdmission) and answer a different question — "what can it carry right NOW" — so a
+ * refusal carrying one of them names something the user can act on this minute:
+ *
+ *  - `"available"` — a fact about this MOMENT: the free memory left after everything currently
+ *    resident (Chrome, a runaway agent, someone's video export) won't hold another agent. The
+ *    remedy is *close something*, not *buy more RAM*; the static ceiling is unchanged and the slot
+ *    comes back on its own the moment the machine frees up.
+ *  - `"pressure"` — the OS itself says the machine is squeezed: the compressor is working or swap
+ *    is in use. This is not arithmetic over a free-page count, it is the kernel's own verdict, and
+ *    it means starting another agent would make an already-degraded machine worse.
+ *
+ * Both are strictly NARROWING — sampling may only ever refuse, never raise the predicted ceiling.
+ */
+export type ConcurrencyBound =
+  | "cpu"
+  | "ram"
+  | "both"
+  | "pinned"
+  | "unknown"
+  | "available"
+  | "pressure";
 export interface ConfigPaths {
   global: string;
   /** Present only when a project root is in context. */

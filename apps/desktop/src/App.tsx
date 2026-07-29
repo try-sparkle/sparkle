@@ -13,6 +13,8 @@ import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
 import { getConfig, onConfigChanged } from "./services/config";
 import { refreshRoborevAuth } from "./services/configActions";
+import { pollMemoryAdmission } from "./services/agentCapacity";
+import { MEMORY_ADMISSION_POLL_MS } from "./services/memoryAdmission";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
   AppBoot,
@@ -288,6 +290,39 @@ export function App() {
       cancelled = true;
       void safeUnlisten(unlistenPromise);
     };
+  }, []);
+
+  // Keep the LIVE memory reading fresh, so the concurrency ceiling can react to the machine.
+  //
+  // Everything the hydrate above loads is a prediction made once at startup (installed RAM, cores,
+  // a pin in config.toml) and it never changes while the app runs. This poll is the other half:
+  // services/memoryAdmission caches what the machine actually looks like right now, and
+  // localAgentCapacity narrows its ceiling by that — so a refused spawn can say "refused: memory
+  // pressure" instead of a bare "at capacity" on a machine that is already swapping.
+  //
+  // 5s, and the number is load-bearing in both directions. Cheap enough: the Rust side shells out
+  // to vm_stat/sysctl behind its own 1s TTL, so this is a handful of process spawns a minute and
+  // most ticks are served from that cache. Frequent enough: three polls fit inside the module's 15s
+  // staleness TTL, so one slow or dropped sample never expires the narrowing and starts admitting
+  // spawns onto a squeezed machine — while a backend that has genuinely stopped answering (every
+  // build predating the command rejects on every tick) releases the ceiling within ~15s. That
+  // tolerance is real rather than aspirational: the module keeps its cached reading on a failed poll
+  // and lets the TTL expire it, and it sequences replies so a slow sample cannot land as fresh.
+  //
+  // Fire-and-forget by design: refreshMemoryAdmission never rejects, and this must never delay a
+  // paint or block anything. It reads capacity fresh on each tick rather than closing over it, so the
+  // empty dep array is correct — nothing in here goes stale.
+  //
+  // WHICH count gets sent is a correctness decision (`live`, not `used` — roborev 55383), so it
+  // lives in pollMemoryAdmission() next to the gate that consumes it, where it is unit-testable.
+  // Inline here it was not, and it shipped wrong.
+  useEffect(() => {
+    const tick = () => {
+      void pollMemoryAdmission();
+    };
+    tick(); // don't make the first reading wait a whole interval
+    const id = window.setInterval(tick, MEMORY_ADMISSION_POLL_MS);
+    return () => window.clearInterval(id);
   }, []);
 
   return (

@@ -49,6 +49,7 @@ mod judge;
 mod logging;
 mod mac_panel;
 mod main_window;
+mod memwatch;
 mod mic_permission;
 mod model;
 mod model_catalog;
@@ -411,6 +412,8 @@ pub fn run() {
             pty::pty_kill,
             pty::pty_set_paused,
             pty::pty_ack,
+            memwatch::memory_admission,
+            memwatch::agent_memory_watchdog,
             preflight::claude_preflight,
             preflight::claude_version,
             preflight::claude_session_info,

@@ -71,6 +71,50 @@ pub struct WorkersConfig {
     pub agent_heap_mb: u32,
 }
 
+/// Runtime memory measurement — the MEASURED half of the concurrency ceiling, and the watchdog.
+/// See `memwatch.rs` for what each of these drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryConfig {
+    /// Whether a runtime memory sample may narrow the derived concurrency ceiling. On by default:
+    /// the static ceiling is a PREDICTION (installed RAM ÷ an assumed per-agent budget, memoized
+    /// once at startup) and it reacts to nothing — not to Chrome being resident, not to an agent
+    /// exceeding its assumed share, not to the compressor thrashing. Off restores exactly the
+    /// pre-`sparkle-0bye` behavior, which is the escape hatch if the sampler ever misjudges.
+    ///
+    /// It can only ever REFUSE. No sample, and no setting, can raise the ceiling above what
+    /// `[workers].max_concurrent` and the machine derivation already allow.
+    pub pressure_gate: bool,
+    /// Per-AGENT (whole process tree, not one pid) RSS at which the UI warns, in MiB.
+    ///
+    /// Default 4096. Measured 2026-07-29: **1.11 GiB per agent** across 19 agents, and
+    /// `sparkle-hfhs` measured ~525 MiB per PROCESS on a different day at a different agent count.
+    /// 4 GiB is therefore ~3.6× the normal working set — high enough that ordinary heavy work
+    /// (a build, a big test suite) does not cry wolf, low enough to catch a ramp long before the
+    /// 2026-07-20 incident's ~4 GiB-per-process runaway became unrecoverable.
+    pub agent_rss_warn_mb: u32,
+    /// Per-agent RSS at which the UI OFFERS to kill, in MiB. Default 8192 — past the point where an
+    /// agent is doing anything explicable with memory, given a 3072 MiB heap ceiling per process.
+    /// 0 disables this tier.
+    pub agent_rss_kill_mb: u32,
+    /// Kill automatically at `agent_rss_kill_mb` instead of asking. **Default false, deliberately.**
+    /// Killing an agent throws away work the user cannot recover, and a false positive is worse
+    /// than a slow machine; `sparkle-0bye` asks to "warn in UI past a threshold, offer/auto kill",
+    /// and the offer is what ships on by default.
+    pub agent_rss_auto_kill: bool,
+}
+
+impl MemoryConfig {
+    /// The shipped defaults, as a const so `Default for SparkleConfig` and any test can name the
+    /// same values without a second literal that could drift.
+    pub const DEFAULT: Self = MemoryConfig {
+        pressure_gate: true,
+        agent_rss_warn_mb: 4096,
+        agent_rss_kill_mb: 8192,
+        agent_rss_auto_kill: false,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AiConfig {
@@ -632,6 +676,10 @@ pub struct DeliveredConfig {
 pub struct SparkleConfig {
     pub workflow: WorkflowConfig,
     pub workers: WorkersConfig,
+    /// Runtime memory sampling + the per-agent RSS watchdog (`memwatch.rs`). Its own section rather
+    /// than more `[workers]` keys because it governs a different KIND of decision: `[workers]` is
+    /// what the machine is predicted to hold, `[memory]` is what it is observed to hold.
+    pub memory: MemoryConfig,
     pub ai: AiConfig,
     pub tools: ToolsConfig,
     /// Claude Code marketplace plugins pre-enabled for every agent (repo-scoped overridable).
@@ -683,6 +731,7 @@ impl Default for SparkleConfig {
             // only lower the configured value, never raise it. 3 GiB per agent sits well under V8's
             // ~4 GiB default so the heap cap actually bites, while leaving a real agent room to work.
             workers: WorkersConfig { max_concurrent: None, agent_heap_mb: 3072 },
+            memory: MemoryConfig::DEFAULT,
             ai: AiConfig {
                 auto_rename: true,
                 voice_dictation: true,
@@ -859,6 +908,14 @@ struct PartialWorkers {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialMemory {
+    pressure_gate: Option<bool>,
+    agent_rss_warn_mb: Option<u32>,
+    agent_rss_kill_mb: Option<u32>,
+    agent_rss_auto_kill: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialAi {
     auto_rename: Option<bool>,
     voice_dictation: Option<bool>,
@@ -988,6 +1045,7 @@ struct PartialDelivered {
 struct PartialConfig {
     workflow: Option<PartialWorkflow>,
     workers: Option<PartialWorkers>,
+    memory: Option<PartialMemory>,
     ai: Option<PartialAi>,
     tools: Option<PartialTools>,
     plugins: Option<PartialPlugins>,
@@ -1054,6 +1112,22 @@ fn apply_workers(into: &mut WorkersConfig, p: Option<PartialWorkers>) {
     }
     if let Some(v) = p.agent_heap_mb {
         into.agent_heap_mb = v;
+    }
+}
+
+fn apply_memory(into: &mut MemoryConfig, p: Option<PartialMemory>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.pressure_gate {
+        into.pressure_gate = v;
+    }
+    if let Some(v) = p.agent_rss_warn_mb {
+        into.agent_rss_warn_mb = v;
+    }
+    if let Some(v) = p.agent_rss_kill_mb {
+        into.agent_rss_kill_mb = v;
+    }
+    if let Some(v) = p.agent_rss_auto_kill {
+        into.agent_rss_auto_kill = v;
     }
 }
 
@@ -1331,6 +1405,13 @@ fn apply_delivered(into: &mut DeliveredConfig, p: Option<PartialDelivered>) {
 /// Smallest per-agent heap worth allowing. Below this an agent OOMs before doing useful work.
 const MIN_AGENT_HEAP_MB: u32 = 512;
 
+/// The floor under `[memory]`'s RSS thresholds, in MiB. Measured 2026-07-29: an agent's whole
+/// process tree resides at ~1.11 GiB during ordinary work. A threshold at or below that marks every
+/// healthy agent as a runaway on the first poll, and a warning that is always on is a warning the
+/// user learns to dismiss — which is exactly the failure `sparkle-0bye` describes from the other
+/// direction ("nothing watched it").
+const MIN_AGENT_RSS_THRESHOLD_MB: u32 = 1536;
+
 /// The `max_concurrent` the app used to ship as a hardcoded default, before the limit became
 /// machine-derived. Installs carrying exactly this value are migrated to AUTO (see `validate`):
 /// the app wrote it for them, so it is not a choice we would be discarding.
@@ -1380,7 +1461,7 @@ const PEAK_HEAP_OVERCOMMIT: u32 = 2;
 ///
 /// Taking the max of the two divisors is exactly `min()` of the two agent counts they would each
 /// derive (same numerator, larger divisor → smaller quotient), stated once instead of twice.
-fn agent_ram_budget_mb(heap_ceiling_mb: u32) -> u32 {
+pub(crate) fn agent_ram_budget_mb(heap_ceiling_mb: u32) -> u32 {
     let steady = AGENT_TYPICAL_RSS_MB.min(heap_ceiling_mb);
     let peak_share = heap_ceiling_mb / PEAK_HEAP_OVERCOMMIT;
     steady.max(peak_share).max(1)
@@ -1420,14 +1501,25 @@ fn ram_derived_concurrency(total_ram_bytes: u64, reserve_bytes: u64, heap_ceilin
 /// hundred of them burst at once on 18 cores.
 ///
 /// roborev 54816: an earlier draft of this comment claimed, in the present tense, that runtime
-/// pressure-aware admission and an RSS watchdog make that survivable. NEITHER EXISTS YET. This
-/// raise ships AHEAD OF them — `sparkle-asz5`'s memory-aware half stops at a STATIC prediction (it
-/// samples installed RAM once and memoizes it; it never re-samples available memory or pressure at
-/// admission time), and the RSS watchdog is `sparkle-0bye`, still OPEN. Until both land, this
-/// constant is the ONLY guard, not a ceiling under a governor — do not read this comment as a
-/// description of protection that is already in force. If this constant is ever raised again
-/// WITHOUT that feedback loop landing first, that is a regression to the arithmetic that produced
-/// `sparkle-hfhs` (P0: 32 GiB Macs cannot run Sparkle).
+/// pressure-aware admission and an RSS watchdog make that survivable. NEITHER EXISTED then, and this
+/// raise shipped AHEAD OF them.
+///
+/// STATUS (be precise here — the whole point of this note is that it is not aspirational). The two
+/// halves of `memwatch.rs` are in DIFFERENT states, and conflating them is how this comment has
+/// already been wrong twice, in both directions:
+///
+///   * **Admission — WIRED.** `services/memoryAdmission.ts` polls `memory_admission` every 5s and
+///     `localAgentCapacity()` narrows its ceiling by the result, so a spawn IS now gated on a live
+///     memory reading and this constant is no longer the only guard on that path.
+///   * **The RSS watchdog — NOT WIRED.** `agent_memory_watchdog` compiles, is tested and is
+///     registered, but nothing calls it and nothing acts on a `WatchdogVerdict`. There is no kill
+///     path and no warning surface. `agent_rss_auto_kill` therefore does nothing whatever its value.
+///
+/// So: still do NOT read this as clearance to raise the constant. Admission being connected removes
+/// only the *ceiling* half of the risk; a runaway agent — the actual `sparkle-hfhs` failure mode, and
+/// the one the 2026-07-20 incident was — is still unwatched, because the watchdog has no caller.
+/// Raising this before that lands is the same unguarded arithmetic. Check for a real watchdog
+/// consumer first, not just a `memory_admission` one.
 ///
 /// Note this flips which dimension binds on a big-RAM Mac: 18 × 6 = 108 vs `by_ram` 81, so RAM now
 /// binds at 81 and `Bound::Ram` is what the human is told. That is intended — RAM is the dimension
@@ -1467,6 +1559,15 @@ pub enum Bound {
     /// could carry, so the ceiling is a CHOICE, not a hardware fact. Telling the human about RAM or
     /// cores here would send them to tune hardware that is not the constraint.
     Pinned,
+    /// A RUNTIME measurement bound it, not the static prediction: memory available *right now* is
+    /// less than `installed − reserve` assumed (`memwatch::sampled_admission`). Distinct from
+    /// [`Bound::Ram`], which is a fact about the machine; this one is a fact about this MOMENT, and
+    /// the remedy is to close something, not to buy RAM.
+    Available,
+    /// The OS (or our own reading of the compressor/swap) says the machine is under memory
+    /// PRESSURE, so no further agent is admitted regardless of what the arithmetic allows. The one
+    /// bound that says "refused: memory pressure" rather than "at capacity".
+    Pressure,
     /// Nothing measurable (unsupported platform / sysctl failure) and no pin either.
     Unknown,
 }
@@ -1748,6 +1849,38 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
         ));
         cfg.workers.agent_heap_mb = MIN_AGENT_HEAP_MB;
     }
+    // A watchdog that fires below what an agent NORMALLY resides at is a watchdog nobody reads.
+    // Measured 2026-07-29: 1.11 GiB per agent (whole process tree). A threshold under that would
+    // mark every healthy agent as runaway on the first poll, and the first thing a user learns is
+    // to ignore the warning. 0 stays meaningful — it disables that tier — so only a positive,
+    // too-small value is floored.
+    if cfg.memory.agent_rss_warn_mb > 0 && cfg.memory.agent_rss_warn_mb < MIN_AGENT_RSS_THRESHOLD_MB
+    {
+        warnings.push(format!(
+            "[memory].agent_rss_warn_mb ({}) is below the measured normal per-agent working set; \
+             using {}",
+            cfg.memory.agent_rss_warn_mb, MIN_AGENT_RSS_THRESHOLD_MB
+        ));
+        cfg.memory.agent_rss_warn_mb = MIN_AGENT_RSS_THRESHOLD_MB;
+    }
+    if cfg.memory.agent_rss_kill_mb > 0 && cfg.memory.agent_rss_kill_mb < MIN_AGENT_RSS_THRESHOLD_MB
+    {
+        warnings.push(format!(
+            "[memory].agent_rss_kill_mb ({}) is below the measured normal per-agent working set; \
+             using {}",
+            cfg.memory.agent_rss_kill_mb, MIN_AGENT_RSS_THRESHOLD_MB
+        ));
+        cfg.memory.agent_rss_kill_mb = MIN_AGENT_RSS_THRESHOLD_MB;
+    }
+    // Arming auto-kill with the kill tier DISABLED is a config that reads as protection and
+    // provides none. Say so rather than silently doing nothing.
+    if cfg.memory.agent_rss_auto_kill && cfg.memory.agent_rss_kill_mb == 0 {
+        warnings.push(
+            "[memory].agent_rss_auto_kill is on but agent_rss_kill_mb is 0 (disabled), so nothing \
+             will ever be killed; set a threshold or turn auto-kill off"
+                .to_string(),
+        );
+    }
     // Cap the pool so a fat-fingered size can't spawn a huge burst of parked worktrees (each a real
     // checkout on disk). 16 is far above any sane fan-out; anything higher is almost certainly a typo.
     if cfg.worktree_pool.size > 16 {
@@ -1813,6 +1946,7 @@ fn build_effective(
             Ok(p) => {
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 apply_workers(&mut cfg.workers, p.workers);
+                apply_memory(&mut cfg.memory, p.memory);
                 apply_ai(&mut cfg.ai, p.ai);
                 apply_tools(&mut cfg.tools, p.tools);
                 rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
@@ -1841,6 +1975,16 @@ fn build_effective(
                 if p.workers.is_some() {
                     warnings.push(
                         "[workers] in a per-project .sparkle/config.toml is ignored — it is a \
+                         machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.memory.is_some() {
+                    // Same rule and same reason as [workers]: memory is a property of the MACHINE,
+                    // and one repo must not be able to arm auto-kill (or disarm the gate) for every
+                    // other project sharing the same RAM.
+                    warnings.push(
+                        "[memory] in a per-project .sparkle/config.toml is ignored — it is a \
                          machine-wide setting; set it in the global config.toml"
                             .to_string(),
                     );
@@ -2124,11 +2268,11 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 #
 # WHERE THIS LIVES (two layers, both optional):
 #   • Global  — this file, in Sparkle's app-data dir. Applies to every project. Holds your
-#               machine-wide preferences ([workers], [ai]) plus default rules.
+#               machine-wide preferences ([workers], [memory], [ai]) plus default rules.
 #   • Project — a `.sparkle/config.toml` checked into a repo. Overrides ONLY the repo-scoped
 #               rules ([workflow], [freshness], [approvals], [plugins]) for that one project, and
-#               travels with the repo so a team shares them. [workers]/[ai]/[tools] there are
-#               ignored (they're per-machine).
+#               travels with the repo so a team shares them. [workers]/[memory]/[ai]/[tools] there
+#               are ignored (they're per-machine).
 #
 # PRECEDENCE: built-in defaults  →  this global file  →  a project's .sparkle/config.toml.
 #
@@ -2187,9 +2331,10 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 # GiB ~= 81), not its cores. Whichever of the two limits is smaller wins, and the resolved value —
 # with both inputs AND which dimension bound it — is logged at startup and shown in the app.
 #
-# The x6 core multiplier and the ~1.1 GiB RAM figure are BOTH recent changes (2026-07-29) shipping
-# ahead of runtime memory-pressure sampling and an RSS watchdog (bead sparkle-0bye, still open) —
-# until those land, this derivation is a static prediction, not a governed ceiling.
+# This derivation is a PREDICTION made once from installed RAM and cores. What it cannot see —
+# memory actually free right now, the compressor, a runaway agent — is what the [memory] section
+# below is being built for. NOTE that section is not yet wired to anything (see its own comment),
+# so today this prediction is the only limit actually in force.
 #
 # Uncomment to pin your own CEILING. It only ever lowers the automatic value — setting 40 on a 16 GB
 # Mac still gets you ~6, because the point of the clamp is to keep the kernel from killing your
@@ -2208,6 +2353,46 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 # you set your own NODE_OPTIONS, yours is preserved and merged with this; an explicit
 # --max-old-space-size of your own always wins.
 agent_heap_mb = 3072
+
+# --- Watching memory for real, instead of predicting it (per-machine) ------------------
+[memory]
+# PARTLY ACTIVE — read the per-key notes, because the two halves of this section differ:
+#   pressure_gate    ACTIVE. A live reading really does narrow how many agents are admitted.
+#   agent_rss_*      NOT ACTIVE YET. The thresholds are parsed and validated, but nothing watches
+#                    agent memory against them, so no agent is warned about, offered for kill, or
+#                    killed. Setting them today records your preference for when that lands.
+#
+# [workers] above is a PREDICTION: it reads your installed RAM once at startup and divides. It
+# cannot see that Chrome and Xcode are resident, that the compressor is thrashing, or that one
+# agent has run away. This section is the part that actually looks.
+#
+# ACTIVE. true = a live memory reading may LOWER how many agents Sparkle will admit. It can never
+# raise the number above what [workers] already allows — sampling only ever refuses. When it
+# refuses, the app says "refused: memory pressure" (or names the available memory) rather than a
+# bare "at capacity", so you can tell a full machine apart from a ceiling you set. Set false to go
+# back to the prediction alone.
+#
+# What "squeezed" means, so a refusal is never a surprise: below 20% of RAM available is a warning
+# (the ceiling is narrowed to what measurably fits), below 8% is critical (no further agent is
+# admitted until one finishes). Swap only counts against you when free memory is ALSO under 35% —
+# macOS keeps reporting swap it used hours ago, and treating that alone as pressure once froze
+# spawns on machines with 95 GiB free.
+pressure_gate = true
+# NOT ACTIVE YET (nothing watches agent memory against these three keys — see the header above).
+# Per-AGENT memory at which Sparkle warns you, in MiB. "Per agent" means the WHOLE process tree
+# an agent runs, not one process: a measured agent is ~2 processes (5 when it fans out subagents)
+# totalling ~1.1 GiB, so watching a single process undercounts by about half.
+# 4096 is ~3.6x the normal working set — high enough that a big build doesn't cry wolf.
+# Set 0 to disable this tier; the kill tier below stays independent of it.
+agent_rss_warn_mb = 4096
+# NOT ACTIVE YET. Per-agent memory at which Sparkle OFFERS to kill the agent, in MiB. Set 0 to
+# disable this tier (the warn tier above keeps its own threshold either way).
+agent_rss_kill_mb = 8192
+# NOT ACTIVE YET — there is no kill path, so this does nothing whichever value you set.
+# false (default) = you are warned and offered the kill; nothing is killed behind your back.
+# true = kill automatically at agent_rss_kill_mb. Opt in only if you would rather lose an agent's
+# in-progress work than risk the machine — a killed agent's work is not recoverable.
+agent_rss_auto_kill = false
 
 # --- AI features (per-machine; each degrades to a non-AI baseline when off) ------------
 [ai]
@@ -3699,6 +3884,126 @@ quit_app = 42
         assert!(!warns.iter().any(|w| w.contains("agent_heap_mb")));
     }
 
+    // ── [memory]: the section memwatch.rs reads (bead sparkle-0bye) ──────────────────────────
+
+    #[test]
+    fn a_memory_section_round_trips_from_toml_into_the_effective_config() {
+        // The WIRING test. `memwatch::memory_admission` / `agent_memory_watchdog` read these four
+        // fields off `current_effective()`, so a `[memory]` block that parses but never reaches the
+        // effective config would leave the whole feature running on defaults while looking
+        // configured. EVERY value here is deliberately the opposite of `MemoryConfig::DEFAULT`, so
+        // this fails if `apply_memory` is not called (the config would still hold the defaults).
+        let (cfg, warns, hard) = effective(
+            Some(
+                "[memory]\n\
+                 pressure_gate = false\n\
+                 agent_rss_warn_mb = 5000\n\
+                 agent_rss_kill_mb = 9000\n\
+                 agent_rss_auto_kill = true\n",
+            ),
+            None,
+        );
+        assert!(!hard, "a valid [memory] block is not a parse failure: {warns:?}");
+        assert!(!cfg.memory.pressure_gate, "pressure_gate did not survive the merge");
+        assert_eq!(cfg.memory.agent_rss_warn_mb, 5000);
+        assert_eq!(cfg.memory.agent_rss_kill_mb, 9000);
+        assert!(cfg.memory.agent_rss_auto_kill);
+        assert_ne!(cfg.memory, MemoryConfig::DEFAULT, "…and it is not merely the default");
+        assert!(
+            !warns.iter().any(|w| w.contains("[memory]")),
+            "a valid, above-floor [memory] block must warn about nothing: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_memory_section_leaves_the_shipped_defaults_intact() {
+        // The other half of the merge: a partial section must not zero the fields it omits.
+        let (cfg, _, _) = effective(Some("[memory]\npressure_gate = false\n"), None);
+        assert!(!cfg.memory.pressure_gate);
+        assert_eq!(
+            cfg.memory.agent_rss_warn_mb,
+            MemoryConfig::DEFAULT.agent_rss_warn_mb,
+            "an omitted key keeps its default rather than becoming 0"
+        );
+        assert_eq!(cfg.memory.agent_rss_kill_mb, MemoryConfig::DEFAULT.agent_rss_kill_mb);
+    }
+
+    #[test]
+    fn validate_floors_a_below_floor_agent_rss_warn_mb_and_says_so() {
+        // A threshold under the measured ~1.11 GiB per-agent working set marks every healthy agent
+        // as a runaway on the first poll. Assert BOTH side effects: the value is rewritten, and the
+        // user is told — a silent floor would leave them believing the number they typed is live.
+        let (cfg, warns, _) = effective(Some("[memory]\nagent_rss_warn_mb = 256\n"), None);
+        assert_eq!(cfg.memory.agent_rss_warn_mb, MIN_AGENT_RSS_THRESHOLD_MB, "floored to 1536");
+        assert!(
+            warns.iter().any(|w| w.contains("agent_rss_warn_mb") && w.contains("1536")),
+            "the floor must be announced, not applied silently: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn validate_floors_a_below_floor_agent_rss_kill_mb_and_says_so() {
+        let (cfg, warns, _) = effective(Some("[memory]\nagent_rss_kill_mb = 900\n"), None);
+        assert_eq!(cfg.memory.agent_rss_kill_mb, MIN_AGENT_RSS_THRESHOLD_MB);
+        assert!(warns.iter().any(|w| w.contains("agent_rss_kill_mb")), "{warns:?}");
+    }
+
+    #[test]
+    fn a_zero_rss_threshold_is_the_documented_opt_out_not_a_floored_value() {
+        // 0 disables that tier (memwatch's `watchdog_verdicts` never fires on it). Flooring it to
+        // 1536 would silently re-arm a watchdog the user turned off.
+        let (cfg, warns, _) =
+            effective(Some("[memory]\nagent_rss_warn_mb = 0\nagent_rss_kill_mb = 0\n"), None);
+        assert_eq!(cfg.memory.agent_rss_warn_mb, 0);
+        assert_eq!(cfg.memory.agent_rss_kill_mb, 0);
+        assert!(
+            !warns.iter().any(|w| w.contains("below the measured")),
+            "0 is an opt-out, not a too-small value: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn arming_auto_kill_with_the_kill_tier_disabled_warns_that_nothing_will_be_killed() {
+        // Reads as protection, provides none. The config is left as written — this one only warns.
+        let (cfg, warns, _) =
+            effective(Some("[memory]\nagent_rss_kill_mb = 0\nagent_rss_auto_kill = true\n"), None);
+        assert!(cfg.memory.agent_rss_auto_kill);
+        assert_eq!(cfg.memory.agent_rss_kill_mb, 0);
+        assert!(
+            warns.iter().any(|w| w.contains("agent_rss_auto_kill") && w.contains("nothing")),
+            "an armed-but-inert auto-kill must be called out: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn project_memory_is_ignored_with_warning() {
+        // Same rule as [workers]: one repo must not be able to arm auto-kill — or disarm the
+        // pressure gate — for every other project sharing the machine's RAM.
+        let (cfg, warns, _) = effective(
+            None,
+            Some("[memory]\npressure_gate = false\nagent_rss_auto_kill = true\n"),
+        );
+        assert_eq!(
+            cfg.memory,
+            MemoryConfig::DEFAULT,
+            "a project layer must not move a machine-wide setting"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[memory]") && w.contains("ignored")),
+            "the ignoring must be visible, not silent: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_template_parses_to_exactly_the_memory_defaults() {
+        // DEFAULT_TEMPLATE is what `reset_config` writes. If its [memory] block ever drifts from
+        // `MemoryConfig::DEFAULT`, a user who resets their config gets different behavior than a
+        // user who has no config at all.
+        let (cfg, _, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard);
+        assert_eq!(cfg.memory, MemoryConfig::DEFAULT);
+    }
+
     #[test]
     fn ram_derived_concurrency_divides_usable_ram_by_the_agent_ram_budget() {
         // At the default 3072 MiB ceiling the budget is 1536 MiB (half the ceiling — above the
@@ -4358,10 +4663,66 @@ quit_app = 42
             (Bound::Ram, "\"ram\""),
             (Bound::Both, "\"both\""),
             (Bound::Pinned, "\"pinned\""),
+            // The two memory bounds carry the "refused: memory pressure" copy, so they are the ones
+            // whose renaming would most visibly break a refusal — and they were the ones this
+            // hardcoded table forgot when they were added (roborev 55384). The frontend branches on
+            // these exact strings in services/config.ts's `ConcurrencyBound` union.
+            (Bound::Available, "\"available\""),
+            (Bound::Pressure, "\"pressure\""),
             (Bound::Unknown, "\"unknown\""),
         ] {
             assert_eq!(serde_json::to_string(&b).unwrap(), s);
         }
+    }
+
+    /// The wire string for each `Bound`, as an EXHAUSTIVE match with no wildcard arm.
+    ///
+    /// This is the enforcement mechanism, and the compiler is the thing doing the enforcing: adding a
+    /// variant to `Bound` makes this function fail to COMPILE until its wire string is declared here.
+    ///
+    /// The first attempt at this guard (roborev 55425) was a hand-written array plus
+    /// `assert_eq!(all.len(), 7)`. That is a compile-time tautology — a new variant changes neither
+    /// the literal nor its length, so the test stayed green while the variant went unpinned, which is
+    /// precisely how `Available`/`Pressure` were missed in the first place. It was the repo's #1
+    /// defect shape (an assertion already true before the change) written *while fixing* an instance
+    /// of it. Recorded rather than quietly deleted, because the seductive part is that it reads like
+    /// a real check.
+    fn bound_wire_string(b: Bound) -> &'static str {
+        match b {
+            Bound::Cpu => "\"cpu\"",
+            Bound::Ram => "\"ram\"",
+            Bound::Both => "\"both\"",
+            Bound::Pinned => "\"pinned\"",
+            Bound::Available => "\"available\"",
+            Bound::Pressure => "\"pressure\"",
+            Bound::Unknown => "\"unknown\"",
+        }
+    }
+
+    /// Every variant serializes to the string `bound_wire_string` declares, and all of them are
+    /// distinct and lowercase. Exhaustiveness is guaranteed by the compiler, not by this test.
+    #[test]
+    fn every_bound_variant_is_covered_by_the_serialization_table() {
+        // ALL_BOUNDS is checked against the match above by construction: if a variant were missing
+        // here, `bound_wire_string` would still compile — so the real guard is that adding a variant
+        // breaks `bound_wire_string`, and whoever fixes that lands here next.
+        const ALL_BOUNDS: [Bound; 7] = [
+            Bound::Cpu,
+            Bound::Ram,
+            Bound::Both,
+            Bound::Pinned,
+            Bound::Available,
+            Bound::Pressure,
+            Bound::Unknown,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for b in ALL_BOUNDS {
+            let s = serde_json::to_string(&b).unwrap();
+            assert_eq!(s, bound_wire_string(b), "{b:?} serializes to an undeclared string");
+            assert_eq!(s, s.to_lowercase(), "{s} is not lowercase");
+            assert!(seen.insert(s.clone()), "{s} is a duplicate discriminant");
+        }
+        assert_eq!(seen.len(), ALL_BOUNDS.len());
     }
 
     #[test]

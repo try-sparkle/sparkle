@@ -30,6 +30,12 @@ struct PtySession {
     /// IPC emit credit gate: bounds the bytes emitted-but-not-yet-acked by the frontend, so the
     /// (unbounded) Tauri IPC queue can't grow without limit. See `InflightState` / `pty_ack`.
     inflight: Arc<InflightState>,
+    /// The child's pid, captured at spawn — the ROOT of the agent's process tree. The memory
+    /// watchdog (`memwatch::agent_footprints`) walks descendants from here, because an agent is
+    /// ~2 processes (peak 5), so watching this pid alone would undercount its RSS by about half.
+    /// `None` when the platform did not report one; such a session is skipped rather than reported
+    /// at zero, since "no pid" is not the same fact as "using no memory".
+    pid: Option<u32>,
 }
 
 /// Cooperative pause gate shared between a session's reader thread and `pty_set_paused`. The reader
@@ -218,6 +224,21 @@ impl PtyManager {
         // later pty_spawn/write/resize/kill app-wide. The recovered guard still points at a
         // valid HashMap (mirrors accounts.rs / trial.rs).
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+
+    /// `(session id, root pid)` for every live session that reported a pid.
+    ///
+    /// The session id IS the agent id (`pty:output:<agentId>`), so the memory watchdog needs no
+    /// mapping table that could drift. Sessions without a pid are SKIPPED rather than emitted with
+    /// a placeholder: a footprint of zero would read as "this agent uses no memory", which is a
+    /// different claim from "we could not measure it".
+    pub fn session_pids(&self) -> Vec<(String, u32)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(id, s)| s.pid.map(|pid| (id.clone(), pid)))
+            .collect()
     }
 }
 
@@ -594,6 +615,9 @@ pub async fn pty_spawn(
 
             let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
             let killer = child.clone_killer();
+            // Capture the pid BEFORE the child can be reaped: `process_id()` stops answering once
+            // the child is waited on, and the watchdog needs the tree root for the session's life.
+            let pid = child.process_id();
             // Drop the slave so the master sees EOF when the child exits.
             drop(pair.slave);
 
@@ -624,6 +648,7 @@ pub async fn pty_spawn(
                     killer,
                     pause: Arc::new(PauseState::new()),
                     inflight: Arc::new(InflightState::new()),
+                    pid,
                 },
                 reader,
                 child,
@@ -1211,6 +1236,69 @@ mod tests {
         );
     }
 
+    // ── sparkle-0bye: the memory watchdog's view of live sessions ─────────────────────────────
+
+    /// `session_pids` must report the REAL spawned pid, keyed by session id, for every session that
+    /// has one — and skip the ones that don't. `memwatch::agent_footprints` walks the process tree
+    /// from these roots, so a wrong or missing pid silently makes an agent invisible to the
+    /// watchdog (it would report 0 bytes, which reads as "healthy" rather than "unmeasured").
+    #[test]
+    fn session_pids_reports_the_spawned_pid_and_skips_sessions_without_one() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let Ok(pair) =
+            sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            return; // no PTY in this environment — skip
+        };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let pid = child.process_id();
+        assert!(pid.is_some(), "portable_pty must report a pid for a live child");
+        let writer = pair.master.take_writer().expect("take_writer");
+        let mgr = PtyManager::default();
+        mgr.sessions.lock().unwrap().insert(
+            "agent-with-pid".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid,
+            },
+        );
+
+        let pids = mgr.session_pids();
+        assert_eq!(pids.len(), 1, "one session with a pid → one entry: {pids:?}");
+        assert_eq!(pids[0].0, "agent-with-pid", "keyed by session id, which IS the agent id");
+        assert_eq!(
+            pids[0].1,
+            pid.unwrap(),
+            "the pid reported must be the one the child actually got"
+        );
+
+        // A session whose platform gave no pid is SKIPPED, not emitted as 0 — pid 0 would make the
+        // watchdog walk the wrong tree (or none) while looking like a successful measurement.
+        let removed = mgr.sessions.lock().unwrap().remove("agent-with-pid");
+        if let Some(mut s) = removed {
+            s.pid = None;
+            mgr.sessions.lock().unwrap().insert("agent-no-pid".to_string(), s);
+        }
+        assert!(
+            mgr.session_pids().is_empty(),
+            "a session without a pid contributes no entry at all"
+        );
+
+        let removed = mgr.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove("agent-no-pid");
+        if let Some(mut s) = removed {
+            let _ = s.killer.kill();
+            let _ = child.wait();
+        }
+    }
+
     // ── sparkle-4orh: per-session write lock ──────────────────────────────────────────────────
     /// Holding a session's per-session writer lock (as `pty_write` does across a blocking write)
     /// must NOT keep the global `sessions` map locked — otherwise a big paste into a stalled child
@@ -1229,6 +1317,7 @@ mod tests {
             return;
         };
         let killer = child.clone_killer();
+        let pid = child.process_id();
         let writer = pair.master.take_writer().expect("take_writer");
         let session = PtySession {
             writer: Arc::new(Mutex::new(writer)),
@@ -1236,6 +1325,7 @@ mod tests {
             killer,
             pause: Arc::new(PauseState::new()),
             inflight: Arc::new(InflightState::new()),
+            pid,
         };
         let sessions: Mutex<HashMap<String, PtySession>> = Mutex::new(HashMap::new());
         sessions.lock().unwrap().insert("a".to_string(), session);

@@ -12,6 +12,7 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore, enforcedWorkerCap, concurrencyBasis } from "../stores/settingsStore";
+import { currentMemoryAdmission, refreshMemoryAdmission } from "./memoryAdmission";
 import { wasProjectVisited } from "./sessionProjects";
 
 export interface CapacityReading {
@@ -33,13 +34,21 @@ export interface CapacityReading {
    * field exists to remove.
    */
   live: number;
-  /** The machine-wide ceiling actually ENFORCED — `enforcedWorkerCap`, the same number every other
-   *  gate compares against. Reporting anything else here is how the app came to refuse a spawn
-   *  citing a limit it was not using. */
+  /**
+   * The machine-wide ceiling actually ENFORCED. Reporting anything else here is how the app came to
+   * refuse a spawn citing a limit it was not using.
+   *
+   * Normally `enforcedWorkerCap` — the same number every other gate compares against. It can be
+   * LOWER when a fresh live memory reading says the machine cannot hold that many right now (see
+   * the narrowing block in `localAgentCapacity`); it is never higher, in any state, for any reason.
+   * So the sibling gates still agree with this one whenever they refuse: this one may additionally
+   * refuse earlier, which is the direction that protects the machine.
+   */
   limit: number;
   /**
    * WHY `limit` is that number, as a sentence fit to show a human: `"CPU-bound: 18 cores × 2 agents
-   * per core"`, `"pinned to 32 in config.toml…"`, `"RAM-bound: 16 GiB installed − 6 GiB reserved…"`.
+   * per core"`, `"pinned to 32 in config.toml…"`, `"RAM-bound: 16 GiB installed − 6 GiB reserved…"`,
+   * or — when a live reading is what's binding — `"refused: memory pressure (…)"`.
    *
    * Carried on the reading so a refusal cannot state the number without its cause. The refusal used
    * to hardcode "the ceiling is derived from installed RAM", which on the machine that reported this
@@ -119,8 +128,41 @@ export function localAgentCapacity(): CapacityReading {
   //
   // The genuinely pin-invariant field, if a future gate wants "what the hardware alone can carry",
   // is `machineMaxConcurrentWorkers` — which is what the ⋯-menu slider's track now uses.
-  const limit = Math.max(1, enforcedWorkerCap(settings));
-  return { used, live, limit, basis: concurrencyBasis(settings), atCapacity: used >= limit };
+  const staticLimit = Math.max(1, enforcedWorkerCap(settings));
+  let limit = staticLimit;
+  let basis = concurrencyBasis(settings);
+
+  // Narrow by what the machine ACTUALLY has right now, if anything measured it recently.
+  //
+  // Everything above this line is a prediction made once at startup from installed RAM and core
+  // count; it does not react to Chrome being resident, to an agent running away, or to the
+  // compressor thrashing. services/memoryAdmission caches a live reading (polled in App.tsx) so
+  // this gate — which must stay SYNCHRONOUS, because both spawn paths and several render paths
+  // call it — can consult one without awaiting anything.
+  //
+  // Strictly one-directional: the sample may only ever LOWER the ceiling. The `Math.min` against
+  // `staticLimit` is not redundant with the Rust side's `effective <= static_max` guarantee — it is
+  // the frontend refusing to let a backend bug, a version skew, or a tampered payload raise a
+  // ceiling that exists to stop the machine being jetsam-killed (sparkle-01xv / sparkle-asz5).
+  //
+  // No reading, a stale one, or `sampled: false` all mean "no basis to narrow" and leave the
+  // reading byte-for-byte as it was before this block existed. An unmeasured machine is not a
+  // squeezed one, and the failure mode of getting that backwards is refusing every spawn on the
+  // strength of an unrelated backend error.
+  const admission = currentMemoryAdmission();
+  if (admission && admission.sampled) {
+    const narrowed = Math.max(1, Math.min(staticLimit, Math.floor(admission.effective)));
+    if (narrowed < staticLimit) {
+      limit = narrowed;
+      // Take the sampled basis ONLY when it actually binds, so the refusal names memory instead of
+      // cores. A reading that agrees with the static ceiling must not relabel a CPU-bound machine
+      // as memory-bound — naming the wrong dimension is the exact bug `basis` exists to close, and
+      // it already sent one human chasing memory that was 94% free (roborev 54175).
+      basis = admission.basis?.trim() || basis;
+    }
+  }
+
+  return { used, live, limit, basis, atCapacity: used >= limit };
 }
 
 /**
@@ -153,4 +195,29 @@ export function atCapacitySentence(capacity: CapacityReading, lead: string): str
     `${lead} This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. ` +
     `The ceiling is ${capacity.basis}. Close or finish one before starting another.`
   );
+}
+
+/**
+ * One poll of the live memory reading. Called on an interval from `App.tsx`.
+ *
+ * This exists as a named function here, rather than as two lines inline in the effect, for one
+ * reason: **which count gets sent is a correctness decision, and inline in `App.tsx` it was not
+ * unit-testable.** It shipped wrong once (roborev 55383) — `used` instead of `live` — and nothing
+ * could have caught it, because the only assertion available was that some number was forwarded.
+ *
+ * `live`, not `used`. Rust's `sampled_admission` returns `in_use + available/per_agent`, adding
+ * `in_use` back because agents that are already running have already been subtracted from
+ * `available_bytes`. That premise is true only of agents that actually hold memory. `used` counts
+ * every row, including rows in project tabs the user has never opened — no PTY, no footprint — so
+ * crediting them with a per-agent share inflates the ceiling by `(used - live) × per_agent`, in the
+ * permissive direction, which stopped the available-memory bound from narrowing at all.
+ *
+ * Note the asymmetry with the gate below, which is deliberate: we ask the question in RESIDENT
+ * agents (what memory has actually been consumed) and enforce the answer against ROWS (`used >=
+ * limit`), because a dormant row becomes resident the moment its tab is clicked, with no gate in
+ * between. Sending `live` and comparing `used` is what makes the ceiling mean "agents this machine
+ * can hold" while still refusing rows it cannot hold one click later.
+ */
+export function pollMemoryAdmission(): Promise<void> {
+  return refreshMemoryAdmission(localAgentCapacity().live);
 }
