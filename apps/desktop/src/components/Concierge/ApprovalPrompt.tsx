@@ -23,7 +23,7 @@ import { FiAlertTriangle, FiCheck, FiRepeat, FiSettings, FiX } from "react-icons
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import type { ConciergeApproval } from "../../stores/conciergeApprovals";
 
-import { RADIUS, TYPE } from "../../theme/scale";
+import { FONT_MONO, RADIUS, TYPE } from "../../theme/scale";
 export interface ApprovalPromptProps {
   /** Every unanswered request, oldest first (stores/conciergeApprovals.pendingApprovals). */
   approvals: readonly ConciergeApproval[];
@@ -209,7 +209,7 @@ const riskPill: CSSProperties = {
 };
 
 const opName: CSSProperties = {
-  fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+  fontFamily: FONT_MONO,
   fontSize: TYPE.micro,
   color: C.conciergeMuted,
   minWidth: 0,
@@ -242,7 +242,7 @@ const argsBlock: CSSProperties = {
   borderRadius: 6,
   background: CHAT_USER_BUBBLE,
   fontSize: 12,
-  fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+  fontFamily: FONT_MONO,
 };
 
 const argKey: CSSProperties = { flex: "none", color: C.conciergeMuted, margin: 0 };

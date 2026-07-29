@@ -26,6 +26,7 @@
 // be added from here). They are therefore read from the spec data per resolved theme, which costs a
 // re-render on a theme flip. That re-render must never become a REMOUNT: a Terminal unmount kills
 // its PTY. `Terminal.blueprint.test.tsx` holds that line.
+import { FONT_MONO, FONT_UI } from "../theme/scale";
 import { BLUEPRINT } from "../theme/blueprintSpec";
 import type { ResolvedTheme } from "../theme/theme";
 
@@ -47,11 +48,18 @@ export const TERM_TYPE = { micro: 10, small: 12, body: 13, title: 17 } as const;
 export const TERM_RADIUS = { sm: 3, input: 4, modal: 6 } as const;
 
 /** `--k-mono` — anything monospaced in the pane's chrome (never the terminal BODY, which xterm
- *  renders in its own font stack). */
-export const TERM_MONO = 'ui-monospace, "SF Mono", Menlo, monospace';
+ *  renders in its own font stack).
+ *
+ *  RE-EXPORTED FROM THE TOKEN, not re-typed. These two were literal copies of `--k-mono` / `--k-ui`,
+ *  which is the drift `fontTokens.test.ts` exists to stop: the app once shipped IBM Plex Sans and
+ *  Verdana against a spec that uses the system face for both, and that single substitution is most
+ *  of why the running app read as a different product from the approved design. A second copy of a
+ *  stack is a second place for that to happen. The names stay so the pane's call sites keep reading
+ *  in terminal-plane vocabulary. */
+export const TERM_MONO = FONT_MONO;
 
 /** `--k-ui` — the system face the whole direction is set in. */
-export const TERM_UI = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+export const TERM_UI = FONT_UI;
 
 /** Primary ink ON the terminal plane. A separate register from the shell's `cream`. */
 export function termInk(resolved: ResolvedTheme): string {

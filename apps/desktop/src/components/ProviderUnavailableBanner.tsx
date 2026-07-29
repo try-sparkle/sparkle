@@ -9,6 +9,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL_DARK } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
+import { FONT_UI } from "../theme/scale";
 import {
   isOutageActive,
   useAiProviderStore,
@@ -54,7 +55,7 @@ const bar: CSSProperties = {
   padding: "6px 16px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   letterSpacing: 0.2,
 };
 

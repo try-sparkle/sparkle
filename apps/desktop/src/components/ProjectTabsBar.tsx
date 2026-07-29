@@ -44,7 +44,8 @@ import { pickProjectFolder, basename } from "../services/dialog";
 import { resolveOpenTarget } from "../services/openTarget";
 import { openProjectTab } from "../services/openProjectTab";
 import { closeProjectTab, closedProjects } from "../services/projectTabs";
-import { openProjectsOf } from "../engine/openProjects";
+import { isProjectOpen, openProjectsOf } from "../engine/openProjects";
+import { projectsOnSide, resolveSideSelection, sideOf } from "../engine/pairs";
 import type { ConciergeFeed } from "../services/conciergeFeed";
 import { tearOffTopLeft } from "./tabDrag";
 import { clampToScreen, hitTestPoint, monitorToRect, screenFor, type Rect } from "../helper/helperGeometry";
@@ -127,7 +128,15 @@ export function ProjectTabsBar({
   side?: PairSide;
 }) {
   const projects = useProjectStore((s) => s.projects);
-  const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
+  const globalSelectedProjectId = useProjectStore((s) => s.selectedProjectId);
+  // WHICH PROJECTS THIS STRIP SHOWS, and which of them is selected. A pair's strip lists ONLY that
+  // pair's projects: the tabs are the pair's, so a tab here must name something this pair can
+  // actually show. Listing all of them on both sides would let a click select a project whose panes
+  // are mounted in the OTHER stage — a sidebar full of agent rows with no terminal beside them.
+  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  const leftProjectId = useUiStore((s) => s.leftProjectId);
+  const setLeftProject = useUiStore((s) => s.setLeftProject);
+  const assignProjectToPair = useUiStore((s) => s.assignProjectToPair);
   const addProject = useProjectStore((s) => s.addProject);
   const reorderProject = useProjectStore((s) => s.reorderProject);
   const tornOut = useTornOutProjects();
@@ -144,14 +153,63 @@ export function ProjectTabsBar({
   // yet — every install upgrading into this) means "all of them", so the bar is unchanged until the
   // user actually closes something. See engine/openProjects.
   const openProjects = useMemo(
-    () => openProjectsOf(projects, openProjectIds),
-    [projects, openProjectIds],
+    () => projectsOnSide(openProjectsOf(projects, openProjectIds), pairAssignment, side),
+    [projects, openProjectIds, pairAssignment, side],
   );
+  // This strip's selection, validated against what this side actually holds — so a project that
+  // moved to the other pair stops reading as selected here rather than leaving both strips lit.
+  const selectedProjectId = resolveSideSelection(
+    side === "left" ? leftProjectId : globalSelectedProjectId,
+    openProjects,
+  );
+  // Selecting on the LEFT writes only the left slot. `selectedProjectId` in the project store keeps
+  // meaning "the current project" for the concierge feed, notifications, capture and satellite
+  // ownership — ten call sites that are about the app, not about a pair — so the left pair must not
+  // move it. That is also why `openProjectTab` (which sets it) is the RIGHT path only.
+  const selectOnThisSide = (id: string) => {
+    if (side === "left") setLeftProject(id);
+    else if (id !== globalSelectedProjectId) openProjectTab(id);
+  };
+  /**
+   * Open a project from THIS strip.
+   *
+   * Every "+" flow — the folder picker, the reopen list, Clone & Open — used to commit straight
+   * through `openProjectTab`, which lands a project on the RIGHT, so taken from the left strip the
+   * action visibly did nothing where it was performed (roborev 55149).
+   *
+   * `isNew` IS THE WHOLE SAFETY OF THIS FUNCTION, and the first version did not have it. Assigning
+   * unconditionally meant reopening a LEFT-assigned project from the right strip — which is easy to
+   * do, because the reopen list is not side-filtered and lists every closed project on both strips —
+   * yanked it into the right pair and discarded its stored side. Moving a project between pairs
+   * remounts its panes, and a Terminal unmount KILLS its PTY: so "undo a close" silently destroyed
+   * running terminals and a persisted layout choice, in the one affordance whose entire promise is
+   * that closing a tab keeps panes and PTYs alive (engine/openProjects). (roborev 55158)
+   *
+   * So: a project that is genuinely NEW has no side yet and adopts this strip's. One that already
+   * exists keeps the side it has, and `openProjectTab` routes it there.
+   */
+  const openFromThisStrip = (id: string, isNew: boolean) => {
+    // CLEAR HERE, not in `pickAndOpen`. All three strip-opening paths funnel through this — the
+    // folder picker, the reopen list and Clone & Open — and putting the clear one level up left the
+    // stale banner alive on the other two: refuse once, hit "+" again, reopen something from the
+    // list, and the banner still named a different project in the other pair. (roborev 55211)
+    setTearOffError(null);
+    if (isNew) assignProjectToPair(id, side);
+    openProjectTab(id);
+  };
   // The projects with no tab — offered for one-click reopen inside the "+" dialog, so closing is
   // never a one-way door that costs a trip through the folder picker to undo.
+  // FILTERED TO THIS STRIP. The list is what the "+" dialog offers to reopen, and
+  // `openFromThisStrip` routes an EXISTING project to the side it already lives on — so an
+  // unfiltered list advertises choices this strip cannot honour: reopening a right-side project
+  // from the LEFT strip opens the tab in the other pair, which is the "the action visibly does
+  // nothing where it was performed" defect all over again (roborev 55192). Filtering is the half of
+  // that fix the routing change did not cover.
   const reopenable = useMemo(
-    () => closedProjects(projects, openProjectIds),
-    [projects, openProjectIds],
+    // `projectsOnSide`, not a hand-rolled filter: it is the same partition the tab strip itself
+    // uses and is already pinned by engine/pairs.test.ts, so the two cannot drift apart.
+    () => projectsOnSide(closedProjects(projects, openProjectIds), pairAssignment, side),
+    [projects, openProjectIds, pairAssignment, side],
   );
 
   // Trial counter + Unlock, kept visible in the new chrome (parity #14). Same derivation and the
@@ -183,11 +241,55 @@ export function ProjectTabsBar({
   // Pop the native folder picker, map the folder to an existing project (reuse) or a brand-new one
   // (created only on commit, so a cancelled picker adds nothing), then select its tab.
   const pickAndOpen = async (title: string) => {
+    // A refusal must not outlive the situation it described: pick a different folder, that project
+    // opens correctly, and the banner still reads "Beta is open in the right pair" above it. The
+    // clear for the OPENING paths lives in `openFromThisStrip`; this one covers the case where the
+    // picker is cancelled or refuses again, so a previous refusal does not linger either.
+    // (roborev 55207)
+    setTearOffError(null);
     const picked = await pickProjectFolder(title);
     if (!picked) return;
     const target = resolveOpenTarget(picked, projects, basename);
+    // AN EXISTING PROJECT THAT LIVES IN THE OTHER PAIR HAS TO SAY SO.
+    //
+    // Unlike the reopen list, the picker cannot be filtered — the user chose a folder, and it maps
+    // to a project that already has a side. Committing silently would route the tab to the other
+    // pair, so the strip the user acted on visibly does nothing: the exact defect the reopen filter
+    // exists to prevent. Moving it here instead is not an option either — that remounts its panes
+    // and kills its PTYs (engine/pairs). So: say it, and leave the project where it is.
+    // (roborev 55196)
+    // REFUSE ONLY WHEN IT IS ACTUALLY OPEN OVER THERE.
+    //
+    // `sideOf` answers "which pair owns it", not "does it have a tab" — and it answers "right" for
+    // any project with no entry at all, which is every pre-existing one. Refusing on that alone told
+    // the user "X is already open in the other pair" about a project that was not open ANYWHERE, and
+    // broke a path that used to work: picking a closed project's folder from the left strip
+    // previously reopened its tab (in the right pair — visible, just not on this strip). A refusal
+    // string is an instruction the user will follow, so it has to describe a state that exists and
+    // name a way out (AGENTS.md). Closed → reopen it on its own side, as before. (roborev 55200)
+    if (
+      target.kind === "existing" &&
+      sideOf(pairAssignment, target.id) !== side &&
+      isProjectOpen(target.id, openProjectIds)
+    ) {
+      const name = projects.find((p) => p.id === target.id)?.name ?? "That project";
+      setTearOffError(
+        `${name} is open in the ${side === "left" ? "right" : "left"} pair — switch to that strip to see it.`,
+      );
+      return;
+    }
     const id = target.kind === "existing" ? target.id : addProject(target.name, target.path);
-    openProjectTab(id);
+    // `existing` keeps whatever side it is already on — see openFromThisStrip.
+    openFromThisStrip(id, target.kind !== "existing");
+    // SAY WHERE IT WENT. Reopening a closed project on its own side is right — moving it would kill
+    // its PTYs — but doing it SILENTLY from this strip is the very defect the reopen list is
+    // side-filtered to prevent: the tab appears in the other pair and the strip the user acted on
+    // shows nothing. The banner is `role="status"` and click-to-dismiss, so it carries an
+    // informational line fine. (roborev 55207)
+    if (target.kind === "existing" && sideOf(pairAssignment, target.id) !== side) {
+      const name = projects.find((p) => p.id === target.id)?.name ?? "That project";
+      setTearOffError(`${name} reopened in the ${side === "left" ? "right" : "left"} pair.`);
+    }
   };
 
   // Pull a tab clear of the strip → that project gets its own OS window showing columns ② + ③
@@ -215,6 +317,10 @@ export function ProjectTabsBar({
     <div className="ptabstrip" data-side={side} data-testid="project-tabs-strip">
       <ProjectTabs
         projects={openProjects.map((p) => ({ id: p.id, name: p.name }))}
+        // The left strip paints right-to-left (index.css `.ptabstrip[data-side="left"]`), so the
+        // drag resolver has to be told: it compares screen x against tabs given in ARRAY order, and
+        // those two disagree exactly when the flow is reversed.
+        reversed={side === "left"}
         selectedProjectId={selectedProjectId}
         pinnedProjectId={pinnedProjectId}
         countsByProject={countsFromFeed(feed)}
@@ -236,8 +342,15 @@ export function ProjectTabsBar({
         // Doing both costs nothing — the window comes forward, and the recovery stays reachable
         // behind it.
         onSelect={(id) => {
+          // The banner clears on the GESTURE, not on the navigation. The "reopened in the other
+          // pair" line is an EVENT written into a STATE banner with no timeout and no dismissal but
+          // a click, so it needs a next-deliberate-act expiry — and a re-click of the current tab is
+          // still that act, while the guard below deliberately treats it as no navigation. Clearing
+          // inside `selectOnThisSide` would therefore miss it, which also made the single-tab case
+          // untestable. (roborev 55211)
+          setTearOffError(null);
           if (tornOut.has(id)) void focusSatellite(id);
-          if (id !== selectedProjectId) openProjectTab(id);
+          if (id !== selectedProjectId) selectOnThisSide(id);
         }}
         onTogglePin={togglePinnedProject}
         onOpenSettings={(id) => {
@@ -252,6 +365,8 @@ export function ProjectTabsBar({
               <OpenPrMenu
                 rootPath={project.rootPath ?? null}
                 resolveAgent={resolveAgentForPr}
+                // A PR's agent may live in EITHER pair's project, so this one must NOT force the
+                // project into this strip — it routes by the existing assignment.
                 onOpenAgent={(link) => openProjectTab(link.projectId, link.agentId)}
               />
             )}
@@ -293,10 +408,12 @@ export function ProjectTabsBar({
           reopenable={reopenable.map((p) => ({ id: p.id, name: p.name, rootPath: p.rootPath }))}
           onReopen={(id) => {
             setNewProjectOpen(false);
-            openProjectTab(id);
+            // REOPEN IS NOT A MOVE. This project already exists and already has a side; taking it
+            // over would kill its PTYs (see openFromThisStrip).
+            openFromThisStrip(id, false);
           }}
           // Clone & Open: create + select the cloned project's tab (no window question to ask).
-          onCloned={(name, path) => openProjectTab(addProject(name, path))}
+          onCloned={(name, path) => openFromThisStrip(addProject(name, path), true)}
         />
       )}
     </div>

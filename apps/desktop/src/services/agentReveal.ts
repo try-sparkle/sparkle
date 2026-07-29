@@ -31,10 +31,13 @@ export function selectAndOpen(projectId: string, agentId: string): void {
   // the next × treats a selection with no tab as stale and yanks the user elsewhere
   // (engine/openProjects.selectionAfterClose).
   //
-  // It lives HERE, in the shared seam, rather than in the callers, because the callers only reopen
-  // CONDITIONALLY: useAttentionNotifications guards its `setProject` with `p.projectId !== mine`
-  // (:504 and :525), so a reveal into a project that is ALREADY selected but closed reopened
-  // nothing. That case is reachable, not theoretical — requestProjectTabFromOtherWindow writes
+  // It lives HERE, in the shared seam, rather than in the callers, because a caller's own reopen is
+  // not guaranteed to run. useAttentionNotifications USED to guard its `setProject` with
+  // `p.projectId !== mine`, so a reveal into a project that was ALREADY selected but closed reopened
+  // nothing. Both of its branches now write unconditionally through `selectProjectOnItsSide` — which
+  // is idempotent — so that particular hole is closed at the source; this call stays because the
+  // seam should not depend on every future caller remembering. The race it was written for is
+  // reachable, not theoretical — requestProjectTabFromOtherWindow writes
   // `selectedProjectId` before emitting `focus-agent`, and projectStore IS cross-window synced with
   // synchronous storage, so the main window can already be on that project when the event lands.
   // Repro: close Beta's tab, then click Beta's agent row in the tray popover.

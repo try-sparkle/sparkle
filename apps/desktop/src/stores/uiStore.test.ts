@@ -407,6 +407,16 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // project open), which is serializable, so it shows up in the blob from the very first write.
     "openProjectIds",
     "pinnedProjectId",
+    // The second pair (engine/pairs). WHICH SIDE of the concierge each project sits on is a
+    // deliberate arrangement of the workspace, not a transient view state, so it survives a
+    // relaunch — otherwise every launch would silently collapse the cockpit back to one pair and
+    // remount the left pair's terminals, killing their PTYs. The map is sparse and left-only, so
+    // an install that has never used the left pair persists `{}` and reads as the single-pair
+    // layout it had.
+    "pairAssignment",
+    // …and which project that pair is showing, for the same reason: restoring the pair but not its
+    // selection would reopen it on an arbitrary project.
+    "leftProjectId",
     "themePref",
     "zoom",
   ];

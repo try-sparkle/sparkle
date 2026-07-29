@@ -1,7 +1,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiCloud, FiX } from "react-icons/fi";
 import { C, DANGER, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import type { Project } from "../types";
 import { useUiStore } from "../stores/uiStore";
@@ -245,7 +245,7 @@ const dialog: CSSProperties = {
   zIndex: 61,
   display: "flex",
   flexDirection: "column",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const titleBar: CSSProperties = {
@@ -297,7 +297,7 @@ const fieldBase: CSSProperties = {
   borderRadius: RADIUS.input,
   padding: "8px 10px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const input: CSSProperties = fieldBase;
@@ -314,7 +314,7 @@ const actionBtn: CSSProperties = {
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const primaryBtn: CSSProperties = {

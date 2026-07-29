@@ -47,6 +47,19 @@ export interface TabDragInput {
    *  safe default to fall back on. Latch it to true on the first non-idle result and leave it set
    *  for the rest of the gesture; reset only on pointer-up/cancel. */
   dragging: boolean;
+  /**
+   * Is this strip painted RIGHT-TO-LEFT? True for the left pair, whose `.ptabstrip[data-side="left"]`
+   * sets `flex-direction: row-reverse` so the active tab hugs the centre on both sides.
+   *
+   * It has to be told, not guessed. `tabs` arrives in ARRAY order while the comparison below is on
+   * SCREEN x, and those two disagree exactly when the flow is reversed — so without this the
+   * midpoint scan walks the strip backwards and a dragged tab lands in the mirror image of the slot
+   * the user aimed at. Deriving it from the rects instead would need two tabs to see any ordering,
+   * and a one-tab strip is a real state.
+   *
+   * Optional, defaulting to false: every existing caller is a left-to-right strip.
+   */
+  reversed?: boolean;
 }
 
 export interface TabDragOpts {
@@ -74,11 +87,25 @@ export type TabDragResult =
  * `reorderAgent`. Filtering it out here would instead report the NEIGHBOUR's slot, i.e. a real
  * move, for a drag that went nowhere.
  */
-function insertionBefore(pointerX: number, tabs: readonly TabRect[]): string | null {
-  for (const t of tabs) {
-    if (pointerX < t.x + t.width / 2) return t.id;
+function insertionBefore(
+  pointerX: number,
+  tabs: readonly TabRect[],
+  reversed = false,
+): string | null {
+  // Scan in VISUAL order — the order the midpoints actually appear across the screen — then map the
+  // slot back to an ARRAY position, which is what `beforeId` means to `reorderProject`.
+  //
+  // For a normal strip the two coincide and this is the original loop. For a reversed one, visual
+  // slot k sits between v[k-1] and v[k] where v[k] === tabs[n-1-k], so dropping to the LEFT of v[k]
+  // is dropping AFTER tabs[n-1-k] in the array — i.e. BEFORE tabs[n-k]. The two ends fall out of
+  // that same expression: k = 0 (far left, visually first) gives tabs[n], which is undefined and
+  // therefore "append", and running off the end (far right, visually last) gives tabs[0].
+  const n = tabs.length;
+  for (let k = 0; k < n; k++) {
+    const t = reversed ? tabs[n - 1 - k]! : tabs[k]!;
+    if (pointerX < t.x + t.width / 2) return reversed ? (tabs[n - k]?.id ?? null) : t.id;
   }
-  return null;
+  return reversed ? (tabs[0]?.id ?? null) : null;
 }
 
 /** Is the point outside `rect` grown by `margin` on every side? Inclusive at the boundary, so a
@@ -103,7 +130,10 @@ export function resolveTabDrag(input: TabDragInput, o: TabDragOpts): TabDragResu
 
   if (outside(input.pointer, input.strip, o.tearMargin)) return { kind: "tearoff" };
 
-  return { kind: "reorder", beforeId: insertionBefore(input.pointer.x, input.tabs) };
+  return {
+    kind: "reorder",
+    beforeId: insertionBefore(input.pointer.x, input.tabs, input.reversed),
+  };
 }
 
 /**

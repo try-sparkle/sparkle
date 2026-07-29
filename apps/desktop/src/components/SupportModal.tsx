@@ -10,7 +10,7 @@
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, CHAT_USER_BUBBLE, ON_GOLD_FILL } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { Markdown } from "./Markdown";
 import { getIdentities } from "../services/accountStore";
@@ -280,7 +280,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                           borderRadius: 4,
                           padding: "3px 10px",
                           fontSize: 12,
-                          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                          fontFamily: FONT_UI,
                           cursor: "pointer",
                         }}
                       >
@@ -325,7 +325,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               padding: "8px 10px",
               color: C.cream,
               fontSize: 13,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               lineHeight: 1.4,
             }}
           />
@@ -345,7 +345,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               padding: "0 14px",
               fontSize: 13,
               fontWeight: 600,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: !input.trim() || chatBusy ? "default" : "pointer",
               opacity: !input.trim() || chatBusy ? 0.5 : 1,
             }}
@@ -373,7 +373,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                 padding: "8px 10px",
                 color: C.cream,
                 fontSize: 13,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
               }}
             />
           )}
@@ -393,7 +393,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               padding: "9px 14px",
               fontSize: 13,
               fontWeight: 600,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: ticketBusy ? "default" : "pointer",
               opacity: ticketBusy ? 0.6 : 1,
             }}
@@ -449,7 +449,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               border: "none",
               color: C.cream,
               fontSize: 12,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               outline: "none",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -468,7 +468,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               borderRadius: RADIUS.input,
               padding: "4px 10px",
               fontSize: 12,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: "pointer",
               whiteSpace: "nowrap",
             }}
@@ -494,7 +494,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               padding: "10px 14px",
               fontSize: 13,
               fontWeight: 600,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: "pointer",
             }}
           >
@@ -511,7 +511,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               borderRadius: RADIUS.input,
               padding: "10px 16px",
               fontSize: 13,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: "pointer",
             }}
           >

@@ -49,6 +49,8 @@ export interface ProjectTabsProps {
    *  tab bar was. */
   onClose?: (projectId: string) => void;
   onAddProject?: () => void;
+  /** Is this strip painted right-to-left (the left pair)? Feeds the drag resolver — see tabDrag. */
+  reversed?: boolean;
   /** Top-right cluster (kebab menu + avatar) rendered flush-right in the tab bar. */
   topRight?: ReactNode;
   /** Drop a dragged tab into a new slot. `beforeId` is the tab to insert before; null = append.
@@ -217,6 +219,7 @@ export function ProjectTabs({
   onOpenSettings,
   onClose,
   onAddProject,
+  reversed = false,
   topRight,
   onReorder,
   onTearOff,
@@ -295,6 +298,7 @@ export function ProjectTabs({
         tabs: m.tabs,
         draggedId: g.projectId,
         dragging: g.dragging,
+        reversed,
       },
       { slop: DRAG_SLOP, tearMargin: TEAR_MARGIN },
     );

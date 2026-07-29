@@ -9,6 +9,7 @@ import type { Runtime } from "../types";
 // type import is erased at compile time, so it can't. The default below is spelled inline for the
 // same reason (rather than calling allBandsVisible()).
 import type { StatusBand } from "../engine/buildSections";
+import { assignToSide, pruneAssignment, type PairSide } from "../engine/pairs";
 
 // Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
 // on a component file — SettingsDialog imports and re-exports it for its own consumers.
@@ -281,6 +282,25 @@ interface UiState {
   // closed the last tab". The rules live in the engine; the store just holds the value.
   openProjectIds: string[] | null;
   setOpenProjectIds: (ids: string[]) => void;
+  // WHICH PAIR EACH PROJECT LIVES IN (engine/pairs). The cockpit's full form is
+  // `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`; the app shipped the right half, and this is what
+  // makes the left half real. SPARSE and left-only: an absent entry means "right", so an existing
+  // install with no map renders exactly the single-pair layout it had, and "empty map" and "no left
+  // pair" are the same state — there is no way to persist a left pair with nothing in it.
+  // Persisted, because which side a project sits on is a deliberate arrangement of the user's
+  // workspace, not a transient view state. The rules live in the engine; the store holds the value.
+  pairAssignment: Record<string, PairSide>;
+  /** Move a project to a side. A no-op assignment must not churn the map — see engine/pairs. */
+  assignProjectToPair: (projectId: string, side: PairSide) => void;
+  /** Drop entries for projects that no longer exist, so a stale one cannot strand an empty pair. */
+  prunePairAssignment: (projects: readonly { id: string }[]) => void;
+  // The LEFT pair's selected project. The right pair's selection stays `projectStore.selectedProjectId`
+  // — deliberately, because that value means "the current project" to ten other call sites
+  // (notifications, capture, satellite ownership, the concierge feed) and re-pointing it at a
+  // two-sided concept would change all of them. So: right keeps the existing meaning, left gets its
+  // own slot, and `resolveSideSelection` validates each against what its side actually holds.
+  leftProjectId: string | null;
+  setLeftProject: (id: string | null) => void;
   // Whether the user has ✕'d the "$0 credit balance" banner (see ZeroCreditBanner). Transient —
   // NOT persisted (see partialize), so the warning returns on the next launch: the balance is
   // still zero and the AI extras are still dark, which the user deserves to be reminded of.
@@ -474,6 +494,23 @@ export const useUiStore = create<UiState>()(
       setPinnedProject: (id) => set({ pinnedProjectId: id }),
       openProjectIds: null,
       setOpenProjectIds: (ids) => set({ openProjectIds: ids }),
+      pairAssignment: {},
+      // Both of these apply an engine reducer and set the RESULT, which returns the same object for
+      // a no-op. That identity is load-bearing, not tidiness: `Workspace` partitions its live pane
+      // list through this map, so a fresh-but-equal object re-renders the stages and REMOUNTS panes
+      // that never moved — and a Terminal unmount kills its PTY.
+      assignProjectToPair: (projectId, side) =>
+        set((s) => {
+          const next = assignToSide(s.pairAssignment, projectId, side);
+          return next === s.pairAssignment ? {} : { pairAssignment: next };
+        }),
+      prunePairAssignment: (projects) =>
+        set((s) => {
+          const next = pruneAssignment(s.pairAssignment, projects);
+          return next === s.pairAssignment ? {} : { pairAssignment: next };
+        }),
+      leftProjectId: null,
+      setLeftProject: (id) => set({ leftProjectId: id }),
       zeroCreditBannerDismissed: false,
       zeroCreditBannerDismissedFor: null,
       conciergeCopyOnSelection: true,

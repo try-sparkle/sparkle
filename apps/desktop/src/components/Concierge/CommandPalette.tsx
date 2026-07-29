@@ -23,6 +23,7 @@ import { useHistoryStore } from "../../stores/historyStore";
 import type { HistoryHit, RetentionTier } from "../../services/history";
 import { relativeTime, renderSnippet } from "../HistorySearch";
 import { defaultJumpDeps, jumpToHit, type JumpOutcome } from "./paletteJump";
+import { FONT_UI } from "../../theme/scale";
 
 /** Shown on a row whose source agent no longer exists (closing an agent deletes its worktree,
  *  so there's nothing to reopen — say so honestly, same wording as HistorySearch). */
@@ -199,7 +200,7 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
         alignItems: "flex-start",
         paddingTop: "12vh",
         background: "rgba(2, 6, 18, 0.55)",
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <div
@@ -400,7 +401,7 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
         display: "inline-flex",
         gap: 5,
         alignItems: "center",
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <FiSearch size={12} aria-hidden />

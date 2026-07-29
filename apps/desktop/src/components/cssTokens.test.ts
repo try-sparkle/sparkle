@@ -64,12 +64,15 @@ describe("index.css spends the same tokens the TSX does", () => {
 });
 
 // ── THE INDIRECTION RATCHET ────────────────────────────────────────────────────────────────────
-// `packages/ui`'s `FONT` export is the pre-spec webfonts. Its two remaining consumers are owned by
-// other branches, so this is a ratchet rather than a ban — but "deferred" and "invisible" are
-// different things, and leaving nothing that can see a THIRD consumer being added is what turns a
-// deferral into a hole. Lowering this count IS the migration record; when it reaches 0, retire
-// `FONT` from `packages/ui` in the same PR.
-const MAX_FONT_INDIRECTION = 2;
+// `packages/ui`'s `FONT` export is the pre-spec webfonts — `FONT.mono` is literally
+// `'"Source Code Pro", monospace'`. It sat at 2 because its two consumers were owned by other
+// branches; that rationale expired when the font sweep landed, and those two sites were the ONLY
+// places in the app still rendering a replaced webfont. Leaving them while `fontTokens`'s ceilings
+// read 0 would have made "0" mean "no more retyped STRINGS" while the visible defect those ceilings
+// exist to prevent was still on screen — a guard whose number reads finished and is not
+// (roborev 55159). Both now use `FONT_MONO`, so this is 0 and `FONT` has no consumers left in the
+// desktop app; retire it from `packages/ui` when nothing else imports it.
+const MAX_FONT_INDIRECTION = 0;
 
 function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -94,7 +97,9 @@ describe("nothing new reaches the old webfonts through @sparkle/ui's FONT", () =
       `${hits.length} references to @sparkle/ui's FONT vs ceiling ${MAX_FONT_INDIRECTION}. That ` +
         `token still holds "IBM Plex Sans" / "Source Code Pro" — the faces the spec replaced — so a ` +
         `reference here renders a webfont no ratchet can see. Use FONT_UI / FONT_MONO from ` +
-        `theme/scale. Known, and owned by other branches: Workspace.tsx, AgentSidebar.tsx.\n${hits.join("\n")}`,
+        `theme/scale. There is no sanctioned baseline any more — the last two references ` +
+        `(Workspace.tsx, AgentSidebar.tsx) were migrated when the ceiling went to 0, so anything ` +
+        `listed below is new.\n${hits.join("\n")}`,
     ).toBeLessThanOrEqual(MAX_FONT_INDIRECTION);
   });
 });

@@ -95,8 +95,9 @@ import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
-import { resetVisitedProjects } from "../services/sessionProjects";
+import { markProjectVisited, resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { openProjectTab } from "../services/openProjectTab";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(id: string): AgentTab {
@@ -122,6 +123,7 @@ beforeEach(() => {
   useRuntimeStore.setState({ openAgentIds: ["a1"], status: {} } as never);
   useUiStore.setState({
     activeSpecial: null, workMode: "build", pinnedProjectId: null, openProjectIds: null,
+    pairAssignment: {}, leftProjectId: null,
   } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);
   useAuthStore.setState({ me: null, tokenPresent: false, loading: false } as never);
@@ -332,5 +334,184 @@ describe("wiring and the overlay cannot both be true", () => {
     act(() => useCableStore.getState().overlayTo("assist"));
     expect(shell().getAttribute("data-wired")).toBe("off");
     expect(shell().getAttribute("data-over")).toBe("assist");
+  });
+});
+
+// ── 5. THE SECOND PAIR ────────────────────────────────────────────────────────────────────────
+//
+// The left half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. The interesting assertions here are
+// not "does a second column appear" — they are about OWNERSHIP: a project's panes must be mounted
+// in exactly one stage. Zero means dead terminals under a live tab; two means two xterms on one
+// PTY, which is what `pty_spawn`'s `sessions.insert` orphans a child process over.
+describe("the second pair", () => {
+  /** Two projects, both visited so both sets of panes are eligible to mount. */
+  const twoProjects = () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "Alpha", [mkAgent("a1")], "a1"),
+        mkProject("p2", "Beta", [mkAgent("a2")], "a2"),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({ openAgentIds: ["a1", "a2"], status: {} } as never);
+    markProjectVisited("p1");
+    markProjectVisited("p2");
+  };
+  const sendLeft = (id: string) =>
+    act(() => useUiStore.getState().assignProjectToPair(id, "left"));
+
+  it("renders ONE pair until something is assigned to the left", () => {
+    // The upgrade path: an install that has never used the left pair must get byte-identical
+    // layout to the shell it had, which is what the sparse "absent means right" map buys.
+    twoProjects();
+    render(<Workspace />);
+    expect(shell().getAttribute("data-pairs")).toBe("1");
+    expect(screen.queryByTestId("pair-left")).toBeNull();
+  });
+
+  it("renders the left pair as soon as a project is sent there", () => {
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    expect(shell().getAttribute("data-pairs")).toBe("2");
+    expect(screen.getByTestId("pair-left")).toBeTruthy();
+  });
+
+  // THE INVARIANT. Not "the left pane exists" — that would pass with the pane rendered in both
+  // stages, which is the failure mode that costs a user their terminal.
+  it("mounts each project's panes in EXACTLY ONE stage", () => {
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+
+    // Exactly one of each — never two.
+    expect(screen.getAllByTestId("pane-a1")).toHaveLength(1);
+    expect(screen.getAllByTestId("pane-a2")).toHaveLength(1);
+    // …and each in ITS OWN pair's stage.
+    const left = screen.getByTestId("terminal-stage-left");
+    const right = screen.getByTestId("terminal-stage");
+    expect(left.contains(screen.getByTestId("pane-a2"))).toBe(true);
+    expect(left.contains(screen.getByTestId("pane-a1"))).toBe(false);
+    expect(right.contains(screen.getByTestId("pane-a1"))).toBe(true);
+    expect(right.contains(screen.getByTestId("pane-a2"))).toBe(false);
+  });
+
+  it("gives each pair its own tab strip, listing only that pair's projects", () => {
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    const leftPair = screen.getByTestId("pair-left");
+    const rightPair = screen.getByTestId("pair-right");
+    // A tab naming a project the OTHER pair holds would let a click select a project whose panes
+    // are mounted in the other stage — agent rows with no terminal beside them.
+    expect(leftPair.textContent).toContain("Beta");
+    expect(leftPair.textContent).not.toContain("Alpha");
+    expect(rightPair.textContent).toContain("Alpha");
+    expect(rightPair.textContent).not.toContain("Beta");
+  });
+
+  it("collapses back to one pair when the last left project is sent back", () => {
+    // Derived from the assignment map, so "an empty left pair" is unrepresentable rather than a
+    // state someone has to remember to clean up.
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    expect(shell().getAttribute("data-pairs")).toBe("2");
+    act(() => useUiStore.getState().assignProjectToPair("p2", "right"));
+    expect(shell().getAttribute("data-pairs")).toBe("1");
+    expect(screen.queryByTestId("pair-left")).toBeNull();
+    // The panes came back rather than vanishing with the pair.
+    expect(screen.getAllByTestId("pane-a2")).toHaveLength(1);
+  });
+
+  it("does not let the left pair move the app-wide current project", () => {
+    // `selectedProjectId` means "the current project" to the concierge feed, notifications, capture
+    // and satellite ownership. The left pair having its own slot is what keeps those ten call sites
+    // meaning what they meant.
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  it("drops a stale assignment when its project is gone", () => {
+    // Otherwise the entry keeps the pair open forever with no tab in it and no way to close it.
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    expect(shell().getAttribute("data-pairs")).toBe("2");
+    act(() => {
+      useProjectStore.setState({
+        projects: [mkProject("p1", "Alpha", [mkAgent("a1")], "a1")],
+        selectedProjectId: "p1",
+      } as never);
+    });
+    expect(shell().getAttribute("data-pairs")).toBe("1");
+    expect(useUiStore.getState().pairAssignment).toEqual({});
+  });
+
+  // THE RELAUNCH SHAPE — the bug the tests above could not see, because `twoProjects()` marks both
+  // projects visited by hand and so pre-satisfies the mount gate. `pairAssignment`/`leftProjectId`
+  // are PERSISTED; the visited set is module-level and is NOT. So a cold launch restores a left pair
+  // whose strip and sidebar are full while its stage is blank, and no click can repair it because
+  // the gate is per PROJECT. (roborev 55149)
+  it("mounts the left pair's panes on a cold launch, with nothing visited", () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "Alpha", [mkAgent("a1")], "a1"),
+        mkProject("p2", "Beta", [mkAgent("a2")], "a2"),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({ openAgentIds: ["a1", "a2"], status: {} } as never);
+    // Exactly what a relaunch looks like: assignment restored from the blob, visited set empty.
+    resetVisitedProjects();
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: "p2" } as never);
+
+    render(<Workspace />);
+
+    expect(screen.getByTestId("pair-left")).toBeTruthy();
+    const left = screen.getByTestId("terminal-stage-left");
+    expect(left.contains(screen.getByTestId("pane-a2"))).toBe(true);
+  });
+
+  // Every cross-app "show me this project" path funnels through `openProjectTab` — notifications,
+  // the palette, history, the concierge and its tools. Before this it always wrote the RIGHT pair's
+  // selection, so revealing a left-pair agent either did nothing or yanked the right pair away.
+  it("routes a reveal of a left-assigned project INTO the left pair", () => {
+    twoProjects();
+    render(<Workspace />);
+    sendLeft("p2");
+    act(() => useProjectStore.getState().selectProject("p1"));
+    act(() => openProjectTab("p2"));
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
+    // …and it did NOT drag the right pair off its own project.
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  // Assigning alone left the destination pair's selection where it was, so sending a SECOND project
+  // across mounted its panes invisibly and the control read as "does nothing but grow a tab".
+  it("moves the selection with the project", () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "Alpha", [mkAgent("a1")], "a1"),
+        mkProject("p2", "Beta", [mkAgent("a2")], "a2"),
+        mkProject("p3", "Gamma", [mkAgent("a3")], "a3"),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({ openAgentIds: ["a1", "a2", "a3"], status: {} } as never);
+    markProjectVisited("p1");
+    markProjectVisited("p2");
+    markProjectVisited("p3");
+    render(<Workspace />);
+    sendLeft("p2");
+    act(() => openProjectTab("p2"));
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
+    // Now send a second one across; the left pair must follow it rather than stay on Beta.
+    sendLeft("p3");
+    act(() => openProjectTab("p3"));
+    expect(useUiStore.getState().leftProjectId).toBe("p3");
+    expect(screen.getByTestId("terminal-stage-left").contains(screen.getByTestId("pane-a3"))).toBe(true);
   });
 });

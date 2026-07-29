@@ -12,7 +12,7 @@
 import { useState, type CSSProperties } from "react";
 import { FiGithub, FiLock, FiGlobe, FiSearch, FiLoader, FiChevronLeft } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { signInHandoff } from "../services/trialUnlock";
 import { pickProjectFolder } from "../services/dialog";
@@ -39,7 +39,7 @@ const tabBtn = (active: boolean): CSSProperties => ({
   cursor: "pointer",
   fontSize: 13,
   fontWeight: active ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 });
 
 const primaryBtn: CSSProperties = {
@@ -51,7 +51,7 @@ const primaryBtn: CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   display: "inline-flex",
   alignItems: "center",
   gap: 8,
@@ -65,7 +65,7 @@ const secondaryBtn: CSSProperties = {
   padding: "9px 14px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const inputStyle: CSSProperties = {
@@ -77,7 +77,7 @@ const inputStyle: CSSProperties = {
   borderRadius: RADIUS.input,
   padding: "9px 12px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 /** A project that exists but has no tab — offered for one-click reopen on the folder tab. */
@@ -219,7 +219,7 @@ function FolderTab({
                   cursor: "pointer",
                   color: C.cream,
                   fontSize: 13,
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
                 }}
               >
                 <span style={{ fontWeight: FONT_WEIGHT.semibold }}>{p.name}</span>
@@ -383,7 +383,7 @@ function RepoRow({ repo, onSelect }: { repo: GithubRepo; onSelect: () => void })
         padding: "10px 12px",
         cursor: "pointer",
         textAlign: "left",
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <span style={{ marginTop: 2, color: C.muted, flex: "0 0 auto" }} title={repo.private ? "Private" : "Public"}>

@@ -89,6 +89,7 @@ import { routeMessage } from "../services/conciergeRouter";
 import { mentionFreeText, rosterFromMentions, type ConciergeMention } from "./Concierge/mentions";
 import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
+import { useCableStore } from "../stores/cableStore";
 import { useUiStore } from "../stores/uiStore";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
@@ -563,6 +564,8 @@ export function ConciergeHost({
   /** The shell's ⌘K palette trigger, rendered under the scope/vitals line (PRD §4). */
   searchSlot?: ReactNode;
 }) {
+  // Which side the cable is patched into, or "off". Drives the column's flood + lift.
+  const wired = useCableStore((s) => s.wired);
   // Latest feed for the event handlers (send/nudge actions), which run after render.
   const feedRef = useRef(feed);
   // The thread's arrival ledger: which message ids have been seen, and in what order. A REF, not
@@ -2357,6 +2360,14 @@ export function ConciergeHost({
         model={model}
         controller={controller}
         width={width}
+        // THE CABLE. `ConciergeColumn` has carried the flood and the lift since the cockpit landed,
+        // keyed off this prop — and NOTHING PASSED IT, so it defaulted to "off" and both treatments
+        // were dead code. Wiring an agent changed the shell root's `data-wired` and the two CSS
+        // seam rules, and the column itself never learned: no flood, no shadow, no drop to flush.
+        // Read from the store here rather than threaded down from Workspace because this host is
+        // where the column's other live state already comes from, and `engine/cable` is the one
+        // holder of the value (MAPPING.md: `data-wired` must not become scattered component state).
+        wired={wired}
         searchSlot={searchSlot}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's
         // own onCancel (which restores the files and posts to the thread), so the controller here

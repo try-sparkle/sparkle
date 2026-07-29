@@ -11,7 +11,11 @@ vi.mock("./attention", () => ({
   emitSelectProject: (p: unknown) => emitSelectProject(p),
 }));
 
-import { openProjectTab, requestProjectTabFromOtherWindow } from "./openProjectTab";
+import {
+  openProjectTab,
+  requestProjectTabFromOtherWindow,
+  selectProjectOnItsSide,
+} from "./openProjectTab";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -200,5 +204,79 @@ describe("requestProjectTabFromOtherWindow", () => {
     expect(useProjectStore.getState().selectedProjectId).toBe("p1");
     expect(emitFocusAgent).not.toHaveBeenCalled();
     expect(emitSelectProject).not.toHaveBeenCalled();
+  });
+});
+
+// ── THE SECOND PAIR ───────────────────────────────────────────────────────────────────────────
+//
+// `selectProject` writes the RIGHT pair's selection. Every cross-app "show me this project" path
+// funnels through here, so before the left pair existed that one write was the whole job. For a
+// LEFT-assigned project it is now actively wrong: the Workspace's reconcile effect snaps
+// `selectedProjectId` back a commit later and `leftProjectId` never moves, so the reveal is
+// invisible and the caller believes it succeeded. (roborev 55149 / 55158)
+describe("side-aware routing (engine/pairs)", () => {
+  it("selects a LEFT-assigned project in the left pair, not the right", () => {
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: null } as never);
+    openProjectTab("p2");
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
+  });
+
+  it("does NOT move the app-wide current project when routing left", () => {
+    // `selectedProjectId` means "the current project" to the concierge feed, notifications, capture
+    // and satellite ownership. A left-pair reveal must leave all of them alone.
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: null } as never);
+    openProjectTab("p2");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  it("still writes selectedProjectId for an unassigned project", () => {
+    // The upgrade path: with no assignment map every project is on the right and this behaves
+    // exactly as it always did.
+    useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never);
+    openProjectTab("p2");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+    expect(useUiStore.getState().leftProjectId).toBe(null);
+  });
+});
+
+// ── THE SHARED SEAM ───────────────────────────────────────────────────────────────────────────
+//
+// `selectProjectOnItsSide` is the ONE place the side rule lives. It was extracted because the rule
+// had been copy-pasted at four call sites — `openProjectTab`, `useReplaceCurrentProject`,
+// `buildAgentSpawn` and the concierge `select_project` tool — which is verbatim what
+// `openProjectTab`'s own comment forbids, and the prediction in that comment came true immediately:
+// the reopen path was the copy nobody remembered. These pin the seam itself, so a fifth writer that
+// calls it inherits the behaviour rather than re-deriving it. (roborev 55192)
+describe("selectProjectOnItsSide", () => {
+  it("writes the LEFT slot for a left-assigned project", () => {
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: null } as never);
+    selectProjectOnItsSide("p2");
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
+    // …and leaves the app-wide current project — the concierge feed, notifications, capture and
+    // satellite ownership all read it — exactly where it was.
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+  });
+
+  it("writes selectedProjectId for a right-assigned project", () => {
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: null } as never);
+    selectProjectOnItsSide("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p1");
+    expect(useUiStore.getState().leftProjectId).toBe(null);
+  });
+
+  it("treats an unassigned project as right — the upgrade path", () => {
+    useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never);
+    selectProjectOnItsSide("p2");
+    expect(useProjectStore.getState().selectedProjectId).toBe("p2");
+    expect(useUiStore.getState().leftProjectId).toBe(null);
+  });
+
+  it("is idempotent, so callers need no guard of their own", () => {
+    // The notification handler's `p.projectId !== mine` guard was removed on this promise: `mine` is
+    // the RIGHT pair's selection, so for a left-assigned project it compared against the wrong slot
+    // and skipped the write entirely — a dead click on a tray row.
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: "p2" } as never);
+    selectProjectOnItsSide("p2");
+    expect(useUiStore.getState().leftProjectId).toBe("p2");
   });
 });

@@ -4,7 +4,7 @@
 // the per-tab P0/P1 badges come from the concierge feed, "+" opens a project by selecting its TAB
 // (never a window), and the project-settings entry TopBar's project button used to own still exists.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const pickProjectFolder = vi.fn(async (_title?: string) => "/tmp/picked" as string | null);
 vi.mock("../services/dialog", () => ({
@@ -23,11 +23,24 @@ vi.mock("../services/openProjectTab", () => ({
 vi.mock("./Concierge/KebabMenu", () => ({ ConciergeTopRight: () => <div data-testid="topright" /> }));
 vi.mock("./OpenPrMenu", () => ({ OpenPrMenu: () => null, agentLinkForBranch: () => null }));
 vi.mock("./TrialChrome", () => ({ TrialIndicator: () => <div data-testid="trial" /> }));
+// `onReopen` is rendered too: without it the reopen-list path was unreachable from the suite, which
+// is why the stale-banner clear could land on `pickAndOpen` alone and look covered (roborev 55211).
 vi.mock("./NewProjectDialog", () => ({
-  NewProjectDialog: ({ onOpenFromFolder }: { onOpenFromFolder: () => void }) => (
-    <button data-testid="from-folder" onClick={onOpenFromFolder}>
-      From folder
-    </button>
+  NewProjectDialog: ({
+    onOpenFromFolder,
+    onReopen,
+  }: {
+    onOpenFromFolder: () => void;
+    onReopen: (id: string) => void;
+  }) => (
+    <>
+      <button data-testid="from-folder" onClick={onOpenFromFolder}>
+        From folder
+      </button>
+      <button data-testid="reopen-p2" onClick={() => onReopen("p2")}>
+        Reopen Beta
+      </button>
+    </>
   ),
 }));
 
@@ -167,5 +180,102 @@ describe("ProjectTabsBar", () => {
     useTrialStore.setState({ started: true, loading: false } as never);
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
     expect(screen.getByTestId("trial")).toBeTruthy();
+  });
+});
+
+// ── THE SECOND PAIR ───────────────────────────────────────────────────────────────────────────
+//
+// These exist because their absence is what let a fix regress: every existing picker test renders
+// the DEFAULT `side="right"`, where `sideOf(...) !== side` can never be true, so the whole left-strip
+// branch was unreachable from the suite. (roborev 55200)
+describe("ProjectTabsBar — the left strip", () => {
+  beforeEach(() => {
+    useProjectStore.setState({
+      projects: [mkProject("p1", "Alpha"), mkProject("p2", "Beta")],
+      selectedProjectId: "p1",
+    } as never);
+    openProjectTab.mockClear();
+  });
+
+  it("refuses a folder whose project is OPEN in the other pair, and says where it is", () => {
+    // p2 is right-assigned (absent from the map) and its tab is open, so the left strip genuinely
+    // cannot show it — and moving it would remount its panes and kill its PTYs.
+    useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
+    render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-add"));
+    fireEvent.click(screen.getByTestId("from-folder"));
+    return waitFor(() => {
+      expect(screen.getByTestId("tear-off-error").textContent).toContain("right pair");
+      expect(openProjectTab).not.toHaveBeenCalled();
+    });
+  });
+
+  it("REOPENS a closed project instead of claiming it is open elsewhere", () => {
+    // The regression the refusal introduced: `sideOf` answers "which pair owns it", not "does it
+    // have a tab", so a closed project tripped the refusal and was told it was already open — a
+    // sentence describing a state that did not exist, on a path that used to reopen it.
+    useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1"] } as never);
+    render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-add"));
+    fireEvent.click(screen.getByTestId("from-folder"));
+    return waitFor(() => {
+      expect(openProjectTab).toHaveBeenCalledWith("p2");
+      // …and it SAYS where the tab went. Reopening on its own side is right (moving it would kill
+      // its PTYs) but doing it silently from this strip is the defect the reopen-list filter exists
+      // to prevent: the tab lands in the other pair and this strip shows nothing.
+      expect(screen.getByTestId("tear-off-error").textContent).toContain("reopened in the right pair");
+    });
+  });
+
+  it("clears a stale refusal on the REOPEN path too, not just the picker", () => {
+    // The clear used to live in `pickAndOpen`, so the reopen list — reached by hitting "+" again
+    // after the dialog closed on the refusing click — still showed the old message over a project
+    // it had nothing to do with.
+    useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
+    render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-add"));
+    fireEvent.click(screen.getByTestId("from-folder"));
+    return waitFor(() => expect(screen.getByTestId("tear-off-error")).toBeTruthy()).then(() => {
+      fireEvent.click(screen.getByTestId("reopen-p2"));
+      expect(screen.queryByTestId("tear-off-error")).toBeNull();
+    });
+  });
+
+  it("expires the reopened-elsewhere notice on the next tab selection", () => {
+    // It is an EVENT in a banner with no timeout. Selecting a tab is the next deliberate act on
+    // this strip, by which point the notice has been read.
+    // p2 is CLOSED and left-assigned, so picking its folder from the right strip reopens it on its
+    // own side and announces where it went — rather than refusing, which needs it to be OPEN there.
+    useUiStore.setState({ pairAssignment: { p2: "left" }, openProjectIds: ["p1"] } as never);
+    render(<ProjectTabsBar side="right" feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-add"));
+    fireEvent.click(screen.getByTestId("from-folder"));
+    return waitFor(() => {
+      expect(screen.getByTestId("tear-off-error").textContent).toContain("reopened in the left pair");
+    }).then(() => {
+      fireEvent.click(screen.getByTestId("tab-p1"));
+      expect(screen.queryByTestId("tear-off-error")).toBeNull();
+    });
+  });
+
+  it("clears a stale refusal once a later pick succeeds", () => {
+    // The banner only ever got set, so a refusal outlived the situation it described and sat over a
+    // freshly opened project telling the user it was somewhere else.
+    useUiStore.setState({ pairAssignment: {}, openProjectIds: ["p1", "p2"] } as never);
+    render(<ProjectTabsBar side="left" feed={feed} onOpenProjectSettings={() => {}} />);
+    fireEvent.click(screen.getByTestId("tab-add"));
+    fireEvent.click(screen.getByTestId("from-folder"));
+    return waitFor(() => expect(screen.getByTestId("tear-off-error")).toBeTruthy()).then(() => {
+      // Now the same pick resolves to a project this strip CAN open. `act`, so the component
+      // actually re-reads the assignment rather than refusing again off a stale closure.
+      act(() => {
+        useUiStore.setState({ pairAssignment: { p2: "left" } } as never);
+      });
+      fireEvent.click(screen.getByTestId("from-folder"));
+      return waitFor(() => {
+        expect(openProjectTab).toHaveBeenCalledWith("p2");
+        expect(screen.queryByTestId("tear-off-error")).toBeNull();
+      });
+    });
   });
 });

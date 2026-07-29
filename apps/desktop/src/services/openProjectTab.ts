@@ -17,6 +17,7 @@ import { useUiStore } from "../stores/uiStore";
 import { selectAndOpen } from "./agentReveal";
 import { emitFocusAgent, emitSelectProject } from "./attention";
 import { markProjectOpen } from "./projectTabs";
+import { sideOf } from "../engine/pairs";
 
 /**
  * Select `projectId`'s tab. With `agentId`, also leave any Plan/Sparkle overlay, switch to Build,
@@ -40,16 +41,62 @@ import { markProjectOpen } from "./projectTabs";
  *   • `selectAndOpen` (services/agentReveal) — every agent reveal, unconditionally.
  *
  * The third is load-bearing and was added last, after two review rounds: the notification handler
- * guards its `useReplaceCurrentProject` call with `p.projectId !== mine`, so a reveal into a project
- * that is ALREADY selected but closed reopened nothing at all. Spelling the division out because
- * two successively narrower versions of this comment each claimed a coverage guarantee the call
- * sites did not provide, and the second one was documenting a live bug as covered.
+ * USED to guard its `useReplaceCurrentProject` call with `p.projectId !== mine`, so a reveal into a
+ * project that was ALREADY selected but closed reopened nothing at all. That guard is GONE — both
+ * of the handler's branches now write unconditionally through `selectProjectOnItsSide`, because
+ * `mine` is the RIGHT pair's selection and comparing against it skipped the write entirely for a
+ * left-assigned project (roborev 55192/55196). `selectAndOpen`'s own `markProjectOpen` still stands
+ * on its own: the seam should not depend on every future caller remembering.
+ *
+ * Spelling the division out because two successively narrower versions of this comment each claimed
+ * a coverage guarantee the call sites did not provide, and the second one was documenting a live bug
+ * as covered.
  */
+/**
+ * Select a project IN THE PAIR THAT OWNS IT — the one place that rule lives.
+ *
+ * `projectStore.selectProject` writes the RIGHT pair's selection. For a LEFT-assigned project that
+ * is not merely the wrong slot: `Workspace`'s reconcile effect snaps `selectedProjectId` back on the
+ * next commit, so the write is silently reverted and `leftProjectId` never moves — the reveal is
+ * invisible and the caller believes it succeeded (roborev 55149 / 55158).
+ *
+ * EXTRACTED BECAUSE IT WAS COPY-PASTED AT FOUR SITES, which is exactly what `openProjectTab`'s own
+ * comment says not to do — *"a per-call-site fix would be eight copies of this rule, and the ones
+ * nobody remembered would keep the bug."* That prediction came true inside one commit: four copies
+ * landed and the reopen path was the one nobody remembered (roborev 55192). A fifth writer of a
+ * selection should be a one-line call, not a re-derivation.
+ *
+ * Idempotent for a project already selected on its own side, so callers need no guard.
+ */
+export function selectProjectOnItsSide(projectId: string): void {
+  const ui = useUiStore.getState();
+  if (sideOf(ui.pairAssignment, projectId) === "left") ui.setLeftProject(projectId);
+  else useProjectStore.getState().selectProject(projectId);
+}
+
 export function openProjectTab(projectId: string, agentId?: string | null): void {
   const store = useProjectStore.getState();
   if (!store.projects.some((p) => p.id === projectId)) return; // unknown/deleted project — no-op
   markProjectOpen(projectId);
-  store.selectProject(projectId);
+  // SELECT IT IN THE PAIR THAT ACTUALLY HOLDS IT (engine/pairs).
+  //
+  // `selectProject` writes `selectedProjectId`, which is the RIGHT pair's selection. Every
+  // cross-app "show me this project" path lands here — attention notifications, ⌘K, history
+  // search, the concierge and its tools, the tray broadcast, the "+" dialog and its reopen list —
+  // so before the second pair existed, writing that one value was the whole job.
+  //
+  // It is not any more. For a LEFT-assigned project, writing `selectedProjectId` selects it in a
+  // pair that does not list it: `resolveSideSelection` discards the id and the right pair falls
+  // back to its own first project, while the left pair reads `leftProjectId` and never follows. The
+  // observable bug is that clicking a notification for a left-pair agent either does nothing or
+  // yanks the RIGHT pair to an unrelated project, with `selectedProjectId` pointing at something
+  // invisible (roborev 55149).
+  //
+  // Routing here rather than at each call site is deliberate: this function exists because several
+  // surfaces open projects and "they must land the user in exactly the same place". A per-call-site
+  // fix would be eight copies of this rule, and the ones nobody remembered would keep the bug.
+  selectProjectOnItsSide(projectId);
+  const ui = useUiStore.getState();
   // `activeSpecial` is APP-global, not per-project. Improve Sparkle ("sparkle") is an app-owned
   // pane that covers column ③ — leaving it up means clicking another project's tab visibly does
   // NOTHING, because the Sparkle pane is still the thing on screen. Clear it here, on the one path
@@ -68,7 +115,6 @@ export function openProjectTab(projectId: string, agentId?: string | null): void
   // notification, ⌘K, history search) means "take me to project X" whether or not X is current.
   // The one caller for which a re-click means "do nothing" is the tab bar itself, and it decides
   // that before calling in (components/ProjectTabsBar).
-  const ui = useUiStore.getState();
   if (ui.activeSpecial === "sparkle") {
     ui.setActiveSpecial(null);
     if (ui.workMode === "plan") ui.setWorkMode("build");

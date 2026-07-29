@@ -8,6 +8,7 @@
 // pane that mounts when `open(id)` lands it in the open set, which is why nothing here shells out.
 // The bead is created async + best-effort and attached when `bd` returns: a build agent without a
 // bead is still fine if bd is unavailable.
+import { selectProjectOnItsSide } from "./openProjectTab";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { landInAgent } from "./landInAgent";
@@ -118,9 +119,11 @@ export function spawnBuildAgentInProject(
     // (engine/openProjects.selectionAfterClose). A bare selectProject here was a fourth seam
     // reintroducing exactly that (roborev 55095).
     markProjectOpen(project.id);
-    if (useProjectStore.getState().selectedProjectId !== project.id) {
-      useProjectStore.getState().selectProject(project.id);
-    }
+    // Side-aware (engine/pairs): "the thing you just asked for is what you are now looking at" only
+    // holds if the selection lands in the pair that OWNS the project. For a left-assigned one, a bare
+    // selectProject is reverted by the Workspace's reconcile effect and `leftProjectId` never moves,
+    // so the freshly spawned agent lands off-screen (roborev 55158).
+    selectProjectOnItsSide(project.id);
     // Visited is the OTHER half of the mount gate: a project selected but never marked is skipped
     // again as soon as the user navigates elsewhere.
     markProjectVisited(project.id);

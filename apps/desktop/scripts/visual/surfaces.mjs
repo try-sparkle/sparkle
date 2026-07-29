@@ -13,7 +13,8 @@
  *   { waitFor }            wait until the selector matches
  *   { click }              click the first match
  *   { clickText: {sel,t} } click the first match whose textContent is exactly `t` (trimmed)
- *   { setAttr: {sel,name,value} }  set an attribute (how mock states are reached)
+ *   { setAttr: {sel,name,value} }  set an attribute (how MOCK states are reached)
+ *   { cable: "off"|"left"|"right" } patch the real cable store (how APP states are reached)
  */
 
 /** Everything in the mock page that is scaffolding rather than design, hidden before capture. */
@@ -28,7 +29,7 @@ export const SURFACES = [
         { waitFor: "[data-testid=workspace-shell]" },
         { waitFor: "[data-testid=agent-sidebar-column]" },
         { waitFor: "[data-testid=terminal-stage]" },
-        { setAttr: { sel: "[data-testid=workspace-shell]", name: "data-wired", value: "off" } },
+        { cable: "off" },
       ],
       clip: null, // full viewport
     },
@@ -44,7 +45,7 @@ export const SURFACES = [
       steps: [
         { waitFor: "[data-testid=workspace-shell]" },
         { waitFor: "[data-testid=agent-sidebar-column]" },
-        { setAttr: { sel: "[data-testid=workspace-shell]", name: "data-wired", value: "left" } },
+        { cable: "left" },
       ],
       clip: null,
     },
@@ -60,7 +61,7 @@ export const SURFACES = [
       steps: [
         { waitFor: "[data-testid=workspace-shell]" },
         { waitFor: "[data-testid=agent-sidebar-column]" },
-        { setAttr: { sel: "[data-testid=workspace-shell]", name: "data-wired", value: "right" } },
+        { cable: "right" },
       ],
       clip: null,
     },
@@ -171,6 +172,14 @@ export function stepToExpression(step) {
     return `(() => { const e = document.querySelector(${JSON.stringify(sel)});
       if (!e) return false; e.setAttribute(${JSON.stringify(name)}, ${JSON.stringify(value)});
       return true; })()`;
+  }
+  if (step.cable) {
+    // The APP's wired state lives in the cable store, not in the DOM. Setting `data-wired` by hand
+    // wired nothing — React owns that attribute — so this drives the store through the dev-only
+    // handle visualFixtures installs, and returns false when it is absent so a missing handle fails
+    // the step loudly instead of silently capturing the unwired app.
+    return `(() => { const f = window.__sparkleCable; if (!f) return false;
+      f(${JSON.stringify(step.cable)}); return true; })()`;
   }
   throw new Error(`Unrecognised step: ${JSON.stringify(step)}`);
 }

@@ -14,7 +14,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { FiCheck } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, DANGER, ROW_ACTIVE_BUBBLE } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_MONO, FONT_UI, RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { ModalShell } from "./ModalShell";
 import { getConfig } from "../services/config";
@@ -644,7 +644,7 @@ const badge: CSSProperties = {
   borderRadius: RADIUS.input,
   padding: "1px 6px",
   whiteSpace: "nowrap",
-  fontFamily: '"IBM Plex Mono", monospace',
+  fontFamily: FONT_MONO,
 };
 
 const deliveredMeta: CSSProperties = {
@@ -701,7 +701,7 @@ const chatInput: CSSProperties = {
   borderRadius: RADIUS.input,
   padding: "8px 11px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const primaryBtn: CSSProperties = {
@@ -713,7 +713,7 @@ const primaryBtn: CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const ghostBtn: CSSProperties = {
@@ -724,7 +724,7 @@ const ghostBtn: CSSProperties = {
   padding: "8px 16px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 export default DefineStageModal;

@@ -9,7 +9,7 @@
 // Mounting is controlled by settingsStore.roborevConsentOpen (App.tsx renders this once, globally).
 import { useState } from "react";
 import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { useSettingsStore } from "../stores/settingsStore";
 import { markRoborevConsentPrompted, setRoborevEnabled } from "../services/configActions";
@@ -57,7 +57,7 @@ export function RoborevConsentModal() {
             borderRadius: RADIUS.input,
             padding: "9px 16px",
             fontSize: 13,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             cursor: busy ? "default" : "pointer",
             opacity: busy ? 0.6 : 1,
           }}
@@ -76,7 +76,7 @@ export function RoborevConsentModal() {
             padding: "9px 18px",
             fontSize: 13,
             fontWeight: FONT_WEIGHT.semibold,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             cursor: busy ? "default" : "pointer",
             opacity: busy ? 0.6 : 1,
           }}

@@ -31,6 +31,7 @@ import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { ScopeVitals } from "./ScopeVitals";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
+import { FONT_UI } from "../../theme/scale";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
@@ -227,7 +228,7 @@ export function ConciergeColumn({
         // spec (`--k-term` / `--k-term-ink`) and separating them would put shell ink on a terminal
         // surface. Set on the section so everything that inherits follows it in one place.
         color: isWired ? BLUEPRINT[mode].termInk : C.cream,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
         fontSize: 13,
         lineHeight: 1.5,
       }}

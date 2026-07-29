@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
-import { C, FONT, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
+import { C, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
@@ -38,7 +38,14 @@ import {
 } from "../windowContext";
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
-import { unbindsOnKey, unbindsOnPointerDown, type PairCount, type PairSide } from "../engine/cable";
+import { unbindsOnKey, unbindsOnPointerDown, type PairSide } from "../engine/cable";
+import {
+  pairCountFor,
+  projectsOnSide,
+  resolveSideSelection,
+  sideOf,
+} from "../engine/pairs";
+import { openProjectsOf } from "../engine/openProjects";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { resolveStage, rollupStages } from "../engine/workflowStage";
@@ -64,6 +71,7 @@ import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
 import { useImprovementScheduler } from "../useImprovementScheduler";
 import { ErrorBoundary, AgentPaneErrorCard } from "./ErrorBoundary";
 import { perfRender } from "../perfTrace";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
 
 // Code-split the heavy, not-always-visible surfaces so a cold start doesn't ship them in the
 // initial chunk (bead sparkle-alrm.5, #9). AgentPane pulls the terminal (xterm + webgl), Onboarding
@@ -97,20 +105,79 @@ function PaneFallback() {
 /**
  * HOW MANY PAIRS FLANK THE CONCIERGE — `data-pairs` on the shell root.
  *
- * ONE, today, and this constant is where that fact lives rather than a literal buried in the JSX.
- * The cockpit's full form is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`; the single-pair form is the
- * right half of it, which is also the layout the app already had. The structure below is written
- * bilaterally (see `Pair`) so the second pair is a render, not a rewrite.
+ * DERIVED, not a constant: `pairCountFor(projects, pairAssignment)` in the render below. It used to
+ * be a hardcoded `1` with a comment explaining why the second pair was real work rather than a
+ * render, and that comment named the constraint correctly (MAPPING.md, Gaps §3): pane mounting is
+ * keyed per project/agent, **a Terminal unmount kills its PTY**, and every agent must be owned by
+ * exactly one pair — mounting the same agent id in two stages puts two xterms on one PTY, the
+ * failure the tear-off ownership map exists to prevent.
  *
- * WHY IT IS NOT 2 YET, stated plainly because it is the interesting constraint (MAPPING.md, Gaps
- * §3): pane mounting is keyed per project/agent and **a Terminal unmount kills its PTY**, so a
- * second pair must MOUNT its own panes, never move the existing ones across the tree. Every agent
- * would also have to be owned by exactly one pair — mounting the same agent id in two stages puts
- * two xterms on one PTY, which is the failure the tear-off ownership map exists to prevent. That is
- * real work, and shipping it half-done costs users their running terminals, so this lands the
- * cockpit's geometry and its state machine and stops there.
+ * That constraint is now MET rather than avoided. `engine/pairs` assigns each project to exactly
+ * one side and `livePanes` partitions the mounted panes through it, so each stage renders only its
+ * own — a project's panes can be in one stage or the other, never both, by construction. Moving a
+ * project between sides does remount its panes and cost a respawn, which is precisely what tearing
+ * one out to its own window already does; see the module header for why that trade is the right
+ * way round.
+ *
+ * The count is derived rather than stored so it cannot disagree with the assignment map. Every such
+ * disagreement — a left pair with nothing in it, or a left-assigned project with no pair to render
+ * it — is a project whose panes have nowhere to mount.
  */
-const PAIR_COUNT: PairCount = 1;
+
+/**
+ * The mounted agent panes for ONE pair's stage.
+ *
+ * Extracted so both stages render the same thing from their OWN slice of the pane list. It takes
+ * `panes` rather than filtering a shared list itself, which is the point: the caller has already
+ * partitioned through `sideOf`, so this component cannot accidentally render an agent that belongs
+ * to the other pair. Mounting the same agent id in two stages puts two xterms on one PTY.
+ *
+ * `visibleAgentId` is null when the stage is showing something else entirely (the Plan board, the
+ * Improve Sparkle pane) — the panes stay MOUNTED and merely invisible, because a Terminal unmount
+ * kills its PTY.
+ */
+function AgentPaneList({
+  panes,
+  visibleAgentId,
+  calm,
+}: {
+  panes: ReadonlyArray<{ project: Project; agent: AgentTab }>;
+  visibleAgentId: string | null;
+  calm: boolean;
+}) {
+  // One Suspense around the list, not per pane: the agent panes share a chunk, and loading one must
+  // never blank a sibling that is already mounted and holding a PTY.
+  return (
+    <Suspense fallback={<PaneFallback />}>
+      {panes.map(({ project: p, agent }) => {
+        // Agent ids are globally unique, so this comparison is exactly "is this the pane to show" —
+        // a background tab's agent never matches.
+        const visible = agent.id === visibleAgentId;
+        // Per-pane boundary: one crashing pane degrades to an inline card (respecting its
+        // visibility) instead of unmounting the workspace and its sibling agents.
+        return (
+          <ErrorBoundary
+            key={agent.id}
+            scope="agent-pane"
+            fallback={({ error, reset }) => (
+              <AgentPaneErrorCard error={error} reset={reset} visible={visible} />
+            )}
+          >
+            <AgentPane
+              project={p}
+              agent={agent}
+              visible={visible}
+              // Calm is a property of the pane you are LOOKING at, so only the visible one ever
+              // carries it — a background pane re-theming would clear its WebGL atlas for a screen
+              // nobody is watching.
+              calm={visible && calm}
+            />
+          </ErrorBoundary>
+        );
+      })}
+    </Suspense>
+  );
+}
 
 /**
  * A PAIR — a build column and its terminal, which are ONE project and are never split.
@@ -470,7 +537,62 @@ export function Workspace() {
     return () => window.removeEventListener("keydown", onKey);
   }, [zoomIn, zoomOut, resetZoom]);
 
-  const project = projects.find((p) => p.id === currentProjectId) ?? null;
+  // ── THE TWO PAIRS ────────────────────────────────────────────────────────────────────────────
+  // Which side each project lives on, and therefore which stage mounts its panes. Every rule is in
+  // engine/pairs; this reads the map and applies them. See PAIR_COUNT's note for why the second
+  // pair could not simply be rendered twice.
+  const openProjectIds = useUiStore((s) => s.openProjectIds);
+  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  const leftProjectIdRaw = useUiStore((s) => s.leftProjectId);
+  const prunePairAssignment = useUiStore((s) => s.prunePairAssignment);
+  // Drop assignments for projects that are gone. Without this a removed project's entry keeps the
+  // left pair open forever with no tab in it and no way to close it. In an effect (not render) so
+  // it never sets state in another component mid-render; the derivations below already ignore
+  // entries naming absent projects, so one commit of lag changes nothing on screen.
+  useEffect(() => prunePairAssignment(projects), [projects, prunePairAssignment]);
+
+  // Only OPEN projects can be a pair's selection or fill its tab strip — the same rule the single
+  // strip already applied, now applied per side.
+  const openProjects = useMemo(
+    () => openProjectsOf(projects, openProjectIds),
+    [projects, openProjectIds],
+  );
+  const leftProjects = useMemo(
+    () => projectsOnSide(openProjects, pairAssignment, "left"),
+    [openProjects, pairAssignment],
+  );
+  const rightProjects = useMemo(
+    () => projectsOnSide(openProjects, pairAssignment, "right"),
+    [openProjects, pairAssignment],
+  );
+  // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees
+  // with what the map says is unrepresentable. Counts assignment over ALL projects, not just open
+  // ones: closing a tab is a view operation that deliberately keeps the project's panes and PTYs
+  // alive, so collapsing the pair under it would unmount them.
+  const pairCount = pairCountFor(projects, pairAssignment);
+
+  // Each side's selection, validated against what that side actually holds. The RIGHT pair keeps
+  // using `selectedProjectId` — that value means "the current project" to the concierge feed,
+  // notifications, capture and satellite ownership, and re-pointing it at a two-sided concept would
+  // change all of them. The left pair gets its own slot.
+  const rightProjectId = resolveSideSelection(currentProjectId, rightProjects);
+  const leftProjectId = resolveSideSelection(leftProjectIdRaw, leftProjects);
+  const project = projects.find((p) => p.id === rightProjectId) ?? null;
+  const leftProject = projects.find((p) => p.id === leftProjectId) ?? null;
+  // COMMIT THE RIGHT PAIR'S FALLBACK BACK TO THE STORE.
+  //
+  // `resolveSideSelection` is a local repair, so without this `selectedProjectId` and the project
+  // actually on screen diverge indefinitely once the selected project moves to the left pair — and
+  // `selectedProjectId` is what the rest of the app means by "the current project". Two observed
+  // consequences (roborev 55149): the concierge feed lookup missed, so `isCalmBand(undefined)` read
+  // CALM and desaturated a busy agent's terminal — the very regression `terminalCalm`'s note exists
+  // to prevent; and the user could not click their way out, because the tab bar guards a re-click
+  // against the RESOLVED id while the commit path guards against the STORE's, making the highlighted
+  // tab a double no-op.
+  const selectProject = useProjectStore((s) => s.selectProject);
+  useEffect(() => {
+    if (rightProjectId !== null && rightProjectId !== currentProjectId) selectProject(rightProjectId);
+  }, [rightProjectId, currentProjectId, selectProject]);
 
   // The window is titled "Sparkle", full stop — NOT the selected project's name.
   //
@@ -487,6 +609,17 @@ export function Workspace() {
   }, []);
 
   const activeAgentId = project?.selectedAgentId ?? null;
+  // The LEFT pair's selected agent — which of its panes is visible in its stage. Same rule as
+  // `activeAgentId`, read off that pair's own project.
+  const leftActiveAgentId = leftProject?.selectedAgentId ?? null;
+  // WHICH PAIR THE CONCIERGE IS TALKING TO. `wired` is the whole answer, exactly as MAPPING.md
+  // requires ("`data-wired` is the whole connection feature … do NOT implement it as scattered
+  // component state"): patching the cable into a left build row means the compose box routes there.
+  // Without this the left pair would be a second set of terminals the concierge could never reach —
+  // the cable would light up and the prompt would still land in the right pair, which is the exact
+  // "user-facing remedy that does the unsafe thing" shape AGENTS.md warns about.
+  const wiredProject = wired === "left" ? leftProject : project;
+  const wiredAgentId = wiredProject?.selectedAgentId ?? null;
   // The agent the concierge compose box can prompt directly (CM-U7): the selected tab's selected
   // agent. This is what re-homes the removed AgentPane composer — with a target the box can send a
   // real prompt into a terminal instead of only chatting with the brain. Null → the box is
@@ -498,8 +631,8 @@ export function Workspace() {
   // recoverable, rather than sitting inert behind a tooltip. The decision function keeps returning
   // it so the reason is one edit away if a surface ever wants it again.
   const { target: promptTarget } = useMemo(
-    () => decidePromptTarget(project, activeAgentId),
-    [project, activeAgentId],
+    () => decidePromptTarget(wiredProject, wiredAgentId),
+    [wiredProject, wiredAgentId],
   );
   // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
   // Agent" row does (same hook → same behavior).
@@ -573,6 +706,9 @@ export function Workspace() {
   // mid-render; one commit of lag is irrelevant to a 250ms-debounced roster push). The CURRENT
   // tab is unioned in at render time below, so its panes still mount in the same commit.
   useEffect(() => markProjectVisited(currentProjectId), [currentProjectId]);
+  // The left pair's project too — same reason, and it is the one the persisted assignment brings
+  // back on a cold launch without ever passing through `currentProjectId`.
+  useEffect(() => markProjectVisited(leftProjectId), [leftProjectId]);
 
   // Projects that have been pulled out into their own window (services/satelliteWindows). This is
   // the ONE subscription that has to be synchronous: the claim lands before the satellite window is
@@ -594,7 +730,16 @@ export function Workspace() {
       // tab. This `continue` is the entire pane-ownership gate; see `tornOut` above for why letting
       // it slip costs a duplicated PTY rather than a duplicated pixel.
       if (tornOut.has(p.id)) continue;
-      if (!wasProjectVisited(p.id) && p.id !== currentProjectId) continue;
+      // BOTH PAIRS' SELECTIONS COUNT AS VISITED, not just the right one's.
+      //
+      // The visited set is module-level and NOT persisted, while `pairAssignment` and
+      // `leftProjectId` ARE. Gate only on `currentProjectId` and a relaunch brings back a left pair
+      // whose tab strip and sidebar are full of agent rows while `livePanes.left` is empty — a blank
+      // stage, with the `!leftProject` hint not firing because `leftProject` resolves fine. Clicking
+      // rows cannot repair it: this gate is per PROJECT, so `openAgentIds` never gets a say. That is
+      // the "zero mounted → dead terminals under a live tab" half of the invariant engine/pairs
+      // claims to make unrepresentable (roborev 55149).
+      if (!wasProjectVisited(p.id) && p.id !== currentProjectId && p.id !== leftProjectId) continue;
       for (const a of p.agents) {
         if (open.has(a.id)) out.push({ project: p, agent: a });
       }
@@ -602,7 +747,20 @@ export function Workspace() {
     return out;
     // visitedVersion is the subscription token for the module set read via wasProjectVisited.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projects, openAgentIds, visitedVersion, currentProjectId, tornOut]);
+  }, [projects, openAgentIds, visitedVersion, currentProjectId, leftProjectId, tornOut]);
+
+  // PARTITION THE PANES BY PAIR — the whole reason `engine/pairs` exists.
+  //
+  // Each stage renders ONLY its own side's panes. Rendering `live` in both stages would mount every
+  // agent TWICE, putting two xterms on one PTY and letting `pty_spawn`'s `sessions.insert` orphan
+  // one of the child processes — the identical failure the tear-off ownership map prevents. A
+  // partition makes that unrepresentable rather than merely avoided: `sideOf` is total, so every
+  // pane lands in exactly one of these two lists.
+  const livePanes = useMemo(() => {
+    const byPair: Record<PairSide, typeof live> = { left: [], right: [] };
+    for (const entry of live) byPair[sideOf(pairAssignment, entry.project.id)].push(entry);
+    return byPair;
+  }, [live, pairAssignment]);
 
   // Is the tab the user is looking at one whose columns now live in another window?
   const selectedIsTornOut = !!project && tornOut.has(project.id);
@@ -695,11 +853,13 @@ export function Workspace() {
   // which also keeps it off the WebGL canvas's per-frame composite path.
   const terminalCalm = useMemo(() => {
     if (sparkleActive || boardActive || !activeAgentId || !activeIsOpen) return false;
-    const p = feed.projects.find((x) => x.id === currentProjectId);
+    // Keyed off the RESOLVED project, not `currentProjectId`: the two differ for a commit after the
+    // selected project moves pairs, and a miss here reads as CALM and desaturates a busy terminal.
+    const p = feed.projects.find((x) => x.id === project?.id);
     // An agent the feed doesn't know reads `undefined`, which isCalmBand treats as calm — the same
     // answer the old `?? 2` default gave.
     return isCalmBand(p?.agents.find((a) => a.id === activeAgentId)?.status);
-  }, [feed, currentProjectId, activeAgentId, activeIsOpen, sparkleActive, boardActive]);
+  }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, boardActive]);
 
   // Plan/Build handlers for the collapsed Plan column's header. Deliberately simpler than the
   // sidebar's copy: there is no "second click spawns an agent" stage to honor from Plan.
@@ -782,7 +942,7 @@ export function Workspace() {
       // this div — which is a fair sign it belongs here. Marker only: no styling, no behaviour.
       className="shell"
       data-testid="workspace-shell"
-      data-pairs={String(PAIR_COUNT)}
+      data-pairs={String(pairCount)}
       data-wired={wired}
       data-over={overlay}
       style={{
@@ -794,7 +954,7 @@ export function Workspace() {
         // terminal darkest; the shell itself sits below all three).
         background: C.deepForest,
         color: C.cream,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       {/* Spans the very top of the app, just below the window chrome, above everything else.
@@ -824,6 +984,49 @@ export function Workspace() {
           renders its own strip; see the `tabs` prop below. Taking main's line back would put a
           second, contradicting tab bar above the whole shell. */}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        {/* THE LEFT PAIR — the other half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`.
+            Rendered only when something is assigned to it, so an install that has never used it
+            gets byte-identical layout to the single-pair shell. `Pair` mirrors the flow, so the
+            children are given in the SAME [build, terminal] order as the right pair and the
+            terminal ends up outboard.
+
+            It carries no Sparkle pane, no Plan board and no onboarding hints: those are single
+            surfaces that belong to the primary (right) pair, and duplicating them would put two of
+            each on screen with no way to say which one a click meant. */}
+        {pairCount === 2 && (
+          <Pair
+            side="left"
+            wired={wired === "left"}
+            tabs={
+              <ProjectTabsBar
+                side="left"
+                feed={feed}
+                onOpenProjectSettings={setSettingsProject}
+              />
+            }
+          >
+            <AgentSidebar project={leftProject} />
+            <div
+              data-testid="terminal-stage-left"
+              data-calm="false"
+              style={{ flex: 1, position: "relative", minHeight: 0, background: C.forest }}
+            >
+              <AgentPaneList
+                panes={livePanes.left}
+                visibleAgentId={leftActiveAgentId}
+                // Calm is the RIGHT pair's treatment: it follows the agent the concierge is looking
+                // at, and duplicating it here would desaturate a pane nobody is asking about.
+                calm={false}
+              />
+              {!leftProject && (
+                <Hint title="Nothing here yet">
+                  Pick a project in the tab strip above, or move one across with{" "}
+                  <strong>Move to the left pair</strong> in its build column header.
+                </Hint>
+              )}
+            </div>
+          </Pair>
+        )}
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
             experience now, not a flagged addition to the old UI.
 
@@ -898,37 +1101,11 @@ export function Workspace() {
               // out-numbering it instead — see components/layers.ts.
             }}
           >
-            {/* Each lazy surface gets its own Suspense so loading one never blanks a sibling that's
-                already mounted (the live agent panes keep their PTYs). The agent panes share one
-                chunk, so a single boundary around the list is enough. */}
-            <Suspense fallback={<PaneFallback />}>
-              {live.map(({ project: p, agent }) => {
-                // Agent ids are globally unique, so "is this the selected tab's selected agent"
-                // is exactly this comparison — a background tab's agent never matches.
-                const visible = !sparkleActive && !boardActive && agent.id === activeAgentId;
-                // Per-pane boundary: one crashing pane degrades to an inline card (respecting its
-                // visibility) instead of unmounting the workspace and its sibling agents.
-                return (
-                  <ErrorBoundary
-                    key={agent.id}
-                    scope="agent-pane"
-                    fallback={({ error, reset }) => (
-                      <AgentPaneErrorCard error={error} reset={reset} visible={visible} />
-                    )}
-                  >
-                    <AgentPane
-                      project={p}
-                      agent={agent}
-                      visible={visible}
-                      // Calm is a property of the pane you are LOOKING at, so only the visible one
-                      // ever carries it — a background pane re-theming would clear its WebGL atlas
-                      // for a screen nobody is watching.
-                      calm={visible && terminalCalm}
-                    />
-                  </ErrorBoundary>
-                );
-              })}
-            </Suspense>
+            <AgentPaneList
+              panes={livePanes.right}
+              visibleAgentId={sparkleActive || boardActive ? null : activeAgentId}
+              calm={terminalCalm}
+            />
 
             {sparkleOpen && (
               <Suspense fallback={<PaneFallback />}>
@@ -963,7 +1140,7 @@ export function Workspace() {
                       padding: "10px 20px",
                       fontWeight: FONT_WEIGHT.semibold,
                       cursor: "pointer",
-                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                      fontFamily: FONT_UI,
                     }}
                   >
                     Show that window
@@ -987,7 +1164,7 @@ export function Workspace() {
                       fontWeight: FONT_WEIGHT.semibold,
                       cursor: reclaimingIds.has(project.id) ? "default" : "pointer",
                       opacity: reclaimingIds.has(project.id) ? 0.6 : 1,
-                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                      fontFamily: FONT_UI,
                     }}
                   >
                     {reclaimingIds.has(project.id) ? "Bringing it back…" : "Bring it back here"}
@@ -1033,7 +1210,7 @@ export function Workspace() {
                     padding: "10px 20px",
                     fontWeight: FONT_WEIGHT.semibold,
                     cursor: "pointer",
-                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                    fontFamily: FONT_UI,
                   }}
                 >
                   ▶ Start this agent
@@ -1155,7 +1332,7 @@ function KbdKey({ children }: { children: React.ReactNode }) {
         // "gold #e0982f" while painting the amber STATUS token.
         background: C.goldFill,
         color: ON_GOLD_FILL,
-        font: `700 15px/1 ${FONT.mono}`,
+        font: `700 15px/1 ${FONT_MONO}`,
         letterSpacing: 0.5,
         padding: "3px 8px",
         borderRadius: 4,

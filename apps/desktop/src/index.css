@@ -301,11 +301,13 @@ body {
    concierge rather than left-to-right on a side where "left" is the outer edge. Straight from the
    mock's `.pair[data-side="left"] .pairtabs`, hung off the `role="tablist"` ProjectTabs renders.
 
-   ⚠️ THIS RULE IS INERT TODAY AND MUST NOT BE MADE REACHABLE ON ITS OWN. Nothing renders a left
-   pair yet (PAIR_COUNT is 1). Whoever lands the second pair has to fix `ProjectTabs.measure()` IN
-   THE SAME CHANGE: the drag-reorder resolver walks `projects` in RENDER order and compares `x`
-   coordinates, so reversing the flow makes visual order disagree with DOM order and a dragged tab
-   lands in the wrong slot. Reversing the strip and teaching the resolver about it are one job. */
+   LIVE NOW, and the resolver was fixed in the same change, as the warning that used to sit here
+   demanded. The hazard it named is real and permanent: the drag resolver compares screen `x`
+   against tabs handed to it in ARRAY order, and reversing the flow makes those two disagree, so a
+   dragged tab lands in the mirror image of the slot the user aimed at. `ProjectTabsBar` now passes
+   `reversed={side === "left"}` down to `ProjectTabs` and into `resolveTabDrag`, which scans in
+   visual order and maps the slot back to an array position (components/tabDrag.ts). If you change
+   this rule, change that flag with it — they are one mechanism. */
 .ptabstrip[data-side="left"] > [role="tablist"] {
   flex-direction: row-reverse;
 }
@@ -341,10 +343,17 @@ body {
    last-active row is still selected; it simply isn't plugged into you. So no `opacity` and no
    `filter` may ever appear in a `[data-wired]` rule here. A desaturating filter over a live column
    is the exact regression that was pulled out of the sidebar on 2026-07-27 (see Workspace.tsx's
-   `terminalCalm` note) — it makes a running agent look stopped. */
-.shell[data-wired="left"] .pair[data-side="left"] .paircols > :first-child {
+   `terminalCalm` note) — it makes a running agent look stopped.
+
+   NAMED, NOT POSITIONAL — for the same reason the border rules above are. These two used
+   `:first-child` on the same false invariant: `AgentSidebar` renders TWO siblings when its overlay
+   mode is on and the aria-hidden spacer comes FIRST, so for anyone carrying that persisted
+   preference the seam was removed from the spacer while the build column kept its border. Patching
+   in then looked like nothing happened. It was already wrong for the right pair; landing the left
+   one would have doubled it. */
+.shell[data-wired="left"] .pair[data-side="left"] .paircols > [data-testid="agent-sidebar-column"] {
   border-right-color: transparent;
 }
-.shell[data-wired="right"] .pair[data-side="right"] .paircols > :first-child {
+.shell[data-wired="right"] .pair[data-side="right"] .paircols > [data-testid="agent-sidebar-column"] {
   border-left-color: transparent;
 }

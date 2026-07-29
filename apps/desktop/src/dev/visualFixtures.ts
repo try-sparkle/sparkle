@@ -39,6 +39,7 @@ import type { WorkflowStageId } from "../engine/workflowStage";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConnectionStore } from "../stores/connectionStore";
+import { useCableStore } from "../stores/cableStore";
 import { devBypassAuthEnabled } from "./devBypassAuth";
 
 /** The query parameter that turns fixtures on: `?visual=1`. */
@@ -278,6 +279,31 @@ export function applyVisualFixtures(
   // with no reachable probe endpoint always shows it. The mock has no such banner, so leaving it
   // in would score as a layout-wide diff on every surface. Forced online.
   useConnectionStore.setState({ isOnline: true, browserOnline: true, probeOk: true });
+
+  // ── A HANDLE ON THE CABLE, FOR THE CAPTURE HARNESS ──────────────────────────────────────────
+  //
+  // The harness reached the wired states by setting `data-wired` on the shell root as a DOM
+  // ATTRIBUTE. That never wired anything: the attribute is BOUND to the cable store
+  // (`data-wired={wired}` in Workspace), so React owns it, and every surface that actually paints
+  // the connection — the concierge's flood and lift are inline styles off `useCableStore` — kept
+  // reading "off". The only thing that responded was the handful of `[data-wired]` rules in
+  // index.css, which key off the raw attribute. So `workspace-wired-left` came out BYTE-IDENTICAL
+  // to `workspace-unwired`, and the two wired surfaces have been scoring the unwired app since they
+  // were added.
+  //
+  // Exposing the store's own action is what makes those surfaces real. Behind the same two gates as
+  // everything above (DEV build AND the auth-bypass flag AND `?visual=1`), so it cannot exist in a
+  // shipped app.
+  // `typeof window` guarded: this module's own suite runs in the NODE environment (it is pure
+  // store logic), where a bare `window` reference throws and would take the seeding tests down with
+  // it — the fixtures are the thing under test there, not the browser handle.
+  if (typeof window !== "undefined") {
+    (window as unknown as { __sparkleCable?: (side: "off" | "left" | "right") => void }).__sparkleCable =
+      (side) => {
+        if (side === "off") useCableStore.getState().unbind();
+        else useCableStore.getState().patch(side);
+      };
+  }
 
   return true;
 }

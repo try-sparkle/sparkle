@@ -614,7 +614,7 @@ export function useAttentionNotifications(): void {
       cancelPending = stop;
     };
     const handle = (p: FocusAgentPayload) => {
-      const { projectId: mine, replace: setProject } = ctx.current;
+      const { replace: setProject } = ctx.current;
       // VALIDATE FIRST. The broadcast can be stale (the roster lags a deletion) or rogue,
       // and everything below is a side effect: `runtimeStore.open` does not check that the agent
       // exists, so a phantom id would sit in `openAgentIds` forever (roborev 46249-L1). But a
@@ -632,8 +632,15 @@ export function useAttentionNotifications(): void {
             void bringToFront();
             if (agentExists(p.projectId, p.agentId)) {
               // The agent arrived with the rehydrate — do the full reveal after all.
-              const { projectId: cur, replace: set } = ctx.current;
-              if (p.projectId !== cur) set(p.projectId);
+              //
+              // UNCONDITIONAL, for the same reason as the fast path below, and this branch needs it
+              // MORE: it runs when the agent was not in the store yet, i.e. the cross-webview case
+              // where `requestProjectTabFromOtherWindow` has already written `selectedProjectId`
+              // side-blind and projectStore has synced it in. Comparing against that value — the
+              // RIGHT pair's selection — saw an equal id for a LEFT-assigned project, skipped the
+              // write, and left `leftProjectId` untouched while `selectAndOpen` mounted the agent
+              // into a stage showing something else. The seam is idempotent. (roborev 55196)
+              ctx.current.replace(p.projectId);
               selectAndOpen(p.projectId, p.agentId);
             } else {
               openProjectTab(p.projectId);
@@ -654,7 +661,18 @@ export function useAttentionNotifications(): void {
       // This click resolves NOW, so any older deferral still waiting for its project is stale.
       cancelDeferral();
       void bringToFront();
-      if (p.projectId !== mine) setProject(p.projectId);
+      // UNCONDITIONAL — the `p.projectId !== mine` guard was wrong once the left pair existed.
+      //
+      // `mine` is `selectedProjectId`, which is the RIGHT pair's selection; for a LEFT-assigned
+      // project it is not that pair's selection at all. The tray/capture webview reaches here with
+      // `selectedProjectId` ALREADY pointing at the left project — `requestProjectTabFromOtherWindow`
+      // writes it side-blind and projectStore is cross-window synced synchronously — so the guard
+      // saw `p.projectId === mine`, skipped the write, and `leftProjectId` never moved. The agent
+      // then mounted and selected into a stage whose pair was showing something else: a dead click.
+      // The fix cannot live in the emitting webview, because uiStore (which holds the assignment
+      // map) is deliberately NOT cross-window synced — only the main window can route this.
+      // `setProject` is idempotent for a project already selected on its own side. (roborev 55192)
+      setProject(p.projectId);
       selectAndOpen(p.projectId, p.agentId);
       jumpToPrompt();
     };

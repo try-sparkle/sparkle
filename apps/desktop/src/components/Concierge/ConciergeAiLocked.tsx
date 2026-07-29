@@ -20,6 +20,7 @@ import { AiEnhancementsBadge } from "../AiEnhancementsBadge";
 import { AiLockedNotice } from "../AiLockedNotice";
 import { RefillLink } from "../OutOfCreditsNotice";
 import type { ConciergeAiLockReason } from "./conciergeAiLock";
+import { FONT_UI } from "../../theme/scale";
 
 /** The pitch, in the founder's words. Exported so tests (and any future surface that says the same
  *  thing) assert against the one string rather than a copy of it. */
@@ -56,7 +57,7 @@ const settingsBtn: CSSProperties = {
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   whiteSpace: "nowrap",
 };
 

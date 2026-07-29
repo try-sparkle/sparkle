@@ -17,8 +17,8 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
 // FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
 import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool, FiHelpCircle } from "react-icons/fi";
-import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
-import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
+import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
+import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { SIDEBAR_OVERLAY_Z } from "./layers";
@@ -58,6 +58,9 @@ import {
   firstVisibleAgentId,
 } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
+import { sideOf } from "../engine/pairs";
+import { useCableStore } from "../stores/cableStore";
+import { openProjectTab } from "../services/openProjectTab";
 import { publishedStatusFor, rollupViewFor } from "../useAttentionNotifications";
 import {
   bandOfStatus,
@@ -139,7 +142,7 @@ const DASHED_ROW_STYLE: React.CSSProperties = {
   borderRadius: 6,
   background: "transparent",
   color: C.muted,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
@@ -385,6 +388,13 @@ export function AgentSidebar({
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+  // WHICH PAIR THIS SIDEBAR IS IN — derived from the project it is rendering, not passed as a prop.
+  // The assignment map is already the single answer to "where does this project live" (engine/pairs),
+  // and a prop would be a second copy of it that could disagree with the stage its panes mount in.
+  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  const assignProjectToPair = useUiStore((s) => s.assignProjectToPair);
+  const pairSide = sideOf(pairAssignment, project?.id ?? "");
+  const patchCable = useCableStore((s) => s.patch);
   // The Improve-Sparkle agent is keyed by window label (sparkleAgentIdFor — see onSelectSparkle /
   // services/sparkleReveal). There is exactly one app window now, and its label is the constant
   // APP_WINDOW_LABEL; the id is spelled through it rather than the literal so the persistence key
@@ -631,6 +641,18 @@ export function AgentSidebar({
     setActiveSpecial(null);
     selectAgent(project.id, id);
     open(id);
+    // ── PATCH THE CABLE ──────────────────────────────────────────────────────────────────────
+    // THE GESTURE THAT MAKES THE WHOLE CONNECTION FEATURE REACHABLE. Everything downstream of
+    // `wired` — the concierge's flood and lift, the shell root's `data-wired`, the seam that
+    // vanishes, and `promptTarget` routing to THIS pair — was already built and correct, and none
+    // of it could ever fire: nothing in app code called `patch`. The only producers were the test
+    // suite and the dev-only capture handle, so in a shipped build `wired` was permanently "off"
+    // and the two `workspace-wired-*` surfaces captured a state no user could reach (roborev 55221).
+    //
+    // Selecting a build row IS the connection: MAPPING.md's `data-wired` is "which side holds the
+    // live cable", and the side is this sidebar's own pair. ONE LIVE CIRCUIT falls out of
+    // `patchCable` — patching the other side moves the cable rather than lighting both.
+    patchCable(pairSide);
   };
   // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Build
   // is two-stage: the FIRST click (when Build isn't already the active section) just switches into
@@ -1768,6 +1790,49 @@ export function AgentSidebar({
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
           />
+          {/* `.plus` in MAPPING.md — THE CONTROL THAT OPENS THE SECOND PAIR.
+              Moves this project to the other side of the concierge, giving the cockpit its full
+              `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM` form. Sending the last left-side project
+              back collapses the pair, because the count is derived from the assignment map
+              (engine/pairs) rather than stored.
+
+              It says what it COSTS in the tooltip. Moving remounts this project's panes, and a
+              Terminal unmount kills its PTY — so its agents respawn and lose scrollback, exactly as
+              tearing the project out to its own window already does. That is a fine trade to make
+              deliberately and a nasty surprise to discover, so the control states it. */}
+          <button
+            type="button"
+            data-testid="send-to-other-pair"
+            aria-label={
+              pairSide === "right" ? "Move project to the left pair" : "Move project to the right pair"
+            }
+            title={
+              (pairSide === "right" ? "Move to the left pair" : "Move to the right pair") +
+              " — restarts this project's terminals"
+            }
+            // MOVE THE SELECTION WITH THE PROJECT. Assigning alone leaves the destination pair's
+            // selection on whatever it already had, so sending a SECOND project across mounted its
+            // panes invisibly and the button read as "does nothing but grow a tab" (roborev 55149).
+            // `openProjectTab` is side-aware now, so it lands the selection in whichever pair the
+            // assignment just put it in — hence assign first, then select.
+            onClick={() => {
+              const to = pairSide === "right" ? "left" : "right";
+              assignProjectToPair(project.id, to);
+              openProjectTab(project.id);
+            }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              background: "none",
+              border: "none",
+              padding: 2,
+              cursor: "pointer",
+              color: C.muted,
+              flex: "0 0 auto",
+            }}
+          >
+            {pairSide === "right" ? <FiChevronsLeft size={14} /> : <FiChevronsRight size={14} />}
+          </button>
           {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. */}
           <span aria-hidden style={{ flex: 1, minWidth: 0 }} />
           {/* Hidden in Plan (no rows to filter) and when the project has no top-level agents at all
@@ -2148,7 +2213,7 @@ export function AgentSidebar({
               cursor: "pointer",
               fontSize: TYPE.body,
               fontWeight: FONT_WEIGHT.semibold,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
             }}
           >
             Got it
@@ -4115,7 +4180,7 @@ function AgentDetailLines({
     fontSize: 10,
     fontWeight: 700,
     lineHeight: 1,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     padding: "2px 7px",
     // RADIUS.sm, not a hand-typed 5. theme/scale.test.ts is a ratchet on off-scale values and this
     // pill was one of them; 4 vs 5 is imperceptible at this size, and the migration is the
@@ -4230,7 +4295,7 @@ function PathReveal({ path }: { path: string }) {
       style={{
         color: hover ? C.accentInk : C.muted,
         fontSize: 12,
-        fontFamily: FONT.mono,
+        fontFamily: FONT_MONO,
         whiteSpace: "nowrap",
         cursor: "pointer",
         textDecoration: hover ? "underline" : "none",

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -96,7 +96,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
           borderRadius: RADIUS.modal,
           padding: 22,
           color: C.cream,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           boxShadow: MODAL_SHADOW,
         }}
       >

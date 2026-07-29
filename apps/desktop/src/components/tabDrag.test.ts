@@ -132,3 +132,56 @@ describe("tearOffTopLeft", () => {
     });
   });
 });
+
+// ── THE LEFT PAIR'S STRIP IS PAINTED RIGHT-TO-LEFT ────────────────────────────────────────────
+//
+// `.ptabstrip[data-side="left"]` sets `flex-direction: row-reverse` so the active tab hugs the
+// centre on both sides of the concierge. That makes ARRAY order and SCREEN order disagree, and the
+// midpoint scan compares screen x — so without `reversed` a dragged tab lands in the mirror image
+// of the slot the user aimed at. The `beforeId` these return is always an ARRAY position, because
+// that is what `reorderProject` consumes.
+describe("resolveTabDrag — a reversed (left-pair) strip", () => {
+  // Same three tabs, same array order [a, b, c], but PAINTED c, b, a from left to right. The rects
+  // are what the DOM would actually report under row-reverse.
+  const REV_TABS: TabRect[] = [
+    { id: "a", x: 500, width: 200 },
+    { id: "b", x: 300, width: 200 },
+    { id: "c", x: 100, width: 200 },
+  ];
+  const revDrag = (x: number) =>
+    resolveTabDrag(
+      {
+        pointer: { x, y: 68 },
+        origin: { x: 600, y: 68 },
+        strip: STRIP,
+        tabs: REV_TABS,
+        draggedId: "a",
+        dragging: true,
+        reversed: true,
+      },
+      OPTS,
+    );
+
+  it("appends when dropped at the far LEFT, because visually-first is array-last", () => {
+    // The end that is easiest to get backwards: the leftmost pixel of a reversed strip is the END
+    // of the array, so this must be an append (null), not "before a".
+    expect(revDrag(120)).toEqual({ kind: "reorder", beforeId: null });
+  });
+
+  it("inserts before the array-FIRST tab when dropped at the far RIGHT", () => {
+    expect(revDrag(690)).toEqual({ kind: "reorder", beforeId: "a" });
+  });
+
+  it("maps an interior slot to the array position left of the tab it was dropped before", () => {
+    // Between painted c and b (visual slots 1|2) → array-wise that is before c.
+    expect(revDrag(250)).toEqual({ kind: "reorder", beforeId: "c" });
+    // Between painted b and a → before b.
+    expect(revDrag(450)).toEqual({ kind: "reorder", beforeId: "b" });
+  });
+
+  it("is the plain left-to-right rule when `reversed` is absent", () => {
+    // The default must not disturb the right pair, which is every existing caller.
+    expect(drag({ x: 690, y: 68 }, "a", true)).toEqual({ kind: "reorder", beforeId: null });
+    expect(drag({ x: 120, y: 68 }, "a", true)).toEqual({ kind: "reorder", beforeId: "a" });
+  });
+});

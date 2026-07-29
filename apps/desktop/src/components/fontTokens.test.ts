@@ -5,12 +5,18 @@
 // substitution is most of why the running app read as a different product from the approved design.
 // The fix was a sweep, and a sweep only holds if the next person cannot quietly re-type the string.
 //
-// A RATCHET, not a ban — the same shape and for the same reason as `theme/scale.test.ts`. The sweep
-// that landed this covered every surface one agent owned; the concierge, the workspace shell and the
-// modals are being migrated on their own branches, so a hard `=== 0` here would red the fleet for
-// work that is in flight rather than missing. The gate is `<=`: it fails only when the count RISES
-// (someone retyped a stack) and tolerates it falling (someone migrated one). Lower the constants in
-// the same PR that lowers reality, so the ceiling stays tight.
+// A RATCHET, not a ban — the same shape and for the same reason as `theme/scale.test.ts`. The gate
+// is `<=`: it fails only when the count RISES (someone retyped a stack) and tolerates it falling
+// (someone migrated one). Lower the constants in the same PR that lowers reality, so the ceiling
+// stays tight.
+//
+// BOTH CEILINGS ARE NOW 0. The sweep that created this file covered one agent's surfaces and left
+// the ceiling at 52 for the concierge, the workspace shell and the modals, which were in flight on
+// other branches. Those have landed, so the remaining 42 sites were migrated to `FONT_UI` /
+// `FONT_MONO`, `terminalChrome`'s `TERM_UI`/`TERM_MONO` now RE-EXPORT the tokens rather than
+// re-typing them, and the two surfaces with a genuine typographic reason to name a face are exempt
+// BY PATH below. Reaching 0 is what makes the guard mean "nobody retypes the stack" instead of
+// "nobody retypes more of it than we already had".
 //
 // It reads the SOURCE, for the same reason scale.test.ts does: these are inline style objects with
 // no shared render path, so there is no runtime seam to inspect, and the thing being guarded is what
@@ -46,6 +52,27 @@ const BANNED = ["IBM Plex Sans", "IBM Plex Mono", "Source Code Pro", "Verdana"];
 const FONT_EXEMPT = new Set(["components/Terminal.tsx"]);
 
 /**
+ * Paths allowed to name a font stack literally — exempt from the QUOTED count ONLY.
+ *
+ * SEPARATE FROM `FONT_EXEMPT` ON PURPOSE (roborev 55159). Collapsing the two into one
+ * skip-the-whole-file gate was wider than its own justification: Terminal needs a real
+ * box-drawing mono and SparkleOverlay's reply is a deliberate serif, and NEITHER of those
+ * requires immunity from `BANNED`. Blanket immunity would have let someone type `IBM Plex Sans`
+ * or `Verdana` into the overlay with both ratchets still green — precisely the substitution this
+ * guard exists to prevent. It also reopened the hoisting hole the scanner's header claims closed:
+ * a stack `const`-exported from a fully-skipped file is invisible to every importer, because the
+ * per-file const sweep is the only thing that would have counted it.
+ */
+const QUOTED_PATH_EXEMPT = new Set([
+  // xterm needs a real monospace carrying the U+2500 box-drawing block.
+  "components/Terminal.tsx",
+  // The Sparkle voice overlay's reply is set in a SERIF on purpose — the one surface deliberately
+  // not in the instrument's own face. Listed rather than counted: an exemption you can see is one
+  // the next person can argue with; a number they cannot.
+  "components/SparkleOverlay/SparkleOverlay.tsx",
+]);
+
+/**
  * `theme/scale.ts` DEFINES `FONT_UI` and `FONT_MONO`, so its two `export const … = 'system-ui, …'`
  * lines are the canonical source of truth — not drift (roborev 54781).
  *
@@ -61,9 +88,20 @@ const FONT_EXEMPT = new Set(["components/Terminal.tsx"]);
 const QUOTED_EXEMPT = new Set(["theme/scale.ts"]);
 
 /** Lines naming a replaced webfont, outside the exempt path. Lower as branches land. */
-const MAX_BANNED_FAMILY = 3;
-/** `fontFamily:` properties still holding a quoted stack instead of FONT_UI / FONT_MONO. */
-const MAX_QUOTED_STACK = 52;
+const MAX_BANNED_FAMILY = 0;
+/**
+ * `fontFamily:` properties still holding a quoted stack instead of FONT_UI / FONT_MONO.
+ *
+ * ZERO — the destination this ratchet was written to reach, arrived at rather than declared. It sat
+ * at 52 while the sweep that created it covered only one agent's surfaces; the rest are migrated
+ * now, `terminalChrome`'s TERM_UI/TERM_MONO re-export the tokens instead of re-typing them, and the
+ * two genuine holdouts are exempt BY PATH above rather than hidden inside a number.
+ *
+ * It stays a `<=` ratchet, not a `=== 0`: the gate should fail when someone re-types a stack, and a
+ * future surface with a real typographic reason to name a face belongs in FONT_EXEMPT with its
+ * reason written down — not smuggled in by nudging a constant.
+ */
+const MAX_QUOTED_STACK = 0;
 
 /** Keywords, not stacks. `fontFamily: "inherit"` is a legitimate thing to write. */
 const NOT_A_STACK = new Set(["inherit", "monospace", "initial", "unset", "revert"]);
@@ -134,7 +172,13 @@ export function scanSource(rel: string, src: string): { banned: string[]; quoted
       }
     }
 
-    for (const m of src.matchAll(/\bfontFamily:/g)) {
+    // BOTH the longhand AND the `font:` SHORTHAND, which carries a family too and is already
+    // idiomatic here (15 call sites, two of them setting a face). Reading only `fontFamily:` left
+    // `font: '700 13px/1 system-ui, …'` retyping the stack character-for-character with both
+    // ceilings still at 0 — a fourth evasion of exactly the shape the header enumerates as closed,
+    // and one that costs more at 0 than it did at 52 (roborev 55159). The depth/quote-aware value
+    // walk below needs no change: it already reads to the real terminator.
+    for (const m of src.matchAll(/\bfont(?:Family)?:/g)) {
       const start = m.index! + m[0].length;
       if (isComment(m.index!)) continue;
       // Read to the value expression's REAL terminator, so a wrapped ternary is not exempt.
@@ -163,9 +207,79 @@ export function scanSource(rel: string, src: string): { banned: string[]; quoted
         } else if ((c === "," || c === ";") && depth === 0) break;
       }
       const expr = src.slice(start, end);
-      for (const q of expr.matchAll(/(['"])(.*?)\1/g)) {
-        if (NOT_A_STACK.has(q[2]!)) continue;
-        quoted.push(`${rel}:${lineAt(m.index!)}: ${q[2]}`);
+      // JUDGE THE VALUE BY `looksLikeStack`, NOT BY "it contains a quote" (roborev 55194).
+      //
+      // The quote-based rule was wrong in BOTH directions once `font:` was in scope:
+      //
+      //  • It missed backticks entirely. Every real shorthand that sets a face is a TEMPLATE
+      //    LITERAL, because the shorthand needs size interpolation — so
+      //    `font: \`700 13px/1 ui-monospace, Menlo, monospace\`` retyped a stack, named no BANNED
+      //    family, and left both ceilings at 0. The widened regex matched the property and then
+      //    found nothing to report.
+      //  • It over-fired on the prefix. A shorthand's value legitimately carries size/weight text,
+      //    so `font: '700 13px/1 ' + FONT_UI` — a correct use of the token — was reported as a
+      //    retyped stack, as were the CSS system-font keywords (`caption`, `menu`, `status-bar`);
+      //    only `inherit` was excused.
+      //
+      // Both go away by asking the same question the hoist sweep asks: does this text look like a
+      // font stack? Backticks are included in the fragment scan, and a fragment that does not look
+      // like a stack is not one.
+      // WHICH RULE APPLIES DEPENDS ON WHICH PROPERTY MATCHED (roborev 55199).
+      //
+      // For `fontFamily:` a quoted value IS a family by definition, so ANY quoted fragment counts —
+      // the original rule. Applying the shape heuristic here too punched a new hole in the very
+      // ratchet the previous commit closed: `fontFamily: "Georgia"`,
+      // `'"Helvetica Neue", Helvetica, Arial'` and `"Menlo, Consolas"` are all fully retyped stacks
+      // that name no BANNED family and carry no `system-ui`-class token, so they went from one hit
+      // to none with both ceilings still reading 0.
+      //
+      // The shorthand is the case that needs the heuristic, and only it: its value legitimately
+      // carries size/weight text, and the CSS system-font keywords (`caption`, `menu`,
+      // `status-bar`) are legal there and nowhere else.
+      const shorthand = !m[0].includes("Family");
+      for (const q of expr.matchAll(/(['"`])([\s\S]*?)\1/g)) {
+        const v = q[2]!;
+        if (NOT_A_STACK.has(v.trim())) continue;
+        // PURE INTERPOLATION IS A TOKEN USE, NOT A STACK. Backticks only entered this scan when the
+        // shorthand did, and `looksLikeStack` was masking them; with the longhand back on its
+        // any-quoted-fragment rule, `` fontFamily: `${FONT_UI}` `` would be reported as drift —
+        // telling its author to migrate code that is already migrated, which is precisely the
+        // false-positive the shorthand has its own regression test for. (roborev 55203)
+        //
+        // A QUOTE INSIDE THE BRACES IS THE SIGNAL — not the expression's shape.
+        //
+        // `[^}]*` accepted anything, and because the fragment regex consumes the whole backtick
+        // span, literals nested inside are never scanned on their own: wrapping a stack in `${…}`
+        // was a fourth evasion of a scanner whose header enumerates three as closed (roborev 55209).
+        // But narrowing to a BARE BINDING over-corrected — `` `${mono ? FONT_MONO : FONT_UI}` `` is
+        // a fully migrated spelling that names no family, and it was reported as drift, the same
+        // "go migrate code that is already migrated" false positive this file keeps two regression
+        // tests for (roborev 55223).
+        //
+        // A literal-free interpolation cannot hide a stack, whatever its shape; one containing a
+        // quote is exactly the case that can. So the rule is the quote, and both cases fall out.
+        if (q[1] === "`" && /^\s*\$\{[^'"`}]*\}\s*$/.test(v)) continue;
+        // A DEPTH-0 COMMA IS THE OTHER THING THAT MAKES A FALLBACK LIST A STACK.
+        //
+        // `looksLikeStack` alone needs a strong token, or a generic keyword AND a comma — so under
+        // the shorthand it waved through exactly what the longhand fix had just caught:
+        // `font: '700 13px/1 "Helvetica Neue", Helvetica, Arial'`, `font: "italic 12px Menlo,
+        // Consolas"`. And the shorthand is where the real retypes live here — every site that sets a
+        // face is a shorthand template literal. None of the legitimate shorthand values carry a
+        // comma (`'700 13px/1 ' + FONT_UI`, `caption`, `` `700 ${SIZE}px/1 ${FONT_MONO}` ``), so the
+        // comma is a safe second signal.
+        // DEPTH-0 means what it says now: interpolations are stripped before the comma test. A
+        // comma inside `${…}` is an argument separator, not a font fallback — so
+        // `` font: `700 ${Math.max(11, size)}px/1 ${FONT_UI}` `` was being reported as a retyped
+        // stack, the same false positive the prefix case has a regression test for, arriving
+        // through the interpolation instead. (roborev 55209)
+        // Strip only LITERAL-FREE interpolations. Removing their contents wholesale erased the
+        // evidence along with the separator, which re-opened the same evasion one line down:
+        // `` font: `${"italic 12px Menlo, Consolas"}` `` stripped to the empty string, found no
+        // comma, and scored zero — while the unwrapped spelling is pinned at one hit. (roborev 55223)
+        const literal = v.replace(/\$\{[^'"`}]*\}/g, "");
+        if (shorthand && !looksLikeStack(v) && !literal.includes(",")) continue;
+        quoted.push(`${rel}:${lineAt(m.index!)}: ${v}`);
       }
       // A bare identifier as the value needs no separate handling: if it names a stack hoisted in
       // this file, the `consts` sweep above already counted the DECLARATION — which is the honest
@@ -176,16 +290,35 @@ export function scanSource(rel: string, src: string): { banned: string[]; quoted
   return { banned, quoted };
 }
 
-function scan(): { banned: string[]; quoted: string[] } {
+/**
+ * Apply the two exemption gates across a set of already-scanned files.
+ *
+ * EXPORTED, and parameterised on the (rel, source) pairs, because the gates were previously
+ * unreachable from any test: the scanner describe exercises `scanSource` directly and never got
+ * here, so "the overlay is no longer immune to BANNED" — the entire point of splitting the two
+ * sets — was asserted nowhere (roborev 55194).
+ */
+export function applyExemptions(
+  files: ReadonlyArray<readonly [string, string]>,
+): { banned: string[]; quoted: string[] } {
   const banned: string[] = [];
   const quoted: string[] = [];
-  for (const file of sourceFiles(SRC)) {
-    const rel = file.slice(SRC.length);
-    const r = scanSource(rel, readFileSync(file, "utf8"));
+  for (const [rel, src] of files) {
+    const r = scanSource(rel, src);
+    // TWO SEPARATE GATES. The quoted exemption is what made 0 reachable (roborev 54852) — it used
+    // to gate `banned` only, so the holdouts' deliberate stacks still counted toward the quoted
+    // ceiling, an exemption that did not exempt. But it must NOT also grant immunity from BANNED:
+    // see QUOTED_PATH_EXEMPT.
     if (!FONT_EXEMPT.has(rel)) banned.push(...r.banned);
-    quoted.push(...r.quoted);
+    if (!QUOTED_PATH_EXEMPT.has(rel)) quoted.push(...r.quoted);
   }
   return { banned, quoted };
+}
+
+function scan(): { banned: string[]; quoted: string[] } {
+  return applyExemptions(
+    sourceFiles(SRC).map((f) => [f.slice(SRC.length), readFileSync(f, "utf8")] as const),
+  );
 }
 
 describe("font families come from the scale, never from a retyped literal", () => {
@@ -272,4 +405,95 @@ describe("the scan cannot be evaded by moving code", () => {
     expect(q(`const a = { fontFamily: "inherit" };`)).toEqual([]);
     expect(q(`// fontFamily: "IBM Plex Mono, monospace" in a comment is documentation\n`)).toEqual([]);
   });
+
+  // THE `font:` SHORTHAND — the fourth evasion. It carries a family too, and every real site that
+  // sets a face is a TEMPLATE LITERAL because the shorthand needs size interpolation.
+  it("SHORTHAND: `font:` with a stack counts, in quotes or backticks", () => {
+    expect(
+      q(`const a = { font: '700 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif' };\n`),
+    ).toHaveLength(1);
+    // The backtick form is the one that actually appears in this codebase.
+    expect(q("const a = { font: `700 13px/1 ui-monospace, Menlo, monospace` };\n")).toHaveLength(1);
+  });
+
+  // THE LONGHAND KEEPS THE STRICT RULE. These three are fully retyped stacks that name no BANNED
+  // family and carry no `system-ui`-class token, so a shape heuristic would wave them through — and
+  // did, for one commit. The pre-existing longhand cases all happen to carry a generic keyword AND a
+  // comma, so they clear that bar by accident and cannot detect the narrowing. (roborev 55199)
+  it("LONGHAND: any quoted family counts, with or without a generic or a comma", () => {
+    expect(q('const a = { fontFamily: "Georgia" };\n')).toHaveLength(1);
+    expect(q(`const a = { fontFamily: '"Helvetica Neue", Helvetica, Arial' };\n`)).toHaveLength(1);
+    expect(q('const a = { fontFamily: "Menlo, Consolas" };\n')).toHaveLength(1);
+    // …but the keywords are still not stacks.
+    expect(q('const a = { fontFamily: "inherit" };\n')).toEqual([]);
+  });
+
+  it("SHORTHAND: a comma-bearing family list counts even with no system-ui-class token", () => {
+    // The same wave-through the longhand case above pins, one property over — and this is the
+    // property the real retypes actually use. (roborev 55203)
+    expect(q(`const a = { font: '700 13px/1 "Helvetica Neue", Helvetica, Arial' };\n`)).toHaveLength(1);
+    expect(q('const a = { font: "italic 12px Menlo, Consolas" };\n')).toHaveLength(1);
+    expect(q("const a = { font: `600 13px/1 Georgia, Palatino` };\n")).toHaveLength(1);
+  });
+
+  it("LONGHAND: a pure-interpolation template is a token use, not drift", () => {
+    expect(q("const a = { fontFamily: `${FONT_UI}` };\n")).toEqual([]);
+    // …but only a BARE BINDING. Arbitrary code inside the braces hides a literal from the scan,
+    // because the fragment regex swallows the whole backtick span.
+    expect(q(`const a = { fontFamily: \`\${cond ? "Menlo, Consolas" : FONT_UI}\` };\n`)).toHaveLength(1);
+  });
+
+  it("SHORTHAND: a comma INSIDE an interpolation is an argument, not a fallback list", () => {
+    expect(q("const a = { font: `700 ${Math.max(11, size)}px/1 ${FONT_UI}` };\n")).toEqual([]);
+    // …but a QUOTED literal inside one is a stack in hiding, not an argument. Stripping the whole
+    // interpolation erased the evidence with the separator and let this score zero, while the
+    // unwrapped spelling is pinned at one hit above.
+    expect(q(`const a = { font: \`\${"italic 12px Menlo, Consolas"}\` };\n`)).toHaveLength(1);
+  });
+
+  it("a literal-free interpolation is a token use, whatever its shape", () => {
+    // Requiring a BARE BINDING rejected this — a fully migrated spelling that names no family.
+    expect(q("const a = { fontFamily: `${mono ? FONT_MONO : FONT_UI}` };\n")).toEqual([]);
+    expect(q("const a = { fontFamily: `${props.mono ? FONT_MONO : FONT_UI}` };\n")).toEqual([]);
+  });
+
+  it("SHORTHAND: the size/weight prefix does not make a token use look like a retype", () => {
+    // `font: '700 13px/1 ' + FONT_UI` is a CORRECT use of the token. A quote-based rule reported it
+    // as drift, which would have told its author to go migrate code that was already migrated.
+    expect(q("const a = { font: '700 13px/1 ' + FONT_UI };\n")).toEqual([]);
+    expect(q("const a = { font: `700 ${SIZE}px/1 ${FONT_MONO}` };\n")).toEqual([]);
+    // CSS system-font keywords are not stacks either.
+    expect(q('const a = { font: "caption" };\n')).toEqual([]);
+    expect(q('const a = { font: "inherit" };\n')).toEqual([]);
+  });
 });
+
+// ── THE TWO EXEMPTION GATES ───────────────────────────────────────────────────────────────────
+//
+// `FONT_EXEMPT` (banned) and `QUOTED_PATH_EXEMPT` (quoted) are deliberately SEPARATE. Collapsing
+// them into one skip-the-file gate was wider than its justification and handed the exempt paths
+// blanket immunity from BANNED — someone could type `Verdana` into the overlay with both ceilings
+// still green. These are the cases that were asserted nowhere before (roborev 55194).
+describe("the exemption gates", () => {
+  const OVERLAY = "components/SparkleOverlay/SparkleOverlay.tsx";
+
+  it("suppresses a quoted stack on a quoted-exempt path", () => {
+    const r = applyExemptions([[OVERLAY, `const a = { fontFamily: '"Iowan Old Style", "Palatino", serif' };\n`]]);
+    expect(r.quoted).toEqual([]);
+  });
+
+  it("STILL reports a banned family on that same path", () => {
+    // The whole point of the split. A serif reply is a typographic decision; shipping Verdana is the
+    // regression this guard exists to prevent, and the exemption must not cover it.
+    const r = applyExemptions([[OVERLAY, `const a = { fontFamily: '"Verdana", serif' };\n`]]);
+    expect(r.banned.length).toBe(1);
+    expect(r.banned[0]).toContain("Verdana");
+  });
+
+  it("reports both on a path that is not exempt at all", () => {
+    const r = applyExemptions([["components/Whatever.tsx", `const a = { fontFamily: '"IBM Plex Sans", sans-serif' };\n`]]);
+    expect(r.banned.length).toBe(1);
+    expect(r.quoted.length).toBe(1);
+  });
+});
+

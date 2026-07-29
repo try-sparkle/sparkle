@@ -11,6 +11,7 @@ import { useUiStore } from "./stores/uiStore";
 import { useDictationStore } from "./stores/dictationStore";
 import { bootSelection } from "./engine/openProjects";
 import { markProjectOpen } from "./services/projectTabs";
+import { selectProjectOnItsSide } from "./services/openProjectTab";
 import {
   setWindowProject,
   clearWindowProject,
@@ -274,7 +275,16 @@ export const useReplaceCurrentProject = (): ((id: string | null) => void) => {
       const st = useProjectStore.getState();
       if (id) {
         markProjectOpen(id);
-        st.selectProject(id);
+        // SIDE-AWARE, exactly as `openProjectTab` is (engine/pairs).
+        //
+        // This is the seam the notification reveal ACTUALLY uses: useAttentionNotifications'
+        // focus-agent handler calls here, and reaches `openProjectTab` only in its stale-agent
+        // fallback. So routing only that one left this path writing the RIGHT pair's selection for a
+        // LEFT-assigned project — and the Workspace's reconcile effect then cancels the write on the
+        // next commit, leaving `leftProjectId` untouched and the reveal invisible. Clicking a
+        // notification for a left-pair agent did nothing at all. Same for App.tsx's capture
+        // hand-off. (roborev 55158)
+        selectProjectOnItsSide(id);
       } else st.setSelectedProject(null);
     },
     [],

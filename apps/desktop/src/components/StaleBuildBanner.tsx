@@ -2,6 +2,7 @@ import { type CSSProperties } from "react";
 import { FiAlertTriangle, FiRefreshCw, FiX } from "react-icons/fi";
 import { C, ON_BRAND_FILL, FONT_WEIGHT } from "../theme/colors";
 import { useStaleBuildStore, restartToFinishUpdate } from "../services/staleBuildService";
+import { FONT_UI } from "../theme/scale";
 
 // "Restart to finish updating" banner (bead sparkle-jeen). Shows when the build INSTALLED on disk
 // differs from the one this process is RUNNING — i.e. an update landed but the old process is still
@@ -24,7 +25,7 @@ const bar: CSSProperties = {
   borderBottom: `1px solid ${C.amberInk}`,
   color: C.cream,
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
 };
 
@@ -39,7 +40,7 @@ const primaryBtn: CSSProperties = {
   padding: "5px 12px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -53,7 +54,7 @@ const dismissBtn: CSSProperties = {
   borderRadius: 6,
   padding: "5px 10px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 

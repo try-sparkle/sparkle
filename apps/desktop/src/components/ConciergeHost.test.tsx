@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { resetCable, useCableStore } from "../stores/cableStore";
 import type {
   ConciergeDispatchPath,
   ConciergeDispatchResult,
@@ -2410,5 +2411,34 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     expect(usePendingAttachmentsStore.getState().drain("someone-else")).toEqual([
       "/tmp/theirs.png",
     ]);
+  });
+});
+
+// ── THE CABLE REACHES THE COLUMN ──────────────────────────────────────────────────────────────
+//
+// `ConciergeColumn` has carried the flood and the lift since the cockpit landed, and
+// `ConciergeColumn.wired.test.tsx` has asserted both — GIVEN THE PROP. Nothing passed it. The prop
+// defaults to "off", so wiring an agent moved the shell root's `data-wired` and the two CSS seam
+// rules while the column itself never learned: no flood, no drop to flush, both treatments dead
+// code that a green unit test vouched for.
+//
+// This pins the WIRING rather than the unit — the half that was missing.
+describe("the cable reaches the concierge column", () => {
+  beforeEach(() => resetCable());
+  afterEach(() => resetCable());
+
+  it("is off at rest", () => {
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
+  });
+
+  it("follows the cable into either pair", () => {
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    act(() => useCableStore.getState().patch("right"));
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("right");
+    act(() => useCableStore.getState().patch("left"));
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("left");
+    act(() => useCableStore.getState().unbind());
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
   });
 });

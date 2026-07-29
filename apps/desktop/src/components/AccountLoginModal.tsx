@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { C, MODAL_SHADOW, SCRIM } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { FONT_UI, RADIUS } from "../theme/scale";
 import type { Account } from "../services/accountStore";
 import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
 import { checkClaude } from "../preflight";
@@ -75,7 +75,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           borderRadius: RADIUS.modal,
           padding: 16,
           color: C.cream,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           boxShadow: MODAL_SHADOW,
         }}
       >

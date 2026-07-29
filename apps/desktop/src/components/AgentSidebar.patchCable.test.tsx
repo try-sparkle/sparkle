@@ -1,0 +1,123 @@
+// @vitest-environment jsdom
+//
+// SELECTING A BUILD ROW PATCHES THE CABLE — the gesture the whole connection feature hangs off.
+//
+// Everything downstream of `wired` was built and correct long before this: the concierge's flood and
+// lift, the shell root's `data-wired`, the seam that vanishes at the wired pair, and `promptTarget`
+// routing to that pair's selected agent. None of it could ever fire, because NOTHING IN APP CODE
+// CALLED `patch`. The only producers were the test suite and a DEV-only capture handle, so in a
+// shipped build `wired` was permanently "off" and the two `workspace-wired-*` visual surfaces were
+// capturing a state no user could reach (roborev 55221).
+//
+// These CLICK A ROW rather than calling `patch` directly, which is the entire point: a test that
+// drives the store proves the store works and says nothing about whether a user can get there. That
+// distinction is what let the break survive — `ConciergeColumn.wired.test.tsx` asserted the flood in
+// full, supplying the prop itself, and passed the whole time the feature was dead.
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+  revealItemInDir: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
+vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
+vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
+vi.mock("../services/branchStatus", () => ({
+  refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+  landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
+}));
+
+import { AgentSidebar } from "./AgentSidebar";
+import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
+import { resetCable, useCableStore } from "../stores/cableStore";
+import type { AgentTab, Project } from "../types";
+
+function mkAgent(id: string, name: string): AgentTab {
+  return {
+    id, name, kind: "build", parentId: null, runtime: "local",
+    worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
+    promptHistory: [], namePinned: true, autoNameBasis: null,
+    autoNameVariants: null, shellCommand: null,
+  };
+}
+
+const PROJECT: Project = {
+  id: "p1",
+  name: "Alpha",
+  rootPath: "/tmp/p1",
+  defaultBranch: null,
+  createdAt: new Date(0).toISOString(),
+  selectedAgentId: "a1",
+  agents: [mkAgent("a1", "Stripe checkout retry"), mkAgent("a2", "Concierge column layout")],
+};
+
+const rowFor = (name: string) =>
+  screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
+
+beforeEach(() => {
+  useProjectStore.setState({ projects: [PROJECT], selectedProjectId: "p1" } as never);
+  useRuntimeStore.setState({ openAgentIds: ["a1", "a2"], status: {} } as never);
+  useUiStore.setState({
+    activeSpecial: null,
+    collapsedOrchestrators: {},
+    autoExpandedOrchestrators: {},
+    pairAssignment: {},
+    leftProjectId: null,
+  } as never);
+  resetCable();
+});
+afterEach(() => {
+  cleanup();
+  resetCable();
+});
+
+describe("selecting a build row patches the cable", () => {
+  it("is unwired until a row is clicked", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    expect(useCableStore.getState().wired).toBe("off");
+  });
+
+  it("patches to the RIGHT for a right-assigned project", () => {
+    // Absent from the assignment map means right — the historical single-pair home, and what every
+    // pre-existing project reads as.
+    render(<AgentSidebar project={PROJECT} />);
+    fireEvent.click(rowFor("Concierge column layout"));
+    expect(useCableStore.getState().wired).toBe("right");
+  });
+
+  it("patches to the LEFT when this sidebar's project lives in the left pair", () => {
+    // The side is the SIDEBAR'S OWN pair, read from the assignment map — not a prop and not a
+    // guess, so it cannot disagree with the stage its panes are mounted in.
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    render(<AgentSidebar project={PROJECT} />);
+    fireEvent.click(rowFor("Concierge column layout"));
+    expect(useCableStore.getState().wired).toBe("left");
+  });
+
+  it("MOVES the cable rather than lighting both sides", () => {
+    // ONE LIVE CIRCUIT. This falls out of `patchCable`'s reducer rather than being re-imposed here,
+    // which is why patching the other side is a move and never an addition.
+    render(<AgentSidebar project={PROJECT} />);
+    fireEvent.click(rowFor("Concierge column layout"));
+    expect(useCableStore.getState().wired).toBe("right");
+    useUiStore.setState({ pairAssignment: { p1: "left" } } as never);
+    cleanup();
+    render(<AgentSidebar project={PROJECT} />);
+    fireEvent.click(rowFor("Stripe checkout retry"));
+    expect(useCableStore.getState().wired).toBe("left");
+  });
+
+  it("docks a floating concierge, so wired and floating cannot both be true", () => {
+    // Also `patchCable`'s own invariant: a floating concierge sits on top of the very row it claims
+    // to be wired to. Asserted through the GESTURE so the guarantee is the user's, not the store's.
+    useCableStore.getState().overlayTo("assist");
+    render(<AgentSidebar project={PROJECT} />);
+    fireEvent.click(rowFor("Concierge column layout"));
+    expect(useCableStore.getState().overlay).toBe("off");
+    expect(useCableStore.getState().wired).toBe("right");
+  });
+});

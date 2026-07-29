@@ -48,6 +48,7 @@
 //
 // DELIBERATELY ABSENT: the updater's install path, `reset_config` and `write_config_text`. They
 // belong to other domains and are too dangerous to expose in this pass.
+import { selectProjectOnItsSide } from "../openProjectTab";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -374,7 +375,10 @@ export function selectProject(projectId: string): WorkspaceResult<{ projectId: s
       `"${project.name}" has no open tab. Use open_project_tab to put it back on screen first.`,
     );
   }
-  useProjectStore.getState().selectProject(projectId);
+  // Side-aware (engine/pairs). A bare `selectProject` for a LEFT-assigned project is reverted by
+  // the Workspace's reconcile effect one commit later, so this returned `ok(...)` — and the agent
+  // told the user it had switched — for a switch that visibly never happened (roborev 55158).
+  selectProjectOnItsSide(projectId);
   return ok("select_project", { projectId });
 }
 
