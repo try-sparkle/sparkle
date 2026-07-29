@@ -1069,6 +1069,27 @@ describe("a disposed engine goes silent", () => {
   // would overwrite the LIVE agent's status with a terminal `done`/`errored` — which opens the
   // destructive-op gate through LIVE_AGENT_STATUSES entirely on its own, independently of the
   // turn-end-witness path.
+  //
+  // Fake timers here for the same reason the main suite uses them: the resurrection this guards
+  // against is a re-armed setTimeout, so the test has to be able to advance past it.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("ignores a late pty:data chunk — no status write, no resurrected timers", () => {
+    // roborev 55094. `pty:data` is unlistened over the same async round-trip as `pty:exit`, so a
+    // dead PTY's chunk can reach the old engine after the pane remounted. Without the latch it would
+    // write a status onto the LIVE agent's row and re-arm the timers dispose() just cleared, so the
+    // corpse keeps writing for another SCREEN_RECHECK_MS.
+    const { engine, statuses } = makeEngine(() => IDLE_SCREEN);
+    engine.ingest("doing work\n");
+    engine.dispose();
+    const before = statuses.length;
+    engine.ingest("✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)");
+    engine.ingest("more output\n");
+    vi.advanceTimersByTime(60_000); // nothing may fire from a resurrected timer
+    expect(statuses.length).toBe(before);
+  });
+
   it("ignores a pty:exit that arrives after dispose", () => {
     const { engine, statuses } = makeEngine();
     engine.ingest("doing work\n");

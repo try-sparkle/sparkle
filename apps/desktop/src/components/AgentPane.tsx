@@ -1063,9 +1063,19 @@ function AgentPaneInner({
                 // exits — i.e. the user explicitly quits `claude` (e.g. /exit). Because
                 // buildClaudeExec launches `claude` in its interactive REPL mode, an active worker
                 // that finishes its task and writes result.json will remain alive in the REPL; it
-                // does NOT exit. The Terminal component also removes its exit listener before
-                // killPty, so a programmatic kill won't reach here either. In practice this
-                // block rarely fires for interactive workers. Plan 2 reads result.json by polling
+                // does NOT exit. A PROGRAMMATIC KILL CAN STILL REACH HERE, and the comment that
+                // used to sit here ("Terminal also removes its exit listener before killPty, so a
+                // programmatic kill won't reach here either") was wrong twice over. The unlisten is
+                // async and fire-and-forget, so the old effect's handler could still fire — that
+                // part is now closed by Terminal's `disposed` guard (roborev 55107). But pty events
+                // are addressed by AGENT ID, not by PTY instance, and the id is identical across
+                // attempts: on "Start again" the NEW effect has already subscribed by the time the
+                // old PTY's reader thread emits its exit, so the event lands on a handler that is
+                // not disposed (roborev 55114). Closing THAT needs a spawn epoch echoed back from
+                // Rust so the transport can drop events from a previous generation — not done here.
+                // Until then, treat a call to this block as "an exit for this agent id arrived",
+                // not as proof that THIS attempt's process exited. In practice it rarely fires for
+                // interactive workers. Plan 2 reads result.json by polling
                 // via `read_worker_result` — NOT on PTY exit.
                 //
                 // Only read result.json for worker agents on a FRESH launch. A resumed worker

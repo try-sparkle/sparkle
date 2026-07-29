@@ -110,8 +110,17 @@ export function noteProcessExit(agentId: string, owner?: unknown): void {
   found.exited = true;
 }
 /** The status engine latched Claude's spinner; its disappearance now marks turn end. */
-export function noteSpinnerSeen(agentId: string): void {
-  entry(agentId).spinner = true;
+export function noteSpinnerSeen(agentId: string, owner?: unknown): void {
+  // Same non-creating, ownership-scoped shape as `noteProcessExit`, and for the same race (roborev
+  // 55094). `pty:data` is unlistened over the same async round-trip as `pty:exit`, so a late spinner
+  // frame from a DEAD PTY can reach the old engine's ingest after the pane remounted. Creating or
+  // blindly setting here would grant `spinner: true` on the record the new engine just reset —
+  // converting the live agent's GUESSED idle into a witnessed turn end, which is exactly the
+  // protection this module exists to provide, defeated through a second door.
+  const found = byAgent.get(agentId);
+  if (found === undefined) return;
+  if (owner !== undefined && found.owner !== null && found.owner !== owner) return;
+  found.spinner = true;
 }
 
 /** Is this window driving the agent at all? False for an agent whose pane lives elsewhere (or not at

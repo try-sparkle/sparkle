@@ -355,6 +355,9 @@ export class StatusEngine {
    *      still caught.
    */
   noteUserInput(text: string): void {
+    // Same latch: the engine registry only guards by identity at UNREGISTER time, so a submit path
+    // holding a stale reference could still reach a disposed engine.
+    if (this.disposed) return;
     this.clearStreamFailure();
     this.sawRecentError = false;
     this.sawRecentRisk = false;
@@ -455,6 +458,12 @@ export class StatusEngine {
 
   /** Feed a raw PTY chunk. Splits into lines, classifies, updates status. */
   ingest(chunk: string): void {
+    // A disposed engine must go COMPLETELY silent, and ingest is the loudest path there is: it
+    // writes statuses onto what is now a DIFFERENT agent's row, snapshots a dead xterm buffer, and
+    // re-arms the very timers dispose() just cleared — so a torn-down engine would keep writing for
+    // another SCREEN_RECHECK_MS. `pty:data` is unlistened over the same async round-trip as
+    // `pty:exit`, so this window is real, not theoretical (roborev 55094).
+    if (this.disposed) return;
     const clean = stripAnsi(chunk);
     // The frame that was still being drawn before this chunk landed (everything after the partial's
     // last \r). Joined with the incoming text below, it is how the partial-banner check counts what
@@ -555,7 +564,7 @@ export class StatusEngine {
       // The spinner is now a witness to turn END (its disappearance), so this agent's settled
       // statuses stop being guesses — which is what re-closes the destructive-op gate's escape
       // hatch. Published once, on the latch.
-      noteSpinnerSeen(this.opts.agentId);
+      noteSpinnerSeen(this.opts.agentId, this);
     }
 
     // Token-advance recovery (sparkle-pqxh follow-up): after an API BANNER the request that failed

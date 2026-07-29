@@ -12,10 +12,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
-const { fit, refresh, disposed } = vi.hoisted(() => ({
+const { fit, refresh, disposed, ptyHandlers } = vi.hoisted(() => ({
   fit: vi.fn(),
   refresh: vi.fn(),
   disposed: { value: false },
+  // The handlers Terminal registers with the PTY layer, captured so a test can fire one AFTER
+  // unmount — which is exactly what the async, fire-and-forget unlisten allows in production.
+  ptyHandlers: { exit: undefined as undefined | (() => void) },
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -85,7 +88,13 @@ vi.mock("../pty", () => ({
   killPty: vi.fn(() => Promise.resolve()),
   resizePty: vi.fn(() => Promise.resolve()),
   onPtyOutput: vi.fn(() => Promise.resolve(() => {})),
-  onPtyExit: vi.fn(() => Promise.resolve(() => {})),
+  // NOTE the payload field is `id`, not `agentId`: agentTransport.onExit filters with
+  // `e.id === this.id`, so a mock that emits the wrong key silently never invokes the handler and
+  // any test built on it passes for the wrong reason (caught by mutation-checking this file).
+  onPtyExit: vi.fn((cb: (e: { id: string }) => void) => {
+    ptyHandlers.exit = () => cb({ id: "agent-1" });
+    return Promise.resolve(() => {});
+  }),
   ignorePtyGone: vi.fn(),
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
@@ -120,6 +129,7 @@ beforeEach(() => {
   refresh.mockClear();
   disposed.value = false;
   roCallback = undefined;
+  ptyHandlers.exit = undefined;
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -178,5 +188,25 @@ describe("Terminal dispose guard", () => {
     // While mounted the observer must still drive a fit + repaint — the guard must not over-block.
     expect(fit).toHaveBeenCalled();
     expect(refresh).toHaveBeenCalled();
+  });
+});
+
+describe("late PTY events after cleanup", () => {
+  // roborev 55107. Cleanup flips `disposed` and then calls `void safeUnlisten(off)` — async and
+  // fire-and-forget — so the handlers registered by the OLD effect survive the round trip to Rust
+  // and can still fire. Silencing the status engine was not enough: the listener itself calls
+  // `onExit?.()` and `setSpawnFail("exited")`, which on a "Start again" paints "Agent exited —
+  // Start again" over the freshly spawned, HEALTHY agent. A user who acts on that kills a working
+  // session, which is why the guard belongs at the source rather than in each consumer.
+  it("a stale pty:exit does not report an exit for the live pane", async () => {
+    const onExit = vi.fn();
+    const { unmount } = render(<Terminal {...baseProps} active={true} onExit={onExit} />);
+    // Let the async spawn/registration settle so the handler is captured.
+    await vi.waitFor(() => expect(ptyHandlers.exit).toBeTypeOf("function"));
+
+    unmount();
+    onExit.mockClear();
+    ptyHandlers.exit?.(); // the dead PTY's exit, arriving after the unlisten was requested
+    expect(onExit).not.toHaveBeenCalled();
   });
 });

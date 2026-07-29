@@ -817,6 +817,14 @@ export function Terminal({
     // synchronously here, so cleanup always has both unlistens even if the spawn below is still in
     // flight when the component unmounts.
     const offOut = transport.onOutput((e) => {
+      // THE LATE-EVENT GUARD, at the source (roborev 55107). Cleanup sets `disposed` and then calls
+      // `void safeUnlisten(off)` — genuinely async and fire-and-forget — so these closures survive
+      // the round trip to Rust and can still fire for a PTY this pane no longer owns. On "Start
+      // again" that means dead-PTY bytes setting `gotOutputRef`/`firstOutput`/`spawnFail` for the
+      // NEW attempt, which also defeats the "exited with no output" detection the ref exists for.
+      // Guarding here closes the whole class in one place, rather than hardening each downstream
+      // consumer (engine.ingest, engine.exit, the witness setters) one race at a time.
+      if (disposed) return;
       // First byte for this agent — drop the loading overlay. setState bails on an unchanged
       // value, so calling this on every subsequent chunk costs nothing.
       // Load-bearing ordering: set gotOutputRef SYNCHRONOUSLY here, before any exit can be
@@ -846,6 +854,12 @@ export function Terminal({
     // The transport filters exit to THIS agent's id (pty:exit is a global channel), so no id check
     // is needed here anymore.
     const offExit = transport.onExit(() => {
+      // Same guard, and here it is the user-visible one: without it a stale exit from the PREVIOUS
+      // PTY runs `onExit?.()` (AgentPane reads result.json for a worker that did not exit) and then
+      // trips `setSpawnFail("exited")` on the freshly spawned, healthy agent — `retry()` has just
+      // reset `gotOutputRef.current` and the new PTY has not emitted yet, so the live pane renders
+      // "Agent exited — Start again" and a user who acts on it kills a working session.
+      if (disposed) return;
       engine.exit();
       onExit?.();
       // If the process exited WITHOUT ever emitting output, don't leave a silent blank pane:

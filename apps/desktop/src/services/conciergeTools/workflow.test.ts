@@ -253,6 +253,21 @@ describe("the busy gate reads a GUESSED idle as still-live", () => {
     expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
   });
 
+  it("a late spinner frame from a dead PTY cannot witness the NEW engine's turn", async () => {
+    // roborev 55094: the second door. noteSpinnerSeen was creating and un-scoped, so one stray
+    // `pty:data` frame from the old process granted `spinner: true` on the record trackAgent just
+    // reset for the new engine — turning the live agent's GUESSED idle into a witnessed turn end and
+    // opening the destructive-op gate.
+    const oldEngine = { id: "old" };
+    const newEngine = { id: "new" };
+    trackAgent("a1", oldEngine);
+    forgetAgent("a1", oldEngine);
+    trackAgent("a1", newEngine);
+    noteSpinnerSeen("a1", oldEngine); // the dead PTY's late frame
+    m.statuses["a1"] = "idle";
+    expect(await refreshAgentBranchTool(build)).toMatchObject({ ok: false, code: "agent-working" });
+  });
+
   it("counts a PTY exit as a witness in its own right", async () => {
     m.statuses["a1"] = "idle";
     trackAgent("a1");
