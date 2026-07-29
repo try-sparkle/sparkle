@@ -12,14 +12,10 @@ import {
   buildVisualFixture,
   visualFixturesRequested,
 } from "./visualFixtures";
-import {
-  PROJECTS_PERSIST_DEBOUNCE_MS,
-  PROJECTS_PERSIST_KEY,
-  flushProjectsPersist,
-  useProjectStore,
-} from "../stores/projectStore";
+import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import type { Project } from "../types";
+import { createJSONStorage } from "zustand/middleware";
 
 const ON = { DEV: true, [DEV_BYPASS_AUTH_FLAG]: "1" };
 
@@ -130,36 +126,97 @@ describe("seeding never reaches disk", () => {
   // roborev 54701. Both seeded stores are persist-backed, so a plain setState writes THROUGH to
   // localStorage — which, for a developer who keeps the bypass flag in their environment and opens
   // their own dev server with ?visual=1, meant losing their real project list with no undo.
-  it("leaves the persisted profile untouched, debounce included", () => {
-    // Drain first. Earlier tests in this file mutated the store, and those writes are DEBOUNCED —
-    // a still-pending one would land on top of the blob below and be misread as this seed's doing.
-    flushProjectsPersist();
-    vi.useFakeTimers();
-    try {
-      const REAL = JSON.stringify({ state: { projects: [{ id: "the-developers-real-project" }] } });
-      localStorage.setItem(PROJECTS_PERSIST_KEY, REAL);
+  //
+  // THE beforeEach IS THE TEST'S TEETH (roborev 54756). detachPersistence() mutates module-level
+  // singletons, and the earlier describe block already calls applyVisualFixtures — so without
+  // re-attaching, both stores arrive here ALREADY detached and these assertions pass no matter what
+  // applyVisualFixtures does. That made them blind to the ordering the source calls load-bearing:
+  // moving detachPersistence() to AFTER the setState calls would have kept the suite green while
+  // production regressed completely. Re-attaching a live storage backend first means a write that
+  // escapes is actually observable.
+  //
+  // A plain synchronous localStorage backend is substituted for the real debounced one on purpose:
+  // the invariant under test is "no store write reaches storage at all", and removing the 400ms
+  // timer removes a way for the test to pass by accident of timing.
+  beforeEach(() => {
+    flushProjectsPersist(); // drain anything an earlier test left pending
+    const live = createJSONStorage(() => localStorage);
+    for (const store of [useProjectStore, useRuntimeStore]) {
+      (store as unknown as { persist: { setOptions: (o: unknown) => void } }).persist.setOptions({
+        storage: live,
+      });
+    }
+    localStorage.removeItem(PROJECTS_PERSIST_KEY);
+    localStorage.removeItem(RUNTIME_PERSIST_KEY);
+  });
 
+  it("leaves the persisted project blob untouched", () => {
+    const REAL = JSON.stringify({ state: { projects: [{ id: "the-developers-real-project" }] } });
+    localStorage.setItem(PROJECTS_PERSIST_KEY, REAL);
+    try {
       expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
       // In memory the fixture is live...
       expect(useProjectStore.getState().projects[0]!.id).toBe(FIXTURE_PROJECT_ID);
-      // ...and the write is debounced, so run the clock past it before believing anything.
-      vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS * 4);
-      flushProjectsPersist();
-
+      // ...and nothing about it reached storage.
       expect(localStorage.getItem(PROJECTS_PERSIST_KEY)).toBe(REAL);
     } finally {
-      vi.useRealTimers();
       localStorage.removeItem(PROJECTS_PERSIST_KEY);
     }
   });
 
-  it("shadows the real state in memory only, so a reload without ?visual=1 recovers it", () => {
-    localStorage.setItem(RUNTIME_PERSIST_KEY, JSON.stringify({ state: { openAgentIds: ["real"] } }));
+  it("leaves the persisted runtime blob untouched — workflowStage IS persisted", () => {
+    // Not a duplicate of the test above: runtimeStore's partialize persists workflowStage and
+    // openAgentIds, both of which the fixture writes, so it needs its own detach and its own proof.
+    const REAL = JSON.stringify({ state: { openAgentIds: ["real"], workflowStage: { a: "merged" } } });
+    localStorage.setItem(RUNTIME_PERSIST_KEY, REAL);
     try {
       applyVisualFixtures("?visual=1", ON);
-      expect(localStorage.getItem(RUNTIME_PERSIST_KEY)).toContain("real");
+      expect(useProjectStore.getState().projects[0]!.id).toBe(FIXTURE_PROJECT_ID);
+      expect(localStorage.getItem(RUNTIME_PERSIST_KEY)).toBe(REAL);
     } finally {
       localStorage.removeItem(RUNTIME_PERSIST_KEY);
+    }
+  });
+
+  it("still survives the real debounced backend", () => {
+    // RE-ATTACHES THE REAL BACKEND, AND PROVES IT IS LIVE BEFORE ASSERTING THE NEGATIVE.
+    //
+    // Two problems, both found by measuring rather than reading. First, the block's `beforeEach`
+    // swaps in a synchronous `createJSONStorage(() => localStorage)` before EVERY test, so
+    // `debouncedProjectsStorage` was not wired to the store at all and the timer advance below
+    // drained a pending map nothing wrote into (roborev 54833). Second — and this is what a
+    // mutation check caught after that was fixed — the assertion is "the blob is UNTOUCHED", which
+    // holds just as well when NOTHING is attached. Deleting `flushProjectsPersist()` still passed.
+    //
+    // A negative assertion is only worth its name next to a positive control, so the control comes
+    // first: a normal store mutation MUST reach disk through the 400ms window. Only then does
+    // "fixtures leave it alone" mean the fixtures did it, rather than the wiring being absent.
+    vi.useFakeTimers();
+    const REAL = JSON.stringify({ state: { projects: [{ id: "real-under-debounce" }] } });
+    (
+      useProjectStore as unknown as { persist: { setOptions: (o: unknown) => void } }
+    ).persist.setOptions({ storage: createJSONStorage(() => debouncedProjectsStorage) });
+    try {
+      // CONTROL: the debounced path is live and does reach localStorage.
+      localStorage.setItem(PROJECTS_PERSIST_KEY, REAL);
+      useProjectStore.setState((st) => ({ ...st }));
+      vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS * 4);
+      flushProjectsPersist();
+      expect(
+        localStorage.getItem(PROJECTS_PERSIST_KEY),
+        "control failed: the debounced backend never wrote, so the assertion below proves nothing",
+      ).not.toBe(REAL);
+
+      // THE ACTUAL CLAIM: with fixtures on, persistence is detached and the blob survives.
+      localStorage.setItem(PROJECTS_PERSIST_KEY, REAL);
+      applyVisualFixtures("?visual=1", ON);
+      useProjectStore.setState((st) => ({ ...st }));
+      vi.advanceTimersByTime(PROJECTS_PERSIST_DEBOUNCE_MS * 4);
+      flushProjectsPersist();
+      expect(localStorage.getItem(PROJECTS_PERSIST_KEY)).toBe(REAL);
+    } finally {
+      vi.useRealTimers();
+      localStorage.removeItem(PROJECTS_PERSIST_KEY);
     }
   });
 });

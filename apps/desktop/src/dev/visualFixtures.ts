@@ -21,9 +21,16 @@
 // and `?visual=1`, and a developer who keeps VITE_SPARKLE_DEV_BYPASS_AUTH=1 in their environment
 // and opens their own dev server with `?visual=1` — to reproduce a capture by hand, say — satisfies
 // both. That would have overwritten their real project list and their removal tombstones, with no
-// undo. detachPersistence() below stops the write at the storage layer, so the seed is
-// memory-only: the developer's stored profile survives, and reloading without `?visual=1` restores
-// their session. (roborev 54701)
+// undo. detachPersistence() below stops the write at the storage layer, so reloading without
+// `?visual=1` restores their session. (roborev 54701)
+//
+// THE PRECISE GUARANTEE IS "no STORE write reaches disk", not "memory-only". detachPersistence only
+// covers zustand `persist` storage. Code that writes localStorage directly is unaffected — notably
+// capture/LastFocusedProjectTracker, which stamps `sparkle-last-focused-project` with the selected
+// project on mount/focus and will therefore record the fixture project id, outliving the tab. That
+// key degrades benignly (lastFocusedProject falls back to the first project), so it is left alone
+// rather than special-cased; what is NOT acceptable is a comment claiming a guarantee wider than
+// the mechanism delivers. (roborev 54756)
 
 import { createJSONStorage } from "zustand/middleware";
 import type { AgentTab, Project } from "../types";
@@ -259,7 +266,12 @@ export function applyVisualFixtures(
     removedIds: {},
   });
 
-  // Live-only state — never persisted, so it must be written on every boot.
+  // `status` is the only live-only key here — it is never persisted, so it must be written on every
+  // boot or the rows render with no dot at all. `workflowStage` and `openAgentIds` ARE persisted
+  // (runtimeStore's partialize covers openAgentIds, workflowStage and workflowShipped), and writing
+  // them is only safe because detachPersistence() ran above. Do NOT drop useRuntimeStore from that
+  // loop on the strength of a "live-only" reading of this line — that restores the clobber, this
+  // time of the developer's stage watermarks. (roborev 54756)
   useRuntimeStore.setState({ status, workflowStage, openAgentIds: [] });
 
   // The offline banner is real UI that pushes the whole workspace down, and a headless browser

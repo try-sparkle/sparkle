@@ -21,8 +21,9 @@ import {
   stepToExpression,
   surfaceByName,
 } from "./surfaces.mjs";
-import { parseArgs } from "./capture.mjs";
-import { mockChromeCss, resolveMock } from "./compare.mjs";
+import { numericArg, parseArgs } from "./capture.mjs";
+import { mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
+import { compareDirs } from "./verify-stable.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -296,6 +297,111 @@ describe("cli argument parsing", () => {
   it("ignores positionals", () => {
     expect(parseArgs(["ignored", "--a=1"])).toEqual({ a: "1" });
   });
+
+  it("rejects a bare or non-numeric --scale rather than silently picking a density", () => {
+    // `Number(args.scale || 2)` turned a bare `--scale` into 1 and `--scale=x` into NaN, both
+    // without complaint — a wrong density that reads as a catastrophic design divergence.
+    expect(numericArg(undefined, 2, "scale")).toBe(2);
+    expect(numericArg("3", 2, "scale")).toBe(3);
+    expect(() => numericArg(true, 2, "scale")).toThrow(/--scale must be a number/);
+    expect(() => numericArg("x", 2, "scale")).toThrow(/--scale must be a number/);
+    expect(() => numericArg("0", 2, "scale")).toThrow(/--scale must be a number/);
+    expect(() => numericArg("-1", 2, "scale")).toThrow(/--scale must be a number/);
+  });
+
+  it("allows a zero threshold, which is the exact-match default", () => {
+    expect(numericArg("0", 0, "threshold", 0)).toBe(0);
+    expect(() => numericArg("-1", 0, "threshold", 0)).toThrow(/--threshold/);
+  });
+});
+
+describe("viewport agreement between capture and compare", () => {
+  it("adopts the viewport the capture actually used", () => {
+    // The two commands used to parse their own defaults independently, so capturing at --scale=1
+    // and comparing at the default 2 scored every surface at half density against a double-density
+    // reference — sizes off by exactly 2×, percentage saturated, nothing pointing at the cause.
+    const dir = mkdtempSync(join(tmpdir(), "visual-manifest-"));
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({ viewport: { width: 800, height: 600, deviceScaleFactor: 1 } }),
+    );
+    expect(viewportFromManifest(dir)).toEqual({
+      width: 800,
+      height: 600,
+      deviceScaleFactor: 1,
+      source: "manifest",
+    });
+  });
+
+  it("lets an explicit CLI flag override the manifest", () => {
+    const dir = mkdtempSync(join(tmpdir(), "visual-manifest-"));
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify({ viewport: { deviceScaleFactor: 1 } }));
+    expect(viewportFromManifest(dir, { deviceScaleFactor: 3 }).deviceScaleFactor).toBe(3);
+  });
+
+  it("falls back to defaults when there is no manifest", () => {
+    const dir = mkdtempSync(join(tmpdir(), "visual-nomanifest-"));
+    expect(viewportFromManifest(dir).source).toBe("default");
+    expect(viewportFromManifest(dir).deviceScaleFactor).toBe(2);
+  });
+
+  it("survives a corrupt manifest instead of aborting the comparison", () => {
+    const dir = mkdtempSync(join(tmpdir(), "visual-badmanifest-"));
+    writeFileSync(join(dir, "manifest.json"), "{ not json");
+    expect(viewportFromManifest(dir).deviceScaleFactor).toBe(2);
+  });
+});
+
+describe("determinism check", () => {
+  const dirs = () => [
+    mkdtempSync(join(tmpdir(), "vs-a-")),
+    mkdtempSync(join(tmpdir(), "vs-b-")),
+  ];
+
+  it("calls two runs stable only when every artifact matches byte-for-byte", () => {
+    const [a, b] = dirs();
+    writeFileSync(join(a, "x.png"), Buffer.from([1, 2, 3]));
+    writeFileSync(join(b, "x.png"), Buffer.from([1, 2, 3]));
+    const r = compareDirs(a, b);
+    expect(r.stable).toBe(true);
+    expect(r.compared).toBe(1);
+    expect(r.identical).toBe(1);
+  });
+
+  it("names the artifacts whose bytes differ", () => {
+    const [a, b] = dirs();
+    writeFileSync(join(a, "x.png"), Buffer.from([1, 2, 3]));
+    writeFileSync(join(b, "x.png"), Buffer.from([1, 2, 4]));
+    const r = compareDirs(a, b);
+    expect(r.stable).toBe(false);
+    expect(r.differing).toEqual(["x.png"]);
+  });
+
+  it("distinguishes a missing artifact from a differing one", () => {
+    const [a, b] = dirs();
+    writeFileSync(join(a, "x.png"), Buffer.from([1]));
+    writeFileSync(join(a, "only-a.png"), Buffer.from([1]));
+    writeFileSync(join(b, "x.png"), Buffer.from([1]));
+    const r = compareDirs(a, b);
+    expect(r.stable).toBe(false);
+    expect(r.onlyA).toEqual(["only-a.png"]);
+    expect(r.differing).toEqual([]);
+  });
+
+  it("refuses to call two empty directories stable", () => {
+    // Otherwise a run that captured nothing at all would report determinism.
+    const [a, b] = dirs();
+    expect(compareDirs(a, b).stable).toBe(false);
+  });
+
+  it("ignores non-artifact files like manifest.json", () => {
+    const [a, b] = dirs();
+    writeFileSync(join(a, "x.png"), Buffer.from([1]));
+    writeFileSync(join(b, "x.png"), Buffer.from([1]));
+    writeFileSync(join(a, "manifest.json"), "{}");
+    writeFileSync(join(b, "manifest.json"), "{different}");
+    expect(compareDirs(a, b).stable).toBe(true);
+  });
 });
 
 describe("mock resolution", () => {
@@ -314,22 +420,23 @@ describe("mock resolution", () => {
     expect(html).toContain('class="shell"');
   });
 
-  it("reports a clear error when neither the tree nor any ref carries the mock", () => {
-    // MUST POINT AT A REPO ROOT WITHOUT THE MOCK. This passed only while the mock lived on another
-    // branch: `resolveMock` checks the WORKING TREE before it ever looks at `refs`, so once the
-    // mock landed here the bad ref list stopped being reached and the call succeeded. The test was
-    // asserting the error path while exercising the happy one — it was the mock's absence doing
-    // the work, not the argument.
-    const empty = mkdtempSync(join(tmpdir(), "visual-noroot-"));
+  it("reports a clear error when no ref carries the mock", () => {
+    // `repoRoot` is overridden to an EMPTY temp dir, not left at the real one. `refs` alone does
+    // not skip the working-tree lookup — it is only consulted after `existsSync(repoRoot/MOCK_REL)`
+    // fails. Against the real root this passed only because the mock has not landed yet, so it was
+    // guaranteed to start failing the day it does: a planned, non-defect change turning CI red with
+    // no signal in it. (roborev 54744)
+    const emptyRoot = mkdtempSync(join(tmpdir(), "visual-empty-root-"));
     expect(() =>
-      resolveMock(undefined, { repoRoot: empty, refs: ["definitely-not-a-ref"] }),
+      resolveMock(undefined, { repoRoot: emptyRoot, refs: ["definitely-not-a-ref"] }),
     ).toThrow(/Could not find .*rev4-standalone\.html/);
   });
 
-  // HARD ASSERTION NOW. This was deliberately soft — a try/catch that warned and returned — because
-  // rev4-standalone.html lived only on a feature branch and its absence on a fresh clone was an
-  // environment fact rather than a defect. It is in the tree on this branch, so the skip would now
-  // only ever hide a real breakage in the tree lookup.
+  // HARD ASSERTION. This was deliberately soft — a try/catch that warned and returned — on the
+  // stated premise that "rev4-standalone.html has not landed on main". It has: the mock landed with
+  // the cockpit port, so it is in the working tree on every branch cut from main and the skip can
+  // now only ever hide a real breakage in the tree lookup. The soft form outliving its premise is
+  // the same shape as the assertion above, which passed only because the mock was absent.
   it("locates the approved mock", () => {
     const found = resolveMock();
     expect(found.html).toContain('class="shell"');

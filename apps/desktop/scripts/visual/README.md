@@ -10,10 +10,15 @@ work that uses it — capture, read the number, fix the design, capture again.
 ## Run it
 
 ```bash
-pnpm --filter @sparkle/desktop visual:capture   # app  → visual-out/app/
-pnpm --filter @sparkle/desktop visual:compare   # mock → visual-out/compare/ + the diff table
-pnpm --filter @sparkle/desktop visual           # both, in order
+pnpm --filter @sparkle/desktop visual:capture         # app  → visual-out/app/
+pnpm --filter @sparkle/desktop visual:compare         # mock → visual-out/compare/ + the diff table
+pnpm --filter @sparkle/desktop visual                 # both, in order
+pnpm --filter @sparkle/desktop visual:verify-stable   # capture twice, assert byte-identical
 ```
+
+**Run `visual:verify-stable` before you trust a number that surprised you.** It captures everything
+twice and compares every artifact byte-for-byte; if it fails, the harness is non-deterministic and
+every percentage it reports is suspect. Current result: 12/12 identical.
 
 Output lands in `apps/desktop/visual-out/` (git-ignored). `visual:compare` reads the PNGs
 `visual:capture` wrote, so run capture first.
@@ -25,8 +30,8 @@ Useful flags (both scripts):
 | `--surfaces=a,b` | only these surfaces (default: all) |
 | `--theme=dark` | only this theme (default: both) |
 | `--out=<dir>` | where to write |
-| `--scale=N` | device pixel ratio (default 2) |
-| `--width` / `--height` | viewport in CSS px (default 1600×1000) |
+| `--scale=N` | device pixel ratio (capture default 2; **compare adopts the capture's**) |
+| `--width` / `--height` | viewport in CSS px (capture default 1600×1000; compare adopts the capture's) |
 | `--verbose` | stream the Vite dev-server log (capture only) |
 | `--app=<dir>` | where to read captures from (compare only) |
 | `--mock=<path>` | use this reference file (compare only) |
@@ -125,8 +130,23 @@ A diff percentage is only a measurement if the same input gives the same pixels.
 - Animations and transitions are zeroed, and the caret is made transparent.
 - GPU rasterization, subpixel text positioning and font hinting are off; the colour profile is
   pinned to sRGB.
-- Each surface gets a **fresh page**: surfaces mutate app state (the settings surface opens a
-  modal), and leaking that into the next capture is how a baseline becomes untrustworthy.
+- Each surface gets a **fresh page, and the previous one is closed**. Surfaces mutate app state (the
+  settings surface opens a modal), and leaking that into the next capture is how a baseline becomes
+  untrustworthy — but an unclosed page is just as bad in a subtler way: it leaves a fully mounted
+  copy of the app running, so the last surface would be photographed while eleven others compete
+  for the CPU.
+- **Compare renders the mock at the viewport the capture actually used**, read from
+  `manifest.json`. Otherwise capturing at `--scale=1` and comparing at the default 2 scores every
+  surface at half density against a double-density reference, and the report reads as catastrophic
+  design divergence with nothing pointing at the cause.
+- The theme is applied **after the app has mounted**, then verified to hold across consecutive
+  reads. `useApplyTheme` is the single writer of `<html data-theme>` and runs in an effect, so an
+  attribute set before mount is silently overwritten — and a check that reads back its own write
+  proves nothing. The real lever is the emulated `prefers-color-scheme`; the attribute is
+  belt-and-braces that now fails loudly if the app disagrees.
+
+Two independent runs are expected to produce **byte-identical** PNGs. If they don't, something in
+the list above has regressed — that is the first thing to check, before trusting any number.
 
 ### Where the reference comes from
 

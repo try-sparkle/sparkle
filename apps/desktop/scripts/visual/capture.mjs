@@ -50,23 +50,53 @@ export async function settle(page) {
   })()`);
 }
 
-/** Apply a theme the way the app itself does — the media feature AND the explicit attribute. */
+/**
+ * Apply a theme, and PROVE it took.
+ *
+ * MUST BE CALLED AFTER THE APP HAS MOUNTED. `useApplyTheme` (src/theme/theme.ts) is the documented
+ * single writer of `<html data-theme>` and runs in an effect after mount, so an attribute written
+ * before that is simply overwritten moments later. The old check then read the value back
+ * immediately and "passed" by observing its own write — so the real mechanism was the emulated
+ * media feature alone, and a profile carrying an explicit light/dark preference would have produced
+ * a light capture in a file named `-dark.png` with no error anywhere. (roborev 54744)
+ *
+ * The media emulation is the genuine lever (the app's theme preference defaults to "auto", and the
+ * harness always launches with a fresh user-data-dir, so "auto" is what it reads). The attribute
+ * write stays as belt-and-braces — but it is now verified for STABILITY, so if the app's effect
+ * disagrees, the run fails loudly instead of mislabelling a screenshot.
+ */
 export async function applyTheme(page, theme) {
   await page.setColorScheme(theme);
-  // MAPPING.md: `data-theme` on <html> is already how the app themes. Setting it explicitly stops
-  // the capture depending on whether the user's persisted preference happened to be "auto".
   await page.evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
-  await page.waitForFunction(
-    `document.documentElement.dataset.theme === ${JSON.stringify(theme)}`,
-  );
+  await page.waitForStableValue("document.documentElement.dataset.theme", theme);
+}
+
+/**
+ * Reject a non-numeric CLI value instead of silently capturing at the wrong size.
+ *
+ * `Number(args.scale || 2)` turned a bare `--scale` into 1 (true → 1) and `--scale=x` into NaN,
+ * both without complaint — the same silently-wrong-density class of bug as the clip-scale one.
+ * `min` is 0 for tolerances (a threshold of 0 means "exact" and is the default) and left at its
+ * default for dimensions, where zero is meaningless. (roborev 54744)
+ */
+export function numericArg(raw, fallback, name, min = Number.EPSILON) {
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (typeof raw === "boolean" || raw === "" || !Number.isFinite(n) || n < min) {
+    throw new Error(
+      `--${name} must be a number >= ${min === Number.EPSILON ? "0 (exclusive)" : min} ` +
+        `(got ${JSON.stringify(raw)})`,
+    );
+  }
+  return n;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const outDir = resolve(args.out || join(process.cwd(), "visual-out", "app"));
-  const scale = Number(args.scale || 2);
-  const width = Number(args.width || DEFAULT_VIEWPORT.width);
-  const height = Number(args.height || DEFAULT_VIEWPORT.height);
+  const scale = numericArg(args.scale, 2, "scale");
+  const width = numericArg(args.width, DEFAULT_VIEWPORT.width, "width");
+  const height = numericArg(args.height, DEFAULT_VIEWPORT.height, "height");
   const surfaces = selectSurfaces(args.surfaces);
   const themes = args.theme ? [args.theme] : THEMES;
 
@@ -75,10 +105,16 @@ async function main() {
 
   const server = await startDevServer({ quiet: !args.verbose });
   console.log(`[capture] dev server (auth bypass on) at ${server.url}`);
-  const browser = await launch({ width, height });
+  // `browser` is declared here but LAUNCHED INSIDE the try. Launching outside it meant that a
+  // missing Chrome (CHROME_PATH defaults to a macOS path — any Linux/CI runner misses it) threw
+  // after the 30s debugger timeout with `server.stop()` never reached. vite is spawned detached as
+  // its own process-group leader, so it outlived the failed run and kept its port and CPU forever,
+  // once per attempt, with nothing in the output to say so. (roborev 54744)
+  let browser = null;
   const results = [];
 
   try {
+    browser = await launch({ width, height });
     for (const theme of themes) {
       for (const surface of surfaces) {
         // A FRESH PAGE PER SURFACE, deliberately. Surfaces mutate app state — the settings surface
@@ -91,8 +127,12 @@ async function main() {
           await page.addInitScript(TAURI_SHIM);
           await page.addInitScript(FROZEN_CLOCK);
           await page.navigate(`${server.url}/?visual=1`);
-          await applyTheme(page, theme);
+          // Media emulation FIRST (the app reads prefers-color-scheme as it mounts), then the
+          // steps that wait for the shell, and only then applyTheme — which asserts the attribute
+          // holds. See applyTheme's docblock for why the old order could not have worked.
+          await page.setColorScheme(theme);
           await runSteps(page, surface.app.steps);
+          await applyTheme(page, theme);
           await settle(page);
 
           let clip = null;
@@ -118,12 +158,15 @@ async function main() {
           record.error = e.message;
           record.consoleErrors = page.consoleErrors.slice(0, 5);
           console.log(`[capture] ✗ ${record.file} — ${e.message}`);
+        } finally {
+          // Tear the page down before the next surface mounts its own copy of the app.
+          await page.close();
         }
         results.push(record);
       }
     }
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
     server.stop();
   }
 

@@ -180,9 +180,10 @@ function connect(url, timeoutMs = 15000) {
  * every method here is used by capture.mjs or compare.mjs.
  */
 export class Page {
-  constructor(conn, sessionId) {
+  constructor(conn, sessionId, targetId) {
     this.conn = conn;
     this.sessionId = sessionId;
+    this.targetId = targetId;
     this.consoleErrors = [];
     conn.on("Runtime.consoleAPICalled", (p, sid) => {
       if (sid === sessionId && p.type === "error") {
@@ -258,6 +259,26 @@ export class Page {
     return r.result?.value;
   }
 
+  /**
+   * Close this page's target.
+   *
+   * Not optional book-keeping. Each surface gets its own page, and an unclosed one keeps a fully
+   * mounted copy of the app alive — dev bundle, React tree, store timers — inside the same Chrome
+   * process. Leaving twelve of them running means the last surface is photographed while eleven
+   * other app instances compete for the CPU, which is a growing, order-dependent background load
+   * in an instrument whose whole premise is a reproducible raster. It also makes the "fresh page
+   * per surface" isolation claim false. (roborev 54744)
+   */
+  async close() {
+    if (!this.targetId) return;
+    try {
+      await this.conn.send("Target.closeTarget", { targetId: this.targetId });
+    } catch {
+      /* the target may already be gone */
+    }
+    this.targetId = null;
+  }
+
   /** Poll a JS predicate. Polling beats a MutationObserver here: React commits in batches. */
   async waitForFunction(expression, { timeout = 30000, poll = 100 } = {}) {
     const deadline = Date.now() + timeout;
@@ -276,6 +297,31 @@ export class Page {
 
   waitForSelector(selector, opts) {
     return this.waitForFunction(`document.querySelector(${JSON.stringify(selector)})`, opts);
+  }
+
+  /**
+   * Wait until `expression` equals `expected` and STAYS equal across consecutive reads.
+   *
+   * A single read taken right after writing a value proves nothing — it observes the write, not
+   * the steady state. That is exactly how the theme check used to pass while the app's own effect
+   * overwrote the attribute a moment later, silently producing a light image in a file named
+   * `-dark.png`. Requiring the value to survive `settleReads` polls makes a losing race fail loudly
+   * instead. (roborev 54744)
+   */
+  async waitForStableValue(expression, expected, { timeout = 15000, poll = 100, settleReads = 3 } = {}) {
+    const deadline = Date.now() + timeout;
+    let streak = 0;
+    let last;
+    while (Date.now() < deadline) {
+      last = await this.evaluate(expression);
+      streak = last === expected ? streak + 1 : 0;
+      if (streak >= settleReads) return true;
+      await sleep(poll);
+    }
+    throw new Error(
+      `waitForStableValue: ${expression} never held at ${JSON.stringify(expected)} ` +
+        `for ${settleReads} consecutive reads (last saw ${JSON.stringify(last)})`,
+    );
   }
 
   /**
@@ -342,7 +388,7 @@ export class Browser {
       targetId,
       flatten: true,
     });
-    const page = new Page(this.conn, sessionId);
+    const page = new Page(this.conn, sessionId, targetId);
     await page.send("Page.enable", {});
     await page.send("Runtime.enable", {});
     return page;

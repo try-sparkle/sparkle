@@ -16,7 +16,7 @@ import { launch } from "./cdp.mjs";
 import { decodePng, encodePng } from "./png.mjs";
 import { compareImages, diffImage, sideBySide } from "./diff.mjs";
 import { MOCK_CHROME_SELECTORS, THEMES, artifactName, selectSurfaces } from "./surfaces.mjs";
-import { applyTheme, parseArgs, runSteps, settle } from "./capture.mjs";
+import { applyTheme, numericArg, parseArgs, runSteps, settle } from "./capture.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // apps/desktop/scripts/visual → apps/desktop/scripts → apps/desktop → apps → <repo root>
@@ -89,6 +89,43 @@ export function mockChromeCss(selectors = MOCK_CHROME_SELECTORS) {
   return `${selectors.join(",")} { display: none !important; }`;
 }
 
+/**
+ * The viewport the mock must be rendered at: whatever `visual:capture` actually used.
+ *
+ * capture.mjs writes its viewport into manifest.json precisely so this side does not have to guess,
+ * but this used to re-derive its own defaults and ignore the file. Capture at `--scale=1` and
+ * compare at the default 2 (easy — the `visual` script chains the two commands and forwards
+ * nothing) and every surface is scored at half density against a double-density reference: sizes
+ * differ by exactly 2×, the percentage saturates, and the report reads as catastrophic design
+ * divergence with nothing anywhere pointing at the density. Explicit CLI flags still win, so a
+ * deliberate override is possible; the manifest is the default. (roborev 54744)
+ */
+export function viewportFromManifest(appDir, overrides = {}) {
+  const fallback = { width: 1600, height: 1000, deviceScaleFactor: 2 };
+  let fromManifest = {};
+  const p = join(appDir, "manifest.json");
+  if (existsSync(p)) {
+    try {
+      const m = JSON.parse(readFileSync(p, "utf8"));
+      if (m && typeof m.viewport === "object" && m.viewport) fromManifest = m.viewport;
+    } catch {
+      // A corrupt manifest is not worth aborting a comparison over — fall back and say so.
+      console.warn(`[compare] ${p} is unreadable; falling back to default viewport`);
+    }
+  }
+  const merged = { ...fallback, ...fromManifest, ...overrides };
+  return {
+    width: merged.width,
+    height: merged.height,
+    deviceScaleFactor: merged.deviceScaleFactor,
+    source: Object.keys(overrides).length
+      ? "cli"
+      : Object.keys(fromManifest).length
+        ? "manifest"
+        : "default",
+  };
+}
+
 function fmtPct(n) {
   return `${n.toFixed(2).padStart(6)}%`;
 }
@@ -97,22 +134,29 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const appDir = resolve(args.app || join(process.cwd(), "visual-out", "app"));
   const outDir = resolve(args.out || join(process.cwd(), "visual-out", "compare"));
-  const scale = Number(args.scale || 2);
-  const width = Number(args.width || 1600);
-  const height = Number(args.height || 1000);
-  const threshold = Number(args.threshold || 0);
+  const overrides = {};
+  if (args.scale !== undefined) overrides.deviceScaleFactor = numericArg(args.scale, 2, "scale");
+  if (args.width !== undefined) overrides.width = numericArg(args.width, 1600, "width");
+  if (args.height !== undefined) overrides.height = numericArg(args.height, 1000, "height");
+  const vp = viewportFromManifest(appDir, overrides);
+  const { width, height, deviceScaleFactor: scale } = vp;
+  const threshold = numericArg(args.threshold, 0, "threshold", 0);
   const surfaces = selectSurfaces(args.surfaces);
   const themes = args.theme ? [args.theme] : THEMES;
 
   const mock = resolveMock(args.mock);
   console.log(`[compare] reference: ${mock.source}`);
+  console.log(`[compare] viewport: ${width}×${height} @${scale}x (from ${vp.source})`);
   mkdirSync(outDir, { recursive: true });
 
   const server = await serveHtml(mock.html);
-  const browser = await launch({ width, height });
+  // Launched inside the try for the same reason as capture.mjs: a throw here must not skip
+  // server.stop(). (roborev 54744)
+  let browser = null;
   const rows = [];
 
   try {
+    browser = await launch({ width, height });
     for (const theme of themes) {
       for (const surface of surfaces) {
         const row = { surface: surface.name, theme };
@@ -166,12 +210,14 @@ async function main() {
         } catch (e) {
           row.status = "error";
           row.note = e.message;
+        } finally {
+          await page.close();
         }
         rows.push(row);
       }
     }
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
     server.stop();
   }
 

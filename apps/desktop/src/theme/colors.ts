@@ -255,15 +255,11 @@ export const C = {
   //
   // The var is already in index.css (mirrored from THEME_HEX.inputSurface); this only names it for
   // component inline styles, which is why adding it needs no CSS edit.
+  inputSurface: "var(--c-input-surface)",
   // Lighter chrome for the top bar + composer box. Kept distinct from (lighter than) deepForest
   // so those bars recede against the terminal while the sidebar stays a step darker. See
   // THEME_HEX above.
   barSurface: "var(--c-bar-surface)",
-  // THE FIELD GROUND. `inputSurface` has been in THEME_HEX and mirrored into index.css since the
-  // spec was ported, and no component ever read it — `C` had no entry, so there was nothing to
-  // import. Every text field in the app therefore painted some nearby plane instead. Exposed here
-  // because the settings search box is its first real consumer; pair it with `inputEdge`.
-  inputSurface: "var(--c-input-surface)",
   // ── THE MODAL PLANE — `dialog` / `dialogNav`, AND WHY IT IS NOT `deepForest` ──────────────────
   // Roughly thirty dialogs paint here, and until now every one of them borrowed the BUILDER column's
   // plane (`deepForest`) because that was the nearest thing to a "secondary surface". The spec has

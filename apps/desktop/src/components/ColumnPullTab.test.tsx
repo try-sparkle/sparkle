@@ -11,7 +11,7 @@
 //   • TWO instances, on two boundaries, resizing INDEPENDENTLY.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ColumnPullTab, ConciergeDragGrip } from "./ColumnPullTab";
+import { ColumnPullTab, ConciergeDragGrip, PULL_TAB_RAIL_Z } from "./ColumnPullTab";
 
 afterEach(() => cleanup());
 
@@ -435,5 +435,57 @@ describe("the seam never swallows a click meant for a column — roborev 54691 /
     onWidth.mockClear();
     fireEvent.mouseMove(window, { clientX: 200, buttons: 0 });
     expect(onWidth).not.toHaveBeenCalled();
+  });
+});
+
+describe("the reveal cannot be killed from inside the seam — roborev 54850", () => {
+  it("sliding off the tab but staying on the rail keeps the tab shown", () => {
+    // The tab is a DOM DESCENDANT of the rail (rail > zone > tab), so React dispatches
+    // enter/leave along the DOM path to the common ancestor, not by visual geometry. A leave
+    // handler ON THE TAB therefore fires with no matching enter when you move tab → rail, which
+    // cleared `hovered` while the pointer was still on the rail. The tab vanished and could not
+    // come back: hidden it is `pointerEvents:"none"`, and the pointer had never left the rail, so
+    // nothing would fire again until the user exited the seam entirely.
+    render(
+      <ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />,
+    );
+    const rail = screen.getByTestId("t");
+    fireEvent.mouseEnter(rail);
+    expect(rail.getAttribute("data-shown")).toBe("true");
+
+    // Slide off the tab's bottom edge onto the rail. A browser sends `mouseout` on the TAB with
+    // `relatedTarget` = the rail; React reads that pair, computes the common ancestor (the rail),
+    // and dispatches leave on tab/zone only. Modelled with `mouseOut` + relatedTarget rather than
+    // `fireEvent.mouseLeave`, which supplies no relatedTarget — React then treats it as a leave of
+    // everything and the rail's own handler fires, which is not a motion a pointer can make.
+    fireEvent.mouseOut(screen.getByTestId("t-tab"), { relatedTarget: rail });
+    expect(rail.getAttribute("data-shown")).toBe("true");
+  });
+
+  it("leaving the rail itself still hides it", () => {
+    render(
+      <ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />,
+    );
+    const rail = screen.getByTestId("t");
+    fireEvent.mouseEnter(rail);
+    expect(rail.getAttribute("data-shown")).toBe("true");
+    // Leaving the seam entirely: relatedTarget is outside the rail.
+    fireEvent.mouseOut(rail, { relatedTarget: document.body });
+    expect(rail.getAttribute("data-shown")).toBe("false");
+  });
+});
+
+describe("the rail renders the constant the concierge is pinned against — roborev 55039", () => {
+  it("the rail element's z-index IS PULL_TAB_RAIL_Z, not merely equal to it in the abstract", () => {
+    // The pairing guard in ConciergeColumn.wired.test.tsx compares CONCIERGE_LIFT_Z against
+    // PULL_TAB_RAIL_Z as a NUMBER, and pins only the concierge's rendered value. That leaves the
+    // other half unanchored: re-hardcoding `zIndex: 4` on the rail and bumping the constant keeps
+    // the whole suite green while the lift paints over the tab's overhang and eats its hit area —
+    // roborev 54841, which is itself a re-run of 54712. Anchoring the rail to rendered output is
+    // what makes the pair a real contract rather than two numbers that agree.
+    render(
+      <ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />,
+    );
+    expect(Number(screen.getByTestId("t").style.zIndex)).toBe(PULL_TAB_RAIL_Z);
   });
 });

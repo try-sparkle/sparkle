@@ -550,7 +550,11 @@ export function debouncedLocalStorage(delayMs: number): { storage: StateStorage;
   return { storage, flush };
 }
 
-const { storage: debouncedProjectsStorage, flush: flushProjectsPersistImpl } =
+/** EXPORTED for tests that must exercise the real 400ms coalescing window. A suite that swaps in a
+ *  synchronous backend and then advances timers is testing nothing — the pending map it drains is
+ *  no longer the one the store writes to (roborev 54833). Production wiring is unchanged: the store
+ *  wraps this in `createJSONStorage` below. */
+export const { storage: debouncedProjectsStorage, flush: flushProjectsPersistImpl } =
   debouncedLocalStorage(PROJECTS_PERSIST_DEBOUNCE_MS);
 
 /** Synchronously flush any pending debounced projects write to localStorage. Called by the

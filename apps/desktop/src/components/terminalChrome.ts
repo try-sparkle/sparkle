@@ -76,7 +76,13 @@ export function termInk(resolved: ResolvedTheme): string {
  * move makes the spec's own value legible again.
  */
 export function termMuted(resolved: ResolvedTheme): string {
-  return resolved === "light" ? "#536683" : "#62799d";
+  // DARK IS A REAL STEP, NOT A THRESHOLD PASS. The first cut used `#62799d` — literally +1 per
+  // channel on the spec's `#61789c`, moving 4.4424 → 4.5053. That clears the bar by 0.1%, which no
+  // user can perceive, on text the same commit had just declared illegible at 4.44; and it left
+  // this guard and its companion (`termMutedSpec < 4.5`) only 0.063 apart, so any nudge to the
+  // dark `term` plane would flip one of them red for reasons unrelated to the ink (roborev 54855).
+  // `#6b83a8` is 5.167 — the same blue, a step the eye can actually use.
+  return resolved === "light" ? "#536683" : "#6b83a8";
 }
 
 /** The spec's literal `--k-term-muted`. Not for text — see `termMuted`. */

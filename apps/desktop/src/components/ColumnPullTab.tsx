@@ -222,14 +222,21 @@ export function ColumnPullTab({
           claiming is dead space with no click of its own to receive.
           Only the VISIBLE TAB takes pointer events now, and only while it is shown. That is a
           control the user can actually see under the cursor, which is the whole test for whether
-          something has the right to swallow a press. The tab carries its own hover handlers
-          because it overhangs the rail — without them, travelling onto it would leave the rail,
-          clear `hovered`, and make the tab vanish under the pointer that was reaching for it. */}
+          something has the right to swallow a press.
+
+          HOVER IS OWNED SOLELY BY THE RAIL, and the tab must NOT carry its own enter/leave.
+          I added a pair here on the premise that the tab overhangs the rail geometrically, so
+          travelling onto it would fire the rail's leave. That is not how React synthesises these:
+          it walks the DOM path to the common ancestor, not the visual geometry, and the tab is a
+          DESCENDANT (rail > zone > tab). So the enter was redundant and the LEAVE was actively
+          harmful — moving tab → rail dispatched leave on the tab with no matching enter, clearing
+          `hovered` while the pointer was still on the rail. The tab then vanished, and because a
+          hidden tab is `pointerEvents:"none"` the pointer could not get back to it: it was already
+          inside the rail, so no enter would ever fire again until the user left the seam entirely.
+          A dead reveal, introduced by the fix for roborev 54691/54730 (roborev 54850). */}
       <div data-testid={`${testId}-zone`} style={{ ...zone, top: topOffset, pointerEvents: "none" }}>
         <div
           data-testid={`${testId}-tab`}
-          onMouseEnter={() => setHovered(true)}
-          onMouseLeave={() => setHovered(false)}
           style={{
             ...tab,
             borderRadius: RADIUS.sm,
@@ -441,7 +448,14 @@ const rail: CSSProperties = {
   position: "relative",
   // Above the sticky in-column furniture, so the boundary is never shadowed by something that
   // stops short of it.
-  zIndex: 4,
+  // THE RAIL is the flex sibling of the concierge column, so ITS z-index is what decides who
+  // paints over the ~5px overhang. The merge left this hardcoded and moved
+  // PULL_TAB_RAIL_Z onto `tab` — a grandchild inside `zone`, which has its own stacking
+  // context, so that number was purely local and had no relationship to the concierge.
+  // The pairing guard (CONCIERGE_LIFT_Z < PULL_TAB_RAIL_Z) was therefore inert: you could
+  // satisfy it by bumping the constant while the rail stayed at 4 and the lift went back
+  // to eating the tab's hit area — the exact roborev 54712 regression (roborev 54841).
+  zIndex: PULL_TAB_RAIL_Z,
 };
 
 /**
@@ -472,7 +486,9 @@ const tab: CSSProperties = {
   padding: TAB_PAD,
   background: C.barSurface,
   border: `1px solid ${C.hairline}`,
-  zIndex: PULL_TAB_RAIL_Z,
+  // Local to `zone`, which is `position:absolute` with its own stacking context — this number
+  // has no relationship to the concierge and must NOT be the exported rail constant.
+  zIndex: 1,
   transition: "opacity 120ms ease",
 };
 
