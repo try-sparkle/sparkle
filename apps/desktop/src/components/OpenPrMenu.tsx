@@ -10,6 +10,7 @@
 // The Merge action is deliberately gated (prMergeEligibility) and merges with a MERGE COMMIT via the
 // Rust `merge_pr` command — never a blind or `--auto` merge. See services/openPrs.ts and AGENTS.md.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { FiChevronDown, FiExternalLink, FiGitBranch } from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import {
@@ -223,12 +224,10 @@ export function OpenPrMenu({
           zIndex: 42,
         }}
       >
-        {/* The git-branch glyph, matching the "In PR" stage colour (violet) used by WorkflowLine. */}
-        <span aria-hidden>⑂</span>
+        {/* The git-branch mark, matching the "In PR" stage colour (violet) used by WorkflowLine. */}
+        <FiGitBranch size={12} aria-hidden />
         {label}
-        <span aria-hidden style={{ opacity: 0.7 }}>
-          ▾
-        </span>
+        <FiChevronDown size={12} aria-hidden style={{ opacity: 0.7 }} />
       </button>
 
       {open && (
@@ -410,7 +409,7 @@ export function OpenPrMenu({
                       whiteSpace: "nowrap",
                     }}
                   >
-                    ↗
+                    <FiExternalLink size={12} aria-hidden />
                   </button>
 
                   <button

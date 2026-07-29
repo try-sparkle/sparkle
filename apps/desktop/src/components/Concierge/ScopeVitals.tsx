@@ -375,6 +375,7 @@ export function ScopeVitals({
   counts,
   byProject,
   onProjectClick,
+  dense = false,
 }: {
   pinnedProjectName?: string;
   counts: Record<StatusBand, number>;
@@ -382,6 +383,15 @@ export function ScopeVitals({
   byProject?: readonly ProjectNeedsYou[];
   /** A segment naming ANOTHER project was clicked: switch to it. */
   onProjectClick?: (projectId: string) => void;
+  /** THE SCOPE PILL: this line rendered as one item INSIDE the concierge's single header row
+   *  (rev4.html's `.ahd`) rather than as a centred block of its own beneath it.
+   *
+   *  It drops the top margin and the centring — both belong to a block that owns its own line —
+   *  and becomes shrinkable, so the pills and the avatar to its right keep their width and the
+   *  scope text is what gives way when the column narrows. Everything that makes the line correct
+   *  is untouched: the character budget, the elide-don't-wrap rule, the per-segment accessible
+   *  names. This is a placement flag, not a second rendering. */
+  dense?: boolean;
 }) {
   const total = counts[VITAL_BAND];
   const split = splitFor(pinnedProjectName, byProject);
@@ -395,8 +405,12 @@ export function ScopeVitals({
       // own line box — so a flex layout renders "All projects·2" while `textContent` still reads
       // the spaces, i.e. a spacing regression no assertion on the text could see.
       style={{
-        textAlign: "center",
-        marginTop: 8,
+        textAlign: dense ? "left" : "center",
+        marginTop: dense ? 0 : 8,
+        // In the header row this is the ONE item that may give way — the pills and the avatar
+        // beside it have fixed content and a fixed cost, and the scope text already knows how to
+        // elide (see the clip/ellipsis note below).
+        ...(dense ? { flex: "1 1 auto", minWidth: 0 } : null),
         fontSize: 12,
         color: C.conciergeMuted,
         // THE ONE-LINE PROMISE, enforced rather than merely budgeted. `MAX_SEGMENTS` and

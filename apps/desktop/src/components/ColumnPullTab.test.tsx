@@ -4,13 +4,20 @@
 // paints nothing, so what is pinned here is the contract that regresses silently — the hover
 // gating the founder specifically asked for, the two zones being distinct controls, the drag being
 // a delta, and the overlaid round trip where the DOTS mean "dock me" rather than "resize me".
+//
+// The rev-4 re-cut adds three more, each of which had already been asked for once and lost:
+//   • the ANATOMY — arrow ABOVE dots, a real gap between them, anchored near the TOP of the seam;
+//   • the geometry matching `PRD/sparkle/ui-directions/rev4.html` rather than being re-derived;
+//   • TWO instances, on two boundaries, resizing INDEPENDENTLY.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ColumnPullTab } from "./ColumnPullTab";
+import { ColumnPullTab, ConciergeDragGrip } from "./ColumnPullTab";
 
 afterEach(() => cleanup());
 
-const tab = () => screen.getByTestId("column-pull-tab");
+const root = () => screen.getByTestId("column-pull-tab");
+const zone = () => screen.getByTestId("column-pull-tab-zone");
+const tab = () => screen.getByTestId("column-pull-tab-tab");
 const dots = () => screen.getByTestId("column-pull-tab-dots");
 const chevron = () => screen.getByTestId("column-pull-tab-chevron");
 
@@ -37,16 +44,54 @@ describe("ColumnPullTab — one tab, two zones", () => {
     // now." The control it replaces painted two grey marks on the seam permanently.
     setup();
     expect(tab().style.opacity).toBe("0");
-    fireEvent.mouseEnter(tab());
+    fireEvent.mouseEnter(root());
     expect(tab().style.opacity).toBe("1");
-    fireEvent.mouseLeave(tab());
+    fireEvent.mouseLeave(root());
     expect(tab().style.opacity).toBe("0");
+  });
+
+  it("takes no clicks while hidden OR shown — the ZONE never swallows a press", () => {
+    // THIS USED TO ASSERT THE ZONE GOES LIVE ON HOVER, which was the defect rather than the
+    // contract (roborev 54730). The zone overhangs ~15px into both columns, over the agent rows;
+    // `shown` is entered by crossing the rail, i.e. by the same movement that puts the pointer
+    // inside the sidebar, so "live once shown" still ate presses aimed at a row's left edge.
+    // Only the visible tab is pointer-active now, and that is asserted separately below.
+    render(<ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />);
+    const zone = screen.getByTestId("t-zone");
+    expect(zone.style.pointerEvents).toBe("none");
+    fireEvent.mouseEnter(screen.getByTestId("t"));
+    expect(zone.style.pointerEvents).toBe("none");
+  });
+
+  it("detects hover on the in-flow RAIL, which overhangs nothing", () => {
+    // The corollary of the above: if the zone is inert at rest, something else has to notice the
+    // pointer. That is the 6px rail — the real gap between the two columns — and it is why the
+    // control can be revealed at all without stealing a single click from either neighbour.
+    setup();
+    expect(root().style.width).toBe("6px");
+    expect(root().style.position).toBe("relative");
+    fireEvent.mouseEnter(root());
+    expect(tab().style.opacity).toBe("1");
+  });
+
+  it("is revealed by KEYBOARD FOCUS too, and rings itself", () => {
+    // Hover-only is a mouse rule. Without this, tabbing onto the dots drives a control that paints
+    // nothing at all — there is not even anything for a focus ring to sit on.
+    setup();
+    expect(tab().style.opacity).toBe("0");
+    dots().focus();
+    fireEvent.focus(dots());
+    expect(tab().style.opacity).toBe("1");
+    expect(tab().style.outline).toMatch(/2px solid/);
+    fireEvent.blur(dots());
+    expect(tab().style.opacity).toBe("0");
+    expect(tab().style.outline).toBe("none");
   });
 
   it("stays visible THROUGH a drag, when the pointer has left the tab", () => {
     setup();
     fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseLeave(tab());
+    fireEvent.mouseLeave(root());
     expect(tab().style.opacity).toBe("1");
   });
 
@@ -69,11 +114,68 @@ describe("ColumnPullTab — one tab, two zones", () => {
   });
 });
 
+// ── ANATOMY ────────────────────────────────────────────────────────────────────────────────────
+// "An arrow ABOVE six dots — not beside them", with a real gap, anchored at the TOP of the
+// boundary rather than vertically centred. Every number here is `rev4.html`'s, and the mock is what
+// the founder signed off AFTER asking for the first build to come down ~20% in size.
+describe("ColumnPullTab — the anatomy the founder asked for", () => {
+  it("stacks the ARROW ABOVE the DOTS, with a gap between them", () => {
+    setup();
+    expect(tab().style.flexDirection).toBe("column");
+    // DOM order is the visual order in a column flex with no `order` set.
+    const kids = [...tab().children];
+    expect(kids.indexOf(chevron())).toBeLessThan(kids.indexOf(dots()));
+    // 8px — rev4.html's `.tab{gap:8px}`. The first ask said ten; the correction that superseded it
+    // asked for the whole tab smaller, and 8 is what the approved page shipped.
+    expect(tab().style.gap).toBe("8px");
+  });
+
+  it("anchors near the TOP of the seam, below the header band — never vertically centred", () => {
+    // It used to sit at the column's very top, straight over the sidebar's `+` and its chips. The
+    // clearance is the point: "it's also a little tight with the plus behind it."
+    setup();
+    expect(zone().style.top).toBe("34px"); // --hd-h
+    expect(tab().style.top).toBe("6px");
+    // A centred tab is the thing being replaced: no `bottom`, no `alignItems:center` on the rail.
+    expect(tab().style.bottom).toBe("");
+    expect(root().style.alignItems).toBe("");
+  });
+
+  it("lets a headerless boundary opt out of the header clearance", () => {
+    setup({ topOffset: 0 });
+    expect(zone().style.top).toBe("0px");
+  });
+
+  it("draws the dot field to the mock's geometry — 3px squares, 2px apart", () => {
+    setup();
+    const field = dots().querySelector("span[aria-hidden]") as HTMLElement;
+    expect(field.style.gridTemplateColumns).toBe("repeat(2, 3px)");
+    expect(field.style.gap).toBe("2px");
+    const square = field.firstElementChild as HTMLElement;
+    expect(square.style.width).toBe("3px");
+    expect(square.style.height).toBe("3px");
+    // SQUARE, not round — "a little bit more square than those round dots".
+    expect(square.style.borderRadius).toBe("0");
+  });
+
+  it("straddles the seam without taking layout space from either column", () => {
+    // The rail stays a 6px in-flow band; the 30px hover zone hangs off it absolutely and overhangs
+    // 15px into each column. If the zone ever went in-flow the shell would have to make room for
+    // it, and both columns would jump.
+    setup();
+    expect(root().style.position).toBe("relative");
+    expect(zone().style.position).toBe("absolute");
+    expect(zone().style.width).toBe("30px");
+    expect(zone().style.height).toBe("52px");
+    expect(zone().style.transform).toBe("translateX(-50%)");
+  });
+});
+
 describe("ColumnPullTab — the dots resize", () => {
   it("drags as a DELTA from the mousedown point, not a jump to the cursor", () => {
     const { onWidth } = setup();
     fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 540 });
+    fireEvent.mouseMove(window, { clientX: 540, buttons: 1 });
     expect(onWidth).toHaveBeenLastCalledWith(400);
     fireEvent.mouseUp(window);
   });
@@ -81,9 +183,9 @@ describe("ColumnPullTab — the dots resize", () => {
   it("clamps at both ends", () => {
     const { onWidth } = setup();
     fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 9000 });
+    fireEvent.mouseMove(window, { clientX: 9000, buttons: 1 });
     expect(onWidth).toHaveBeenLastCalledWith(560);
-    fireEvent.mouseMove(window, { clientX: -9000 });
+    fireEvent.mouseMove(window, { clientX: -9000, buttons: 1 });
     expect(onWidth).toHaveBeenLastCalledWith(280);
     fireEvent.mouseUp(window);
   });
@@ -98,11 +200,94 @@ describe("ColumnPullTab — the dots resize", () => {
     expect(onWidth).toHaveBeenLastCalledWith(392);
   });
 
+  it("runs the gesture BACKWARDS for a column on the right of its seam", () => {
+    // The second boundary can own the column on either side. `grows:"right"` means dragging LEFT
+    // grows it — get this wrong and one of the two tabs resizes the wrong way round.
+    const { onWidth } = setup({ grows: "right" });
+    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
+    fireEvent.mouseMove(window, { clientX: 460, buttons: 1 });
+    expect(onWidth).toHaveBeenLastCalledWith(400);
+    fireEvent.mouseUp(window);
+    fireEvent.keyDown(dots(), { key: "ArrowLeft" });
+    expect(onWidth).toHaveBeenLastCalledWith(368);
+  });
+
   it("ignores a non-primary button", () => {
     const { onWidth } = setup();
     fireEvent.mouseDown(dots(), { button: 2, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 600 });
+    fireEvent.mouseMove(window, { clientX: 600, buttons: 1 });
     expect(onWidth).not.toHaveBeenCalled();
+  });
+});
+
+// ── BOTH BOUNDARIES ────────────────────────────────────────────────────────────────────────────
+// "There must be an instance on the left boundary and one on the right, resizable independently."
+// The failure mode this guards is a module-level ref or listener shared between instances: a single
+// tab can never show it, and the shell only ever mounted one.
+describe("ColumnPullTab — two boundaries, two independent tabs", () => {
+  function pair() {
+    const onLeft = vi.fn();
+    const onRight = vi.fn();
+    render(
+      <>
+        <ColumnPullTab
+          width={360}
+          onWidth={onLeft}
+          min={280}
+          max={560}
+          label="Sparkle column"
+          testId="left-tab"
+        />
+        <ColumnPullTab
+          width={240}
+          onWidth={onRight}
+          min={180}
+          max={480}
+          label="Build column"
+          testId="right-tab"
+        />
+      </>,
+    );
+    return { onLeft, onRight };
+  }
+
+  it("each owns its own hover state", () => {
+    pair();
+    fireEvent.mouseEnter(screen.getByTestId("left-tab"));
+    expect(screen.getByTestId("left-tab-tab").style.opacity).toBe("1");
+    expect(screen.getByTestId("right-tab-tab").style.opacity).toBe("0");
+  });
+
+  it("each drags its OWN column, from its own width and against its own clamps", () => {
+    const { onLeft, onRight } = pair();
+
+    fireEvent.mouseDown(screen.getByTestId("left-tab-dots"), { button: 0, clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 140, buttons: 1 });
+    fireEvent.mouseUp(window);
+    expect(onLeft).toHaveBeenLastCalledWith(400); // 360 + 40
+    expect(onRight).not.toHaveBeenCalled();
+
+    fireEvent.mouseDown(screen.getByTestId("right-tab-dots"), { button: 0, clientX: 800 });
+    fireEvent.mouseMove(window, { clientX: 830, buttons: 1 });
+    fireEvent.mouseUp(window);
+    expect(onRight).toHaveBeenLastCalledWith(270); // 240 + 30, its own base width
+    expect(onLeft).toHaveBeenCalledTimes(1); // and the first tab did not move again
+
+    // Its own clamps, not the other's.
+    fireEvent.mouseDown(screen.getByTestId("right-tab-dots"), { button: 0, clientX: 800 });
+    fireEvent.mouseMove(window, { clientX: 9000, buttons: 1 });
+    expect(onRight).toHaveBeenLastCalledWith(480);
+    fireEvent.mouseUp(window);
+  });
+
+  it("keeps their accessible names apart", () => {
+    pair();
+    expect(screen.getByTestId("left-tab-dots").getAttribute("aria-label")).toBe(
+      "Resize the Sparkle column",
+    );
+    expect(screen.getByTestId("right-tab-dots").getAttribute("aria-label")).toBe(
+      "Resize the Build column",
+    );
   });
 });
 
@@ -122,7 +307,7 @@ describe("ColumnPullTab — the chevron overlays, and the dots snap back", () =>
     expect(onOverlayToggle).toHaveBeenCalledTimes(1);
     // …and it must not try to move a boundary that is not on screen.
     fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 600 });
+    fireEvent.mouseMove(window, { clientX: 600, buttons: 1 });
     expect(onWidth).not.toHaveBeenCalled();
     fireEvent.keyDown(dots(), { key: "ArrowRight" });
     expect(onWidth).not.toHaveBeenCalled();
@@ -136,5 +321,119 @@ describe("ColumnPullTab — the chevron overlays, and the dots snap back", () =>
     // No longer a separator: there is no boundary to represent while floating.
     expect(dots().getAttribute("role")).toBe("button");
     expect(dots().getAttribute("aria-valuenow")).toBeNull();
+  });
+});
+
+// ── THE GRIP ───────────────────────────────────────────────────────────────────────────────────
+// A DIFFERENT control from the pull tab: 8 dots in 4 columns, lives in the concierge header, and
+// moves the whole column between sides. `MAPPING.md` puts it in `.ahd`; `ConciergeColumn` mounts it.
+describe("ConciergeDragGrip — 4×2, drags the concierge between sides", () => {
+  const grip = () => screen.getByTestId("concierge-drag-grip");
+
+  function setupGrip(side: "left" | "right" = "left") {
+    const onSideChange = vi.fn();
+    render(<ConciergeDragGrip side={side} onSideChange={onSideChange} />);
+    return { onSideChange };
+  }
+
+  it("is EIGHT dots, FOUR across — visibly not the pull tab's six-in-two", () => {
+    setupGrip();
+    const field = grip().querySelector("span[aria-hidden]") as HTMLElement;
+    expect(field.childElementCount).toBe(8);
+    expect(field.style.gridTemplateColumns).toBe("repeat(4, 3px)");
+  });
+
+  it("is NOT hover-gated — it lives in a header, not on a seam", () => {
+    setupGrip();
+    expect(grip().style.opacity).toBe("");
+    expect(grip().style.pointerEvents).toBe("");
+  });
+
+  it("commits the far side once the drag clears the throw distance", () => {
+    const { onSideChange } = setupGrip("left");
+    fireEvent.mouseDown(grip(), { button: 0, clientX: 100 });
+    fireEvent.mouseUp(window, { clientX: 160 });
+    expect(onSideChange).toHaveBeenCalledWith("right");
+  });
+
+  it("ignores a twitch — teleporting the whole column on a 3px slip is not recoverable", () => {
+    const { onSideChange } = setupGrip("left");
+    fireEvent.mouseDown(grip(), { button: 0, clientX: 100 });
+    fireEvent.mouseUp(window, { clientX: 103 });
+    expect(onSideChange).not.toHaveBeenCalled();
+  });
+
+  it("does not re-commit the side it is already on", () => {
+    const { onSideChange } = setupGrip("right");
+    fireEvent.mouseDown(grip(), { button: 0, clientX: 100 });
+    fireEvent.mouseUp(window, { clientX: 300 });
+    expect(onSideChange).not.toHaveBeenCalled();
+  });
+
+  it("has a keyboard path, and it is ABSOLUTE rather than a toggle", () => {
+    // ← means "put it on the left". A relative toggle would be ambiguous once the control has
+    // travelled with the column it moves.
+    const { onSideChange } = setupGrip("left");
+    expect(grip().getAttribute("tabindex")).toBe("0");
+    expect(grip().getAttribute("aria-label")).toMatch(/other side/i);
+    fireEvent.keyDown(grip(), { key: "ArrowLeft" });
+    expect(onSideChange).not.toHaveBeenCalled(); // already there
+    fireEvent.keyDown(grip(), { key: "ArrowRight" });
+    expect(onSideChange).toHaveBeenCalledWith("right");
+  });
+
+  it("ignores a non-primary button", () => {
+    const { onSideChange } = setupGrip("left");
+    fireEvent.mouseDown(grip(), { button: 2, clientX: 100 });
+    fireEvent.mouseUp(window, { clientX: 400 });
+    expect(onSideChange).not.toHaveBeenCalled();
+  });
+
+  it("abandons a drag whose release went missing, instead of arming the next click", () => {
+    // roborev 54691 (Medium): "throw it to the other side" invites releasing OUTSIDE the window,
+    // and no mouseup arrives for that. The drag then stayed live with a stale origin, so the next
+    // ordinary click anywhere in the app read as its end — and, being almost certainly ≥24px from
+    // that origin, teleported the whole column.
+    const { onSideChange } = setupGrip("left");
+    fireEvent.mouseDown(grip(), { button: 0, clientX: 100 });
+    // The pointer comes back over the window with nothing held: the release already happened.
+    fireEvent.mouseMove(window, { clientX: 400, buttons: 0 });
+    expect(onSideChange).not.toHaveBeenCalled();
+    // …and an unrelated click later must not be mistaken for the end of that drag.
+    fireEvent.mouseUp(window, { clientX: 900 });
+    expect(onSideChange).not.toHaveBeenCalled();
+  });
+
+  it("keeps a live drag alive while the button IS still held", () => {
+    // The cancel above must key on the button state, not merely on movement — otherwise the first
+    // pixel of every legitimate drag kills it.
+    const { onSideChange } = setupGrip("left");
+    fireEvent.mouseDown(grip(), { button: 0, clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 150, buttons: 1 });
+    fireEvent.mouseUp(window, { clientX: 160 });
+    expect(onSideChange).toHaveBeenCalledWith("right");
+  });
+});
+
+describe("the seam never swallows a click meant for a column — roborev 54691 / 54730", () => {
+  it("only the VISIBLE tab takes pointer events", () => {
+    render(<ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />);
+    const tab = screen.getByTestId("t-tab");
+    expect(tab.style.pointerEvents).toBe("none");
+    fireEvent.mouseEnter(screen.getByTestId("t"));
+    expect(tab.style.pointerEvents).toBe("auto");
+  });
+
+  it("abandons a drag whose release went missing", () => {
+    // If the mouseup is lost, `dragging` stays true and the column follows the bare cursor across
+    // the screen until the next click commits a width. `buttons === 0` ends it.
+    const onWidth = vi.fn();
+    render(<ColumnPullTab width={360} onWidth={onWidth} min={240} max={640} label="Build column" testId="t" />);
+    fireEvent.mouseEnter(screen.getByTestId("t"));
+    fireEvent.mouseDown(screen.getByTestId("t-tab"), { clientX: 500 });
+    fireEvent.mouseMove(window, { clientX: 900, buttons: 0 });
+    onWidth.mockClear();
+    fireEvent.mouseMove(window, { clientX: 200, buttons: 0 });
+    expect(onWidth).not.toHaveBeenCalled();
   });
 });

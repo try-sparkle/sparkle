@@ -5,8 +5,17 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyToClipboard } from "../clipboard";
-import { C, CHAT_USER_BUBBLE, xtermTheme } from "../theme/colors";
+import { C, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
+import {
+  TERM_HAIRLINE,
+  TERM_PLANE,
+  TERM_RADIUS,
+  TERM_TYPE,
+  TERM_UI,
+  termInk,
+  termMuted,
+} from "./terminalChrome";
 import type { AgentTabStatus, Runtime } from "../types";
 import { getTransport, type AgentTransport } from "../services/agentTransport";
 import { StatusEngine } from "../engine/statusEngine";
@@ -1081,13 +1090,33 @@ export function Terminal({
   // What to paint over the blank xterm: a fail/exited affordance, a loading hint, or nothing once
   // output streams. Pure (see terminalOverlay.ts) so the "never a silent blank pane" rule is tested.
   const overlay = resolveTerminalOverlay(spawnFail, firstOutput, resuming);
+  // The pane's own inks. `--c-forest` follows a `data-theme` flip through CSS, but the terminal's
+  // ink register has no CSS variable (see terminalChrome), so these resolve in JS. That is a
+  // re-render on a theme flip and MUST NOT become a remount — an unmount kills this PTY. Nothing
+  // below is keyed or conditionally structured on the theme; Terminal.blueprint.test.tsx proves it.
+  const ink = termInk(resolvedTheme);
+  const quietInk = termMuted(resolvedTheme);
 
   return (
     // ph-no-capture: terminal panes render source code, command output, and
     // secrets — never include them in PostHog session replay.
     <div
       className={PH_NO_CAPTURE_CLASS}
-      style={{ position: "relative", width: "100%", height: "100%" }}
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        // THE PANE IS THE SPEC'S `term` PLANE. It was relying on an ancestor to paint it, which
+        // held only as long as every ancestor agreed; declaring it here means the pane carries its
+        // own register, and the overlays below are composited on the surface they were measured
+        // against rather than on whatever happens to be behind them.
+        background: TERM_PLANE,
+        // NO BORDER ON THIS EDGE. Build and terminal are ONE thing inside a pair — the direction
+        // says so in as many words ("NO divider inside a pair"), and the selected agent row bleeds
+        // 9px across this boundary precisely so it reads as an opening INTO this pane. A 1px rule
+        // here seals that: the row docks against the line instead of flowing through, and its
+        // fillets curve into nothing. Do not add one back "for definition".
+      }}
     >
       <div ref={containerRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />
       {/* Affordance over the still-blank terminal. Loading: from spawn until the first PTY byte
@@ -1106,22 +1135,27 @@ export function Terminal({
             alignItems: "center",
             justifyContent: "center",
             gap: 12,
-            color: C.cream,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-            fontSize: 13,
+            color: ink,
+            fontFamily: TERM_UI,
+            fontSize: TERM_TYPE.body,
             zIndex: 5,
           }}
         >
-          <span style={{ opacity: 0.8 }}>{overlay.message}</span>
+          {/* Secondary by TOKEN, not by opacity. A dimmed primary ink composites to whatever the
+              plane happens to be and is measured against nothing; `termMuted` is the register's
+              own quiet tier. */}
+          <span style={{ color: quietInk }}>{overlay.message}</span>
           <button
             onClick={retry}
             style={{
               all: "unset",
               cursor: "pointer",
-              fontSize: 13,
-              color: C.cream,
-              border: `1px solid ${C.muted}`,
-              borderRadius: 6,
+              fontSize: TERM_TYPE.body,
+              color: ink,
+              // A rule drawn ON the terminal plane — `termHairline`, never the chrome hairline
+              // (and never `muted`, which is an INK). See terminalChrome.
+              border: `1px solid ${TERM_HAIRLINE}`,
+              borderRadius: TERM_RADIUS.input,
               padding: "6px 16px",
             }}
           >
@@ -1136,10 +1170,10 @@ export function Terminal({
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            color: C.cream,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-            fontSize: 13,
-            opacity: 0.6,
+            // The loading hint is secondary chrome: the pane's quiet ink, not a faded primary.
+            color: quietInk,
+            fontFamily: TERM_UI,
+            fontSize: TERM_TYPE.body,
             pointerEvents: "none",
             zIndex: 5,
           }}
@@ -1156,12 +1190,15 @@ export function Terminal({
           left: "50%",
           transform: "translateX(-50%)",
           padding: "6px 14px",
-          borderRadius: 6,
+          borderRadius: TERM_RADIUS.modal,
           background: C.deepForest,
           color: C.cream,
-          border: `1px solid ${CHAT_USER_BUBBLE}`,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-          fontSize: 13,
+          // A chip sitting on the terminal plane takes its OWN border. It carried
+          // `CHAT_USER_BUBBLE` — a chrome FILL pressed into service as an edge, floored against the
+          // shell's planes and not against this one.
+          border: `1px solid ${TERM_HAIRLINE}`,
+          fontFamily: TERM_UI,
+          fontSize: TERM_TYPE.small,
           boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
           pointerEvents: "none",
           opacity: copied ? 1 : 0,

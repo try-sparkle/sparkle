@@ -1,4 +1,5 @@
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 
 /** Shown when the window's close (red traffic light) is requested. Lets the user keep the running
@@ -49,7 +50,7 @@ export function ClosePrompt({
             // navy in light mode, which would go low-contrast on the blue fill).
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "11px 14px",
             cursor: "pointer",
             fontSize: 13,
@@ -65,7 +66,7 @@ export function ClosePrompt({
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.sienna}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "11px 14px",
             cursor: "pointer",
             fontSize: 13,
@@ -84,7 +85,7 @@ export function ClosePrompt({
             background: "transparent",
             color: C.muted,
             border: `1px solid ${C.muted}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "8px 16px",
             cursor: "pointer",
           }}

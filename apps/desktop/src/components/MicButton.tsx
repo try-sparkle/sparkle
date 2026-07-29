@@ -7,6 +7,7 @@ import { useAuthStore } from "../stores/authStore";
 import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
 import type { Phase } from "../voice/wakeMachine";
+import { RADIUS } from "../theme/scale";
 
 /** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends
  *  credits, so arming (turning the mic on / setting a listening intent) with an empty balance is
@@ -395,7 +396,7 @@ export function MicMenu({
         flexDirection: "column",
         gap: 4,
         padding: 5,
-        borderRadius: 999,
+        borderRadius: RADIUS.input,
         background: `color-mix(in srgb, ${surfaceColor} 94%, transparent)`,
         border: `1px solid color-mix(in srgb, ${C.muted} 32%, transparent)`,
         boxShadow: "0 8px 24px rgba(0,0,0,0.35)",

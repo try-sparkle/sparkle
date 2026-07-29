@@ -28,6 +28,7 @@ import {
   performTrialUnlock,
 } from "../services/trialUnlock";
 import { PromoRedeem } from "./PromoRedeem";
+import { FONT_UI } from "../theme/scale";
 
 // Extracted to its own file for reuse in the Credits settings pane; re-exported so existing
 // imports (incl. AuthGate.promo.test.tsx) keep resolving from here.
@@ -57,7 +58,7 @@ const primaryBtn: CSSProperties = {
   fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const linkBtn: CSSProperties = {

@@ -18,10 +18,11 @@ import { TbPinFilled } from "react-icons/tb";
 // FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
 import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
-import { RADIUS, TYPE } from "../theme/scale";
+import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { SIDEBAR_OVERLAY_Z } from "./layers";
+import { TERM_HAIRLINE } from "./terminalChrome";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
@@ -95,7 +96,7 @@ import { FittedAgentName } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
-import { resolveStage, rollupStages, stageFraction, stageIndex, LINE_FROM, LINE_TO } from "../engine/workflowStage";
+import { resolveStage, rollupStages, stageFraction, stageIndex, stageMeta, LINE_FROM, LINE_TO } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { useNewAgent } from "../hooks/useNewAgent";
 import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
@@ -113,6 +114,12 @@ import { CloseAgentPrompt } from "./CloseAgentPrompt";
 // fits, or pinned (sticky) at the top when the list is tall enough to scroll.
 // Border is split into longhand props (width/style/color) so NewAgentRow's hover state can flip
 // just the style (dashed → solid) and color without fighting a `border` shorthand.
+// `--hd-h` from rev4.html: the height of every column header band in the cockpit — the concierge's
+// `.ahd` and this column's `.bhd`. One number so the two line up across the seam; a header that is
+// two pixels off its neighbour is the kind of thing that reads as "not the design" without anyone
+// being able to name it.
+const BUILD_HEADER_H = 34;
+
 const DASHED_ROW_STYLE: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -1512,12 +1519,17 @@ export function AgentSidebar({
         // is what makes an undrawn seam viable. (No ratio quoted here on purpose: the last two
         // review rounds were spent on ratios written into comments that then went stale.)
         //
-        // THAT STEP IS NOW GUARDED FROM BOTH SIDES, and this comment used to overclaim it: it said
-        // chromeContrast asserted the step, when the only two assertions naming the pair were
-        // CEILINGS (`toBeLessThan`). Nothing held it up (roborev 54215). It is bounded as a band
-        // now — ≥ PLANE_MIN_SPLIT so an undrawn seam stays visible, < CHROME_MIN_CONTRAST so it
-        // never reads as a drawn line — because a seam with no rule has no fallback if the fill
-        // goes flat.
+        // THIS COMMENT HAS OVERCLAIMED THE GUARD TWICE, AND THE SECOND TIME IS WORTH RECORDING.
+        // First it said chromeContrast asserted the step when the only assertions naming the pair
+        // were CEILINGS (`toBeLessThan`) — nothing held it up (roborev 54215). The correction cited
+        // a band, "≥ PLANE_MIN_SPLIT … < CHROME_MIN_CONTRAST". That floor no longer exists:
+        // `PLANE_MIN_SPLIT` was DELETED, because the approved direction's own planes measure
+        // 1.069–1.194 and would fail it — separation here is by LINE WEIGHT, not by fill.
+        //
+        // So the honest statement is that there is no floor under this seam by design, and none is
+        // wanted. What holds the pair up instead is fidelity: both values are ported verbatim from
+        // the spec (theme/blueprintSpec.ts) and blueprintSpec.test.ts fails on byte drift, so the
+        // step cannot go flat without failing a diff against the design itself.
         borderRight: "none",
         display: "flex",
         flexDirection: "column",
@@ -1602,25 +1614,78 @@ export function AgentSidebar({
           hold, the row itself is gone rather than conditional, and the Plan/Build toggle is now
           the top of this column. */}
 
-      {/* Column-2 header (PRD §3): the Plan / Build segmented toggle. Build keeps its two-stage
-          behavior here — a second click on the active chevron spawns a fresh build agent.
+      {/* ── `.bhd` — THE COLUMN HEADER ────────────────────────────────────────────────────────────
+          One band, `--hd-h` tall, with a bottom hairline: Build/Plan segment · spacer · the status
+          filter chips. Straight from rev4.html:
 
-          The top gap is UNCONDITIONAL. This strip is the top of the column, so without it it would
-          sit flush against ProjectTabsBar — the app's other piece of top chrome — and the two would
-          read as one welded band. It used to be conditional, because a "Show Helper" row sometimes
-          sat above and contributed its own 14px of top padding; §6 deleted that row, so there is no
-          longer a configuration in which something above supplies the spacing. Hiding the helper
-          ISLAND is still possible (§15 put Hide back on the island and in the View menu) but brings
-          no sidebar row back, so it cannot affect this either — AgentSidebar.rowChrome.test.tsx
-          pins exactly that. Do not restore the conditional. */}
+            .bhd{display:flex;align-items:center;gap:8px;height:var(--hd-h);padding:0 10px;
+                 flex:0 0 auto;border-bottom:1px solid var(--k-hair);…}
+            .bhd .sp{flex:1}
+
+          TWO THINGS MOVED HERE, and the second one is the point. The Plan/Build strip was the top
+          of the column with a bare 20px gap above it, floating rather than banded — the gap existed
+          only to stop it welding to ProjectTabsBar. A header with its own bottom rule solves that
+          by being a band instead of by holding empty space, so the gap is gone rather than kept.
+          And the STATUS FILTER CHIPS were the first thing inside the SCROLLING list, which meant
+          the control that decides what the list shows scrolled away from the list it governs. In
+          the header they are always on screen, which is what makes them usable as the single filter
+          mechanism (see below).
+
+          EXACTLY ONE FILTER MECHANISM. An earlier iteration had a header pill and per-column chips
+          each hiding rows with their own CSS, and they disagreed: the pill hid the green rows while
+          the green chip still read ON, so the controls lied about the view. The chips are the only
+          thing in this column that hides anything; anything global must DRIVE them rather than
+          filter alongside them. rev4.html carries the same warning in its own CSS.
+
+          NOT BUILT: the mock's hover-only `.pm` (`+`/`−`) beside the chips, which duplicates the
+          PAIR onto the free side. `Workspace` renders one sidebar and one terminal stage — there is
+          no second pair for it to create, and pane mounting is keyed per project/agent so making
+          one is real work (MAPPING.md's own gap #3). A visible control that cannot do anything is
+          worse than an absent one; see PRD/sparkle/blueprint-agent-sidebar.md. */}
       {project && (
-        <PlanBuildToggle
-          mode={mode}
-          beadsEnabled={beadsEnabled}
-          onPickPlan={onPickPlan}
-          onPickBuild={onPickBuild}
-          style={{ marginTop: 20 }}
-        />
+        <div
+          data-testid="build-column-header"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            // THE BAND WRAPS, and it has to. The chip bar is the only item here with a real shrink
+            // share — the mini segment is `0 0 auto` (~80px) and the spacer's basis is 0 — so
+            // without this the bar absorbs the entire deficit: at the sidebar's MIN_WIDTH of 160
+            // it is handed ~42px, narrower than ONE chip, and every chip lands on its own line with
+            // `Reset` (nowrap, unshrinkable) overflowing a container that sets no overflow. That is
+            // strictly worse than where the bar came from, where it had the full list width.
+            // Wrapping here lets it drop to a full-width second line under the segment instead.
+            flexWrap: "wrap",
+            gap: 8,
+            flex: "0 0 auto",
+            // minHeight, not height: the band grows by a line when the bar wraps rather than
+            // letting the chips spill through the rule below. `--hd-h` is the UNFILTERED width-wise
+            // case — the height the two columns' headers line up at across the seam.
+            minHeight: BUILD_HEADER_H,
+            padding: "0 10px",
+            borderBottom: `1px solid ${C.hairline}`,
+          }}
+        >
+          <PlanBuildToggle
+            variant="mini"
+            mode={mode}
+            beadsEnabled={beadsEnabled}
+            onPickPlan={onPickPlan}
+            onPickBuild={onPickBuild}
+          />
+          {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. */}
+          <span aria-hidden style={{ flex: 1, minWidth: 0 }} />
+          {/* Hidden in Plan (no rows to filter) and when the project has no top-level agents at all
+              — three dead controls over an empty-state hint is worse than no controls. */}
+          {mode !== "plan" && ordered.length + (hiddenByFilter ? 1 : 0) > 0 && (
+            <StatusFilterBar
+              counts={bandCounts}
+              visible={statusFilter}
+              onToggle={toggleStatusBand}
+              onReset={showAllStatusBands}
+            />
+          )}
+        </div>
       )}
 
       {/* The full-text search bar that used to sit here is GONE. It now lives in column ① as the
@@ -1639,7 +1704,14 @@ export function AgentSidebar({
       <div
         ref={listScrollRef}
         data-testid="agent-list-scroll"
-        style={{ flex: 1, overflowY: "auto", padding: "0 8px" }}
+        // `LIST_PAD_X`, NOT a literal 8. Every row's `marginRight: -LIST_PAD_X` exists to eat
+        // exactly this padding and land on the column's edge, and `ROW_PAD_RIGHT` pays it back —
+        // three values that are only correct together. Typed separately, changing this to `0 12px`
+        // leaves every row 4px short of the seam (the active row's fill stops lapping the seam
+        // element, and the fillets flare from a shape that no longer touches the pane) with the
+        // geometry tests still green, because they read the row's own margin and never this.
+        // rowGeometry now asserts the two agree.
+        style={{ flex: 1, overflowY: "auto", padding: `0 ${LIST_PAD_X}px` }}
       >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Plan has none (no agents in Plan). Placement is dynamic (listOverflows):
@@ -1662,17 +1734,10 @@ export function AgentSidebar({
             {newAgentButton}
           </div>
         )}
-        {/* The status-band filter. Above the ladder because it governs the whole ladder; hidden in
-            Plan (no rows) and when the project has no top-level agents at all (nothing to filter,
-            so the chips would just be three dead controls above an empty-state hint). */}
-        {project && mode !== "plan" && ordered.length + (hiddenByFilter ? 1 : 0) > 0 && (
-          <StatusFilterBar
-            counts={bandCounts}
-            visible={statusFilter}
-            onToggle={toggleStatusBand}
-            onReset={showAllStatusBands}
-          />
-        )}
+        {/* The status-band filter USED TO BE HERE, as the first thing inside the scroll container.
+            It moved into the `.bhd` column header above: a control that governs which rows the list
+            shows must not scroll away with the list. Nothing replaces it here — do not add a second
+            one, that is the two-disagreeing-filters bug the header's note describes. */}
         {(() => {
           if (!project) return null;
           if (mode === "plan") return null; // Plan: sidebar list stays clear (board shows in main pane)
@@ -2131,8 +2196,43 @@ const subtreeDomId = (headId: string) => `agent-subtree-${headId}`;
 const ROW_PAD_Y = 4;
 const ROW_PAD_X = 10;
 
-// Radius of the concave fillets that flare the active row's right edge open into the terminal.
-const ACTIVE_FILLET = 6;
+// The agent list's own horizontal padding (`agent-list-scroll`), and therefore exactly how far a
+// row has to reach BACK to touch the column's edge. Named rather than typed twice because the
+// row's margin and its compensating padding both depend on it and must move together.
+const LIST_PAD_X = 8;
+
+// ── GEOMETRY BELONGS TO EVERY ROW, NEVER ONLY THE SELECTED ONE ─────────────────────────────────
+//
+// `.row` in the mock carries the pane-side margin; `.row.on` changes only what is PAINTED. The
+// version this replaces put `marginRight: isActive ? -8 : 0` on the row, which meant the row's
+// CONTENT BOX narrowed by 8px the instant you selected it — so the title under the pointer jumped
+// ~10px on click and jumped back on the next row. The founder reported the list twitching every
+// time they changed agents; this is that bug, and it is a layout property masquerading as a
+// selection style.
+//
+// The fix is the mock's: every row runs to the seam and every row pays the same padding back, so
+// the ink sits at a constant inset from the column's edges in all states. See MAPPING.md,
+// "Row geometry belongs to `.row`, never to `.row.on`" — `padding compensates margin one-for-one
+// instead of just changing it` is the exact instruction, and it is why ROW_PAD_RIGHT exists rather
+// than the row simply keeping `ROW_PAD_X` on both sides.
+const ROW_PAD_RIGHT = ROW_PAD_X + LIST_PAD_X;
+
+// ── THE MOUTH IS 26 × 9, NOT 9 × 9 ─────────────────────────────────────────────────────────────
+//
+// `--r-delta` (9px) is the fillet's RISE and `--m-run` (26px) is its RUN. It is not a square, and
+// the founder rejected the square: a circular 9×9 corner-round is 78% quarter-disc, so it packs the
+// whole flare into the last ~4px before the seam. The near-white build column (`deepForest`, the
+// spec's `--k-bridge`) therefore ran flush beside the row right up to the pane and stopped in a
+// rounded stub — two pale claws pinching the row where it enters the terminal. That is the "white
+// lines shouldn't be there when rounded" report: nothing stray, just a corner-round doing what a
+// corner-round does.
+//
+// Stretched to 26 × 9 the same arc leaves the row's edge with a HORIZONTAL tangent (flush with the
+// row) and meets the seam with a VERTICAL one (flush with the column boundary), so it is smooth at
+// both ends and the bank sweeps out of frame instead of hooking back. Same colours, same anchor,
+// same 9px rise — only the run is longer. 26 is `--grid-step`; the mock records that 38 reads melty.
+const ACTIVE_FILLET = 9;
+const ACTIVE_FILLET_RUN = 26;
 
 // What a rolled-up disc is painted. The three definite marks reuse the AGENT_STATUS tier colors
 // straight (NOT statusInk — that resolves a color to a legible TEXT ink, and this is a filled
@@ -2224,18 +2324,93 @@ export function useRowClock(since: number | undefined): number {
 function ElapsedTimer({ since, now, color }: { since: number; now: number; color: string }) {
   return (
     <div
+      data-testid="row-elapsed"
       style={{
         flex: "0 0 auto",
         height: GLYPH_SLOT_H,
         display: "flex",
         alignItems: "center",
-        fontSize: 12,
+        // `.row .el{font:var(--t-micro) var(--k-mono);color:var(--k-faint)}` — the mock's own rule.
+        // It was 12px system-ui, i.e. the same face and nearly the same size as the NAME beside it,
+        // so the row's two spans read as one run of text with a number in front. Mono at 10px is
+        // what makes the elapsed value read as an instrument reading rather than as part of the
+        // title, and it is the same treatment the stage chip and the group headers take.
+        fontFamily: FONT_MONO,
+        fontSize: TYPE.micro,
         color,
         fontVariantNumeric: "tabular-nums",
       }}
     >
       {formatElapsed(Math.max(0, now - since))}
     </div>
+  );
+}
+
+/**
+ * `.stg` — the row's stage chip. The mock:
+ *
+ *   .row .stg{font:var(--t-micro) var(--k-mono);color:var(--k-muted);
+ *             border:1px solid var(--k-hair-solid);border-radius:var(--r-sm);padding:1px 5px}
+ *   .row.on .stg{border-color:rgba(125,150,180,.4);color:var(--k-term-muted)}
+ *
+ * BORDERED, NOT FILLED, and near-square (`--r-sm` = 3px). That is the design's thesis applied to
+ * the smallest object in the column — *structure is drawn, not filled* — and it is why this is not
+ * one more coloured pill: a filled chip on every row would be a second wall of colour beside the
+ * status dots, which is the treatment the column has already been walked back from twice.
+ *
+ * The text is `stageMeta(stage).short` — "Unsaved", "Saved", "Pushed", "In PR" — the same strings
+ * the mock shows, which is not a coincidence: the mock was drawn from this ladder.
+ *
+ * It answers a different question from the group header above it. The header says which RUNG the
+ * section is; the chip says where this row sits, which matters because a row can be read out of
+ * order (scrolled past its header, or pulled up in a filtered view) and because the two disagree
+ * for a head whose stage rolls up from its workers.
+ */
+function StageChip({ stage, active }: { stage: WorkflowStageId; active: boolean }) {
+  const meta = stageMeta(stage);
+  return (
+    <span
+      data-testid="row-stage-chip"
+      title={meta.detail}
+      style={{
+        flex: "0 0 auto",
+        fontFamily: FONT_MONO,
+        fontSize: TYPE.micro,
+        lineHeight: 1,
+        // `--k-muted`. NOT the stage's own colour: the column's rule is that status never colours a
+        // row's text, and a per-stage hue here would put ten of them down one column.
+        color: C.muted,
+        // TWO PLANES, TWO EDGE TOKENS — and BOTH are themed, which the first cut was not.
+        //
+        // Idle row: `--k-hair-solid`, which is `pillFill` here (theme/colors maps it straight from
+        // BLUEPRINT[mode].hairSolid), so this is the spec value exactly.
+        //
+        // ACTIVE row: the row is painted the TERMINAL's colour, so the chip is no longer sitting on
+        // the build column at all and the column's edge token is the wrong one for it. The mock
+        // swaps to `rgba(125,150,180,.4)` there; that shipped here as a literal for one commit and
+        // it was wrong twice — it is theme-blind (one alpha, applied in both themes, from a
+        // dark-mode mock) and `chromeContrast` / `blueprintSpec` cannot sweep a literal. It takes
+        // `TERM_HAIRLINE` now (components/terminalChrome.ts) — `BLUEPRINT[mode].termHair`, the
+        // spec's own edge FOR THE TERMINAL PLANE, which is precisely what this chip is now sitting
+        // on. `chromeContrast.test.ts` floors that token against the terminal plane specifically,
+        // so unlike the literal it is actually swept.
+        //
+        // Measured on `forest`, so the next person does not have to re-derive it: `termHairline` is
+        // 1.222:1 light / 1.480:1 dark, against the idle chip's 1.332 / 1.583 on the column. So the
+        // chip holds roughly its weight across the two planes, which is what the mock's swap is
+        // for — but note it does not get STRONGER in light, and no token in the set would: in light
+        // `forest` (#d9e3f3) sits inside the hairline band, so every candidate lands between 1.12
+        // and 1.22. Making this edge read on the light terminal plane needs a token that does not
+        // exist; reported in PRD/sparkle/blueprint-agent-sidebar.md. The chip's MEANING never rode
+        // on the border — its ink is `muted`, 4.756:1 on `forest` in light and 7.764 in dark.
+        border: `1px solid ${active ? TERM_HAIRLINE : C.pillFill}`,
+        borderRadius: RADIUS.sm,
+        padding: "1px 5px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {meta.short}
+    </span>
   );
 }
 
@@ -2804,7 +2979,11 @@ const AgentRow = memo(function AgentRow({
   // place you opened precisely to read the names. The disc already says it, per row, in the column
   // the eye scans down. `statusColor` is still live for that disc and for the card's own controls.
   const nameColor = C.cream;
-  // Same reasoning for the elapsed timer — metadata, not a status readout.
+  // Same reasoning for the elapsed timer — metadata, not a status readout. The mock puts `.el` a
+  // tier below the name it leads (`--k-faint`), and this does NOT follow it there, for the same
+  // measured reason the group header does not: `agentIdle` on this column is 3.377:1 in light and
+  // 4.353:1 in dark, under AA for what is 10px text. The mono face and the micro size already
+  // separate the reading from the title; the ink does not have to go under the floor to do it.
   const metaColor = C.muted;
 
   // Rebase a branch (this row's, or one of its inline workers') onto its base. Parameterized by id +
@@ -3159,6 +3338,12 @@ const AgentRow = memo(function AgentRow({
                 {cloudChip}
                 {pinChip}
               </div>
+              {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
+                  (dot · el · nm · stg · close). Outside the name container so the title ellipsizes
+                  against it rather than pushing it off the row. Collapsed only: the card already
+                  renders the full WorkflowLine for this stage, and two readings of one fact in one
+                  view is the thing the row was stripped down to avoid. */}
+              {trackerStage && <StageChip stage={trackerStage} active={isActive} />}
             </div>
           )}
           {/* The agent's live first-person "what I'm building now" narration, self-reported via the
@@ -3428,7 +3613,12 @@ const AgentRow = memo(function AgentRow({
           // 4px, down from 8: the row is a single 20px line of text now (the sub-line and the
           // progress bar moved to the card), so the old padding was sized for content that is no
           // longer here and left the column looking sparse rather than calm.
-          padding: `${ROW_PAD_Y}px ${ROW_PAD_X}px`,
+          //
+          // The RIGHT padding is `ROW_PAD_RIGHT`, not `ROW_PAD_X`, and it is not decoration: it
+          // pays back, one-for-one, the `marginRight` below that every row now carries. Content
+          // inset from the column's pane-side edge is `ROW_PAD_RIGHT - LIST_PAD_X` = ROW_PAD_X in
+          // every state, which is the whole point — see ROW_PAD_RIGHT.
+          padding: `${ROW_PAD_Y}px ${ROW_PAD_RIGHT}px ${ROW_PAD_Y}px ${ROW_PAD_X}px`,
           marginLeft: depth * DEPTH_INDENT,
           // Active row is the TERMINAL color, extending past the list's 8px right padding
           // (marginRight:-8) so it reaches the sidebar's right border. Left corners round into the
@@ -3447,8 +3637,23 @@ const AgentRow = memo(function AgentRow({
           // other row is transparent, plus the square right corner and the fillets shaping that
           // edge into an opening — and, once the card is open, its 4px `hairline` outline. Not the
           // fill step against the column, which is ~1.08:1 and never was the signal.
-          borderRadius: isActive ? "6px 0 0 6px" : 6,
-          marginRight: isActive ? -8 : 0,
+          // PAINT, not layout: a radius on a transparent box draws nothing, so this may key off
+          // selection where the margin below may not. The leading (concierge-side) end takes a
+          // radius; the pane-side end is SQUARE here and is opened by the concave fillets below —
+          // a radius there would neck the row DOWN as it reaches the pane, which is the opposite
+          // operation (MAPPING.md, "Geometry vocabulary").
+          //
+          // The mock's leading radius is `--r-lead: 10px`. `theme/scale.ts` RADIUS tops out at 6
+          // (`modal`) and adding a step there is another agent's file, so this holds at
+          // RADIUS.modal and the missing token is reported rather than hard-coded — a stray `10`
+          // here is both off-scale (theme/scale.test.ts is a ratchet at 0) and the kind of local
+          // re-derivation blueprintSpec.ts exists to end.
+          borderRadius: isActive
+            ? `${RADIUS.modal}px 0 0 ${RADIUS.modal}px`
+            : RADIUS.modal,
+          // EVERY ROW, unconditionally. See ROW_PAD_RIGHT: making this conditional on `isActive`
+          // is the list-twitch bug, not a saving.
+          marginRight: -LIST_PAD_X,
           cursor: "pointer",
           // The whole card is a drag handle for reorderable rows — suppress text selection so a
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
@@ -3477,36 +3682,60 @@ const AgentRow = memo(function AgentRow({
             from its representative worker) and its single rollup progress bar summarizing every worker.
             The individual workers — and the bead/epic detail — are revealed on CLICK, in the detail
             card (see CardDetail); they no longer render inline here. */}
-        {/* CONCAVE corner fillets where the active tab opens into the terminal. Each is a small box
-            just above / below the tab's right edge; a radial-gradient paints the terminal color
-            (C.forest) everywhere EXCEPT a quarter-disc cut from the corner nearest the sidebar, so
-            the forest flares outward into the terminal with a smooth inward (concave) curve — an
-            "opening", not a convex button corner. pointerEvents:none so they never eat clicks.
-            Suppressed while the card is open (showOverlay): the row is no longer visibility:hidden,
-            so — unlike before — these would otherwise show through beside the stand-in card. */}
+        {/* ── THE MOUTH: A CONCAVE FILLET, NOT A CORNER ─────────────────────────────────────────
+            A `border-radius` curves the corner IN. It cuts material away, so the row NECKS DOWN as
+            it reaches the pane — the exact opposite of what a junction should do. A mouth curves
+            OUT, the way a river opens into a delta: the channel widens and the bank sweeps away
+            from it. NO radius value produces that at any size; it is a different construction, and
+            the distinction cost ~20 review rounds (MAPPING.md, "Geometry vocabulary"). If a review
+            says "rounded the wrong way / backwards", changing the number is not converging.
+
+            The construction, straight from the mock's `--m-tr` / `--m-br`: an `--m-run` ×
+            `--r-delta` box sitting just above / below the row at its pane-side end, filled with the
+            PANE's colour, with an ELLIPTICAL quadrant bitten out of the corner FURTHEST from the
+            junction — `radial-gradient(ellipse farthest-side at <far corner>, transparent 0
+            calc(100% - .5px), <pane> 100%)`. Read it as "inside the ellipse → transparent, so the
+            build column shows through; outside → pane colour". It rounds the BUILD COLUMN's corner
+            away from the row, never the row's own.
+
+            `farthest-side` is what makes the box's own dimensions the radii, so the 26 × 9 shape
+            falls out of `width`/`height` rather than being restated. The `-0.5px` is the mock's
+            antialias feather: without it the gradient's hard stop lands on a pixel boundary and the
+            arc renders as a stair.
+
+            The two documented ways to make a CORRECT fillet invisible, so neither is re-diagnosed
+            as bad geometry: an ancestor `overflow:hidden` clipping the overhang, and the pane
+            painting over it because it is later in the DOM (needs z-index on the columns). Both
+            live outside this file — see PRD/sparkle/blueprint-agent-sidebar.md.
+
+            pointerEvents:none so they never eat clicks. Suppressed while the card is open
+            (showOverlay): the row is no longer visibility:hidden, so these would otherwise show
+            through beside the stand-in card. */}
         {isActive && !showOverlay && (
           <>
             <div
               aria-hidden
+              data-testid="row-mouth-top"
               style={{
                 position: "absolute",
                 top: -ACTIVE_FILLET,
                 right: 0,
-                width: ACTIVE_FILLET,
+                width: ACTIVE_FILLET_RUN,
                 height: ACTIVE_FILLET,
-                background: `radial-gradient(circle at top left, transparent ${ACTIVE_FILLET}px, ${C.forest} ${ACTIVE_FILLET}px)`,
+                background: `radial-gradient(ellipse farthest-side at top left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
                 pointerEvents: "none",
               }}
             />
             <div
               aria-hidden
+              data-testid="row-mouth-bottom"
               style={{
                 position: "absolute",
                 bottom: -ACTIVE_FILLET,
                 right: 0,
-                width: ACTIVE_FILLET,
+                width: ACTIVE_FILLET_RUN,
                 height: ACTIVE_FILLET,
-                background: `radial-gradient(circle at bottom left, transparent ${ACTIVE_FILLET}px, ${C.forest} ${ACTIVE_FILLET}px)`,
+                background: `radial-gradient(ellipse farthest-side at bottom left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
                 pointerEvents: "none",
               }}
             />
@@ -3541,6 +3770,11 @@ const AgentRow = memo(function AgentRow({
           // strip takes its natural height and the detail flex-shrinks + scrolls within the rest, so
           // a tall card can't run past the viewport (the cap is on the whole card, not just detail).
           <div
+          // PART OF THE LIVE CIRCUIT (see engine/cable.ts). This card is portalled to
+          // document.body, so ancestry cannot tie it back to the row that owns it — without this
+          // marker, hovering the agent you just patched into and clicking anything in its card
+          // read as "you left" and dropped the cable.
+          data-circuit
             data-testid="agent-hover-card"
             style={{
               position: "fixed",
@@ -3628,19 +3862,21 @@ const AgentRow = memo(function AgentRow({
               style={{
                 pointerEvents: "auto",
                 boxSizing: "border-box",
-                // Offset right by the column width so the detail drops on the terminal side — but lap
-                // 8px back over the column when active, so the active card overlaps the first column
-                // by the same ~8px the inactive (hover-only) card already does. (The active in-flow
-                // row's marginRight:-8 widens its measured colW by 8px, so without this it would land
-                // flush at the sidebar edge with no overlap, unlike the inactive card.)
-                marginLeft: mergeIntoTerminal ? colW - 8 : colW,
+                // Offset right by the column width, then lap LIST_PAD_X back over the column so the
+                // detail overlaps the sidebar by that much rather than butting flush against its
+                // edge. UNCONDITIONAL now: every row carries `marginRight: -LIST_PAD_X`, so the
+                // measured `colW` already runs to the column's edge in every state and the active /
+                // inactive split this used to make no longer describes anything. (It existed
+                // because only the ACTIVE row had the negative margin — the same asymmetry that
+                // made the list twitch; removing it here is the same fix, one surface along.)
+                marginLeft: colW - LIST_PAD_X,
                 // Lap the strip's bottom border (4px when active, else 2px) so the two halves read
                 // as one continuous outline.
                 marginTop: mergeIntoTerminal ? -4 : -2,
-                // When the active card laps 8px back over the column (marginLeft above), widen by the
-                // same 8px so its RIGHT edge stays anchored at the terminal edge — the card grows into
-                // the column rather than sliding left and pulling short on the right.
-                width: mergeIntoTerminal ? ext + 8 : ext,
+                // The card laps LIST_PAD_X back over the column (marginLeft above), so widen by the
+                // same amount to keep its RIGHT edge anchored at the terminal edge — the card grows
+                // into the column rather than sliding left and pulling short on the right.
+                width: ext + LIST_PAD_X,
                 userSelect: rowSection != null && !editing ? "none" : undefined,
                 // flex-shrink + scroll within the wrapper's maxH budget (minus the strip), so the
                 // detail's scroll boundary lands inside the viewport even for a tall card.

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { FiChevronDown, FiInfo } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore, type SparkleImprovementConsent } from "../stores/settingsStore";
 import { setImprovementConsent } from "../services/configActions";
@@ -151,7 +152,7 @@ export function SparkleConsentBanner() {
               cursor: "pointer",
             }}
           >
-            {open ? "▾" : "ⓘ"}
+            {open ? <FiChevronDown size={13} aria-hidden /> : <FiInfo size={13} aria-hidden />}
           </button>
         </span>
         <div

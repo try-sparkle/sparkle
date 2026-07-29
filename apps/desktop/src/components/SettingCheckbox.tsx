@@ -1,5 +1,7 @@
 import { type CSSProperties, type ReactNode } from "react";
+import { FiCheck } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
+import { FONT_UI } from "../theme/scale";
 
 // Shared checkbox row for the ⋯ settings menu (AI features, Notifications, …). Rendered as a
 // semantic <button role="checkbox"> rather than a native input so the box + label can be themed,
@@ -16,7 +18,7 @@ const checkboxRow: CSSProperties = {
   cursor: "pointer",
   textAlign: "left",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   color: C.cream,
 };
 
@@ -59,7 +61,7 @@ export function SettingCheckbox({
           lineHeight: 1,
         }}
       >
-        {checked ? "✓" : ""}
+        {checked ? <FiCheck size={12} aria-hidden /> : null}
       </span>
       {accessory}
       <span style={{ color: checked ? C.cream : C.muted, lineHeight: 1.35 }}>{label}</span>

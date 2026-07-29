@@ -9,6 +9,7 @@ import { setOnePasswordVault, setOnePasswordSeedWorktrees, setToolEnabled } from
 import { installOpCli, opPreflight, opVaults, refreshOpPreflight, type OpStatus, type OpVault } from "../services/onepassword";
 import { backupRows, loadEnvBackupRows, toScanRoots } from "../services/envBackupActions";
 import { rowsNeedingBackup, summarize, type EnvBackupRow, type EnvFileStatus } from "../engine/envBackup";
+import { CHIP, SECTION_LABEL } from "./labelTreatment";
 
 // The "1Password" settings pane: get `op` working, pick a vault, then see every .env file across
 // your projects with its backup state and push the ones that need it.
@@ -370,13 +371,7 @@ export function OnePasswordPane() {
 
 const block: CSSProperties = { display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-start" };
 const body: CSSProperties = { fontSize: 12, color: C.muted, lineHeight: 1.5, margin: 0 };
-const groupLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-};
+const groupLabel: CSSProperties = { ...SECTION_LABEL };
 const noticeStyle: CSSProperties = {
   display: "flex",
   flexDirection: "column",
@@ -458,17 +453,16 @@ const fileTitle: CSSProperties = {
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
 };
+// STATUS IS TEXT, not a control — so this is the spec's chip (`.row .stg`): a hairline box at
+// `--r-sm`, never a capsule. The ink is set by the caller; the border inherits it via `border-color`.
 const statusPill: CSSProperties = {
+  ...CHIP,
   display: "inline-flex",
   alignItems: "center",
   gap: 4,
   flex: "0 0 auto",
   padding: "1px 8px",
-  borderRadius: 999,
   border: "1px solid",
-  fontSize: 10,
-  fontWeight: FONT_WEIGHT.semibold,
-  whiteSpace: "nowrap",
 };
 const checkRow: CSSProperties = {
   display: "flex",

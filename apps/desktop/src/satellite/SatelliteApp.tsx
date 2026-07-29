@@ -25,6 +25,7 @@
 //     — recorded in the PRD as follow-up rather than half-built here.
 
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
+import { FiPlay } from "react-icons/fi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { C, FONT_WEIGHT } from "../theme/colors";
@@ -43,6 +44,7 @@ import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startPresenceTracking } from "../stores/presenceStore";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { setWindowProject, clearWindowProject } from "../services/windowRegistry";
+import { FONT_UI } from "../theme/scale";
 import {
   SATELLITE_REDOCK_EVENT,
   releaseSatellite,
@@ -262,7 +264,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
         width: "100vw",
         background: C.deepForest,
         color: C.cream,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
@@ -313,10 +315,14 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
                   padding: "10px 20px",
                   fontWeight: FONT_WEIGHT.semibold,
                   cursor: "pointer",
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 7,
                 }}
               >
-                ▶ Start this agent
+                <FiPlay size={13} aria-hidden />
+                Start this agent
               </button>
             </Hint>
           )}

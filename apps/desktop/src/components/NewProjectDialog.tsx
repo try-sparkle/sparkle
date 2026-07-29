@@ -12,6 +12,7 @@
 import { useState, type CSSProperties } from "react";
 import { FiGithub, FiLock, FiGlobe, FiSearch, FiLoader, FiChevronLeft } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { signInHandoff } from "../services/trialUnlock";
 import { pickProjectFolder } from "../services/dialog";
@@ -45,7 +46,7 @@ const primaryBtn: CSSProperties = {
   background: C.teal,
   color: ON_BRAND_FILL,
   border: "none",
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "11px 16px",
   cursor: "pointer",
   fontSize: 13,
@@ -60,7 +61,7 @@ const secondaryBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "9px 14px",
   cursor: "pointer",
   fontSize: 13,
@@ -73,7 +74,7 @@ const inputStyle: CSSProperties = {
   background: C.barSurface,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "9px 12px",
   fontSize: 13,
   fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
@@ -213,7 +214,7 @@ function FolderTab({
                   textAlign: "left",
                   background: "transparent",
                   border: "none",
-                  borderRadius: 6,
+                  borderRadius: RADIUS.input,
                   padding: "7px 8px",
                   cursor: "pointer",
                   color: C.cream,
@@ -378,7 +379,7 @@ function RepoRow({ repo, onSelect }: { repo: GithubRepo; onSelect: () => void })
         gap: 10,
         background: C.barSurface,
         border: `1px solid ${C.hairline}`,
-        borderRadius: 6,
+        borderRadius: RADIUS.input,
         padding: "10px 12px",
         cursor: "pointer",
         textAlign: "left",
@@ -467,7 +468,7 @@ function DestinationView({
       {cloneError?.kind === "git_missing" && (
         <div
           role="alert"
-          style={{ background: C.barSurface, border: `1px solid ${C.muted}`, borderRadius: 6, padding: "12px 14px", marginBottom: 18 }}
+          style={{ background: C.barSurface, border: `1px solid ${C.muted}`, borderRadius: RADIUS.input, padding: "12px 14px", marginBottom: 18 }}
         >
           <div style={{ color: C.cream, fontSize: 13, fontWeight: FONT_WEIGHT.medium, marginBottom: 6 }}>
             Git isn&apos;t installed yet
@@ -476,7 +477,7 @@ function DestinationView({
             Install Apple&apos;s Xcode Command Line Tools, then try again. Run this in Terminal:
           </div>
           <code
-            style={{ display: "block", background: C.forest, color: C.cream, borderRadius: 6, padding: "8px 10px", fontSize: 12, userSelect: "text" }}
+            style={{ display: "block", background: C.forest, color: C.cream, borderRadius: RADIUS.input, padding: "8px 10px", fontSize: 12, userSelect: "text" }}
           >
             {XCODE_CLT_CMD}
           </code>

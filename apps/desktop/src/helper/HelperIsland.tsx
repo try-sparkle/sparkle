@@ -20,6 +20,7 @@ import { ERROR_W, type Edge } from "./helperGeometry";
 import type { Vitals } from "../services/helper";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
 import type { StatusBand } from "../engine/buildSections";
+import { FONT_UI } from "../theme/scale";
 
 // The island offers the two bands worth interrupting for. `done` is deliberately not a chiclet:
 // on a resting fleet it is nearly every agent, so it would sit at a large constant number and
@@ -32,7 +33,7 @@ const chiclet = {
   display: "flex",
   alignItems: "center",
   gap: 5,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontSize: 13,
   fontWeight: 600,
   color: C.cream,

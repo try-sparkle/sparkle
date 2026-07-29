@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { FiRotateCcw } from "react-icons/fi";
 import { C } from "../theme/colors";
-import { FONT_WEIGHT } from "@sparkle/ui";
+import { FONT_UI } from "../theme/scale";
+import { SECTION_LABEL } from "./labelTreatment";
 import {
   useKeybindingsStore,
   SHORTCUT_LABELS,
@@ -94,7 +96,7 @@ export function KeyboardShortcutsMenu() {
                 aria-label={`Reset ${SHORTCUT_LABELS[id].title} to default`}
                 style={resetBtn}
               >
-                ↺
+                <FiRotateCcw size={12} aria-hidden />
               </button>
             </div>
           </div>
@@ -108,14 +110,7 @@ export function KeyboardShortcutsMenu() {
   );
 }
 
-const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 4,
-};
+const subLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 4 };
 
 const blurb: CSSProperties = { fontSize: 12, color: C.muted, marginBottom: 8, lineHeight: 1.4 };
 
@@ -128,7 +123,7 @@ const captureBtn: CSSProperties = {
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   textAlign: "center",
 };
 

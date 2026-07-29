@@ -241,12 +241,17 @@ function actionBtn(): CSSProperties {
   };
 }
 
-// Gold on gold — the column's affirmative treatment, same as a nudge's primary action.
+// THE SPEC'S PRIMARY PAIR — opaque, same as a nudge's primary action.
+// This was a `goldHotInk` label over a 16% BRAND-GOLD wash, and the comment above it used to say
+// "gold on gold". That stopped being true at the repaint: every gold token moved to the
+// Blueprint's primary BLUE while this plate stayed gold, so the label went blue on gold and
+// measured ~4.2-4.5 in dark — under AA. It is byte-for-byte the stack NudgeCard carried, and it
+// has to move with it or the defect simply relocates.
 const approveBtn: CSSProperties = {
   ...actionBtn(),
-  color: C.goldHotInk,
-  background: `color-mix(in srgb, ${C.gold} 16%, transparent)`,
-  border: `1px solid color-mix(in srgb, ${C.gold} 50%, transparent)`,
+  color: C.onGoldFill,
+  background: C.goldFill,
+  border: `1px solid ${C.goldFill}`,
 };
 
 const declineBtn: CSSProperties = {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FiX, FiCheck, FiChevronDown, FiArrowUpRight } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import type { SuggestionButton } from "../../services/suggestions/types";
+import { FONT_UI } from "../../theme/scale";
 
 // The recommended one-click action, shown when an agent is waiting on the user and the composer
 // is empty. Rendered as an ABSOLUTE OVERLAY pinned to the trailing-right edge of the textarea
@@ -181,7 +182,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "
             cursor: "pointer",
             maxWidth: SUGGESTION_PILL_LABEL_MAX,
             fontWeight: FONT_WEIGHT.semibold,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontSize: 13,
           }}
         >
@@ -222,7 +223,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "
               boxShadow: "0 6px 20px rgba(0,0,0,0.4)",
               color: C.cream,
               fontWeight: FONT_WEIGHT.medium,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               fontSize: 12,
               lineHeight: 1.4,
               whiteSpace: "normal",
@@ -321,7 +322,7 @@ export function SuggestionRow({ buttons, visible, onClick, onDismiss, layout = "
                   padding: "6px 8px",
                   cursor: "pointer",
                   fontWeight: FONT_WEIGHT.semibold,
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
                   fontSize: 13,
                 }}
               >

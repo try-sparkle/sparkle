@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Reac
 import { FiRefreshCw } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
+import { FONT_MONO, FONT_UI, RADIUS } from "../theme/scale";
+import { SECTION_LABEL, tag } from "./labelTreatment";
 import {
   fetchSpendReport,
   type Bucket,
@@ -365,14 +367,7 @@ function Table({
 
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ─────────────────────
 
-const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 8,
-};
+const subLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 8 };
 
 const panel: CSSProperties = {
   background: C.forest,
@@ -425,13 +420,7 @@ const statValue = (accent?: boolean): CSSProperties => ({
   lineHeight: 1.2,
 });
 
-const statLabel: CSSProperties = {
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.6,
-  color: C.muted,
-  marginTop: 3,
-};
+const statLabel: CSSProperties = { ...SECTION_LABEL, marginTop: 3 };
 
 const chartMax: CSSProperties = {
   fontSize: 10,
@@ -484,12 +473,8 @@ const table: CSSProperties = {
 };
 
 const th: CSSProperties = {
+  ...SECTION_LABEL,
   padding: "6px 8px",
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.5,
   borderBottom: `1px solid ${C.hairline}`,
   whiteSpace: "nowrap",
 };
@@ -511,28 +496,19 @@ const nameCell: CSSProperties = {
 };
 
 const monoCell: CSSProperties = {
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontFamily: FONT_MONO,
 };
 
-const unpricedTag: CSSProperties = {
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.4,
-  color: C.amber,
-  border: `1px solid ${C.amber}`,
-  borderRadius: 4,
-  padding: "0 5px",
-  flex: "none",
-};
+const unpricedTag: CSSProperties = { ...tag(C.amber), flex: "none" };
 
 const chipBtn: CSSProperties = {
   background: "transparent",
   border: `1px solid ${C.muted}`,
-  borderRadius: 999,
+  borderRadius: RADIUS.input,
   padding: "4px 11px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const iconBtn: CSSProperties = {
@@ -557,5 +533,5 @@ const actionBtn: CSSProperties = {
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

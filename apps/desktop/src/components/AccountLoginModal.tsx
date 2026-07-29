@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { C } from "../theme/colors";
+import { C, MODAL_SHADOW, SCRIM } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import type { Account } from "../services/accountStore";
 import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
 import { checkClaude } from "../preflight";
@@ -53,7 +54,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.5)",
+        background: SCRIM,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -69,13 +70,13 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           maxHeight: "85vh",
           display: "flex",
           flexDirection: "column",
-          background: C.deepForest,
-          border: `1px solid ${C.hairline}`,
-          borderRadius: 6,
+          background: C.dialogSurface,
+          border: `1px solid ${C.dialogEdge}`,
+          borderRadius: RADIUS.modal,
           padding: 16,
           color: C.cream,
           fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-          boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+          boxShadow: MODAL_SHADOW,
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
@@ -86,7 +87,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             style={{
               background: "transparent",
               border: `1px solid ${C.muted}`,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               color: C.cream,
               fontSize: 12,
               padding: "4px 10px",
@@ -115,7 +116,7 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
             ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
             : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
         </p>
-        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: 6, overflow: "hidden", padding: 6 }}>
+        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: RADIUS.input, overflow: "hidden", padding: 6 }}>
           {spawn ? (
             <Terminal
               agentId={`account-login-${account.id}`}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
-import { TYPE } from "../theme/scale";
+import { FONT_UI, TYPE } from "../theme/scale";
 import { useSettingsStore } from "../stores/settingsStore";
 import { safeUnlisten } from "../services/safeUnlisten";
 import {
@@ -234,7 +234,7 @@ const action: CSSProperties = {
   cursor: "pointer",
   fontSize: TYPE.body,
   textAlign: "center",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const option: CSSProperties = {
@@ -248,7 +248,7 @@ const option: CSSProperties = {
   cursor: "pointer",
   fontSize: TYPE.body,
   textAlign: "left",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const hintText: CSSProperties = { fontSize: TYPE.small, opacity: 0.85 };
@@ -256,14 +256,14 @@ const hintText: CSSProperties = { fontSize: TYPE.small, opacity: 0.85 };
 const caption: CSSProperties = {
   fontSize: TYPE.small,
   color: C.muted,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const groupLabel: CSSProperties = {
   fontSize: TYPE.small,
   color: C.muted,
   marginBottom: 6,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const warning: CSSProperties = {
@@ -276,7 +276,7 @@ const warning: CSSProperties = {
   fontSize: TYPE.small,
   lineHeight: 1.45,
   color: C.cream,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const checkboxRow: CSSProperties = {
@@ -286,5 +286,5 @@ const checkboxRow: CSSProperties = {
   fontSize: TYPE.body,
   color: C.cream,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

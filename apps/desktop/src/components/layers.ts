@@ -47,3 +47,37 @@
 // either number in a way that inverts them fails a test instead of silently restoring the bug.
 export const SIDEBAR_OVERLAY_Z = 25;
 export const PLAN_COLUMN_Z = 26;
+
+// ── THE TWO COLUMNS OF A PAIR, AT REST ─────────────────────────────────────────────────────────
+// Separate from the two constants above, which are about a column that has been FLOATED. These are
+// the ordinary docked case, and they exist because of one visible defect: the selected agent row
+// bleeds 9px out of the Build column and into the terminal pane — that overhang, and the concave
+// fillets that shape it, are what make the row read as an opening INTO the pane it selects.
+//
+// It was invisible. The direction diagnoses it directly (`rev4.html`, and MAPPING.md's "Geometry
+// vocabulary" section): the terminal is LATER IN THE DOM than the Build column, and at equal
+// stacking level a later sibling paints last — so the pane simply covered the overhang. The mock
+// fixes it with two declarations and nothing else:
+//
+//     .paircols .build{position:relative;z-index:2}
+//     .paircols .term {position:relative;z-index:1}
+//
+// The fix is NOT to remove the overhang. That was tried, it "worked", and it deleted the one piece
+// of geometry the whole selected-row treatment is built on.
+//
+//   BUILD_COLUMN_Z    the Build column (`AgentSidebar`'s docked root, `Workspace.tsx`'s ② slot).
+//   TERMINAL_PANE_Z   an agent pane inside the terminal stage — what `paneVisibilityStyle` puts on
+//                     the VISIBLE pane to keep it above the inert hidden ones it overlaps.
+//
+// WHY THE PANE AND NOT THE STAGE CARRIES THE LOWER NUMBER. The mock's `.term` is one element; the
+// app's terminal stage is a stage full of stacked panes. Putting a z-index on `terminal-stage`
+// would make it a STACKING CONTEXT, which is the exact move the note at that element (and the
+// `isolation: isolate` note above) says breaks the app: every `position: fixed` surface rendered
+// from inside a pane — `composer/ModalOverlay` at 1000, AgentPane's click-away backdrop — exists to
+// cover column ①, and a contained stage caps them under the columns. The panes are ALREADY
+// stacking contexts (`paneVisibilityStyle` has always given the visible one a z-index), so pinning
+// them one below the Build column reproduces the mock's ordering without containing anything new.
+//
+// The ordering — not the values — is the contract, and `paneVisibility.test.ts` asserts it.
+export const TERMINAL_PANE_Z = 1;
+export const BUILD_COLUMN_Z = 2;

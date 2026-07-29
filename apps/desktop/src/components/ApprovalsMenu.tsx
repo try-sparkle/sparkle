@@ -6,6 +6,8 @@ import { useApprovalsStore } from "../stores/approvalsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useCurrentProjectId } from "../windowContext";
 import { useAiFeatureVisible } from "../services/aiGate";
+import { FONT_UI } from "../theme/scale";
+import { tag } from "./labelTreatment";
 import {
   useSyncProjectApprovals,
 } from "../services/suggestions/approvalsRuntime";
@@ -266,16 +268,10 @@ const noticeBox: CSSProperties = {
 };
 
 const warnPill: CSSProperties = {
+  ...tag(C.amber),
   display: "inline-flex",
   alignItems: "center",
   gap: 3,
-  fontSize: 10,
-  color: C.amber,
-  border: `1px solid ${C.amber}`,
-  borderRadius: 6,
-  padding: "1px 5px",
-  textTransform: "uppercase",
-  letterSpacing: 0.5,
 };
 
 function btn(active: boolean): CSSProperties {
@@ -288,7 +284,7 @@ function btn(active: boolean): CSSProperties {
     borderRadius: 6,
     padding: "5px 9px",
     fontSize: 12,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     cursor: "pointer",
     whiteSpace: "nowrap",
   };

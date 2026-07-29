@@ -11,8 +11,10 @@
 // order plainly: backdrop below menu. React's enter/leave events traverse the fiber tree
 // through portals, so the hover card's mouseenter/mouseleave liveness survives both portals.
 import { useEffect, useRef, useState } from "react";
+import { FiChevronDown } from "react-icons/fi";
 import { createPortal } from "react-dom";
 import { C } from "../theme/colors";
+import { FONT_UI } from "../theme/scale";
 import {
   CLAUDE_MODELS,
   isDefaultModel,
@@ -150,7 +152,7 @@ export function ModelPill({
           border: `1px solid ${C.muted}`,
           borderRadius: 4,
           color: C.cream,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           fontSize: compact ? 10 : 12,
           fontWeight: 600,
           lineHeight: 1,
@@ -164,18 +166,23 @@ export function ModelPill({
             floor on any of them (the stated exception in THE NEUTRAL LADDER). On the new `pillFill`
             it would read 2.600/1.914; `cream` reads 6.662/6.097, which is also better than the
             5.886/3.890 it had on the old plane fill. Same move AgentPane's selected row made. */}
-        <span style={{ color: C.cream }}>▾</span>
+        <FiChevronDown size={13} aria-hidden style={{ color: C.cream, flex: "none" }} />
       </button>
       {open &&
         createPortal(
           <>
             <div
               data-testid="model-pill-backdrop"
+              // PART OF THE LIVE CIRCUIT. Portalled to document.body, so the cable's
+              // "did the press leave the circuit" test — which walks DOM ancestry — cannot reach
+              // it from the row it belongs to, and dismissing this menu dropped the cable.
+              data-circuit
               onClick={close}
               style={{ position: "fixed", inset: 0, zIndex: BACKDROP_Z }}
             />
             <div
               data-testid="model-pill-menu"
+              data-circuit
               style={{
                 position: "fixed",
                 top: menuPos?.top ?? 8,
@@ -215,7 +222,7 @@ export function ModelPill({
                       border: "none",
                       borderRadius: 6,
                       cursor: "pointer",
-                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                      fontFamily: FONT_UI,
                       fontSize: 12,
                       color: C.cream,
                       // pillFill, not forest: the selected row's fill IS the selection, and

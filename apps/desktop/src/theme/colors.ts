@@ -6,6 +6,7 @@
 // CSS variables (an enforced equality test guards the mirror — see theme.test / index.css),
 // and Terminal reads them directly via xtermTheme() because xterm needs concrete hex.
 import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
+import { BLUEPRINT } from "./blueprintSpec";
 
 // DARK IS THE BLACK-AND-GOLD PALETTE FROM THE CANONICAL PROTOTYPE
 // (PRD/sparkle/concierge-mode/prototype.html `:root`). Dark is the default theme and the
@@ -84,48 +85,37 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // The test for a new boundary is therefore not "how big is the step" but "does anything need to
 // pass through it".
 //
-// ── THE NEUTRAL LADDER — READ THIS BEFORE CHANGING ANY VALUE BELOW ────────────────────────────
-// The eight neutral tokens are ONE designed ladder, not eight independently-tuned values, and
-// three rounds of review were spent learning that the hard way. Each round nudged a single token
-// to clear a single floor, and each nudge landed the token on top of a NEIGHBOUR: `chatBubble`
-// came to rest on `hairline` and `chatBubbleActive` on `pillFill`, in both themes — two distinct
-// values one hair apart, which is the exact defect the round before had existed to catch. A
-// fourth nudge would have produced a fifth round.
+// ── THE NEUTRAL LADDER IS RETIRED. THE VALUES BELOW COME FROM THE SPEC. ───────────────────────
+// This block used to derive the eight neutrals as ONE ladder ordered by distance from the planes,
+// and tabulated their hexes. Every one of those hexes is gone — the tokens resolve to
+// `BLUEPRINT.*` now, i.e. they are PORTED from the approved direction rather than solved for. The
+// old table listed `chatBubble` dark #3c4a6e / light #8ca0c7; the shipped values are #14294a and
+// #e8f0fd. Leaving that table here would invite the next reader to re-derive the palette and undo
+// the port, which is the exact failure this file's header records.
 //
-// So the ladder is derived ONCE, from the constraints, and written down here as the record of
-// intent. Ordered by DISTANCE FROM THE PLANES (which is "lighter" in dark and "darker" in light,
-// so the ordering below is the same sentence in both themes):
+// THREE CLAIMS IN THE OLD BLOCK ARE NOW FALSE, and they are retracted here rather than quietly
+// dropped, because each one reads as a rule someone would restore in good faith:
 //
-//   the four PLANES, a recession ramp, lightest first (see the ramp block above for the ordering)
-//     dark   conciergeSurface #212f4e → barSurface #1c2944 → deepForest #172036 → forest #070b12
-//     light  conciergeSurface #ffffff → barSurface #e4eaf4 → deepForest #cbd7e8 → forest #b6c5dc
-//   then the four CHROME slots, each one step further out:
-//     slot 1  chatBubble        dark #3c4a6e   light #8ca0c7   the hovered row / user's bubble
-//     slot 2  pillFill          dark #46577f   light #7c8ebc   the filled chip
-//     slot 3  chatBubbleActive  dark #526695   light #6a7cb0   the row you are IN
-//     slot 4  hairline          dark #5d73aa   light #5b6ea1   the panel EDGE
+//  1. THE ORDERING. "Each chrome slot one step further out than the last" does not hold on this
+//     palette, in either theme — slots 2 and 3 are swapped (light luminance .8657 → .6775 → .8339
+//     → .6292). It does not sort because these are two FAMILIES, not one ramp: `chatBubble` and
+//     `chatBubbleActive` are FILLS (a deliberately shallow hover ramp, 1.035:1 apart, sitting near
+//     their ground), while `pillFill` and `hairline` are EDGES, which must read AGAINST the planes
+//     and are therefore far from the fills by construction. Interleaving them can only zig-zag.
+//  2. COMPOSITED PAIRS CLEARING `CHROME_MIN_CONTRAST`. Measured on this palette, `hairline` on
+//     `pillFill` is 1.07 in light. That is not a regression: `seam` #c3d1e6 and `hairSolid`
+//     #cbd8ea are ADJACENT BY DESIGN, because this direction separates by LINE WEIGHT, not fill.
+//     A floor forcing them apart would rebuild the separate-by-fill model the port removes.
+//  3. "chromeContrast.test.ts asserts the ORDER and every gap of the whole ladder." It does not,
+//     and it should not. What it asserts today: INK floors on the surfaces ink is read on, EDGE
+//     visibility per edge token against the planes it is actually drawn on (the terminal plane has
+//     its own `termHairline`), the hover ramp pinned as a ramp, and the spec-fidelity diff in
+//     blueprintSpec.test.ts. Separation between fills is no longer a contract.
 //
-// WHY THAT ORDER, AND WHY EACH GAP IS THE SIZE IT IS. Three kinds of constraint fix it:
-//
-//  1. FLOOR — every chrome slot must clear CHROME_MIN_CONTRAST against all four planes, because
-//     the same border/fill draws on each. That is what puts slot 1 where it is.
-//  2. SPACING — two slots that a component actually COMPOSITES (paints one on the other) clear
-//     CHROME_MIN_CONTRAST between them: `hairline` around a `pillFill` chip (DragVisionHintPill),
-//     `hairline` on a `chatBubble` fill (the sidebar's Improve row), and `chatBubble` against
-//     `chatBubbleActive` (the three row states). Two slots that merely coexist in the ladder clear
-//     the weaker RAMP_MIN_SPLIT — enough that they can never again be one hair apart, and by
-//     construction more than any deliberate step between two PLANES.
-//  3. CAP — `cream` is the ink on all three FILL slots, and it has to stay readable, so the fills
-//     cannot be pushed away from the planes without limit. `hairline` is the only chrome token
-//     with NO ink on it, which is exactly why it is the slot that can afford to be furthest out —
-//     and why it, not `pillFill`, sits at the end of the ladder. (`pillFill` was documented as
-//     "one step stronger than hairline"; the ladder inverts that, and the reason is this cap.)
-//
-// The cap is what makes this a system rather than four preferences: the whole band between the
-// floor and the cap is narrower than three CHROME_MIN_CONTRAST steps in BOTH themes, so the
-// constraint set has no slack to spend on a reactive nudge. Move one value and something else
-// must move; theme/chromeContrast.test.ts asserts the ORDER and every gap of the whole ladder, so
-// an edit that collapses any two of the eight fails there rather than in a fourth review round.
+// WHAT REPLACES THE LADDER as the thing that stops reactive nudges: the values are not ours to
+// nudge. `theme/blueprintSpec.ts` is the direction transcribed verbatim and `blueprintSpec.test.ts`
+// re-reads the spec page and fails on byte drift, so a "make it pop" edit to any neutral below is
+// a failing diff against the design rather than an argument about a floor.
 //
 // ONE PAIRING THE LADDER CANNOT HOLD, stated rather than hidden: `muted` cannot clear the ink
 // floor on ANY chrome fill, in either theme, and no choice of values fixes that. In dark every
@@ -141,7 +131,8 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // forest → conciergeSurface → deepForest, which under the new ordering are not adjacent at all, so
 // it measured the ramp's two ENDS (1.590) and called it one step. The pairs it never looked at were
 // the two that had collapsed — conciergeSurface↔barSurface at 1.098 and barSurface↔deepForest at
-// 1.109, both under PLANE_MIN_SPLIT. `barSurface` is not a bystander there: it is what every bar,
+// 1.109 — steps the retired PLANE_MIN_SPLIT floor would have rejected. `barSurface` is not a
+// bystander there: it is what every bar,
 // every dialog and every INACTIVE AGENT CARD is painted in, so that is exactly where the gray-on-gray
 // had moved to. Light's four planes are now derived as one ladder, every adjacent pair measured:
 //
@@ -172,8 +163,58 @@ import { C as BRAND, AGENT_STATUS } from "@sparkle/ui";
 // nudged until a test went quiet. `DANGER` stopped being a literal in the same pass, for the same
 // reason: see its own note below.
 export const THEME_HEX = {
-  dark: { forest: "#070b12", deepForest: "#172036", conciergeSurface: "#212f4e", conciergeMuted: "#93a1c4", barSurface: "#1c2944", hairline: "#5d73aa", pillFill: "#46577f", cream: "#dee8f7", muted: "#93a1c4", chatBubble: "#3c4a6e", chatBubbleActive: "#526695", accentInk: "#7fb2ff", agentIdle: "#93a1c4", successInk: "#34c759", dangerInk: "#f4968f", goldInk: "#7fb2ff", goldHotInk: "#a9caff", goldFill: "#5c96ff", onGoldFill: "#04101f", amberInk: "#ecb968", mixedInk: "#ecb968", tealInk: "#7fb2ff", violetInk: "#a185f5" },
-  light: { forest: "#b6c5dc", deepForest: "#cbd7e8", conciergeSurface: "#ffffff", conciergeMuted: "#3b4e74", barSurface: "#e4eaf4", hairline: "#5b6ea1", pillFill: "#7c8ebc", cream: "#060a14", muted: "#3b4e74", chatBubble: "#8ca0c7", chatBubbleActive: "#6a7cb0", accentInk: "#12459e", agentIdle: "#3b4e74", successInk: "#0d5326", dangerInk: "#8f1d16", goldInk: "#12459e", goldHotInk: "#0b3378", goldFill: "#1a4fae", onGoldFill: "#ffffff", amberInk: "#664200", mixedInk: "#ab4e07", tealInk: "#12459e", violetInk: "#5636b8" },
+  // ── THE PLANES AND CHROME COME FROM THE SPEC, NOT FROM A SOLVER ─────────────────────────────
+  // Every surface/edge/accent below is `BLUEPRINT[mode].<token>` — the approved direction, read as
+  // data (theme/blueprintSpec.ts) and checked against the spec page itself by blueprintSpec.test.
+  // The values these replaced were DERIVED by a contrast solver, and three releases shipped looking
+  // nothing like the design because a derived palette is a different palette however rigorous the
+  // derivation.
+  //
+  // The STATUS inks are not in the spec and stay semantic: the direction's mock never shows an
+  // error, a blocked agent or a mixed-status disc, so there is nothing to port. They keep their
+  // own floors (statusInk / chromeContrast).
+  dark: {
+    inputSurface: BLUEPRINT.dark.input,
+    dialogSurface: BLUEPRINT.dark.dialog,
+    dialogNav: BLUEPRINT.dark.dialogNav,
+    dialogEdge: BLUEPRINT.dark.dialogEdge,
+    inputEdge: BLUEPRINT.dark.inputEdge,
+    termHairline: BLUEPRINT.dark.termHair,
+    forest: BLUEPRINT.dark.term, deepForest: BLUEPRINT.dark.bridge,
+    conciergeSurface: BLUEPRINT.dark.assist, barSurface: BLUEPRINT.dark.bar,
+    conciergeMuted: BLUEPRINT.dark.muted, muted: BLUEPRINT.dark.muted,
+    // agentIdle is READ AS TEXT, not just painted as a dot: statusInk() maps idle/done/stopped to
+    // it and BandBadge colours its count with it. The spec's `faint` tier is a hairline/label
+    // grey (3.68 on the concierge column, 2.85 on the terminal plane) and fails AA at every one
+    // of those sites. `muted` is the spec's readable secondary ink; that is the right tier here.
+    agentIdle: BLUEPRINT.dark.muted, cream: BLUEPRINT.dark.ink,
+    hairline: BLUEPRINT.dark.seam, pillFill: BLUEPRINT.dark.hairSolid,
+    chatBubble: BLUEPRINT.dark.bubble, chatBubbleActive: BLUEPRINT.dark.sel,
+    accentInk: BLUEPRINT.dark.primary, goldInk: BLUEPRINT.dark.primary,
+    tealInk: BLUEPRINT.dark.primary, goldHotInk: BLUEPRINT.dark.primary,
+    goldFill: BLUEPRINT.dark.primary, onGoldFill: BLUEPRINT.dark.onPrimary,
+    successInk: "#34c759", dangerInk: "#f4968f", amberInk: "#ecb968",
+    mixedInk: "#ecb968", violetInk: "#a185f5",
+  },
+  light: {
+    inputSurface: BLUEPRINT.light.input,
+    dialogSurface: BLUEPRINT.light.dialog,
+    dialogNav: BLUEPRINT.light.dialogNav,
+    dialogEdge: BLUEPRINT.light.dialogEdge,
+    inputEdge: BLUEPRINT.light.inputEdge,
+    termHairline: BLUEPRINT.light.termHair,
+    forest: BLUEPRINT.light.term, deepForest: BLUEPRINT.light.bridge,
+    conciergeSurface: BLUEPRINT.light.assist, barSurface: BLUEPRINT.light.bar,
+    conciergeMuted: BLUEPRINT.light.muted, muted: BLUEPRINT.light.muted,
+    agentIdle: BLUEPRINT.light.muted, cream: BLUEPRINT.light.ink,
+    hairline: BLUEPRINT.light.seam, pillFill: BLUEPRINT.light.hairSolid,
+    chatBubble: BLUEPRINT.light.bubble, chatBubbleActive: BLUEPRINT.light.sel,
+    accentInk: BLUEPRINT.light.primary, goldInk: BLUEPRINT.light.primary,
+    tealInk: BLUEPRINT.light.primary, goldHotInk: BLUEPRINT.light.primary,
+    goldFill: BLUEPRINT.light.primary, onGoldFill: BLUEPRINT.light.onPrimary,
+    successInk: "#0d5326", dangerInk: "#8f1d16", amberInk: "#664200",
+    mixedInk: "#ab4e07", violetInk: "#5636b8",
+  },
 } as const;
 
 // Themed token object for component inline styles. The four theme-dependent tokens become
@@ -202,10 +243,52 @@ export const C = {
   // real stack; this was the fourth, and it was the one that failed. Both gradient stops are
   // enforced in theme/chromeContrast.test.ts.
   conciergeMuted: "var(--c-concierge-muted)",
+  // THE INPUT FIELD'S OWN GROUND — the spec's `--k-input`, white in light and a deep navy in dark.
+  //
+  // It exists as a `C` token because the concierge's COMPOSER sits on it, and that is the one
+  // surface in the column whose plate the contrast suite already models (theme/amberInk.test.ts's
+  // `composerPlate`). That box used to be a 16% black SCRIM over the concierge column instead,
+  // which in light mode dropped `conciergeMuted` to 4.23 — under AA — on the box you type into.
+  // The approved direction does not scrim the composer at all: it gives the input its own surface
+  // with an edge rule around it, which is both the faithful reading and the one that clears the
+  // floor. Do not reintroduce the scrim.
+  //
+  // The var is already in index.css (mirrored from THEME_HEX.inputSurface); this only names it for
+  // component inline styles, which is why adding it needs no CSS edit.
   // Lighter chrome for the top bar + composer box. Kept distinct from (lighter than) deepForest
   // so those bars recede against the terminal while the sidebar stays a step darker. See
   // THEME_HEX above.
   barSurface: "var(--c-bar-surface)",
+  // THE FIELD GROUND. `inputSurface` has been in THEME_HEX and mirrored into index.css since the
+  // spec was ported, and no component ever read it — `C` had no entry, so there was nothing to
+  // import. Every text field in the app therefore painted some nearby plane instead. Exposed here
+  // because the settings search box is its first real consumer; pair it with `inputEdge`.
+  inputSurface: "var(--c-input-surface)",
+  // ── THE MODAL PLANE — `dialog` / `dialogNav`, AND WHY IT IS NOT `deepForest` ──────────────────
+  // Roughly thirty dialogs paint here, and until now every one of them borrowed the BUILDER column's
+  // plane (`deepForest`) because that was the nearest thing to a "secondary surface". The spec has
+  // never agreed: `--k-dialog` is its OWN token, and in both themes it equals the GROUND, not the
+  // builder column. A modal is not a panel inside the shell — it floats above the whole shell, so it
+  // takes the paper the shell is drawn on and separates itself with a rule and a shadow, exactly the
+  // mechanism the direction uses everywhere else.
+  //
+  // The consequence is visible: in LIGHT, `deepForest` is #f2f6fd and `dialog` is #ffffff, so every
+  // dialog had been painted one plane too dark. In DARK the two are the other way round.
+  //
+  // `dialogNav` is the settings dialog's category RAIL (`.dlg .nav` in the spec page) — the one
+  // interior register a dialog gets, and it is a hair off the surface rather than a step. Do not
+  // "improve" that separation by darkening it: the rule between them is what divides them, and
+  // theme/dialogContrast.test.ts pins BOTH halves of that claim.
+  dialogSurface: "var(--c-dialog-surface)",
+  dialogNav: "var(--c-dialog-nav)",
+  // THE MODAL'S OWN OUTLINE. Distinct from `hairline` (the shell's column seam) because in dark the
+  // spec draws it a full step stronger — a floating surface needs a harder boundary than an interior
+  // rule. Use this for the outer border of a modal; use `hairline` for the rules INSIDE it.
+  dialogEdge: "var(--c-dialog-edge)",
+  // THE RULE AROUND AN INPUT. Every text field, search box and select in the app had been outlined in
+  // `hairline` — the token whose job is the column seam. The spec gives inputs their own edge, and
+  // wiring it is what stops a retune of the shell's seam silently restyling every form control.
+  inputEdge: "var(--c-input-edge)",
   // THE PANEL EDGE. Every 1px rule that has to be SEEN — modal and dropdown outlines, section
   // dividers, the well around an embedded terminal, the nesting rule under a checkbox. It is
   // deliberately NOT one of the depth planes: on the prototype's near-black shell an edge reads
@@ -349,6 +432,22 @@ export const C = {
   mixedInk: "var(--c-mixed-ink)",
 };
 
+// ── THE OVERLAY SCRIM AND THE MODAL SHADOW ────────────────────────────────────────────────────
+// These two are spec tokens like every other value above, but they are NOT hex — `scrim` is an
+// `rgba()` and `shadow` is a whole `box-shadow` — so they cannot live in THEME_HEX. That object is
+// mirrored into the `--c-*` block by a test that parses `#rrggbb` and asserts KEY-SET equality, and
+// a non-hex entry there would be a key with no parseable value: the mirror would report a missing
+// var for something index.css actually declares.
+//
+// So they take the spec's OWN prefix in index.css (`--k-scrim` / `--k-shadow`), which also says what
+// they are — untransformed spec values rather than app-derived tokens. They are not left as literals
+// because that is precisely the state this repaint is undoing: eleven dialogs each carried their own
+// hand-typed `rgba(0,0,0,0.5)` and `0 20px 60px rgba(0,0,0,0.5)`, none of them themed, so the scrim
+// over light mode's near-white shell was the same flat black as over dark's navy. `cssMirror.test.ts`
+// holds both against `BLUEPRINT[mode]` the same way it holds the hex.
+export const SCRIM = "var(--k-scrim)";
+export const MODAL_SHADOW = "var(--k-shadow)";
+
 // ── THE CHROME FLOORS ─────────────────────────────────────────────────────────────────────────
 // Modelled on CALM_MIN_CONTRAST/CALM_MIN_SPLIT below: the numbers live next to the palette they
 // constrain, and theme/chromeContrast.test.ts computes them from the actual hex in BOTH themes so
@@ -360,6 +459,17 @@ export const C = {
  *  sit at the pre-repaint forest↔deepForest step (the one four near-black planes collapse, taking
  *  every modal outline and filled pill with it); `goldFill` is held to the stricter WCAG 1.4.11
  *  non-text floor because it is the only thing giving the Send BUTTON an edge. */
+/** Floor for a drawn EDGE against the surface it is drawn on.
+ *
+ *  THIS IS THE FLOOR THAT MATTERS IN THIS DESIGN. The approved direction separates registers by
+ *  LINE WEIGHT, not by fill — the assistant column and the ground are the same colour in light
+ *  mode — so an invisible rule means an invisible boundary. It is deliberately LOWER than the old
+ *  `CHROME_MIN_CONTRAST`: a hairline is a 1px line the eye resolves against its ground, not a
+ *  filled shape that has to hold its own area, and the spec's own seams measure in the 1.2–1.6
+ *  band. Held by theme/chromeContrast.test.ts on every plane in both themes.
+ */
+export const EDGE_MIN_CONTRAST = 1.2;
+
 export const CHROME_MIN_CONTRAST = 1.5;
 /** Floor between ANY two neighbouring slots of the neutral ladder (see THE NEUTRAL LADDER above),
  *  including the pairs no component happens to composite today.
@@ -372,65 +482,23 @@ export const CHROME_MIN_CONTRAST = 1.5;
  *  measured a whisker over 1.0 while every per-pair floor someone had remembered to write still
  *  reported green, so the guard sweeps the whole ladder rather than a list of remembered pairs. */
 export const RAMP_MIN_SPLIT = 1.2;
-/** Floor between PLANES. Where it applies is not symmetric, and the exact scope matters more than
- *  the number — this header said "the THREE COLUMN PLANES in LIGHT mode" while the constant was
- *  being applied to four light planes and to two dark pairs, which would send anyone re-deriving
- *  dark toward a red suite the docblock told them to expect green.
+/** THE DIALOG PLANE'S CEILING — an UPPER bound, and the only constant in this file that is one.
  *
- *  APPLIED TO:
- *    • LIGHT — every adjacent pair of the four-plane ramp
- *      (conciergeSurface → barSurface → deepForest → forest).
- *    • DARK — two SEAMS only, not the ramp: `forest`↔`deepForest` (the active row's fill step,
- *      bounded from above as well) and `conciergeSurface`↔`deepForest` (the concierge column
- *      against the builder column). Both are boundaries the user looks at directly.
+ *  A dialog's body and its nav rail must stay CLOSE: structure is drawn, not filled, so the rule
+ *  between them is what divides them. theme/dialogContrast.test.ts asserts `toBeLessThan` on this.
  *
- *  DARK'S RAMP IS EXEMPT FROM THE SWEEP and that is not an oversight: dark's planes are the
- *  prototype's four near-blacks, a recession ramp that is MEANT to collapse, and `forest` there is
- *  also the terminal background every calm ink is measured against. The two seams above are held
- *  anyway because a seam is not a recession — it is an edge with nothing drawn on it. Light is the
- *  opposite case throughout — the columns are the
- *  only thing telling the eye where one pane ends and the next begins, and the old spacing sat under
- *  even RAMP_MIN_SPLIT, the bar this file sets for two chrome tokens no component ever paints
- *  together. That is what "gray-on-gray" was.
+ *  IT IS ITS OWN CONSTANT. For one round it borrowed the since-DELETED `PLANE_MIN_SPLIT`
+ *  (roborev 54686), a trap pointing the wrong way: that was a FLOOR on how far apart adjacent
+ *  shell planes must be, and a ceiling reading it meant anyone raising the floor to strengthen the
+ *  shell's planes would have silently LOOSENED this ceiling — the one edit most likely to be made
+ *  in good faith
+ *  would have unlocked "the rail looks too subtle, let me darken it" — the exact regression the
+ *  ceiling exists to block.
  *
- *  IT IS BOXED IN FROM ABOVE, BUT NOT THE WAY THIS PARAGRAPH ONCE CLAIMED. The old argument was
- *  that contrast multiplies along the ramp, so two steps under a 1.5 end-to-end cap meant neither
- *  could exceed √1.5 ≈ 1.2247 — which fixed the floor at 1.2 by arithmetic. That held for a
- *  THREE-plane light ramp and is false now: `barSurface` is a rung, light runs four planes, and the
- *  ramp spans well past 1.5 end to end by construction. The 1.5 bound applies to ONE adjacent pair
- *  (`forest`↔`deepForest`, the active row's fill step), not to the ramp as a whole.
- *
- *  What still boxes this floor in is the CHROME LADDER, one layer out: every chrome slot must clear
- *  CHROME_MIN_CONTRAST against the darkest plane, and `cream` must still read on the fills. Raising
- *  this floor darkens light's `forest`, which drags the ladder into that ink cap — measured, the
- *  chatBubble window falls from ~9 representable values to ~1. So a much higher floor would make
- *  two guards unsatisfiable together, i.e. force one to be deleted, which is the move this whole
- *  file exists to prevent. Same conclusion, honest derivation.
- *
- *  IT IS `RAMP_MIN_SPLIT`, NOT A HAIR UNDER IT (roborev 53986). It shipped at 1.18 for one round,
- *  which is BELOW the defect it was written to catch: the old `conciergeSurface`↔`deepForest` step
- *  measured 1.184, so a revert to the exact gray-on-gray spacing stayed green — and 1.18 was also
- *  weaker than the bar this file already applies to two chrome tokens no component composites.
- *
- *  THE CORRIDOR IS NARROW, AND THE NUMBERS ARE NOT WRITTEN HERE — that is this section's own rule
- *  ("NO RATIOS ARE WRITTEN IN THE COMMENTS ABOVE — the test is the only contract"), and it was
- *  broken twice by the very rounds that were fixing ratio drift elsewhere. An earlier version of
- *  this paragraph quoted four figures for light's THREE-plane ramp plus a "neither step can exceed
- *  √1.5 ≈ 1.2247" argument. Both are dead: `barSurface` became a rung, so light runs FOUR planes,
- *  and four floors COMPOSE past 1.5 end to end by construction — which is what retires the cap.
- *  (Not, as a previous draft of this retraction claimed, because some individual step exceeds
- *  √1.5; no adjacent step in either theme does. The cap failed because it was derived from a
- *  two-step budget, not because a step outgrew it.) The ramp section at the top of this file
- *  carries the same correction.
- *
- *  What survives is the shape of the constraint, which is what a reader actually needs: light's
- *  planes are pinned to within roughly a percent of their floors and MUST BE CHANGED AS A SET.
- *  Nudging one alone goes red on the floor below or the ceiling above, and the fix for one is a
- *  violation of the other. That is the intended state — the box is what stops "make it pop" from
- *  quietly deleting a guard — but it is a box, not a comfortable margin. Anyone re-spacing these
- *  re-derives the whole ladder plus every ink measured on it; PRD/sparkle/ui-directions/derive.mjs
- *  and inks.mjs do exactly that, and chromeContrast.test.ts holds the result. */
-export const PLANE_MIN_SPLIT = 1.2;
+ *  The number coinciding with the floor's today is a coincidence of this palette, not a relationship.
+ *  They are free to move independently, which is the whole point of separating them. */
+export const DIALOG_MAX_FILL_SPLIT = 1.2;
+
 /** The stricter floor, for a shape that is a control boundary rather than a divider. */
 export const CONTROL_MIN_CONTRAST = 3;
 /** Floor for any themed INK against the surface it is read on — WCAG AA for normal text. The

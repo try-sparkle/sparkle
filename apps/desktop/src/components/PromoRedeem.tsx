@@ -5,6 +5,7 @@
 import { useState, type CSSProperties } from "react";
 import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { redeemCoupon, redeemPromo } from "../services/sparkleApi";
+import { FONT_UI } from "../theme/scale";
 
 // Local copies of AuthGate's button/input styles — the two components render on the same
 // forest-green surface, so the values must stay visually in sync with AuthGate's consts.
@@ -17,7 +18,7 @@ const primaryBtn: CSSProperties = {
   fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const promoInput: CSSProperties = {
@@ -30,7 +31,7 @@ const promoInput: CSSProperties = {
   borderRadius: 6,
   padding: "8px 10px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   width: 160,
 };
 

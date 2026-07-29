@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import type { Project } from "../types";
 import {
   childrenOf,
@@ -29,7 +30,7 @@ import {
   type EpicChildView,
 } from "../services/planView";
 import { WorkflowLine } from "./WorkflowLine";
-import { FiUsers } from "react-icons/fi";
+import { FiUsers, FiX } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
 import { getConfig, onConfigChanged } from "../services/config";
@@ -43,6 +44,8 @@ import {
 import { DefineStageModal } from "./DefineStageModal";
 import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip } from "./StageColumnHeader";
 import { CardCriteria } from "./CardCriteria";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { TAG } from "./labelTreatment";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
  *  Backlog / In Progress → Done; Done → Delivered; Delivered is terminal (none). */
@@ -437,7 +440,7 @@ function Card({
         display: "flex",
         flexDirection: "column",
         gap: 6,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <button
@@ -452,7 +455,7 @@ function Card({
           flexDirection: "column",
           gap: 6,
           width: "100%",
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
         }}
       >
         <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13, lineHeight: 1.3 }}>
@@ -466,7 +469,7 @@ function Card({
             color: C.muted,
             opacity: 0.7,
             fontSize: 12,
-            fontFamily: '"IBM Plex Mono", monospace',
+            fontFamily: FONT_MONO,
           }}
         >
           {bead.id}
@@ -587,7 +590,7 @@ function StartControls({
           fontSize: 12,
           fontWeight: FONT_WEIGHT.semibold,
           cursor: startDisabled ? "default" : "pointer",
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
         }}
       >
         Build It
@@ -604,7 +607,7 @@ function StartControls({
             cursor: "pointer",
             padding: "2px 8px",
             fontSize: 12,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
           }}
         >
           decomposing…
@@ -622,7 +625,7 @@ function StartControls({
             cursor: "pointer",
             padding: "2px 8px",
             fontSize: 12,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
           }}
         >
           decompose failed
@@ -812,7 +815,7 @@ function DetailOverlay({
       style={{
         position: "absolute",
         inset: 0,
-        background: "rgba(0,0,0,0.55)",
+        background: SCRIM,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -827,10 +830,10 @@ function DetailOverlay({
           width: "min(620px, 100%)",
           maxHeight: "100%",
           overflowY: "auto",
-          background: C.deepForest,
-          border: `1px solid ${C.hairline}`,
-          borderRadius: 6,
-          boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
+          background: C.dialogSurface,
+          border: `1px solid ${C.dialogEdge}`,
+          borderRadius: RADIUS.modal,
+          boxShadow: MODAL_SHADOW,
           padding: 20,
           display: "flex",
           flexDirection: "column",
@@ -854,10 +857,10 @@ function DetailOverlay({
               padding: "2px 8px",
               fontSize: 13,
               lineHeight: 1.2,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
             }}
           >
-            ✕
+            <FiX size={13} aria-hidden />
           </button>
         </div>
 
@@ -866,7 +869,7 @@ function DetailOverlay({
             color: C.muted,
             opacity: 0.8,
             fontSize: 12,
-            fontFamily: '"IBM Plex Mono", monospace',
+            fontFamily: FONT_MONO,
           }}
         >
           {bead.id}
@@ -876,12 +879,14 @@ function DetailOverlay({
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <span
               style={{
-                fontSize: 12,
-                textTransform: "uppercase",
-                letterSpacing: 0.5,
+                // `TAG`, not `CHIP` plus a hand-typed uppercase and tracking — that is precisely the
+                // near-copy the treatment exists to retire, and hard-coding `0.1em` would have made
+                // this the one site a change to the scale silently skipped (roborev 54772).
+                ...TAG,
                 color: status === "done" ? C.teal : status === "in_progress" ? C.cream : C.muted,
+                // The hairline edge wins over the ink edge here: the status colour is carried by the
+                // TEXT, and a coloured box around it would read as three different chips.
                 border: `1px solid ${C.hairline}`,
-                borderRadius: 4,
                 padding: "2px 10px",
               }}
             >
@@ -901,7 +906,7 @@ function DetailOverlay({
                 fontWeight: FONT_WEIGHT.semibold,
                 cursor: buildBusy ? "default" : "pointer",
                 opacity: buildBusy ? 0.7 : 1,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
               }}
             >
               {buildBusy ? "Building…" : "Build It"}
@@ -922,7 +927,7 @@ function DetailOverlay({
                   fontWeight: FONT_WEIGHT.semibold,
                   cursor: buildBusy ? "default" : "pointer",
                   opacity: buildBusy ? 0.7 : 1,
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
                 }}
               >
                 {`Build all ${prdEpics.length} epics in this PRD`}
@@ -949,7 +954,7 @@ function DetailOverlay({
                 fontWeight: FONT_WEIGHT.semibold,
                 cursor: buildBusy ? "default" : "pointer",
                 opacity: buildBusy ? 0.7 : 1,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
               }}
             >
               {buildBusy ? "Building…" : "Build It"}

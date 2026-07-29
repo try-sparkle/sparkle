@@ -16,6 +16,7 @@ import { C } from "../theme/colors";
 import { log } from "../logger";
 import { SupportModal } from "./SupportModal";
 import { paneVisibilityStyle } from "./paneVisibility";
+import { FONT_UI } from "../theme/scale";
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -81,7 +82,7 @@ function buttonStyle(filled: boolean) {
     padding: "9px 18px",
     fontSize: 13,
     fontWeight: 600,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     cursor: "pointer",
   } as const;
 }
@@ -108,7 +109,7 @@ export function AppErrorFallback({ reset }: { error: Error; reset: () => void })
         textAlign: "center",
         background: C.forest,
         color: C.cream,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <h1 style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>Something broke</h1>
@@ -158,7 +159,7 @@ export function AgentPaneErrorCard({
         textAlign: "center",
         background: C.forest,
         color: C.cream,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       <h2 style={{ margin: 0, fontSize: 17, fontWeight: 600 }}>This agent's view hit an error</h2>

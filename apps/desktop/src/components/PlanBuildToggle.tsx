@@ -8,6 +8,7 @@
 // Presentational + prop-driven: the callers own what a click DOES (AgentSidebar keeps its
 // two-stage Build chevron, which spawns a fresh build agent on a second click).
 import { C, ON_GOLD_FILL } from "../theme/colors";
+import { FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { FaTasks } from "react-icons/fa";
 import { FiTool } from "react-icons/fi";
 import type { WorkMode } from "../stores/uiStore";
@@ -96,7 +97,7 @@ function createBtnStyle(
     marginLeft: leftNotch ? -(CHEVRON - SEAM) : 0,
     clipPath: chevronClip(leftNotch, rightPoint),
     cursor: "pointer",
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     fontSize: 13,
     whiteSpace: "nowrap",
     background: BUILD_FILL,
@@ -131,6 +132,36 @@ export interface PlanBuildToggleProps {
   onPickBuild: () => void;
   /** Extra margin for the placement (the sidebar insets it; the plan column doesn't). */
   style?: React.CSSProperties;
+  /**
+   * `"chevron"` (default) is the full-width gold chevron strip — the Plan column's header and the
+   * satellite window's, where it IS the header and has the width to be one.
+   *
+   * `"mini"` is the blueprint cockpit's `.mini`: a bordered ~19px segment that shares a 34px `.bhd`
+   * header row with the status-filter chips. The chevron strip cannot live in that row — it is
+   * taller than the row and full-width by construction — and the alternative was a SECOND
+   * Plan/Build control drawn inline in AgentSidebar, i.e. two implementations of one mode selector
+   * left to drift apart. One component, two placements, which is what this file's own header
+   * already argues for.
+   */
+  variant?: "chevron" | "mini";
+}
+
+/** `.mini span` from rev4.html: `font-size:var(--t-micro);padding:2px 7px;color:var(--k-muted)`,
+ *  with the selected one taking the accent fill. Squared to `--r-sm` by the wrapper's overflow. */
+function miniSegStyle(active: boolean): React.CSSProperties {
+  return {
+    appearance: "none",
+    border: "none",
+    borderRadius: 0,
+    padding: "2px 7px",
+    cursor: "pointer",
+    fontFamily: FONT_UI,
+    fontSize: TYPE.micro,
+    lineHeight: 1,
+    whiteSpace: "nowrap",
+    background: active ? C.goldFill : "transparent",
+    color: active ? ON_GOLD_FILL : C.muted,
+  };
 }
 
 export function PlanBuildToggle({
@@ -139,7 +170,49 @@ export function PlanBuildToggle({
   onPickPlan,
   onPickBuild,
   style,
+  variant = "chevron",
 }: PlanBuildToggleProps) {
+  if (variant === "mini") {
+    return (
+      <span
+        data-testid="plan-build-mini"
+        style={{
+          display: "inline-flex",
+          flex: "0 0 auto",
+          border: `1px solid ${C.pillFill}`,
+          borderRadius: RADIUS.sm,
+          overflow: "hidden",
+          ...style,
+        }}
+      >
+        {/* BUILD FIRST, then Plan — the mock's own order (`<span class="on">Build</span><span>
+            Plan</span>`), and it inverts the chevron strip's. That is deliberate rather than an
+            oversight: this segment lives at the top of the BUILD column, where Build is the mode
+            you are in and Plan is the way out, whereas the chevron strip is the Plan column's own
+            header. The two are never on screen together. */}
+        <button
+          data-hint="build"
+          onClick={onPickBuild}
+          aria-pressed={mode === "build"}
+          title="Build mode — your Build orchestrator agents"
+          style={miniSegStyle(mode === "build")}
+        >
+          Build
+        </button>
+        {beadsEnabled && (
+          <button
+            data-hint="plan"
+            onClick={onPickPlan}
+            aria-pressed={mode === "plan"}
+            title="Plan mode — this project's read-only Tasks board"
+            style={miniSegStyle(mode === "plan")}
+          >
+            Plan
+          </button>
+        )}
+      </span>
+    );
+  }
   return (
     <div
       style={{

@@ -9,8 +9,18 @@
 //   - "Open (or create) a project" → the tab bar's "+" (same NewProjectDialog + folder picker +
 //     resolveOpenTarget flow), except the opened project simply becomes the selected TAB.
 //   - Project settings (rename / move) → double-click a tab (the ProjectModal the ⚙ used to open).
-//   - The open-PR menu, the trial counter + Unlock, and the signed-in avatar (now inside
-//     ConciergeTopRight together with the kebab that owns settings/version/changelog/support).
+//   - The open-PR menu and the trial counter + Unlock.
+//
+// THE AVATAR AND KEBAB ARE NOT HERE ANY MORE. `ConciergeTopRight` moved into the concierge's own
+// header when that header consolidated to one row (rev4.html's `.ahd`; the founder's ask). This bar
+// belongs to a PAIR — build + terminal are one project — while the avatar is about the human and
+// the kebab about the app, so neither is a per-project control.
+//
+// It was mounted in BOTH places for one commit, which shipped two "Sparkle menu" buttons and two
+// auth controls driving the same settings seam (roborev 54712). Nothing caught it: every whole-
+// shell suite stubs `ConciergeTopRight`, and each component's own tests render only itself, so the
+// duplicate existed exactly where no test was looking. `ProjectTabsBar.duplicateChrome.test.tsx`
+// now mounts this bar and the concierge column together, unstubbed, and counts.
 //
 // Only OPEN projects get a tab. "Exists in the project store" is a weaker fact than "is open right
 // now" — the bar used to render the former, so it only ever grew and a repo you tried once had a tab
@@ -21,7 +31,6 @@
 import { useMemo, useState } from "react";
 import type { Project } from "../types";
 import { ProjectTabs, type ProjectTabCounts } from "./ProjectTabs";
-import { ConciergeTopRight } from "./Concierge/KebabMenu";
 import { TrialIndicator } from "./TrialChrome";
 import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
 import { NewProjectDialog } from "./NewProjectDialog";
@@ -46,6 +55,7 @@ import {
   tearOffProject,
 } from "../services/satelliteWindows";
 import { useTornOutProjects } from "../hooks/useTornOutProjects";
+import type { PairSide } from "../engine/cable";
 import { C } from "../theme/colors";
 
 /**
@@ -97,11 +107,24 @@ export function countsFromFeed(feed: ConciergeFeed): Record<string, ProjectTabCo
 export function ProjectTabsBar({
   feed,
   onOpenProjectSettings,
+  side = "right",
 }: {
   feed: ConciergeFeed;
   /** Double-clicking a tab opens that project's settings (rename / move) — the Workspace owns the
    *  modal, exactly as it did when the TopBar's project button opened it. */
   onOpenProjectSettings: (p: Project) => void;
+  /**
+   * WHICH PAIR THIS STRIP BELONGS TO.
+   *
+   * The tabs are the PAIR's, not the window's — build and terminal are one project, so the strip
+   * sits above the pair and never above the concierge (MAPPING.md, `.tabs` / `.ptab`: *"Moves:
+   * above the pairs only, never above the concierge."*). The two sides mirror, so the active tab
+   * hugs the centre on both: the strip is published as `data-side` and `index.css` reverses the
+   * left one, exactly as `rev4.html` does with `.pair[data-side="left"] .pairtabs`.
+   *
+   * Defaults to `right` so every existing caller and test keeps the layout it had.
+   */
+  side?: PairSide;
 }) {
   const projects = useProjectStore((s) => s.projects);
   const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
@@ -189,7 +212,7 @@ export function ProjectTabsBar({
   };
 
   return (
-    <>
+    <div className="ptabstrip" data-side={side} data-testid="project-tabs-strip">
       <ProjectTabs
         projects={openProjects.map((p) => ({ id: p.id, name: p.name }))}
         selectedProjectId={selectedProjectId}
@@ -238,7 +261,6 @@ export function ProjectTabsBar({
                 signInFailedUrl={trialFailedUrl}
               />
             )}
-            <ConciergeTopRight />
           </>
         }
       />
@@ -277,6 +299,6 @@ export function ProjectTabsBar({
           onCloned={(name, path) => openProjectTab(addProject(name, path))}
         />
       )}
-    </>
+    </div>
   );
 }

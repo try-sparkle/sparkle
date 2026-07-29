@@ -49,6 +49,12 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
+/** The takeover's send buttons, by the label a user actually reads. They render an icon beside that
+ *  label, so `getByText` on a concatenated "Chat ❯" string no longer finds them. */
+function sendButton(label: string): HTMLButtonElement {
+  return screen.getByRole("button", { name: label }) as HTMLButtonElement;
+}
+
 describe("CaptureApp", () => {
   // The capture window renders its own React root with NO AuthGate, so unless it loads auth itself,
   // `me` stays null → hasAiCredits false → the mic falsely reports "out of credits" and gets
@@ -81,12 +87,16 @@ describe("CaptureApp", () => {
 
     expect(screen.getByTestId("capture-scrim")).toBeTruthy();
     expect(screen.getByAltText("Captured screenshot")).toBeTruthy();
-    expect(screen.getByText("Chat ❯")).toBeTruthy();
+    expect(sendButton("Chat")).toBeTruthy();
     // "Plan" is RETIRED, not renamed away from a still-live route — the Chief PRD pipeline
     // behind it is gone (see CaptureSendMode). Pinned so a revert has to be deliberate.
-    expect(screen.queryByText("Plan ❯")).toBeNull();
-    // Build now opens an options menu, so it's badged with a ▾ affordance, not the ❯ send glyph.
-    expect(screen.getByText("Build ▾")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Plan" })).toBeNull();
+    // Build OPENS A MENU rather than sending, so it carries a down caret where Chat carries a
+    // send chevron. Both are react-icons now (this repo bans emoji-as-icons), so the distinction
+    // is the icon each button renders, not a glyph baked into its label.
+    expect(sendButton("Build")).toBeTruthy();
+    expect(sendButton("Chat").querySelector("svg")).toBeTruthy();
+    expect(sendButton("Build").querySelector("svg")).toBeTruthy();
   });
 
   it("paints the SAME masked wordmark the rest of the app does, not the raw cyan asset", () => {
@@ -125,7 +135,7 @@ describe("CaptureApp", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Chat ❯"));
+    fireEvent.click(sendButton("Chat"));
 
     expect(emitCaptureSend).toHaveBeenCalledWith({
       mode: "chat",
@@ -142,7 +152,7 @@ describe("CaptureApp", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Build ▾"));
+    fireEvent.click(sendButton("Build"));
     // Menu is open, nothing sent yet.
     expect(emitCaptureSend).not.toHaveBeenCalled();
     expect(screen.getByTestId("build-menu")).toBeTruthy();
@@ -180,7 +190,7 @@ describe("CaptureApp", () => {
     render(<CaptureApp />);
     fireShot();
 
-    fireEvent.click(screen.getByText("Build ▾"));
+    fireEvent.click(sendButton("Build"));
     // Only build agents are listed (the worker agent is not), and autoNameVariants.title wins.
     expect(screen.queryByText("Ideation")).toBeNull();
     expect(screen.getByText("Build 1")).toBeTruthy();
@@ -201,7 +211,7 @@ describe("CaptureApp", () => {
   it("clicking the Build menu backdrop closes the menu without closing the takeover", () => {
     render(<CaptureApp />);
     fireShot();
-    fireEvent.click(screen.getByText("Build ▾"));
+    fireEvent.click(sendButton("Build"));
     expect(screen.getByTestId("build-menu")).toBeTruthy();
     fireEvent.mouseDown(screen.getByTestId("build-menu-backdrop"));
     expect(screen.queryByTestId("build-menu")).toBeNull();
@@ -213,8 +223,8 @@ describe("CaptureApp", () => {
     useProjectStore.setState({ projects: [] });
     render(<CaptureApp />);
     fireShot();
-    expect((screen.getByText("Build ▾") as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByText("Build ▾"));
+    expect(sendButton("Build").disabled).toBe(true);
+    fireEvent.click(sendButton("Build"));
     // Disabled Build must not open the menu nor send.
     expect(screen.queryByTestId("build-menu")).toBeNull();
     expect(emitCaptureSend).not.toHaveBeenCalled();

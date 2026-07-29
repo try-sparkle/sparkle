@@ -1,6 +1,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiCloud, FiX } from "react-icons/fi";
-import { C, DANGER, ON_BRAND_FILL } from "../theme/colors";
+import { C, DANGER, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import type { Project } from "../types";
 import { useUiStore } from "../stores/uiStore";
@@ -225,7 +226,7 @@ function repoLabel(project: Project): string {
 const backdrop: CSSProperties = {
   position: "fixed",
   inset: 0,
-  background: "rgba(0,0,0,0.45)",
+  background: SCRIM,
   zIndex: 60,
 };
 
@@ -236,9 +237,11 @@ const dialog: CSSProperties = {
   transform: "translate(-50%, -50%)",
   width: 460,
   maxWidth: "90vw",
-  background: C.barSurface,
+  background: C.dialogSurface,
+  border: `1px solid ${C.dialogEdge}`,
+  boxShadow: MODAL_SHADOW,
   color: C.cream,
-  borderRadius: 6,
+  borderRadius: RADIUS.modal,
   zIndex: 61,
   display: "flex",
   flexDirection: "column",
@@ -271,7 +274,7 @@ const body: CSSProperties = {
 
 const panel: CSSProperties = {
   background: C.forest,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "12px 14px",
   display: "flex",
   flexDirection: "column",
@@ -291,7 +294,7 @@ const fieldBase: CSSProperties = {
   background: C.forest,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 10px",
   fontSize: 13,
   fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
@@ -307,7 +310,7 @@ const actionBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,

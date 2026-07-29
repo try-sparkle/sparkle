@@ -13,6 +13,8 @@ import { evaluateStage, type EvalContext } from "../services/criteriaEval";
 import { useCriteriaStore } from "../services/criteriaStore";
 import type { StageDefinition, StageKey } from "../services/stageDefs";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { SECTION_LABEL } from "./labelTreatment";
 
 export function CardCriteria({
   bead,
@@ -155,7 +157,7 @@ const progressChip: CSSProperties = {
   fontSize: 12,
   cursor: "pointer",
   color: C.muted,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const markButton: CSSProperties = {
@@ -167,7 +169,7 @@ const markButton: CSSProperties = {
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const critList: CSSProperties = {
@@ -181,14 +183,7 @@ const critList: CSSProperties = {
   borderRadius: 6,
 };
 
-const critHeader: CSSProperties = {
-  fontSize: 10,
-  fontWeight: FONT_WEIGHT.semibold,
-  color: C.muted,
-  textTransform: "uppercase",
-  letterSpacing: 0.4,
-  paddingBottom: 2,
-};
+const critHeader: CSSProperties = { ...SECTION_LABEL, paddingBottom: 2 };
 
 const critItem: CSSProperties = {
   display: "flex",
@@ -213,5 +208,5 @@ const tag: CSSProperties = {
   borderRadius: 4,
   padding: "0 5px",
   whiteSpace: "nowrap",
-  fontFamily: '"IBM Plex Mono", monospace',
+  fontFamily: FONT_MONO,
 };

@@ -145,9 +145,17 @@ describe("ProjectTabsBar", () => {
     );
   });
 
-  it("carries the top-right cluster (kebab + avatar)", () => {
+  // THE TOP-RIGHT CLUSTER IS NOT HERE ANY MORE. `ConciergeTopRight` (kebab + signed-in avatar)
+  // moved into the concierge's own header when that consolidated to one row: this bar belongs to a
+  // PAIR, and neither the avatar nor the app menu is a per-project control.
+  //
+  // This assertion is INVERTED rather than deleted, because the failure mode of the move is that
+  // both copies render at once — which is what shipped for one commit (roborev 54712). Note it can
+  // only speak about the stub, since this file mocks the module; the real double-mount is counted
+  // with both surfaces live in ProjectTabsBar.duplicateChrome.test.tsx.
+  it("no longer carries the top-right cluster — it lives in the concierge header", () => {
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
-    expect(screen.getByTestId("topright")).toBeTruthy();
+    expect(screen.queryByTestId("topright")).toBeNull();
   });
 
   it("shows the trial counter only while in trial (parity #14)", () => {

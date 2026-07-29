@@ -8,6 +8,7 @@ import { DownloadIcon } from "./icons";
 import { downloadAttachments } from "./attachmentsApi";
 import { rangeSelect, type Attachment, type TextBlock } from "./attachments";
 import { log } from "../../logger";
+import { FONT_UI } from "../../theme/scale";
 
 /** The row above the textarea: collapsed text pills + image/file tiles, with multi-select
  *  (checkbox and Cmd/Shift-click) and a bulk-download action. Owns its own selection and
@@ -122,7 +123,7 @@ export function AttachmentRow({
             color: ON_BRAND_FILL,
             border: "none",
             cursor: bulkBusy ? "default" : "pointer",
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontWeight: FONT_WEIGHT.semibold,
             fontSize: 12,
             alignSelf: "center",

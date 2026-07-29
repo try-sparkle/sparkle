@@ -76,7 +76,9 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
-import { C, COMPOSE_SCRIM, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { BLUEPRINT } from "../../theme/blueprintSpec";
+import { useResolvedTheme } from "../../theme/theme";
 import type { Attachment, ConciergeAttachKind } from "./types";
 import { useUiStore } from "../../stores/uiStore";
 import { PresenceSlider } from "./PresenceSlider";
@@ -387,6 +389,7 @@ export function ComposeBox({
   interim = "",
   registerInsert,
   onTextEdit,
+  wired = false,
   mentionAgents = EMPTY_MENTION_AGENTS,
   preferredAgentId = null,
 }: {
@@ -414,6 +417,12 @@ export function ComposeBox({
   /** The user TYPED (or deleted) — reports the new value. Not fired for dictated segments or the
    *  clear-on-send, so the host can see the box being emptied by hand. */
   onTextEdit?: (text: string) => void;
+  /** The column around this box is PATCHED to a terminal (`data-wired` is left/right), so it has
+   *  taken the terminal's colour. The composer then stops painting its own `--k-input` plate — it
+   *  goes transparent over the flood with the terminal's own edge token around it, exactly as
+   *  rev4.html's `.shell[data-wired] .assist .cmp` does. Purely presentational; the column decides.
+   */
+  wired?: boolean;
   /** Every builder agent the "@" picker may offer. Supplied by the host from the cross-project feed
    *  — this box has no store of its own (see the file header) and cannot ask who exists.
    *
@@ -426,6 +435,9 @@ export function ComposeBox({
   preferredAgentId?: string | null;
 }) {
   const [text, setText] = useState("");
+  // Concrete hex for the two spec tokens that have no CSS var of their own (see
+  // theme/blueprintSpec) — the terminal plane the wired composer floats on, and its edge.
+  const mode = useResolvedTheme();
   // The voice state behind the placeholder copy, read from the store rather than taken as a prop.
   // Deliberate: deriveMicPresentation exists so every mic surface renders the SAME state for one
   // store snapshot, and a second path to it through this component's prop contract is exactly how
@@ -859,8 +871,23 @@ export function ComposeBox({
     <div
       ref={rootRef}
       data-testid="concierge-compose"
+      data-wired={wired ? "yes" : "no"}
       style={{
         flex: "none",
+        // ── `.cmp` — A BOX ON `--k-input`, NOT A SCRIM ─────────────────────────────────────────
+        // This was a full-bleed strip with a top rule, filled with COMPOSE_SCRIM: a 16% BLACK wash
+        // over the concierge column. That scrim dropped `conciergeMuted` to 4.23 in light — under
+        // AA — on the box you type into, and every control in this row (the attach buttons, the
+        // presence slider, the interim transcript, the textarea's own text) is read on it. The
+        // approved direction does not scrim the composer at all: `.cmp` is an inset box sitting on
+        // `--k-input` with a rule around it, which is both the faithful reading of the mock and the
+        // one that clears the floor. DO NOT REINTRODUCE THE SCRIM — theme/amberInk.test.ts already
+        // models this plate as `inputSurface` and will go red if it moves.
+        //
+        // Inset rather than full-bleed (`margin`, `borderRadius`), because a box is what makes the
+        // surface change read as "this is the field" rather than as a second plane in the column.
+        margin: "0 10px 10px",
+        borderRadius: 4,
         // The positioning context for the MENTION PICKER, which hangs off this box's TOP edge.
         //
         // Anchored to the ROOT, deliberately, and not to the textarea's `slotRef` wrapper below —
@@ -871,11 +898,22 @@ export function ComposeBox({
         // list, on every keystroke of a query. Here it is outside that walk, and spanning the root
         // also lines the list up with the composer's outer edges rather than with the textarea.
         position: "relative",
-        borderTop: `1px solid ${line}`,
+        // NO `borderTop`. That line is the FULL-BLEED STRIP this box replaced — a rule across the
+        // top of a scrimmed band — and the three-way merge with main reinstated it beside the new
+        // `border`, giving the box a rule all the way round PLUS a doubled top edge. The direction
+        // separates registers by line weight, so the edge is the whole border and nothing else.
         padding: "10px 12px 12px",
-        // COMPOSE_SCRIM, not a literal: it is the plate every control in this row sits on, so the
-        // contrast tests have to composite from the same number (theme/colors.ts, roborev 53655-H).
-        background: dropActive ? `color-mix(in srgb, ${C.teal} 10%, ${COMPOSE_SCRIM})` : COMPOSE_SCRIM,
+        // WIRED: the column has taken the terminal's colour, so the composer stops painting a plate
+        // of its own and floats on the flood with the terminal's own edge token around it. Its inks
+        // are the terminal register's, set by the column on the section (they inherit).
+        background: wired
+          ? dropActive
+            ? `color-mix(in srgb, ${C.teal} 10%, ${BLUEPRINT[mode].term})`
+            : "transparent"
+          : dropActive
+            ? `color-mix(in srgb, ${C.teal} 10%, ${C.inputSurface})`
+            : C.inputSurface,
+        border: `1px solid ${wired ? BLUEPRINT[mode].termHair : C.hairline}`,
         outline: dropActive ? `1.5px dashed ${C.teal}` : "none",
         outlineOffset: -2,
       }}
@@ -1092,12 +1130,20 @@ export function ComposeBox({
               // Past the auto cap the content scrolls INSIDE the box rather than the box growing on
               // forever. `auto` (not `scroll`) so a one-line draft shows no dead scrollbar gutter.
               overflowY: "auto",
-              // barSurface, not forest: under the black-and-gold palette forest is the
-              // near-black TERMINAL plane and punches a hole through the composer.
-              background: C.barSurface,
-              border: `1px solid ${line}`,
+              // NO PLATE AND NO EDGE OF ITS OWN. The box AROUND this textarea is now `.cmp` — one
+              // inset box on `--k-input` with a rule around it — and a second filled, outlined
+              // field inside it would draw the same boundary twice, which is the box-in-a-box the
+              // direction's "structure is drawn, not filled" thesis rejects.
+              //
+              // The border is kept as `transparent` rather than removed: the rich placeholder
+              // overlay is positioned against the textarea's border + padding (PLACEHOLDER_INSET),
+              // and the auto-grow measurement is taken off its box, so deleting a pixel of border
+              // would shift the painted copy off row one and silently mis-size the box. Transparent
+              // costs nothing and keeps that geometry exactly where it was.
+              background: "transparent",
+              border: "1px solid transparent",
               borderRadius: 6,
-              color: C.cream,
+              color: "inherit",
               padding: "10px 12px",
               fontSize: 13,
               lineHeight: PLACEHOLDER_TYPE.lineHeight,

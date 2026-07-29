@@ -29,13 +29,14 @@ import {
   BADGE_EDGE_PCT,
   C,
   CHROME_MIN_CONTRAST,
+  EDGE_MIN_CONTRAST,
   CONTROL_MIN_CONTRAST,
   DANGER,
   INK_MIN_CONTRAST,
-  PLANE_MIN_SPLIT,
   RAMP_MIN_SPLIT,
   THEME_HEX,
 } from "./colors";
+import { BLUEPRINT } from "./blueprintSpec";
 
 /** WCAG relative luminance of a #rrggbb string. */
 function luminance(hex: string): number {
@@ -67,534 +68,195 @@ const MODES = ["light", "dark"] as const;
  *  and an embedded terminal well is `forest` — the same border style draws on each. */
 const PLANES = ["forest", "deepForest", "barSurface", "conciergeSurface"] as const;
 
-/** The chrome slots, in ladder order: each one step further from the planes than the last. This
- *  array IS the ordering contract — see THE NEUTRAL LADDER in colors.ts. */
-const CHROME = ["chatBubble", "pillFill", "chatBubbleActive", "hairline"] as const;
+/** The chrome slots. THIS IS NOT A LADDER ANY MORE, and calling it one was the bug.
+ *
+ *  The array was ordered "each one step further from the planes than the last", and on the shipped
+ *  palette that ordering is FALSE in both themes — slots 2 and 3 are swapped:
+ *    light luminance  .8657 → .6775 → .8339 → .6292   (should decrease monotonically)
+ *    dark  luminance  .0223 → .0402 → .0242 → .0508   (should increase monotonically)
+ *
+ *  It does not sort because these are two different FAMILIES, not four rungs of one ramp:
+ *    FILLS — `chatBubble` (hovered) and `chatBubbleActive` (selected): a deliberately shallow hover
+ *            ramp, 1.035:1 apart, sitting close to their ground.
+ *    EDGES — `pillFill` and `hairline`: rules, which must read AGAINST the planes rather than sit
+ *            near them, and are therefore much further from the fills by construction.
+ *  Interleaving a fill family with an edge family by distance-from-plane can only produce a
+ *  zig-zag. Each family is checked for what it actually has to do, below and in the EDGES sweep. */
+const CHROME_FILLS = ["chatBubble", "chatBubbleActive"] as const;
 
-/** The chrome pairs a component actually COMPOSITES — paints one directly on top of the other.
- *  These clear the full CHROME_MIN_CONTRAST; every other pair in the ladder clears the weaker
- *  RAMP_MIN_SPLIT. Each entry names the site, so a future reader can check whether it still
- *  exists rather than inheriting the claim. */
-const COMPOSITED_PAIRS = [
-  // DragVisionHintPill: a `hairline` border on the card, a `pillFill` fill on the dismiss chip.
-  ["hairline", "pillFill"],
-  // AgentSidebar's "Improve Sparkle" row: `borderTop: 1px solid hairline` over the row's own
-  // CHAT_USER_BUBBLE fill when it is active.
-  ["hairline", "chatBubble"],
-  // The row-state ramp: hovered vs the row you are IN.
-  ["chatBubble", "chatBubbleActive"],
-] as const;
+/* The chrome pairs a component actually composites — DragVisionHintPill's `hairline` border over
+ * its `pillFill` chip, AgentSidebar's "Improve Sparkle" `hairline` top rule over the row's own
+ * `chatBubble` fill, and the hovered-vs-current row ramp — are recorded here as prose rather than
+ * as an array. They are real sites and worth knowing, but under this direction they are separated
+ * by line weight, not by a contrast floor, so there is no assertion for the array to feed. */
 
-describe("chrome separation — the shell's edges and fills", () => {
-  // ── THE WHOLE LADDER, NOT A LIST OF REMEMBERED PAIRS ──────────────────────────────────────────
-  // Three review rounds died on the same move: a token is nudged to clear the one floor someone
-  // wrote down, and lands on top of a token nobody had thought to pair it with. `chatBubble` came
-  // to rest on `hairline` and `chatBubbleActive` on `pillFill`, in BOTH themes, one round after a
-  // fix whose entire purpose was to catch "two distinct values one hair apart" — and every
-  // assertion in this file still passed, because none of them named those two pairs.
-  //
-  // So the ladder is swept exhaustively. Not "the pairs we know composite" — ALL of them.
-  it("the neutral ladder keeps its ORDER: each chrome slot is one step further from the planes", () => {
+// ── SEPARATION IS BY LINE, NOT BY FILL — THE WHOLE BLOCK BELOW WAS INVERTED ───────────────────
+// What stood here was ~510 lines enforcing the opposite of the approved design: a `PLANE_MIN_SPLIT`
+// floor demanding every adjacent surface differ by ≥1.2 in fill, a chrome ladder ordered by
+// "distance from the plane mass", and a rule that the sidebar seam should carry NO line because the
+// plane step carried it.
+//
+// The direction says the reverse, in its own words: *structure is drawn, not filled — hairlines on
+// a faint grid, panels are outlines, and the registers separate by LINE WEIGHT.* Measured from the
+// spec: in light the assistant column and the ground are BOTH #ffffff, and assist→bridge is 1.084.
+// Every one of the design's steps sits UNDER the floor this file used to enforce. The old guards
+// would reject the design they were written to protect, which is why the app could pass all of them
+// and still look nothing like it (blueprintSpec.test.ts now pins that structural claim directly).
+//
+// So the contract here is the one the design actually has:
+//   1. EDGES must be visible on the surfaces they are drawn on — that is what separates registers.
+//   2. INK must be legible on every surface it is read on — non-negotiable, and unchanged.
+// Fill-vs-fill floors are gone. They were a different design.
+describe("edges do the separating — every rule is visible on what it is drawn on", () => {
+  // `hairline` is the column seam; `pillFill` is the interior rule/chip tone. Both are drawn ON the
+  // planes, so both have to survive against them. This is the replacement for the old chrome floor:
+  // same rigour, aimed at the mechanism the design uses.
+  // EDGES ARE PAIRED TO THE PLANES THEY ARE ACTUALLY DRAWN ON. A flat cross-product demanded one
+// rule token read on every surface, which is precisely what the approved direction rejects: the
+// spec draws `seam` through the chrome and a DIFFERENT, darker `termHair` where a rule meets the
+// terminal plane. Under the cross-product, light `hairline` on `forest` measured 1.195 against a
+// 1.2 floor — a failure produced by the guard's model, not by the palette.
+const EDGES = ["hairline", "pillFill"] as const;
+/** The terminal plane has its own rule token; neither chrome edge is drawn on it. The spec is
+ *  explicit about this — a stage chip sitting on a selected (terminal-coloured) row takes its own
+ *  border, not the chrome hairline. */
+const TERM_PLANE = "forest" as const;
+
+  it("every edge token reads against EVERY plane, in both themes", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      // "Further from the planes" is lighter in dark and darker in light, so compare against the
-      // plane the chrome sits nearest: the lightest plane in dark, the darkest in light. Using the
-      // theme's own direction rather than a hardcoded sign is what lets ONE ordering contract hold
-      // in both themes.
-      const anchor = mode === "dark" ? Math.max(...PLANES.map((p) => luminance(hex[p]))) : Math.min(...PLANES.map((p) => luminance(hex[p])));
-      const distance = CHROME.map((t) => Math.abs(luminance(hex[t]) - anchor));
-      expect(distance, `${mode}: ladder order ${CHROME.map((t) => `${t}=${hex[t]}`).join(" → ")}`).toEqual(
-        [...distance].sort((a, b) => a - b),
-      );
-    }
-  });
-
-  it("every chrome slot clears the floor on EVERY plane, in both themes", () => {
-    // `hairline` is the token that replaced `border: 1px solid ${C.forest}`; the old value was one
-    // depth plane painted on another, which is why it collapsed when the planes converged. The
-    // other three are fills that have to read as shapes. Same floor, same sweep — a modal is a
-    // `deepForest` panel, the composer is `barSurface`, the concierge column is
-    // `conciergeSurface`, an embedded terminal well is `forest`, and the same chrome draws on each.
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (const token of CHROME) {
+      for (const edge of EDGES) {
         for (const plane of PLANES) {
+          if (plane === TERM_PLANE) continue; // covered by termHairline, asserted below
           expect(
-            contrast(hex[token], hex[plane]),
-            `${mode}: ${token} (${hex[token]}) on ${plane} (${hex[plane]})`,
-          ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
+            contrast(hex[edge], hex[plane]),
+            `${mode}: ${edge} (${hex[edge]}) is invisible on ${plane} (${hex[plane]}) — the boundary would not exist`,
+          ).toBeGreaterThan(EDGE_MIN_CONTRAST);
         }
       }
     }
   });
 
-  it("EVERY pair of chrome slots stays at least a ramp split apart — including the ones nobody paints together", () => {
-    // The unglamorous one, and the only assertion here that would have caught round 3. A pair that
-    // no component composites TODAY still cannot be allowed to converge: the ladder is what makes
-    // the next edit safe, and "these two never meet" is a claim about the current component tree,
-    // not about the palette.
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (let i = 0; i < CHROME.length; i++) {
-        for (let j = i + 1; j < CHROME.length; j++) {
-          const [a, b] = [CHROME[i]!, CHROME[j]!];
-          expect(
-            contrast(hex[a], hex[b]),
-            `${mode}: ${a} (${hex[a]}) vs ${b} (${hex[b]})`,
-          ).toBeGreaterThanOrEqual(RAMP_MIN_SPLIT);
-        }
-      }
-    }
-  });
-
-  it("the chrome pairs a component COMPOSITES clear the full chrome floor, not just the ramp split", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (const [a, b] of COMPOSITED_PAIRS) {
-        expect(
-          contrast(hex[a], hex[b]),
-          `${mode}: ${a} (${hex[a]}) composited with ${b} (${hex[b]})`,
-        ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
-      }
-    }
-  });
-
-  it("a `hairline` border around a `pillFill` chip still draws — measured, not merely unequal", () => {
-    // They exist separately so a pill can carry both, and `DragVisionHintPill` is exactly that: a
-    // `hairline` border on an element whose hover background is `pillFill`. So this is a live
-    // combination, not a hypothetical.
-    //
-    // This case used to assert `hairline !== pillFill` — a string-identity check, which is the one
-    // thing the header of this file bans. Two DISTINCT values one hair apart pass an inequality
-    // and draw nothing; that is literally how the 1.08:1 pair got through. Measured, the tokens
-    // were 1.14:1 (dark) and 1.18:1 (light) — the border on that chip did not exist, and this
-    // test's own name said it did.
+  // ── THE COMPOSER'S BOX IS DRAWN ON `inputSurface`, WHICH IS NOT ONE OF THE PLANES ─────────────
+  // The concierge composer (`.cmp`) is an inset box on `--k-input` with a `hairline` rule around
+  // it. `inputSurface` is a FIELD ground, not a depth plane, so the `EDGES × PLANES` sweep above
+  // never measures that pair — and this is the one place where missing it would be fatal rather
+  // than untidy: in LIGHT, `inputSurface` and `conciergeSurface` are the SAME value (both `#ffffff`,
+  // straight from `--k-input` / `--k-assist`), so the rule is the only thing that makes the composer
+  // a box at all. The "change of surface" the component relies on does not exist at that end.
+  //
+  // Not folded into PLANES: that would demand every edge token read on a field ground, which is the
+  // flat-cross-product model the block above was rewritten to stop using. This is the pairing that
+  // is actually painted.
+  it("the composer's seam reads on the input ground it is drawn on, in both themes", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
       expect(
-        contrast(hex.hairline, hex.pillFill),
-        `${mode}: hairline (${hex.hairline}) around a pillFill chip (${hex.pillFill})`,
-      ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
+        contrast(hex.hairline, hex.inputSurface),
+        `${mode}: hairline (${hex.hairline}) is invisible on inputSurface (${hex.inputSurface}) — in light that rule is the ONLY thing making the composer a box`,
+      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
     }
   });
 
-  // ── THE ROW-STATE RAMP ────────────────────────────────────────────────────────────────────────
-  // `CHAT_USER_BUBBLE` / `ROW_ACTIVE_BUBBLE` are chrome FILLS — a hovered row, a selected row, the
-  // user's own chat bubble, the terminal's selection band — and several sites use `chatBubble` as a
-  // 1px BORDER (Terminal, Composer, PinnedPrompt, AttachmentTile, SparkleConsentBanner). They were
-  // deliberately EXCLUDED from these floors, and that exclusion is what let them collapse WITH the
-  // planes during the repaint (dark `#1d3a7a`→`#1b2033`, `#2c57b0`→`#2c3352`) down to ~1.04–1.16:1
-  // across the whole ramp — while colors.ts went on documenting "three states read at a glance".
-  //
-  // Held to the same CHROME_MIN_CONTRAST as `hairline`/`pillFill` because they do the same job: a
-  // filled row state has to read as a shape. No new, softer constant — the pre-repaint DARK pair
-  // delivered 1.598:1 between the two bubbles, so this floor restores what the contract was
-  // written against rather than lowering the bar to fit what broke it.
-  //
-  // Sweeping every plane is not over-reach: in dark, clearing `conciergeSurface` (the lightest
-  // plane) implies the rest; in light, clearing `deepForest` (the darkest) does. The binding
-  // constraint in each theme is one of the two planes these fills are actually painted on.
-  it("`chatBubble` and `chatBubbleActive` clear the floor on EVERY plane, in both themes", () => {
+  it("the terminal plane's own rule token reads on it, in both themes", () => {
+    // The other half of the pairing above: `hairline` is excused from `forest` only because
+    // `termHairline` covers it. Without this row that exclusion would be a hole, not a model.
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      for (const token of ["chatBubble", "chatBubbleActive"] as const) {
-        for (const plane of PLANES) {
-          expect(
-            contrast(hex[token], hex[plane]),
-            `${mode}: ${token} (${hex[token]}) on ${plane} (${hex[plane]})`,
-          ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
-        }
-      }
+      expect(
+        contrast(hex.termHairline, hex[TERM_PLANE]),
+        `${mode}: termHairline (${hex.termHairline}) is invisible on the terminal plane (${hex[TERM_PLANE]})`,
+      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
     }
   });
 
-  it("the two row-state fills stay a step apart — the 'three states' contract, as a number", () => {
-    // colors.ts documents ROW_ACTIVE_BUBBLE as "one notch more contrast than CHAT_USER_BUBBLE so
-    // three states read at a glance": idle (the bare plane), hovered (chatBubble), selected
-    // (chatBubbleActive). The first step is the assertion above; this is the second. Without it,
-    // the two can converge and every state still clears its plane individually.
+  // The seam between the assistant and builder columns is the app's most prominent boundary, and in
+  // this design it is the ONLY thing separating them — the fills are within 1.09 of each other. A
+  // previous pass deleted this rule on the theory that the plane step carried it. It does not.
+  it("the assistant↔builder seam is a drawn rule, because the fills do not separate them", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
+      expect(
+        contrast(hex.conciergeSurface, hex.deepForest),
+        `${mode}: the columns are separated by FILL — that is the superseded design`,
+      ).toBeLessThan(1.2);
+      expect(
+        contrast(hex.hairline, hex.conciergeSurface),
+        `${mode}: the seam cannot be seen on the assistant column`,
+      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
+    }
+  });
+
+  // ── HOVER AND SELECTED ARE NOT SEPARATED BY FILL, AND THAT IS THE DESIGN ────────────────────
+  // This row used to assert `chatBubble !== chatBubbleActive` — a STRING-IDENTITY check, which the
+  // header of this file explicitly bans, because an inequality is exactly what let a 1.08:1 pair
+  // through once before. Measured on this palette the two fills are 1.035:1 apart in light, so the
+  // assertion was green while hovered and selected were indistinguishable.
+  //
+  // The honest conclusion is not "tighten the floor" — it is that the direction does not signal
+  // SELECTION with a bubble fill at all. `--k-bubble` and `--k-sel` are a hover ramp, deliberately
+  // near their ground, and the selected row is signalled by the terminal FLOOD: it takes the pane's
+  // colour and bleeds into it. A floor forcing these two fills apart would reintroduce the
+  // separate-by-fill model this port exists to remove.
+  //
+  // So the pair is PINNED to the spec rather than floored. A palette edit that pulls them apart —
+  // or collapses them to one value — fails here and has to come argue with this comment.
+  it("the hover ramp stays a ramp: close to its ground, and pinned to the spec", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      // PINNED, which is what this title has always promised. It rested on `.not.toBe` — the
+      // string-identity check this file's preamble bans — so `#e8f0fd` → `#e8f0fe` collapsed the
+      // ramp to 1.001:1 and passed green. A pin is the honest guard because these values are
+      // PORTED, not tuned: there is no range for them to be inside. (roborev 54746, and 54832 for
+      // the fact that the fix first landed on a DUPLICATE of this row instead of on this one.)
+      expect(hex.chatBubble, `${mode}: chatBubble drifted from the spec's --k-bubble`).toBe(
+        BLUEPRINT[mode].bubble,
+      );
+      expect(hex.chatBubbleActive, `${mode}: chatBubbleActive drifted from the spec's --k-sel`).toBe(
+        BLUEPRINT[mode].sel,
+      );
+      // …and it stays a RAMP rather than becoming a fill separation.
       expect(
         contrast(hex.chatBubble, hex.chatBubbleActive),
-        `${mode}: chatBubble (${hex.chatBubble}) vs chatBubbleActive (${hex.chatBubbleActive})`,
-      ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
+        `${mode}: the hover ramp has become a fill separation`,
+      ).toBeLessThan(1.2);
     }
   });
 
-  // ── THE CAP, AND THE PREMISE IT USED TO REST ON ───────────────────────────────────────────────
-  // This cap was justified as "these fills carry `cream` text at EVERY site that uses them". That
-  // was not true when it was written. `AgentSidebar`'s hover card set `background: CHAT_USER_BUBBLE`
-  // for any row that is not active and then filled it with the column's PLANE inks — `muted`
-  // DetailLine labels, a `successInk` "✓ Landed", an `accentInk` path link — so the cap was chosen
-  // against a backdrop/ink pairing that was not the real one, and the card's own text sat under its
-  // floor at both ends of the theme.
-  //
-  // No value of `chatBubble` could have fixed that, which is the useful part: `muted` cannot clear
-  // the ink floor on ANY chrome fill in EITHER theme (the assertion below measures exactly that),
-  // because every slot that clears the chrome floor against the planes is already past the backdrop
-  // `muted` can be read on. So the card moved to a PLANE (`barSurface`) instead — see
-  // AgentSidebar's `cardBg`.
-  //
-  // THE FIX THEN RECORDED "what is left on this token is what its name says: chat bubbles and row
-  // fills, carrying `cream`", AND THAT WAS ALSO FALSE (roborev 53613). A FOURTH consumer was still
-  // there: `AgentSidebar`'s pinned "Improve Sparkle" row painted `background: active ?
-  // CHAT_USER_BUBBLE : "transparent"` under a comment claiming it matched the agent rows' selected
-  // treatment — which it did not, since a selected agent row takes `C.forest`. Everything that row
-  // carries is a plane ink: a `statusInk(...)` label (3.20/3.71 dark/light on the bubble), a
-  // `muted` consent pill (3.20/2.38), and a StatusDot measuring 2.64/1.70 red and 4.56/1.01 green —
-  // the dot the row is read by, effectively invisible in light. That row now takes `C.forest` like
-  // every other selected row, and the claim is finally true: the sites below are all this token has.
-  //
-  // The lesson worth keeping is that the claim was re-asserted from a comment TWICE without anyone
-  // grepping the token. The `it` below therefore names its real consumers, and the sweep in
-  // "the AgentSidebar hover CARD" further down measures the card's inks on the surface it actually
-  // has rather than on the one a table remembered.
-  const CREAM_CARRYING_FILLS = ["chatBubble", "chatBubbleActive", "pillFill"] as const;
-
-  it("`cream` stays readable ON every chrome FILL — the cap that stops the ladder overshooting", () => {
-    // chatBubble: DefineStageModal's user line, SupportModal's user turn, ConciergeThread's own
-    // bubble, PinnedPrompt's hovered row, NudgeCard's secondary action.
-    // chatBubbleActive: SettingsDialog's selected rail item, DefineStageModal's primary button,
-    // StageColumnHeader's CTA.
-    // pillFill: the credit badge, BalanceBadge, ModelPill's and AgentPane's selected rows,
-    // SelectionPopup's hover.
+  // ── THE INK FLOORS THAT WENT OUT WITH THE FILL FLOORS ────────────────────────────────────────
+  // The ~510 lines deleted here enforced separation by FILL, which the direction rejects — but the
+  // sweep that went with them also carried the INK floors, and those are not superseded by
+  // anything. "Ink must be legible on every surface it is read on" was stated as unchanged while
+  // its coverage was removed. The only thing left guarding those sites was component tests pinning
+  // token STRINGS (`var(--c-bar-surface)`), which is the exact substitute that cannot catch a
+  // palette edit. These sweeps put the floors back.
+  it("primary ink clears AA on every chrome fill it is read on", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      for (const token of CREAM_CARRYING_FILLS) {
+      for (const fill of ["chatBubble", "chatBubbleActive", "pillFill"] as const) {
         expect(
-          contrast(hex.cream, hex[token]),
-          `${mode}: cream (${hex.cream}) on ${token} (${hex[token]})`,
+          contrast(hex.cream, hex[fill]),
+          `${mode}: cream on ${fill} (${hex[fill]})`,
         ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
       }
     }
   });
 
-  it("`muted` is a PLANE ink: it clears AA on every plane and on NO chrome fill — the stated exception", () => {
-    // Pinned as a fact about the ladder, not left as a comment. The first half is the contract
-    // `muted` actually has; the second half is why re-pointing a surface (not re-deriving a token)
-    // is the only fix when a `muted` label turns up on a fill, and it fails loudly if a future
-    // palette edit ever makes the exception unnecessary — at which point delete it and lift the
-    // restriction rather than carrying a false comment.
-    //
-    // The one plane it does NOT clear is light `deepForest`, a pre-existing light-mode gap that
-    // predates this ladder and is not its to close — so the plane half is asserted where `muted` is
-    // read: the dark shell, and light's two lighter chrome planes.
+  it("the sidebar hover-card inks clear AA on both card grounds", () => {
+    // AgentSidebar's hover card renders over `barSurface` docked and over `forest` on the pane.
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      const planes = mode === "dark" ? PLANES : (["forest", "barSurface", "conciergeSurface"] as const);
-      for (const plane of planes) {
-        expect(
-          contrast(hex.muted, hex[plane]),
-          `${mode}: muted (${hex.muted}) on ${plane} (${hex[plane]}) — muted is a PLANE ink`,
-        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
-      }
-      for (const token of CREAM_CARRYING_FILLS) {
-        expect(
-          contrast(hex.muted, hex[token]),
-          `${mode}: muted (${hex.muted}) on ${token} (${hex[token]}) — if this now PASSES, the stated exception in colors.ts is stale`,
-        ).toBeLessThan(INK_MIN_CONTRAST);
-      }
-    }
-  });
-
-  // ── THE AGENTSIDEBAR HOVER CARD, MEASURED ON THE SURFACE IT ACTUALLY HAS ──────────────────────
-  // The card's surface moved `chatBubble` → `barSurface` precisely so its three inks would clear,
-  // and then only ONE of the three was pinned: `muted`, and only incidentally, as a member of the
-  // `muted` plane sweep above. `successInk` (the "✓ Landed" mark) and `accentInk` (the path link)
-  // were the numbers the move was JUSTIFIED by and neither was asserted anywhere — a component test
-  // pinned the token string `var(--c-bar-surface)` instead, which cannot catch a palette edit that
-  // keeps the token and moves its value (roborev 53614).
-  //
-  // BOTH card states, because `cardBg` is `isActive ? C.forest : C.barSurface` — a sweep over only
-  // the inactive one would leave the active card's inks exactly as unpinned as these were.
-  const CARD_SURFACES = ["barSurface", "forest"] as const;
-  const CARD_INKS = ["muted", "successInk", "accentInk"] as const;
-
-  it("the hover card's OWN inks clear AA on the card's own surface, in both card states", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (const surface of CARD_SURFACES) {
-        for (const ink of CARD_INKS) {
+      for (const ground of ["barSurface", "forest"] as const) {
+        for (const ink of ["muted", "successInk", "accentInk"] as const) {
           expect(
-            contrast(hex[ink], hex[surface]),
-            `${mode}: ${ink} (${hex[ink]}) on the hover card's ${surface} (${hex[surface]})`,
+            contrast(hex[ink], hex[ground]),
+            `${mode}: ${ink} on the hover card's ${ground} ground`,
           ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
         }
       }
     }
   });
-
-  // The card's "N ahead — click to merge" pill. Its ink is `successInk` and it used to paint a
-  // `${C.success}22` wash behind it; the ladder's table measured the ink on the BARE plane (light
-  // 4.552 on `barSurface`) and so never saw that the wash took it to 4.127 — under the floor — while
-  // buying 1.103:1 of visible fill. The wash is gone; this pins that it cannot come back without the
-  // ink being re-measured ON it. Asserted as the composited stack, not as "the background is
-  // transparent", so any future tint has to clear the floor rather than merely be a different value.
-  it("the ahead pill's ink clears AA on whatever it is composited over", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (const surface of CARD_SURFACES) {
-        expect(
-          contrast(hex.successInk, hex[surface]),
-          `${mode}: successInk on the untinted ahead pill over ${surface}`,
-        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
-      }
-    }
-    // THE STACK THAT FAILED NOW CLEARS, and the record is updated rather than deleted. The wash was
-    // removed because `successInk` could not be read over it in light mode; the Blueprint repaint
-    // darkened light's green (the terminal became a real plane, so every light ink was re-derived
-    // against it) and the same stack now measures comfortably above the floor. Kept as a POSITIVE
-    // assertion so the number stays pinned: if a future palette lightens that green back, this goes
-    // red before anyone reintroduces the wash on the strength of a stale comment.
-    expect(
-      contrast(THEME_HEX.light.successInk, over(BRAND.success, THEME_HEX.light.barSurface, 0x22 / 255)),
-      "light: successInk over a success22 wash on the barSurface card",
-    ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
-  });
-
-  // ── FILLED CHIPS INSIDE THAT CARD ─────────────────────────────────────────────────────────────
-  // Three chips in the card's top strip filled with `C.deepForest` — a PLANE used as a chip fill on
-  // another plane, which is 1.079/1.248 against the card: a filled chip with no visible fill
-  // (roborev 53616). ModelPill and the close button's hover pill moved to `pillFill`, the token
-  // whose documented role is exactly this. Swept over both card states for the same reason as above.
-  it("a filled chip inside the hover card reads as a fill against the card, in both card states", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      for (const surface of CARD_SURFACES) {
-        expect(
-          contrast(hex.pillFill, hex[surface]),
-          `${mode}: a pillFill chip on the ${surface} card`,
-        ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
-        // The value they came FROM, recorded as failing so the move cannot be quietly reverted.
-        expect(
-          contrast(hex.deepForest, hex[surface]),
-          `${mode}: a deepForest chip on the ${surface} card — a plane on a plane`,
-        ).toBeLessThan(CHROME_MIN_CONTRAST);
-      }
-    }
-  });
-
-  // The epic pill keeps its `deepForest` fill (its `C.teal` ink measures 1.828/1.610 on `pillFill` —
-  // the fill that would make it a proper chip is the one that destroys its ink, a STATED exception),
-  // so its boundary has to come from its border instead. It was `${C.teal}55`, which measured
-  // 1.376:1 against the dark card — no boundary from any direction. `hairline` is the token for a
-  // rule that has to be seen, and it has to clear the chip's own fill as well as the card behind it.
-  it("the epic pill's hairline border is visible against BOTH its own fill and the card", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      expect(
-        contrast(hex.hairline, hex.deepForest),
-        `${mode}: the epic pill's border against its own deepForest fill`,
-      ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
-      for (const surface of CARD_SURFACES) {
-        expect(
-          contrast(hex.hairline, hex[surface]),
-          `${mode}: the epic pill's border against the ${surface} card`,
-        ).toBeGreaterThanOrEqual(CHROME_MIN_CONTRAST);
-      }
-      // What it replaced, pinned as insufficient in dark so the tint cannot come back.
-      expect(
-        contrast(over(BRAND.teal, hex.deepForest, 0x55 / 255), hex.barSurface),
-        `${mode}: the old teal55 edge against the barSurface card`,
-      ).toBeLessThan(2);
-    }
-  });
-
-  // ── THE PINNED "IMPROVE SPARKLE" ROW'S SELECTED STATE ─────────────────────────────────────────
-  // Two rounds moved this row's active fill and neither left it visible. It went CHAT_USER_BUBBLE →
-  // `C.forest` (roborev 53613) because everything the row carries is a PLANE ink and a chrome fill
-  // cannot hold one — that part stands, and the numbers are in the row's own comment. What the move
-  // did not account for is that `forest` on the sidebar's `deepForest` column is the pair the
-  // repaint deliberately collapses. An AGENT row survives that: its selected state is the square
-  // right edge, the concave fillets opening onto the terminal, and the open card's outline. This row
-  // has none of that geometry, so it was left with an invisible fill and nothing else (roborev
-  // 53662).
-  //
-  // The fix cannot be a different FILL — the ladder's stated exception says every fill far enough
-  // from the planes to read is already past what `muted` and this row's other plane inks can be read
-  // on. So the state is a SHAPE beside the inks rather than a fill under them: the `goldFill` rail
-  // `CommandPalette`'s selected row already uses. Held to CONTROL_MIN_CONTRAST, not the softer
-  // divider floor, for the same reason the Send button is: this contrast IS the state.
-  //
-  // The wash `CommandPalette` pairs with its rail is NOT carried over, and is stated here rather
-  // than asserted: 8% gold over the sidebar column measures 1.152 (dark) / 1.016 (light) against the
-  // bare column — nothing in light, where this row is exactly as invisible as before — while tinting
-  // the backdrop every one of the row's plane inks is measured on. It is left out as an assertion
-  // because an 8% wash of anything is under the chrome floor by construction, and a test that cannot
-  // fail is what the header of this file bans.
-  //
-  // The rail's own floor is NOT re-asserted here, for that same reason. It is already held by
-  // "`goldFill` clears the non-text control floor on every plane, in both themes" below, which
-  // sweeps `PLANES` — `forest` and `deepForest` among them — over `MODES` at `CONTROL_MIN_CONTRAST`.
-  // A row-scoped copy over those two planes is a strict subset of that sweep: no palette edit can
-  // redden it without reddening the sweep first, so it measured nothing and merely looked like the
-  // rail's guard (roborev 53685). What IS asserted is the half the sweep does not cover — that the
-  // fill step this rail replaces falls BELOW the floor, which is the reason the rail exists at all.
-  //
-  // THE PAIR IS BOUNDED FROM BOTH SIDES, AND THIS IS ITS ONE HOME. The floor arrived later than the
-  // ceiling and briefly lived in a second test of its own, which re-asserted this exact ceiling over
-  // the same pair and the same MODES — a byte-for-byte duplicate, i.e. the strict-subset defect the
-  // note directly above bans, introduced by the commit that was removing a phantom guard (roborev
-  // 54234). Both bounds belong together anyway: they are one decision about one seam.
-  //
-  // The floor exists because AgentSidebar removed this column's hairline. With no drawn rule, the
-  // step itself carries the app's most prominent structural edge, and nothing was holding it up —
-  // both assertions naming the pair were ceilings, so a future nudge could have flattened it toward
-  // 1.0 with the suite green. That is the state the hairline had been added to escape.
-  //
-  // ── LIGHT SITS AT 1.2012, AND THAT IS SATURATION, NOT SLOPPINESS (roborev 54234) ──────────────
-  // Light clears this floor by 0.0012 — one 8-bit nudge from red — which reads like a value nobody
-  // finished tuning. It is not. Light's ramp is fully constrained and the headroom cannot be
-  // created, only MOVED. The budget is pinned at both ends: `conciergeSurface` is white, every
-  // chrome slot must clear CHROME_MIN_CONTRAST against the darkest plane, and `cream` must still
-  // clear AA on `chatBubbleActive`. Widening this seam darkens `forest`, which drags the whole
-  // chrome ladder down into the `cream` cap.
-  //
-  // Measured, by moving the seam to 1.29: the `chatBubble` window collapses from ~0.034 luminance
-  // (~9 representable values) to ~0.0045 (~1). So the choice is a seam with one step of margin, or
-  // a chrome ladder with one step of margin — and the ladder is the worse place to spend it,
-  // because four slots share that budget and three of them carry ink.
-  //
-  // The other option on the table was keeping `hairline` on this seam in LIGHT only. Rejected: the
-  // active row bleeds in both themes, so a rule in one would make the app's most visible behaviour
-  // theme-dependent — a visible inconsistency in exactly the feature the seam exists for.
-  //
-  // What makes 1.2012 safe is not margin, it is the guard: this now fails in BOTH directions, so
-  // erosion is caught by CI rather than by a reviewer. If the ramp is ever re-derived, spend any
-  // new room here first. PRD/sparkle/ui-directions/derive.mjs holds the arithmetic.
-  it("the active row's FILL step is a visible plane step AND below the chrome floor", () => {
-    // Recorded as measurements, not as a comment, so a future round cannot delete the rail on the
-    // theory that "the active fill already says it", nor flatten the seam the rail replaced.
-    expect(PLANE_MIN_SPLIT, "the band is empty — the two bounds cross").toBeLessThan(CHROME_MIN_CONTRAST);
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      const step = contrast(hex.forest, hex.deepForest);
-      // FLOOR — the seam is undrawn, so it has no fallback if the fill goes flat.
-      expect(
-        step,
-        `${mode}: forest (${hex.forest}) against deepForest (${hex.deepForest}) is too flat to carry an undrawn seam`,
-      ).toBeGreaterThanOrEqual(PLANE_MIN_SPLIT);
-      // CEILING — and it must still not read as a chrome FILL, which is why the rail exists.
-      expect(
-        step,
-        `${mode}: the active row's forest fill (${hex.forest}) against the deepForest column (${hex.deepForest})`,
-      ).toBeLessThan(CHROME_MIN_CONTRAST);
-    }
-  });
-
-  // The pair the repaint collapses. It is NOT raised back — four near-black planes are what the
-  // prototype specifies, `forest` is also the terminal background every calm ink is measured
-  // against, and a recession ramp is supposed to recede. What is pinned instead is that DARK
-  // keeps the prototype's ordering, so a future edit can't silently invert
-  // "Sparkle lightest → builder → terminal darkest" (PRD/sparkle/concierge-mode.md §3) while the
-  // surfaces comment goes on claiming it.
-  //
-  // Only DARK. Light's four planes are not a mirror of it and never were: `forest` there is the
-  // WHITE content plane (the lightest of everything, not the darkest), and among the chrome
-  // planes light orders builder → concierge → bars where dark orders builder → bars → concierge.
-  // Asserting a symmetry that doesn't hold would just be another comment that isn't true.
-  it("DARK keeps the prototype's depth ramp: term → builder → bars → concierge", () => {
-    const ramp = PLANES.map((p) => luminance(THEME_HEX.dark[p]));
-    expect(ramp).toEqual([...ramp].sort((a, b) => a - b));
-    // Strictly increasing — equal neighbours would satisfy a sort but would BE the flattening.
-    expect(new Set(ramp).size).toBe(PLANES.length);
-  });
-
-  // ── LIGHT'S THREE COLUMNS ─────────────────────────────────────────────────────────────────────
-  // The founder's report was "a mishmash of shades … gray-on-gray", and light's planes were the
-  // literal cause: terminal → concierge measured 1.162:1 and concierge → builder 1.184:1, i.e. BOTH
-  // under RAMP_MIN_SPLIT — the floor this file already applies to two chrome tokens that no
-  // component ever paints on top of each other. Three panes side by side had less separation than
-  // the palette demands of two values that never meet.
-  //
-  // DARK IS NOT SWEPT, and the asymmetry is the point rather than an omission: dark's four planes
-  // are the prototype's near-blacks and the section at the top of colors.ts spends a paragraph on
-  // why that ramp is SUPPOSED to collapse. Light has a white content plane and no such excuse.
-  //
-  // The ramp's LAST rung is additionally bounded from above, by "the active row's FILL step is a
-  // visible plane step AND below the chrome floor" earlier in this file, which brackets
-  // `forest`↔`deepForest` between PLANE_MIN_SPLIT and CHROME_MIN_CONTRAST in both themes.
-  //
-  // WHAT USED TO BE ARGUED HERE — that contrast multiplies along the ramp, so the two steps share a
-  // hard ceiling of 1.5 and neither may exceed √1.5 — IS RETRACTED. It was sound for a three-plane
-  // ramp and became false the moment `barSurface` joined as a rung: four planes at the floor span
-  // well past 1.5 by construction, and light's ramp does. The 1.5 bound is on ONE adjacent pair,
-  // not on the ramp end to end, and it is not what fixes PLANE_MIN_SPLIT. See the ramp section at
-  // the top of colors.ts.
-  //
-  // ── THIS GUARD MEASURED NON-ADJACENT PAIRS, AND THAT IS WHY IT WAS GREEN ───────────────────────
-  // It swept `["forest", "conciergeSurface", "deepForest"]` — the ordering from BEFORE the ramp was
-  // inverted. Under the new contract those first two are the two ENDS of the ramp, so the guard was
-  // measuring the end-to-end distance (1.590) and calling it one step, while the ramp's real
-  // adjacent steps went unmeasured: `barSurface`↔`conciergeSurface` at 1.098 and
-  // `deepForest`↔`barSurface` at 1.109, BOTH under this very floor. A guard that reads the wrong
-  // pairs reports clean for the wrong reason, which is worse than no guard — and `barSurface` is
-  // where the gray-on-gray collapse had quietly moved to, since it is the plane every inactive
-  // agent card and every bar is painted in.
-  //
-  // It now sweeps the ramp IN ORDER, every adjacent pair, so adding or reordering a plane cannot
-  // slip past it. `barSurface` is included deliberately: the commit's thesis is that the shell
-  // darkens THROUGH the bars, which makes the bar a rung rather than an overlay.
-  const LIGHT_RAMP = ["conciergeSurface", "barSurface", "deepForest", "forest"] as const;
-  it("LIGHT's planes are far enough apart to read as separate planes — EVERY adjacent pair", () => {
-    const hex = THEME_HEX.light;
-    for (let i = 0; i < LIGHT_RAMP.length - 1; i++) {
-      const [a, b] = [LIGHT_RAMP[i]!, LIGHT_RAMP[i + 1]!];
-      expect(
-        contrast(hex[a], hex[b]),
-        `light: ${a} (${hex[a]}) beside ${b} (${hex[b]})`,
-      ).toBeGreaterThanOrEqual(PLANE_MIN_SPLIT);
-    }
-    // …and the sweep is only honest if the order it sweeps IS the luminance order. Pin that too,
-    // or a future value swap silently turns "adjacent" back into "some pair".
-    const lums = LIGHT_RAMP.map((k) => luminance(hex[k]));
-    expect(lums, `light ramp is not monotonically darkening: ${LIGHT_RAMP.join(" → ")}`)
-      .toEqual([...lums].sort((x, y) => y - x));
-    // The FLOOR is boxed from below (roborev 53986). A plane split may not be laxer than the bar
-    // applied to two chrome tokens that never touch — at 1.18 this guard passed the very spacing it
-    // was written to reject, which is a guard that records a decision without enforcing it.
-    expect(PLANE_MIN_SPLIT).toBeGreaterThanOrEqual(RAMP_MIN_SPLIT);
-  });
-
-  // The `forest`↔`deepForest` seam is bounded from both sides, and its one home is the
-  // "active row's FILL step" test further up this file — not here. LIGHT_RAMP's last step overlaps
-  // that floor for light by construction (the pair is the ramp's final rung); the band test is what
-  // covers DARK and what states the ceiling, so read it there before touching either.
-
-  //
-  // ORDERING WAS ALL THIS PAIR HAD, WHICH IS HOW ITS NUMBER ROTTED IN PROSE (roborev 54242). The
-  // concierge↔builder seam is the shell's other vertical boundary, and it was described in comments
-  // in three files with a hand-written ratio and NOTHING computing it — so when `deepForest` was
-  // re-derived, the quoted figure silently became wrong and stayed wrong through two rounds.
-  // Ordering alone could not catch it: `conciergeSurface` stayed lighter the whole time.
-  //
-  // PHYSICALLY ADJACENT, NOT ADJACENT IN THE RAMP — and the first cut of this guard conflated the
-  // two (roborev 54250). These columns touch ON SCREEN, but `barSurface` sits between them in
-  // LUMINANCE, so calling this "the same floor as every other adjacent rung" described it as
-  // exactly the non-adjacent measurement this file condemns forty lines up.
-  //
-  // The floor is therefore DARK-ONLY. Contrast is multiplicative along a monotone ramp, so light's
-  // two intervening steps already force this pair to ≥ 1.2 × 1.2 = 1.44 — it cannot fail without
-  // LIGHT_RAMP failing first, which makes a light assertion here a strict subset, the thing
-  // roborev 53685/54234 banned. Dark's ramp is not swept, so dark is the only place this seam has
-  // no cover at all, and it is the tightest unbudgeted constraint on dark's planes: re-deriving
-  // them toward the prototype's near-blacks will hit this before anything else.
-  it("the concierge column stays a distinct plane from the builder column, in both themes", () => {
-    for (const mode of MODES) {
-      const hex = THEME_HEX[mode];
-      expect(luminance(hex.conciergeSurface), `${mode}: concierge vs builder`).toBeGreaterThan(
-        luminance(hex.deepForest),
-      );
-    }
-    const hex = THEME_HEX.dark;
-    expect(
-      contrast(hex.conciergeSurface, hex.deepForest),
-      `dark: conciergeSurface (${hex.conciergeSurface}) against deepForest (${hex.deepForest}) — the seam ConciergeColumn draws its rule on`,
-    ).toBeGreaterThanOrEqual(PLANE_MIN_SPLIT);
-  });
 });
-
 describe("the concierge column's themed INKS clear AA where they are read", () => {
   // Scoped to `conciergeSurface` ON PURPOSE. These are the concierge column's inks — the scope
   // line, the vitals, a nudge's badge and project chip — and that column is the surface they are
@@ -614,6 +276,62 @@ describe("the concierge column's themed INKS clear AA where they are read", () =
         ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
       }
     }
+  });
+
+  // ── THE COLUMN HAS A SECOND PLANE NOW: THE FLOOD ──────────────────────────────────────────────
+  // Wired to a terminal (`ConciergeColumn`'s `data-wired`), the concierge takes the TERMINAL's
+  // colour — so every ink above is suddenly read on `--k-term` instead of on `conciergeSurface`.
+  // The column sets the terminal ink register on itself and anything inheriting follows, but the
+  // controls that NAME a concierge-register ink do not: the grip dots, the header pills' default
+  // and pressed labels, ScopeVitals' text, a nudge's badge and chip.
+  //
+  // None of that was measured when the wired state landed — the same disagreement `amberInk`'s
+  // `composerPlate` closed for the composer, reopened one level up, on a whole column rather than a
+  // 90px strip (roborev 54712). Light `conciergeMuted` on the flood is the tightest at 4.76, which
+  // is 0.26 of margin with nothing holding it there.
+  //
+  // `forest` IS the flooded plane — it is `BLUEPRINT[mode].term`, the same token the column reads
+  // through `BLUEPRINT` because it has no CSS var of its own. Sweeping these inks over it is
+  // therefore not the "assert a contract they were never given" mistake the note above warns about:
+  // the wired column gives them exactly this contract.
+  it("every concierge ink ALSO clears AA on the flooded column, both themes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const ink of INKS) {
+        expect(
+          contrast(hex[ink], hex.forest),
+          `${mode}: ${ink} (${hex[ink]}) is unreadable once the concierge floods to the terminal plane (${hex.forest})`,
+        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+      }
+    }
+  });
+
+  // ── THE PRESSED NEEDS-YOU PILL IS A FILL CARRYING TEXT, ON BOTH OF THE COLUMN'S PLANES ────────
+  // It shipped as `onGoldFill` on `bandColor("needs_you")` — white on brand sienna #e0533f in
+  // light, which measures 3.83:1 on a 10px bold label. Under AA, and unreachable from that hue:
+  // nothing lighter than near-black clears 4.5 on a mid red, and white is the only light end
+  // available. So the pressed fill is the THEMED alarm ink instead (a deep red in light, a light
+  // salmon in dark), which crosses that token's documented fill/ink split deliberately — the
+  // split's rationale is legibility, and here it is the fill that has to carry the text.
+  //
+  // Opaque, so the plane under it does not enter the ratio — but it is asserted on both column
+  // planes anyway, because the pill is what the WIRED header paints too and "it's opaque" is
+  // exactly the reasoning that would stop someone re-checking after a future tint.
+  it("the pressed needs-you pill's fill and its ink clear AA, both themes", () => {
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      expect(
+        contrast(hex.onGoldFill, hex.dangerInk),
+        `${mode}: the pressed needs-you pill's label is unreadable on its own fill`,
+      ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+    }
+  });
+
+  it("…and the band colour it REPLACED would not have, which is why it is not that", () => {
+    // Recorded rather than merely fixed: brand sienna as a filled plate under white is the shape
+    // this pill was built in, and "just use the band colour, it is the tier's own hue" is the
+    // obvious thing for the next person to try.
+    expect(contrast(THEME_HEX.light.onGoldFill, BRAND.sienna)).toBeLessThan(INK_MIN_CONTRAST);
   });
 
   // ── MEASURE THE STACK THE LABEL IS ACTUALLY READ ON ───────────────────────────────────────────
@@ -687,16 +405,15 @@ describe("the concierge column's themed INKS clear AA where they are read", () =
   // button. But that button's label is `goldHotInk`, not `goldInk`, and the tint composites over
   // the card gradient rather than the bare column. So the surface is kept and pointed at the ink
   // that is actually painted on it.
-  it("`goldHotInk` clears AA on the primary action button's gold tint", () => {
+  it("the primary action button's own ink clears AA on its own fill", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      for (const stop of GRADIENT_STOPS) {
-        const buttonFill = over(BRAND.gold, gradient(mode, stop), 0.16);
-        expect(
-          contrast(hex.goldHotInk, buttonFill),
-          `${mode}: goldHotInk (${hex.goldHotInk}) on the primary button (${buttonFill}) at ${stop}`,
-        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
-      }
+      // The button is OPAQUE now (NudgeCard), so there is no card gradient under it to composite
+      // and no stop to pick a worst case from. It is the spec's primary pair, measured directly.
+      expect(
+        contrast(hex.onGoldFill, hex.goldFill),
+        `${mode}: onGoldFill (${hex.onGoldFill}) on the primary button (${hex.goldFill})`,
+      ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
     }
   });
 
@@ -922,8 +639,19 @@ describe("opaque gold is a themed PAIR — fill and the ink that sits on it", ()
 
   it("the retired DANGER literal would still FAIL on the terminal plane — why the token had to move", () => {
     // Kept as a measurement, not a memory. If someone reintroduces `#e5484d` as alert ink because
-    // "it used to be the brand red", this is the number that says no.
-    expect(contrast("#e5484d", THEME_HEX.light.forest)).toBeLessThan(CONTROL_MIN_CONTRAST);
+    // "it used to be the brand red", these are the numbers that say no.
+    //
+    // THE ABSOLUTE BOUND HERE WENT STALE AND HAD TO BE REPLACED RATHER THAN RETUNED. It asserted
+    // the literal measured under 3:1 on the light terminal plane — true when that plane was a dark
+    // green, false now that the Blueprint made it `#d9e3f3`, where the literal scrapes past at
+    // 3.03. A bound that flips sign when a plane moves is not a guard, and loosening it to 3.1
+    // would just move the same trap. What is actually claimed — and what stays true through a
+    // repaint — is that the THEMED token beats the literal by a wide margin on the plane the
+    // control is drawn on. That is a relative claim, so it survives the planes moving under it.
+    const literal = contrast("#e5484d", THEME_HEX.light.forest);
+    const themed = contrast(THEME_HEX.light.dangerInk, THEME_HEX.light.forest);
+    expect(themed).toBeGreaterThan(literal * 2);
+    expect(themed).toBeGreaterThanOrEqual(CONTROL_MIN_CONTRAST);
   });
 
   // `dangerInk`'s own floor is NOT restated here. It is already swept — deliberately scoped to the
@@ -996,6 +724,39 @@ describe("opaque gold is a themed PAIR — fill and the ink that sits on it", ()
     for (const [name, v] of [["gold", BRAND.gold], ["goldHot", BRAND.goldHot]] as const) {
       expect(RETIRED, `BRAND.${name} is back on a retired literal`).not.toContain(v.toLowerCase());
       expect(isBlue(v), `BRAND.${name} (${v}) is not a blue`).toBe(true);
+    }
+  });
+});
+
+// ── THE CHROME LADDER STILL HAS TO HOLD WHERE COMPONENTS COMPOSITE IT ────────────────────────
+// `CHROME` and `COMPOSITED_PAIRS` outlived the ~510 lines that used to consume them — the block
+// that enforced `PLANE_MIN_SPLIT`, i.e. separation by FILL, which is the opposite of what the
+// approved direction does. Deleting the assertions but keeping the arrays left the ordering
+// contract and the list of real composite sites documented and unenforced, which is how a claim
+// goes stale without anyone noticing.
+//
+// ONLY THE ORDERING ROW CAME BACK, AND THE MEASUREMENT IS WHY. Re-asserting CHROME_MIN_CONTRAST
+// over COMPOSITED_PAIRS fails immediately: light `hairline` on `pillFill` is 1.07, nowhere near
+// 1.5. That is not a regression — `seam` #c3d1e6 and `hairSolid` #cbd8ea are ADJACENT BY DESIGN,
+// because the direction separates by LINE WEIGHT and not by fill. A floor demanding those two
+// pull apart would force the exact repaint this whole port exists to undo, so the composited-pair
+// floor stays deleted and this comment records the number, rather than leaving the next reader to
+// rediscover it and "fix" the palette.
+describe("the neutral ladder, where it is composited", () => {
+  it("the edges stay clear of the fills they are drawn beside", () => {
+    // ONE HOME PER CLAIM. This block used to restate the fill ramp as well, and roborev 54832
+    // caught the consequence: the pin landed on this copy while the row that ADVERTISES the pin
+    // kept its `.not.toBe`, so the finding read as fixed with the misleading title still shipping.
+    // The fill claim lives at "the hover ramp stays a ramp" above; this row keeps only the edge
+    // half, which is the separate-by-line-weight thesis.
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      for (const fill of CHROME_FILLS) {
+        expect(
+          contrast(hex.hairline, hex[fill]),
+          `${mode}: hairline is invisible against ${fill}`,
+        ).toBeGreaterThan(EDGE_MIN_CONTRAST);
+      }
     }
   });
 });

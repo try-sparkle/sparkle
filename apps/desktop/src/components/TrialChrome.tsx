@@ -13,6 +13,7 @@ import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { useTrialStore, trialPromptsLeft, trialExhausted, TRIAL_LIMIT } from "../stores/trialStore";
 import { copyToClipboard } from "../clipboard";
 import { WelcomeScreen } from "./WelcomeScreen";
+import { FONT_UI } from "../theme/scale";
 
 // Plain in-bar layout — deliberately NO background / border / fixed positioning. It reads as bar
 // text alongside the other TopBar controls. minWidth:0 + flexShrink lets it yield space rather
@@ -23,7 +24,7 @@ const indicator: CSSProperties = {
   alignItems: "center",
   fontSize: 12,
   color: C.cream,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   minWidth: 0,
   flexShrink: 1,
   overflow: "hidden",

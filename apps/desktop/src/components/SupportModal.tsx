@@ -9,7 +9,8 @@
 // done in Rust (supportApi.ts → support::* commands); this component is presentation + orchestration.
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { C, CHAT_USER_BUBBLE } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, ON_GOLD_FILL } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { Markdown } from "./Markdown";
 import { getIdentities } from "../services/accountStore";
@@ -240,7 +241,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                   alignSelf: "flex-end",
                   maxWidth: "85%",
                   background: CHAT_USER_BUBBLE,
-                  borderRadius: 6,
+                  borderRadius: RADIUS.input,
                   padding: "8px 12px",
                   fontSize: 13,
                   lineHeight: 1.5,
@@ -256,7 +257,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                   style={{
                     background: C.forest,
                     border: `1px solid ${C.hairline}`,
-                    borderRadius: 6,
+                    borderRadius: RADIUS.input,
                     padding: "8px 12px",
                   }}
                 >
@@ -320,7 +321,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               resize: "none",
               background: C.forest,
               border: `1px solid ${C.hairline}`,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "8px 10px",
               color: C.cream,
               fontSize: 13,
@@ -337,10 +338,10 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               display: "inline-flex",
               alignItems: "center",
               gap: 6,
-              background: C.accentInk,
-              color: C.deepForest,
+              background: C.goldFill,
+              color: ON_GOLD_FILL,
               border: "none",
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "0 14px",
               fontSize: 13,
               fontWeight: 600,
@@ -368,7 +369,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
                 marginBottom: 10,
                 background: C.forest,
                 border: `1px solid ${C.hairline}`,
-                borderRadius: 6,
+                borderRadius: RADIUS.input,
                 padding: "8px 10px",
                 color: C.cream,
                 fontSize: 13,
@@ -385,10 +386,10 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               alignItems: "center",
               justifyContent: "center",
               gap: 8,
-              background: emphasizeTicket ? C.accentInk : "transparent",
+              background: emphasizeTicket ? C.goldFill : "transparent",
               border: `1px solid ${C.accentInk}`,
-              color: emphasizeTicket ? C.deepForest : C.accentInk,
-              borderRadius: 6,
+              color: emphasizeTicket ? ON_GOLD_FILL : C.accentInk,
+              borderRadius: RADIUS.input,
               padding: "9px 14px",
               fontSize: 13,
               fontWeight: 600,
@@ -433,7 +434,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
             gap: 8,
             background: C.forest,
             border: `1px solid ${C.hairline}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "8px 10px",
             marginBottom: 14,
           }}
@@ -464,7 +465,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: "transparent",
               border: `1px solid ${copied ? C.successInk : C.accentInk}`,
               color: copied ? C.successInk : C.accentInk,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "4px 10px",
               fontSize: 12,
               fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
@@ -486,10 +487,10 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               alignItems: "center",
               justifyContent: "center",
               gap: 8,
-              background: C.accentInk,
-              color: C.deepForest,
+              background: C.goldFill,
+              color: ON_GOLD_FILL,
               border: "none",
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "10px 14px",
               fontSize: 13,
               fontWeight: 600,
@@ -507,7 +508,7 @@ export function SupportModal({ onClose }: { onClose: () => void }) {
               background: "transparent",
               border: `1px solid ${C.hairline}`,
               color: C.muted,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "10px 16px",
               fontSize: 13,
               fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',

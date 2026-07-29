@@ -18,7 +18,7 @@ import {
 } from "react";
 // Brand constants (amber/accent are literal hex — canvas can't consume var()); the
 // themed forest/cream vars flip with light/dark for the DOM pieces below.
-import { C } from "../../theme/colors";
+import { C, SCRIM } from "../../theme/colors";
 import {
   applyTransition,
   computeTargets,
@@ -39,6 +39,7 @@ import {
 import { deriveFlags, type Anchor, type Mode, type OverlayState } from "./state";
 import { orbTextMaxWidth, orbTextPosition, presize } from "./presize";
 import { sparkleOverlayEnabled } from "./flag";
+import { FONT_MONO, LABEL, TYPE } from "../../theme/scale";
 
 // The prototype's gold/hot/cool sprite trio. The gold and hot core are now the prototype's own
 // `--gold` / `--gold-hot` (they were `lightenHex(C.amber, …)` re-derivations only because the
@@ -514,7 +515,10 @@ function SparkleOverlayInner({
           plus the "you ·" attribution prefix on the heard line, prototype-style. */}
       <style>{
         `@keyframes sparkle-caret-blink { 50% { opacity: 0; } }` +
-        `[data-sparkle-heard]::before { content: "you · "; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; opacity: .75; }`
+        // The attribution prefix is a SECTION LABEL — mono, uppercase, tracked, at the micro step.
+        // It is injected as CSS rather than styled inline (it is a ::before), so the tokens are
+        // interpolated instead of spread. Retyping them as `10px` / `.14em` is how it drifted.
+        `[data-sparkle-heard]::before { content: "you · "; font-family: ${FONT_MONO}; font-size: ${TYPE.micro}px; letter-spacing: ${LABEL.letterSpacing}; text-transform: uppercase; opacity: .75; }`
       }</style>
 
       {/* Dim veil: the app recedes ONLY while Sparkle answers front-and-center. */}
@@ -527,7 +531,9 @@ function SparkleOverlayInner({
             inset: 0,
             zIndex: 39,
             pointerEvents: "none",
-            background: "rgba(0,0,0,.45)",
+            // The SAME scrim every dialog uses. It was a hard-coded black, i.e. dark mode's wash
+            // applied to both themes — see components/modalChrome.test.ts, which caught this one.
+            background: SCRIM,
             transition: "background .35s ease",
           }}
         />

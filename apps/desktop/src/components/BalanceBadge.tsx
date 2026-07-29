@@ -3,6 +3,7 @@ import { C } from "../theme/colors";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
 import { formatBalance } from "../services/creditPricing";
+import { FONT_UI } from "../theme/scale";
 
 // Shows the user's remaining AI-credit balance in the builder sidebar header — top-right of that
 // column (design spec §7.3). It no longer sits beside the Sparkle.ai wordmark: the wordmark moved
@@ -23,7 +24,7 @@ const badge: CSSProperties = {
   color: C.cream,
   fontSize: 12,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   whiteSpace: "nowrap",
 };
 

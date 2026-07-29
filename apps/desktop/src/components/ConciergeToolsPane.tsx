@@ -21,7 +21,8 @@ import {
   type ToolPolicyEvaluation,
 } from "../services/conciergeTools/policy";
 
-import { RADIUS, TYPE } from "../theme/scale";
+import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
+import { SECTION_LABEL, tag } from "./labelTreatment";
 // The ⋯ Settings → "Concierge tools" pane: every tool the concierge can invoke, grouped by domain,
 // each with an allow / ask first / never control.
 //
@@ -268,20 +269,13 @@ const row: CSSProperties = {
   borderBottom: `1px solid ${C.hairline}`,
 };
 
-const groupHeading: CSSProperties = {
-  margin: 0,
-  fontSize: 12,
-  fontWeight: FONT_WEIGHT.semibold,
-  color: C.muted,
-  textTransform: "uppercase",
-  letterSpacing: 0.6,
-};
+const groupHeading: CSSProperties = { ...SECTION_LABEL, margin: 0 };
 
 const toolName: CSSProperties = {
   color: C.cream,
   fontWeight: FONT_WEIGHT.semibold,
   fontSize: 13,
-  fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+  fontFamily: FONT_MONO,
 };
 
 // An inset well inside the SettingsDialog shell — same treatment (and same reasoning about which
@@ -340,7 +334,7 @@ const turnOnBtn: CSSProperties = {
   padding: "4px 12px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
@@ -349,15 +343,8 @@ function pill(color: string): CSSProperties {
   return {
     display: "inline-flex",
     alignItems: "center",
+    ...tag(color),
     gap: 3,
-    fontSize: 10,
-    color,
-    border: `1px solid ${color}`,
-    borderRadius: 6,
-    padding: "1px 5px",
-    textTransform: "uppercase",
-    letterSpacing: 0.5,
-    whiteSpace: "nowrap",
   };
 }
 
@@ -378,7 +365,7 @@ function btn(active: boolean): CSSProperties {
     borderRadius: RADIUS.input,
     padding: "5px 9px",
     fontSize: 12,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     cursor: "pointer",
     whiteSpace: "nowrap",
   };

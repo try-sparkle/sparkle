@@ -9,8 +9,9 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C } from "../theme/colors";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
 
-const MONO = '"IBM Plex Mono", monospace';
+const MONO = FONT_MONO;
 
 // Hoisted so ReactMarkdown receives a STABLE plugin-array reference across renders (a fresh
 // `[remarkGfm]` literal each render defeats react-markdown's own memoization of the parse).
@@ -22,7 +23,7 @@ const SUBTLE = "rgba(52, 224, 240, 0.10)";
 const HAIRLINE = "rgba(138, 160, 196, 0.30)"; // muted, low-alpha — borders/rules
 
 const prose: CSSProperties = {
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontSize: 13,
   lineHeight: 1.55,
   color: C.cream,
@@ -32,7 +33,7 @@ const prose: CSSProperties = {
 };
 
 const heading = (size: number, top: number): CSSProperties => ({
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontWeight: 600,
   fontSize: size,
   lineHeight: 1.3,

@@ -17,6 +17,7 @@ import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
 import { shouldShowZeroCreditBanner } from "../services/zeroCreditBanner";
 import { RefillLink } from "./OutOfCreditsNotice";
+import { FONT_UI } from "../theme/scale";
 
 /** The exact sentence, verbatim in both variants. "$0" is a literal, not a formatted balance: the
  *  banner exists only in the balance ≤ 0 case, so the figure is always zero, and a negative ledger
@@ -47,8 +48,7 @@ const bar: CSSProperties = {
   padding: "6px 32px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-  letterSpacing: 0.2,
+  fontFamily: FONT_UI,
 };
 
 const inlineStrip: CSSProperties = {

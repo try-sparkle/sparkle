@@ -3,6 +3,7 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import { SettingCheckbox } from "./SettingCheckbox";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useDictationStore } from "../stores/dictationStore";
+import { FONT_UI } from "../theme/scale";
 import {
   setWakeWord,
   setStopWord,
@@ -26,7 +27,7 @@ const label: CSSProperties = {
   fontWeight: 600,
   color: C.cream,
   marginBottom: 4,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const caption: CSSProperties = {
@@ -34,7 +35,7 @@ const caption: CSSProperties = {
   color: C.muted,
   marginTop: 4,
   lineHeight: 1.35,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const input: CSSProperties = {
@@ -46,7 +47,7 @@ const input: CSSProperties = {
   padding: "6px 8px",
   color: C.cream,
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const seg: CSSProperties = {
@@ -58,7 +59,7 @@ const seg: CSSProperties = {
   borderRadius: 6,
   padding: "6px 0",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -197,7 +198,7 @@ export function VoiceControlsMenu() {
           padding: "6px 10px",
           color: C.muted,
           fontSize: 12,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           cursor: "pointer",
         }}
       >

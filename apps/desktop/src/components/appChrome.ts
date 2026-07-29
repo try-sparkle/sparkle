@@ -17,6 +17,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { C } from "../theme/colors";
 import { getAppVersion, getLogDir, revealLogs, log } from "../logger";
 import { checkForUpdates, type CheckOutcome } from "../services/updaterService";
+import { FONT_UI } from "../theme/scale";
 
 export const CHANGELOG_URL = "https://sparkle.ai/changelog";
 
@@ -126,7 +127,7 @@ export const menuItemStyle: CSSProperties = {
   borderRadius: 4,
   color: C.cream,
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };

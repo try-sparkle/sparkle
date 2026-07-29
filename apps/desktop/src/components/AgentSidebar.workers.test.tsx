@@ -159,9 +159,13 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
   it("shows each worker's progress bar (with stage label) in its detail block once the card opens", () => {
     const project = seedOrchestratorWithWorker({ ahead: 0, behind: 0 } as BranchStatus);
     render(<AgentSidebar project={project} />);
-    // Collapsed: the head shows only its rollup bar (no worded label) and no worker bar at all, so the
-    // "Building locally (Unsaved)…" stage detail is absent entirely.
-    expect(screen.queryAllByText(/unsaved/i)).toHaveLength(0);
+    // Collapsed: no worker BAR and no worded "Building locally (Unsaved)…" stage detail. Asserted
+    // as "no progress bar in the column" rather than "the string `unsaved` appears nowhere": the
+    // blueprint row now carries a `.stg` stage chip whose text is the SHORT stage name ("Unsaved"),
+    // so the old text sweep would fail on the element it is supposed to allow. The chip is a
+    // one-word tick; what this test is about is the worded bar, which is `role="img"`.
+    expect(document.querySelectorAll('[data-hint="agent"] [role="img"]')).toHaveLength(0);
+    expect(screen.getAllByTestId("row-stage-chip").length).toBeGreaterThan(0);
 
     openOrchestratorCard();
     // In the card the worker's bar renders EXPANDED in its detail block (below the worker name), so it

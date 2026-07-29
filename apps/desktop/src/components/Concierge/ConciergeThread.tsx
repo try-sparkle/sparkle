@@ -100,9 +100,15 @@ export function ConciergeThread({
   onNudgeAction,
   onRedirect,
   onDigestClick,
+  wired = false,
 }: {
   messages: ConciergeMessage[];
   typing?: boolean;
+  /** The column around this thread is PATCHED to a terminal and has taken its colour. The user's
+   *  bubble then paints a wash of the terminal's own ink instead of `--k-bubble`, which is a SHELL
+   *  surface and would read as a foreign blue rectangle sitting on the flood. Purely
+   *  presentational; the column decides (see ConciergeColumn's `data-wired`). */
+  wired?: boolean;
   onNudgeClick: (nudge: ConciergeNudge) => void;
   onNudgeAction: (nudge: ConciergeNudge, actionId: string) => void;
   /** Redirect the message with this id the other way (see RoutingReceipt). */
@@ -258,11 +264,23 @@ export function ConciergeThread({
             >
               <div
                 data-testid="you-bubble"
+                data-wired={wired ? "yes" : "no"}
                 style={{
                   display: "inline-block",
                   textAlign: "left",
                   fontSize: 13,
-                  background: CHAT_USER_BUBBLE,
+                  // WIRED: a wash of the terminal's OWN ink over the flood, not `--k-bubble`.
+                  //
+                  // The mock writes this as `rgba(255,255,255,.08)`, which is a dark-mode idiom —
+                  // on light's terminal plane (#d9e3f3) a white wash is very nearly invisible, so
+                  // copying the literal would give the bubble a fill in one theme and none in the
+                  // other. A wash of `termInk` is the themed equivalent: it moves AWAY from the
+                  // plane in both directions, so the bubble reads as a bubble at both ends, and it
+                  // stays inside the terminal's own register rather than reaching back into the
+                  // shell's for a colour the flood just replaced.
+                  background: wired
+                    ? `color-mix(in srgb, currentColor 10%, transparent)`
+                    : CHAT_USER_BUBBLE,
                   // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it
                   // says the same thing twice and, at a 25% wash of `muted`, said it faintly. The
                   // founder called this out directly: the bubble should read as one solid object,

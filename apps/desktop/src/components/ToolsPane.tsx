@@ -27,6 +27,8 @@ import {
 } from "../services/configActions";
 import { BUILDER_INDEX_URL } from "../services/builderIndex";
 import { matchesSearch } from "../engine/settingsSearch";
+import { FONT_UI, PILL } from "../theme/scale";
+import { CHIP, SECTION_LABEL } from "./labelTreatment";
 
 // The "Tools" pane of the ⋯ settings dialog. Two groups:
 //   • "Your tools"        — real on/off rows (config-backed). Off means the tool is used NOWHERE in
@@ -156,18 +158,15 @@ function BadgePill({ kind, children }: { kind: BadgeKind; children: string }) {
   return (
     <span
       style={{
+        ...CHIP,
         display: "inline-flex",
         alignItems: "center",
         padding: "1px 7px",
-        borderRadius: 999,
-        fontSize: 10,
-        fontWeight: FONT_WEIGHT.semibold,
-        letterSpacing: 0.3,
+        letterSpacing: "0.1em",
         textTransform: "uppercase",
         background: p.bg,
         color: p.fg,
         border: `1px solid ${p.border}`,
-        whiteSpace: "nowrap",
       }}
     >
       {children}
@@ -200,7 +199,9 @@ function Switch({
         flex: "0 0 auto",
         width: 34,
         height: 20,
-        borderRadius: 999,
+        // A switch TRACK is the capsule shape itself, the way its knob is a circle — `PILL` is what
+        // scale.ts keeps for exactly these, so this is naming the shape, not reaching past the scale.
+        borderRadius: PILL,
         border: "none",
         padding: 0,
         background: checked ? C.teal : C.muted,
@@ -585,14 +586,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
 
 // ── styles ──────────────────────────────────────────────────────────────────────────────────
 
-const groupLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 6,
-};
+const groupLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 6 };
 
 const rowStyle: CSSProperties = {
   display: "flex",
@@ -620,7 +614,7 @@ const learnMoreStyle: CSSProperties = {
   color: C.accentInk,
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const hintStyle: CSSProperties = {
@@ -638,7 +632,7 @@ const hintButtonStyle: CSSProperties = {
   border: "none",
   cursor: "pointer",
   textAlign: "left",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const emptyStyle: CSSProperties = {

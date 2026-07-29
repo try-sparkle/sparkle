@@ -1,3 +1,5 @@
+import { TERMINAL_PANE_Z } from "./layers";
+
 // The hide-style an inactive pane applies. Narrowed to concrete literal/number types (not the wide
 // CSSProperties unions) so callers — and the unit tests — can compare zIndex numerically.
 export interface PaneVisibilityStyle {
@@ -35,7 +37,10 @@ export function paneVisibilityStyle(visible: boolean): PaneVisibilityStyle {
     // Belt-and-suspenders so a stacked hidden pane can never intercept a click meant for the active
     // one (independent of `visibility`, in case a descendant ever forces itself visible).
     pointerEvents: visible ? "auto" : "none",
-    // Keep the active pane unambiguously on top of the inert hidden ones it overlaps.
-    zIndex: visible ? 1 : 0,
+    // Keep the active pane unambiguously on top of the inert hidden ones it overlaps — and, just
+    // as load-bearing, keep it BELOW the Build column. The selected agent row bleeds 9px out of
+    // that column into this pane; the pane is later in the DOM, so at an equal level it paints over
+    // the overhang and the bleed vanishes. See components/layers.ts.
+    zIndex: visible ? TERMINAL_PANE_Z : 0,
   };
 }

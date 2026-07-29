@@ -15,6 +15,7 @@ import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { openPaywall, PAYWALL_URL } from "../services/sparkleApi";
 import { openPaywallCheckout, lastCheckoutUrl } from "../services/creditsMenuApi";
 import { useAuthStore } from "../stores/authStore";
+import { FONT_UI } from "../theme/scale";
 
 const wrap: CSSProperties = {
   display: "flex",
@@ -27,7 +28,7 @@ const wrap: CSSProperties = {
   padding: "8px 12px",
   fontSize: 12,
   color: C.cream,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const message: CSSProperties = {
@@ -46,7 +47,7 @@ const unlockBtn: CSSProperties = {
   fontSize: 12,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   whiteSpace: "nowrap",
 };
 

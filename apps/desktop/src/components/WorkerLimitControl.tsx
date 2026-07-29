@@ -5,6 +5,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 // dragging (cheap, instant), and persists to the file once on release — a per-step file write would
 // be ~one atomic disk round-trip + reload per integer dragged. See setMaxConcurrentWorkers.
 import { setMaxConcurrentWorkers as persistMaxConcurrentWorkers } from "../services/configActions";
+import { FONT_UI } from "../theme/scale";
 
 // The slider's practical ceiling. The setting itself is unbounded (setMaxConcurrentWorkers only
 // floors at 1), so this is just how high the UI control reaches — far beyond any real fan-out, so
@@ -107,12 +108,12 @@ const readout: CSSProperties = {
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const hint: CSSProperties = {
   color: C.muted,
   fontSize: 12,
   lineHeight: 1.4,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

@@ -1,7 +1,9 @@
 import { useState, type MouseEvent } from "react";
+import { FiCheck, FiX } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FileIcon } from "./icons";
 import type { Attachment } from "./attachments";
+import { FONT_UI } from "../../theme/scale";
 
 const TILE_H = 46;
 
@@ -69,7 +71,7 @@ export function AttachmentTile({
             <FileIcon />
             <span
               style={{
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 12,
                 fontWeight: FONT_WEIGHT.semibold,
                 lineHeight: 1.2,
@@ -111,7 +113,7 @@ export function AttachmentTile({
             justifyContent: "center",
           }}
         >
-          {selected ? "✓" : ""}
+          {selected ? <FiCheck size={11} aria-hidden /> : null}
         </button>
       )}
 
@@ -134,7 +136,7 @@ export function AttachmentTile({
           padding: 0,
         }}
       >
-        ×
+        <FiX size={11} aria-hidden />
       </button>
     </div>
   );

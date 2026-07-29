@@ -1,6 +1,8 @@
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
+import { FONT_MONO, FONT_UI, RADIUS } from "../../theme/scale";
 import { ModalOverlay } from "./ModalOverlay";
 import type { TextBlock } from "./attachments";
+import { FiX } from "react-icons/fi";
 
 /** Modal for a collapsed text pill: shows the full pasted text read-only, with a button
  *  to expand it back into the composer as regular text (which removes the pill). */
@@ -29,7 +31,7 @@ export function TextPillModal({
         <span
           style={{
             color: C.cream,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontWeight: FONT_WEIGHT.semibold,
             fontSize: 13,
           }}
@@ -49,7 +51,7 @@ export function TextPillModal({
             padding: 4,
           }}
         >
-          ×
+          <FiX size={15} aria-hidden />
         </button>
       </div>
 
@@ -62,7 +64,7 @@ export function TextPillModal({
           minHeight: 0,
           color: C.cream,
           background: C.deepForest,
-          fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+          fontFamily: FONT_MONO,
           fontSize: 13,
           lineHeight: 1.5,
           whiteSpace: "pre-wrap",
@@ -88,9 +90,9 @@ export function TextPillModal({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "9px 16px",
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontWeight: FONT_WEIGHT.semibold,
             fontSize: 13,
             cursor: "pointer",

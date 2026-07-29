@@ -6,6 +6,7 @@ import type { CSSProperties } from "react";
 import { C, ON_BRAND_FILL, DANGER } from "../theme/colors";
 import { C as BRAND } from "@sparkle/ui";
 import { AiEnhancementsBadge, AI_ENHANCEMENTS_GRADIENT } from "./AiEnhancementsBadge";
+import { FONT_UI } from "../theme/scale";
 
 const screen: CSSProperties = {
   position: "fixed",
@@ -56,7 +57,7 @@ const primaryBtn: CSSProperties = {
   fontSize: 17,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   alignSelf: "stretch",
 };
 const ul: CSSProperties = {

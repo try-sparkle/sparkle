@@ -14,6 +14,7 @@ import { usageTelemetry } from "./services/usageTelemetry";
 import { flushCrashReports } from "./services/crashReporter";
 import { disableNativeTooltips } from "./disableNativeTooltips";
 import { resolveThemeFromStorage } from "./theme/theme";
+import { applyVisualFixtures } from "./dev/visualFixtures";
 import { useHistoryStore } from "./stores/historyStore";
 import { refreshModelCatalog } from "./services/models";
 import {
@@ -101,6 +102,14 @@ if (isAppWindow) {
     void useHistoryStore.getState().prune();
   }, HISTORY_PRUNE_INTERVAL_MS);
 }
+
+// Seed the visual-fidelity harness's deterministic fixtures (scripts/visual/, dev/visualFixtures).
+// Runs BEFORE createRoot so the first render already has the roster — a fixture that lands after
+// mount would make the capture race the seed. Doubly inert outside a dev serve: the branch is
+// `import.meta.env.DEV` (statically false in a `vite build`, so Rollup drops the call and, with it,
+// the side-effect-free module), and applyVisualFixtures itself re-checks the auth-bypass flag and
+// the `?visual=1` parameter before writing anything.
+if (import.meta.env.DEV) applyVisualFixtures(search);
 
 // NOTE: no React.StrictMode — its double-invoke of effects would spawn each agent's PTY
 // twice (one would leak). Each AgentPane owns a single live PTY.

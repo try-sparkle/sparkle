@@ -6,6 +6,7 @@
 // raise). If the agent has since been closed (deleted), the row reports "That agent has been
 // closed" instead of navigating.
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { FiArrowRight } from "react-icons/fi";
 import { C, DANGER, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -16,6 +17,8 @@ import type { PromptHistoryEntry } from "../types";
 import type { HistoryHit, RetentionTier } from "../services/history";
 import { purchaseRetention } from "../services/credits";
 import { openProjectTab } from "../services/openProjectTab";
+import { FONT_UI } from "../theme/scale";
+import { TAG } from "./labelTreatment";
 
 /** Retained shape of the injectable router (tests pass their own). "new" is the only mode the
  *  single-window shell ever asks for — it means "make that project the active tab". */
@@ -114,13 +117,8 @@ export function renderSnippet(snippet: string): ReactNode[] {
 }
 
 const badgeStyle = (kind: HistoryHit["kind"]): CSSProperties => ({
+  ...TAG,
   flex: "0 0 auto",
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.5,
-  fontWeight: FONT_WEIGHT.semibold,
-  padding: "1px 5px",
-  borderRadius: 4,
   // Badge always sits on a constant brand blue fill (accentMid or teal), so its text must stay
   // light in both themes — C.cream would flip to navy in light mode and go low-contrast.
   color: ON_BRAND_FILL,
@@ -262,7 +260,7 @@ export function HistorySearch({
           borderRadius: 6,
           padding: "7px 10px",
           fontSize: 13,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           outline: "none",
         }}
       />
@@ -309,7 +307,7 @@ export function HistorySearch({
                       cursor: disabled ? "default" : "pointer",
                       opacity: disabled ? 0.5 : 1,
                       padding: "8px 12px",
-                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                      fontFamily: FONT_UI,
                     }}
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
@@ -395,10 +393,13 @@ export function HistorySearch({
                   fontSize: 12,
                   fontWeight: FONT_WEIGHT.semibold,
                   padding: 0,
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
                 }}
               >
-                Extend history →
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  Extend history
+                  <FiArrowRight size={12} aria-hidden />
+                </span>
               </button>
             )}
           </div>

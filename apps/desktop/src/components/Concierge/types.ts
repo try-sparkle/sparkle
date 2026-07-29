@@ -217,7 +217,27 @@ export interface ConciergeViewModel {
   /** True while a native file drag is over the compose box — lights the drop affordance. The
    *  webview drag event is window-global, so only the integration layer can hit-test it. */
   dropActive?: boolean;
+  /** How many open pull requests are ready to merge, across every in-scope project — the header's
+   *  PR pill. Absent or zero renders NO pill: a "0 ready" chip is chrome asserting the absence of
+   *  a thing, and the header consolidated precisely to stop carrying those. */
+  prsReady?: number;
+  /** Whether the GLOBAL needs-you filter is currently on. It is state the shell owns (it focuses
+   *  every open column at once), reflected here so the header pill can paint it; the column never
+   *  filters anything itself. */
+  needsYouFilter?: boolean;
 }
+
+/** Which side of the shell holds the live cable, or `off` for none.
+ *
+ *  ONE VALUE, and every visual consequence follows from it — the flood, the dropped lift, the
+ *  composer going transparent, the user bubble's fill. MAPPING.md is explicit that this must NOT be
+ *  implemented as scattered component state, and this type is how that survives contact with a
+ *  React tree: the column takes the value and derives, rather than each piece deciding for itself.
+ *
+ *  The column does not choose it. `Workspace` owns the shell's layout and therefore owns which pair
+ *  is patched, so this arrives as a prop and defaults to `off` — which is what lets that file and
+ *  this one be worked on independently. */
+export type ConciergeWired = "off" | "left" | "right";
 
 /** Every gesture the column can emit. The integration layer supplies all of these. */
 export interface ConciergeController {
@@ -249,6 +269,16 @@ export interface ConciergeController {
   onProjectClick?(projectId: string): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
+  /** The header's 8-dot grip was used: move the concierge to the OTHER side of the shell. Optional,
+   *  and the grip renders only when it is supplied — a grip with nowhere to drag to is an
+   *  affordance that lies, the same rule ScopeVitals' segment buttons already follow. */
+  onMoveSide?(): void;
+  /** The header's red pill was pressed: toggle the GLOBAL "show only what needs you" filter. It
+   *  focuses every open column at once, which is why it is a shell gesture rather than something
+   *  this column can do; `ConciergeViewModel.needsYouFilter` reflects the result back. */
+  onNeedsYouFilterToggle?(): void;
+  /** The header's PR pill was pressed: open the pull-request sheet. */
+  onPrClick?(): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
   onNudgeAction(nudge: ConciergeNudge, actionId: string): void;
 }
@@ -307,6 +337,10 @@ export interface ConciergeColumnProps {
    *  Like the countdown it must carry NO live region of its own: `announcement` above is the
    *  column's only one, and a second `aria-live` node would double-announce. */
   approvalSlot?: ReactNode;
+  /** Which side of the shell holds the live cable (see {@link ConciergeWired}). Defaults to `off`,
+   *  which is the LIFTED state: a soft shadow, no colour change, reading as a layer above the
+   *  pairs. Patched, the column drops flush and takes the terminal's colour. */
+  wired?: ConciergeWired;
 }
 
 /** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists

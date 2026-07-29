@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
-import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import type { Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -78,7 +79,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.5)",
+        background: SCRIM,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -90,13 +91,13 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
         style={{
           width: 520,
           maxWidth: "90vw",
-          background: C.deepForest,
-          border: `1px solid ${C.hairline}`,
-          borderRadius: 6,
+          background: C.dialogSurface,
+          border: `1px solid ${C.dialogEdge}`,
+          borderRadius: RADIUS.modal,
           padding: 22,
           color: C.cream,
           fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-          boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+          boxShadow: MODAL_SHADOW,
         }}
       >
         <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
@@ -115,7 +116,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "9px 11px",
             fontSize: 13,
             outline: "none",
@@ -132,7 +133,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             style={{
               flex: 1,
               background: C.forest,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "9px 11px",
               fontSize: 13,
               color: C.cream,
@@ -149,7 +150,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: "transparent",
               color: C.accentInk,
               border: `1px solid ${C.muted}`,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "8px 12px",
               cursor: "pointer",
               fontSize: 13,
@@ -184,7 +185,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "9px 11px",
             fontSize: 13,
             outline: "none",
@@ -208,7 +209,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: "transparent",
               color: C.muted,
               border: `1px solid ${C.muted}`,
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "9px 16px",
               cursor: "pointer",
             }}
@@ -222,7 +223,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
               background: C.teal,
               color: ON_BRAND_FILL,
               border: "none",
-              borderRadius: 6,
+              borderRadius: RADIUS.input,
               padding: "9px 18px",
               fontWeight: FONT_WEIGHT.semibold,
               cursor: busy ? "wait" : !nameValid ? "not-allowed" : "pointer",

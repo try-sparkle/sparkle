@@ -1,4 +1,5 @@
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 
 /** Asks where to open a project: swap this window's project, or spin up a new window.
@@ -25,7 +26,7 @@ export function OpenTargetDialog({
             background: C.forest,
             color: C.cream,
             border: `1px solid ${C.muted}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "11px 14px",
             cursor: "pointer",
             fontSize: 13,
@@ -40,7 +41,7 @@ export function OpenTargetDialog({
             background: C.teal,
             color: ON_BRAND_FILL,
             border: "none",
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "11px 14px",
             cursor: "pointer",
             fontSize: 13,
@@ -58,7 +59,7 @@ export function OpenTargetDialog({
             background: "transparent",
             color: C.muted,
             border: `1px solid ${C.muted}`,
-            borderRadius: 6,
+            borderRadius: RADIUS.input,
             padding: "8px 16px",
             cursor: "pointer",
           }}

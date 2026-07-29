@@ -122,10 +122,18 @@ export function NudgeCard({
                 cursor: "pointer",
                 ...(act.kind === "primary"
                   ? {
-                      // Prototype `.nudge button.primary` — a gold tint under a gold-hot label.
-                      color: C.goldHotInk,
-                      background: `color-mix(in srgb, ${C.gold} 16%, transparent)`,
-                      border: `1px solid color-mix(in srgb, ${C.gold} 50%, transparent)`,
+                      // THE BLUEPRINT'S PRIMARY ACTION IS A SOLID FILL, NOT A TINT. This was a
+                      // 16% BRAND-GOLD wash under a `goldHotInk` label, which survived the repaint
+                      // only as a mismatch: the repaint moved every gold token to the Blueprint's
+                      // primary BLUE, so the label went blue while the plate it sits on stayed
+                      // gold. Blue ink on a gold wash measured 4.48 in dark — under the AA floor
+                      // this file enforces, and unreachable by nudging the percentage, because the
+                      // two colours no longer belong to the same family. The spec's primary button
+                      // is `--k-primary` with `--k-on-primary`; that pair is opaque and clears AA
+                      // by a wide margin in both themes.
+                      color: C.onGoldFill,
+                      background: C.goldFill,
+                      border: `1px solid ${C.goldFill}`,
                     }
                   : act.kind === "ghost"
                     ? {

@@ -246,11 +246,38 @@ describe("AgentSidebar — the status filter", () => {
     const project = seed([mkAgent("a1", "Alpha")]);
     setStatuses({ a1: "working" });
     render(<AgentSidebar project={project} />);
-    // Content-sized chips plus a nowrap Reset want ~168px against ~140px of content width at the
-    // sidebar's MIN_WIDTH. The list's `overflowY: auto` makes overflow-x `auto` too, so an
-    // unwrapped row scrolls sideways and `marginLeft: auto` collapses, hiding Reset exactly when
-    // it is needed. Wrapping is the only thing standing between this layout and that.
+    // STALE RATIONALE REPLACED. This used to reason about the SCROLL CONTAINER's `overflowY: auto`
+    // forcing overflow-x to `auto`; the bar does not live in that container any more — it moved
+    // into the `.bhd` column header. The need is the same and the geometry is tighter: the header
+    // hands the bar only what the mini Build/Plan segment leaves, so at the sidebar's MIN_WIDTH of
+    // 160 the bar must be able to wrap BOTH ways — the header wraps it onto a full-width second
+    // line (asserted below), and this inner wrap then keeps `Reset` on the row instead of letting
+    // a nowrap, unshrinkable control overflow a container that sets no overflow.
     expect(screen.getByTestId("status-filter-bar").style.flexWrap).toBe("wrap");
+  });
+
+  // THE OTHER HALF OF THAT WRAP, and the one the move introduced. The bar is the only item in the
+  // header with a real shrink share — the mini segment is `0 0 auto` (~80px) and the spacer's basis
+  // is 0 — so without a wrap on the BAND the bar absorbs the whole deficit: ~42px at MIN_WIDTH,
+  // narrower than a single chip, every chip on its own line, `Reset` overflowing. jsdom performs no
+  // layout, so this is asserted as the two properties that make the wrap possible rather than as a
+  // measured height.
+  it("lets the header drop the whole bar to a second line, rather than squeezing it", () => {
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStatuses({ a1: "working" });
+    render(<AgentSidebar project={project} />);
+
+    expect(screen.getByTestId("build-column-header").style.flexWrap).toBe("wrap");
+    // `auto` basis, so the bar's hypothetical size is its max-content width and the header's wrap
+    // fires at all — flex resolves wrapping BEFORE shrinking. A `0` basis would silently restore
+    // the squeeze with this file still green.
+    expect(screen.getByTestId("status-filter-bar").style.flexBasis).toBe("auto");
+    // GROW 0, and this row used to demand 1 — locking in a layout regression. Only the BASIS makes
+    // the wrap possible; grow decides what happens to the leftover space in the WIDE case, and
+    // grow:1 split it 50/50 with the header's spacer, pushing the chips roughly halfway back off
+    // the pane-side edge. The mock has the spacer take all of it (`.bhd .sp{flex:1}`) so the chips
+    // sit flush there (roborev 54779). Asserted rather than dropped so the wide case has a guard.
+    expect(screen.getByTestId("status-filter-bar").style.flexGrow).toBe("0");
   });
 
   it("does not render the filter at all when the project has no agents", () => {

@@ -56,6 +56,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { GOLD_SHEEN, LOGO_SRC, SparkleWordmark } from "./SparkleWordmark";
+import { wordmarkRamp } from "./Concierge/wordmarkRamp";
+import { BLUEPRINT } from "../theme/blueprintSpec";
 import { C } from "../theme/colors";
 import { prefixedStyle } from "./statusDotTestUtils";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
@@ -139,14 +141,23 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(prefixedStyle(logo, "WebkitMaskImage")).toBe(`url(${LOGO_SRC})`);
     expect(logo.style.maskSize).toBe("contain");
     expect(prefixedStyle(logo, "WebkitMaskSize")).toBe("contain");
-    // THE PAINT BEHIND THE MASK — a gold SHEEN in this header since 2026-07-27 ("make the logo
-    // sparklier"), where it used to be the flat `C.goldInk`. What that change must not do is
-    // reintroduce the asset's own cyan→blue gradient, which is the entire reason the mark is a mask
-    // over a themed fill rather than an <img>; so this asserts the composition, not just "some
-    // background is set".
-    expect(logo.style.background).toBe(GOLD_SHEEN);
-    expect(logo.style.background).toContain(C.goldInk);
-    expect(logo.style.background).toContain(C.goldHotInk);
+    // THE PAINT BEHIND THE MASK — the Blueprint WORDMARK RAMP, dark → light left to right, since
+    // the cockpit port. It was a gold SHEEN ("make the logo sparklier", 2026-07-27) and before that
+    // the flat `C.goldInk`; Blueprint retired gold entirely, so a gold glint here was the last gold
+    // left on screen. What every one of those changes must not do is reintroduce the asset's own
+    // cyan→blue gradient, which is the entire reason the mark is a mask over a themed fill rather
+    // than an <img>; so this asserts the composition, not just "some background is set".
+    //
+    // The ramp's two ends are a per-theme token PAIR rather than a fixed order of `ink` and
+    // `primary`, because which of those is the darker one flips between themes — see
+    // theme/blueprintSpec.ts and the assertions in theme/blueprintSpec.test.ts. jsdom resolves to
+    // dark here (systemPrefersDark defaults true with no matchMedia).
+    expect(logo.style.background).toBe(wordmarkRamp("dark"));
+    expect(logo.style.background).toContain(BLUEPRINT.dark.wmDark);
+    expect(logo.style.background).toContain(BLUEPRINT.dark.wmLit);
+    // GOLD_SHEEN is still exported and still correct for anything that wants it; it is simply no
+    // longer this header's paint. Asserted so a revert has to be deliberate.
+    expect(logo.style.background).not.toBe(GOLD_SHEEN);
     // The decorative hue, in either spelling the asset uses. A "sparklier" fill that reached for it
     // would undo the token decision by the back door.
     expect(logo.style.background.toLowerCase()).not.toContain("34e0f0");
@@ -235,22 +246,27 @@ describe("the Sparkle.ai logo lives in column one, the concierge", () => {
     expect(screen.getAllByRole("img", { name: "Sparkle" })).toHaveLength(1);
   });
 
-  it("shares the credit pill's row, hard left, with the pill hard right", () => {
+  // IT NO LONGER SHARES A ROW WITH THE CREDIT PILL. That pairing was the pre-cockpit header: mark
+  // hard left, pill hard right, `space-between` doing the pushing. The header has since
+  // CONSOLIDATED to one row carrying wordmark · grip · scope · needs-you · PR · avatar · kebab
+  // (the founder's explicit ask), and the credit badge is not on that list — it moved to the strip
+  // below, with the waveform. See ConciergeColumn.header.test.tsx for the full row's contract; what
+  // this file still owns is that the mark leads it and the badge did not get lost in the move.
+  it("leads the consolidated header row, with the credit pill no longer beside it", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
-    const row = screen.getByTestId("concierge-brand-row");
+    const head = screen.getByTestId("concierge-header");
     // By role rather than alt — §1 turned the mark into an alpha-masked box (`role="img"` +
     // `aria-label`) instead of a painted <img>, so the accessible name survives but the element
-    // is no longer an image. The placement contract this file guards is unchanged.
+    // is no longer an image.
     const logo = screen.getByRole("img", { name: "Sparkle" });
     const pill = screen.getByRole("button", { name: "Open credits" });
-    // ONE row holding both, not two stacked blocks.
-    expect(row.contains(logo)).toBe(true);
-    expect(row.contains(pill)).toBe(true);
-    // "To the left of", asserted as document order — the mark comes first.
+    expect(head.contains(logo)).toBe(true);
+    expect(head.contains(pill)).toBe(false);
+    // The mark is the row's FIRST element — nothing may be inserted to its left.
+    expect(head.firstElementChild?.contains(logo)).toBe(true);
+    // The badge still renders, still below the mark, and is still the shell's one money pill (the
+    // last clause is asserted in its own describe further down).
     expect(logo.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // …and pushed to OPPOSITE ENDS, not merely adjacent. Without this the pair renders as a
-    // left-clustered logo+pill, which is not the corner-to-corner layout that was asked for.
-    expect(row.style.justifyContent).toBe("space-between");
   });
 
   it("has no star field left anywhere in the column", () => {

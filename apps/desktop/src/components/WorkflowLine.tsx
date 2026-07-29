@@ -7,6 +7,7 @@
 import { memo } from "react";
 import { stageFraction, stageLineColor, stageMeta, LINE_FROM } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { RADIUS } from "../theme/scale";
 
 // Unfilled track: a faint muted rail so the remaining path reads as "to do" without looking broken.
 const TRACK_BG = "rgba(138,160,196,0.22)";
@@ -48,7 +49,7 @@ export const WorkflowLine = memo(function WorkflowLine({
           // progress bar vanishes behind the label (the bug where expanded workers showed no bar).
           minWidth: 48,
           height,
-          borderRadius: 999,
+          borderRadius: RADIUS.sm,
           background: TRACK_BG,
           overflow: "hidden",
         }}
@@ -60,7 +61,7 @@ export const WorkflowLine = memo(function WorkflowLine({
             top: 0,
             bottom: 0,
             width: `${frac * 100}%`,
-            borderRadius: 999,
+            borderRadius: RADIUS.sm,
             // The fill is the left slice of the logo gradient: cyan "S" → the blue it has reached.
             background: `linear-gradient(90deg, ${LINE_FROM}, ${end})`,
             transition: "width 240ms ease",

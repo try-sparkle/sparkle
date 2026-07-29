@@ -4,6 +4,7 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { useUiStore } from "../stores/uiStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
+import { FONT_UI } from "../theme/scale";
 
 // The Local / Cloud runtime toggle at agent creation (Service B, spec §"One toggle at agent
 // creation: Local (free) vs Cloud (credits)"). It renders NOTHING unless the server has advertised
@@ -97,5 +98,5 @@ const option: CSSProperties = {
   cursor: "pointer",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

@@ -5,6 +5,8 @@ import { CopyIcon, DownloadIcon } from "./icons";
 import { copyImageToClipboard, downloadAttachment } from "./attachmentsApi";
 import type { Attachment } from "./attachments";
 import { log } from "../../logger";
+import { FONT_UI } from "../../theme/scale";
+import { FiX } from "react-icons/fi";
 
 /** Expanded view of a single attachment. Images render full-size with copy + download
  *  actions in the top-right; non-image files show their name with download only. */
@@ -63,7 +65,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
           title={att.path}
           style={{
             color: C.cream,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontWeight: FONT_WEIGHT.semibold,
             fontSize: 13,
             overflow: "hidden",
@@ -93,7 +95,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
             <DownloadIcon />
           </button>
           <button onClick={onClose} title="Close" style={{ ...iconBtn, fontSize: 17 }}>
-            ×
+            <FiX size={15} aria-hidden />
           </button>
         </div>
       </div>
@@ -117,7 +119,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
             style={{ maxWidth: "100%", maxHeight: "70vh", objectFit: "contain", display: "block" }}
           />
         ) : (
-          <span style={{ color: C.muted, fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif', fontSize: 13 }}>
+          <span style={{ color: C.muted, fontFamily: FONT_UI, fontSize: 13 }}>
             No preview available — use Download to save this file.
           </span>
         )}
@@ -131,7 +133,7 @@ export function ImageLightbox({ att, onClose }: { att: Attachment; onClose: () =
             padding: "8px 12px",
             borderTop: `1px solid ${C.hairline}`,
             color: C.sienna,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             fontSize: 12,
           }}
         >

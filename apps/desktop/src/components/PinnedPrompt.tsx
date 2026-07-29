@@ -1,8 +1,11 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { copyToClipboard } from "../clipboard";
-import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, DANGER } from "../theme/colors";
+import { C, CHAT_USER_BUBBLE, DANGER, FONT_WEIGHT } from "../theme/colors";
 import type { PromptHistoryEntry } from "../types";
 import { formatAgo, oneLine } from "./promptHistory";
+import { TERM_HAIRLINE } from "./terminalChrome";
+import { FONT_UI } from "../theme/scale";
 
 /** Outcome of a jump attempt: the terminal scrolled, or the prompt's marker is gone (a prior
  *  session, or trimmed out of scrollback) so there's nothing to scroll to. */
@@ -229,7 +232,12 @@ export function PinnedPrompt({
           // chrome, so it uses the lighter barSurface (not the darker sidebar deepForest). The
           // history dropdown it opens (below) stays deepForest, like the app's other menus.
           background: C.barSurface,
-          borderBottom: `1px solid ${C.hairline}`,
+          // THE PANE HEADER'S BOTTOM EDGE IS WHERE A BAR MEETS THE TERMINAL PLANE, and the spec
+          // draws a different, darker rule there. `C.hairline` is the shell's seam: it is floored
+          // against every plane EXCEPT the terminal's — `theme/chromeContrast.test.ts` skips that
+          // pair on purpose and floors `termHairline` there instead — so this one line was the
+          // app's only completely unguarded edge. See components/terminalChrome.
+          borderBottom: `1px solid ${TERM_HAIRLINE}`,
           display: "flex",
           gap: 8,
           alignItems: "center",
@@ -252,7 +260,7 @@ export function PinnedPrompt({
                     aria-hidden="true"
                     style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, padding: "0 6px" }}
                   >
-                    ›
+                    <FiChevronRight size={12} aria-hidden />
                   </span>
                 )}
                 <button
@@ -272,7 +280,7 @@ export function PinnedPrompt({
                     padding: 0,
                     margin: 0,
                     color: C.cream,
-                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                    fontFamily: FONT_UI,
                     fontWeight: FONT_WEIGHT.regular,
                     fontSize: 13,
                     cursor: "pointer",
@@ -333,7 +341,7 @@ export function PinnedPrompt({
               transform: open ? "rotate(180deg)" : "none",
             }}
           >
-            ▾
+            <FiChevronDown size={11} aria-hidden />
           </button>
         )}
       </div>
@@ -541,7 +549,7 @@ function RowButton({ label, onClick }: { label: string; onClick: () => void }) {
         borderRadius: 6,
         padding: "3px 10px",
         fontSize: 12,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
         fontWeight: FONT_WEIGHT.medium,
         cursor: "pointer",
         whiteSpace: "nowrap",

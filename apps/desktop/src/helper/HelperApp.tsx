@@ -22,6 +22,7 @@ import {
 import { safeUnlisten } from "../services/safeUnlisten";
 import { emitFocusTier, quitApp } from "../services/attention";
 import { captureScreenRegion, showCaptureWindow } from "../screenshot";
+import { FONT_UI } from "../theme/scale";
 
 const ZERO: Vitals = { needsYou: 0, running: 0 };
 const FALLBACK_SCREEN: Rect = { x: 0, y: 0, width: 0, height: 0 };
@@ -624,7 +625,7 @@ export function HelperApp() {
 const menuItem = {
   all: "unset" as const,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontSize: 12,
   color: C.cream,
   padding: "5px 10px",

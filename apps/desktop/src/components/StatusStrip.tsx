@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { C } from "../theme/colors";
 import { SupportModal } from "./SupportModal";
+import { FONT_UI } from "../theme/scale";
 import {
   CHANGELOG_URL,
   checkLabel,
@@ -39,7 +40,7 @@ function linkStyle(hover: boolean) {
     margin: 0,
     color: hover ? C.cream : C.muted,
     fontSize: 12,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     textDecoration: "underline",
     textUnderlineOffset: 2,
     cursor: "pointer",
@@ -169,7 +170,7 @@ export function StatusStrip() {
               margin: 0,
               color: hover === "version" && version ? C.cream : C.muted,
               fontSize: 12,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               cursor: version ? "pointer" : "default",
             }}
           >

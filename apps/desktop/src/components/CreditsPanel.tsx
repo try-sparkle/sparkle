@@ -30,6 +30,8 @@ import { PromoRedeem } from "./PromoRedeem";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { SupportModal } from "./SupportModal";
+import { FONT_UI } from "../theme/scale";
+import { SECTION_LABEL } from "./labelTreatment";
 
 /** Same recovery as AuthGate's fallback: when the system browser can't launch, show the URL
  *  selectable so the user can open it manually — never a dead button. */
@@ -598,21 +600,14 @@ function Upsell({ unpaid, refresh }: { unpaid: boolean; refresh: () => Promise<v
 
 // ── styles (inline CSSProperties, matching SettingsDialog's pane idiom) ─────────────────────
 
-const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 8,
-};
+const subLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 8 };
 
 const balanceText: CSSProperties = {
   fontSize: 17,
   fontWeight: FONT_WEIGHT.semibold,
   color: C.cream,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const packBtn: CSSProperties = {
@@ -624,7 +619,7 @@ const packBtn: CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   fontVariantNumeric: "tabular-nums",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const quietHint: CSSProperties = {
@@ -642,7 +637,7 @@ const primaryBtn: CSSProperties = {
   fontSize: 13,
   fontWeight: 600,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const smallBtn: CSSProperties = {
@@ -653,7 +648,7 @@ const smallBtn: CSSProperties = {
   padding: "4px 10px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const selectStyle: CSSProperties = {
@@ -664,7 +659,7 @@ const selectStyle: CSSProperties = {
   borderRadius: 6,
   padding: "4px 8px",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const warnRow: CSSProperties = {
@@ -682,7 +677,7 @@ const historyRow: CSSProperties = {
   alignItems: "baseline",
   gap: 10,
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 // The project column. Fixed width (like the date) so the label column keeps taking the slack and

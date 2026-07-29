@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from "re
 import { FiRefreshCw, FiSmartphone } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { SECTION_LABEL, tag } from "./labelTreatment";
 import {
   listPairedDevices,
   mintPairCode,
@@ -352,14 +354,7 @@ function relativeTime(iso: string | null | undefined, now: number): string {
 
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ──────
 
-const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 8,
-};
+const subLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 8 };
 
 const panel: CSSProperties = {
   background: C.forest,
@@ -377,7 +372,7 @@ const codeStyle: CSSProperties = {
   fontWeight: FONT_WEIGHT.semibold,
   letterSpacing: 12,
   color: C.cream,
-  fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontFamily: FONT_MONO,
   fontVariantNumeric: "tabular-nums",
   alignSelf: "center",
   // Re-center the glyphs: letterSpacing adds a trailing gap after the last character.
@@ -409,7 +404,7 @@ const actionBtn: CSSProperties = {
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const iconBtn: CSSProperties = {
@@ -452,13 +447,7 @@ const deviceNameText: CSSProperties = {
 };
 
 const currentBadge: CSSProperties = {
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.5,
-  color: C.accentInk,
-  border: `1px solid ${C.accentInk}`,
-  borderRadius: 4,
-  padding: "1px 6px",
+  ...tag(C.accentInk),
   flex: "none",
 };
 
@@ -476,5 +465,5 @@ const smallBtn: CSSProperties = {
   padding: "5px 10px",
   cursor: "pointer",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

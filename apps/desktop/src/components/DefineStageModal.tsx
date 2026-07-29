@@ -14,6 +14,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { FiCheck } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, DANGER, ROW_ACTIVE_BUBBLE } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { ModalShell } from "./ModalShell";
 import { getConfig } from "../services/config";
@@ -605,7 +606,7 @@ const userLine: CSSProperties = {
   lineHeight: 1.5,
   color: C.cream,
   background: CHAT_USER_BUBBLE,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 11px",
   alignSelf: "flex-end",
   maxWidth: "85%",
@@ -613,7 +614,7 @@ const userLine: CSSProperties = {
 
 const previewCard: CSSProperties = {
   border: `1px solid ${C.hairline}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "10px 12px",
   background: C.forest,
 };
@@ -640,7 +641,7 @@ const critText: CSSProperties = { color: C.cream };
 const badge: CSSProperties = {
   fontSize: 10,
   border: "1px solid",
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "1px 6px",
   whiteSpace: "nowrap",
   fontFamily: '"IBM Plex Mono", monospace',
@@ -682,7 +683,7 @@ const errorBanner: CSSProperties = {
   // plane in both themes by theme/chromeContrast.test.ts. Nothing to keep in step.
   color: C.dangerInk,
   border: `1px solid ${DANGER}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 10px",
   marginBottom: 10,
 };
@@ -697,7 +698,7 @@ const chatInput: CSSProperties = {
   background: C.deepForest,
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 11px",
   fontSize: 13,
   fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
@@ -707,7 +708,7 @@ const primaryBtn: CSSProperties = {
   background: ROW_ACTIVE_BUBBLE,
   color: C.cream,
   border: "none",
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 16px",
   cursor: "pointer",
   fontSize: 13,
@@ -719,7 +720,7 @@ const ghostBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
   border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "8px 16px",
   cursor: "pointer",
   fontSize: 13,

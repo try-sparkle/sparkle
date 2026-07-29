@@ -13,6 +13,7 @@
 // and it has nothing to click anyway.
 import { FiPaperclip } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
+import { FONT_UI, RADIUS } from "../theme/scale";
 
 export function TerminalDropOverlay({ agentName }: { agentName: string }) {
   return (
@@ -38,11 +39,11 @@ export function TerminalDropOverlay({ agentName }: { agentName: string }) {
           alignItems: "center",
           gap: 8,
           padding: "9px 14px",
-          borderRadius: 999,
+          borderRadius: RADIUS.input,
           background: C.deepForest,
           border: `1px solid ${C.teal}`,
           color: C.cream,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           fontSize: 13,
           fontWeight: FONT_WEIGHT.semibold,
           boxShadow: "0 10px 28px rgba(0,0,0,0.45)",

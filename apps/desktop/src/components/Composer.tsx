@@ -11,7 +11,7 @@ import {
   type RefObject,
 } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { FiAlertTriangle, FiDownloadCloud, FiChevronDown } from "react-icons/fi";
+import { FiAlertTriangle, FiChevronDown, FiChevronUp, FiDownloadCloud } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { submitPrompt, PtyGoneError } from "../pty";
 import { SuggestionRow, SUGGESTION_PILL_ZONE } from "./composer/SuggestionRow";
@@ -101,6 +101,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { log } from "../logger";
 import { ComposerMic } from "./MicButton";
 import { ComposerOutOfCreditsNotice } from "./OutOfCreditsNotice";
+import { FONT_UI, RADIUS } from "../theme/scale";
 
 const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140);
 
@@ -1377,7 +1378,7 @@ export function Composer({
                 padding: "4px 10px",
                 fontSize: 12,
                 color: C.muted,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
               }}
             >
               <span>
@@ -1392,7 +1393,7 @@ export function Composer({
                   color: C.accentInk,
                   cursor: "pointer",
                   fontSize: 12,
-                  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                  fontFamily: FONT_UI,
                   textDecoration: "underline",
                   padding: 0,
                 }}
@@ -1427,7 +1428,7 @@ export function Composer({
           gap: 6,
           cursor: "ns-resize",
           color: C.muted,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           fontSize: 12,
           userSelect: "none",
         }}
@@ -1452,7 +1453,7 @@ export function Composer({
               boxShadow: "0 -1px 6px rgba(0,0,0,0.28)",
             }}
           >
-            <span style={{ fontSize: 10 }}>▴</span>
+            <FiChevronUp size={11} aria-hidden />
             <span>Use the modern prompt box with voice</span>
           </div>
         ) : hiddenBelow > 0 ? (
@@ -1473,11 +1474,11 @@ export function Composer({
               alignItems: "center",
               gap: 4,
               padding: "1px 10px",
-              borderRadius: 999,
+              borderRadius: RADIUS.input,
               border: "none",
               background: C.accent,
               color: ON_BRAND_FILL,
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
               fontWeight: FONT_WEIGHT.semibold,
               fontSize: 12,
               lineHeight: 1.4,
@@ -1530,7 +1531,7 @@ export function Composer({
                 // Amber + alert glyph, matching ComposerVoiceError — the sibling inline notice in
                 // this same box, so the two read as one treatment.
                 color: C.amber,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 12,
                 lineHeight: 1.3,
               }}
@@ -1561,7 +1562,7 @@ export function Composer({
                 border: dropActive ? "1.5px solid transparent" : "1px solid transparent",
                 borderRadius: 6,
                 padding: "8px 10px",
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 13,
                 lineHeight: 1.4,
                 whiteSpace: "pre-wrap",
@@ -1669,7 +1670,7 @@ export function Composer({
                 border: dropActive ? `1.5px dashed ${C.teal}` : `1px solid ${CHAT_USER_BUBBLE}`,
                 borderRadius: 6,
                 padding: "8px 10px",
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 13,
                 lineHeight: 1.4,
                 // Match the mirror's long-token wrapping so a pasted URL/path breaks at the
@@ -1717,7 +1718,7 @@ export function Composer({
                 // Click-through like the placeholder overlay it stands in for, so the textarea
                 // underneath still focuses on click; Dismiss re-enables pointer events on itself.
                 pointerEvents: "none",
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 13,
                 lineHeight: 1.4,
               }}
@@ -1750,7 +1751,7 @@ export function Composer({
                 right: suggestionButtons.length > 0 ? SUGGESTION_PILL_ZONE : 11,
                 pointerEvents: "none",
                 color: C.muted,
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
                 fontSize: 13,
                 lineHeight: 1.4,
               }}
@@ -1830,7 +1831,7 @@ export function Composer({
             borderRadius: 6,
             padding: "9px 18px",
             fontWeight: FONT_WEIGHT.semibold,
-            fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+            fontFamily: FONT_UI,
             cursor: disabled ? "not-allowed" : "pointer",
             height: 40,
             opacity: disabled ? 0.6 : 1,

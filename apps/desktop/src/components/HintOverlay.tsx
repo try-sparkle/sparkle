@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { C, FONT, ON_GOLD_FILL } from "../theme/colors";
+import { C, ON_GOLD_FILL } from "../theme/colors";
+import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
 import { focusQuietly } from "../services/programmaticFocus";
 import { useHintMode } from "../keyboardHints/useHintMode";
 import {
@@ -77,7 +78,7 @@ const CLIPS = /^(auto|scroll|hidden|clip)$/;
 
 // Badge box metrics. These are the single source of truth: the style block below reads them, and
 // BADGE_H is DERIVED from them, so restyling the chiclet can't silently un-center it.
-const BADGE_LINE_H = 12; // font line-height, px
+const BADGE_LINE_H = TYPE.small; // font line-height, px — the scale's `small` step
 const BADGE_PAD_Y = 2; // vertical padding, px
 const BADGE_PAD_X = 5; // horizontal padding, px
 const BADGE_BORDER = 1; // border width, px
@@ -551,10 +552,19 @@ export function HintOverlay() {
             // to be themed rather than a constant.
             background: C.goldFill,
             color: ON_GOLD_FILL,
-            font: `700 ${BADGE_LINE_H}px/1 ${FONT.mono}`,
+            // NOT the shared `FONT.mono`, which is still the old `"Source Code Pro"` webfont —
+            // packages/ui has not been migrated and two out-of-scope callers still read it.
+            font: `700 ${BADGE_LINE_H}px/1 ${FONT_MONO}`,
+            // 0.5px, NOT the label's 0.1em. This is not the label register: the chiclet is 700
+            // weight at `TYPE.small`, where the treatment is `WEIGHT.med` at `TYPE.micro`, so
+            // inheriting the label tracking is not automatic. It is also not free — React appends
+            // `px` to a NUMBER, so `0.1em` here would be 1.2px at this size, a 2.4x increase on the
+            // densest element the app draws, and CSS emits tracking AFTER the last character, so a
+            // one-character badge would sit off-centre inside `BADGE_PAD_X`'s symmetric padding —
+            // breaking the invariant stated above (roborev 54788).
             letterSpacing: 0.5,
             padding: `${BADGE_PAD_Y}px ${BADGE_PAD_X}px`,
-            borderRadius: 4,
+            borderRadius: RADIUS.input,
             border: `${BADGE_BORDER}px solid ${ON_GOLD_FILL}`,
             boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
             textTransform: "uppercase",

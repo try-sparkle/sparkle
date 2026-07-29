@@ -4,6 +4,7 @@ import { FiActivity } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { SettingCheckbox } from "./SettingCheckbox";
 import { useSettingsStore } from "../stores/settingsStore";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
 import {
   attentionCoverage,
   namingCoverage,
@@ -29,7 +30,7 @@ const btn: CSSProperties = {
   padding: "6px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   whiteSpace: "nowrap",
 };
 
@@ -64,7 +65,7 @@ function SelfReportObservability() {
     fontSize: 12,
     lineHeight: 1.6,
     color: C.cream,
-    fontFamily: '"IBM Plex Mono", monospace',
+    fontFamily: FONT_MONO,
   };
   const label: CSSProperties = { color: C.muted };
 
@@ -230,7 +231,7 @@ export function AdvancedConfigMenu() {
           padding: 10,
           fontSize: 12,
           lineHeight: 1.5,
-          fontFamily: '"IBM Plex Mono", monospace',
+          fontFamily: FONT_MONO,
           whiteSpace: "pre",
           overflowWrap: "normal",
           overflowX: "auto",
@@ -238,7 +239,7 @@ export function AdvancedConfigMenu() {
       />
 
       {error && (
-        <div style={{ color: "#e88", fontSize: 12, marginTop: 6, fontFamily: '"IBM Plex Mono", monospace' }}>
+        <div style={{ color: "#e88", fontSize: 12, marginTop: 6, fontFamily: FONT_MONO }}>
           {error}
         </div>
       )}

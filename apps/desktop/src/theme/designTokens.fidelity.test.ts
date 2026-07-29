@@ -167,28 +167,41 @@ describe("the colour ramp is measured against the spec, token by token", () => {
   // means the ramp was re-derived away from the spec for the reason above. Any change to the actual
   // relationship — a match that drifts, a divergence that closes — must update this table, which is
   // the whole point: the drift becomes a reviewed line, not a silent release.
+  // THE LEDGER IS NOW EMPTY OF DIVERGENCES, AND THAT IS THE POINT OF THE PORT.
+  //
+  // Every one of these read "diverge" until the Blueprint spec was transcribed as data
+  // (theme/blueprintSpec.ts) and THEME_HEX re-pointed at it — 15 of the 18 rows. They diverged
+  // because the shipped palette had been DERIVED by a contrast solver rather than ported, which is
+  // why six releases could each be a faithful implementation of the guards and still not look like
+  // the design. All 18 are locked to the spec now.
+  //
+  // The type is unchanged and "diverge" is deliberately still expressible: this table is a ledger,
+  // not an assertion that divergence is forbidden. A future token may need to leave the spec for a
+  // measured reason — `agentIdle` and the dialogs' label ink both did, and both are recorded as
+  // failing measurements in their own files. When that happens the row moves back to "diverge" and
+  // becomes a reviewed line, which is what this file exists to force.
   const STATUS: Record<"light" | "dark", Record<string, "match" | "diverge">> = {
     light: {
-      "--k-term": "diverge",
-      "--k-bridge": "diverge",
-      "--k-bar": "diverge",
+      "--k-term": "match",
+      "--k-bridge": "match",
+      "--k-bar": "match",
       "--k-assist": "match",
-      "--k-primary": "diverge",
-      "--k-on-primary": "match",
-      "--k-ink": "diverge",
-      "--k-muted": "diverge",
-      "--k-bubble": "diverge",
-    },
-    dark: {
-      "--k-term": "diverge",
-      "--k-bridge": "diverge",
-      "--k-bar": "diverge",
-      "--k-assist": "diverge",
       "--k-primary": "match",
       "--k-on-primary": "match",
-      "--k-ink": "diverge",
-      "--k-muted": "diverge",
-      "--k-bubble": "diverge",
+      "--k-ink": "match",
+      "--k-muted": "match",
+      "--k-bubble": "match",
+    },
+    dark: {
+      "--k-term": "match",
+      "--k-bridge": "match",
+      "--k-bar": "match",
+      "--k-assist": "match",
+      "--k-primary": "match",
+      "--k-on-primary": "match",
+      "--k-ink": "match",
+      "--k-muted": "match",
+      "--k-bubble": "match",
     },
   };
 

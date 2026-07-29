@@ -43,53 +43,69 @@
    `:root` is the dark default; `:root[data-theme="light"]` overrides for light. Static CSS
    (not JS) so flipping <html data-theme> re-themes with no FOUC and no re-render. */
 :root {
-  --c-forest: #070b12;
-  --c-deep-forest: #172036;
-  --c-concierge-surface: #212f4e;
-  --c-concierge-muted: #93a1c4;
-  --c-bar-surface: #1c2944;
-  --c-hairline: #5d73aa;
-  --c-pill-fill: #46577f;
-  --c-cream: #dee8f7;
-  --c-muted: #93a1c4;
-  --c-chat-bubble: #3c4a6e;
-  --c-chat-bubble-active: #526695;
-  --c-accent-ink: #7fb2ff;
-  --c-agent-idle: #93a1c4;
-  --c-success-ink: #34c759;
-  --c-danger-ink: #f4968f;
-  --c-gold-ink: #7fb2ff;
-  --c-gold-hot-ink: #a9caff;
+  --c-input-surface: #0c1728;
+  --c-dialog-surface: #0d1b31;
+  --c-dialog-nav: #091426;
+  --c-dialog-edge: #2a4d7c;
+  --c-input-edge: #26456f;
+  --k-scrim: rgba(2, 8, 18, 0.6);
+  --k-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+  --c-term-hairline: #1a2f4d;
+  --c-forest: #030913;
+  --c-deep-forest: #091426;
+  --c-concierge-surface: #0d1b31;
+  --c-bar-surface: #101f39;
+  --c-concierge-muted: #8ba3c8;
+  --c-muted: #8ba3c8;
+  --c-agent-idle: #8ba3c8;
+  --c-cream: #dce8fc;
+  --c-hairline: #24406a;
+  --c-pill-fill: #21395c;
+  --c-chat-bubble: #14294a;
+  --c-chat-bubble-active: #172b4b;
+  --c-accent-ink: #5c96ff;
+  --c-gold-ink: #5c96ff;
+  --c-teal-ink: #5c96ff;
+  --c-gold-hot-ink: #5c96ff;
   --c-gold-fill: #5c96ff;
   --c-on-gold-fill: #04101f;
+  --c-success-ink: #34c759;
+  --c-danger-ink: #f4968f;
   --c-amber-ink: #ecb968;
   --c-mixed-ink: #ecb968;
-  --c-teal-ink: #7fb2ff;
   --c-violet-ink: #a185f5;
 }
 :root[data-theme="light"] {
-  --c-forest: #b6c5dc;
-  --c-deep-forest: #cbd7e8;
+  --c-input-surface: #ffffff;
+  --c-dialog-surface: #ffffff;
+  --c-dialog-nav: #f2f6fd;
+  --c-dialog-edge: #c3d1e6;
+  --c-input-edge: #c3d1e6;
+  --k-scrim: rgba(10, 27, 51, 0.28);
+  --k-shadow: 0 18px 44px rgba(10, 27, 51, 0.16);
+  --c-term-hairline: #c0cfe4;
+  --c-forest: #d9e3f3;
+  --c-deep-forest: #f2f6fd;
   --c-concierge-surface: #ffffff;
-  --c-concierge-muted: #3b4e74;
-  --c-bar-surface: #e4eaf4;
-  --c-hairline: #5b6ea1;
-  --c-pill-fill: #7c8ebc;
-  --c-cream: #060a14;
-  --c-muted: #3b4e74;
-  --c-chat-bubble: #8ca0c7;
-  --c-chat-bubble-active: #6a7cb0;
-  --c-accent-ink: #12459e;
-  --c-agent-idle: #3b4e74;
+  --c-bar-surface: #f7fafe;
+  --c-concierge-muted: #4f6284;
+  --c-muted: #4f6284;
+  --c-agent-idle: #4f6284;
+  --c-cream: #0a1b33;
+  --c-hairline: #c3d1e6;
+  --c-pill-fill: #cbd8ea;
+  --c-chat-bubble: #e8f0fd;
+  --c-chat-bubble-active: #e4ecfa;
+  --c-accent-ink: #1550cf;
+  --c-gold-ink: #1550cf;
+  --c-teal-ink: #1550cf;
+  --c-gold-hot-ink: #1550cf;
+  --c-gold-fill: #1550cf;
+  --c-on-gold-fill: #ffffff;
   --c-success-ink: #0d5326;
   --c-danger-ink: #8f1d16;
-  --c-gold-ink: #12459e;
-  --c-gold-hot-ink: #0b3378;
-  --c-gold-fill: #1a4fae;
-  --c-on-gold-fill: #ffffff;
   --c-amber-ink: #664200;
   --c-mixed-ink: #ab4e07;
-  --c-teal-ink: #12459e;
   --c-violet-ink: #5636b8;
 }
 
@@ -239,7 +255,10 @@ body {
 }
 .xterm-viewport::-webkit-scrollbar-thumb {
   background: var(--c-chat-bubble); /* token: CHAT_USER_BUBBLE */
-  border-radius: 5px;
+  /* 3px = RADIUS.sm. It was 5px, which on a 10px-wide track is a fully-round capsule — the one
+     shape the approved direction never draws (its only round corner in the whole page is `50%` on
+     a 7px status dot). A drawn thumb is the point: structure is drawn, not filled. */
+  border-radius: 3px;
 }
 
 /* Think composer: the textarea is transparent-text over a mention-highlight overlay. Hide its
@@ -251,4 +270,81 @@ body {
 .think-composer-input::-webkit-scrollbar {
   width: 0;
   height: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════════
+   THE COCKPIT — layout and the cable's visual consequences.
+
+   Every rule below is keyed off `data-pairs` / `data-wired` / `data-side` on the shell root and the
+   pairs. That is the point, and it is MAPPING.md's instruction verbatim: *"`data-wired` is the whole
+   connection feature. One value, and every visual consequence follows from CSS — the receding pair,
+   the row bleed, the flood, the trace. Do not implement it as scattered component state."* The React
+   side writes ONE enum onto ONE element; nothing here is toggled by a component.
+
+   Structure (PRD/sparkle/ui-directions/rev4.html):
+
+       TERM │ BUILD │ CONCIERGE │ BUILD │ TERM
+
+   Build is ALWAYS adjacent to the concierge; the terminals sit at the outer edges. A PAIR is build
+   plus its terminal and is never split — one project, which is why the project tabs belong to the
+   pair and never sit above the concierge.
+   ═══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* The pair's own tab strip. `flex: 0 0 auto` so the tabs keep their height and the columns take the
+   rest — a pair is a column stack, and the strip is its head. */
+.pairtabs {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+/* THE MIRROR — the active tab hugs the CENTRE on both sides, so the strip reads inward toward the
+   concierge rather than left-to-right on a side where "left" is the outer edge. Straight from the
+   mock's `.pair[data-side="left"] .pairtabs`, hung off the `role="tablist"` ProjectTabs renders.
+
+   ⚠️ THIS RULE IS INERT TODAY AND MUST NOT BE MADE REACHABLE ON ITS OWN. Nothing renders a left
+   pair yet (PAIR_COUNT is 1). Whoever lands the second pair has to fix `ProjectTabs.measure()` IN
+   THE SAME CHANGE: the drag-reorder resolver walks `projects` in RENDER order and compares `x`
+   coordinates, so reversing the flow makes visual order disagree with DOM order and a dragged tab
+   lands in the wrong slot. Reversing the strip and teaching the resolver about it are one job. */
+.ptabstrip[data-side="left"] > [role="tablist"] {
+  flex-direction: row-reverse;
+}
+
+/* NO VERTICAL DIVIDING LINE INSIDE A PAIR. The founder was explicit: build and terminal are one
+   thing, and the seam exists only at the CONCIERGE boundary.
+   TARGETED BY NAME, NOT BY POSITION. This used `.paircols > :first-child` on the stated invariant
+   that first-child is always the build column, since `Pair` takes [build, terminal] on both sides
+   and mirrors by reversing the flex FLOW rather than the DOM. That invariant is false in one real
+   configuration: `AgentSidebar` renders TWO siblings when its overlay mode is on, and the empty
+   spacer comes FIRST — so for any user carrying that persisted preference the seam was painted on
+   an aria-hidden spacer while the floating column got none (roborev 54699). Overlay is a saved
+   setting, not an edge case, so this shipped wrong for whoever had it on.
+   `[data-testid="agent-sidebar-column"]` names the element instead. A position selector that
+   depends on another component's internal child order is a coupling that cannot be seen from
+   either file. */
+.paircols > [data-testid="agent-sidebar-column"] {
+  border-inline: none;
+}
+.pair[data-side="right"] .paircols > [data-testid="agent-sidebar-column"] {
+  border-left: 1px solid var(--c-hairline);
+}
+.pair[data-side="left"] .paircols > [data-testid="agent-sidebar-column"] {
+  border-right: 1px solid var(--c-hairline);
+}
+
+/* WIRED: the seam between build and the concierge goes — one continuous circuit. Only on the pair
+   that actually holds the cable.
+
+   THIS IS ALSO HOW "ONE LIVE CIRCUIT" IS SAID. With pairs on both sides, patching left makes the
+   right pair recede — and receding is the ABSENCE of this treatment, not a treatment of its own.
+   The founder was explicit that the unwired side is NOT greyed out: it is still rendering and its
+   last-active row is still selected; it simply isn't plugged into you. So no `opacity` and no
+   `filter` may ever appear in a `[data-wired]` rule here. A desaturating filter over a live column
+   is the exact regression that was pulled out of the sidebar on 2026-07-27 (see Workspace.tsx's
+   `terminalCalm` note) — it makes a running agent look stopped. */
+.shell[data-wired="left"] .pair[data-side="left"] .paircols > :first-child {
+  border-right-color: transparent;
+}
+.shell[data-wired="right"] .pair[data-side="right"] .paircols > :first-child {
+  border-left-color: transparent;
 }

@@ -9,7 +9,8 @@
 // The API key travels one way. It lives in this component's state only until Confirm hands it to
 // Rust (keychain); `status.hasApiKey` is what comes back, never the key.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { C, FONT_WEIGHT } from "../theme/colors";
+import { C, ON_GOLD_FILL } from "../theme/colors";
+import { FONT_UI, LABEL, LINE_READ, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
 import { useSettingsStore } from "../stores/settingsStore";
 import { setToolEnabled } from "../services/configActions";
@@ -187,19 +188,19 @@ export function BuilderIndexConsentModal() {
 
   return (
     <ModalShell width={480} zIndex={300} onCancel={close}>
-      <h2 style={{ margin: "0 0 10px", fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
+      <h2 style={{ margin: "0 0 10px", fontSize: TYPE.title, fontWeight: WEIGHT.bold, letterSpacing: "-0.015em", color: C.cream }}>
         Publish your token totals to the Builder Index?
       </h2>
-      <p style={{ margin: "0 0 12px", fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
+      <p style={{ margin: "0 0 12px", fontSize: TYPE.body, color: C.muted, lineHeight: LINE_READ }}>
         The tokenmaxxing leaderboard is a public ranking of how much builders actually spend. Sparkle
         can report your daily totals every couple of hours.
       </p>
-      <ul style={{ margin: "0 0 6px", paddingLeft: 18, fontSize: 12, color: C.muted, lineHeight: 1.6 }}>
+      <ul style={{ margin: "0 0 6px", paddingLeft: 18, fontSize: TYPE.small, color: C.muted, lineHeight: LINE_READ }}>
         {SENDS.map((line) => (
           <li key={line}>{line}</li>
         ))}
       </ul>
-      <p style={{ margin: "0 0 16px", fontSize: 12, color: C.cream, lineHeight: 1.6 }}>{NEVER}</p>
+      <p style={{ margin: "0 0 16px", fontSize: TYPE.small, color: C.cream, lineHeight: LINE_READ }}>{NEVER}</p>
 
       <label style={labelStyle} htmlFor="bi-username">
         tokenmaxxing username
@@ -228,13 +229,13 @@ export function BuilderIndexConsentModal() {
         autoComplete="off"
         style={inputStyle}
       />
-      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+      <div style={{ fontSize: TYPE.small, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
         Stored in your system keychain, never in Sparkle&apos;s config or logs.
       </div>
 
-      {message && <div style={{ fontSize: 12, color: C.amber, marginBottom: 12 }}>{message}</div>}
+      {message && <div style={{ fontSize: TYPE.small, color: C.amberInk, marginBottom: 12 }}>{message}</div>}
       {!message && status?.lastStatus && (
-        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>{status.lastStatus}</div>
+        <div style={{ fontSize: TYPE.small, color: C.muted, marginBottom: 12 }}>{status.lastStatus}</div>
       )}
 
       <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
@@ -268,26 +269,42 @@ export function BuilderIndexConsentModal() {
 
 // ── styles ──────────────────────────────────────────────────────────────────────────────────
 
+// The LABEL treatment, from the spec — mono, uppercase, 10px, 0.1em. It was a 12px semibold SANS
+// label with 0.8px of tracking, i.e. the same idea approximated by eye.
 const labelStyle: React.CSSProperties = {
+  ...LABEL,
   display: "block",
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 0.8,
   color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
   marginBottom: 4,
 };
 
+// A FIELD, so it takes the FIELD TOKENS: `inputSurface` for the ground, `inputEdge` for the rule.
+//
+// THE REASON IS TOKEN ROLE, NOT APPEARANCE, and the first version of this comment got that wrong in
+// a way worth recording (roborev 54710). It claimed the previous `background: "transparent"` made the
+// input "read as a bordered region of the modal rather than as a well you type into" — implying the
+// new fill separates the field from the dialog. It does not, and cannot: `inputSurface` IS the dialog
+// surface in light (both #ffffff, 1.000:1) and a hair off it in dark (1.042:1), and in light
+// `inputEdge` is byte-identical to `hairline`. The field renders exactly as it did.
+//
+// That is the DESIGN, not a shortfall — `dialogContrast.test.ts` states and enforces it: the modal
+// plane separates by LINE, not by fill. A field here is meant to sit flush with the dialog and be
+// carried entirely by its rule. Anyone who believed the old comment would have gone looking for the
+// missing "well" and darkened `--k-input` to produce it, tripping a ceiling test whose message points
+// at the rail rather than at them.
+//
+// What the swap actually buys: the field now re-themes with `--k-input` / `--k-input-edge` instead of
+// with the shell's column seam, so retuning the seam no longer restyles every form control in the app.
 const inputStyle: React.CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
-  background: "transparent",
-  border: `1px solid ${C.hairline}`,
-  borderRadius: 6,
+  background: C.inputSurface,
+  border: `1px solid ${C.inputEdge}`,
+  borderRadius: RADIUS.input,
   padding: "8px 10px",
   color: C.cream,
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontFamily: FONT_UI,
   marginBottom: 12,
 };
 
@@ -295,10 +312,10 @@ const secondaryStyle: React.CSSProperties = {
   background: "transparent",
   border: `1px solid ${C.hairline}`,
   color: C.muted,
-  borderRadius: 6,
+  borderRadius: RADIUS.input,
   padding: "9px 16px",
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -307,14 +324,19 @@ const dangerStyle: React.CSSProperties = {
   marginRight: "auto",
 };
 
+// THE PRIMARY BUTTON IS A THEMED PAIR, and this one had been assembled from two halves that do not
+// belong together: an accent INK as the fill, with the BUILDER COLUMN's plane as the text on top of
+// it. `goldFill`/`ON_GOLD_FILL` are the opaque-accent pair the palette maintains precisely so that
+// picking one picks the other — see the note on `goldFill` in theme/colors.ts. Their contrast is
+// held in theme/dialogContrast.test.ts.
 const primaryStyle: React.CSSProperties = {
-  background: C.accentInk,
+  background: C.goldFill,
   border: "none",
-  color: C.deepForest,
-  borderRadius: 6,
+  color: ON_GOLD_FILL,
+  borderRadius: RADIUS.input,
   padding: "9px 18px",
-  fontSize: 13,
-  fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontWeight: WEIGHT.bold,
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };

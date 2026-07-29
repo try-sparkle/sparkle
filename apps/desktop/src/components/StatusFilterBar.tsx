@@ -1,9 +1,11 @@
 import { memo, useEffect, useLayoutEffect, useRef } from "react";
 import { IoFilter } from "react-icons/io5";
 import { C, FONT_WEIGHT } from "../theme/colors";
+import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
 import { STATUS_BANDS, type StatusBand } from "../engine/buildSections";
 import { bandCountLabel, bandColor } from "../engine/statusBandLabels";
 import { BandBadge } from "./BandBadge";
+import { FONT_UI } from "../theme/scale";
 
 /** The group's accessible name, and the handle `focusFirstStatusChip` finds it by. */
 const GROUP_LABEL = "Filter agents by status";
@@ -163,16 +165,33 @@ export const StatusFilterBar = memo(function StatusFilterBar({
         // pushes Reset, the one control this bar adds, off the edge exactly when a band is hidden
         // and the user needs it. Let the row drop Reset to a second line instead.
         flexWrap: "wrap",
-        gap: 4,
-        padding: "6px 2px 2px",
+        // `1 1 auto`, so the bar's hypothetical size is its max-content width and the HEADER's own
+        // wrap can push it to a full-width second line, rather than the flex algorithm squeezing it
+        // into whatever the mini segment left over. Flex wrapping is resolved before shrinking, so
+        // an `auto` basis is what makes that decision happen at all.
+        // GROW 0. Only the `auto` BASIS is load-bearing here — it is what lets the bar wrap to a
+        // full-width second line instead of being squeezed by the flex algorithm. Adding grow:1
+        // split the free space 50/50 with the header's spacer, pushing the chip cluster roughly
+        // halfway back off the pane-side edge; the mock has `.bhd .sp{flex:1}` absorb ALL of it so
+        // the chips sit flush at that end (roborev 54779).
+        flex: "0 1 auto",
+        gap: 3,
+        // NO PADDING OF ITS OWN. The bar lives inside the `.bhd` column header now (it used to be
+        // the first thing in the scrolling list), and that header owns the band's height and its
+        // insets. A second set of paddings here would push the chips off the header's centreline.
+        padding: 0,
+        // Grows the header's band when the chips wrap at narrow widths rather than spilling out of
+        // it — the header is `minHeight`, not `height`, for exactly this.
+        minWidth: 0,
       }}
     >
       {/* Names what the row of dots IS. Without it three bare dots above the ladder read as status
-          indicators (something the sidebar has plenty of) rather than as controls. */}
+          indicators (something the sidebar has plenty of) rather than as controls.
+          `.fchips .fico` in the mock: 12px, stroked, `--k-faint`. */}
       <IoFilter
         aria-hidden
-        size={13}
-        style={{ flex: "0 0 auto", color: C.muted, marginRight: 1 }}
+        size={12}
+        style={{ flex: "0 0 auto", color: C.agentIdle, marginRight: 1 }}
       />
       {STATUS_BANDS.map((band) => {
         const on = visible[band.id];
@@ -198,23 +217,41 @@ export const StatusFilterBar = memo(function StatusFilterBar({
               // a third of the sidebar is what forced the truncation this replaced.
               flex: "0 0 auto",
               justifyContent: "center",
-              padding: "3px 8px",
-              // Matches ShowHelperButton's 6 rather than a full 999 pill: at this size the capsule
-              // read as a tag, and the sidebar's other small buttons are all soft rectangles.
-              borderRadius: 6,
+              height: 18,
+              padding: "0 6px",
+              // ── SQUARED, NOT PILLED (`.chip{border-radius:var(--r-sm)}`) ──────────────────────
+              // `--r-sm` is the same 3px corner the stage chips and the group rules use, so the
+              // filter stops looking like a different product's control dropped into this column.
+              // It was 6; a 999px capsule — which this deliberately is not — reads as a consumer
+              // tag rather than as part of a drawn instrument.
+              borderRadius: RADIUS.sm,
               borderWidth: 1,
               borderStyle: "solid",
-              // An ON chip carries its band's color at low alpha; an OFF chip keeps its shape but
-              // drops to the neutral outline, so the row of chips never changes size on toggle.
-              // That outline is `hairline`, not a depth plane: an OFF chip whose border is the
-              // plane below the sidebar has no shape left to keep under the near-black palette.
+              // ON: the tier's own colour on the EDGE (and, via BandBadge's default ink, on the
+              // numeral) — the dot alone is too small to read as state. OFF: the neutral outline,
+              // so the row of chips never changes size on toggle. That outline is `hairline`, not a
+              // depth plane: an OFF chip whose border is the plane below the sidebar has no shape
+              // left to keep.
+              //
+              // NO FILL in either state. The ON chip used to carry `${dot}1f`, a 12% wash of the
+              // band colour; the mock draws `background:transparent` and lets the border and the
+              // numeral carry it. Dropping the wash also drops a composite the count's ink was
+              // measured without.
               borderColor: on ? dot : C.hairline,
-              background: on ? `${dot}1f` : "transparent",
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-              fontSize: 12,
+              background: "transparent",
+              // MONO AND TABULAR (`font:var(--t-micro)/1 var(--k-mono);font-variant-numeric:
+              // tabular-nums`). Both inherit down into BandBadge's count, which sets neither. The
+              // tabular part is not a nicety: these counts re-poll constantly, and a proportional
+              // digit change re-widths the chip and twitches the whole row every time.
+              fontFamily: FONT_MONO,
+              fontSize: TYPE.micro,
+              fontVariantNumeric: "tabular-nums",
               fontWeight: FONT_WEIGHT.semibold,
               cursor: "pointer",
-              // NO OPACITY on the OFF chip, for the same reason the Plan/Build strip lost its 0.9
+              // NO OPACITY on the OFF chip — and this is the ONE place this port deviates from the
+              // mock on purpose. rev4.html dims an off chip (`opacity:.55`) and an empty tier
+              // (`.38`); doing that here would knowingly re-open roborev 54038. Same reason the
+              // Plan/Build strip lost its 0.9
               // (roborev 54038): opacity composites the CONTENT over the plane, so it was quietly
               // multiplying against the count's ink — light `muted` went 3.86:1 → 2.24:1 on the
               // sidebar, dark 5.89 → 3.18. OFF-ness is already carried three other ways that cost
@@ -236,6 +273,11 @@ export const StatusFilterBar = memo(function StatusFilterBar({
               filled={on}
               silent
               ink={on ? undefined : C.muted}
+              // `.chip i{width:6px;height:6px}` and the chip's own `--t-micro`. The badge sets no
+              // fontFamily / fontVariantNumeric, so the mono + tabular treatment on the button
+              // above inherits straight into the count.
+              dotSize={6}
+              fontSize={TYPE.micro}
             />
           </button>
         );
@@ -270,7 +312,7 @@ export const StatusFilterBar = memo(function StatusFilterBar({
           background: "none",
           border: "none",
           padding: "0 2px",
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
           fontSize: 12,
           color: C.accent,
           cursor: "pointer",

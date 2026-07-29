@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { C, DANGER, FONT_WEIGHT } from "../theme/colors";
+import { RADIUS } from "../theme/scale";
 import { ModalShell } from "./ModalShell";
+import { FONT_UI } from "../theme/scale";
 
 /**
  * Shown when a user closes a Build agent that still has UNMERGED work at risk (see
@@ -37,12 +39,12 @@ export function CloseAgentPrompt({
         background: "transparent",
         color,
         border: `1px solid ${color}`,
-        borderRadius: 6,
+        borderRadius: RADIUS.input,
         padding: "9px 18px",
         cursor: "pointer",
         fontSize: 13,
         fontWeight: FONT_WEIGHT.semibold,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       {label}
@@ -60,7 +62,7 @@ export function CloseAgentPrompt({
         fontSize: 13,
         textDecoration: "underline",
         padding: 0,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
       }}
     >
       {label}

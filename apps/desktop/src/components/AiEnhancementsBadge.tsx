@@ -5,6 +5,7 @@
 import type { CSSProperties } from "react";
 import { C } from "../theme/colors";
 import { C as BRAND } from "@sparkle/ui";
+import { FONT_UI } from "../theme/scale";
 
 // Left→right logo fade: light teal (accent cyan) → primary brand blue. Exported so the
 // Welcome screen's paid-box stroke reuses the exact same gradient (no literal duplication).
@@ -18,7 +19,7 @@ const wrap: CSSProperties = {
   borderRadius: 4,
   border: "1.5px solid transparent",
   background: `linear-gradient(${C.forest}, ${C.forest}) padding-box, ${AI_ENHANCEMENTS_GRADIENT} border-box`,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   fontWeight: 700,
   fontSize: 17,
 };

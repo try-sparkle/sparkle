@@ -2,6 +2,7 @@ import { type CSSProperties, type ComponentType } from "react";
 import { TbDeviceDesktop, TbSunFilled, TbMoonFilled } from "react-icons/tb";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { useUiStore, type ThemePref } from "../stores/uiStore";
+import { FONT_UI } from "../theme/scale";
 
 // Segmented Theme control for the TopBar ⋯ menu: Auto | ☀ | ☾. The selected segment is
 // teal-filled; it reads/writes `themePref` from uiStore, which the root's useApplyTheme()
@@ -29,7 +30,7 @@ const seg: CSSProperties = {
   padding: "6px 0",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 export function ThemeToggle() {

@@ -36,6 +36,8 @@ import {
   useCurrentWindowLabel,
 } from "../windowContext";
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
+import { useCableStore } from "../stores/cableStore";
+import { unbindsOnKey, unbindsOnPointerDown, type PairCount, type PairSide } from "../engine/cable";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { resolveStage, rollupStages } from "../engine/workflowStage";
@@ -89,6 +91,91 @@ export const WINDOW_TITLE = "Sparkle";
  * loading never flashes a blank/white frame under the (eager) shell. */
 function PaneFallback() {
   return <div style={{ position: "absolute", inset: 0, background: C.forest }} />;
+}
+
+/**
+ * HOW MANY PAIRS FLANK THE CONCIERGE — `data-pairs` on the shell root.
+ *
+ * ONE, today, and this constant is where that fact lives rather than a literal buried in the JSX.
+ * The cockpit's full form is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`; the single-pair form is the
+ * right half of it, which is also the layout the app already had. The structure below is written
+ * bilaterally (see `Pair`) so the second pair is a render, not a rewrite.
+ *
+ * WHY IT IS NOT 2 YET, stated plainly because it is the interesting constraint (MAPPING.md, Gaps
+ * §3): pane mounting is keyed per project/agent and **a Terminal unmount kills its PTY**, so a
+ * second pair must MOUNT its own panes, never move the existing ones across the tree. Every agent
+ * would also have to be owned by exactly one pair — mounting the same agent id in two stages puts
+ * two xterms on one PTY, which is the failure the tear-off ownership map exists to prevent. That is
+ * real work, and shipping it half-done costs users their running terminals, so this lands the
+ * cockpit's geometry and its state machine and stops there.
+ */
+const PAIR_COUNT: PairCount = 1;
+
+/**
+ * A PAIR — a build column and its terminal, which are ONE project and are never split.
+ *
+ * The pair owns the project tabs (`.pairtabs`): build and terminal are the same project, so the
+ * tabs belong to the pair and never sit above the concierge. That is the structural difference
+ * between this shell and the one it replaces, where a single full-width strip spanned everything.
+ *
+ * THE MIRROR. Children are always given in the order `[build, terminal]`; the LEFT pair reverses
+ * its column flow so the terminal ends up outboard and build stays adjacent to the concierge:
+ *
+ *     left pair  →  TERM │ BUILD │ concierge
+ *     right pair →  concierge │ BUILD │ TERM
+ *
+ * Reversing the FLOW rather than the children keeps the DOM order — and therefore the tab order and
+ * the reading order — identical on both sides.
+ *
+ * NO VERTICAL DIVIDING LINE INSIDE A PAIR. The founder was explicit: build and terminal are one
+ * thing. The only seam is at the concierge boundary, which is why `.build` carries a border on
+ * exactly one side (its inboard one) and the terminal carries none. See `index.css`.
+ */
+export function Pair({
+  side,
+  tabs,
+  children,
+  wired = false,
+}: {
+  side: PairSide;
+  /** Does this pair hold the live circuit? Marks it as part of the circuit for the unbind gesture. */
+  wired?: boolean;
+  /** The pair's project tab strip. Above the pair only — never above the concierge. */
+  tabs: React.ReactNode;
+  /** `[build, terminal]`, in that order, on both sides. */
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="pair"
+      data-pair
+      data-side={side}
+      data-wired-pair={String(wired)}
+      data-testid={`pair-${side}`}
+      style={{ display: "flex", flexDirection: "column", minWidth: 0, flex: 1, position: "relative" }}
+    >
+      <div className="pairtabs" data-side={side} data-testid={`pair-tabs-${side}`}>
+        {tabs}
+      </div>
+      {/* Position:relative so Plan mode can lay ONE wide card column over both columns —
+          covering, never unmounting: a Terminal unmount kills its PTY, so a mode flip must not
+          tear the panes down (and display:none would zero their measured size). */}
+      <div
+        className="paircols"
+        data-testid={`pair-cols-${side}`}
+        style={{
+          flex: 1,
+          display: "flex",
+          minWidth: 0,
+          minHeight: 0,
+          position: "relative",
+          flexDirection: side === "left" ? "row-reverse" : "row",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 /** The concierge column's persisted width, and the range a drag/arrow-key commit is clamped to.
@@ -307,6 +394,59 @@ export function Workspace() {
     });
     return () => void safeUnlisten(unlistenPromise);
   }, []);
+
+  // ── THE CABLE ───────────────────────────────────────────────────────────────────────────────
+  // One value, read once, projected onto the shell root as `data-wired`. Every visual consequence
+  // — the concierge taking the terminal's material, the seam vanishing at the wired boundary, the
+  // far pair receding — is a CSS rule in index.css keyed off that attribute. MAPPING.md is explicit
+  // that this must not become scattered component state, so this is the ONLY read of it in the
+  // shell, and the rules themselves live in engine/cable.ts.
+  const wired = useCableStore((s) => s.wired);
+  const overlay = useCableStore((s) => s.overlay);
+  const unbind = useCableStore((s) => s.unbind);
+
+  // UNBIND GESTURE 1 — ESCAPE returns the concierge to floating middle.
+  //
+  // On `window`, not the shell root, because the press that most needs to unbind is the one made
+  // while focus is inside a terminal or the compose box, and a root-level React handler only sees
+  // what bubbles through React's tree. NOT preventDefault'd and NOT stopped: Escape is a busy key,
+  // and unbinding is an additional meaning for it, not a claim on it. `unbindsOnKey` gates on
+  // `wired !== "off"`, so while nothing is patched this listener decides nothing at all.
+  //
+  // …AND ONLY WHEN NOTHING ELSE IS CLAIMING THE PRESS. Fifteen components treat Escape as "close
+  // me", and this listener is on `window`, so with a cable patched one Escape aimed at a modal
+  // also unbound — two state changes for one press (roborev 54697). `dismissibleOpen` asks the DOM
+  // whether such a surface is open rather than threading state from fifteen places; a dialog is
+  // identified the way it already identifies itself to assistive tech.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const dismissibleOpen =
+        document.querySelector('[role="dialog"], [role="menu"], [data-dismissible-open="true"]') !=
+        null;
+      if (unbindsOnKey(useCableStore.getState(), e.key, { dismissibleOpen })) unbind();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [unbind]);
+
+  // UNBIND GESTURE 2 — clicking anywhere that is NOT a build agent row does the same thing.
+  //
+  // The SAME state change as Escape (engine/cable's `unbindCable`), which is why both call one
+  // function rather than each setting the enum themselves.
+  //
+  // `pointerdown` in the CAPTURE phase, on `window`: the gesture has to survive handlers that stop
+  // propagation (menus, the sidebar's own row press, drag starts), and it must land before the
+  // click it precedes so the unbind and whatever the click does are not fighting over one frame.
+  // Capture also means a row press is judged on where it STARTED, not on where a re-render left the
+  // element — a row that unmounts under the pointer would otherwise read as "not a row" and unbind
+  // the very cable the click just patched.
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      if (unbindsOnPointerDown(useCableStore.getState(), e.target)) unbind();
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  }, [unbind]);
 
   // Cmd +/- to resize the terminal text, Cmd 0 to reset (matches browser/editor
   // conventions). The size factor is applied to the terminal font only — see Terminal.tsx —
@@ -631,6 +771,19 @@ export function Workspace() {
 
   return (
     <div
+      // THE SHELL ROOT — `.shell` in the mock, and the one element the cockpit's state hangs off.
+      // `data-pairs` and `data-wired` are the entire state surface (MAPPING.md's State table); the
+      // CSS in index.css reads them and everything visual follows. `data-over` is the mock's
+      // overlay state, carried here for the same reason: one attribute, no second copy.
+      //
+      // `data-testid` is also the visual-fidelity harness's selector hook (scripts/visual/). Two
+      // agents added it independently and for the same reason — nothing else in the tree identified
+      // this div — which is a fair sign it belongs here. Marker only: no styling, no behaviour.
+      className="shell"
+      data-testid="workspace-shell"
+      data-pairs={String(PAIR_COUNT)}
+      data-wired={wired}
+      data-over={overlay}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -643,10 +796,14 @@ export function Workspace() {
         fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
       }}
     >
-      {/* Spans the very top of the app, just below the window chrome, above the tabs.
+      {/* Spans the very top of the app, just below the window chrome, above everything else.
           Offline sits ABOVE out-of-credits on purpose: when both are up, connectivity is the more
           urgent (and the more likely) explanation for AI features misbehaving, and a top-up can't
-          be bought without a network anyway. */}
+          be bought without a network anyway.
+
+          These stay OUTSIDE the pairs. A pair is one project; an offline banner is a statement
+          about the machine, so it spans the window rather than living above one project's columns
+          (with two pairs it would otherwise have to be drawn twice, saying the same thing). */}
       <OfflineBanner />
       <ZeroCreditBanner />
       {/* Below both on purpose. Offline and a $0 balance are things the USER can act on, so they
@@ -654,11 +811,21 @@ export function Workspace() {
           alternative — what shipped before — was every AI feature going dark with no explanation
           anywhere for 12 hours. Renders only while an outage is actually recorded. */}
       <ProviderUnavailableBanner />
-      {/* The project tabs + the top-right kebab/avatar cluster — the app's only top chrome. */}
-      <ProjectTabsBar feed={feed} onOpenProjectSettings={setSettingsProject} />
+      {/* NO FULL-WIDTH PROJECT TAB STRIP. `main` still renders one here across the whole window.
+          The cockpit moves it: tabs belong to the PAIR, because a pair IS one project (build and
+          its terminal), and they must never sit above the concierge — which is cross-project by
+          definition and would be claimed by whichever tab happened to be active. Each `Pair`
+          renders its own strip; see the `tabs` prop below. Taking main's line back would put a
+          second, contradicting tab bar above the whole shell. */}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
-            experience now, not a flagged addition to the old UI. */}
+            experience now, not a flagged addition to the old UI.
+
+            `data-concierge-root` marks it as part of the LIVE CIRCUIT (engine/cable.ts). Without
+            it, the unbind gesture read every press inside Sparkle — the compose box, Send, the
+            thread — as "outside", so patching in and then typing to the agent you just patched
+            into dropped the cable on the very first click. */}
+        <div data-concierge-root style={{ display: "flex", minHeight: 0 }}>
         <ConciergeHost
           width={conciergeWidth}
           feed={feed}
@@ -680,10 +847,16 @@ export function Workspace() {
           label="Sparkle column"
           testId="concierge-pull-tab"
         />
-        {/* ② + ③. Position:relative so Plan mode can lay ONE wide card column over both of them —
-            covering, never unmounting: a Terminal unmount kills its PTY, so a mode flip must not
-            tear the panes down (and display:none would zero their measured size). */}
-        <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
+        </div>
+        {/* THE PAIR — build + its terminal, one project, never split, with its OWN project tabs.
+            The single-pair cockpit is the right half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`,
+            so this pair is `data-side="right"`: build adjacent to the concierge, terminal outboard.
+            Children are always [build, terminal]; `Pair` mirrors the flow for a left pair. */}
+        <Pair
+          side="right"
+          wired={wired === "right"}
+          tabs={<ProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
+        >
           {/* ② Builder agents (the sidebar owns the Plan/Build toggle as its header). */}
           <AgentSidebar project={sidebarProject} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
@@ -896,7 +1069,7 @@ export function Workspace() {
               </div>
             </div>
           )}
-        </div>
+        </Pair>
       </div>
 
       {/* The app's only bottom chrome: Changelog · Support · v{version}, hugging the bottom-right

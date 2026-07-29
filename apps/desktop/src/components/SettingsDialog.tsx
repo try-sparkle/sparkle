@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
 import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield } from "react-icons/fi";
-import { C, ROW_ACTIVE_BUBBLE } from "../theme/colors";
-import { FONT_WEIGHT } from "@sparkle/ui";
+import { C, MODAL_SHADOW, ROW_ACTIVE_BUBBLE, SCRIM } from "../theme/colors";
+import { FONT_MONO, FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import { openSignIn, signOut } from "../services/sparkleApi";
 import { authIdentity } from "../services/entitlement";
 import { fetchTrial } from "../services/trialApi";
@@ -181,7 +181,9 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
       <div data-testid="settings-backdrop" onClick={onClose} style={backdrop} />
       <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Settings" style={dialog}>
         <div style={titleBar}>
-          <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold }}>Settings</div>
+          <div style={{ fontSize: TYPE.title, fontWeight: WEIGHT.bold, letterSpacing: "-0.015em" }}>
+            Settings
+          </div>
           <button type="button" aria-label="Close settings" onClick={onClose} style={closeBtn}>
             <FiX size={18} />
           </button>
@@ -212,10 +214,17 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
                     type="button"
                     aria-current={selected ? "page" : undefined}
                     onClick={() => setActive(id)}
+                    // THE SELECTION CARRIES THREE SIGNALS, and the spec's `.dlg .nav .item.on` has
+                    // all three for a reason: `background: --k-sel`, `color: --k-ink`, AND
+                    // `font-weight: --w-med`. The fill alone cannot do this job in light mode — the
+                    // measurement is in theme/dialogContrast.test.ts — so shipping only the fill and
+                    // the ink, as the first cut did, left the weakest of the three doing the most
+                    // visible work. The INK step is what actually reads; the fill is a hint.
                     style={{
                       ...railItem,
                       background: selected ? ROW_ACTIVE_BUBBLE : "transparent",
                       color: selected ? C.cream : C.muted,
+                      fontWeight: selected ? WEIGHT.med : undefined,
                     }}
                   >
                     <Icon size={16} />
@@ -505,13 +514,24 @@ function AppearancePane() {
   );
 }
 
-// ── styles (inline CSSProperties, matching the file's existing convention) ──────────────────
+// ── styles ─────────────────────────────────────────────────────────────────────────────────────
+//
+// This is the app's `.dlg` — the one surface the approved design draws in full (the settings modal
+// in `PRD/sparkle/ui-directions/index.html`), so every value below has a line in that stylesheet to
+// answer to rather than a taste call to defend. `PRD/sparkle/ui-directions/MAPPING.md` is the index.
+//
+// THE ONE THAT MATTERED: the category rail was painted `C.forest` — the TERMINAL plane. Against the
+// dialog body that is a step well over the fill ceiling the direction sets for adjacent registers,
+// which is the "separated by fill" defect stated the other way round: not a panel darkened to
+// improve separation, but a rail that had borrowed the darkest plane in the app because no dialog
+// token existed to reach for. It takes `dialogNav` now — a hair off the body, divided by a rule.
+// theme/dialogContrast.test.ts pins both halves of that.
 
 const backdrop: CSSProperties = {
   position: "fixed",
   inset: 0,
   zIndex: 40,
-  background: "rgba(0,0,0,0.55)",
+  background: SCRIM,
 };
 
 const dialog: CSSProperties = {
@@ -525,10 +545,10 @@ const dialog: CSSProperties = {
   maxHeight: "86vh",
   display: "flex",
   flexDirection: "column",
-  background: C.deepForest,
-  border: `1px solid ${C.hairline}`,
-  borderRadius: 6,
-  boxShadow: "0 24px 64px rgba(0,0,0,0.5)",
+  background: C.dialogSurface,
+  border: `1px solid ${C.dialogEdge}`,
+  borderRadius: RADIUS.modal,
+  boxShadow: MODAL_SHADOW,
   zIndex: 41,
   overflow: "hidden",
   outline: "none", // focused on mount for a11y; no focus ring on the container itself
@@ -539,6 +559,8 @@ const titleBar: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   padding: "14px 18px",
+  // INTERIOR rule, so `hairline` and not `dialogEdge`: the modal's own outline is the harder of the
+  // two in dark, and a title bar divider that matched it would read as a second boundary.
   borderBottom: `1px solid ${C.hairline}`,
   flex: "none",
 };
@@ -551,7 +573,7 @@ const closeBtn: CSSProperties = {
   color: C.muted,
   cursor: "pointer",
   padding: 4,
-  borderRadius: 6,
+  borderRadius: RADIUS.sm,
 };
 
 const bodyRow: CSSProperties = {
@@ -564,8 +586,8 @@ const rail: CSSProperties = {
   width: 184,
   flex: "none",
   borderRight: `1px solid ${C.hairline}`,
-  background: C.forest,
-  padding: "12px 9px",
+  background: C.dialogNav,
+  padding: "12px 8px", // the spec's `.dlg .nav`
   display: "flex",
   flexDirection: "column",
   gap: 3,
@@ -590,22 +612,24 @@ const searchIcon: CSSProperties = {
 const searchInput: CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
-  background: C.deepForest,
+  // A field gets the INPUT surface and the INPUT edge — both spec tokens, and neither of them was
+  // wired until this pass. The note this replaces is worth keeping as history: the box had been a
+  // `deepForest` well in a `forest` rail outlined in `hairline`, and the pair it was sunk into fell
+  // to 1.11:1 in the repaint, leaving the field with no outer boundary at all. That was a symptom of
+  // borrowing three shell tokens for a dialog control; the fix is the tokens the design actually has
+  // for it, not a fourth borrowed one.
+  background: C.inputSurface,
   color: C.cream,
-  // The FILL stays `deepForest` (a well sunk into the `forest` rail); the BORDER is a hairline.
-  // Excluding this as "already zero-contrast" only held for the border against its OWN fill —
-  // the field sits in a rail painted `C.forest`, and that pair fell from 1.50:1 to 1.11:1 with
-  // the repaint, so the box had no outer boundary left either. See theme/colors `hairline`.
-  border: `1px solid ${C.hairline}`,
-  borderRadius: 6,
+  border: `1px solid ${C.inputEdge}`,
+  borderRadius: RADIUS.input,
   padding: "7px 10px 7px 28px",
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontFamily: FONT_UI,
   outline: "none",
 };
 
 const railEmpty: CSSProperties = {
-  fontSize: 12,
+  fontSize: TYPE.small,
   color: C.muted,
   padding: "8px 11px",
   lineHeight: 1.4,
@@ -618,53 +642,62 @@ const railItem: CSSProperties = {
   width: "100%",
   textAlign: "left",
   border: "none",
-  borderRadius: 6,
-  padding: "9px 11px",
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  borderRadius: RADIUS.sm,
+  padding: "6px 10px", // `--sp-navitem`
+  fontSize: TYPE.small,
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
 const pane: CSSProperties = {
   flex: 1,
   minWidth: 0,
-  padding: "18px 20px",
+  padding: "18px 22px", // the spec's `.dlg .pane`
   overflowY: "auto",
 };
 
 const paneHeading: CSSProperties = {
   margin: "0 0 3px",
-  fontSize: 17,
-  fontWeight: FONT_WEIGHT.semibold,
+  fontSize: TYPE.title,
+  fontWeight: WEIGHT.bold,
+  letterSpacing: "-0.015em", // `.dlg .pane h3`
   color: C.cream,
 };
 
 const paneBlurb: CSSProperties = {
   margin: "0 0 16px",
-  fontSize: 12,
+  fontSize: TYPE.small,
   color: C.muted,
   lineHeight: 1.5,
 };
 
+// THE LABEL TREATMENT — mono, uppercase, tracked, 10px. The single most characteristic mark of the
+// direction (`.grp` and `.dlg .nav .t` in the mock), and the app had none of it. This was a 12px
+// SEMIBOLD SANS label with 1px of tracking, which is a different typographic idea entirely: it reads
+// as a small heading rather than as an instrument's engraved legend.
+//
+// The colour is `muted`, not the spec's `--k-faint`. That is a deliberate, measured departure —
+// `faint` does not clear AA on either dialog surface, and this treatment is the SMALLEST text in the
+// product, where the bar is higher rather than lower. theme/dialogContrast.test.ts records it as a
+// failing measurement so it reads as a decision and not as a porting slip.
 const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
+  ...LABEL,
   color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
   marginBottom: 8,
 };
 
+// A control's edge is a RULE, so it takes a rule token. These were `1px solid ${C.muted}` — an ink
+// used as a border, which is why the buttons read heavier than anything around them.
 const stepBtn: CSSProperties = {
   background: "transparent",
   color: C.cream,
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  border: `1px solid ${C.hairline}`,
+  borderRadius: RADIUS.input,
   padding: "6px 0",
   minWidth: 34,
   cursor: "pointer",
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontFamily: FONT_UI,
   textAlign: "center",
 };
 
@@ -676,14 +709,14 @@ const accountStack: CSSProperties = {
 };
 
 const accountLine: CSSProperties = {
-  fontSize: 13,
+  fontSize: TYPE.body,
   color: C.muted,
   lineHeight: 1.5,
 };
 
 const installIdValue: CSSProperties = {
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  fontSize: 12,
+  fontFamily: FONT_MONO,
+  fontSize: TYPE.small,
   color: C.cream,
   letterSpacing: 0.5,
   userSelect: "text",
@@ -692,11 +725,11 @@ const installIdValue: CSSProperties = {
 const fullButton: CSSProperties = {
   background: "transparent",
   color: C.cream,
-  border: `1px solid ${C.muted}`,
-  borderRadius: 6,
+  border: `1px solid ${C.hairline}`,
+  borderRadius: RADIUS.input,
   padding: "8px 14px",
   cursor: "pointer",
-  fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontSize: TYPE.body,
+  fontFamily: FONT_UI,
   textAlign: "left",
 };

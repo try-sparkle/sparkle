@@ -16,6 +16,7 @@ import { FiFile } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import { ImageLightbox } from "./ImageLightbox";
 import { isImagePath, type Attachment } from "./attachments";
+import { FONT_UI } from "../../theme/scale";
 
 export const MESSAGE_ATTACHMENTS_TESTID = "concierge-message-attachments";
 
@@ -95,7 +96,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
                 <FiFile size={13} color={C.conciergeMuted} aria-hidden style={{ flex: "0 0 auto" }} />
                 <span
                   style={{
-                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                    fontFamily: FONT_UI,
                     fontSize: 12,
                     fontWeight: FONT_WEIGHT.semibold,
                     lineHeight: 1.3,
@@ -110,7 +111,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
                 {ext && (
                   <span
                     style={{
-                      fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                      fontFamily: FONT_UI,
                       fontSize: 10,
                       lineHeight: 1.3,
                       color: C.conciergeMuted,

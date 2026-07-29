@@ -9,6 +9,8 @@ import { FiCheck, FiAlertTriangle } from "react-icons/fi";
 import { C, FONT_WEIGHT, ROW_ACTIVE_BUBBLE } from "../theme/colors";
 import type { BoardColumn } from "../services/beads";
 import type { StageKey } from "../services/stageDefs";
+import { FONT_UI, TYPE } from "../theme/scale";
+import { CHIP, COUNT, SECTION_LABEL } from "./labelTreatment";
 
 /** Only these two columns are definable; the map both gates the affordance and names the stage. */
 export function definableStageKey(columnKey: BoardColumn): StageKey | null {
@@ -134,11 +136,7 @@ const headerRow: CSSProperties = {
   alignItems: "flex-start",
   gap: 8,
   padding: "10px 12px",
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  fontWeight: FONT_WEIGHT.semibold,
-  color: C.muted,
+  ...SECTION_LABEL,
 };
 
 /** Title over count. `min-width: 0` so a long lane label truncates rather than pushing the chips. */
@@ -152,10 +150,11 @@ const titleStack: CSSProperties = {
 
 /** The count line: same muted ink, but out of the uppercase/tracked treatment the label carries —
  *  a number rendered with 1px letter-spacing reads as a code, not a quantity. */
+// The inheritance resets that used to live here moved into `COUNT` itself — they belong to the
+// treatment, not to one of its call sites (roborev 54739).
 const countLine: CSSProperties = {
-  fontSize: 12,
-  letterSpacing: 0,
-  textTransform: "none",
+  ...COUNT,
+  fontSize: TYPE.small,
   fontWeight: FONT_WEIGHT.regular,
   opacity: 0.7,
 };
@@ -174,16 +173,18 @@ const titleButton: CSSProperties = {
   textUnderlineOffset: 3,
 };
 
+// STATUS IS TEXT — this is a `<span>`, never a button. The spec's chip geometry (`.row .stg`):
+// hairline box at `--r-sm`, mono, micro. It keeps sentence casing because it carries a live phrase
+// ("2 delivered today") rather than a field name, so the label treatment's uppercase is wrong here.
 const statusChip: CSSProperties = {
+  ...CHIP,
   display: "inline-flex",
   alignItems: "center",
   gap: 4,
   marginLeft: "auto",
   border: "1px solid",
-  borderRadius: 6,
   padding: "1px 6px",
-  fontSize: 10,
-  letterSpacing: 0.3,
+  letterSpacing: 0,
   textTransform: "none",
   maxWidth: 160,
 };
@@ -213,7 +214,7 @@ const ctaButton: CSSProperties = {
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
   cursor: "pointer",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const ctaHint: CSSProperties = { color: C.muted, opacity: 0.7, fontSize: 12, lineHeight: 1.4, maxWidth: 200 };

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { C } from "../../theme/colors";
+import { C, MODAL_SHADOW, SCRIM } from "../../theme/colors";
+import { RADIUS } from "../../theme/scale";
 
 /** Full-window dimmed backdrop hosting a centered panel. Click the backdrop or press
  *  Escape to dismiss; clicks inside the panel don't bubble out to close it.
@@ -72,7 +73,7 @@ export function ModalOverlay({
         position: "fixed",
         inset: 0,
         zIndex: 1000,
-        background: "rgba(0,0,0,0.55)",
+        background: SCRIM,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -87,10 +88,10 @@ export function ModalOverlay({
           maxHeight: "100%",
           display: "flex",
           flexDirection: "column",
-          background: C.forest,
-          border: `1px solid ${C.hairline}`,
-          borderRadius: 6,
-          boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+          background: C.dialogSurface,
+          border: `1px solid ${C.dialogEdge}`,
+          borderRadius: RADIUS.modal,
+          boxShadow: MODAL_SHADOW,
           overflow: "hidden",
         }}
       >

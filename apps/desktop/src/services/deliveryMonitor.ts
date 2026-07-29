@@ -106,7 +106,10 @@ export async function pollOnce(
   const detectable = anyTestable;
   const shippedCount = signals.filter((s) => s.inRelease).length;
   const status = !anyTestable
-    ? "⚠ can't detect — manual"
+    // NO LEADING GLYPH. `StageColumnHeader` already draws a real `FiAlertTriangle` beside this
+    // string when `detectable` is false, so the character was a SECOND warning icon rendered in
+    // whatever face the chip inherited — and this repo's rule is that an icon is a react-icon.
+    ? "can't detect — manual"
     : anyShipped
       ? `watching via git releases — ${shippedCount} shipped`
       : "watching via git releases";

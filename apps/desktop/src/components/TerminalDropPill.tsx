@@ -18,6 +18,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "re
 import { createPortal } from "react-dom";
 import { FiAlertTriangle, FiPaperclip, FiX } from "react-icons/fi";
 import { C } from "../theme/colors";
+import { FONT_UI } from "../theme/scale";
 
 /** Auto-dismiss the pill after this long if the user doesn't act. */
 const AUTO_DISMISS_MS = 8000;
@@ -111,7 +112,7 @@ export function TerminalDropPill({
         border: `1px solid ${C.hairline}`,
         borderRadius: 6,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
         color: C.cream,
         padding: "12px 12px 10px",
         animation: "sparkle-tooltip-in 90ms ease-out",

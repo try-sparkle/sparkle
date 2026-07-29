@@ -2,6 +2,7 @@ import { type CSSProperties } from "react";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore } from "../stores/settingsStore";
 import { setDeleteMergedBranch } from "../services/configActions";
+import { FONT_UI } from "../theme/scale";
 
 // Two-option control for the TopBar ⋯ menu: what happens to a build agent's branch when you close
 // it after its work has merged to main. "delete" = a SAFE delete (refuses if not actually merged);
@@ -30,7 +31,7 @@ const opt: CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   textAlign: "left",
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 export function BranchCleanupToggle() {

@@ -1,5 +1,15 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
+import { useResolvedTheme } from "../theme/theme";
+import {
+  TERM_HAIRLINE,
+  TERM_PLANE,
+  TERM_RADIUS,
+  TERM_TYPE,
+  TERM_UI,
+  termInk,
+  termMuted,
+} from "./terminalChrome";
 import type { AgentTab, Project } from "../types";
 import {
   prepareAgentWorkspace,
@@ -166,6 +176,13 @@ function AgentPaneInner({
   // unrelated store write is the render-thrash fingerprint — `grep 'perf.*render AgentPane'` and watch
   // the count. Called every render (cheap Map bump + debug line).
   perfRender("AgentPane", agent.id, { visible });
+
+  // The terminal plane's ink register. The plane itself is a CSS var and needs no React, but
+  // `termInk`/`termMuted` have no variable to ride (see terminalChrome), so a theme flip re-renders
+  // this pane. That is a RE-RENDER ONLY: the Terminal below keeps its element type and its
+  // account-derived key across the flip, so React reconciles rather than remounting — which matters
+  // because a Terminal unmount kills its PTY. AgentPane.blueprint.test.tsx pins that.
+  const resolvedTheme = useResolvedTheme();
 
   const [phase, setPhase] = useState<Phase>("preparing");
   const [errorMsg, setErrorMsg] = useState("");
@@ -882,7 +899,13 @@ function AgentPaneInner({
         // stays measured and never re-renders into a thin column on reveal. See paneVisibility.ts.
         ...paneVisibilityStyle(visible),
         flexDirection: "column",
-        background: C.forest,
+        // THE SPEC'S `term` PLANE — the pane's whole surface, and the colour the selected agent
+        // row is painted in so it reads as an opening into here.
+        background: TERM_PLANE,
+        // NO VERTICAL RULE ON THE BUILD SIDE, deliberately and permanently. The direction is
+        // explicit that build and terminal are ONE thing inside a pair, and the selected row bleeds
+        // 9px across that boundary. A border here — on either column — cancels the bleed and turns
+        // an opening into a dock. See terminalChrome and the sidebar's own `borderRight: none`.
       }}
     >
       <PinnedPrompt
@@ -900,7 +923,16 @@ function AgentPaneInner({
       {phase === "error" && (
         <Centered>
           <div style={{ color: C.sienna, marginBottom: 10 }}>Couldn't start this agent</div>
-          <div style={{ color: C.muted, fontSize: 13, maxWidth: 480, marginBottom: 16 }}>
+          {/* Read on the terminal plane, so it takes the terminal's secondary ink — `C.muted` is a
+              PLANE ink for the shell's surfaces, not for this one. */}
+          <div
+            style={{
+              color: termMuted(resolvedTheme),
+              fontSize: TERM_TYPE.body,
+              maxWidth: 480,
+              marginBottom: 16,
+            }}
+          >
             {errorMsg}
           </div>
           <PrimaryButton onClick={() => void prepare()}>Try again</PrimaryButton>
@@ -1094,6 +1126,7 @@ export function AccountBadge({
   onToggle: () => void;
   onPick: (a: Account) => void;
 }) {
+  const resolvedTheme = useResolvedTheme();
   const identityFor = (id: string) => identities.find((i) => i.id === id);
   const chosenIdentity = identityFor(chosen.id);
   // The trustworthy label is the REAL logged-in email; the nickname is only a secondary alias.
@@ -1122,21 +1155,26 @@ export function AccountBadge({
           alignItems: "center",
           gap: 6,
           background: C.deepForest,
-          border: `1px solid ${C.muted}`,
-          borderRadius: 6,
-          color: C.cream,
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-          fontSize: 12,
+          // THIS CHIP SITS ON THE TERMINAL PLANE, so its edge is the terminal's rule. It carried
+          // `C.muted` — an INK used as a border, and one whose only contrast floors are measured as
+          // text on the shell's planes. `termHairline` is the token with a guard on this surface.
+          border: `1px solid ${TERM_HAIRLINE}`,
+          borderRadius: TERM_RADIUS.modal,
+          color: termInk(resolvedTheme),
+          fontFamily: TERM_UI,
+          fontSize: TERM_TYPE.small,
           padding: "3px 8px",
           cursor: "pointer",
           boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
         }}
       >
-        <span style={{ width: 6, height: 6, borderRadius: 3, background: C.teal }} />
+        <span
+          style={{ width: 6, height: 6, borderRadius: TERM_RADIUS.sm, background: C.teal }}
+        />
         <span style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {chosenReal}
         </span>
-        <span style={{ color: C.muted }}>▾</span>
+        <span style={{ color: termMuted(resolvedTheme) }}>▾</span>
       </button>
       {open && (
         <>
@@ -1149,8 +1187,11 @@ export function AccountBadge({
               marginTop: 4,
               minWidth: 180,
               background: C.deepForest,
-              border: `1px solid ${C.hairline}`,
-              borderRadius: 6,
+              // The menu's outline is drawn against the terminal plane behind it, so it takes the
+              // terminal's rule. `C.hairline` is floored on every plane EXCEPT this one
+              // (theme/chromeContrast.test.ts skips the pair) — here it is an unguarded edge.
+              border: `1px solid ${TERM_HAIRLINE}`,
+              borderRadius: TERM_RADIUS.modal,
               boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
               padding: 6,
               zIndex: 21,
@@ -1181,10 +1222,13 @@ export function AccountBadge({
                     alignItems: "center",
                     gap: 8,
                     padding: "6px 8px",
-                    borderRadius: 6,
+                    borderRadius: TERM_RADIUS.input,
                     cursor: "pointer",
-                    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-                    fontSize: 12,
+                    fontFamily: TERM_UI,
+                    fontSize: TERM_TYPE.small,
+                    // `cream` / `muted` / `pillFill` INSIDE the menu are correct and stay: these
+                    // rows are read on the menu's own plane, not on the terminal's, and their
+                    // pairing is the measured one (see the note below + AgentPane.accountBadge.test).
                     color: C.cream,
                     // pillFill, not forest — see the same note in ModelPill: forest on a
                     // deepForest menu draws no selection under the near-black palette.
@@ -1195,7 +1239,7 @@ export function AccountBadge({
                     style={{
                       width: 6,
                       height: 6,
-                      borderRadius: 3,
+                      borderRadius: TERM_RADIUS.sm,
                       flexShrink: 0,
                       background: active ? C.teal : "transparent",
                       border: active ? "none" : `1px solid ${C.muted}`,
@@ -1206,15 +1250,15 @@ export function AccountBadge({
                       {primary}
                     </span>
                     {alias && (
-                      <span style={{ display: "block", color: secondaryInk, fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ display: "block", color: secondaryInk, fontSize: TERM_TYPE.micro, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {alias}
                       </span>
                     )}
                     {!identity?.email && (
-                      <span style={{ display: "block", color: secondaryInk, fontSize: 10 }}>not signed in</span>
+                      <span style={{ display: "block", color: secondaryInk, fontSize: TERM_TYPE.micro }}>not signed in</span>
                     )}
                   </span>
-                  {a.isDefault && <span style={{ color: secondaryInk, fontSize: 10, flexShrink: 0 }}>default</span>}
+                  {a.isDefault && <span style={{ color: secondaryInk, fontSize: TERM_TYPE.micro, flexShrink: 0 }}>default</span>}
                 </div>
               );
             })}
@@ -1226,6 +1270,7 @@ export function AccountBadge({
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
+  const resolvedTheme = useResolvedTheme();
   return (
     <div
       style={{
@@ -1235,7 +1280,8 @@ function Centered({ children }: { children: React.ReactNode }) {
         alignItems: "center",
         justifyContent: "center",
         textAlign: "center",
-        color: C.muted,
+        // Empty/preparing states are read straight on the terminal plane — its own quiet ink.
+        color: termMuted(resolvedTheme),
         padding: 24,
       }}
     >

@@ -1,5 +1,7 @@
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import type { TextBlock } from "./attachments";
+import { FONT_UI } from "../../theme/scale";
+import { FiFileText, FiX } from "react-icons/fi";
 
 /** Collapsed pasted-text block. Click the body to open the full-text modal; × removes it. */
 export function TextPill({
@@ -27,10 +29,10 @@ export function TextPill({
           background: C.deepForest,
           color: C.cream,
           cursor: "pointer",
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+          fontFamily: FONT_UI,
         }}
       >
-        <span style={{ fontSize: 17, lineHeight: 1 }}>📄</span>
+        <FiFileText size={17} aria-hidden style={{ flex: "none" }} />
         <span style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
           <span style={{ fontSize: 12, fontWeight: FONT_WEIGHT.semibold, lineHeight: 1.3 }}>
             Pasted text
@@ -59,7 +61,7 @@ export function TextPill({
           padding: 0,
         }}
       >
-        ×
+        <FiX size={12} aria-hidden />
       </button>
     </div>
   );

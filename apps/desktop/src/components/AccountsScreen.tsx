@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
+import { FONT_UI } from "../theme/scale";
+import { tag } from "./labelTreatment";
 import {
   listAccounts,
   getUsage,
@@ -38,7 +41,7 @@ export interface AccountsScreenProps {
   deps?: Partial<AccountsDeps>;
 }
 
-const fontStack = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+const fontStack = FONT_UI;
 
 const card: CSSProperties = {
   border: `1px solid ${C.muted}`,
@@ -67,15 +70,7 @@ const primaryBtn: CSSProperties = {
   color: ON_BRAND_FILL,
 };
 
-const tag: CSSProperties = {
-  fontSize: 10,
-  textTransform: "uppercase",
-  letterSpacing: 0.5,
-  border: `1px solid ${C.teal}`,
-  color: C.accentInk,
-  borderRadius: 4,
-  padding: "1px 5px",
-};
+const tagStyle: CSSProperties = { ...tag(C.accentInk), borderColor: C.teal };
 
 const inputStyle: CSSProperties = {
   background: "transparent",
@@ -387,7 +382,7 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
                   )}
                 </span>
               )}
-              {a.isDefault && <span style={tag}>default</span>}
+              {a.isDefault && <span style={tagStyle}>default</span>}
               {/* Log in / re-point this config dir at a different Claude account. Without this an
                   account could only ever be logged in at the moment it was CREATED, so an account
                   that was never signed into — or two that turned out to hold the SAME login — had no
@@ -479,7 +474,10 @@ export function AccountsScreen({ onLogin, deps }: AccountsScreenProps) {
             </div>
 
             {exhausted && (
-              <div style={{ marginTop: 6, fontSize: 12, color: C.amber }}>⚠ {exhausted}</div>
+              <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: C.amber }}>
+                <FiAlertTriangle size={12} aria-hidden />
+                {exhausted}
+              </div>
             )}
 
             <UsageBar label="5-hour window" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />

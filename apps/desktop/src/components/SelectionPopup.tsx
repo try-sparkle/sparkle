@@ -25,6 +25,8 @@ import {
   createTaskFromText,
 } from "./selectionActions";
 import { useProjectStore } from "../stores/projectStore";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { SECTION_LABEL } from "./labelTreatment";
 
 const WIDTH = 300;
 
@@ -160,7 +162,7 @@ export function SelectionPopup({
         border: `1px solid ${C.hairline}`,
         borderRadius: 6,
         boxShadow: "0 12px 34px rgba(0,0,0,0.5)",
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        fontFamily: FONT_UI,
         color: C.cream,
         padding: "10px 4px 8px",
         animation: "sparkle-tooltip-in 90ms ease-out",
@@ -171,7 +173,7 @@ export function SelectionPopup({
       </div>
       <div
         style={{
-          fontFamily: '"Source Code Pro", monospace',
+          fontFamily: FONT_MONO,
           fontSize: 12,
           color: C.muted,
           background: C.forest,
@@ -205,13 +207,7 @@ export function SelectionPopup({
 function Label({ children }: { children: React.ReactNode }) {
   return (
     <div
-      style={{
-        fontSize: 10,
-        letterSpacing: 0.8,
-        textTransform: "uppercase",
-        color: C.muted,
-        margin: "11px 12px 6px",
-      }}
+      style={{ ...SECTION_LABEL, margin: "11px 12px 6px" }}
     >
       {children}
     </div>

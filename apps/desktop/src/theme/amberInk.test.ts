@@ -15,13 +15,11 @@
 // chip 9.5px — both far under the 18.66px "large text" threshold that would allow 3:1.
 import { describe, expect, it } from "vitest";
 import { C as BRAND } from "@sparkle/ui";
-import {
-  CARD_WASH_PCT,
-  COMPOSE_SCRIM_HEX,
-  COMPOSE_SCRIM_PCT,
-  PRESENCE_SEGMENT_TINT_PCT,
-  THEME_HEX,
-} from "./colors";
+// COMPOSE_SCRIM_* are deliberately absent: the ComposeBox port landed, so the composer paints its
+// own `--k-input` plate and there is no scrim left to composite. See `composerPlate` below, and
+// note that pointing this at a token NOTHING paints is the mistake this file's header records —
+// which is why the import went away only once the component actually moved.
+import { CARD_WASH_PCT, PRESENCE_SEGMENT_TINT_PCT, THEME_HEX } from "./colors";
 
 const AA_NORMAL = 4.5;
 
@@ -56,15 +54,27 @@ function over(tint: string, pct: number, surface: string): string {
 
 type Theme = "dark" | "light";
 
-/** ComposeBox's plate: its scrim over the concierge column (ConciergeColumn paints
- *  `conciergeSurface`; the thread between them adds no background of its own). */
-const composerPlate = (t: Theme) =>
-  over(COMPOSE_SCRIM_HEX, COMPOSE_SCRIM_PCT, THEME_HEX[t].conciergeSurface);
+/** ComposeBox has TWO plates, and modelling only one is how this file's own headline mistake comes
+ *  back — measuring a control against a surface it may not be sitting on.
+ *
+ *  UNWIRED (`false`) the box is an inset `--k-input` box. It USED to be a 16% black scrim over the
+ *  concierge column, which in light mode dropped `conciergeMuted` to 4.23 — under AA — on the box
+ *  you type into. The approved direction does not scrim the composer at all: it gives the input its
+ *  own surface (`--k-input`, white in light) with an `--k-input-edge` rule around it.
+ *
+ *  WIRED (`true`) the concierge is patched to a terminal and has FLOODED to the terminal's plane,
+ *  so the composer goes transparent and every control in the row is read on `--k-term` instead —
+ *  a completely different surface, and in light a considerably darker one. That state is
+ *  reachable at the current operating point (`ConciergeColumn`'s `data-wired`), so both plates are
+ *  measured below rather than one being assumed. */
+const composerPlate = (t: Theme, wired = false) =>
+  wired ? THEME_HEX[t].forest : THEME_HEX[t].inputSurface;
 
 /** The Away segment when ACTIVE: the brand-amber segment tint on top of that plate. Every layer
  *  here comes from the constant the component paints with — including this one, which was the
  *  topmost and most influential wash and was still a literal in both places (roborev 53665-M). */
-const awayFill = (t: Theme) => over(BRAND.amber, PRESENCE_SEGMENT_TINT_PCT, composerPlate(t));
+const awayFill = (t: Theme, wired = false) =>
+  over(BRAND.amber, PRESENCE_SEGMENT_TINT_PCT, composerPlate(t, wired));
 
 /** A concierge card's plate: its accent wash over the same column. */
 const cardPlate = (t: Theme) => over(THEME_HEX[t].accentInk, CARD_WASH_PCT, THEME_HEX[t].conciergeSurface);
@@ -119,7 +129,7 @@ describe("the OTHER ink on the composer plate — muted text, no tint under it",
   // but the composer's scrim moves the surface out from under it in light mode.
   for (const theme of ["dark", "light"] as const) {
     it(`measures conciergeMuted on the composer plate in ${theme} mode`, () => {
-      const ratio = contrast(THEME_HEX[theme].conciergeMuted, composerPlate(theme));
+      const ratio = contrast(THEME_HEX[theme].conciergeMuted, composerPlate(theme, false));
       // THE RESIDUAL IS CLOSED. It was bounded from above precisely so this row would go red
       // "the day someone fixes it properly" — the Blueprint repaint is that day. Light's planes
       // were re-derived so the column is the LIGHTEST plane rather than a mid grey, and the ink
@@ -128,6 +138,66 @@ describe("the OTHER ink on the composer plate — muted text, no tint under it",
       expect(ratio).toBeGreaterThanOrEqual(AA_NORMAL);
     });
   }
+});
+
+// ── THE COMPOSER'S OTHER PLATE: THE FLOOD ───────────────────────────────────────────────────────
+// When the concierge is wired to a terminal it takes that terminal's colour, the composer goes
+// transparent, and every control in the row is suddenly read on `--k-term`. The column sets the
+// terminal INK register on itself, so anything inheriting follows — but the controls that name a
+// concierge-register ink explicitly do not, and those are the ones measured here:
+//
+//   • `conciergeMuted` — the attach buttons, the attachment chips' ✕, the inactive presence segment
+//   • `muted`          — the live interim dictation line
+//   • `cream`          — a staged attachment chip's filename
+//   • the ACTIVE Away segment's amber, composited over the flood instead of over `--k-input`
+//
+// None of these were measured when the wired state landed: `composerPlate` was unconditionally
+// `inputSurface`, so the suite modelled one plate while the component could paint another. That is
+// this file's own headline mistake, one state over, and the reason it is caught here rather than
+// left to a screenshot is that a flood is a whole-surface change — every ink in the row moves at
+// once, and none of it throws.
+describe("every ink in the composer row, measured on the FLOOD it is read on when wired", () => {
+  const INKS = ["conciergeMuted", "muted", "cream"] as const;
+
+  for (const theme of ["dark", "light"] as const) {
+    for (const ink of INKS) {
+      it(`${ink} clears AA on the wired composer in ${theme} mode`, () => {
+        expect(
+          contrast(THEME_HEX[theme][ink], composerPlate(theme, true)),
+          `${theme}: ${ink} is unreadable once the concierge floods to the terminal plane`,
+        ).toBeGreaterThanOrEqual(AA_NORMAL);
+      });
+    }
+
+    it(`the active Away segment clears AA on the wired composer in ${theme} mode`, () => {
+      expect(contrast(THEME_HEX[theme].amberInk, awayFill(theme, true))).toBeGreaterThanOrEqual(
+        AA_NORMAL,
+      );
+    });
+  }
+
+  // WHY THE ROWS ABOVE ARE NOT A DUPLICATE — and this corrects a claim I wrote from assumption a
+  // moment before running it. I asserted the flood was "a genuinely different surface at both
+  // ends"; in DARK it measures 1.111, which is no more of a step than any other pair in this
+  // design. The asymmetry is the same one blueprintSpec.test.ts already records for bridge→term:
+  // light steps a real amount onto the terminal, dark barely does.
+  //
+  // So the justification for the wired rows is LIGHT-ONLY, and it is emphatic there: the plate goes
+  // from #ffffff to a mid blue-grey, which is a surface every ink in the row has to be re-measured
+  // against. Dark's rows are near-neighbours of the unwired ones and are kept as regression guards
+  // rather than as an independent claim. Stated per-theme, because a blanket claim is exactly what
+  // went stale here.
+  it("moves the plate FAR in light, which is what the wired rows are for", () => {
+    expect(contrast(composerPlate("light", false), composerPlate("light", true))).toBeGreaterThan(
+      1.15,
+    );
+  });
+
+  it("…and barely moves it in dark, so those rows are a regression guard, not a new claim", () => {
+    expect(contrast(composerPlate("dark", false), composerPlate("dark", true))).toBeLessThan(
+      contrast(composerPlate("light", false), composerPlate("light", true)),
+    );
+  });
 });
 
 describe("the recap card's project chip", () => {

@@ -6,6 +6,7 @@
 // only care about the rail/pane shell.
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FONT_MONO, TYPE, WEIGHT } from "../theme/scale";
 
 // Controls inside the panes persist to config.toml via these actions; mock so no IPC fires
 // when a pane mounts or a control is touched. PARTIAL (spreads the real module) because this
@@ -120,15 +121,79 @@ describe("SettingsDialog", () => {
   });
 
   // The search box was excluded from the repaint's border sweep as "already zero-contrast", which
-  // was only true of its border against its OWN fill. The field is a `deepForest` well sunk into a
+  // was only true of its border against its OWN fill. The field was a `deepForest` well sunk into a
   // `forest` rail, and that pair fell from 1.50:1 to 1.11:1 — so post-repaint the box had no
-  // boundary at all, inner or outer. The FILL stays a well; the BORDER is a hairline.
-  it("the search field keeps a visible boundary: hairline border over the deep-forest well", () => {
+  // boundary at all, inner or outer.
+  //
+  // THE TOKENS CHANGED AND THE CLAIM DID NOT. Three shell tokens had been borrowed for a dialog
+  // control because the spec's own pair — `inputSurface` and `inputEdge` — was mirrored into
+  // index.css but never exposed on `C`, so no component could reach it. The invariant asserted here
+  // is the same one, and it is still the interesting one: the field has a fill, it has a border, and
+  // the border is NOT the fill. What is new is that both now come from the tokens the design has for
+  // a field, so retuning the shell's column seam can no longer restyle every input in the app.
+  it("the search field keeps a visible boundary: an input edge over the input surface", () => {
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
     const search = screen.getByLabelText("Search settings") as HTMLInputElement;
-    expect(search.style.background).toBe("var(--c-deep-forest)");
-    expect(search.style.border).toContain("var(--c-hairline)");
-    expect(search.style.border).not.toContain("var(--c-deep-forest)");
+    expect(search.style.background).toBe("var(--c-input-surface)");
+    expect(search.style.border).toContain("var(--c-input-edge)");
+    expect(search.style.border).not.toContain("var(--c-input-surface)");
+    // and it is no longer wearing the shell's seam
+    expect(search.style.border).not.toContain("var(--c-hairline)");
+  });
+
+  // ── THE RAIL WAS PAINTED IN THE TERMINAL PLANE ────────────────────────────────────────────────
+  // `C.forest` is the terminal's colour — the darkest surface in the app — and the settings rail had
+  // it because no dialog token was wired for a component to reach. Against the dialog body that is a
+  // step far over the fill ceiling the direction sets for adjacent registers, which is the
+  // "separated by fill" defect in reverse: not a panel someone darkened, but one that started that
+  // way. `dialogNav` is a hair off the body and the rule between them does the dividing.
+  it("the category rail takes the dialog's nav surface, not the terminal plane", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    const rail = screen.getByRole("navigation", { name: "Settings categories" });
+    expect(rail.style.background).toBe("var(--c-dialog-nav)");
+    expect(rail.style.background).not.toContain("forest");
+  });
+
+  it("the dialog floats on the modal plane with the spec's edge, scrim and shadow", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    const box = screen.getByRole("dialog", { name: "Settings" });
+    expect(box.style.background).toBe("var(--c-dialog-surface)");
+    expect(box.style.border).toBe("1px solid var(--c-dialog-edge)");
+    // The two constants every dialog used to hand-type, unthemed.
+    expect(box.style.boxShadow).toBe("var(--k-shadow)");
+    expect(screen.getByTestId("settings-backdrop").style.background).toBe("var(--k-scrim)");
+  });
+
+  // ── THE SELECTION CARRIES THREE SIGNALS, NOT TWO ──────────────────────────────────────────────
+  // The spec's `.dlg .nav .item.on` sets `background` + `color` + `font-weight`, and the first cut
+  // of this reskin shipped only the first two. That left the FILL doing the most visible work, and
+  // measured on this palette the fill is under the edge floor in light mode — the selected category
+  // was a weaker signal than a hairline (roborev 54686). The ink and the weight are what actually
+  // read; this pins all three so a future tidy-up cannot quietly drop one again.
+  it("the selected rail item is marked by fill, ink AND weight", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    const selected = screen.getByRole("button", { name: "AI features" });
+    const other = screen.getByRole("button", { name: "Appearance" });
+    expect(selected.style.background).toBe("var(--c-chat-bubble-active)");
+    expect(selected.style.color).toBe("var(--c-cream)");
+    expect(selected.style.fontWeight).toBe(String(WEIGHT.med));
+    // …and an unselected row carries none of the three, or the contrast is not a contrast.
+    expect(other.style.background).toBe("transparent");
+    expect(other.style.color).toBe("var(--c-muted)");
+    expect(other.style.fontWeight).toBe("");
+  });
+
+  // The LABEL treatment — mono, uppercase, tracked — is the direction's most characteristic mark and
+  // the app carried none of it. These were 12px semibold SANS headings, which is a different
+  // typographic idea: a small heading rather than an instrument's engraved legend.
+  it("a pane's sub-labels use the mono LABEL treatment, not a sans heading", () => {
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
+    const label = screen.getByText("Theme");
+    expect(label.style.fontFamily).toBe(FONT_MONO);
+    expect(label.style.textTransform).toBe("uppercase");
+    expect(label.style.letterSpacing).toBe("0.1em");
+    expect(label.style.fontSize).toBe(`${TYPE.micro}px`);
   });
 
   it("fires onClose from the close button", () => {

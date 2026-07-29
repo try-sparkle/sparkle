@@ -3,6 +3,7 @@
 // narrates (dictation) or types, picks a project, and routes it to Chat / Build — which
 // just broadcasts `capture://send` and hides; the owning project window does the work (Task 4).
 import { useEffect, useRef, useState } from "react";
+import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, THEME_HEX } from "../theme/colors";
 
 /** The primary button's hover: brand teal lifted toward white, DERIVED from the token rather
@@ -25,6 +26,7 @@ import { readLastFocusedProject } from "./lastFocusedProject";
 import { shouldConfirmDiscard } from "./discard";
 import { onCaptureShot, emitCaptureSend, hideCaptureWindow } from "./captureEvents";
 import type { CaptureSendMode, CaptureSendPayload, CaptureShot } from "./types";
+import { FONT_UI } from "../theme/scale";
 
 // The takeover is a dark surface by design (approved mockup) regardless of the app theme, so the
 // card uses the dark-theme literals rather than the var()-based tokens (main.tsx also pins
@@ -282,7 +284,7 @@ export function CaptureApp() {
             cursor: "pointer",
           }}
         >
-          ✕
+          <FiX size={15} aria-hidden />
         </button>
 
         <img
@@ -338,7 +340,7 @@ export function CaptureApp() {
               fontSize: 13,
               lineHeight: 1.5,
               outline: "none",
-              fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+              fontFamily: FONT_UI,
             }}
           />
           {audioActive && interim && (
@@ -349,7 +351,7 @@ export function CaptureApp() {
                 fontSize: 13,
                 lineHeight: 1.4,
                 padding: "0 2px",
-                fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+                fontFamily: FONT_UI,
               }}
             >
               {interim}
@@ -453,9 +455,16 @@ export function CaptureApp() {
                       fontSize: 13,
                       fontWeight: FONT_WEIGHT.semibold,
                       cursor: sendEnabled ? "pointer" : "default",
+                      // The caret used to be a character inside the label string; as a real icon it
+                      // is a second child, so the button has to lay them out.
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 4,
                     }}
                   >
-                    {isBuild ? `${label} ▾` : `${label} ❯`}
+                    {label}
+                    {isBuild ? <FiChevronDown size={13} aria-hidden /> : <FiChevronRight size={13} aria-hidden />}
                   </button>
                 );
               })}

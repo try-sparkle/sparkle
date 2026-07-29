@@ -1,5 +1,6 @@
 import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../theme/colors";
 import { useConnectionStore } from "../stores/connectionStore";
+import { FONT_UI } from "../theme/scale";
 
 // The shell's opaque-gold PAIR — the fill and the ink that sits on it, themed together. This was
 // a hardcoded #D4AF37 whose comment explained it needed "a true gold, not the theme's warmer
@@ -28,8 +29,7 @@ export function OfflineBanner() {
         padding: "6px 14px",
         fontSize: 13,
         fontWeight: FONT_WEIGHT.semibold,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-        letterSpacing: 0.2,
+        fontFamily: FONT_UI,
       }}
     >
       Your connection is offline.

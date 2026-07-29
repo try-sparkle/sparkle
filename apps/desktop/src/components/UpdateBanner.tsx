@@ -2,6 +2,7 @@ import { type CSSProperties } from "react";
 import { FiDownload, FiRefreshCw, FiX } from "react-icons/fi";
 import { C, ON_BRAND_FILL, FONT_WEIGHT } from "../theme/colors";
 import { useUpdaterStore, applyUpdateAndRestart } from "../services/updaterService";
+import { FONT_UI } from "../theme/scale";
 
 // Non-intrusive top-of-app banner for the auto-updater (see updaterService). Renders nothing
 // unless an update is pending and the user hasn't dismissed it:
@@ -25,7 +26,7 @@ const bar: CSSProperties = {
   borderBottom: `1px solid ${C.accent}`,
   color: C.cream,
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   boxShadow: "0 2px 8px rgba(0,0,0,0.25)",
 };
 
@@ -40,7 +41,7 @@ const primaryBtn: CSSProperties = {
   padding: "5px 12px",
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -54,7 +55,7 @@ const dismissBtn: CSSProperties = {
   borderRadius: 6,
   padding: "5px 10px",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 

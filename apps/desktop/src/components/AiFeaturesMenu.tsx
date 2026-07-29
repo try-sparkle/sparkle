@@ -12,6 +12,7 @@ import {
 // store optimistically; the resulting config-changed event re-hydrates the store.
 import { setAiFeature, setAllAiFeatures, setAutoApprovePreset } from "../services/configActions";
 import { autoApprovePresetOf } from "../services/autoApprovePreset";
+import { FONT_UI } from "../theme/scale";
 
 // "Use AI Features" control for the TopBar ⋯ menu. A segmented All | Some | Off master plus a
 // checkbox per feature. The master is DERIVED from the four feature flags (aiFeatureMode):
@@ -54,7 +55,7 @@ function scopeBtn(active: boolean): CSSProperties {
     borderRadius: 6,
     padding: "5px 8px",
     fontSize: 12,
-    fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+    fontFamily: FONT_UI,
     cursor: "pointer",
     lineHeight: 1.2,
   };
@@ -80,7 +81,7 @@ const seg: CSSProperties = {
   borderRadius: 6,
   padding: "6px 0",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 /** The All | Some | Off master segment. All/Off are actions; Some is a derived status only. */

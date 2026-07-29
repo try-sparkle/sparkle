@@ -5,6 +5,7 @@ import { useAuthStore } from "../stores/authStore";
 import { useTrialStore } from "../stores/trialStore";
 import { useUiStore } from "../stores/uiStore";
 import { deriveAuthControl, avatarLetter, authIdentity } from "../services/entitlement";
+import { FONT_UI } from "../theme/scale";
 
 // A small circular profile avatar (a letter in a disc), sized to sit inline with the TopBar's
 // pill buttons. Teal brand fill so it reads as THE user's own icon, cream ink on top (constant
@@ -21,7 +22,7 @@ const avatar: CSSProperties = {
   color: ON_BRAND_FILL,
   fontSize: 13,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   lineHeight: 1,
 };
 
@@ -35,7 +36,7 @@ const pill: CSSProperties = {
   padding: "6px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   whiteSpace: "nowrap",
 };
 

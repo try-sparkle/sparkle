@@ -164,8 +164,13 @@ describe("ModelPill — a filled chip on the hover card takes the FILL token, no
 
   it("its caret takes cream — the ink a chrome fill can carry — not the plane ink muted", () => {
     const button = openCard(mkProject([mkAgent()]));
-    const caret = Array.from(button.querySelectorAll("span")).find((s) => s.textContent === "▾")!;
+    // The caret is a react-icon now, not a "▾" character — so it is an <svg>, and the ink reaches
+    // it through `color` rather than being painted on the glyph. That is also the ONLY spelling
+    // that works: `var()` does not resolve in an SVG presentation attribute on WebKit, so a
+    // `stroke={TOKEN}` caret would render invisible (see theme/svgTokens.test.ts).
+    const caret = button.querySelector("svg")!;
     expect(caret.style.color).toBe("var(--c-cream)");
     expect(caret.style.color).not.toBe("var(--c-muted)");
+    expect(caret.getAttribute("stroke")).toBe("currentColor");
   });
 });

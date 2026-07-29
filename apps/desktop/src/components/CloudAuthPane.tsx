@@ -1,9 +1,10 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiKey, FiTrash2 } from "react-icons/fi";
 import { C, DANGER } from "../theme/colors";
-import { FONT_WEIGHT } from "@sparkle/ui";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
 import type { ClaudeAuthMethod } from "../services/cloudAgents/api";
+import { FONT_MONO, FONT_UI } from "../theme/scale";
+import { SECTION_LABEL } from "./labelTreatment";
 
 // Settings → "Claude auth for cloud agents" (Service B, W5). A cloud agent runs Claude Code in a
 // Sparkle-provisioned sandbox with the USER's own Claude credential, so this pane is where that
@@ -205,14 +206,7 @@ function MethodOption({
 
 // ── styles (inline CSSProperties, matching SettingsDialog's convention) ──────
 
-const subLabel: CSSProperties = {
-  fontSize: 12,
-  textTransform: "uppercase",
-  letterSpacing: 1,
-  color: C.muted,
-  fontWeight: FONT_WEIGHT.semibold,
-  marginBottom: 8,
-};
+const subLabel: CSSProperties = { ...SECTION_LABEL, marginBottom: 8 };
 
 const panel: CSSProperties = {
   background: C.forest,
@@ -246,7 +240,7 @@ const input: CSSProperties = {
   borderRadius: 6,
   padding: "8px 10px",
   fontSize: 13,
-  fontFamily: '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontFamily: FONT_MONO,
 };
 
 const actionBtn: CSSProperties = {
@@ -260,5 +254,5 @@ const actionBtn: CSSProperties = {
   padding: "7px 12px",
   cursor: "pointer",
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };

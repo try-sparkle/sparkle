@@ -127,28 +127,58 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("Build column — header clears the project tab bar", () => {
-  it("puts ~20px above the Plan/Build strip when the helper row is absent", () => {
-    const project = seed();
-    render(<AgentSidebar project={project} />);
-    const strip = document.querySelector<HTMLElement>('[data-hint="build"]')?.parentElement;
-    expect(strip).toBeTruthy();
-    expect(strip!.style.marginTop).toBe("20px");
+// ── THE HEADER IS A BAND NOW, NOT A GAP ────────────────────────────────────────────────────────
+//
+// This used to pin a bare `marginTop: 20px` above the Plan/Build strip, whose whole job was to stop
+// the strip welding onto ProjectTabsBar — the app's other piece of top chrome — because the strip
+// floated at the top of the column with nothing marking where the column began.
+//
+// The blueprint `.bhd` solves that by BEING a boundary rather than by holding empty space: a
+// `--hd-h` band with its own bottom hairline. So the assertions moved with the mechanism. Pinning
+// the old gap here would fight the port; pinning nothing would let the weld come back silently,
+// which is the regression the original test existed to prevent — hence the hairline assertion.
+describe("Build column — the header is its own band, above the list", () => {
+  const header = () => screen.getByTestId("build-column-header");
+
+  it("draws a bottom rule, so it never welds onto the tab bar above it", () => {
+    render(<AgentSidebar project={seed()} />);
+    expect(header().style.borderBottom).toBe(`1px solid ${C.hairline}`);
+    // …and it does NOT fall back to floating on a bare gap.
+    expect(header().style.marginTop).toBe("");
   });
 
-  // The helper row already contributes 14px of its own top padding, so stacking the gap on top of
-  // it would double-space only that configuration.
-  // The "helper row is already there" case is GONE, not merely untested: §6 deleted the Show Helper
-  // button and the row that carried it, so the strip no longer has a neighbour above it to avoid
-  // double-spacing against. The gap is now unconditional, which is what the test above pins. Hiding
-  // the helper island (still possible — §15 put Hide back on the island and in the View menu) does
-  // not bring a sidebar row back, so it cannot change this spacing either.
-  it("keeps the gap even when the helper island is hidden — no sidebar row rides on that flag", () => {
+  it("holds the mock's --hd-h band height", () => {
+    render(<AgentSidebar project={seed()} />);
+    // minHeight, not height: the chip bar wraps at MIN_WIDTH and the band grows with it.
+    expect(header().style.minHeight).toBe("34px");
+  });
+
+  // The helper island can still be hidden (§15 put Hide back on the island and in the View menu),
+  // and no sidebar row rides on that flag — so nothing about this band may depend on it.
+  it("is unchanged when the helper island is hidden", () => {
     useHelperPrefs.setState({ enabled: false } as never);
-    const project = seed();
-    render(<AgentSidebar project={project} />);
-    const strip = document.querySelector<HTMLElement>('[data-hint="build"]')?.parentElement;
-    expect(strip!.style.marginTop).toBe("20px");
+    render(<AgentSidebar project={seed()} />);
+    expect(header().style.borderBottom).toBe(`1px solid ${C.hairline}`);
+    expect(header().style.minHeight).toBe("34px");
+  });
+
+  it("carries the Build/Plan segment and the filter chips, in that order", () => {
+    render(<AgentSidebar project={seed()} />);
+    const seg = header().querySelector('[data-testid="plan-build-mini"]')!;
+    const chips = header().querySelector('[data-testid="status-filter-bar"]')!;
+    expect(seg).toBeTruthy();
+    expect(chips).toBeTruthy();
+    expect(seg.compareDocumentPosition(chips) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // ONE FILTER MECHANISM. The chips governed the list from INSIDE the scrolling list, so the
+  // control scrolled away from what it controls — and any "fix" for that which adds a second
+  // filtering surface is the header-pill-vs-chips bug the mock's own CSS warns about.
+  it("leaves no second filter bar behind in the scrolling list", () => {
+    render(<AgentSidebar project={seed()} />);
+    const list = screen.getByTestId("agent-list-scroll");
+    expect(list.querySelector('[data-testid="status-filter-bar"]')).toBeNull();
+    expect(screen.getAllByTestId("status-filter-bar")).toHaveLength(1);
   });
 });
 
@@ -329,10 +359,17 @@ describe("Build column — workers nest tightly under their orchestrator", () =>
     expect(rowFor("Alpha").style.marginBottom).toBe("2px");
   });
 
+  // The RIGHT padding is deliberately larger than the left: every row now runs to the column's
+  // pane-side edge (`marginRight: -8`) and pays that back in padding, so the ink sits at a constant
+  // 10px from both edges whatever the selection is. AgentSidebar.rowGeometry.test.tsx owns that
+  // contract; this one just pins that the vertical padding stayed tight through the change.
   it("tightens every row's vertical padding", () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    expect(rowFor("Alpha").style.padding).toBe("4px 10px");
+    const row = rowFor("Alpha");
+    expect(row.style.paddingTop).toBe("4px");
+    expect(row.style.paddingBottom).toBe("4px");
+    expect(row.style.paddingLeft).toBe("10px");
   });
 });
 
@@ -615,20 +652,27 @@ describe("Build column — the card stands over its row without anything jumping
   // row doesn't. A flat padding here put the disc and title several px down-and-right of where they
   // had just been. The horizontal half was always slightly off; cutting the row's vertical padding
   // to 4px made the vertical half obvious.
+  // Read side-by-side rather than by splitting the `padding` shorthand: the row's horizontal
+  // padding is ASYMMETRIC now (right pays back the pane-side bleed, see rowGeometry), so a
+  // positional split would compare the card's left inset against the row's RIGHT one and pass or
+  // fail for reasons that have nothing to do with alignment. The card is pinned at the row's left
+  // edge, so the left inset is the one that has to agree.
   it("matches the row's content offset on BOTH axes", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    const rowPad = rowFor("Alpha").style.padding; // "4px 10px"
+    const row = rowFor("Alpha");
+    const rowY = parseInt(row.style.paddingTop, 10);
+    const rowX = parseInt(row.style.paddingLeft, 10);
 
     fireEvent.contextMenu(rowFor("Alpha"));
     const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
     const border = parseInt(strip.style.border, 10);
-    const [padY, padX] = strip.style.padding.split(" ").map((v) => parseInt(v, 10));
-    const [rowY, rowX] = rowPad.split(" ").map((v) => parseInt(v, 10));
+    const padY = parseInt(strip.style.paddingTop, 10);
+    const padX = parseInt(strip.style.paddingLeft, 10);
 
     // border + padding on the card must equal the row's bare padding, or the content shifts.
-    expect(border + padY!).toBe(rowY);
-    expect(border + padX!).toBe(rowX);
+    expect(border + padY).toBe(rowY);
+    expect(border + padX).toBe(rowX);
   });
 });
 

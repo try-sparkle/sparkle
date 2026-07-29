@@ -3,6 +3,7 @@ import { FiCheck } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { setApprovalRule } from "../../services/configActions";
 import { approvalCategoryLabel, type ApprovalCategory } from "../../services/suggestions/approvalCategories";
+import { FONT_UI } from "../../theme/scale";
 
 // The inline offer shown after the user clicks an "approve" answer on a classifiable Claude Code
 // permission prompt (composer, spec §4). Two states:
@@ -118,7 +119,7 @@ const bar: CSSProperties = {
   background: C.barSurface,
   border: `1px solid ${C.muted}`,
   borderRadius: 6,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
 };
 
 const toast: CSSProperties = {
@@ -132,7 +133,7 @@ const toast: CSSProperties = {
   borderRadius: 6,
   color: C.cream,
   fontSize: 13,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -144,7 +145,7 @@ const primaryBtn: CSSProperties = {
   padding: "4px 12px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -155,7 +156,7 @@ const ghostBtn: CSSProperties = {
   borderRadius: 6,
   padding: "4px 10px",
   fontSize: 12,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
 };
 
@@ -166,7 +167,7 @@ const linkBtn: CSSProperties = {
   padding: "2px 4px",
   fontSize: 12,
   fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+  fontFamily: FONT_UI,
   cursor: "pointer",
   textDecoration: "underline",
 };

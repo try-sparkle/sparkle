@@ -12,26 +12,117 @@
 // exactly as they did there. Routing them through the view-model would have meant teaching the
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
+import { FiGitPullRequest } from "react-icons/fi";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
-import { C } from "../../theme/colors";
+import { BLUEPRINT } from "../../theme/blueprintSpec";
+import { C, FONT_WEIGHT } from "../../theme/colors";
+import { useResolvedTheme } from "../../theme/theme";
+import { bandColor } from "../../engine/statusBandLabels";
 import { BalanceBadge } from "../BalanceBadge";
 import { LogoWaveform } from "../LogoWaveform";
 import { SparkleLogoLink } from "../SparkleLogoLink";
-import { GOLD_SHEEN } from "../SparkleWordmark";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
+import { ConciergeTopRight } from "./KebabMenu";
 import { ScopeVitals } from "./ScopeVitals";
+import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
 
 /** LogoWaveform carries its own 14px side padding (it used to be a direct child of the builder
- *  column, which had none). Pull it back out so the bars line up with the mark above and the scope
- *  line below instead of sitting inset by header-padding + its own. */
+ *  column, which had none). Pull it back out so the bars line up with the column's own inset
+ *  instead of sitting inset by strip-padding + its own. */
 const WAVEFORM_INSET = -14;
+
+/** `--hd-h` — the ONE header height in the cockpit. The concierge's header row and a pair's build
+ *  header are the same height, which is what lets the eye read across the shell at that line. */
+const HEADER_H = 34;
+
+/** `--t-title` — the wordmark's type size. The mask is sized by HEIGHT alone (its width follows the
+ *  asset's aspect), so this is the mark's height rather than a font-size. */
+const WORDMARK_H = 17;
+
+/** WHERE THE LIFTED COLUMN SITS IN THE STACK — above the pairs, so its shadow falls ON them, and
+ *  strictly BELOW `PULL_TAB_RAIL_Z`.
+ *
+ *  That second half is not tidiness. The pull tab is ~17px wide centred in a 6px rail, so it
+ *  OVERHANGS this column by ~5px; a column that outranks the rail paints over that overhang and
+ *  swallows its hit area, leaving the seam control with part of its chrome and part of its click
+ *  target gone. This was `6` when the lift landed and did exactly that (roborev 54712). The two
+ *  values are asserted against each other in ConciergeColumn.wired.test.tsx, so neither can be
+ *  bumped back into the other without a red test. */
+export const CONCIERGE_LIFT_Z = 3;
+
+/** rev4's `.pill`: a squared 19px chip, not a capsule. The direction draws boxes. */
+const pillStyle = (edge: string) =>
+  ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 4,
+    flex: "0 0 auto",
+    height: 19,
+    padding: "0 6px",
+    borderRadius: 3,
+    border: `1px solid ${edge}`,
+    background: "transparent",
+    font: "inherit",
+    fontSize: 10,
+    fontWeight: FONT_WEIGHT.bold,
+    lineHeight: 1,
+    color: C.conciergeMuted,
+    cursor: "pointer",
+  }) as const;
+
+/**
+ * THE 8-DOT DRAG GRIP — `.grip` in MAPPING.md, 4×2 dots.
+ *
+ * It moves the concierge between the sides of the shell, which is a thing only the shell can do —
+ * so this reports the gesture and renders nothing about the outcome, like every other control in
+ * this column. Rendered only when a handler is supplied: a grip with nowhere to drag to is an
+ * affordance that lies (the same rule ScopeVitals' segment buttons follow).
+ *
+ * A BUTTON, not a bare drag surface. The gesture the mock draws is a drag, but a drag-only control
+ * is unreachable by keyboard and by assistive tech, and there are exactly two destinations — so
+ * activating it moves the column to the other side and the drag is the enhancement, not the
+ * contract.
+ */
+function ConciergeGrip({ onMoveSide }: { onMoveSide: () => void }) {
+  return (
+    <button
+      type="button"
+      data-testid="concierge-grip"
+      aria-label="Move the concierge to the other side"
+      title="Move the concierge to the other side"
+      onClick={onMoveSide}
+      style={{
+        display: "grid",
+        // 4 columns × 2 rows of dots — the mock's grip, which reads as a drag handle at a size
+        // where an icon would not.
+        gridTemplateColumns: "repeat(4, 2px)",
+        gridAutoRows: "2px",
+        gap: 2,
+        flex: "0 0 auto",
+        padding: 4,
+        border: "none",
+        background: "transparent",
+        cursor: "grab",
+        color: "inherit",
+      }}
+    >
+      {Array.from({ length: 8 }, (_, i) => (
+        <span
+          key={i}
+          aria-hidden
+          style={{ width: 2, height: 2, borderRadius: "50%", background: C.conciergeMuted }}
+        />
+      ))}
+    </button>
+  );
+}
 
 export function ConciergeColumn({
   model,
@@ -44,12 +135,20 @@ export function ConciergeColumn({
   announcement = EMPTY_ANNOUNCEMENT,
   countdownSlot,
   approvalSlot,
+  wired = "off",
   mentionAgents,
   preferredAgentId,
 }: ConciergeColumnProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
   const aiLock = useConciergeAiLock();
+  // Concrete hex for the three spec values with no CSS var of their own — the wordmark's two ends,
+  // the terminal register this column floods to, and the lift it drops when it does. See
+  // theme/blueprintSpec for why they are not in THEME_HEX, and ./wordmarkRamp for the ramp.
+  const mode = useResolvedTheme();
+  const isWired = wired !== "off";
+  const needsYou = model.vitals.needs_you;
+  const prsReady = model.prsReady ?? 0;
   return (
     <section
       aria-label="Sparkle concierge"
@@ -58,16 +157,38 @@ export function ConciergeColumn({
       // concierge attaches to the next prompt, and the box below paints the affordance showing
       // where it will land.
       data-dnd-target={CONCIERGE_COLUMN_DND_TARGET}
+      // `data-wired` — the WHOLE connection feature, as one value, exactly as MAPPING.md requires:
+      // every visual consequence below follows from it rather than from scattered component state.
+      // It is mirrored onto the element so the state is inspectable in the running app and
+      // assertable in a test without reading a style.
+      data-wired={wired}
       style={{
         position: "relative",
         flex: "0 0 auto",
         width,
+        // ── FULL HEIGHT, AND DELIBERATELY HEIGHT-AGNOSTIC ────────────────────────────────────
+        // The concierge runs the full height of the window in the cockpit and has lost its project
+        // tabs — tabs belong to the build+terminal PAIR now, since build and terminal are one
+        // project and the concierge is not any project at all. What the column must NOT do is
+        // hard-code that height: `Workspace` owns the shell's layout and is a concurrent worker's
+        // file this pass, so this fills whatever box it is given and nothing here has to change
+        // when the tabs move above the pairs.
+        height: "100%",
         minHeight: 0,
         display: "flex",
         flexDirection: "column",
-        // Depth layer ① — the LIGHTEST of the shell's three planes (PRD §3: Sparkle lightest →
-        // builder → terminal darkest). See theme/colors THEME_HEX.conciergeSurface.
-        background: C.conciergeSurface,
+        // ── LIFT AT REST, FLOOD WHEN WIRED ───────────────────────────────────────────────────
+        // UNWIRED it LIFTS: a soft shadow and NO colour change, so it reads as a layer above the
+        // pairs. WIRED it DROPS FLUSH — loses the shadow and takes the TERMINAL's colour, which is
+        // what says "this column is now one end of that cable". The two are alternatives: a
+        // shadow AND a colour change would read as two unrelated effects rather than as one
+        // control being plugged in.
+        background: isWired ? BLUEPRINT[mode].term : C.conciergeSurface,
+        boxShadow: isWired ? "none" : BLUEPRINT[mode].lift,
+        // Above the pairs while it is lifted, so the shadow falls ON them rather than under them —
+        // but BELOW the pull tab's rail. See CONCIERGE_LIFT_Z.
+        zIndex: CONCIERGE_LIFT_Z,
+        transition: "background .24s ease, box-shadow .24s ease, color .24s ease",
         // THE COLUMN'S EDGE, not a wash of one. This was `color-mix(muted 25%, transparent)` — a
         // quarter-strength tint, which on light mode's near-white planes is very nearly nothing.
         //
@@ -86,62 +207,162 @@ export function ConciergeColumn({
         // `hairline` is the token whose whole job is a 1px rule that must be SEEN, and it is held
         // to the chrome floor on every plane in both themes.
         borderRight: `1px solid ${C.hairline}`,
-        color: C.cream,
+        // The flood takes the TERMINAL's ink register with its plane — the two are a pair in the
+        // spec (`--k-term` / `--k-term-ink`) and separating them would put shell ink on a terminal
+        // surface. Set on the section so everything that inherits follows it in one place.
+        color: isWired ? BLUEPRINT[mode].termInk : C.cream,
         fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
         fontSize: 13,
         lineHeight: 1.5,
       }}
     >
-      <div style={{ position: "relative", flex: "none", padding: "16px 16px 12px" }}>
-        {/* THE HEADER'S ONE ROW: brand mark hard left, remaining-credit pill hard right — the two
-            top corners, with `space-between` doing the pushing rather than a spacer or a margin.
-            Both are flex children of the same row, so neither can drift onto the other's line as
-            the column is resized.
+      {/* ── `.ahd` — ONE ROW ────────────────────────────────────────────────────────────────────
+          wordmark · 8-dot grip · scope pill · needs-you filter · PR/merge pill · avatar · kebab.
 
-            The mark used to sit CENTERED on its own line below this row, nested inside a star-field
-            canvas that painted drifting particles behind it. Both are gone: the field is deleted
-            outright (not hidden — see SparkleLogo.placement.test), and with it the last reason the
-            mark needed a line of its own. That reclaims a whole row of header height above the
-            thread, which is the column's scarcest space.
+          The founder asked for this consolidation explicitly, and the reason it is worth a whole
+          restructure is that the shell used to SCATTER these: the scope line had its own centred
+          block, the credit pill shared a row with the mark, the avatar and kebab lived over in the
+          project tabs bar, and there was no global "just show me what needs me" control anywhere.
+          Gathering them costs one row of header height — the column's scarcest space, since
+          everything below it is the thread — and it puts every cross-project control in the one
+          column that is about every project.
 
-            The pill shows credits REMAINING (counting down) — the number the founder acts on. The
-            deleted SpendPill showed a locally-derived trailing-24h spend ESTIMATE that only ever
-            counted up and was never billed. */}
-        <div
-          data-testid="concierge-brand-row"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 8,
-            marginBottom: 8,
-          }}
-        >
-          {/* The SHEEN fill, not the flat one (founder, 2026-07-27: "make the logo sparklier").
-              Still the same masked mark and the same themed gold — see SparkleWordmark.GOLD_SHEEN
-              for why it is a gold glint rather than the asset's own cyan gradient. */}
-          <SparkleLogoLink fill={GOLD_SHEEN} />
-          <BalanceBadge />
-        </div>
-        {/* The always-listening voice ring + waveform, directly under the brand row. It followed
-            the logo out of the builder column: the mic is Sparkle's, not a per-project build tool,
-            and it belongs beside the box you talk into. Now the header's ONLY voice surface — the
-            star field showed the CONVERSATION's state (it buzzed while Sparkle typed a reply), and
-            with it deleted this is the sole live indicator, reading your own microphone level. */}
-        <div style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}>
-          <LogoWaveform />
-        </div>
-        {/* ONE line, not two: scope + who needs you (`All projects · 2 here · 1 in mobile`). See
-            ScopeVitals' header for what was dropped and why — the founder's "it's taking up too
-            much space", 2026-07-27. */}
+          Nothing here is a second rendering of something that exists elsewhere. The scope pill IS
+          ScopeVitals (`dense`), the avatar and kebab ARE `ConciergeTopRight`, and the counts come
+          off the same view-model the thread does. */}
+      <div
+        data-testid="concierge-header"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          height: HEADER_H,
+          flex: "0 0 auto",
+          // Asymmetric, per the mock: the right edge keeps clearance so the kebab never sits under
+          // the column's pull tab.
+          padding: "0 20px 0 10px",
+          borderBottom: `1px solid ${isWired ? BLUEPRINT[mode].termHair : C.hairline}`,
+        }}
+      >
+        {/* THE WORDMARK, ramping DARK → LIGHT left to right and ending on a lighter blue. The paint
+            is a per-theme TOKEN PAIR rather than a fixed order of `ink` and `primary`, because
+            which of those two is the darker one flips between themes — see ./wordmarkRamp and the
+            assertions in theme/blueprintSpec.test.ts. It replaces the gold SHEEN this header used
+            to carry: Blueprint retired gold entirely, so a gold glint was the last gold left on
+            screen. Still the same masked asset and the same accessible name. */}
+        <SparkleLogoLink height={WORDMARK_H} fill={wordmarkRamp(mode)} />
+        {controller.onMoveSide && <ConciergeGrip onMoveSide={controller.onMoveSide} />}
+        {/* Scope + who needs you (`All projects · 2 here · 1 in mobile`), inline. */}
         <ScopeVitals
+          dense
           pinnedProjectName={model.scope.pinnedProjectName}
           counts={model.vitals}
           byProject={model.needsYouByProject}
           onProjectClick={controller.onProjectClick}
         />
-        {searchSlot && <div style={{ marginTop: 10 }}>{searchSlot}</div>}
+        {/* THE GLOBAL NEEDS-YOU FILTER — the red pill. It focuses every open column at once, where
+            a build column's own chips filter only themselves; that split is why it lives here and
+            not there.
+
+            RENDERED WHEN THERE IS SOMETHING TO FILTER **OR** THE FILTER IS ENGAGED. The second
+            clause is the one that matters and it was missing: `vitals.needs_you` is the SCOPED
+            count and is unaffected by the filter, so answering the last waiting agent takes it to
+            zero — and with only the first clause the pill unmounted while the filter was still ON,
+            leaving every open column showing needs-you items only, i.e. nothing, with no control
+            anywhere to clear it. "A filter offering to hide nothing is a control with no state to
+            be in" was the justification, and an ENGAGED filter is precisely a state it is in. */}
+        {(needsYou > 0 || model.needsYouFilter === true) && controller.onNeedsYouFilterToggle && (
+          <button
+            type="button"
+            data-testid="concierge-needs-filter"
+            aria-pressed={model.needsYouFilter === true}
+            aria-label={`Show only what needs you (${needsYou})`}
+            title="Show only what needs you"
+            onClick={controller.onNeedsYouFilterToggle}
+            style={{
+              ...pillStyle(model.needsYouFilter ? C.dangerInk : bandColor("needs_you")),
+              // PRESSED fills; unpressed is the tier's colour on the edge and the numeral. The dot
+              // alone is too small to carry state at 19px, which is the mistake the per-column
+              // chips already corrected.
+              //
+              // THE PRESSED FILL IS `dangerInk`, NOT THE BAND COLOUR — and this crosses that
+              // token's documented fill/ink split ON PURPOSE, because the split's whole rationale
+              // is legibility and here it is the fill that has to carry text. Brand sienna
+              // (`bandColor("needs_you")`, #e0533f) is a mid red: in LIGHT it measures 3.83:1
+              // against `onGoldFill`'s white on this pill's 10px bold label — under AA, and
+              // unreachable from that hue, since nothing lighter than near-black clears 4.5 on it
+              // and white is the only light end available. The themed alarm ink is a deep red in
+              // light and a light salmon in dark, so paired with `onGoldFill` it clears AA by a
+              // wide margin at BOTH ends while staying the same colour the tier means.
+              // Measured in theme/chromeContrast.test.ts — on the flooded column too.
+              color: model.needsYouFilter ? C.onGoldFill : C.dangerInk,
+              background: model.needsYouFilter ? C.dangerInk : "transparent",
+            }}
+          >
+            <span
+              aria-hidden
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: model.needsYouFilter ? C.onGoldFill : bandColor("needs_you"),
+              }}
+            />
+            {needsYou}
+          </button>
+        )}
+        {/* THE PR / MERGE PILL. Green and filled once something is actually mergeable — that is the
+            one state in the shell where the next action is a single click, so it is the one pill
+            allowed to shout. Hidden at zero for the same reason as the filter above. */}
+        {prsReady > 0 && controller.onPrClick && (
+          <button
+            type="button"
+            data-testid="concierge-pr-pill"
+            data-ready="yes"
+            aria-label={`${prsReady} pull request${prsReady === 1 ? "" : "s"} ready to merge`}
+            title={`${prsReady} pull request${prsReady === 1 ? "" : "s"} ready to merge`}
+            onClick={controller.onPrClick}
+            style={{
+              ...pillStyle(C.successInk),
+              color: C.onGoldFill,
+              background: C.successInk,
+            }}
+          >
+            <FiGitPullRequest size={11} aria-hidden />
+            {prsReady}
+          </button>
+        )}
+        {/* The signed-in avatar + the kebab, as one cluster. `ConciergeTopRight` is the same export
+            the project tabs bar mounts today; the cockpit's tabs belong to a PAIR, and this cluster
+            is about the human rather than about a project, so its home is this header. */}
+        <ConciergeTopRight />
       </div>
+      {/* ── BELOW the header, and deliberately NOT in it ────────────────────────────────────────
+          The always-listening voice ring + waveform, and the remaining-credit pill.
+
+          Neither is in the founder's list for `.ahd`, and the row above is already full — but
+          neither could simply be deleted either. The ring is the app's SINGLE mic control
+          (arm / mute / off) and it is what names the concierge as the voice surface, which is what
+          steers dictated speech into the compose box; the badge is the only "Open credits" entry
+          point in the shell and the only place a top-up done elsewhere shows up. So they keep a
+          thin strip of their own rather than being folded into a header that consolidated
+          precisely to stop carrying everything. */}
+      <div
+        data-testid="concierge-voice-strip"
+        style={{
+          flex: "0 0 auto",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "6px 16px 0",
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0, marginLeft: WAVEFORM_INSET }}>
+          <LogoWaveform />
+        </div>
+        <BalanceBadge />
+      </div>
+      {searchSlot && <div style={{ flex: "0 0 auto", padding: "10px 16px 0" }}>{searchSlot}</div>}
       {/* THE LOCKED STATE swaps the paid half — the chat with the `claude -p` brain — for the
           upsell, and NOTHING above this line changes: the header, the scope line, the needs-you
           counts and the per-project segments are all derived from local app state, cost nothing to
@@ -151,6 +372,7 @@ export function ConciergeColumn({
         <ConciergeAiLocked reason={aiLock} />
       ) : (
         <ConciergeThread
+          wired={isWired}
           messages={model.messages}
           typing={model.typing}
           onNudgeClick={controller.onNudgeClick}
@@ -210,6 +432,7 @@ export function ConciergeColumn({
           from here at all (the service-level refusal stays the backstop, not the only line). */}
       {!aiLock && (
         <ComposeBox
+          wired={isWired}
           onSend={controller.onSend}
           onAttach={controller.onAttach}
           onRemoveAttachment={controller.onRemoveAttachment}

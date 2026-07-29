@@ -1992,6 +1992,21 @@ export function ConciergeHost({
       // mirror image of the bug bead `sparkle-vohh` fixed — and this is that same shared path, not
       // a second switcher. What to do once you are there is column two's job; the digest lines in
       // the thread are what narrow it.
+      // THE HEADER'S NEEDS-YOU PILL. `ConciergeColumn` has rendered this pill behind
+      // `controller.onNeedsYouFilterToggle && …` since it was built, and nothing ever supplied the
+      // handler — so the second conjunct was permanently `undefined` and the pill never mounted in
+      // production, while its tests passed by injecting one (roborev 54769).
+      //
+      // It writes the SAME `statusFilter` the sidebar's chips write, via the store's own
+      // `isolateStatusBand`/`showAllStatusBands`, so there is ONE filter state rather than two that
+      // can disagree — the same mistake the mock made with a header pill and per-column chips
+      // hiding rows through separate mechanisms, which is called out in rev4.html.
+      onNeedsYouFilterToggle: () => {
+        const ui = useUiStore.getState();
+        const isolated = ui.statusFilter.needs_you && !ui.statusFilter.running && !ui.statusFilter.done;
+        if (isolated) ui.showAllStatusBands();
+        else ui.isolateStatusBand("needs_you");
+      },
       onProjectClick: (projectId: string) => openProjectTab(projectId),
       onNudgeClick: (n: ConciergeNudge) => {
         const a = resolveAgent(n.id);
@@ -2128,6 +2143,13 @@ export function ConciergeHost({
   // `messages` reference as "the thread changed"; it keys auto-follow on message count + last id +
   // last length for exactly this reason. An identity-keyed consumer scrolls the column out from
   // under the reader.
+  // The pill's PRESSED state, read from the same store its toggle writes. Subscribed (not
+  // `getState()`) so the pill re-renders when the sidebar's chips change the filter — one state,
+  // reflected in both places, rather than a header control that can disagree with the column.
+  const needsYouIsolated = useUiStore(
+    (s) => s.statusFilter.needs_you && !s.statusFilter.running && !s.statusFilter.done,
+  );
+
   const model: ConciergeViewModel = useMemo(() => {
     // DIGEST, don't enumerate (bead sparkle-4562.4). One item of a priority keeps its card; two or
     // more become a single line. Without this, eight P0s and nineteen P1s meant twenty-seven cards
@@ -2166,8 +2188,18 @@ export function ConciergeHost({
       typing,
       attachments,
       dropActive,
+      needsYouFilter: needsYouIsolated,
     };
-  }, [feed, chat, typing, pinnedProjectName, needsYouByProject, attachments, dropActive]);
+  }, [
+    feed,
+    chat,
+    typing,
+    pinnedProjectName,
+    needsYouByProject,
+    attachments,
+    dropActive,
+    needsYouIsolated,
+  ]);
 
   return (
     <>

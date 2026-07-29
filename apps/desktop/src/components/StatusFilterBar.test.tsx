@@ -10,6 +10,7 @@ import { StatusFilterBar } from "./StatusFilterBar";
 import { allBandsVisible, type StatusBand } from "../engine/buildSections";
 import { bandColor } from "../engine/statusBandLabels";
 import { C, statusInk } from "../theme/colors";
+import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
 import { asRgb } from "./statusDotTestUtils";
 
 afterEach(cleanup);
@@ -559,5 +560,50 @@ describe("StatusFilterBar — Reset focus re-homing", () => {
       <StatusFilterBar counts={counts} visible={allBandsVisible()} onToggle={vi.fn()} onReset={vi.fn()} />,
     );
     expect(document.activeElement).toBe(before);
+  });
+});
+
+// ── THE CHIP'S SHAPE — the blueprint cockpit's `.chip` ─────────────────────────────────────────
+//
+// rev4.html states the reasoning in its own CSS, and both halves matter:
+//
+//   "SQUARED, not pilled. The live app draws these as 999px capsules; this direction draws boxes —
+//    r-sm is the same corner the stage chips and lane rules use, so the filter stops looking like a
+//    different product's control. Counts are MONO and tabular so the three chips hold their width
+//    as the numbers change, instead of the row twitching every poll."
+//
+// The tabular half is not cosmetic: these counts re-poll continuously, and a proportional digit
+// swap re-widths every chip and shifts the whole header band each time.
+describe("StatusFilterBar — the chip is a drawn box, not a capsule", () => {
+  const chipEl = (band: StatusBand = "needs_you") =>
+    screen.getByTestId(`status-chip-${band}`);
+
+  it("uses the --r-sm corner the stage chips and group rules use", () => {
+    renderBar();
+    expect(chipEl().style.borderRadius).toBe(`${RADIUS.sm}px`);
+    expect(chipEl().style.borderRadius).not.toBe("999px");
+  });
+
+  it("sets mono, micro and tabular numerals — which the badge's count inherits", () => {
+    renderBar();
+    expect(chipEl().style.fontFamily).toBe(FONT_MONO);
+    expect(chipEl().style.fontSize).toBe(`${TYPE.micro}px`);
+    expect(chipEl().style.fontVariantNumeric).toBe("tabular-nums");
+    // BandBadge sets neither, which is what makes the inheritance the mechanism rather than a
+    // coincidence: a fontFamily added there would silently take the chip off the treatment.
+    expect(screen.getByTestId("band-badge-needs_you").style.fontFamily).toBe("");
+  });
+
+  // The ON chip used to carry `${dot}1f`, a 12% wash of its band colour. The mock draws
+  // `background:transparent` and lets the border plus the numeral carry the state — which also
+  // removes a composite the count's ink was never measured through.
+  it("carries no fill in either state; the border and the numeral carry the state", () => {
+    const visible = { ...allBandsVisible(), running: false };
+    renderBar({ visible });
+    expect(chipEl("needs_you").style.background).toBe("transparent");
+    expect(chipEl("running").style.background).toBe("transparent");
+    // …and the ON chip's edge is still its own band colour, so nothing was flattened away with it.
+    expect(chipEl("needs_you").style.borderColor).toBe(asRgb(bandColor("needs_you")));
+    expect(chipEl("running").style.borderColor).toBe(C.hairline);
   });
 });

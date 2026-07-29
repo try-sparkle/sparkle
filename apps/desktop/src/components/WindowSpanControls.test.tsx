@@ -135,10 +135,17 @@ describe("WindowSpanControls", () => {
     withLayout({ ...RAGGED, spanning_enabled: false });
     render(<WindowSpanControls />);
 
-    const span = await screen.findByRole("button", { name: /Span the Sparkle window/i });
+    // AWAIT THE ALERT, NOT THE BUTTON. The button is `disabled={blockedBySpaces || noLayout}` and
+    // exists from the FIRST render, so `findByRole("button")` matches it immediately and does not
+    // wait for the async layout at all — which made `hasAttribute("disabled")` pass for the wrong
+    // reason (noLayout, not blocked) and left the synchronous `getByRole("alert")` racing a promise
+    // it never waited on. Under full-suite load that race loses. The alert renders only once layout
+    // has ARRIVED and says spanning is blocked, so awaiting it is what actually pins the state.
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Displays have separate Spaces");
     // The action genuinely cannot work in this state; offering it would just look broken.
+    const span = screen.getByRole("button", { name: /Span the Sparkle window/i });
     expect(span.hasAttribute("disabled")).toBe(true);
-    expect(screen.getByRole("alert").textContent).toContain("Displays have separate Spaces");
   });
 
   it("does not warn about separate Spaces on a single display, where spanning is just maximizing", async () => {
@@ -150,8 +157,13 @@ describe("WindowSpanControls", () => {
     });
     render(<WindowSpanControls />);
 
-    const span = await screen.findByRole("button", { name: /Span the Sparkle window/i });
-    expect(span.hasAttribute("disabled")).toBe(false);
+    // The MIRROR IMAGE of the race above, and it would have failed the other way: the button starts
+    // disabled (noLayout) and only becomes enabled once layout lands, so asserting `false` against
+    // the first-render element is a bet on timing. Wait for the state instead of sampling it.
+    await waitFor(() => {
+      const span = screen.getByRole("button", { name: /Span the Sparkle window/i });
+      expect(span.hasAttribute("disabled")).toBe(false);
+    });
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
