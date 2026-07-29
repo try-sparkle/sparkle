@@ -19,6 +19,14 @@ import {
   reenabledRecord,
   EMPTY_ALERT,
 } from "../engine/alertDismissal";
+import {
+  clearGoalMet,
+  escalateGoal,
+  markGoalMet,
+  newGoal,
+  noteContinue,
+  resetGoalRetries,
+} from "../engine/agentGoal";
 import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
 import { usageTelemetry } from "../services/usageTelemetry";
@@ -163,6 +171,22 @@ export interface ProjectState {
   /** Set the agent's live "what I'm building now" activity narration (sparkle-control MCP
    *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name. */
   setAgentActivity: (projectId: string, agentId: string, activity: string) => void;
+  /** Set (or replace) the agent's GOAL — the standing objective that decides whether an idle turn
+   *  gets auto-continued (engine/goalContinuation) and whether an idle row reads "done" or
+   *  "stalled" (engine/agentStall). An empty string CLEARS the goal, which also disables
+   *  auto-continue for that agent — the safe way to opt out. */
+  setAgentGoal: (projectId: string, agentId: string, text: string, ttlMs?: number) => void;
+  /** Mark the current goal met (or un-mark it). This is the only thing that makes an idle agent
+   *  legitimately finished, so it is the agent's own way to stop being resumed. */
+  setAgentGoalMet: (projectId: string, agentId: string, met: boolean) => void;
+  /** Record that an auto-continue was just spent, against the progress mark it was spent at.
+   *  Advances the retry counters the escalation bound is read from. */
+  noteAgentGoalContinue: (projectId: string, agentId: string, mark: string) => void;
+  /** Hand the goal to the human — auto-continue has given up. Latched; only `resetAgentGoalRetries`
+   *  (a human acting) or a new goal clears it. */
+  escalateAgentGoal: (projectId: string, agentId: string, reason: string) => void;
+  /** Clear the retry budget and any escalation, because a human acted on this agent. */
+  resetAgentGoalRetries: (projectId: string, agentId: string) => void;
   /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
    *  epic pill immediately, before any of its workers bind to a bead). */
   setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
@@ -1142,6 +1166,97 @@ export const useProjectStore = create<ProjectState>()(
             // Unlike renameAgent this NEVER pins the name or touches auto-naming — activity is a
             // separate, always-live secondary field.
             mapAgent(p, agentId, (a) => ({ ...a, activity: activity.trim() })),
+          ),
+        })),
+
+      // ── Goals ────────────────────────────────────────────────────────────────────────────────
+      // All five delegate the actual rules to engine/agentGoal rather than editing the record
+      // inline. That module is where the invariants live (met-before-expired, latched escalation,
+      // idempotent marking), it is pure, and it is what the continuation engine and the stall
+      // surface read — a second copy of the arithmetic here is exactly how those three fall out of
+      // step about whether a goal is still outstanding.
+
+      setAgentGoal: (projectId, agentId, text, ttlMs) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => {
+              const trimmed = text.trim();
+              // Empty CLEARS — and clearing is the documented opt-out from auto-continue, so it
+              // has to drop the whole record (counters included) rather than blank the text and
+              // leave a goal that reads as unmet forever.
+              if (trimmed === "") {
+                const { goal: _dropped, ...rest } = a;
+                return rest;
+              }
+              // A goal whose TEXT is unchanged keeps its COUNTERS but RE-ARMS its lifecycle.
+              //
+              // Both halves matter. Keeping the counters stops a restarted agent — which
+              // re-asserts its objective routinely — from silently refilling the retry budget and
+              // defeating the bound. But keeping the lifecycle STAMPS made the call a silent no-op
+              // in two common cases (roborev 55254): an agent that met "keep the build green" and
+              // re-asserts it for the next round kept `metAt`, so the goal stayed `met` forever and
+              // the row read "done"; and an expired goal could never be revived by re-typing it,
+              // because `setAt` never moved, so expiry recurred immediately — and a fresh `ttlMs`
+              // measured from the OLD `setAt` could even land in the past. The caller got no signal
+              // that the set did nothing.
+              //
+              // An ESCALATION is deliberately NOT cleared here. Re-asserting the same text is
+              // something the agent does on its own; taking back a goal a human has been handed is
+              // the human's call, via `resetAgentGoalRetries`.
+              if (a.goal && a.goal.text === trimmed) {
+                const { metAt: _met, ...rest } = a.goal;
+                return {
+                  ...a,
+                  goal: { ...rest, setAt: Date.now(), ttlMs: ttlMs ?? a.goal.ttlMs },
+                };
+              }
+              return { ...a, goal: newGoal(trimmed, Date.now(), ttlMs) };
+            }),
+          ),
+        })),
+
+      setAgentGoalMet: (projectId, agentId, met) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => {
+              if (!a.goal) return a;
+              if (met) return { ...a, goal: markGoalMet(a.goal, Date.now()) };
+              // Un-marking is a correction ("it isn't actually done"). It clears the CONSECUTIVE
+              // streak only — `clearGoalMet`, not `resetGoalRetries`.
+              //
+              // This surface is how an AGENT declares itself done, so the actor holding the lever
+              // is exactly the one `MAX_CONTINUES_TOTAL` defends the fleet against (roborev 55254).
+              // Running the full reset here let an agent mark itself met and immediately un-mark
+              // itself to refill its entire twenty-restart budget — repeatable every twenty
+              // restarts, forever — and un-latched `escalatedAt`, quietly taking back a goal a
+              // human had already been handed and returning it to the auto-continue pool.
+              // `clearGoalMet` is a no-op on a goal that was never met, so it cannot be used as a
+              // budget reset either.
+              return { ...a, goal: clearGoalMet(a.goal) };
+            }),
+          ),
+        })),
+
+      noteAgentGoalContinue: (projectId, agentId, mark) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: noteContinue(a.goal, mark) } : a)),
+          ),
+        })),
+
+      escalateAgentGoal: (projectId, agentId, reason) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal ? { ...a, goal: escalateGoal(a.goal, Date.now(), reason) } : a,
+            ),
+          ),
+        })),
+
+      resetAgentGoalRetries: (projectId, agentId) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: resetGoalRetries(a.goal) } : a)),
           ),
         })),
 

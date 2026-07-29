@@ -347,12 +347,20 @@ describe("createHookEventHandler", () => {
     const activate = vi.fn();
     const captureHistory = vi.fn();
     const noteTranscript = vi.fn();
+    const noteThrash = vi.fn();
     return {
       onStatus,
       activate,
       captureHistory,
       noteTranscript,
-      handle: createHookEventHandler({ engine, activate, captureHistory, noteTranscript }),
+      noteThrash,
+      handle: createHookEventHandler({
+        engine,
+        activate,
+        captureHistory,
+        noteTranscript,
+        noteThrash,
+      }),
     };
   };
 
@@ -362,7 +370,17 @@ describe("createHookEventHandler", () => {
     expect(h.activate).toHaveBeenCalledTimes(1);
     expect(h.captureHistory).toHaveBeenCalledTimes(1);
     expect(h.noteTranscript).toHaveBeenCalledTimes(1);
+    expect(h.noteThrash).toHaveBeenCalledTimes(1);
     expect(h.onStatus).toHaveBeenLastCalledWith("working");
+  });
+
+  it("feeds the thrash accumulator, including events that change no status", () => {
+    // PreCompact maps to no status at all, so a handler that only forwarded status-bearing events
+    // would silently drop the one signal that reveals context exhaustion.
+    const h = mk();
+    h.handle({ event: "PreCompact", session_id: "main" });
+    expect(h.noteThrash).toHaveBeenCalledTimes(1);
+    expect(h.onStatus).not.toHaveBeenCalled();
   });
 
   it("activates BEFORE ingest, so the first event's status is not swallowed", () => {
@@ -378,11 +396,14 @@ describe("createHookEventHandler", () => {
       activate: () => order.push("activate"),
       captureHistory: () => order.push("capture"),
       noteTranscript: () => order.push("transcript"),
+      noteThrash: () => order.push("thrash"),
     });
     handle({ event: "UserPromptSubmit", session_id: "main" });
     // `transcript` before `capture`: captureHistory reads useHistoryStore.getState() inside its own
     // error-swallowing try, and a throw there must not cost the concierge its transcript path.
-    expect(order).toEqual(["activate", "status", "transcript", "capture"]);
+    // `thrash` also sits before `capture`, for the same reason `transcript` does: captureHistory
+    // swallows its own errors, and a throw there must not cost us the progress signal.
+    expect(order).toEqual(["activate", "status", "transcript", "thrash", "capture"]);
   });
 
   it("a background session's event drives NOTHING — not even liveness", () => {
@@ -428,5 +449,8 @@ describe("createHookEventHandler", () => {
     h.handle({ event: "SessionEnd", session_id: "bg" }); // background one-shot ending
     expect(h.onStatus).not.toHaveBeenCalledWith("done");
     expect(h.captureHistory).toHaveBeenCalledTimes(1);
+    // A background `claude` sharing this worktree must not feed the thrash counters either: its
+    // tool calls would mask a real no-progress streak, and its prompts would fake repetition.
+    expect(h.noteThrash).toHaveBeenCalledTimes(1);
   });
 });

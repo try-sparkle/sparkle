@@ -1,6 +1,14 @@
-// Escalate a FINISHED agent that still has un-landed committed work to the RED `unmerged` status,
-// so its dot goes red ("Needs merge") until its work reaches main — the "don't silently lose an
-// un-merged branch" signal (the user finished, but the work still needs them to open/merge the PR).
+// Escalate a FINISHED agent that still has un-landed committed work to the `unmerged` status, so its
+// row reads "Needs merge" until that work reaches main — the "don't silently lose an un-merged
+// branch" signal (the user finished, but the work still needs them to open/merge the PR).
+//
+// `unmerged` IS GRAY, not red, and this header used to say red. It stopped being red on 2026-07-26
+// because 27 of 51 agents on a real fleet sat in this band and the wall of red carried no
+// information (the derivation is at packages/ui/tokens.ts:150-157). What makes such a row leave the
+// calm tier NOW is engine/stallEscalation, which asks a narrower question — is there EVIDENCE of
+// outstanding work — and escalates to `blocked` rather than recolouring this status. So: this module
+// still decides "has this agent got unlanded commits", and that module decides "does that make the
+// row an alarm". Keep the two separate; collapsing them is what produced the undismissable red.
 //
 // This is a pure status-map overlay in the same family as engine/alertDismissal.withDismissedAlerts
 // and engine/workerAttention.*: it takes the live status map and returns a (possibly new) map,

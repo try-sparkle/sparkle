@@ -2,6 +2,9 @@
 // rendered one-per-tab with a real `claude` PTY underneath. Live runtime state (status,
 // PTY handles) is NOT stored here — see stores/runtimeStore.ts.
 import type { AgentTabStatus } from "@sparkle/ui";
+import type { AgentGoal } from "./engine/agentGoal";
+
+export type { AgentGoal };
 
 export type Runtime = "local" | "cloud";
 
@@ -78,6 +81,20 @@ export interface AgentTab {
   // under the agent name (see AgentSidebar / FittedAgentName). Optional so legacy records need no
   // migration; undefined/empty renders nothing.
   activity?: string;
+  // What this agent is trying to ACHIEVE, and whether it has (engine/agentGoal.AgentGoal).
+  //
+  // Distinct from `activity` in the way that matters: `activity` is what the agent is doing right
+  // now and is expected to change constantly; a goal is the standing objective, carries a TTL, and
+  // has a met/unmet answer. That answer is the only thing that makes an idle agent legitimately
+  // "done" — a turn ending does not set it — which is what lets engine/agentStall tell
+  // idle-and-finished from idle-and-stalled, and what licenses engine/goalContinuation to restart
+  // a turn that ended with work remaining.
+  //
+  // Persisted deliberately: a relaunch is itself one of the most common ways a turn gets ended
+  // mid-task (an app restart ended fourteen build agents' turns at once on 2026-07-29), so the
+  // goal has to survive the very event it exists to recover from. Optional, so legacy records need
+  // no migration and read as "no goal" — which disables auto-continue for them, the safe default.
+  goal?: AgentGoal;
   // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
   // and proposes before editing. Only ever "plan" — ordinary mode is the ABSENCE of this, so we
   // never override a user who configured a different default in their own Claude Code settings.

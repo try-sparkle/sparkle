@@ -28,6 +28,20 @@ describe("sparkle-hook normalize", () => {
     expect(out.message).toBe("Claude needs your permission to use Bash");
   });
 
+  it("forwards SessionStart's `source`, and it survives the round-trip to a HookEvent", () => {
+    // Without this the app cannot tell a human restarting an agent (`startup`/`clear`) from Claude
+    // Code compacting it (`compact`) — and engine/agentThrash must treat those OPPOSITELY: a
+    // restart means forget the pressure history, a compaction IS the pressure history. Claude
+    // Code's own matcher vocabulary for the event is `startup|resume|clear|compact` (roborev 55296).
+    const out = normalize(
+      { hook_event_name: "SessionStart", source: "compact", session_id: "s1" },
+      6000,
+    );
+    expect(out.source).toBe("compact");
+    // ...and the reader must not drop it on the floor.
+    expect(parseHookLine(JSON.stringify(out))?.source).toBe("compact");
+  });
+
   it("tolerates a missing/!object payload without throwing", () => {
     expect(normalize(undefined, 1).event).toBe("");
     expect(normalize(null, 1).event).toBe("");

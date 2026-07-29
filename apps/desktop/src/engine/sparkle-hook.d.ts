@@ -12,5 +12,7 @@ declare module "*/sparkle-hook.mjs" {
     session_id?: string;
     prompt?: string;
     transcript_path?: string;
+    /** SessionStart's `startup|resume|clear|compact` — see HookEvent.source. */
+    source?: string;
   };
 }

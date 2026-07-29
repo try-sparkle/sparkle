@@ -28,6 +28,19 @@ export interface HookEvent {
   /** Stop: path to Claude Code's session transcript JSONL. Mapped from the raw `transcript_path`
    *  the emitter passes through; used to read the last assistant turn for history capture. */
   transcriptPath?: string;
+  /**
+   * SessionStart's `source`: `startup` | `resume` | `clear` | `compact` (Claude Code's own matcher
+   * vocabulary for the event — the official plugin hooks register exactly
+   * `"matcher": "startup|resume|clear|compact"`).
+   *
+   * LOAD-BEARING for `engine/agentThrash`, because a SessionStart is NOT only a human restarting an
+   * agent: Claude Code fires one after every COMPACTION too. Those two demand opposite handling — a
+   * restart means the human applied the remedy and prior evidence should be dropped, while a
+   * compaction is itself evidence OF context pressure and must not erase the history that proves
+   * it. Absent (an older emitter, or any other event) it is simply `undefined`, and the consumer
+   * must fail toward keeping evidence rather than destroying it.
+   */
+  source?: string;
 }
 
 // A Notification fires for two very different reasons: when Claude needs permission for a tool
@@ -68,7 +81,11 @@ export function hookEventToStatus(ev: HookEvent): AgentTabStatus | null {
     case "SessionEnd":
       return "done";
     default:
-      // PreCompact and anything we don't model leave the status untouched.
+      // PreCompact and anything we don't model leave the STATUS untouched — which is right, since
+      // compacting is not a status. It is emphatically NOT ignored, though: PreCompact is the only
+      // structured signal that an agent is running out of usable context, and engine/agentThrash
+      // consumes it from the same stream to surface that pressure before it degenerates into a
+      // compaction retry loop. Returning null here means "no status change", not "discard".
       return null;
   }
 }
@@ -230,6 +247,17 @@ export interface HookEventHandlerDeps {
    * required dep, dropping it is a compile error.
    */
   noteTranscript: (ev: HookEvent) => void;
+  /**
+   * Fold the event into the agent's thrash/context-pressure accumulator
+   * (`engine/agentThrash.noteThrashEvent`).
+   *
+   * REQUIRED rather than optional, for the same reason `noteTranscript` is: this is the ONLY place
+   * the app sees `PreToolUse.tool`, `UserPromptSubmit.prompt` and `PreCompact` together, and they
+   * are the entire evidence base for telling a working agent from one repeating a failing command.
+   * As a required dep, dropping it is a compile error rather than a silent return to screen-only
+   * signals — which is precisely the regression that let a three-`/compact` loop read as healthy.
+   */
+  noteThrash: (ev: HookEvent) => void;
 }
 
 /**
@@ -254,6 +282,11 @@ export interface HookEventHandlerDeps {
  *  4. `noteTranscript` BEFORE `captureHistory`, so the registry write does not ride on the history
  *     store resolving. `captureHistory` reads `useHistoryStore.getState()` inside its own
  *     error-swallowing try, and a throw there must not cost the concierge its transcript path.
+ *  5. `noteThrash` sits INSIDE the session gate with everything else. A background `claude` in the
+ *     same worktree runs its own prompts and its own tools; counting those would both mask a real
+ *     no-progress streak (a foreign tool call reads as this agent working) and manufacture false
+ *     repetition. It goes before `captureHistory` for the same reason `noteTranscript` does — that
+ *     call swallows its own errors, and a throw there must not cost us the thrash signal.
  */
 export function createHookEventHandler(deps: HookEventHandlerDeps): (ev: HookEvent) => void {
   return (ev) => {
@@ -262,6 +295,7 @@ export function createHookEventHandler(deps: HookEventHandlerDeps): (ev: HookEve
     deps.activate();
     deps.engine.ingest(ev);
     deps.noteTranscript(ev);
+    deps.noteThrash(ev);
     deps.captureHistory(ev);
   };
 }

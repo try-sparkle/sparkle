@@ -27,6 +27,15 @@ const GUARD_MARKER: &str = "worktree-guard.mjs";
 /// Tool-scoped events carry a `matcher`; we want every tool, so `*`.
 const TOOL_EVENTS: &[&str] = &["PreToolUse", "PostToolUse"];
 /// Lifecycle events with no tool matcher.
+///
+/// `PreCompact` is the newest and the least obvious. It fires when Claude Code compacts a session,
+/// which is the ONLY structured signal that an agent is running out of usable context — and it was
+/// missing here, so the signal never reached the app at all. It cost a real incident: agent
+/// a0d5dc98 (2026-07-29) ran `/compact` three times in a row, the third failing with "Not enough
+/// messages to compact", while `get_agent_status` reported it idle and the build column showed it
+/// fine. The founder found it by reading the terminal himself. Sparkle never issues `/compact`
+/// (nothing in this repo does), so the retry loop was the agent's own — which is exactly why the
+/// app has to be able to SEE compaction rather than cause it. Consumed by engine/agentThrash.
 const PLAIN_EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "Notification",
@@ -34,6 +43,24 @@ const PLAIN_EVENTS: &[&str] = &[
     "SubagentStop",
     "SessionStart",
     "SessionEnd",
+    // `PreCompact` fires when Claude Code compacts a session — the only structured signal that an
+    // agent is running out of usable context, and the thing agent a0d5dc98's three-`/compact` loop
+    // (2026-07-29) needed someone to see.
+    //
+    // REGISTERED BARE, and that is now an evidence-backed choice rather than an assumption. It was
+    // briefly registered with an all-matching `"*"` on the theory that a matcher-scoped lifecycle
+    // event needs one — but `SessionStart` is matcher-scoped in exactly the same way (Claude Code's
+    // own plugins register `"matcher": "startup|resume|clear|compact"`), is registered bare here and
+    // in this machine's global settings with `"matcher": ""`, and demonstrably DELIVERS: the whole
+    // hook status engine runs on it. So bare matches. Meanwhile `"*"` is only an all-match if Claude
+    // Code special-cases the string — as a regex it is invalid — which means the "safer" form was
+    // the unverified one, and it risked causing the very dead-arm outcome it claimed to prevent
+    // (roborev 55296).
+    //
+    // Still not observed end-to-end (no `PreCompact` line has appeared in this machine's logs yet;
+    // they predate the registration), and thrash detection deliberately does not depend on it — the
+    // repetition and no-tool-turn rules catch the `/compact` loop on their own.
+    "PreCompact",
 ];
 
 /// Minimal POSIX single-quote escaping for embedding a path in a hook command string.

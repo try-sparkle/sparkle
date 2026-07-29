@@ -137,6 +137,27 @@ export function hasTurnEndAuthority(agentId: string): boolean {
 }
 
 /**
+ * Has this agent's PTY exited? `undefined` when this window is not driving the agent — which is NOT
+ * "it is alive", and callers must keep the two apart.
+ *
+ * THE ONLY READER OF `exited` IN THE APP, and it exists because a consumer needed a real death
+ * signal and there was nowhere to get one. `services/agentLiveness` says so in as many words ("for a
+ * real death signal ask something that watches the process"); this module is that something, since
+ * `noteProcessExit` is called from StatusEngine's own exit path. `engine/goalContinuation` needs it
+ * to tell an `unmerged` row whose agent is still running from one whose process is gone — the
+ * `unmerged` band is an overlay over idle/done/stopped, so the status itself cannot answer, and
+ * without this reader that gate had no producer at all and refused the whole band (roborev 55298).
+ *
+ * Note the asymmetry with `hasTurnEndAuthority`, which folds `exited` into an OR: there, an exited
+ * PTY is the strongest possible witness that a turn ended. Here it is the evidence that there is no
+ * terminal left to type into. Same flag, opposite consequence, which is exactly why it needs its own
+ * reader rather than being inferred from the other one.
+ */
+export function hasExited(agentId: string): boolean | undefined {
+  return byAgent.get(agentId)?.exited;
+}
+
+/**
  * Drop an agent's record — its pane unmounted, so this window no longer witnesses anything.
  *
  * OWNERSHIP-GUARDED, mirroring `unregisterStatusEngine` in engine/engineRegistry and for the same

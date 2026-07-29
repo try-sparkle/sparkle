@@ -52,6 +52,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
 import { noteHooksDead, noteHooksLive } from "../engine/turnEndAuthority";
+import { forgetThrash, noteThrashEvent } from "../engine/agentThrash";
 import { log } from "../logger";
 import { watchHookEvents, type HookWatcher } from "../services/hookWatcher";
 import { useHistoryStore } from "../stores/historyStore";
@@ -416,6 +417,12 @@ function AgentPaneInner({
     // Hand status authority back to the scraper until the next run's first hook event, so a
     // restart doesn't stay frozen on the prior run's last hook status.
     routerRef.current?.reset();
+    // Drop the thrash accumulator with the watcher that fed it. Without this the entry outlives the
+    // pane: a closed agent leaks its counters, and a restarted one inherits the previous session's
+    // compaction timestamps — which defeats the module's own remedy, since `context-pressure` tells
+    // the human to start a fresh session and the fresh session would keep reporting pressure.
+    // `SessionStart` also resets the accumulator, so recovery does not depend on this path alone.
+    forgetThrash(agent.id);
   };
 
   const prepare = async () => {
@@ -561,6 +568,10 @@ function AgentPaneInner({
               // that used to stand in for it.
               noteHooksLive(agent.id);
             },
+            // Progress evidence, from the same gated stream: which tools ran, what command was
+            // submitted, and whether the session compacted. This is what tells a working agent
+            // apart from one repeating a failing command — the screen cannot (engine/agentThrash).
+            noteThrash: (ev) => noteThrashEvent(agent.id, ev),
             captureHistory: captureHistoryFromHook,
             // Tier (d) of the concierge's read chain. A REQUIRED dep, so this hand-off cannot be
             // dropped without a compile error — see HookEventHandlerDeps.noteTranscript.

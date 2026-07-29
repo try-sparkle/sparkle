@@ -21,6 +21,11 @@ export function normalize(payload, ts) {
   // prompts/responses to the searchable history store. Defensive: only string values survive.
   if (typeof p.prompt === "string") out.prompt = p.prompt;
   if (typeof p.transcript_path === "string") out.transcript_path = p.transcript_path;
+  // SessionStart's `source` — one of startup|resume|clear|compact. WITHOUT THIS the app cannot tell
+  // a human restarting an agent from Claude Code compacting it, and those demand opposite handling:
+  // a restart means "forget what you knew", a compaction is EVIDENCE OF CONTEXT PRESSURE and must
+  // not erase the pressure history that proves it (engine/agentThrash).
+  if (typeof p.source === "string") out.source = p.source;
   return out;
 }
 
