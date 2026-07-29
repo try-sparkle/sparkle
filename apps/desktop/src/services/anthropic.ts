@@ -78,8 +78,9 @@ export function noteAiProviderFailure(err: unknown): void {
 /**
  * Record the SERVICE-level health of a proxied call for the app-shell AiServiceBanner. Distinct from
  * the provider-account signal above: this is the sustained-gateway-failure detector that surfaces the
- * bare-502 outage the named-reason banner cannot see (see stores/aiServiceHealthStore). Written from
- * this same chokepoint so whichever feature calls first lights (or clears) the banner for all of them.
+ * bare-502 outage the named-reason banner cannot see (see stores/aiServiceHealthStore). Like the
+ * provider pair, and for the same reason (there is NO single JS chokepoint — roborev 54761), EVERY
+ * proxied wrapper must call both of these so whichever feature fails/recovers first drives the banner.
  */
 export function noteAiServiceHealthy(): void {
   useAiServiceHealthStore.getState().noteSuccess();

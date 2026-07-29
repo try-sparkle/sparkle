@@ -18,7 +18,7 @@
 // passes it in, which is what keeps tier 1 unit-testable without a live app. The single impure
 // thing is the tier-2 invoke, injectable via `deps` for tests.
 import { invoke } from "@tauri-apps/api/core";
-import { noteAiProviderFailure, noteAiProviderHealthy } from "./anthropic";
+import { noteAiProviderFailure, noteAiProviderHealthy, noteAiServiceFailure, noteAiServiceHealthy } from "./anthropic";
 import type { AgentTabStatus } from "../types";
 import { log } from "../logger";
 import { isTerseAnswer, liveOptionsFor } from "./conciergeDispatch";
@@ -262,10 +262,12 @@ export function invokeClassify(text: string, context: string): Promise<string> {
   return invoke<string>("route_classify", { text, context }).then(
     (out) => {
       noteAiProviderHealthy();
+      noteAiServiceHealthy();
       return out;
     },
     (err: unknown) => {
       noteAiProviderFailure(err);
+      noteAiServiceFailure(err);
       throw err;
     },
   );

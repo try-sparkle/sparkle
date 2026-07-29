@@ -15,7 +15,7 @@
 // (no API key, network) just leaves the current name as-is. The naming call must never block
 // or break the send path, so callers fire-and-forget.
 import { invoke } from "@tauri-apps/api/core";
-import { noteAiProviderFailure, noteAiProviderHealthy } from "./anthropic";
+import { noteAiProviderFailure, noteAiProviderHealthy, noteAiServiceFailure, noteAiServiceHealthy } from "./anthropic";
 import { useProjectStore } from "../stores/projectStore";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
@@ -297,6 +297,8 @@ export async function maybeAutoName(
     // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
     // one on a banner the user cannot dismiss (roborev 54761).
     noteAiProviderHealthy();
+    // …and that the SERVICE is up, retiring the sustained-failure banner (aiServiceHealthStore).
+    noteAiServiceHealthy();
     // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +
     // description on hover.
     const canonical = name?.title?.trim();
@@ -313,6 +315,7 @@ export async function maybeAutoName(
     // for THIS surface (a name is cosmetic), but a provider outage must still be recorded so the
     // app-level banner can name it — that is the failure mode this whole path went dark under.
     noteAiProviderFailure(e);
+    noteAiServiceFailure(e);
     console.debug("auto-name skipped:", e);
   } finally {
     inFlight.delete(agentId);
@@ -500,6 +503,7 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
     // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
     // one on a banner the user cannot dismiss (roborev 54761).
     noteAiProviderHealthy();
+    noteAiServiceHealthy();
     const canonical = name?.title?.trim();
     if (canonical) {
       // TERMINAL: we produced a name, so never spend a second call for this agent.
@@ -517,6 +521,7 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
     }
   } catch (e) {
     noteAiProviderFailure(e);
+    noteAiServiceFailure(e);
     // Retryable — no API key yet, offline, keychain locked, proxy 500. Deliberately do NOT mark the
     // attempt terminal: the old code marked it BEFORE the invoke, so a single blip permanently
     // pinned the agent at its default for the whole app session (that Set is module-level and never

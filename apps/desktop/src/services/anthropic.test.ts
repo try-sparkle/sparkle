@@ -9,6 +9,8 @@ import {
   chatOnce,
   noteAiProviderFailure,
   noteAiProviderHealthy,
+  noteAiServiceFailure,
+  noteAiServiceHealthy,
   structuredJson,
   extractJson,
   parseUnavailableReason,
@@ -19,6 +21,11 @@ import { OutOfCreditsError } from "./credits";
 import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useAiProviderStore } from "../stores/aiProviderStore";
+import {
+  AI_SERVICE_DEGRADED_THRESHOLD,
+  HEALTHY_SERVICE,
+  useAiServiceHealthStore,
+} from "../stores/aiServiceHealthStore";
 
 /** chatOnce/structuredJson now enforce a hard local credit gate, so the network-path tests need a
  *  funded, signed-in account or the gate throws before invoke is ever reached. */
@@ -95,6 +102,57 @@ describe("noteAiProviderHealthy / noteAiProviderFailure", () => {
     noteAiProviderFailure(new Error("boom"));
     noteAiProviderFailure(undefined);
     expect(useAiProviderStore.getState().outage).toBeNull();
+  });
+});
+
+describe("noteAiServiceHealthy / noteAiServiceFailure (the sustained-outage signal)", () => {
+  // The SEV that this exists for was bare 502s, which the provider signal above never sees. And like
+  // that signal, it must be fed from EVERY wrapper, not just chatOnce — so these test the wiring fns
+  // the four wrappers call, plus chatOnce end-to-end.
+  beforeEach(() => useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE }));
+
+  it("degrades after a SUSTAINED run of 502s from ANY wrapper, not just chatOnce", () => {
+    for (let i = 0; i < AI_SERVICE_DEGRADED_THRESHOLD; i += 1) {
+      noteAiServiceFailure("ai request failed (HTTP 502)");
+    }
+    expect(useAiServiceHealthStore.getState().degraded).toBe(true);
+    expect(useAiServiceHealthStore.getState().reason).toBe("unreachable");
+  });
+
+  it("does NOT degrade on a lone 502 — the non-flappy guard", () => {
+    noteAiServiceFailure("ai request failed (HTTP 502)");
+    expect(useAiServiceHealthStore.getState().degraded).toBe(false);
+  });
+
+  it("CLEARS degradation from a non-chatOnce success — the recovery path", () => {
+    useAiServiceHealthStore.setState({
+      consecutiveFailures: AI_SERVICE_DEGRADED_THRESHOLD,
+      degraded: true,
+      reason: "unreachable",
+      dismissed: false,
+    });
+    noteAiServiceHealthy();
+    expect(useAiServiceHealthStore.getState().degraded).toBe(false);
+  });
+
+  it("ignores non-string rejections and the offline sentinel (OfflineBanner owns offline)", () => {
+    for (let i = 0; i < AI_SERVICE_DEGRADED_THRESHOLD + 2; i += 1) noteAiServiceFailure("ai_unreachable");
+    noteAiServiceFailure(new Error("boom"));
+    noteAiServiceFailure(undefined);
+    expect(useAiServiceHealthStore.getState().degraded).toBe(false);
+  });
+
+  it("chatOnce end-to-end: sustained rejections degrade, a success clears", async () => {
+    useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE });
+    invokeMock.mockRejectedValue("ai request failed (HTTP 502)");
+    for (let i = 0; i < AI_SERVICE_DEGRADED_THRESHOLD; i += 1) {
+      await expect(chatOnce("sys", "usr")).rejects.toThrow();
+    }
+    expect(useAiServiceHealthStore.getState().degraded).toBe(true);
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue("ok");
+    await chatOnce("sys", "usr");
+    expect(useAiServiceHealthStore.getState().degraded).toBe(false);
   });
 });
 
