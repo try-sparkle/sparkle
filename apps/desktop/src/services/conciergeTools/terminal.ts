@@ -71,15 +71,16 @@ import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { isRedStatus } from "../windowStatus";
-import { isObserved, livenessOf, type AgentLiveness } from "../agentLiveness";
+import { isObserved, type AgentLiveness } from "../agentLiveness";
+import {
+  findKnownAgent,
+  knownAgentLiveness,
+  type KnownAgentSource,
+} from "../knownAgents";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import { calmNewAgent } from "../../engine/newAgentAttention";
 import { useInteractionStore } from "../../stores/interactionStore";
-import { useProjectStore } from "../../stores/projectStore";
-import {
-  useRuntimeStore,
-  mergeOpenAgentIds,
-  readPersistedOpenAgentIds,
-} from "../../stores/runtimeStore";
+import { useRuntimeStore } from "../../stores/runtimeStore";
 import type { AgentTabStatus } from "../../types";
 import {
   detectTerminalPrompts,
@@ -197,7 +198,14 @@ export interface ReadAgentTerminalOptions {
 
 export interface AgentStatusReport {
   agentId: string;
-  /** Does the project store know this agent at all? `false` usually means a closed or invented id. */
+  /**
+   * Can this window address this agent at all? `false` means a closed or invented id.
+   *
+   * NOT "is there a project-store row": it also covers the app-owned Improve Sparkle agent, which is
+   * never in any project's roster, and any agent this window has a live status for. `detail` names
+   * which. The one guarantee worth branching on is that `known` is TRUE whenever `observed` is —
+   * see the note at the return site for the contradiction that used to be reachable here.
+   */
   known: boolean;
   status: AgentTabStatus | "unknown";
   runtime: "local" | "cloud" | "unknown";
@@ -513,27 +521,49 @@ async function readTranscriptTier(agentId: string): Promise<TierResult> {
 // Status
 // ---------------------------------------------------------------------------------------------
 
-/** The store row for an agent, or undefined. */
-function findAgent(agentId: string) {
-  return useProjectStore
-    .getState()
-    .projects.flatMap((p) => p.agents)
-    .find((a) => a.id === agentId);
-}
+/** Anything this window can address by this id — a roster row, the app-owned Sparkle agent, or an
+ *  agent it is actively observing. See services/knownAgents for the three arms and why a bare
+ *  roster scan was wrong (it is what made "Improve Sparkle" unreachable from here). */
+const findAgent = findKnownAgent;
 
 /** The sentence that goes with each report, so an LLM reading this result does not have to infer
  *  what a `false` establishes. Kept beside the report it describes. Pure. */
 function statusDetail(
-  known: boolean,
+  source: KnownAgentSource | undefined,
   liveness: AgentLiveness,
   status: AgentTabStatus | undefined,
   needsYou: boolean,
 ): string {
-  if (!known) {
+  if (source === undefined) {
     return (
       "No agent with this id is open. It was closed, or the id is stale — a roster read taken " +
       "even a moment earlier can legitimately list an agent that has since been closed, so this " +
       "is not the app contradicting itself. Re-read the roster before treating it as missing."
+    );
+  }
+  // WHAT KIND of known, said out loud. `known: true` used to imply "there is a roster row", and the
+  // two extra arms would be a silent widening of that promise if the detail did not name them: a
+  // caller told an agent exists will go looking for it in `get_state`, and neither of these appears
+  // there. The Sparkle line also carries the ADDRESS, because the id is the one thing a caller
+  // cannot discover from the roster.
+  if (source === "sparkle") {
+    return (
+      "This is the built-in Improve Sparkle agent — the app's own self-improvement agent, " +
+      "addressable at the stable id `" +
+      SPARKLE_AGENT_ID +
+      "`. It is not part of any project's roster (it works on Sparkle itself, in an app-owned " +
+      "clone), so it will not appear in get_state — but these terminal ops reach it exactly as " +
+      "they reach a build agent. " +
+      (liveness === "local"
+        ? `Read live: status '${status}'.`
+        : "Its pane is open in another window, so the status below is a default, not a reading.")
+    );
+  }
+  if (source === "observed") {
+    return (
+      "This window is reading a live status for this agent, but it has no roster row here — its " +
+      "project is not loaded in this window, or it was closed while running. The status below is " +
+      "a real reading; the agent's name, project and kind are not available."
     );
   }
   if (liveness !== "local") {
@@ -576,6 +606,12 @@ function statusDetail(
 export function getAgentStatus(agentId: string): AgentStatusReport {
   const agent = findAgent(agentId);
   const rt = useRuntimeStore.getState();
+  // `calmNewAgent` corrects for "spawned but never briefed", which needs the roster row's own
+  // creation/brief timestamps. The other two arms have no row, and neither needs the correction: the
+  // Sparkle agent is briefed by the app itself the moment it starts (a mission prompt, or the hourly
+  // pass's), and an `observed`-only id is by definition one this window is watching run. So they
+  // read the raw status rather than being handed a synthetic row to satisfy a signature.
+  const tab = agent?.tab;
   // The raw runtime status, CORRECTED for "spawned but never briefed" (engine/newAgentAttention).
   // A briefless agent reaches `blocked` on statusEngine's 25s stall timer having asked nobody
   // anything, and `blocked` is in the red-colour tier `needsYou` is derived from — so without this
@@ -587,10 +623,10 @@ export function getAgentStatus(agentId: string): AgentStatusReport {
   //
   // `livenessOf` deliberately keeps asking the RAW map: it answers "did this window observe this
   // agent at all", which is a question about the entry's existence, not its value.
-  const status = agent
+  const status = tab
     ? calmNewAgent(
         rt.status[agentId],
-        agent,
+        tab,
         Date.now(),
         // Route 4: the LIVE (in-memory) record of a brief typed straight into the terminal pane.
         // Not the only one any more — route 5 (`agent.terminalBriefedAt`) rides along on the agent
@@ -599,23 +635,28 @@ export function getAgentStatus(agentId: string): AgentStatusReport {
         useInteractionStore.getState().lastAt[agentId],
       )
     : rt.status[agentId];
-  const openIds = new Set(
-    mergeOpenAgentIds(rt.openAgentIds ?? [], readPersistedOpenAgentIds()),
-  );
-  const liveness = livenessOf(agentId, rt.status, openIds);
+  const liveness = knownAgentLiveness(agentId);
   // The red-COLOR tier (waiting|approval|blocked|errored), asked of the shared predicate so this
   // can't drift from what the sidebar paints.
   const needsYou = isRedStatus(status);
   return {
     agentId,
+    // KNOWN AND OBSERVED CAN NO LONGER DISAGREE, and that is an invariant, not a side effect of
+    // this particular resolver. The pair used to report `{ known: false, observed: true, status:
+    // "working" }` for the Improve Sparkle agent — the same call saying it was reading a live status
+    // for an agent that does not exist. A caller cannot act on that: `known: false` is documented as
+    // "closed or invented", which tells it to stop, while `observed: true` tells it the reading is
+    // authoritative. `findKnownAgent`'s third arm resolves ANY id with a live status entry, so the
+    // contradiction is now unrepresentable rather than merely unlikely. See knownAgents' header, and
+    // the invariant test in terminal.test.ts.
     known: agent !== undefined,
     status: status ?? "unknown",
-    runtime: agent === undefined ? "unknown" : agent.runtime === "cloud" ? "cloud" : "local",
+    runtime: agent?.runtime ?? "unknown",
     canAcceptInput: agentCanAcceptInput(agentId),
     needsYou,
     liveness,
     observed: isObserved(liveness),
-    detail: statusDetail(agent !== undefined, liveness, status, needsYou),
+    detail: statusDetail(agent?.source, liveness, status, needsYou),
   };
 }
 
@@ -799,17 +840,32 @@ export interface ConciergeToolDescriptor {
 // `string` union routes nothing and catches nothing). `satisfies` keeps the shape check this
 // annotation was doing while preserving the literal names, so adding a descriptor here is a
 // TYPECHECK FAILURE in the registry until it is routed.
+/** The one sentence that makes "Improve Sparkle" REACHABLE rather than merely resolvable.
+ *
+ *  Its id is the only agent address in the app that a caller cannot discover: it is app-owned, so it
+ *  is deliberately absent from `get_state`'s roster, and the concierge's whole model of "which
+ *  agents exist" comes from that roster. Fixing the resolver without saying the id out loud would
+ *  leave the capability present and undiscoverable — which is indistinguishable, from the user's
+ *  seat, from the bug it fixes. Appended to all three descriptions because a caller may reach for
+ *  any of them first, and the read ops are the ones it will reach for before it dares a write. */
+const SPARKLE_AGENT_TOOL_NOTE =
+  `Works for the built-in Improve Sparkle agent too, at the stable id \`${SPARKLE_AGENT_ID}\` — ` +
+  "it is the app's own self-improvement agent, so it does NOT appear in get_state's roster, but " +
+  "these ops reach it exactly as they reach a build agent.";
+
 export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "read_agent_terminal",
     description:
-      "Read what an agent's terminal recently showed. Returns the text plus the SOURCE and FRESHNESS it came from (live screen, the screen captured when it last asked for you, searched history, or its transcript) — say which when it isn't live. Output is capped and reports what it dropped.",
+      "Read what an agent's terminal recently showed. Returns the text plus the SOURCE and FRESHNESS it came from (live screen, the screen captured when it last asked for you, searched history, or its transcript) — say which when it isn't live. Output is capped and reports what it dropped. " +
+      SPARKLE_AGENT_TOOL_NOTE,
     write: false,
   },
   {
     name: "get_agent_status",
     description:
-      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Check `observed` first: when it is false there was no live status to read, so `needsYou: false` means NOT OBSERVED rather than calm — relay `detail` instead of reporting the agent as fine. Read-only.",
+      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Check `observed` first: when it is false there was no live status to read, so `needsYou: false` means NOT OBSERVED rather than calm — relay `detail` instead of reporting the agent as fine. Read-only. " +
+      SPARKLE_AGENT_TOOL_NOTE,
     write: false,
   },
   {
@@ -833,7 +889,8 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "send_to_agent_terminal",
     description:
-      "Type a message into an agent's terminal, as if the human had typed it. Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer.",
+      "Type a message into an agent's terminal, as if the human had typed it. Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer. " +
+      SPARKLE_AGENT_TOOL_NOTE,
     write: true,
   },
 ] as const satisfies readonly ConciergeToolDescriptor[];

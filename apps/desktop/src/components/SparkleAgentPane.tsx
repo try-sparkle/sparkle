@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
+import { registerSparkleTranscript } from "../services/sparkleTranscript";
 import { buildClaudeExec } from "../services/claudeSpawn";
 import { cancelImprovementPass } from "../services/improvementPass";
 import {
@@ -97,6 +98,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
         setPhase("no-claude");
         return;
       }
+      // Register this worktree's transcript so the concierge can READ this agent once the pane is
+      // unmounted (tier (d) — see services/sparkleTranscript). Fire-and-forget: it must not delay or
+      // fail a spawn.
+      void registerSparkleTranscript(agentId, wt.path);
       const resume = await claudeHasSession(wt.path).catch(() => false);
       // Consent gates what the agent may do (bead sparkle-4xwk.1). Read at prepare() time — the
       // spawned command is built here, so a consent change while a session is already running is

@@ -29,6 +29,7 @@ import {
 import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { rollupDotAccessor } from "../engine/workerRollup";
+import { agentDisplayName } from "../engine/agentDisplayName";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
@@ -574,7 +575,13 @@ function handleGetState(req: ControlRequest): {
   const all = projects.flatMap((p) =>
     p.agents.map((a) => ({
       id: a.id,
-      name: a.name,
+      // The SHARED rule (engine/agentDisplayName), not `a.name`. A bare `a.name` is right only for
+      // an agent whose name is authoritative; for an auto-named one it is the creation-time fallback
+      // while every other surface shows the derived title, so the roster and the concierge's
+      // needs-you feed (services/conciergeFeed, which has always used this rule) could name the same
+      // id two different things. They did — see the header of agentDisplayName for the pair that
+      // sent a user chasing a bug that did not exist.
+      name: agentDisplayName(a),
       kind: a.kind,
       status: status[a.id] ?? "stopped",
       // What the row's disc says once its workers are counted — "green" | "red" | "orange" | "gray"

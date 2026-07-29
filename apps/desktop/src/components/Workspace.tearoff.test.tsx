@@ -49,7 +49,13 @@ vi.mock("../services/crossWindowSync", () => ({ subscribeToCrossWindowSync: () =
 // what makes a project eligible for a retry (roborev 52648/52649).
 const reattach = vi.hoisted(() => vi.fn(async (_id: string): Promise<string[] | null> => []));
 vi.mock("../services/cloudAgents/startup", () => ({ reattachProjectOnOpen: reattach }));
-vi.mock("../services/sparkleAgent", () => ({
+// PARTIAL, not a replacement: the real module also exports the reserved-id constants
+// (SPARKLE_AGENT_ID / SPARKLE_PROJECT_ID / isSparkleAgentId), which other modules in this render
+// tree now import transitively. A whole-module mock silently drops them, and the failure surfaces as
+// an unrelated import error in whichever file happens to need one — so spread the original and
+// override only the three launch decisions this suite is steering.
+vi.mock("../services/sparkleAgent", async (orig) => ({
+  ...(await orig<typeof import("../services/sparkleAgent")>()),
   sparkleAgentIdFor: () => "sparkle",
   sparkleOpenSetWhitelist: () => [],
   shouldWarmSparkleAtLaunch: () => false,

@@ -69,6 +69,7 @@ import { recordTrialSend, trialSendAllowed } from "./trialMeter";
 import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
 import { paneState } from "./paneReadiness";
+import { findKnownAgent } from "./knownAgents";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 import type { SuggestionButton } from "./suggestions/types";
@@ -242,21 +243,25 @@ export function matchAnswerToOption(
   return null;
 }
 
-/** The one store lookup behind both predicates below. */
-function findAgent(agentId: string) {
-  return useProjectStore
-    .getState()
-    .projects.flatMap((p) => p.agents)
-    .find((a) => a.id === agentId);
-}
+/**
+ * The one lookup behind both predicates below.
+ *
+ * NOT a bare `projectStore` scan any more. That array is the user's build-agent roster and is not
+ * the set of agents the app runs — the app-owned Sparkle self-improvement agent is deliberately
+ * outside it — so scanning it made "Improve Sparkle" unaddressable from every surface that gates on
+ * this. `findKnownAgent` (services/knownAgents) is the shared resolver; read its header for the
+ * three arms and why the Sparkle one is not merely a special case of the last.
+ */
+const findAgent = findKnownAgent;
 
 /**
  * Is this agent DEFINITELY a cloud agent (no local PTY)? The dispatcher's refusal test.
  *
- * Deliberately only true when the store says so. An agent the store doesn't know about may still
- * have a live PTY — a store/window sync gap, an agent mounted before its project row lands — and
- * refusing it as "cloud-agent" would be a lie about why the send failed. Let the write attempt
- * decide; it reports pty-gone honestly if there's nothing there.
+ * Deliberately only true on EVIDENCE. An agent nothing can resolve may still have a live PTY — a
+ * store/window sync gap, an agent mounted before its project row lands — and refusing it as
+ * "cloud-agent" would be a lie about why the send failed. So would refusing on the `observed` arm's
+ * `runtime: "unknown"`, which says "no record names the runtime", not "it is remote". Let the write
+ * attempt decide; it reports pty-gone honestly if there's nothing there.
  */
 function isCloudAgent(agentId: string): boolean {
   return findAgent(agentId)?.runtime === "cloud";

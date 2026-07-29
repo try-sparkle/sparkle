@@ -63,6 +63,7 @@ import {
   passRetryDueAt,
   PROBE_KILL_WAIT_MS,
   PROBE_TIMEOUT_MS,
+  refusalDetail,
   resetPassRetryForTests,
   runImprovementPass,
 } from "./improvementPass";
@@ -103,10 +104,12 @@ function resetHarness() {
 }
 
 /** The two warnings the park guard can emit, quoted from improvementPass.ts. Shared so the positive
- *  assertions and `warnedStaleBase` cannot drift from each other by a typo — a mistyped literal
+ *  assertions and `warnedRefusal` cannot drift from each other by a typo — a mistyped literal
  *  inside the negative helper would otherwise return false forever and pass silently. */
-const STALE_BASE_WARNING = "improvement pass: starting from a stale base —";
-const PARK_FAILED_WARNING = "improvement pass: could not park the worktree on a fresh base:";
+const REFUSED_WARNING = "improvement pass: refusing to run from an unknown base —";
+/** The OUTER catch's warning. A park throw is deliberately not caught locally any more — it must
+ *  reach this handler, which is the only one that arms the connectivity re-attempt. */
+const PASS_ERRORED_WARNING = "improvement pass errored:";
 
 /** Run `fn` with `console.warn` stubbed, always restoring it. A spy restored by a trailing call is
  *  left installed for the rest of the file the moment an assertion above it throws — the same
@@ -127,10 +130,17 @@ async function withWarnSpy(fn: (warn: MockInstance<typeof console.warn>) => Prom
  *  What protects the literal is the SHARED CONSTANT, not the annotation: DOM's `Console.warn` is
  *  `(...data: any[]): void`, so `calls` is `any[][]` and `c[0]` is `any` no matter how the spy is
  *  typed. `MockInstance<typeof console.warn>` is a readability tidy-up over
- *  `ReturnType<typeof vi.spyOn>`, nothing more — don't inline STALE_BASE_WARNING believing the type
+ *  `ReturnType<typeof vi.spyOn>`, nothing more — don't inline REFUSED_WARNING believing the type
  *  would catch a typo, because it would not, and this helper would then return false forever. */
-function warnedStaleBase(warn: MockInstance<typeof console.warn>): boolean {
-  return warn.mock.calls.some((c) => c[0] === STALE_BASE_WARNING);
+function warnedRefusal(warn: MockInstance<typeof console.warn>): boolean {
+  return warn.mock.calls.some((c) => c[0] === REFUSED_WARNING);
+}
+
+/** Assert the pass never spawned. THE SIDE EFFECT, and the reason these tests exist: a refusal that
+ *  warns but still runs `claude` against an unknown base is precisely the bug being fixed, and a
+ *  test that only checks the warning would go green against it. */
+function expectNoRunInvoked() {
+  expect(harness.invokes.map((c) => c.cmd)).not.toContain("sparkle_improve_run");
 }
 
 describe("runImprovementPass watchdog", () => {
@@ -252,11 +262,16 @@ describe("runImprovementPass watchdog", () => {
     const pass = runImprovementPass("always");
     await untilRunInvoked();
 
+    // The trailing "stash" is load-bearing, not incidental: the widened dirt rule is OPT-IN in Rust,
+    // so the pass only benefits from it by asking. Drop the argument and every park silently reverts
+    // to declining on leftovers — which, now that a decline is a GATE, turns the old fixed point
+    // ("runs from a stale base every hour") into a worse one ("never runs at all").
     expect(parkWorktreeOnBase).toHaveBeenCalledWith(
       "/app-data/oss",
       SPARKLE_PROJECT_ID,
       SPARKLE_AGENT_ID,
       "main",
+      "stash",
     );
     const parkOrder = vi.mocked(parkWorktreeOnBase).mock.invocationCallOrder[0];
     const runIndex = vi.mocked(invoke).mock.calls.findIndex((c) => c[0] === "sparkle_improve_run");
@@ -271,34 +286,42 @@ describe("runImprovementPass watchdog", () => {
     await pass;
   });
 
-  it("a DECLINED park is not a gate either: the pass runs and the stale base is warned about", async () => {
-    // Between "parked" and "threw" sits the case the service actually branches on: park returns
-    // parked: false for a reason other than already-fresh (a dirty or unpushed worktree it refuses
-    // to move). That must warn and continue, never skip the user's hourly pass.
-    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "dirty" });
+  // PARK OR REFUSE. This pair used to assert the opposite — that a declined park warned and ran the
+  // pass anyway — which is how the defect survived: an hourly `starting from a stale base` line in a
+  // log nobody reads, while every pass built on whatever the last one left behind. `unpushed` is the
+  // case that cannot be stashed away (a stash cannot save a commit), so it is the one that still
+  // reaches this branch after the dirt policy widened, and it is what the fixture uses.
+  it("an UNPUSHED park is a gate: the pass never spawns and the row goes blocked", async () => {
+    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
 
     await withWarnSpy(async (warn) => {
-      const pass = runImprovementPass("always");
-      await untilRunInvoked();
-      harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
-      await pass;
+      await runImprovementPass("always");
 
-      expect(warn).toHaveBeenCalledWith(STALE_BASE_WARNING, "dirty");
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("idle");
+      // The side effect is the claim: no `claude` was spawned against a base we cannot describe.
+      expectNoRunInvoked();
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
       expect(isPassRunning()).toBe(false);
+      // Loud, not silent — but the warning is the secondary assertion, never the only one.
+      expect(warn).toHaveBeenCalledWith(
+        REFUSED_WARNING,
+        "unpushed",
+        "—",
+        refusalDetail("unpushed"),
+      );
     });
   });
 
-  it("an ALREADY-FRESH worktree is not a stale base and must not warn", async () => {
+  it("an ALREADY-FRESH worktree is not a refusal: the pass runs normally", async () => {
     // The other half of the service's guard (`!park.parked && park.reason !== "already-fresh"`).
-    // Nothing pinned it, so deleting that second clause — turning every ordinary fresh-worktree
-    // pass into a spurious stale-base warning, once an hour, forever — kept the suite green.
+    // Nothing pinned it, so deleting that second clause kept the suite green — and now that a
+    // refusal is a GATE, dropping it would block the most ordinary outcome there is (a worktree
+    // already sitting on the base) once an hour, forever. The cost of the missing clause went up.
     const { parkWorktreeOnBase } = await import("./worktree");
     harness.parkImpl = () => Promise.resolve({ parked: false, reason: "already-fresh" });
 
     await withWarnSpy(async (warn) => {
       const pass = runImprovementPass("always");
-      await untilRunInvoked();
+      await untilRunInvoked(); // the side effect: `already-fresh` still SPAWNS the pass
       harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
       await pass;
 
@@ -306,29 +329,108 @@ describe("runImprovementPass watchdog", () => {
       // happened: on its own, "did not warn" is equally satisfied by the whole park step being
       // deleted. resetHarness clears call history, so this sees THIS test's park only.
       expect(parkWorktreeOnBase).toHaveBeenCalled();
-      expect(warnedStaleBase(warn)).toBe(false);
+      expect(warnedRefusal(warn)).toBe(false);
       expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("idle");
       expect(isPassRunning()).toBe(false);
     });
   });
 
-  it("a failed park is advisory: the pass still runs", async () => {
-    // Parking is a freshness optimization, never a gate — a git/network failure there must not
-    // cost the user their hourly pass. The THROW branch of the same guard as the two tests above,
-    // so it pins its warning for the same reason they pin theirs (and stops the rejection printing
-    // a real warn into the test output).
+  it("a THROWN park is a gate too: the least-informed case is not the most permissive one", async () => {
+    // The throw branch of the same guard. This used to be swallowed entirely — so a park that
+    // rejected (it fetches, and it takes the per-repo git lock) promoted "we have no idea what the
+    // base is" to the most permissive outcome available. "We do not know" is the same conclusion as
+    // a decline, not a lesser one.
     harness.parkImpl = () => Promise.reject(new Error("git exploded"));
 
     await withWarnSpy(async (warn) => {
-      const pass = runImprovementPass("always");
-      await untilRunInvoked();
-      harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
-      await pass;
+      await runImprovementPass("always", true);
 
-      expect(warn).toHaveBeenCalledWith(PARK_FAILED_WARNING, expect.any(Error));
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("idle");
+      expectNoRunInvoked();
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
       expect(isPassRunning()).toBe(false);
+      // The throw reaches the OUTER catch, not a local handler — see below.
+      expect(warn).toHaveBeenCalledWith(PASS_ERRORED_WARNING, expect.any(Error));
     });
+  });
+
+  // Park is the MOST networked setup step (it fetches), and the first cut caught its throw locally
+  // and returned from inside the `try` — which bypassed `armRetryIfTransient`, the only place a
+  // lost-connectivity failure earns this slot's one early re-attempt. Every OTHER setup-step throw
+  // (worktree creation, guard install, integrity assert) reaches the outer catch and does arm it.
+  // The scheduler has already stamped `lastRunAt`, so the slot was spent either way: a connectivity
+  // blip cost a full hour of no pass, where before the gate existed it cost nothing at all.
+  // roborev 55239.
+  it("a connectivity-shaped park throw still arms the slot's one re-attempt", async () => {
+    harness.parkImpl = () => Promise.reject(new Error("getaddrinfo ENOTFOUND github.com"));
+
+    await withWarnSpy(async () => {
+      await runImprovementPass("always", true);
+
+      // THE SIDE EFFECT: an armed retry, not merely a warning. A local catch would leave this null.
+      expect(passRetryDueAt()).not.toBeNull();
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expectNoRunInvoked();
+    });
+  });
+
+  // A decline is PERMANENT for the reasons that reach it — a stash cannot save a commit, so nothing
+  // in the pass, the app, or the next hour's park can clear `unpushed`. A red row with no text is
+  // then the same shape the Rust side just removed, relocated from "runs forever from a stale base"
+  // to "never runs again". So the reason is written where someone will actually read it. roborev
+  // 55239.
+  it("writes a readable reason and remedy where the user (and the concierge) will see it", async () => {
+    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+
+    await withWarnSpy(async () => {
+      await runImprovementPass("always");
+
+      // `attentionScreen` is what the pane shows for a red agent, what the phone relays, and what
+      // `read_agent_terminal` returns at tier (b) — so this one write reaches every surface.
+      const screen = useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "";
+      expect(screen).toBe(refusalDetail("unpushed"));
+      // It must NAME A REMEDY, not just restate the machine token: a user told "unpushed" has no
+      // way to know the thing to act on is a branch in a worktree they have never opened.
+      expect(screen).toMatch(/push that branch|delete it/i);
+      expect(screen).not.toMatch(/^unpushed$/);
+    });
+  });
+
+  // ...AND RETRACTS IT once it stops being true. Nothing else clears `attentionScreen`, and this is
+  // not cosmetic residue: it is tier (b) of `readAgentTerminal`, so a stale "can't start a pass —
+  // push that branch" would be handed to the concierge as this agent's CURRENT screen and relayed in
+  // the present tense while the pass it describes was running fine. This branch is what exposed it,
+  // by making the agent readable at all. roborev.
+  it("clears the refusal text once a later pass actually starts", async () => {
+    // A refusal happens...
+    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+    await withWarnSpy(async () => {
+      await runImprovementPass("always");
+    });
+    expect(useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID]).toBeTruthy();
+
+    // ...and the next hour the blocker is gone.
+    harness.parkImpl = () => Promise.resolve({ parked: true, reason: "parked" });
+    const pass = runImprovementPass("always", true);
+    await untilRunInvoked();
+    // THE SIDE EFFECT: cleared by the time the pass is actually running, so a read taken now cannot
+    // return the old refusal.
+    expect(useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "").toBe("");
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+    await pass;
+  });
+
+  // Every reason the gate can see gets a sentence — including one it does not enumerate. A refusal
+  // that fell through to an empty string would put a red row on screen explaining nothing, which is
+  // the state this whole surface exists to remove.
+  it("has a remedy sentence for every decline reason, including an unknown one", () => {
+    for (const reason of ["unpushed", "dirty", "no-base", "checkout-failed", "something-new"]) {
+      const text = refusalDetail(reason);
+      expect(text.length, reason).toBeGreaterThan(40);
+      expect(text, reason).toMatch(/Improve Sparkle/);
+    }
+    // The fallback still names the machine token, so a reason nobody wrote copy for is at least
+    // diagnosable from what the user can see.
+    expect(refusalDetail("something-new")).toContain("something-new");
   });
 
   it("an external cancel settles the pass at once instead of leaving it to the watchdog", async () => {
@@ -413,6 +515,7 @@ describe("runImprovementPass watchdog", () => {
     }
 
     it("names the leftovers, and the drift they cause, when the probe declines", async () => {
+      const { parkWorktreeOnBase } = await import("./worktree");
       const parks = planParks(
         { parked: true, reason: "parked" },
         { parked: false, reason: "dirty" },
@@ -429,6 +532,18 @@ describe("runImprovementPass watchdog", () => {
           "dirty",
           "— the next pass will start from a stale base",
         );
+        // THE PROBE MUST STAY ON "decline" — the startup park's "stash" would be actively wrong
+        // here. This probe exists to REPORT what the killed pass left behind, and stashing would
+        // relocate the very leftovers it is reporting on: the answer would come back "nothing at
+        // risk" because asking the question had already moved it. Nothing else pins the argument,
+        // and the mistake is a one-word edit that no other assertion in this file would notice.
+        expect(vi.mocked(parkWorktreeOnBase).mock.calls[1]).toEqual([
+          "/app-data/oss",
+          SPARKLE_PROJECT_ID,
+          SPARKLE_AGENT_ID,
+          "main",
+          "decline",
+        ]);
       });
     });
 

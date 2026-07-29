@@ -1529,6 +1529,29 @@ fn log_repo_lock_wait(op: &'static str, waited: std::time::Duration) {
     }
 }
 
+/// What a park is allowed to do about a worktree that is dirty with something OTHER than the
+/// session-tooling churn [`tooling_churn_to_restore`] already whitelists.
+///
+/// OPT-IN BY CONSTRUCTION, and that is the whole point of it being a parameter rather than a
+/// behaviour change. [`park_worktree_on_base_at`] is generic over worktrees, but only ONE caller
+/// today points it at a worktree the app itself owns end-to-end (the recurring headless
+/// self-improvement pass). A worktree cut from a USER'S own repository must keep the historical
+/// decline-don't-touch semantics: their uncommitted edits are not ours to relocate, however
+/// recoverable the relocation is. So the default is [`DirtyPolicy::Decline`], and widening it is
+/// something a call site has to say out loud.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DirtyPolicy {
+    /// Today's behaviour, and the default: real dirt declines the park and the tree is left exactly
+    /// as it was found.
+    #[default]
+    Decline,
+    /// Set real dirt aside into a per-agent stash and park anyway. STASH, never commit and never
+    /// discard — see the call site in [`park_worktree_on_base_at`] for why those are the two things
+    /// this deliberately does not do.
+    Stash,
+}
+
 /// What [`park_worktree_on_base_at`] did (or, when `parked` is false, why it declined). `reason`
 /// is a stable machine token, never prose, so the caller can log it without leaking a path.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -1537,11 +1560,17 @@ pub struct ParkOutcome {
     pub parked: bool,
     /// `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`.
     pub reason: String,
+    /// True when this park pushed a stash — session-tooling churn, or (under
+    /// [`DirtyPolicy::Stash`]) the whole leftover tree. It means "something was set aside and is
+    /// recoverable by hand from `git stash list`", so the caller can say so rather than implying a
+    /// park found nothing to move. Single bare word deliberately: [`ParkOutcome`] has no
+    /// `rename_all`, so the field name crosses to TypeScript exactly as written.
+    pub stashed: bool,
 }
 
 impl ParkOutcome {
     fn declined(reason: &str) -> Self {
-        Self { parked: false, reason: reason.into() }
+        Self { parked: false, reason: reason.into(), stashed: false }
     }
 }
 
@@ -1562,6 +1591,107 @@ const TOOLING_CHURN_PATHS: &[&str] = &[".beads/interactions.jsonl"];
 /// Stash message identifying a park's own churn entry, so the next park can retire it rather than
 /// stack another. Matched by substring against `git stash list`, so it must stay distinctive.
 const PARK_CHURN_STASH_MARKER: &str = "sparkle: session-tooling churn from park";
+
+/// Stash message for the WHOLE leftover tree a [`DirtyPolicy::Stash`] park sets aside.
+///
+/// DISTINCT FROM [`PARK_CHURN_STASH_MARKER`], not a reuse of it, because retiring is scoped by
+/// marker. Sharing one marker would bound the stash at a single entry per agent, but it would do so
+/// by letting a churn-only park — the cheap, routine case — retire the entry holding a previous
+/// pass's REAL leftover work, which is the more valuable of the two and the one a human is more
+/// likely to come looking for. Two markers means at most one live entry of each kind per agent:
+/// still bounded, and the retiring never crosses between kinds.
+const PARK_DIRT_STASH_MARKER: &str = "sparkle: leftover worktree dirt from park";
+
+/// How many leftover-dirt stashes survive per agent, newest first.
+///
+/// NOT ONE, which is what churn keeps and what this originally copied. Each dirt entry holds a
+/// DIFFERENT pass's unrecovered work — hour 1's half-finished edit and hour 2's unrelated one are
+/// not the same content, and neither supersedes the other — and a dirt stash is only ever popped by
+/// hand, so retiring on the churn rule silently destroyed the older one before anyone knew it
+/// existed (roborev 55238).
+///
+/// A ring rather than no bound at all: an unbounded push still stacks an entry per failed pass
+/// forever, pinning blobs against gc. Ten is the operating point because dirt is EXCEPTIONAL — it
+/// takes a pass that died mid-edit to produce any, unlike churn which is dirty on essentially every
+/// pass — so ten covers well over a day of consecutive failures, by which point the red row and its
+/// remedy text have been sitting in front of the user for a long time.
+const PARK_DIRT_STASH_KEEP: usize = 10;
+
+/// Churn keeps exactly one: the file is whitelisted and routinely regenerated, so entry N+1 really
+/// does supersede entry N. Named rather than inlined so the contrast with the constant above is
+/// visible at both call sites.
+const PARK_CHURN_STASH_KEEP: usize = 1;
+
+/// Push a stash under a PER-AGENT marker, then retire that marker's older entries. `Ok(())` only
+/// when the push itself succeeded — every caller keys its fail-closed handling off that.
+///
+/// The marker is per agent because `refs/stash` is REPOSITORY-WIDE, not per worktree: several
+/// app-owned worktrees share one repo, so a shared marker would have agent A's park retiring agent
+/// B's only recovery copy — the reverse of what retiring is for.
+///
+/// PUSH FIRST, RETIRE AFTER — never the other way round. Retiring first was deletion deferred by one
+/// pass: `stash push` is fallible (a locked index, a pathspec git refuses), and on that path the
+/// previous entry was already gone and no new one existed, so an operation that was supposed to lose
+/// nothing had destroyed the only recoverable copy. Sequenced this way, a failed push leaves the
+/// older entry exactly where it was and the tree untouched.
+///
+/// Retiring at all is bounded growth, not supersession: park runs hourly, so an unconditional push
+/// stacks an entry per hour forever, each pinning its blobs against gc and each surfacing in the
+/// main checkout's `git stash list`. Do NOT read the surviving entry as containing the retired ones
+/// — each stash is the diff against the tree at ITS park, and the tree is reverted in between.
+///
+/// HOW MANY TO KEEP IS THE CALLER'S CALL, and it is not a tuning knob — the two kinds of stash have
+/// different contents and the wrong answer DESTROYS WORK (roborev 55238). Churn is a whitelisted,
+/// routinely-regenerated file, so entry N+1 genuinely supersedes entry N and keeping one is right.
+/// Leftover DIRT is different in kind: each entry holds a *different* pass's unrecovered work, it is
+/// only ever popped by hand, and nothing tells anyone it exists — so retiring on the churn rule
+/// meant hour 1's half-finished `notes.md` was dropped, unreachable and gc-able, the moment hour 2
+/// stashed an unrelated `plan.md`. That is a destroy path in the one module whose whole invariant is
+/// "declines rather than destroys". Dirt therefore keeps a bounded RING (see
+/// [`PARK_DIRT_STASH_KEEP`]) instead of a single entry.
+///
+/// `keep` is how many entries under this marker survive, newest first. It is clamped to at least 1,
+/// so the entry just pushed can never be retired by the call that pushed it.
+fn push_park_stash(
+    wt: &str,
+    agent_id: &str,
+    marker_base: &str,
+    extra_args: &[&str],
+    paths: &[String],
+    keep: usize,
+) -> Result<(), String> {
+    let marker = format!("{marker_base} [{agent_id}]");
+    let mut cmd: Vec<&str> = vec!["stash", "push", "--quiet"];
+    cmd.extend_from_slice(extra_args);
+    cmd.extend_from_slice(&["-m", &marker]);
+    if !paths.is_empty() {
+        cmd.push("--");
+        cmd.extend(paths.iter().map(String::as_str));
+    }
+    git(wt, &cmd)?;
+    // `git stash list` is NEWEST FIRST, so this marker's entries come back in that order and
+    // `skip(keep)` leaves exactly the `keep` most recent alive. The entry just pushed is
+    // `stash@{0}` and is therefore always among them (keep is at least 1), which is what keeps this
+    // a retire rather than a self-erase.
+    //
+    // Dropped HIGHEST INDEX FIRST — `stash drop` renumbers everything below the entry it removes, so
+    // dropping in list order would make every later index refer to the wrong entry. `.rev()` over a
+    // newest-first list gives descending indices.
+    let keep = keep.max(1);
+    if let Ok(list) = git(wt, &["stash", "list", "--format=%gd%x09%gs"]) {
+        let stale: Vec<String> = list
+            .lines()
+            .filter(|l| l.contains(&marker))
+            .filter_map(|l| l.split('\t').next())
+            .skip(keep)
+            .map(str::to_string)
+            .collect();
+        for entry in stale.iter().rev() {
+            let _ = git(wt, &["stash", "drop", "--quiet", entry]);
+        }
+    }
+    Ok(())
+}
 
 /// Split one porcelain-v1 line into its `XY` status code and its path.
 ///
@@ -1747,12 +1877,19 @@ fn describe_blocking_dirt(porcelain: &str) -> String {
 ///     to the one run that had to rely on it. Worse, it was self-reinforcing — the decline suppressed
 ///     the fetch that would have cleared the decline, so a single interrupted pass could keep the
 ///     worktree drifting for as long as nothing else in the repo happened to fetch.
+///
+/// `dirty_policy` widens ONLY the dirt rule, and only for a caller that asks. Under
+/// [`DirtyPolicy::Stash`] real dirt is set aside into a per-agent stash instead of declining the
+/// park — see the branch below for why stashing is the only one of the three obvious moves that is
+/// acceptable. Every OTHER valve above is unaffected: `unpushed` in particular still declines under
+/// both policies, because a stash cannot save a commit.
 pub fn park_worktree_on_base_at(
     root: &str,
     project_id: &str,
     agent_id: &str,
     base_branch: &str,
     app_data: &Path,
+    dirty_policy: DirtyPolicy,
 ) -> Result<ParkOutcome, String> {
     let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
@@ -1778,8 +1915,35 @@ pub fn park_worktree_on_base_at(
     // The one exception is dirt the AGENT'S OWN TOOLING writes: see `tooling_churn_to_restore` for
     // why a bare emptiness check made this decline PERMANENTLY on the recurring headless worktree.
     let porcelain = git(&wt_str, &["status", "--porcelain"])?;
+    // How much was set aside, for the log. A COUNT, never the paths — see `describe_blocking_dirt`.
+    let dirt_entries = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
+    // `None` from the churn whitelist means REAL dirt. Whether that ends the park is the one thing
+    // `dirty_policy` decides; `stash_all` carries the answer down to the single stash step below so
+    // that nothing between here and there has to re-derive it.
+    let mut stash_all = false;
     let churn = match tooling_churn_to_restore(&porcelain) {
         Some(paths) => paths,
+        None if dirty_policy == DirtyPolicy::Stash => {
+            // The whitelist exists because a RESTORE cannot faithfully undo an arbitrary change. A
+            // stash can, which is what makes widening this safe where widening the whitelist would
+            // not be — and why the three moves are not interchangeable:
+            //   * COMMIT would put unreviewed leftovers into branch history that can later be
+            //     pushed, laundering something nobody read into the repo.
+            //   * RESET/checkout-over would destroy work outright; this module's entire design is
+            //     that it declines rather than destroys.
+            //   * STASH (with `-u`, so untracked residue comes too) loses nothing — every line
+            //     stays recoverable by hand — and it is the mechanism this function already trusts
+            //     for churn. Same argument, wider input.
+            // Logged as a COUNT, never paths: see `describe_blocking_dirt` for why status codes are
+            // the most any of this may say about a worktree that can be cut from a user's own repo.
+            tracing::info!(
+                agent_id = %agent_id,
+                blocking = %describe_blocking_dirt(&porcelain),
+                "park: setting leftover worktree dirt aside into a stash so the next run starts clean"
+            );
+            stash_all = true;
+            Vec::new()
+        }
         None => {
             // The decline itself is routine; being unable to say WHY is what made the recurring
             // stale-base episodes unfixable. `describe_blocking_dirt` reports status codes only —
@@ -1850,11 +2014,26 @@ pub fn park_worktree_on_base_at(
     // Already sitting on the fresh base with the right branch checked out → nothing to do. Checking
     // the branch too (not just the SHA) keeps the outcome honest when a topic branch happens to
     // point at the base commit.
+    //
+    // `!stash_all` is what keeps this a pure short-circuit under the default policy: an already-fresh
+    // tree returns having had NOTHING done to it, exactly as it did before `dirty_policy` existed
+    // (session-tooling churn included — it survives an already-fresh park today and still does).
+    //
+    // A Stash-policy caller falls through instead, because "already on the base" and "clean" are
+    // different facts and only the second one is what the next pass needs. A pass that edited files
+    // and died before committing leaves the worktree on the agent branch at the base commit with the
+    // edits still in the tree — already-fresh by SHA, and carrying the very leftovers this policy
+    // exists to clear. Returning here would hand the next pass a tree it cannot trust while telling
+    // it everything was fine. The stash below runs, then the park reports `already-fresh` honestly.
     let head_sha = git(&wt_str, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
-    if head_sha == base_sha && head_branch == branch {
+    let already_fresh = head_sha == base_sha && head_branch == branch;
+    if already_fresh && !stash_all {
         return Ok(ParkOutcome::declined("already-fresh"));
     }
 
+    // Whether the park that is about to happen set anything aside — read by the success return at
+    // the very end, outside the lock's scope.
+    let parked_stashed;
     // `checkout -B` creates-or-resets the agent's own branch at the base and checks it out in one
     // step. Under the per-repo lock so a background pool warm can't collide on index.lock.
     {
@@ -1875,48 +2054,68 @@ pub fn park_worktree_on_base_at(
         // something — strictly worse than the pre-change decline, which never touched the tree.
         // With a stash, that path loses nothing either.
         //
-        // Best-effort: if the stash fails the tree stays dirty and `checkout -B` reports
-        // `checkout-failed`, which is the conservative outcome.
-        if !churn.is_empty() {
-            // The marker is PER AGENT because `refs/stash` is repository-wide, not per-worktree.
-            // This command is parameterized by `agent_id` and several app-owned worktrees share one
-            // repo, so a shared marker would have agent A's park retiring agent B's only recovery
-            // copy — the reverse of what the retiring is for.
-            let marker = format!("{PARK_CHURN_STASH_MARKER} [{agent_id}]");
-            let mut stash: Vec<&str> = vec!["stash", "push", "--quiet", "-m", &marker, "--"];
-            stash.extend(churn.iter().map(String::as_str));
-            // PUSH FIRST, RETIRE AFTER — never the other way round. Retiring first was deletion
-            // deferred by one pass: `stash push` is fallible (a locked index, a pathspec git
-            // refuses), and on that path the previous entry was already gone and no new one
-            // existed, so a decline that was supposed to lose nothing had destroyed the only
-            // recoverable copy. Sequenced this way, a failed push leaves the older entry exactly
-            // where it was and the tree dirty, which `checkout -B` then declines on.
+        // Best-effort for CHURN: if the stash fails the tree stays dirty and `checkout -B` reports
+        // `checkout-failed`, which is the conservative outcome. The leftover-dirt branch below is
+        // stricter — see its own comment.
+        let mut stashed = false;
+        if stash_all {
+            // `-u` so untracked residue comes too. The whole tree is the pathspec, deliberately:
+            // the point is that the next pass starts from a tree it can trust, and a partial stash
+            // would leave exactly the entries the whitelist could not classify.
             //
-            // Retiring at all is bounded growth, not supersession: park runs hourly and the churn
-            // is dirty on essentially every pass, so an unconditional push stacks an entry per hour
-            // forever, each pinning its blobs against gc and each showing up in the main checkout's
-            // `git stash list`. Do NOT read the surviving entry as containing the retired ones —
-            // each stash is the diff against the tree at ITS park, and the file is reverted in
-            // between, so pass N+1's churn is only the lines written since pass N. One recoverable
-            // copy of the CURRENT churn is the guarantee; a full history of it is not.
-            match git(&wt_str, &stash) {
-                Ok(_) => {
+            // NOT `-a`/`--all`: ignored files stay put. Sweeping those in would mean stashing
+            // `target/`, `node_modules/` and every build artifact — enormous, and destructive to the
+            // next pass's own incremental state rather than protective of anything.
+            //
+            // FAIL CLOSED. A failed push means the leftovers are NOT saved anywhere, and the very
+            // next statement would `checkout -B` over them. Falling through to let the checkout
+            // "probably fail too" is not a safety property — git carries a modified file across a
+            // checkout whenever the file is identical in both commits, so the fall-through can
+            // silently succeed and take the unsaved dirt with it. Decline `dirty` instead, which is
+            // precisely the pre-change outcome: nothing saved, so nothing touched.
+            match push_park_stash(
+                &wt_str,
+                agent_id,
+                PARK_DIRT_STASH_MARKER,
+                &["-u"],
+                &[],
+                PARK_DIRT_STASH_KEEP,
+            ) {
+                Ok(()) => {
+                    stashed = true;
+                    tracing::info!(
+                        %agent_id,
+                        entries = dirt_entries,
+                        "park stashed leftover worktree dirt"
+                    );
+                }
+                Err(_) => {
+                    // The error TEXT is dropped on purpose. git names the path it could not write
+                    // (`…/index.lock`) or the pathspec it refused, and this runs for worktrees that
+                    // can be cut from a user's own repository — the same rule `describe_blocking_dirt`
+                    // follows. The churn branch below can afford `error = %e` because its pathspec is
+                    // a fixed whitelist; a whole-tree stash has no such bound.
+                    tracing::warn!(
+                        %agent_id,
+                        entries = dirt_entries,
+                        "park declined: could not stash the leftover worktree dirt, so the tree was \
+                         left exactly as it was found"
+                    );
+                    return Ok(ParkOutcome::declined("dirty"));
+                }
+            }
+        } else if !churn.is_empty() {
+            match push_park_stash(
+                &wt_str,
+                agent_id,
+                PARK_CHURN_STASH_MARKER,
+                &[],
+                &churn,
+                PARK_CHURN_STASH_KEEP,
+            ) {
+                Ok(()) => {
+                    stashed = true;
                     tracing::info!(paths = churn.len(), "park stashed session-tooling churn");
-                    // Highest index first — dropping renumbers everything below it. `stash@{0}` is
-                    // the entry just pushed, so skipping it is what keeps this a retire and not a
-                    // self-erase.
-                    if let Ok(list) = git(&wt_str, &["stash", "list", "--format=%gd%x09%gs"]) {
-                        let stale: Vec<String> = list
-                            .lines()
-                            .filter(|l| l.contains(&marker))
-                            .filter_map(|l| l.split('\t').next())
-                            .filter(|r| *r != "stash@{0}")
-                            .map(str::to_string)
-                            .collect();
-                        for entry in stale.iter().rev() {
-                            let _ = git(&wt_str, &["stash", "drop", "--quiet", entry]);
-                        }
-                    }
                 }
                 Err(e) => tracing::warn!(
                     paths = churn.len(),
@@ -1925,9 +2124,19 @@ pub fn park_worktree_on_base_at(
                 ),
             }
         }
-        if git(&wt_str, &["checkout", "-B", &branch, &base_sha]).is_err() {
-            return Ok(ParkOutcome::declined("checkout-failed"));
+        // Reached only under `stash_all` (the check above returns otherwise): the tree needed
+        // clearing but the branch and base were already right, so there is no checkout to do. Report
+        // the same token the short-circuit does — `parked` stays false because nothing moved — with
+        // `stashed` telling the caller the tree is now clean.
+        if already_fresh {
+            return Ok(ParkOutcome { parked: false, reason: "already-fresh".into(), stashed });
         }
+        if git(&wt_str, &["checkout", "-B", &branch, &base_sha]).is_err() {
+            // Carries `stashed`: a decline that already moved something must say so, or a caller
+            // reading `stashed: false` would go looking for leftovers that are now in the stash.
+            return Ok(ParkOutcome { parked: false, reason: "checkout-failed".into(), stashed });
+        }
+        parked_stashed = stashed;
     }
     // SAY WHAT WE STEPPED OVER — and only now, because only now is it true. Every path above can
     // still decline (`unpushed` on the agent branch, `no-base`, `checkout-failed`), and a diagnostic
@@ -1952,11 +2161,17 @@ pub fn park_worktree_on_base_at(
              they remain reachable by that branch, but nothing else records them"
         );
     }
-    Ok(ParkOutcome { parked: true, reason: "parked".into() })
+    Ok(ParkOutcome { parked: true, reason: "parked".into(), stashed: parked_stashed })
 }
 
 /// Park an app-owned, unattended agent worktree back on a fresh integration base before its next
-/// headless run. Declines (never destroys) when the tree is dirty or holds unpushed commits.
+/// headless run. Declines (never destroys) when the tree holds unpushed commits, and — unless the
+/// caller passes `dirtyPolicy: "stash"` — when it is dirty.
+///
+/// `dirty_policy` is `Option` so that OMITTING it is a valid call that means [`DirtyPolicy::Decline`].
+/// The safe reading has to be the one you get by not thinking about it: a future caller pointing this
+/// at a user's own project worktree must inherit decline-don't-touch without having to know the
+/// parameter exists.
 #[tauri::command]
 pub async fn park_worktree_on_base(
     app: AppHandle,
@@ -1964,13 +2179,22 @@ pub async fn park_worktree_on_base(
     project_id: String,
     agent_id: String,
     base_branch: String,
+    dirty_policy: Option<DirtyPolicy>,
 ) -> Result<ParkOutcome, String> {
     let app_data = app_data_dir(&app)?;
+    let policy = dirty_policy.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
-        let out = park_worktree_on_base_at(&root, &project_id, &agent_id, &base_branch, &app_data);
+        let out =
+            park_worktree_on_base_at(&root, &project_id, &agent_id, &base_branch, &app_data, policy);
         // Log the machine token only — never the path, branch, or any user content.
         if let Ok(o) = &out {
-            tracing::info!(%agent_id, parked = o.parked, reason = %o.reason, "park_worktree_on_base");
+            tracing::info!(
+                %agent_id,
+                parked = o.parked,
+                reason = %o.reason,
+                stashed = o.stashed,
+                "park_worktree_on_base"
+            );
         }
         out
     })
@@ -5856,7 +6080,7 @@ mod tests {
             .unwrap();
         assert_eq!(behind, 2, "precondition: the reused worktree is stale");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert!(out.parked, "a clean, fully-pushed worktree must be parked: {out:?}");
 
         assert_eq!(
@@ -5883,7 +6107,7 @@ mod tests {
         let tip = git(&wt, &["rev-parse", "HEAD"]).unwrap();
         advance_origin_main(&r, "up1");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip, "the commit must survive");
         assert!(Path::new(&wt).join("pass-work.txt").exists(), "its files must survive");
@@ -5904,7 +6128,7 @@ mod tests {
         let abandoned_tip = git(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         advance_origin_main(&r, "up1");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert!(out.parked, "an abandoned topic branch must not pin the worktree: {out:?}");
         assert_eq!(
             git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
@@ -5931,7 +6155,7 @@ mod tests {
         let tip = git(&wt, &["rev-parse", "HEAD"]).unwrap();
         advance_origin_main(&r, "up1");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip, "the commit must survive");
     }
@@ -5949,7 +6173,7 @@ mod tests {
         git(&wt, &["checkout", "-q", "-b", "sparkle/improve-elsewhere", "origin/main"]).unwrap();
         advance_origin_main(&r, "up1");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
         assert_eq!(
             git(&r, &["rev-parse", "refs/heads/sparkle/agent-a1"]).unwrap().trim(),
@@ -5983,7 +6207,7 @@ mod tests {
             .trim()
             .to_string();
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert!(out.parked, "an empty tip set has nothing to prove: {out:?}");
         // The property that MAKES parking acceptable here, not just that it happened: parking is
         // only safe because the departing branch keeps naming its commits.
@@ -6015,7 +6239,7 @@ mod tests {
         std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
         advance_origin_main(&r, "up1");
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("dirty"));
         assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
     }
@@ -6037,7 +6261,7 @@ mod tests {
         // What the hook does the moment an agent starts: one more line, uncommitted.
         std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n{\"id\":2}\n").unwrap();
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert!(out.parked, "tooling churn alone must not block parking: {out:?}");
         assert!(
             git(&wt, &["status", "--porcelain"]).unwrap().is_empty(),
@@ -6052,6 +6276,331 @@ mod tests {
         assert!(
             git(&wt, &["stash", "show", "-p", "stash@{0}"]).unwrap().contains("{\"id\":2}"),
             "every churn line must survive inside the stash"
+        );
+    }
+
+    /// Reproduce the dirt the app-owned worktree was actually observed stuck on — the log line read
+    /// `4 entries: 2×' M' 2×'??'`, i.e. a killed pass left uncommitted edits to tracked files AND
+    /// untracked residue behind. The tracked baseline is committed and PUSHED first so the
+    /// containment valve has nothing to object to and the DIRT is the only thing under test.
+    fn seed_leftovers(wt: &str) {
+        std::fs::write(format!("{wt}/notes.md"), "committed baseline\n").unwrap();
+        std::fs::write(format!("{wt}/plan.md"), "committed baseline\n").unwrap();
+        git(wt, &["add", "."]).unwrap();
+        git(wt, &["commit", "-q", "-m", "baseline the pass will edit"]).unwrap();
+        git(wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+        std::fs::write(format!("{wt}/notes.md"), "half-finished edit\n").unwrap();
+        std::fs::write(format!("{wt}/plan.md"), "half-finished edit\n").unwrap();
+        std::fs::write(format!("{wt}/scratch.log"), "residue\n").unwrap();
+        std::fs::write(format!("{wt}/tmp-output.txt"), "residue\n").unwrap();
+    }
+
+    // DEFECT 2, the fixed point this parameter exists to break: real dirt is outside the churn
+    // whitelist, so the park declined every hour forever and each headless pass inherited the last
+    // one's leftovers. Under `Stash` the leftovers are SET ASIDE and the park proceeds.
+    #[test]
+    fn park_stashes_leftover_dirt_and_parks_when_the_policy_allows_it() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-stash");
+        seed_leftovers(&wt);
+        advance_origin_main_elsewhere(&r, "park-dirt-stash", "up1");
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        assert!(out.parked, "leftover dirt must not block a Stash-policy park: {out:?}");
+        assert!(out.stashed, "the outcome must report that something was set aside: {out:?}");
+        // THE SIDE EFFECT, not the precondition: the tree the next pass inherits is clean...
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().is_empty(),
+            "the leftovers must be cleared, not carried onto the fresh base"
+        );
+        // ...and it sits on the fresh base, on the agent's own branch. Both, because "clean" and
+        // "fresh" are separate claims and the defect is about the second one.
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "HEAD..origin/main"]).unwrap().trim(),
+            "0",
+            "the worktree must now sit ON the fresh base"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "parking lands on the agent's OWN branch"
+        );
+        // MOVED, NOT DESTROYED — the whole reason this is a stash and not a reset. Assert the
+        // CONTENT comes back, not merely that `git stash list` is non-empty.
+        assert!(
+            !Path::new(&wt).join("scratch.log").exists(),
+            "precondition: the untracked residue really did leave the tree"
+        );
+        git(&wt, &["stash", "pop"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(),
+            "half-finished edit\n",
+            "the uncommitted edit must come back intact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/scratch.log")).unwrap(),
+            "residue\n",
+            "`-u`: untracked residue must be recoverable too, not silently deleted"
+        );
+    }
+
+    // THE OPT-IN, pinned. `park_worktree_on_base_at` is generic over worktrees and a future caller
+    // may point it at a USER'S project — where uncommitted edits are not ours to relocate, however
+    // recoverable the relocation is. The default policy must behave exactly as it did before.
+    #[test]
+    fn park_declines_the_same_leftover_dirt_under_the_default_policy() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-decline");
+        seed_leftovers(&wt);
+        advance_origin_main_elsewhere(&r, "park-dirt-decline", "up1");
+        let head_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline)
+            .unwrap();
+
+        assert_eq!(out, ParkOutcome::declined("dirty"), "widening the dirt rule must be OPT-IN");
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            head_before,
+            "a decline must not move the worktree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(),
+            "half-finished edit\n",
+            "the edit must be left exactly where it was"
+        );
+        assert!(Path::new(&wt).join("scratch.log").exists(), "untracked residue must be left too");
+        assert!(
+            git(&wt, &["stash", "list"]).unwrap().is_empty(),
+            "and nothing may be stashed either — Decline means UNTOUCHED, not 'moved somewhere safe'"
+        );
+    }
+
+    // FAIL CLOSED. A stash push that fails leaves the leftovers saved nowhere, and the very next
+    // statement would `checkout -B` over them. Falling through to let the checkout "probably fail
+    // too" is not a safety property: git carries a modified file across a checkout whenever the file
+    // is identical in both commits, so the fall-through can succeed and take unsaved dirt with it.
+    #[test]
+    fn park_declines_and_touches_nothing_when_the_leftovers_cannot_be_stashed() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-stash-fails");
+        seed_leftovers(&wt);
+        advance_origin_main_elsewhere(&r, "park-dirt-stash-fails", "up1");
+        let head_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        // Fail the stash the way it really fails in the field: something else holds the index lock.
+        // `git status` still succeeds under it (it just skips writing the refreshed index), so the
+        // park reaches the stash step and fails THERE — which is the path under test, rather than
+        // some earlier probe erroring out and reaching the same token by accident.
+        let git_dir = git(&wt, &["rev-parse", "--absolute-git-dir"]).unwrap().trim().to_string();
+        std::fs::write(format!("{git_dir}/index.lock"), "").unwrap();
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        // `dirty`, NOT `checkout-failed`: reaching the checkout at all would mean the park had tried
+        // to move a tree it knew it had failed to save.
+        assert_eq!(
+            out,
+            ParkOutcome::declined("dirty"),
+            "an unsaveable tree must decline BEFORE the checkout, not through it"
+        );
+        assert!(!out.stashed, "nothing was saved, so the outcome must not claim otherwise");
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            head_before,
+            "nothing may be checked out over dirt that could not be saved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(),
+            "half-finished edit\n",
+            "the unsaved edit must survive verbatim"
+        );
+        assert!(Path::new(&wt).join("scratch.log").exists(), "untracked residue must survive too");
+    }
+
+    // Hourly x forever, the leftover-dirt edition: an unconditional push stacks an entry per pass
+    // into the REPOSITORY-WIDE `refs/stash`, each pinning its blobs against gc and each surfacing in
+    // the main checkout's `git stash list`.
+    #[test]
+    fn repeated_parks_do_not_stack_leftover_dirt_stashes() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-twice");
+        std::fs::write(format!("{wt}/notes.md"), "committed baseline\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "baseline"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        // PAST THE RING, so the bound is actually exercised rather than assumed.
+        for n in 1..=(PARK_DIRT_STASH_KEEP + 3) {
+            advance_origin_main_elsewhere(&r, "park-dirt-twice", &format!("up{n}"));
+            std::fs::write(format!("{wt}/notes.md"), format!("pass {n} leftovers\n")).unwrap();
+            std::fs::write(format!("{wt}/scratch.log"), format!("pass {n} leftovers\n")).unwrap();
+            let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash)
+                .unwrap();
+            assert!(out.parked && out.stashed, "park {n} must stash and park: {out:?}");
+        }
+
+        let entries = git(&wt, &["stash", "list"]).unwrap();
+        assert_eq!(
+            entries.lines().filter(|l| l.contains("leftover worktree dirt")).count(),
+            PARK_DIRT_STASH_KEEP,
+            "leftover-dirt stashes are a bounded ring, not an unbounded stack: {entries}"
+        );
+        // Bounded AND still real: the newest entry is THIS pass's leftovers, poppable. Each stash is
+        // the diff at its own park, so no entry contains another.
+        git(&wt, &["stash", "pop"]).unwrap();
+        let newest = format!("pass {} leftovers\n", PARK_DIRT_STASH_KEEP + 3);
+        assert_eq!(std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(), newest);
+        assert_eq!(std::fs::read_to_string(format!("{wt}/scratch.log")).unwrap(), newest);
+    }
+
+    /// THE DESTROY PATH THE RING EXISTS TO CLOSE (roborev 55238).
+    ///
+    /// Retiring dirt on the churn rule — keep exactly one — silently drops a previous pass's
+    /// unrecovered work: churn is a regenerated file where entry N+1 supersedes entry N, but each
+    /// dirt entry holds a DIFFERENT pass's leftovers and is only ever popped by hand, so nothing
+    /// tells anyone the older one existed before it becomes unreachable and gc-able.
+    ///
+    /// The sibling test above could not catch this: it writes the SAME files every pass, which is
+    /// the one shape where dropping is harmless because the survivor happens to cover the retired
+    /// entry's paths. Here pass 2 touches a file pass 1 never did, so a lost entry is lost content.
+    #[test]
+    fn a_later_park_does_not_destroy_an_earlier_passes_leftovers() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-distinct");
+        std::fs::write(format!("{wt}/notes.md"), "committed\n").unwrap();
+        std::fs::write(format!("{wt}/plan.md"), "committed\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "baseline"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        // Pass 1 dies mid-edit to notes.md.
+        advance_origin_main_elsewhere(&r, "park-dirt-distinct", "up1");
+        std::fs::write(format!("{wt}/notes.md"), "hour one, half finished\n").unwrap();
+        assert!(
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash)
+                .unwrap()
+                .stashed
+        );
+
+        // Pass 2 dies mid-edit to a DIFFERENT file. Nothing about this supersedes pass 1's work.
+        advance_origin_main_elsewhere(&r, "park-dirt-distinct", "up2");
+        std::fs::write(format!("{wt}/plan.md"), "hour two, unrelated\n").unwrap();
+        assert!(
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash)
+                .unwrap()
+                .stashed
+        );
+
+        // THE SIDE EFFECT: pass 1's edit is still THERE, and comes back as content. Asserting the
+        // entry count alone would pass against a stash whose blob had been dropped.
+        let entries = git(&wt, &["stash", "list"]).unwrap();
+        assert_eq!(
+            entries.lines().filter(|l| l.contains("leftover worktree dirt")).count(),
+            2,
+            "both passes' leftovers must survive — they are different work: {entries}"
+        );
+        git(&wt, &["stash", "pop", "stash@{1}"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(),
+            "hour one, half finished\n",
+            "the FIRST pass's uncommitted edit must still be recoverable after a later park"
+        );
+    }
+
+    /// The two-marker split, pinned. Its doc comment justifies the split as a safety property — a
+    /// cheap churn-only park must not retire the entry holding a previous pass's REAL leftovers —
+    /// but every other test exercises one marker at a time, so collapsing the two constants (or
+    /// reusing the churn marker in the `stash_all` branch) would keep the suite green while
+    /// reintroducing exactly that data loss. roborev 55238.
+    #[test]
+    fn a_churn_only_park_does_not_retire_a_previous_passes_leftover_dirt() {
+        let (r, wt, app_data) = init_repo_with_origin("park-marker-split");
+        let beads = Path::new(&wt).join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n").unwrap();
+        std::fs::write(format!("{wt}/notes.md"), "committed\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "baseline"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        // A pass dies leaving real leftovers → a DIRT stash.
+        advance_origin_main_elsewhere(&r, "park-marker-split", "up1");
+        std::fs::write(format!("{wt}/notes.md"), "real leftover work\n").unwrap();
+        assert!(
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash)
+                .unwrap()
+                .stashed
+        );
+
+        // The next park sees ONLY session-tooling churn — the cheap, routine case, which takes the
+        // churn branch and its keep-exactly-one retirement.
+        advance_origin_main_elsewhere(&r, "park-marker-split", "up2");
+        std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n{\"id\":2}\n").unwrap();
+        assert!(
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash)
+                .unwrap()
+                .parked
+        );
+
+        let entries = git(&wt, &["stash", "list"]).unwrap();
+        assert_eq!(
+            entries.lines().filter(|l| l.contains("leftover worktree dirt")).count(),
+            1,
+            "the churn park must not have retired the dirt entry — different marker: {entries}"
+        );
+        // Content, not just presence.
+        let dirt = entries
+            .lines()
+            .find(|l| l.contains("leftover worktree dirt"))
+            .and_then(|l| l.split(':').next())
+            .unwrap()
+            .to_string();
+        git(&wt, &["stash", "pop", &dirt]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/notes.md")).unwrap(),
+            "real leftover work\n",
+            "the earlier pass's leftovers must survive a churn-only park intact"
+        );
+    }
+
+    /// `already-fresh` is a claim about the BASE, not about the tree — and only the second is what
+    /// the next pass needs. A pass that edited files and died before committing leaves the worktree
+    /// on the agent branch AT the base commit, already fresh by SHA and still carrying every
+    /// leftover; returning early there would hand the next pass a tree it cannot trust while telling
+    /// it everything was fine. That is defect 2 again, in the one window where origin has not moved.
+    #[test]
+    fn park_clears_leftover_dirt_even_when_the_base_is_already_fresh() {
+        let (r, wt, app_data) = init_repo_with_origin("park-dirt-already-fresh");
+        // No `advance_origin_main`: the worktree already sits on the base, on its own branch.
+        std::fs::write(format!("{wt}/scratch.log"), "residue\n").unwrap();
+        let head_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        // The dirt rule is evaluated BEFORE the base is, so the default policy still reports `dirty`
+        // here — and, either way, touches nothing.
+        let decline = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline)
+            .unwrap();
+        assert_eq!(decline, ParkOutcome::declined("dirty"));
+        assert!(Path::new(&wt).join("scratch.log").exists(), "the default policy must touch nothing");
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        assert!(!out.parked, "nothing was checked out — the base was already right");
+        assert_eq!(out.reason, "already-fresh", "so the token must stay honest: {out:?}");
+        assert!(out.stashed, "but the tree WAS cleared, and the outcome must say so: {out:?}");
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().is_empty(),
+            "the next pass must inherit a CLEAN tree even when the base needed no move"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            head_before,
+            "clearing the tree must not move HEAD"
+        );
+        git(&wt, &["stash", "pop"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/scratch.log")).unwrap(),
+            "residue\n",
+            "recoverable, as everywhere else"
         );
     }
 
@@ -6072,7 +6621,7 @@ mod tests {
             advance_origin_main_elsewhere(&r, "park-churn-twice", &format!("up{n}"));
             std::fs::write(beads.join("interactions.jsonl"), format!("{{\"id\":1}}\n{line}\n"))
                 .unwrap();
-            let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+            let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
             assert!(out.parked, "park {n} must succeed: {out:?}");
         }
 
@@ -6107,7 +6656,7 @@ mod tests {
         std::fs::write(beads.join("interactions.jsonl"), "{\"id\":1}\n{\"id\":2}\n").unwrap();
         std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("dirty"));
         assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
         assert_eq!(
@@ -6180,7 +6729,7 @@ mod tests {
     #[test]
     fn park_is_a_reported_no_op_when_already_fresh() {
         let (r, _wt, app_data) = init_repo_with_origin("park-fresh");
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("already-fresh"));
     }
 
@@ -6190,7 +6739,7 @@ mod tests {
     fn park_declines_when_there_is_no_worktree() {
         let r = init_repo("park-none");
         let app_data = unique_root("park-none-appdata");
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("no-worktree"));
     }
 
@@ -6201,7 +6750,7 @@ mod tests {
         let r = init_repo("park-no-origin");
         let app_data = unique_root("park-no-origin-appdata");
         create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
     }
 
@@ -6244,7 +6793,7 @@ mod tests {
             "precondition: no LOCAL origin ref contains the landed commit"
         );
 
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert!(out.parked, "work already on origin/main must not read as unpushed: {out:?}");
         assert_eq!(
             git(&wt, &["rev-list", "--count", "HEAD..origin/main"]).unwrap().trim(),
@@ -6270,7 +6819,7 @@ mod tests {
 
         // Uncommitted work → park must still decline, and must not touch it.
         std::fs::write(format!("{wt}/scratch.txt"), "uncommitted").unwrap();
-        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("dirty"));
         assert!(Path::new(&wt).join("scratch.txt").exists(), "uncommitted work must survive");
 

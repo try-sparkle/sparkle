@@ -435,6 +435,7 @@ pub fn run() {
             concierge::concierge_proactive_turn,
             claude::claude_has_session,
             claude::claude_latest_session_id,
+            claude::claude_latest_session_path,
             claude::agent_session_title,
             model_catalog::list_claude_models,
             // Multi-display window spanning (Appearance → Window).

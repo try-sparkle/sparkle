@@ -60,6 +60,7 @@ import {
 } from "./terminal";
 import { useProjectStore } from "../../stores/projectStore";
 import { NEW_AGENT_GRACE_MS } from "../../engine/newAgentAttention";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import {
   conciergeToolAuthority,
   type ConciergeToolAuthority,
@@ -831,6 +832,166 @@ describe("CONCIERGE_TERMINAL_TOOLS — the descriptor seam", () => {
   it("gives every tool a description worth putting in a context window", () => {
     for (const t of CONCIERGE_TERMINAL_TOOLS) expect(t.description.length).toBeGreaterThan(20);
   });
+
+  // The capability is useless if the caller cannot learn the address. `__sparkle_self__` is the one
+  // agent id in the app that never appears in `get_state`, so the descriptions are the only place a
+  // model can find it — a resolver fix without this reads, from the user's seat, exactly like the
+  // bug it fixes.
+  //
+  // Scoped to the THREE ops the capability is about, not to every terminal op. It was written as
+  // "every op" and that was wrong twice over: `read_picker_options` / `select_picker_option` answer
+  // a menu that is already on screen — they are not how a caller discovers an agent — so the note
+  // would be pure context-window noise there, and the blanket form broke the moment those two
+  // landed. Naming the ops keeps the assertion meaningful: dropping the note from any of the three
+  // still fails.
+  it("tells the caller the Improve Sparkle agent's id, on the ops that reach it", () => {
+    const reachOps = ["read_agent_terminal", "get_agent_status", "send_to_agent_terminal"];
+    for (const name of reachOps) {
+      const t = CONCIERGE_TERMINAL_TOOLS.find((d) => d.name === name);
+      expect(t, `${name} must exist to carry the note`).toBeDefined();
+      expect(t!.description, name).toContain(SPARKLE_AGENT_ID);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// THE APP'S OWN AGENT
+// ---------------------------------------------------------------------------------------------
+//
+// "Improve Sparkle" is app-owned: it works on Sparkle itself in an app-owned clone, and it is
+// deliberately NOT a member of any project's `agents` array. Every predicate in this domain used to
+// resolve an agent by scanning that array, so the concierge had no route to it at all — the same
+// call reported `{ known: false, observed: true, status: "working" }`, and a send came back
+// `unknown-agent`, which is the gate that exists to catch a model-invented id, fired at the one id
+// the app itself defines.
+describe("the Improve Sparkle agent is addressable", () => {
+  /** The Sparkle agent as the app actually presents it: a live runtime status, and NO roster row —
+   *  that absence is the whole point, so the store is emptied rather than seeded. */
+  function seedSparkle(status = "working") {
+    useProjectStore.setState({ projects: [] });
+    runtimeStateMock.mockReturnValue({
+      attentionScreen: {},
+      status: { [SPARKLE_AGENT_ID]: status },
+    } as never);
+  }
+
+  it("reports it as known, local and addressable while it is working", () => {
+    seedSparkle("working");
+    const s = getAgentStatus(SPARKLE_AGENT_ID);
+    expect(s.known).toBe(true);
+    expect(s.status).toBe("working");
+    expect(s.runtime).toBe("local");
+    expect(s.canAcceptInput).toBe(true);
+  });
+
+  it("names it, and says where it lives, rather than leaving the caller to guess", () => {
+    seedSparkle("working");
+    expect(getAgentStatus(SPARKLE_AGENT_ID).detail).toContain(SPARKLE_AGENT_ID);
+    expect(getAgentStatus(SPARKLE_AGENT_ID).detail).toMatch(/Improve Sparkle/i);
+  });
+
+  // THE SIDE EFFECT, not the verdict: before the fix this refused with `unknown-agent` and nothing
+  // reached the PTY, so asserting `ok` alone would not distinguish "delivered" from "mislabelled".
+  it("delivers a message to it, exactly as it would to a build agent", async () => {
+    seedSparkle("working");
+    const r = await sendToAgentTerminal(SPARKLE_AGENT_ID, "your outage advice is out of date", ALLOWED);
+    expect(r.path).not.toBe("unknown-agent");
+    expect(r.ok).toBe(true);
+    expect(submitPrompt).toHaveBeenCalledWith(
+      SPARKLE_AGENT_ID,
+      "your outage advice is out of date",
+    );
+  });
+
+  it("reads its terminal through the same chain, labelling the source", async () => {
+    seedSparkle("working");
+    scrollbackMock.mockImplementation((id) => (id === SPARKLE_AGENT_ID ? "reviewing logs…" : null));
+    const r = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(r.source).toBe("scrollback");
+    expect(r.text).toContain("reviewing logs");
+  });
+
+  // Per-window copies (`__sparkle_self__-win-<uuid>`) share the namespace and must resolve too.
+  it("resolves a secondary window's copy under the same namespace", () => {
+    useProjectStore.setState({ projects: [] });
+    const perWindow = `${SPARKLE_AGENT_ID}-win-abc`;
+    runtimeStateMock.mockReturnValue({
+      attentionScreen: {},
+      status: { [perWindow]: "working" },
+    } as never);
+    expect(getAgentStatus(perWindow).known).toBe(true);
+  });
+
+  // THE CASE ONLY THE SPARKLE ARM COVERS, and therefore the one that pins it. With its pane open in
+  // ANOTHER window there is no local status entry, so the generic observed-arm fallback does not
+  // reach it — yet this is exactly when the concierge is most likely to be asked about it. It stays
+  // addressable, and the report stays honest that the status is a default rather than a reading.
+  it("stays addressable when its pane is open in another window", () => {
+    useProjectStore.setState({ projects: [] });
+    runtimeStateMock.mockReturnValue({ attentionScreen: {}, status: {} } as never);
+    vi.mocked(readPersistedOpenAgentIds).mockReturnValue([SPARKLE_AGENT_ID]);
+    const s = getAgentStatus(SPARKLE_AGENT_ID);
+    expect(s.known).toBe(true);
+    expect(s.canAcceptInput).toBe(true);
+    expect(s.liveness).toBe("other-window");
+    expect(s.observed).toBe(false);
+    expect(s.detail).toMatch(/another window/i);
+  });
+
+  // The namespace alone is not enough — an id nothing has ever observed stays unknown, so the
+  // `unknown-agent` write gate keeps working for a Sparkle-shaped id that isn't running anywhere.
+  it("still refuses a Sparkle-namespace id this window has never seen", async () => {
+    useProjectStore.setState({ projects: [] });
+    runtimeStateMock.mockReturnValue({ attentionScreen: {}, status: {} } as never);
+    vi.mocked(readPersistedOpenAgentIds).mockReturnValue([]);
+    const ghost = `${SPARKLE_AGENT_ID}-win-never-ran`;
+    expect(getAgentStatus(ghost).known).toBe(false);
+    const r = await sendToAgentTerminal(ghost, "hello", ALLOWED);
+    expect(r.path).toBe("unknown-agent");
+    expect(submitPrompt).not.toHaveBeenCalled();
+  });
+});
+
+// The invariant that made the original report unactionable: one call cannot both say it is reading
+// an agent's live status and that no such agent exists. `known: false` is documented as "closed or
+// invented" (stop), while `observed: true` says the reading is authoritative (act) — a caller has no
+// way to obey both. This is asserted as a PROPERTY over every arm rather than as one more case,
+// because the arms are what keep growing.
+describe("get_agent_status — known and observed can never disagree", () => {
+  const arms: [string, () => string][] = [
+    ["a roster agent", () => (seedAgent("local", "working"), AGENT)],
+    [
+      "the app-owned Sparkle agent",
+      () => {
+        useProjectStore.setState({ projects: [] });
+        runtimeStateMock.mockReturnValue({
+          attentionScreen: {},
+          status: { [SPARKLE_AGENT_ID]: "working" },
+        } as never);
+        return SPARKLE_AGENT_ID;
+      },
+    ],
+    [
+      "an agent this window watches but has no row for",
+      () => {
+        useProjectStore.setState({ projects: [] });
+        runtimeStateMock.mockReturnValue({
+          attentionScreen: {},
+          status: { "orphan-1": "waiting" },
+        } as never);
+        return "orphan-1";
+      },
+    ],
+  ];
+
+  for (const [label, seed] of arms) {
+    it(`holds for ${label}`, () => {
+      const id = seed();
+      const s = getAgentStatus(id);
+      expect(s.observed, `${label}: expected a live reading`).toBe(true);
+      expect(s.known, `${label}: observed but reported as not known`).toBe(true);
+    });
+  }
 });
 
 // A compile-time note as much as a test: the read result is the shape callers destructure.

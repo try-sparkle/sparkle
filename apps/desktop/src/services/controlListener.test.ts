@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
+import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 
@@ -166,6 +167,49 @@ describe("controlListener", () => {
     expect(caller).toMatchObject({ name: expect.any(String), kind: "build", status: "working", parentId: null, activity: null });
     const worker = res.agents.find((a) => a.id === otherId)!;
     expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "waiting" });
+  });
+
+  // ONE AGENT, ONE NAME. `get_state` named rows off `agent.name` while the concierge's needs-you
+  // feed named them through `agentDisplayName` — two rules, so the same id could carry two names on
+  // screen at once. It did: an agent that had renamed itself "Concierge Issue Triage" was still
+  // called "Debug Sparkle concierge agent control and capacity issues" in the feed, because
+  // `selfNameAgent` clears `autoNameVariants` but deliberately keeps `aiTitle` (the auto-namer's
+  // race anchor) and `aiTitle` led the display chain.
+  //
+  // Asserted by comparing the TWO SURFACES against each other, with the exact pair of strings from
+  // the report, rather than against one hard-coded expectation — the defect was a disagreement, so a
+  // test that only pinned one side would have kept passing through it.
+  //
+  // (Routing get_state through the shared rule is a DEDUPLICATION, not the behavioral fix: for an
+  // authoritative name `a.name` was already right. The fix is in `agentDisplayName`, and it is what
+  // this test fails on if it regresses.)
+  it("get_state and the concierge feed give one agent ONE name", async () => {
+    const store = useProjectStore.getState();
+    // The agent names itself — the sparkle-control `rename_agent` path — over a session title Claude
+    // Code had already derived from its first turn. `selfNameAgent` keeps `aiTitle` on purpose (it
+    // is the auto-namer's race anchor), which is what used to leave the feed showing the old one.
+    const STALE_TITLE = "Debug Sparkle concierge agent control and capacity issues";
+    const CHOSEN = "Concierge Issue Triage";
+    store.applyAiTitle(projectId, callerId, STALE_TITLE);
+    store.selfNameAgent(projectId, callerId, CHOSEN);
+    useRuntimeStore.getState().setStatus(callerId, "working");
+    fire({ reqId: "nm1", op: "get_state", callerAgentId: callerId, payload: {} });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    const rosterName = res.agents.find((a) => a.id === callerId)!.name;
+
+    // The needs-you feed the concierge receives, built from the same store.
+    const feed = buildConciergeFeed({
+      projects: useProjectStore.getState().projects,
+      status: { [callerId]: "working" },
+    });
+    const feedName = feed.projects
+      .flatMap((p) => p.agents)
+      .find((a) => a.id === callerId)!.name;
+
+    expect(rosterName).toBe(feedName);
+    expect(rosterName).toBe(CHOSEN);
+    expect(feedName).not.toBe(STALE_TITLE);
   });
 
   // An agent with NO runtime status entry reads as "stopped" (no process), not "idle" (finished its

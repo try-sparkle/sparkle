@@ -366,6 +366,56 @@ pub(crate) fn claude_session_info_sync(
     claude_session_info_in(config_dir.as_deref(), home.as_deref(), worktree_path)
 }
 
+/// Pure form of [`claude_latest_session_path`]: the FULL PATH of the worktree's newest transcript.
+///
+/// Distinct from [`claude_latest_session_id_in`], which returns only the filename stem. The stem is
+/// what `claude --resume` wants; a READER needs the path, and deriving one from the other means
+/// re-implementing the `<projects-root>/<slug>/` layout at the call site. That derivation is exactly
+/// what the concierge's terminal module refuses to do (see its tier-(d) note: it will not guess a
+/// `~/.claude/projects/<slug>/<id>.jsonl`, because the slug rule lives here and a wrong guess fails
+/// confusingly). So the rule stays in one place and the path is handed out whole.
+fn claude_latest_session_path_in(
+    config_dir: Option<&Path>,
+    home: Option<&Path>,
+    worktree_path: &str,
+) -> Option<String> {
+    let root = claude_projects_root(config_dir, home)?;
+    let file = latest_session_file(&claude_session_dir_for(&root, worktree_path))?;
+    Some(file.to_string_lossy().into_owned())
+}
+
+/// Sync core of [`claude_latest_session_path`].
+pub(crate) fn claude_latest_session_path_sync(
+    worktree_path: &str,
+    config_dir: Option<&str>,
+) -> Option<String> {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let config_dir = resolve_session_config_dir(config_dir, env);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    claude_latest_session_path_in(config_dir.as_deref(), home.as_deref(), worktree_path)
+}
+
+/// The absolute path of the newest transcript for `worktree_path`, or None.
+///
+/// Exists so an app-owned agent whose terminal pane is NOT mounted can still be read. The concierge's
+/// read chain falls through to the session transcript as its last tier, but that tier is fed by a
+/// registry which only the app writes — and the one agent with no pane to write it was the Sparkle
+/// self-improvement agent, whose hourly headless pass has no PTY at all. This is how a caller that
+/// legitimately knows the worktree (the pane's prepare, the hourly pass) can register it.
+#[tauri::command]
+pub async fn claude_latest_session_path(
+    worktree_path: String,
+    config_dir: Option<String>,
+) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_latest_session_path_sync(&worktree_path, config_dir.as_deref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tauri::command]
 pub async fn claude_latest_session_id(worktree_path: String, config_dir: Option<String>) -> Option<String> {
     // `async` + `spawn_blocking`: the `read_dir` transcript-directory scan is filesystem I/O that

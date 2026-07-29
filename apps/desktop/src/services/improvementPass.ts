@@ -25,10 +25,12 @@ import {
   SPARKLE_PROJECT_ID,
   type SubmitVerdict,
 } from "./sparkleAgent";
+import { registerSparkleTranscript } from "./sparkleTranscript";
 import {
   assertWorkspaceIntegrity,
   createAgentWorktree,
   installWorktreeGuard,
+  type ParkOutcome,
   parkWorktreeOnBase,
 } from "./worktree";
 
@@ -388,7 +390,13 @@ async function reportTimeoutLeftovers(
       return;
     }
     const park = await Promise.race([
-      parkWorktreeOnBase(repoPath, SPARKLE_PROJECT_ID, SPARKLE_AGENT_ID, defaultBranch),
+      // DECLINE, deliberately — NOT the "stash" policy the startup park uses. This probe exists to
+      // REPORT what the killed pass left behind, and a stash would relocate the very leftovers it is
+      // reporting on: the answer would become "nothing at risk" because the question had already
+      // moved it. Declining is what makes the reading true. The startup park an hour later is the
+      // right place to clear it, because by then the reporting has happened and the decision to
+      // proceed is a separate one.
+      parkWorktreeOnBase(repoPath, SPARKLE_PROJECT_ID, SPARKLE_AGENT_ID, defaultBranch, "decline"),
       // BOUNDED, because this is awaited before the latch is released. Park takes the per-repo git
       // lock and fetches, so an unbounded wait here could hold `passRunning` forever — which is the
       // exact wedge the watchdog exists to prevent, reintroduced on the most common failure path.
@@ -418,6 +426,54 @@ async function reportTimeoutLeftovers(
     }
   } catch (e) {
     console.warn("improvement pass: could not tell what the killed pass left behind:", e);
+  }
+}
+
+/**
+ * What the user is told when a park refuses, and what they can do about it.
+ *
+ * NAMES THE REMEDY, per reason. These declines are self-perpetuating — nothing in the pass, the app,
+ * or the next hour's park can clear them, and the `"stash"` policy explicitly cannot help (a stash
+ * cannot save a commit) — so the hourly pass stops for good until a human acts. A red row alone does
+ * not tell them that, or that the thing to act on is a leftover branch in an app-owned worktree they
+ * have never opened. AGENTS.md's rule applies: a refusal a user is expected to act on needs a remedy
+ * they can actually see.
+ *
+ * PATH-FREE and BRANCH-FREE by construction, exactly like the Rust side's reason token: this text is
+ * relayed to the phone and returned by `read_agent_terminal`, so it says WHAT to look for and leaves
+ * the caller to run the command in the worktree, rather than embedding anything that could carry a
+ * user's content.
+ */
+export function refusalDetail(reason: string): string {
+  switch (reason) {
+    case "unpushed":
+      return (
+        "Improve Sparkle can't start a pass: its workspace still holds commits that exist nowhere " +
+        "else, so it won't reset the branch out from under them. Nothing here can clear that on its " +
+        "own — push that branch, or delete it once you're sure you don't want the work, and the next " +
+        "hourly pass will run."
+      );
+    case "dirty":
+      return (
+        "Improve Sparkle can't start a pass: it tried to set aside leftover changes in its workspace " +
+        "and the stash failed, so it left the workspace exactly as it found it rather than write over " +
+        "it. Clearing the workspace by hand will let the next hourly pass run."
+      );
+    case "no-base":
+      return (
+        "Improve Sparkle can't start a pass: it can't resolve the branch it builds from, so it has no " +
+        "known starting point. This usually clears on its own once the machine is back online."
+      );
+    case "checkout-failed":
+      return (
+        "Improve Sparkle can't start a pass: switching its workspace to a fresh starting point " +
+        "failed. Nothing was lost, but the next hourly pass won't run until that workspace is usable."
+      );
+    default:
+      return (
+        `Improve Sparkle can't start a pass: its workspace isn't in a state it can build from (${reason}), ` +
+        "so it stopped rather than work from a starting point it can't describe."
+      );
   }
 }
 
@@ -516,22 +572,73 @@ export async function runImprovementPass(
     // idempotent by leaving an existing worktree alone, so without this every hourly pass inherits
     // the PREVIOUS pass's topic branch and drifts further behind main — the exact "never a stale
     // base" trap AGENTS.md warns about, which also eventually trips the build's staleness gate.
-    // Advisory, never fatal: parking declines on its own whenever there's anything to lose (dirty
-    // tree, or commits not yet on an origin ref — e.g. a pass that committed but couldn't push, or
-    // a case-by-case draft awaiting review), and a failure here must not cost the user a pass.
-    try {
-      const park = await parkWorktreeOnBase(
-        ws.repoPath,
-        SPARKLE_PROJECT_ID,
-        SPARKLE_AGENT_ID,
-        ws.defaultBranch,
-      );
-      if (!park.parked && park.reason !== "already-fresh") {
-        console.warn("improvement pass: starting from a stale base —", park.reason);
-      }
-    } catch (e) {
-      console.warn("improvement pass: could not park the worktree on a fresh base:", e);
+    //
+    // "stash": this worktree is APP-OWNED end to end, so leftover dirt from a killed pass is ours to
+    // set aside. It is stashed, never committed and never discarded — recoverable by hand from
+    // `git stash list`. The default policy stays decline-don't-touch for everyone else.
+    //
+    // PARK OR REFUSE. This used to warn and run the pass anyway, which is how the defect stayed
+    // invisible for so long: an hourly `starting from a stale base — dirty` in a log nobody reads,
+    // while every pass built on whatever the last one left behind. A pass from an unknown base is
+    // worse than no pass — it burns the hour, and its output is a diff against a tree we cannot
+    // describe. So a park that neither moved the worktree nor found it already fresh stops the run.
+    //
+    // "blocked" is the existing user-visible surface for exactly this: RED, so the row recolors and
+    // re-sorts, but deliberately outside the badge/notification set, so it does not fire a banner —
+    // and dismissible, since it persists until the retry an hour later. That makes the refusal loud
+    // enough to see and quiet enough to ignore, rather than log-only.
+    //
+    // A THROW is deliberately NOT caught here. It used to be swallowed, which silently promoted the
+    // least-informed case to the most-permissive outcome — but catching it HERE was wrong in the
+    // other direction (roborev 55239): the local handler returned from inside the `try`, so it
+    // bypassed `armRetryIfTransient`, the only place a lost-connectivity failure earns this slot's
+    // one early re-attempt. Park is the MOST networked setup step (it fetches), so it was the one
+    // step whose throw could not arm a retry, and the scheduler has already stamped `lastRunAt` —
+    // making a connectivity blip cost a full hour of no pass, where before it cost nothing.
+    // The outer `catch` already warns, arms the retry and sets `blocked`; letting the throw reach it
+    // gets all three, so there is nothing left for a local handler to do.
+    const park: ParkOutcome = await parkWorktreeOnBase(
+      ws.repoPath,
+      SPARKLE_PROJECT_ID,
+      SPARKLE_AGENT_ID,
+      ws.defaultBranch,
+      "stash",
+    );
+    if (!park.parked && park.reason !== "already-fresh") {
+      // `unpushed` is the common one and is a CONTAINMENT hold, not a failure: a previous pass
+      // committed and could not push, so its work exists nowhere else and park refuses to step over
+      // it. A stash cannot save a commit, so nothing here can clear it — a human has to.
+      //
+      // WHICH MEANS THE REFUSAL IS PERMANENT, and a permanent refusal whose only signal is a red row
+      // is the same shape the Rust side just spent a commit removing (a guard becoming the thing it
+      // exists to prevent), relocated from "runs forever from a stale base" to "never runs again"
+      // (roborev 55239). So the reason is WRITTEN WHERE SOMEONE WILL READ IT, not just warned:
+      // `attentionScreen` is the text captured when an agent goes red, which is what the pane shows,
+      // what the phone relays, and — since the concierge can now address this agent at all — what
+      // `read_agent_terminal` returns for it at tier (b). The remedy is named, not implied: a user
+      // told only "blocked" has no way to learn that a leftover branch in an app-owned worktree they
+      // have never seen is what stopped it.
+      const detail = refusalDetail(park.reason);
+      console.warn("improvement pass: refusing to run from an unknown base —", park.reason, "—", detail);
+      useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, detail);
+      setStatus(SPARKLE_AGENT_ID, "blocked");
+      return; // `finally` still clears the passRunning latch.
     }
+    // READABLE WITHOUT A PANE. This pass has no PTY, so the concierge's live tiers are all empty for
+    // it — registering the transcript is the only thing that makes "what is Improve Sparkle doing?"
+    // answerable while an hourly pass is mid-flight. Awaited but never fatal (see the helper).
+    void registerSparkleTranscript(SPARKLE_AGENT_ID, wt.path);
+    // THE REFUSAL TEXT IS RETRACTED THE MOMENT IT STOPS BEING TRUE. Nothing else clears it, and it
+    // is not merely cosmetic residue: `attentionScreen` is tier (b) of `readAgentTerminal`, so a
+    // stale "can't start a pass — push that branch" would be handed to the concierge as this agent's
+    // CURRENT screen, and relayed to the user in the present tense, while the pass it describes was
+    // running fine. That is the confidently-wrong failure the whole read chain is built to avoid,
+    // and this branch is what newly exposed it (before, nothing could read this agent at all).
+    //
+    // Cleared HERE — after the gate, before the pass starts — because this is the exact point at
+    // which the previous refusal is known to be over. Writing `""` rather than deleting the key is
+    // what tier (b) already treats as "no ask-screen captured".
+    useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, "");
     // Same protections the interactive pane installs — this pass runs with auto-approved
     // tools, so the write-guard + integrity check matter MORE here, not less.
     try {

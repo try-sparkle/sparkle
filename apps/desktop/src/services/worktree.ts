@@ -103,26 +103,51 @@ export function createAgentWorktree(
   return invoke<WorktreeInfo>("create_agent_worktree", { root, projectId, agentId, baseBranch });
 }
 
+/** What a park may do about a worktree that is dirty with something other than the session-tooling
+ *  churn the Rust side already whitelists.
+ *
+ *  `"decline"` is the DEFAULT and is what an omitted argument means: leave the tree exactly as
+ *  found. `"stash"` sets the leftovers aside into a per-agent stash (untracked files included) and
+ *  parks anyway — never commits them, never discards them, so every line stays recoverable by hand.
+ *  Only pass `"stash"` for a worktree the APP owns end to end; a user's own project worktree keeps
+ *  the decline-don't-touch semantics, because their uncommitted edits are not ours to relocate. */
+export type DirtyPolicy = "decline" | "stash";
+
 /** What `parkWorktreeOnBase` did, or the machine token for why it declined. */
 export interface ParkOutcome {
   parked: boolean;
   /** `parked` | `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`. */
   reason: string;
+  /** True when the park pushed a stash — session-tooling churn, or (under `"stash"`) the whole
+   *  leftover tree. Means "something was set aside and is recoverable from `git stash list`".
+   *
+   *  OPTIONAL on purpose. Rust always sends it, but typing it as required would break every test
+   *  double that returns a bare `{parked, reason}` — and forcing those to grow a field they do not
+   *  exercise buys nothing. Read it as `park.stashed === true`, never as a bare truthiness check on
+   *  an outcome that may predate the field. */
+  stashed?: boolean;
 }
 
 /** Park an app-owned, UNATTENDED agent worktree back on a fresh `origin/<baseBranch>` before its
  *  next headless run. `createAgentWorktree` is idempotent by leaving an existing worktree alone, so
  *  a recurring pass would otherwise inherit the previous run's topic branch and drift further
- *  behind main every hour. Conservative by construction: declines (never destroys) when the tree is
- *  dirty or carries commits that aren't on any origin ref yet. Not for interactive agents — their
- *  in-progress branch must survive. */
+ *  behind main every hour. Conservative by construction: declines (never destroys) when the tree
+ *  carries commits that aren't on any origin ref yet, and — unless `dirtyPolicy` says otherwise —
+ *  when it is dirty. Not for interactive agents: their in-progress branch must survive. */
 export function parkWorktreeOnBase(
   root: string,
   projectId: string,
   agentId: string,
   baseBranch: string,
+  dirtyPolicy?: DirtyPolicy,
 ): Promise<ParkOutcome> {
-  return invoke<ParkOutcome>("park_worktree_on_base", { root, projectId, agentId, baseBranch });
+  return invoke<ParkOutcome>("park_worktree_on_base", {
+    root,
+    projectId,
+    agentId,
+    baseBranch,
+    dirtyPolicy,
+  });
 }
 
 /** Remove an agent's worktree (leaves the branch so it can resume later). */
