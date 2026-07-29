@@ -51,6 +51,20 @@
 // 4000-character cap, shows the reader `@Name` rather than raw syntax. Degradation is the default
 // path here, not an extra branch someone has to remember to write.
 
+import { fromMarkdown } from "mdast-util-from-markdown";
+
+/** The shape `stripAgentRefs` walks. Structural rather than mdast's full union: this module needs
+ *  three fields, and naming them here keeps it free of a type dependency on the renderer's stack. */
+interface MdastNode {
+  type: string;
+  value?: string;
+  children?: MdastNode[];
+  position?: { start: { offset?: number }; end: { offset?: number } };
+}
+interface MdastLink extends MdastNode {
+  url: string;
+}
+
 /** The scheme that marks a link as an agent reference. A constant, not a literal scattered across
  *  the parser, the renderer and the persona's instructions — those three must agree exactly. */
 export const AGENT_REF_SCHEME = "sparkle-agent:";
@@ -107,10 +121,6 @@ export function stripMentionSigil(text: string): string {
   return t.startsWith("@") ? t.slice(1).trim() : t;
 }
 
-/** Any markdown inline link, so the stripper below can ask the PARSER whether each one is ours
- *  rather than carrying a second spelling of the scheme (see `AGENT_REF_SCHEME`'s note). */
-const MD_LINK_RE = /\[([^\]]*)\]\(([^)]*)\)/g;
-
 /**
  * Flatten agent references to the words a reader sees, for consumers that are not the renderer.
  *
@@ -121,11 +131,56 @@ const MD_LINK_RE = /\[([^\]]*)\]\(([^)]*)\)/g;
  * yields `@Kraken Auth`, and this makes the third path agree with the other two.
  *
  * Ordinary links are LEFT ALONE — a real `[docs](https://…)` is part of the answer and belongs in
- * the paste. The test for "ours" is `parseAgentRefHref`, the same function the renderer asks, so a
- * malformed reference is flattened by neither and stays literal in both. One parser, no drift.
+ * the paste. "Ours" is decided by `parseAgentRefHref`, the same function the renderer asks.
+ *
+ * ══ IT PARSES, IT DOES NOT PATTERN-MATCH ═══════════════════════════════════════════════════════
+ * This ran on a hand-rolled `/\[([^\]]*)\]\(([^)]*)\)/g` first, and a second grammar is a second
+ * set of answers. roborev 55092 found it disagreeing with remark in BOTH directions on exactly the
+ * model-authored text this feature exists for:
+ *
+ *   • OVER-stripping. remark never parses a link inside a code span or a fence; a regex does. An
+ *     answer quoting a stored message — ``the source is `Ask [@K](sparkle-agent:9f3c)` `` — renders
+ *     as literal syntax in the thread but would have copied with the reference rewritten. That is
+ *     the button silently editing code the user copied BECAUSE it preserves source verbatim.
+ *   • UNDER-stripping, which reintroduces the very bug this function exists to fix. CommonMark
+ *     allows a title — `(sparkle-agent:9f3c "Kraken Auth")` — and an angle-bracketed destination —
+ *     `(<sparkle-agent:9f3c>)`. remark splits the title off and unwraps the brackets, so both
+ *     render as pills; the regex handed the whole string to `parseAgentRefHref`, got null, and left
+ *     the dead link with its uuid in the clipboard. Nested brackets in a label failed the same way.
+ *
+ * So the destination is now read from the SAME markdown grammar the thread renders through, and
+ * every one of those cases follows from that rather than from a rule someone remembered to add.
+ * The link nodes carry source offsets, so the rewrite is a splice of the original text: everything
+ * this function does not understand is passed through byte-for-byte, which is the property a
+ * copy-the-source button needs most.
  */
 export function stripAgentRefs(text: string): string {
-  return text.replace(MD_LINK_RE, (whole, label: string, href: string) =>
-    parseAgentRefHref(href) === null ? whole : `@${stripMentionSigil(label)}`,
-  );
+  const edits: { start: number; end: number; label: string }[] = [];
+  visitLinks(fromMarkdown(text), (node) => {
+    if (parseAgentRefHref(node.url) === null) return;
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    // A node without offsets cannot be spliced safely; leaving it literal is the same outcome as a
+    // malformed reference, which the renderer also declines to turn into a pill.
+    if (start === undefined || end === undefined) return;
+    edits.push({ start, end, label: `@${stripMentionSigil(nodeText(node))}` });
+  });
+  // Back to front, so each splice leaves the offsets of the ones before it untouched.
+  let out = text;
+  for (const e of edits.sort((a, b) => b.start - a.start)) {
+    out = out.slice(0, e.start) + e.label + out.slice(e.end);
+  }
+  return out;
+}
+
+/** Every `link` node in the tree, in document order. */
+function visitLinks(node: MdastNode, fn: (link: MdastLink) => void): void {
+  if (node.type === "link") fn(node as MdastLink);
+  for (const child of node.children ?? []) visitLinks(child, fn);
+}
+
+/** A node's visible words — what the pill would draw, and what a selection copy already yields. */
+function nodeText(node: MdastNode): string {
+  if (typeof node.value === "string") return node.value;
+  return (node.children ?? []).map(nodeText).join("");
 }

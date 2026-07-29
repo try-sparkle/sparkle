@@ -116,3 +116,40 @@ describe("stripAgentRefs — the clipboard is the second consumer", () => {
   it("is a no-op on text with no links at all", () =>
     expect(stripAgentRefs("just words")).toBe("just words"));
 });
+
+// The divergences a hand-rolled `[..](..)` regex had from the grammar the thread actually renders
+// through (roborev 55092). Each of these follows from parsing rather than from a remembered rule.
+describe("stripAgentRefs parses — it does not pattern-match", () => {
+  it("does NOT touch a reference inside an inline code span", () => {
+    // The button copies source verbatim; a quoted reference is CODE the user asked for, and
+    // rewriting it edits what they were quoting. remark parses no links in a code span, so neither
+    // does this. A regex did.
+    const md = "the source is `Ask [@K](sparkle-agent:9f3c1d2e)` verbatim";
+    expect(stripAgentRefs(md)).toBe(md);
+  });
+
+  it("does NOT touch a reference inside a fenced block", () => {
+    const md = "```md\nAsk [@K](sparkle-agent:9f3c1d2e)\n```";
+    expect(stripAgentRefs(md)).toBe(md);
+  });
+
+  it("flattens a reference carrying a CommonMark TITLE", () =>
+    // remark splits the title off and renders a pill; the regex handed the whole string to
+    // parseAgentRefHref, got null, and left the uuid in the clipboard — the original bug, back.
+    expect(stripAgentRefs('Ask [@Kraken Auth](sparkle-agent:9f3c1d2e "Kraken Auth") first.')).toBe(
+      "Ask @Kraken Auth first.",
+    ));
+
+  it("flattens an ANGLE-BRACKETED destination", () =>
+    expect(stripAgentRefs("Ask [@Kraken Auth](<sparkle-agent:9f3c1d2e>) first.")).toBe(
+      "Ask @Kraken Auth first.",
+    ));
+
+  it("flattens a label containing brackets", () =>
+    expect(stripAgentRefs("[@Chief `web`](sparkle-agent:a1) replied.")).toBe("@Chief web replied."));
+
+  it("neither over- nor under-strips when both forms appear together", () => {
+    const md = "`[@A](sparkle-agent:a1)` but [@B](<sparkle-agent:b2> 'B') really replied.";
+    expect(stripAgentRefs(md)).toBe("`[@A](sparkle-agent:a1)` but @B really replied.");
+  });
+});
