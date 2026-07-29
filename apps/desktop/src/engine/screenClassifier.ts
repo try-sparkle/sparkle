@@ -50,14 +50,18 @@ const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;
 //      PR #730 · esc to interrupt", "⏸ manual mode on · ? for shortcuts", "Update installed ·
 //      Restart to apply"), and prose is a sentence, not a hint bar. Requiring two also keeps a
 //      lone mention ("Tip: press esc to cancel…") out.
-//   2. `to interrupt` disqualifies the line outright — that verb marks the always-present status
-//      bar; "interrupt" means a turn is RUNNING, the opposite of blocked. `to cycle` was ALSO on
-//      this list once, but nothing in the fixture exercised it: the one line using that phrase
-//      ("shift+tab to cycle") is already rejected by rule 1 alone (it opens with a non-hint glyph,
-//      "▶▶"), so the clause was untested and — per roborev 54749 — risked a false calm on any real
-//      dialog using "to cycle" for a genuine affordance (the sibling footers already use "to
-//      switch"/"to navigate"/"to adjust" for the same shape). Dropped rather than kept unproven.
-// NON_PICKER_HINT_LINES_2_1_220 in the fixture pins rule 1, and rule 2 only for `to interrupt`.
+//   2. `to interrupt` disqualifies the line outright. That verb marks the always-present status
+//      bar — "interrupt" means a turn is RUNNING, which is the opposite of blocked.
+// NON_PICKER_HINT_LINES_2_1_220 in the fixture pins rule 1 and 2 against real chrome.
+//
+// Rule 2 is a literal denylist on a matcher whose whole thesis is that literals drift, so it is
+// kept to the ONE verb that earns it. `to cycle` was in it and was removed (roborev 54749): the
+// only real chrome carrying `to cycle` is the permission-mode bar above, which rule 1 rejects
+// unaided on its leading "▶▶" — so the entry bought nothing — while "cycle" is a plausible verb for
+// a genuine blocking footer (the sibling footers already say "to switch" / "to navigate" / "to
+// adjust" for the same affordance), and ONE such segment blanks the WHOLE line. That is false calm
+// on a dialog, which the header above calls strictly worse than a false red. Both halves of that
+// trade are pinned by tests, so re-adding `to cycle` now goes red instead of passing silently.
 const FOOTER_KEY_ATOM =
   "(?:(?:ctrl|control|cmd|command|alt|opt|option|shift|meta|fn)\\s*\\+\\s*\\w+" +
   "|enter|return|esc(?:ape)?|tab|space(?:bar)?|backspace|del(?:ete)?|home|end" +

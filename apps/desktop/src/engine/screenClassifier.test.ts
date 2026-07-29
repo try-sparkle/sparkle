@@ -223,6 +223,51 @@ describe("screenAwaitsInput — captured Claude Code 2.1.220 screens", () => {
     expect(PICKER_FOOTER.test(" /permissions to update rules")).toBe(false);
   });
 
+  // roborev 54749b: `to cycle` was REMOVED from the disqualifier, and these tests are what make that
+  // removal a decision instead of a drift. The finding's complaint was that rule 2 is a literal
+  // denylist bolted onto a matcher whose thesis is "literals drift, match by shape", and that it was
+  // UNPROVEN: every pinned line carrying `to cycle` ALSO carries `to interrupt`, so nothing in the
+  // suite failed when `to cycle` was deleted — and, measured, nothing failed when the whole
+  // lookahead was deleted either. All three legs of that trade are pinned below.
+  describe("rule 2 (the `to …` disqualifier) is pinned to what it actually buys", () => {
+    it("drops `to cycle` because rule 1 rejects the permission-mode bar UNAIDED", () => {
+      // The only real chrome we have carrying `to cycle` is the permission-mode bar, and it also
+      // says "esc to interrupt" — so the full line proves nothing about WHICH rule rejected it.
+      // Stripped of that segment, it is still rejected, and only rule 1 can be doing it: the line
+      // opens on "▶▶", which is not a key atom, and `^[ \t]*[│|┃]?[ \t]*` admits nothing else.
+      // That is the whole justification for dropping `to cycle`; if it ever stops holding, this
+      // goes red rather than the removal quietly becoming a false red on a running agent.
+      expect(PICKER_FOOTER.test("▶▶ bypass permissions on (shift+tab to cycle) · PR #730")).toBe(
+        false,
+      );
+    });
+
+    it("drops `to cycle` because it is a plausible verb for a REAL blocking footer", () => {
+      // CONSTRUCTED, not captured — flagged as such deliberately. The shape argument is the
+      // evidence: the sibling footers in OTHER_PICKER_FOOTERS_2_1_220 use "to switch", "to
+      // navigate" and "to adjust" for exactly this move-between-options affordance, so "to cycle"
+      // sits squarely inside the space Claude already draws from. Denylisting it blanks the ENTIRE
+      // line on one segment — false calm on a dialog, which this file's header calls strictly worse
+      // than a false red. No "enter to select…cancel" pair here on purpose, so FOOTER_LEGACY cannot
+      // match and this pins the SHAPE arm specifically. Re-add `to cycle` and this goes red.
+      const footer = "shift+tab to cycle modes · ↑/↓ to navigate · Esc to cancel";
+      expect(PICKER_FOOTER.test(footer)).toBe(true);
+      expect(screenAwaitsInput(footer)).toBe(true);
+    });
+
+    it("keeps `to interrupt` because it ALONE rejects an all-hints spinner bar", () => {
+      // The same "don't keep an untested guard" standard, applied to the verb that survived. Every
+      // other line pinned against rule 2 opens on a non-key glyph ("▶▶", "✻", "⏸") and so is already
+      // rejected by rule 1 — which is why the entire lookahead could be deleted with the suite still
+      // green. This line is the case that is NOT true of: every segment IS a well-formed
+      // "<key> to <verb>" hint, so rule 1 admits it and only rule 2 stands between a RUNNING turn
+      // and a false red. Delete the lookahead and this goes red.
+      const spinnerBar = "esc to interrupt · ctrl+t to show todos";
+      expect(PICKER_FOOTER.test(spinnerBar)).toBe(false);
+      expect(screenAwaitsInput(spinnerBar)).toBe(false);
+    });
+  });
+
   // roborev 54749: the "to interrupt" disqualifier must be scoped to ONE RENDERED LINE.
   //
   // `m` makes ^/$ break on \r as well as \n, but the lookahead was written `[^\n]*`, which scans

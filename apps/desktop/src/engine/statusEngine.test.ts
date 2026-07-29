@@ -978,6 +978,35 @@ describe("StatusEngine — transition logging", () => {
     );
   });
 
+  it("says BLANK, not calm, when settle had no getScreen to read at all", () => {
+    // roborev 54741. `logged("b1")` wires no `getScreen` — the shape of every construction that
+    // omits it (the mid-stream rows below, redAttentionTaxonomy.test.ts, and any caller that has no
+    // terminal attached). `screenAwaitsInput` short-circuits false on an empty snapshot BEFORE it
+    // examines anything, so logging `calm` here claimed a classification that never happened: it was
+    // indistinguishable from "the classifier read a real screen and found no question". A blank
+    // snapshot is a leading suspect for the false-GRAY bug this line exists to diagnose, so the
+    // undifferentiated verdict hid the log's own subject.
+    const engine = logged("b1");
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000); // spinner stops re-drawing → settle
+    expect(transitionLines().at(-1)).toMatch(
+      /^agent-status agent=b1 working->idle trigger=spinner-gone-settle screen=blank mono=\d+$/,
+    );
+  });
+
+  it("says BLANK when the snapshot is an empty viewport of whitespace", () => {
+    // The other half of the same finding: `snapshotScreen` returns a run of blank lines whenever the
+    // visible viewport is empty, which reaches the classifier as a non-undefined string that still
+    // short-circuits. The resulting STATUS is idle either way — only this line can tell a real calm
+    // screen from no screen at all, which is the whole reason it was added.
+    const engine = logged("b2", () => "\n \n\n   \n");
+    engine.ingest(SPINNER);
+    vi.advanceTimersByTime(2000);
+    expect(transitionLines().at(-1)).toMatch(
+      /^agent-status agent=b2 working->idle trigger=spinner-gone-settle screen=blank mono=\d+$/,
+    );
+  });
+
   it("logs a mid-stream prompt with its own trigger, and no screen verdict (none was read)", () => {
     const engine = logged("a4");
     engine.ingest("Do you want to proceed? (y/n)\n");

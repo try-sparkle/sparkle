@@ -3,6 +3,7 @@
 // every assertion in the original change in fact went through the spy. These tests hold the two
 // things a spy cannot: the exact rendered line, and `monotonicNow`'s fallback.
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { runInNewContext } from "node:vm";
 import { formatStatusTransition, monotonicNow } from "./statusTransitionLog";
 
 describe("formatStatusTransition", () => {
@@ -90,6 +91,20 @@ describe("monotonicNow", () => {
     expect(src).toMatch(/typeof\s+performance\s*!==\s*["']undefined["']/);
     // And the broken form must be gone: `performance?.now` still evaluates `performance`.
     expect(src).not.toMatch(/typeof\s+performance\?\./);
+  });
+
+  // The BEHAVIORAL half of the row above. A source-text assertion proves the fix's shape but never
+  // executes the failing case, so it cannot show what the old form actually did. A fresh vm context
+  // is the real thing: it carries the language intrinsics and NO host globals, so `performance` is
+  // an UNDECLARED identifier there — not a property set to undefined, which `vi.stubGlobal` gives
+  // and which the broken `typeof performance?.now` survived. Evaluating the shipped function body in
+  // that context reproduces the bare non-DOM context the fallback is documented for; the old guard
+  // threw ReferenceError here, and because logStatusTransition runs from the StatusEngine
+  // constructor that throw took engine construction with it.
+  it("returns 0 in a context where `performance` is UNDECLARED, rather than throwing", () => {
+    const ctx = runInNewContext(`typeof performance`);
+    expect(ctx).toBe("undefined"); // guard the guard: a vm context that HAD performance proves nothing
+    expect(runInNewContext(`(${monotonicNow.toString()})()`)).toBe(0);
   });
 
   it("does not throw when performance is absent altogether", () => {
