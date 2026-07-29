@@ -4,16 +4,19 @@
 // description on hover. The call lives in Rust — not the webview — so the user's Sparkle bearer
 // token never ships in the JS bundle.
 //
-// Billing (task #10): the Anthropic call goes through the orchestration `POST /ai/anthropic` proxy
-// on the user's keychain bearer (see `ai::call_anthropic_proxy`). The SERVER holds the vendor key
-// and meters credits — there is no BYOK Anthropic key on the desktop anymore, so no developer
-// secret ships in the binary. Cloud dictation moved the SAME way (task #13): the Deepgram key +
-// meter now live behind the orchestration `/ai/deepgram` relay, so the local Deepgram key resolver
-// was removed too. (The `resolve_env_secret` helper below survives ONLY for the Chief PAT.)
+// The call runs on the USER'S OWN Claude Code subscription via `claude_oneshot` — their
+// authenticated `claude` CLI. It previously went through the orchestration `POST /ai/anthropic`
+// proxy on the user's keychain bearer, where the SERVER held a vendor key and metered credits; that
+// key ran out of funds on 2026-07-28 and took auto-naming down with it. There is no Sparkle-funded
+// key left to exhaust, no credit to meter, and NO SPARKLE LOGIN REQUIRED — the bearer read is gone.
 //
-// Everything degrades gracefully: signed out, out of credits, or any network/parse failure returns
-// Err — the frontend treats that as "leave the current name alone", so the feature is a no-op until
-// the user is signed in with credit rather than a hard error.
+// Cloud dictation is NOT the same: it is Deepgram, a different vendor that cannot run on a Claude
+// subscription, so it stays behind the orchestration `/ai/deepgram` relay and keeps billing credits.
+// The `resolve_env_secret` helper below survives for the Chief PAT (and that Deepgram path).
+//
+// Everything degrades gracefully: no `claude` CLI, not signed into Claude Code, a busy pool, a
+// timeout, or a malformed reply all return Err — the frontend treats that as "leave the current
+// name alone", so the feature is a no-op rather than a hard error.
 
 use std::path::{Path, PathBuf};
 
@@ -306,54 +309,57 @@ fn interpret_reply(text: &str) -> Result<AgentName, String> {
     parse_name(text).ok_or_else(|| "naming reply was malformed or truncated JSON".to_string())
 }
 
-/// Generate a title + description for an agent from a prompt. Returns Err on any failure (no key,
-/// network, HTTP error, empty result) so the caller can silently keep the existing name.
+/// Generate a title + description for an agent from a prompt. Returns Err on any failure (no
+/// `claude` CLI, not signed into Claude Code, timeout, busy, malformed reply) so the caller can
+/// silently keep the existing name.
 #[tauri::command]
 pub async fn generate_agent_name(
     prompt: String,
-    // Display name of the project this agent belongs to, for credit-history attribution.
-    // Metering-only; a caller that doesn't know passes nothing (→ None).
+    // Display name of the project this agent belongs to. Diagnostic only now — it used to attribute
+    // a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
 ) -> Result<AgentName, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
         return Err("empty prompt".into());
     }
-    // The Anthropic call runs server-side on the user's Sparkle bearer (from the keychain).
-    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
-    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
-    // token → signed out; degrade (leave the name as-is) rather than call the proxy.
-    tauri::async_runtime::spawn_blocking(move || {
-        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_anthropic(&base, &token, &prompt, project.as_deref())
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
+    // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
+    // runtime's worker threads, exactly as the proxy call it replaced did. The Sparkle bearer read
+    // and its "not signed in" precondition are gone: naming runs on the user's own Claude Code
+    // login, so it works whether or not they have a Sparkle account.
+    tauri::async_runtime::spawn_blocking(move || call_naming(&prompt, project.as_deref()))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_anthropic(
-    base: &str,
-    token: &str,
-    prompt: &str,
-    project: Option<&str>,
-) -> Result<AgentName, String> {
-    // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the model
-    // often adds) fits comfortably in 256 tokens. The proxy holds the vendor key + meters credits.
-    let json = crate::ai::call_anthropic_proxy(
-        base,
-        token,
-        NAMING_MODEL,
-        SYSTEM_PROMPT,
-        prompt,
-        256,
-        crate::ai::CLASSIFY_READ_TIMEOUT,
-        // Metering description + project attribution shown in the credit history.
-        crate::ai::Metering::new("Naming an agent", project),
-    )?;
-    let text = crate::ai::extract_text(&json)
-        .ok_or_else(|| "naming returned no text".to_string())?;
+/// Build the request. Split out so the encoded decisions are testable — each compiles fine when
+/// wrong and produces no visible error. See the test.
+fn naming_request<'a>(
+    prompt: &'a str,
+    project: Option<&'a str>,
+) -> crate::claude_oneshot::OneShot<'a> {
+    crate::claude_oneshot::OneShot {
+        model: NAMING_MODEL,
+        system: SYSTEM_PROMPT,
+        user: prompt,
+        // A short title + one sentence (plus JSON braces/keys/quotes, and a ```json fence the model
+        // often adds) fits comfortably in 256 tokens.
+        max_tokens: 256,
+        timeout: crate::claude_oneshot::CLASSIFY_TIMEOUT,
+        // Background: the sidebar keeps the current name until this lands, so nothing is blocked on
+        // it. It must not take a slot from a call the user is waiting on.
+        tier: crate::claude_oneshot::Tier::Background,
+        // The name is a pure function of the prompt, so re-naming from an unchanged prompt (a retry,
+        // a second pane on the same agent) must not spend another turn of the user's quota.
+        cacheable: true,
+        purpose: "naming",
+        project,
+    }
+}
+
+fn call_naming(prompt: &str, project: Option<&str>) -> Result<AgentName, String> {
+    let text = crate::claude_oneshot::run(naming_request(prompt, project))?;
     interpret_reply(&text)
 }
 
@@ -362,30 +368,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn naming_runs_in_the_background_tier_and_caches() {
+        // Each of these compiles when flipped and produces no visible error. Interactive would let
+        // background naming take a slot from a blocked human; cacheable:false would re-name from an
+        // unchanged prompt; an unpinned model would inherit a user on Opus for a 5-word title.
+        let req = naming_request("build a login page", None);
+        assert_eq!(req.tier, crate::claude_oneshot::Tier::Background);
+        assert!(req.cacheable);
+        assert_eq!(req.model, "claude-haiku-4-5");
+    }
+
+    // These fixtures used to be spelled with the Anthropic key names. They are written with the
+    // keys this resolver ACTUALLY serves now (the Chief PAT and Deepgram) — `parse_env_value` is
+    // generic over the names, so nothing about the coverage changes, and the crate no longer
+    // mentions an Anthropic key name outside a comment. See
+    // `claude_oneshot::no_anthropic_key`, the test that enforces that.
+    #[test]
     fn parses_either_key_name() {
         // Fixture value is a deliberately non-secret-shaped placeholder: this test only
         // exercises dotenv parsing, and a real key prefix here would (correctly) trip the
         // publish leak-gate since this file is in the public export.
-        let body = "# comment\nANTHROPIC_API=\"dummy-key-value\"\nOTHER=1\n";
+        let body = "# comment\nCHIEF_API=\"dummy-key-value\"\nOTHER=1\n";
         assert_eq!(
-            parse_env_value(body, &["ANTHROPIC_API_KEY", "ANTHROPIC_API"]),
+            parse_env_value(body, &["VITE_CHIEF_PAT", "CHIEF_API"]),
             Some("dummy-key-value".to_string())
         );
     }
 
     #[test]
     fn prefers_first_listed_key() {
-        let body = "ANTHROPIC_API=second\nANTHROPIC_API_KEY=first\n";
+        let body = "CHIEF_API=second\nVITE_CHIEF_PAT=first\n";
         assert_eq!(
-            parse_env_value(body, &["ANTHROPIC_API_KEY", "ANTHROPIC_API"]),
+            parse_env_value(body, &["VITE_CHIEF_PAT", "CHIEF_API"]),
             Some("first".to_string())
         );
     }
 
     #[test]
     fn empty_value_is_ignored() {
-        let body = "ANTHROPIC_API=\n";
-        assert_eq!(parse_env_value(body, &["ANTHROPIC_API"]), None);
+        let body = "DEEPGRAM_API=\n";
+        assert_eq!(parse_env_value(body, &["DEEPGRAM_API"]), None);
     }
 
     #[test]

@@ -1,21 +1,30 @@
-// One place that answers "are AI enhancement features live?" — true ⇔ the signed-in user has
-// CREDITS (balanceCents > 0). Every per-feature read ANDs its settings flag with this, so an AI
-// feature is on only when its toggle is on AND the user has credits, and it turns off ONLY when the
-// user runs out of credits or turns that feature off in preferences — nothing else gates it.
+// One place that answers "are AI enhancement features live?" The rule is per-feature and depends on
+// WHO PAYS for that feature's inference — see `SUBSCRIPTION_FUNDED` and `affordable` below:
 //
-// `entitled` (the one-time $99) still governs two OTHER things and is deliberately NOT part of the
-// per-feature gate: the app paywall (deriveAuthView) and the anonymous-trial worker-send cap
-// (trialMeter, via aiEnhancementsEnabled). Once a user is past the paywall, credits — not a
-// one-time entitlement — decide whether the AI extras run. The anonymous trial has no `me`, so it
-// has no credits either, which keeps the "trial = no AI enhancements" rule intact.
+//   • Sparkle-funded (Deepgram cloud dictation) → flag AND a served CREDIT BALANCE. Unchanged.
+//   • Subscription-funded (naming, suggestions, concierge) → flag AND (ENTITLEMENT OR credits).
+//     These run on the user's own Claude Code subscription and cost Sparkle nothing, so a credit
+//     balance cannot be what decides them — and after the vendor key was retired, a credit gate
+//     there would be one no top-up could ever satisfy.
+//
+// The header used to state the credit rule absolutely ("nothing else gates it"). That is no longer
+// true, and the `entitled` note below is why the OR arm exists rather than entitlement alone: this
+// repo's own rule is that credits — not the one-time purchase — unlock the AI extras for a
+// non-entitled user who has a balance, and the split must not take that away.
+//
+// `entitled` (the one-time $99) also governs the app paywall (deriveAuthView) and the anonymous-trial
+// worker-send cap (trialMeter, via aiEnhancementsEnabled). The anonymous trial has no `me`, so it has
+// neither entitlement nor credits — which keeps the "trial = no AI enhancements" rule intact under
+// both arms.
 //
 // VISIBLE vs USABLE vs LOCKED (the trial "see it but buy the app to use it" split):
 //   - visible (useAiFeatureVisible / aiFeatureVisibleNow) = the settings flag ONLY. Decides whether
 //     a user-initiated AI SURFACE renders (the Think chevron, the composer overlay, the mic button),
 //     so a trial user can SEE the AI features exist.
-//   - usable (useAiFeature / aiFeatureNow) = flag && credits. The real gate that decides whether an
-//     AI extra actually runs (spends credits). Unchanged — the credit machinery + OutOfCreditsError
-//     still govern a signed-in, entitled user who has run their balance to zero.
+//   - usable (useAiFeature / aiFeatureNow) = flag && affordable(key). The real gate that decides
+//     whether an AI extra actually runs. For Sparkle-funded features that is still the credit
+//     machinery; for subscription-funded ones an entitled user at a zero balance now passes, which
+//     is the case the whole migration exists to fix.
 //   - locked (useAiFeatureLocked / aiFeatureLockedNow) = flag && NOT entitled (the $99 not yet
 //     bought). True exactly when the surface is visible but the action must be blocked with a
 //     buy-the-app upsell (AiLockedNotice → openPaywall, the $99 checkout). This is ENTITLEMENT-based,
@@ -85,19 +94,71 @@ export function assertAiCredits(): void {
   if (!hasAiCredits(me)) throw new OutOfCreditsError(me?.balanceCents ?? 0);
 }
 
-/** A feature is effectively on only when its setting is on AND the user has credits. */
+/**
+ * Features whose inference runs on the USER'S OWN Claude Code subscription, not on a Sparkle-funded
+ * vendor key. These cost Sparkle nothing, so a Sparkle credit balance must NOT gate them — a user
+ * who has run their balance to zero would otherwise lose auto-naming and suggestions for no reason
+ * anyone can defend, which is the trap that made a dead vendor key look like a product decision.
+ *
+ * Everything NOT listed here stays credit-gated because it still spends Sparkle's money:
+ *   - `voiceDictation` and `composer` both drive the Deepgram cloud-dictation relay
+ *     (`start_cloud_stream`). Deepgram is a different vendor and cannot run on a Claude
+ *     subscription, so those keep the balance gate exactly as before.
+ *   - `autoApprove` is left in the gated set deliberately: it is not obviously subscription-funded,
+ *     and the safe direction for a gate is to keep it until someone establishes otherwise.
+ *
+ * Adding a key here is a MONETIZATION decision, not a refactor — it removes something a Sparkle
+ * credit balance buys. See the PRD.
+ */
+const SUBSCRIPTION_FUNDED: ReadonlySet<AiFeatureKey> = new Set<AiFeatureKey>([
+  "autoRename",
+  "suggestedActions",
+  "concierge",
+]);
+
+/** Does this feature's spend land on Sparkle's bill (and therefore need a credit balance)? */
+export function needsSparkleCredits(key: AiFeatureKey): boolean {
+  return !SUBSCRIPTION_FUNDED.has(key);
+}
+
+/**
+ * The affordability half of the gate, for one feature.
+ *
+ * TWO DIFFERENT QUESTIONS, and conflating them is what this split exists to stop:
+ *
+ *   - Sparkle-funded (Deepgram cloud dictation) → "is there a CREDIT BALANCE to spend?" Unchanged:
+ *     Sparkle really is paying a vendor per minute, so a balance is exactly the right gate.
+ *
+ *   - Subscription-funded (naming, suggestions, concierge) → "has this person paid for Sparkle in
+ *     ANY form?" The inference runs on the user's own Claude Code subscription and costs Sparkle
+ *     nothing, so a credit balance cannot be what decides it — an entitled user who has run their
+ *     balance to zero is the case the whole migration exists to fix, and with the vendor key retired
+ *     a credit gate there is one no top-up could ever satisfy.
+ *
+ * `entitled || credits`, NOT `entitled` alone. Requiring entitlement by itself looked tidier and was
+ * wrong in a way worth recording: it would have taken these features AWAY from a non-entitled user
+ * who has a positive credit balance, which is a live case this repo has an explicit rule for
+ * ("credits — not the one-time entitlement — decide whether AI features run", see the header). The
+ * OR keeps that rule intact while adding the zero-balance-but-paid case, and still refuses the
+ * anonymous trial, which has neither.
+ */
+function affordable(key: AiFeatureKey, me: Me | null, floorCents?: number): boolean {
+  if (needsSparkleCredits(key)) return hasAiCredits(me, floorCents);
+  return aiEnhancementsEnabled(me) || hasAiCredits(me, floorCents);
+}
+
+/** A feature is effectively on when its setting is on AND it is affordable (see {@link affordable}). */
 export function useAiFeature(key: AiFeatureKey): boolean {
   const flag = useSettingsStore((s) => s[AI_FEATURE_FIELD[key]]);
-  const credits = useHasAiCredits();
-  return flag && credits;
+  const ok = useAuthStore((s) => affordable(key, s.me, s.creditFloorCents));
+  return flag && ok;
 }
 
 /** Imperative read for non-React call sites (effects, event handlers). */
 export function aiFeatureNow(key: AiFeatureKey): boolean {
-  return (
-    useSettingsStore.getState()[AI_FEATURE_FIELD[key]] &&
-    hasAiCredits(useAuthStore.getState().me)
-  );
+  if (!useSettingsStore.getState()[AI_FEATURE_FIELD[key]]) return false;
+  const s = useAuthStore.getState();
+  return affordable(key, s.me, s.creditFloorCents);
 }
 
 /** VISIBLE: the settings flag ONLY (ignores credits). Decides whether a user-initiated AI surface

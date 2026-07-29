@@ -25,12 +25,16 @@ vi.mock("./engine", () => ({
   computeSuggestions: (...a: unknown[]) => computeSuggestions(...a),
   SuggestionOfflineError,
 }));
-const { AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
+// AiBusyError must be in the mock even though this file never throws one: the module under test
+// references it in `computeDeferralReason`, and a partial mock leaves the binding undefined, which
+// makes `instanceof` throw at runtime rather than fail a test.
+const { AiUnavailableError, AiUnreachableError, AiBusyError } = vi.hoisted(() => {
   class AiUnavailableError extends Error {}
   class AiUnreachableError extends Error {}
-  return { AiUnavailableError, AiUnreachableError };
+  class AiBusyError extends Error {}
+  return { AiUnavailableError, AiUnreachableError, AiBusyError };
 });
-vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
+vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError, AiBusyError }));
 
 // PER-AGENT scrollback — the whole point of this file is that two agents are in play at once, so a
 // single constant screen (what the other useSuggestions suites use) would hide exactly what's

@@ -33,12 +33,7 @@ import { invoke } from "@tauri-apps/api/core";
 // subsystem already knowing a picker is up while the status system says green is the bug below;
 // two detectors that could disagree later would be the same bug with extra steps.
 import { detectTerminalPrompts } from "./suggestions/heuristics";
-import {
-  noteAiProviderFailure,
-  noteAiProviderHealthy,
-  noteAiServiceFailure,
-  noteAiServiceHealthy,
-} from "./anthropic";
+import { noteAiProviderFailure, noteAiServiceFailure } from "./anthropic";
 import { log } from "../logger";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
@@ -314,11 +309,12 @@ export async function judgeNeedsFollowup(args: {
       response: args.response,
       project: args.project,
     });
-  // Every proxied AI wrapper reports what it learned about Sparkle's provider account — there is
-  // no single JS chokepoint (each command has its own wrapper), so a wrapper that skips this both
-  // hides a live outage and, worse, leaves a false one on screen after recovery (roborev 54761).
-    noteAiProviderHealthy();
-    noteAiServiceHealthy();
+    // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
+    // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired
+    // or anything is spawned — so a success here may never have touched the CLI. Reporting healthy
+    // from one would zero the failure run and let a wedged or signed-out CLI hide behind a
+    // non-dismissible banner saying everything is fine. `chatOnce` is uncached, always really runs,
+    // and is the authoritative recovery signal (see anthropic.ts's contract block).
   } catch (e) {
     // Record the provider-health observation FIRST (stores/aiProviderStore, via the shared
     // chokepoint helper) so ProviderUnavailableBanner can name the cause, then answer honestly
@@ -326,30 +322,26 @@ export async function judgeNeedsFollowup(args: {
     // verdict". The banner owns the first; this function must not let it colour the second.
     noteAiProviderFailure(e);
     noteAiServiceFailure(e);
-    // THE JUDGE COULD NOT RUN — no verdict exists, so we report exactly that and let the caller
-    // decide. What we must NOT do is answer the question anyway.
+    // EVERY failure resolves to `unknown` — there is no tiered fallback here any more, and the
+    // single return below is the whole rule. The comment that used to sit here described one (a
+    // STRONG signal failing CLOSED to `waiting`), which was removed after 2026-07-28 precisely
+    // because a fleet-wide backend outage turned that guess into the ONLY verdict any agent got and
+    // paged the human on nearly every finished turn. Re-adding it would reinstate that.
     //
-    // This used to return `classifyFollowupSignal(...) === "strong"`, i.e. a confident RED whenever
-    // the tail carried a phrase like "want me to", "should i", "ready for you" or "once you confirm"
-    // (sparkle-blpf, which was reasoning about a user who had simply never configured a key). The
-    // failure mode that reasoning missed is a backend that dies UNDER A WHOLE FLEET: from 2026-07-28
-    // 16:48 the AI proxy returned 502 for 99.3% of calls, so the judge stopped running everywhere at
-    // once and that fallback became the ONLY verdict any agent got. Agents end turns with "Want me
-    // to open the PR?" constantly, so effectively every finished turn was paged to the human as red
-    // — and it oscillated, because statusRouter drops the verdict on the next screen `working` or
-    // non-idle hook and the next Stop re-asserts it (red → clear → red with no user action).
-    //
-    // The local phrase match is a PRE-FILTER for "is this worth a model call", not a verdict. Its
-    // strength is retained on the outcome so a caller can surface "there may be an ask here, and it
-    // could not be judged" — but as UNKNOWN, never as a confident alarm. This holds whichever
-    // backend the judge is pointed at, which is the property the coming BYOK→subscription move needs.
-    // Feed the app-wide degraded indicator. The judge is often the FIRST AI call to fail after a
-    // backend dies (it runs on every finished turn), so it is the earliest honest witness there is.
+    // The distinction that matters is upstream, not here: a refusal (`ai_busy` — the concurrency cap
+    // declining to ask) and a timeout are not evidence of anything, and neither is an auth failure.
+    // None of them is a verdict, so none of them may colour a status. `signal` rides along for
+    // EXPLANATION only — the caller may show what the turn looked like, never treat it as a ruling.
+    const signal = classifyFollowupSignal(args.response);
+    // Through the app logger, not console.debug: this module runs on every finished turn, which
+    // makes it the earliest honest witness of a dead backend. `console.debug` never reaches the log
+    // file, so a user reporting "statuses stopped going red" would give us `verdict: "unknown"` on
+    // every turn with no way to tell a wedged CLI from a signed-out one from a rate limit.
     log.warn("turn-followup", "judge unavailable — reporting UNKNOWN, not a red", {
-      signal: classifyFollowupSignal(args.response),
+      signal,
       error: e instanceof Error ? e.message : String(e),
     });
-    return { verdict: "unknown", signal: classifyFollowupSignal(args.response) };
+    return { verdict: "unknown", signal };
   }
   // The judge RAN — trust its verdict. A real DONE pulls the ambiguous turn back to gray.
   return { verdict: interpretVerdict(raw) ? "followup" : "done" };

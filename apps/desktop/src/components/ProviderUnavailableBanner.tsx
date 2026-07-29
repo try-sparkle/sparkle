@@ -1,16 +1,10 @@
-// The app-level "Sparkle's AI provider is down" warning — the sibling of ZeroCreditBanner for the
-// failure that is OURS, not the user's.
+// ProviderUnavailableBanner — names WHY AI enhancement is unavailable, so a total outage is never
+// silent again.
 //
-// ZeroCreditBanner exists because when the USER's balance hits zero every AI enhancement goes dark
-// at once and the only tells were feature-local. This is the same argument for the other way the
-// same lights go out: the provider account behind the server-side proxy runs out of credit, or its
-// key is rejected. On 2026-07-28 that happened for 12+ hours — 7,164 failed calls, suggestions dead
-// throughout — and nothing anywhere said so. The cause was found by reading server logs by hand.
-//
-// The copy's job is to be HONEST about whose problem it is. Three things it must never do:
-//   • offer a Refill link — the user's balance is fine, and taking their money would fix nothing;
-//   • blame their network — that is OfflineBanner's job and a different condition entirely;
-//   • imply the feature is working. A silent degrade is what made the outage invisible.
+// It reads aiProviderStore, which since the Claude Code migration holds reasons about the USER'S own
+// CLI (missing, not signed in, at its usage limit) rather than Sparkle's retired vendor account. The
+// consequence for copy is the whole point: every reason now has an action attached, where the old
+// ones could only say "this is ours to fix". See the WARNING map below.
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 import { C, ON_BRAND_FILL_DARK } from "../theme/colors";
@@ -22,19 +16,25 @@ import {
 } from "../stores/aiProviderStore";
 
 /**
- * The sentence for each reason. Both name Sparkle as the owner of the problem ("Sparkle's AI
- * provider", "we") so nobody reads it as something they misconfigured or can pay to fix.
+ * The sentence for each reason.
  *
- * Deliberately NOT dismissible, unlike ZeroCreditBanner. That one is dismissible because the user
- * can act on it and may reasonably not want to right now; this one they cannot act on at all, and it
- * clears itself the moment a proxied call succeeds (aiProviderStore.noteHealthy). A ✕ here would
- * just re-hide the outage that went unnoticed for 12 hours in the first place.
+ * REWRITTEN with the transport. These used to say "this is ours to fix" and told the user to do
+ * nothing, because the cause was Sparkle's own unfunded vendor account. AI enhancement now runs on
+ * the USER'S Claude Code subscription, so every remaining cause is one they CAN fix — and the copy
+ * has to say how. Each line names the cause and the next action, and none of them mentions Sparkle
+ * credits, which are no longer involved in these features at all.
+ *
+ * Deliberately NOT dismissible, unlike ZeroCreditBanner. It clears itself the moment any AI call
+ * succeeds (aiProviderStore.noteHealthy), so a ✕ would only re-hide the kind of outage that went
+ * unnoticed for 12 hours in the first place.
  */
 const WARNING: Record<AiProviderOutageReason, string> = {
-  provider_unfunded:
-    "Sparkle's AI provider account is out of credit, so AI Enhanced features are unavailable. This is ours to fix — your credits and network are fine",
-  provider_key_rejected:
-    "Sparkle's AI provider rejected our credentials, so AI Enhanced features are unavailable. This is ours to fix — your credits and network are fine",
+  cli_missing:
+    "Sparkle's AI features need the Claude Code CLI, and it isn't installed. Install it and they'll turn back on",
+  cli_not_authenticated:
+    "Claude Code isn't signed in, so Sparkle's AI features are paused. Run `claude` in a terminal and sign in",
+  usage_limit:
+    "Your Claude usage limit has been reached, so Sparkle's AI features are paused. They'll resume when it resets",
 };
 
 // Brand amber is the caution fill and is theme-CONSTANT, so it needs an ink legible on it in both

@@ -5,6 +5,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { RosterPayload } from "./relayClient";
 import type { Roster } from "./rosterTypes";
 import type { StatusBand } from "../engine/buildSections";
+import { noteAiProviderFailure, noteAiServiceFailure } from "./anthropic";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -41,9 +42,13 @@ export function notifyAttention(n: AttentionNotice): void {
  *  waiting/approval "ask" cases. Returns null outside Tauri and on any failure (no key, network,
  *  empty) — never throws — so the caller falls back to the generic body.
  *
- *  `project` is metering-only: it attributes this call's credit debit to a project in the Credits
- *  history. Omit it when the owning project can't be resolved — the row then carries no project
- *  rather than a wrong one. */
+ *  `project` is diagnostic only now — it used to attribute a credit debit, and this call spends the
+ *  user's own Claude Code subscription rather than Sparkle credits.
+ *
+ *  Reports AI health both ways (see anthropic.ts). It is a high-frequency BACKGROUND caller, which
+ *  makes it the likeliest wrapper to be the one that clears a stale banner after the user installs
+ *  or signs into the CLI — and, if a session's only AI traffic is attention summaries, the only one
+ *  that would ever light it. */
 export async function summarizeAttention(
   screen: string,
   project?: string,
@@ -51,8 +56,15 @@ export async function summarizeAttention(
   if (!hasTauri) return null;
   try {
     const summary = await invoke<string>("summarize_attention", { screen, project });
+    // NO healthy-report. summarize_attention is `cacheable: true`, and claude_oneshot serves a
+    // cache hit before acquiring a permit or spawning anything — and its own doc says the point is
+    // that a re-raised identical prompt must not re-summarize, so a persistent unanswered prompt
+    // hits the cache on EVERY tick. Reporting healthy from that would zero the failure run and let a
+    // wedged or signed-out CLI hide behind a non-dismissible banner saying everything is fine.
     return typeof summary === "string" ? summary : null;
   } catch (e) {
+    noteAiProviderFailure(e);
+    noteAiServiceFailure(e);
     console.debug("summarize_attention failed", e);
     return null;
   }

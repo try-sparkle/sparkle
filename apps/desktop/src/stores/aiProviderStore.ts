@@ -1,29 +1,44 @@
-// aiProviderStore — "is SPARKLE'S OWN AI provider account usable right now?"
+// aiProviderStore — "can we actually run AI enhancement right now, and if not, WHY?"
 //
 // Deliberately NOT the same question as `hasAiCredits` (does the USER have Sparkle credits) or
-// `isOnline` (can this machine reach anything). This is the third failure mode, and until now it was
-// the invisible one: the provider account behind the server-side proxy can be out of credit or have
-// its key rejected, which takes every AI Enhanced feature down for everyone at once while the user's
-// own balance and network are perfectly fine.
+// `isOnline` (can this machine reach anything). This is the third failure mode, and it was the
+// invisible one.
 //
-// What that looked like when it happened (2026-07-28 16:48 UTC onward): the provider balance hit
-// zero, the proxy answered every call with a generic gateway error, and each settled agent state
-// spent its full retry budget on calls that could not succeed — 7,164 failures in ~12 hours, 99.3%
-// of all proxy traffic. Suggestions were dead the entire time. Nothing on any surface said so; the
-// cause was found by reading server logs by hand. That is the specific silence this store exists to
-// end — it holds the observation so ProviderUnavailableBanner can NAME the cause.
+// What that looked like on 2026-07-28: the AI backend stopped answering, and each settled agent
+// state spent its full retry budget on calls that could not succeed — 7,164 failures in ~12 hours,
+// 99.3% of all traffic, suggestions dead throughout. Nothing on any surface said so; the cause was
+// found by reading server logs by hand. That silence is what this store exists to end — it holds the
+// observation so ProviderUnavailableBanner can NAME the cause.
 //
-// Written from the ONE place every proxied AI call already funnels through (services/anthropic.ts),
-// mirroring how `authStore.noteCreditsRefused` records the server's credit refusal at that same
-// chokepoint. Recording it at the chokepoint rather than per-feature is what makes the banner
-// truthful for whichever feature happens to call first.
+// REPOINTED, not repurposed. The cause then was Sparkle's own vendor account (unfunded, or its key
+// rejected), and the fix for the whole incident was to retire that account: AI enhancement now runs
+// on the USER'S OWN Claude Code subscription (src-tauri/src/claude_oneshot.rs). So the question the
+// store answers is unchanged in shape and different in substance — it is now about their CLI, and
+// every reason it can hold has an action the user can take. That is a strict improvement on the old
+// copy, which could only say "this is ours to fix" and ask them to wait.
+//
+// Written from the ONE place every AI call funnels through (services/anthropic.ts), mirroring how
+// `authStore.noteCreditsRefused` records a refusal at that same chokepoint. Recording it there
+// rather than per-feature is what makes the banner truthful for whichever feature calls first.
 import { create } from "zustand";
 
-/** Why Sparkle's provider account is unusable. Mirrors the proxy's `ai_unconfigured` reasons; any
- *  value the desktop doesn't recognise is dropped upstream (see src-tauri/src/ai.rs), so this union
- *  is closed on purpose — an unknown reason degrades to "no outage recorded" rather than rendering a
- *  banner we can't write honest copy for. */
-export type AiProviderOutageReason = "provider_unfunded" | "provider_key_rejected";
+/** Why AI enhancement is unusable.
+ *
+ *  REPOINTED, not extended. These were `provider_unfunded` / `provider_key_rejected` — states of
+ *  SPARKLE'S vendor account — and neither can occur any more: that account was retired and the work
+ *  moved onto the user's own Claude Code subscription (src-tauri/src/claude_oneshot.rs). The store,
+ *  the banner and the every-wrapper reporting contract were all worth keeping; only the answers
+ *  changed. Each reason below has an ACTION attached, which is what makes a banner worth showing.
+ *
+ *  Closed on purpose: an unrecognised reason degrades to "no outage recorded" rather than rendering
+ *  a banner we can't write honest copy for. */
+export type AiProviderOutageReason =
+  /** No `claude` on PATH — Claude Code isn't installed. */
+  | "cli_missing"
+  /** The CLI is installed but not signed in. */
+  | "cli_not_authenticated"
+  /** The user's Claude subscription hit its usage limit for this window. */
+  | "usage_limit";
 
 /** A recorded outage: why, and when we last saw it. `at` is epoch ms, injected by the caller (never
  *  read from the clock here) so the store stays pure and testable. */
@@ -60,7 +75,7 @@ export function isOutageActive(
 interface AiProviderState {
   /** The current outage, or null when the provider is believed healthy. */
   outage: AiProviderOutage | null;
-  /** Record a proxy `ai_unconfigured:<reason>` answer. Idempotent for the same reason apart from
+  /** Record a typed unavailability answer. Idempotent for the same reason apart from
    *  refreshing `at`, so a retry storm can't churn subscribers into a re-render loop. */
   noteOutage: (reason: AiProviderOutageReason, at: number) => void;
   /** Any successful proxied AI call proves the provider is usable again — clear the outage so the

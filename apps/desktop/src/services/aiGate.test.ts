@@ -85,7 +85,11 @@ describe("hasAiCredits — the credit floor (a balance the SERVER already refuse
     expect(hasAiCredits(useAuthStore.getState().me)).toBe(true);
     useAuthStore.getState().noteCreditsRefused(1);
     expect(hasAiCredits(useAuthStore.getState().me)).toBe(false);
-    expect(aiFeatureNow("suggestedActions")).toBe(false);
+    // Asserted through a feature Sparkle still PAYS for. This used to read `suggestedActions`,
+    // which is now subscription-funded and deliberately ignores the balance — a floor test that
+    // ran through it would be asserting the wrong module's behaviour and would fail for a reason
+    // that has nothing to do with the floor.
+    expect(aiFeatureNow("voiceDictation")).toBe(false);
   });
 
   // The known imprecision: the 402 reports the balance, not the unaffordable hold, so a pricey call
@@ -158,11 +162,46 @@ describe("aiFeatureNow — credits × per-feature flag", () => {
     useSettingsStore.getState().setAiFeature("autoRename", false);
     expect(aiFeatureNow("autoRename")).toBe(false);
   });
-  it("out of credits + flag on -> false (even when entitled)", () => {
+  // REVERSED, deliberately. These two used to require credits, and asserting that is now wrong:
+  // auto-naming and suggestions run on the USER'S OWN Claude Code subscription (see
+  // src-tauri/src/claude_oneshot.rs), so they cost Sparkle nothing. Gating them on a Sparkle
+  // balance would disable a feature that spends no Sparkle money — and, with the vendor key
+  // retired, it would be a gate no top-up could ever satisfy for these paths.
+  it("out of credits + flag on -> TRUE for subscription-funded features (when entitled)", () => {
     account({ balanceCents: 0, entitled: true });
+    useSettingsStore.getState().setAllAiFeatures(true);
+    expect(aiFeatureNow("autoRename")).toBe(true);
+    expect(aiFeatureNow("suggestedActions")).toBe(true);
+    expect(aiFeatureNow("concierge")).toBe(true);
+  });
+
+  // The other half of the split, and the reason it is a split rather than a removal: cloud
+  // dictation is DEEPGRAM — a different vendor that cannot run on a Claude subscription — so
+  // Sparkle still pays for it and the balance still gates it.
+  it("out of credits + flag on -> still FALSE for the Sparkle-funded ones", () => {
+    account({ balanceCents: 0, entitled: true });
+    useSettingsStore.getState().setAllAiFeatures(true);
+    expect(aiFeatureNow("voiceDictation")).toBe(false);
+    expect(aiFeatureNow("composer")).toBe(false);
+  });
+
+  // Removing the CREDIT gate must not remove the PAYWALL with it. An anonymous trial (no `me`) has
+  // not bought the app, and the subscription-funded extras stay off for them — the call would cost
+  // Sparkle nothing, but that was never what entitlement was answering.
+  it("subscription-funded features stay OFF for an unentitled/anonymous user", () => {
+    useAuthStore.setState({ me: null } as never);
     useSettingsStore.getState().setAllAiFeatures(true);
     expect(aiFeatureNow("autoRename")).toBe(false);
     expect(aiFeatureNow("suggestedActions")).toBe(false);
+    expect(aiFeatureNow("concierge")).toBe(false);
+  });
+
+  it("a flag that is OFF still wins, subscription-funded or not", () => {
+    // Ungating credits must not make the preference toggle meaningless.
+    account({ balanceCents: 0, entitled: true });
+    useSettingsStore.getState().setAllAiFeatures(true);
+    useSettingsStore.getState().setAiFeature("autoRename", false);
+    expect(aiFeatureNow("autoRename")).toBe(false);
   });
   it("credits unlock the feature even for a non-entitled account", () => {
     // The founder's rule: credits — not the one-time entitlement — decide whether AI features run.

@@ -1,44 +1,34 @@
 // Where does this message go? — the decision the compose box's target toggle used to make for us.
 //
 // See PRD/sparkle/concierge-auto-routing.md §2. The box is now empty and the user never picks a
-// destination, so every send lands here first. Two tiers:
+// destination, so every send lands here first.
 //
-//   1. HEURISTIC — deterministic, zero latency, zero cost. Covers the overwhelming majority of
-//      sends: nothing to prompt, an answer to a question the agent is visibly asking, or a
-//      question about the fleet that only Sparkle can answer.
-//   2. CLASSIFIED — one cheap Haiku call for the genuinely ambiguous middle.
+// HEURISTICS ONLY — deterministic, zero latency, zero cost. They cover the overwhelming majority of
+// sends: nothing to prompt, an answer to a question the agent is visibly asking, or a question
+// about the fleet that only Sparkle can answer.
 //
-// …and a FALLBACK that is a design decision, not an accident: any failure of tier 2 resolves to
-// `sparkle`. The two error directions are not symmetric. A wrong chat answer costs the user one
-// click on the receipt's redirect. A paragraph wrongly typed into a live PTY cannot be pulled back
-// — it may already have set an agent off doing the wrong thing. So when the router doesn't know,
-// it picks the reversible side. NEVER change this fallback to "agent".
+// …and a FALLBACK that is a design decision, not an accident: anything the heuristics can't place
+// resolves to `sparkle`. The two error directions are not symmetric. A wrong chat answer costs the
+// user one click on the receipt's redirect. A paragraph wrongly typed into a live PTY cannot be
+// pulled back — it may already have set an agent off doing the wrong thing. So when the router
+// doesn't know, it picks the reversible side. NEVER change this fallback to "agent".
 //
-// PURE-ish BY CONSTRUCTION: this module reads no stores. The caller builds `RouteContext` and
-// passes it in, which is what keeps tier 1 unit-testable without a live app. The single impure
-// thing is the tier-2 invoke, injectable via `deps` for tests.
-import { invoke } from "@tauri-apps/api/core";
-import { noteAiProviderFailure, noteAiProviderHealthy, noteAiServiceFailure, noteAiServiceHealthy } from "./anthropic";
+// There WAS a tier 2 here: one Haiku classify for the ambiguous middle. It was removed when the AI
+// backend moved onto the user's own Claude Code subscription — a `claude -p` classify measures
+// ~5.8s against the 4s deadline this path needs, so it would have become "always Sparkle" while
+// still spending the user's quota. See the note at the end of `routeMessage` for the full reasoning.
+//
+// PURE BY CONSTRUCTION: this module reads no stores and makes no calls. The caller builds
+// `RouteContext` and passes it in, which is what keeps the whole thing unit-testable without a live
+// app — now with no impure seam left at all.
 import type { AgentTabStatus } from "../types";
-import { log } from "../logger";
 import { isTerseAnswer, liveOptionsFor } from "./conciergeDispatch";
 import type { SuggestionButton } from "./suggestions/types";
 
 export type RouteTarget = "sparkle" | "agent";
+/** `classified` is retained in the union but no longer produced — see the tier-2 note above. It
+ *  stays so persisted/telemetry rows written before the removal still typecheck. */
 export type RouteSource = "heuristic" | "classified" | "fallback";
-
-/** How long tier 2 gets before we stop waiting on it. The Rust side's own bound is
- *  CONNECT_TIMEOUT + CLASSIFY_READ_TIMEOUT (~40s) — far too long to hold a send with the user's
- *  text in limbo. A classify that hasn't answered in this long is treated exactly like an error:
- *  route to `sparkle`, the recoverable direction.
- *
- *  4s, not the 2.5s first tried: this has to cover TLS connect + the proxy hop + a Haiku round
- *  trip, and on a cold connection 2.5s would time out a large share of classifies. That failure is
- *  expensive in a way the others are not — the losing promise is ABANDONED, not cancelled, so the
- *  server still bills the credit while the answer is discarded. Timeouts therefore log distinctly
- *  (see the `deadline` branch), so systematic ones are detectable rather than reading as ordinary
- *  fallbacks in a ledger full of identical "Routing a message" charges. */
-export const ROUTE_DEADLINE_MS = 4000;
 
 export interface RouteDecision {
   target: RouteTarget;
@@ -75,14 +65,10 @@ export interface RouteContext {
   agent: RouteAgent | null;
 }
 
-/** Injectable seams so tier 1 can be tested with no Tauri and tier 2 with no network. */
+/** Injectable seam so routing can be tested with no Tauri. */
 export interface RouteDeps {
   /** The prompt options currently on the agent's screen (defaults to the real terminal read). */
   liveOptions?: (agentId: string) => SuggestionButton[];
-  /** The Haiku classify call (defaults to the Tauri command). */
-  classify?: (text: string, context: string) => Promise<string>;
-  /** Override the tier-2 deadline (defaults to ROUTE_DEADLINE_MS). */
-  deadlineMs?: number;
 }
 
 /**
@@ -128,37 +114,6 @@ export function looksLikeAnswer(text: string, options: SuggestionButton[]): bool
   const t = text.trim().replace(/[.!?]+$/, "").trim();
   if (BARE_ANSWER.test(t)) return true;
   return isTerseAnswer(text, options);
-}
-
-/** How many on-screen options, and how much of each, reach the classifier. A screenful of long
- *  labels would otherwise bill unbounded metered INPUT tokens on every ambiguous send. */
-const MAX_OPTIONS = 6;
-const MAX_LABEL_CHARS = 80;
-
-/** The compact "what is this agent doing" line handed to the classifier. Bounded (see above) and
- *  built to be treated as DATA — the agent name and option labels are terminal output, which is
- *  untrusted content the classifier must not read as instructions (see route_classify.rs). */
-export function contextLine(agent: RouteAgent, options: SuggestionButton[]): string {
-  const labels = options
-    .slice(0, MAX_OPTIONS)
-    .map((o) => o.label.slice(0, MAX_LABEL_CHARS))
-    .join(" / ");
-  const asking = labels ? ` It is on screen asking: ${labels}.` : "";
-  const name = agent.name.slice(0, MAX_LABEL_CHARS);
-  return `The user is looking at a coding agent named "${name}" (status: ${agent.status ?? "unknown"}).${asking}`;
-}
-
-/** Read the model's verdict. Tolerant of a chatty reply (same habit as naming.rs's parser), but
- *  it must be UNAMBIGUOUS — a reply mentioning both destinations is treated as no answer, so it
- *  falls through to the safe default rather than being decided by regex ordering. */
-export function parseVerdict(raw: string): RouteTarget | null {
-  const t = raw.toLowerCase();
-  const agent = /\bagent\b/.test(t);
-  // Both alternatives need the trailing boundary. `/\bsparkle|\bchat\b/` groups as
-  // `(\bsparkle)|(\bchat\b)`, so "sparkles"/"sparkled" matched — a real bug, not a style nit.
-  const sparkle = /\b(?:sparkle|chat)\b/.test(t);
-  if (agent === sparkle) return null; // both or neither → not a usable answer
-  return agent ? "agent" : "sparkle";
 }
 
 export async function routeMessage(
@@ -213,92 +168,25 @@ export async function routeMessage(
     return { target: "sparkle", reason: "asks about the fleet", source: "heuristic" };
   }
 
-  // ── Tier 2 ──────────────────────────────────────────────────────────────────────────────────
-  const classify = deps.classify ?? invokeClassify;
-  // Captured once: the log below must report the deadline that ACTUALLY fired, not the default.
-  // Logging a constant while an override was in force defeats the whole point of the branch, which
-  // is making systematic deadline problems measurable.
-  const deadlineMs = deps.deadlineMs ?? ROUTE_DEADLINE_MS;
-  try {
-    // Raced against a deadline: the Rust bound is ~40s, which would hold the user's send hostage.
-    const reply = await withDeadline(
-      Promise.resolve().then(() => classify(text, contextLine(agent, options))),
-      deadlineMs,
-    );
-    const verdict = parseVerdict(reply);
-    if (verdict) {
-      return {
-        target: verdict,
-        reason: verdict === "agent" ? "reads as work for the agent" : "reads as a question for me",
-        source: "classified",
-      };
-    }
-    log.warn("router", "unusable verdict, defaulting to Sparkle", { reply });
-    return { target: "sparkle", reason: "the router gave no clear answer", source: "fallback" };
-  } catch (e) {
-    // NOT silent. A swallowed failure here is invisible twice over: the user gets a chat answer
-    // with no hint that routing failed, and an out-of-credits account (the proxy's typed
-    // `insufficient_credits:<bal>`) looks identical to being offline.
-    const message = e instanceof Error ? e.message : String(e);
-    // A timeout is logged as its own event, not folded in with the rest: it is the failure that
-    // still SPENT a credit (the abandoned call completes server-side), so a systematic deadline
-    // problem has to be greppable rather than hidden among ordinary fallbacks.
-    if (message.includes("deadline")) {
-      log.warn("router", `classify exceeded ${deadlineMs}ms — billed but discarded`, { deadlineMs });
-    } else {
-      log.warn("router", "classify failed, defaulting to Sparkle", { message });
-    }
-    return { target: "sparkle", reason: failureReason(message), source: "fallback" };
-  }
-}
-
-/** The default tier-2 seam: the Tauri command. Extracted so a test can assert the command name and
- *  payload shape — a rename on either side of the IPC boundary otherwise fails silently at runtime
- *  and routes to `sparkle` forever, which looks exactly like the intended fallback. */
-export function invokeClassify(text: string, context: string): Promise<string> {
-  // Every proxied AI wrapper reports what it learned about Sparkle's provider account — there is
-  // no single JS chokepoint (each command has its own wrapper), so a wrapper that skips this both
-  // hides a live outage and, worse, leaves a false one on screen after recovery (roborev 54761).
-  return invoke<string>("route_classify", { text, context }).then(
-    (out) => {
-      noteAiProviderHealthy();
-      noteAiServiceHealthy();
-      return out;
-    },
-    (err: unknown) => {
-      noteAiProviderFailure(err);
-      noteAiServiceFailure(err);
-      throw err;
-    },
-  );
-}
-
-/** Reject with `deadline` once `ms` have passed. The losing promise is left to settle unobserved;
- *  it has no side effects beyond a metered call already made. */
-function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    p.finally(() => clearTimeout(timer)),
-    new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("deadline")), ms);
-    }),
-  ]);
-}
-
-/** Turn a failure into a short debuggable reason. The classes come from the proxy
- *  (`services/anthropic.ts` maps the same strings), so a misroute leaves a trace of WHY. */
-export function failureReason(message: string): string {
-  // `includes`, not `startsWith`: the IPC layer wraps errors ("invoke failed: insufficient_credits:0"),
-  // so an anchored match quietly fell through to the generic reason — losing exactly the class this
-  // function exists to name.
-  if (message.includes("insufficient_credits")) return "out of credits — answering here instead";
-  if (message.includes("deadline")) return "the router took too long — answering here is undoable";
-  // Signed-out is its OWN class. Folding it into "offline" mislabels a persistent, user-fixable
-  // state as a transient network blip — and this string is what a future debugger reads.
-  if (message.includes("not signed in")) return "not signed in — answering here instead";
-  if (message.includes("ai_unreachable")) {
-    return "couldn't reach the router (offline) — answering here is undoable";
-  }
-  if (message.includes("ai_unconfigured")) return "routing isn't configured — answering here instead";
-  return "couldn't tell — answering here is undoable";
+  // ── No tier 2 ───────────────────────────────────────────────────────────────────────────────
+  // The heuristics above didn't place this message, so it takes the reversible direction.
+  //
+  // There USED to be a model call here: one Haiku classify, raced against a 4s deadline. It was
+  // removed when the AI backend moved onto the user's own Claude Code subscription, because the
+  // numbers stopped working — and they do not work at any deadline:
+  //
+  //   • A `claude -p` classify measures 5.7-6.0s wall clock (three runs, warm), against a 4s
+  //     deadline that exists because this sits on the critical path of pressing Enter. Every
+  //     classify would have blown it, so tier 2 would have become "always Sparkle" while still
+  //     paying for the call.
+  //   • Raising the deadline to fit is not free either: it stalls the user's send by ~6s on exactly
+  //     the ambiguous messages, which is a worse product than answering in chat with a redirect.
+  //   • The deadline race ABANDONS the losing promise rather than cancelling it, so each timed-out
+  //     classify would leave a `claude` process running to completion — burning the user's own
+  //     subscription quota for an answer nobody reads.
+  //
+  // What is lost is bounded and recoverable by design: an unplaced message is answered by Sparkle,
+  // and the receipt offers a one-click redirect to the agent. What is kept is the property this
+  // module exists for — when the router doesn't know, it never types into a live PTY.
+  return { target: "sparkle", reason: "couldn't place it — answering here is undoable", source: "fallback" };
 }

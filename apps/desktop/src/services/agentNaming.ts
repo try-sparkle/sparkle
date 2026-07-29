@@ -15,7 +15,7 @@
 // (no API key, network) just leaves the current name as-is. The naming call must never block
 // or break the send path, so callers fire-and-forget.
 import { invoke } from "@tauri-apps/api/core";
-import { noteAiProviderFailure, noteAiProviderHealthy, noteAiServiceFailure, noteAiServiceHealthy } from "./anthropic";
+import { noteAiProviderFailure, noteAiServiceFailure } from "./anthropic";
 import { useProjectStore } from "../stores/projectStore";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
@@ -293,12 +293,13 @@ export async function maybeAutoName(
       // Metering-only: attributes this paid naming call to its project in the Credits history.
       project: projectName(projectId),
     });
-    // Report what this proxied call learned about Sparkle's provider account. Every AI wrapper must
-    // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
-    // one on a banner the user cannot dismiss (roborev 54761).
-    noteAiProviderHealthy();
+    // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
+    // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired
+    // or anything is spawned — so a success here may never have touched the CLI. Reporting healthy
+    // from one would zero the failure run and let a wedged or signed-out CLI hide behind a
+    // non-dismissible banner saying everything is fine. `chatOnce` is uncached, always really runs,
+    // and is the authoritative recovery signal (see anthropic.ts's contract block).
     // …and that the SERVICE is up, retiring the sustained-failure banner (aiServiceHealthStore).
-    noteAiServiceHealthy();
     // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +
     // description on hover.
     const canonical = name?.title?.trim();
@@ -461,6 +462,35 @@ function markTerminal(agentId: string): void {
   workBackstopFailures.delete(agentId);
 }
 
+/**
+ * Did this failure happen BEFORE anything was spawned, and cost nothing?
+ *
+ * `ai_busy` ONLY. The local concurrency pool was saturated, so `claude_oneshot` refused in-process
+ * without forking anything. That makes it categorically different from every other throw here:
+ *
+ *   - it is FREE — {@link MAX_WORK_BACKSTOP_ATTEMPTS}'s whole justification is that "a throw is NOT
+ *     reliably a free failure", which was true when a throw could be the model's own billed SKIP
+ *     verdict. It is not true of this one.
+ *   - it is CORRELATED IN TIME — it comes from one burst of concurrent work, and this backstop runs
+ *     on the ~15s sidebar tick. So ~45 seconds of a finish burst (exactly when many agents become
+ *     eligible at once) would burn the entire per-agent budget and pin the agent at "Build N" for
+ *     the rest of the session, having never asked the model anything.
+ *
+ * `ai_timeout` was briefly exempted here too and that was WRONG: it is produced only after the CLI
+ * ran its FULL 60s wall clock, so the call was billed, and for a wedged CLI it is deterministic
+ * rather than bursty. Exempting it made this backstop retry forever on the sidebar tick — one
+ * continuously-running 60s child per agent — which is precisely the unbounded paid loop
+ * {@link MAX_WORK_BACKSTOP_ATTEMPTS} exists to prevent.
+ *
+ * Matching on the sentinel string is safe in a way that doc feared it would not be:
+ * `claude_oneshot::classify_cli_failure` defines these as typed sentinels for the JS layer to branch
+ * on, so they are a contract rather than incidental error prose.
+ */
+function isFreeRefusal(e: unknown): boolean {
+  const m = e instanceof Error ? e.message : String(e);
+  return m.includes("ai_busy");
+}
+
 /** Record one non-terminal (retryable) attempt, promoting the agent to TERMINAL once it has burned
  *  through the cap — so retries can never become an unbounded paid loop. */
 function countRetryableAttempt(agentId: string): void {
@@ -499,11 +529,12 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
       prompt: basis,
       project: projectName(projectId),
     });
-    // Report what this proxied call learned about Sparkle's provider account. Every AI wrapper must
-    // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
-    // one on a banner the user cannot dismiss (roborev 54761).
-    noteAiProviderHealthy();
-    noteAiServiceHealthy();
+    // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
+    // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired
+    // or anything is spawned — so a success here may never have touched the CLI. Reporting healthy
+    // from one would zero the failure run and let a wedged or signed-out CLI hide behind a
+    // non-dismissible banner saying everything is fine. `chatOnce` is uncached, always really runs,
+    // and is the authoritative recovery signal (see anthropic.ts's contract block).
     const canonical = name?.title?.trim();
     if (canonical) {
       // TERMINAL: we produced a name, so never spend a second call for this agent.
@@ -528,7 +559,9 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
     // pruned). Counted against the cap, because a throw is NOT reliably a free failure — naming.rs
     // also returns Err for the model's own SKIP/unusable-title verdicts, which were billed and are
     // deterministic for this basis. See MAX_WORK_BACKSTOP_ATTEMPTS.
-    countRetryableAttempt(agentId);
+    // EXCEPT the pre-spawn refusal, which never reached the model — see isFreeRefusal for why
+    // charging it would pin an agent at "Build N" for a burst it had no part in.
+    if (!isFreeRefusal(e)) countRetryableAttempt(agentId);
     console.debug("work-backstop name skipped (retryable):", e);
   } finally {
     inFlight.delete(agentId);

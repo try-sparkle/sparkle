@@ -49,7 +49,8 @@ import {
   requestApproval,
 } from "../../stores/conciergeApprovals";
 import { useSettingsStore } from "../../stores/settingsStore";
-import { aiFeatureNow } from "../aiGate";
+import { aiEnhancementsEnabled, aiFeatureNow } from "../aiGate";
+import { useAuthStore } from "../../stores/authStore";
 import type { ToolPolicyDecision } from "../dispatchAuthority";
 import {
   CONCIERGE_RISK_NOTE,
@@ -93,16 +94,51 @@ export function readToolPolicyOverrides(): {
 
 /** Are AI enhancements live for the concierge (bead sparkle-4562)?
  *
- *  `aiFeatureNow("concierge")` is the settings flag AND a served credit balance, so this is false
- *  for a human who turned the feature off, for one who has run out of credits, AND — with no extra
- *  code path — for a build compiled from the open-source repo, which has no Sparkle backend and so
- *  never has a signed-in `me`. One rule covers all three.
+ *  `aiFeatureNow("concierge")` is the settings flag AND `affordable()` — which for a
+ *  subscription-funded key means ENTITLEMENT OR CREDITS (aiGate.ts). It is NOT the flag alone; an
+ *  earlier version of this comment said so and was wrong in a way worth naming, because a maintainer
+ *  reading it would conclude the open-source build is broken and "fix" it by loosening the paywall.
+ *
+ *  What DID change: the credit requirement is gone as a standalone gate. The concierge turn runs on
+ *  the user's own Claude Code subscription (`concierge.rs` shells out to their authenticated
+ *  `claude`), so it spends no Sparkle money and an entitled user at a zero balance now gets it.
+ *
+ *  What did NOT change: a build compiled from the public mirror has no Sparkle backend and never
+ *  gets a signed-in `me`, so it satisfies neither arm and still refuses — see the test that asserts
+ *  exactly this. The refusal now comes from the PAYWALL rather than the credit check. What such a
+ *  build degrades on instead is the honest condition: no `claude` on PATH, or one that is not signed
+ *  in, which `claude_oneshot` reports as `ai_unconfigured` / `claude_not_authenticated` with a
+ *  message saying what to fix.
  *
  *  Fails CLOSED on a throw: an unreadable store means we cannot show the gate is open, and the
  *  concierge acting on that assumption is the expensive direction to be wrong in. */
 export function conciergeAiEnabled(): boolean {
   try {
     return aiFeatureNow("concierge");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * May the concierge's TOOL SURFACE run — spawning build agents, navigating, mutating the workspace?
+ *
+ * Deliberately a DIFFERENT question from {@link conciergeAiEnabled}, and split out when the credit
+ * gate was removed. Those two used to be the same call, which conflated two unrelated things:
+ *
+ *   - "can we afford this inference?" — no longer meaningful. The concierge turn runs on the user's
+ *     own Claude Code subscription and costs Sparkle nothing, so a Sparkle balance cannot answer it.
+ *   - "has this person bought the app?" — still very much meaningful, and it is what actually
+ *     governs whether Sparkle will go and BUILD things on their behalf.
+ *
+ * Keeping them fused would have silently handed the whole tool surface to any build with no Sparkle
+ * backend, as a side effect of an inference-cost decision. Entitlement (`aiEnhancementsEnabled`) is
+ * the paywall this repo already uses for that question — see aiGate.ts's header — so it is what is
+ * asked here. Fails CLOSED on a throw, same reasoning as above.
+ */
+export function conciergeToolsEnabled(): boolean {
+  try {
+    return conciergeAiEnabled() && aiEnhancementsEnabled(useAuthStore.getState().me);
   } catch {
     return false;
   }
@@ -222,7 +258,9 @@ function evaluateWithHydrationHold(op: string): {
   held: boolean;
 } {
   const { overrides, hydrated } = readToolPolicyOverrides();
-  const evaluation = evaluateToolPolicy(op, { overrides, aiEnabled: conciergeAiEnabled() });
+  // The TOOL surface asks the entitlement question, not the inference-cost one — see
+  // `conciergeToolsEnabled`.
+  const evaluation = evaluateToolPolicy(op, { overrides, aiEnabled: conciergeToolsEnabled() });
   const held =
     !hydrated && evaluation.decision === "allow" && evaluation.riskClass !== "read-only";
   return { evaluation, held };

@@ -23,7 +23,7 @@ vi.mock("./engine", () => ({
 // Same stand-in trick for AiUnavailableError / AiUnreachableError: the hook's `instanceof` checks key
 // off the classes it imports from "../anthropic", so tests must reject with the very same classes.
 // Mocking the module also keeps the real one's @tauri-apps/api/core import out of this suite.
-const { AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
+const { AiUnavailableError, AiUnreachableError, AiBusyError } = vi.hoisted(() => {
   class AiUnavailableError extends Error {
     constructor() {
       super("AI backend is unavailable");
@@ -36,9 +36,12 @@ const { AiUnavailableError, AiUnreachableError } = vi.hoisted(() => {
       this.name = "AiUnreachableError";
     }
   }
-  return { AiUnavailableError, AiUnreachableError };
+  // See the reaim suite: a partial mock of ../anthropic leaves AiBusyError undefined, and
+  // computeDeferralReason's `instanceof` then throws instead of failing a test.
+  class AiBusyError extends Error {}
+  return { AiUnavailableError, AiUnreachableError, AiBusyError };
 });
-vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
+vi.mock("../anthropic", () => ({ AiUnavailableError, AiUnreachableError, AiBusyError }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => "Done. Committed abc. Nothing further." }));
 // Credit-gated, and drivable: `useAiFeature` ANDs the feature flag with the live credit balance, so
 // flipping this false→true is what a top-up looks like to the hook. Reset in beforeEach.

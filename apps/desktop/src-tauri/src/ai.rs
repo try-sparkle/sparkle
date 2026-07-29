@@ -1,51 +1,35 @@
-// Generic Anthropic chat command for the Sparkle Chief interview/synthesis flows, plus the SHARED
-// server-side AI proxy client used by every Anthropic caller in the app (naming, judge, attention
-// summary, and this chat sink).
+// Generic Claude chat command for the Sparkle Chief interview/synthesis flows.
 //
-// Billing keystone (task #10): these calls no longer POST directly to api.anthropic.com with a
-// BYOK key. They go through the orchestration `POST /ai/anthropic` route on the user's Sparkle
-// bearer token (read from the OS keychain in auth.rs — it never enters JS). The SERVER holds the
-// vendor key and meters entitlement + credits (Haiku at 10× actual tokens), so the desktop can no
-// longer bypass the meter and no developer secret ships in the binary.
+// `anthropic_chat` now runs on the USER'S OWN Claude Code subscription via `claude_oneshot` (their
+// authenticated `claude` CLI). It previously POSTed to the orchestration `/ai/anthropic` route,
+// where the SERVER held a vendor key and metered credits at 10x — that key ran out of funds on
+// 2026-07-28 and took auto-naming, the judge, Chief synthesis and suggestions down together. The
+// decision was to retire the vendor key rather than refund it, so there is no Sparkle-funded key
+// left to exhaust and no credit to meter on this path.
 //
-// MODEL NOTE: the proxy meters every model in its aiPricing table (`isMeteredAnthropicModel`
-// server-side) — Haiku 4.5, Sonnet 4.6, and Opus 4.8 — and REJECTS any other model with 400
-// `unsupported_model`. The generic chat sink here uses Sonnet 4.6 (restored from a temporary Haiku
-// downgrade, bead sparkle-8k3v, that existed only while the server priced Haiku alone); the tiny
-// classify calls (naming/judge/attention) stay on Haiku 4.5 in their own modules.
+// The proxy client that used to live here — `call_anthropic_proxy`, `build_proxy_body`, `Metering`,
+// `extract_text`, `classify_proxy_error`, `vendor_status`, `classify_transport_kind` and their
+// loopback test harness — is GONE, along with the last caller (`route_classify`). This module is
+// now a thin command over `claude_oneshot`; there is no HTTP in it at all, which is why the ureq
+// note that used to sit here went with it.
 //
-// ureq is pulled WITHOUT its optional `json` feature, so we serialize/parse with serde_json
-// directly (send_string / into_string), never send_json/into_json.
+// MODEL NOTE: the chat sink uses Sonnet 4.6; the tiny classify calls (naming/judge/attention) stay
+// on Haiku 4.5 in their own modules. Pinning the model matters more now than it did under the
+// proxy: these run on the user's own quota, so inheriting a user configured on Opus would multiply
+// their cost several-fold for no gain.
 
-use std::time::Duration;
-
-use crate::auth;
-
-/// Sonnet 4.6 — the generic-chat model (brainstorm / AI-composer / ThinkPanel task-planning). Metered
-/// server-side at 10× ($3/$15 per MTok). Bare alias, no date suffix.
+/// Sonnet 4.6 — the generic-chat model (brainstorm / AI-composer / ThinkPanel task-planning).
+/// Bare alias, no date suffix. Pinned rather than inherited: this runs on the user's own
+/// subscription, so a user configured on Opus would multiply their own cost for no gain.
 const CHAT_MODEL: &str = "claude-sonnet-4-6";
-
-/// Bound the proxy call so a stalled orchestration host can't pin a spawn_blocking thread forever
-/// (which would eventually exhaust the blocking pool). ureq has no default timeout. A hung endpoint
-/// then hits the existing Err/degrade path. Connect is short; the read budget is per-caller (see
-/// below). Mirrors connectivity.rs's AgentBuilder shape.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Generous read budget for the interview/synthesis chat sink, whose replies can be long and
-/// slow-but-progressing.
-const CHAT_READ_TIMEOUT: Duration = Duration::from_secs(120);
-/// Tight read budget for the tiny one-shot classification/label calls (naming/judge/attention);
-/// their replies are ≤ a few dozen tokens and return fast, so a hung host degrades ~4× sooner than
-/// the chat budget would allow. `pub(crate)` so those modules share the exact bound.
-pub(crate) const CLASSIFY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default token budget when the caller passes 0, so a forgotten/zero `max_tokens` still yields a
 /// usable reply rather than the API rejecting a zero budget.
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 /// Upper bound on `max_tokens`. An unclamped budget from a compromised renderer would be a
-/// costly-output amplifier (billed to the user's credits via the server meter). 8192 covers the
-/// interview/synthesis replies this drives with headroom; anything larger is clamped down. (The
-/// server independently caps forwarded output tokens too — this is defence in depth.)
+/// costly-output amplifier — now against the user's own subscription quota rather than a Sparkle
+/// meter. 8192 covers the interview/synthesis replies this drives with headroom.
 const MAX_MAX_TOKENS: u32 = 8192;
 
 /// Resolve the effective token budget: 0 (forgotten/unset) → default; otherwise the request,
@@ -57,295 +41,123 @@ fn clamp_max_tokens(requested: u32) -> u32 {
     }
 }
 
-/// One-shot Anthropic chat: send `system` + `user`, return the model's first text block. Routed
-/// through the server-side proxy on the user's Sparkle bearer (server holds the vendor key + meters
-/// credits). Returns Err on any failure (not signed in, out of credits, network, empty result) so
-/// the caller can degrade; an out-of-credits error is the typed `insufficient_credits:<bal>` string
-/// the JS layer maps to the upsell UI.
+/// One-shot Claude chat: send `system` + `user`, return the model's reply text. Runs on the USER'S
+/// OWN Claude Code subscription via `claude_oneshot` (their authenticated `claude` CLI). Returns Err
+/// on any failure (no CLI, not signed into Claude Code, timeout, busy, empty result) so the caller
+/// can degrade.
+///
+/// Note what is NO LONGER here: the Sparkle bearer read, the "not signed in" precondition, and the
+/// `insufficient_credits` path. There is no Sparkle-side balance to exhaust on this route, so that
+/// typed error can no longer be produced.
 #[tauri::command]
 pub async fn anthropic_chat(
     system: String,
     user: String,
     max_tokens: u32,
-    // Optional, metering-only human description of WHY this call was made (e.g. "Renamed agent to
-    // 'Fix OAuth loop'"). Forwarded in the proxy body so the server persists it into the credit
-    // ledger (`meta.description`); it is NEVER sent to the vendor. Back-compat: a missing key → None.
+    // Short human description of WHY this call was made (e.g. "Suggesting next actions"). It used to
+    // be forwarded to the server for the credit ledger; with no server call it is diagnostic only,
+    // and lands on claude_oneshot's tracing line. Back-compat: a missing key → None.
     purpose: Option<String>,
-    // Optional, metering-only display name of the PROJECT this call belongs to, so the Credits
-    // history can answer "which project did this cost me?". Persisted to `meta.project`; likewise
-    // never sent to the vendor. Back-compat: a missing key → None.
+    // Display name of the PROJECT this call belongs to. Diagnostic only now, same reason.
     project: Option<String>,
+    // Whether this call is AUTOMATIC (fired by the app on a timer/state change) rather than one a
+    // human is sitting behind. It selects the concurrency tier, and getting it wrong starves the
+    // other kind — see the tier comment below. Back-compat: a missing key → None → interactive.
+    background: Option<bool>,
 ) -> Result<String, String> {
     let user = user.trim().to_string();
     if user.is_empty() {
         return Err("empty user message".into());
     }
-    // 0 → default; otherwise clamp so a hostile caller can't amplify metered spend.
+    // 0 → default; otherwise clamp. This no longer bounds metered spend (there is none) — it bounds
+    // the reply-truncation budget in claude_oneshot, and still stops a compromised renderer asking
+    // for an unbounded reply.
     let max_tokens = clamp_max_tokens(max_tokens);
 
-    let base = auth::base_url(); // just an env read — cheap, non-blocking.
-
-    // ureq is blocking AND the keychain read (bearer_token) is a synchronous Security-framework
-    // syscall that can block on a locked keychain — keep BOTH off the async runtime's worker by
-    // resolving the token inside the blocking closure. No token → signed out; degrade.
+    // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
+    // runtime's worker threads, exactly as the proxy call it replaced did.
     tauri::async_runtime::spawn_blocking(move || {
-        let token = auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        let json = call_anthropic_proxy(
-            &base,
-            &token,
-            CHAT_MODEL,
+        crate::claude_oneshot::run(chat_request(
             &system,
             &user,
             max_tokens,
-            CHAT_READ_TIMEOUT,
-            Metering { purpose: purpose.as_deref(), project: project.as_deref() },
-        )?;
-        extract_text(&json).ok_or_else(|| "anthropic chat returned no text".to_string())
+            purpose.as_deref(),
+            project.as_deref(),
+            background.unwrap_or(false),
+        ))
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-/// Cap on the metering `purpose` string forwarded to the server (wire contract: <= 200 chars).
-/// Defence in depth — the server validates this too, but a hostile renderer must not be able to
-/// bloat the ledger `meta.description` from the desktop side.
-const MAX_PURPOSE_CHARS: usize = 200;
-
-/// Cap on the metering `project` name (wire contract: <= 120 chars — a name, not a sentence).
-/// Same defence-in-depth reasoning as MAX_PURPOSE_CHARS.
-const MAX_PROJECT_CHARS: usize = 120;
-
-/// The METERING-ONLY annotations attached to a proxied AI call. Neither field is ever forwarded to
-/// the vendor: the server records them in the credit ledger row's `meta` so the Credits history can
-/// say WHAT the spend was for (`purpose` → `meta.description`) and WHICH PROJECT it belonged to
-/// (`project` → `meta.project`).
-///
-/// A struct rather than two adjacent `Option<&str>` parameters: at a call site
-/// `Metering { purpose: Some("Naming an agent"), project: None }` cannot be silently transposed the
-/// way two positional options can, and `Metering::default()` reads better than `None, None`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Metering<'a> {
-    /// Short human description of WHY this call was made, e.g. "Renamed agent to 'Fix OAuth loop'".
-    pub purpose: Option<&'a str>,
-    /// Display name of the project the spend belongs to. None for genuinely account-level calls
-    /// (and for any caller that doesn't know) — the history renders that absence honestly.
-    pub project: Option<&'a str>,
-}
-
-impl<'a> Metering<'a> {
-    /// A purpose, attributed to a project when the caller knows one. Every real caller has a
-    /// purpose; only the project is genuinely optional, which is why this is the single constructor.
-    pub fn new(purpose: &'a str, project: Option<&'a str>) -> Self {
-        Self { purpose: Some(purpose), project }
-    }
-}
-
-/// Insert a trimmed, length-capped metering string under `key`, or omit the key entirely when the
-/// value is absent/blank. Shared by both metering fields so they can't drift in their handling.
-fn put_metering(body: &mut serde_json::Value, key: &str, value: Option<&str>, max_chars: usize) {
-    if let Some(v) = value {
-        let v = v.trim();
-        if !v.is_empty() {
-            let clipped: String = v.chars().take(max_chars).collect();
-            body[key] = serde_json::Value::String(clipped);
-        }
-    }
-}
-
-/// Build the JSON body POSTed to the orchestration `/ai/anthropic` route. Pure so the shape is
-/// pinned by unit tests without a network call. Matches the server's `anthropicBody` zod schema:
-/// `{ model, max_tokens, messages:[{role,content}], system?, purpose?, project? }`. `system` is
-/// omitted when empty; both `Metering` fields (metering-only, persisted into the credit ledger,
-/// NEVER sent to the vendor) are omitted when None/blank and truncated to their wire caps.
-pub(crate) fn build_proxy_body(
-    model: &str,
-    system: &str,
-    user: &str,
+/// Build the chat request. Split out from the command so the decisions encoded here are TESTABLE —
+/// each compiles fine when wrong and produces no visible error at runtime.
+fn chat_request<'a>(
+    system: &'a str,
+    user: &'a str,
     max_tokens: u32,
-    metering: Metering<'_>,
-) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{ "role": "user", "content": user }],
-    });
-    if !system.trim().is_empty() {
-        body["system"] = serde_json::Value::String(system.to_string());
-    }
-    put_metering(&mut body, "purpose", metering.purpose, MAX_PURPOSE_CHARS);
-    put_metering(&mut body, "project", metering.project, MAX_PROJECT_CHARS);
-    body
-}
-
-/// Map a proxy HTTP error status (+ its response body) to a typed error string the JS layer can
-/// branch on. `402` carries the current balance so the UI can show "you have $X"; `403`/`404`/`503`
-/// are stable sentinels; anything else is a generic message. Pure so it's unit-testable. Never
-/// echoes the raw server body (it can contain request fragments).
-pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
-    match code {
-        402 => {
-            let bal = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| v.get("balanceCents").and_then(serde_json::Value::as_i64))
-                .unwrap_or(0);
-            format!("insufficient_credits:{bal}")
-        }
-        403 => "not_entitled".to_string(),
-        // The route never 404s on its own: gates answer 400/402/403/503 and vendor failures are
-        // re-emitted as 502. So a 404 means `/ai/anthropic` isn't registered at all — the client is
-        // pointed at a server that doesn't serve it. That's the backend being unavailable, not a
-        // per-request failure, so it maps onto the same sentinel as 503: no amount of retrying the
-        // same call will make the route appear.
-        //
-        // A 503 may now carry a `reason` naming WHY the backend is unusable — most importantly
-        // `provider_unfunded`, i.e. Sparkle's own AI provider account has no credit left. That
-        // distinction is what lets the UI say something true and actionable instead of failing
-        // silently: without it, an outage that is entirely ours is indistinguishable from a
-        // misconfigured install, and the user is left guessing (or, far worse, shown the
-        // out-of-credits upsell for a balance that is fine). The reason is APPENDED rather than
-        // replacing the sentinel so every existing `== "ai_unconfigured"` comparison still matches
-        // its prefix and the deferral behaviour is unchanged.
-        404 | 503 => match unconfigured_reason(body) {
-            Some(reason) => format!("ai_unconfigured:{reason}"),
-            None => "ai_unconfigured".to_string(),
+    purpose: Option<&'a str>,
+    project: Option<&'a str>,
+    background: bool,
+) -> crate::claude_oneshot::OneShot<'a> {
+    crate::claude_oneshot::OneShot {
+        model: CHAT_MODEL,
+        system,
+        user,
+        max_tokens,
+        timeout: crate::claude_oneshot::CHAT_TIMEOUT,
+        // Chosen by the CALLER, not fixed here. An earlier cut hardcoded `Interactive` on the
+        // reasoning that "every caller of this sink is a user-initiated flow behind a spinner".
+        // That is false of its HIGHEST-VOLUME caller: suggestions/engine.ts fires automatically on
+        // every settled state, per agent. Pinning those to Interactive put automatic traffic into
+        // the pool reserved for blocked humans, so a handful of concurrent suggestion computes could
+        // leave a user pressing Send in Define Done with no slot — exactly the starvation the tier
+        // split exists to prevent, rebuilt inside the Interactive tier.
+        tier: if background {
+            crate::claude_oneshot::Tier::Background
+        } else {
+            crate::claude_oneshot::Tier::Interactive
         },
-        // A 502 is the proxy's envelope for "the VENDOR call failed", and the route puts the
-        // vendor's own status in the body (`{"error":"vendor_error","status":<n>}`). Reporting the
-        // envelope's 502 instead of that inner status loses the only bit callers branch on: the JS
-        // retry classifier treats a 4xx as terminal and a 5xx as worth retrying, so a vendor 400
-        // (malformed request, over the context window, unknown model — permanently doomed) arrived
-        // looking like a transient gateway hiccup and was re-issued until the retry budget ran out.
-        // Surface the inner status so it classifies as what it is. Only the NUMBER is taken; the
-        // body is never echoed, and a 502 with no readable status falls through to the generic
-        // message (`vendor_timeout`/`vendor_unreachable` have none, and both are genuinely
-        // retryable, so the 502 they keep is correct).
-        502 => match vendor_status(body) {
-            Some(status) => format!("ai request failed (HTTP {status})"),
-            None => format!("ai request failed (HTTP {code})"),
-        },
-        _ => format!("ai request failed (HTTP {code})"),
+        // NOT cached, deliberately. This is the generic chat sink for brainstorm/composer flows
+        // where a user's "regenerate" must actually regenerate; serving a cached reply would make
+        // that button a silent no-op.
+        cacheable: false,
+        // The caller's own description ("Suggesting next actions", "Defining the delivered stage",
+        // Chief synthesis…). That breakdown is exactly what diagnosing call-volume needs, and an
+        // earlier cut threw it away by forcing a `&'static str` literal here.
+        purpose: purpose.unwrap_or("chat"),
+        project,
     }
-}
-
-/// The proxy's `reason` for an `ai_unconfigured` answer, when it sent a RECOGNISED one.
-///
-/// Allow-listed rather than passed through: this string is appended to a sentinel the JS layer
-/// parses, so an unrecognised (or hostile) `reason` must not be able to invent a new sentinel or
-/// smuggle text into a user-facing message. An unknown value degrades to the bare `ai_unconfigured`,
-/// which is exactly the pre-existing behaviour — so a server that grows a new reason before the
-/// desktop knows about it stays correct, just less specific.
-///
-/// Pure; separate from `classify_proxy_error` so the parsing contract is testable on its own.
-fn unconfigured_reason(body: &str) -> Option<&'static str> {
-    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    match v.get("reason").and_then(serde_json::Value::as_str)? {
-        "provider_unfunded" => Some("provider_unfunded"),
-        "provider_key_rejected" => Some("provider_key_rejected"),
-        _ => None,
-    }
-}
-
-/// The vendor's own HTTP status out of the proxy's `vendor_error` body, when there is one. Bounded
-/// to a plausible error status so a malformed/hostile `status` can't be pasted into a message that
-/// the JS side then parses as an HTTP code. Pure; separate from `classify_proxy_error` so the
-/// parsing contract is testable on its own.
-fn vendor_status(body: &str) -> Option<u16> {
-    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    if v.get("error").and_then(serde_json::Value::as_str)? != "vendor_error" {
-        return None;
-    }
-    let status = v.get("status").and_then(serde_json::Value::as_u64)?;
-    (400..600).contains(&status).then_some(status as u16)
-}
-
-/// Map a ureq TRANSPORT failure (the request never reached the proxy at all — no HTTP status was
-/// ever received) to a typed error string. `Dns`/`ConnectionFailed`/`Io` all mean the same thing
-/// operationally: this machine currently has no working network path to the orchestration host.
-/// That is a LOCAL condition, not a fault in the request, so the JS layer treats it as a
-/// connectivity signal rather than spending a retry budget on paid calls that cannot succeed.
-///
-/// Everything else (`InvalidUrl`, `UnknownScheme`, proxy-config errors, …) stays generic: those are
-/// misconfiguration, not connectivity, and must not masquerade as "you're offline".
-/// Pure so it's unit-testable without a network.
-pub(crate) fn classify_transport_kind(kind: ureq::ErrorKind) -> String {
-    match kind {
-        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => {
-            "ai_unreachable".to_string()
-        }
-        _ => "ai request failed".to_string(),
-    }
-}
-
-/// Shared blocking client for the server-side Anthropic proxy. POSTs `{model,system,user,max_tokens}`
-/// to `{base_url}/ai/anthropic` authenticated as the user's Sparkle bearer, and returns the parsed
-/// JSON response (the Anthropic message shape plus an injected `balanceCents`) on success. `base_url`
-/// and `token` are injected (not read from the keychain here) so the request shape + auth header are
-/// unit-testable against a loopback server. `read_timeout` is per-caller (tight for the small
-/// classification calls, generous for the chat sink). Used by every Anthropic caller.
-pub(crate) fn call_anthropic_proxy(
-    base_url: &str,
-    token: &str,
-    model: &str,
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-    read_timeout: Duration,
-    // Metering-only annotations (purpose + project); forwarded in the body (persisted to the
-    // ledger), never to the vendor. `Metering::default()` when the caller has neither.
-    metering: Metering<'_>,
-) -> Result<serde_json::Value, String> {
-    let body = build_proxy_body(model, system, user, max_tokens, metering);
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {e}"))?;
-    let url = format!("{}/ai/anthropic", base_url.trim_end_matches('/'));
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(read_timeout)
-        .build();
-    let resp = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("content-type", "application/json")
-        .send_string(&body_str);
-
-    let raw = match resp {
-        Ok(r) => r.into_string().map_err(|e| format!("read body: {e}"))?,
-        Err(ureq::Error::Status(code, r)) => {
-            // Log the (bounded) body server-side for debugging; return only the typed sentinel.
-            let detail = r.into_string().unwrap_or_default();
-            tracing::debug!(code, detail = %detail.chars().take(200).collect::<String>(), "ai proxy returned an error status");
-            return Err(classify_proxy_error(code, &detail));
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, kind = ?e.kind(), "ai proxy request failed");
-            return Err(classify_transport_kind(e.kind()));
-        }
-    };
-    serde_json::from_str(&raw).map_err(|e| format!("bad JSON: {e}"))
-}
-
-/// Pull the first non-empty text block from a Messages API response:
-/// `{ "content": [ { "type": "text", "text": "..." }, ... ] }`. Skips non-text blocks (e.g.
-/// `tool_use`) and empty/whitespace-only text blocks, so neither a leading tool block nor an empty
-/// text block masks real text. Returns None when there is no usable text — the module's contract is
-/// that an empty reply degrades through the caller's Err path, not a silent `Ok("")`.
-pub(crate) fn extract_text(json: &serde_json::Value) -> Option<String> {
-    let blocks = json.get("content")?.as_array()?;
-    for block in blocks {
-        if block.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-            if let Some(t) = block.get("text").and_then(serde_json::Value::as_str) {
-                if !t.trim().is_empty() {
-                    return Some(t.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chat_sink_never_caches_and_follows_the_callers_tier() {
+        // cacheable:true compiles and leaves the suite green while turning every "regenerate" button
+        // into a silent no-op — the documented reason the flag is false.
+        let req = chat_request("sys", "usr", 1024, None, None, false);
+        assert!(!req.cacheable, "the chat sink must never serve a cached reply");
+        assert_eq!(req.tier, crate::claude_oneshot::Tier::Interactive);
+        assert_eq!(req.model, "claude-sonnet-4-6");
+
+        // An AUTO-fired caller (suggestions) must land in the background tier, or it competes with
+        // blocked humans for the small interactive pool.
+        let bg = chat_request("sys", "usr", 512, Some("Suggesting next actions"), None, true);
+        assert_eq!(bg.tier, crate::claude_oneshot::Tier::Background);
+    }
+
+    #[test]
+    fn the_callers_purpose_survives_to_the_log_line() {
+        // An earlier cut forced a &'static str here and collapsed every caller to the literal
+        // "chat", throwing away the per-caller breakdown that diagnosing call volume depends on.
+        let req = chat_request("sys", "usr", 512, Some("Suggesting next actions"), None, true);
+        assert_eq!(req.purpose, "Suggesting next actions");
+        let bare = chat_request("sys", "usr", 512, None, None, false);
+        assert_eq!(bare.purpose, "chat", "a caller that names no purpose still labels the route");
+    }
 
     #[test]
     fn clamp_max_tokens_defaults_zero_and_caps_large() {
@@ -356,397 +168,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_pulls_first_text_block() {
-        let j = serde_json::json!({
-            "content": [
-                { "type": "text", "text": "hello world" },
-                { "type": "text", "text": "second" }
-            ]
-        });
-        assert_eq!(extract_text(&j), Some("hello world".to_string()));
-    }
-
-    #[test]
-    fn extract_text_skips_non_text_blocks() {
-        let j = serde_json::json!({
-            "content": [
-                { "type": "tool_use", "id": "x" },
-                { "type": "text", "text": "after tool" }
-            ]
-        });
-        assert_eq!(extract_text(&j), Some("after tool".to_string()));
-    }
-
-    #[test]
-    fn extract_text_none_when_missing_or_empty() {
-        assert_eq!(extract_text(&serde_json::json!({ "content": [] })), None);
-        assert_eq!(extract_text(&serde_json::json!({})), None);
-        // content present but no text-type block.
-        assert_eq!(
-            extract_text(&serde_json::json!({ "content": [ { "type": "tool_use" } ] })),
-            None
-        );
-    }
-
-    #[test]
-    fn build_proxy_body_shapes_the_request_and_omits_empty_system() {
-        let b = build_proxy_body("claude-haiku-4-5", "you are terse", "hi", 256, Metering::default());
-        assert_eq!(b["model"], "claude-haiku-4-5");
-        assert_eq!(b["max_tokens"], 256);
-        assert_eq!(b["system"], "you are terse");
-        assert_eq!(b["messages"][0]["role"], "user");
-        assert_eq!(b["messages"][0]["content"], "hi");
-        // No metering passed → both keys are omitted entirely.
-        assert!(b.get("purpose").is_none());
-        assert!(b.get("project").is_none());
-
-        // An empty/whitespace system is omitted entirely (not sent as "").
-        let b2 = build_proxy_body("claude-haiku-4-5", "   ", "hi", 8, Metering::default());
-        assert!(b2.get("system").is_none());
-    }
-
-    #[test]
-    fn build_proxy_body_forwards_and_bounds_purpose() {
-        // A real purpose is forwarded verbatim under the `purpose` key (metering-only).
-        let b = build_proxy_body(
-            "claude-sonnet-4-6",
-            "sys",
-            "hi",
-            256,
-            Metering::new("Renamed agent to 'Fix OAuth loop'", None),
-        );
-        assert_eq!(b["purpose"], "Renamed agent to 'Fix OAuth loop'");
-
-        // A blank/whitespace purpose is omitted (same treatment as an empty system).
-        let blank = build_proxy_body("m", "sys", "hi", 8, Metering::new("   ", None));
-        assert!(blank.get("purpose").is_none());
-
-        // An over-long purpose is clipped to MAX_PURPOSE_CHARS (defence in depth vs the server cap).
-        let long = "x".repeat(500);
-        let clipped = build_proxy_body("m", "sys", "hi", 8, Metering::new(&long, None));
-        assert_eq!(
-            clipped["purpose"].as_str().map(|s| s.chars().count()),
-            Some(MAX_PURPOSE_CHARS)
-        );
-    }
-
-    #[test]
-    fn build_proxy_body_forwards_and_bounds_project() {
-        // A project rides alongside the purpose under its own key (metering-only, meta.project).
-        let b = build_proxy_body("m", "sys", "hi", 8, Metering::new("Naming an agent", Some("sparkle")));
-        assert_eq!(b["project"], "sparkle");
-        assert_eq!(b["purpose"], "Naming an agent");
-
-        // A blank/whitespace project is omitted — the history must show "no project recorded",
-        // never an empty string masquerading as one.
-        let blank = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", Some("   ")));
-        assert!(blank.get("project").is_none());
-
-        // An over-long project is clipped to the wire cap (defence in depth vs the server's 120).
-        let long = "x".repeat(500);
-        let clipped = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", Some(&long)));
-        assert_eq!(
-            clipped["project"].as_str().map(|s| s.chars().count()),
-            Some(MAX_PROJECT_CHARS)
-        );
-
-        // A purpose with no project keeps the pre-attribution shape exactly.
-        let none = build_proxy_body("m", "sys", "hi", 8, Metering::new("p", None));
-        assert!(none.get("project").is_none());
-    }
-
-    #[test]
     fn chat_model_is_sonnet_restored_from_haiku_downgrade() {
         // Guards the sparkle-8k3v restoration: the generic chat sink runs on Sonnet 4.6 again (the
         // server now meters Sonnet), not the temporary Haiku downgrade. Bare alias, no date suffix.
         assert_eq!(CHAT_MODEL, "claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn classify_proxy_error_maps_typed_statuses() {
-        // 402 carries the balance so the UI can show "you have $X".
-        assert_eq!(
-            classify_proxy_error(402, r#"{"error":"insufficient_credits","balanceCents":1234}"#),
-            "insufficient_credits:1234"
-        );
-        // 402 with an unparseable / balance-less body still yields the sentinel (balance 0).
-        assert_eq!(classify_proxy_error(402, "nope"), "insufficient_credits:0");
-        assert_eq!(classify_proxy_error(403, "{}"), "not_entitled");
-        assert_eq!(classify_proxy_error(503, "{}"), "ai_unconfigured");
-        // A 503 that NAMES its reason keeps the sentinel as a prefix and appends it, so the UI can
-        // tell the user something true ("Sparkle's AI provider is out of credit") instead of
-        // degrading silently.
-        assert_eq!(
-            classify_proxy_error(503, r#"{"error":"ai_unconfigured","reason":"provider_unfunded"}"#),
-            "ai_unconfigured:provider_unfunded"
-        );
-        assert_eq!(
-            classify_proxy_error(503, r#"{"error":"ai_unconfigured","reason":"provider_key_rejected"}"#),
-            "ai_unconfigured:provider_key_rejected"
-        );
-        // A 404 means the route isn't registered on the server we're pointed at — the backend is
-        // unavailable, so it shares the 503 sentinel instead of the generic retryable message.
-        assert_eq!(
-            classify_proxy_error(
-                404,
-                r#"{"message":"Route POST:/ai/anthropic not found","statusCode":404}"#
-            ),
-            "ai_unconfigured"
-        );
-        assert_eq!(classify_proxy_error(500, "boom"), "ai request failed (HTTP 500)");
-        // A 502 whose body carries no readable vendor status stays generic + retryable: unlike a 404
-        // it can be a transient vendor blip, so it must keep drawing on the caller's retry budget.
-        // (A 502 that DOES carry a status is unwrapped to that status — see the test below.)
-        assert_eq!(
-            classify_proxy_error(502, r#"{"error":"vendor_error"}"#),
-            "ai request failed (HTTP 502)"
-        );
-    }
-
-    #[test]
-    fn classify_proxy_error_reports_the_vendors_status_not_the_502_envelope() {
-        // The bug this pins: a vendor 400 is permanently doomed, but wearing the 502 envelope it
-        // read as a retryable gateway blip and got re-issued until the retry budget was spent.
-        assert_eq!(
-            classify_proxy_error(502, r#"{"error":"vendor_error","status":400}"#),
-            "ai request failed (HTTP 400)"
-        );
-        // A vendor 429 is genuinely retryable — the callers' own classifier exempts it, which only
-        // works if the real status reaches them.
-        assert_eq!(
-            classify_proxy_error(502, r#"{"error":"vendor_error","status":429}"#),
-            "ai request failed (HTTP 429)"
-        );
-        // A vendor 5xx passes through as a 5xx: still retryable, just honestly labelled.
-        assert_eq!(
-            classify_proxy_error(502, r#"{"error":"vendor_error","status":529}"#),
-            "ai request failed (HTTP 529)"
-        );
-    }
-
-    #[test]
-    fn vendor_status_reads_only_a_well_formed_in_range_vendor_error() {
-        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":404}"#), Some(404));
-        // The other 502 shapes the route emits carry no status; they must not be invented.
-        assert_eq!(vendor_status(r#"{"error":"vendor_unreachable"}"#), None);
-        assert_eq!(vendor_status(r#"{"error":"vendor_bad_response"}"#), None);
-        assert_eq!(vendor_status(r#"{"error":"vendor_error"}"#), None);
-        // Out-of-range / wrong-typed / unparseable statuses fall back rather than being pasted into
-        // a message the JS side parses as an HTTP code.
-        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":200}"#), None);
-        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":600}"#), None);
-        assert_eq!(vendor_status(r#"{"error":"vendor_error","status":"400"}"#), None);
-        assert_eq!(vendor_status("not json at all"), None);
-    }
-
-    #[test]
-    fn unconfigured_reason_reads_only_allow_listed_values() {
-        assert_eq!(
-            unconfigured_reason(r#"{"error":"ai_unconfigured","reason":"provider_unfunded"}"#),
-            Some("provider_unfunded")
-        );
-        assert_eq!(
-            unconfigured_reason(r#"{"error":"ai_unconfigured","reason":"provider_key_rejected"}"#),
-            Some("provider_key_rejected")
-        );
-        // No reason at all — the shape the unset-server-key path and a 404 both send.
-        assert_eq!(unconfigured_reason(r#"{"error":"ai_unconfigured"}"#), None);
-        assert_eq!(unconfigured_reason("not json"), None);
-        // An unrecognised or wrong-typed reason degrades to the bare sentinel rather than inventing
-        // a new one — a newer server can add reasons without breaking an older desktop.
-        assert_eq!(unconfigured_reason(r#"{"reason":"something_new"}"#), None);
-        assert_eq!(unconfigured_reason(r#"{"reason":42}"#), None);
-        // A hostile reason must not be able to smuggle text into the sentinel the JS layer parses.
-        assert_eq!(unconfigured_reason(r#"{"reason":"provider_unfunded\nX"}"#), None);
-    }
-
-    #[test]
-    fn classify_transport_kind_flags_only_the_no_network_path_kinds() {
-        // The three kinds observed in the field when the machine loses its route: a DNS resolve
-        // failure, a TLS/connect timeout, and a mid-request socket error. All mean "unreachable".
-        assert_eq!(classify_transport_kind(ureq::ErrorKind::Dns), "ai_unreachable");
-        assert_eq!(
-            classify_transport_kind(ureq::ErrorKind::ConnectionFailed),
-            "ai_unreachable"
-        );
-        assert_eq!(classify_transport_kind(ureq::ErrorKind::Io), "ai_unreachable");
-        // Misconfiguration is NOT connectivity — it must not be reported as being offline, or a bad
-        // base URL would silently show the offline banner and defer forever instead of surfacing.
-        assert_eq!(
-            classify_transport_kind(ureq::ErrorKind::InvalidUrl),
-            "ai request failed"
-        );
-        assert_eq!(
-            classify_transport_kind(ureq::ErrorKind::UnknownScheme),
-            "ai request failed"
-        );
-    }
-
-    #[test]
-    fn extract_text_ignores_the_injected_balance_field() {
-        // The proxy returns the Anthropic message shape PLUS a sibling `balanceCents`; extract_text
-        // must still pull the reply text and never confuse the extra field for content.
-        let j = serde_json::json!({
-            "content": [ { "type": "text", "text": "hello" } ],
-            "balanceCents": 4200
-        });
-        assert_eq!(extract_text(&j), Some("hello".to_string()));
-    }
-
-    // True once `data` holds a complete HTTP request: headers terminated by `\r\n\r\n`, followed by
-    // at least `Content-Length` body bytes (or no `Content-Length`, meaning a bodyless request).
-    fn request_complete(data: &[u8]) -> bool {
-        let sep = b"\r\n\r\n";
-        let Some(hdr_end) = data.windows(sep.len()).position(|w| w == sep) else {
-            return false; // headers not fully received yet
-        };
-        let body_start = hdr_end + sep.len();
-        let headers = String::from_utf8_lossy(&data[..hdr_end]);
-        let content_len = headers
-            .lines()
-            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
-            .and_then(|(_, v)| v.trim().parse::<usize>().ok());
-        match content_len {
-            Some(len) => data.len().saturating_sub(body_start) >= len,
-            None => true, // no body expected
-        }
-    }
-
-    // A minimal one-shot loopback HTTP server: accept a single connection, capture the raw request,
-    // and reply with `status` + `body`. Returns the captured request text so tests can assert the
-    // method/path/headers we sent. Kept tiny (no deps) — enough to pin the proxy contract end-to-end.
-    //
-    // We deliberately do NOT send `Connection: close` and we `mem::forget` the socket after writing:
-    // `call_anthropic_proxy` uses a POOLING ureq agent, which — on a fully-buffered 2xx body —
-    // returns the underlying stream to its pool via a setsockopt that PANICS if the peer already
-    // closed the socket (ureq response.rs). Keeping the socket open makes that pool-return succeed.
-    // (One leaked test socket per call is harmless.)
-    //
-    // A single `read()` is NOT guaranteed to return the whole request: the kernel can deliver the
-    // headers and the POST body in separate TCP segments, so one read often captures only the
-    // headers. Tests that assert on the request BODY then flake under load (this bit CI). We loop
-    // until the full request has arrived — `Content-Length` body bytes past the `\r\n\r\n` header
-    // terminator — bounded by a read timeout so a bodyless request can't hang the thread.
-    fn serve_once(status: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("addr");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set read timeout");
-            let mut data: Vec<u8> = Vec::with_capacity(8192);
-            let mut buf = [0u8; 8192];
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,                              // peer closed
-                    Ok(n) => {
-                        data.extend_from_slice(&buf[..n]);
-                        if request_complete(&data) {
-                            break;
-                        }
-                    }
-                    Err(_) => break, // timeout / error — proceed with whatever arrived
-                }
-            }
-            let req = String::from_utf8_lossy(&data).to_string();
-            let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
-            std::mem::forget(stream); // keep the socket open for ureq's pool-return (see note above)
-            req
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    #[test]
-    fn call_anthropic_proxy_posts_bearer_to_ai_anthropic_and_returns_balance() {
-        let (base, handle) = serve_once(
-            "200 OK",
-            r#"{"content":[{"type":"text","text":"named it"}],"usage":{"input_tokens":5,"output_tokens":2},"balanceCents":4200}"#,
-        );
-        let json = call_anthropic_proxy(
-            &base,
-            "tok-abc",
-            "claude-haiku-4-5",
-            "sys",
-            "hello",
-            256,
-            Duration::from_secs(5),
-            Metering::new("Renamed agent to 'Fix OAuth loop'", Some("sparkle-desktop")),
-        )
-        .expect("proxy call should succeed");
-        let req = handle.join().expect("server thread");
-
-        // We hit the right route, with the user's bearer, as a POST.
-        assert!(req.starts_with("POST /ai/anthropic "), "unexpected request line: {req:?}");
-        assert!(req.contains("Authorization: Bearer tok-abc"), "missing bearer: {req:?}");
-        // The metering purpose reaches the request BODY (server persists it into the ledger).
-        assert!(
-            req.contains("Renamed agent to 'Fix OAuth loop'"),
-            "purpose missing from request body: {req:?}"
-        );
-        // …as does the project it belonged to (server persists it into meta.project).
-        assert!(
-            req.contains("sparkle-desktop"),
-            "project missing from request body: {req:?}"
-        );
-        // The response passes through (text + the injected balance).
-        assert_eq!(extract_text(&json), Some("named it".to_string()));
-        assert_eq!(json.get("balanceCents").and_then(serde_json::Value::as_i64), Some(4200));
-    }
-
-    #[test]
-    fn request_complete_tracks_headers_then_body() {
-        // Headers not yet terminated → incomplete.
-        assert!(!request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n"));
-        // Headers done but body still short of Content-Length → incomplete (the split-segment case
-        // that made the body assertion flaky under load).
-        assert!(!request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhi"));
-        // Full body present → complete.
-        assert!(request_complete(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"));
-        // Header name matched case-insensitively.
-        assert!(request_complete(b"POST / HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi"));
-        // No Content-Length → bodyless request is complete once headers terminate.
-        assert!(request_complete(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
-    }
-
-    #[test]
-    fn call_anthropic_proxy_maps_402_to_insufficient_credits() {
-        let (base, handle) = serve_once(
-            "402 Payment Required",
-            r#"{"error":"insufficient_credits","balanceCents":15}"#,
-        );
-        let err = call_anthropic_proxy(&base, "tok", "claude-haiku-4-5", "", "hi", 8, Duration::from_secs(5), Metering::default())
-            .expect_err("402 must be an Err");
-        let _ = handle.join();
-        assert_eq!(err, "insufficient_credits:15");
-    }
-
-    #[test]
-    fn extract_text_skips_empty_text_blocks() {
-        // An empty/whitespace-only text block is "no text" — fall through to the next real block,
-        // or None so anthropic_chat returns Err rather than a silent Ok("").
-        assert_eq!(
-            extract_text(&serde_json::json!({ "content": [ { "type": "text", "text": "" } ] })),
-            None
-        );
-        assert_eq!(
-            extract_text(&serde_json::json!({ "content": [ { "type": "text", "text": "   " } ] })),
-            None
-        );
-        assert_eq!(
-            extract_text(&serde_json::json!({
-                "content": [
-                    { "type": "text", "text": "  " },
-                    { "type": "text", "text": "real" }
-                ]
-            })),
-            Some("real".to_string())
-        );
     }
 }

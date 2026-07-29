@@ -595,6 +595,32 @@ describe("maybeNameFromWork — Tier 2 paid backstop", () => {
     expect(useSelfReportMetrics.getState().namingOutcomes.work_haiku_backstop).toBe(0); // failure ≠ paid win
   });
 
+  // THE free-vs-billed split, as an executable property. Both sentinels are retryable, but only one
+  // is free — and exempting the billed one from the cap turned this backstop into an unbounded paid
+  // loop: one continuously-running 60s `claude` child per agent, forever, on the ~15s sidebar tick.
+  it("a saturated pool (FREE) never burns the cap, but a TIMEOUT (billed) does", async () => {
+    seed(workAgent());
+    // ai_busy: refused in-process, nothing spawned. N of these must leave the agent retryable.
+    for (let i = 0; i < MAX_WORK_BACKSTOP_ATTEMPTS + 2; i += 1) {
+      invoke.mockRejectedValueOnce(new Error("ai_busy"));
+      await maybeNameFromWork("p1", "a1");
+    }
+    const afterBusy = (invoke as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+    expect(afterBusy).toBe(MAX_WORK_BACKSTOP_ATTEMPTS + 2); // still trying — never terminal
+
+    // ai_timeout: the CLI ran its full wall clock and was killed. These are billed, so the cap must
+    // engage and stop the loop.
+    __resetNamingGuards();
+    seed(workAgent());
+    for (let i = 0; i < MAX_WORK_BACKSTOP_ATTEMPTS + 3; i += 1) {
+      invoke.mockRejectedValueOnce(new Error("ai_timeout"));
+      await maybeNameFromWork("p1", "a1");
+    }
+    const timeoutCalls =
+      (invoke as unknown as { mock: { calls: unknown[] } }).mock.calls.length - afterBusy;
+    expect(timeoutCalls).toBeLessThanOrEqual(MAX_WORK_BACKSTOP_ATTEMPTS);
+  });
+
   it("a TRANSIENT invoke failure leaves the backstop retryable", async () => {
     // The attempt was marked BEFORE the invoke, so ONE transient failure (offline, signed out,
     // keychain locked, proxy 500) permanently burned the agent's single backstop attempt. The Set is

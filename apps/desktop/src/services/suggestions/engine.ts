@@ -107,7 +107,15 @@ export async function computeSuggestions(opts: ComputeOpts): Promise<SuggestionS
   const project = projectNameForAgent(agentId);
   const call =
     opts.callHaiku ??
-    ((sys, user) => chatOnce(sys, user, 512, { purpose: "Suggesting next actions", project }));
+    ((sys, user) =>
+      chatOnce(sys, user, 512, {
+        purpose: "Suggesting next actions",
+        project,
+        // This is the sink's highest-volume caller and it fires on a timer, not on a click — nobody
+        // is watching a spinner for it. Without this it competes with Chief synthesis and Define
+        // Done for the small pool reserved for calls a human is actually blocked on.
+        background: true,
+      }));
 
   const user = [
     `Recent terminal output:\n${lastLines(scrollback, SCROLLBACK_LINES)}`,

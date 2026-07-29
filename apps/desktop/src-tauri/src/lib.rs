@@ -26,6 +26,9 @@ mod capture_window;
 mod chief;
 mod claude;
 mod claude_chat;
+/// One-shot text inference on the user's own Claude Code subscription, via their authenticated
+/// `claude` CLI. Replaces the server-side `/ai/anthropic` proxy that `ai.rs` used to own.
+mod claude_oneshot;
 mod cloud;
 mod crash;
 mod config;
@@ -55,7 +58,6 @@ mod proc;
 mod project_window;
 mod pty;
 mod retention;
-mod route_classify;
 mod transcribe;
 mod screenshot;
 mod setup;
@@ -498,7 +500,6 @@ pub fn run() {
             logging::reveal_logs,
             logging::frontend_log,
             naming::generate_agent_name,
-            route_classify::route_classify,
             connectivity::probe_connectivity,
             chief::chief_pat,
             chief::chief_pat_secure_get,

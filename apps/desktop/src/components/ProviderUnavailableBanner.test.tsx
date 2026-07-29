@@ -18,26 +18,33 @@ describe("ProviderUnavailableBanner", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("names an unfunded provider account and says it is ours to fix", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: Date.now() } });
+  it("names the missing CLI and tells the user how to fix it", () => {
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     render(<ProviderUnavailableBanner />);
     const text = screen.getByRole("status").textContent ?? "";
-    expect(text).toContain("out of credit");
+    expect(text).toContain("Claude Code CLI");
     // The load-bearing half: the user must not read this as their own balance.
-    expect(text).toContain("ours to fix");
-    expect(text).toContain("your credits and network are fine");
+    // The copy used to say "ours to fix" and give the user nothing to do, because the cause was
+    // Sparkle's own unfunded vendor account. Every remaining cause is theirs to act on, so the
+    // sentence has to carry an action.
+    expect(text).toContain("Install it");
+    // The old copy reassured "your credits and network are fine", which was right when the cause
+    // was Sparkle's own unfunded account. It is the wrong shape now — the cause IS the user's
+    // setup — but the property underneath it survives and still matters: never send someone to the
+    // credits screen for a problem a top-up cannot fix.
+    expect(text).not.toMatch(/credit/i);
   });
 
   it("distinguishes a rejected key from an unfunded account", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_key_rejected", at: Date.now() } });
+    useAiProviderStore.setState({ outage: { reason: "cli_not_authenticated", at: Date.now() } });
     render(<ProviderUnavailableBanner />);
     const text = screen.getByRole("status").textContent ?? "";
-    expect(text).toContain("rejected our credentials");
-    expect(text).not.toContain("out of credit");
+    expect(text).toContain("sign in");
+    expect(text).not.toContain("Install it");
   });
 
   it("offers NO refill affordance — taking the user's money would fix nothing", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: Date.now() } });
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     render(<ProviderUnavailableBanner />);
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.getByRole("status").textContent ?? "").not.toMatch(/refill|top up|upgrade|buy/i);
@@ -46,15 +53,15 @@ describe("ProviderUnavailableBanner", () => {
   it("has no dismiss control — an outage the user cannot act on must not be re-hidden", () => {
     // ZeroCreditBanner has a ✕ because the user can act on it and may not want to now. Here a ✕
     // would restore exactly the silence that let a 12-hour outage go unnoticed.
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: Date.now() } });
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     render(<ProviderUnavailableBanner />);
     expect(screen.queryByLabelText("Dismiss")).toBeNull();
   });
 
   it("renders the inline variant for Settings → Credits", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: Date.now() } });
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     render(<ProviderUnavailableBanner inline />);
-    expect(screen.getByRole("status").textContent ?? "").toContain("out of credit");
+    expect(screen.getByRole("status").textContent ?? "").toContain("Claude Code CLI");
   });
 
   it("does not assert a STALE observation — a forgotten clear cannot strand a false banner", () => {
@@ -62,14 +69,14 @@ describe("ProviderUnavailableBanner", () => {
     // banner has no dismiss control, so an un-cleared record would otherwise claim a broken provider
     // for the rest of the session while it is healthy.
     useAiProviderStore.setState({
-      outage: { reason: "provider_unfunded", at: Date.now() - OUTAGE_MAX_AGE_MS - 1 },
+      outage: { reason: "cli_missing", at: Date.now() - OUTAGE_MAX_AGE_MS - 1 },
     });
     const { container } = render(<ProviderUnavailableBanner />);
     expect(container.innerHTML).toBe("");
   });
 
   it("disappears on its own once the provider recovers", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: Date.now() } });
+    useAiProviderStore.setState({ outage: { reason: "cli_missing", at: Date.now() } });
     const { container, rerender } = render(<ProviderUnavailableBanner />);
     expect(container.innerHTML).not.toBe("");
     useAiProviderStore.setState({ outage: null });

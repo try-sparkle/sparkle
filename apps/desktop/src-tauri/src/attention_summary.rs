@@ -3,25 +3,26 @@
 // notification-friendly line saying WHAT it's asking — used as the macOS banner body so the ping
 // tells you the actual question instead of a generic "Needs your answer".
 //
-// Like judge.rs / naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust — not
-// the webview — so the user's Sparkle bearer never ships in the JS bundle. The call goes through the
-// server-side `/ai/anthropic` proxy (`ai::call_anthropic_proxy`); the server holds the vendor key
-// and meters credits. Degrades gracefully: signed out / out of credits / network / parse / empty
-// returns Err, and the caller (useAttentionNotifications) falls back to the existing generic body —
-// so the feature is a no-op until the user is signed in with credit rather than a blank banner.
+// Like judge.rs / naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust rather
+// than the webview. It runs on the USER'S OWN Claude Code subscription via `claude_oneshot` — their
+// authenticated `claude` CLI — not on a Sparkle-funded vendor key. Degrades gracefully: no CLI, not
+// signed into Claude Code, timeout, busy, parse or empty all return Err, and the caller
+// (useAttentionNotifications) falls back to the existing generic body, so the feature is a no-op
+// rather than a blank banner.
 
-use crate::ai::{call_anthropic_proxy, extract_text, Metering, CLASSIFY_READ_TIMEOUT};
+use crate::claude_oneshot::{run, OneShot, Tier, CLASSIFY_TIMEOUT};
 
 /// Cheapest current Claude model — a one-line summary needs nothing more. (claude-api skill:
-/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
-/// only model the server-side proxy meters, so every proxied call must use it.
+/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) Pinning it also
+/// matters now that this runs on the user's own subscription: inheriting a user configured on Opus
+/// would burn ~30x their quota rendering a single notification line.
 const SUMMARY_MODEL: &str = "claude-haiku-4-5";
 
 /// A single short line out (≤ ~12 words), so a tiny budget is plenty.
 const SUMMARY_MAX_TOKENS: u32 = 40;
 
-/// Bound the input so a giant scrollback can't amplify BYOK token spend. The ask always sits at the
-/// END of the visible screen, so we keep the TAIL.
+/// Bound the input so a giant scrollback can't amplify the user's subscription spend. The ask always
+/// sits at the END of the visible screen, so we keep the TAIL.
 const SCREEN_TAIL_CHARS: usize = 2000;
 
 /// Hard cap on the returned summary length (chars) — a notification body shows only a line or two,
@@ -68,48 +69,47 @@ fn clean_summary(s: &str) -> String {
 #[tauri::command]
 pub async fn summarize_attention(
     screen: String,
-    // Display name of the project whose agent is asking, so the debit is attributable in the
-    // Credits history. Metering-only; a caller that doesn't know passes nothing (→ None).
+    // Display name of the project whose agent is asking. Diagnostic only now — it used to attribute
+    // a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
 ) -> Result<String, String> {
     let screen = tail(&screen, SCREEN_TAIL_CHARS);
     // Nothing to summarize — an empty screen isn't an ask. (The caller pre-filters, but a
-    // direct/empty call must not bill a request.)
+    // direct/empty call must not spend a turn of the user's quota.)
     if screen.is_empty() {
         return Err("empty screen".into());
     }
-    // Server-side proxy on the user's bearer (see module docs).
-    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
-    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
-    // token → signed out; degrade (generic banner) rather than call the proxy.
-    tauri::async_runtime::spawn_blocking(move || {
-        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_summarize(&base, &token, &screen, project.as_deref())
-    })
-    .await
-    .map_err(|e| format!("join error: {e}"))?
+    // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
+    // runtime's worker threads, exactly as the proxy call it replaced did. The Sparkle bearer read
+    // and its "not signed in" precondition are gone: this runs on the user's own Claude Code login.
+    tauri::async_runtime::spawn_blocking(move || call_summarize(&screen, project.as_deref()))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_summarize(
-    base: &str,
-    token: &str,
-    screen: &str,
-    project: Option<&str>,
-) -> Result<String, String> {
-    let json = call_anthropic_proxy(
-        base,
-        token,
-        SUMMARY_MODEL,
-        SYSTEM_PROMPT,
-        screen,
-        SUMMARY_MAX_TOKENS,
-        CLASSIFY_READ_TIMEOUT,
-        // Metering description + project attribution shown in the credit history.
-        Metering::new("Summarizing what an agent needs", project),
-    )?;
-    let text = extract_text(&json).ok_or_else(|| "summarize returned no text".to_string())?;
+/// Build the request. Split out so the encoded decisions are testable — each compiles fine when
+/// wrong and produces no visible error. See the test.
+fn summary_request<'a>(screen: &'a str, project: Option<&'a str>) -> OneShot<'a> {
+    OneShot {
+        model: SUMMARY_MODEL,
+        system: SYSTEM_PROMPT,
+        user: screen,
+        max_tokens: SUMMARY_MAX_TOKENS,
+        timeout: CLASSIFY_TIMEOUT,
+        // Background: the notification already has a usable generic body, so nothing is blocked on
+        // this landing.
+        tier: Tier::Background,
+        // The summary is a pure function of the screen tail. An agent that re-raises the same
+        // unanswered prompt must not re-summarize it.
+        cacheable: true,
+        purpose: "attention-summary",
+        project,
+    }
+}
+
+fn call_summarize(screen: &str, project: Option<&str>) -> Result<String, String> {
+    let text = run(summary_request(screen, project))?;
     let cleaned = clean_summary(&text);
     if cleaned.is_empty() {
         return Err("summarize returned empty text".into());
@@ -120,6 +120,16 @@ fn call_summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_summary_runs_in_the_background_tier_and_caches() {
+        // Same reasoning as judge/naming: the notification already has a usable generic body, so
+        // nothing is blocked on this, and a re-raised identical prompt must not re-summarize.
+        let req = summary_request("Do you want to continue? (y/n)", None);
+        assert_eq!(req.tier, crate::claude_oneshot::Tier::Background);
+        assert!(req.cacheable);
+        assert_eq!(req.model, "claude-haiku-4-5");
+    }
 
     #[test]
     fn tail_keeps_the_end_within_the_budget() {

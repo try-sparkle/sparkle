@@ -6,6 +6,11 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 
 import {
+  AiBusyError,
+  AiTransientError,
+  ClaudeAuthError,
+  ClaudeMissingError,
+  ClaudeUsageLimitError,
   chatOnce,
   noteAiProviderFailure,
   noteAiProviderHealthy,
@@ -17,7 +22,6 @@ import {
   AiUnavailableError,
   AiUnreachableError,
 } from "./anthropic";
-import { OutOfCreditsError } from "./credits";
 import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useAiProviderStore } from "../stores/aiProviderStore";
@@ -55,24 +59,20 @@ afterEach(() => {
 });
 
 describe("parseUnavailableReason", () => {
-  it("distinguishes 'not this error' from 'this error, no reason'", () => {
-    // undefined vs null is the whole contract: the caller must not treat an unrelated failure as an
-    // ai_unconfigured, nor drop a reasonless one.
+  // REPOINTED with the transport. The reasons used to describe SPARKLE'S vendor account
+  // (provider_unfunded / provider_key_rejected); neither can occur now that the account is retired
+  // and the work runs on the user's own Claude Code subscription. What can occur is local to their
+  // install — and unlike the old reasons, each of these has an action the user can take.
+  it("distinguishes 'not this error' from a real outage sentinel", () => {
     expect(parseUnavailableReason("ai request failed (HTTP 502)")).toBeUndefined();
-    expect(parseUnavailableReason("insufficient_credits:5")).toBeUndefined();
-    expect(parseUnavailableReason("ai_unconfigured")).toBeNull();
+    expect(parseUnavailableReason("ai_busy")).toBeUndefined();
+    expect(parseUnavailableReason("ai_timeout")).toBeUndefined();
   });
 
   it("reads the recognised reasons", () => {
-    expect(parseUnavailableReason("ai_unconfigured:provider_unfunded")).toBe("provider_unfunded");
-    expect(parseUnavailableReason("ai_unconfigured:provider_key_rejected")).toBe("provider_key_rejected");
-  });
-
-  it("degrades an unknown reason to 'no reason' rather than inventing one", () => {
-    // A newer server growing a reason this build doesn't know must still defer correctly; it just
-    // doesn't get a banner it has no honest copy for.
-    expect(parseUnavailableReason("ai_unconfigured:something_new")).toBeNull();
-    expect(parseUnavailableReason("ai_unconfigured:")).toBeNull();
+    expect(parseUnavailableReason("ai_unconfigured")).toBe("cli_missing");
+    expect(parseUnavailableReason("claude_not_authenticated")).toBe("cli_not_authenticated");
+    expect(parseUnavailableReason("claude_usage_limit")).toBe("usage_limit");
   });
 });
 
@@ -84,19 +84,20 @@ describe("noteAiProviderHealthy / noteAiProviderFailure", () => {
   // non-dismissible banner claiming the provider was broken while it was healthy (roborev 54761).
   it("records an outage from any wrapper, not just chatOnce", () => {
     useAiProviderStore.setState({ outage: null });
-    noteAiProviderFailure("ai_unconfigured:provider_unfunded");
-    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_unfunded");
+    noteAiProviderFailure("claude_not_authenticated");
+    expect(useAiProviderStore.getState().outage?.reason).toBe("cli_not_authenticated");
   });
 
   it("CLEARS an outage from a non-chatOnce success — the recovery path that was missing", () => {
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: 1 } });
+    useAiProviderStore.setState({ outage: { reason: "cli_not_authenticated", at: 1 } });
     noteAiProviderHealthy();
     expect(useAiProviderStore.getState().outage).toBeNull();
   });
 
   it("ignores failures that say nothing about the provider", () => {
     useAiProviderStore.setState({ outage: null });
-    for (const e of ["ai request failed (HTTP 502)", "ai_unconfigured", "insufficient_credits:5"]) {
+    // ai_busy/ai_timeout are LOCAL stalls, not outages — they must never light the banner.
+    for (const e of ["ai request failed (HTTP 502)", "ai_busy", "ai_timeout"]) {
       noteAiProviderFailure(e);
     }
     noteAiProviderFailure(new Error("boom"));
@@ -204,166 +205,81 @@ describe("chatOnce", () => {
     await expect(chatOnce("sys", "usr")).rejects.toThrow("network down");
   });
 
-  it("maps the server's typed insufficient_credits error to OutOfCreditsError with the balance", async () => {
-    // The Rust proxy returns `insufficient_credits:<balanceCents>` when the /ai/anthropic gate 402s.
-    invokeMock.mockRejectedValue("insufficient_credits:1234");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(1234);
-  });
+  // The eight `insufficient_credits` balance-bookkeeping cases that used to sit here are GONE with
+  // the metered proxy: there is no Sparkle balance on this route to exhaust, so the Rust side cannot
+  // produce that sentinel. The credit machinery itself is untouched and still covered by
+  // credits.test.ts / aiGate.test.ts — it just no longer sits on this path.
 
-  // An amount-less refusal reports the balance we already hold rather than a fabricated 0.
-  // Contract only — see the `OutOfCreditsError.balanceCents` doc.
-  // 250, not the `beforeEach` default of 500 — otherwise the assertion could pass on the default
-  // instead of on the held balance actually being read.
-  it("reports the held balance when the credits error carries no amount", async () => {
-    fund(250);
-    invokeMock.mockRejectedValue("insufficient_credits");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(250);
-  });
-
-  // Pins the READ ORDER, which the hoist alone does not: against today's store both orderings give
-  // the same answer, so a refactor moving the read back below the mutation would pass everything.
-  // Overriding the action to wipe `me` makes the two orderings differ — post-mutation would report
-  // 0. Fails if the read moves.
-  it("reports the balance held BEFORE the store mutation, not after", async () => {
-    fund(250);
-    // The stub is undone by `afterEach` (see `initialState`), not by a local finally.
-    useAuthStore.setState({
-      noteCreditsRefused: () => useAuthStore.setState({ me: null, creditFloorCents: 0 }),
-    });
-    invokeMock.mockRejectedValue("insufficient_credits");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    // Type asserted first, like every sibling case: without it, a refactor throwing a plain Error
-    // would fail as "expected undefined to be 250" and read as a read-order regression.
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(250);
-  });
-
-  // Pins the CONTRACT for the `?? 0` arm, not a live path: `held` is read only when `reported` is
-  // null (see its doc in authStore.ts). Given that, a sign-out mid-request leaves no balance to report.
-  it("falls back to 0 when a sign-out nulls `me` during an amount-less refusal", async () => {
-    fund(250);
-    // Seeded non-zero so the floor assertion below is not vacuous: `beforeEach` zeroes the floor,
-    // so expecting 0 against an untouched store would pass even if the refusal never wrote it.
-    useAuthStore.setState({ creditFloorCents: 99 });
-    invokeMock.mockImplementation(() => {
-      useAuthStore.setState({ me: null, tokenPresent: false });
-      return Promise.reject("insufficient_credits");
-    });
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(0);
-    expect(useAuthStore.getState().me).toBeNull(); // no identity conjured by the refusal
-    // The consequential half: a signed-out race must leave no floor behind for the next session's
-    // `me` to be gated against — so the seeded 99 must be overwritten, not preserved.
-    expect(useAuthStore.getState().creditFloorCents).toBe(0);
-  });
-
-  // Regression: the 402 used to be mapped and thrown, and the balance it carried thrown away with
-  // it. A leftover positive balance kept satisfying the local `balance > 0` gate, so every AI
-  // surface re-issued the same guaranteed-402 call — the refusal never taught the client anything.
-  it("records the server's refusal so the local credit gate closes at that balance", async () => {
-    fund(1); // enough for the client gate, not enough for the server's reservation
-    invokeMock.mockRejectedValue("insufficient_credits:1");
-    await chatOnce("sys", "usr").catch(() => {});
-    expect(useAuthStore.getState().creditFloorCents).toBe(1);
-    expect(useAuthStore.getState().me?.balanceCents).toBe(1);
-
-    // The gate is now closed, so the NEXT call fails locally without another doomed round-trip.
-    invokeMock.mockReset();
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect(invokeMock).not.toHaveBeenCalled();
-  });
-
-  it("adopts the server's balance figure over the client's stale one", async () => {
-    fund(500); // stale local view
-    invokeMock.mockRejectedValue("insufficient_credits:3");
-    await chatOnce("sys", "usr").catch(() => {});
-    expect(useAuthStore.getState().me?.balanceCents).toBe(3);
-  });
-
-  // Pins the contract for the suffix-less sentinel, which the real caller cannot produce today —
-  // see the `noteCreditsRefused` doc in authStore.ts (sparkle-q5re).
-  it("a suffix-less refusal does NOT zero a known balance", async () => {
-    fund(400);
-    invokeMock.mockRejectedValue("insufficient_credits");
-    await chatOnce("sys", "usr").catch(() => {});
-    expect(useAuthStore.getState().me?.balanceCents).toBe(400);
-    expect(useAuthStore.getState().creditFloorCents).toBe(400); // falls back to the held balance
-  });
-
-  // CHARACTERIZATION of today's REACHABLE behavior, and it is the buggy one. An unparseable 402
-  // body reaches us as `insufficient_credits:0`, so the fabricated 0 IS adopted as the balance and
-  // the floor lands at 0 — which does not even close the gate (`hasAiCredits` needs balance > floor,
-  // and 0 > 0 is false, so the surface goes dark via the zero balance rather than via the floor).
-  // Asserted, not fixed, because the fix belongs in the Rust classifier: bead sparkle-q5re must
-  // make this test change, rather than silently altering an untested path.
-  it("adopts the fabricated 0 from an unparseable 402 body (sparkle-q5re)", async () => {
-    fund(400);
-    invokeMock.mockRejectedValue("insufficient_credits:0");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(useAuthStore.getState().me?.balanceCents).toBe(0); // the funded 400 is lost
-    expect(useAuthStore.getState().creditFloorCents).toBe(0);
-    // The THROWN figure is fabricated too. `reported` is 0, not null, so `?? held` never fires and
-    // the sibling test's held-balance protection does NOT cover this path. Asserted so the two
-    // adjacent tests can't be read as "the thrown balance is safe everywhere". Flips with the bead.
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(0);
-  });
-
-  it("leaves the floor alone for a non-credits failure", async () => {
-    invokeMock.mockRejectedValue("ai_unconfigured");
-    await chatOnce("sys", "usr").catch(() => {});
-    expect(useAuthStore.getState().creditFloorCents).toBe(0);
-  });
-
-  it("maps the server's typed ai_unconfigured error to AiUnavailableError", async () => {
-    // The Rust proxy returns `ai_unconfigured` when /ai/anthropic 503s (no vendor key) or 404s
-    // (route absent). Callers branch on the class to defer instead of retrying a doomed call.
-    invokeMock.mockRejectedValue("ai_unconfigured");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(AiUnavailableError);
-  });
-
-  it("carries the proxy's reason on AiUnavailableError and RECORDS the outage", async () => {
-    // The silence this closes: the provider account ran dry and every AI feature went dark with
-    // nothing on any surface saying so. Recording it here — at the one chokepoint every proxied
-    // call passes — is what lets ProviderUnavailableBanner name the cause for all of them.
-    useAiProviderStore.setState({ outage: null });
-    invokeMock.mockRejectedValue("ai_unconfigured:provider_unfunded");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(AiUnavailableError);
-    expect((err as AiUnavailableError).reason).toBe("provider_unfunded");
-    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_unfunded");
-  });
-
-  it("records a rejected key distinctly from an unfunded account", async () => {
-    useAiProviderStore.setState({ outage: null });
-    invokeMock.mockRejectedValue("ai_unconfigured:provider_key_rejected");
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect((err as AiUnavailableError).reason).toBe("provider_key_rejected");
-    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_key_rejected");
-  });
-
-  it("records NO outage for a reasonless ai_unconfigured", async () => {
-    // An unset server key or a missing route is a deployment problem, not a provider outage — the
-    // banner would be telling the user something false.
+  it("maps ai_unconfigured to ClaudeMissingError and RECORDS the outage", async () => {
+    // The silence this closes is the same one main's provider banner was built for; only the cause
+    // changed. Recording it here — at the one chokepoint every call passes — is what lets
+    // ProviderUnavailableBanner name it for whichever feature happens to fail first.
     useAiProviderStore.setState({ outage: null });
     invokeMock.mockRejectedValue("ai_unconfigured");
     const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(AiUnavailableError);
-    expect((err as AiUnavailableError).reason).toBeNull();
-    expect(useAiProviderStore.getState().outage).toBeNull();
+    expect(err).toBeInstanceOf(ClaudeMissingError);
+    expect(err).toBeInstanceOf(AiUnavailableError); // existing defer paths keep working
+    expect((err as AiUnavailableError).reason).toBe("cli_missing");
+    expect((err as Error).message).toMatch(/Claude Code CLI/);
+    expect(useAiProviderStore.getState().outage?.reason).toBe("cli_missing");
+  });
+
+  it("maps claude_not_authenticated to ClaudeAuthError and says to sign in", async () => {
+    useAiProviderStore.setState({ outage: null });
+    invokeMock.mockRejectedValue("claude_not_authenticated");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeAuthError);
+    expect((err as Error).message).toMatch(/Sign in to Claude Code/);
+    expect(useAiProviderStore.getState().outage?.reason).toBe("cli_not_authenticated");
+  });
+
+  it("maps claude_usage_limit to ClaudeUsageLimitError, which recovers on its own", async () => {
+    useAiProviderStore.setState({ outage: null });
+    invokeMock.mockRejectedValue("claude_usage_limit");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeUsageLimitError);
+    expect(useAiProviderStore.getState().outage?.reason).toBe("usage_limit");
+  });
+
+  // THE distinction the retry budgets depend on. Both are retryable and neither is an outage or a
+  // network failure — but only ONE of them is free, and callers exempt only that one from their
+  // bounded attempt caps. Grouping them was a real bug: a timeout is produced only after the CLI ran
+  // its FULL wall clock (60s classify / 180s chat), so it spent the user's quota, and for a wedged
+  // CLI it is deterministic rather than bursty. Exempting it turned the naming backstop into one
+  // continuously-running child per agent forever.
+  it("treats a saturated pool as FREE — its own class, exempt from retry budgets", async () => {
+    useAiProviderStore.setState({ outage: null });
+    useConnectionStore.setState({ isOnline: true });
+    invokeMock.mockRejectedValue("ai_busy");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(AiBusyError);
+    expect(err).not.toBeInstanceOf(AiTransientError); // billed and free must not be one class
+    expect(err).not.toBeInstanceOf(AiUnavailableError); // retryable, not deferrable
+    expect(err).not.toBeInstanceOf(AiUnreachableError);
+    expect(useAiProviderStore.getState().outage).toBeNull(); // never lights the named-reason banner
+    expect(useConnectionStore.getState().isOnline).toBe(true); // says nothing about the network
+  });
+
+  it("treats a timeout / throttle as BILLED — retryable, but not exempt", async () => {
+    for (const sentinel of ["ai_timeout", "ai_rate_limited"] as const) {
+      useAiProviderStore.setState({ outage: null });
+      useConnectionStore.setState({ isOnline: true });
+      invokeMock.mockRejectedValue(sentinel);
+      const err = await chatOnce("sys", "usr").catch((e) => e);
+      expect(err).toBeInstanceOf(AiTransientError);
+      expect(err).not.toBeInstanceOf(AiBusyError); // must NOT reach the exempt class
+      expect(err).not.toBeInstanceOf(AiUnavailableError);
+      expect(useAiProviderStore.getState().outage).toBeNull();
+      expect(useConnectionStore.getState().isOnline).toBe(true);
+      // A modal renders `.message`, so it must be a sentence rather than the raw sentinel.
+      expect((err as Error).message).not.toContain(sentinel);
+    }
   });
 
   it("clears a recorded outage as soon as a call succeeds", async () => {
     // Recovery must be automatic: the banner has no dismiss control precisely because the user can
     // do nothing about it, so a stale outage would be permanent for the session.
-    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: 1 } });
+    useAiProviderStore.setState({ outage: { reason: "cli_not_authenticated", at: 1 } });
     invokeMock.mockResolvedValue("hello");
     await chatOnce("sys", "usr");
     expect(useAiProviderStore.getState().outage).toBeNull();
@@ -410,27 +326,40 @@ describe("chatOnce", () => {
   });
 });
 
-describe("hard credit gate (fail fast, no network)", () => {
-  it("chatOnce throws OutOfCreditsError with the live balance and never calls invoke at zero credits", async () => {
+// Replaces the old "hard credit gate" suite, which asserted the OPPOSITE: that a zero balance threw
+// OutOfCreditsError before `invoke` was reached. That gate was correct while the call spent Sparkle
+// credits through the metered proxy. It is wrong now — the call spends the USER'S OWN Claude
+// subscription, so refusing it on a Sparkle balance would disable a feature that costs Sparkle
+// nothing, behind a gate no top-up could ever satisfy.
+describe("no local credit gate — the call spends the user's own subscription", () => {
+  it("chatOnce still reaches invoke at a zero balance", async () => {
     fund(0);
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect((err as OutOfCreditsError).balanceCents).toBe(0);
-    expect(invokeMock).not.toHaveBeenCalled();
+    invokeMock.mockResolvedValue("hello");
+    await expect(chatOnce("sys", "usr")).resolves.toBe("hello");
+    expect(invokeMock).toHaveBeenCalled();
   });
 
-  it("chatOnce throws OutOfCreditsError when signed out (no me)", async () => {
+  it("chatOnce still reaches invoke when signed out of Sparkle entirely", async () => {
+    // The strongest form: these features no longer require a Sparkle account at all, because the
+    // Rust side's bearer read is gone too.
     useAuthStore.setState({ me: null, tokenPresent: false, loading: false });
-    const err = await chatOnce("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect(invokeMock).not.toHaveBeenCalled();
+    invokeMock.mockResolvedValue("hello");
+    await expect(chatOnce("sys", "usr")).resolves.toBe("hello");
+    expect(invokeMock).toHaveBeenCalled();
   });
 
-  it("structuredJson throws OutOfCreditsError before building the prompt at zero credits", async () => {
+  it("structuredJson still reaches invoke at a zero balance", async () => {
     fund(0);
-    const err = await structuredJson("sys", "usr").catch((e) => e);
-    expect(err).toBeInstanceOf(OutOfCreditsError);
-    expect(invokeMock).not.toHaveBeenCalled();
+    invokeMock.mockResolvedValue('{"a":1}');
+    await expect(structuredJson("sys", "usr")).resolves.toEqual({ a: 1 });
+    expect(invokeMock).toHaveBeenCalled();
+  });
+
+  it("forwards the background flag so auto-fired callers take the background tier", async () => {
+    invokeMock.mockResolvedValue("ok");
+    await chatOnce("sys", "usr", 256, { purpose: "Suggesting next actions", background: true });
+    const [, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
+    expect(args.background).toBe(true);
   });
 });
 

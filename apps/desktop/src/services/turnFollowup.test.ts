@@ -15,6 +15,8 @@ import {
   ASK_USER_QUESTION_2_1_220,
   IDLE_AFTER_TURN_2_1_220,
 } from "../engine/capturedScreens.fixture";
+import { useAiProviderStore } from "../stores/aiProviderStore";
+import { HEALTHY_SERVICE, useAiServiceHealthStore } from "../stores/aiServiceHealthStore";
 
 describe("mightNeedFollowup (local fast-path)", () => {
   it("skips a plain completion report with no question or proposal", () => {
@@ -304,6 +306,58 @@ describe("judgeNeedsFollowup (orchestration)", () => {
       response: "Want me to land it now?",
     });
     expect(result).toEqual({ verdict: "unknown", signal: "strong" });
+  });
+
+  // The CLI transport's own sentinels, rejected the way Tauri actually rejects them.
+  //
+  // `judge_turn_followup` is `Result<String, String>`, so invoke rejects with a BARE STRING — which
+  // is precisely why noteAiProviderFailure/noteAiServiceFailure are written as string guards. An
+  // earlier version of these tests wrapped the sentinel in `new Error(...)`, which made both calls
+  // no-op and left the cases byte-identical to the generic one above: they would have passed for any
+  // rejection value at all. So the assertions below check the SIDE EFFECT, not just the verdict.
+  it.each([
+    ["ai_timeout", 1],
+    ["ai_rate_limited", 1],
+  ])("%s reports UNKNOWN and advances the service run", async (sentinel, expectedRun) => {
+    useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE });
+    invokeMock.mockRejectedValueOnce(sentinel);
+    const result = await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "Want me to land it now?",
+    });
+    // STRONG signal + no verdict must still be unknown: if this ever returned `followup`, a wedged
+    // CLI would page the human on every finished turn.
+    expect(result).toEqual({ verdict: "unknown", signal: "strong" });
+    expect(useAiServiceHealthStore.getState().consecutiveFailures).toBe(expectedRun);
+  });
+
+  it("ai_busy reports UNKNOWN and leaves the run UNTOUCHED", async () => {
+    // The neutral-vs-degrade distinction, pinned from this caller. ai_busy is the concurrency cap
+    // declining to ask — it arrives exactly when many agents finish at once, which is when this
+    // runs — so counting it would light an outage banner during a healthy burst.
+    useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE, consecutiveFailures: 2 });
+    invokeMock.mockRejectedValueOnce("ai_busy");
+    const result = await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "Want me to land it now?",
+    });
+    expect(result).toEqual({ verdict: "unknown", signal: "strong" });
+    expect(useAiServiceHealthStore.getState().consecutiveFailures).toBe(2);
+  });
+
+  it("claude_not_authenticated reports UNKNOWN, names the reason, and yields the run", async () => {
+    useAiProviderStore.setState({ outage: null });
+    useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE, consecutiveFailures: 3 });
+    invokeMock.mockRejectedValueOnce("claude_not_authenticated");
+    const result = await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "Want me to land it now?",
+    });
+    expect(result).toEqual({ verdict: "unknown", signal: "strong" });
+    // The named-reason banner owns this one and says what to fix; the vaguer service banner steps
+    // aside rather than stacking on top of it.
+    expect(useAiProviderStore.getState().outage?.reason).toBe("cli_not_authenticated");
+    expect(useAiServiceHealthStore.getState().consecutiveFailures).toBe(0);
   });
 
   it("reports UNKNOWN when the judge cannot run on a WEAK open-ended recap too", async () => {

@@ -3,35 +3,38 @@
 // it?") versus genuinely done or merely offering optional new work. The frontend turns a
 // "blocked on you" verdict into a RED status; everything else stays gray.
 //
-// Like naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust — not the
-// webview — so the user's Sparkle bearer never ships in the JS bundle. The call goes through the
-// server-side `/ai/anthropic` proxy (`ai::call_anthropic_proxy`); the server holds the vendor key
-// and meters credits.
+// Like naming.rs this asks the cheapest Claude model (Haiku 4.5) and lives in Rust rather than the
+// webview. It runs on the USER'S OWN Claude Code subscription via `claude_oneshot` — their
+// authenticated `claude` CLI — not on a Sparkle-funded vendor key. It used to POST to the
+// orchestration `/ai/anthropic` proxy, whose key ran out of credit on 2026-07-28 and took every
+// verdict down with it; there is no longer a Sparkle-side key to exhaust, and no credit to meter.
 //
-// FAILURE CONTRACT — read this before changing the caller. Signed out / out of credits / network /
-// parse failure all return Err, and Err means EXACTLY ONE thing: no verdict exists. The caller
-// (services/turnFollowup.ts) maps that to `unknown` and paints NO status from it.
+// FAILURE CONTRACT — read this before changing the caller. Every failure (no `claude` on PATH, not
+// signed into Claude Code, timeout, busy, parse failure) returns Err, and Err means EXACTLY ONE
+// thing: NO VERDICT EXISTS. It does not mean "done" and it does not mean "needs you". The caller
+// must paint no status from it.
 //
-// This comment used to claim the caller treated any failure as "not a followup" (gray). It had been
-// false since sparkle-blpf, which changed the caller to fail CLOSED to red whenever the turn's text
-// carried a phrase like "want me to" — and on 2026-07-28 the proxy started returning 502 for 99.3%
-// of calls, so that fallback became the only verdict any agent got and paged the human on nearly
-// every finished turn. Two lessons worth keeping: a stale comment about someone else's error
-// handling is worse than none, and neither guess (always-gray or always-red) is available to a
-// component that could not run. Say "unknown" and let the caller decide.
+// That distinction is the whole lesson of 2026-07-28. The caller then failed CLOSED to red whenever
+// the turn's tail carried a phrase like "want me to" — a rule written for users who had simply never
+// configured a key, where guessing was bounded. When the backend died for everyone at once, the
+// guess became the ONLY verdict any agent got, and paged the human on nearly every finished turn.
+// Neither guess is available to a component that could not run. Say nothing, and let the caller
+// decide what to render.
 
-use crate::ai::{call_anthropic_proxy, extract_text, Metering, CLASSIFY_READ_TIMEOUT};
+use crate::claude_oneshot::{run, OneShot, Tier, CLASSIFY_TIMEOUT};
 
 /// Cheapest current Claude model — a one-word classification needs nothing more. (claude-api skill:
-/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) It is also the
-/// only model the server-side proxy meters, so every proxied call must use it.
+/// claude-haiku-4-5 is $1/$5 per MTok; the bare alias is complete, no date suffix.) Pinning it also
+/// matters now that this runs on the user's own subscription: inheriting a user configured on Opus
+/// would burn ~30x their quota rendering a single word.
 const JUDGE_MODEL: &str = "claude-haiku-4-5";
 
 /// One word out, so a tiny budget is plenty (a couple tokens of headroom over "FOLLOWUP").
 const JUDGE_MAX_TOKENS: u32 = 8;
 
-/// Bound the inputs so a giant transcript can't amplify BYOK token spend. The ask always sits at
-/// the END of the final message, so we keep its TAIL; the task is short context, so we keep its head.
+/// Bound the inputs so a giant transcript can't amplify the user's subscription spend. The ask
+/// always sits at the END of the final message, so we keep its TAIL; the task is short context, so
+/// we keep its head.
 const RESPONSE_TAIL_CHARS: usize = 2000;
 const TASK_HEAD_CHARS: usize = 400;
 
@@ -85,56 +88,62 @@ fn build_user_message(task: &str, response: &str) -> String {
 }
 
 /// Classify a finished turn. Returns the model's one-word verdict text (typically "FOLLOWUP" or
-/// "DONE"); the frontend interprets it leniently (turnFollowup.ts). Returns Err on any failure (no
-/// key, empty response, network, HTTP error, empty result) so the caller degrades to gray.
+/// "DONE"); the frontend interprets it leniently (turnFollowup.ts). Returns Err on any failure —
+/// see the FAILURE CONTRACT in the module docs: Err means no verdict exists, not "done".
+///
+/// Note what is NO LONGER here: the Sparkle bearer-token read and its "not signed in" precondition.
+/// The judge runs on the user's own Claude Code login now, so it works whether or not they have a
+/// Sparkle account.
 #[tauri::command]
 pub async fn judge_turn_followup(
     task: String,
     response: String,
-    // Display name of the project whose agent produced this turn, so the debit is attributable in
-    // the Credits history. Metering-only; a caller that doesn't know passes nothing (→ None).
+    // Display name of the project whose agent produced this turn. Diagnostic only now — it used to
+    // attribute a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
 ) -> Result<String, String> {
     let response = response.trim().to_string();
     // Nothing to judge — an empty turn isn't an ask. (The frontend already pre-filters, but a
-    // direct/empty call must not bill a request.)
+    // direct/empty call must not spend a turn of the user's quota.)
     if response.is_empty() {
         return Err("empty response".into());
     }
-    // Server-side proxy on the user's bearer (see module docs).
-    let base = crate::auth::base_url(); // just an env read — cheap, non-blocking.
 
-    // ureq is blocking AND the keychain read is a syscall that can block on a locked keychain — keep
-    // BOTH off the async runtime's worker by resolving the token inside the blocking closure. No
-    // token → signed out; degrade (gray verdict) rather than call the proxy.
+    // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
+    // runtime's worker threads, exactly as the proxy call it replaced did.
     tauri::async_runtime::spawn_blocking(move || {
-        let token = crate::auth::bearer_token().ok_or_else(|| "not signed in".to_string())?;
-        call_judge(&base, &token, &task, &response, project.as_deref())
+        call_judge(&task, &response, project.as_deref())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
 }
 
-fn call_judge(
-    base: &str,
-    token: &str,
-    task: &str,
-    response: &str,
-    project: Option<&str>,
-) -> Result<String, String> {
+/// Build the request. Split out from `call_judge` so the three decisions encoded here are TESTABLE:
+/// each one compiles fine when wrong and produces no visible error at runtime, so without a test
+/// they are only a comment.
+fn judge_request<'a>(user: &'a str, project: Option<&'a str>) -> OneShot<'a> {
+    OneShot {
+        model: JUDGE_MODEL,
+        system: SYSTEM_PROMPT,
+        user,
+        max_tokens: JUDGE_MAX_TOKENS,
+        timeout: CLASSIFY_TIMEOUT,
+        // Background: nobody is staring at a spinner waiting for this. It must never take the last
+        // concurrency slot from a call the user IS waiting on — 50 agents finishing at once is the
+        // ordinary case, not the edge case.
+        tier: Tier::Background,
+        // The verdict is a pure function of (task, final message), so an unchanged message must
+        // never be re-judged. This is the single biggest saving in the whole migration: the judge's
+        // job is largely re-answering questions it has already answered.
+        cacheable: true,
+        purpose: "judge",
+        project,
+    }
+}
+
+fn call_judge(task: &str, response: &str, project: Option<&str>) -> Result<String, String> {
     let user = build_user_message(task, response);
-    let json = call_anthropic_proxy(
-        base,
-        token,
-        JUDGE_MODEL,
-        SYSTEM_PROMPT,
-        &user,
-        JUDGE_MAX_TOKENS,
-        CLASSIFY_READ_TIMEOUT,
-        // Metering description + project attribution shown in the credit history.
-        Metering::new("Checking whether an agent needs you", project),
-    )?;
-    extract_text(&json).ok_or_else(|| "judge returned no text".to_string())
+    run(judge_request(&user, project))
 }
 
 #[cfg(test)]
@@ -167,6 +176,23 @@ mod tests {
     fn build_user_message_marks_an_unknown_task() {
         let msg = build_user_message("   ", "Want me to land it?");
         assert!(msg.starts_with("TASK: (unknown)"));
+    }
+
+    #[test]
+    fn the_judge_runs_in_the_background_tier_and_caches() {
+        // Every one of these compiles when flipped and produces no visible error, which is exactly
+        // why they need pinning:
+        //  - Interactive would let a 50-agent judge storm take the last slot from a blocked human,
+        //    the specific starvation the tier split exists to prevent.
+        //  - cacheable:false would re-judge every unchanged final message, the migration's single
+        //    biggest saving.
+        //  - an unpinned model would inherit a user configured on Opus and burn ~30x their own
+        //    subscription quota rendering one word.
+        let req = judge_request("TASK: x\n\nFINAL MESSAGE:\ny", None);
+        assert_eq!(req.tier, crate::claude_oneshot::Tier::Background);
+        assert!(req.cacheable);
+        assert_eq!(req.model, "claude-haiku-4-5");
+        assert_eq!(req.max_tokens, JUDGE_MAX_TOKENS);
     }
 
     #[test]

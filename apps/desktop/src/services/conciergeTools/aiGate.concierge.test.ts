@@ -69,16 +69,24 @@ describe("the AI-enhancements gate on the concierge tool surface", () => {
     expect(appOpPolicy("navigate").tier).toBe("deny");
   });
 
-  it("refuses when the user has run out of credits, even with the feature on", () => {
+  // REVERSED with the move to the user's own Claude Code subscription. The concierge turn spends
+  // no Sparkle money now (concierge.rs shells out to their authenticated `claude`), so a zero
+  // Sparkle balance cannot be what decides whether it may run — and with the vendor key retired it
+  // would be a gate no top-up could satisfy. The FLAG still gates it (asserted above).
+  it("runs on a zero credit balance — the concierge spends the user's own subscription", () => {
     useAuthStore.setState({
       me: { clerkUserId: "u1", entitled: true, balanceCents: 0, tokenVersion: 1 },
     } as never);
-    expect(conciergeAiEnabled()).toBe(false);
-    expect(configuredToolPolicy(query("list_projects", false)).tier).toBe("deny");
+    expect(conciergeAiEnabled()).toBe(true);
+    expect(configuredToolPolicy(query("list_projects", false)).tier).not.toBe("deny");
   });
 
-  // THE OPEN-SOURCE BUILD. No Sparkle backend, so no `me` ever arrives. One rule covers it; there
-  // is deliberately no separate open-source code path to keep in step with this one.
+  // THE OPEN-SOURCE BUILD. No Sparkle backend, so no `me` ever arrives — neither entitlement nor a
+  // credit balance — and the concierge still declines. The VERDICT is unchanged; what changed is the
+  // REASON, and it is worth being precise about which gate is doing the work now: it is the paywall,
+  // not the old credit check. An entitled user sitting at a zero balance now gets the concierge
+  // (asserted above), because the turn runs on their own Claude Code subscription and costs Sparkle
+  // nothing. One rule still covers all three refusal cases; it is just a different rule.
   it("refuses in a build with no Sparkle backend (no signed-in user at all)", () => {
     useAuthStore.setState({ me: null } as never);
     expect(conciergeAiEnabled()).toBe(false);

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { computeSuggestions, SuggestionOfflineError } from "./engine";
 import { AiUnavailableError } from "../anthropic";
 import { getAgentScrollback } from "../terminalScrollback";
-import { AiUnreachableError } from "../anthropic";
+import { AiUnreachableError, AiBusyError } from "../anthropic";
 import { useAiFeature } from "../aiGate";
 import { OutOfCreditsError } from "../credits";
 import { useRuntimeStore } from "../../stores/runtimeStore";
@@ -183,9 +183,29 @@ export function isTerminalComputeError(message: string): boolean {
  *
  * Pure, for testing.
  */
-export function computeDeferralReason(err: unknown): "offline" | "credits" | null {
+export function computeDeferralReason(err: unknown): "offline" | "credits" | "busy" | null {
   if (err instanceof SuggestionOfflineError || err instanceof AiUnreachableError) return "offline";
   if (err instanceof OutOfCreditsError) return "credits";
+  // `busy` — the LOCAL concurrency pool was saturated, so the call was refused before anything was
+  // spawned. Deferred for the same reason as the two above and satisfying the same safety property:
+  // the refusal is FREE (no claude child ran, no quota spent) and the identical compute succeeds
+  // once the burst drains.
+  //
+  // A TIMEOUT is deliberately NOT deferred here, though it arrives from the same neighbourhood: it
+  // is produced only after the CLI ran its full 180s wall clock, so it is billed and — for a wedged
+  // CLI — deterministic. Deferring it would leave `lastHash` unadvanced and the budget unspent, so
+  // the settle watcher would re-issue a doomed 180s compute every tick: the exact "every re-render
+  // buys another doomed call" hazard the paragraph above says a deferrable reason must not have.
+  //
+  // It must not be charged to the budget, and the arithmetic is why: these refusals are correlated
+  // in time — they all come from one in-flight burst — so the three attempts and their 700/1400/2800ms
+  // backoffs all land inside the SAME burst, permanently suppressing suggestions for a settled state
+  // on which nothing was ever asked of the model. It also must not feed the vendor-outage breaker
+  // (returning here skips `noteOutageFailure`): a full local pool is not evidence about the vendor.
+  //
+  // Its recovery dep is the settle watcher rather than a store flip — with `lastHash` unadvanced and
+  // the budget unspent, the next tick re-bumps `retryTick` and recomputes.
+  if (err instanceof AiBusyError) return "busy";
   return null;
 }
 

@@ -434,6 +434,24 @@ function AutoTopupBlock({ fallback }: { fallback?: AutoTopup }) {
   );
 }
 
+/**
+ * Says out loud that this ledger is no longer the whole picture.
+ *
+ * Auto-naming, the followup judge, attention summaries, suggestions and Chief synthesis moved off
+ * Sparkle's metered Anthropic proxy and onto the user's OWN Claude Code subscription, so they
+ * produce no ledger row at all — there is no debit to record. Without this line the history reads
+ * as complete spend and silently under-reports, which is the same class of quiet wrongness that let
+ * a dead vendor key look like a state-machine bug for a full day. Stating it costs one line.
+ */
+function SubscriptionSpendNote() {
+  return (
+    <p style={quietHint}>
+      AI features (naming, status checks, suggestions) run on your Claude Code subscription and
+      don&apos;t appear here.
+    </p>
+  );
+}
+
 /** Transaction history (spec §4): newest-first ledger pages with signed color-coded amounts and
  *  a "Load more" while the server reports another page. Failures stay inside this block. */
 function HistoryBlock() {
@@ -495,10 +513,17 @@ function HistoryBlock() {
     </div>
   );
   if (entries === null) return failed ? errorRow : <p style={quietHint}>Loading…</p>;
-  if (entries.length === 0 && !failed) return <p style={quietHint}>No activity yet.</p>;
+  if (entries.length === 0 && !failed)
+    return (
+      <>
+        <p style={quietHint}>No activity yet.</p>
+        <SubscriptionSpendNote />
+      </>
+    );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <SubscriptionSpendNote />
       {entries.map((e) => {
         const credit = e.deltaCents >= 0;
         // U+2212 minus (not a hyphen) so debits read as amounts, matching the design copy.
