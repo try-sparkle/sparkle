@@ -34,8 +34,10 @@ import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
 import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools/registry";
 // What the concierge is doing right now, for the thread's thinking indicator. Recorded from the one
-// call site that both sees every tool call and knows it came from the concierge.
-import { noteConciergeToolCall } from "./conciergeActivity";
+// call site that both sees every tool call and knows it came from the concierge — and read back by
+// `selfIdentity` below, so the concierge can be told what it is doing rather than only the human.
+import { noteConciergeToolCall, useConciergeActivityStore } from "./conciergeActivity";
+import { conciergeActivityLine } from "../engine/conciergeActivityLine";
 import { noteConciergeAuditCall } from "./conciergeAudit";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
@@ -252,6 +254,85 @@ function resolveTargetId(req: ControlRequest): string | undefined {
   return req.callerAgentId;
 }
 
+/** The name the human sees on the concierge — used as its `self.name` so the identity get_state
+ *  reports is the one the human would recognise, not an internal id. */
+export const CONCIERGE_SELF_NAME = "Sparkle";
+
+/**
+ * WHO THE CALLER IS — the `self` block on every `get_state` reply (bead `sparkle-4w09`).
+ *
+ * This exists because the concierge had no answer to "who am I". `scope: "self"` filters the roster
+ * on `a.id === callerAgentId`, and the concierge's reserved id matches no AgentTab, so that scope
+ * came back `agents: []` — an EMPTY SUCCESS, which is the failure mode this whole surface is being
+ * cleaned of: a call that looks like it worked and told the caller nothing. The roster filter is not
+ * wrong (the concierge really has no row), so the fix is not to fake a row — it is to answer the
+ * question the caller was actually asking, in a field the roster cannot hold.
+ *
+ * `isAgent` is the load-bearing field, not decoration: it is exactly the precondition the per-agent
+ * ops (`rename_agent`, `set_agent_activity`, `unpin_agent`, `set_agent_model`) default on. `false`
+ * means `targetRequired` will refuse a targetless call, so a caller can learn that from one read
+ * instead of from a refusal.
+ *
+ * `null` is a real answer: an UNRESOLVABLE caller (a stale or malformed id) is not described as
+ * anything. Inventing an identity for an id that resolves to nothing would be the same lie one
+ * layer up.
+ *
+ * `projectId` IS THE ANSWERING WINDOW'S SELECTION. `selectedProjectId` is per-window (each window
+ * owns its current project) and `control:request` is broadcast to every window, whichever replies
+ * first. That is not a caveat to hide — it is the SAME default the concierge's own tools apply when
+ * a `projectId` is omitted (`conciergeTools/lifecycle.ts` reads `state.selectedProjectId`), so this
+ * field tells a caller what "the selected project" will mean for its next call.
+ *
+ * There is deliberately no window field. The concierge is app-global — one headless brain on one
+ * dedicated socket, not a per-window child — so it is not BOUND to a window, and reporting the
+ * label of whichever window happened to answer would read as a binding that does not exist.
+ */
+export interface SelfIdentity {
+  /** The caller's id: the reserved `sparkle:concierge` for the concierge, else its AgentTab id. */
+  id: string;
+  /** "concierge", or the AgentTab kind ("build" | "worker" | "shell"). */
+  kind: string;
+  name: string;
+  /** Does this caller have a roster row? `false` ⇒ per-agent ops REQUIRE an explicit targetAgentId. */
+  isAgent: boolean;
+  projectId: string | null;
+  projectName: string | null;
+  /** What the caller is doing right now — its own `set_agent_activity` line for an agent, and for
+   *  the concierge the OBSERVED tool line the human's thinking indicator is showing. */
+  activity: string | null;
+}
+
+/** Build the caller's {@link SelfIdentity}, or `null` when the caller resolves to nothing. */
+function selfIdentity(req: ControlRequest): SelfIdentity | null {
+  const { projects, selectedProjectId } = useProjectStore.getState();
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
+    const project = projects.find((p) => p.id === selectedProjectId);
+    // OBSERVED, never predicted — conciergeActivity records what dispatch actually ran, so this is
+    // the same sentence the human is reading in the column, not a second account of it.
+    const latest = useConciergeActivityStore.getState().latest;
+    return {
+      id: CONCIERGE_CALLER_AGENT_ID,
+      kind: "concierge",
+      name: CONCIERGE_SELF_NAME,
+      isAgent: false,
+      projectId: project?.id ?? null,
+      projectName: project?.name ?? null,
+      activity: latest ? (conciergeActivityLine(latest)?.text ?? null) : null,
+    };
+  }
+  const found = findAgent(req.callerAgentId);
+  if (!found) return null;
+  return {
+    id: found.agent.id,
+    kind: found.agent.kind,
+    name: found.agent.name,
+    isAgent: true,
+    projectId: found.projectId,
+    projectName: projects.find((p) => p.id === found.projectId)?.name ?? null,
+    activity: found.agent.activity ?? null,
+  };
+}
+
 /** The typed refusal for a per-agent op invoked without saying WHICH agent, by a caller that has no
  *  own agent to default to.
  *
@@ -265,9 +346,14 @@ function resolveTargetId(req: ControlRequest): string | undefined {
  *  that names a cause it did not check would misattribute the moment a second such caller exists —
  *  and a wrong explanation is worse than a generic one. (roborev 54149.) */
 function targetRequired(op: string, req: ControlRequest): Record<string, unknown> {
+  // The concierge HAS an identity now (get_state's `self`), so "it is not an agent" on its own
+  // reads as a flat contradiction of the field one op over. What it does not have is a ROSTER ROW,
+  // which is the precise thing a per-agent default needs — say that, and point at the field that
+  // says so before the call.
   const why =
     req.callerAgentId === CONCIERGE_CALLER_AGENT_ID
-      ? "the concierge is not an agent, so there is no caller to default the target to"
+      ? "the concierge has an identity (get_state's `self`) but no agent row of its own, so there " +
+        "is nothing to default the target to"
       : "this caller has no own agent to default the target to";
   return { ok: false, code: "target_required", error: `${op} requires an explicit targetAgentId: ${why}` };
 }
@@ -403,6 +489,7 @@ function callerMayAdminister(callerAgentId: string): boolean {
  *  to say "unknown" would trade this false negative for a worse one. */
 function handleGetState(req: ControlRequest): {
   agents: unknown[];
+  self: SelfIdentity | null;
   scope: StateScope;
   totalAgents: number;
   omitted: number;
@@ -508,6 +595,9 @@ function handleGetState(req: ControlRequest): {
   );
   const agents = all.filter((a) => {
     if (scope === "all") return true;
+    // A ROW filter, and the concierge has no row — so this is legitimately empty for it. That is
+    // why the reply's `self` block is unconditional: "which of these rows is me" and "who am I" are
+    // different questions, and only the first one the roster can answer. See SelfIdentity.
     if (scope === "self") return a.id === req.callerAgentId;
     // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
     // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
@@ -546,6 +636,12 @@ function handleGetState(req: ControlRequest): {
   // is what lets a caller resolve a specific agent without re-asking with scope:"all".
   return {
     agents,
+    // WHO IS ASKING — sent on EVERY scope, not only "self". The roster answers "who else is there";
+    // nothing answered "who am I", and for the concierge nothing could: its reserved id matches no
+    // row, so `scope: "self"` returned an empty roster and a caller reading it learned nothing
+    // (bead `sparkle-4w09`). ~150 chars against a roster that runs several thousand, so it is
+    // unconditional rather than another scope the caller has to know to ask for. See SelfIdentity.
+    self: selfIdentity(req),
     scope,
     totalAgents: all.length,
     omitted: omittedAll.length,

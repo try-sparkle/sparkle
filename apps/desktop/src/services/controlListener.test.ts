@@ -948,15 +948,116 @@ describe("controlListener", () => {
       ).toBe("self narrated");
     });
 
-    it("get_state works, and scope 'self' is empty — the concierge has no row of its own", async () => {
+    it("get_state works, and the concierge is not IN the roster it can read", async () => {
       fire({ reqId: "c10", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
       await flush();
-      const all = lastReply() as { agents: unknown[] };
+      const all = lastReply() as { agents: Array<{ id: string }> };
       expect(all.agents).toHaveLength(2); // it can read the whole roster...
-      fire({ reqId: "c11", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "self" } });
+      // ...and is not one of the rows. `scope: "self"` filters on the caller's own row, so it
+      // returns none — which is why the identity has to travel in a field of its own (next suite).
+      expect(all.agents.map((a) => a.id)).not.toContain(CONCIERGE_CALLER_AGENT_ID);
+    });
+  });
+
+  // ── `self` — WHO IS ASKING (bead sparkle-4w09) ──────────────────────────────────────────────────
+  //
+  // The bug: `scope: "self"` returned `agents: []` for the concierge and nothing else, so the one
+  // caller that most needed to know who it was got an EMPTY SUCCESS. These cases assert the reply
+  // now CARRIES the answer, not merely that an identity constant exists somewhere — an assertion on
+  // a recorded constant would pass against the broken code, which is the vacuous-test failure.
+  describe("get_state → self", () => {
+    // The full round trip for the caller the bead is about: ask with the cheap scope, get told who
+    // you are, which project you are pointed at, and what you are doing.
+    it("answers scope 'self' for the CONCIERGE with an identity, not an empty roster", async () => {
+      useProjectStore.setState({ selectedProjectId: projectId } as never);
+      fire({
+        reqId: "self-1",
+        op: "get_state",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { scope: "self" },
+      });
       await flush();
-      const self = lastReply() as { agents: unknown[] };
-      expect(self.agents).toEqual([]); // ...but is not IN it, so "self" is legitimately empty
+      const res = lastReply() as { agents: unknown[]; self: Record<string, unknown> | null };
+      // The roster half is still legitimately empty — the concierge has no row and we do not fake
+      // one. What changed is that the reply no longer STOPS there.
+      expect(res.agents).toEqual([]);
+      expect(res.self).toEqual({
+        id: CONCIERGE_CALLER_AGENT_ID,
+        kind: "concierge",
+        name: "Sparkle",
+        // The precondition the per-agent ops default on — false is why they refuse below.
+        isAgent: false,
+        projectId,
+        projectName: "Demo",
+        activity: null, // nothing observed yet this run
+      });
+    });
+
+    // THE NON-VACUOUS HALF. `activity` is not a stored field the concierge can set; it is read back
+    // out of the OBSERVED tool recorder that drives the human's thinking indicator. Driving a real
+    // concierge_tool call through dispatch and then reading it here proves the wiring, not that an
+    // object literal has the key.
+    it("reports what the concierge is ACTUALLY doing, from the observed tool recorder", async () => {
+      useProjectStore.setState({ selectedProjectId: projectId } as never);
+      fire({
+        reqId: "self-2a",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { domain: "workspace", op: "list_projects", args: {}, toolCallId: "tc-self" },
+      });
+      await flush();
+      // Sanity: the indicator's own store saw it, so the read below is reading something real.
+      expect(useConciergeActivityStore.getState().latest).toMatchObject({
+        domain: "workspace",
+        op: "list_projects",
+        outcome: "done",
+      });
+      fire({
+        reqId: "self-2b",
+        op: "get_state",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { scope: "self" },
+      });
+      await flush();
+      const res = lastReply() as { self: { activity: string | null } };
+      // The settled past tense, phrased by engine/conciergeActivityLine — the same sentence the
+      // human is reading in the column, not a second account of it.
+      expect(res.self.activity).toBe("Looked over your projects");
+    });
+
+    it("gives an ORDINARY agent caller its own row as `self`, on every scope", async () => {
+      useProjectStore.getState().setAgentActivity(projectId, callerId, "wiring the seam");
+      for (const scope of ["self", "active", "all"] as const) {
+        fire({ reqId: `self-3-${scope}`, op: "get_state", callerAgentId: callerId, payload: { scope } });
+        await flush();
+        const res = lastReply() as { self: Record<string, unknown> | null };
+        expect(res.self, `scope ${scope} must still say who is asking`).toMatchObject({
+          id: callerId,
+          kind: "build",
+          isAgent: true,
+          projectId,
+          projectName: "Demo",
+          activity: "wiring the seam",
+        });
+      }
+    });
+
+    // An id that resolves to nothing is described as nothing. Inventing an identity for a stale or
+    // spoofed caller would be the same lie the empty roster was, one field over.
+    it("reports self: null for a caller that resolves to no agent at all", async () => {
+      fire({ reqId: "self-4", op: "get_state", callerAgentId: "ghost-agent", payload: { scope: "all" } });
+      await flush();
+      expect((lastReply() as { self: unknown }).self).toBeNull();
+    });
+
+    // The other half of the bead: the defaulting REFUSES BY NAME rather than no-opping — and now
+    // the refusal and `self.isAgent` tell the same story instead of contradicting each other.
+    it("refuses a targetless per-agent op by name, citing the identity it DOES have", async () => {
+      fire({ reqId: "self-5", op: "rename_agent", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { name: "X" } });
+      await flush();
+      const reply = lastReply() as { ok: boolean; code: string; error: string };
+      expect(reply).toMatchObject({ ok: false, code: "target_required" });
+      expect(reply.error).toContain("no agent row of its own");
     });
   });
 
