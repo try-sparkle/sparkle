@@ -134,6 +134,13 @@ export default defineConfig(({ mode, command }) => {
     // real-timer waitFor under coverage instrumentation surfaces its own RTL error/DOM dump
     // rather than a bare vitest timeout ().
     testTimeout: 15000,
+    // Bounded retry (sparkle-jjqj). CI now runs this suite ONCE — instrumented and sharded — as
+    // both the correctness and the coverage gate; the redundant plain pass was dropped. A single
+    // async-settling flake under instrumentation load would therefore turn the whole gate red, so
+    // a failed test is retried up to twice before it counts. This is a backstop for rare DOM-timing
+    // flakes (e.g. a getAllByTestId count observed once under max pool contention), NOT a licence to
+    // leave a genuinely broken test — a test that fails all three attempts still fails the gate.
+    retry: 2,
     // Coverage with a blocking ratchet (bead .1): CI fails if statement/line
     // coverage regresses below the floor below. The floor is set a few points UNDER the
     // measured coverage so it doesn't flake on the CI runner; raise it as coverage climbs,
