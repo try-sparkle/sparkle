@@ -54,6 +54,7 @@ import {
   authWarningFor,
   refreshRoborevAuth,
   markRoborevConsentPrompted,
+  setImprovementConsent,
   setBuilderIndexEnabled,
   setOnePasswordVault,
   setOnePasswordSeedWorktrees,
@@ -563,6 +564,24 @@ describe("configActions", () => {
     await markRoborevConsentPrompted();
     expect(useSettingsStore.getState().roborevConsentPrompted).toBe(true);
     expect(setConfigValue).toHaveBeenCalledWith("roborev.consent_prompted", true);
+  });
+
+  it("setImprovementConsent mirrors the mode to [improvement].consent and updates the store", async () => {
+    useSettingsStore.setState({ sparkleImprovementConsent: "case_by_case" });
+    await setImprovementConsent("always");
+    // The whole point of the mirror: the chosen mode is written to the file under the snake_case
+    // dotted path so a headless agent can read it.
+    expect(setConfigValue).toHaveBeenCalledWith("improvement.consent", "always");
+    // ...and the store is updated optimistically for an instant UI response.
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("always");
+  });
+
+  it("setImprovementConsent keeps the optimistic store value when the config write fails", async () => {
+    vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+    useSettingsStore.setState({ sparkleImprovementConsent: "case_by_case" });
+    await setImprovementConsent("never");
+    // A failed file write is non-fatal — the optimistic update stands (the next hydrate reconciles).
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("never");
   });
 
   // The one non-obvious invariant of the 1Password write path: a blank vault UNSETS the key rather

@@ -1,8 +1,16 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, fireEvent, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SparkleConsentBanner, consentCopy } from "./SparkleConsentBanner";
 import { useSettingsStore } from "../stores/settingsStore";
+
+// The banner now routes mode changes through setImprovementConsent, which mirrors the choice to
+// config.toml via setConfigValue → a Tauri invoke that is absent under jsdom. Stub just that write
+// (keeping the rest of the module real) so a click updates the store without a caught invoke error.
+vi.mock("../services/config", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/config")>()),
+  setConfigValue: vi.fn().mockResolvedValue(undefined),
+}));
 
 afterEach(cleanup);
 beforeEach(() => {

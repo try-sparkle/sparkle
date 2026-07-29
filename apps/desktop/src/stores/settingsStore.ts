@@ -750,7 +750,14 @@ export const useSettingsStore = create<SettingsState>()(
         // `?? pinnedCeiling` covers a backend predating memory-aware concurrency; with neither we
         // have no basis at all, so fall back to 1 rather than inventing a number.
         const derived = Math.max(1, Math.floor(eff.effective_max_concurrent ?? pinnedCeiling ?? 1));
-        set({
+        // `improvement.consent` mirrors sparkleImprovementConsent from config.toml. It is ALSO
+        // persisted to localStorage (see partialize), so — unlike the other config-only mirrors —
+        // an unset/absent value must NOT overwrite the store: on first launch after upgrade the file
+        // has no [improvement] section (Rust sends consent: null) and clobbering here would revert a
+        // user's persisted "always" to the default. Only a recognized written value is adopted;
+        // null / an older backend / a garbage hand-edit all keep the persisted choice (fail-safe).
+        const mirroredConsent = config.improvement?.consent;
+        set((s) => ({
           // Concurrency + AI flags (also surfaced in the ⋯ menu controls). With no pinned ceiling
           // the user's "request" IS the derived value, so the two agree and enforcedWorkerCap's
           // min() is a no-op rather than a clamp to a stale default.
@@ -822,8 +829,16 @@ export const useSettingsStore = create<SettingsState>()(
           // `?? false`: an absent [roborev] block (older backend) means we've never prompted, so a
           // first reviewable commit still surfaces the one-time consent modal.
           roborevConsentPrompted: config.roborev?.consent_prompted ?? false,
+          // Adopt the mirrored consent ONLY when it's one of the three known modes; otherwise keep
+          // the store's persisted value (see mirroredConsent above for why this can't clobber).
+          sparkleImprovementConsent:
+            mirroredConsent === "always" ||
+            mirroredConsent === "case_by_case" ||
+            mirroredConsent === "never"
+              ? mirroredConsent
+              : s.sparkleImprovementConsent,
           configWarnings: warnings,
-        });
+        }));
       },
     }),
     {

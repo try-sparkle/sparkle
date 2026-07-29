@@ -19,6 +19,7 @@ import {
   type AiFeatureKey,
   type PluginKey,
   type ToolKey,
+  type SparkleImprovementConsent,
 } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import {
@@ -583,6 +584,20 @@ export async function markRoborevConsentPrompted(): Promise<void> {
     await setConfigValue("roborev.consent_prompted", true);
   } catch (e) {
     console.warn("config write failed (roborev consent)", e);
+  }
+}
+
+/** Set the Sparkle-improvement consent mode. Optimistic store set (so the banner responds instantly)
+ *  then MIRROR it to [improvement].consent in config.toml — the whole point of the mirror is to give
+ *  headless agents (orchestrator / improvement pass), which can't read the webview store, a
+ *  file-based read path to gate an auto-forward on `=== "always"`. A write failure is non-fatal: the
+ *  optimistic update stands and the next hydrate reconciles from the file. */
+export async function setImprovementConsent(mode: SparkleImprovementConsent): Promise<void> {
+  useSettingsStore.getState().setSparkleImprovementConsent(mode);
+  try {
+    await setConfigValue("improvement.consent", mode);
+  } catch (e) {
+    console.warn("config write failed (improvement consent)", e);
   }
 }
 

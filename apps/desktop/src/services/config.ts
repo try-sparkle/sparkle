@@ -92,6 +92,15 @@ export interface PluginsConfig {
 export interface RoborevConfig {
   consent_prompted: boolean;
 }
+/** Machine-wide mirror of the Sparkle-improvement consent, so headless agents can read it from the
+ *  file instead of the webview store. Machine-wide (like [roborev]); ignored in a per-project file.
+ *  `consent` is null until the user sets it — see the Rust `ImprovementConfig` on why it stays
+ *  distinguishable from a written value (so a hydrate never clobbers a persisted store choice). The
+ *  value mirrors `SparkleImprovementConsent` in settingsStore.ts; kept inline to avoid a store↔service
+ *  import cycle, and typed `| null` for the unset case. */
+export interface ImprovementConfig {
+  consent: "always" | "case_by_case" | "never" | null;
+}
 /** 1Password env-backup state (chosen vault + worktree seeding). Machine-wide; ignored in a
  *  per-project file — and here that's a security boundary, not just tidiness: a project-level
  *  value would let one repo redirect where another repo's secrets are written. */
@@ -154,6 +163,10 @@ export interface SparkleConfig {
   // Optional for the same back-compat reason as `tools?` above: a payload from a Rust backend
   // predating [roborev] omits it. Callers read `config.roborev?.consent_prompted ?? false`.
   roborev?: RoborevConfig;
+  /** Optional for the same back-compat reason as `roborev?` above: a payload from a Rust backend
+   *  predating [improvement] omits it. Callers read `config.improvement?.consent ?? <store value>`,
+   *  so an absent section (or a null consent) keeps the store's persisted choice. */
+  improvement?: ImprovementConfig;
   /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
    *  backend predating [onepassword] omits it. Callers must guard and fall back to the off/unset
    *  defaults — never read an absent section as "enabled". */

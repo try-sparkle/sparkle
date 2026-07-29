@@ -196,6 +196,68 @@ describe("settingsStore — Sparkle improvement consent", () => {
   });
 });
 
+describe("hydrateFromConfig — [improvement].consent mirror", () => {
+  // A minimal-but-complete effective config, with the [improvement] section swapped in per case.
+  const baseConfig = {
+    workflow: {
+      require_pr: true,
+      worktree_isolation: true,
+      default_branch: "",
+      born_fresh_from_base: true,
+      delete_merged_branch: true,
+      drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+    },
+    workers: { max_concurrent: 5 },
+    ai: {
+      auto_rename: true,
+      voice_dictation: true,
+      composer: true,
+      suggested_actions: true,
+      auto_approve: true,
+    },
+    freshness: {
+      staleness_warn_commits: 25,
+      stale_build_block_commits: 25,
+      require_fresh_branch: true,
+    },
+    capture: { popover_shortcut: "ctrl+shift+r" },
+    done: { description: null, criteria: [] },
+    delivered: {
+      description: null,
+      detected_method: null,
+      confidence: null,
+      confidence_note: null,
+      learned: false,
+      criteria: [],
+    },
+  };
+  const eff = (improvement?: { consent: "always" | "case_by_case" | "never" | null }) =>
+    ({
+      config: { ...baseConfig, ...(improvement ? { improvement } : {}) },
+      warnings: [],
+    }) as EffectiveConfig;
+
+  it("adopts a written consent value from the file", () => {
+    useSettingsStore.setState({ sparkleImprovementConsent: "case_by_case" });
+    useSettingsStore.getState().hydrateFromConfig(eff({ consent: "always" }));
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("always");
+  });
+
+  it("does NOT clobber a persisted choice when the [improvement] section is absent", () => {
+    // First launch after upgrade: the file has no [improvement] yet. The store's persisted "always"
+    // (from webview localStorage) must survive — this is the whole reason consent is nullable.
+    useSettingsStore.setState({ sparkleImprovementConsent: "always" });
+    useSettingsStore.getState().hydrateFromConfig(eff());
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("always");
+  });
+
+  it("does NOT clobber a persisted choice when consent is explicitly null (unset)", () => {
+    useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+    useSettingsStore.getState().hydrateFromConfig(eff({ consent: null }));
+    expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("never");
+  });
+});
+
 describe("settingsStore — Chief doc state", () => {
   beforeEach(() => {
     useSettingsStore.setState({ chiefDocStateByProject: {} });

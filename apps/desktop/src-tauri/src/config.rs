@@ -391,6 +391,31 @@ pub struct RoborevConfig {
     pub consent_prompted: bool,
 }
 
+/// Machine-wide mirror of the user's Sparkle-improvement consent (`"always"|"case_by_case"|"never"`).
+/// Its ONLY reason to exist is a file-based read path: the improvement/orchestrator agents run as
+/// headless `claude` processes with no access to the webview's localStorage, where this setting
+/// otherwise lives alone (`settingsStore.ts` `sparkleImprovementConsent`). Mirroring it here lets
+/// those agents gate an auto-forward on `consent == "always"` by reading the file. Machine-wide
+/// (like [roborev]/[tools]): a per-project value is ignored with a warning — a repo doesn't get to
+/// decide how the user's own usage is shared.
+///
+/// `consent` is `Option<String>`, NOT a concrete default, on PURPOSE. Unlike roborev's flag, the
+/// webview store is `persist`ed to localStorage, so `None` here must stay distinguishable from a
+/// written value: on first launch after upgrade the file has no `[improvement]` section, and if
+/// this resolved to a concrete "case_by_case" the hydrate would CLOBBER a user's persisted
+/// "always" back to the default. `None` lets the store keep its persisted value (see
+/// `hydrateFromConfig`). An unset section also means an orchestrator reading the raw file falls
+/// back to its own fail-closed default (anything but "always" ⇒ no auto-forward).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ImprovementConfig {
+    /// The mirrored consent mode, or `None` when the user has never set it (no `[improvement]`
+    /// section on disk). Stored as a free string; the TS union `SparkleImprovementConsent`
+    /// (`"always"|"case_by_case"|"never"`) is the contract, and the reader fail-closes on anything
+    /// outside it.
+    pub consent: Option<String>,
+}
+
 /// Branch/build freshness rules — guardrails against doing work on (or shipping a DMG from) a
 /// branch that has fallen far behind `origin/main`. Read by the build script and the session-start
 /// staleness hook as well as the app. Per-project overridable (a repo can set its own thresholds).
@@ -491,6 +516,9 @@ pub struct SparkleConfig {
     /// roborev machine-wide state (the one-time consent flag). Kept in its own section so Rust can
     /// gate the first-run modal on it.
     pub roborev: RoborevConfig,
+    /// Sparkle-improvement consent, mirrored from the webview store so headless agents can read it
+    /// from the file. Machine-wide, like [roborev]; `consent` is `None` until the user sets it.
+    pub improvement: ImprovementConfig,
     /// 1Password env-backup state (chosen vault + worktree seeding). Its own section for the same
     /// reason as [roborev]: it is machine-wide state, not a per-repo preference.
     pub onepassword: OnePasswordConfig,
@@ -567,6 +595,9 @@ impl Default for SparkleConfig {
             plugins: PluginsConfig { superpowers: true, frontend_design: true },
             // First-run consent is unresolved until the user answers the one-time modal.
             roborev: RoborevConfig { consent_prompted: false },
+            // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
+            // None rather than defaulting to "case_by_case" (it must not clobber a persisted choice).
+            improvement: ImprovementConfig { consent: None },
             // No vault until the user picks one, and no worktree seeding until they ask for it.
             onepassword: OnePasswordConfig { vault_id: None, seed_worktrees: false },
             freshness: FreshnessConfig {
@@ -719,6 +750,11 @@ struct PartialRoborev {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialImprovement {
+    consent: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialOnePassword {
     vault_id: Option<String>,
     seed_worktrees: Option<bool>,
@@ -780,6 +816,7 @@ struct PartialConfig {
     tools: Option<PartialTools>,
     plugins: Option<PartialPlugins>,
     roborev: Option<PartialRoborev>,
+    improvement: Option<PartialImprovement>,
     onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
     worktree_pool: Option<PartialWorktreePool>,
@@ -1006,6 +1043,12 @@ fn apply_plugins(into: &mut PluginsConfig, p: Option<PartialPlugins>) {
 fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
     if let Some(PartialRoborev { consent_prompted: Some(v) }) = p {
         into.consent_prompted = v;
+    }
+}
+
+fn apply_improvement(into: &mut ImprovementConfig, p: Option<PartialImprovement>) {
+    if let Some(PartialImprovement { consent: Some(v) }) = p {
+        into.consent = Some(v);
     }
 }
 
@@ -1352,6 +1395,7 @@ fn build_effective(
                 apply_tools(&mut cfg.tools, p.tools);
                 apply_plugins(&mut cfg.plugins, p.plugins);
                 apply_roborev(&mut cfg.roborev, p.roborev);
+                apply_improvement(&mut cfg.improvement, p.improvement);
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
@@ -1397,6 +1441,14 @@ fn build_effective(
                     warnings.push(
                         "[roborev] in a per-project .sparkle/config.toml is ignored — it is a \
                          machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.improvement.is_some() {
+                    warnings.push(
+                        "[improvement] in a per-project .sparkle/config.toml is ignored — your \
+                         improvement-sharing consent is a machine-wide preference, not something a \
+                         repo gets to set; change it in the app or the global config.toml"
                             .to_string(),
                     );
                 }
@@ -1809,6 +1861,16 @@ frontend_design = true   # Anthropic's official UI-quality skill
 # Not-now) so you're never asked again. Toggle the tool itself under [tools] (roborev), not here.
 [roborev]
 consent_prompted = false   # set true once the one-time "review your commits?" prompt is resolved
+
+# --- Sparkle-improvement consent (per-machine; ignored in a project file) ---------------
+# Mirrors the "help improve Sparkle" choice from the in-app banner so headless agents (which can't
+# read the app's webview storage) can honor it from this file. "always" lets Sparkle auto-submit an
+# improvement PR from your usage; "case_by_case" drafts one for you to approve; "never" is off.
+# Left UNSET by default: an absent [improvement] means "follow the app's default (case_by_case)" and
+# is read fail-closed (anything but "always" ⇒ no auto-submit). Change it from the in-app banner, not
+# here — the app writes this key when you pick a mode.
+# [improvement]
+# consent = "case_by_case"   # "always" | "case_by_case" | "never"
 
 # --- Menu-bar capture (per-machine; ignored in a project file) --------------------------
 [capture]
@@ -2825,6 +2887,31 @@ quit_app = 42
         let (cfg, warns, _) = effective(None, Some(p));
         assert!(!cfg.roborev.consent_prompted);
         assert!(warns.iter().any(|w| w.contains("[roborev]")));
+    }
+
+    #[test]
+    fn improvement_consent_defaults_none_and_global_sets_it() {
+        // Unset by default (None, NOT "case_by_case") so a first-launch hydrate can't clobber a
+        // persisted webview choice — an absent [improvement] means "the app's default applies".
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.improvement.consent, None);
+
+        // A global [improvement] section mirrors the chosen mode into the file.
+        let g = "[improvement]\nconsent = \"always\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.improvement.consent.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn project_improvement_is_ignored_with_warning() {
+        // [improvement] is machine-wide (like [roborev]); a repo can't set how the user's usage is
+        // shared, so a per-project value is ignored and a warning is surfaced.
+        let p = "[improvement]\nconsent = \"always\"\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert_eq!(cfg.improvement.consent, None);
+        assert!(warns.iter().any(|w| w.contains("[improvement]")));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore, type SparkleImprovementConsent } from "../stores/settingsStore";
+import { setImprovementConsent } from "../services/configActions";
 
 /**
  * Consent banner for the Sparkle self-improvement agent. Sits at the top of the Sparkle pane
@@ -80,7 +81,10 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
 
 export function SparkleConsentBanner() {
   const mode = useSettingsStore((s) => s.sparkleImprovementConsent);
-  const setMode = useSettingsStore((s) => s.setSparkleImprovementConsent);
+  // Route through the configAction (not the raw store setter) so the choice is MIRRORED to
+  // [improvement].consent in config.toml — that file is the only path headless agents have to it.
+  // The action updates the store optimistically, so the control still responds instantly.
+  const setMode = (m: SparkleImprovementConsent) => void setImprovementConsent(m);
   const launchWarm = useSettingsStore((s) => s.improvementLaunchWarm);
   const setLaunchWarm = useSettingsStore((s) => s.setImprovementLaunchWarm);
   const copy = consentCopy(mode);
