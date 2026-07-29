@@ -2013,6 +2013,43 @@ fn ahead_only_status(root: &str, branch: &str, dirty: bool, worktree_on_branch: 
     BranchStatus { ahead, behind: 0, dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch }
 }
 
+/// The branch an agent's worktree is actually checked out on, or "" when the tree is missing, the
+/// read fails, or the head is DETACHED (git reports the literal "HEAD" for that, which names no
+/// branch). `--abbrev-ref` doesn't touch the index, so this can't defeat the batch poll's
+/// index-mtime fingerprint skip.
+fn worktree_head_branch(wt_str: &str, exists: bool) -> String {
+    if !exists {
+        return String::new();
+    }
+    match git(wt_str, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(h) if h.trim() != "HEAD" => h.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// RECORD which branch an agent is working on, whatever it is called.
+///
+/// This is what resolves a PR back to its agent when the branch name embeds no id — the case
+/// branch-name parsing could never answer (`sparkle/left-pair` → #806) — and the only signal that
+/// covers a PR an agent opened by running `gh pr create` in its own shell instead of through
+/// `open_agent_pr`. It is deliberately called from the status probes, because those are the only
+/// places that see a branch an agent chose for ITSELF, after the fact.
+///
+/// Cheap by construction: `pr_owner::record_branch` writes only when the mapping actually changes,
+/// so a steady-state poll re-reads a small file and writes nothing. Best-effort — a failure costs a
+/// resolvable owner, never a status reading.
+fn observe_worktree_branch(app_data: &Path, project_id: &str, agent_id: &str, head_branch: &str) {
+    if head_branch.is_empty() {
+        return;
+    }
+    if let Err(e) = crate::pr_owner::observe_branch(app_data, project_id, head_branch, agent_id) {
+        tracing::warn!(
+            %head_branch, %agent_id, error = %e,
+            "could not record branch → agent ownership (non-fatal)"
+        );
+    }
+}
+
 /// Core (AppHandle-free, testable): live ahead/behind + dirty + size of an agent branch vs its
 /// (no-fetch) effective base. The worktree lives OUTSIDE the project, under `app_data`.
 pub fn agent_branch_status_at(
@@ -2032,13 +2069,9 @@ pub fn agent_branch_status_at(
     // does it too). If it has, the tree there belongs to a DIFFERENT branch, so its dirt is not
     // this branch's dirt. A missing tree is not a mismatch — that case is handled below and has
     // its own long-standing meaning.
-    let worktree_on_branch = if wt.exists() {
-        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .map(|h| h.trim() == branch)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let head_branch = worktree_head_branch(&wt_str, wt.exists());
+    let worktree_on_branch = head_branch == branch;
+    observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
 
     // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
     // stays open and keeps getting polled), a removed tree has no uncommitted changes — report
@@ -2589,10 +2622,9 @@ pub async fn project_pr_list_url(root: String) -> Result<Option<String>, String>
 }
 
 /// One open pull request, richer than the bare `probe_open_pr_count` count: enough for the TopBar
-/// PR menu to LIST each PR, join it to a live agent by `head_ref_name` (the `sparkle/agent-<id>`
-/// convention), and gate its Merge action on `checks`/`mergeable`. Serialized camelCase for the JS
-/// side.
-#[derive(Serialize, Clone, Debug, PartialEq)]
+/// PR menu to LIST each PR, name the agent that owns it, and gate its Merge action on
+/// `checks`/`mergeable`. Serialized camelCase for the JS side.
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrRow {
     pub number: u64,
@@ -2605,6 +2637,16 @@ pub struct PrRow {
     /// "mergeable" | "conflicting" | "unknown". GitHub computes mergeability asynchronously, so a
     /// freshly opened PR often reads "unknown"; the UI treats that as "let gh decide", not a block.
     pub mergeable: String,
+    /// The agent that opened this PR, from the DURABLE mapping in `pr_owner` — `None` when nothing
+    /// identifies it. Never inferred: a pill carrying the wrong id opens the wrong agent, which is
+    /// worse than no pill, so "couldn't tell" stays null. See `pr_owner`'s module header.
+    pub agent_id: Option<String>,
+    /// Which `pr_owner::SOURCE_*` produced `agent_id`; `None` alongside a `None` owner.
+    pub agent_id_source: Option<String>,
+    /// The PR body, carried only so `pr_owner`'s marker can be read out of it. NOT serialized — the
+    /// JS side has no use for 100 PR bodies, and shipping them would bloat every poll.
+    #[serde(skip)]
+    pub body: String,
 }
 
 /// Aggregate a `gh` `statusCheckRollup` array into one word. A failing check dominates (red beats
@@ -2686,17 +2728,27 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                     url: str_field("url"),
                     checks,
                     mergeable,
+                    // Ownership is resolved by the caller, which has the app-data store; the pure
+                    // decoder only carries the raw material (`body`) forward.
+                    agent_id: None,
+                    agent_id_source: None,
+                    body: str_field("body"),
                 })
             })
             .collect(),
     )
 }
 
-/// The open PRs authored by this identity in `root`'s repo. Mirrors `probe_open_pr_count`'s
-/// gh-invocation shape (non-interactive env, bounded wall-clock, failure reads as `None`) but asks
-/// for the richer field set the menu needs. Best-effort: gh absent, unauthed, offline, no remote, or
-/// a timeout all yield `None`.
-fn probe_open_prs(root: &str) -> Option<Vec<PrRow>> {
+/// The open PRs authored by this identity in `root`'s repo, each joined to the agent that owns it.
+/// Mirrors `probe_open_pr_count`'s gh-invocation shape (non-interactive env, bounded wall-clock,
+/// failure reads as `None`) but asks for the richer field set the menu needs. Best-effort: gh
+/// absent, unauthed, offline, no remote, or a timeout all yield `None`.
+///
+/// `body` is requested purely so `pr_owner`'s marker can be read off PRs this machine never opened
+/// — the one channel that survives a lost store or a fresh install. Resolving here (rather than in
+/// JS) also BACKFILLS the durable store in the same pass, so a legacy `sparkle/agent-<id>` PR keeps
+/// resolving once its branch is renamed or deleted.
+fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<PrRow>> {
     let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
         .args([
@@ -2708,7 +2760,7 @@ fn probe_open_prs(root: &str) -> Option<Vec<PrRow>> {
             "--limit",
             "100",
             "--json",
-            "number,title,headRefName,url,mergeable,statusCheckRollup",
+            "number,title,headRefName,url,mergeable,statusCheckRollup,body",
         ])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1")
@@ -2718,16 +2770,96 @@ fn probe_open_prs(root: &str) -> Option<Vec<PrRow>> {
     if !output.status.success() {
         return None;
     }
-    decode_open_prs(&String::from_utf8_lossy(&output.stdout))
+    let rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout))?;
+    Some(attach_pr_owners(rows, project_id, app_data))
+}
+
+/// Fill each row's `agent_id`/`agent_id_source` from the durable mapping, backfilling it as a side
+/// effect. Split out from the `gh` call so the join is unit-tested without a network or a binary.
+fn attach_pr_owners(mut rows: Vec<PrRow>, project_id: &str, app_data: &Path) -> Vec<PrRow> {
+    let inputs: Vec<(u64, String, String)> = rows
+        .iter()
+        .map(|r| (r.number, r.head_ref_name.clone(), r.body.clone()))
+        .collect();
+    for (row, owner) in
+        rows.iter_mut().zip(crate::pr_owner::resolve_and_backfill(app_data, project_id, &inputs))
+    {
+        // Bodies exist only to be read for the marker; drop them once they have been.
+        row.body = String::new();
+        if let Some(o) = owner {
+            row.agent_id = Some(o.agent_id);
+            row.agent_id_source = Some(o.source);
+        }
+    }
+    rows
 }
 
 /// The open PRs waiting in `root`'s repo, for the TopBar PR menu. `Ok(None)` means "couldn't find
 /// out" (see `probe_open_prs`); the menu renders nothing for it, exactly as the count badge does.
 #[tauri::command]
-pub async fn project_open_prs(root: String) -> Result<Option<Vec<PrRow>>, String> {
-    tauri::async_runtime::spawn_blocking(move || probe_open_prs(&root))
+pub async fn project_open_prs(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+) -> Result<Option<Vec<PrRow>>, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || probe_open_prs(&root, &project_id, &app_data))
         .await
         .map_err(|e| format!("project_open_prs task failed: {e}"))
+}
+
+/// Read one PR's head branch and body — the two fields `pr_owner` resolves against — for a PR that
+/// `project_open_prs` did not list (someone else's, or past the 100-row cap).
+///
+/// A failed probe yields `None`, which the caller must keep DISTINCT from "no owner": a PR nobody
+/// could read is unknown, not unowned.
+fn probe_pr_ref_and_body(root: &str, number: u64) -> Option<(String, String)> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.arg("pr")
+        .args(["view", &number.to_string(), "--json", "headRefName,body"])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    Some((field("headRefName"), field("body")))
+}
+
+/// Which agent owns PR `number`, for a PR `project_open_prs` did not list.
+///
+/// Answers from the durable store first and only shells out to `gh` when it has nothing — so a PR
+/// recorded at creation resolves offline. Always returns a full answer; an unknown owner is
+/// `agentId: null` WITH a reason, never a guess.
+#[tauri::command]
+pub async fn pr_owner(
+    app: AppHandle,
+    root: String,
+    project_id: String,
+    number: u64,
+) -> Result<crate::pr_owner::PrOwnerAnswer, String> {
+    let app_data = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // A record written at creation time is first-hand and needs no network round-trip.
+        let store = crate::pr_owner::load_store(&app_data);
+        if let Some(o) = crate::pr_owner::resolve_owner(&store, &project_id, number, "", "") {
+            return crate::pr_owner::PrOwnerAnswer {
+                number,
+                agent_id: Some(o.agent_id),
+                source: Some(o.source),
+                branch: None,
+                reason: None,
+            };
+        }
+        let (head_ref, body) = probe_pr_ref_and_body(&root, number).unwrap_or_default();
+        crate::pr_owner::answer_for(&app_data, &project_id, number, &head_ref, &body)
+    })
+    .await
+    .map_err(|e| format!("pr_owner task failed: {e}"))
 }
 
 /// Wall-clock ceiling for a user-initiated `gh pr merge`. Longer than `NETWORK_TIMEOUT`: a merge does
@@ -3326,9 +3458,11 @@ fn rev_parse_tip(root: &str, refname: &str) -> String {
 /// once per distinct base instead of once per agent.
 fn branch_status_with_base(
     root: &str,
+    project_id: &str,
     agent_id: &str,
     base_ref: &str,
     wt: &Path,
+    app_data: &Path,
 ) -> Result<BranchStatus, String> {
     let branch = format!("sparkle/agent-{agent_id}");
     let wt_str = wt.to_string_lossy().to_string();
@@ -3340,13 +3474,11 @@ fn branch_status_with_base(
     // the sidebar/status BATCH poll uses, so it is the one that actually drives what the user
     // sees — fixing only the single-agent path would leave the misreport live in the UI.
     // `rev-parse` doesn't touch the index, so it can't defeat the fingerprint skip above.
-    let worktree_on_branch = if wt.exists() {
-        git(&wt_str, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .map(|h| h.trim() == branch)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let head_branch = worktree_head_branch(&wt_str, wt.exists());
+    let worktree_on_branch = head_branch == branch;
+    // Only agents the fingerprint did NOT skip reach here — which is exactly right for ownership:
+    // a skipped agent is unchanged by definition, so its branch mapping cannot have moved either.
+    observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
     let dirty = if wt.exists() {
         !git(&wt_str, &["--no-optional-locks", "status", "--porcelain"])?.is_empty()
     } else {
@@ -3593,7 +3725,14 @@ pub fn project_agents_status_at(
 
         // Compute fresh. A per-agent branch-status error (e.g. a missing branch) is non-fatal: report
         // unchanged so one bad agent can't fail the whole batch (mirrors pollBranchStatus swallowing).
-        let branch_status = match branch_status_with_base(root, &a.agent_id, &base_ref, &wt) {
+        let branch_status = match branch_status_with_base(
+            root,
+            project_id,
+            &a.agent_id,
+            &base_ref,
+            &wt,
+            app_data,
+        ) {
             Ok(bs) => bs,
             Err(e) => {
                 tracing::debug!(agent = %a.agent_id, error = %e, "batch branch status failed");
@@ -4064,7 +4203,17 @@ pub async fn delete_agent_branch_if_merged(
 /// Build the `gh pr create` argv for an agent branch. Pure + tested so the guard/defaulting logic is
 /// exercised without invoking `gh`: rejects a blank `target` (else `--base ""` yields an opaque gh
 /// error) and falls back to the branch name when `title` is blank.
-fn pr_create_args(branch: &str, target: &str, title: &str) -> Result<Vec<String>, String> {
+///
+/// The body carries `pr_owner`'s ownership marker. That marker is the ONLY copy of the PR→agent
+/// mapping that lives on GitHub rather than on this machine, so it is what lets another install (or
+/// this one after its store is lost) still name the owning agent. It is an HTML comment, so it is
+/// invisible in the rendered PR.
+fn pr_create_args(
+    branch: &str,
+    target: &str,
+    title: &str,
+    owner_marker: &str,
+) -> Result<Vec<String>, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("no target branch".to_string());
@@ -4080,7 +4229,7 @@ fn pr_create_args(branch: &str, target: &str, title: &str) -> Result<Vec<String>
         "--title".into(),
         title.to_string(),
         "--body".into(),
-        "Opened by Sparkle (close-agent → Ship).".into(),
+        format!("Opened by Sparkle (close-agent → Ship).\n\n{owner_marker}"),
     ])
 }
 
@@ -4090,19 +4239,28 @@ fn pr_create_args(branch: &str, target: &str, title: &str) -> Result<Vec<String>
 /// Pre-checks the branch exists and the target is non-empty so a missing branch / blank base surface
 /// as clear errors instead of opaque `gh` stderr; other failures (no gh / PR already exists / no
 /// remote) surface as Err for the caller to handle.
+///
+/// The PR→agent mapping is RECORDED here, twice over: once in the durable local store and once as a
+/// marker in the PR body. Both are best-effort side effects — a failure to record costs a resolvable
+/// owner, never the PR, so it is logged and swallowed rather than turned into an error the user sees
+/// after their PR already exists.
 #[tauri::command]
 pub async fn open_agent_pr(
+    app: AppHandle,
     root: String,
+    project_id: String,
     agent_id: String,
     target_branch: String,
     title: String,
 ) -> Result<String, String> {
+    let app_data = app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let branch = format!("sparkle/agent-{agent_id}");
         if git(&root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
             return Err("no-branch".to_string());
         }
-        let args = pr_create_args(&branch, &target_branch, &title)?;
+        let marker = crate::pr_owner::pr_body_marker(&agent_id, &project_id);
+        let args = pr_create_args(&branch, &target_branch, &title, &marker)?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(&args)
             .current_dir(&root)
@@ -4111,7 +4269,25 @@ pub async fn open_agent_pr(
         apply_noninteractive(&mut cmd);
         let out = cmd.output().map_err(|e| format!("failed to run gh: {e}"))?;
         if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match crate::pr_owner::pr_number_from_url(&url) {
+                Some(number) => {
+                    if let Err(e) = crate::pr_owner::record_pr_created(
+                        &app_data, &project_id, number, &agent_id, &branch,
+                    ) {
+                        tracing::warn!(
+                            number, %agent_id, error = %e,
+                            "open_agent_pr: could not record PR ownership (non-fatal)"
+                        );
+                    }
+                }
+                // The body marker still carries the mapping, so this degrades rather than losing it.
+                None => tracing::warn!(
+                    %url,
+                    "open_agent_pr: no PR number in gh output; owner recorded only in the PR body"
+                ),
+            }
+            Ok(url)
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
@@ -6701,6 +6877,10 @@ mod tests {
                 url: "https://github.com/o/r/pull/42".into(),
                 checks: "passing".into(),
                 mergeable: "mergeable".into(),
+                // Ownership is attached by `attach_pr_owners`, not by the pure decoder.
+                agent_id: None,
+                agent_id_source: None,
+                body: String::new(),
             }
         );
         // A sparse row keeps its number and defaults the rest — a missing rollup is "none", a missing
@@ -6714,7 +6894,78 @@ mod tests {
                 url: String::new(),
                 checks: "none".into(),
                 mergeable: "unknown".into(),
+                agent_id: None,
+                agent_id_source: None,
+                body: String::new(),
             }
+        );
+    }
+
+    #[test]
+    fn attach_pr_owners_names_the_agent_for_a_descriptive_branch_and_stays_null_otherwise() {
+        // THE HEADLINE CASE. `sparkle/left-pair` (#806) carries no agent id anywhere, so the old
+        // branch-name parse could only say "owner unresolved". Now the recorded mapping answers it,
+        // while a PR nothing knows about stays honestly null rather than borrowing a neighbour's id.
+        let d = tempfile::tempdir().unwrap();
+        crate::pr_owner::record_pr_created(d.path(), "p1", 806, "agent-cockpit", "sparkle/left-pair")
+            .unwrap();
+        let rows = decode_open_prs(
+            r#"[
+                { "number": 806, "headRefName": "sparkle/left-pair" },
+                { "number": 802, "headRefName": "sparkle/router-skip-doomed-classify" },
+                { "number": 804, "headRefName": "sparkle/agent-9e48bf5c-02fb-499b-9bc7-d24034577799" }
+            ]"#,
+        )
+        .unwrap();
+        let out = attach_pr_owners(rows, "p1", d.path());
+
+        assert_eq!(out[0].agent_id.as_deref(), Some("agent-cockpit"));
+        assert_eq!(out[0].agent_id_source.as_deref(), Some(crate::pr_owner::SOURCE_CREATED));
+        // Nothing has ever identified #802 — null, never a guess.
+        assert_eq!(out[1].agent_id, None);
+        assert_eq!(out[1].agent_id_source, None);
+        // The legacy convention still resolves, and is now BACKFILLED into the durable store, so it
+        // survives the branch being renamed or deleted.
+        assert_eq!(
+            out[2].agent_id.as_deref(),
+            Some("9e48bf5c-02fb-499b-9bc7-d24034577799")
+        );
+        let store = crate::pr_owner::load_store(d.path());
+        assert_eq!(
+            crate::pr_owner::resolve_owner(&store, "p1", 804, "", "").unwrap().agent_id,
+            "9e48bf5c-02fb-499b-9bc7-d24034577799",
+        );
+        // Bodies are read for the marker and then dropped — they must never reach the JS side.
+        assert!(out.iter().all(|r| r.body.is_empty()));
+    }
+
+    #[test]
+    fn attach_pr_owners_reads_the_body_marker_when_the_store_knows_nothing() {
+        // A PR opened on ANOTHER machine (or before this store existed) still resolves, because the
+        // marker rides along on GitHub rather than on this disk.
+        let d = tempfile::tempdir().unwrap();
+        let marker = crate::pr_owner::pr_body_marker("agent-elsewhere", "p1");
+        let rows = decode_open_prs(&format!(
+            r#"[{{ "number": 12, "headRefName": "feature/no-id", "body": "hello\n\n{marker}" }}]"#
+        ))
+        .unwrap();
+        let out = attach_pr_owners(rows, "p1", d.path());
+        assert_eq!(out[0].agent_id.as_deref(), Some("agent-elsewhere"));
+        assert_eq!(out[0].agent_id_source.as_deref(), Some(crate::pr_owner::SOURCE_PR_BODY));
+    }
+
+    #[test]
+    fn pr_create_args_embeds_the_ownership_marker_in_the_body() {
+        // The marker is the only copy of the mapping that lives on GitHub. If it stops being written
+        // the app still works — and silently loses cross-machine resolution — so assert it directly.
+        let marker = crate::pr_owner::pr_body_marker("a1", "p1");
+        let args = pr_create_args("sparkle/agent-a1", "main", "T", &marker).unwrap();
+        let body = args.last().unwrap();
+        assert!(body.contains(&marker), "body must carry the owner marker, got {body:?}");
+        assert_eq!(
+            crate::pr_owner::parse_pr_body_marker(body),
+            Some(("a1".into(), "p1".into())),
+            "the body we send must parse back to the same owner",
         );
     }
 
@@ -7693,6 +7944,98 @@ mod tests {
     }
 
     #[test]
+    fn a_status_poll_records_the_branch_an_agents_worktree_is_actually_on() {
+        // roborev 55253. The `worktree-branch` source — the one that rescues a PR an agent opened by
+        // running `gh pr create` in its own shell — is WIRED here and nowhere else, and nothing was
+        // asserting the wiring: `pr_owner`'s own tests call `observe_branch` directly (the
+        // precondition, not this side effect), and the two `branch_status_with_base` tests point at a
+        // nonexistent worktree, so `head_branch` was "" and the call returned at its first guard.
+        // Deleting both call sites left the whole suite green with the feature 100% dead.
+        //
+        // So: a REAL worktree, a real status poll, and an assertion on the store it wrote.
+        let root = unique_root("observe-branch");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("observe-branch-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+
+        // The single-agent path.
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert_eq!(
+            crate::pr_owner::resolve_owner(
+                &crate::pr_owner::load_store(&app_data),
+                "p",
+                1,
+                "sparkle/agent-s1",
+                "",
+            )
+            .map(|o| (o.agent_id, o.source)),
+            Some(("s1".to_string(), crate::pr_owner::SOURCE_WORKTREE_BRANCH.to_string())),
+            "the poll must record (project, branch) -> agent",
+        );
+
+        // The BATCH path is the one that actually drives the sidebar, so it gets its own assertion
+        // against a fresh store — fixing only the single-agent path would leave the feature dead
+        // where it is used.
+        let batch_data = unique_root("observe-branch-batch");
+        branch_status_with_base(&root_str, "p", "s1", "main", Path::new(&info.path), &batch_data)
+            .unwrap();
+        assert_eq!(
+            crate::pr_owner::resolve_owner(
+                &crate::pr_owner::load_store(&batch_data),
+                "p",
+                1,
+                "sparkle/agent-s1",
+                "",
+            )
+            .map(|o| o.agent_id),
+            Some("s1".to_string()),
+        );
+
+        // A DESCRIPTIVE branch the agent chose itself — the whole point. Nothing in the name
+        // identifies the agent, and the mapping is recorded anyway. Same `app_data` as above,
+        // because that is where the worktree this poll reads actually lives.
+        git(&info.path, &["checkout", "-b", "sparkle/left-pair"]).unwrap();
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        assert_eq!(
+            crate::pr_owner::resolve_owner(
+                &crate::pr_owner::load_store(&app_data),
+                "p",
+                806,
+                "sparkle/left-pair",
+                "",
+            )
+            .map(|o| o.agent_id),
+            Some("s1".to_string()),
+            "a branch with no agent id in its name must still be recorded",
+        );
+
+        // A DETACHED head names no branch — git reports the literal "HEAD" — so recording it would
+        // map every detached worktree in the project to whichever agent was polled last.
+        let head_sha = git(&info.path, &["rev-parse", "HEAD"]).unwrap();
+        git(&info.path, &["checkout", "--detach", head_sha.trim()]).unwrap();
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let branches = crate::pr_owner::load_store(&app_data).branches;
+        let recorded = branches.get("p").expect("the earlier polls recorded branches");
+        assert!(
+            !recorded.contains_key("HEAD"),
+            "a detached head must record nothing — got {:?}",
+            recorded.keys().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "exactly the two real branches, and no third entry from the detached poll",
+        );
+
+        for d in [&root, &app_data, &batch_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
     fn agent_branch_status_counts_ahead_behind_and_dirty() {
         let root = unique_root("status");
         let root_str = root.to_string_lossy().to_string();
@@ -7887,7 +8230,11 @@ mod tests {
 
         // A non-existent worktree path (the agent hasn't been created) — dirty must read clean, not error.
         let wt = root.join("nonexistent-wt");
-        let st = branch_status_with_base(&root_str, "s1", "main", &wt).unwrap();
+        // Ownership recording writes under app-data; give it a throwaway dir so the test doesn't
+        // touch the real store.
+        let owners = tempfile::tempdir().unwrap();
+        let st =
+            branch_status_with_base(&root_str, "p", "s1", "main", &wt, owners.path()).unwrap();
         assert_eq!(st.ahead, 0, "no ref ⇒ nothing ahead");
         assert_eq!(st.behind, 0, "no ref ⇒ nothing behind");
         assert!(!st.dirty, "no worktree ⇒ clean");
@@ -7936,7 +8283,8 @@ mod tests {
         );
 
         let wt = root.join("nonexistent-wt");
-        let st = branch_status_with_base(&root_str, "s1", ghost, &wt).unwrap();
+        let owners = tempfile::tempdir().unwrap();
+        let st = branch_status_with_base(&root_str, "p", "s1", ghost, &wt, owners.path()).unwrap();
         assert_eq!(st.ahead, total, "unresolvable base ⇒ ahead = the branch's own commits");
         assert_eq!(st.behind, 0, "unresolvable base ⇒ nothing to be behind");
         assert!(!st.dirty, "no worktree ⇒ clean");
@@ -8608,15 +8956,15 @@ mod tests {
     #[test]
     fn pr_create_args_guards_blank_target_and_defaults_title() {
         // Blank base would become `gh pr create --base ""` (opaque error) — reject early.
-        assert!(pr_create_args("sparkle/agent-x", "  ", "t").is_err());
+        assert!(pr_create_args("sparkle/agent-x", "  ", "t", "").is_err());
         // Title falls back to the branch name when blank.
-        let a = pr_create_args("sparkle/agent-x", "main", "  ").unwrap();
+        let a = pr_create_args("sparkle/agent-x", "main", "  ", "").unwrap();
         let joined = a.join(" ");
         assert!(joined.contains("--base main"));
         assert!(joined.contains("--head sparkle/agent-x"));
         assert!(joined.contains("--title sparkle/agent-x"), "blank title → branch name");
         // A real title is preserved (trimmed).
-        let b = pr_create_args("sparkle/agent-x", "main", " Ship it ").unwrap();
+        let b = pr_create_args("sparkle/agent-x", "main", " Ship it ", "").unwrap();
         assert!(b.join(" ").contains("--title Ship it"));
     }
 

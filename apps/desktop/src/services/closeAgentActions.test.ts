@@ -38,8 +38,8 @@ describe("shipAgent", () => {
   it("pushed → opens a PR and closes the bead (submitted for review)", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
     vi.mocked(branch.openAgentPr).mockResolvedValue("https://pr/1");
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
-    expect(branch.openAgentPr).toHaveBeenCalledWith("/r", "a", "main", "T");
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    expect(branch.openAgentPr).toHaveBeenCalledWith("/r", "p1", "a", "main", "T");
     expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-1");
     expect(branch.landAgentBranch).not.toHaveBeenCalled();
     expect(beads.markBeadDelivered).not.toHaveBeenCalled();
@@ -48,14 +48,14 @@ describe("shipAgent", () => {
   it("pushed but PR open FAILS (no gh/auth) → does NOT close the bead (not under review)", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
     vi.mocked(branch.openAgentPr).mockRejectedValue(new Error("gh: not found"));
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
     expect(beads.closeBead).not.toHaveBeenCalled();
   });
 
   it("no remote → lands locally, records the merge SHA, then marks the bead delivered", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main", mergeSha: "abc123" });
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
     expect(branch.landAgentBranch).toHaveBeenCalled();
     // The landed SHA is recorded (Task B) BEFORE delivered, so the monitor can test it for release
     // containment. Ordering matters: capture the commit before the bead moves.
@@ -70,7 +70,7 @@ describe("shipAgent", () => {
   it("no remote, land returns no SHA (older Rust) → still delivers; recordBeadMergeSha no-ops on undefined", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main" });
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
     // We still call through (the helper itself no-ops on a blank SHA — honesty lives in one place).
     expect(beads.recordBeadMergeSha).toHaveBeenCalledWith("/r", "bd-1", undefined);
     expect(beads.markBeadDelivered).toHaveBeenCalledWith("/r", "bd-1");
@@ -79,14 +79,14 @@ describe("shipAgent", () => {
   it("pushed (PR path) → never records a merge SHA (the GitHub merge is uncapturable here)", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
     vi.mocked(branch.openAgentPr).mockResolvedValue("https://pr/1");
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
     expect(beads.recordBeadMergeSha).not.toHaveBeenCalled();
   });
 
   it("no remote + land FAILS → does not touch the bead (work didn't land)", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: false, reason: "conflict", files: [] });
-    await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
+    await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T", beadId: "bd-1" });
     expect(beads.markBeadDelivered).not.toHaveBeenCalled();
     expect(beads.closeBead).not.toHaveBeenCalled();
   });
@@ -98,7 +98,7 @@ describe("shipAgent → ShipOutcome", () => {
   it("pushed + PR opened → kind 'pr-opened', carrying the PR url", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
     vi.mocked(branch.openAgentPr).mockResolvedValue("https://pr/7");
-    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    const r = await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T" });
     expect(r).toEqual({
       kind: "pr-opened",
       pushed: true,
@@ -111,7 +111,7 @@ describe("shipAgent → ShipOutcome", () => {
   it("pushed but `gh` failed → kind 'pushed-no-pr' with the reason (NOT a silent success)", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("pushed");
     vi.mocked(branch.openAgentPr).mockRejectedValue(new Error("gh: not found"));
-    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    const r = await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T" });
     expect(r).toMatchObject({ kind: "pushed-no-pr", pushed: true, prOpened: false, landed: false });
     expect(r.kind === "pushed-no-pr" && r.reason).toMatch(/gh: not found/);
   });
@@ -119,7 +119,7 @@ describe("shipAgent → ShipOutcome", () => {
   it("no remote + land ok → kind 'landed' with the merge SHA", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: true, target: "main", mergeSha: "abc123" });
-    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    const r = await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T" });
     expect(r).toEqual({
       kind: "landed",
       pushed: false,
@@ -132,7 +132,7 @@ describe("shipAgent → ShipOutcome", () => {
   it("no remote + land FAILED → kind 'land-failed' carrying git's reason", async () => {
     vi.mocked(branch.pushAgentBranch).mockResolvedValue("no-remote");
     vi.mocked(branch.landAgentBranch).mockResolvedValue({ ok: false, reason: "conflict", files: ["a.ts"] });
-    const r = await shipAgent({ root: "/r", agentId: "a", targetBranch: "main", prTitle: "T" });
+    const r = await shipAgent({ root: "/r", projectId: "p1", agentId: "a", targetBranch: "main", prTitle: "T" });
     expect(r).toMatchObject({ kind: "land-failed", pushed: false, prOpened: false, landed: false });
     expect(r.kind === "land-failed" && r.reason).toMatch(/conflict/);
   });

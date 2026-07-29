@@ -32,7 +32,8 @@ import { useMemo, useState } from "react";
 import type { Project } from "../types";
 import { ProjectTabs, type ProjectTabCounts } from "./ProjectTabs";
 import { TrialIndicator } from "./TrialChrome";
-import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
+import { OpenPrMenu, agentLinkForPr, type PrAgentLink } from "./OpenPrMenu";
+import type { PrRow } from "../services/openPrs";
 import { NewProjectDialog } from "./NewProjectDialog";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
@@ -235,8 +236,8 @@ export function ProjectTabsBar({
 
   // Open-PR menu (repo-scoped, agent-independent — a PR outlives the agent that opened it). Its
   // "open agent" lands through the one tab-select path, so a PR from another project switches tabs.
-  const resolveAgentForPr = (branch: string): PrAgentLink | null =>
-    agentLinkForBranch(branch, projects, selectedProjectId);
+  const resolveAgentForPr = (pr: PrRow): PrAgentLink | null =>
+    agentLinkForPr(pr, projects, selectedProjectId);
 
   // Pop the native folder picker, map the folder to an existing project (reuse) or a brand-new one
   // (created only on commit, so a cancelled picker adds nothing), then select its tab.
@@ -364,6 +365,7 @@ export function ProjectTabsBar({
             {project && (
               <OpenPrMenu
                 rootPath={project.rootPath ?? null}
+                projectId={project.id}
                 resolveAgent={resolveAgentForPr}
                 // A PR's agent may live in EITHER pair's project, so this one must NOT force the
                 // project into this strip — it routes by the existing assignment.

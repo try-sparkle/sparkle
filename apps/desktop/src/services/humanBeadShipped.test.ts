@@ -92,6 +92,7 @@ describe("human-filed bead → Build → land → Shipped (bead sparkle-0bhr)", 
     // 2. The human ships the orchestrator; no remote, so it lands locally.
     const outcome = await shipAgent({
       root: projects[0]!.rootPath,
+      projectId: projects[0]!.id,
       agentId,
       targetBranch: "main",
       prTitle: agent.epicId ?? "",
@@ -106,7 +107,7 @@ describe("human-filed bead → Build → land → Shipped (bead sparkle-0bhr)", 
   it("does not regress the AUTO path: an agent carrying an auto-created beadId still delivers on land", async () => {
     // The auto-lifecycle path already sets agent.beadId (buildAgentSpawn / syncBeadLifecycle); ship
     // still marks it delivered. Same shared shipAgent mechanism — this guards it stayed intact.
-    await shipAgent({ root: "/repo", agentId: "auto-agent", targetBranch: "main", prTitle: "T", beadId: "auto-9" });
+    await shipAgent({ root: "/repo", projectId: "p1", agentId: "auto-agent", targetBranch: "main", prTitle: "T", beadId: "auto-9" });
     expect(beads.markBeadDelivered).toHaveBeenCalledWith("/repo", "auto-9");
   });
 });

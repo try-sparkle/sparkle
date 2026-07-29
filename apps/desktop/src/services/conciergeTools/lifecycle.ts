@@ -729,6 +729,7 @@ export async function shipAgent(agentId: string): Promise<LifecycleResult<Shippe
   try {
     outcome = await shipAgentWork({
       root: project.rootPath,
+      projectId: project.id,
       agentId,
       targetBranch: project.defaultBranch ?? agent.baseBranch ?? "main",
       prTitle: agent.name,

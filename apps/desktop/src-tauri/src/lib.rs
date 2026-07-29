@@ -53,6 +53,7 @@ mod model;
 mod model_catalog;
 mod naming;
 mod onepassword;
+mod pr_owner;
 mod preflight;
 mod proc;
 mod project_window;
@@ -475,6 +476,7 @@ pub fn run() {
             worktree::project_open_pr_count,
             worktree::project_pr_list_url,
             worktree::project_open_prs,
+            worktree::pr_owner,
             worktree::merge_pr,
             worktree::land_agent_branch,
             worktree::push_agent_branch,

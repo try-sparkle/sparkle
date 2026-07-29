@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => h.invoke(...a) }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => h.openUrl(u) }));
 
-import { OpenPrMenu, agentLinkForBranch, type PrAgentLink } from "./OpenPrMenu";
+import { OpenPrMenu, agentLinkForBranch, agentLinkForPr, type PrAgentLink } from "./OpenPrMenu";
 import type { PrRow } from "../services/openPrs";
 import type { AgentTab, Project } from "../types";
 
@@ -54,7 +54,7 @@ const noop = () => {};
 describe("OpenPrMenu", () => {
   it("renders the count when PRs are waiting", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     await waitFor(() =>
       expect(screen.getByTestId("open-pr-badge").textContent).toContain("2 PRs waiting"),
     );
@@ -63,19 +63,19 @@ describe("OpenPrMenu", () => {
   it("renders NOTHING at a known-empty list, and NOTHING when the probe couldn't run", async () => {
     stubList([]);
     const { rerender } = render(
-      <OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />,
+      <OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />,
     );
     await waitFor(() => expect(h.invoke).toHaveBeenCalled());
     expect(screen.queryByTestId("open-pr-badge")).toBeNull();
 
     stubList(null);
-    rerender(<OpenPrMenu rootPath="/repo2" resolveAgent={noAgent} onOpenAgent={noop} />);
+    rerender(<OpenPrMenu rootPath="/repo2" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     await waitFor(() => expect(screen.queryByTestId("open-pr-badge")).toBeNull());
   });
 
   it("opens the dropdown and lists each PR", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     expect(await screen.findByTestId("merge-1")).toBeTruthy();
     expect(screen.getByTestId("merge-2")).toBeTruthy();
@@ -83,7 +83,7 @@ describe("OpenPrMenu", () => {
 
   it("gates merge on checks: a failing PR's Merge is disabled, a passing one's is enabled", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     expect((await screen.findByTestId("merge-1")).hasAttribute("disabled")).toBe(false);
     expect(screen.getByTestId("merge-2").hasAttribute("disabled")).toBe(true);
@@ -91,7 +91,7 @@ describe("OpenPrMenu", () => {
 
   it("merges a single PR through the Rust command", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>
@@ -101,7 +101,7 @@ describe("OpenPrMenu", () => {
 
   it("'Merge all ready' merges only the eligible PRs, skipping the failing one", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-all"));
     await waitFor(() =>
@@ -119,9 +119,9 @@ describe("OpenPrMenu", () => {
       projectId: "p1",
       isCurrentProject: true,
     };
-    const resolve = (branch: string) => (branch === PASS.headRefName ? link : null);
+    const resolve = (pr: PrRow) => (pr.headRefName === PASS.headRefName ? link : null);
     const onOpen = vi.fn();
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={resolve} onOpenAgent={onOpen} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={resolve} onOpenAgent={onOpen} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("open-agent-1"));
     expect(onOpen).toHaveBeenCalledWith(link);
@@ -226,7 +226,7 @@ function stubLayout(innerWidth: number) {
 async function openPanelAt(innerWidth: number) {
   const restore = stubLayout(innerWidth);
   stubList([PASS, FAILING]);
-  render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+  render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
   fireEvent.click(await screen.findByTestId("open-pr-badge"));
   const panel = await screen.findByTestId("open-pr-panel");
   return { panel, rect: panel.getBoundingClientRect(), restore };
@@ -235,7 +235,7 @@ async function openPanelAt(innerWidth: number) {
 describe("OpenPrMenu (containment — §12a)", () => {
   it("anchors the panel to the badge's RIGHT edge, never its left", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.right).toBe("0px");
@@ -249,7 +249,7 @@ describe("OpenPrMenu (containment — §12a)", () => {
   // tested it (roborev 53787).
   it("clamps BOTH min-width and max-width to the viewport", async () => {
     stubList([PASS]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.minWidth).toBe("min(340px, calc(100vw - 16px))");
@@ -295,7 +295,7 @@ describe("OpenPrMenu (containment — §12a)", () => {
 
   it("stays scrollable at small window heights (the list can never outgrow the window)", async () => {
     stubList([PASS, FAILING]);
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     const panel = await screen.findByTestId("open-pr-panel");
     expect(panel.style.overflowY).toBe("auto");
@@ -357,6 +357,81 @@ describe("agentLinkForBranch", () => {
   });
 });
 
+describe("agentLinkForPr", () => {
+  const agent = (over: Partial<AgentTab> & { id: string }): AgentTab =>
+    ({ kind: "build", parentId: null, name: over.id, branch: null, ...over }) as AgentTab;
+  const project = (id: string, agents: AgentTab[]): Project =>
+    ({ id, name: id, rootPath: `/${id}`, createdAt: "2026-01-01T00:00:00Z", agents }) as Project;
+  const pr = (over: Partial<PrRow>): PrRow => ({ ...PASS, ...over });
+
+  it("resolves a PR on a DESCRIPTIVE branch — no agent id in the name — from the recorded owner", () => {
+    // THE HEADLINE CASE. `sparkle/left-pair` (#806) has no id to parse, so the branch-name join
+    // below can never answer it; the durable `agentId` can, and that is the whole point of recording
+    // the mapping instead of re-deriving it from a string.
+    const projects = [
+      project("p1", [agent({ id: "cockpit", branch: "sparkle/left-pair", name: "Left Pair" })]),
+    ];
+    const row = pr({ number: 806, headRefName: "sparkle/left-pair", agentId: "cockpit" });
+    expect(agentLinkForPr(row, projects, "p1")).toEqual({
+      agentId: "cockpit",
+      agentName: "Left Pair",
+      projectId: "p1",
+      isCurrentProject: true,
+    });
+    // Prove the branch name is doing NO work: the same recorded owner still resolves when the
+    // branch has been renamed to something the roster join cannot match at all.
+    const renamed = pr({ number: 806, headRefName: "totally/unrelated", agentId: "cockpit" });
+    expect(agentLinkForPr(renamed, projects, "p1")?.agentId).toBe("cockpit");
+  });
+
+  it("prefers the recorded owner over the branch join when the two disagree", () => {
+    // A branch can be handed between agents; the recorded owner is who OPENED the PR, and it wins.
+    const projects = [
+      project("p1", [
+        agent({ id: "opener", branch: "some/other-branch", name: "Opener" }),
+        agent({ id: "squatter", branch: "shared/branch", name: "Squatter" }),
+      ]),
+    ];
+    const row = pr({ headRefName: "shared/branch", agentId: "opener" });
+    expect(agentLinkForPr(row, projects, "p1")?.agentId).toBe("opener");
+  });
+
+  it("falls back to the branch join for a PR recorded before the mapping existed", () => {
+    const projects = [
+      project("p1", [agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" })]),
+    ];
+    const row = pr({ headRefName: "sparkle/agent-a", agentId: null });
+    expect(agentLinkForPr(row, projects, "p1")?.agentId).toBe("a");
+  });
+
+  it("returns null rather than the nearest plausible agent when nothing matches", () => {
+    // A link is only useful if it OPENS the agent it names. A recorded id for an agent that has left
+    // the roster, and a PR nothing identifies at all, must both be null — never a neighbour's id.
+    const projects = [
+      project("p1", [agent({ id: "a", branch: "sparkle/agent-a", name: "Alpha" })]),
+    ];
+    expect(agentLinkForPr(pr({ headRefName: "sparkle/left-pair", agentId: "gone" }), projects, "p1"))
+      .toBeNull();
+    expect(agentLinkForPr(pr({ headRefName: "sparkle/left-pair", agentId: null }), projects, "p1"))
+      .toBeNull();
+  });
+
+  it("a KNOWN owner that left the roster is null — it never falls through to the branch join", () => {
+    // roborev 55253. The branch here DOES match a live agent, so the fallback would happily return
+    // "Squatter" — an agent we already know did not open the PR. "The owner left" and "nobody
+    // recorded an owner" are different facts, and re-attributing the first by branch name is exactly
+    // the wrong-pill failure the durable mapping exists to prevent.
+    const projects = [
+      project("p1", [agent({ id: "squatter", branch: "shared/branch", name: "Squatter" })]),
+    ];
+    const row = pr({ headRefName: "shared/branch", agentId: "departed" });
+    expect(agentLinkForPr(row, projects, "p1")).toBeNull();
+    // …and the same row with NO recorded owner does use the join, which is what makes the case above
+    // a real divergence rather than a branch that simply never matched.
+    expect(agentLinkForPr({ ...row, agentId: null }, projects, "p1")?.agentId).toBe("squatter");
+  });
+});
+
 describe("OpenPrMenu (merge error surfacing)", () => {
   it("surfaces the gh error text when a merge is declined", async () => {
     h.invoke.mockImplementation((cmd: string) => {
@@ -364,7 +439,7 @@ describe("OpenPrMenu (merge error surfacing)", () => {
       if (cmd === "merge_pr") return Promise.reject(new Error("required status check is pending"));
       return Promise.resolve(null);
     });
-    render(<OpenPrMenu rootPath="/repo" resolveAgent={noAgent} onOpenAgent={noop} />);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
     fireEvent.click(await screen.findByTestId("open-pr-badge"));
     fireEvent.click(await screen.findByTestId("merge-1"));
     await waitFor(() =>

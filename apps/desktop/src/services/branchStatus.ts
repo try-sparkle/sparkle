@@ -173,14 +173,19 @@ export function deleteAgentBranchIfMerged(
 }
 
 /** Open a GitHub PR for an agent's branch (close-agent Ship). Resolves the PR URL; rejects when gh
- *  is missing/unauthed, there's no remote, or a PR already exists. Push first. */
+ *  is missing/unauthed, there's no remote, or a PR already exists. Push first.
+ *
+ *  `projectId` is what makes the resulting PR resolvable back to this agent later: Rust records the
+ *  (project, PR number) → agent mapping the moment `gh` returns a URL, and embeds the same pair as a
+ *  marker in the PR body. Without it the PR would be owner-less the instant its branch is renamed. */
 export function openAgentPr(
   root: string,
+  projectId: string,
   agentId: string,
   targetBranch: string,
   title: string,
 ): Promise<string> {
-  return invoke<string>("open_agent_pr", { root, agentId, targetBranch, title });
+  return invoke<string>("open_agent_pr", { root, projectId, agentId, targetBranch, title });
 }
 
 export type RefreshResult =

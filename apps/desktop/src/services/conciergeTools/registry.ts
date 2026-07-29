@@ -115,6 +115,7 @@ import {
   prChecksStatusTool,
   projectAgentsStatusTool,
   projectOpenPrsTool,
+  prOwnerTool,
   pushAgentBranchTool,
   refreshAgentBranchTool,
   type AgentWorkflowContext,
@@ -803,11 +804,18 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
     ),
   ),
   project_open_prs: route(projectOnly, (a, ctx) =>
-    withProject(ctx, a.projectId, async (p) => fromWorkflow(ctx, await projectOpenPrsTool(p.rootPath))),
+    withProject(ctx, a.projectId, async (p) =>
+      fromWorkflow(ctx, await projectOpenPrsTool(p.rootPath, p.id)),
+    ),
+  ),
+  pr_owner: route(prNumberArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromWorkflow(ctx, await prOwnerTool(p.rootPath, p.id, a.number)),
+    ),
   ),
   pr_checks_status: route(prNumberArgs, (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
-      fromWorkflow(ctx, await prChecksStatusTool(p.rootPath, a.number)),
+      fromWorkflow(ctx, await prChecksStatusTool(p.rootPath, p.id, a.number)),
     ),
   ),
   agent_landed_check: route(agentOnly, (a, ctx) =>
@@ -835,6 +843,7 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
         ctx,
         await mergePrTool({
           root: p.rootPath,
+          projectId: p.id,
           number: a.number,
           // Forwarded so mergePrTool's runtime backstop — not this schema — is what refuses them.
           ...(a.method !== undefined ? { method: a.method as "merge" } : {}),

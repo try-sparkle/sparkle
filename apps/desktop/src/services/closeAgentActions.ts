@@ -14,6 +14,9 @@ import { removeAgentWorkspace } from "./worktree";
 
 export interface ShipParams {
   root: string;
+  /** Scopes the durable PR→agent record written when the PR opens, so the PR stays resolvable to
+   *  this agent no matter what its branch is called (or is later renamed to). */
+  projectId: string;
   agentId: string;
   targetBranch: string;
   prTitle: string;
@@ -80,7 +83,7 @@ export async function shipAgent(p: ShipParams): Promise<ShipOutcome> {
   // so that rare case leaves the bead in_progress rather than falsely-closed — under-report, not
   // over-report.) The branch is safe on the remote either way, so the caller still tears the agent
   // down — but it is told `prOpened: false` so it doesn't announce a review that isn't happening.
-  const pr = await openAgentPr(p.root, p.agentId, p.targetBranch, p.prTitle)
+  const pr = await openAgentPr(p.root, p.projectId, p.agentId, p.targetBranch, p.prTitle)
     .then((url) => ({ ok: true as const, url }))
     .catch((e: unknown) => ({ ok: false as const, reason: e instanceof Error ? e.message : String(e) }));
   if (!pr.ok) {

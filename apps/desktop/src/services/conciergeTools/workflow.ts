@@ -64,7 +64,13 @@ import {
   type BranchStatus,
   type WorkflowState,
 } from "../branchStatus";
-import { fetchOpenPrs, mergePr, prMergeEligibility, type PrRow } from "../openPrs";
+import {
+  fetchOpenPrs,
+  fetchPrOwner,
+  mergePr,
+  prMergeEligibility,
+  type PrRow,
+} from "../openPrs";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { hasTurnEndAuthority, isTracked } from "../../engine/turnEndAuthority";
@@ -81,6 +87,7 @@ export type WorkflowOperation =
   | "agent_workflow_state"
   | "project_agents_status"
   | "project_open_prs"
+  | "pr_owner"
   | "pr_checks_status"
   | "agent_landed_check"
   // mutating
@@ -134,6 +141,21 @@ const PR_SCOPE =
   "only the PRs authored by the signed-in `gh` identity (`--author @me`), first 100 by recency";
 
 /**
+ * HOW TO READ `agentId`, in the words the model is given.
+ *
+ * The concierge is required to attach the owning build agent to every PR it mentions rather than
+ * cite a bare number. `agentId` is the DURABLE answer to that — recorded when the PR is opened, not
+ * parsed out of the branch name — so it is right even for a PR on a descriptive branch like
+ * `sparkle/left-pair`, which carries no id at all.
+ *
+ * The half that matters more is the null case. A pill pointing at the wrong agent opens the wrong
+ * agent and the user cannot tell; "unresolved" costs them one question. So the instruction is
+ * explicit that null means unknown and must never be filled in by inference.
+ */
+const PR_OWNERSHIP_NOTE =
+  "`agentId` is the agent that opened the PR, from a durable recorded mapping — it is correct even when the branch name contains no agent id. A null `agentId` means UNKNOWN, not \"no agent\": say the owner is unresolved. Do NOT infer an owner from the branch name, the title, or which agent seems likely — a pill carrying the wrong id opens the wrong agent, which is worse than no pill.";
+
+/**
  * THE risk map — an exhaustive `Record` over `WorkflowOperation`, which is the point: adding an
  * operation to the union without classifying it here is a TYPECHECK FAILURE, not a code review
  * question. A separate policy layer consumes this; the guarantee this module owes it is that the
@@ -161,6 +183,13 @@ export const WORKFLOW_RISK: Record<WorkflowOperation, WorkflowRiskProfile> = {
   project_open_prs: {
     risk: "read-only",
     summary: `List the open pull requests waiting in the project's repo — ${PR_SCOPE}.`,
+    requiresConfirmation: false,
+    undo: null,
+  },
+  pr_owner: {
+    risk: "read-only",
+    summary:
+      "Name the agent that opened a PR, by number — the durable mapping, not a branch-name guess. Answers null when unknown.",
     requiresConfirmation: false,
     undo: null,
   },
@@ -230,6 +259,7 @@ export const WORKFLOW_OPERATIONS = [
   "agent_workflow_state",
   "project_agents_status",
   "project_open_prs",
+  "pr_owner",
   "pr_checks_status",
   "agent_landed_check",
   "refresh_agent_branch",
@@ -632,7 +662,7 @@ export async function openAgentPrTool(
   const t = (title || "").trim();
   if (!t) return refused(op, "invalid-request", "Refused: a PR needs a title. Say what the work does.");
   try {
-    const url = await openAgentPr(ctx.root, ctx.agentId, target, t);
+    const url = await openAgentPr(ctx.root, ctx.projectId, ctx.agentId, target, t);
     return ok(op, { url, target, title: t });
   } catch (e) {
     const msg = errText(e);
@@ -665,6 +695,8 @@ export interface MergePrRequest {
    * is the model's word — and this operation is `mutates-main`.
    */
   root: string;
+  /** Scopes the PR→agent ownership lookup that annotates the probe. Same project as `root`. */
+  projectId: string;
   number: number;
   /** The only merge method Sparkle allows. Optional, and if given it must be exactly "merge". */
   method?: "merge";
@@ -709,7 +741,7 @@ export async function mergePrTool(
 
   let rows: PrRow[] | null;
   try {
-    rows = await fetchOpenPrs(req.root);
+    rows = await fetchOpenPrs(req.root, req.projectId);
   } catch (e) {
     return failed(op, "probe-failed", errText(e));
   }
@@ -893,14 +925,59 @@ export async function projectAgentsStatusTool(
  */
 export async function projectOpenPrsTool(
   root: string,
-): Promise<WorkflowResult<{ prs: PrRow[]; scope: string }>> {
+  projectId: string,
+): Promise<WorkflowResult<{ prs: PrRow[]; scope: string; ownership: string }>> {
   const op = "project_open_prs";
   if (!isRegisteredRoot(root)) return refused(op, "invalid-request", UNKNOWN_ROOT_MSG(root));
   try {
-    const rows = await fetchOpenPrs(root);
+    const rows = await fetchOpenPrs(root, projectId);
     if (rows === null)
       return failed(op, "probe-failed", "Could not read the repo's open PRs (no gh, unauthed, offline, or no remote). This is NOT the same as there being none.");
-    return ok(op, { prs: rows, scope: `This list covers ${PR_SCOPE}. Other people's open PRs are not in it, so it is not evidence the repo has none.` });
+    return ok(op, {
+      prs: rows,
+      scope: `This list covers ${PR_SCOPE}. Other people's open PRs are not in it, so it is not evidence the repo has none.`,
+      ownership: PR_OWNERSHIP_NOTE,
+    });
+  } catch (e) {
+    return failed(op, "probe-failed", errText(e));
+  }
+}
+
+/** What `pr_owner` answers with. Mirrors the Rust `PrOwnerAnswer`. */
+export interface PrOwnerResult {
+  number: number;
+  /** The owning agent, or null for UNKNOWN — never a guess. */
+  agentId: string | null;
+  /** How the answer was reached: "created" | "pr-body" | "worktree-branch" | "branch-name". */
+  source: string | null;
+  branch: string | null;
+  /** Why there is no owner. Null when there is one. */
+  reason: string | null;
+  ownership: string;
+}
+
+/**
+ * Which agent owns PR `number` — the lookup for a PR `project_open_prs` did NOT list (someone
+ * else's, or past the 100-row cap), so the concierge can still name an owner instead of citing a
+ * bare number.
+ *
+ * Answers from the durable store first, so a PR this app opened resolves without a network round
+ * trip; only an unknown PR costs a `gh pr view`. An unresolvable owner is a SUCCESS with
+ * `agentId: null` and a reason, not a failure — "I could not find out" is a real answer and the
+ * caller must be able to say it.
+ */
+export async function prOwnerTool(
+  root: string,
+  projectId: string,
+  number: number,
+): Promise<WorkflowResult<PrOwnerResult>> {
+  const op = "pr_owner";
+  if (!isRegisteredRoot(root)) return refused(op, "invalid-request", UNKNOWN_ROOT_MSG(root));
+  if (!Number.isInteger(number) || number <= 0)
+    return refused(op, "invalid-request", "Refused: a PR number is required.");
+  try {
+    const a = await fetchPrOwner(root, projectId, number);
+    return ok(op, { ...a, ownership: PR_OWNERSHIP_NOTE });
   } catch (e) {
     return failed(op, "probe-failed", errText(e));
   }
@@ -937,12 +1014,13 @@ export interface PrChecksStatus {
  */
 export async function prChecksStatusTool(
   root: string,
+  projectId: string,
   number: number,
 ): Promise<WorkflowResult<PrChecksStatus>> {
   const op = "pr_checks_status";
   if (!isRegisteredRoot(root)) return refused(op, "invalid-request", UNKNOWN_ROOT_MSG(root));
   try {
-    const rows = await fetchOpenPrs(root);
+    const rows = await fetchOpenPrs(root, projectId);
     if (rows === null)
       return failed(op, "probe-failed", "Could not read the repo's PRs (no gh, unauthed, offline, or no remote), so the checks are unknown.");
     const pr = rows.find((r) => r.number === number);

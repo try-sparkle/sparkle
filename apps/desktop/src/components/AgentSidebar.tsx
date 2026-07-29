@@ -872,6 +872,7 @@ export function AgentSidebar({
     try {
       outcome = await shipAgent({
         root: project.rootPath,
+        projectId: project.id,
         agentId: id,
         targetBranch: target,
         prTitle: agent?.name ?? "",

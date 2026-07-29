@@ -13,8 +13,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** One open PR as surfaced to the TopBar PR menu. Mirrors the Rust `PrRow` (camelCase). `checks` is
  *  the aggregate CI rollup and `mergeable` is GitHub's async-computed conflict state; together they
- *  drive `prMergeEligibility`. `headRefName` is what joins a PR back to the agent that opened it
- *  (`sparkle/agent-<id>`). */
+ *  drive `prMergeEligibility`. */
 export interface PrRow {
   number: number;
   title: string;
@@ -22,21 +21,62 @@ export interface PrRow {
   url: string;
   checks: "passing" | "pending" | "failing" | "none";
   mergeable: "mergeable" | "conflicting" | "unknown";
+  /**
+   * The agent that opened this PR, from the DURABLE mapping Rust's `pr_owner` keeps — or `null`
+   * when nothing identifies it.
+   *
+   * This is what makes a PR clickable back to its owner regardless of what the branch is called.
+   * It used to be derived by parsing `sparkle/agent-<id>` out of `headRefName`, which meant the
+   * PRs most worth clicking into — the ones on descriptive branches like `sparkle/left-pair` —
+   * resolved to nothing at all.
+   *
+   * NEVER infer a value for this. A pill carrying the wrong agent id opens the wrong agent, which
+   * is strictly worse than no pill: the user cannot tell it went astray. `null` means "unknown",
+   * not "no agent". Optional in the type so a Rust build predating the field reads as undefined.
+   */
+  agentId?: string | null;
+  /** Which `pr_owner` source produced `agentId` ("created" | "pr-body" | "worktree-branch" |
+   *  "branch-name"); absent alongside a null owner. */
+  agentIdSource?: string | null;
 }
 
 /** The open PRs waiting in `root`'s repo, or null when it could not be determined (no `gh`, unauthed,
  *  offline, no remote, timeout). Null is NOT an empty list — the menu renders nothing for both, but
- *  a confident "no PRs" on a failed probe is exactly the false reassurance to avoid. */
-export async function fetchOpenPrs(root: string): Promise<PrRow[] | null> {
+ *  a confident "no PRs" on a failed probe is exactly the false reassurance to avoid.
+ *
+ *  `projectId` scopes the ownership lookup (and its backfill), which is keyed per project so an
+ *  agent id can never resolve into a project the user isn't looking at. */
+export async function fetchOpenPrs(root: string, projectId: string): Promise<PrRow[] | null> {
   if (!root) return null;
   try {
-    const rows = await invoke<PrRow[] | null>("project_open_prs", { root });
+    const rows = await invoke<PrRow[] | null>("project_open_prs", { root, projectId });
     return Array.isArray(rows) ? rows : null;
   } catch {
     // Best-effort by design: a probe failure must never surface as an error toast. The menu simply
     // doesn't render, which is honest — we don't know.
     return null;
   }
+}
+
+/** Who owns a PR, for one `fetchOpenPrs` could not list (someone else's, or past the 100-row cap).
+ *  Mirrors the Rust `PrOwnerAnswer`: an unknown owner is `agentId: null` WITH a `reason`, never a
+ *  guess, so a caller can say "unresolved" instead of pointing at the wrong agent. */
+export interface PrOwnerAnswer {
+  number: number;
+  agentId: string | null;
+  source: string | null;
+  branch: string | null;
+  reason: string | null;
+}
+
+/** Resolve one PR's owning agent by number. Rejects only on an IPC failure — an unresolvable owner
+ *  is a successful answer with `agentId: null`. */
+export function fetchPrOwner(
+  root: string,
+  projectId: string,
+  number: number,
+): Promise<PrOwnerAnswer> {
+  return invoke<PrOwnerAnswer>("pr_owner", { root, projectId, number });
 }
 
 /** Ask GitHub to merge PR `number` with a MERGE COMMIT (the Rust `merge_pr` command). Rejects with

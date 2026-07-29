@@ -13,6 +13,7 @@ const m = vi.hoisted(() => ({
   agentWorkflowState: vi.fn(),
   projectAgentsStatus: vi.fn(),
   fetchOpenPrs: vi.fn(),
+  fetchPrOwner: vi.fn(),
   mergePr: vi.fn(),
   statuses: {} as Record<string, string>,
   projects: [] as Array<{ rootPath: string }>,
@@ -32,7 +33,12 @@ vi.mock("../branchStatus", () => ({
 
 vi.mock("../openPrs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../openPrs")>();
-  return { ...actual, fetchOpenPrs: m.fetchOpenPrs, mergePr: m.mergePr };
+  return {
+    ...actual,
+    fetchOpenPrs: m.fetchOpenPrs,
+    fetchPrOwner: m.fetchPrOwner,
+    mergePr: m.mergePr,
+  };
 });
 
 // The busy gate reads LIVE status from the store rather than trusting a caller-supplied flag —
@@ -64,6 +70,7 @@ import {
   agentWorkflowStateTool,
   projectAgentsStatusTool,
   projectOpenPrsTool,
+  prOwnerTool,
   prChecksStatusTool,
   agentLandedCheckTool,
   type AgentWorkflowContext,
@@ -492,7 +499,7 @@ describe("open_agent_pr", () => {
       risk: "outward-facing",
       data: { url: "https://github.com/o/r/pull/7", target: "main", title: "Do the thing" },
     });
-    expect(m.openAgentPr).toHaveBeenCalledWith("/repo", "a1", "main", "Do the thing");
+    expect(m.openAgentPr).toHaveBeenCalledWith("/repo", "p1", "a1", "main", "Do the thing");
   });
 
   it("refuses a blank title instead of opening a nameless PR", async () => {
@@ -534,7 +541,7 @@ describe("merge_pr", () => {
     // is off, so gh merges IMMEDIATELY with checks pending). The type forbids both; this is the
     // runtime backstop for the unstructured JSON an LLM sends.
     for (const bad of [{ method: "squash" }, { method: "rebase" }, { auto: true }, { squash: true }]) {
-      const r = await mergePrTool({ root: "/repo", number: 7, ...bad } as never);
+      const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 7, ...bad } as never);
       expect(r).toMatchObject({ ok: false, kind: "refused", code: "invalid-request" });
     }
     expect(m.mergePr).not.toHaveBeenCalled();
@@ -544,7 +551,7 @@ describe("merge_pr", () => {
   it("merges with a MERGE COMMIT once checks are green", async () => {
     m.fetchOpenPrs.mockResolvedValue([openPr]);
     m.mergePr.mockResolvedValue(undefined);
-    const r = await mergePrTool({ root: "/repo", number: 7 });
+    const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 7 });
     expect(r).toEqual({
       ok: true,
       op: "merge_pr",
@@ -561,7 +568,7 @@ describe("merge_pr", () => {
       { ...openPr, mergeable: "conflicting" as const },
     ]) {
       m.fetchOpenPrs.mockResolvedValue([row]);
-      expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+      expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
         kind: "refused",
         code: "checks-blocked",
       });
@@ -571,13 +578,13 @@ describe("merge_pr", () => {
 
   it("refuses to merge blind when the PR probe could not answer", async () => {
     m.fetchOpenPrs.mockResolvedValue(null);
-    expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
       kind: "refused",
       code: "checks-unknown",
     });
 
     m.fetchOpenPrs.mockResolvedValue([{ ...openPr, number: 9 }]);
-    expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
       kind: "refused",
       code: "pr-not-found",
     });
@@ -587,13 +594,13 @@ describe("merge_pr", () => {
   it("reports gh's own refusal when the merge itself fails", async () => {
     m.fetchOpenPrs.mockResolvedValue([openPr]);
     m.mergePr.mockRejectedValue("Pull request is not mergeable: the merge commit cannot be cleanly created");
-    expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
       kind: "failed",
       code: "conflict",
     });
 
     m.mergePr.mockRejectedValue("GraphQL: Required status checks have not passed");
-    expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
       kind: "failed",
       code: "checks-blocked",
     });
@@ -777,7 +784,7 @@ describe("pr_checks_status", () => {
         mergeable: "unknown" as const,
       },
     ]);
-    const r = await prChecksStatusTool("/repo", 7);
+    const r = await prChecksStatusTool("/repo", "p1", 7);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.data.stepsExecuted).toBeNull();
@@ -797,13 +804,13 @@ describe("pr_checks_status", () => {
         mergeable: "mergeable" as const,
       },
     ]);
-    const r = await prChecksStatusTool("/repo", 7);
+    const r = await prChecksStatusTool("/repo", "p1", 7);
     if (r.ok) expect(r.data.ambiguity).toBeNull();
   });
 
   it("fails honestly when the probe cannot answer", async () => {
     m.fetchOpenPrs.mockResolvedValue(null);
-    expect(await prChecksStatusTool("/repo", 7)).toMatchObject({ kind: "failed", code: "probe-failed" });
+    expect(await prChecksStatusTool("/repo", "p1", 7)).toMatchObject({ kind: "failed", code: "probe-failed" });
   });
 });
 
@@ -829,18 +836,96 @@ describe("read-only passthroughs", () => {
 
   it("tells 'no open PRs' apart from 'could not look'", async () => {
     m.fetchOpenPrs.mockResolvedValue([]);
-    const empty = await projectOpenPrsTool("/repo");
+    const empty = await projectOpenPrsTool("/repo", "p1");
     expect(empty).toMatchObject({ ok: true });
     if (empty.ok) expect(empty.data.prs).toEqual([]);
 
     m.fetchOpenPrs.mockResolvedValue(null);
-    expect(await projectOpenPrsTool("/repo")).toMatchObject({ kind: "failed", code: "probe-failed" });
+    expect(await projectOpenPrsTool("/repo", "p1")).toMatchObject({ kind: "failed", code: "probe-failed" });
   });
 
   it("surfaces an unexpected read failure as a typed result instead of throwing", async () => {
     m.agentBranchStatus.mockRejectedValue("boom");
     const r = await agentBranchStatusTool(build);
     expect(r).toMatchObject({ ok: false, kind: "failed", code: "unknown-error" });
+  });
+});
+
+// The concierge must attach the OWNING AGENT to every PR it names, so the human can click through
+// instead of decoding a bare "#806". These cover the two halves of that contract: the id has to
+// reach the model, and an unknown owner has to stay unknown.
+describe("PR ownership reaches the model, and null stays null", () => {
+  /** A path the human never added as a project — the root guard must reject it before any probe. */
+  const unregistered = "/tmp/somebody-elses-repo";
+  const row = (over: Record<string, unknown>) => ({
+    number: 806,
+    title: "the cockpit work",
+    headRefName: "sparkle/left-pair",
+    url: "https://github.com/o/r/pull/806",
+    checks: "passing" as const,
+    mergeable: "mergeable" as const,
+    ...over,
+  });
+
+  it("passes the project id to the probe and carries agentId through for a descriptive branch", async () => {
+    // `sparkle/left-pair` has no agent id to parse. Before the durable mapping the concierge could
+    // only say "owner unresolved" for exactly the PRs most worth clicking into.
+    m.fetchOpenPrs.mockResolvedValue([row({ agentId: "cockpit", agentIdSource: "created" })]);
+    const r = await projectOpenPrsTool("/repo", "p1");
+    // The lookup is per-project; a probe called without it silently loses every owner.
+    expect(m.fetchOpenPrs).toHaveBeenCalledWith("/repo", "p1");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.prs[0]!.agentId).toBe("cockpit");
+      expect(r.data.ownership).toMatch(/null .*means UNKNOWN|UNKNOWN, not/i);
+    }
+  });
+
+  it("hands the model a null owner UNCHANGED, with the do-not-guess instruction attached", async () => {
+    m.fetchOpenPrs.mockResolvedValue([row({ number: 802, agentId: null })]);
+    const r = await projectOpenPrsTool("/repo", "p1");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.prs[0]!.agentId).toBeNull();
+      // The instruction is the guard: a model that fills a null in from the branch name sends the
+      // human to the wrong agent, which is worse than telling them it is unresolved.
+      expect(r.data.ownership).toMatch(/do not infer|Do NOT infer/i);
+    }
+  });
+
+  it("pr_owner answers by number for a PR the list cannot see, and refuses a bad one", async () => {
+    m.fetchPrOwner.mockResolvedValue({
+      number: 806,
+      agentId: "cockpit",
+      source: "created",
+      branch: "sparkle/left-pair",
+      reason: null,
+    });
+    const r = await prOwnerTool("/repo", "p1", 806);
+    expect(m.fetchPrOwner).toHaveBeenCalledWith("/repo", "p1", 806);
+    expect(r).toMatchObject({ ok: true, data: { agentId: "cockpit", source: "created" } });
+
+    // An unresolvable owner is a SUCCESS carrying null + a reason — not a failure. The caller has to
+    // be able to say "unresolved" out loud rather than treat it as a broken probe.
+    m.fetchPrOwner.mockResolvedValue({
+      number: 802,
+      agentId: null,
+      source: null,
+      branch: "sparkle/router-skip-doomed-classify",
+      reason: "No ownership record for PR #802 ... do not guess an owner.",
+    });
+    const unknown = await prOwnerTool("/repo", "p1", 802);
+    expect(unknown.ok).toBe(true);
+    if (unknown.ok) {
+      expect(unknown.data.agentId).toBeNull();
+      expect(unknown.data.reason).toMatch(/do not guess/i);
+    }
+
+    // Guards that come BEFORE the probe: an unregistered root and a nonsense number never reach gh.
+    m.fetchPrOwner.mockClear();
+    expect(await prOwnerTool(unregistered, "p1", 7)).toMatchObject({ ok: false, code: "invalid-request" });
+    expect(await prOwnerTool("/repo", "p1", 0)).toMatchObject({ ok: false, code: "invalid-request" });
+    expect(m.fetchPrOwner).not.toHaveBeenCalled();
   });
 });
 
@@ -860,7 +945,7 @@ describe("the PR probe's scope is stated, not implied", () => {
   // makes the concierge say "no PRs are waiting" for a repo full of other people's PRs.
   it("says whose PRs, and how many, the list actually covers", async () => {
     m.fetchOpenPrs.mockResolvedValue([]);
-    const r = await projectOpenPrsTool("/repo");
+    const r = await projectOpenPrsTool("/repo", "p1");
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.data.scope).toMatch(/authored|@me/i);
     if (r.ok) expect(r.data.scope).toMatch(/100/);
@@ -868,11 +953,11 @@ describe("the PR probe's scope is stated, not implied", () => {
 
   it("does not call someone else's open PR 'merged or closed'", async () => {
     m.fetchOpenPrs.mockResolvedValue([{ ...row, number: 9 }]);
-    const merge = await mergePrTool({ root: "/repo", number: 7 });
+    const merge = await mergePrTool({ root: "/repo", projectId: "p1", number: 7 });
     expect(merge).toMatchObject({ kind: "refused", code: "pr-not-found" });
     if (!merge.ok) expect(merge.message).toMatch(/authored|@me/i);
 
-    const checks = await prChecksStatusTool("/repo", 7);
+    const checks = await prChecksStatusTool("/repo", "p1", 7);
     expect(checks).toMatchObject({ code: "pr-not-found" });
     if (!checks.ok) expect(checks.message).toMatch(/authored|@me/i);
   });
@@ -891,15 +976,15 @@ describe("a model-supplied root is checked against the projects the human added"
   const foreign = "/tmp/somebody-elses-repo";
 
   it("refuses merge_pr against an unregistered root, without touching gh", async () => {
-    const r = await mergePrTool({ root: foreign, number: 7 });
+    const r = await mergePrTool({ root: foreign, projectId: "p1", number: 7 });
     expect(r).toMatchObject({ ok: false, kind: "refused", code: "invalid-request" });
     expect(m.fetchOpenPrs).not.toHaveBeenCalled();
     expect(m.mergePr).not.toHaveBeenCalled();
   });
 
   it("refuses the read-only probes against an unregistered root too", async () => {
-    expect(await projectOpenPrsTool(foreign)).toMatchObject({ ok: false, code: "invalid-request" });
-    expect(await prChecksStatusTool(foreign, 7)).toMatchObject({ ok: false, code: "invalid-request" });
+    expect(await projectOpenPrsTool(foreign, "p1")).toMatchObject({ ok: false, code: "invalid-request" });
+    expect(await prChecksStatusTool(foreign, "p1", 7)).toMatchObject({ ok: false, code: "invalid-request" });
     expect(await projectAgentsStatusTool(foreign, "p1", [], false)).toMatchObject({
       ok: false,
       code: "invalid-request",
@@ -910,12 +995,12 @@ describe("a model-supplied root is checked against the projects the human added"
 
   it("accepts a registered root, trailing slash and all", async () => {
     m.fetchOpenPrs.mockResolvedValue([]);
-    expect(await projectOpenPrsTool("/repo/")).toMatchObject({ ok: true });
+    expect(await projectOpenPrsTool("/repo/", "p1")).toMatchObject({ ok: true });
   });
 
   it("refuses everything when the project list cannot be read — fails CLOSED", async () => {
     m.projects.length = 0;
-    expect(await mergePrTool({ root: "/repo", number: 7 })).toMatchObject({
+    expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({
       ok: false,
       code: "invalid-request",
     });

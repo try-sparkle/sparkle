@@ -143,6 +143,7 @@ const WORKFLOW_PHRASES: Record<WorkflowOperation, OpPhrase> = {
   // `indefinite`. A template that spelled it out read "Checking PR the PR's checks" the moment the
   // number was missing.
   pr_checks_status: phrase("Checking %s's checks", "Checked %s's checks", PR),
+  pr_owner: phrase("Working out who owns %s", "Worked out who owns %s", PR),
   agent_landed_check: phrase("Checking whether %s's work landed", "Checked whether %s's work landed", AGENT),
   refresh_agent_branch: phrase("Refreshing %s's branch", "Refreshed %s's branch", AGENT),
   land_agent_branch: phrase("Landing %s's branch", "Landed %s's branch", AGENT),

@@ -34,11 +34,13 @@ export interface PrAgentLink {
 }
 
 /**
- * The live agent that opened a PR on `branch`, or null. A PR's branch is `sparkle/agent-<id>`, so the
- * agent whose `branch` field EQUALS the PR's `headRefName` is the one that opened it. Searched across
- * ALL projects (a PR you're merging may belong to another project's agent). Pure so the join — the
- * bit most likely to regress (a null branch, a worker sharing a name) — is unit-tested without a
- * component. A null/empty `branch` never matches (an unstarted or think agent has none).
+ * The live agent whose `branch` field EQUALS `branch`, or null. Searched across ALL projects (a PR
+ * you're merging may belong to another project's agent). Pure so the join — the bit most likely to
+ * regress (a null branch, a worker sharing a name) — is unit-tested without a component. A
+ * null/empty `branch` never matches (an unstarted or think agent has none).
+ *
+ * This is a LIVE-ROSTER join and dies with the agent, which is why it is no longer the primary
+ * answer: see {@link agentLinkForPr}.
  */
 export function agentLinkForBranch(
   branch: string,
@@ -57,6 +59,46 @@ export function agentLinkForBranch(
       };
   }
   return null;
+}
+
+/**
+ * The agent that opened `pr`, or null — "Open agent" for a row in the menu.
+ *
+ * Prefers the DURABLE `pr.agentId` Rust records at PR-creation time, which is right whatever the
+ * branch is called; the roster join is only a fallback for a PR opened before the mapping existed.
+ * The old code path was the fallback ALONE, which is why a PR on a descriptive branch (no agent id
+ * in the name) could never offer "Open agent" at all.
+ *
+ * A recorded id still has to name an agent that is actually in the roster before it becomes a
+ * clickable link — the link's whole job is to OPEN that agent, and a link to an agent that no
+ * longer exists is a dead end, not a shortcut.
+ *
+ * A KNOWN owner that is absent from the roster yields NULL, and specifically does NOT fall through
+ * to the branch join (roborev 55253). The fallback exists for a PR whose owner was never recorded;
+ * reaching it with a recorded owner in hand would re-attribute that PR by branch name — the very
+ * inference this module exists to demote — and hand the reader a pill that opens an agent we
+ * already know did not open the PR. "The owner left" and "nobody recorded an owner" are different
+ * facts and only the second one may be guessed at.
+ */
+export function agentLinkForPr(
+  pr: Pick<PrRow, "headRefName" | "agentId">,
+  projects: Project[],
+  currentProjectId: string | null,
+): PrAgentLink | null {
+  if (pr.agentId) {
+    for (const p of projects) {
+      const a = p.agents.find((ag) => ag.id === pr.agentId);
+      if (a)
+        return {
+          agentId: a.id,
+          agentName: a.name,
+          projectId: p.id,
+          isCurrentProject: p.id === currentProjectId,
+        };
+    }
+    return null;
+  }
+  return agentLinkForBranch(pr.headRefName, projects, currentProjectId);
 }
 
 // CONTAINMENT IS PURE CSS, and deliberately so (roborev 53787).
@@ -108,11 +150,14 @@ function checksTitle(checks: PrRow["checks"]): string {
 
 export function OpenPrMenu({
   rootPath,
+  projectId,
   resolveAgent,
   onOpenAgent,
 }: {
   rootPath: string | null;
-  resolveAgent: (branch: string) => PrAgentLink | null;
+  /** Scopes the durable PR→agent lookup Rust does while listing. */
+  projectId: string;
+  resolveAgent: (pr: PrRow) => PrAgentLink | null;
   onOpenAgent: (link: PrAgentLink) => void;
 }) {
   const [prs, setPrs] = useState<PrRow[] | null>(null);
@@ -128,10 +173,10 @@ export function OpenPrMenu({
   const refetch = useMemo(
     () => async () => {
       if (!rootPath) return;
-      const rows = await fetchOpenPrs(rootPath);
+      const rows = await fetchOpenPrs(rootPath, projectId);
       if (aliveRef.current) setPrs(rows);
     },
-    [rootPath],
+    [rootPath, projectId],
   );
 
   useEffect(() => {
@@ -319,7 +364,7 @@ export function OpenPrMenu({
             {list.map((pr) => {
               const elig = prMergeEligibility(pr);
               const busy = merging.has(pr.number);
-              const agent = resolveAgent(pr.headRefName);
+              const agent = resolveAgent(pr);
               return (
                 <div
                   key={pr.number}
