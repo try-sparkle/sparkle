@@ -432,6 +432,62 @@ describe("agentLinkForPr", () => {
   });
 });
 
+/** PR #779 to the life: every check green, and completely unmergeable. */
+const CONFLICTING: PrRow = {
+  number: 779,
+  title: "fix(worktree): ignore agent scratch worktrees",
+  headRefName: "sparkle/ignore-agent-scratch-worktrees",
+  url: "https://github.com/o/r/pull/779",
+  checks: "passing",
+  mergeable: "conflicting",
+};
+
+describe("OpenPrMenu (the dot reflects MERGEABILITY, not just checks)", () => {
+  it("does not render green for a green-CI PR that conflicts (#779)", async () => {
+    stubList([CONFLICTING]);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const dot = await screen.findByTestId("pr-dot-779");
+    // The assertion is on the RENDERED tone, so it fails against the old checks-only dot — which
+    // painted this exact row green.
+    expect(dot.getAttribute("data-tone")).toBe("blocked");
+    expect(dot.getAttribute("data-tone")).not.toBe("ready");
+    // …and the reason is actually stated to the reader rather than implied by a colour.
+    expect(dot.getAttribute("title")).toMatch(/conflict/i);
+    expect(dot.getAttribute("aria-label")).toMatch(/conflict/i);
+  });
+
+  it("still renders green for a genuinely ready PR", async () => {
+    // Guards the fix against over-correcting into "nothing is ever green".
+    stubList([PASS]);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    expect((await screen.findByTestId("pr-dot-1")).getAttribute("data-tone")).toBe("ready");
+  });
+
+  it("disables Merge on a conflicting PR and says why in the tooltip", async () => {
+    stubList([CONFLICTING]);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const btn = (await screen.findByTestId("merge-779")) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.getAttribute("title")).toMatch(/conflict/i);
+    // A disabled control must also be INERT — clicking it must not fire a merge that silently fails.
+    fireEvent.click(btn);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+  });
+
+  it("keeps a conflicting PR out of 'Merge all ready'", async () => {
+    stubList([CONFLICTING]);
+    render(<OpenPrMenu rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />);
+    fireEvent.click(await screen.findByTestId("open-pr-badge"));
+    const all = (await screen.findByTestId("merge-all")) as HTMLButtonElement;
+    expect(all.disabled).toBe(true);
+    fireEvent.click(all);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+  });
+});
+
 describe("OpenPrMenu (merge error surfacing)", () => {
   it("surfaces the gh error text when a merge is declined", async () => {
     h.invoke.mockImplementation((cmd: string) => {

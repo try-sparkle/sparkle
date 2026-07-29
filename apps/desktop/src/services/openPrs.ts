@@ -114,6 +114,59 @@ export function prMergeEligibility(pr: Pick<PrRow, "checks" | "mergeable">): Mer
   return { canMerge: true, reason: null };
 }
 
+/** How a PR's status dot should read. A TONE rather than a colour so the rule stays pure and
+ *  testable here while the palette stays a component concern. */
+export type PrDotTone =
+  /** Green — you can merge this RIGHT NOW. */
+  | "ready"
+  /** Amber — not blocked, but not actionable yet either (checks running, mergeability unknown). */
+  | "waiting"
+  /** Red — merging is impossible as things stand (a conflict, or red checks). */
+  | "blocked"
+  /** Muted — nothing to report (no checks ran at all). */
+  | "none";
+
+export interface PrStatusDot {
+  tone: PrDotTone;
+  /** Tooltip text naming the ACTUAL blocker, not just the CI rollup. */
+  title: string;
+}
+
+/**
+ * What a PR's status dot should say — derived from BOTH the CI rollup and GitHub's mergeability.
+ *
+ * The invariant, and the whole reason this is not a `switch` on `pr.checks`: **`tone: "ready"`
+ * implies `prMergeEligibility(pr).canMerge`.** Green means "you can merge this right now" and
+ * nothing else. The exhaustive test asserts that implication over every checks × mergeable pair, so
+ * the dot and the Merge button cannot drift apart.
+ *
+ * They HAD drifted, and that is the bug this fixes: the dot was a pure function of `checks`, so PR
+ * #779 — 17 passing checks, `mergeable: "conflicting"`, completely unmergeable — rendered the same
+ * confident green as a PR that was ready to land. A green dot on a PR that can never merge is worse
+ * than no dot: it sends the user to click a button that cannot work.
+ *
+ * Note the implication is ONE-directional. A `canMerge` PR may still be non-green ("none" checks is
+ * muted — informational, nothing ran). What must never happen is the reverse: green over a blocker.
+ *
+ * `unknown` mergeability is deliberately `waiting`, not `ready`. GitHub computes mergeability
+ * asynchronously and invalidates it on every push to the base branch, so `unknown` genuinely means
+ * "we do not know yet" — and a dot that renders confident green on an unknown is the same false
+ * reassurance in a narrower window. The Merge button stays enabled there (see `prMergeEligibility`;
+ * blocking would strand mergeable PRs and `gh` is the backstop) — but the dot does not promise.
+ */
+export function prStatusDot(pr: Pick<PrRow, "checks" | "mergeable">): PrStatusDot {
+  // Ordered most-blocking first: a conflict outranks a green CI rollup, which is exactly the
+  // conflation that made #779 look ready.
+  if (pr.mergeable === "conflicting")
+    return { tone: "blocked", title: "Conflicts with the base branch — this cannot be merged" };
+  if (pr.checks === "failing") return { tone: "blocked", title: "Checks failing" };
+  if (pr.checks === "pending") return { tone: "waiting", title: "Checks still running" };
+  if (pr.mergeable === "unknown")
+    return { tone: "waiting", title: "GitHub has not finished computing mergeability yet" };
+  if (pr.checks === "none") return { tone: "none", title: "No checks ran" };
+  return { tone: "ready", title: "All checks passed — ready to merge" };
+}
+
 /**
  * What the badge should read, or null to render NOTHING.
  *

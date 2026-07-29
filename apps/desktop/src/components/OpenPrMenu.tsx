@@ -18,7 +18,9 @@ import {
   formatPrBadge,
   mergePr,
   prMergeEligibility,
+  prStatusDot,
   OPEN_PR_POLL_MS,
+  type PrDotTone,
   type PrRow,
 } from "../services/openPrs";
 import { log } from "../logger";
@@ -121,30 +123,23 @@ export function agentLinkForPr(
 // `calc(100vw - 16px)` half of each clamp is the backstop if that minimum ever moves. Both clamps
 // are asserted directly in the test file; deleting either one fails the suite.
 
-/** Colour for a PR's aggregate CI rollup, matching the status-dot palette used elsewhere. */
-function checksColor(checks: PrRow["checks"]): string {
-  switch (checks) {
-    case "passing":
+/**
+ * Colour for a PR's status dot, keyed off the TONE `prStatusDot` decides — not off the CI rollup.
+ *
+ * This used to be `checksColor(pr.checks)`, which is how a conflicting-but-green-CI PR (#779) got a
+ * confident green dot next to a Merge button that could never work. The mergeability half of the
+ * decision now lives in `prStatusDot`, so this is purely the palette.
+ */
+function dotColor(tone: PrDotTone): string {
+  switch (tone) {
+    case "ready":
       return C.success;
-    case "pending":
+    case "waiting":
       return C.amber;
-    case "failing":
+    case "blocked":
       return C.sienna;
     default:
-      return C.muted; // "none" — no checks at all
-  }
-}
-
-function checksTitle(checks: PrRow["checks"]): string {
-  switch (checks) {
-    case "passing":
-      return "All checks passed";
-    case "pending":
-      return "Checks still running";
-    case "failing":
-      return "Checks failing";
-    default:
-      return "No checks";
+      return C.muted; // "none" — no checks ran at all
   }
 }
 
@@ -363,6 +358,7 @@ export function OpenPrMenu({
 
             {list.map((pr) => {
               const elig = prMergeEligibility(pr);
+              const dot = prStatusDot(pr);
               const busy = merging.has(pr.number);
               const agent = resolveAgent(pr);
               return (
@@ -377,14 +373,19 @@ export function OpenPrMenu({
                   }}
                 >
                   <span
-                    aria-hidden
-                    title={checksTitle(pr.checks)}
+                    // Not aria-hidden: the dot now carries the BLOCKING REASON, not just a
+                    // decorative CI colour, so it has to be readable rather than skipped.
+                    role="img"
+                    aria-label={dot.title}
+                    data-testid={`pr-dot-${pr.number}`}
+                    data-tone={dot.tone}
+                    title={dot.title}
                     style={{
                       flex: "0 0 auto",
                       width: 8,
                       height: 8,
                       borderRadius: "50%",
-                      background: checksColor(pr.checks),
+                      background: dotColor(dot.tone),
                     }}
                   />
                   <div style={{ flex: 1, minWidth: 0 }}>

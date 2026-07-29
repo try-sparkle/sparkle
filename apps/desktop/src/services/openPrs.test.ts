@@ -4,6 +4,8 @@ import {
   OPEN_PR_POLL_MS,
   OPEN_PR_QUERY_LIMIT,
   prMergeEligibility,
+  prStatusDot,
+  type PrRow,
 } from "./openPrs";
 
 describe("formatPrBadge", () => {
@@ -99,5 +101,63 @@ describe("prMergeEligibility", () => {
     expect(prMergeEligibility({ checks: "failing", mergeable: "conflicting" }).reason).toMatch(
       /conflict/i,
     );
+  });
+});
+
+const ALL_CHECKS: PrRow["checks"][] = ["passing", "pending", "failing", "none"];
+const ALL_MERGEABLE: PrRow["mergeable"][] = ["mergeable", "conflicting", "unknown"];
+
+describe("prStatusDot", () => {
+  it("NEVER renders green for a PR that cannot be merged (the #779 regression)", () => {
+    // THE headline property, and the one the old checks-only dot violated. PR #779 had 17 passing
+    // checks and conflicted with main: it rendered the same confident green as a landable PR, which
+    // is what sent the user to click a Merge button that could not work.
+    const conflicting = prStatusDot({ checks: "passing", mergeable: "conflicting" });
+    expect(conflicting.tone).toBe("blocked");
+    expect(conflicting.title).toMatch(/conflict/i);
+  });
+
+  it("holds tone==='ready' ⟹ canMerge across EVERY checks × mergeable pair", () => {
+    // Exhaustive rather than case-by-case: green means "you can merge this right now", so the dot
+    // may never promise something the merge gate would refuse. This is what stops the two from
+    // drifting apart again — they drifted once and shipped #779's false green.
+    for (const checks of ALL_CHECKS) {
+      for (const mergeable of ALL_MERGEABLE) {
+        const pr = { checks, mergeable };
+        if (prStatusDot(pr).tone === "ready")
+          expect(prMergeEligibility(pr).canMerge, `green over a blocker: ${checks}/${mergeable}`)
+            .toBe(true);
+      }
+    }
+  });
+
+  it("is green ONLY for passing checks on a confirmed-mergeable PR", () => {
+    // Pins the one green case, so the implication above cannot be satisfied trivially by a function
+    // that never returns "ready" at all.
+    const green = ALL_CHECKS.flatMap((checks) =>
+      ALL_MERGEABLE.map((mergeable) => ({ checks, mergeable })),
+    ).filter((pr) => prStatusDot(pr).tone === "ready");
+    expect(green).toEqual([{ checks: "passing", mergeable: "mergeable" }]);
+  });
+
+  it("treats UNKNOWN mergeability as waiting, not ready — we do not know yet", () => {
+    // The button stays enabled here on purpose (gh is the backstop), but the DOT must not promise.
+    // GitHub invalidates mergeability on every push to the base branch, so this window is routine.
+    const d = prStatusDot({ checks: "passing", mergeable: "unknown" });
+    expect(d.tone).toBe("waiting");
+    expect(prMergeEligibility({ checks: "passing", mergeable: "unknown" }).canMerge).toBe(true);
+  });
+
+  it("reports the blocker, not the CI rollup, when both could apply", () => {
+    expect(prStatusDot({ checks: "failing", mergeable: "conflicting" }).title).toMatch(/conflict/i);
+    expect(prStatusDot({ checks: "failing", mergeable: "mergeable" }).tone).toBe("blocked");
+    expect(prStatusDot({ checks: "pending", mergeable: "mergeable" }).tone).toBe("waiting");
+    expect(prStatusDot({ checks: "none", mergeable: "mergeable" }).tone).toBe("none");
+  });
+
+  it("always gives a non-empty reason, so a dot is never an unexplained colour", () => {
+    for (const checks of ALL_CHECKS)
+      for (const mergeable of ALL_MERGEABLE)
+        expect(prStatusDot({ checks, mergeable }).title.length).toBeGreaterThan(0);
   });
 });
