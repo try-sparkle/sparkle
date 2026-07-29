@@ -36,6 +36,7 @@ import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools
 // What the concierge is doing right now, for the thread's thinking indicator. Recorded from the one
 // call site that both sees every tool call and knows it came from the concierge.
 import { noteConciergeToolCall } from "./conciergeActivity";
+import { noteConciergeAuditCall } from "./conciergeAudit";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
@@ -829,6 +830,24 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   // success reported a refused merge as "Merged PR #753", in the same column that was showing the
   // approval request for it. `ok` starts FALSE so a throw settles as an attempt too.
   const settleActivity = noteConciergeToolCall(domain, op, req.payload.args);
+  // The AUDIT LOG shares this seam for the same reason the indicator does: it is the one place every
+  // `concierge_tool` call passes through. It records the ATTEMPT, so a denial, an unapproved
+  // ask-tier call, `bad-args` and `unknown-op` are all in the record — those are precisely the
+  // entries that answer "why didn't it do the thing I asked?".
+  //
+  // The `toolCallId` passed here is carried for DISPLAY and correlation only, and may be the empty
+  // string — the line above normalises a missing/non-string one and deliberately does not reject it.
+  // So the audit module mints its own join key rather than keying on this: every blank-id call would
+  // otherwise share one key, and a settler would stamp the oldest such row (roborev 55160). Do not
+  // "simplify" that counter away.
+  const settleAudit = noteConciergeAuditCall(toolCallId, domain, op, req.payload.args);
+  // Defaults describe a call that THREW past the dispatch — which is not the same as a refusal the
+  // dispatch produced, so it gets its own code rather than borrowing `internal-error`'s.
+  let auditReply: { ok: boolean; code?: string; message?: string } = {
+    ok: false,
+    code: "no-reply",
+    message: "The call ended without producing a reply.",
+  };
   let ok = false;
   try {
     // Total by contract — it resolves to a reply for an unknown domain, bad args, or an internal
@@ -844,9 +863,13 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       { policy: configuredToolPolicy },
     );
     ok = reply.ok === true;
+    auditReply = reply.ok
+      ? { ok: true }
+      : { ok: false, code: reply.code, message: reply.message };
     return reply;
   } finally {
     settleActivity(ok);
+    settleAudit(auditReply);
   }
 }
 

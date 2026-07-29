@@ -266,6 +266,28 @@ describe("dispatchConciergeTool — coverage", () => {
 // ---------------------------------------------------------------------------------------------
 
 describe("dispatchConciergeTool — argument validation", () => {
+  // THE SENTINEL MUST REACH THE HANDLER, NOT THE SCHEMA.
+  //
+  // `read_picker_options` legitimately returns `fingerprint: ""` for a PRESENT menu whose question
+  // could not be read. While `expectFingerprint` was `.min(1)`, echoing that back produced a
+  // validation refusal telling the model to do exactly what it had just done, and the
+  // `unreadable-picker` refusal that explains the situation was unreachable through the registry.
+  // The existing test for it called `selectPickerOption` directly, BELOW the schema, so it passed
+  // throughout (roborev 55204). This one goes through `dispatchConciergeTool`.
+  it("lets the empty fingerprint through to the handler's own refusal", async () => {
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "select_picker_option",
+        args: { agentId: "a1", index: 0, expectFingerprint: "" },
+      }),
+    );
+
+    // Whatever it refuses with, it must NOT be the schema — the point is that the handler ran.
+    expect(refusal(r).code).not.toBe(REGISTRY_CODES.badArgs);
+    expect(refusal(r).message).not.toContain("echo back");
+  });
+
   it("names the MISSING field", async () => {
     const r = await dispatchConciergeTool(call({ domain: "lifecycle", op: "preview_close", args: {} }));
     expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);

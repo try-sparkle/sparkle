@@ -31,7 +31,18 @@ vi.mock("../stores/beadsStore", () => {
   return { useBeadsStore };
 });
 
-vi.mock("../services/sendToBuild", () => ({ sendToBuild: vi.fn() }));
+// `sendToBuildBlockedReason` is the PREFLIGHT every handoff below calls before it claims the bead
+// (roborev 55139). It must be in the mock: an exhaustive factory like this one returns `undefined`
+// for anything it omits, so a missing entry makes the guard throw and the handoff never runs —
+// which is exactly how these four tests failed when it was added. `null` = "not blocked".
+const blockedReasonMock = vi.fn<(p: string, e: string, m?: string) => string | null>(() => null);
+vi.mock("../services/sendToBuild", () => ({
+  sendToBuild: vi.fn(),
+  // Forwards ALL args, so tests can assert the MODE each handler passes. The previous version
+  // dropped them (`() => blockedReasonMock()`), which is why a call site that never passed "task"
+  // went unnoticed while a unit test of the function itself passed (roborev 55145).
+  sendToBuildBlockedReason: (...a: [string, string, string?]) => blockedReasonMock(...a),
+}));
 
 // ── Definable Done & Delivered (Unit 5) mocks ────────────────────────────────────────────────
 // getConfig returns whatever `configState` holds; onConfigChanged is a no-op subscription. Tests
@@ -102,6 +113,7 @@ import { BoardView } from "./BoardView";
 import { sendToBuild } from "../services/sendToBuild";
 import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
+import { useProjectStore } from "../stores/projectStore";
 import { waitFor } from "@testing-library/react";
 
 /** Point the mocked config at a defined "Done" (a single criterion of the given kind). */
@@ -167,12 +179,36 @@ afterEach(() => {
   stopDeliveryMonitor.mockClear();
   vi.mocked(closeBead).mockClear();
   vi.mocked(markBeadDelivered).mockClear();
+  // claimBead too: the at-capacity test asserts it was NOT called, which a leaked call from an
+  // earlier test would silently defeat (or, worse, make pass only because of suite ordering).
+  vi.mocked(claimBead).mockClear();
+  // Reset the preflight globally, not per-describe: a test that sets it to "blocked" would
+  // otherwise leak into every later handoff test and refuse handoffs they expect to succeed.
+  blockedReasonMock.mockReset();
+  blockedReasonMock.mockReturnValue(null);
   useCriteriaStore.setState({ ticks: {} });
+  useProjectStore.setState({ projects: [], selectedProjectId: null });
 });
 
 beforeEach(() => {
   snapshot = { beads: [], board, loadedAt: Date.now() };
   error = undefined;
+  // SEED THE STORE. DetailOverlay reads `rootPath` from it, and every overlay handler claims only
+  // `if (rootPath)`. Unseeded, `rootPath` is null, so `claimBead` is DEAD in these tests and every
+  // `expect(claimBead).not.toHaveBeenCalled()` here passed vacuously — with the guard deleted, with
+  // the guard moved after the claim, and before the guard existed at all (roborev 55152). Seeding is
+  // what makes "refuses WITHOUT claiming" — the ordering this whole change is about — assertable.
+  // NO `as never` here. This seed is the single object the claim assertions depend on, and
+  // `as never` satisfies every setState overload — so if ProjectState's fields are renamed,
+  // BoardView fails to compile and gets fixed while this seed compiles unchanged, silently reverts
+  // rootPath to null, and quietly makes every claim assertion vacuous again (roborev 55155). Typed,
+  // a rename breaks HERE too, which is the point.
+  useProjectStore.setState({ projects: [project], selectedProjectId: project.id });
+  // Self-verifying: if this ever stops taking effect, `rootPath` silently returns to null and every
+  // claimBead assertion in this file quietly re-inerts with a GREEN suite. Fail loudly instead.
+  if (useProjectStore.getState().projects[0]?.rootPath !== project.rootPath) {
+    throw new Error("BoardView tests: project store seed did not take effect — claim assertions would be vacuous");
+  }
 });
 
 describe("BoardView", () => {
@@ -301,6 +337,7 @@ describe("BoardView", () => {
 });
 
 describe("BoardView — Build It (epic handoff)", () => {
+  beforeEach(() => blockedReasonMock.mockReturnValue(null));
   function epicSnapshot(description: string) {
     return {
       beads: [],
@@ -315,7 +352,156 @@ describe("BoardView — Build It (epic handoff)", () => {
     };
   }
 
-  it("shows the status pill + Build It on an epic and hands off with the parsed PRD path", () => {
+  // AT CAPACITY THE HANDOFF MUST NOT CLAIM THE BEAD FIRST.
+  //
+  // Every handoff here calls claimBead (→ in_progress) before sendToBuild. That was harmless while
+  // sendToBuild only threw for an unknown project — a state the caller had ruled out — but the
+  // machine-wide cap makes claim-then-fail routine: the epic would sit in progress with no
+  // orchestrator, and nothing un-claims it. On a BACKLOG card it is worse, because the claim moves
+  // the card out of the `backlog` column that renders the button at all, so the affordance the user
+  // just pressed disappears and the retry is only reachable through the detail overlay
+  // (roborev 55139). So: refuse BEFORE mutating, show why, and leave the bead alone.
+  it("at capacity, refuses without claiming the bead — and says why", async () => {
+    blockedReasonMock.mockReturnValue("This machine has 8 of its 8 agent slots taken.");
+    snapshot = epicSnapshot("Ship the app.");
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Build the app"));
+    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
+    fireEvent.click(within(statusRow).getByText("Build It"));
+
+    await waitFor(() => expect(screen.getByText(/8 of its 8 agent slots/)).toBeTruthy());
+    expect(sendToBuild).not.toHaveBeenCalled();
+    // THE point: the bead is untouched, so the card stays where the user can retry it.
+    expect(claimBead).not.toHaveBeenCalled();
+  });
+
+  // ASSERTED AT THE CALL SITE, not on the function.
+  //
+  // The preflight's `mode` DEFAULTS to "epic", and each handler must pass its own. A unit test of
+  // sendToBuildBlockedReason("p1","e1","task") passes whether or not any caller actually supplies
+  // the argument — which is precisely how the single-task handler shipped without it, rendering
+  // "Starting this plan…" for a one-bead handoff (roborev 55145). So: assert what the HANDLERS pass.
+  it("each handoff tells the preflight which KIND of build it is", async () => {
+    snapshot = epicSnapshot("Ship the app.");
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Build the app"));
+    const statusRow = screen.getByText("not started").parentElement as HTMLElement;
+    fireEvent.click(within(statusRow).getByText("Build It"));
+
+    // SETTLE the handler before returning: it now suspends at `await claimBead(...)`, so without
+    // this its continuation (sendToBuild / onClose / setBuildBusy) runs after the test body — outside
+    // act(), and in the same window as afterEach's mockClear, which can leak a call into the next
+    // test where `expect(claimBead).not.toHaveBeenCalled()` cannot tell a leak from a real call.
+    await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
+
+    const epicCall = blockedReasonMock.mock.calls.at(-1)!;
+    expect(epicCall[1]).toBe("p1-e1");
+    // `?? "epic"` would have passed for `undefined` too, so it could not fail against a call site
+    // that passed nothing — assert the absence directly (roborev 55155).
+    expect(epicCall[2]).toBeUndefined();
+  });
+
+  // The build-all LOOP: the ceiling can be reached partway through a batch, and claiming an epic we
+  // then cannot hand off would mark it in progress with no orchestrator. It must stop cleanly and
+  // say how far it got — and without a test here, neutralising that guard leaves the suite green
+  // (roborev 55150).
+  it("build-all stops at the ceiling, reporting progress and leaving the rest untouched", async () => {
+    const prd = "PRD file: PRD/shared.md";
+    const e1 = bead({ id: "p1-e1", title: "Epic one", type: "epic", description: prd });
+    const e2 = bead({ id: "p1-e2", title: "Epic two", type: "epic", description: prd });
+    snapshot = {
+      beads: [e1, e2],
+      board: { backlog: [e1, e2], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+    // Let the FIRST epic through, then hit the ceiling on the second.
+    let call = 0;
+    blockedReasonMock.mockImplementation(() =>
+      ++call > 1 ? "This machine has 8 of its 8 agent slots taken." : null,
+    );
+
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Epic one")); // open the detail overlay
+    fireEvent.click(screen.getByTitle("Claim and build all 2 epics that share this PRD"));
+
+    // Stopped partway, and SAID so — the number is what tells the user the batch is incomplete.
+    await waitFor(() => expect(screen.getByText(/Started 1 of 2/)).toBeTruthy());
+    expect(screen.getByText(/the rest are untouched/)).toBeTruthy();
+    // Only the FIRST epic was handed off AND claimed; the blocked one is left alone rather than
+    // marked in progress with no orchestrator behind it. With the store seeded, the claim assertion
+    // is real rather than inert.
+    expect(vi.mocked(sendToBuild)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendToBuild)).toHaveBeenCalledWith(
+      expect.objectContaining({ epicId: "p1-e1" }),
+    );
+    expect(vi.mocked(claimBead)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(claimBead)).toHaveBeenCalledWith("/tmp/demo", "p1-e1");
+  });
+
+  // The single-task guard's REFUSAL BEHAVIOUR, not just the argument it passes.
+  //
+  // The mode test below runs with the preflight returning null, so deleting the whole
+  // `if (blocked) { … return; }` block leaves it green — the mutated code takes the identical path.
+  // (My earlier mutation neutralised the CALL, which only broke the argument assertion. Deleting the
+  // BLOCK is the mutation that matters here.) roborev 55152.
+  it("the SINGLE-TASK Build It refuses at capacity without claiming or handing off", async () => {
+    blockedReasonMock.mockReturnValue("Building this task would need another agent.");
+    snapshot = {
+      beads: [],
+      board: {
+        backlog: [bead({ id: "p1-t2", title: "Another small task", type: "task" })],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+      },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Another small task"));
+    fireEvent.click(
+      screen.getByTitle(
+        "Build It — build this single task on one isolated worker branch, then verify and integrate it",
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText(/Building this task/)).toBeTruthy());
+    expect(vi.mocked(sendToBuild)).not.toHaveBeenCalled();
+    expect(vi.mocked(claimBead)).not.toHaveBeenCalled();
+  });
+
+  it("the SINGLE-TASK Build It passes mode 'task', so the refusal never calls it a plan", async () => {
+    // A task-typed bead renders the task-level Build It (BoardView's `isTask` branch).
+    snapshot = {
+      beads: [],
+      board: {
+        backlog: [bead({ id: "p1-t1", title: "One small task", type: "task" })],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+      },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("One small task")); // open the detail overlay
+    fireEvent.click(
+      screen.getByTitle(
+        "Build It — build this single task on one isolated worker branch, then verify and integrate it",
+      ),
+    );
+
+    // Same reason as above: settle the async handler inside the test.
+    await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
+
+    const call = blockedReasonMock.mock.calls.at(-1)!;
+    expect(call[1]).toBe("p1-t1");
+    // THE assertion: without this argument the preflight silently defaults to "epic" and the user is
+    // told "Starting this plan…" for a one-bead build (roborev 55145).
+    expect(call[2]).toBe("task");
+  });
+
+  it("shows the status pill + Build It on an epic and hands off with the parsed PRD path", async () => {
     snapshot = epicSnapshot("Ship the app.\n\nPRD file: PRD/2026-06-27-build-the-app.md");
     render(<BoardView project={project} />);
     fireEvent.click(screen.getByText("Build the app")); // open the epic's detail overlay
@@ -324,14 +510,20 @@ describe("BoardView — Build It (epic handoff)", () => {
     // overlay's status row — the "not started" pill and the overlay's Build It button are siblings.
     const statusRow = screen.getByText("not started").parentElement as HTMLElement;
     fireEvent.click(within(statusRow).getByText("Build It"));
-    expect(sendToBuild).toHaveBeenCalledWith({
-      projectId: "p1",
-      epicId: "p1-e1",
-      prdPath: "PRD/2026-06-27-build-the-app.md",
-    });
+    // AWAITED: with the store seeded, `await claimBead(...)` genuinely runs before the handoff, so
+    // this is a microtask later. It only read as synchronous while the claim was dead code.
+    await waitFor(() =>
+      expect(sendToBuild).toHaveBeenCalledWith({
+        projectId: "p1",
+        epicId: "p1-e1",
+        prdPath: "PRD/2026-06-27-build-the-app.md",
+      }),
+    );
+    // …and the claim really happened, which the null-rootPath fixture could never show.
+    expect(claimBead).toHaveBeenCalledWith("/tmp/demo", "p1-e1");
   });
 
-  it("hands off a PRD-less epic with prdPath null (no longer blocks)", () => {
+  it("hands off a PRD-less epic with prdPath null (no longer blocks)", async () => {
     // The "no linked PRD" hard block was removed (unify Build It affordances): a PRD-less epic now
     // hands off with prdPath null and sendToBuild seeds off `bd show <epicId>` instead of blocking.
     snapshot = epicSnapshot("no PRD link in this body");
@@ -339,7 +531,9 @@ describe("BoardView — Build It (epic handoff)", () => {
     fireEvent.click(screen.getByText("Build the app"));
     const statusRow = screen.getByText("not started").parentElement as HTMLElement;
     fireEvent.click(within(statusRow).getByText("Build It"));
-    expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null });
+    await waitFor(() =>
+      expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null }),
+    );
   });
 });
 
@@ -372,6 +566,21 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       loadedAt: Date.now(),
     };
   }
+
+  // The FOURTH call site (StartControls.handleStart). Without this, deleting its guard leaves the
+  // suite green — the other Start tests all run with the preflight returning null (roborev 55150).
+  it("Start refuses at capacity WITHOUT claiming, so the card keeps its button", async () => {
+    blockedReasonMock.mockReturnValue("This machine has 8 of its 8 agent slots taken.");
+    startSnapshot({});
+    render(<BoardView project={project} />);
+    fireEvent.click(screen.getByText("Build It"));
+
+    await waitFor(() => expect(screen.getByText(/8 of its 8 agent slots/)).toBeTruthy());
+    expect(sendToBuild).not.toHaveBeenCalled();
+    // The claim is what would move this card out of `backlog` — the column that renders the button
+    // at all — so leaving the bead alone is what keeps the retry reachable.
+    expect(claimBead).not.toHaveBeenCalled();
+  });
 
   it("claims the epic then hands off to Build with the parsed PRD path", async () => {
     startSnapshot({});

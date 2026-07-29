@@ -23,6 +23,8 @@ import type { WorkflowOperation } from "../services/conciergeTools/workflow";
 import type { WorkspaceOp } from "../services/conciergeTools/workspace";
 import type { BoardOp } from "../services/conciergeTools/board";
 import type { ApprovalsOp } from "../services/conciergeTools/approvals";
+import type { DiffOp } from "../services/conciergeTools/diff";
+import type { PlansOp } from "../services/conciergeTools/plans";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
  *  indicator maps these onto react-icons/fi (this repo uses Feather; no emoji as icons). */
@@ -126,6 +128,9 @@ const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
 const TERMINAL_PHRASES: Record<TerminalOp, OpPhrase> = {
   read_agent_terminal: phrase("Reading %s's terminal", "Read %s's terminal", AGENT),
   get_agent_status: phrase("Checking on %s", "Checked on %s", AGENT),
+  read_picker_options: phrase("Reading %s's options", "Read %s's options", AGENT),
+  select_picker_option: phrase("Answering %s's prompt", "Answered %s's prompt", AGENT),
+  send_control_key: phrase("Pressing a key in %s", "Pressed a key in %s", AGENT),
   send_to_agent_terminal: phrase("Writing to %s", "Wrote to %s", AGENT),
 };
 
@@ -189,6 +194,21 @@ const APPROVALS_PHRASES: Record<ApprovalsOp, OpPhrase> = {
   get_approval: phrase("Checking an approval", "Checked an approval"),
 };
 
+/** The Plan-side ops. Typed over the domain's op union like every other table here, so a new plan
+ *  op is a compile error rather than an un-phrased fallback. */
+const PLANS_PHRASES: Record<PlansOp, OpPhrase> = {
+  list_plans: phrase("Reading your plans", "Read your plans"),
+  get_plan: phrase("Looking at a plan", "Looked at a plan"),
+  create_plan: phrase("Writing up a plan", "Wrote up a plan"),
+  promote_plan_to_build: phrase("Handing a plan to a build agent", "Handed a plan to a build agent"),
+};
+
+const DIFF_PHRASES: Record<DiffOp, OpPhrase> = {
+  list_changed_files: phrase("Looking at what %s changed", "Looked at what %s changed", AGENT),
+  read_file_diff: phrase("Reading a file %s changed", "Read a file %s changed", AGENT),
+  list_commits: phrase("Reading %s's commits", "Read %s's commits", AGENT),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -205,6 +225,10 @@ const DOMAINS: Record<
   workspace: { icon: "workspace", phrases: WORKSPACE_PHRASES },
   board: { icon: "workspace", phrases: BOARD_PHRASES },
   approvals: { icon: "agents", phrases: APPROVALS_PHRASES },
+  plans: { icon: "workspace", phrases: PLANS_PHRASES },
+  // Reuses the workflow glyph: reading a diff is asking about the shape of landed work, which is the
+  // same question the workflow ops answer from the other side.
+  diff: { icon: "workflow", phrases: DIFF_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

@@ -19,7 +19,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useShallow } from "zustand/react/shallow";
-import { sendToBuild } from "../services/sendToBuild";
+import { sendToBuild, sendToBuildBlockedReason } from "../services/sendToBuild";
 import {
   workersForBead,
   epicStatus,
@@ -551,6 +551,14 @@ function StartControls({
     setErr("");
     setBusy(true);
     try {
+      // PREFLIGHT BEFORE THE CLAIM. claimBead moves the bead to in_progress, which moves this card
+      // out of the `backlog` column that renders Start at all — so claiming and THEN failing would
+      // hide the button the user just pressed (roborev 55139).
+      const blocked = sendToBuildBlockedReason(project.id, bead.id);
+      if (blocked) {
+        setErr(blocked);
+        return;
+      }
       await claimBead(project.rootPath, bead.id); // → in_progress
       const prd = parsePrdRef(bead.description);
       sendToBuild({ projectId: project.id, epicId: bead.id, prdPath: prd?.relPath ?? null });
@@ -757,6 +765,11 @@ function DetailOverlay({
     setBuildErr("");
     setBuildBusy(true);
     try {
+      const blocked = sendToBuildBlockedReason(projectId, bead.id);
+      if (blocked) {
+        setBuildErr(blocked);
+        return;
+      }
       if (rootPath) await claimBead(rootPath, bead.id); // match StartControls' claim+handoff
       sendToBuild({ projectId, epicId: bead.id, prdPath });
       onClose();
@@ -774,6 +787,15 @@ function DetailOverlay({
     setBuildErr("");
     setBuildBusy(true);
     try {
+      // "task" MUST be passed: the preflight defaults to "epic", and the early return below means
+      // sendToBuild — the only other place that derives the lead from the mode — is never reached at
+      // capacity. Omitting it rendered "Starting this plan…" for a handoff that builds one bead on
+      // one worker branch (roborev 55145).
+      const blocked = sendToBuildBlockedReason(projectId, bead.id, "task");
+      if (blocked) {
+        setBuildErr(blocked);
+        return;
+      }
       if (rootPath) await claimBead(rootPath, bead.id);
       sendToBuild({ projectId, epicId: bead.id, prdPath, mode: "task" });
       onClose();
@@ -790,9 +812,21 @@ function DetailOverlay({
     setBuildErr("");
     setBuildBusy(true);
     try {
+      // Per-epic, INSIDE the loop: the ceiling can be reached partway through, and claiming an epic
+      // we then cannot hand off would mark it in progress with no orchestrator. Stop cleanly and say
+      // how far we got, rather than throwing out of the middle of a batch (roborev 55139).
+      let built = 0;
       for (const epic of prdEpics) {
+        const blocked = sendToBuildBlockedReason(projectId, epic.id);
+        if (blocked) {
+          setBuildErr(
+            `${blocked} Started ${built} of ${prdEpics.length}; the rest are untouched.`,
+          );
+          return;
+        }
         if (rootPath) await claimBead(rootPath, epic.id);
         sendToBuild({ projectId, epicId: epic.id, prdPath });
+        built += 1;
       }
       onClose();
     } catch (e) {

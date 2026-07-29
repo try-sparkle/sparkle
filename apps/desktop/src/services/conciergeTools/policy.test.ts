@@ -45,6 +45,8 @@ import { WORKFLOW_OPERATIONS } from "./workflow";
 import { WORKSPACE_OPS } from "./workspace";
 import { BOARD_OPS } from "./board";
 import { APPROVALS_OPS } from "./approvals";
+import { PLANS_OPS } from "./plans";
+import { DIFF_OPS } from "./diff";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -212,6 +214,8 @@ describe("the tool set is derived from the domains", () => {
       "workspace",
       "board",
       "approvals",
+      "plans",
+      "diff",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -257,6 +261,8 @@ describe("the tool set is derived from the domains", () => {
         WORKSPACE_OPS.length +
         BOARD_OPS.length +
         APPROVALS_OPS.length +
+        PLANS_OPS.length +
+        DIFF_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });

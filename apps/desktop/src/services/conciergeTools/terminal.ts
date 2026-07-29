@@ -63,9 +63,11 @@ import { log } from "../../logger";
 import {
   agentCanAcceptInput,
   dispatchConciergeAnswer,
+  liveOptionsFor,
   type ConciergeDispatchPath,
 } from "../conciergeDispatch";
 import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAuthority";
+import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { isRedStatus } from "../windowStatus";
@@ -79,6 +81,14 @@ import {
   readPersistedOpenAgentIds,
 } from "../../stores/runtimeStore";
 import type { AgentTabStatus } from "../../types";
+import {
+  detectTerminalPrompts,
+  pickerBlockBounds,
+  pickerWindow,
+  MENU_LINE,
+  YN,
+  TAIL_LINES,
+} from "../suggestions/heuristics";
 import type { SuggestionButton } from "../suggestions/types";
 
 // ---------------------------------------------------------------------------------------------
@@ -802,9 +812,526 @@ export const CONCIERGE_TERMINAL_TOOLS = [
     write: false,
   },
   {
+    name: "read_picker_options",
+    description:
+      "Read the menu an agent is offering right now, as indexed options. Empty when there is no menu — a normal state, not an error. A PRESENT menu with an EMPTY `fingerprint` is different: the menu is there but its question could not be read, so it cannot be told apart from any other menu with the same options and is NOT answerable — relay it to the human rather than pressing anything. Read this BEFORE select_picker_option: that op requires you to echo back the `fingerprint` this returns, which covers the question AND the options — so a menu that re-rendered into a different ask is refused rather than answered.",
+    write: false,
+  },
+  {
+    name: "select_picker_option",
+    description:
+      "Press one of an agent's live menu options. Takes the index AND the `fingerprint` from read_picker_options, and refuses if the menu changed underneath — pressing a button the human never read is not something to guess at. An EMPTY fingerprint is refused as `unreadable-picker`: the question could not be read, so there is nothing to match against. Requires an authorized tool policy, like any other write to a terminal.",
+    write: true,
+  },
+  {
+    name: "send_control_key",
+    description:
+      "Press a key that is not text: esc to interrupt a runaway agent, shift+tab to cycle its permission modes, ctrl+b to background a long-running command, enter to submit what is already typed, or an arrow key. A NAMED set — no arbitrary escape sequences. Nothing is appended: these are keys, not lines. When a menu is VISIBLE to the app the picker-driving keys (enter, arrows) are refused — answer it with select_picker_option instead. VISIBLE means the LIVE screen when the app can read it; only when it cannot — an unmounted pane — does the screen captured at the agent's last ask count, and then only while that agent is still asking. That refusal is EVIDENCE-BASED, not a guarantee: an agent whose pane is closed and which is not currently asking has no menu evidence at all, so the keys go through. Never infer safety from it. Nor are the keys it does not refuse harmless while a dialog is up: esc DECLINES whatever is being asked, which can discard work in progress, and shift+tab changes the permission mode governing that very approval. Requires an authorized tool policy.",
+    write: true,
+  },
+  {
     name: "send_to_agent_terminal",
     description:
       "Type a message into an agent's terminal, as if the human had typed it. Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer.",
     write: true,
   },
 ] as const satisfies readonly ConciergeToolDescriptor[];
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// ANSWERING A PICKER
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// A menu on screen is the single most common state that blocks an agent, and until now the
+// concierge could SEE one and do nothing about it: `send_to_agent_terminal` correctly refuses an
+// ambiguous send (`ambiguous-picker`) and even returns the live options, but there was no op to read
+// them deliberately and no op to answer one.
+//
+// SELECTION PRESSES A BUTTON THE HUMAN NEVER READ, which is why this is two ops and not one, and
+// why the second one is defensive. The addressed-at-picker incident (AGENTS.md, bead sparkle-8bvh)
+// is the precedent: a control surface that answers a menu on the model's inference put an answer
+// somewhere nobody intended. So:
+//
+//   • the caller must have READ the options (`read_picker_options`) and echo back the `fingerprint`
+//     it returned. An index alone is not enough — the menu is live, and an option list that
+//     re-renders between the read and the press would make the same index a different answer. Nor is
+//     a LABEL enough: numbered menus reuse labels, and a yes/no dialog's Approve/Deny pair is a
+//     global constant, so the fingerprint covers the QUESTION as well as the options.
+//   • `select_picker_option` re-reads the menu and refuses unless that fingerprint still matches.
+//     A changed menu is a refusal, never a best guess.
+//   • the press goes through the SAME authority-gated write as any other send, so a picked option is
+//     attributable to a toolCallId exactly like typed text.
+
+// NO LOCAL "OPTION ROW" PATTERN LIVES HERE ANY MORE.
+//
+// There used to be one, deliberately WIDER than the detector's `MENU_LINE` so it could not miss a
+// shape the parser accepted. That reasoning was backwards: a locator that matches a line the PARSER
+// SKIPS is just as broken as one that misses a line the parser takes — a stray `> 4. see the guide`
+// counted as an option row here, broke the run, produced no block, and refused every press forever
+// (roborev 55218). The rule that survived four rounds of this is parity, not generosity, so the
+// generic branch imports `MENU_LINE` and there is exactly one definition of what an option row is.
+
+/** Content that MOVES on its own: progress percentages, `(3120/6640)` counters, byte totals,
+ *  elapsed-time readouts, braille/ASCII spinners. Any of it inside a fingerprint makes the
+ *  fingerprint tick while the question sits still, so `read_picker_options` and
+ *  `select_picker_option` disagree and the prompt becomes UNANSWERABLE — with a refusal whose own
+ *  remedy is "re-read and try again", which loops (roborev 55170).
+ *
+ *  NORMALISED, NOT DROPPED. Dropping the whole line was worse than the bug it fixed: these patterns
+ *  match ordinary question text — "Delete 2.3 GB of build artifacts? [y/n]" is a volatile line by
+ *  this pattern — so the filter discarded the only content that distinguishes one prompt from
+ *  another, and two destructive-vs-benign prompts collapsed to the same empty block (roborev 55172).
+ *  Replacing just the moving SPAN with a placeholder keeps the distinguishing text and neutralises
+ *  the movement. */
+const VOLATILE_SPAN = /\d+(?:\.\d+)?\s*%|\(\s*\d+\s*\/\s*\d+\s*\)|\b\d+(?:\.\d+)?\s*[KMG]i?B\b|\b\d+m\s*\d+s\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/g;
+
+/** Neutralise the moving parts of a line, keeping everything else. */
+function steady(line: string): string {
+  return line.replace(VOLATILE_SPAN, "#");
+}
+
+/** How far above the option block the question may sit. Claude Code's Bash-approval dialog puts the
+ *  command and its description 3–4 lines up; generous without reaching into unrelated output. */
+const QUESTION_CONTEXT_LINES = 10;
+
+/** Hard ceiling on the block, whatever the anchors say. A fingerprint over hundreds of lines of live
+ *  log output changes constantly, which is the same permanent-disagreement failure as a moving tail. */
+const QUESTION_BLOCK_MAX_LINES = 20;
+
+/** How many trailing non-empty lines a y/n question may occupy — the detector's own rule. */
+const YN_TAIL = 2;
+
+/** The same screen re-rendered with a different highlight colour must not read as a different
+ *  question, so escapes come off before anything is hashed. Hoisted with the disable comment the
+ *  way `suggestions/pendingQuestion.ts` and `engine/statusEngine.ts` do it — the rule is right in
+ *  general, and this is the one place it does not apply. */
+// eslint-disable-next-line no-control-regex
+const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
+
+/**
+ * Where the GENERIC menu's option block is — by the detector's rule, not a stricter one.
+ *
+ * `heuristics.ts`'s generic path collects `MENU_LINE` numbers across the whole tail and looks for a
+ * contiguous run counting 1,2,3… restarting at each "1"; intervening non-matching lines do NOT break
+ * it. An earlier version here demanded immediate adjacency, which is stricter — so a menu with a
+ * wrapped or described option row returned options from the detector and nothing from this, and the
+ * press refused forever. Exactly the deadlock fixed for the Claude Code picker, one path over
+ * (roborev 55204). A run of two is still required: a single `[1] 91234` from bash job control, a
+ * footnote or an ordinary log line is not a menu.
+ */
+function optionRun(lines: readonly string[]): { first: number; last: number } | null {
+  // MENU_LINE, the detector's own — see the note where the old local pattern used to live. Parity
+  // with the parser is the whole property here (roborev 55218).
+  const hits: { index: number; n: number }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = MENU_LINE.exec(lines[i]!);
+    if (m) hits.push({ index: i, n: parseInt(m[1]!, 10) });
+  }
+  // Walk the HITS (not the lines), so anything between two option rows is skipped the way the
+  // detector skips it. Take the run closest to the end: an answered menu higher in the buffer is
+  // stale, and the live dialog is the one at the bottom.
+  let best: { first: number; last: number } | null = null;
+  let start = -1;
+  let expected = 1;
+  for (const { index, n } of hits) {
+    if (n === 1) {
+      start = index;
+      expected = 2;
+      continue;
+    }
+    if (start >= 0 && n === expected) {
+      expected += 1;
+      best = { first: start, last: index };
+      continue;
+    }
+    start = -1;
+    expected = 1;
+  }
+  return best;
+}
+
+
+/**
+ * The dialog's OWN text: the option block the DETECTOR parsed, plus the lines above it.
+ *
+ * ASK THE PARSER, DO NOT RE-DERIVE IT. Every previous version of this located the block with its own
+ * rule and every one of them disagreed with `parsePickerOptions` in some way — a narrower option
+ * pattern (55166), a wider window (55172), a stricter adjacency rule and a wider footer search
+ * (55195). A locator that disagrees with the parser that produced its input IS the bug class: the
+ * option shape describes one dialog while the question describes another, and two different prompts
+ * hash the same. `pickerBlockBounds` returns the exact indices that parse used, so there is nothing
+ * left to disagree about — including the wrapped and description lines the parser deliberately skips
+ * between option rows, which a strict adjacency rule rejected outright and thereby made every
+ * soft-wrapped picker permanently unanswerable.
+ *
+ * The y/n path stays separate because the detector treats it separately: a confirmation has no
+ * option rows at all, and `YN` (the detector's own regex) is what tells the two apart.
+ */
+function questionBlock(scrollback: string, yesNo: boolean): string {
+  const clean = scrollback.replace(ANSI, "");
+  if (!yesNo) {
+    const lines = pickerWindow(clean);
+    const bounds = pickerBlockBounds(clean);
+    if (bounds) {
+      // The footer sits just below the last option row, so the block is [first, footer).
+      const block = lines
+        .slice(Math.max(0, bounds.first - QUESTION_CONTEXT_LINES), bounds.footer)
+        // The pointer MOVES as the user arrows around without the question changing, so it is
+        // normalised away — otherwise merely navigating a menu would invalidate a fingerprint.
+        .map((l) => steady(l.replace(/^\s*[❯›>]\s*/, "")).trim())
+        .filter((l) => l !== "");
+      // Cap from the START. The block runs question-first, option-rows-last, and the OPTIONS are
+      // already in the fingerprint's `shape` half — the question is the only part this contributes.
+      // Taking the last N therefore dropped precisely the material that distinguishes one ask from
+      // another, which is the collision everything here exists to prevent (roborev 55204).
+      return block.slice(0, QUESTION_BLOCK_MAX_LINES).join("\n");
+    }
+    // No Claude Code picker. The GENERIC menu path is the detector's other option source, and it
+    // reads only the last TAIL_LINES with the choice prompt on the final line — so that, and
+    // nothing above it, is where a generic menu's question can be.
+    const generic = clean
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .slice(-TAIL_LINES);
+    const run = optionRun(generic);
+    if (!run) return "";
+    let first = run.first;
+    for (let i = run.first - 1; i >= 0; i--) {
+      if (MENU_LINE.test(generic[i]!)) first = i;
+      else break;
+    }
+    return generic
+      .slice(Math.max(0, first - QUESTION_CONTEXT_LINES), run.last + 1)
+      .map((l) => steady(l.replace(/^\s*[❯›>]\s*/, "")).trim())
+      .filter((l) => l !== "")
+      // Question-first: see the note in the picker branch above.
+      .slice(0, QUESTION_BLOCK_MAX_LINES)
+      .join("\n");
+  }
+  // A yes/no confirmation: no option rows, and its question is in the trailing lines by the
+  // detector's own rule. Without this the fingerprint would fall back to the option shape alone,
+  // which for the constant Approve/Deny pair is a GLOBAL CONSTANT (roborev 55166).
+  const tail = clean
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .slice(-YN_TAIL);
+  if (!YN.test(tail.join("\n"))) return "";
+  return tail
+    .map((l) => steady(l).trim())
+    .filter((l) => l !== "")
+    .join("\n");
+}
+
+/**
+ * A stable identity for the MENU ITSELF, not for its options.
+ *
+ * WHY NOT THE OPTIONS ALONE. The most common picker shape is a NUMBERED menu whose labels are "1",
+ * "2", "3", so two different questions are label-identical. Worse, Claude Code's Bash-approval
+ * dialog renders the SAME three options for every command ("Yes" / "Yes, and don't ask again" /
+ * "No, and tell Claude what to do…") — the option set is constant while the thing being approved
+ * changes completely.
+ *
+ * WHY NOT THE TAIL OF THE SCROLLBACK. That was the first implementation and it was wrong (roborev
+ * 55163). Ink keeps rendering BELOW the dialog, which is the entire reason `detectClaudeCodePicker`
+ * searches a window for the footer rather than reading the last line. A blind tail slice hashes UI
+ * chrome, and fails BOTH ways: it misses a changed question — you could approve `rm -rf build/`
+ * having read the prompt for `git status` — and it invents changes from a moving task checklist,
+ * refusing a menu that never moved.
+ *
+ * Not a cryptographic hash — this guards against the menu MOVING, not against a forger. A caller
+ * that fabricates a fingerprint already holds an authority and could just send the keystroke.
+ */
+function pickerFingerprint(agentId: string, options: readonly SuggestionButton[]): string {
+  // The detector emits exactly this pair, and only this pair, for a yes/no confirmation
+  // (`heuristics.ts`: `[btn("Approve", "y\n"), btn("Deny", "n\n")]`). Matching on the VALUES rather
+  // than the labels because the values are the keystrokes — a label is display text and could be
+  // relabelled without changing what the buttons do.
+  const yesNo =
+    options.length === 2 && options[0]?.value === "y\n" && options[1]?.value === "n\n";
+  const prompt = questionBlock(getAgentScrollback(agentId) ?? "", yesNo);
+  // An EMPTY question block means the dialog could not be located, not that it has no question. A
+  // fingerprint over the option shape alone is a global constant for both of the shapes that matter
+  // (numbered menus, and the constant Approve/Deny pair), so producing one would be worse than
+  // producing none. "" is the sentinel: `select_picker_option` refuses on it.
+  if (prompt === "") return "";
+  const shape = options.map((o) => `${o.label}\u0000${o.value}`).join("\u0001");
+  let h = 5381;
+  const material = `${shape}\u0002${prompt}`;
+  for (let i = 0; i < material.length; i++) h = ((h * 33) ^ material.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/** One option as the concierge sees it. `index` is what `select_picker_option` takes. */
+export interface PickerOptionView {
+  index: number;
+  label: string;
+}
+
+export interface PickerOptionsRead {
+  agentId: string;
+  /** Empty when there is no menu on screen — a normal state, not an error. */
+  options: PickerOptionView[];
+  /** True when the agent has a live prompt with options right now. */
+  present: boolean;
+  /** Echo this back to `select_picker_option`. It identifies the MENU, so a different question with
+   *  the same option labels (every numbered menu) cannot be answered by mistake.
+   *
+   *  EMPTY MEANS UNANSWERABLE, in either of two ways: there is no menu, or there is one but its
+   *  question could not be located — and without the question there is nothing that distinguishes
+   *  this ask from any other with the same option shape, which for both shapes that reach here is a
+   *  global constant. `select_picker_option` refuses on an empty fingerprint rather than comparing
+   *  it, so the two collapse to the same safe outcome and the caller never has to tell them apart. */
+  fingerprint: string;
+}
+
+/** Read the options an agent is offering, so the caller can decide (or relay them to the human). */
+export function readPickerOptions(agentId: string): PickerOptionsRead {
+  const live = liveOptionsFor(agentId);
+  return {
+    agentId,
+    options: live.map((o, index) => ({ index, label: o.label })),
+    present: live.length > 0,
+    fingerprint: live.length > 0 ? pickerFingerprint(agentId, live) : "",
+  };
+}
+
+export interface SelectPickerResult {
+  ok: boolean;
+  agentId: string;
+  /** The label actually pressed, on success. */
+  label?: string;
+  /** Why it was refused, machine-readable. */
+  reason?: "no-picker" | "out-of-range" | "changed" | "unreadable-picker" | ConciergeSendPath;
+  detail?: string;
+}
+
+/**
+ * Press one of the agent's live options.
+ *
+ * `expectFingerprint` is REQUIRED and is the whole safety property: it is the caller stating WHICH
+ * MENU it read. If the agent moved on between the read and this call, the fingerprint no longer
+ * matches and we refuse — rather than pressing whatever now happens to sit at that index. It
+ * identifies the menu rather than the option precisely because a numbered menu's labels ("1", "2")
+ * are identical across completely different questions.
+ */
+export async function selectPickerOption(
+  agentId: string,
+  index: number,
+  expectFingerprint: string,
+  authority: ConciergeToolAuthority,
+): Promise<SelectPickerResult> {
+  const live = liveOptionsFor(agentId);
+  if (live.length === 0) {
+    return {
+      ok: false,
+      agentId,
+      reason: "no-picker",
+      detail: "That agent doesn't have a menu on screen right now, so there's nothing to answer.",
+    };
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= live.length) {
+    return {
+      ok: false,
+      agentId,
+      reason: "out-of-range",
+      detail: `There are ${live.length} options (0–${live.length - 1}); ${index} isn't one of them.`,
+    };
+  }
+  const now = pickerFingerprint(agentId, live);
+  // CANNOT FINGERPRINT. The detector found options but this could not locate the dialog they came
+  // from, so there is no material that distinguishes THIS ask from any other with the same option
+  // shape — and both shapes that reach here have a constant one. Comparing "" to "" would let a
+  // caller answer any such dialog with a fingerprint read from a different one, which is the
+  // collision the fingerprint exists to prevent. Refuse instead (roborev 55182).
+  if (now === "" || expectFingerprint === "") {
+    return {
+      ok: false,
+      agentId,
+      reason: "unreadable-picker",
+      detail:
+        "That agent has a menu up, but I can't read the question it's attached to — so I can't " +
+        "tell this prompt apart from any other with the same options, and I won't press a button " +
+        "on a guess. Its terminal pane may not be mounted; open it and read the prompt directly.",
+    };
+  }
+  if (now !== expectFingerprint) {
+    return {
+      ok: false,
+      agentId,
+      reason: "changed",
+      detail:
+        "The menu changed since you read it, so I didn't press anything. Read the options again " +
+        "and decide against the current list.",
+    };
+  }
+  const chosen = live[index]!;
+  // The option's own `value` is the exact string the human's click would inject, so this presses the
+  // button the same way the UI does — through the ordinary authority-gated send, not a second path.
+  const sent = await sendToAgentTerminal(agentId, chosen.value, authority);
+  return sent.ok
+    ? { ok: true, agentId, label: chosen.label }
+    : { ok: false, agentId, reason: sent.path, detail: sent.detail };
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// CONTROL KEYS
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Some things a human does to an agent are not text. Interrupting a runaway command is `esc`;
+// cycling permission modes is `shift+tab`; backgrounding a long-running one is `ctrl+b`. Without
+// these the concierge could only ever ADD to what an agent is doing, never steer or stop it — so
+// "it's stuck in a loop, make it stop" was something it had to ask the human to do by hand.
+//
+// A NAMED SET, NOT ARBITRARY BYTES. The op takes a key NAME and this module owns the mapping. A
+// `send_control_bytes(agentId, "\x1b[200~…")` would be strictly more powerful and strictly worse:
+// arbitrary escape sequences can rewrite the terminal's state, spoof a bracketed paste around
+// somebody else's text, or issue a mode change nothing here reasons about. The point of this tool
+// is the handful of things a human's keyboard actually does.
+//
+// NO CARRIAGE RETURN IS EVER APPENDED. These are keys, not lines. `enter` exists as its own key for
+// the case where the caller genuinely wants to submit what is already on the input line — a
+// different act from typing text, and one that stays visible as its own entry in the audit log.
+
+/** The keys a human's keyboard sends that are not text. */
+export const CONTROL_KEYS = {
+  /** Interrupt / dismiss. The one that stops a runaway agent. */
+  esc: "\x1b",
+  /** Submit whatever is already on the input line. */
+  enter: "\r",
+  /** Claude Code cycles permission modes on shift+tab (CSI Z — "back-tab"). */
+  "shift+tab": "\x1b[Z",
+  /** Background the running foreground job. */
+  "ctrl+b": "\x02",
+  /** History / menu movement. */
+  up: "\x1b[A",
+  down: "\x1b[B",
+  left: "\x1b[D",
+  right: "\x1b[C",
+} as const;
+
+export type ControlKeyName = keyof typeof CONTROL_KEYS;
+
+/** The keys that DRIVE a picker: `enter` commits the highlighted option, the arrows move which one
+ *  that is. Refused while a menu is live, so `select_picker_option`'s fingerprint guard cannot be
+ *  walked around by pressing keys instead (roborev 55165). `esc`/`ctrl+b` are deliberately absent:
+ *  they decline rather than answer, and declining is the thing this tool is most useful for. */
+const PICKER_DRIVING_KEYS = new Set<ControlKeyName>(["enter", "up", "down", "left", "right"]);
+
+/**
+ * Might this agent have a menu up? FAILS CLOSED when blind — but only when it is actually blind.
+ *
+ * TIER (a) IS EXCLUSIVE WHEN IT IS READABLE. `liveOptionsFor` reads the live xterm buffer, which is
+ * the present tense; `attentionScreen` is a SNAPSHOT taken when the agent crossed into
+ * waiting/approval and is never cleared when it answers and resumes (runtimeStore drops it only on
+ * close/reset). Consulting the snapshot while the live screen is readable and definitively clean
+ * would refuse `enter` and the arrows FOREVER for any agent that has ever hit a picker — and
+ * `select_picker_option` refuses there too (`no-picker`), so the refusal's own remedy is a dead end
+ * and the concierge has no route at all. That is a deadlock, not a guard (roborev 55170). It also
+ * inverts the tier ordering the read chain follows, where (b) is strictly a fallback for an
+ * unreadable (a).
+ *
+ * WHEN IT IS BLIND — an unmounted pane, the norm on a real fleet by this module's own header — the
+ * capture is the only evidence there is, and gating on it is what stops the raw keystroke sailing
+ * through on exactly the agents the concierge exists to drive unattended (roborev 55168). But a
+ * stale capture says nothing about NOW, so it counts only while the agent is still in a red status,
+ * i.e. still asking.
+ */
+function mayHaveMenu(agentId: string): boolean {
+  if (getAgentScrollback(agentId) !== null) return liveOptionsFor(agentId).length > 0;
+  const { attentionScreen, status } = useRuntimeStore.getState();
+  if (!isRedStatus(status[agentId])) return false;
+  const captured = attentionScreen[agentId];
+  return typeof captured === "string" && detectTerminalPrompts(captured).length > 0;
+}
+
+/** The names, for the wire enum and for a caller listing what it may press. */
+export const CONTROL_KEY_NAMES = Object.keys(CONTROL_KEYS) as ControlKeyName[];
+
+export interface ControlKeyResult {
+  ok: boolean;
+  agentId: string;
+  key?: ControlKeyName;
+  /** The dispatch vocabulary, plus one of this op's own: `send-failed` covers a write that failed
+   *  for a reason that is NOT a dead PTY. Kept out of `ConciergeDispatchPath` because that union
+   *  describes what the dispatcher did, and this never reaches it. */
+  reason?: ConciergeSendPath | "send-failed";
+  detail?: string;
+}
+
+/**
+ * Press one control key in an agent's terminal.
+ *
+ * Rides the SAME gates as a text send — authority, then `agentCanAcceptInput` — because it is the
+ * same kind of act: it changes what a running process does next and cannot be un-pressed. `esc` in
+ * particular is the most consequential thing on this list; it can discard work in progress.
+ *
+ * Writes RAW, via `writePtyChainedStrict`: a control key is bytes, not a prompt, so it must not get
+ * the bracketed-paste + carriage-return framing `submitPrompt` applies. Chained on the same
+ * per-agent queue as every other write, so a key can never land between another write's paste and
+ * its return and be swallowed by it.
+ */
+export async function sendControlKey(
+  agentId: string,
+  key: ControlKeyName,
+  authority: ConciergeToolAuthority,
+): Promise<ControlKeyResult> {
+  if (!isDispatchAuthority(authority) || authority.kind !== "concierge-tool") {
+    log.warn("concierge", "control key refused — no valid authority", { agentId, key });
+    return {
+      ok: false,
+      agentId,
+      reason: "unauthorized",
+      detail: sendDetail("unauthorized", agentId),
+    };
+  }
+  if (!agentCanAcceptInput(agentId)) {
+    const path: ConciergeSendPath =
+      findAgent(agentId) === undefined ? "unknown-agent" : "cloud-agent";
+    return { ok: false, agentId, reason: path, detail: sendDetail(path, agentId) };
+  }
+  // A LIVE MENU CLOSES THIS ROUTE TO THE PICKER-DRIVING KEYS.
+  //
+  // Without this, `send_control_key` is an unguarded way to do the exact act `select_picker_option`
+  // refuses to do blind (roborev 55165). `enter` presses the HIGHLIGHTED option of whatever dialog
+  // is on screen — nothing read, no fingerprint, no index — and the arrows move that highlight, so
+  // down-then-enter reaches any option at all. Both ops sit in the same `disruptive` tier, so the
+  // policy layer cannot tell them apart either: the guard was simply missing on one route.
+  //
+  // `esc` and `ctrl+b` stay allowed, and that asymmetry is the point. They DECLINE or step back —
+  // "stop what you're doing" is the single most valuable thing this tool does, and it is the one
+  // act that is safe precisely because it commits to nothing.
+  if (PICKER_DRIVING_KEYS.has(key) && mayHaveMenu(agentId)) {
+    return {
+      ok: false,
+      agentId,
+      reason: "ambiguous-picker",
+      detail:
+        `That agent has a menu on screen, so "${key}" would answer it without either of us having ` +
+        `read it. Use read_picker_options and then select_picker_option, which names the option and ` +
+        `refuses if the menu moved. esc is NOT a safe way out of this: it DECLINES whatever is being ` +
+        `asked, which on an unread dialog can discard work in progress or deny a call the human ` +
+        `wanted. Send it only when interrupting is what you mean to do.`,
+    };
+  }
+  try {
+    await writePtyChainedStrict(agentId, CONTROL_KEYS[key]);
+    return { ok: true, agentId, key };
+  } catch (e) {
+    log.warn("concierge", "control key write failed", { agentId, key, error: String(e) });
+    // NARROW, deliberately. `writePtyChainedStrict` converts only a dead PTY into `PtyGoneError`;
+    // pty.ts says any other error propagates unchanged, and conciergeDispatch is the precedent that
+    // checks the type rather than assuming it. `pty-gone`'s copy is a factual claim — "the agent's
+    // terminal has closed" — and under this repo's rule that a remedy is an instruction the user
+    // will follow, telling them that after a transient IPC failure invites them to close or discard
+    // an agent that is alive and fine (roborev 55165).
+    if (e instanceof PtyGoneError) {
+      return { ok: false, agentId, reason: "pty-gone", detail: sendDetail("pty-gone", agentId) };
+    }
+    return {
+      ok: false,
+      agentId,
+      reason: "send-failed",
+      detail: `I couldn't press ${key} in that agent's terminal: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}

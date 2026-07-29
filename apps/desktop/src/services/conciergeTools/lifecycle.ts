@@ -58,6 +58,7 @@ import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/wor
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
 import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
 import { isTornOut } from "../satelliteWindows";
+import { atCapacitySentence } from "../agentCapacity";
 import {
   shipAgent as shipAgentWork,
   saveAgent as saveAgentWork,
@@ -394,20 +395,12 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
     // pane here is a row this window is not DISPLAYING; its process may be running perfectly well,
     // and that sentence sent a human looking for agents that would start later when they were
     // already running. So the clause now reports what `live` actually measures and nothing more.
-    const dormant =
-      capacity.live < capacity.used
-        ? ` (${capacity.live} of them showing in this window; the rest are in project tabs that ` +
-          `aren't open here — most are already running, they're just not on screen)`
-        : "";
     return refuse(
       "spawn_build_agent",
       "at-capacity",
-      `This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. ` +
-        // NAME the binding dimension instead of asserting RAM. On the machine that reported this the
-        // ceiling was CPU-bound at 36 and pinned at 32 while memory sat 94% free, so "derived from
-        // installed RAM" was wrong twice and sent the human tuning the one knob that could not move
-        // the number. The sentence comes from the Rust derivation that computed the number itself.
-        `The ceiling is ${capacity.basis}. Close or finish one before starting another.`,
+      // ONE sentence, shared with every other gate (services/agentCapacity). Two hand-written
+      // copies had already got the `live` clause and the ceiling's cause wrong in turn.
+      atCapacitySentence(capacity, "I can't start another agent right now."),
     );
   }
   const agentId = spawnBuildAgentInProject(project, {

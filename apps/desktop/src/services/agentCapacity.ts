@@ -122,3 +122,35 @@ export function localAgentCapacity(): CapacityReading {
   const limit = Math.max(1, enforcedWorkerCap(settings));
   return { used, live, limit, basis: concurrencyBasis(settings), atCapacity: used >= limit };
 }
+
+/**
+ * THE at-capacity sentence, in ONE place.
+ *
+ * Every gate that refuses a spawn has to say the same true things: how many slots are taken, how
+ * many of those rows actually have a pane in THIS window, and WHY the ceiling is that number. Each
+ * of those was got wrong at least once by a hand-written copy — the ceiling was asserted as
+ * "derived from installed RAM" on a machine that was CPU-bound (roborev 54175), and the `live`
+ * clause was dropped, which "sent a human looking for agents that would start later when they were
+ * already running" (roborev 54225).
+ *
+ * A second refusal site immediately re-introduced the second of those (roborev 55136), which is the
+ * argument for this function existing rather than for fixing the copy again: two gates that must
+ * agree cannot be kept in agreement by discipline.
+ *
+ * `lead` is the caller's own first clause — what was refused and why it costs a slot — so each site
+ * keeps its specific framing while sharing every factual claim.
+ */
+export function atCapacitySentence(capacity: CapacityReading, lead: string): string {
+  // `live < used` is normal, not a bug: a row in a project tab the user hasn't opened holds a slot
+  // without holding a process. Saying so is the difference between an actionable refusal and one
+  // that reads as a miscount.
+  const dormant =
+    capacity.live < capacity.used
+      ? ` (${capacity.live} of them showing in this window; the rest are in project tabs that ` +
+        `aren't open here — most are already running, they're just not on screen)`
+      : "";
+  return (
+    `${lead} This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. ` +
+    `The ceiling is ${capacity.basis}. Close or finish one before starting another.`
+  );
+}

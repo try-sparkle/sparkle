@@ -93,6 +93,11 @@ import {
   CONCIERGE_TERMINAL_TOOLS,
   getAgentStatus,
   readAgentTerminal,
+  CONTROL_KEY_NAMES,
+  readPickerOptions,
+  selectPickerOption,
+  sendControlKey,
+  type ControlKeyName,
   sendToAgentTerminal,
 } from "./terminal";
 import {
@@ -163,6 +168,25 @@ import {
   type ApprovalsOp,
   type ApprovalsResult,
 } from "./approvals";
+import {
+  PLANS_OPS,
+  PLANS_RISK,
+  listPlans,
+  getPlan,
+  createPlan,
+  promotePlanToBuild,
+  type PlansOp,
+  type PlansResult,
+} from "./plans";
+import {
+  DIFF_OPS,
+  DIFF_RISK,
+  listChangedFiles,
+  readFileDiff,
+  listCommits,
+  type DiffOp,
+  type DiffResult,
+} from "./diff";
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
@@ -182,6 +206,8 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "workspace",
   "board",
   "approvals",
+  "plans",
+  "diff",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -394,6 +420,17 @@ function fromBoard<T>(ctx: OpContext, r: BoardResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
+/** plans: same convention as board — the Plan side of the Plan/Build toggle. */
+function fromPlans<T>(ctx: OpContext, r: PlansResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** diff: same convention as board. Read-only throughout — every op is one git plumbing READ, which
+ *  is what lets the domain answer without an approval round-trip. */
+function fromDiff<T>(ctx: OpContext, r: DiffResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
 /** approvals: same convention as board. Read-only throughout — see approvals.ts's header for why
  *  there is deliberately no `approve` op for this to normalize. */
 function fromApprovals<T>(ctx: OpContext, r: ApprovalsResult<T>): ConciergeToolReply {
@@ -591,7 +628,67 @@ const sendTerminalArgs = z
   })
   .strict();
 
+/** The press takes the index AND the `fingerprint` from `read_picker_options` — see terminal.ts for
+ *  why an index alone (or an index plus a label) is not a safe way to answer a LIVE menu. */
+const selectPickerArgs = z
+  .object({
+    agentId: agentIdArg,
+    index: z.number().int().min(0, "an option index is required"),
+    // NOT `.min(1)`. An empty fingerprint is a real value `read_picker_options` returns — it means
+    // the menu is present but its question could not be read, so the ask cannot be told apart from
+    // any other with the same option shape. Rejecting it at the schema handed the model a validation
+    // error telling it to do exactly what it had just done, while the refusal that actually explains
+    // the situation (`unreadable-picker`) was unreachable through the registry (roborev 55195).
+    expectFingerprint: z.string(),
+  })
+  .strict();
+
+/** A NAMED key, not arbitrary bytes — the enum is the whole safety boundary here (see terminal.ts). */
+const controlKeyArgs = z
+  .object({
+    agentId: agentIdArg,
+    key: z.enum(CONTROL_KEY_NAMES as [string, ...string[]]),
+  })
+  .strict();
+
 const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
+  send_control_key: route(controlKeyArgs, async (a, ctx) => {
+    // Same authority as any other terminal write: pressing esc can discard work in flight, so it is
+    // not a lesser act than typing and does not get a lesser gate.
+    const authority = conciergeToolAuthority(ctx.toolCallId, ctx.decision);
+    if (!authority) {
+      log.warn("concierge-tools", "control key refused — no authority could be built", {
+        agentId: a.agentId,
+        tier: ctx.decision.tier,
+      });
+      return err(
+        ctx,
+        REGISTRY_CODES.unauthorized,
+        "Not pressed: nothing authorized this write. A concierge tool write needs a tool-call id and a resolved allow/approved policy.",
+      );
+    }
+    const r = await sendControlKey(a.agentId, a.key as ControlKeyName, authority);
+    return r.ok ? ok(ctx, r) : err(ctx, r.reason ?? "action-failed", r.detail ?? "Not pressed.");
+  }),
+  read_picker_options: route(agentOnly, (a, ctx) => ok(ctx, readPickerOptions(a.agentId))),
+  select_picker_option: route(selectPickerArgs, async (a, ctx) => {
+    // Pressing a menu option writes to a PTY, so it rides the SAME authority as typed text — a
+    // picked option is attributable to a toolCallId exactly like a send.
+    const authority = conciergeToolAuthority(ctx.toolCallId, ctx.decision);
+    if (!authority) {
+      log.warn("concierge-tools", "picker press refused — no authority could be built", {
+        agentId: a.agentId,
+        tier: ctx.decision.tier,
+      });
+      return err(
+        ctx,
+        REGISTRY_CODES.unauthorized,
+        "Not pressed: nothing authorized this write. Answering a menu needs a tool-call id and a resolved allow/approved policy.",
+      );
+    }
+    const r = await selectPickerOption(a.agentId, a.index, a.expectFingerprint, authority);
+    return r.ok ? ok(ctx, r) : err(ctx, r.reason ?? "action-failed", r.detail ?? "Not pressed.");
+  }),
   read_agent_terminal: route(readTerminalArgs, async (a, ctx) =>
     ok(
       ctx,
@@ -982,6 +1079,82 @@ const APPROVALS_ROUTES: Record<ApprovalsOp, Handler> = {
   get_approval: route(approvalIdArgs, (a, ctx) => fromApprovals(ctx, getApproval(a.id))),
 };
 
+// ---------------------------------------------------------------------------------------------
+// PLANS — epics and their children, plus the handoff into a build agent.
+// ---------------------------------------------------------------------------------------------
+
+const planScope = z.object({ projectId: z.string().min(1).optional() }).strict();
+const planIdArgs = planScope.extend({ id: z.string().min(1, "a plan id is required") });
+
+const createPlanArgs = z
+  .object({
+    projectId: projectIdArg,
+    title: z.string().min(1, "a title is required"),
+    body: z.string().optional(),
+  })
+  .strict();
+
+/** Promotion is a WRITE that starts an agent, so it names its project explicitly — same rule as the
+ *  board's writes, and for the same reason (the call that runs must be the call that was asked for). */
+const promoteArgs = z
+  .object({
+    projectId: projectIdArg,
+    epicId: z.string().min(1, "a plan id is required"),
+    /** Repo-relative PRD path, or omitted for a plan with no PRD — sendToBuild then points the
+     *  orchestrator at the epic's own description instead of blocking on a file that isn't there. */
+    prdPath: z.string().min(1).nullable().optional(),
+  })
+  .strict();
+
+/** Diff args. `limit`/`maxLines` are OPTIONAL and only ever LOWER the module's cap — the ceiling
+ *  lives in Rust, so a hallucinated `limit: 5_000_000` cannot widen it. */
+const diffListArgs = z
+  .object({ agentId: agentIdArg, limit: z.number().int().positive().optional() })
+  .strict();
+
+const diffFileArgs = z
+  .object({
+    agentId: agentIdArg,
+    path: z.string().min(1, "name a path from list_changed_files"),
+    maxLines: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const DIFF_ROUTES: Record<DiffOp, Handler> = {
+  list_changed_files: route(diffListArgs, async (a, ctx) =>
+    fromDiff(ctx, await listChangedFiles(a.agentId, a.limit)),
+  ),
+  read_file_diff: route(diffFileArgs, async (a, ctx) =>
+    fromDiff(ctx, await readFileDiff(a.agentId, a.path, a.maxLines)),
+  ),
+  list_commits: route(diffListArgs, async (a, ctx) =>
+    fromDiff(ctx, await listCommits(a.agentId, a.limit)),
+  ),
+};
+
+const PLANS_ROUTES: Record<PlansOp, Handler> = {
+  list_plans: route(planScope, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) =>
+      fromPlans(ctx, await listPlans(p.rootPath, p.id)),
+    ),
+  ),
+  get_plan: route(planIdArgs, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) =>
+      fromPlans(ctx, await getPlan(p.rootPath, p.id, a.id)),
+    ),
+  ),
+  create_plan: route(createPlanArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromPlans(ctx, await createPlan(p.rootPath, a.title, a.body ?? "")),
+    ),
+  ),
+  promote_plan_to_build: route(promoteArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromPlans(ctx, await promotePlanToBuild(p.rootPath, p.id, a.epicId, a.prdPath ?? null)),
+    ),
+  ),
+};
+
 interface DomainEntry {
   routes: Record<string, Handler>;
   /** Whether an op changes the world — asked of the DOMAIN's own classification wherever it has one
@@ -1014,10 +1187,20 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => WORKSPACE_OP_RISK[op as WorkspaceOp] !== "read-only",
     ops: WORKSPACE_OPS,
   },
+  diff: {
+    routes: DIFF_ROUTES,
+    write: (op) => DIFF_RISK[op as DiffOp] !== "read-only",
+    ops: DIFF_OPS,
+  },
   board: {
     routes: BOARD_ROUTES,
     write: (op) => BOARD_RISK[op as BoardOp] !== "read-only",
     ops: BOARD_OPS,
+  },
+  plans: {
+    routes: PLANS_ROUTES,
+    write: (op) => PLANS_RISK[op as PlansOp] !== "read-only",
+    ops: PLANS_OPS,
   },
   approvals: {
     // Every op is read-only by construction (see approvals.ts), so this is a constant rather than a
@@ -1037,6 +1220,8 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   workspace: DOMAINS.workspace.ops,
   board: DOMAINS.board.ops,
   approvals: DOMAINS.approvals.ops,
+  plans: DOMAINS.plans.ops,
+  diff: DOMAINS.diff.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

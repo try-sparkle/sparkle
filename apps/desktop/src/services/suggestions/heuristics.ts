@@ -7,13 +7,19 @@ import { PICKER_FOOTER } from "../../engine/screenClassifier";
 export { PICKER_FOOTER };
 
 // Only the last N non-empty lines are considered "live" — a prompt scrolled far up is stale.
-const TAIL_LINES = 12;
+export const TAIL_LINES = 12;
 
 // `YN` matches "[y/n]" / "[yes/no]" case-insensitively (the bracket alternatives), plus bare
 // "y/n" / "yes/no" word forms. (An earlier YN_DEFAULT regex was removed — it was fully subsumed
 // by this one and added no behavior.)
-const YN = /\b(y\/n|yes\/no)\b|\[y\/n\]|\[yes\/no\]/i;
-const MENU_LINE = /^\s*[[(]?(\d{1,2})[\]).]\s+\S/; // "1) x", "2. x", "[3] x", "(4) x"
+/** Exported so the concierge's picker fingerprint can decide whether a screen with no option run is
+ *  a y/n confirmation or simply a dialog it failed to locate — those must not be conflated, because
+ *  the second one is unsafe to fingerprint at all (roborev 55182). One definition, not two. */
+export const YN = /\b(y\/n|yes\/no)\b|\[y\/n\]|\[yes\/no\]/i;
+/** Exported so the concierge's fingerprint can locate a generic menu's rows with the DETECTOR'S
+ *  pattern rather than a wider one of its own — a locator that accepts a line the parser rejects
+ *  breaks the run and produces a permanent refusal (roborev 55218). */
+export const MENU_LINE = /^\s*[[(]?(\d{1,2})[\]).]\s+\S/; // "1) x", "2. x", "[3] x", "(4) x"
 
 // A real choice prompt either names the action, or is a pure-punctuation prompt like "? " / ">"
 // (a single-word label ending in ":" such as "Changes:"/"Results:" is a HEADER, not a prompt —
@@ -51,8 +57,8 @@ function asksChoice(lastLine: string): boolean {
 // screenClassifier) anchors on the always-present "esc to cancel … ctrl+e to explain" pair, which
 // sits BELOW the option block in the same structural position as the standard footer, so the upward
 // option walk works identically.
-const PICKER_WINDOW = 50; // non-empty lines to search for the footer
-const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
+export const PICKER_WINDOW = 50; // non-empty lines to search for the footer
+export const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
 const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
 const PICKER_LABEL_MAX = 40;
 const PICKER_MAX_BUTTONS = 6;
@@ -66,7 +72,38 @@ function truncateLabel(s: string): string {
  *  order (1..N), or `[]` when no valid picker is present. Shared by {@link detectClaudeCodePicker}
  *  (renders every option as a button) and {@link detectResumePrompt} (looks for two specific
  *  options), so the footer-search + count-down parse lives in exactly one place. */
+/** The region a successful picker parse actually used, in NON-EMPTY line indices relative to the
+ *  window `tail(scrollback, PICKER_WINDOW)` returns. Exported so the concierge's fingerprint can
+ *  hash the block THE DETECTOR PARSED rather than re-deriving it with a stricter rule of its own —
+ *  every re-derivation so far has disagreed with this one in some way (roborev 55166/55172/55195),
+ *  and a locator that disagrees with the parser that produced its input is the whole bug class. */
+export interface PickerBounds {
+  /** Index of the first option row (option "1"). */
+  first: number;
+  /** Index of the footer line, which sits just below the last option row. */
+  footer: number;
+}
+
+/** Where the last successful picker parse found its block, or null if there is no valid picker.
+ *  Indices are into `tail(scrollback, PICKER_WINDOW)` — see {@link pickerWindow}. */
+export function pickerBlockBounds(scrollback: string): PickerBounds | null {
+  const r = parsePickerOptionsWithBounds(scrollback);
+  return r.opts.length > 0 ? r.bounds : null;
+}
+
+/** The exact window the picker parse reads, so a caller can index into the same array. */
+export function pickerWindow(scrollback: string): string[] {
+  return tail(scrollback, PICKER_WINDOW);
+}
+
 function parsePickerOptions(scrollback: string): { n: number; label: string }[] {
+  return parsePickerOptionsWithBounds(scrollback).opts;
+}
+
+function parsePickerOptionsWithBounds(scrollback: string): {
+  opts: { n: number; label: string }[];
+  bounds: PickerBounds | null;
+} {
   const lines = tail(scrollback, PICKER_WINDOW);
   // The LAST footer wins — an earlier, answered picker higher in the window is stale.
   let footerIdx = -1;
@@ -76,7 +113,7 @@ function parsePickerOptions(scrollback: string): { n: number; label: string }[] 
       break;
     }
   }
-  if (footerIdx < 0) return [];
+  if (footerIdx < 0) return { opts: [], bounds: null };
 
   // Walk the block above the footer bottom-up, collecting options while the numbers count DOWN
   // to 1. Most wrapped description lines don't match PICKER_OPTION and are skipped; one that
@@ -85,6 +122,7 @@ function parsePickerOptions(scrollback: string): { n: number; label: string }[] 
   // than expected means the current anchor was junk below the true last option — restart the
   // run from this line. A LOWER number than expected is junk inside the block — skip it.
   let opts: { n: number; label: string }[] = [];
+  let firstIdx = -1;
   let expected = -1; // the next number we accept walking upward (-1 = any to start)
   for (let i = footerIdx - 1; i >= Math.max(0, footerIdx - PICKER_SPAN); i--) {
     const m = (lines[i] ?? "").match(PICKER_OPTION);
@@ -95,11 +133,12 @@ function parsePickerOptions(scrollback: string): { n: number; label: string }[] 
       opts = []; // bad anchor: this is the true bottom of the option run
     }
     opts.unshift({ n, label: m[2] });
+    firstIdx = i;
     if (n === 1) break;
     expected = n - 1;
   }
-  if (opts.length < 2 || opts[0]?.n !== 1) return [];
-  return opts;
+  if (opts.length < 2 || opts[0]?.n !== 1) return { opts: [], bounds: null };
+  return { opts, bounds: { first: firstIdx, footer: footerIdx } };
 }
 
 /** Detect Claude Code's option picker; returns one button per option ("N · label" → "N\n"). */

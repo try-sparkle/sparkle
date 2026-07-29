@@ -9376,3 +9376,517 @@ mod tests {
         assert!(REPO_LOCK_WAIT_LOG_MS < WORKTREE_OP_SLOW_MS);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DIFF INSPECTION (concierge PRD section J)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// "What did this agent actually change?" was unanswerable from the concierge column. It could see
+// that a branch was ahead by N commits (`agent_branch_status`) and it could read the agent's
+// terminal, but the terminal narrates INTENT — what the agent said it did — and the two diverge
+// exactly when it matters. The diff is the only account of the work that cannot be wrong.
+//
+// READ-ONLY BY CONSTRUCTION. Every git invocation here is a plumbing read (`diff --stat`,
+// `diff --numstat`, `diff -- <path>`, `log`). Nothing writes a ref, stages, stashes or checks out.
+// That is what lets the whole surface sit in the `read-only` risk tier and run without an approval.
+//
+// TWO BUDGETS, BOTH MANDATORY. A diff is unbounded and lands in an LLM context window, so:
+//   • the FILE LIST is capped by count — a 900-file refactor returns the first N and says so;
+//   • a FILE'S TEXT is capped by lines AND chars, and a truncated body says so, in words, with
+//     amounts. Silent truncation would let the concierge report "that's the whole change" about a
+//     fragment, which is the confident-and-wrong failure this surface must not have.
+
+/// Ceiling on files returned by one `diff_files` call. A caller may ask for fewer, never more.
+const DIFF_MAX_FILES: usize = 200;
+/// Ceiling on lines of one file's patch text.
+const DIFF_MAX_LINES: usize = 400;
+/// Ceiling on chars of one file's patch text — the same budget the terminal read uses, for the same
+/// reason (a runaway payload someone pays for).
+const DIFF_MAX_CHARS: usize = 4000;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffFile {
+    pub path: String,
+    /// Lines added / removed. `None` for a binary file — numstat prints "-" there, and reporting 0
+    /// would read as "nothing changed" rather than "not countable".
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
+    pub binary: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSummary {
+    pub base: String,
+    pub head: String,
+    pub files: Vec<DiffFile>,
+    /// How many files the diff ACTUALLY has, before the cap. Equal to `files.len()` when nothing
+    /// was dropped; larger when the cap bit — so a caller can always tell the difference between
+    /// "that's all of them" and "that's the first 200 of 900".
+    pub total_files: usize,
+    pub truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffText {
+    pub path: String,
+    pub text: String,
+    pub truncated: bool,
+    /// Present only when truncated: what was left out, so the caller can say so honestly.
+    pub omitted_lines: Option<usize>,
+    /// Bytes left out. The LINE count alone understates badly when one dropped line is a minified
+    /// bundle: "1 line omitted" is true and useless about 200 KB.
+    pub omitted_bytes: Option<usize>,
+}
+
+/// The two-dot range every op here reads. `base...head` (three-dot) would diff against the merge
+/// base, which is what a PR shows; two-dot shows the literal difference between the two trees. We
+/// use three-dot deliberately: "what did this agent change" means its own commits, not other
+/// people's work that landed on the base since it branched.
+fn diff_range(base: &str, head: &str) -> String {
+    format!("{base}...{head}")
+}
+
+/// Apply BOTH budgets in one pass, returning the text and how many lines it actually holds.
+///
+/// Applying the line cap, deciding `omitted_lines` from it, and THEN cutting on chars made the
+/// number a lie whenever the char cap bound first — which it does for any patch averaging over 10
+/// chars a line, i.e. essentially every real one. A 300-line patch came back `truncated: true,
+/// omitted_lines: null` (no amount to report, though both descriptors tell the model to report one),
+/// and a 500-line patch came back `omitted_lines: 100` when the text stopped near line 100 — a
+/// confident ~4x under-report, worse than silence (roborev 55193).
+///
+/// Cuts on a LINE boundary: a mid-line cut leaves `- if (x) return` as the last emitted line, which
+/// reads as a complete diff line rather than as a fragment.
+fn clip_patch(lines: &[&str], cap: usize) -> (String, usize) {
+    let mut text = String::new();
+    let mut emitted = 0usize;
+    for line in lines.iter().take(cap) {
+        let cost = line.len() + usize::from(!text.is_empty());
+        if text.len() + cost > DIFF_MAX_CHARS {
+            // THE FIRST LINE IS NOT EXEMPT. Guarding this on `!text.is_empty()` meant line one was
+            // emitted whole and unbounded — and a patch whose first line is a minified bundle, a
+            // source map, a lockfile blob or an inlined data URI is one line. `read_file_diff` then
+            // returned hundreds of KB with `truncated: false`, blowing the stated cap by orders of
+            // magnitude while reporting a complete patch: wrong about itself in the opposite
+            // direction from the bug this function was written to fix (roborev 55201).
+            if text.is_empty() {
+                // Nothing would fit at all. Emit a prefix so the caller sees SOMETHING of the
+                // patch, cut on a char boundary — a byte slice through UTF-8 panics, and diffs are
+                // full of it. It does NOT count as emitted, so `omitted_lines` still reports every
+                // line as missing, which is true: no line was delivered in full.
+                let mut end = DIFF_MAX_CHARS.min(line.len());
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.push_str(&line[..end]);
+            }
+            break;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+        emitted += 1;
+    }
+    (text, emitted)
+}
+
+/// How a clip is REPORTED. Extracted so the mapping can be tested directly: the previous test
+/// asserted `400 - emitted == 400 - text.lines().count()`, which reduces to `emitted ==
+/// text.lines().count()` — a tautology of clip_patch's own loop that would pass against any
+/// implementation, including one reporting `omitted_lines` wrongly (roborev 55201). The behaviour
+/// that actually regressed is this mapping, so this is the thing to test.
+fn clip_report(total: usize, emitted: usize) -> (bool, Option<usize>) {
+    if emitted < total {
+        (true, Some(total - emitted))
+    } else {
+        (false, None)
+    }
+}
+
+/// How many BYTES were dropped, which the line count alone can badly understate: a patch of four
+/// header lines plus one 200 KB minified line reports `omitted_lines: 1`, literally true and wildly
+/// misleading about the size of what is missing (roborev 55208). Reported alongside the line count
+/// so a caller can say "1 line, 200 KB" rather than "1 line".
+fn omitted_bytes(lines: &[&str], emitted: usize) -> Option<usize> {
+    let dropped: usize = lines.iter().skip(emitted).map(|l| l.len() + 1).sum();
+    if dropped > 0 {
+        Some(dropped)
+    } else {
+        None
+    }
+}
+
+/// git C-QUOTES any path with non-ASCII bytes, a quote or a backslash unless `core.quotepath` is
+/// off: `src/café.ts` comes back as `"src/caf\303\251.ts"`. The descriptor tells the model to feed a
+/// path straight from `diff_files` into `diff_file_text`, and a quoted literal matches NO pathspec —
+/// git then exits 0 with empty output, so the answer is "that file is unchanged" about a file that
+/// was rewritten. A silent wrong answer on the one surface whose stated purpose is that it cannot be
+/// wrong about itself (roborev 55193). `-c` rather than a repo config write: this is a read.
+fn git_raw_paths(cwd: &str, args: &[&str]) -> Result<String, String> {
+    let mut full = vec!["-c", "core.quotepath=false"];
+    full.extend_from_slice(args);
+    git(cwd, &full)
+}
+
+/// Which ref could not be resolved — so a caller can tell "this agent hasn't committed" from "this
+/// project's default branch isn't checked out locally". Both surface as git's one `ambiguous
+/// argument` message, and the first is a claim about the AGENT while the second is a claim about the
+/// REPO; reporting the second as the first tells the human an agent did no work while its branch
+/// sits there with commits on it (roborev 55193).
+/// The ref prelude every diff command runs. One helper so the three call sites cannot drift —
+/// `diff_commits` was missing it while the TS classifier's fallback regex was simultaneously
+/// removed, so a branchless agent's `list_commits` regressed from the supported `no-branch` state to
+/// a raw `fatal: ambiguous argument` reaching the concierge (roborev 55201).
+fn require_refs(cwd: &str, base: &str, head: &str) -> Result<(), String> {
+    // PROBE THE REPO FIRST. `rev-parse --verify --quiet` exits non-zero for a ref that is absent AND
+    // for a repo that cannot be read at all — a moved project root, a deleted checkout, git missing
+    // from PATH. Treating the second as the first makes `list_commits` answer "that agent hasn't
+    // committed anything" about an agent whose branch and commits are sitting right there, which is
+    // the confident false claim this helper's own doc says it exists to prevent (roborev 55208).
+    // A failure here is returned RAW so it classifies as `git-failed`.
+    git(cwd, &["rev-parse", "--git-dir"])?;
+    match missing_ref(cwd, base, head) {
+        Some("missing-head") => Err(format!("missing-head: {head}")),
+        Some(which) => Err(format!("{which}: {base}")),
+        None => Ok(()),
+    }
+}
+
+fn missing_ref(cwd: &str, base: &str, head: &str) -> Option<&'static str> {
+    let resolves = |r: &str| git(cwd, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok();
+    if !resolves(head) {
+        return Some("missing-head");
+    }
+    if !resolves(base) {
+        return Some("missing-base");
+    }
+    None
+}
+
+fn parse_numstat(line: &str) -> Option<DiffFile> {
+    let mut parts = line.splitn(3, '\t');
+    let a = parts.next()?;
+    let r = parts.next()?;
+    let path = parts.next()?.to_string();
+    // git prints "-\t-\tpath" for a binary file.
+    let binary = a == "-" || r == "-";
+    Some(DiffFile {
+        path,
+        added: a.parse::<u32>().ok(),
+        removed: r.parse::<u32>().ok(),
+        binary,
+    })
+}
+
+/// The files an agent's branch changed against its base, with per-file line counts.
+#[tauri::command]
+pub async fn diff_files(
+    cwd: String,
+    base: String,
+    head: String,
+    limit: Option<usize>,
+) -> Result<DiffSummary, String> {
+    validate_ref(&base)?;
+    validate_ref(&head)?;
+    let cap = limit.unwrap_or(DIFF_MAX_FILES).min(DIFF_MAX_FILES).max(1);
+    tauri::async_runtime::spawn_blocking(move || {
+        require_refs(&cwd, &base, &head)?;
+        let range = diff_range(&base, &head);
+        // `--no-renames` so a rename reports as one add + one delete rather than a path pair the
+        // parser would mis-split on the tab-separated form.
+        let out = git_raw_paths(&cwd, &["diff", "--numstat", "--no-renames", &range, "--"])?;
+        let all: Vec<DiffFile> = out.lines().filter_map(parse_numstat).collect();
+        let total_files = all.len();
+        let truncated = total_files > cap;
+        Ok(DiffSummary {
+            base,
+            head,
+            files: all.into_iter().take(cap).collect(),
+            total_files,
+            truncated,
+        })
+    })
+    .await
+    .map_err(|e| format!("diff_files task failed: {e}"))?
+}
+
+/// One file's patch text, capped by lines and chars.
+#[tauri::command]
+pub async fn diff_file_text(
+    cwd: String,
+    base: String,
+    head: String,
+    path: String,
+    max_lines: Option<usize>,
+) -> Result<DiffText, String> {
+    validate_ref(&base)?;
+    validate_ref(&head)?;
+    if path.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    // A path is passed after `--`, so git treats it as a pathspec and never as an option — but a
+    // leading '-' would still be ambiguous to anything that re-parses the string later, and a
+    // control char has no business in a repo path.
+    if path.starts_with('-') || path.bytes().any(|c| c.is_ascii_control()) {
+        return Err(format!("refusing suspicious path: {path:?}"));
+    }
+    let cap = max_lines.unwrap_or(DIFF_MAX_LINES).min(DIFF_MAX_LINES).max(1);
+    tauri::async_runtime::spawn_blocking(move || {
+        require_refs(&cwd, &base, &head)?;
+        let range = diff_range(&base, &head);
+        let out = git_raw_paths(&cwd, &["diff", "--no-renames", &range, "--", &path])?;
+        let lines: Vec<&str> = out.lines().collect();
+        let total = lines.len();
+
+        let (text, emitted) = clip_patch(&lines, cap);
+        let (truncated, omitted_lines) = clip_report(total, emitted);
+        Ok(DiffText {
+            path,
+            text,
+            truncated,
+            omitted_lines,
+            omitted_bytes: omitted_bytes(&lines, emitted),
+        })
+    })
+    .await
+    .map_err(|e| format!("diff_file_text task failed: {e}"))?
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRow {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Unix seconds — the caller formats. A pre-formatted date here would bake in a locale the
+    /// caller may not want.
+    pub timestamp: i64,
+}
+
+/// The commits on `head` that are not on `base` — the agent's own work, newest first.
+#[tauri::command]
+pub async fn diff_commits(
+    cwd: String,
+    base: String,
+    head: String,
+    limit: Option<usize>,
+) -> Result<Vec<CommitRow>, String> {
+    validate_ref(&base)?;
+    validate_ref(&head)?;
+    let cap = limit.unwrap_or(50).min(200).max(1);
+    tauri::async_runtime::spawn_blocking(move || {
+        require_refs(&cwd, &base, &head)?;
+        let range = format!("{base}..{head}");
+        // %x1f (unit separator) rather than a printable delimiter: a commit subject can contain
+        // any printable char, and splitting on one that appears in the subject silently corrupts
+        // every later field.
+        let out = git(
+            &cwd,
+            &[
+                "log",
+                &format!("-{cap}"),
+                "--format=%H%x1f%s%x1f%an%x1f%at",
+                &range,
+            ],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\u{1f}');
+                Some(CommitRow {
+                    sha: f.next()?.to_string(),
+                    subject: f.next()?.to_string(),
+                    author: f.next()?.to_string(),
+                    timestamp: f.next()?.parse().ok()?,
+                })
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("diff_commits task failed: {e}"))?
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    // A binary file is "-\t-\tpath" in numstat. Reporting 0/0 would read as "nothing changed" when
+    // the truth is "not countable", and a caller relaying that would tell the human a changed
+    // binary was untouched.
+    #[test]
+    fn binary_files_report_none_not_zero() {
+        let f = parse_numstat("-\t-\tassets/icon.png").expect("parses");
+        assert_eq!(f.path, "assets/icon.png");
+        assert!(f.binary);
+        assert_eq!(f.added, None);
+        assert_eq!(f.removed, None);
+    }
+
+    #[test]
+    fn text_files_carry_their_counts() {
+        let f = parse_numstat("12\t3\tsrc/pty.rs").expect("parses");
+        assert_eq!((f.added, f.removed, f.binary), (Some(12), Some(3), false));
+    }
+
+    // A path may contain a tab-free but space-bearing name, and splitn(3) must hand the WHOLE
+    // remainder back as the path rather than splitting it further.
+    #[test]
+    fn paths_with_spaces_survive() {
+        let f = parse_numstat("1\t0\tdocs/My Notes.md").expect("parses");
+        assert_eq!(f.path, "docs/My Notes.md");
+    }
+
+    #[test]
+    fn junk_lines_are_skipped_rather_than_panicking() {
+        assert!(parse_numstat("").is_none());
+        assert!(parse_numstat("not numstat").is_none());
+    }
+
+    // THREE-dot, not two. Two-dot attributes everything that landed on the base since the agent
+    // branched to that agent, and a stale branch is the normal state here — so the wrong operator
+    // makes this tool actively misleading rather than merely incomplete.
+    // THE ACCOUNTING MUST MATCH THE TEXT. Asserting the REPORT directly, against ground truth —
+    // the previous version compared `400 - emitted` to `400 - text.lines().count()`, which reduces
+    // to `emitted == text.lines().count()`: a tautology of clip_patch's own loop that would pass
+    // against any implementation, including one reporting omitted_lines wrongly (roborev 55201).
+    #[test]
+    fn a_char_bound_clip_reports_a_real_count() {
+        // 400 lines of 100 chars: the CHAR cap binds long before the 400-line cap.
+        let owned: Vec<String> = (0..400).map(|i| format!("+{:0>99}", i)).collect();
+        let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let (text, emitted) = clip_patch(&lines, 400);
+
+        assert!(text.len() <= DIFF_MAX_CHARS);
+        assert!(400 - emitted > 300, "the char cap must drop most of the patch");
+        // The report is non-None and EQUAL to the real shortfall — the old code said None here.
+        assert_eq!(clip_report(400, emitted), (true, Some(400 - emitted)));
+        // …and the last line delivered is WHOLE, not a mid-line fragment.
+        assert_eq!(text.lines().last().unwrap().len(), 100);
+    }
+
+    // THE REALISTIC SHAPE: a real `git diff` starts with header lines, so the giant line is never
+    // line 0 — a test built from a bare giant line does not exercise what actually happens
+    // (roborev 55208).
+    #[test]
+    fn a_real_patch_whose_body_is_one_giant_line_stays_bounded_and_honest() {
+        let giant = format!("+{}", "x".repeat(200_000));
+        let owned = vec![
+            "diff --git a/bundle.min.js b/bundle.min.js".to_string(),
+            "index 1234567..89abcde 100644".to_string(),
+            "--- a/bundle.min.js".to_string(),
+            "+++ b/bundle.min.js".to_string(),
+            giant,
+        ];
+        let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let (text, emitted) = clip_patch(&lines, 400);
+
+        assert!(text.len() <= DIFF_MAX_CHARS, "got {} chars", text.len());
+        assert_eq!(emitted, 4, "the four header lines fit; the body does not");
+        assert_eq!(clip_report(5, emitted), (true, Some(1)));
+        // "1 line omitted" is true and useless about 200 KB — the byte count is what makes it usable.
+        let bytes = omitted_bytes(&lines, emitted).expect("some bytes were dropped");
+        assert!(bytes > 200_000, "got {bytes}");
+    }
+
+    // A SINGLE ENORMOUS LINE. Exempting the first line from the char budget let a minified bundle,
+    // a source map or an inlined data URI through whole — hundreds of KB reported as a COMPLETE,
+    // untruncated patch, blowing the stated cap by orders of magnitude (roborev 55201).
+    #[test]
+    fn one_giant_line_is_still_bounded_and_reported_as_truncated() {
+        let giant = format!("+{}", "x".repeat(100_000));
+        let (text, emitted) = clip_patch(&[giant.as_str()], 400);
+
+        assert!(text.len() <= DIFF_MAX_CHARS, "got {} chars", text.len());
+        // No line was delivered IN FULL, so the report must not claim one was.
+        assert_eq!(emitted, 0);
+        assert_eq!(clip_report(1, emitted), (true, Some(1)));
+        assert!(omitted_bytes(&[giant.as_str()], emitted).unwrap() > 100_000);
+    }
+
+    // …and the prefix is cut on a char boundary: a byte slice through UTF-8 panics, and diffs are
+    // full of it.
+    #[test]
+    fn a_giant_multibyte_line_does_not_panic() {
+        let giant = format!("+{}", "é".repeat(100_000));
+        let (text, _) = clip_patch(&[giant.as_str()], 400);
+        assert!(text.len() <= DIFF_MAX_CHARS);
+        assert!(text.chars().all(|c| c == '+' || c == 'é'));
+    }
+
+    #[test]
+    fn a_line_bound_clip_reports_the_line_shortfall() {
+        let owned: Vec<String> = (0..50).map(|i| format!("+{i}")).collect();
+        let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let (text, emitted) = clip_patch(&lines, 10);
+
+        assert_eq!(emitted, 10);
+        assert_eq!(text.lines().count(), 10);
+        assert_eq!(clip_report(50, emitted), (true, Some(40)));
+    }
+
+    #[test]
+    fn a_patch_inside_both_budgets_is_untruncated() {
+        let lines = vec!["+a", "-b", " c"];
+        let (text, emitted) = clip_patch(&lines, 400);
+        assert_eq!((emitted, text.as_str()), (3, "+a\n-b\n c"));
+        // The untruncated case must report NO amount, not Some(0).
+        assert_eq!(clip_report(3, emitted), (false, None));
+        // Nothing dropped means NO byte count either — not Some(0).
+        assert_eq!(omitted_bytes(&lines, emitted), None);
+    }
+
+    // THE REPO PROBE. Deleting the `rev-parse --git-dir` line left every other test in this module
+    // green while restoring the confident false claim it exists to prevent — "that agent hasn't
+    // committed anything" about an agent whose branch is sitting right there (roborev 55218). These
+    // pin both arms of the branch.
+    #[test]
+    fn a_directory_that_is_not_a_repo_is_a_git_failure_not_a_missing_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let err = require_refs(&dir.path().to_string_lossy(), "main", "sparkle/agent-1")
+            .expect_err("a non-repo must not resolve");
+
+        // The RAW git error, so the TS side classifies it `git-failed` — NOT either sentinel, which
+        // would make the concierge report the agent as having done no work.
+        assert!(!err.starts_with("missing-head"), "got {err}");
+        assert!(!err.starts_with("missing-base"), "got {err}");
+        assert!(err.contains("not a git repository"), "got {err}");
+    }
+
+    #[test]
+    fn a_real_repo_missing_the_agent_branch_reports_missing_head() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        git(&cwd, &["init", "-q", "-b", "main"]).expect("init");
+        git(&cwd, &["config", "user.email", "t@example.com"]).expect("email");
+        git(&cwd, &["config", "user.name", "T"]).expect("name");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "root"]).expect("commit");
+
+        let err = require_refs(&cwd, "main", "sparkle/agent-1").expect_err("no such branch");
+        assert_eq!(err, "missing-head: sparkle/agent-1");
+
+        // …and the base arm, which must name the ref that failed rather than the agent's.
+        let err = require_refs(&cwd, "nope-branch", "main").expect_err("no such base");
+        assert_eq!(err, "missing-base: nope-branch");
+
+        // Both present resolves cleanly.
+        assert!(require_refs(&cwd, "main", "main").is_ok());
+    }
+
+    #[test]
+    fn the_range_is_merge_base_relative() {
+        assert_eq!(diff_range("main", "sparkle/agent-1"), "main...sparkle/agent-1");
+    }
+
+    // The refs reach a subprocess, so an option-shaped one must be refused rather than passed
+    // through — the same guard the rest of this module applies to every ref it takes.
+    #[test]
+    fn option_shaped_refs_are_refused() {
+        assert!(validate_ref("--upload-pack=touch /tmp/pwn").is_err());
+        assert!(validate_ref("-x").is_err());
+        assert!(validate_ref("main").is_ok());
+    }
+}

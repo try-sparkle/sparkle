@@ -6,6 +6,59 @@
 import { useProjectStore } from "../stores/projectStore";
 import { beadsProtocol } from "./buildAgent";
 import { landInAgent } from "./landInAgent";
+import { localAgentCapacity, atCapacitySentence } from "./agentCapacity";
+
+/** Thrown when the handoff would need a NEW build agent and the machine is at its ceiling. A named
+ *  class so callers can map it to their own vocabulary — the concierge to a typed `at-capacity`
+ *  refusal — instead of string-matching a generic Error. */
+export class AtCapacityError extends Error {
+  readonly atCapacity = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "AtCapacityError";
+  }
+}
+
+/**
+ * The refusal's first clause, matched to what was actually asked for.
+ *
+ * `atCapacitySentence`'s `lead` exists precisely so each site keeps an accurate opening while
+ * sharing every factual claim. "Build It" on a single task builds ONE bead on ONE worker branch —
+ * there is no plan in it — and the sentence is shown verbatim in the overlay, so calling it a plan
+ * would describe something the user did not ask for (roborev 55143).
+ */
+function capacityLead(mode: SendToBuildArgs["mode"]): string {
+  return mode === "task"
+    ? "Building this task would need another agent."
+    : "Starting this plan would need another agent.";
+}
+
+/**
+ * Would {@link sendToBuild} refuse this handoff? Returns the reason, or null if it would proceed.
+ *
+ * ASK BEFORE YOU MUTATE. Every board handoff `claimBead`s the epic to `in_progress` BEFORE calling
+ * sendToBuild. That was harmless while sendToBuild only threw for an unknown project — a state the
+ * caller had already ruled out — but the capacity throw makes claim-then-fail a ROUTINE path: the
+ * epic would be left marked in progress with no orchestrator bound, and nothing un-claims it. For a
+ * backlog card it is worse than untidy, because the claim moves the card out of the `backlog`
+ * column that renders the Start button at all, so the affordance the user just clicked disappears
+ * and the retry is only reachable through the detail overlay (roborev 55139).
+ *
+ * Same reading as the gate itself, so the two cannot disagree — this is a PREFLIGHT, not a second
+ * policy. The gate stays authoritative: a caller that skips this check is still refused.
+ */
+export function sendToBuildBlockedReason(
+  projectId: string,
+  epicId: string,
+  mode: SendToBuildArgs["mode"] = "epic",
+): string | null {
+  const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+  if (!project) return null; // not our error to report; sendToBuild throws its own for this
+  const existing = project.agents.find((a) => a.kind === "build" && a.epicId === epicId);
+  if (existing) return null; // resuming a bound orchestrator consumes no slot
+  const capacity = localAgentCapacity();
+  return capacity.atCapacity ? atCapacitySentence(capacity, capacityLead(mode)) : null;
+}
 
 export interface SendToBuildArgs {
   projectId: string;
@@ -72,6 +125,29 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // An UNBOUND build agent (no epicId) is deliberately not reused: it may be one the user started
   // by hand and is talking to.
   const existing = project.agents.find((a) => a.kind === "build" && a.epicId === args.epicId);
+  // THE MACHINE-WIDE CAP, enforced HERE rather than in the callers (roborev 55135).
+  //
+  // This function reaches `store.addAgent` directly, and addAgent has no capacity check — the other
+  // gates live in `spawnBuildAgentInProject` and the concierge's `spawn_build_agent`, neither of
+  // which this path touches. It was first gated in ONE caller (the concierge's
+  // promote_plan_to_build), which left the four Plan-board handoffs — "Start", "Build It",
+  // "Build It (task)", and the epic-row button in BoardView — sailing straight past it. That is the
+  // same asymmetry agentCapacity's own header records from the last occurrence, and the reason the
+  // gate belongs on the shared path: a cap enforced on some callers is not a cap.
+  //
+  // Only when a NEW agent would be created: reusing the orchestrator already bound to this epic
+  // consumes no slot, and refusing that would leave an at-capacity machine unable to resume work it
+  // had already started.
+  //
+  // THROWS, because every caller already has a failure channel for it: the concierge maps it to a
+  // typed `at-capacity` refusal, and the board's click handlers surface it the way they surface any
+  // other handoff failure. Returning null would have been silently ignored by the click paths.
+  if (!existing) {
+    const capacity = localAgentCapacity();
+    if (capacity.atCapacity) {
+      throw new AtCapacityError(atCapacitySentence(capacity, capacityLead(args.mode)));
+    }
+  }
   const agentId = existing ? existing.id : store.addAgent(args.projectId, { kind: "build" });
   // addAgent returns null only for an unknown project, which the guard above already rejected —
   // keep the check anyway so a future reorder can't turn it into a silent phantom-id path.

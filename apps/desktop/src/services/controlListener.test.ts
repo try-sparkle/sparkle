@@ -54,8 +54,11 @@ interface ToolCallOnTheWire {
 // settings load-bearing, and dropping it here would let `{ policy: configuredToolPolicy }` be
 // deleted from the call site with every test still green — a silent revert to "allow everything"
 // (roborev 54247, finding 2).
+// Return type is the REAL reply union, not the inferred shape of the happy-path literal: dispatch
+// is total, so a test that needs a refusal (`denied`, `needs-approval`, `bad-args`…) must be able to
+// return one without a cast.
 const dispatchConciergeToolMock = vi.fn(
-  async (_call: ToolCallOnTheWire, _opts?: { policy?: unknown }) => ({
+  async (_call: ToolCallOnTheWire, _opts?: { policy?: unknown }): Promise<ConciergeToolReply> => ({
     ok: true,
     domain: "workspace",
     op: "list_projects",
@@ -82,6 +85,8 @@ import {
   _resetConciergeActivityForTests,
   useConciergeActivityStore,
 } from "./conciergeActivity";
+import { useConciergeAudit, _resetConciergeAuditForTests } from "./conciergeAudit";
+import type { ConciergeToolReply } from "./conciergeTools/registry";
 
 
 // The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
@@ -114,6 +119,9 @@ describe("controlListener", () => {
     setConfigCalls.length = 0;
     setConfigValuesCalls.length = 0;
     dispatchConciergeToolMock.mockClear();
+    // The audit log is module-level state; without this, entries from an earlier case would make
+    // the length assertions below pass or fail on suite ordering.
+    _resetConciergeAuditForTests();
     _resetConciergeActivityForTests();
     // A BOOTED app: config has been read, and the human has set no per-tool overrides. Without the
     // hydrated flag the policy layer deliberately holds back `allow` for anything that can change
@@ -992,6 +1000,55 @@ describe("controlListener", () => {
         domain: "workspace",
         op: "list_projects",
         data: [{ id: "p1" }],
+      });
+    });
+
+    // THE AUDIT LOG (services/conciergeAudit) shares this seam — it is the one place every
+    // concierge_tool call passes through. Asserted HERE rather than only on the store, because what
+    // can silently break is the WIRING: drop these two lines and the store keeps working perfectly
+    // while nothing is ever recorded.
+    it("records the call in the audit log, and settles it with the reply", async () => {
+      fire({
+        reqId: "t1z",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: toolPayload,
+      });
+      await flush();
+
+      const entries = useConciergeAudit.getState().entries;
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        toolCallId: "tc-42", // carried for display; the join key is minted in the audit module
+        domain: "workspace",
+        op: "list_projects",
+        outcome: "ok",
+      });
+    });
+
+    // The entries that answer "why didn't it do what I asked?" are the REFUSED ones — and dispatch
+    // is TOTAL, so a denial arrives as an ordinary resolved reply, not a throw.
+    it("records a REFUSED call with its code and message", async () => {
+      dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+        ok: false,
+        domain: "workflow",
+        op: "merge_pr",
+        code: "needs-approval",
+        message: "merge_pr needs your go-ahead.",
+      }));
+      fire({
+        reqId: "t1y",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { domain: "workflow", op: "merge_pr", args: { number: 7 }, toolCallId: "tc-77" },
+      });
+      await flush();
+
+      expect(useConciergeAudit.getState().entries[0]).toMatchObject({
+        toolCallId: "tc-77",
+        outcome: "refused",
+        code: "needs-approval",
+        message: "merge_pr needs your go-ahead.",
       });
     });
 

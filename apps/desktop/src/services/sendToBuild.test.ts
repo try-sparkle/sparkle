@@ -44,7 +44,13 @@ vi.mock("../stores/uiStore", () => ({
   },
 }));
 
-import { sendToBuild } from "./sendToBuild";
+const capacityMock = vi.fn(() => ({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" }));
+vi.mock("./agentCapacity", async (orig) => ({
+  ...(await orig<typeof import("./agentCapacity")>()),
+  localAgentCapacity: () => capacityMock(),
+}));
+
+import { sendToBuild, AtCapacityError, sendToBuildBlockedReason } from "./sendToBuild";
 
 describe("sendToBuild", () => {
   beforeEach(() => {
@@ -285,5 +291,138 @@ describe("sendToBuild", () => {
     expect(seed).toContain("bd update"); // claim-before-spawn instruction
     expect(seed).toContain("bd close"); // close-after-merge instruction
     expect(seed).toContain("delivered"); // label-on-ship instruction
+  });
+});
+
+// THE MACHINE-WIDE CAP LIVES HERE, on the shared path — not in the callers.
+//
+// This function reaches store.addAgent directly, and addAgent has no capacity check. Gating only
+// the concierge's promote_plan_to_build left the four Plan-board handoffs ("Start", "Build It",
+// "Build It (task)", the epic-row button) sailing past it — a cap enforced on some callers is not a
+// cap (roborev 55135). These tests pin it at the one place every caller goes through.
+describe("the machine-wide agent cap", () => {
+  beforeEach(() => {
+    // This describe is a SIBLING of the one above, so its beforeEach does not run here — without
+    // these resets the "created nothing" assertions would see calls left by earlier tests.
+    addAgentMock.mockReset();
+    appendPromptMock.mockReset();
+    setAgentEpicIdMock.mockReset();
+    capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
+  });
+
+  it("refuses a handoff that would need a NEW agent, creating nothing", () => {
+    projects = [{ id: "p1", agents: [] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 3, basis: "CPU-bound" });
+
+    expect(() => sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null })).toThrow(
+      AtCapacityError,
+    );
+    expect(addAgentMock).not.toHaveBeenCalled();
+    expect(appendPromptMock).not.toHaveBeenCalled();
+  });
+
+  it("says how many of the taken slots are actually showing here, and why the ceiling is what it is", () => {
+    projects = [{ id: "p1", agents: [] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 3, basis: "CPU-bound" });
+
+    try {
+      sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      const msg = (e as Error).message;
+      // The `live` clause exists because omitting it "sent a human looking for agents that would
+      // start later when they were already running" (roborev 54225).
+      expect(msg).toMatch(/3 of them showing in this window/);
+      // …and the ceiling is never asserted as RAM when it isn't (roborev 54175).
+      expect(msg).toMatch(/CPU-bound/);
+    }
+  });
+
+  // Reusing the orchestrator already bound to this epic consumes no slot, so refusing it would
+  // leave an at-capacity machine unable to resume work it had already started.
+  it("still RESUMES an orchestrator already bound to the epic at capacity", () => {
+    projects = [{ id: "p1", agents: [{ id: "a1", kind: "build", epicId: "e1" }] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 8, basis: "test" });
+
+    expect(sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null })).toBe("a1");
+    expect(addAgentMock).not.toHaveBeenCalled();
+    // …and it is genuinely re-seeded, not merely selected.
+    expect(appendPromptMock).toHaveBeenCalled();
+  });
+});
+
+// The PREFLIGHT the board handoffs use before they claimBead. Every one of them marks the epic
+// in_progress BEFORE handing off; claiming and then failing would leave it in progress with no
+// orchestrator, and for a backlog card it also moves the card out of the column that renders the
+// Start button — hiding the affordance the user just pressed (roborev 55139).
+describe("sendToBuildBlockedReason (preflight)", () => {
+  beforeEach(() => {
+    capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
+  });
+
+  it("returns null when the handoff would proceed", () => {
+    projects = [{ id: "p1", agents: [] }];
+    expect(sendToBuildBlockedReason("p1", "e1")).toBeNull();
+  });
+
+  it("returns the SAME sentence the gate throws, so the two cannot disagree", () => {
+    projects = [{ id: "p1", agents: [] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 3, basis: "CPU-bound" });
+
+    const reason = sendToBuildBlockedReason("p1", "e1");
+    expect(reason).toBeTruthy();
+    let thrown = "";
+    try {
+      sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null });
+    } catch (e) {
+      thrown = (e as Error).message;
+    }
+    expect(reason).toBe(thrown);
+  });
+
+  // Resuming a bound orchestrator consumes no slot, so the preflight must not block it — otherwise
+  // an at-capacity machine could not pick up work it had already started.
+  it("does not block resuming an orchestrator already bound to the epic", () => {
+    projects = [{ id: "p1", agents: [{ id: "a1", kind: "build", epicId: "e1" }] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 8, basis: "test" });
+    expect(sendToBuildBlockedReason("p1", "e1")).toBeNull();
+  });
+
+  // It is a PREFLIGHT, not a second policy: a caller that skips it is still refused by the gate.
+  it("is advisory only — the gate still refuses a caller that ignores it", () => {
+    projects = [{ id: "p1", agents: [] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 8, basis: "test" });
+    expect(() => sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null })).toThrow(
+      AtCapacityError,
+    );
+  });
+});
+
+// The lead clause must describe what was ACTUALLY asked for. "Build It" on a single task builds one
+// bead on one worker branch — there is no plan in it — and the sentence is rendered verbatim in the
+// overlay, so calling it a plan describes something the user did not ask for (roborev 55143).
+describe("the refusal names the right thing", () => {
+  beforeEach(() => {
+    projects = [{ id: "p1", agents: [] }];
+    capacityMock.mockReturnValue({ atCapacity: true, used: 8, limit: 8, live: 8, basis: "test" });
+  });
+
+  it("says PLAN for an epic handoff and TASK for a single-task one", () => {
+    expect(sendToBuildBlockedReason("p1", "e1")).toMatch(/Starting this plan/);
+    expect(sendToBuildBlockedReason("p1", "e1", "task")).toMatch(/Building this task/);
+    expect(sendToBuildBlockedReason("p1", "e1", "task")).not.toMatch(/plan/i);
+  });
+
+  it("the thrown gate agrees with the preflight on both modes", () => {
+    for (const mode of ["epic", "task"] as const) {
+      const preflight = sendToBuildBlockedReason("p1", "e1", mode);
+      let thrown = "";
+      try {
+        sendToBuild({ projectId: "p1", epicId: "e1", prdPath: null, mode });
+      } catch (e) {
+        thrown = (e as Error).message;
+      }
+      expect(thrown).toBe(preflight);
+    }
   });
 });

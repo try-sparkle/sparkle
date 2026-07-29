@@ -82,6 +82,25 @@ describe("conciergeActivityLine", () => {
     expect(icon("terminal", "get_agent_status")).toBe("terminal");
     expect(icon("workflow", "merge_pr")).toBe("workflow");
     expect(icon("workspace", "list_projects")).toBe("workspace");
+    expect(icon("diff", "list_changed_files")).toBe("workflow");
+  });
+
+  // The diff domain's phrases were shipped un-exercised: DIFF_PHRASES was typed
+  // `Record<string, …>` rather than over its op union, so a fourth op would have fallen through to
+  // the un-phrased "Using diff · …" default with tsc still green (roborev 55193). The type is fixed;
+  // this covers the rendering.
+  it("phrases a diff op with the agent it is about", () => {
+    expect(
+      conciergeActivityLine(
+        activity({ domain: "diff", op: "list_changed_files", subject: "Kraken Auth" }),
+      )?.text,
+    ).toBe("Looking at what Kraken Auth changed");
+  });
+
+  it("falls back to the indefinite form when the agent could not be named", () => {
+    expect(
+      conciergeActivityLine(activity({ domain: "diff", op: "list_commits", subject: null }))?.text,
+    ).toBe("Reading an agent's commits");
   });
 
   it("phrases a PR op with the number the call carried", () => {

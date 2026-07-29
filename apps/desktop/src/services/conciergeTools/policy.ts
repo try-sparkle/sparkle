@@ -72,6 +72,8 @@ import {
 } from "./workspace";
 import { BOARD_OPS, BOARD_RISK, type BoardOp } from "./board";
 import { APPROVALS_OPS, APPROVALS_RISK, type ApprovalsOp } from "./approvals";
+import { PLANS_OPS, PLANS_RISK, type PlansOp } from "./plans";
+import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 
 // ---------------------------------------------------------------------------------------------
 // The three values
@@ -154,6 +156,8 @@ export type ConciergeToolDomain =
   | "workspace"
   | "board"
   | "approvals"
+  | "plans"
+  | "diff"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -164,6 +168,8 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "workspace", label: "Projects & window" },
   { id: "board", label: "Tasks & work graph" },
   { id: "approvals", label: "Approvals" },
+  { id: "plans", label: "Plans" },
+  { id: "diff", label: "Diff" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -273,6 +279,9 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
 export const TERMINAL_TOOL_NAMES = [
   "read_agent_terminal",
   "get_agent_status",
+  "read_picker_options",
+  "select_picker_option",
+  "send_control_key",
   "send_to_agent_terminal",
 ] as const;
 
@@ -286,6 +295,14 @@ export type TerminalToolName = (typeof TERMINAL_TOOL_NAMES)[number];
 export const TERMINAL_TOOL_RISK: Record<TerminalToolName, ConciergeRiskClass> = {
   read_agent_terminal: "read-only",
   get_agent_status: "read-only",
+  read_picker_options: "read-only",
+  // `disruptive` for the same reason as a send, and it is NOT a lesser act: pressing a menu option
+  // decides what a running process does next, on the human's behalf, and cannot be un-pressed.
+  // Classifying it below a send would let an autonomy policy gate typing "2" while waving through
+  // pressing option 2 — the same outcome by a different route.
+  select_picker_option: "disruptive",
+  // `esc` can discard work in flight; this is at least as consequential as typing.
+  send_control_key: "disruptive",
   send_to_agent_terminal: "disruptive",
 };
 
@@ -294,6 +311,9 @@ export const TERMINAL_TOOL_RISK: Record<TerminalToolName, ConciergeRiskClass> = 
 const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
   read_agent_terminal: "Read what an agent's terminal recently showed.",
   get_agent_status: "Read an agent's live status and whether it is waiting on you.",
+  read_picker_options: "Read the menu an agent is showing right now.",
+  select_picker_option: "Answer a menu an agent is showing, as if you had picked it.",
+  send_control_key: "Press esc, shift+tab, ctrl+b, enter or an arrow key in an agent's terminal.",
   send_to_agent_terminal: "Type a message into an agent's terminal, as if you had typed it.",
 };
 
@@ -367,6 +387,8 @@ export type ConciergeToolName =
   | WorkspaceOp
   | BoardOp
   | ApprovalsOp
+  | DiffOp
+  | PlansOp
   | AppToolName;
 
 /**
@@ -411,6 +433,8 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // translation rather than declaring a second identical one.
   ...translateRisk(BOARD_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(APPROVALS_RISK, WORKSPACE_RISK_TO_CLASS),
+  ...translateRisk(PLANS_RISK, WORKSPACE_RISK_TO_CLASS),
+  ...translateRisk(DIFF_RISK, WORKSPACE_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
   ...APP_TOOL_RISK,
   // LAST, so a cross-domain correction wins over the domain's own word. See RISK_OVERRIDES.
@@ -425,6 +449,8 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(TERMINAL_TOOL_RISK, "terminal" as const),
   ...constantOver(BOARD_RISK, "board" as const),
   ...constantOver(APPROVALS_RISK, "approvals" as const),
+  ...constantOver(PLANS_RISK, "plans" as const),
+  ...constantOver(DIFF_RISK, "diff" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -446,6 +472,8 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   workspace: WORKSPACE_OPS,
   board: BOARD_OPS,
   approvals: APPROVALS_OPS,
+  plans: PLANS_OPS,
+  diff: DIFF_OPS,
   app: APP_TOOL_NAMES,
 };
 
