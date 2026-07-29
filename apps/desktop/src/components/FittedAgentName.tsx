@@ -12,6 +12,33 @@ import { FONT_WEIGHT } from "../theme/colors";
 export const AGENT_NAME_FONT_SIZE = 13;
 const FONT_SIZE = AGENT_NAME_FONT_SIZE;
 
+/**
+ * FOCUS IS CARRIED BY WEIGHT, BECAUSE COLOUR IS ALREADY SPOKEN FOR.
+ *
+ * Every row title used to be `semibold`, with `bold` on the selected one. Two problems: a list
+ * where every line is heavy has no hierarchy — the whole column shouts — and one step from 600 to
+ * 700 is nearly invisible, so the focus it was meant to carry did not read at all.
+ *
+ * Regular everywhere, bold on the active row. Four steps instead of one, so the focal point is
+ * unmistakable AND the column is calmer at rest.
+ *
+ * WHY NOT COLOUR, which was the first proposal (white on the active row, grey on the rest): colour
+ * in this app is fully committed to STATUS — red/green/grey, on the dots, one vocabulary. Spending
+ * it on focus as well would overload the single channel that currently means exactly one thing, and
+ * grey-on-dark additionally collides with the DISABLED reading, so "not focused" and "not
+ * available" would look identical. Weight was an unused axis; it carries focus without competing.
+ *
+ * AND IT IS NOT THE ONLY SIGNAL — deliberately. The flood and the two-sided connector say which row
+ * is wired; this is reinforcement, so a reader who cannot resolve a weight difference has lost no
+ * information.
+ *
+ * EXPORTED because three titles have to agree and a literal in each is how they drift: this
+ * component (the ordinary row), the hover card's expanded title, and the pinned Improve Sparkle row
+ * — which cannot use this component at all, since it has no AgentTab and never renames.
+ */
+export const rowTitleWeight = (active: boolean) =>
+  active ? FONT_WEIGHT.bold : FONT_WEIGHT.regular;
+
 export function FittedAgentName({
   title,
   name,
@@ -24,7 +51,7 @@ export function FittedAgentName({
   /** Canonical fallback name. */
   name: string;
   color: string;
-  /** Selected row uses the bold weight; others semibold. */
+  /** Selected row takes bold; every other row takes regular. See `rowTitleWeight`. */
   active: boolean;
   onDoubleClick: (e: ReactMouseEvent) => void;
 }) {
@@ -40,7 +67,7 @@ export function FittedAgentName({
           display: "block",
           color, // the whole name takes its status color
           fontSize: FONT_SIZE,
-          fontWeight: active ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+          fontWeight: rowTitleWeight(active),
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",

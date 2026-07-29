@@ -16,12 +16,13 @@ import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
 // FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
-import { FiCloud, FiChevronsLeft, FiChevronsRight, FiTool, FiHelpCircle } from "react-icons/fi";
+import { FiCloud, FiTool, FiHelpCircle, FiPlus, FiMinus } from "react-icons/fi";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
-import { SIDEBAR_OVERLAY_Z } from "./layers";
+import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
+import { ColumnPullTab } from "./ColumnPullTab";
 import { TERM_HAIRLINE } from "./terminalChrome";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
@@ -58,8 +59,11 @@ import {
   firstVisibleAgentId,
 } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
-import { sideOf } from "../engine/pairs";
+import { otherSide, pairCountFor, projectsOnSide, sideOf } from "../engine/pairs";
+import { LIST_PAD_X, rowBox } from "../engine/rowGeometry";
+import type { PairSide } from "../engine/rowGeometry";
 import { useCableStore } from "../stores/cableStore";
+import { pairIsLive } from "../engine/cable";
 import { openProjectTab } from "../services/openProjectTab";
 import { publishedStatusFor, rollupViewFor } from "../useAttentionNotifications";
 import {
@@ -101,7 +105,7 @@ import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
 import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
-import { FittedAgentName, AGENT_NAME_FONT_SIZE } from "./FittedAgentName";
+import { FittedAgentName, AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
 import { ModelPill } from "./ModelPill";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import { WorkflowLine } from "./WorkflowLine";
@@ -392,9 +396,15 @@ export function AgentSidebar({
   // The assignment map is already the single answer to "where does this project live" (engine/pairs),
   // and a prop would be a second copy of it that could disagree with the stage its panes mount in.
   const pairAssignment = useUiStore((s) => s.pairAssignment);
-  const assignProjectToPair = useUiStore((s) => s.assignProjectToPair);
   const pairSide = sideOf(pairAssignment, project?.id ?? "");
   const patchCable = useCableStore((s) => s.patch);
+  // DOES THIS PAIR HOLD THE CABLE? Read from the one enum, never mirrored into local state — the
+  // rows use it to open their concierge end (engine/rowGeometry), which is the second half of the
+  // circuit the flood and the vanishing seam are the rest of. `pairIsLive` rather than a `===` so
+  // "one live circuit" is stated in exactly one place (engine/cable).
+  // Selected as a BOOLEAN, so this column re-renders when its own circuit opens or closes and not
+  // on every unrelated cable move (patching the other side, floating an overlay).
+  const jointOpen = useCableStore((s) => pairIsLive(s, pairSide));
   // The Improve-Sparkle agent is keyed by window label (sparkleAgentIdFor — see onSelectSparkle /
   // services/sparkleReveal). There is exactly one app window now, and its label is the constant
   // APP_WINDOW_LABEL; the id is spelled through it rather than the literal so the persistence key
@@ -538,6 +548,9 @@ export function AgentSidebar({
   // hidden and no `bd` shell-out runs (see beadsStore).
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const [editing, setEditing] = useState<string | null>(null);
+  /** Is the pointer (or focus) anywhere in the column header? Reveals `PairCountControl`, which
+   *  cannot reveal itself — a hidden box takes neither hover nor Tab. */
+  const [headerHover, setHeaderHover] = useState(false);
   // Which agent the Ship/Save/Discard close prompt is asking about (null = no prompt).
   const [closePromptId, setClosePromptId] = useState<string | null>(null);
   // What the chosen close outcome ACTUALLY did, when that differs from what the button promised
@@ -555,52 +568,75 @@ export function AgentSidebar({
     return saved >= MIN_WIDTH && saved <= MAX_WIDTH ? saved : 220;
   });
 
-  const startResize = (e: React.MouseEvent) => {
-    // Left button only. A right-click or a middle-click on the strip used to install the global
-    // move/up listeners too, which left the body cursor pinned to col-resize until the next
-    // primary click released it.
-    if (e.button !== 0) return;
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = width;
-    let latest = startW;
-    const onMove = (ev: MouseEvent) => {
-      latest = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startW + (ev.clientX - startX)));
-      setWidth(latest);
+  /** Commit a width the pull tab has ALREADY clamped and logged.
+   *
+   *  This used to be three things — an inline `Math.min/Math.max`, its own `log.info`, and an
+   *  `onKeyDown` implementing arrows/Home/End — because this column owned a bespoke resize strip.
+   *  `ColumnPullTab` owns the whole gesture now: it clamps through `engine/columnResize`, emits the
+   *  `requested → applied, clamped by …` line for BOTH the drag and the arrow keys, and guards the
+   *  auto-repeat case.
+   *
+   *  MEMOIZED, AND NOT PERSISTED PER PIXEL — both halves are on the drag's hot path, and both were
+   *  wrong here for one commit in exactly the way `Workspace` documents for the concierge seam.
+   *  `ColumnPullTab.commit` calls `onWidth` on EVERY mousemove, so a plain function meant a
+   *  synchronous disk-backed `localStorage.setItem` per pointer event where the deleted strip did
+   *  one per drag; and a fresh closure each render changed `commit`'s identity, which tears down and
+   *  re-adds the live drag's window listeners mid-gesture. The write is debounced on a trailing
+   *  timer and flushed on teardown, so a drag writes once and the keyboard path — which has no
+   *  settle event of its own — is covered by the same timer. */
+  const commitWidth = useCallback((next: number) => {
+    // MARK THIS INSTANCE DIRTY. See `widthDirty` — an instance that never resized must never write.
+    widthDirty.current = true;
+    setWidth(next);
+  }, []);
+  const widthRef = useRef(width);
+  widthRef.current = width;
+  // ONLY AN INSTANCE THAT ACTUALLY RESIZED MAY PERSIST, and this is not tidiness — the key is
+  // SHARED and the state is not. `Workspace` mounts this component TWICE once the left pair is open,
+  // plus once more in the satellite window, and each instance seeds its own `width` from
+  // `sparkle-sidebar-width` at mount with nothing reconciling them afterwards.
+  //
+  // So an unconditional flush lets an instance that never moved overwrite the width the user did
+  // set: drag the RIGHT build column to 400, then click MINUS — the left sidebar unmounts, its
+  // cleanup writes its untouched 220, and the next launch comes back at 220 while the right column
+  // is still showing 400. Worse on shutdown, where nothing unmounts at all: every instance
+  // registers the same three teardown listeners, so the last one mounted wins regardless of which
+  // column the user touched, and resizing the LEFT column then quitting loses it deterministically.
+  //
+  // Before the debounce landed, the write only happened on an explicit commit, so a non-resized
+  // column could not write. This restores that property without giving up the debounce. (It also
+  // stops the effect below firing a write on mount.)
+  const widthDirty = useRef(false);
+  useEffect(() => {
+    if (!widthDirty.current) return;
+    const id = setTimeout(() => localStorage.setItem("sparkle-sidebar-width", String(width)), 200);
+    return () => clearTimeout(id);
+  }, [width]);
+  useEffect(() => {
+    // A debounce that only cancels is a way to LOSE a width. Same trio the concierge seam and
+    // projectStore register, for the same reason: a native window close destroys the webview and
+    // React never unmounts, so `pagehide` alone is not enough.
+    const flush = () => {
+      if (!widthDirty.current) return;
+      try {
+        localStorage.setItem("sparkle-sidebar-width", String(widthRef.current));
+      } catch {
+        // A width we cannot persist is cosmetic; it must not take the shutdown with it.
+      }
     };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      // Persist once the drag settles rather than on every intermediate pixel.
-      localStorage.setItem("sparkle-sidebar-width", String(latest));
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
     };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  // Keyboard path for the same resize. The tab is a real focusable control (role="separator" with
-  // aria-value*), so a pointer is not the only way to move this boundary — arrows nudge, Shift
-  // jumps, Home/End slam to the clamp. Persisted on each commit: unlike a drag there is no
-  // "settle" event to hang the write off.
-  const RESIZE_STEP = 16;
-  const commitWidth = (next: number) => {
-    const clamped = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, next));
-    setWidth(clamped);
-    localStorage.setItem("sparkle-sidebar-width", String(clamped));
-  };
-  const onResizeKey = (e: React.KeyboardEvent) => {
-    const step = e.shiftKey ? RESIZE_STEP * 4 : RESIZE_STEP;
-    if (e.key === "ArrowLeft") commitWidth(width - step);
-    else if (e.key === "ArrowRight") commitWidth(width + step);
-    else if (e.key === "Home") commitWidth(MIN_WIDTH);
-    else if (e.key === "End") commitWidth(MAX_WIDTH);
-    else return;
-    e.preventDefault();
-  };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVisibility);
+      flush();
+    };
+  }, []);
 
   // OVERLAY MODE (§10, the second pull tab). Same right edge, second control: instead of RESIZING
   // the column — which reflows the whole shell and forces the terminal to re-measure — this lifts
@@ -635,12 +671,46 @@ export function AgentSidebar({
   // that wrapper's live width instead of a stored `window.innerWidth`.
   const OVERLAY_WIDTH = "max(280px, min(480px, 100%))";
 
-  const onSelect = (id: string) => {
+  /**
+   * PUT A BUILD AGENT IN FRONT OF THE USER, AND PLUG THE CABLE INTO IT.
+   *
+   * The one place selection-plus-wiring lives, because the producer landed on `onSelect` alone and
+   * the sibling paths in this same file kept moving the selection WITHOUT the cable — the identical
+   * "only half the callers got it" shape as the reopen/picker split two commits ago (roborev 55234).
+   *
+   * The far-pair case is worse than a no-op: the shell's pointerdown capture sees a chevron or the
+   * "+ New Build Agent" row — no `[role="treeitem"]`, not inside a wired pair — and UNBINDS first.
+   * So creating an agent in the unwired pair dropped the cable to "off", selected the new agent, and
+   * sent the very next prompt ("start on X") to Sparkle instead of the agent just created. Clicking
+   * that agent's row afterwards wired it; creating it did not.
+   */
+  const selectAndWire = (id: string | null) => {
+    if (!project) return;
+    selectAgent(project.id, id);
+    // NOTHING TO PLUG INTO — SEAT NOTHING, PATCH NOTHING. `id` is nullable because `onPickBuild`
+    // passes null on purpose: a pair with no build rows clears the selection and shows the empty
+    // Build state. Patching anyway claims a live circuit whose far end is EMPTY — `wiredAgentId`
+    // reads the now-null selection, so `promptTarget` (Workspace) falls back to Sparkle while
+    // `data-wired` floods this side and recedes the other. With two pairs it is the same lost
+    // message this helper exists to prevent, just via the chevron: cable patched LEFT onto a real
+    // agent, user clicks the RIGHT pair's Build chevron in a project that has no build agents, and
+    // the next prompt goes to Sparkle instead of the agent they plugged into. A gesture that seats
+    // no agent is not a connection (roborev 55246).
+    if (!id) return;
+    open(id);
+    patchCable(pairSide);
+  };
+  const onSelect = (id: string, via?: "hover") => {
     if (!project) return;
     // Switching to a normal project agent leaves the special (Sparkle) view.
     setActiveSpecial(null);
-    selectAgent(project.id, id);
-    open(id);
+    if (via === "hover") {
+      // Selection may follow the mouse; the cable may not — see below.
+      selectAgent(project.id, id);
+      open(id);
+      return;
+    }
+    selectAndWire(id);
     // ── PATCH THE CABLE ──────────────────────────────────────────────────────────────────────
     // THE GESTURE THAT MAKES THE WHOLE CONNECTION FEATURE REACHABLE. Everything downstream of
     // `wired` — the concierge's flood and lift, the shell root's `data-wired`, the seam that
@@ -652,7 +722,19 @@ export function AgentSidebar({
     // Selecting a build row IS the connection: MAPPING.md's `data-wired` is "which side holds the
     // live cable", and the side is this sidebar's own pair. ONE LIVE CIRCUIT falls out of
     // `patchCable` — patching the other side moves the cable rather than lighting both.
-    patchCable(pairSide);
+    //
+    // A DELIBERATE ACTIVATION ONLY — never the hover-intent auto-select. `onSelect` is BOTH paths:
+    // `armSelect` fires it from a 90ms `setTimeout` on plain mouseenter, with no click anywhere. So
+    // hanging the patch on it meant a cursor merely resting over any row re-wired the cable, which
+    // broke two documented behaviours (roborev 55234):
+    //
+    //  1. It defeated the unbind gestures. engine/cable states Escape and click-away are the one way
+    //     back to floating middle; after either, moving the pointer back across the column re-patched
+    //     with no intent at all — from exactly the transit the hover-intent gate exists to make inert.
+    //  2. WORSE, it re-routed prompts ACROSS PAIRS. `promptTarget` derives from `wired`, so with two
+    //     pairs and the cable patched left, a cursor crossing the RIGHT sidebar and pausing 90ms
+    //     moved the cable — and Send delivered the user's message to a different pair's terminal
+    //     than the one they plugged into. Selection may follow the mouse; the cable may not.
   };
   // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Build
   // is two-stage: the FIRST click (when Build isn't already the active section) just switches into
@@ -668,7 +750,24 @@ export function AgentSidebar({
   // empty-state start button via the useSpawnBuildAgent hook so both create agents identically.
   // Runtime-aware: with the Local/Cloud toggle on "Cloud" this opens the cloud create dialog
   // instead of spawning a local PTY. Identical behavior in both "+ New Build Agent" call sites.
-  const spawnBuildAgent = useNewAgent(project);
+  const spawnBuildAgentRaw = useNewAgent(project);
+  /**
+   * Spawn, then WIRE what was spawned.
+   *
+   * Creating an agent is the strongest possible "talk to this one" — you asked for it to exist —
+   * and it was the path that left the cable off. In the far pair it actively dropped it: the shell's
+   * pointerdown capture sees the "+ New Build Agent" row as outside the circuit and unbinds before
+   * the spawn runs, so the next prompt went to Sparkle rather than the agent just created.
+   *
+   * `spawnLocal` returns the new id synchronously; the CLOUD branch returns null (the server has to
+   * start the session before a tab exists), and there is nothing to wire yet in that case — the row
+   * click that follows its arrival does it.
+   */
+  const spawnBuildAgent = () => {
+    const id = spawnBuildAgentRaw();
+    if (id) selectAndWire(id);
+    return id;
+  };
   const onPickBuild = () => {
     const alreadyHere = mode === "build" && activeSpecial === null;
     setMode("build");
@@ -683,8 +782,9 @@ export function AgentSidebar({
     // pane matches the chevron (or clear it → the empty Build state with "+ New Build Agent").
     // Ladder- and filter-aware: array order would happily select a row the user has filtered out.
     const next = firstRenderedRowId(project.agents, "build") ?? firstVisibleAgentId(project.agents, "build");
-    selectAgent(project.id, next);
-    if (next) open(next);
+    // Wires too: switching into Build is the user putting a build agent in front of themselves,
+    // which is the same act as clicking its row.
+    selectAndWire(next);
   };
   // Stable so the memoized SparkleAgentRow doesn't re-render on unrelated status flips (sparkle-alrm.3).
   // Improve Sparkle is per-window: reveal THIS window's own copy in place (its own worktree/branch/
@@ -1623,6 +1723,27 @@ export function AgentSidebar({
         width,
         flex: "0 0 auto",
         position: "relative",
+        // THE HALF OF THE CIRCUIT THAT WAS NEVER WIRED — and the reason the selected row read as
+        // plugged in at the concierge end and dead flat at the terminal end.
+        //
+        // `layers.ts` has described this fix since the pair lift landed: the selected row bleeds out
+        // of this column INTO the terminal pane, and that overhang plus its concave mouths are what
+        // make the row read as an opening into the pane it selects. The terminal is LATER IN THE DOM
+        // than this column, so at an equal stacking level the pane paints last and simply covers the
+        // overhang. `paneVisibilityStyle` puts `TERMINAL_PANE_Z` (1) on the visible pane; this column
+        // carried NO z-index at all, so it sat at `auto` and lost — every time.
+        //
+        // The constant existed, the ordering was even asserted, and nothing applied it: the guard
+        // compared `BUILD_COLUMN_Z > TERMINAL_PANE_Z` as two numbers, which is true whether or not
+        // either one reaches an element. So the mock's `.paircols .build{z-index:2}` was documented,
+        // tested, and absent from the running app. The row test below asserts it on the DOM instead.
+        //
+        // NOT on the terminal stage, deliberately — see the note at `terminal-stage` in Workspace and
+        // the `isolation: isolate` note in layers.ts: giving the STAGE a z-index makes it a stacking
+        // context and caps the `position: fixed` surfaces rendered from inside panes, which exist to
+        // cover the concierge column. The panes are already stacking contexts, so pinning them one
+        // BELOW this column reproduces the mock's ordering without containing anything new.
+        zIndex: BUILD_COLUMN_Z,
         background: C.deepForest,
         // THE LINE IS GONE BECAUSE SOMETHING HAS TO FLOW THROUGH THIS SEAM. The active agent row
         // is painted in `forest`, the terminal's own colour, so it reads as an opening INTO the
@@ -1654,12 +1775,20 @@ export function AgentSidebar({
         height: "100%",
         // OVERLAY MODE: the same element, lifted out of flow and laid over the terminal. Absolute
         // against the ②+③ wrapper, whose content box starts exactly where this column starts — so
-        // left/top/bottom 0 reproduces the docked anchor with no measurement, and the spacer below
-        // holds the slot so nothing beside it reflows.
+        // anchoring it at the column's OWN edge reproduces the docked position with no measurement,
+        // and the spacer below holds the slot so nothing beside it reflows.
+        //
+        // THE ANCHOR MIRRORS WITH THE PAIR, and it did not. `left: 0` was correct while the only
+        // pair was the right one, where the build column is the first item in the row. A LEFT pair
+        // lays its columns out `row-reverse`, so the build column sits at the RIGHT of the wrapper
+        // and `left: 0` pinned the floating panel to the far side of the terminal — the column
+        // visibly teleported across the row on toggle, taking its dock tab with it, several hundred
+        // pixels from the spacer holding its slot. The mirrored chevron actively invited that by
+        // telling a left-pair user the panel would come toward them (roborev 55337).
         ...(overlay
           ? {
               position: "absolute" as const,
-              left: 0,
+              [pairSide === "right" ? "left" : "right"]: 0,
               top: 0,
               bottom: 0,
               height: "auto",
@@ -1755,14 +1884,27 @@ export function AgentSidebar({
           thing in this column that hides anything; anything global must DRIVE them rather than
           filter alongside them. rev4.html carries the same warning in its own CSS.
 
-          NOT BUILT: the mock's hover-only `.pm` (`+`/`−`) beside the chips, which duplicates the
-          PAIR onto the free side. `Workspace` renders one sidebar and one terminal stage — there is
-          no second pair for it to create, and pane mounting is keyed per project/agent so making
-          one is real work (MAPPING.md's own gap #3). A visible control that cannot do anything is
-          worse than an absent one; see PRD/sparkle/blueprint-agent-sidebar.md. */}
+          THE MOCK'S `.pm` IS BUILT — `PairCountControl` below, hover/focus-revealed beside the
+          chips. It read "NOT BUILT… there is no second pair for it to create" for as long as the
+          shell had one pair; the left pair closed MAPPING.md's gap #3, so the control adds and
+          removes a pair rather than duplicating anything. */}
       {project && (
         <div
           data-testid="build-column-header"
+          // THE REVEAL LIVES ON THE HEADER, not on the control it reveals. A `visibility: hidden`
+          // box is not a hit-test target — the pointer passes straight through it, so `mouseenter`
+          // never fires — and it is skipped by sequential focus navigation, so Tab cannot reach it
+          // either. Wiring `onMouseEnter`/`onFocus` to the hidden element made BOTH reveal paths
+          // dead: the control could never be summoned in a real browser, only in a test that
+          // dispatches at the node and bypasses hit-testing entirely (roborev 55349).
+          //
+          // `ColumnPullTab` already documents this exact trap and solves it the same way: hover is
+          // owned by the always-live rail, and only the descendant tab is hidden. React's focus
+          // events bubble, so `onFocus` here also catches a Tab onto the button inside.
+          onMouseEnter={() => setHeaderHover(true)}
+          onMouseLeave={() => setHeaderHover(false)}
+          onFocus={() => setHeaderHover(true)}
+          onBlur={() => setHeaderHover(false)}
           style={{
             display: "flex",
             alignItems: "center",
@@ -1791,49 +1933,6 @@ export function AgentSidebar({
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
           />
-          {/* `.plus` in MAPPING.md — THE CONTROL THAT OPENS THE SECOND PAIR.
-              Moves this project to the other side of the concierge, giving the cockpit its full
-              `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM` form. Sending the last left-side project
-              back collapses the pair, because the count is derived from the assignment map
-              (engine/pairs) rather than stored.
-
-              It says what it COSTS in the tooltip. Moving remounts this project's panes, and a
-              Terminal unmount kills its PTY — so its agents respawn and lose scrollback, exactly as
-              tearing the project out to its own window already does. That is a fine trade to make
-              deliberately and a nasty surprise to discover, so the control states it. */}
-          <button
-            type="button"
-            data-testid="send-to-other-pair"
-            aria-label={
-              pairSide === "right" ? "Move project to the left pair" : "Move project to the right pair"
-            }
-            title={
-              (pairSide === "right" ? "Move to the left pair" : "Move to the right pair") +
-              " — restarts this project's terminals"
-            }
-            // MOVE THE SELECTION WITH THE PROJECT. Assigning alone leaves the destination pair's
-            // selection on whatever it already had, so sending a SECOND project across mounted its
-            // panes invisibly and the button read as "does nothing but grow a tab" (roborev 55149).
-            // `openProjectTab` is side-aware now, so it lands the selection in whichever pair the
-            // assignment just put it in — hence assign first, then select.
-            onClick={() => {
-              const to = pairSide === "right" ? "left" : "right";
-              assignProjectToPair(project.id, to);
-              openProjectTab(project.id);
-            }}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              background: "none",
-              border: "none",
-              padding: 2,
-              cursor: "pointer",
-              color: C.muted,
-              flex: "0 0 auto",
-            }}
-          >
-            {pairSide === "right" ? <FiChevronsLeft size={14} /> : <FiChevronsRight size={14} />}
-          </button>
           {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. */}
           <span aria-hidden style={{ flex: 1, minWidth: 0 }} />
           {/* Hidden in Plan (no rows to filter) and when the project has no top-level agents at all
@@ -1846,6 +1945,7 @@ export function AgentSidebar({
               onReset={showAllStatusBands}
             />
           )}
+          <PairCountControl projectId={project.id} pairSide={pairSide} shown={headerHover} />
         </div>
       )}
 
@@ -2046,12 +2146,14 @@ export function AgentSidebar({
               rowSection={rowSection}
               dragSection={dragSection}
               dragActive={dragId != null}
+              paneSide={pairSide}
+              jointOpen={jointOpen}
               onDragStartAgent={onAgentDragStart}
               onDragEndAgent={onAgentDragEnd}
               onDropAgent={onAgentDrop}
               editing={editing === a.id}
               setEditing={setEditing}
-              onSelect={() => onSelect(a.id)}
+              onSelect={(via) => onSelect(a.id, via)}
               onLand={() => onLand(a)}
               onClose={() => requestClose(a.id)}
             />
@@ -2169,6 +2271,8 @@ export function AgentSidebar({
           dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : undefined}
           workerCount={sparkleWorkerCount}
           onSelect={onSelectSparkle}
+          paneSide={pairSide}
+          jointOpen={jointOpen}
         />
       )}
 
@@ -2222,123 +2326,61 @@ export function AgentSidebar({
         </ModalShell>
       )}
 
-      {/* THE TWO PULL TABS on the right edge (§10). Left boundary only — this is the one column
-          boundary that gets them.
+      {/* ── ONE TAB, AT THE TOP OF THE BOUNDARY ──────────────────────────────────────────────
+          This replaces THREE controls that used to live on this edge: a full-height 6px
+          `col-resize` strip, a 4×28 grey grip floating at mid-height as its only signage, and a
+          separate `»` chevron button in a rounded box below that grip. The founder's read was that
+          the mid-height pair is redundant now that the hover affordance lives at the TOP of a
+          boundary — and that they were visual noise on the shell's most prominent seam.
 
-          1. RESIZE — the full-height 6px `col-resize` strip. It reflows the layout: the column
-             takes the space, the terminal gives it up.
-          2. OVERLAY — pops this column OUT as a floating panel over the terminal instead, leaving
-             the layout alone (an in-flow spacer holds the slot). The SAME button docks it back,
-             and it rides on the panel itself, so the overlay can never hide its own way out.
+          So the agent-column boundary finally takes the same `ColumnPullTab` the concierge seam has
+          had, carrying BOTH gestures in two zones:
 
-          They are stacked vertically and each carries its own accessible name and title, so they
-          read as two distinct controls rather than two mystery grey strips.
+            ›   the chevron zone — OVERLAY. Put this column OVER the terminal instead of sharing
+                width with it. This matters MORE at five columns, not less: when there is no width
+                left to redistribute, overlay is how a column gets real space without starving a
+                neighbour.
+            ⣿   the dot zone      — RESIZE. Drag to move the boundary; arrows nudge it.
 
-          zIndex: the sticky "+ New Build Agent" wrapper is zIndex 3 but stops 8px shy of this edge
-          (the scroll container's padding), so the 6px strip never actually fought it. The overlay
-          tab is wider than that 8px gap, so both tabs are lifted ABOVE 3 rather than left to rely
-          on two pixels of clearance.
+          That closes the handoff `ColumnPullTab`'s own header has described since it shipped — it
+          said the shell mounted only one, on the concierge seam, and that `grows: "right"` had no
+          production caller. It has one now: the LEFT pair, whose terminal is on the row's left, so
+          its boundary and its drag direction both mirror.
 
-          The resize strip is suppressed while floating: the panel's width is derived from the
-          viewport, not dragged, so a drag there would silently move a boundary you can't see. */}
-      {!overlay && (
-        <div
-          onMouseDown={startResize}
-          onKeyDown={onResizeKey}
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize the agent column"
-          aria-valuenow={width}
-          aria-valuemin={MIN_WIDTH}
-          aria-valuemax={MAX_WIDTH}
-          tabIndex={0}
-          title="Drag to resize the agent column (or focus it and use ← →)"
-          data-testid="sidebar-resize-tab"
-          style={{
-            // Kept fully inside the column (right:0) so the 6px hit area can't intercept
-            // clicks on the adjacent panel's left edge.
-            position: "absolute",
-            top: 0,
-            right: 0,
-            width: 6,
-            height: "100%",
-            cursor: "col-resize",
-            zIndex: 4,
-          }}
-        />
-      )}
+          ANCHORED TO THE PANE-SIDE EDGE, which is `pairSide`. `TERM │ BUILD │ CONCIERGE │ BUILD │
+          TERM` — the terminal is to the row's right in the right pair and to its left in the left
+          one, so the boundary this tab owns flips with the pair exactly as the row geometry does.
+
+          Suppressed while OVERLAID for the resize half only — the component already handles that
+          (its dots become a "dock me" button), so the round trip out and back rides on the panel
+          itself and the overlay can never hide its own way out. */}
       <div
         style={{
           position: "absolute",
-          right: 0,
-          top: "50%",
-          transform: "translateY(-50%)",
+          top: 0,
+          bottom: 0,
+          [pairSide]: 0,
+          width: 6,
           display: "flex",
-          flexDirection: "column",
-          alignItems: "flex-end",
-          gap: 6,
-          zIndex: 5,
-          // The WRAPPER is inert; only the button below re-enables pointer events. It sits above
-          // the resize strip (zIndex 5 vs 4) and is wider than the grip inside it, so without this
-          // it swallows the mousedown over the one part of the resize tab a user can actually SEE
-          // — the grip — and the visible affordance becomes the single dead spot on the edge.
-          // Caught in the browser (the grip looked fine and did nothing); jsdom cannot hit-test.
-          pointerEvents: "none",
+          // The rail inside is a flex item; `stretch` is what gives it the column's full height
+          // without this wrapper having to know one.
+          alignItems: "stretch",
         }}
       >
-        {/* The grip: pure signage for the strip behind it, so the resize tab is VISIBLE and not
-            just a 6px band of nothing. pointerEvents:none — every drag belongs to the strip. */}
-        {!overlay && (
-          <div
-            aria-hidden
-            data-testid="sidebar-resize-grip"
-            style={{
-              width: 4,
-              height: 28,
-              marginRight: 1,
-              borderRadius: 3,
-              background: C.hairline,
-              pointerEvents: "none",
-            }}
-          />
-        )}
-        <button
-          type="button"
-          onClick={toggleOverlay}
-          aria-pressed={overlay}
-          aria-label={
-            overlay
-              ? "Dock the agent column back into the layout"
-              : "Pop the agent column out over the terminal"
-          }
-          title={
-            overlay
-              ? "Dock the agent column back into the layout"
-              : "Pop the agent column out over the terminal"
-          }
-          data-testid="sidebar-overlay-tab"
-          style={{
-            // Also kept fully inside the column, for the same reason as the strip: a tab hanging
-            // over the terminal would eat clicks meant for the terminal's left edge.
-            width: 14,
-            height: 34,
-            padding: 0,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            cursor: "pointer",
-            // Re-enabled against the inert wrapper above — this button is the ONLY interactive
-            // thing in the cluster; everything else falls through to the resize strip.
-            pointerEvents: "auto",
-            border: `1px solid ${C.hairline}`,
-            borderRight: "none",
-            borderRadius: "4px 0 0 4px",
-            background: C.barSurface,
-            color: overlay ? C.accentInk : C.muted,
-          }}
-        >
-          {overlay ? <FiChevronsLeft size={11} /> : <FiChevronsRight size={11} />}
-        </button>
+        <ColumnPullTab
+          width={width}
+          onWidth={commitWidth}
+          min={MIN_WIDTH}
+          max={MAX_WIDTH}
+          label="agent column"
+          overlaid={overlay}
+          onOverlayToggle={toggleOverlay}
+          // `grows` names where the OWNED column sits relative to the boundary, which is the
+          // opposite of the side the terminal is on: in the right pair build is left of the seam
+          // (drag right to grow it), in the left pair it is right of it (drag left to grow it).
+          grows={pairSide === "right" ? "left" : "right"}
+          testId="sidebar-pull-tab"
+        />
       </div>
     </div>
     </SidebarScrollContext.Provider>
@@ -2358,12 +2400,124 @@ const DEPTH_INDENT = 32;
 
 // DOM id of a head's worker `group`. One function so the row's aria-owns and the group's own id
 // cannot drift — a mismatched pair is a dangling reference that reads as no relationship at all.
+/**
+ * ADD OR REMOVE A WHOLE PAIR — `.plus` in MAPPING.md, and the fix for a ONE-WAY DOOR.
+ *
+ * This replaces a `«` chevron that MOVED this project to the other side of the concierge. The pair
+ * count is derived from the assignment map rather than stored (engine/pairs.pairCountFor), so
+ * sending the last left-side project back collapsed the second pair — which worked, and which the
+ * user could not undo, because nothing about a chevron says anything can come back. Their words:
+ * "now I don't know how to open it back up." An action that removes half the cockpit needs a
+ * visible inverse, not a technically-reachable one.
+ *
+ * PLUS AND MINUS ARE SELF-EVIDENTLY INVERSE, which a direction glyph is not. The pair count is a
+ * two-state thing, so the control is two-state and reversible:
+ *
+ *   one pair open  → PLUS,  opens the mirrored pair on the other side
+ *   both open      → MINUS, closes this one and returns its projects to the other side
+ *
+ * WHY IT LIVES HERE, next to the filter chips, and not on the boundary. There are three distinct
+ * controls in play now and confusing them is the real hazard: the 6-dot grip RESIZES a boundary,
+ * the arrow OVERLAYS across a boundary, and this ADDS OR REMOVES A PAIR. The first two act ON a
+ * boundary and belong on it; this one acts on the COLUMN'S EXISTENCE and belongs in the column's
+ * own header. Boundary controls on the boundary, column controls in the column.
+ *
+ * ON HOVER, per the ask — it is a rare, structural action and does not earn permanent space in the
+ * header row, which is the column's scarcest. Focus reveals it too: hover-only is a mouse rule, and
+ * a keyboard user tabbing onto a control that paints nothing has no idea what they are on.
+ */
+function PairCountControl({
+  projectId,
+  pairSide,
+  shown,
+}: {
+  projectId: string;
+  pairSide: PairSide;
+  /** Revealed by the HEADER's hover/focus, never by this button's own — a hidden box cannot be
+   *  hovered or tabbed to, so a self-revealing control is a dead control. See the header. */
+  shown: boolean;
+}) {
+  const projects = useProjectStore((s) => s.projects);
+  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  const assignProjectToPair = useUiStore((s) => s.assignProjectToPair);
+  const pairs = pairCountFor(projects, pairAssignment);
+  const willOpen = pairs === 1;
+
+  // CLOSING RETURNS EVERY PROJECT ON THE LEFT, not just the one whose column was clicked. Moving
+  // only this project would leave the pair open holding the others — a "close" that does not close,
+  // which is how the original control read as unpredictable.
+  //
+  // AND IT LANDS A SELECTION. Reassigning alone leaves `selectedProjectId` pointing wherever it was,
+  // so the project the user was looking at when they clicked MINUS silently is not the one the
+  // surviving pair shows — their context disappears with the column. That is the same hole the
+  // deleted chevron's own comment recorded (roborev 55149); the open branch always called
+  // `openProjectTab` and the close branch was the asymmetric one.
+  const toggle = () => {
+    if (willOpen) {
+      assignProjectToPair(projectId, otherSide(pairSide));
+      openProjectTab(projectId);
+      return;
+    }
+    const moved = projectsOnSide(projects, pairAssignment, "left");
+    for (const p of moved) assignProjectToPair(p.id, "right");
+    // Follow the project the user was on when it is one of the ones that just moved; otherwise the
+    // first returned project, so the surviving pair always names something real.
+    const follow = moved.some((p) => p.id === projectId) ? projectId : moved[0]?.id;
+    if (follow) openProjectTab(follow);
+  };
+
+  // THE COPY NAMES THE LEFT PAIR EXPLICITLY, because this control renders in BOTH columns and
+  // "the second pair" / "this side" are wrong in at least one of them. From the right column MINUS
+  // destroys the OTHER column; from the left column the projects go to the other side and this side
+  // ceases to exist, so "return its projects to this side" was false there. A user who reads either
+  // string has to predict the right outcome — remedy copy is code (roborev 55349).
+  const label = willOpen
+    ? "Open the left pair"
+    : "Close the left pair — its projects return to the right";
+
+  return (
+    <button
+      type="button"
+      data-testid="pair-count-control"
+      data-shown={String(shown)}
+      onClick={toggle}
+      aria-label={label}
+      title={label}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flex: "0 0 auto",
+        width: 16,
+        height: 16,
+        padding: 0,
+        marginLeft: 4,
+        background: "none",
+        border: "none",
+        cursor: "pointer",
+        color: C.muted,
+        // `opacity` + `pointerEvents`, NOT `visibility`. A `visibility: hidden` control is removed
+        // from sequential focus navigation, so a keyboard user could never reach it; this one stays
+        // focusable, and a Tab onto it bubbles focus to the header, which reveals it.
+        opacity: shown ? 1 : 0,
+        pointerEvents: shown ? "auto" : "none",
+        transition: "opacity 120ms ease",
+      }}
+    >
+      {willOpen ? <FiPlus size={14} aria-hidden /> : <FiMinus size={14} aria-hidden />}
+    </button>
+  );
+}
+
 const subtreeDomId = (headId: string) => `agent-subtree-${headId}`;
 
 // The row box. Named because the hover card has to reproduce them EXACTLY (minus its own border)
 // to stand over a row without anything jumping — see the card strip's padding.
+//
+// `ROW_PAD_X` and `LIST_PAD_X` now live in `engine/rowGeometry` alongside the rule that consumes
+// them: which end of a row bleeds, and by how much, is a property of the PAIR's side, and putting
+// the numbers next to the rule is what stopped them being re-derived inline for one pair.
 const ROW_PAD_Y = 4;
-const ROW_PAD_X = 10;
 
 // ── THE ROW ANATOMY, SHARED WITH THE PINNED IMPROVE SPARKLE ROW ───────────────────────────────
 // Improve Sparkle is not a project agent — it has no AgentTab, so it cannot go through AgentRow —
@@ -2379,11 +2533,6 @@ const DOT_SLOT_W = 24;
 // Diameter of the status disc on a row (StatusDot's own default 9 is for the TopBar cluster).
 const DOT_SIZE = 12;
 
-// The agent list's own horizontal padding (`agent-list-scroll`), and therefore exactly how far a
-// row has to reach BACK to touch the column's edge. Named rather than typed twice because the
-// row's margin and its compensating padding both depend on it and must move together.
-const LIST_PAD_X = 8;
-
 // ── GEOMETRY BELONGS TO EVERY ROW, NEVER ONLY THE SELECTED ONE ─────────────────────────────────
 //
 // `.row` in the mock carries the pane-side margin; `.row.on` changes only what is PAINTED. The
@@ -2396,9 +2545,12 @@ const LIST_PAD_X = 8;
 // The fix is the mock's: every row runs to the seam and every row pays the same padding back, so
 // the ink sits at a constant inset from the column's edges in all states. See MAPPING.md,
 // "Row geometry belongs to `.row`, never to `.row.on`" — `padding compensates margin one-for-one
-// instead of just changing it` is the exact instruction, and it is why ROW_PAD_RIGHT exists rather
-// than the row simply keeping `ROW_PAD_X` on both sides.
-const ROW_PAD_RIGHT = ROW_PAD_X + LIST_PAD_X;
+// instead of just changing it` is the exact instruction, and it is why `ROW_PAD_COMPENSATED`
+// exists rather than the row simply keeping `ROW_PAD_X` on both sides.
+//
+// BOTH of those live in `engine/rowGeometry` now, with the rule that decides which END takes them.
+// They were written here for a right-hand pair and read correctly for years because there was only
+// one pair, on the right. See `rowBox`.
 
 // ── THE MOUTH IS 26 × 9, NOT 9 × 9 ─────────────────────────────────────────────────────────────
 //
@@ -2417,11 +2569,14 @@ const ROW_PAD_RIGHT = ROW_PAD_X + LIST_PAD_X;
 const ACTIVE_FILLET = 9;
 const ACTIVE_FILLET_RUN = 26;
 
+
 // ── THE SELECTED ROW'S GEOMETRY, IN ONE PLACE ─────────────────────────────────────────────────
 // The active row's corners: square on the PANE side (it opens into the terminal — the mouth below
-// does that work) and rounded on the concierge side; fully rounded when it isn't selected.
+// does that work) and rounded on the concierge side; fully rounded when it isn't selected. WHICH
+// physical side each of those is flips with the pair, and the cable squares the concierge end too —
+// both decided by `rowBox`, which is why this is now a call rather than two constants.
 //
-// Named, because two rows draw it: a build/worker row and the pinned Improve Sparkle row. They were
+// Shared, because two rows draw it: a build/worker row and the pinned Improve Sparkle row. They were
 // literals in both for one commit, which is the one-sided-drift hazard the rest of the row anatomy
 // was consolidated to remove — changing one leaves the other on the old geometry with every test
 // green. AgentSidebar.sparkleRow.test.tsx compares the two rows' computed radius and mouth paint
@@ -2431,8 +2586,20 @@ const ACTIVE_FILLET_RUN = 26;
 // 0) and the kind of local re-derivation blueprintSpec.ts exists to end. The mock's leading radius
 // is `--r-lead: 10px` and RADIUS tops out at 6 (`modal`); this holds at the token and the missing
 // step is reported rather than hard-coded.
-const ACTIVE_ROW_RADIUS = `${RADIUS.modal}px 0 0 ${RADIUS.modal}px`;
-const IDLE_ROW_RADIUS = RADIUS.modal;
+function rowBoxFor(opts: {
+  paneSide: PairSide;
+  jointOpen: boolean;
+  isActive: boolean;
+  depthIndent?: number;
+  pinned?: boolean;
+}) {
+  return rowBox({
+    ...opts,
+    leadRadius: RADIUS.modal,
+    idleRadius: RADIUS.modal,
+    padY: ROW_PAD_Y,
+  });
+}
 
 /** THE MOUTH: a concave fillet where a selected row opens into the pane — NOT a corner.
  *
@@ -2462,35 +2629,51 @@ const IDLE_ROW_RADIUS = RADIUS.modal;
  *  `pointerEvents:none` so they never eat clicks; `aria-hidden` since they are pure chrome. The
  *  caller positions them by making its own box `position: relative`, and is responsible for any
  *  suppression rule of its own (the build row hides them behind its open hover card). */
-function ActiveFillets() {
+function ActiveFillets({ ends, paneSide }: { ends: PairSide[]; paneSide: PairSide }) {
   return (
     <>
-      <div
-        aria-hidden
-        data-testid="row-mouth-top"
-        style={{
-          position: "absolute",
-          top: -ACTIVE_FILLET,
-          right: 0,
-          width: ACTIVE_FILLET_RUN,
-          height: ACTIVE_FILLET,
-          background: `radial-gradient(ellipse farthest-side at top left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-          pointerEvents: "none",
-        }}
-      />
-      <div
-        aria-hidden
-        data-testid="row-mouth-bottom"
-        style={{
-          position: "absolute",
-          bottom: -ACTIVE_FILLET,
-          right: 0,
-          width: ACTIVE_FILLET_RUN,
-          height: ACTIVE_FILLET,
-          background: `radial-gradient(ellipse farthest-side at bottom left, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
-          pointerEvents: "none",
-        }}
-      />
+      {ends.map((end) => {
+        // The arc is bitten out of the corner FURTHEST from the junction, so an end that opens to
+        // the RIGHT anchors its ellipse on the left and vice versa. Mirroring the anchor with the
+        // end is the whole of the left pair's fix: keep it at `left` and the left pair's bank
+        // sweeps the wrong way, hooking back into the row instead of away from it.
+        const far = end === "right" ? "left" : "right";
+        // `row-mouth-*` is the PANE end — the one every selected row has had since this shipped, and
+        // the id the existing geometry tests read. `row-joint-*` is the concierge end, which exists
+        // only while this pair holds the cable. Two names because they are two different claims: one
+        // says "this row feeds its terminal", the other says "…and the concierge is plugged in".
+        const id = end === paneSide ? "mouth" : "joint";
+        return (
+          <Fragment key={end}>
+            <div
+              aria-hidden
+              data-testid={`row-${id}-top`}
+              style={{
+                position: "absolute",
+                top: -ACTIVE_FILLET,
+                [end]: 0,
+                width: ACTIVE_FILLET_RUN,
+                height: ACTIVE_FILLET,
+                background: `radial-gradient(ellipse farthest-side at top ${far}, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
+                pointerEvents: "none",
+              }}
+            />
+            <div
+              aria-hidden
+              data-testid={`row-${id}-bottom`}
+              style={{
+                position: "absolute",
+                bottom: -ACTIVE_FILLET,
+                [end]: 0,
+                width: ACTIVE_FILLET_RUN,
+                height: ACTIVE_FILLET,
+                background: `radial-gradient(ellipse farthest-side at bottom ${far}, transparent 0 calc(100% - .5px), ${C.forest} 100%)`,
+                pointerEvents: "none",
+              }}
+            />
+          </Fragment>
+        );
+      })}
     </>
   );
 }
@@ -2827,12 +3010,21 @@ type AgentRowProps = {
   // shows no landing spots at all rather than lighting up and then silently refusing the drop.
   dragSection: BuildSectionId | null;
   dragActive: boolean;
+  /** Which side of this row its own terminal is on — this sidebar's pair side. The cockpit is
+   *  `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`, so it decides which end bleeds and which end takes
+   *  the leading radius. See engine/rowGeometry. */
+  paneSide: PairSide;
+  /** Does this pair hold the live cable? Opens the row's CONCIERGE end too, so a wired row reads as
+   *  a length of cable seated in two sockets rather than one. */
+  jointOpen: boolean;
   onDragStartAgent: (id: string, section?: BuildSectionId) => void;
   onDragEndAgent: () => void;
   onDropAgent: (targetId: string, targetSection?: BuildSectionId) => void;
   editing: boolean;
   setEditing: (id: string | null) => void;
-  onSelect: () => void;
+  /** Called on activation. `"hover"` marks the hover-intent auto-select — see the parent's
+   *  `onSelect`, where it is what keeps a mere transit from re-wiring the cable. */
+  onSelect: (via?: "hover") => void;
   onLand: () => void;
   onClose: () => void;
 };
@@ -2896,6 +3088,10 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.rowSection === next.rowSection &&
     prev.dragSection === next.dragSection &&
     prev.dragActive === next.dragActive &&
+    // Both are GEOMETRY inputs: miss them here and a project moved to the other pair, or a cable
+    // patched in, leaves every already-mounted row painting the old side's box.
+    prev.paneSide === next.paneSide &&
+    prev.jointOpen === next.jointOpen &&
     prev.editing === next.editing &&
     workerDetailsEqual(prev.workers, next.workers)
   );
@@ -2924,6 +3120,8 @@ const AgentRow = memo(function AgentRow({
   rowSection,
   dragSection,
   dragActive,
+  paneSide,
+  jointOpen,
   onDragStartAgent,
   onDragEndAgent,
   onDropAgent,
@@ -3016,6 +3214,26 @@ const AgentRow = memo(function AgentRow({
     }
     setHover(true);
   };
+  // RE-MEASURE ONCE THE ROW'S OWN BOX HAS SETTLED. `openCard` calls `onSelect()` — which patches the
+  // cable — and then `show()` in the same handler, so the rect above is captured against the
+  // PRE-patch box while the card is padded from the POST-patch one. Those disagree by exactly the
+  // compensation: in a right pair not already holding the cable the row's box left moves from
+  // `E + LIST_PAD_X` to `E` as its padding goes 10 → 18 (the ink stays put, which is the invariant),
+  // so a card pinned at the stale left and padded 18 put its disc and title 8px right of the row's.
+  // The old constant was accidentally correct in that one case, so reading the live padding without
+  // this traded the left-pair jump for a right-pair one — in the DEFAULT configuration (roborev
+  // 55287).
+  //
+  // A layout effect, so it runs after the DOM has the new box and before paint: nothing is ever
+  // shown at the stale position. Keyed on the geometry inputs rather than on every render, so it
+  // does not re-measure in a loop.
+  useLayoutEffect(() => {
+    if (!hover) return;
+    const el = rowRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setRect({ left: r.left, top: r.top, width: r.width });
+  }, [hover, jointOpen, paneSide, depth]);
   const hide = () => {
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setHover(false), 60);
@@ -3027,7 +3245,8 @@ const AgentRow = memo(function AgentRow({
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
     hoverTimer.current = window.setTimeout(() => {
       hoverTimer.current = null;
-      onSelect();
+      // MARKED as hover: this is the only caller that is not a deliberate act.
+      onSelect("hover");
     }, HOVER_INTENT_MS);
   };
   const disarmSelect = () => {
@@ -3568,7 +3787,7 @@ const AgentRow = memo(function AgentRow({
                     style={{
                       color: nameColor,
                       fontSize: 13,
-                      fontWeight: isActive ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+                      fontWeight: rowTitleWeight(isActive),
                     }}
                   >
                     {fullTitle}
@@ -3834,6 +4053,19 @@ const AgentRow = memo(function AgentRow({
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.
   const showOverlay = hover && !editing;
 
+  // WHICH END OF THIS ROW OPENS INTO WHAT — see engine/rowGeometry. `filletEnds` is pulled out
+  // because it names the ends to draw a mouth at, not a CSS property to spread onto the box.
+  //
+  // `padLeft` comes out too, and NOT onto the box: the hover card stands in for this row at this
+  // row's own rect, so it has to reproduce THIS row's content offset rather than a constant. See
+  // the card strip's padding.
+  const { filletEnds, padLeft: rowPadLeft, padRight: rowPadRight, ...boxStyle } = rowBoxFor({
+    paneSide,
+    jointOpen,
+    isActive,
+    depthIndent: depth * DEPTH_INDENT,
+  });
+
   // The drag handle for reorder (top-level rows only; workers keep insertion order). Grab and drop
   // on another row to pin this agent at that row's position (manual-agent-reorder-pin). Suppressed
   // while renaming so the <input> behaves normally. These props go on the in-flow row AND on BOTH
@@ -3900,43 +4132,31 @@ const AgentRow = memo(function AgentRow({
           position: "relative",
           display: "flex",
           flexDirection: "column",
-          // 4px, down from 8: the row is a single 20px line of text now (the sub-line and the
-          // progress bar moved to the card), so the old padding was sized for content that is no
-          // longer here and left the column looking sparse rather than calm.
+          // 4px vertical, down from 8: the row is a single 20px line of text now (the sub-line and
+          // the progress bar moved to the card), so the old padding was sized for content that is
+          // no longer here and left the column looking sparse rather than calm.
           //
-          // The RIGHT padding is `ROW_PAD_RIGHT`, not `ROW_PAD_X`, and it is not decoration: it
-          // pays back, one-for-one, the `marginRight` below that every row now carries. Content
-          // inset from the column's pane-side edge is `ROW_PAD_RIGHT - LIST_PAD_X` = ROW_PAD_X in
-          // every state, which is the whole point — see ROW_PAD_RIGHT.
-          padding: `${ROW_PAD_Y}px ${ROW_PAD_RIGHT}px ${ROW_PAD_Y}px ${ROW_PAD_X}px`,
-          marginLeft: depth * DEPTH_INDENT,
-          // Active row is the TERMINAL color, extending past the list's 8px right padding
-          // (marginRight:-8) so it reaches the sidebar's right border. Left corners round into the
-          // sidebar (8px); the right edge is square here, with CONCAVE fillets (below) shaping it
-          // into an opening rather than a convex "button" corner. Idle rows are fully rounded.
+          // HORIZONTALLY IT IS `rowBox`'S CALL, not this file's. A bleeding end pays its bleed back
+          // one-for-one in padding, so the ink's inset from the column edge is constant in every
+          // state; WHICH end bleeds is the pair's side, and the concierge end joins it once the
+          // cable is patched. All three decisions live in engine/rowGeometry.
+          ...boxStyle,
+          // Active row is the TERMINAL color, extending past the list's 8px padding on the pane side
+          // so it reaches the column's edge, with CONCAVE fillets (below) shaping that end into an
+          // opening rather than a convex "button" corner. Idle rows are fully rounded.
           //
-          // THE ROW BLEEDS THROUGH THE COLUMN'S EDGE, and the -8 is what makes that possible: it
-          // eats the list's 8px right padding so the fill reaches the seam and laps its last pixel,
-          // painting over it (the seam is a positioned sibling EARLIER in tree order — see the
-          // column's own note). For one release the edge was a `border-right`, which no descendant
-          // can paint on, and the rule ran straight across this row: the bleed became a dock
-          // against a drawn line. Don't reintroduce that by moving the seam back onto the border or
-          // by giving it a z-index.
+          // THE ROW BLEEDS THROUGH THE COLUMN'S EDGE, and the negative margin is what makes that
+          // possible: it eats the list's 8px padding so the fill reaches the seam and laps its last
+          // pixel, painting over it (the seam is a positioned sibling EARLIER in tree order — see
+          // the column's own note). For one release the edge was a `border-right`, which no
+          // descendant can paint on, and the rule ran straight across this row: the bleed became a
+          // dock against a drawn line. Don't reintroduce that by moving the seam back onto the
+          // border or by giving it a z-index.
           //
           // What carries the active state is the fill being the terminal's own colour where every
-          // other row is transparent, plus the square right corner and the fillets shaping that
+          // other row is transparent, plus the square pane-side corner and the fillets shaping that
           // edge into an opening — and, once the card is open, its 4px `hairline` outline. Not the
           // fill step against the column, which is ~1.08:1 and never was the signal.
-          // PAINT, not layout: a radius on a transparent box draws nothing, so this may key off
-          // selection where the margin below may not. The leading (concierge-side) end takes a
-          // radius; the pane-side end is SQUARE here and is opened by the concave mouth below —
-          // a radius there would neck the row DOWN as it reaches the pane, which is the opposite
-          // operation (MAPPING.md, "Geometry vocabulary"). Both values are shared with the pinned
-          // Improve Sparkle row — see ACTIVE_ROW_RADIUS, which carries the `RADIUS.modal` rationale.
-          borderRadius: isActive ? ACTIVE_ROW_RADIUS : IDLE_ROW_RADIUS,
-          // EVERY ROW, unconditionally. See ROW_PAD_RIGHT: making this conditional on `isActive`
-          // is the list-twitch bug, not a saving.
-          marginRight: -LIST_PAD_X,
           cursor: "pointer",
           // The whole card is a drag handle for reorderable rows — suppress text selection so a
           // drag grabs the card instead of highlighting the name underneath the cursor. Gated on
@@ -3969,7 +4189,7 @@ const AgentRow = memo(function AgentRow({
             pinned Improve Sparkle row draws from too, so the two can never drift apart. Suppressed
             HERE while the card is open (showOverlay): the row is no longer visibility:hidden, so
             these would otherwise show through beside the stand-in card. */}
-        {isActive && !showOverlay && <ActiveFillets />}
+        {!showOverlay && <ActiveFillets ends={filletEnds} paneSide={paneSide} />}
         {/* Drop target — live only while a drag is in flight, only on top-level rows, and only when
             the drag STARTED in this row's own section. Moving a row between sections is not a thing
             the user can do: a row's section is derived from its git state, so "drag it into Merged"
@@ -4030,7 +4250,7 @@ const AgentRow = memo(function AgentRow({
             <div
               ref={stripRef}
               {...dragProps}
-              onClick={onSelect}
+              onClick={() => onSelect()}
               onMouseEnter={show}
               onMouseLeave={hide}
               style={{
@@ -4045,13 +4265,29 @@ const AgentRow = memo(function AgentRow({
                 // cardLeft = rect.left) and stands in for it, but the card has a 2/4px border the
                 // row doesn't — so a flat `8px 10px` here put the disc and title several pixels
                 // down-and-right of where they had just been, and everything visibly jumped on
-                // open. The row's own padding is 4px/10px (ROW_PAD_Y / ROW_PAD_X).
+                // open. The row's own vertical padding is ROW_PAD_Y; its HORIZONTAL padding is
+                // whatever `rowBox` gave THIS row, which is why that number is read off the row
+                // instead of being written again here.
+                //
+                // IT USED TO BE THE CONSTANT `ROW_PAD_X`, and that was correct only while the row's
+                // left padding was always 10. It is `ROW_PAD_COMPENSATED` (18) on any OPEN end — so
+                // for every row in a LEFT pair, and for every row in either pair once the cable is
+                // patched. A row click patches the cable, so wired is the ordinary state, and the
+                // constant slid the disc and title 8px left of where they had just been the instant
+                // a card opened: exactly the "everything visibly jumped" regression the rest of this
+                // note exists to prevent (roborev 55270).
                 //
                 // The horizontal half of this was always slightly wrong; cutting the row's vertical
                 // padding to 4px is what made the vertical half obvious (roborev 53814). The
                 // alignment test pins BOTH axes now — it used to compare only slot widths, which
                 // cannot see an offset.
-                padding: `${Math.max(0, ROW_PAD_Y - cardBorder)}px ${Math.max(0, ROW_PAD_X - cardBorder)}px`,
+                // PER SIDE, not the two-value shorthand. The shorthand applied the row's LEFT
+                // padding to the card's right as well — and `padLeft` carries the depth indent on an
+                // open end, so a depth-1 worker's card got a 46px right inset where it had been 6–8,
+                // pulling the close ×, the elapsed timer and the progress bar ~40px off the card's
+                // right edge. The card's right edge stands over the TERMINAL, not over the row, so
+                // it has no business tracking the row's left padding at all (roborev 55287).
+                padding: `${Math.max(0, ROW_PAD_Y - cardBorder)}px ${Math.max(0, rowPadRight - cardBorder)}px ${Math.max(0, ROW_PAD_Y - cardBorder)}px ${Math.max(0, rowPadLeft - cardBorder)}px`,
                 cursor: "pointer",
                 userSelect: rowSection != null && !editing ? "none" : undefined,
                 background: cardBg,
@@ -4085,7 +4321,7 @@ const AgentRow = memo(function AgentRow({
               // — wheeling a tall many-worker card scrolls the card, not the column.
               data-hovercard-detail=""
               {...dragProps}
-              onClick={onSelect}
+              onClick={() => onSelect()}
               onMouseEnter={show}
               onMouseLeave={hide}
               style={{
@@ -4387,6 +4623,8 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
   dotLabel,
   workerCount,
   onSelect,
+  paneSide,
+  jointOpen,
 }: {
   active: boolean;
   status: AgentTabStatus;
@@ -4398,6 +4636,10 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
    *  the same rule build rows use so a future subtree gets the same badge for free. */
   workerCount: number;
   onSelect: () => void;
+  /** Same two geometry inputs every build row takes — this row is the same anatomy, so it mirrors
+   *  with the pair and opens its concierge end on the same cable. See engine/rowGeometry. */
+  paneSide: PairSide;
+  jointOpen: boolean;
 }) {
   const consent = useSettingsStore((s) => s.sparkleImprovementConsent);
   const pill = consentPillLabel(consent);
@@ -4407,6 +4649,7 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
   // than an ever-growing number (see this row's note in PRD/sparkle/improve--parity.md).
   const lastTouchAt = useInteractionStore((s) => s.lastAt[sparkleAgentIdFor(APP_WINDOW_LABEL)]);
   const clockNow = useRowClock(lastTouchAt);
+  const pinBox = rowBoxFor({ paneSide, jointOpen, isActive: active, pinned: true });
   return (
     <div
       data-hint="improve"
@@ -4419,21 +4662,21 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
         display: "flex",
         alignItems: "flex-start",
         gap: 8,
-        // LIST_PAD_X as a LEFT margin, because this row is pinned OUTSIDE the padded scroll
-        // container — that inset plus ROW_PAD_X plus the centered disc slot is what puts the disc on
-        // the same vertical line as every build row's.
+        // THE SAME RULE THE BUILD ROWS USE — `rowBox`, with `pinned` set, because this row sits
+        // OUTSIDE the padded scroll container and so already touches the column's edges: its open
+        // end takes margin 0 where a list row takes a negative one, and its shut end is held off by
+        // a POSITIVE margin where a list row simply keeps the container's padding. Both baselines
+        // land the ink at the identical distance from the column edge, which is what puts this
+        // row's disc on the same vertical line as every build row's.
         //
         // NOTHING HERE IS CONDITIONAL ON `active`, and that is the same rule the build rows follow:
         // geometry belongs to every row, never only the selected one. A `marginRight: active ? …`
         // narrows the row's CONTENT BOX the instant you select it, so the title under the pointer
-        // jumps — the list-twitch the build rows were just fixed for. This row is outside the
-        // padded container, so it already reaches the seam at margin-right 0; it pays the inset back
-        // through ROW_PAD_RIGHT exactly as a build row does, leaving the ink at the identical
-        // distance from the column's pane-side edge in every state.
+        // jumps — the list-twitch the build rows were just fixed for.
         //
         // The trailing 6 is the gap to the footer, not a separator.
-        margin: `0 0 6px ${LIST_PAD_X}px`,
-        padding: `${ROW_PAD_Y}px ${ROW_PAD_RIGHT}px ${ROW_PAD_Y}px ${ROW_PAD_X}px`,
+        margin: `0 ${pinBox.marginRight}px 6px ${pinBox.marginLeft}px`,
+        padding: pinBox.padding,
         cursor: "pointer",
         // THE SELECTED STATE IS THE BUILD ROW'S, NOT A BESPOKE ONE — and that resolves the long
         // argument this comment used to record.
@@ -4462,7 +4705,7 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
         // separate — it is pinned below the scroll container, outside every stage group — so the
         // rule was saying it a second time, in the one vocabulary no other row uses.
         background: active ? C.forest : "transparent",
-        borderRadius: active ? ACTIVE_ROW_RADIUS : IDLE_ROW_RADIUS,
+        borderRadius: pinBox.borderRadius,
       }}
     >
       {/* The disc, in the SAME fixed slot a build row gives it: fixed height so the title beside it
@@ -4505,7 +4748,7 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
               // were taken off years of ago. Color lives in the disc.
               color: C.cream,
               fontSize: AGENT_NAME_FONT_SIZE,
-              fontWeight: active ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+              fontWeight: rowTitleWeight(active),
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
@@ -4529,7 +4772,7 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
       {/* THE SAME COMPONENT a selected build row draws, not a copy of it — they are what makes the
           1.08:1 fill step legible as selection, so they are not decoration and must not be dropped.
           No `showOverlay` condition here: this row has no hover card to be stood in for. */}
-      {active && <ActiveFillets />}
+      <ActiveFillets ends={pinBox.filletEnds} paneSide={paneSide} />
     </div>
   );
 });

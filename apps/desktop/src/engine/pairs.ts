@@ -7,22 +7,35 @@
 //
 // THE ONE INVARIANT, and the reason this is a module rather than two `useState`s:
 //
-//     A project's panes are mounted in EXACTLY ONE stage.
+//     A project's panes are mounted EXACTLY ONCE.
 //
 // Not zero (its terminals would be dead while its tab still claimed to be open) and never two. Two
-// is the expensive one: `Terminal.tsx` spawns a PTY per mount, so the same agent id mounted in both
-// stages puts two xterms on one PTY and `pty_spawn`'s `sessions.insert` orphans one of the child
-// processes. That is the identical failure the tear-off ownership map exists to prevent
-// (services/satelliteWindows), and the reason `Workspace` partitions its `live` list through
-// `sideOf` rather than rendering the same list twice.
+// is the expensive one: `Terminal.tsx` spawns a PTY per mount, so the same agent id mounted twice
+// puts two xterms on one PTY and `pty_spawn`'s `sessions.insert` orphans one of the child processes.
+// That is the identical failure the tear-off ownership map exists to prevent
+// (services/satelliteWindows).
 //
-// WHAT MOVING A PROJECT BETWEEN PAIRS COSTS, stated plainly because it looks alarming and is not:
-// re-assigning a project unmounts its panes on one side and mounts them on the other, and a
-// Terminal unmount KILLS its PTY — so its agents respawn (`claude --resume`) and lose scrollback.
-// That is exactly what tearing a project out to its own window already does, where the code calls
-// it "the user loses a respawn, not the project". It is a real cost, it is survivable, and it is
-// precedented; what is NOT survivable is the double mount above. So this module makes moving
-// possible and makes double-mounting unrepresentable.
+// HOW `Workspace` HOLDS IT — and note this changed, in the direction of a STRONGER guarantee.
+//
+// It used to be "mounted in exactly one STAGE": each stage rendered its own slice of the live pane
+// list, and the guarantee came from `sideOf` partitioning that list so neither slice could hold the
+// same agent twice. Correct, but a property of the partition rather than of the shape — and it made
+// moving a project ruinous. Re-assigning it moved its panes from one JSX parent to the other, which
+// React cannot see as a move: the old pane unmounted, a new one mounted, and a Terminal unmount
+// KILLS its PTY. So every project that changed sides respawned (`claude --resume`) and lost its
+// scrollback, and closing a pair — which moves everything on it — cost that once per project.
+//
+// Now there is ONE mount site (`AgentPaneList`, at the shell root) and each pane is PORTALLED into
+// the stage its side owns. `sideOf` decides where a pane is DISPLAYED, not whether it is
+// constructed, so a side change changes the portal's destination and the component is never touched:
+// the PTY lives, the scrollback survives, the xterm keeps its buffer. Double-mounting stopped being
+// a hazard the partition avoids and became something the code cannot express — there is a single
+// list, keyed by agent id.
+//
+// Nothing about the rules below changes. `sideOf` is still total, `projectsOnSide` still answers
+// which tabs a strip shows, and `pairCountFor` is still derived so it cannot disagree with the map.
+// See `PaneHost` in components/Workspace.tsx for why the portal is re-parented by hand rather than
+// by handing `createPortal` a different container (that is itself an unmount).
 
 import type { PairCount, PairSide } from "./cable";
 

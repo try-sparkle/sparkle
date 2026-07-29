@@ -16,6 +16,7 @@ import { ensureCloudProjectId } from "../services/cloudAgents/projectLink";
 import { projectRepoUrl } from "../services/cloudAgents/repoUrl";
 import { classifyStartError, type StartGuidance } from "../services/cloudAgents/startError";
 import { openSignIn } from "../services/sparkleApi";
+import { ModalLayer } from "./ModalLayer";
 
 // "New cloud agent" (Service B, W5). A cloud agent is started server-side BEFORE it has a tab, and
 // the server needs a goal and a repo up front (it clones the repo and seeds Claude Code with the
@@ -119,8 +120,11 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
   const startDisabled =
     starting || goal.trim().length === 0 || guidance?.reason === "started_untracked";
 
+  // Backdrop 60 / dialog 61 are ROOT-layer numbers (components/layers.ts's app-modal band), and
+  // ModalLayer is what makes them root numbers: Workspace mounts this inside the shell, where any
+  // lifted ancestor would otherwise flatten both to that ancestor's single layer.
   return (
-    <>
+    <ModalLayer>
       <div data-testid="cloud-dialog-backdrop" onClick={onClose} style={backdrop} />
       <div role="dialog" aria-modal="true" aria-label="New cloud agent" style={dialog}>
         <div style={titleBar}>
@@ -211,7 +215,7 @@ export function NewCloudAgentDialog({ project, onClose }: { project: Project; on
           )}
         </div>
       </div>
-    </>
+    </ModalLayer>
   );
 }
 

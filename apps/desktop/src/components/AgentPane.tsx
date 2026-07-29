@@ -71,6 +71,7 @@ import { TerminalDropPill } from "./TerminalDropPill";
 import { useTerminalDrop } from "../hooks/useTerminalDrop";
 import { Onboarding } from "./Onboarding";
 import { paneVisibilityStyle } from "./paneVisibility";
+import { arePanePropsEqual } from "./panePropsEqual";
 import { TERMINAL_STAGE_PADDING } from "./terminalStageAnchor";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
@@ -1175,30 +1176,10 @@ function AgentPaneInner({
   );
 }
 
-/** Skip a re-render when nothing THIS pane depends on changed. A projectStore write for a SIBLING
- *  agent (a status flip, an activity narration, a prompt append) mints a new `projects` array + a new
- *  project object (mapProject/mapAgent) and re-renders Workspace — which, unmemoized, re-rendered
- *  EVERY mounted pane (terminal + composer) on every such write. But mapAgent replaces only the
- *  touched agent's object, so this pane's own `agent` ref is preserved, and the only `project` fields
- *  this pane's render (and ThinkPanel) read are the four scalars below. So when `agent` and `visible`
- *  and those scalars are unchanged, the pane's output is identical and we can safely bail. `agent`
- *  referential equality already re-renders on this pane's own updates; `visible` re-renders on switch.
- *  Internal store subscriptions (composerMinimized, scrollIntent, AI gates) are unaffected — memo only
- *  gates PARENT-driven re-renders, not the component's own subscriptions. */
-export function arePanePropsEqual(
-  a: { project: Project; agent: AgentTab; visible: boolean; calm?: boolean },
-  b: { project: Project; agent: AgentTab; visible: boolean; calm?: boolean },
-): boolean {
-  return (
-    a.agent === b.agent &&
-    a.visible === b.visible &&
-    !!a.calm === !!b.calm &&
-    a.project.id === b.project.id &&
-    a.project.rootPath === b.project.rootPath &&
-    a.project.name === b.project.name &&
-    a.project.defaultBranch === b.project.defaultBranch
-  );
-}
+/** Re-exported from `panePropsEqual.ts`, where the comparator lives so it can be imported without
+ *  this file's module graph (xterm + the Tauri bridge + a dozen services). Kept exported here
+ *  because `AgentPane.memo.test.ts` and every other caller already import it from this module. */
+export { arePanePropsEqual };
 
 /** The live pane. Memoized (see arePanePropsEqual) so N open panes don't all re-render on every
  *  sibling-agent store write — the main render-thrash source when many agents are open. */

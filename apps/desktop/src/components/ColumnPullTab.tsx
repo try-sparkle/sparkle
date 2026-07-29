@@ -44,13 +44,12 @@
 // coordination — `ColumnPullTab.test.tsx` pins that, because the failure mode (one module-level
 // ref, one shared listener) is invisible until the second instance is mounted.
 //
-// ⚠ THE SHELL STILL MOUNTS ONLY ONE, on the concierge seam (`Workspace.tsx`). The agent-column
-// boundary keeps the legacy pair this file's header says it replaces — a separate `col-resize`
-// strip plus a separate overlay button in `AgentSidebar.tsx`, with their own listeners and their
-// own persisted width. Converting it is a change to those two files, which this one does not own,
-// so `grows: "right"` has no production caller yet. The test's second instance proves the component
-// supports the mount; it cannot and does not prove the shell has made it. See
-// `PRD/sparkle/blueprint-pull-tab.md` for the exact mount and the handoff.
+// MOUNTED ON BOTH SEAMS NOW. This block used to warn that the shell mounted only one instance, on
+// the concierge boundary, and that `grows: "right"` had no production caller — so the agent column
+// kept the legacy trio this file's header says it replaces (a `col-resize` strip, a mid-height grip,
+// a separate overlay button). All three are gone: `AgentSidebar` mounts this on the build/terminal
+// boundary, anchored to the pair's pane side, and the LEFT pair is `grows: "right"`'s caller. The
+// clearance note above still applies and `.bhd`'s seam-side padding lives in that file.
 //
 // The dots are SQUARE (no rounding) per the same conversation — "a little bit more square than
 // those round dots". A round dot field reads as a generic drag handle; squares match a shell
@@ -59,6 +58,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Keyb
 import { FiChevronLeft, FiChevronRight } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
+import { log } from "../logger";
+import { clampWidth, type ClampedBy } from "../engine/columnResize";
 
 /** Keyboard step, and the larger step when Shift is held. */
 const STEP = 8;
@@ -132,9 +133,59 @@ export function ColumnPullTab({
   const [focused, setFocused] = useState(false);
   const origin = useRef({ x: 0, width: 0 });
 
+  // The last clamp state we reported, so a drag that sits pinned against a bound logs ONCE rather
+  // than once per pointer event. Edge-triggered on purpose: `onMove` fires at pointer rate, and
+  // every forwarded log line costs a JSON render plus a synchronous IPC → disk write on the main
+  // thread (see logger.ts). Instrumenting a drag must not become its own source of jank — that
+  // would be indistinguishable from the bug it was added to diagnose.
+  const lastClamp = useRef<ClampedBy | "start">("start");
+  // The last width we actually applied, for the drag-end line. A REF rather than reading the
+  // `width` prop in the effect below: `width` in that dep array would tear down and re-add the
+  // window listeners on every pointer event of the drag, which is churn on the exact hot path this
+  // instrumentation exists to keep honest.
+  const lastApplied = useRef<number | null>(null);
+  /** Are we inside a RUN of arrow presses that are no longer moving the boundary? Separate from
+   *  `lastClamp`, which belongs to the drag — see the note in `onKeyDown` for why one ref cannot
+   *  serve both. */
+  const keyPinned = useRef(false);
+
   const commit = useCallback(
-    (next: number) => onWidth(Math.min(max, Math.max(min, Math.round(next)))),
-    [onWidth, min, max],
+    (next: number) => {
+      const { requested, applied, clampedBy } = clampWidth(next, min, max);
+      // WHY THIS LINE EXISTS: resizing was completely uninstrumented, so "the divider registers but
+      // nothing moves" could not be told apart from "the divider moves it and something downstream
+      // refuses to paint". `requested` vs `applied` answers exactly that, and `clampedBy` names the
+      // bound when they differ.
+      if (clampedBy !== lastClamp.current) {
+        lastClamp.current = clampedBy;
+        log.info(
+          "resize",
+          clampedBy
+            ? `${label}: requested ${requested} → applied ${applied}, clamped by ${clampedBy} (min ${min}, max ${max})`
+            : `${label}: requested ${requested} → applied ${applied}, unclamped`,
+        );
+      }
+      lastApplied.current = applied;
+      onWidth(applied);
+    },
+    [onWidth, min, max, label],
+  );
+
+  /** One line at the end of a gesture, so a drag is a bracketed span in the log rather than a
+   *  scatter of width changes. `reason` distinguishes an ordinary release from a release the app
+   *  never saw (`buttons === 0`), which is a real failure mode this component already guards. */
+  const endDrag = useCallback(
+    (reason: "release" | "release-lost") => {
+      log.info(
+        "resize",
+        `${label}: drag end (${reason}) at ${lastApplied.current ?? "unchanged"}${
+          lastApplied.current == null ? "" : "px"
+        }`,
+      );
+      lastApplied.current = null;
+      setDragging(false);
+    },
+    [label],
   );
 
   // While OVERLAID there is no boundary to drag: the column floats over its neighbour and its width
@@ -145,6 +196,13 @@ export function ColumnPullTab({
     if (overlaid) return;
     e.preventDefault();
     origin.current = { x: e.clientX, width };
+    // A drag is a new gesture too, so it must not inherit a latched keyboard run.
+    keyPinned.current = false;
+    // The START of the gesture, named. Without it a log shows widths changing with no way to tell
+    // WHICH seam the user grabbed, and — more importantly for the v0.63.0 report — a drag that
+    // produces no width lines at all is silent about whether it was ever recognised.
+    lastClamp.current = "start";
+    log.info("resize", `${label}: drag start at ${width}px (min ${min}, max ${max}, grows ${grows})`);
     setDragging(true);
   };
 
@@ -158,32 +216,56 @@ export function ColumnPullTab({
       // shell actually mounts, while the control that HAD the guard was mounted nowhere
       // (roborev 54730). `buttons === 0` means no button is held: the gesture is over.
       if (e.buttons === 0) {
-        setDragging(false);
+        endDrag("release-lost");
         return;
       }
       const dx = e.clientX - origin.current.x;
       commit(origin.current.width + (grows === "left" ? dx : -dx));
     };
-    const onUp = () => setDragging(false);
+    const onUp = () => endDrag("release");
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [dragging, commit, grows]);
+  }, [dragging, commit, grows, endDrag]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if (overlaid) return;
     const step = e.shiftKey ? BIG_STEP : STEP;
     const sign = grows === "left" ? 1 : -1;
-    if (e.key === "ArrowRight") {
-      e.preventDefault();
-      commit(width + step * sign);
-    } else if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      commit(width - step * sign);
+    // THE RESET LIVES INSIDE THE ARROW BRANCHES, not above them. Arrowing outward after a drag that
+    // ended pinned at `max` used to log nothing at all — `clampedBy` never changed — so the reported
+    // symptom happened in silence. But resetting on EVERY keydown meant Tab, Enter or any character
+    // cleared the drag's edge state too, re-arming per-event logging on a key that moves nothing.
+    // Only a key that actually commits a width gets to clear it.
+    const target =
+      e.key === "ArrowRight" ? width + step * sign : e.key === "ArrowLeft" ? width - step * sign : null;
+    if (target === null) return;
+    e.preventDefault();
+    // TWO RULES PULL OPPOSITE WAYS HERE, and the keyboard needs its own edge state to satisfy both.
+    //
+    //  • A NEW GESTURE that goes nowhere must SAY SO. Arrowing outward after a drag that already
+    //    ended pinned used to emit nothing at all — `clampedBy` never changed — so the reported
+    //    symptom happened in silence. That is why the arrow re-arms `lastClamp` (the DRAG's edge
+    //    state) rather than inheriting it.
+    //  • A HELD arrow must not say so thirty times a second. OS auto-repeat is ~30/s and each line
+    //    costs a JSON render plus a synchronous IPC → disk write on the main thread, so re-arming
+    //    unconditionally turned the instrumentation into the jank it exists to diagnose.
+    //
+    // `keyPinned` is what separates them: it tracks a RUN of arrows that are no longer moving the
+    // boundary, so the first one reports and the repeats are quiet — while a drag's pinned state,
+    // which lives in `lastClamp`, cannot silence the first keypress that follows it.
+    const moves = clampWidth(target, min, max).applied !== width;
+    if (moves) {
+      keyPinned.current = false;
+      lastClamp.current = "start";
+    } else if (!keyPinned.current) {
+      keyPinned.current = true;
+      lastClamp.current = "start";
     }
+    commit(target);
   };
 
   // Visible while hovered, FOCUSED, or mid-drag.
@@ -267,10 +349,20 @@ export function ColumnPullTab({
               title={overlaid ? `Dock the ${label}` : `Overlay the ${label}`}
               style={zoneBtn}
             >
-              {overlaid ? (
-                <FiChevronLeft size={ARROW} strokeWidth={ARROW_STROKE} aria-hidden />
-              ) : (
+              {/* THE ARROW POINTS AT THE THING IT WILL DO, and that mirrors with the pair. Docked,
+                  it points ACROSS the boundary — the direction the column is about to expand over.
+                  Overlaid, it points BACK — the direction it will dock into. `grows` already
+                  encodes which side of the seam the owned column sits on, so the mirror is read off
+                  that rather than off a second prop that could disagree with it.
+
+                  Hardcoding `FiChevronRight` here read correctly for years because the only
+                  boundary that mounted this was the concierge's, on the right of the shell. The
+                  left pair makes it wrong the same way every other unmirrored number in the row box
+                  was wrong: the affordance points away from the pane it acts on. */}
+              {(grows === "left") !== overlaid ? (
                 <FiChevronRight size={ARROW} strokeWidth={ARROW_STROKE} aria-hidden />
+              ) : (
+                <FiChevronLeft size={ARROW} strokeWidth={ARROW_STROKE} aria-hidden />
               )}
             </button>
           )}
@@ -295,6 +387,15 @@ export function ColumnPullTab({
               if (overlaid) onOverlayToggle?.();
             }}
             onKeyDown={onKeyDown}
+            // THE RUN ENDS WITH THE KEY. `keyPinned` used to be cleared only by an arrow that
+            // MOVED the boundary, so it stayed latched indefinitely: press ArrowRight at `max`
+            // once (line logged), release, press again minutes later — a genuinely new gesture
+            // that goes nowhere — and nothing was logged, which is the silent symptom the whole
+            // instrumentation exists to remove. OS auto-repeat emits no intervening `keyup`, so
+            // this ends a run without ending a repeat.
+            onKeyUp={() => {
+              keyPinned.current = false;
+            }}
             style={{ ...zoneBtn, cursor: overlaid ? "pointer" : "col-resize" }}
           >
             <span aria-hidden style={dotField(2)}>

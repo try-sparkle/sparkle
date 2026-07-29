@@ -29,8 +29,7 @@
 // CEILING — and it is TIGHTER than "anything under 50". The bands above, in order:
 //
 //   40      SettingsDialog's backdrop (41 its dialog) and OpenPrMenu's click-away backdrop (41/42).
-//           Both are `position: fixed; inset: 0` rendered from hosts that are NOT stacking contexts
-//           (ProjectTabsBar for the PR menu), so they compete at ROOT against these two constants.
+//           Both are `position: fixed; inset: 0` competing at ROOT against these two constants.
 //           PLAN_COLUMN_Z sat at exactly 40 for one commit: the tie went to the plan board on DOM
 //           order (it renders after ProjectTabsBar), so in Plan mode a click over the board hit a
 //           card instead of dismissing the open PR menu, which then stayed open. Stay clear of the
@@ -41,6 +40,24 @@
 //           CommandPalette and composer/ModalOverlay 1000. Every dialog covers both of these.
 //
 // So the usable window is roughly 22–37. These sit at the bottom of it.
+//
+// ── "COMPETES AT ROOT" IS A PROPERTY OF THE PORTAL, NOT OF THE NUMBER ──────────────────────────
+// This ladder only describes reality for surfaces that actually REACH the root stacking context,
+// and that line above used to justify itself with "rendered from hosts that are NOT stacking
+// contexts". That premise was true when written and rotted silently. `Concierge/KebabMenu` mounts
+// SettingsDialog inside `ConciergeColumn`'s root `<section>`, which is `position: relative` +
+// `CONCIERGE_LIFT_Z` (3) — a stacking context — so the dialog's 40/41 were capped at 3 and the pull
+// tab's rail at `PULL_TAB_RAIL_Z` (4), a sibling of the column, painted over an app-modal dialog and
+// its scrim. Nothing in this file was wrong; the modal simply never arrived in the layer the file
+// describes.
+//
+// The premise is now enforced instead of assumed: every modal that paints its own scrim wraps
+// itself in `components/ModalLayer`, which portals it to `document.body`. Read these numbers as
+// "where a modal lands ONCE PORTALED" — a modal that skips ModalLayer is not on this ladder at all,
+// whatever it typed. `modalLayering.test.ts` fails the build if a new one skips it, and
+// `ModalLayer.wiring.test.tsx` re-opens the settings dialog through the real column and checks it
+// escaped. The corollary for anyone adding a lifted container: you may make your column a stacking
+// context freely — that is no longer a way to break a modal.
 //
 // AgentSidebar.pullTabs.test.tsx asserts the ordering invariant against these constants and that the
 // sidebar renders at its own; Workspace.tabs.test.tsx pins the board to PLAN_COLUMN_Z. Changing

@@ -13,7 +13,7 @@
 // drives the store proves the store works and says nothing about whether a user can get there. That
 // distinction is what let the break survive — `ConciergeColumn.wired.test.tsx` asserted the flood in
 // full, supplying the prop itself, and passed the whole time the feature was dead.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -108,6 +108,88 @@ describe("selecting a build row patches the cable", () => {
     cleanup();
     render(<AgentSidebar project={PROJECT} />);
     fireEvent.click(rowFor("Stripe checkout retry"));
+    expect(useCableStore.getState().wired).toBe("left");
+  });
+
+  // ── HOVER IS NOT A DELIBERATE ACT ───────────────────────────────────────────────────────────
+  //
+  // `onSelect` is BOTH paths: `armSelect` fires it from a 90ms setTimeout on plain mouseenter, with
+  // no click anywhere. Hanging the patch on it meant a cursor merely RESTING over a row re-wired
+  // the cable (roborev 55234) — which defeated the unbind gestures, and, far worse, re-routed
+  // `promptTarget` across pairs so Send delivered to a terminal the user never plugged into.
+  //
+  // Selection may follow the mouse. The cable may not.
+  it("does NOT patch on hover-intent, however long the cursor rests", () => {
+    vi.useFakeTimers();
+    try {
+      render(<AgentSidebar project={PROJECT} />);
+      fireEvent.mouseEnter(rowFor("Concierge column layout"));
+      // Well past the 90ms dwell — the hover-commit has definitely fired.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(useCableStore.getState().wired).toBe("off");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hovering does not STEAL a cable already patched to the other side", () => {
+    // The prompt-routing case, which is the one that costs a user their message: patched left,
+    // cursor transits the right column, Send must still go left.
+    useCableStore.getState().patch("left");
+    vi.useFakeTimers();
+    try {
+      render(<AgentSidebar project={PROJECT} />);
+      fireEvent.mouseEnter(rowFor("Stripe checkout retry"));
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(useCableStore.getState().wired).toBe("left");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wires the agent it just SPAWNED", () => {
+    // Creating an agent is the strongest "talk to this one" there is — and it was the path that
+    // left the cable off. In the far pair it actively DROPPED it: the shell's pointerdown capture
+    // reads the "+ New Build Agent" row as outside the circuit and unbinds, so the next prompt went
+    // to Sparkle instead of the agent the user had just asked for. (roborev 55234)
+    render(<AgentSidebar project={PROJECT} />);
+    expect(useCableStore.getState().wired).toBe("off");
+    fireEvent.click(screen.getByText("+ New Build Agent"));
+    expect(useCableStore.getState().wired).toBe("right");
+  });
+
+  // ── THE BUILD CHEVRON ───────────────────────────────────────────────────────────────────────
+  //
+  // Switching INTO Build puts a build agent in front of you, which is the same act as clicking its
+  // row — so it wires. But it is also the one caller that passes NULL: a pair with no build rows
+  // clears the selection instead. Both directions live here because the second was the regression.
+  const clickBuildChevron = () => fireEvent.click(screen.getByTitle(/^Build mode/));
+
+  it("wires when the Build chevron seats a row", () => {
+    // Parked on Sparkle, so this is a real switch INTO Build rather than the second-click spawn.
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    render(<AgentSidebar project={PROJECT} />);
+    clickBuildChevron();
+    expect(useCableStore.getState().wired).toBe("right");
+  });
+
+  it("does NOT patch when the chevron seats NOTHING — and cannot steal the other pair's cable", () => {
+    // `firstRenderedRowId ?? firstVisibleAgentId` is null when the pair has no build agents at all,
+    // and `onPickBuild` passes that null through deliberately (→ the empty Build state). Patching
+    // on it wires a circuit with no agent on the far end: `promptTarget` derives from the selected
+    // agent, so it falls back to Sparkle — and here it would ALSO drop a cable already seated on a
+    // real agent in the other pair, sending the user's next message somewhere they never plugged in.
+    const EMPTY: Project = { ...PROJECT, agents: [], selectedAgentId: null };
+    useProjectStore.setState({ projects: [EMPTY], selectedProjectId: "p1" } as never);
+    useRuntimeStore.setState({ openAgentIds: [], status: {} } as never);
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    useCableStore.getState().patch("left");
+    render(<AgentSidebar project={EMPTY} />);
+    clickBuildChevron();
     expect(useCableStore.getState().wired).toBe("left");
   });
 

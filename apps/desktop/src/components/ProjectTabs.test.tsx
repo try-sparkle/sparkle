@@ -2,7 +2,30 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { StatusBand } from "../engine/buildSections";
-import { ProjectTabs, pinTitle, tabBand, TAB_LABEL_MAX_WIDTH } from "./ProjectTabs";
+import { bandColor } from "../engine/statusBandLabels";
+import { C, INK_MIN_CONTRAST, CONTROL_MIN_CONTRAST, THEME_HEX } from "../theme/colors";
+import { asRgb } from "./statusDotTestUtils";
+import {
+  ProjectTabs,
+  pinTitle,
+  tabBadgeCount,
+  tabBand,
+  TAB_LABEL_MAX_WIDTH,
+} from "./ProjectTabs";
+
+/** WCAG relative luminance / contrast for a #rrggbb pair — the same arithmetic
+ *  theme/chromeContrast.test.ts uses, kept local so this file's colour floors are self-contained. */
+function luminance(hex: string): number {
+  const ch = (i: number) => {
+    const v = parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * ch(0) + 0.7152 * ch(1) + 0.0722 * ch(2);
+}
+function contrast(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x) as [number, number];
+  return (hi + 0.05) / (lo + 0.05);
+}
 
 /** Counts with only the named bands set — a tab takes the full per-band Record. */
 function counts(over: Partial<Record<StatusBand, number>> = {}): Record<StatusBand, number> {
@@ -75,24 +98,132 @@ describe("ProjectTabs", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("badges a project whose agents need you, agreeing in number", () => {
-    renderTabs({ countsByProject: { website: counts({ needs_you: 2, running: 1 }) } });
-    expect(screen.getByTestId("count-website").textContent).toBe("2 Need you");
-  });
+  // ── THE BADGE: ● N ON THE TABS YOU ARE NOT LOOKING AT, AND NOTHING ON THE ONE YOU ARE ──────────
+  // These assert the SIDE EFFECT of the rule, not its precondition. The first one is the load-
+  // bearing case: the active tab's count is nonzero, so every input that used to produce a badge is
+  // still present and only the new rule suppresses it. Written the other way round — "the active
+  // tab is calm, so no badge" — it would have passed before the change too.
 
-  it("uses the singular verb for exactly one", () => {
-    renderTabs({ countsByProject: { website: counts({ needs_you: 1 }) } });
-    expect(screen.getByTestId("count-website").textContent).toBe("1 Needs you");
-  });
-
-  it("shows no badge for a project that is only running or done", () => {
-    renderTabs({ countsByProject: { website: counts({ running: 3, done: 5 }) } });
-    expect(screen.queryByTestId("count-website")).toBeNull();
-  });
-
-  it("shows no badge when a project is calm", () => {
-    renderTabs({ countsByProject: { sparkle: counts() } });
+  it("the ACTIVE tab shows NO badge and NO count text, even with agents needing you", () => {
+    // `sparkle` is selected AND has 3 needing you. Deleting the `active` guard in `tabBadgeCount`
+    // brings a "3" back onto this tab, which is what this test exists to catch.
+    renderTabs({
+      selectedProjectId: "sparkle",
+      countsByProject: { sparkle: counts({ needs_you: 3, running: 1 }) },
+    });
     expect(screen.queryByTestId("count-sparkle")).toBeNull();
+    // Not just the badge element — no digit from that count reaches the tab at all. The label is
+    // "sparkle", so a stray "3" anywhere in the tab is the count leaking back by another route.
+    expect(screen.getByTestId("tab-sparkle").textContent).toBe("sparkle");
+  });
+
+  it("an INACTIVE tab with a nonzero count shows the band dot and the bare number", () => {
+    renderTabs({ countsByProject: { website: counts({ needs_you: 2, running: 1 }) } });
+    const badge = screen.getByTestId("count-website");
+    // The NUMBER only — "2", never "2 Need you". A regression that restores the phrase changes this.
+    expect(badge.textContent).toBe("2");
+    // …and it counts `needs_you`, not the 1 running beside it.
+    const dot = screen.getByTestId("band-badge-needs_you").firstElementChild as HTMLElement;
+    // The dot is the BAND's own paint — the same fill the agent rows' dots and the filter chips
+    // take — so the badge is a legend for exactly the rows it counts. `asRgb`, because jsdom
+    // normalises a hex background to rgb().
+    expect(dot.style.background).toBe(asRgb(bandColor("needs_you")));
+    expect(dot.style.width).toBe("8px");
+    expect(dot.style.borderRadius).toBe("50%");
+  });
+
+  it("an inactive tab whose count is ZERO shows no badge", () => {
+    renderTabs({ countsByProject: { website: counts({ needs_you: 0, running: 3, done: 5 }) } });
+    expect(screen.queryByTestId("count-website")).toBeNull();
+    expect(screen.getByTestId("tab-website").textContent).toBe("drodio-website");
+  });
+
+  it('the words "Needs you" are nowhere in the tab strip', () => {
+    // Both tabs badged and one of them plural, so every branch of the old phrase renders if it is
+    // still there at all. This is the founder's line: the badge is a dot and a number, never a
+    // sentence — the filter chips below the strip are where the bands are named.
+    renderTabs({
+      selectedProjectId: "sparkle",
+      countsByProject: {
+        sparkle: counts({ needs_you: 4 }),
+        website: counts({ needs_you: 1 }),
+      },
+    });
+    const strip = screen.getByRole("tablist").textContent ?? "";
+    expect(strip).not.toMatch(/needs? you/i);
+    // Guard the guard: the assertion above is worthless if nothing is rendering. The one badged
+    // (inactive) tab must still be showing its number.
+    expect(screen.getByTestId("count-website").textContent).toBe("1");
+  });
+
+  it("keeps the whole phrase as the badge's ACCESSIBLE name — the words are dropped VISUALLY only", () => {
+    // A red dot and a bare "1" is punctuation-plus-a-digit to a screen reader. The phrase moves to
+    // the accessible name rather than being deleted, and it still agrees in number.
+    const { rerender } = render(
+      <ProjectTabs
+        projects={projects}
+        selectedProjectId="sparkle"
+        pinnedProjectId={null}
+        countsByProject={{ website: counts({ needs_you: 1 }) }}
+        onSelect={vi.fn()}
+        onTogglePin={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("img", { name: "1 Needs you" })).toBeTruthy();
+    rerender(
+      <ProjectTabs
+        projects={projects}
+        selectedProjectId="sparkle"
+        pinnedProjectId={null}
+        countsByProject={{ website: counts({ needs_you: 3 }) }}
+        onSelect={vi.fn()}
+        onTogglePin={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("img", { name: "3 Need you" })).toBeTruthy();
+    // No `title`: a tooltip is VISIBLE chrome, so spelling the phrase out on hover would put the
+    // words back on screen through the side door.
+    expect(screen.getByTestId("count-website").hasAttribute("title")).toBe(false);
+    expect(screen.getByTestId("band-badge-needs_you").hasAttribute("title")).toBe(false);
+  });
+
+  it("paints the numeral with the themed alarm ink, which the band's raw red cannot replace", () => {
+    renderTabs({ countsByProject: { website: counts({ needs_you: 2 }) } });
+    expect(screen.getByTestId("band-badge-needs_you").style.color).toBe(C.dangerInk);
+  });
+
+  it("…and that ink clears AA on the tab strip in BOTH themes, where the band's red does not", () => {
+    // The reason the line above is not just a preference. Asserted as a measurement in both
+    // directions so neither half can be reverted to "the band colour is fine here".
+    for (const mode of ["dark", "light"] as const) {
+      const hex = THEME_HEX[mode];
+      expect(
+        contrast(hex.dangerInk, hex.barSurface),
+        `${mode}: the tab badge's numeral is unreadable on the tab strip`,
+      ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+      expect(
+        contrast(bandColor("needs_you"), hex.barSurface),
+        `${mode}: the band's raw red now clears AA as text — this override may be retired`,
+      ).toBeLessThan(INK_MIN_CONTRAST);
+      // The DOT is a shape, not text, so it is held to the non-text control floor instead — and it
+      // has to clear that, or the thing carrying the alarm is invisible on the strip.
+      expect(
+        contrast(bandColor("needs_you"), hex.barSurface),
+        `${mode}: the badge's dot is invisible on the tab strip`,
+      ).toBeGreaterThanOrEqual(CONTROL_MIN_CONTRAST);
+    }
+  });
+
+  describe("tabBadgeCount", () => {
+    it("is null on the active tab whatever the count, and the count otherwise", () => {
+      expect(tabBadgeCount(counts({ needs_you: 5 }), true)).toBeNull();
+      expect(tabBadgeCount(counts({ needs_you: 5 }), false)).toBe(5);
+      expect(tabBadgeCount(counts({ needs_you: 0 }), false)).toBeNull();
+      // Running and done never badge — same rule `tabBand` already owns, asserted through here so
+      // the two cannot drift.
+      expect(tabBadgeCount(counts({ running: 4, done: 9 }), false)).toBeNull();
+      expect(tabBadgeCount(undefined, false)).toBeNull();
+    });
   });
 
   it("renders the add-project button and the top-right cluster", () => {
@@ -220,3 +351,37 @@ describe("the close ×", () => {
     expect(css).toContain('.concierge-tab-close[data-active="true"]');
   });
 });
+// ── THE GLOW IS NOW THE ACTIVE TAB'S ONLY ALARM ───────────────────────────────────────────────
+//
+// Suppressing the badge on the active tab makes the glow load-bearing there — and nothing in this
+// file or ProjectTabsBar.test.tsx asserted it existed. The plausible follow-up ("make the glow
+// consistent with the badge and suppress it there too", or a restyle that drops `boxShadow`) would
+// leave a selected project whose agents need you showing NO alarm in any modality, with the whole
+// suite green. The commit that suppressed the badge called the glow "deliberately untouched"; that
+// is exactly the kind of load-bearing decision every other rule here pins as a side effect
+// (roborev 55307).
+describe("ProjectTabs — the active tab keeps its glow", () => {
+  it("glows when the SELECTED project has agents needing you, badge or no badge", () => {
+    renderTabs({
+      selectedProjectId: "sparkle",
+      countsByProject: { sparkle: counts({ needs_you: 3 }) },
+    });
+    const tab = screen.getByTestId("tab-sparkle");
+    expect(tab.style.boxShadow).not.toBe("");
+    // The same red the dots and chips use — one alarm vocabulary, not a bespoke tab colour.
+    // Compared as HEX, not via `asRgb`: jsdom normalises `background` to rgb() but leaves
+    // `boxShadow` as authored, and the glow appends an alpha suffix to the token.
+    expect(tab.style.boxShadow).toContain(bandColor("needs_you"));
+    // …and the badge really is suppressed, so the glow is genuinely carrying it alone.
+    expect(screen.queryByTestId("count-sparkle")).toBeNull();
+  });
+
+  it("does NOT glow when the selected project is calm", () => {
+    renderTabs({
+      selectedProjectId: "sparkle",
+      countsByProject: { sparkle: counts({ running: 3, done: 5 }) },
+    });
+    expect(screen.getByTestId("tab-sparkle").style.boxShadow).toBe("");
+  });
+});
+

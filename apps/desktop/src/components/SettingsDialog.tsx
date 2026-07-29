@@ -8,6 +8,7 @@ import { fetchTrial } from "../services/trialApi";
 import { useAuthStore } from "../stores/authStore";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
 import { useUiStore, type CategoryId } from "../stores/uiStore";
+import { ModalLayer } from "./ModalLayer";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
 import { NotificationsMenu } from "./NotificationsMenu";
 import { ThemeToggle } from "./ThemeToggle";
@@ -179,7 +180,7 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
   }, []);
 
   return (
-    <>
+    <ModalLayer>
       <div data-testid="settings-backdrop" onClick={onClose} style={backdrop} />
       <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Settings" style={dialog}>
         <div style={titleBar}>
@@ -247,7 +248,7 @@ export function SettingsDialog({ onClose, onManageAccounts, initialCategory }: S
           </section>
         </div>
       </div>
-    </>
+    </ModalLayer>
   );
 }
 

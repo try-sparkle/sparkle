@@ -158,9 +158,43 @@ describe("the shell root carries the whole cockpit state", () => {
     render(<Workspace />);
     patch("right");
     expect(shell().getAttribute("data-wired")).toBe("right");
+
+    // ONE LIVE CIRCUIT — patching the other side MOVES the cable, never lights both. Seeded with a
+    // real LEFT pair, because `data-wired` is a projection now, not a mirror: it names a side only
+    // when there is an agent on the far end of the cable. This used to patch left with no left pair
+    // in the fixture at all and assert "left" anyway — i.e. it pinned the lit-cable-with-nothing-
+    // there state as the contract, which is the bug the projection exists to make unrepresentable.
+    act(() => {
+      useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: "p2" } as never);
+      useProjectStore.setState({
+        projects: [
+          mkProject("p1", "Alpha", [mkAgent("a1")], "a1"),
+          mkProject("p2", "Beta", [mkAgent("b1")], "b1"),
+        ],
+      } as never);
+    });
     patch("left");
-    // ONE LIVE CIRCUIT — patching the other side MOVES the cable, never lights both.
     expect(shell().getAttribute("data-wired")).toBe("left");
+  });
+
+  // THE STATE AN ACQUISITION GUARD CANNOT PREVENT, because nothing is being acquired: patch a side,
+  // then empty it. `selectAndWire` refuses to patch when it seats no agent, and that closes one
+  // route; switching the wired pair to an agent-less project or closing its last agent closes
+  // nothing. Left unprojected, the shell floods that pair and recedes the other while the compose
+  // box falls back to Sparkle — a lit cable whose prompt goes somewhere else (roborev 55249).
+  it("reports OFF when the wired side has no agent on the far end", () => {
+    render(<Workspace />);
+    patch("right");
+    expect(shell().getAttribute("data-wired")).toBe("right");
+    act(() => {
+      useProjectStore.setState({
+        projects: [mkProject("p1", "Alpha", [mkAgent("a1")], null as never)],
+      } as never);
+    });
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    // The STORE still holds the patch — this is a read-side projection, so nothing had to remember
+    // to unbind and re-selecting an agent lights it again with no second gesture.
+    expect(useCableStore.getState().wired).toBe("right");
   });
 
   // The whole point of the attribute: nothing else needs to change for the app to look wired, so a

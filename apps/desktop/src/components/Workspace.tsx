@@ -1,4 +1,16 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, getAllWindows } from "@tauri-apps/api/window";
 import { C, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
@@ -44,6 +56,7 @@ import {
   projectsOnSide,
   resolveSideSelection,
   sideOf,
+  type PairAssignment,
 } from "../engine/pairs";
 import { openProjectsOf } from "../engine/openProjects";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
@@ -125,59 +138,163 @@ function PaneFallback() {
  */
 
 /**
- * The mounted agent panes for ONE pair's stage.
+ * ONE PANE, MOUNTED ONCE, DISPLAYED WHEREVER ITS PAIR IS — the mechanism that makes moving a
+ * project between pairs free.
  *
- * Extracted so both stages render the same thing from their OWN slice of the pane list. It takes
- * `panes` rather than filtering a shared list itself, which is the point: the caller has already
- * partitioned through `sideOf`, so this component cannot accidentally render an agent that belongs
- * to the other pair. Mounting the same agent id in two stages puts two xterms on one PTY.
+ * THE PROBLEM. Each stage used to render its OWN slice of the pane list, so re-assigning a project
+ * moved its panes from one JSX parent to the other. React has no way to see that as a move: the
+ * `<AgentPane>` under the left stage and the one under the right are different positions in the
+ * tree, so the old one unmounts and a new one mounts. A `Terminal` unmount KILLS its PTY, so every
+ * project that changed sides paid a `claude --resume` respawn and lost its scrollback. Closing a
+ * pair moves EVERY project on it, so a dozen open projects cost a dozen respawns per toggle. The
+ * founder's requirement was the opposite: "all the project tabs would just move over to the right
+ * one. And they wouldn't lose anything."
  *
- * `visibleAgentId` is null when the stage is showing something else entirely (the Plan board, the
- * Improve Sparkle pane) — the panes stay MOUNTED and merely invisible, because a Terminal unmount
- * kills its PTY.
+ * THE FIX. The loss comes from UNMOUNTING, not from moving. So the pane is mounted exactly once, in
+ * one stable place in the React tree (see `AgentPaneList`'s call site), and PORTALLED into whichever
+ * stage should display it. Changing sides changes the portal's DESTINATION; the component, its
+ * effects, its xterm and its PTY are never touched.
+ *
+ * WHY A HAND-MANAGED HOST DIV RATHER THAN `createPortal(children, stage)`. Because handing
+ * `createPortal` a different container is itself an unmount: React's reconciler compares
+ * `stateNode.containerInfo`, and a portal fiber whose container changed is deleted and re-created —
+ * the exact remount this exists to avoid. So the portal's container is a div THIS component owns and
+ * never swaps, and it is the div that is re-parented, with `appendChild`. React sees one container
+ * for the lifetime of the pane; the DOM sees a subtree move, which preserves every node in it.
+ *
+ * `display: contents` so the host generates no box of its own. The pane inside is
+ * `position: absolute; inset: 0` and must resolve against the STAGE, exactly as it did when it was a
+ * direct child — a real wrapper box would become the containing block and would also sit in the
+ * stage's hit-test as a full-bleed rectangle over every pane below it.
+ *
+ * A NULL TARGET IS A REAL, SAFE STATE. The left stage does not exist until `pairCount` is 2, so for
+ * the one commit between "this project is now left" and "the left stage has mounted and reported its
+ * node" the host is simply left where it already was. It is never detached, never unmounted, and it
+ * moves on the next commit. That is a frame of staleness, not a respawn.
+ *
+ * WHAT A DOM MOVE COSTS xterm, since it is the obvious worry: nothing that is not already handled.
+ * The canvas and the whole xterm subtree move intact. If the stages differ in width the pane's box
+ * changes size, which is what `Terminal`'s ResizeObserver already exists to fit; if they don't, there
+ * is nothing to re-fit. A WebGL context lost across the move lands in `WebglAddon.onContextLoss` →
+ * `recoverFromWebglContextLoss` (components/terminalWebgl.ts), which disposes the addon, falls back
+ * to the DOM renderer and forces a repaint — a path that predates this change and has its own tests.
+ */
+function PaneHost({ target, children }: { target: HTMLElement | null; children: React.ReactNode }) {
+  // Created ONCE, per pane, and never replaced — the stable container the note above requires.
+  // `useState` with an initializer rather than `useRef`, so it is allocated exactly once even under
+  // StrictMode's double-invoked render.
+  const [host] = useState(() => {
+    const el = document.createElement("div");
+    el.style.display = "contents";
+    el.dataset.paneHost = "";
+    return el;
+  });
+  // useLayoutEffect, not useEffect: the pane must be under its stage before the browser paints, or a
+  // side change flashes the pane in its old column for a frame.
+  useLayoutEffect(() => {
+    // `appendChild` MOVES the node when it already has a parent — one call is both the insert and
+    // the removal-from-the-old-stage. Deliberately no cleanup that detaches on target change: a
+    // detach-then-attach would take the subtree out of the document between commits for no gain.
+    if (target) target.appendChild(host);
+  }, [target, host]);
+  // The only real teardown. Runs when the PANE unmounts (its agent closed, its project torn out),
+  // which is the one case where the DOM should actually lose the node.
+  useEffect(() => () => host.remove(), [host]);
+  return createPortal(children, host);
+}
+
+/**
+ * EVERY mounted agent pane, in ONE list, each portalled into the stage its pair owns.
+ *
+ * THE INVARIANT `engine/pairs` EXISTS FOR IS STRONGER HERE, NOT WEAKER: a project's panes are
+ * mounted in exactly one place. There used to be two stages that could each construct a pane, and
+ * the guarantee came from partitioning `live` so that neither list ever held the same agent twice —
+ * correct, but a property of the partition rather than of the shape. Now there is a SINGLE mount
+ * site keyed by agent id, so "the same agent id mounted in two stages" — two xterms on one PTY, one
+ * of the child processes orphaned by `pty_spawn`'s `sessions.insert` — is not something the code can
+ * express. `sideOf` decides where a pane is DISPLAYED, not whether it is constructed.
+ *
+ * `visibleAgentId[side]` is null when that stage is showing something else entirely (the Plan board,
+ * the Improve Sparkle pane) — the panes stay MOUNTED and merely invisible, because a Terminal
+ * unmount kills its PTY.
  */
 function AgentPaneList({
   panes,
+  pairAssignment,
+  stages,
   visibleAgentId,
   calm,
 }: {
   panes: ReadonlyArray<{ project: Project; agent: AgentTab }>;
-  visibleAgentId: string | null;
-  calm: boolean;
+  pairAssignment: PairAssignment;
+  /** The DOM node each side's stage renders into. `null` while that pair is not on screen. */
+  stages: Readonly<Record<PairSide, HTMLElement | null>>;
+  visibleAgentId: Readonly<Record<PairSide, string | null>>;
+  calm: Readonly<Record<PairSide, boolean>>;
 }) {
-  // One Suspense around the list, not per pane: the agent panes share a chunk, and loading one must
-  // never blank a sibling that is already mounted and holding a PTY.
   return (
-    <Suspense fallback={<PaneFallback />}>
+    <>
       {panes.map(({ project: p, agent }) => {
+        const side = sideOf(pairAssignment, p.id);
         // Agent ids are globally unique, so this comparison is exactly "is this the pane to show" —
         // a background tab's agent never matches.
-        const visible = agent.id === visibleAgentId;
-        // Per-pane boundary: one crashing pane degrades to an inline card (respecting its
-        // visibility) instead of unmounting the workspace and its sibling agents.
+        const visible = agent.id === visibleAgentId[side];
         return (
-          <ErrorBoundary
-            key={agent.id}
-            scope="agent-pane"
-            fallback={({ error, reset }) => (
-              <AgentPaneErrorCard error={error} reset={reset} visible={visible} />
-            )}
-          >
-            <AgentPane
-              project={p}
-              agent={agent}
-              visible={visible}
-              // Calm is a property of the pane you are LOOKING at, so only the visible one ever
-              // carries it — a background pane re-theming would clear its WebGL atlas for a screen
-              // nobody is watching.
-              calm={visible && calm}
-            />
-          </ErrorBoundary>
+          // The Suspense boundary is INSIDE the portal, which is a change forced by the portal and
+          // worth naming. It used to be one boundary around the whole list, on the reasoning that
+          // the panes share a chunk so they should share a fallback. That reasoning still holds —
+          // they do all resolve together — but the list no longer renders where the fallback needs
+          // to appear: it lives outside both stages now, and `PaneFallback` is `position: absolute;
+          // inset: 0`, so a boundary out there would paint its backdrop against the VIEWPORT and
+          // cover the whole window. Inside the host it lands in the stage, exactly where the pane it
+          // is standing in for will land.
+          <PaneHost key={agent.id} target={stages[side]}>
+            <Suspense fallback={<PaneFallback />}>
+              {/* Per-pane boundary: one crashing pane degrades to an inline card (respecting its
+                  visibility) instead of unmounting the workspace and its sibling agents. */}
+              <ErrorBoundary
+                scope="agent-pane"
+                fallback={({ error, reset }) => (
+                  <AgentPaneErrorCard error={error} reset={reset} visible={visible} />
+                )}
+              >
+                <AgentPane
+                  project={p}
+                  agent={agent}
+                  visible={visible}
+                  // Calm is a property of the pane you are LOOKING at, so only the visible one ever
+                  // carries it — a background pane re-theming would clear its WebGL atlas for a
+                  // screen nobody is watching.
+                  calm={visible && calm[side]}
+                />
+              </ErrorBoundary>
+            </Suspense>
+          </PaneHost>
         );
       })}
-    </Suspense>
+    </>
   );
 }
+
+/**
+ * THE SHELL RE-RENDERS AT POINTER RATE DURING A COLUMN DRAG. These two must not follow it.
+ *
+ * Every pointer event of a seam drag commits a new width, which re-renders `Workspace` and — before
+ * this — everything it renders directly. The panes were already safe (`arePanePropsEqual`), but the
+ * sidebar re-rendered its whole agent list and each tab strip re-derived its per-side partition,
+ * once per pointer event. Measured in `Workspace.renderCost.test.tsx` at 30 renders each across a
+ * 30-step drag, against 0 for the panes.
+ *
+ * Neither component takes a prop that a column boundary can change — the sidebar takes one project
+ * object, the strips take a side, the memoized concierge feed and a `useState` setter — so the
+ * default shallow comparison is exactly right, and both keep their own store subscriptions (memo
+ * gates PARENT-driven renders only, never a component's own updates or context).
+ *
+ * Wrapped HERE rather than at their definitions because those files are owned by other work in
+ * flight; this is a property of how the shell calls them either way.
+ */
+const MemoAgentSidebar = memo(AgentSidebar);
+const MemoProjectTabsBar = memo(ProjectTabsBar);
 
 /**
  * A PAIR — a build column and its terminal, which are ONE project and are never split.
@@ -291,10 +408,67 @@ export function Workspace() {
     const saved = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY));
     return saved >= CONCIERGE_MIN_WIDTH && saved <= CONCIERGE_MAX_WIDTH ? saved : CONCIERGE_DEFAULT_WIDTH;
   });
-  const setConciergeWidth = (next: number) => {
-    setConciergeWidthRaw(next);
-    localStorage.setItem(CONCIERGE_WIDTH_KEY, String(next));
-  };
+  // NOT PERSISTED PER PIXEL, and not re-created per render. Both halves are on the drag's hot path.
+  //
+  // `localStorage.setItem` is SYNCHRONOUS and disk-backed, and this used to run on every pointer
+  // event of a resize — hundreds of blocking writes per drag, on the main thread, interleaved with
+  // the full Workspace re-render each width change already costs. The agent column's own strip has
+  // always persisted on settle instead ("Persist once the drag settles rather than on every
+  // intermediate pixel"); this is the same rule, applied to the boundary that lacked it. The
+  // trailing write below lands ~200ms after the last change, so a drag writes once and the keyboard
+  // path (which has no mouseup to hang a commit off) is covered by the same timer.
+  //
+  // `useCallback` is the second half: this function is `onWidth` on the pull tab, and the tab's
+  // drag installs its window listeners in an effect keyed on that identity. Unmemoized, every
+  // Workspace render — and the shell re-renders on EVERY projectStore write — tore the live drag's
+  // mousemove listener down and re-added it mid-gesture.
+  const setConciergeWidth = useCallback((next: number) => setConciergeWidthRaw(next), []);
+  // THE DEBOUNCE MUST FLUSH, or it is a way to LOSE a width rather than a way to write it less.
+  // A trailing timer whose cleanup only cancels drops whatever the user just set if anything tears
+  // the tree down inside the window — resize the seam (or nudge it with ← →) and quit within 200ms
+  // and the next launch restores the old width. The old per-pixel write could not lose a committed
+  // value; this could. The agent column has no such hole because it hangs its write off `mouseup`
+  // and off each keyboard commit, which are edge events that cannot be cancelled.
+  const conciergeWidthRef = useRef(conciergeWidth);
+  conciergeWidthRef.current = conciergeWidth;
+  useEffect(() => {
+    const id = setTimeout(() => {
+      localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidth));
+    }, 200);
+    return () => clearTimeout(id);
+  }, [conciergeWidth]);
+  useEffect(() => {
+    // ALL THREE TEARDOWN SIGNALS, not just `pagehide` — which is the one this codebase never leans
+    // on alone. A native window close in a Tauri/WKWebView destroys the webview outright, and React
+    // does not unmount on process teardown, so hanging the quit path on a single event that may
+    // never fire loses the width exactly as before. `projectStore` solves the identical problem with
+    // this same trio, and `main.tsx` calls `beforeunload` "the pragmatic best-effort 'app closing'
+    // hook in the webview". The effect cleanup covers a real React unmount; all four read the ref,
+    // so whichever fires first writes the latest committed width.
+    //
+    // GUARDED, for the same reason `projectStore` guards its own: `localStorage` can throw (quota,
+    // or disabled entirely), and an unguarded throw here escapes an effect cleanup and an event
+    // handler — turning "we couldn't save a column width" into a broken teardown.
+    const flush = () => {
+      try {
+        localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidthRef.current));
+      } catch {
+        // A width we cannot persist is a cosmetic loss; it must not take the shutdown with it.
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVisibility);
+      flush();
+    };
+  }, []);
   const projects = useProjectStore((s) => s.projects);
   const currentProjectId = useCurrentProjectId();
   const isMainWindow = useIsMainWindow();
@@ -620,6 +794,23 @@ export function Workspace() {
   // "user-facing remedy that does the unsafe thing" shape AGENTS.md warns about.
   const wiredProject = wired === "left" ? leftProject : project;
   const wiredAgentId = wiredProject?.selectedAgentId ?? null;
+  // A CIRCUIT WITH NOTHING ON THE FAR END IS NOT A CIRCUIT — enforced HERE, where the state is
+  // READ, rather than only where it is written.
+  //
+  // `selectAndWire` refuses to patch when it seats no agent, and that closed one route in. It could
+  // not close the others, because they do not seat anything at all: switch the WIRED pair's project
+  // tab to a project with no agents, or close the last agent in it, and `wired` still names that
+  // side while `wiredAgentId` is null. The consequences were exactly the ones that bug was filed
+  // for — `data-wired` floods the pair and recedes the other one, while `promptTarget` falls back to
+  // Sparkle, so the cable is lit and the user's next message goes somewhere else. Every acquisition
+  // guard in the world cannot fix a state reachable by removing something.
+  //
+  // Deriving the effective side makes that state UNREPRESENTABLE instead: the one enum every visual
+  // consequence follows from (MAPPING.md) can only say "left" or "right" when there is an agent on
+  // the other end of the cable. The store is untouched — this is a read-side projection, so nothing
+  // has to remember to unbind, which is the same reason the row geometry reads its side rather than
+  // mirroring it into local state (roborev 55249).
+  const effectiveWired: typeof wired = wiredAgentId === null ? "off" : wired;
   // The agent the concierge compose box can prompt directly (CM-U7): the selected tab's selected
   // agent. This is what re-homes the removed AgentPane composer — with a target the box can send a
   // real prompt into a terminal instead of only chatting with the brain. Null → the box is
@@ -749,18 +940,18 @@ export function Workspace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projects, openAgentIds, visitedVersion, currentProjectId, leftProjectId, tornOut]);
 
-  // PARTITION THE PANES BY PAIR — the whole reason `engine/pairs` exists.
+  // WHERE EACH PAIR'S PANES ARE DISPLAYED — the DOM node, not a slice of the list.
   //
-  // Each stage renders ONLY its own side's panes. Rendering `live` in both stages would mount every
-  // agent TWICE, putting two xterms on one PTY and letting `pty_spawn`'s `sessions.insert` orphan
-  // one of the child processes — the identical failure the tear-off ownership map prevents. A
-  // partition makes that unrepresentable rather than merely avoided: `sideOf` is total, so every
-  // pane lands in exactly one of these two lists.
-  const livePanes = useMemo(() => {
-    const byPair: Record<PairSide, typeof live> = { left: [], right: [] };
-    for (const entry of live) byPair[sideOf(pairAssignment, entry.project.id)].push(entry);
-    return byPair;
-  }, [live, pairAssignment]);
+  // `live` is rendered ONCE, by a single `AgentPaneList` below, and each pane portals into the stage
+  // its side owns (see `PaneHost`). So this is not the old partition under another name: there is
+  // one mount site, and these are the two destinations it can portal to. `null` for the left while
+  // `pairCount` is 1 and that stage is not on screen.
+  //
+  // State rather than a ref because the list has to RE-RENDER when a stage appears — a ref would
+  // hold the node with nothing to tell the portals about it, and the left pair would come up empty
+  // until some unrelated write happened to re-render the shell.
+  const [leftStage, setLeftStage] = useState<HTMLElement | null>(null);
+  const [rightStage, setRightStage] = useState<HTMLElement | null>(null);
 
   // Is the tab the user is looking at one whose columns now live in another window?
   const selectedIsTornOut = !!project && tornOut.has(project.id);
@@ -943,7 +1134,7 @@ export function Workspace() {
       className="shell"
       data-testid="workspace-shell"
       data-pairs={String(pairCount)}
-      data-wired={wired}
+      data-wired={effectiveWired}
       data-over={overlay}
       style={{
         display: "flex",
@@ -996,28 +1187,25 @@ export function Workspace() {
         {pairCount === 2 && (
           <Pair
             side="left"
-            wired={wired === "left"}
+            wired={effectiveWired === "left"}
             tabs={
-              <ProjectTabsBar
+              <MemoProjectTabsBar
                 side="left"
                 feed={feed}
                 onOpenProjectSettings={setSettingsProject}
               />
             }
           >
-            <AgentSidebar project={leftProject} />
+            <MemoAgentSidebar project={leftProject} />
+            {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
+                this stage contributes the destination (`ref`) and nothing else, which is what keeps
+                a project moving to the other pair from unmounting its terminals. See `PaneHost`. */}
             <div
+              ref={setLeftStage}
               data-testid="terminal-stage-left"
               data-calm="false"
               style={{ flex: 1, position: "relative", minHeight: 0, background: C.forest }}
             >
-              <AgentPaneList
-                panes={livePanes.left}
-                visibleAgentId={leftActiveAgentId}
-                // Calm is the RIGHT pair's treatment: it follows the agent the concierge is looking
-                // at, and duplicating it here would desaturate a pane nobody is asking about.
-                calm={false}
-              />
               {!leftProject && (
                 <Hint title="Nothing here yet">
                   Pick a project in the tab strip above, or move one across with{" "}
@@ -1063,11 +1251,11 @@ export function Workspace() {
             Children are always [build, terminal]; `Pair` mirrors the flow for a left pair. */}
         <Pair
           side="right"
-          wired={wired === "right"}
-          tabs={<ProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
+          wired={effectiveWired === "right"}
+          tabs={<MemoProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
         >
           {/* ② Builder agents (the sidebar owns the Plan/Build toggle as its header). */}
-          <AgentSidebar project={sidebarProject} />
+          <MemoAgentSidebar project={sidebarProject} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
               paints in C.forest too, so the join is seamless).
 
@@ -1079,6 +1267,7 @@ export function Workspace() {
               click-away backdrop to the stage (roborev 46254). `data-calm` stays: it is what the
               shell tests read. */}
           <div
+            ref={setRightStage}
             data-testid="terminal-stage"
             // Files dropped anywhere on the stage attach to the VISIBLE agent's next message
             // (hooks/useTerminalDrop). Tauri's drag events are window-global and carry no target
@@ -1101,12 +1290,7 @@ export function Workspace() {
               // out-numbering it instead — see components/layers.ts.
             }}
           >
-            <AgentPaneList
-              panes={livePanes.right}
-              visibleAgentId={sparkleActive || boardActive ? null : activeAgentId}
-              calm={terminalCalm}
-            />
-
+            {/* The panes portal in here — see the single `AgentPaneList` at the end of the shell. */}
             {sparkleOpen && (
               <Suspense fallback={<PaneFallback />}>
                 <SparkleAgentPane visible={sparkleActive} agentId={sparkleAgentId} />
@@ -1254,6 +1438,32 @@ export function Workspace() {
           )}
         </Pair>
       </div>
+
+      {/* ── EVERY AGENT PANE, MOUNTED EXACTLY ONCE ────────────────────────────────────────────────
+          It renders NO DOM of its own here: every pane is a `createPortal` into the stage its pair
+          owns. This position in the tree is load-bearing precisely because it is boring — it is a
+          child of the shell root, which never unmounts and never changes with the pair layout, so a
+          project moving between pairs (or a pair opening or closing under it) cannot move this
+          element. That is the whole feature: the panes' place in the REACT tree is fixed, and only
+          their place in the DOM changes.
+
+          It sits below the pairs so the portalled panes are appended AFTER the stage's own children
+          (the Sparkle pane, the empty-state hints). Stacking is unaffected — `paneVisibilityStyle`
+          gives the one visible pane `TERMINAL_PANE_Z` and every hidden one `visibility: hidden` plus
+          `zIndex: 0`, and a stage never shows the Sparkle pane and an agent pane at once (the
+          right-hand `visibleAgentId` below is null whenever Sparkle or the board is up). */}
+      <AgentPaneList
+        panes={live}
+        pairAssignment={pairAssignment}
+        stages={{ left: leftStage, right: rightStage }}
+        visibleAgentId={{
+          left: leftActiveAgentId,
+          right: sparkleActive || boardActive ? null : activeAgentId,
+        }}
+        // Calm is the RIGHT pair's treatment: it follows the agent the concierge is looking at, and
+        // duplicating it on the left would desaturate a pane nobody is asking about.
+        calm={{ left: false, right: terminalCalm }}
+      />
 
       {/* The app's only bottom chrome: Changelog · Support · v{version}, hugging the bottom-right
           corner. A real ROW of this column (not an overlay), so it can never occlude the terminal

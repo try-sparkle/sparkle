@@ -46,6 +46,7 @@ import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { resetCable, useCableStore } from "../stores/cableStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import type { AgentTab, Project } from "../types";
@@ -94,10 +95,18 @@ beforeEach(() => {
     collapsedOrchestrators: {},
     activeSpecial: null,
     statusFilter: allBandsVisible(),
+    pairAssignment: {},
+    leftProjectId: null,
   } as never);
   useHelperPrefs.setState({ enabled: true } as never);
+  // The cable decides whether the CONCIERGE end of every row is open, so every assertion here has
+  // to say which state it is measuring. Default: at rest.
+  resetCable();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetCable();
+});
 
 describe("Build column — the row's box does not move when selection does", () => {
   it("gives an unselected and a selected row the identical content inset", () => {
@@ -262,5 +271,134 @@ describe("Build column — the pane-side end is a mouth, not a corner", () => {
     expect(rowFor("Alpha").style.borderRadius).toBe(
       `${RADIUS.modal}px 0 0 ${RADIUS.modal}px`,
     );
+  });
+});
+
+// ── THE PAIR DECIDES WHICH END IS WHICH ────────────────────────────────────────────────────────
+//
+// `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. In the LEFT pair the terminal is on the row's LEFT, so
+// every number above mirrors. The inline version this replaced was written when the app had one
+// pair, on the right, and hung the bleed on `marginRight`, the leading radius on the left corners
+// and both fillets at `right: 0` — so once the left pair shipped it drew that pair BACKWARDS: the
+// row ran into the concierge, and the mouths opened away from the pane they were supposed to feed.
+describe("Build column — the geometry mirrors with the pair", () => {
+  const leftPair = () =>
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+
+  it("bleeds LEFT — toward its own terminal — for a left-assigned project", () => {
+    leftPair();
+    render(<AgentSidebar project={seed("a1")} />);
+    const box = boxOf(rowFor("Alpha"));
+    expect(box.marginLeft).toBe("-8px");
+    expect(box.marginRight).toBe("0px");
+    // …and the padding pays it back on that same side, so the ink does not move.
+    expect(box.paddingLeft).toBe("18px");
+    expect(box.paddingRight).toBe("10px");
+  });
+
+  it("puts the leading radius on the CONCIERGE end, which is now the right", () => {
+    leftPair();
+    render(<AgentSidebar project={seed("a1")} />);
+    expect(rowFor("Alpha").style.borderRadius).toBe(
+      `0 ${RADIUS.modal}px ${RADIUS.modal}px 0`,
+    );
+  });
+
+  it("anchors the mouths on the left, with the arc bitten out of the RIGHT corner", () => {
+    // The anchor mirrors with the end. Left at `left` and the left pair's bank sweeps the wrong way
+    // — it hooks back into the row instead of away from it, which is the "rounded backwards" report.
+    leftPair();
+    render(<AgentSidebar project={seed("a1")} />);
+    const row = rowFor("Alpha");
+    const top = row.querySelector<HTMLElement>('[data-testid="row-mouth-top"]')!;
+    const bottom = row.querySelector<HTMLElement>('[data-testid="row-mouth-bottom"]')!;
+    expect(top.style.left).toBe("0px");
+    expect(top.style.right).toBe("");
+    expect(top.style.background).toContain("at top right");
+    expect(bottom.style.background).toContain("at bottom right");
+  });
+
+  it("still gives EVERY row the mirrored bleed, not just the selected one", () => {
+    // Rule 1 again, on the other side: if the mirror were applied only to `.on`, the list would
+    // twitch in the left pair exactly as it used to in the right.
+    leftPair();
+    render(<AgentSidebar project={seed("a1")} />);
+    expect(boxOf(rowFor("Beta"))).toEqual(boxOf(rowFor("Alpha")));
+  });
+});
+
+// ── WIRED: THE CONCIERGE END OPENS TOO ─────────────────────────────────────────────────────────
+//
+// Unplugged, the selected row is joined to its own terminal and nothing else — one mouth and one
+// plain leading edge. Patch the cable and the SAME row extends the opposite way into the concierge,
+// completing `concierge ← row → terminal`: all four corners are mouths and the row reads as a
+// length of cable seated in two sockets (MAPPING.md's wired table). The app had only ever drawn the
+// first half.
+describe("Build column — the wired joint bridges the row into the concierge", () => {
+  const joint = (row: HTMLElement) => ({
+    top: row.querySelector<HTMLElement>('[data-testid="row-joint-top"]'),
+    bottom: row.querySelector<HTMLElement>('[data-testid="row-joint-bottom"]'),
+  });
+
+  it("draws no joint while the cable is unplugged", () => {
+    render(<AgentSidebar project={seed("a1")} />);
+    expect(joint(rowFor("Alpha")).top).toBeNull();
+  });
+
+  it("opens the concierge end once THIS pair holds the cable", () => {
+    useCableStore.getState().patch("right");
+    render(<AgentSidebar project={seed("a1")} />);
+    const row = rowFor("Alpha");
+    expect(joint(row).top).toBeTruthy();
+    expect(joint(row).bottom).toBeTruthy();
+    // Square at both ends now: a radius on the concierge end would neck the row down exactly where
+    // it is supposed to open into the column it is plugged into.
+    expect(row.style.borderRadius).toBe("0 0 0 0");
+  });
+
+  it("leaves the OTHER pair alone — one live circuit, not two", () => {
+    // The project is right-assigned; patching LEFT must not open its joint.
+    useCableStore.getState().patch("left");
+    render(<AgentSidebar project={seed("a1")} />);
+    const row = rowFor("Alpha");
+    expect(joint(row).top).toBeNull();
+    expect(row.style.borderRadius).toBe(`${RADIUS.modal}px 0 0 ${RADIUS.modal}px`);
+  });
+
+  it("mirrors the joint too — a wired LEFT pair opens toward the concierge on its right", () => {
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    useCableStore.getState().patch("left");
+    render(<AgentSidebar project={seed("a1")} />);
+    const top = joint(rowFor("Alpha")).top!;
+    expect(top.style.right).toBe("0px");
+    expect(top.style.background).toContain("at top left");
+  });
+
+  it("paints the joint in the very colour the concierge floods to, so the seam has nothing to show", () => {
+    // THIS is what makes the joint correct in BOTH themes without a second token: wiring floods the
+    // concierge to the terminal register (ConciergeColumn: `BLUEPRINT[mode].term`), and `C.forest`
+    // IS that plane (theme/colors derives `forest` from `BLUEPRINT[mode].term`). The fillet's fill
+    // and the surface it opens onto are therefore the same value in light and in dark. A bespoke
+    // colour here would have to be re-derived per theme and would drift the moment either moved.
+    useCableStore.getState().patch("right");
+    render(<AgentSidebar project={seed("a1")} />);
+    const { top, bottom } = joint(rowFor("Alpha"));
+    for (const strip of [top!, bottom!]) {
+      expect(strip.style.background).toContain(`${C.forest} 100%`);
+      expect(strip.style.background).toContain("ellipse farthest-side");
+      expect(strip.style.background).toContain("calc(100% - .5px)");
+    }
+  });
+
+  it("bleeds every row's joint end, so patching in does not move the ink", () => {
+    // Geometry belongs to every row: the concierge-side bleed lands on `.row`, and the padding pays
+    // it back one-for-one. Unselected rows are transparent, so nothing but the selected row's fill
+    // actually reaches further — but the BOXES must agree or the list twitches when you plug in.
+    useCableStore.getState().patch("right");
+    render(<AgentSidebar project={seed("a1")} />);
+    const box = boxOf(rowFor("Beta"));
+    expect(box.marginLeft).toBe("-8px");
+    expect(box.paddingLeft).toBe("18px");
+    expect(boxOf(rowFor("Alpha"))).toEqual(box);
   });
 });

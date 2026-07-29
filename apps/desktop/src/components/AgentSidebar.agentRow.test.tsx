@@ -27,6 +27,7 @@ vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 import { AgentSidebar } from "./AgentSidebar";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { resetCable } from "../stores/cableStore";
 import { landAgentBranch, refreshAgentBranch } from "../services/branchStatus";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { Project, AgentTab } from "../types";
@@ -92,9 +93,17 @@ beforeEach(() => {
   // Mode lives in the singleton uiStore now; reset to the Build default so the worker/build
   // agents under test are listed (Think mode would filter them out).
   useUiStore.setState({ workMode: "build" });
+  // AT REST, EXPLICITLY. Clicks in this file land inside a row's hover card, and that bubbles to the
+  // row — which patches the cable, which opens every row's CONCIERGE end (engine/rowGeometry). The
+  // cable store is module state, so without this the geometry assertions below would read whatever
+  // the previous test left patched and pass or fail on test ORDER.
+  resetCable();
   vi.clearAllMocks();
 });
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  resetCable();
+});
 
 describe("AgentRow — rename input is a single instance across hover", () => {
   it("keeps exactly one input while editing, regardless of hover changes", () => {

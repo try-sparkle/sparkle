@@ -5,6 +5,7 @@ import type { Account } from "../services/accountStore";
 import { buildClaudeLoginExec, SHELL } from "../services/claudeSpawn";
 import { checkClaude } from "../preflight";
 import { Terminal } from "./Terminal";
+import { ModalLayer } from "./ModalLayer";
 
 // The integrator seam for AccountsScreen's `onLogin` (multi Claude Max design, Task 4). After
 // "Add account" creates an empty config dir, the user must complete a normal `claude login` (browser
@@ -48,96 +49,102 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
         }
       : null;
 
+  // `zIndex: 120` only outranks anything if this competes at ROOT, and it is mounted from
+  // Concierge/KebabMenu — inside the concierge column's `CONCIERGE_LIFT_Z` stacking context, which
+  // would flatten it to layer 3 and let a pull tab at 4 paint over it. ModalLayer portals it out.
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: SCRIM,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 120,
-      }}
-    >
+    <ModalLayer>
       <div
-        onClick={(e) => e.stopPropagation()}
+        data-testid="account-login-backdrop"
+        onClick={onClose}
         style={{
-          width: 760,
-          maxWidth: "92vw",
-          height: 520,
-          maxHeight: "85vh",
+          position: "fixed",
+          inset: 0,
+          background: SCRIM,
           display: "flex",
-          flexDirection: "column",
-          background: C.dialogSurface,
-          border: `1px solid ${C.dialogEdge}`,
-          borderRadius: RADIUS.modal,
-          padding: 16,
-          color: C.cream,
-          fontFamily: FONT_UI,
-          boxShadow: MODAL_SHADOW,
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 120,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>Log in to “{account.nickname}”</div>
-          <button
-            type="button"
-            onClick={onClose}
-            style={{
-              background: "transparent",
-              border: `1px solid ${C.muted}`,
-              borderRadius: RADIUS.input,
-              color: C.cream,
-              fontSize: 12,
-              padding: "4px 10px",
-              cursor: "pointer",
-            }}
-          >
-            Done
-          </button>
-        </div>
-        <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
-          Complete the normal Claude login below (it opens your browser). Sparkle never sees your
-          credentials. Close when you’re done.
-        </p>
-        {/* The default account IS the user's real ~/.claude, so "this account's own config folder"
-            would be actively misleading here — the login it writes is the one every `claude`
-            invocation on the machine uses. Say so plainly rather than implying isolation. */}
-        <p
+        <div
+          onClick={(e) => e.stopPropagation()}
           style={{
-            fontSize: 12,
-            color: account.isDefault ? C.amber : C.muted,
-            marginTop: 0,
-            lineHeight: 1.4,
+            width: 760,
+            maxWidth: "92vw",
+            height: 520,
+            maxHeight: "85vh",
+            display: "flex",
+            flexDirection: "column",
+            background: C.dialogSurface,
+            border: `1px solid ${C.dialogEdge}`,
+            borderRadius: RADIUS.modal,
+            padding: 16,
+            color: C.cream,
+            fontFamily: FONT_UI,
+            boxShadow: MODAL_SHADOW,
           }}
         >
-          {account.isDefault
-            ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
-            : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
-        </p>
-        <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: RADIUS.input, overflow: "hidden", padding: 6 }}>
-          {spawn ? (
-            <Terminal
-              agentId={`account-login-${account.id}`}
-              projectId="account-login"
-              projectRootPath={account.configDir}
-              command={spawn.command}
-              args={spawn.args}
-              cwd={spawn.cwd}
-              active
-              onStatus={() => {}}
-              onExit={onClose}
-            />
-          ) : (
-            <div style={{ padding: 20, color: C.muted, fontSize: 13 }}>
-              {claudePath === false
-                ? "Couldn’t find your claude binary. Install Claude Code, then try again."
-                : "Preparing login…"}
-            </div>
-          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>Log in to “{account.nickname}”</div>
+            <button
+              type="button"
+              onClick={onClose}
+              style={{
+                background: "transparent",
+                border: `1px solid ${C.muted}`,
+                borderRadius: RADIUS.input,
+                color: C.cream,
+                fontSize: 12,
+                padding: "4px 10px",
+                cursor: "pointer",
+              }}
+            >
+              Done
+            </button>
+          </div>
+          <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
+            Complete the normal Claude login below (it opens your browser). Sparkle never sees your
+            credentials. Close when you’re done.
+          </p>
+          {/* The default account IS the user's real ~/.claude, so "this account's own config folder"
+              would be actively misleading here — the login it writes is the one every `claude`
+              invocation on the machine uses. Say so plainly rather than implying isolation. */}
+          <p
+            style={{
+              fontSize: 12,
+              color: account.isDefault ? C.amber : C.muted,
+              marginTop: 0,
+              lineHeight: 1.4,
+            }}
+          >
+            {account.isDefault
+              ? "This is your system-wide Claude login (~/.claude). Signing in as someone else here changes the account Claude Code uses everywhere, not just in Sparkle."
+              : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
+          </p>
+          <div style={{ flex: 1, minHeight: 0, border: `1px solid ${C.hairline}`, borderRadius: RADIUS.input, overflow: "hidden", padding: 6 }}>
+            {spawn ? (
+              <Terminal
+                agentId={`account-login-${account.id}`}
+                projectId="account-login"
+                projectRootPath={account.configDir}
+                command={spawn.command}
+                args={spawn.args}
+                cwd={spawn.cwd}
+                active
+                onStatus={() => {}}
+                onExit={onClose}
+              />
+            ) : (
+              <div style={{ padding: 20, color: C.muted, fontSize: 13 }}>
+                {claudePath === false
+                  ? "Couldn’t find your claude binary. Install Claude Code, then try again."
+                  : "Preparing login…"}
+              </div>
+            )}
+          </div>
         </div>
       </div>
-    </div>
+    </ModalLayer>
   );
 }

@@ -6,12 +6,15 @@
 // the literal `#ff9a9a`, one `bandColor()`, one `statusInk(bandColor())`. That drift is the same
 // "mishmash of shades" the §1 pass exists to end, one component down.
 //
-// ITS ONE CONSUMER TODAY IS THE SIDEBAR'S FILTER CHIPS, stated plainly rather than left for the next
-// reader to discover from a grep. This badge is the ● N form — a dot and a NUMBER. ScopeVitals and
-// the project tab badges render the whole PHRASE ("1 Needs you · 2 Running"), so pointing them here
-// would delete words from those surfaces, which is a design change and not a dedup. What they should
-// take from this file when someone does unify them is the COLOUR RULE below, not the markup; the tab
-// badge's `#ff9a9a` is the outstanding case (§7a owns the tab bar).
+// ITS CONSUMERS TODAY ARE THE SIDEBAR'S FILTER CHIPS AND THE PROJECT TAB BADGES, stated plainly
+// rather than left for the next reader to discover from a grep. This badge is the ● N form — a dot
+// and a NUMBER. The tab badge adopted it when the tab strip dropped the phrase (§7a): the tabs are
+// read at a glance beside each other, two words per tab pushed the project name into an ellipsis,
+// and the chips directly below the strip already spell the bands out. That took the outstanding
+// `#ff9a9a` literal named here with it. ScopeVitals still renders the whole PHRASE ("1 Needs you ·
+// 2 Running"), so pointing IT here would delete words from a surface that has the room for them —
+// a design change, not a dedup. What it should take from this file if someone unifies it is the
+// COLOUR RULE below, not the markup.
 //
 // TWO RULES IT ENFORCES FOR EVERY CALLER — the chips today, and anything that adopts it later:
 //

@@ -8,6 +8,7 @@ import { moveProjectFolder } from "../services/worktree";
 import { resolveDefaultBranch } from "../services/branchStatus";
 import { killPty } from "../pty";
 import { pickProjectFolder } from "../services/dialog";
+import { ModalLayer } from "./ModalLayer";
 
 function dirname(p: string): string {
   const trimmed = p.replace(/[/\\]+$/, "");
@@ -73,167 +74,173 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
     }
   };
 
+  // `zIndex: 100` is a ROOT-layer number and only behaves like one because ModalLayer portals this
+  // out of whatever lifted ancestor rendered it — see ./ModalLayer for why the number alone is not
+  // enough.
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: SCRIM,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 100,
-      }}
-    >
+    <ModalLayer>
       <div
-        onClick={(e) => e.stopPropagation()}
+        data-testid="project-modal-backdrop"
+        onClick={onClose}
         style={{
-          width: 520,
-          maxWidth: "90vw",
-          background: C.dialogSurface,
-          border: `1px solid ${C.dialogEdge}`,
-          borderRadius: RADIUS.modal,
-          padding: 22,
-          color: C.cream,
-          fontFamily: FONT_UI,
-          boxShadow: MODAL_SHADOW,
+          position: "fixed",
+          inset: 0,
+          background: SCRIM,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 100,
         }}
       >
-        <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
-          Project settings
-        </div>
-
-        <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
-          Project name
-        </label>
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
+        <div
+          onClick={(e) => e.stopPropagation()}
           style={{
-            width: "100%",
-            background: C.forest,
+            width: 520,
+            maxWidth: "90vw",
+            background: C.dialogSurface,
+            border: `1px solid ${C.dialogEdge}`,
+            borderRadius: RADIUS.modal,
+            padding: 22,
             color: C.cream,
-            border: `1px solid ${C.muted}`,
-            borderRadius: RADIUS.input,
-            padding: "9px 11px",
-            fontSize: 13,
-            outline: "none",
-            marginBottom: 16,
+            fontFamily: FONT_UI,
+            boxShadow: MODAL_SHADOW,
           }}
-        />
+        >
+          <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, marginBottom: 16 }}>
+            Project settings
+          </div>
 
-        <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
-          Lives in
-        </label>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
-          <div
-            title={parent}
+          <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
+            Project name
+          </label>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
             style={{
-              flex: 1,
+              width: "100%",
               background: C.forest,
+              color: C.cream,
+              border: `1px solid ${C.muted}`,
               borderRadius: RADIUS.input,
               padding: "9px 11px",
               fontSize: 13,
-              color: C.cream,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
+              outline: "none",
+              marginBottom: 16,
             }}
-          >
-            {parent}
+          />
+
+          <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
+            Lives in
+          </label>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+            <div
+              title={parent}
+              style={{
+                flex: 1,
+                background: C.forest,
+                borderRadius: RADIUS.input,
+                padding: "9px 11px",
+                fontSize: 13,
+                color: C.cream,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {parent}
+            </div>
+            <button
+              onClick={() => void chooseLocation()}
+              style={{
+                background: "transparent",
+                color: C.accentInk,
+                border: `1px solid ${C.muted}`,
+                borderRadius: RADIUS.input,
+                padding: "8px 12px",
+                cursor: "pointer",
+                fontSize: 13,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Move to…
+            </button>
           </div>
-          <button
-            onClick={() => void chooseLocation()}
+          <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
+            {nameValid ? (
+              <>
+                Full path: <span style={{ color: C.cream }}>{newRootPath}</span>
+                {changed && <span> · renaming/moving the folder on disk</span>}
+              </>
+            ) : (
+              <span style={{ color: C.sienna }}>
+                Name can't contain “/”, “\”, or be “.”/“..”.
+              </span>
+            )}
+          </div>
+
+          <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
+            Integration branch
+          </label>
+          <input
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            placeholder="auto-detected (main)"
             style={{
-              background: "transparent",
-              color: C.accentInk,
+              width: "100%",
+              background: C.forest,
+              color: C.cream,
               border: `1px solid ${C.muted}`,
               borderRadius: RADIUS.input,
-              padding: "8px 12px",
-              cursor: "pointer",
+              padding: "9px 11px",
               fontSize: 13,
-              whiteSpace: "nowrap",
+              outline: "none",
+              marginBottom: 6,
+              boxSizing: "border-box",
             }}
-          >
-            Move to…
-          </button>
-        </div>
-        <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
-          {nameValid ? (
-            <>
-              Full path: <span style={{ color: C.cream }}>{newRootPath}</span>
-              {changed && <span> · renaming/moving the folder on disk</span>}
-            </>
-          ) : (
-            <span style={{ color: C.sienna }}>
-              Name can't contain “/”, “\”, or be “.”/“..”.
-            </span>
+          />
+          <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
+            New agents are branched from this. Leave blank to auto-detect.
+          </div>
+
+          {error && (
+            <div style={{ color: C.sienna, fontSize: 13, marginBottom: 14 }}>{error}</div>
           )}
-        </div>
 
-        <label style={{ display: "block", color: C.muted, fontSize: 12, marginBottom: 6 }}>
-          Integration branch
-        </label>
-        <input
-          value={branch}
-          onChange={(e) => setBranch(e.target.value)}
-          placeholder="auto-detected (main)"
-          style={{
-            width: "100%",
-            background: C.forest,
-            color: C.cream,
-            border: `1px solid ${C.muted}`,
-            borderRadius: RADIUS.input,
-            padding: "9px 11px",
-            fontSize: 13,
-            outline: "none",
-            marginBottom: 6,
-            boxSizing: "border-box",
-          }}
-        />
-        <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
-          New agents are branched from this. Leave blank to auto-detect.
-        </div>
-
-        {error && (
-          <div style={{ color: C.sienna, fontSize: 13, marginBottom: 14 }}>{error}</div>
-        )}
-
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button
-            onClick={onClose}
-            disabled={busy}
-            style={{
-              background: "transparent",
-              color: C.muted,
-              border: `1px solid ${C.muted}`,
-              borderRadius: RADIUS.input,
-              padding: "9px 16px",
-              cursor: "pointer",
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => void save()}
-            disabled={busy || !nameValid}
-            style={{
-              background: C.teal,
-              color: ON_BRAND_FILL,
-              border: "none",
-              borderRadius: RADIUS.input,
-              padding: "9px 18px",
-              fontWeight: FONT_WEIGHT.semibold,
-              cursor: busy ? "wait" : !nameValid ? "not-allowed" : "pointer",
-              opacity: !nameValid ? 0.6 : 1,
-            }}
-          >
-            {busy ? "Saving…" : "Save"}
-          </button>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <button
+              onClick={onClose}
+              disabled={busy}
+              style={{
+                background: "transparent",
+                color: C.muted,
+                border: `1px solid ${C.muted}`,
+                borderRadius: RADIUS.input,
+                padding: "9px 16px",
+                cursor: "pointer",
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => void save()}
+              disabled={busy || !nameValid}
+              style={{
+                background: C.teal,
+                color: ON_BRAND_FILL,
+                border: "none",
+                borderRadius: RADIUS.input,
+                padding: "9px 18px",
+                fontWeight: FONT_WEIGHT.semibold,
+                cursor: busy ? "wait" : !nameValid ? "not-allowed" : "pointer",
+                opacity: !nameValid ? 0.6 : 1,
+              }}
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
         </div>
       </div>
-    </div>
+    </ModalLayer>
   );
 }

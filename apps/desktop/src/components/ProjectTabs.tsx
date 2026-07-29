@@ -21,6 +21,7 @@ import { MdOutlinePushPin } from "react-icons/md";
 import { FiPlus, FiX, FiExternalLink } from "react-icons/fi";
 import type { StatusBand } from "../engine/buildSections";
 import { bandColor, bandCountLabel } from "../engine/statusBandLabels";
+import { BandBadge } from "./BandBadge";
 import { C } from "../theme/colors";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 import { resolveTabDrag, type TabDragResult, type TabRect } from "./tabDrag";
@@ -137,8 +138,63 @@ export function tabBand(counts: ProjectTabCounts | undefined): StatusBand | null
 }
 
 // The one alarm color, taken from the band itself so the tab, the dots it counts, and the sidebar's
-// filter chips can't drift apart.
+// filter chips can't drift apart. This is the GLOW/edge value — a shape, not text. The badge's
+// NUMERAL is `C.dangerInk` instead; see `TabCountBadge`.
 const RED = bandColor("needs_you");
+
+/**
+ * Does this tab show a count badge, and of what?
+ *
+ * `null` on the ACTIVE tab NO MATTER WHAT ITS COUNT IS — that is the whole rule, and it is the one
+ * most likely to regress silently, because every other input to the badge is unchanged. The status
+ * filter chips sit directly beneath the strip and already carry the active project's counts with
+ * more precision (per band, and togglable); a badge on the active tab is a THIRD rendering of the
+ * same number, and the third one is the one that goes stale. An inactive tab has no such
+ * chips — its count is not shown anywhere else — so that is exactly where the badge earns its space.
+ *
+ * Pure and exported so the rule is pinned once, independently of the strip's markup.
+ */
+export function tabBadgeCount(counts: ProjectTabCounts | undefined, active: boolean): number | null {
+  if (active) return null;
+  const band = tabBand(counts);
+  if (!band) return null;
+  const n = counts![band];
+  return n > 0 ? n : null;
+}
+
+/**
+ * ● N — the inactive tab's alarm badge: the band's own dot, then the bare number.
+ *
+ * NO "Needs you" IS RENDERED. The badge is read at a glance across a strip of tabs, where two words
+ * per tab is what pushed the label into an ellipsis; the phrase survives in the accessible name
+ * instead (below), so nothing is lost to a screen reader. That split — visual number, spoken
+ * sentence — is `BandBadge`'s rule 2, which is why this reuses that component rather than growing a
+ * fourth local dot-and-count.
+ *
+ * `silent` + a labelled wrapper, rather than letting BandBadge announce itself: the wrapper owns the
+ * accessible name so a screen reader hears "2 Need you" once, and — deliberately — there is NO
+ * `title`. A tooltip is visible chrome, and a hover that spells out "Needs you" over a tab whose
+ * badge exists to not say it would put the words back on screen. The tab's own `title` already
+ * describes the tab.
+ *
+ * INK IS `dangerInk`, NOT THE BAND'S RAW RED. The dot is a fill and takes `bandColor` (so it is
+ * pixel-identical to the dots it counts), but the numeral is TEXT on `barSurface`, where the brand
+ * red measures 4.29:1 in dark and 3.66:1 in light — under AA at both ends. `dangerInk` is the
+ * themed twin that exists for exactly this and clears it in both themes. Pinned numerically in
+ * ProjectTabs.test.tsx rather than asserted by comment.
+ */
+function TabCountBadge({ projectId, count }: { projectId: string; count: number }) {
+  return (
+    <span
+      data-testid={`count-${projectId}`}
+      role="img"
+      aria-label={bandCountLabel("needs_you", count)}
+      style={{ display: "inline-flex", alignItems: "center", flex: "none" }}
+    >
+      <BandBadge band="needs_you" count={count} silent ink={C.dangerInk} />
+    </span>
+  );
+}
 
 /** How wide a tab's project name may get before it ellipsizes. Sized so a typical repo folder name
  *  fits whole and only genuinely long ones truncate — the point is a bar of UNIFORM-height tabs, not
@@ -347,7 +403,11 @@ export function ProjectTabs({
         const pinned = p.id === pinnedProjectId;
         const counts = countsByProject[p.id];
         const band = tabBand(counts);
+        // The GLOW still lights on the active tab; only the numeric badge is suppressed there. They
+        // say different things: the glow is "something in here wants you", which is true of the tab
+        // you are on too, while the number is the count the chips below already render.
         const glow = band ? `0 0 0 1px ${RED}73, 0 -2px 14px ${RED}29` : undefined;
+        const badgeCount = tabBadgeCount(counts, active);
         const tornOut = tornOutProjectIds?.has(p.id) ?? false;
         const isDragged = drag?.projectId === p.id;
         const caret = drag?.kind === "reorder" && drag.beforeId === p.id;
@@ -478,22 +538,8 @@ export function ProjectTabs({
                 style={{ flex: "none", opacity: 0.9 }}
               />
             )}
-            {band && (
-              <span
-                data-testid={`count-${p.id}`}
-                style={{
-                  fontWeight: 700,
-                  fontSize: 10,
-                  padding: "1px 5px",
-                  borderRadius: 4,
-                  color: "#ff9a9a",
-                  border: `1px solid ${RED}99`,
-                }}
-              >
-                {/* "1 Needs you" / "3 Need you" — the shared helper owns the agreement. */}
-                {bandCountLabel(band, counts![band])}
-              </span>
-            )}
+            {/* ● N, and ONLY on a tab you are not looking at. See `tabBadgeCount`. */}
+            {badgeCount !== null && <TabCountBadge projectId={p.id} count={badgeCount} />}
             {/* NO close button while the project is torn out. Closing the tab hides it and nothing
                 else — but the tab is also the ONLY doorway to that satellite ("Show that window" /
                 "Bring it back here" live behind it), so closing it would leave a live window owning

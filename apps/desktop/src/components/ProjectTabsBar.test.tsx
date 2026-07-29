@@ -102,11 +102,26 @@ describe("countsFromFeed", () => {
 });
 
 describe("ProjectTabsBar", () => {
-  it("badges each tab from the feed — only Needs-you badges, and it agrees in number", () => {
+  it("badges an INACTIVE tab from the feed with the bare number — never the phrase", () => {
+    // Alpha is selected in the fixture, so select Beta and give IT the alarm: the badge is for the
+    // tab you are NOT on. Beta's own 3-running/4-done must still not badge — in-flight work is not
+    // an alert.
+    useProjectStore.setState({ selectedProjectId: "p2" } as never);
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
-    expect(screen.getByTestId("count-p1").textContent).toBe("2 Need you");
-    // Beta is 3 running / 4 done and gets NO badge — in-flight work is not an alert.
+    expect(screen.getByTestId("count-p1").textContent).toBe("2");
     expect(screen.queryByTestId("count-p2")).toBeNull();
+    expect(screen.getByTestId("project-tabs-strip").textContent ?? "").not.toMatch(/needs? you/i);
+  });
+
+  it("the SELECTED tab is not badged by the feed, even while its project needs you", () => {
+    // The end-to-end form of the rule: Alpha is selected AND the feed says `needs_you: 2`, so the
+    // whole path — feed → countsFromFeed → ProjectTabs — is live and only the active-tab guard is
+    // suppressing it. Beta, inactive and calm, is the control: neither tab shows a count, for two
+    // different reasons.
+    render(<ProjectTabsBar feed={feed} onOpenProjectSettings={() => {}} />);
+    expect(screen.queryByTestId("count-p1")).toBeNull();
+    expect(screen.queryByTestId("count-p2")).toBeNull();
+    expect(screen.getByTestId("tab-p1").textContent).toBe("Alpha");
   });
 
   it("shows no badge for a calm project", () => {
@@ -114,6 +129,7 @@ describe("ProjectTabsBar", () => {
       ...feed,
       projects: feed.projects.map((p) => ({ ...p, counts: { needs_you: 0, running: 0, done: 0 } })),
     };
+    useProjectStore.setState({ selectedProjectId: "p2" } as never);
     render(<ProjectTabsBar feed={calm} onOpenProjectSettings={() => {}} />);
     expect(screen.queryByTestId("count-p1")).toBeNull();
   });

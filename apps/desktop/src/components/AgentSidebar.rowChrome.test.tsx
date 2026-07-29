@@ -48,6 +48,7 @@ import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { resetCable } from "../stores/cableStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
@@ -123,9 +124,17 @@ beforeEach(() => {
   // The DEFAULT state (helper island enabled) is the one that needs the header gap: with the helper
   // row absent, the Plan/Build strip would otherwise sit flush against the project tab bar.
   useHelperPrefs.setState({ enabled: true } as never);
+  // AT REST, EXPLICITLY. Several tests here click a row, and a row click patches the cable — which
+  // opens every row's CONCIERGE end (engine/rowGeometry: the wired pair bleeds at both ends). The
+  // cable store is module state, so without this the geometry assertions below would read whatever
+  // the previous test left patched and pass or fail on test ORDER. These measure the RESTING box.
+  resetCable();
   open.mockClear();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetCable();
+});
 
 // ── THE HEADER IS A BAND NOW, NOT A GAP ────────────────────────────────────────────────────────
 //
@@ -657,22 +666,114 @@ describe("Build column — the card stands over its row without anything jumping
   // positional split would compare the card's left inset against the row's RIGHT one and pass or
   // fail for reasons that have nothing to do with alignment. The card is pinned at the row's left
   // edge, so the left inset is the one that has to agree.
-  it("matches the row's content offset on BOTH axes", () => {
+  // MEASURED IN THE STATE THE CARD IS ACTUALLY OPEN IN, and parameterised over the two inputs that
+  // move the row's box. Both halves were wrong before and hid a real regression (roborev 55270):
+  //
+  //  • The row's padding was read BEFORE the card opened. Opening one patches the cable, which opens
+  //    the row's concierge end and changes its left padding from 10 to 18 — so the assertion compared
+  //    a resting row against a wired card and the two genuinely disagreed.
+  //  • It only ever ran in the resting RIGHT pair, which is the one configuration where the row's
+  //    left padding happens to be the bare `ROW_PAD_X` the card used to hard-code. Every other
+  //    configuration — any left pair, any wired pair — was unmeasured, which is exactly where the
+  //    card slid 8px on open.
+  for (const paneSide of ["left", "right"] as const) {
+    it(`matches the row's content offset on BOTH axes (${paneSide} pair)`, () => {
+      const project = seed();
+      if (paneSide === "left") {
+        useUiStore.setState({ pairAssignment: { [project.id]: "left" }, leftProjectId: project.id } as never);
+      }
+      render(<AgentSidebar project={project} />);
+
+      // Hold the ELEMENT from before the card opens — React updates it in place, so its style is
+      // read post-open below. Looking it up by name afterwards is ambiguous: the open card renders
+      // the same agent name a second time.
+      const row = rowFor("Alpha");
+      fireEvent.contextMenu(row);
+
+      const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
+      const border = parseInt(strip.style.border, 10);
+      const padY = parseInt(strip.style.paddingTop, 10);
+      const padX = parseInt(strip.style.paddingLeft, 10);
+
+      // Read the ROW's padding NOW — this is the state the card is standing in for.
+      const rowY = parseInt(row.style.paddingTop, 10);
+      const rowX = parseInt(row.style.paddingLeft, 10);
+
+      // border + padding on the card must equal the row's own padding, or the content shifts.
+      expect(border + padY).toBe(rowY);
+      expect(border + padX).toBe(rowX);
+    });
+  }
+
+  // THE CARD'S RIGHT EDGE STANDS OVER THE TERMINAL, NOT OVER THE ROW. The two-value `padding`
+  // shorthand applied the row's LEFT padding to the card's right as well, and `padLeft` carries the
+  // depth indent on an open end — so a worker's card got a ~46px right inset where it had been 6–8,
+  // pulling the close ×, the timer and the progress bar in off the card's edge (roborev 55287).
+  it("takes the row's RIGHT padding on its right, indent-free", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
     const row = rowFor("Alpha");
-    const rowY = parseInt(row.style.paddingTop, 10);
-    const rowX = parseInt(row.style.paddingLeft, 10);
-
-    fireEvent.contextMenu(rowFor("Alpha"));
+    fireEvent.contextMenu(row);
     const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
     const border = parseInt(strip.style.border, 10);
-    const padY = parseInt(strip.style.paddingTop, 10);
-    const padX = parseInt(strip.style.paddingLeft, 10);
+    expect(border + parseInt(strip.style.paddingRight, 10)).toBe(
+      parseInt(row.style.paddingRight, 10),
+    );
+  });
 
-    // border + padding on the card must equal the row's bare padding, or the content shifts.
-    expect(border + padY).toBe(rowY);
-    expect(border + padX).toBe(rowX);
+  // THE INDENT IS THE CASE THAT BIT. With the two-value shorthand there was one horizontal number to
+  // go round, so the card's right side inherited the LEFT's — indent included — and a worker's card
+  // got a ~46px right inset. `padRight` never carries the indent at any depth (rowGeometry.test pins
+  // that); this is the half that makes sure the CARD actually reads it rather than the left one.
+  it("does not let a worker's indent reach the card's right inset", () => {
+    const project = seedExpanded();
+    render(<AgentSidebar project={project} />);
+    const worker = rowFor("Parser Worker");
+    fireEvent.contextMenu(worker);
+    const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
+    const border = parseInt(strip.style.border, 10);
+    expect(border + parseInt(strip.style.paddingRight, 10)).toBe(
+      parseInt(worker.style.paddingRight, 10),
+    );
+    // The indent lands on the LEFT and nowhere else, so the two sides genuinely differ here — which
+    // is precisely what a single shorthand value could not express.
+    expect(parseInt(worker.style.paddingLeft, 10)).toBeGreaterThan(
+      parseInt(worker.style.paddingRight, 10),
+    );
+  });
+
+  // THE RECT AND THE PADDING MUST DESCRIBE THE SAME MOMENT. Opening a card patches the cable, which
+  // moves the row's box left and grows its left padding by the same amount — the ink does not move.
+  // The card measured the row BEFORE that and padded from AFTER, so it landed 8px off. jsdom rects
+  // are all zero, which is why the padding-only assertions above cannot see this: the rect has to be
+  // stubbed with real numbers for the absolute ink line to mean anything.
+  it("lands its content on the row's ink line, not 8px off it", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    const row = rowFor("Alpha");
+
+    // The row's box left as the browser would report it, and it MOVES with the cable: unwired the
+    // box starts inside the list padding, wired it bleeds out to the column edge.
+    const COLUMN_EDGE = 100;
+    Object.defineProperty(row, "getBoundingClientRect", {
+      configurable: true,
+      value: () => {
+        const marginLeft = parseInt(row.style.marginLeft || "0", 10);
+        return { left: COLUMN_EDGE + 8 + marginLeft, top: 50, width: 200, height: 28 } as DOMRect;
+      },
+    });
+
+    fireEvent.contextMenu(row);
+    const card = screen.getByTestId("agent-hover-card") as HTMLElement;
+    const strip = card.firstElementChild as HTMLElement;
+    const border = parseInt(strip.style.border, 10);
+
+    // Where the row's own ink sits, post-patch.
+    const rowInk =
+      COLUMN_EDGE + 8 + parseInt(row.style.marginLeft || "0", 10) + parseInt(row.style.paddingLeft, 10);
+    // Where the card's ink sits.
+    const cardInk = parseInt(card.style.left, 10) + border + parseInt(strip.style.paddingLeft, 10);
+    expect(cardInk).toBe(rowInk);
   });
 });
 

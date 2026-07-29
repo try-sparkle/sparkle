@@ -118,6 +118,29 @@ const NOT_A_STACK = new Set(["inherit", "monospace", "initial", "unset", "revert
  *   • WEAK signals are the generic CSS families — they are ordinary English words too, so they only
  *     count alongside a comma, which is what makes a list of fallbacks a stack.
  */
+/**
+ * Does this `${…}` span have a font stack hiding inside it?
+ *
+ * Asked of interpolations, whose contents the fragment scan cannot see on their own: the outer
+ * backtick span is consumed whole, so a literal nested inside is invisible unless it is pulled out
+ * here. A span hides a stack when one of ITS literals looks like one, or carries the comma that
+ * makes a list of fallbacks a stack.
+ *
+ * KNOWN GAP, stated rather than papered over: a nested TEMPLATE literal — `` `${`Menlo, Consolas`}` ``
+ * — is not caught, because the value walk above closes its quote on the inner backtick and cuts the
+ * expression short before this is ever reached. Closing it needs a template-aware walk with
+ * interpolation-depth tracking, which is a parser this guard does not otherwise need, for a spelling
+ * that appears nowhere in the repo and that nobody writes by accident. Declined deliberately
+ * (roborev 55235); if that spelling ever shows up, the walk is the thing to fix.
+ */
+function hidesAStack(span: string): boolean {
+  for (const m of span.matchAll(/(['"`])([\s\S]*?)\1/g)) {
+    const lit = m[2]!;
+    if (looksLikeStack(lit) || lit.includes(",")) return true;
+  }
+  return false;
+}
+
 function looksLikeStack(v: string): boolean {
   const strong = /system-ui|-apple-system|ui-monospace|SFMono|Segoe UI|SF Mono/.test(v);
   const weak = /sans-serif|\bmonospace\b|\bserif\b/.test(v);
@@ -256,9 +279,31 @@ export function scanSource(rel: string, src: string): { banned: string[]; quoted
         // "go migrate code that is already migrated" false positive this file keeps two regression
         // tests for (roborev 55223).
         //
-        // A literal-free interpolation cannot hide a stack, whatever its shape; one containing a
-        // quote is exactly the case that can. So the rule is the quote, and both cases fall out.
-        if (q[1] === "`" && /^\s*\$\{[^'"`}]*\}\s*$/.test(v)) continue;
+        // A literal-free interpolation cannot hide a stack, whatever its shape. But "contains a
+        // QUOTE" was too coarse a proxy for the reverse (roborev 55235): a quote inside `${…}` is
+        // just as often a map key or a unit argument, so `` `${FONTS["mono"]}` `` — a fully migrated
+        // spelling naming no family — was reported as drift. The question is whether a nested
+        // literal LOOKS LIKE A STACK, which is what `hidesAStack` asks.
+        // TWO NARROWINGS THE PREVIOUS CUT INTRODUCED, both closed here (roborev 55235):
+        //
+        //  1. A BARE WRAPPED LITERAL IS ALWAYS A STACK. `${"Georgia"}` names a family and satisfies
+        //     neither `looksLikeStack` nor the comma test, so judging the literal's SHAPE let it
+        //     through — where the unwrapped `fontFamily: "Georgia"` is caught, because the longhand's
+        //     rule is "any quoted fragment IS a family". Wrapping is not a migration, so an
+        //     interpolation that IS a single literal is treated as hiding a stack unconditionally.
+        //  2. THE SKIP MUST MATCH ONE INTERPOLATION, not a greedy span. `.*` let a value that merely
+        //     STARTS with `${` and ENDS with `}` count as one — so a stack split across two spans,
+        //     `${"italic 12px Menlo"}, ${"Consolas"}`, was skipped before the depth-0 comma test that
+        //     used to catch it, because neither literal holds the comma itself.
+        const isBareWrappedLiteral = /^\s*\$\{\s*(['"])[\s\S]*?\1\s*\}\s*$/.test(v);
+        const isSingleInterpolation = /^\s*\$\{[^{}]*\}\s*$/.test(v);
+        if (
+          q[1] === "`" &&
+          !isBareWrappedLiteral &&
+          isSingleInterpolation &&
+          !hidesAStack(v)
+        )
+          continue;
         // A DEPTH-0 COMMA IS THE OTHER THING THAT MAKES A FALLBACK LIST A STACK.
         //
         // `looksLikeStack` alone needs a strong token, or a generic keyword AND a comma — so under
@@ -273,11 +318,13 @@ export function scanSource(rel: string, src: string): { banned: string[]; quoted
         // `` font: `700 ${Math.max(11, size)}px/1 ${FONT_UI}` `` was being reported as a retyped
         // stack, the same false positive the prefix case has a regression test for, arriving
         // through the interpolation instead. (roborev 55209)
-        // Strip only LITERAL-FREE interpolations. Removing their contents wholesale erased the
-        // evidence along with the separator, which re-opened the same evasion one line down:
-        // `` font: `${"italic 12px Menlo, Consolas"}` `` stripped to the empty string, found no
-        // comma, and scored zero — while the unwrapped spelling is pinned at one hit. (roborev 55223)
-        const literal = v.replace(/\$\{[^'"`}]*\}/g, "");
+        // Strip interpolations that hide NOTHING. Removing their contents wholesale erased the
+        // evidence along with the separator (`` font: `${"italic 12px Menlo, Consolas"}` `` scored
+        // zero, roborev 55223); keeping any span with a quote in it let an ARGUMENT comma read as a
+        // fallback separator, so `` font: `700 ${fmt(size, "px")}px/1 ${FONT_UI}` `` was reported as
+        // a retype — the same `Math.max(11, size)` false positive arriving through a quoted
+        // argument (roborev 55235). Keep only what actually hides a stack.
+        const literal = v.replace(/\$\{.*?\}/gs, (span) => (hidesAStack(span) ? span : ""));
         if (shorthand && !looksLikeStack(v) && !literal.includes(",")) continue;
         quoted.push(`${rel}:${lineAt(m.index!)}: ${v}`);
       }
@@ -451,6 +498,14 @@ describe("the scan cannot be evaded by moving code", () => {
     expect(q(`const a = { font: \`\${"italic 12px Menlo, Consolas"}\` };\n`)).toHaveLength(1);
   });
 
+  it("a quote inside an interpolation is not proof of a stack", () => {
+    // A map key and a unit argument both carry quotes and neither names a family. Treating the
+    // quote as conclusive red-flagged fully migrated code at a ceiling of 0. (roborev 55235)
+    expect(q('const a = { fontFamily: `${FONTS["mono"]}` };\n')).toEqual([]);
+    // …and the ARGUMENT comma in a quoted call must not read as a fallback separator.
+    expect(q('const a = { font: `700 ${fmt(size, "px")}px/1 ${FONT_UI}` };\n')).toEqual([]);
+  });
+
   it("a literal-free interpolation is a token use, whatever its shape", () => {
     // Requiring a BARE BINDING rejected this — a fully migrated spelling that names no family.
     expect(q("const a = { fontFamily: `${mono ? FONT_MONO : FONT_UI}` };\n")).toEqual([]);
@@ -465,6 +520,26 @@ describe("the scan cannot be evaded by moving code", () => {
     // CSS system-font keywords are not stacks either.
     expect(q('const a = { font: "caption" };\n')).toEqual([]);
     expect(q('const a = { font: "inherit" };\n')).toEqual([]);
+  });
+  // THE TWO NARROWINGS, AS CASES. Neither was covered: the previous cut's regression test pinned
+  // only the two FALSE POSITIVES it fixed, so both holes it opened were invisible (roborev 55235).
+  it("still catches a family that has merely been WRAPPED in an interpolation", () => {
+    // Wrapping is not migrating. `fontFamily: "Georgia"` is caught; this is the same thing.
+    expect(q('const a = { fontFamily: `${"Georgia"}` };')).toHaveLength(1);
+    expect(q('const a = { fontFamily: `${"Helvetica Neue"}` };')).toHaveLength(1);
+  });
+
+  it("still catches a stack SPLIT across two interpolations", () => {
+    // Neither literal holds the comma, so only reaching the depth-0 comma test catches it — which a
+    // greedy single-span skip prevented.
+    expect(q('const a = { font: `${"italic 12px Menlo"}, ${"Consolas"}` };')).toHaveLength(1);
+  });
+
+  it("still waves through the migrated spellings the narrowing was FOR", () => {
+    // The regressions that motivated widening the skip in the first place must stay fixed — this is
+    // the direction that produces "go migrate code that is already migrated".
+    expect(q('const a = { fontFamily: `${FONTS["mono"]}` };')).toEqual([]);
+    expect(q('const a = { font: `700 ${fmt(size, "px")}px/1 ${FONT_UI}` };')).toEqual([]);
   });
 });
 
@@ -495,5 +570,6 @@ describe("the exemption gates", () => {
     expect(r.banned.length).toBe(1);
     expect(r.quoted.length).toBe(1);
   });
+
 });
 

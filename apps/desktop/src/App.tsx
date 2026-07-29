@@ -28,6 +28,7 @@ import { useRosterPublisher } from "./useRosterPublisher";
 import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 import { useLimitSync } from "./hooks/useLimitSync";
 import { useDisplayRespan } from "./hooks/useDisplayRespan";
+import { useSettingsShortcut } from "./hooks/useSettingsShortcut";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { StaleBuildBanner } from "./components/StaleBuildBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
@@ -128,6 +129,10 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
+  // ⌘, opens Settings from ANY focus context (window-level, capture-phase). Mounted here rather
+  // than beside the dialog's host so the binding survives the host moving, and so it is live for
+  // the whole app window instead of only the subtree that happens to render the menu.
+  useSettingsShortcut();
   // Diagnostics: record first-responder + keyboard-capture transitions while the mic is live so a
   // recurrence of the dictation input-freeze (sparkle-d2ec) is pinnable. Inert when dictation off.
   useEffect(
