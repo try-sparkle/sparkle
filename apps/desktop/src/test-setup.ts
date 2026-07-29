@@ -1,4 +1,5 @@
-import { beforeEach } from "vitest";
+import { afterEach, beforeEach } from "vitest";
+import { cleanup } from "@testing-library/react";
 
 // Vitest setup. The store tests run under node (no DOM), but our zustand stores use the
 // `persist` middleware against `localStorage`. Provide a tiny in-memory shim so persisting
@@ -75,6 +76,21 @@ if (!hasUsableStorage()) {
 beforeEach(async () => {
   const { useConciergeThreadStore } = await import("./stores/conciergeThreadStore");
   useConciergeThreadStore.setState({ chat: [] });
+});
+
+// Global RTL auto-cleanup. This suite runs WITHOUT vitest `globals` (see vite.config.ts
+// test block — no `globals: true`), so @testing-library/react's package `afterEach(cleanup)`
+// auto-registration never fires: it only self-installs when `afterEach` exists as a global.
+// Without it, every `render()` leaves its React tree MOUNTED after the test ends — harmless
+// while a feature's ownership comes from a click, but a STATE-DERIVED feature makes the
+// leaked, still-mounted hooks re-subscribe to the shared store and fight the next test's
+// component over it (a live example: 12 failures that pointed at the wrong code). Registering
+// cleanup HERE, once, unmounts each test's trees so no test inherits the previous one's DOM.
+//
+// Safe for the node-environment store tests too: `cleanup()` only iterates the containers a
+// `render()` mounted, so with nothing rendered it is a no-op and never touches `document`.
+afterEach(() => {
+  cleanup();
 });
 /** jsdom implements no `PointerEvent`. Testing-library's `fireEvent.pointerDown/Move/Up` then falls
  *  back to a plain `Event`, which silently DROPS the coordinate fields — so `clientX`/`clientY`
