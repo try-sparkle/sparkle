@@ -198,6 +198,9 @@ pub struct BeadQuery {
     pub assignee: Option<String>,
     pub issue_type: Option<String>,
     pub label: Option<String>,
+    /// Beads carrying this label are EXCLUDED. Independent of `label` (bd treats include/exclude as
+    /// separate axes), so both can apply at once. The board uses it to hide `sparkle-auto` telemetry.
+    pub exclude_label: Option<String>,
     pub title_contains: Option<String>,
     /// Only beads with no active blockers.
     pub ready: Option<bool>,
@@ -282,6 +285,7 @@ fn build_query_args(q: &BeadQuery) -> Vec<String> {
         ("--assignee", &q.assignee),
         ("--type", &q.issue_type),
         ("--label", &q.label),
+        ("--exclude-label", &q.exclude_label),
         ("--title-contains", &q.title_contains),
     ] {
         if let Some(v) = val.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1495,9 +1499,36 @@ mod tests {
             status: Some("   ".into()),
             parent: Some("".into()),
             label: Some(" ".into()),
+            exclude_label: Some("\t".into()),
             ..Default::default()
         };
         assert_eq!(build_query_args(&q), vec!["list", "--limit", "0", "--json"]);
+    }
+
+    /// The board hides app-generated agent telemetry (`sparkle-auto`) this way. Without it those
+    /// beads render as ordinary backlog cards — 299 of them had accumulated by 2026-07-29, 74 stuck
+    /// in "Being built".
+    #[test]
+    fn exclude_label_maps_onto_bds_exclude_label_flag() {
+        let q = BeadQuery { exclude_label: Some("sparkle-auto".into()), ..Default::default() };
+        let a = build_query_args(&q);
+        assert!(a.join(" ").contains("--exclude-label sparkle-auto"));
+        // Two SEPARATE argv tokens, never one "--exclude-label sparkle-auto" string.
+        let i = a.iter().position(|s| s == "--exclude-label").expect("flag present");
+        assert_eq!(a[i + 1], "sparkle-auto");
+    }
+
+    /// `--label` (include) and `--exclude-label` are independent axes in bd, so both must survive.
+    #[test]
+    fn include_and_exclude_label_can_be_combined() {
+        let q = BeadQuery {
+            label: Some("p0".into()),
+            exclude_label: Some("sparkle-auto".into()),
+            ..Default::default()
+        };
+        let joined = build_query_args(&q).join(" ");
+        assert!(joined.contains("--label p0"));
+        assert!(joined.contains("--exclude-label sparkle-auto"));
     }
 
     #[test]

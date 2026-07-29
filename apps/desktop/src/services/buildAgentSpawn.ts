@@ -12,7 +12,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
 import { landInAgent } from "./landInAgent";
 import { createBeadFull } from "./tasks";
-import { isBeadsUnavailable } from "./beads";
+import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
 import { log } from "../logger";
 import { perfStart } from "../perfTrace";
 import type { Project } from "../types";
@@ -45,7 +45,9 @@ export function spawnBuildAgentInProject(project: Project): string | null {
       .getState()
       .projects.find((p) => p.id === project.id)
       ?.agents.find((a) => a.id === id)?.name ?? "Build task";
-  void createBeadFull(project.rootPath, title, "", "task", "", "", "")
+  // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
+  // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
+  void createBeadFull(project.rootPath, title, "", "task", "", "", AUTO_LABEL)
     .then((beadId) => useProjectStore.getState().setAgentBeadId(project.id, id, beadId))
     .catch((e) => {
       // A project with no beads DB is a normal, supported state (bd is optional) — don't cry WARN on

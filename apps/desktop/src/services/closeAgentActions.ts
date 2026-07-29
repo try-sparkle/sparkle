@@ -147,6 +147,9 @@ export interface SpinDownGitParams {
   root: string;
   projectId: string;
   ids: string[]; // the build agent + its workers — every worktree to remove
+  /** The agent's AND its workers' beads — all CLOSED (not deleted; close is reversible). Optional
+   *  because an agent that never reached `building_unsaved` never got a bead. */
+  beadIds?: string[];
   deleteBranch: boolean; // safe-delete each merged branch after its worktree is gone
 }
 
@@ -157,10 +160,20 @@ export interface SpinDownGitParams {
  *  refuses to delete a checked-out branch). Each step is best-effort — the resolved
  *  `BranchDeleteOutcome` is deliberately ignored HERE (nothing acts on it), which is not licence for
  *  a caller that reports the result to a human to do the same. Does NOT touch the stores — the
- *  caller removes the agents. */
+ *  caller removes the agents.
+ *
+ *  Also CLOSES every bead, which is the fix for the orphan leak: the caller drops the agent from the
+ *  store immediately after this, and `syncBeadLifecycle` only ever runs for agents still IN the
+ *  store — so this is the last moment anything can advance the bead. Skipping it left 74 beads
+ *  parked at `in_progress` forever (86% of the board's "Being built" column, cleaned up 2026-07-29).
+ *  Closed, not DELETED: `bd reopen` makes a wrong call recoverable, and unlike Discard this path is
+ *  not a "throw the work away" gesture. Unmerged branches close their bead too — the agent is gone
+ *  either way, so an open bead would just be an orphan nobody can act on. Best-effort like the rest,
+ *  so a project without a beads DB (bd is optional) never breaks the git teardown. */
 export async function spinDownAgentGit(p: SpinDownGitParams): Promise<void> {
   for (const cid of p.ids) {
     await removeAgentWorkspace(p.root, p.projectId, cid).catch(() => {});
     if (p.deleteBranch) await deleteAgentBranchIfMerged(p.root, cid).catch(() => {});
   }
+  for (const bid of p.beadIds ?? []) await closeBead(p.root, bid).catch(() => {});
 }

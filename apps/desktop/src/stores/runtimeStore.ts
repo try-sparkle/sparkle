@@ -18,6 +18,7 @@ import {
   closeBead,
   markBeadDelivered,
   isBeadsUnavailable,
+  AUTO_LABEL,
 } from "../services/beads";
 import { syncProjectMarkdown } from "../services/chiefSync";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
@@ -292,6 +293,7 @@ export async function syncBeadLifecycle(
             projectPath,
             title,
             "Auto-created by Sparkle for a deliverable Build agent.",
+            AUTO_LABEL, // telemetry, not backlog — see AUTO_LABEL and the board's exclude filter
           );
           if (!newId) {
             // bd ran but its output didn't yield an id — don't retry (would orphan a bead per poll).

@@ -16,6 +16,7 @@ import {
   recordBeadMergeSha,
   MERGED_SHA_PREFIX,
   DELIVERED_LABEL,
+  AUTO_LABEL,
   type Bead,
 } from "./beads";
 
@@ -173,6 +174,36 @@ describe("bucketBeads", () => {
     expect(board.inProgress.map((b) => b.id)).toEqual(["ip1"]);
     expect(board.done.map((b) => b.id)).toEqual(["d1", "d2"]);
     expect(board.delivered.map((b) => b.id)).toEqual(["del1"]);
+  });
+
+  // App-generated Build-agent beads are telemetry, not backlog: one per spawn and one per
+  // first-dirty-file, titled from the agent's default display name ("Build 7") with no description.
+  // By 2026-07-29 they were 299 of 873 beads (34%) and 74 of the 86 cards in "Being built", so the
+  // board was reporting app sessions instead of work. They stay in the DB; they just aren't cards.
+  it("excludes sparkle-auto telemetry beads from every column", () => {
+    const beads = [
+      bead({ id: "real-open", status: "open" }),
+      bead({ id: "auto-open", status: "open", labels: [AUTO_LABEL] }),
+      bead({ id: "auto-ip", status: "in_progress", labels: [AUTO_LABEL] }),
+      bead({ id: "auto-done", status: "closed", labels: [AUTO_LABEL] }),
+      bead({ id: "auto-del", status: "closed", labels: [AUTO_LABEL, DELIVERED_LABEL] }),
+      bead({ id: "real-ip", status: "in_progress" }),
+    ];
+    const board = bucketBeads(beads);
+    expect(board.backlog.map((b) => b.id)).toEqual(["real-open"]);
+    expect(board.inProgress.map((b) => b.id)).toEqual(["real-ip"]);
+    expect(board.done).toEqual([]);
+    expect(board.delivered).toEqual([]);
+    expect(board.blocked).toEqual([]);
+  });
+
+  it("still excludes an auto bead that is also blocked", () => {
+    const board = bucketBeads(
+      [bead({ id: "auto-blocked", status: "open", labels: [AUTO_LABEL] })],
+      new Set(["auto-blocked"]),
+    );
+    expect(board.blocked).toEqual([]);
+    expect(board.backlog).toEqual([]);
   });
 });
 

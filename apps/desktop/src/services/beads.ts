@@ -142,13 +142,16 @@ export function parseCreatedBeadId(raw: string): string | null {
   }
 }
 
-/** Create a bead for a deliverable agent and return its new id, or null if bd failed. */
+/** Create a bead for a deliverable agent and return its new id, or null if bd failed. `labels` is a
+ *  comma-separated list; auto-created agent beads pass {@link AUTO_LABEL} so the board can tell them
+ *  apart from human-filed backlog. */
 export async function createBead(
   projectPath: string,
   title: string,
   body: string,
+  labels?: string,
 ): Promise<string | null> {
-  const raw = await invoke<string>("create_bead", { projectPath, title, body });
+  const raw = await invoke<string>("create_bead", { projectPath, title, body, labels });
   return parseCreatedBeadId(raw);
 }
 
@@ -222,6 +225,15 @@ export type BoardColumn = "backlog" | "blocked" | "inProgress" | "done" | "deliv
 /** A closed bead carrying this label lands in "delivered" instead of "done". */
 export const DELIVERED_LABEL = "delivered";
 
+/** Stamped on every bead the APP creates for a Build agent, as opposed to one a human filed.
+ *
+ *  These are agent telemetry, not backlog: an un-renamed agent yields a bead titled "Build 7" with
+ *  no description, and one is created per spawn AND per first-dirty-file. By 2026-07-29 they were
+ *  299 of the 873 beads in this repo's DB (34%) and 74 of the 86 cards in "Being built" — the board
+ *  was measuring app sessions rather than work. The back-fill labeled all 299 with this exact
+ *  string, so the value is load-bearing for the board filter; do not rename it casually. */
+export const AUTO_LABEL = "sparkle-auto";
+
 /** Which board column a bead belongs in:
  *  open+blocked -> blocked; open -> backlog; in_progress -> inProgress;
  *  closed+delivered-label -> delivered; closed (no label) -> done.
@@ -244,10 +256,16 @@ export interface Board {
   delivered: Bead[];
 }
 
-/** Group beads into board columns, preserving input order within each column. */
+/** Group beads into board columns, preserving input order within each column.
+ *
+ *  Beads labeled {@link AUTO_LABEL} are DROPPED — they are app telemetry (one per Build-agent spawn
+ *  and one per first-dirty-file, titled from the agent's throwaway display name), not work anyone
+ *  filed. Filtered HERE rather than in the query so the underlying `listBeads` payload stays
+ *  complete: the Beads list view and `childrenOf` still see them, only the BOARD hides them. */
 export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board {
   const board: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
   for (const bead of beads) {
+    if (bead.labels.includes(AUTO_LABEL)) continue;
     switch (columnFor(bead, blocked)) {
       case "backlog":
         board.backlog.push(bead);

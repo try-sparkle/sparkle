@@ -211,4 +211,56 @@ describe("spinDownAgentGit (close a shipped build agent)", () => {
     expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent");
     expect(branch.deleteAgentBranchIfMerged).not.toHaveBeenCalled();
   });
+
+  // THE LEAK (2026-07-29 backlog cleanup): spin-down removed the worktree and branch but left the
+  // bead untouched. Because the caller then drops the agent from the store, `syncBeadLifecycle` is
+  // never invoked for it again — so the bead is unreachable by the ONLY code that could advance it
+  // and sits at `in_progress` forever. That produced 74 orphaned beads (86% of the board's "Being
+  // built" column). Closing here is the sole point where the agent is known to be going away.
+  it("CLOSES each bead so spin-down can't orphan one at in_progress", async () => {
+    vi.mocked(branch.deleteAgentBranchIfMerged).mockResolvedValue("deleted");
+    await spinDownAgentGit({
+      root: "/r",
+      projectId: "p1",
+      ids: ["parent", "w1"],
+      beadIds: ["bd-parent", "bd-w1"],
+      deleteBranch: true,
+    });
+    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-parent");
+    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-w1");
+    expect(beads.deleteBead).not.toHaveBeenCalled(); // close is reversible; delete is not
+  });
+
+  // An UNMERGED branch still closes its bead. The agent is gone either way, so nothing can ever
+  // advance the bead again — leaving it open is not "preserving work", it is the orphan bug.
+  it("closes the bead even when the branch was kept (not merged)", async () => {
+    vi.mocked(branch.deleteAgentBranchIfMerged).mockResolvedValue("kept-not-merged");
+    await spinDownAgentGit({
+      root: "/r",
+      projectId: "p1",
+      ids: ["parent"],
+      beadIds: ["bd-parent"],
+      deleteBranch: true,
+    });
+    expect(beads.closeBead).toHaveBeenCalledWith("/r", "bd-parent");
+  });
+
+  it("is best-effort: a bead close failure never breaks the git teardown", async () => {
+    vi.mocked(beads.closeBead).mockRejectedValue(new Error("no beads database found"));
+    await expect(
+      spinDownAgentGit({
+        root: "/r",
+        projectId: "p1",
+        ids: ["parent"],
+        beadIds: ["bd-parent"],
+        deleteBranch: false,
+      }),
+    ).resolves.toBeUndefined();
+    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent");
+  });
+
+  it("tolerates a caller that passes no beadIds (agent never got a bead)", async () => {
+    await spinDownAgentGit({ root: "/r", projectId: "p1", ids: ["parent"], deleteBranch: false });
+    expect(beads.closeBead).not.toHaveBeenCalled();
+  });
 });

@@ -35,10 +35,17 @@ export async function closeBuildAgent(buildAgentId: string): Promise<void> {
   const { close } = useRuntimeStore.getState();
   for (const id of ids) close(id);
 
+  // Collect the beads BEFORE removeAgent drops the rows that carry the ids. Without this the beads
+  // are orphaned at `in_progress` forever — nothing re-reaches them once the agent leaves the store.
+  const beadIds = ids
+    .map((id) => project.agents.find((a) => a.id === id)?.beadId)
+    .filter((b): b is string => !!b);
+
   await spinDownAgentGit({
     root: project.rootPath,
     projectId: project.id,
     ids,
+    beadIds,
     deleteBranch: useSettingsStore.getState().deleteMergedBranch,
   });
 

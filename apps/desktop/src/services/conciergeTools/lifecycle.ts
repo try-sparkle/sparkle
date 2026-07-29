@@ -771,6 +771,12 @@ async function tearDownKeepingBranches(project: Project, ids: string[]): Promise
   await Promise.all(ids.map((id) => terminateIfCloud(project.agents.find((a) => a.id === id))));
   const { close } = useRuntimeStore.getState();
   for (const id of ids) close(id);
+  // `beadIds` is deliberately NOT passed here, unlike the closeBuildAgent path. A SAVE keeps every
+  // branch precisely so the work can be resumed, so closing its bead would contradict the gesture.
+  // The trade-off is real and known: removeAgent below means syncBeadLifecycle can never reach this
+  // bead again, so it stays wherever it was. That is a parked bead, not a shipped one — the right
+  // end-state is arguably `open` rather than `in_progress`, which bd has no single verb for. Left
+  // as a deliberate follow-up rather than silently closing preserved work.
   await spinDownAgentGit({
     root: project.rootPath,
     projectId: project.id,

@@ -259,10 +259,27 @@ pub fn append_note(project_path: String, text: String, timestamp: String) -> Res
 /// interpolated into a shell string, so they can't break out of the command; `run_bd` pins the cwd
 /// via `.current_dir` (replacing the old `cd "$3"`). Returns bd's raw `--json` stdout (the created
 /// issue, or an `{"error": …}` object).
+///
+/// `labels` is an optional comma-separated list forwarded as `-l`. It exists so the app can stamp
+/// `sparkle-auto` on the beads it auto-creates for Build agents: unlabeled, those are
+/// indistinguishable from human-filed backlog the moment the agent is gone, which is how 299 of
+/// them accumulated. `Option` rather than `String` so existing callers that omit it still compile
+/// and no `-l` is passed at all when it's absent (bd rejects an empty label).
 #[tauri::command]
-pub async fn create_bead(project_path: String, title: String, body: String) -> Result<String, String> {
+pub async fn create_bead(
+    project_path: String,
+    title: String,
+    body: String,
+    labels: Option<String>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let output = run_bd(&project_path, &["create", &title, "-d", &body, "--json"])?;
+        let mut args: Vec<&str> = vec!["create", &title, "-d", &body, "--json"];
+        let labels = labels.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(l) = labels {
+            args.push("-l");
+            args.push(l);
+        }
+        let output = run_bd(&project_path, &args)?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         select_bd_result(output.status.success(), &stdout, &stderr)
