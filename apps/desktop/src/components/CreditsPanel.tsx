@@ -28,6 +28,7 @@ import {
 } from "../services/creditsMenuApi";
 import { PromoRedeem } from "./PromoRedeem";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
+import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { SupportModal } from "./SupportModal";
 
 /** Same recovery as AuthGate's fallback: when the system browser can't launch, show the URL
@@ -128,6 +129,9 @@ export function CreditsPanel() {
       {/* Same warning as the workspace bar, in its compact variant — a bare "$0.00" balance below
           doesn't say what stopped working. Shared component, so the copy can't drift. */}
       <ZeroCreditBanner inline />
+      {/* A healthy balance while every AI feature is dark is exactly the confusion this prevents:
+          say plainly that the provider — not their credit — is why. */}
+      <ProviderUnavailableBanner inline />
       <div>
         <div style={subLabel}>Balance</div>
         <div style={balanceText}>{formatBalance(me.balanceCents)}</div>

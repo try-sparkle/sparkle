@@ -22,6 +22,7 @@ import { PlanBuildToggle } from "./PlanBuildToggle";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
+import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
 import {
@@ -648,6 +649,11 @@ export function Workspace() {
           be bought without a network anyway. */}
       <OfflineBanner />
       <ZeroCreditBanner />
+      {/* Below both on purpose. Offline and a $0 balance are things the USER can act on, so they
+          lead; this one they cannot act on at all. It is here rather than nowhere because the
+          alternative — what shipped before — was every AI feature going dark with no explanation
+          anywhere for 12 hours. Renders only while an outage is actually recorded. */}
+      <ProviderUnavailableBanner />
       {/* The project tabs + the top-right kebab/avatar cluster — the app's only top chrome. */}
       <ProjectTabsBar feed={feed} onOpenProjectSettings={setSettingsProject} />
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>

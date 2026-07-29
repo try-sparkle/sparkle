@@ -196,7 +196,19 @@ pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
         // pointed at a server that doesn't serve it. That's the backend being unavailable, not a
         // per-request failure, so it maps onto the same sentinel as 503: no amount of retrying the
         // same call will make the route appear.
-        404 | 503 => "ai_unconfigured".to_string(),
+        //
+        // A 503 may now carry a `reason` naming WHY the backend is unusable — most importantly
+        // `provider_unfunded`, i.e. Sparkle's own AI provider account has no credit left. That
+        // distinction is what lets the UI say something true and actionable instead of failing
+        // silently: without it, an outage that is entirely ours is indistinguishable from a
+        // misconfigured install, and the user is left guessing (or, far worse, shown the
+        // out-of-credits upsell for a balance that is fine). The reason is APPENDED rather than
+        // replacing the sentinel so every existing `== "ai_unconfigured"` comparison still matches
+        // its prefix and the deferral behaviour is unchanged.
+        404 | 503 => match unconfigured_reason(body) {
+            Some(reason) => format!("ai_unconfigured:{reason}"),
+            None => "ai_unconfigured".to_string(),
+        },
         // A 502 is the proxy's envelope for "the VENDOR call failed", and the route puts the
         // vendor's own status in the body (`{"error":"vendor_error","status":<n>}`). Reporting the
         // envelope's 502 instead of that inner status loses the only bit callers branch on: the JS
@@ -212,6 +224,24 @@ pub(crate) fn classify_proxy_error(code: u16, body: &str) -> String {
             None => format!("ai request failed (HTTP {code})"),
         },
         _ => format!("ai request failed (HTTP {code})"),
+    }
+}
+
+/// The proxy's `reason` for an `ai_unconfigured` answer, when it sent a RECOGNISED one.
+///
+/// Allow-listed rather than passed through: this string is appended to a sentinel the JS layer
+/// parses, so an unrecognised (or hostile) `reason` must not be able to invent a new sentinel or
+/// smuggle text into a user-facing message. An unknown value degrades to the bare `ai_unconfigured`,
+/// which is exactly the pre-existing behaviour — so a server that grows a new reason before the
+/// desktop knows about it stays correct, just less specific.
+///
+/// Pure; separate from `classify_proxy_error` so the parsing contract is testable on its own.
+fn unconfigured_reason(body: &str) -> Option<&'static str> {
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    match v.get("reason").and_then(serde_json::Value::as_str)? {
+        "provider_unfunded" => Some("provider_unfunded"),
+        "provider_key_rejected" => Some("provider_key_rejected"),
+        _ => None,
     }
 }
 
@@ -443,6 +473,17 @@ mod tests {
         assert_eq!(classify_proxy_error(402, "nope"), "insufficient_credits:0");
         assert_eq!(classify_proxy_error(403, "{}"), "not_entitled");
         assert_eq!(classify_proxy_error(503, "{}"), "ai_unconfigured");
+        // A 503 that NAMES its reason keeps the sentinel as a prefix and appends it, so the UI can
+        // tell the user something true ("Sparkle's AI provider is out of credit") instead of
+        // degrading silently.
+        assert_eq!(
+            classify_proxy_error(503, r#"{"error":"ai_unconfigured","reason":"provider_unfunded"}"#),
+            "ai_unconfigured:provider_unfunded"
+        );
+        assert_eq!(
+            classify_proxy_error(503, r#"{"error":"ai_unconfigured","reason":"provider_key_rejected"}"#),
+            "ai_unconfigured:provider_key_rejected"
+        );
         // A 404 means the route isn't registered on the server we're pointed at — the backend is
         // unavailable, so it shares the 503 sentinel instead of the generic retryable message.
         assert_eq!(
@@ -496,6 +537,27 @@ mod tests {
         assert_eq!(vendor_status(r#"{"error":"vendor_error","status":600}"#), None);
         assert_eq!(vendor_status(r#"{"error":"vendor_error","status":"400"}"#), None);
         assert_eq!(vendor_status("not json at all"), None);
+    }
+
+    #[test]
+    fn unconfigured_reason_reads_only_allow_listed_values() {
+        assert_eq!(
+            unconfigured_reason(r#"{"error":"ai_unconfigured","reason":"provider_unfunded"}"#),
+            Some("provider_unfunded")
+        );
+        assert_eq!(
+            unconfigured_reason(r#"{"error":"ai_unconfigured","reason":"provider_key_rejected"}"#),
+            Some("provider_key_rejected")
+        );
+        // No reason at all — the shape the unset-server-key path and a 404 both send.
+        assert_eq!(unconfigured_reason(r#"{"error":"ai_unconfigured"}"#), None);
+        assert_eq!(unconfigured_reason("not json"), None);
+        // An unrecognised or wrong-typed reason degrades to the bare sentinel rather than inventing
+        // a new one — a newer server can add reasons without breaking an older desktop.
+        assert_eq!(unconfigured_reason(r#"{"reason":"something_new"}"#), None);
+        assert_eq!(unconfigured_reason(r#"{"reason":42}"#), None);
+        // A hostile reason must not be able to smuggle text into the sentinel the JS layer parses.
+        assert_eq!(unconfigured_reason(r#"{"reason":"provider_unfunded\nX"}"#), None);
     }
 
     #[test]

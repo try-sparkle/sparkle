@@ -18,6 +18,7 @@
 // passes it in, which is what keeps tier 1 unit-testable without a live app. The single impure
 // thing is the tier-2 invoke, injectable via `deps` for tests.
 import { invoke } from "@tauri-apps/api/core";
+import { noteAiProviderFailure, noteAiProviderHealthy } from "./anthropic";
 import type { AgentTabStatus } from "../types";
 import { log } from "../logger";
 import { isTerseAnswer, liveOptionsFor } from "./conciergeDispatch";
@@ -255,7 +256,19 @@ export async function routeMessage(
  *  payload shape — a rename on either side of the IPC boundary otherwise fails silently at runtime
  *  and routes to `sparkle` forever, which looks exactly like the intended fallback. */
 export function invokeClassify(text: string, context: string): Promise<string> {
-  return invoke<string>("route_classify", { text, context });
+  // Every proxied AI wrapper reports what it learned about Sparkle's provider account — there is
+  // no single JS chokepoint (each command has its own wrapper), so a wrapper that skips this both
+  // hides a live outage and, worse, leaves a false one on screen after recovery (roborev 54761).
+  return invoke<string>("route_classify", { text, context }).then(
+    (out) => {
+      noteAiProviderHealthy();
+      return out;
+    },
+    (err: unknown) => {
+      noteAiProviderFailure(err);
+      throw err;
+    },
+  );
 }
 
 /** Reject with `deadline` once `ms` have passed. The losing promise is left to settle unobserved;

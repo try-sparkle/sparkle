@@ -16,6 +16,7 @@
 // FALL BACK to the fast-path's own verdict (→ `waiting`) rather than swallow a real ask to gray
 // (sparkle-blpf). Only a judge that actually RAN and said DONE pulls an ambiguous turn back to gray.
 import { invoke } from "@tauri-apps/api/core";
+import { noteAiProviderFailure, noteAiProviderHealthy } from "./anthropic";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
 // long body of what they did. Scanning the tail keeps a '?' buried in the middle of a report (a
@@ -233,7 +234,12 @@ export async function judgeNeedsFollowup(args: {
       response: args.response,
       project: args.project,
     });
+  // Every proxied AI wrapper reports what it learned about Sparkle's provider account — there is
+  // no single JS chokepoint (each command has its own wrapper), so a wrapper that skips this both
+  // hides a live outage and, worse, leaves a false one on screen after recovery (roborev 54761).
+    noteAiProviderHealthy();
   } catch (e) {
+    noteAiProviderFailure(e);
     // The judge could not run (no API key, offline, model hiccup). We can't distinguish done from
     // blocked, so fall back to the deterministic fast-path — but TIERED, not a blanket red. Only a
     // STRONG signal (a whole-message gate, or a concrete action-proposal like "want me to land it?")

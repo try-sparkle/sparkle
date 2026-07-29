@@ -8,6 +8,7 @@ import { OutOfCreditsError } from "./credits";
 import { assertAiCredits } from "./aiGate";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useAuthStore } from "../stores/authStore";
+import { useAiProviderStore, type AiProviderOutageReason } from "../stores/aiProviderStore";
 
 /**
  * The request never reached the proxy: no HTTP status came back because this machine has no working
@@ -28,12 +29,60 @@ export class AiUnreachableError extends Error {
  * route isn't registered on the server we're pointed at). It is an ENVIRONMENTAL condition, not a
  * failure of the specific request: identical retries stay doomed until the backend comes back. So
  * it's modelled like being offline — callers should defer rather than spend a retry budget on it.
+ *
+ * `reason` names WHY when the proxy said so — `provider_unfunded` (Sparkle's provider account has no
+ * credit) or `provider_key_rejected` (our key was refused). It is null for the reasonless shapes (an
+ * unset server key, a missing route, an older server). Callers that merely need to defer should keep
+ * branching on the TYPE; `reason` exists so the UI can name the cause instead of failing silently.
  */
 export class AiUnavailableError extends Error {
-  constructor() {
-    super("AI backend is unavailable");
+  readonly reason: AiProviderOutageReason | null;
+  constructor(reason: AiProviderOutageReason | null = null) {
+    super(reason ? `AI backend is unavailable: ${reason}` : "AI backend is unavailable");
     this.name = "AiUnavailableError";
+    this.reason = reason;
   }
+}
+
+/**
+ * Record what a proxied AI call just proved about SPARKLE'S OWN provider account.
+ *
+ * **Every JS wrapper around a proxied Tauri command must call both of these** — `anthropic_chat`,
+ * `generate_agent_name`, `judge_turn_followup`, `route_classify`, and anything added later. They all
+ * funnel through the same Rust `call_anthropic_proxy` and so all receive the same
+ * `ai_unconfigured:<reason>` sentinel, but each owns a separate Tauri command and a separate JS
+ * wrapper, so there is no single JS chokepoint to hook (roborev 54761).
+ *
+ * Wiring only `chatOnce` was wrong in both directions:
+ *   • a session whose AI activity is naming + concierge routing — both of which fail during exactly
+ *     this outage — would get NO banner, which is the silence this whole change exists to end; and
+ *   • worse, after the provider recovers, a successful naming/judge/route call would NOT clear a
+ *     recorded outage. Since `useSuggestions` treats `AiUnavailableError` as terminal and burns the
+ *     state's whole retry budget, `chatOnce` may not run again for a long stretch — leaving a
+ *     non-dismissible banner telling the user the provider is out of credit while it is healthy.
+ *     That is the same dishonesty this change removes, pointed the other way.
+ */
+export function noteAiProviderHealthy(): void {
+  useAiProviderStore.getState().noteHealthy();
+}
+
+/** Counterpart to {@link noteAiProviderHealthy} — see its doc for why every wrapper needs both.
+ *  Ignores anything that isn't a provider-outage sentinel, so it is safe to call on any rejection. */
+export function noteAiProviderFailure(err: unknown): void {
+  if (typeof err !== "string") return;
+  const reason = parseUnavailableReason(err);
+  if (reason) useAiProviderStore.getState().noteOutage(reason, Date.now());
+}
+
+/** Parse the Rust layer's `ai_unconfigured[:<reason>]` sentinel into its optional reason.
+ *  Returns `undefined` when `err` is not that sentinel at all, so the caller can tell "not this
+ *  error" from "this error, no reason given". The reason is allow-listed on the Rust side, but it is
+ *  re-checked here so this function is safe against any string and stays independently testable. */
+export function parseUnavailableReason(err: string): AiProviderOutageReason | null | undefined {
+  if (err === "ai_unconfigured") return null;
+  if (!err.startsWith("ai_unconfigured:")) return undefined;
+  const reason = err.slice("ai_unconfigured:".length);
+  return reason === "provider_unfunded" || reason === "provider_key_rejected" ? reason : null;
 }
 
 /** The metering-only annotations attached to a proxied AI call — see {@link chatOnce}. Declared
@@ -83,6 +132,9 @@ export async function chatOnce(
     if (metering.purpose !== undefined) args.purpose = metering.purpose;
     if (metering.project !== undefined) args.project = metering.project;
     const raw = await invoke<string>("anthropic_chat", args);
+    // A call that came back proves Sparkle's provider account is usable — clear any recorded outage
+    // so the banner retires on its own the moment service is restored, with no restart or dismissal.
+    noteAiProviderHealthy();
     return raw.trim();
   } catch (err) {
     if (typeof err === "string") {
@@ -103,8 +155,16 @@ export async function chatOnce(
         // nothing renders today — see its doc. Contract-hardening, not a live display fix.
         throw new OutOfCreditsError(reported ?? held);
       }
-      // Typed server gate: `ai_unconfigured` → the backend is down/unserved, so this is deferrable.
-      if (err === "ai_unconfigured") throw new AiUnavailableError();
+      // Typed server gate: `ai_unconfigured[:<reason>]` → the backend is down/unserved, deferrable.
+      // When the proxy named a reason, RECORD it: that observation is the only thing standing
+      // between "every AI feature is quietly dead" and a banner that says why. Recorded here, at the
+      // single chokepoint every proxied call passes through, so whichever feature fails first lights
+      // the banner for all of them — the same placement as `noteCreditsRefused` above.
+      const reason = parseUnavailableReason(err);
+      if (reason !== undefined) {
+        noteAiProviderFailure(err);
+        throw new AiUnavailableError(reason);
+      }
       // A transport failure is FRESHER evidence of connectivity than the 30s reachability
       // heartbeat: we just proved the host is unreachable with a real request. Feed that straight
       // into the store (the heartbeat's own next tick re-confirms, and flips us back on recovery)

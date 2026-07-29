@@ -15,6 +15,7 @@
 // (no API key, network) just leaves the current name as-is. The naming call must never block
 // or break the send path, so callers fire-and-forget.
 import { invoke } from "@tauri-apps/api/core";
+import { noteAiProviderFailure, noteAiProviderHealthy } from "./anthropic";
 import { useProjectStore } from "../stores/projectStore";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
@@ -292,6 +293,10 @@ export async function maybeAutoName(
       // Metering-only: attributes this paid naming call to its project in the Credits history.
       project: projectName(projectId),
     });
+    // Report what this proxied call learned about Sparkle's provider account. Every AI wrapper must
+    // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
+    // one on a banner the user cannot dismiss (roborev 54761).
+    noteAiProviderHealthy();
     // The title is the canonical `name`; the sidebar truncates it to fit and reveals the title +
     // description on hover.
     const canonical = name?.title?.trim();
@@ -304,7 +309,10 @@ export async function maybeAutoName(
         .autoRenameAgent(projectId, agentId, canonical, prompt, name, agent.aiTitle ?? null);
     }
   } catch (e) {
-    // No API key, offline, or model hiccup — keep the existing name silently.
+    // No API key, offline, or model hiccup — keep the existing name silently. "Silently" is right
+    // for THIS surface (a name is cosmetic), but a provider outage must still be recorded so the
+    // app-level banner can name it — that is the failure mode this whole path went dark under.
+    noteAiProviderFailure(e);
     console.debug("auto-name skipped:", e);
   } finally {
     inFlight.delete(agentId);
@@ -488,6 +496,10 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
       prompt: basis,
       project: projectName(projectId),
     });
+    // Report what this proxied call learned about Sparkle's provider account. Every AI wrapper must
+    // (no single JS chokepoint): skipping it hides a live outage and, after recovery, leaves a false
+    // one on a banner the user cannot dismiss (roborev 54761).
+    noteAiProviderHealthy();
     const canonical = name?.title?.trim();
     if (canonical) {
       // TERMINAL: we produced a name, so never spend a second call for this agent.
@@ -504,6 +516,7 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
       countRetryableAttempt(agentId);
     }
   } catch (e) {
+    noteAiProviderFailure(e);
     // Retryable — no API key yet, offline, keychain locked, proxy 500. Deliberately do NOT mark the
     // attempt terminal: the old code marked it BEFORE the invoke, so a single blip permanently
     // pinned the agent at its default for the whole app session (that Set is module-level and never

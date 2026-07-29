@@ -7,14 +7,18 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock
 
 import {
   chatOnce,
+  noteAiProviderFailure,
+  noteAiProviderHealthy,
   structuredJson,
   extractJson,
+  parseUnavailableReason,
   AiUnavailableError,
   AiUnreachableError,
 } from "./anthropic";
 import { OutOfCreditsError } from "./credits";
 import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
+import { useAiProviderStore } from "../stores/aiProviderStore";
 
 /** chatOnce/structuredJson now enforce a hard local credit gate, so the network-path tests need a
  *  funded, signed-in account or the gate throws before invoke is ever reached. */
@@ -41,6 +45,57 @@ beforeEach(() => {
 afterEach(() => {
   invokeMock.mockReset();
   useAuthStore.setState(initialState, true);
+});
+
+describe("parseUnavailableReason", () => {
+  it("distinguishes 'not this error' from 'this error, no reason'", () => {
+    // undefined vs null is the whole contract: the caller must not treat an unrelated failure as an
+    // ai_unconfigured, nor drop a reasonless one.
+    expect(parseUnavailableReason("ai request failed (HTTP 502)")).toBeUndefined();
+    expect(parseUnavailableReason("insufficient_credits:5")).toBeUndefined();
+    expect(parseUnavailableReason("ai_unconfigured")).toBeNull();
+  });
+
+  it("reads the recognised reasons", () => {
+    expect(parseUnavailableReason("ai_unconfigured:provider_unfunded")).toBe("provider_unfunded");
+    expect(parseUnavailableReason("ai_unconfigured:provider_key_rejected")).toBe("provider_key_rejected");
+  });
+
+  it("degrades an unknown reason to 'no reason' rather than inventing one", () => {
+    // A newer server growing a reason this build doesn't know must still defer correctly; it just
+    // doesn't get a banner it has no honest copy for.
+    expect(parseUnavailableReason("ai_unconfigured:something_new")).toBeNull();
+    expect(parseUnavailableReason("ai_unconfigured:")).toBeNull();
+  });
+});
+
+describe("noteAiProviderHealthy / noteAiProviderFailure", () => {
+  // These exist because chatOnce is NOT the only proxied path: generate_agent_name,
+  // judge_turn_followup and route_classify each own a Tauri command and a JS wrapper, all receiving
+  // the same sentinel. Wiring only chatOnce meant a naming+routing session saw no banner, and — the
+  // costly half — a successful naming/judge/route call could not CLEAR one, leaving a
+  // non-dismissible banner claiming the provider was broken while it was healthy (roborev 54761).
+  it("records an outage from any wrapper, not just chatOnce", () => {
+    useAiProviderStore.setState({ outage: null });
+    noteAiProviderFailure("ai_unconfigured:provider_unfunded");
+    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_unfunded");
+  });
+
+  it("CLEARS an outage from a non-chatOnce success — the recovery path that was missing", () => {
+    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: 1 } });
+    noteAiProviderHealthy();
+    expect(useAiProviderStore.getState().outage).toBeNull();
+  });
+
+  it("ignores failures that say nothing about the provider", () => {
+    useAiProviderStore.setState({ outage: null });
+    for (const e of ["ai request failed (HTTP 502)", "ai_unconfigured", "insufficient_credits:5"]) {
+      noteAiProviderFailure(e);
+    }
+    noteAiProviderFailure(new Error("boom"));
+    noteAiProviderFailure(undefined);
+    expect(useAiProviderStore.getState().outage).toBeNull();
+  });
 });
 
 describe("chatOnce", () => {
@@ -214,6 +269,46 @@ describe("chatOnce", () => {
     invokeMock.mockRejectedValue("ai_unconfigured");
     const err = await chatOnce("sys", "usr").catch((e) => e);
     expect(err).toBeInstanceOf(AiUnavailableError);
+  });
+
+  it("carries the proxy's reason on AiUnavailableError and RECORDS the outage", async () => {
+    // The silence this closes: the provider account ran dry and every AI feature went dark with
+    // nothing on any surface saying so. Recording it here — at the one chokepoint every proxied
+    // call passes — is what lets ProviderUnavailableBanner name the cause for all of them.
+    useAiProviderStore.setState({ outage: null });
+    invokeMock.mockRejectedValue("ai_unconfigured:provider_unfunded");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(AiUnavailableError);
+    expect((err as AiUnavailableError).reason).toBe("provider_unfunded");
+    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_unfunded");
+  });
+
+  it("records a rejected key distinctly from an unfunded account", async () => {
+    useAiProviderStore.setState({ outage: null });
+    invokeMock.mockRejectedValue("ai_unconfigured:provider_key_rejected");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect((err as AiUnavailableError).reason).toBe("provider_key_rejected");
+    expect(useAiProviderStore.getState().outage?.reason).toBe("provider_key_rejected");
+  });
+
+  it("records NO outage for a reasonless ai_unconfigured", async () => {
+    // An unset server key or a missing route is a deployment problem, not a provider outage — the
+    // banner would be telling the user something false.
+    useAiProviderStore.setState({ outage: null });
+    invokeMock.mockRejectedValue("ai_unconfigured");
+    const err = await chatOnce("sys", "usr").catch((e) => e);
+    expect(err).toBeInstanceOf(AiUnavailableError);
+    expect((err as AiUnavailableError).reason).toBeNull();
+    expect(useAiProviderStore.getState().outage).toBeNull();
+  });
+
+  it("clears a recorded outage as soon as a call succeeds", async () => {
+    // Recovery must be automatic: the banner has no dismiss control precisely because the user can
+    // do nothing about it, so a stale outage would be permanent for the session.
+    useAiProviderStore.setState({ outage: { reason: "provider_unfunded", at: 1 } });
+    invokeMock.mockResolvedValue("hello");
+    await chatOnce("sys", "usr");
+    expect(useAiProviderStore.getState().outage).toBeNull();
   });
 
   it("leaves a generic proxy failure as a plain wrapped Error", async () => {
