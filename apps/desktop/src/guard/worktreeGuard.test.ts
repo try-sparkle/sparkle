@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside, blocksKeychainCommand, isAllowlistedNoteDir } from "../../src-tauri/resources/worktree-guard.mjs";
+import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, callerWorktreeRoot } from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -195,5 +195,43 @@ describe("isAllowlistedNoteDir (real dirs on disk)", () => {
     mkdirSync(proj, { recursive: true });
     symlinkSync(outside, join(proj, "memory"));
     expect(isAllowlistedNoteDir(home, join(proj, "memory", "notes.md"))).toBe(false);
+  });
+});
+
+
+// Worktree-RELATIVE containment: the guard is invoked with ONE baked-in install-root, but the same
+// hook runs for sub-agents / pooled worktrees whose real cwd is a DIFFERENT worktree. callerWorktreeRoot
+// derives the caller's OWN worktree from the tool call's cwd (git rev-parse --show-toplevel), so an
+// edit inside the caller's own worktree is allowed even when that worktree isn't the install-root,
+// while an edit reaching into a different worktree is still denied. resolveToplevel is injected here so
+// the logic is exercised without a real git repo.
+describe("callerWorktreeRoot (worktree-relative)", () => {
+  const installRoot = "/wt/self/__sparkle_self__"; // the single worktree the hook was installed for
+  const poolWorktree = "/wt/pool/agent-42"; // a DIFFERENT worktree the caller actually runs in
+
+  it("derives the caller's worktree from cwd, not the baked-in install-root", () => {
+    const resolve = (dir: string) => (dir.startsWith(poolWorktree) ? poolWorktree : null);
+    expect(callerWorktreeRoot(installRoot, `${poolWorktree}/apps/desktop`, resolve)).toBe(poolWorktree);
+  });
+
+  it("falls back to the install-root when cwd is not in a git work tree", () => {
+    expect(callerWorktreeRoot(installRoot, "/some/where", () => null)).toBe(installRoot);
+    // Missing / non-string cwd also falls back (never derives a bogus root).
+    expect(callerWorktreeRoot(installRoot, undefined, () => poolWorktree)).toBe(installRoot);
+    expect(callerWorktreeRoot(installRoot, "", () => poolWorktree)).toBe(installRoot);
+  });
+
+  // THE regression / mutation-check: an edit inside the caller's OWN (non-install-root) worktree must
+  // be ALLOWED, and an edit into a DIFFERENT worktree must still be DENIED. If the guard reverts to
+  // keying off the install-root (isInside(installRoot, ...)), the first expectation flips to false.
+  it("allows edits in the caller's own worktree yet blocks edits into another worktree", () => {
+    const resolve = (dir: string) => (dir.startsWith(poolWorktree) ? poolWorktree : installRoot);
+    const callerRoot = callerWorktreeRoot(installRoot, `${poolWorktree}/src`, resolve);
+    // Own worktree — allowed even though it is NOT the install-root.
+    expect(isInside(callerRoot, `${poolWorktree}/src/App.tsx`)).toBe(true);
+    // A different worktree (the install-root here) — still denied.
+    expect(isInside(callerRoot, `${installRoot}/src/App.tsx`)).toBe(false);
+    // A sibling worktree — denied.
+    expect(isInside(callerRoot, "/wt/pool/agent-99/src/App.tsx")).toBe(false);
   });
 });

@@ -9,4 +9,12 @@ declare module "*/worktree-guard.mjs" {
   // $HOME/.claude/projects/<any>/memory/ dir, canonicalized through symlinks (both are append-only
   // per-agent note dirs the guard permits even though they live outside the worktree).
   export function isAllowlistedNoteDir(homeDir: string, target: string): boolean;
+  // Worktree-relative containment helper: the worktree the CALLER is actually operating in.
+  // Derives the caller's worktree root from the tool call's `cwd` (via `resolveToplevel`, default
+  // `git rev-parse --show-toplevel`), falling back to `installRoot` when cwd isn't in a git work tree.
+  export function callerWorktreeRoot(
+    installRoot: string,
+    cwd: unknown,
+    resolveToplevel?: (dir: string) => string | null,
+  ): string;
 }

@@ -1,5 +1,11 @@
 // Claude Code PreToolUse guard: refuse any file-write whose resolved path escapes the agent's
-// worktree. Invoked as `node worktree-guard.mjs <worktree-root>` with the tool payload on stdin.
+// worktree. Invoked as `node worktree-guard.mjs <install-root>` with the tool payload on stdin.
+//
+// The <install-root> arg is only the worktree this hook was INSTALLED for; the SAME hook also runs
+// for sub-agents / pooled worktrees whose real cwd is a DIFFERENT worktree. So the containment check
+// is worktree-RELATIVE: it allows edits inside WHICHEVER worktree the caller is actually operating in
+// (derived from the tool call's `cwd` via `git rev-parse --show-toplevel`), falling back to
+// <install-root> when cwd isn't in a git work tree. Editing ANOTHER worktree is still blocked.
 //
 // NOTE: this is a best-effort guardrail, NOT a security sandbox. Its file-path containment check
 // only inspects Edit/Write/MultiEdit/NotebookEdit paths — it does NOT otherwise constrain the Bash
@@ -14,6 +20,7 @@
 import { relative, sep, isAbsolute, dirname } from "node:path";
 import { lstatSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 // Canonicalize `p` by resolving symlinks one path segment at a time — a from-scratch realpath
 // that also tolerates not-yet-existing trailing segments (the file a Write is about to create).
@@ -139,6 +146,41 @@ export function isAllowlistedNoteDir(homeDir, target) {
   return parts.length >= 2 && parts[1] === "memory";
 }
 
+/** Resolve the git worktree root that CONTAINS `dir`, via `git rev-parse --show-toplevel` run with
+ *  `-C dir` so a linked worktree resolves to ITS OWN root (not the repo's main checkout). Returns the
+ *  trimmed toplevel path, or null when `dir` isn't inside a git work tree or git isn't on PATH. stderr
+ *  is silenced (git prints "not a git repository" there) and any spawn failure is swallowed → null. */
+function gitToplevel(dir) {
+  try {
+    const out = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const top = out.trim();
+    return top.length > 0 ? top : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The worktree the CALLER is actually operating in. The guard is installed with ONE baked-in root
+ *  (argv[2] — the worktree it was installed for), but the same hook runs for sub-agents / pooled
+ *  worktrees whose real cwd is a DIFFERENT worktree, so keying off the baked-in root alone wrongly
+ *  blocks an agent editing its OWN (non-install-root) worktree. We derive the caller's worktree from
+ *  the tool call's `cwd` (Claude Code puts the session's working dir in the hook payload) via git
+ *  worktree semantics, falling back to `installRoot` when cwd isn't in a git work tree (or git is
+ *  unavailable) — so a misconfigured/repo-less caller is no MORE permissive than before. This keeps the
+ *  check worktree-RELATIVE: the returned root is fed to isInside(), which allows edits inside the
+ *  caller's own worktree and still DENIES edits reaching into a different worktree. `resolveToplevel`
+ *  is injectable so tests can exercise the logic without a real git repo. */
+export function callerWorktreeRoot(installRoot, cwd, resolveToplevel = gitToplevel) {
+  if (typeof cwd === "string" && cwd.length > 0) {
+    const top = resolveToplevel(cwd);
+    if (typeof top === "string" && top.length > 0) return top;
+  }
+  return installRoot;
+}
+
 async function main() {
   const root = process.argv[2];
   if (!root) process.exit(0); // misconfigured guard must not block work
@@ -164,11 +206,15 @@ async function main() {
   }
   const target = input.file_path ?? input.notebook_path;
   if (!target) process.exit(0); // nothing path-like to guard
+  // Worktree-RELATIVE containment: allow edits inside WHICHEVER worktree the caller is operating in
+  // (derived from the tool call's cwd), not just the single worktree this hook was installed for.
+  // Falls back to the install-time `root` when cwd isn't in a git work tree.
+  const callerRoot = callerWorktreeRoot(root, payload?.cwd);
   // Fail CLOSED on any unexpected error: only exit code 2 blocks the tool, so an exception that
   // escaped here would let the write proceed (fail open). Treat "couldn't decide" as "block".
   let inside;
   try {
-    inside = isInside(root, target);
+    inside = isInside(callerRoot, target);
   } catch {
     inside = false;
   }
@@ -185,7 +231,7 @@ async function main() {
   }
   if (allowedNoteDir) process.exit(0);
   process.stderr.write(
-    `Blocked: ${target} is outside this agent's worktree (${root}). ` +
+    `Blocked: ${target} is outside this agent's worktree (${callerRoot}). ` +
       `Edit only files inside your worktree.\n`,
   );
   process.exit(2); // exit code 2 → Claude Code blocks the tool call
