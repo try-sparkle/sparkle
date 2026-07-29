@@ -76,7 +76,13 @@ vi.mock("../services/suggestions/engine", () => ({
   SuggestionOfflineError,
 }));
 vi.mock("../services/anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
-vi.mock("../services/terminalScrollback", () => ({
+// PARTIAL mock, via importOriginal. This file only needs `getAgentScrollback` stubbed, but a
+// wholesale replacement drops every other export — and the column's approval card now reaches the
+// tool registry (Concierge/ConciergeApprovals → services/conciergeApprovalResume), which reads
+// `SNAPSHOT_MAX_LINES` from here at module scope. A total mock made that a load-time crash for the
+// whole suite, which is a mocking artefact rather than anything about re-aiming.
+vi.mock("../services/terminalScrollback", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/terminalScrollback")>()),
   getAgentScrollback: (id: string) => h.screens[id] ?? null,
 }));
 // `useHasAiCredits` is a newer gate on the compute path (added to aiGate on main after this

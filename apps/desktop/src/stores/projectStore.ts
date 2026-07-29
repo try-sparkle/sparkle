@@ -252,6 +252,10 @@ export interface ProjectState {
    *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching
    *  terminal scroll marker under the same key. */
   appendPrompt: (projectId: string, agentId: string, text: string, source?: PromptSource) => string;
+  /** Record that the user submitted a line straight into this agent's terminal — the DURABLE twin
+   *  of interactionStore's in-memory `lastAt`. Stamps once and never moves, because the only
+   *  question it answers is "has anyone ever briefed this?" (engine/newAgentAttention route 5). */
+  noteTerminalBrief: (projectId: string, agentId: string) => void;
 }
 
 function mapProject(
@@ -1071,10 +1075,14 @@ export const useProjectStore = create<ProjectState>()(
               // records have ONE canonical form and consumers can compare raw values safely (the
               // "default" sentinel stays a UI-only dropdown value).
               model: isDefaultModel(opts?.model) ? undefined : opts?.model,
-              // Stamp creation time so the unstarted-worker dwell (engine/workerAttention) has a real
-              // basis: a just-cut worker isn't treated as a "Start this agent" strand until it has
-              // sat un-launched past the dwell (sparkle-w340). Previously unset, which left the field
-              // dead and the dwell inert.
+              // The spawn stamp, now with THREE consumers — it was declared in types.ts since
+              // sparkle-pckz and written by nobody, so every one of them read `undefined` and quietly
+              // did nothing. (a) the unstarted-worker dwell (engine/workerAttention, sparkle-w340):
+              // a just-cut worker is not a "Start this agent" strand until it has sat un-launched
+              // past the dwell; (b) engine/newAgentAttention's 5-minute backstop, which needs to tell
+              // a freshly spawned agent from an old one; (c) the eviction shield types.ts documents.
+              // Kept OPTIONAL on the type: rows persisted by an older build genuinely have no stamp,
+              // and every consumer must treat "no stamp" as "age unknown" rather than "age zero".
               createdAt: opts?.createdAt ?? Date.now(),
             };
             // A freshly-opened BUILD agent floats to the top of the non-alerting sidebar rows
@@ -1490,12 +1498,36 @@ export const useProjectStore = create<ProjectState>()(
               autoNameVariants: null,
               shellCommand: null,
               model: undefined,
+              // NO `createdAt` HERE, deliberately. This is the disk-reconcile self-heal, not a
+              // spawn: the worker's PROCESS is already running, possibly for hours and possibly from
+              // before a restart. Minting a fresh stamp would tell engine/newAgentAttention this
+              // agent is seconds old and hand a genuinely errored worker a brand-new 5-minute
+              // suppression window — and since the manifest's `task` is optional, a task-less
+              // re-adopted worker would also read as briefless and have its `blocked` permanently
+              // rewritten to `new`. That is exactly the "no red is retroactively calmed across a
+              // restart" guarantee the design rests on. Leaving it undefined makes the age UNKNOWN,
+              // and unknown is deliberately treated as OLD. (roborev 54696)
             };
             // Append WITHOUT changing selectedAgentId — the self-heal must be invisible to the user.
             return { ...p, agents: [...p.agents, agent] };
           }),
         })),
 
+      noteTerminalBrief: (projectId, agentId) => {
+        // WRITE-ONCE. This fires per submitted line, and the persisted record must not churn on
+        // every Enter — the value is "was this ever briefed by hand", not "when last". Returning the
+        // same agent object when it is already stamped also keeps the store from notifying
+        // subscribers, so a hand-driven session does not re-render the fleet once per keystroke line.
+        const p0 = get().projects.find((p) => p.id === projectId);
+        if (p0?.agents.find((a) => a.id === agentId)?.terminalBriefedAt !== undefined) return;
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.terminalBriefedAt === undefined ? { ...a, terminalBriefedAt: Date.now() } : a,
+            ),
+          ),
+        }));
+      },
       appendPrompt: (projectId, agentId, text, source = "composer") => {
         const id = uuid();
         // A picker answer is recorded ONLY to advance promptCount for the naming ladder; it must not

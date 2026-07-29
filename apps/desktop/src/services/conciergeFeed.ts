@@ -340,6 +340,12 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     lastObserved,
     (id) => resolveStage(branchStatus[id], workflowStage[id]),
     rolledUpGreen,
+    undefined, // `now` — this function has no injected clock of its own.
+    // OUR OWN map, not the global store. It already feeds `since` below, and sourcing the two
+    // independently let the feed emit `since: <the user's last touch>` alongside
+    // `status: "new"` ("not briefed") for the SAME agent — and made route 4 untestable here
+    // except by mutating a module singleton. Also what keeps the "Pure" claim above true.
+    interaction,
   );
 
   // Band + parent for EVERY agent in the fleet, so representation can be resolved across projects

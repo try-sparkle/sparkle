@@ -9,6 +9,7 @@
 // The jump action is selectAndOpen (re-exported below, NOT reimplemented) — the same "reveal the
 // agent wherever it is" path a notification click takes.
 import { useEffect, useMemo, useState } from "react";
+import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
 import { getRoster, onRosterChanged } from "./services/attention";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { buildConciergeFeed, type ConciergeFeed } from "./services/conciergeFeed";
@@ -76,6 +77,16 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
     };
   }, []);
 
+  // The `new` grace window is a DEADLINE, and none of this memo's deps change again for a held
+  // `errored` agent — so without a tick the concierge column would band it calm forever while
+  // `get_agent_status` (clock-per-call) reported errored/needsYou. Same defect, same fix, as the
+  // three surfaces in hooks/useNewAgentCalm (roborev 54830).
+  const graceTick = useNewAgentGraceTick(
+    useMemo(() => projects.flatMap((p) => p.agents), [projects]),
+    status,
+    interaction,
+  );
+
   return useMemo(
     () =>
       buildConciergeFeed({
@@ -90,6 +101,10 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         shouldInterrupt,
         pinnedProjectId,
       }),
+    // `graceTick` is not referenced in the body BY DESIGN — it is the only input that changes when a
+    // grace window closes with nothing else happening in the app, which is the whole point of it.
+    // Same pattern, and the same reason, as hooks/useNewAgentCalm's memo.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       projects,
       status,
@@ -101,6 +116,7 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       roster,
       shouldInterrupt,
       pinnedProjectId,
+      graceTick,
     ],
   );
 }

@@ -25,17 +25,27 @@ import { recordTrialSend } from "../services/trialMeter";
 
 // Mirror AgentPane's no-composer wiring: for each non-empty submitted line the scanner reports,
 // call the same handler AgentPane passes as Terminal's onSubmitLine.
+//
+// That handler has TWO statements, and this mirror hand-copies them — so it drifts the moment one
+// side changes, which is exactly what happened when `noteTerminalBrief` was added and only
+// `recordTrialSend` was reflected here (roborev 54849). Both are called, in the same order, so the
+// count below also pins "a bare Enter briefs nothing": the scanner is the shared gate.
+const briefed: Array<[string, string]> = [];
 async function driveRawTerminal(chunks: string[]): Promise<void> {
   const state = makeLineScanState();
   for (const c of chunks) {
     const submits = scanSubmittedLines(state, c);
-    for (let i = 0; i < submits; i += 1) await recordTrialSend();
+    for (let i = 0; i < submits; i += 1) {
+      await recordTrialSend();
+      briefed.push(["p1", "a1"]);
+    }
   }
 }
 
 afterEach(() => {
   blocked = false;
   entitled = false;
+  briefed.length = 0;
   vi.clearAllMocks();
 });
 
@@ -63,5 +73,18 @@ describe("raw-terminal trial metering (Improvement B)", () => {
     // Typed character-by-character, then submitted once.
     await driveRawTerminal(["h", "e", "l", "l", "o", "\r"]);
     expect(consume).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the raw-terminal handler also records the DURABLE brief", () => {
+  it("briefs once per non-empty submitted line, and never on a bare Enter", async () => {
+    // Route 5's producer rides the same scanner gate as the trial meter, so an empty line must
+    // neither charge a trial send nor mark an agent as briefed (engine/newAgentAttention route 5).
+    await driveRawTerminal(["fix the tests\r"]);
+    expect(briefed).toHaveLength(1);
+
+    briefed.length = 0;
+    await driveRawTerminal(["\r", "   \r"]);
+    expect(briefed).toHaveLength(0);
   });
 });

@@ -59,6 +59,9 @@ import {
   type RollupDot,
 } from "./engine/workerRollup";
 import { withUnmergedWork } from "./engine/unmergedAttention";
+import { withNewAgentCalm } from "./engine/newAgentAttention";
+import { useNewAgentCalm } from "./hooks/useNewAgentCalm";
+import { useInteractionStore } from "./stores/interactionStore";
 import {
   withRedWorkerAttention,
   withUnstartedWorkerAttention,
@@ -83,6 +86,10 @@ const isRelayRed = (s: AgentTabStatus | undefined): boolean =>
  *  drifting as two hand-copied call stacks. Read today by the concierge feed (services/
  *  conciergeFeed) for its P0/P1/P2 banding. Order is the contract:
  *
+ *   0. `withNewAgentCalm` — a spawned-but-never-briefed agent reads `new` (GRAY) instead of the red
+ *      `blocked` statusEngine's 25s stall timer gives it for being quiet. FIRST, and on the RAW map,
+ *      so a briefless agent's false red is corrected before steps 1–2 can bubble it to an
+ *      orchestrator, where it would be indistinguishable from the parent's own.
  *   1. `withUnstartedWorkerAttention` — a worker whose worktree was cut but which never went live has
  *      NO status entry, so nothing downstream would call it red. Invents the red and bubbles it.
  *   2. `withRedWorkerAttention` — a worker that started and then went red paints its orchestrator.
@@ -109,8 +116,21 @@ export function publishedStatusFor(
   /** Optional out-param: receives the ids step (5) promoted from calm to `working`. Only the
    *  away-recap needs it — see withWorkerRollupGreen. Everything else ignores it. */
   promoted?: Set<string>,
+  /** Injected clock — see composeRollup. */
+  now?: number,
+  /** agentId → last terminal keystroke. Injected — see composeRollup. Defaults to the live store at
+   *  this OUTERMOST boundary, so ordinary callers keep working and the pure core stays pure. */
+  interaction: Record<string, number> = useInteractionStore.getState().lastAt,
 ): StatusMap {
-  const { published, dotOf } = composeRollup(agents, status, openIds, lastObserved, stageOf);
+  const { published, dotOf } = composeRollup(
+    agents,
+    status,
+    openIds,
+    lastObserved,
+    stageOf,
+    now,
+    interaction,
+  );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
 
@@ -129,8 +149,21 @@ export function rollupViewFor(
   openIds: ReadonlySet<string>,
   lastObserved: LastObservedMap,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
+  /** Injected clock — see composeRollup. */
+  now?: number,
+  /** agentId → last terminal keystroke. Injected — see composeRollup. Defaults to the live store at
+   *  this OUTERMOST boundary, so ordinary callers keep working and the pure core stays pure. */
+  interaction: Record<string, number> = useInteractionStore.getState().lastAt,
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
-  const { own, dotOf } = composeRollup(agents, status, openIds, lastObserved, stageOf);
+  const { own, dotOf } = composeRollup(
+    agents,
+    status,
+    openIds,
+    lastObserved,
+    stageOf,
+    now,
+    interaction,
+  );
   return { own, dotOf };
 }
 
@@ -141,20 +174,40 @@ function composeRollup(
   openIds: ReadonlySet<string>,
   lastObserved: LastObservedMap,
   stageOf: (id: string) => ReturnType<typeof resolveStage>,
+  /** Injected clock for step (0)'s spawn-age backstop. Defaults to now; passed explicitly by tests
+   *  so the time-dependent rule needs no fake timers (house style — stores/conciergeApprovals.ts). */
+  now: number = Date.now(),
+  /** agentId → when the user last typed into that agent's terminal. INJECTED, alongside `now`, for
+   *  the same reason: this composition is consumed by `buildConciergeFeed`, which documents itself
+   *  as pure and ALREADY receives this map as a parameter. Reading the global store in here made the
+   *  two independently sourced, so the feed could emit `since` from the caller's map and `status:
+   *  "new"` from an empty singleton — a self-contradictory payload for one agent — and made route 4
+   *  untestable through the feed except by mutating a module singleton (roborev 54771). Defaults to
+   *  empty, i.e. "never touched", which is the pre-route-4 behaviour rather than a crash. */
+  interaction: Record<string, number> = {},
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
+  // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
+  // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
+  // is indistinguishable from the parent's own once it lands, so this has to be corrected before it
+  // can spread. It cannot interfere with step (1): withUnstartedWorkerAttention invents a red for a
+  // STRANDED WORKER, and a worker carries its orchestrator's `task` as its brief, so it is never
+  // briefless. See engine/newAgentAttention.ts.
+  const calm = withNewAgentCalm(agents, status, now, interaction);
   // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
   // needs exactly this map — pre-unmerged, pre-dismissal — to answer "is this parent in motion?" and
   // "which reds has the user dismissed?".
   const bubbled = withRedWorkerAttention(
     agents,
-    withUnstartedWorkerAttention(agents, status, openIds, lastObserved),
+    withUnstartedWorkerAttention(agents, calm, openIds, lastObserved),
   );
   // (3)+(4) over the bubbled map: the published chain as it has always been.
   const published = withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf));
   // The same chain with the worker bubbles left OUT. Without it the rollup reads a bubbled red as
   // the head's OWN red and returns early, which makes every mixed subtree unreachable (the trap
-  // documented on rollupDotAccessor's `ownStatusOf`).
-  const own = withDismissedAlerts(agents, withUnmergedWork(agents, status, stageOf));
+  // documented on rollupDotAccessor's `ownStatusOf`). Built from `calm`, not `status`: this is the
+  // same chain minus steps (1)+(2), so feeding it the uncorrected map would make a row's OWN status
+  // disagree with its published one for exactly the briefless agents this change is about.
+  const own = withDismissedAlerts(agents, withUnmergedWork(agents, calm, stageOf));
   const dismissed = new Set(
     agents.filter((a) => alertControlKind(a.alert, bubbled[a.id]) === "reenable").map((a) => a.id),
   );
@@ -293,7 +346,7 @@ async function bringToFront(): Promise<void> {
 export { selectAndOpen } from "./services/agentReveal";
 
 export function useAttentionNotifications(): void {
-  const status = useRuntimeStore((s) => s.status);
+  const rawStatus = useRuntimeStore((s) => s.status);
   // NOTE (roborev 46897): branchStatus / workflowStage / openAgentIds are deliberately NOT
   // subscribed here any more. Their only consumer was the cross-window publish's overlay chain,
   // deleted with that channel — and `branchStatus` takes a fresh object identity on every poll, so
@@ -307,6 +360,19 @@ export function useAttentionNotifications(): void {
   const agents = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.agents ?? EMPTY_AGENTS,
   );
+  // The badge count and the banner edge-detector BOTH read this map, and both were firing for
+  // agents nobody had briefed: `errored` inside the spawn window inflates countAttention, and `idle`
+  // — which notifies by DEFAULT as "Finished — your turn" — is simply false about an agent that was
+  // never given a turn. withNewAgentCalm resolves those to `new`, which is in neither set. Same
+  // step (0) publishedStatusFor applies, so the banner and the row cannot describe an agent
+  // differently. Returns the SAME reference when nothing is corrected, so the effect below does not
+  // re-run on unrelated renders.
+  // Terminal keystrokes are recorded ONLY here (Terminal.onData → touch), so this is the only
+  // evidence a hand-driven agent has been briefed — see newAgentAttention route 4.
+  const interactionAt = useInteractionStore((s) => s.lastAt);
+  // Via the hook, not a bare memo: the backstop is a deadline, and an `errored` agent emits no
+  // further status writes to recompute one. See hooks/useNewAgentCalm (roborev 54743, finding 1).
+  const status = useNewAgentCalm(agents, rawStatus, interactionAt);
   const projectName = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.name ?? "",
   );

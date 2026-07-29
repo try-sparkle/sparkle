@@ -52,6 +52,7 @@ import { searchHistory } from "../history";
 import { useRuntimeStore, readPersistedOpenAgentIds } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
 import { useProjectStore } from "../../stores/projectStore";
+import { NEW_AGENT_GRACE_MS } from "../../engine/newAgentAttention";
 import {
   conciergeToolAuthority,
   type ConciergeToolAuthority,
@@ -93,6 +94,39 @@ function seedAgent(runtime: "local" | "cloud" = "local", status?: string) {
         name: "sparkle",
         path: "/tmp/p1",
         agents: [{ id: AGENT, name: "Retry logic", runtime } as never],
+      } as never,
+    ],
+  });
+  runtimeStateMock.mockReturnValue({
+    attentionScreen: {},
+    status: status ? { [AGENT]: status } : {},
+  } as never);
+}
+
+/**
+ * A JUST-SPAWNED agent: it carries a `createdAt` stamp and, unless `over` says otherwise, no brief
+ * of any kind. `seedAgent` above deliberately does NOT set `createdAt` — that models a legacy
+ * persisted row, whose behaviour must not change — so the two helpers are kept separate rather than
+ * one being taught a flag.
+ */
+function seedFreshAgent(status?: string, over: Record<string, unknown> = {}) {
+  useProjectStore.setState({
+    projects: [
+      {
+        id: "p1",
+        name: "sparkle",
+        path: "/tmp/p1",
+        agents: [
+          {
+            id: AGENT,
+            name: "Retry logic",
+            runtime: "local",
+            lastPrompt: "",
+            promptHistory: [],
+            createdAt: Date.now(),
+            ...over,
+          } as never,
+        ],
       } as never,
     ],
   });
@@ -705,6 +739,60 @@ describe("getAgentStatus", () => {
     seedAgent("local", "working");
     expect(getAgentStatus(AGENT).detail.length).toBeGreaterThan(0);
     expect(getAgentStatus("ghost-agent").detail.length).toBeGreaterThan(0);
+  });
+
+  // ── A freshly spawned, never-briefed agent is NEW, not BLOCKED ──────────────────────────────
+  //
+  // `needsYou` is derived from the red-COLOUR tier, and `blocked` is in it. An agent you spawned
+  // and hadn't briefed yet reached `blocked` 25 seconds later purely on statusEngine's stall timer
+  // (BLOCKED_MS) — it had asked nobody anything — so this tool answered `needsYou: true` and a
+  // concierge polling the fleet dutifully reported an agent that needed the human. See
+  // engine/newAgentAttention.ts. THIS SURFACE MUST AGREE WITH THE SIDEBAR: the whole point of
+  // adding a status rather than special-casing a colour is that the row, the banner and this tool
+  // cannot disagree about what the agent is.
+
+  it("does NOT report needsYou for a briefless, freshly spawned agent that went `blocked`", () => {
+    seedFreshAgent("blocked");
+    const s = getAgentStatus(AGENT);
+    expect(s.needsYou).toBe(false);
+    expect(s.status).toBe("new");
+  });
+
+  it("reports the settled `idle` of a never-briefed agent as `new`, not 'done — your turn'", () => {
+    seedFreshAgent("idle");
+    expect(getAgentStatus(AGENT).status).toBe("new");
+    expect(getAgentStatus(AGENT).needsYou).toBe(false);
+  });
+
+  it("STILL reports needsYou when that same fresh agent actually asks something", () => {
+    // The assertion that guards the change: an ask is evidence, and evidence beats the grace period.
+    for (const st of ["waiting", "approval"]) {
+      seedFreshAgent(st);
+      expect(getAgentStatus(AGENT).needsYou, st).toBe(true);
+      expect(getAgentStatus(AGENT).status, st).toBe(st);
+    }
+  });
+
+  it("STILL reports needsYou for a BRIEFED agent that goes blocked, however new it is", () => {
+    seedFreshAgent("blocked", { lastPrompt: "go build the thing" });
+    expect(getAgentStatus(AGENT).needsYou).toBe(true);
+    expect(getAgentStatus(AGENT).status).toBe("blocked");
+  });
+
+  it("holds an unclassifiable red inside the 5-minute backstop, and releases it after", () => {
+    seedFreshAgent("errored", { createdAt: Date.now() - 60_000 });
+    expect(getAgentStatus(AGENT).needsYou).toBe(false);
+
+    seedFreshAgent("errored", { createdAt: Date.now() - (NEW_AGENT_GRACE_MS + 60_000) });
+    expect(getAgentStatus(AGENT).needsYou).toBe(true);
+  });
+
+  it("leaves a legacy row with no spawn stamp exactly as it was", () => {
+    // No createdAt → age unknown → treated as old. This is what keeps the change from retroactively
+    // calming rows that have been red across a restart.
+    seedFreshAgent("blocked", { createdAt: undefined });
+    expect(getAgentStatus(AGENT).needsYou).toBe(true);
+    expect(getAgentStatus(AGENT).status).toBe("blocked");
   });
 });
 

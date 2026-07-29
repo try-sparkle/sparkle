@@ -21,6 +21,7 @@ function approval(over: Partial<ConciergeApproval> = {}): ConciergeApproval {
     riskClass: "irreversible",
     riskNote: "Permanently destroys something that cannot be recovered.",
     args: [{ key: "agentId", value: "kraken-auth" }],
+    rawArgs: { agentId: "kraken-auth" },
     configPath: "concierge.tools.discard_agent",
     fingerprint: "lifecycle.discard_agent#{}",
     requestedAt: 0,
@@ -86,7 +87,10 @@ describe("ApprovalPrompt", () => {
       />,
     );
     fireEvent.click(screen.getByLabelText("Approve workflow.merge_pr"));
-    expect(onApprove).toHaveBeenCalledWith("call-2");
+    // The WHOLE entry, not just its id: approving runs the call, and the runner replays it from the
+    // entry's own stored arguments (services/conciergeApprovalResume).
+    expect(onApprove).toHaveBeenCalledTimes(1);
+    expect((onApprove.mock.calls[0]?.[0] as { id: string } | undefined)?.id).toBe("call-2");
     fireEvent.click(screen.getByLabelText("Decline lifecycle.discard_agent"));
     expect(onDecline).toHaveBeenCalledWith("call-1");
   });

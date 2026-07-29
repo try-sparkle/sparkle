@@ -88,7 +88,7 @@ export const C = {
  * so a glance tells you only what you need to act on:
  *   GREEN  — running                              (working)
  *   RED    — needs your action                    (waiting, approval, errored, blocked)
- *   GRAY   — nothing is stopping you              (idle, done, stopped, unmerged)
+ *   GRAY   — nothing is stopping you              (idle, done, stopped, unmerged, new)
  * RED means the agent needs YOU before it can make progress: it's waiting on your input (a question
  * or an approval it drew on screen, OR a finished-turn ask the followup judge flagged as blocked on
  * you — see turnFollowup.ts / statusRouter.ts); OR it crashed/exited with an error; OR it went
@@ -134,6 +134,15 @@ const GRAY = C.muted; //   #8aa0c4 — not active (legible on navy)
 export const AGENT_STATUS = {
   working: { color: GREEN, label: "Working" }, // actively producing output
   idle: { color: GRAY, label: "Done — your turn" }, // finished its turn, nothing left for you
+  // Spawned, never briefed — the agent exists but nobody has given it anything to do. GRAY, and it
+  // is the ABSENCE of an alarm rather than a quiet one: it has never asked the human a question, so
+  // there is nothing here to answer. It exists because `blocked` used to cover this case and
+  // `blocked` is RED: an agent you spawned and hadn't got round to briefing yet went red 25 seconds
+  // later (statusEngine's BLOCKED_MS stall timer, which cannot tell "quiet because it is wedged"
+  // from "quiet because it has no work"), and raised a "Needs you" banner for a question nobody
+  // asked. That made red mean "an agent exists" on any fleet where agents are spawned ahead of
+  // being briefed. See engine/newAgentAttention.ts for the derivation and the 5-minute backstop.
+  new: { color: GRAY, label: "New — not briefed" },
   waiting: { color: RED, label: "Needs you" }, // asked a question (on-screen prompt)
   approval: { color: RED, label: "Approve?" }, // caution/dangerous action pending
   blocked: { color: RED, label: "Blocked" }, // went quiet / stalled — needs you to unstick it

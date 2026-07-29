@@ -75,7 +75,26 @@ export function newlyEntered(
   const out: Array<{ id: string; status: AgentTabStatus }> = [];
   for (const id of agentIds) {
     const ns = next[id];
-    if (ns !== undefined && ns !== prev[id] && enabled.has(ns)) out.push({ id, status: ns });
+    if (ns === undefined || ns === prev[id] || !enabled.has(ns)) continue;
+    // LEAVING `new` IS A RE-BASELINE, NOT AN ENTRY — but only for the two SYNTHETIC edges
+    // (roborev 54743 finding 2, narrowed by roborev 54830).
+    //
+    // `new` is an overlay, not something statusEngine emits: a briefless agent settles to raw `idle`
+    // and publishes as `new`. The moment somebody briefs it, `isBriefless` goes false and the
+    // published value flips `new` → `idle` — while the RAW status never moved, because the engine
+    // has not seen a spinner yet. That is a synthetic edge into `idle`, which notifies by default,
+    // so briefing an agent would fire "Finished — your turn" about an agent that just STARTED.
+    //
+    // ONLY `idle` and `blocked` can be produced that way, because they are the two statuses
+    // `calmNewAgent` maps UNCONDITIONALLY; suppressing anything broader is a real bug. This guard
+    // first read "not a demonstrated ask", which also swallowed `new` → `errored` — and that is
+    // precisely the edge the 5-minute backstop exists to produce. `errored` is terminal (the runtime
+    // store skips unchanged writes), so dropping it meant NO banner and NO phone push, ever, for a
+    // briefless agent that crashed inside the grace window: the exact "an agent that is genuinely
+    // broken must not stay hidden" promise on NEW_AGENT_GRACE_MS, negated by the guard meant to
+    // support it. Naming the two mappings explicitly keeps this honest as the taxonomy grows.
+    if (prev[id] === "new" && (ns === "idle" || ns === "blocked")) continue;
+    out.push({ id, status: ns });
   }
   return out;
 }
@@ -115,6 +134,17 @@ export function notificationFor(
     working: "Started working",
     blocked: "Blocked / stalled — needs you",
     unmerged: "Done — but not merged to main yet",
+    // OFF by default, but LIVE user-facing copy — not dead code. `new` is false in
+    // DEFAULT_NOTIFY_STATUSES and has no checkbox in NotificationsMenu, which deliberately omits the
+    // passive states. It is still enableable: the concierge op `set_notification_rule`
+    // (services/conciergeTools/settings.ts) is classified `routine`, so an agent may call it without
+    // asking, and it validates the requested status against the STORE's own key set rather than a
+    // curated list — `new` is in that set, `listNotificationRules` enumerates it, and the module says
+    // so on purpose ("a status added to DEFAULT_NOTIFY_STATUSES later is drivable the day it lands").
+    // So this string can reach a real banner. Worded accordingly, and worded so it cannot read as the
+    // agent asking for something: "you spawned this and haven't briefed it" is an observation about
+    // the human's own unfinished action, never a request from the agent.
+    new: "Spawned — waiting for you to brief it",
     stopped: "Stopped",
   };
   const glyph = statusGlyph(status);

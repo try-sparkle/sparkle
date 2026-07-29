@@ -58,6 +58,12 @@ export const DEFAULT_NOTIFY_STATUSES: Record<AgentTabStatus, boolean> = {
   // and does NOT ping by default — a finished agent's un-merged branch is a passive "when you get to
   // it" nudge, not a banner-worthy event.
   unmerged: false,
+  // `new` (spawned, never briefed) must NEVER ping by default. It is the absence of an ask: the
+  // agent has not asked for anything, so a banner would be the app telling the user about their own
+  // un-actioned intent. This default is the notification half of the false-"needs you" fix — the
+  // colour half is the GRAY token (packages/ui/tokens.ts) and the derivation is
+  // engine/newAgentAttention.ts. Still a toggle, for anyone who wants the reminder.
+  new: false,
   stopped: false,
 };
 

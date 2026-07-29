@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAuthStore } from "../../stores/authStore";
 
 import {
+  APPROVAL_GRANT_TTL_MS,
   approveApproval,
   clearConciergeApprovals,
   denyApproval,
@@ -155,7 +156,69 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
         policy: "approved",
       });
       // Single use. "Approve this removal" is not "may always remove projects".
-      expect(configuredToolPolicy(q)).toEqual({ tier: "ask", approvedByUser: false });
+      const spent = configuredToolPolicy(q);
+      expect(spent).toEqual({ tier: "ask", approvedByUser: false });
+    });
+
+    it("MARKS a repeat inside the grant window instead of asking as if it were new", () => {
+      // A spent grant still inside its window means the call already ran (approving dispatches
+      // immediately — services/conciergeApprovalResume). The model does not know that, so it can ask
+      // again; the card must SAY so, or the human answers an identical-looking question and the op
+      // runs twice.
+      const q = query("remove_project", true, { projectId: "p1" });
+      configuredToolPolicy(q);
+      approveApproval("call-1");
+      configuredToolPolicy(q); // spends it
+
+      configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-2"));
+      expect(findApproval("call-2")?.ranRecently).toBe(true);
+    });
+
+    it("does NOT lock the repeat out — the human can still say yes", () => {
+      // An earlier version refused these outright while telling the human to "ask again if you did
+      // mean to do it twice", which produced the same fingerprint and the same refusal — a remedy
+      // that did not exist (roborev 54729, finding 1). A deliberate repeat must stay reachable.
+      const q = query("remove_project", true, { projectId: "p1" });
+      configuredToolPolicy(q);
+      approveApproval("call-1");
+      configuredToolPolicy(q);
+
+      configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-2"));
+      approveApproval("call-2");
+      expect(
+        configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-3")),
+      ).toEqual({ tier: "ask", approvedByUser: true, approvedForToolCallId: "call-3" });
+    });
+
+    it("shows ONE live question when the same call is asked twice before anyone answers", () => {
+      // Ids are minted per call and claimApproval authorises each by id, so two identical PENDING
+      // cards would mean two approvals and two runs for one intention (roborev 54729, finding 2).
+      configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-1"));
+      configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-2"));
+      expect(pendingApprovals()).toHaveLength(1);
+      expect(findApproval("call-2")).toBeUndefined();
+    });
+
+    it("stops marking once the spent grant's window has passed", () => {
+      const q = query("remove_project", true, { projectId: "p1" });
+      configuredToolPolicy(q);
+      approveApproval("call-1");
+      configuredToolPolicy(q); // spends it
+
+      // Past APPROVAL_GRANT_TTL_MS the entry is no longer live, so a repeat reads as a fresh
+      // intention and is put back in front of the human rather than being refused forever.
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(Date.now() + APPROVAL_GRANT_TTL_MS + 1_000);
+        expect(
+          configuredToolPolicy(query("remove_project", true, { projectId: "p1" }, "call-later")),
+        ).toEqual({
+          tier: "ask",
+          approvedByUser: false,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     // The concierge is one `claude -p` process per turn, so the approval has to outlive the turn

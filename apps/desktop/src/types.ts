@@ -129,6 +129,15 @@ export interface AgentTab {
   // Optional — legacy persisted records read as undefined and keep the pre-existing behaviour
   // exactly (no migration step, no retroactive shielding).
   createdAt?: number;
+  // Epoch ms of the first line the user SUBMITTED straight into this agent's terminal. Persisted,
+  // and that is the whole point: it is the durable twin of `interactionStore.lastAt`, which is
+  // in-memory only. An agent driven entirely by hand has empty `lastPrompt`/`promptHistory`, so
+  // without this its brief evaporated on relaunch and engine/newAgentAttention would call it
+  // "spawned, never briefed" again — rendering a genuinely wedged agent calm gray instead of red,
+  // indefinitely, because that mapping is deliberately not time-limited. `createdAt` above survives
+  // a restart, so the evidence that answers it has to survive one too (roborev 54771).
+  // Optional: legacy rows read as undefined and keep their exact prior behaviour.
+  terminalBriefedAt?: number;
 }
 
 export interface Project {

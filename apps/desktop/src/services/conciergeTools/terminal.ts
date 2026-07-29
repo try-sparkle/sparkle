@@ -70,6 +70,8 @@ import { searchHistory } from "../history";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { isRedStatus } from "../windowStatus";
 import { isObserved, livenessOf, type AgentLiveness } from "../agentLiveness";
+import { calmNewAgent } from "../../engine/newAgentAttention";
+import { useInteractionStore } from "../../stores/interactionStore";
 import { useProjectStore } from "../../stores/projectStore";
 import {
   useRuntimeStore,
@@ -563,7 +565,29 @@ function statusDetail(
 export function getAgentStatus(agentId: string): AgentStatusReport {
   const agent = findAgent(agentId);
   const rt = useRuntimeStore.getState();
-  const status = rt.status[agentId];
+  // The raw runtime status, CORRECTED for "spawned but never briefed" (engine/newAgentAttention).
+  // A briefless agent reaches `blocked` on statusEngine's 25s stall timer having asked nobody
+  // anything, and `blocked` is in the red-colour tier `needsYou` is derived from — so without this
+  // the tool answered `needsYou: true` for every agent the user had spawned and not yet briefed,
+  // which is the single most expensive FALSE POSITIVE this API can produce (it is what a concierge
+  // polls to find the agent that is stuck). Applied HERE, on the same map every other surface reads,
+  // rather than as a special case on the boolean: `status` is reported to the caller too, and a tool
+  // that said `blocked` while the sidebar said `new` would just move the disagreement.
+  //
+  // `livenessOf` deliberately keeps asking the RAW map: it answers "did this window observe this
+  // agent at all", which is a question about the entry's existence, not its value.
+  const status = agent
+    ? calmNewAgent(
+        rt.status[agentId],
+        agent,
+        Date.now(),
+        // Route 4: the LIVE (in-memory) record of a brief typed straight into the terminal pane.
+        // Not the only one any more — route 5 (`agent.terminalBriefedAt`) rides along on the agent
+        // record passed above and is what makes the answer survive a relaunch, which this
+        // session-scoped map cannot. See engine/newAgentAttention.
+        useInteractionStore.getState().lastAt[agentId],
+      )
+    : rt.status[agentId];
   const openIds = new Set(
     mergeOpenAgentIds(rt.openAgentIds ?? [], readPersistedOpenAgentIds()),
   );

@@ -1025,7 +1025,14 @@ function AgentPaneInner({
               // decrement. Now UNCONDITIONAL: with the composer gone this is the only in-terminal
               // send path (the concierge dispatch meters its own — see conciergeDispatch).
               // recordTrialSend self-gates, no-opping for entitled users.
-              onSubmitLine={() => void recordTrialSend()}
+              onSubmitLine={() => {
+                void recordTrialSend();
+                // ROUTE 5 of engine/newAgentAttention.isBriefless, and the only DURABLE evidence a
+                // hand-driven agent was ever briefed. interactionStore is in-memory, so on its own
+                // it loses this on relaunch while the persisted `createdAt` gate survives — and a
+                // wedged agent would then read calm gray "New — not briefed" forever. Write-once.
+                useProjectStore.getState().noteTerminalBrief(project.id, agent.id);
+              }}
               focusRef={termFocusRef}
               apiRef={terminalApiRef}
             />

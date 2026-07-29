@@ -920,14 +920,21 @@ export async function dispatchConciergeTool(
       //
       // The dispatch does NOT wait: the concierge is a `claude -p` child, one process per turn, and
       // holding this call would hold the turn (and the bridge's 600s round trip) hostage on a human
-      // who may be away. So the question is raised in the column and the answer is recorded for the
-      // NEXT turn to spend — which is exactly what this sentence tells the model to do.
+      // who may be away. So the question is raised in the column and answered there.
+      //
+      // AND THE APPROVAL RUNS IT — do not tell the model otherwise. This used to end "approve it
+      // there and then tell me to go ahead, and I'll run it", which was true when a grant could only
+      // be spent by a later retry. Approving now dispatches at click time
+      // (services/conciergeApprovalResume), so that sentence invites a DUPLICATE: the human
+      // approves (it runs), obediently says "go ahead", and the model calls again for something
+      // already done. `policyBinding` refuses that repeat, but the honest fix is not to ask for it —
+      // a refusal the model was told to trigger is a refusal that should not have been provoked.
       const settings = `To stop being asked each time, set \`${conciergeToolConfigPath(op)}\` to "Allow" in Settings → Concierge tools.`;
       return err(
         ctx,
         REGISTRY_CODES.needsApproval,
         toolCallId
-          ? `${domain}.${op} needs your go-ahead. I've put an approval request in your Sparkle column — approve it there and then tell me to go ahead, and I'll run it. ${settings}`
+          ? `${domain}.${op} needs your go-ahead. I've put an approval request in your Sparkle column — approving it there runs it, so there's nothing more for you to tell me. ${settings}`
           : `${domain}.${op} needs your go-ahead, but this call carries no tool-call id, so there is nothing to attach an approval to and I can't raise the prompt. ${settings}`,
       );
     }

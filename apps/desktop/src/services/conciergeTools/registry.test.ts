@@ -631,7 +631,10 @@ describe("dispatchConciergeTool — the policy seam", () => {
     // retry, and exactly which config key turns the asking off.
     const message = refusal(r).message;
     expect(message).toContain("approval request in your Sparkle column");
-    expect(message).toContain("tell me to go ahead");
+    // The refusal must NOT ask the human to come back and say "go ahead". Approving in the column
+    // dispatches the call itself now, so inviting a follow-up invites a DUPLICATE run.
+    expect(message).toContain("approving it there runs it");
+    expect(message).not.toContain("tell me to go ahead");
     expect(message).toContain("concierge.tools.remove_project");
     expect(message).toContain("Settings → Concierge tools");
   });

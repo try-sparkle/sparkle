@@ -38,6 +38,8 @@ function ask(
     riskNote: "Permanently destroys something that cannot be recovered.",
     args: [{ key: "agentId", value: "a1" }],
     configPath: `concierge.tools.${op}`,
+    // The verbatim copy the replay runs from — the same value the fingerprint below is taken over.
+    rawArgs: { agentId: "a1" },
     fingerprint: approvalFingerprint(domain, op, { agentId: "a1" }),
     ...overrides,
   };
@@ -99,14 +101,39 @@ describe("conciergeApprovals — the ledger that makes `ask` mean something", ()
       expect(claimApproval("call-2", other, T0 + 2)).toBe(false);
     });
 
-    it("spends only ONE grant when two identical calls were approved", () => {
+    it("collapses two identical LIVE questions into one, so one intention cannot be approved twice", () => {
+      // Ids are minted per call, so a model refused once and retrying before anyone clicks used to
+      // mint a second identical card — and since a claim is authorised per id, approving both ran
+      // the op twice for one intention (roborev 54729, finding 2). The same call asked again while
+      // it is still unanswered now returns the card already waiting.
       const req = ask("call-1");
-      ask("call-2");
+      // Asserted on what the LEDGER returns, not on the request we handed it: `ask` echoes its own
+      // input back, so reading its id would prove nothing about the dedupe.
+      const again = requestApproval({ ...req, id: "call-2" }, T0);
+      expect(again?.id).toBe("call-1");
+      expect(findApproval("call-2")).toBeUndefined();
+      expect(pendingApprovals(undefined, T0)).toHaveLength(1);
+
       approveApproval("call-1", T0 + 1);
-      approveApproval("call-2", T0 + 1);
       expect(claimApproval("retry-a", req.fingerprint, T0 + 2)).toBe(true);
+      // …and it is spent exactly once: there is no second grant hiding behind it.
       expect(findApproval("call-1")?.spent).toBe(true);
-      expect(findApproval("call-2")?.spent).toBe(false);
+      expect(claimApproval("retry-b", req.fingerprint, T0 + 3)).toBe(false);
+    });
+
+    it("still spends only ONE grant when a repeat legitimately follows a spent one", () => {
+      // Once the first grant is spent, an identical call is a genuine new question (marked
+      // `ranRecently` by the policy binding) and does get its own entry. Each claim must consume
+      // exactly one of them.
+      const req = ask("call-1");
+      approveApproval("call-1", T0 + 1);
+      expect(claimApproval("retry-a", req.fingerprint, T0 + 2)).toBe(true);
+
+      ask("call-2", {}, T0 + 3);
+      approveApproval("call-2", T0 + 4);
+      expect(claimApproval("retry-b", req.fingerprint, T0 + 5)).toBe(true);
+      expect(findApproval("call-2")?.spent).toBe(true);
+      expect(claimApproval("retry-c", req.fingerprint, T0 + 6)).toBe(false);
     });
   });
 

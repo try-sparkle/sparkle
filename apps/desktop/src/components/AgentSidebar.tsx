@@ -88,6 +88,11 @@ import {
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
+import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
+
+/** Stable empty list, so the hook below is not handed a fresh `[]` on every render before a project
+ *  resolves — a new array identity each time would re-arm its grace timer forever. */
+const NO_AGENTS: readonly AgentTab[] = [];
 import { AlertToggleButton } from "./AlertToggleButton";
 import { reconcileWorkMode } from "../engine/workMode";
 import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
@@ -302,6 +307,17 @@ export function AgentSidebar({
   // blocking) would render GRAY. Overlay RED ("Approve?") on the strand and bubble it to the parent
   // so the orchestrator row goes red — matching the TopBar dot cluster. No-op (same ref) when
   // nothing is stranded.
+  // Terminal keystrokes land here and nowhere else (Terminal.onData → touch), so this is the ONLY
+  // evidence that an agent driven by hand in the pane has in fact been briefed. Step (0) needs it or
+  // it would keep calling such an agent "New — not briefed" forever. See newAgentAttention route 4.
+  const interactionAt = useInteractionStore((s) => s.lastAt);
+  // Step (0), hoisted out of the memo below and into the hook that owns its CLOCK. The backstop is
+  // a deadline and an `errored` agent emits no further status writes, so a bare
+  // `useMemo(… Date.now() …)` here would hold such a row gray forever (roborev 54743, finding 1).
+  // Same position in the chain as before — see the comment inside the memo.
+  const s0 = useNewAgentCalm(project?.agents ?? NO_AGENTS, liveStatus, interactionAt);
+  // The same wake-up, exposed as a value so the rollup memo far below can depend on it too.
+  const graceTick = useNewAgentGraceTick(project?.agents ?? NO_AGENTS, liveStatus, interactionAt);
   const status = useMemo(() => {
     if (!project) return liveStatus;
     // Two attention overlays, composed: (1) an unstarted worker gets a synthetic red + bubbles to
@@ -309,9 +325,17 @@ export function AgentSidebar({
     // services/windowStatus.isRedStatus) — bubbles its own red to its orchestrator so the
     // orchestrator floats up and shows red. Order matters — run (2) after
     // (1) so a strand's synthetic red also bubbles.
-    const s1 = withUnstartedWorkerAttention(project.agents, liveStatus, openIds, lastObserved);
+    // (0) FIRST, on the raw map: a spawned-but-never-briefed agent reads `new` (GRAY) rather than
+    // the red `blocked` statusEngine's 25s stall timer hands it for being quiet. Before the bubbles,
+    // for the reason spelled out on publishedStatusFor's step (0) — once a red has bubbled to an
+    // orchestrator it is indistinguishable from that row's own. Keeping the same position here is
+    // what keeps this chain equal to publishedStatusFor's (see the CONCIERGE BANDING NOTE below).
+    // `s0` is that step, computed by useNewAgentCalm above so the 5-minute backstop has a clock.
+    // It feeds (1) in place of the raw map; `lastObserved` (origin/main, sparkle-w340) is unrelated
+    // and rides along untouched.
+    const s1 = withUnstartedWorkerAttention(project.agents, s0, openIds, lastObserved);
     return withRedWorkerAttention(project.agents, s1);
-  }, [project, liveStatus, openIds, lastObserved]);
+  }, [project, liveStatus, openIds, s0, lastObserved]);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
   // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
@@ -1401,7 +1425,13 @@ export function AgentSidebar({
       rollupViewFor(project?.agents ?? [], liveStatus, new Set(openAgentIds), lastObserved, (id) =>
         resolveStage(branchStatus[id], workflowStage[id]),
       ),
-    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage],
+    // `graceTick` is deliberate: this memo runs step (0) with an internally-sampled clock, and for a
+    // held `errored` agent none of the other deps ever change again — so the row's disc and its
+    // "Needs you" chip would stay gray `new` while `status` above had already gone red. The two
+    // disagreeing inside one component is exactly what this shared tick exists to prevent
+    // (roborev 54830).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick],
   );
   const rowBandOf = useCallback((id: string) => bandOfRollup(rollupOf(id)), [rollupOf]);
 

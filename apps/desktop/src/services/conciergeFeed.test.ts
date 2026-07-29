@@ -125,6 +125,36 @@ describe("buildConciergeFeed — status banding + status tokens", () => {
     expect(byId["calm"]).toMatchObject({ band: "done", status: "idle", statusColor: GRAY });
   });
 
+  it("honours the INJECTED interaction map, not a global store — a touched agent bands red", () => {
+    // The feed documents itself as pure and already receives `interaction`; the status composition
+    // used to read `useInteractionStore` directly instead, so the two were independently sourced.
+    // A caller supplying a synthetic map (the intended injection point, mirroring the injected
+    // `now`) had route 4 silently ignored, and the payload could carry `since` from the caller's map
+    // beside `status: "new"` from an empty singleton — self-contradictory for one agent
+    // (roborev 54771).
+    const briefless = agent("hand", { createdAt: 1_000 });
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [briefless])],
+      status: { hand: "blocked" },
+      interaction: { hand: 2_000 },
+    });
+    const row = flat(feed)[0]!;
+    // Briefed by hand → its `blocked` is a REAL red, not "New — not briefed".
+    expect(row.status).toBe("blocked");
+    expect(row.band).toBe("needs_you");
+    // …and `since` comes from the same map, so the two halves of the payload agree.
+    expect(row.since).toBe(2_000);
+  });
+
+  it("still calls an untouched briefless agent `new` when the injected map is empty", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("fresh", { createdAt: 1_000 })])],
+      status: { fresh: "blocked" },
+      interaction: {},
+    });
+    expect(flat(feed)[0]!.status).toBe("new");
+  });
+
   it("defaults an agent with no status anywhere to stopped/done/gray (buildRoster's default)", () => {
     const feed = buildConciergeFeed({ projects: [project("p1", [agent("a1")])], status: {} });
     expect(flat(feed)[0]).toMatchObject({

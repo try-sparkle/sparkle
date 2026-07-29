@@ -18,7 +18,7 @@
 // it would run with. All of that prose comes from `policy.ts`'s tables by way of the ledger entry —
 // nothing is written here, so the card cannot drift from the classification it is quoting.
 import type { CSSProperties } from "react";
-import { FiAlertTriangle, FiCheck, FiSettings, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiCheck, FiRepeat, FiSettings, FiX } from "react-icons/fi";
 
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import type { ConciergeApproval } from "../../stores/conciergeApprovals";
@@ -27,7 +27,9 @@ import { RADIUS, TYPE } from "../../theme/scale";
 export interface ApprovalPromptProps {
   /** Every unanswered request, oldest first (stores/conciergeApprovals.pendingApprovals). */
   approvals: readonly ConciergeApproval[];
-  onApprove: (id: string) => void;
+  /** Takes the whole entry, not just its id, because approving now RUNS the call and the runner
+   *  replays it from the entry's own stored arguments (services/conciergeApprovalResume). */
+  onApprove: (approval: ConciergeApproval) => void;
   onDecline: (id: string) => void;
   /**
    * "Don't ask me about this again." Writes the SETTINGS override
@@ -89,6 +91,18 @@ function ApprovalCard({
         <span style={opName}>{`${approval.domain}.${approval.op}`}</span>
       </div>
 
+      {/* ALREADY RAN? Say it before anything else on the card. The commonest way to arrive here is
+          a human who approved this a moment ago, was asked to say "go ahead", and did — so the
+          honest reading of a second identical card is "you have already done this", and without
+          that line the card is indistinguishable from the first one. Deliberate repeats are
+          legitimate and still one click away; this only makes sure the click is informed. */}
+      {approval.ranRecently && (
+        <div data-testid="approval-ran-recently" style={ranNote}>
+          <FiRepeat size={11} aria-hidden />
+          <span>This already ran a moment ago. Approving runs it again.</span>
+        </div>
+      )}
+
       {/* WHAT IT WILL DO — the catalog's own one-liner, then the risk map's own note. */}
       <div style={{ fontSize: TYPE.body, color: C.cream }}>{approval.summary}</div>
       {approval.riskNote && (
@@ -116,7 +130,7 @@ function ApprovalCard({
           // Names the TOOL, not just "Approve": with two cards stacked, a screen-reader user
           // tabbing through identical buttons has no way to tell which call each one answers.
           aria-label={`Approve ${approval.domain}.${approval.op}`}
-          onClick={() => onApprove(approval.id)}
+          onClick={() => onApprove(approval)}
           style={approveBtn}
         >
           <FiCheck size={12} aria-hidden /> Approve once
@@ -202,6 +216,21 @@ const opName: CSSProperties = {
   overflow: "hidden",
   textOverflow: "ellipsis",
   whiteSpace: "nowrap",
+};
+
+// Deliberately louder than the risk note and quieter than the buttons: it is a correction to the
+// reader's assumption, not a new risk. Same sienna the card already uses.
+const ranNote: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 5,
+  marginBottom: 6,
+  padding: "5px 7px",
+  borderRadius: RADIUS.sm,
+  fontSize: TYPE.small,
+  color: C.dangerInk,
+  background: `color-mix(in srgb, ${ACCENT} 14%, transparent)`,
+  border: `1px solid color-mix(in srgb, ${ACCENT} 45%, transparent)`,
 };
 
 const argsBlock: CSSProperties = {

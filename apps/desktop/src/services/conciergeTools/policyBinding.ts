@@ -45,6 +45,7 @@ import {
   approvalFingerprint,
   claimApproval,
   describeApprovalArgs,
+  recentlyRan,
   requestApproval,
 } from "../../stores/conciergeApprovals";
 import { useSettingsStore } from "../../stores/settingsStore";
@@ -156,6 +157,22 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     return { tier: "ask", approvedByUser: true, approvedForToolCallId: c.id };
   }
 
+  // ALREADY RUN MOMENTS AGO? Still ask — but SAY SO on the card.
+  //
+  // Approving dispatches at click time (services/conciergeApprovalResume), and the model's turn had
+  // already ended in a refusal, so it does not know the call ran. A human who follows the refusal's
+  // advice and says "go ahead" makes it call again. The danger is an UNINTENDED second send; the
+  // requirement is that an INTENDED one stays possible.
+  //
+  // An earlier version refused these outright and told the human to "ask me again if you did mean to
+  // do it twice" — which produced the same arguments, the same fingerprint, and the same refusal, so
+  // the remedy it named did not exist and a legitimate repeat (`send_to_agent_terminal` with "continue"
+  // twice, `push_agent_branch` after another commit) was simply blocked for five minutes with no way
+  // through (roborev 54729, finding 1). Marking the card instead puts the judgement where it belongs:
+  // the human is told it already happened and decides. Declining costs one click; the accidental
+  // double-send it prevents cost a duplicated brief.
+  const ranRecently = recentlyRan(fingerprint) !== undefined;
+
   const entry = CATALOG_BY_NAME.get(c.op);
   const riskClass = c.evaluation.riskClass;
   requestApproval({
@@ -168,8 +185,12 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     riskClass,
     riskNote: riskClass ? CONCIERGE_RISK_NOTE[riskClass] : "",
     args: describeApprovalArgs(c.args),
+    // The same value the fingerprint above was computed from, kept verbatim so approving can replay
+    // this exact call instead of waiting for the model to reproduce it. See the ledger's `rawArgs`.
+    rawArgs: c.args,
     configPath: entry?.configPath ?? conciergeToolConfigPath(c.op),
     fingerprint,
+    ranRecently,
   });
   return { tier: "ask", approvedByUser: false };
 }

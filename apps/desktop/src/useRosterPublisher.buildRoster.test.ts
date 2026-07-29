@@ -27,6 +27,53 @@ describe("buildRoster", () => {
   });
 });
 
+// The phone and the helper island read this payload and paint a dot from `status_color`. Their whole
+// job is a glanceable "what needs me", so relaying a briefless agent's stall-timer `blocked` (RED)
+// puts a false alarm on the one surface with no room to explain itself. See
+// engine/newAgentAttention.ts; `now` is passed rather than faked.
+describe("a spawned-but-never-briefed agent relays as `new`, not red `blocked`", () => {
+  const SPAWN = 1_000_000;
+  const GREY = "#8aa0c4";
+  const RED = "#e0533f";
+
+  /** `over` lets a case add a brief or drop the spawn stamp. */
+  const projectWith = (over: Record<string, unknown> = {}): Project => ({
+    id: "p1", name: "Proj", rootPath: "/p", defaultBranch: "main",
+    createdAt: "", selectedAgentId: null,
+    agents: [
+      { id: "a1", name: "Build", kind: "build", parentId: null, runtime: "local",
+        lastPrompt: "", promptHistory: [], createdAt: SPAWN, ...over } as any,
+    ],
+  });
+
+  const agent = (p: Project, status: Record<string, any>, now: number) =>
+    buildRoster([p], status, {}, {}, now).projects[0]!.agents[0]!;
+
+  it("relays `new` in grey for a briefless agent the stall timer marked blocked", () => {
+    const a = agent(projectWith(), { a1: "blocked" }, SPAWN + 60_000);
+    expect(a.status).toBe("new");
+    expect(a.status_color).toBe(GREY);
+  });
+
+  it("STILL relays red when that agent actually asks something", () => {
+    const a = agent(projectWith(), { a1: "waiting" }, SPAWN + 60_000);
+    expect(a.status).toBe("waiting");
+    expect(a.status_color).toBe(RED);
+  });
+
+  it("STILL relays red `blocked` for a BRIEFED agent", () => {
+    const a = agent(projectWith({ lastPrompt: "build it" }), { a1: "blocked" }, SPAWN + 60_000);
+    expect(a.status).toBe("blocked");
+    expect(a.status_color).toBe(RED);
+  });
+
+  it("leaves a legacy row with no spawn stamp exactly as it was", () => {
+    const a = agent(projectWith({ createdAt: undefined }), { a1: "blocked" }, SPAWN + 60_000);
+    expect(a.status).toBe("blocked");
+    expect(a.status_color).toBe(RED);
+  });
+});
+
 // Regression guard for the `publish_window_roster failed unexpected end of hex escape` flood.
 // recentPrompts caps each prompt at 80 chars. A naive UTF-16 `slice(0, 80)` cuts a non-BMP
 // character's surrogate pair in half, leaving a lone leading surrogate that serde_json refuses to

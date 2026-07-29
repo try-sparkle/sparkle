@@ -10,8 +10,13 @@ import { SettingCheckbox } from "./SettingCheckbox";
 //
 // We surface the statuses a user actually reasons about — the red tier (needs you / crashed) and
 // the finished tier (your turn / done). The remaining states are intentionally NOT offered:
-// `working` flips on every turn (notification spam) and `blocked`/`stopped` are passive. They stay
-// off and unlisted; widen this list if that changes.
+// `working` flips on every turn (notification spam) and `blocked`/`stopped`/`new` are passive. They
+// stay off and UNLISTED HERE — which is not the same as unreachable: `set_notification_rule`
+// (services/conciergeTools/settings.ts) validates against the store's own key set, so the concierge
+// can still turn any of them on. Widen this list if that changes. (`new` — spawned, never briefed —
+// is the strongest case for staying out of the UI: it is the ABSENCE of an ask, so a banner for it
+// would be the app reminding the user about their own un-actioned intent. See
+// engine/newAgentAttention.ts.)
 const NOTIFY_OPTIONS: Array<{ status: AgentTabStatus; label: string }> = [
   { status: "waiting", label: "Needs your answer (a question)" },
   { status: "approval", label: "Needs your approval" },

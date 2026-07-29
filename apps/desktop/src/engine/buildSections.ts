@@ -164,6 +164,13 @@ export const STATUS_BANDS: readonly StatusBandMeta[] = [
 // the work hasn't landed" — and WHERE that work got to is now carried by the stage section it sits
 // in, not by its status. That's the whole division of labor: section = how far the work got,
 // dot = whether the agent needs you.
+//
+// `new` (spawned, never briefed — engine/newAgentAttention) also lands in "done", and what matters
+// is which band it is kept OUT of: "needs_you" is the band the concierge digest COUNTS and the
+// filter chip narrows, so banding an un-briefed agent there produces exactly the false "N agents
+// need you" that status was added to kill. "done" overstates it slightly — nothing was done — but
+// the vocabulary is three-valued (see STATUS_BANDS) and "nothing is stopping you" is the right one
+// of the three.
 export function bandOfStatus(status: AgentTabStatus): StatusBand {
   switch (status) {
     case "waiting":
@@ -177,6 +184,7 @@ export function bandOfStatus(status: AgentTabStatus): StatusBand {
     case "done":
     case "stopped":
     case "unmerged":
+    case "new":
       return "done";
   }
 }

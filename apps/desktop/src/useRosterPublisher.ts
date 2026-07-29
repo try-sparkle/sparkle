@@ -12,7 +12,7 @@
 // agent carries up to 4 recent prompt snippets: publishing all of it sent real prompt text from
 // projects the user hasn't touched in months to the relay, on every status tick, in a payload that
 // grew without bound (roborev 46258-M1).
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { AGENT_STATUS, type AgentTabStatus } from "@sparkle/ui";
 import { pushRoster, type RosterPayload } from "./services/relayClient";
 import { publishWindowRoster } from "./services/attention";
@@ -26,6 +26,8 @@ import {
   wasProjectVisited,
 } from "./services/sessionProjects";
 import { agentDisplayName } from "./engine/agentDisplayName";
+import { calmNewAgent } from "./engine/newAgentAttention";
+import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
 import { composerPrompts } from "./components/promptHistory";
 import { safeTruncate, sanitizeJsonStrings, stripLoneSurrogates } from "./services/safeText";
 import type { AgentTab, Project } from "./types";
@@ -94,13 +96,22 @@ export function buildRoster(
   status: Record<string, AgentTabStatus>,
   workflowStage: Record<string, string>,
   interaction: Record<string, number>,
+  /** Injected clock for the spawn-age backstop in `calmNewAgent`. Defaults to now; tests pass it
+   *  explicitly rather than faking timers (house style — stores/conciergeApprovals.ts). */
+  now: number = Date.now(),
 ): RosterPayload {
   return sanitizeJsonStrings<RosterPayload>({
     projects: projects.map((p) => ({
       id: p.id,
       name: p.name,
       agents: p.agents.map((a) => {
-        const st = status[a.id] ?? DEFAULT_STATUS;
+        // Corrected for "spawned but never briefed" before the colour token is read, so the phone
+        // and the helper island paint the same dot the desktop sidebar does. Without it a briefless
+        // agent relays as red `blocked` — statusEngine's 25s stall timer — to a surface whose whole
+        // job is a glanceable "what needs me". See engine/newAgentAttention.ts.
+        // `interaction` is already a parameter here (it feeds lastActivityAt), so route 4 —
+        // "the user has typed into this agent's terminal" — costs nothing to honour.
+        const st = calmNewAgent(status[a.id], a, now, interaction[a.id]) ?? DEFAULT_STATUS;
         const tok = AGENT_STATUS[st] ?? AGENT_STATUS[DEFAULT_STATUS];
         return {
           id: a.id,
@@ -131,6 +142,17 @@ export function useRosterPublisher(): void {
   // user opens a tab that has no live agent yet (its project becomes publishable at that moment).
   const visitedVersion = useSyncExternalStore(onVisitedProjectsChange, visitedProjectsVersion, () => 0);
 
+  // The spawn-age backstop inside `calmNewAgent` is a DEADLINE, and this effect only re-runs when
+  // its inputs change — which, for the `errored` agent the backstop exists to eventually surface,
+  // never happens again. Without this the phone/menu-bar roster would keep publishing `new` forever
+  // while `get_agent_status` (which samples the clock per call) said `errored` (roborev 54743,
+  // finding 1). One timer, aimed at the soonest pending expiry.
+  const graceTick = useNewAgentGraceTick(
+    useMemo(() => projects.flatMap((p) => p.agents), [projects]),
+    status,
+    interaction,
+  );
+
   useEffect(() => {
     // Coalesce rapid changes into one push.
     const t = setTimeout(() => {
@@ -149,5 +171,14 @@ export function useRosterPublisher(): void {
       publishWindowRoster(label, full.projects);
     }, 250);
     return () => clearTimeout(t);
-  }, [projects, status, workflowStage, openAgentIds, interaction, visitedVersion, label]);
+  }, [
+    projects,
+    status,
+    workflowStage,
+    openAgentIds,
+    interaction,
+    visitedVersion,
+    label,
+    graceTick,
+  ]);
 }

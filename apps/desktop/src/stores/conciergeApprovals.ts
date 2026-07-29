@@ -117,10 +117,36 @@ export interface ConciergeApprovalRequest {
   riskNote: string;
   /** Display-safe argument lines. Build with {@link describeApprovalArgs}. */
   args: readonly ApprovalArgLine[];
+  /**
+   * The model's RAW arguments, retained verbatim — never rendered.
+   *
+   * Held so that approving can REPLAY the exact call the human was shown, rather than authorising a
+   * re-issue the model has to compose from memory. That distinction is the whole bug this field
+   * exists to close: `args` above is display-safe (truncated at {@link ARG_VALUE_MAX_CHARS},
+   * secret-ish values masked), so it is lossy by design and cannot be executed. Without a verbatim
+   * copy, the only way to spend an approval was for the model to retype every argument
+   * byte-identically on a later turn so {@link approvalFingerprint} matched — which is fine for
+   * `{projectId: "p1"}` and effectively impossible for a multi-paragraph `text:` brief. Those calls
+   * could be approved but never actually run.
+   *
+   * NOT a widening of authority: this is the same value the fingerprint was computed from, so a
+   * replay can only ever be the call the human read and agreed to.
+   */
+  rawArgs: unknown;
   /** `concierge.tools.<op>` — named in the card so "stop asking me" is one click from discoverable. */
   configPath: string;
   /** Canonical identity of this exact call. Build with {@link approvalFingerprint}. */
   fingerprint: string;
+  /**
+   * True when an identical call ALREADY RAN moments ago off a human's approval.
+   *
+   * The card says so. This is what makes a deliberate repeat possible without making an accidental
+   * one easy: the human is told the thing already happened and decides, rather than the clock
+   * deciding for them (roborev 54729, finding 1 — an earlier version refused these outright while
+   * telling the human to "ask again if you did mean to do it twice", which produced the same
+   * fingerprint and the same refusal, so the remedy it named did not exist).
+   */
+  ranRecently?: boolean;
 }
 
 export interface ConciergeApproval extends ConciergeApprovalRequest {
@@ -259,6 +285,13 @@ function blank(id: unknown): boolean {
  * IDEMPOTENT per id: asking again about an id already in the ledger returns the existing entry
  * untouched. It must never reset a `denied` entry back to `pending`, or a model that simply
  * retried would erase the human's "no" and get a fresh prompt for it.
+ *
+ * IDEMPOTENT PER LIVE QUESTION TOO, and that one is a safety property rather than a nicety. Ids are
+ * minted per call, so a model refused once and retried before anyone clicks would otherwise put a
+ * SECOND card for the identical call on screen — and since `claimApproval` authorises each entry
+ * independently by id, approving both would run the op twice. Two clicks, two sends, one intention
+ * (roborev 54729, finding 2). One live question per identity: the same call asked again while it is
+ * still unanswered returns the card already waiting.
  */
 export function requestApproval(
   request: ConciergeApprovalRequest,
@@ -271,6 +304,14 @@ export function requestApproval(
   if (existing) {
     commit(swept);
     return existing;
+  }
+  // Same call, already on screen and still unanswered → that card IS this question.
+  const onScreen = swept.find(
+    (e) => e.fingerprint === request.fingerprint && e.outcome === "pending" && isLive(e, now),
+  );
+  if (onScreen) {
+    commit(swept);
+    return onScreen;
   }
   const entry: ConciergeApproval = {
     ...request,
@@ -371,6 +412,33 @@ export function claimApproval(
   }
   commit(swept.map((e) => (e === target ? { ...e, spent: true } : e)));
   return true;
+}
+
+/**
+ * Was this exact call ALREADY RUN, moments ago, off a human's approval?
+ *
+ * Guards the duplicate-run path that opened when approving started dispatching immediately
+ * (services/conciergeApprovalResume). The model is not told that the click ran anything — its turn
+ * ended with a refusal — so a human who does the thing the refusal asked for and says "go ahead"
+ * makes it call again. That call mints a fresh `toolCallId`, finds the grant `spent`, and would
+ * raise a SECOND identical card; approving that would type the same brief into an agent twice, spawn
+ * two agents, push a branch again. Non-idempotent ops make that a real side effect, not a nuisance.
+ *
+ * "Moments ago" is the grant window ({@link APPROVAL_GRANT_TTL_MS}) — a spent entry keeps its
+ * `approved` outcome and its deadline (the sweep only lapses UNSPENT entries), so staying live is
+ * exactly the right test. Past that window a repeat is treated as a fresh intention and asked about
+ * again, which is what makes this a de-duplicator rather than a lockout: a human who genuinely wants
+ * the same thing twice waits, or says so and gets asked again.
+ */
+export function recentlyRan(
+  fingerprint: string,
+  now: number = Date.now(),
+): ConciergeApproval | undefined {
+  return useConciergeApprovals
+    .getState()
+    .entries.find(
+      (e) => e.fingerprint === fingerprint && e.outcome === "approved" && e.spent && isLive(e, now),
+    );
 }
 
 /**
