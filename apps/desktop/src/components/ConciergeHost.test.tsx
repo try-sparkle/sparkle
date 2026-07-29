@@ -2423,6 +2423,39 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
 // code that a green unit test vouched for.
 //
 // This pins the WIRING rather than the unit — the half that was missing.
+describe("the resized width reaches the concierge column", () => {
+  // THE LAST TWO LINKS OF THE RESIZE CHAIN, on the REAL host and the REAL column.
+  //
+  // `Workspace.resize.test.tsx` drives a drag through the real Workspace, but it stubs this host —
+  // so it can only prove the width reaches the host's prop boundary. The two links after that,
+  // `ConciergeHost` forwarding `width` to `ConciergeColumn` and the column applying it as
+  // `style.width`, were unasserted anywhere (roborev 55340).
+  //
+  // That gap is not theoretical: `ConciergeColumn` carries its OWN default (`width = 380`) which
+  // DIVERGES from the shell's 360, so a dropped or shadowed prop renders a plausible-looking column
+  // that simply never moves — the exact "the divider registers the drag but nothing moves" report
+  // this suite exists to catch — while every other test stays green.
+  beforeEach(() => {
+    // `h.feed` starts null and each test supplies its own; without this these two pass only when
+    // the whole file runs and an earlier test happens to have left one behind.
+    h.feed = feedWith("approval");
+  });
+
+  it("forwards an explicit width onto the rendered column", () => {
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} width={444} />);
+    expect(screen.getByLabelText("Sparkle concierge").style.width).toBe("444px");
+  });
+
+  it("moves the column when the width changes, rather than pinning a default", () => {
+    const { rerender } = render(<ConciergeHost feed={h.feed as ConciergeFeed} width={300} />);
+    expect(screen.getByLabelText("Sparkle concierge").style.width).toBe("300px");
+    rerender(<ConciergeHost feed={h.feed as ConciergeFeed} width={520} />);
+    // Asserted against a SECOND value, not just a non-default one: pinning to either component's
+    // default (360 or 380) would satisfy a single-value check on the right day.
+    expect(screen.getByLabelText("Sparkle concierge").style.width).toBe("520px");
+  });
+});
+
 describe("the cable reaches the concierge column", () => {
   beforeEach(() => resetCable());
   afterEach(() => resetCable());
