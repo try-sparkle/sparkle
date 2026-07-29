@@ -911,13 +911,12 @@ const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 // NO LOCAL RUN SELECTOR EITHER.
 //
 // Sharing the PATTERN (`MENU_LINE`) closed the deadlock but left the SELECTION RULE as a second
-// definition, and the two disagreed: the detector keeps the LONGEST 1-based run (first-wins on
-// ties) while this kept the run nearest the END. With a numbered plan above a live menu the buttons
-// came from one block and the fingerprinted question from the other — an options/question mismatch
-// the fingerprint cannot catch, because it is hashing the wrong block rather than a stale one
-// (roborev 55245). `genericMenuRun` is now the single definition, indices included.
-
-
+// definition, and the two disagreed: the detector USED TO keep the longest 1-based run (first-wins
+// on ties) while this kept the run nearest the END. With a numbered plan above a live menu the
+// buttons came from one block and the fingerprinted question from the other — an options/question
+// mismatch the fingerprint cannot catch, because it is hashing the wrong block rather than a stale
+// one (roborev 55245). `genericMenuRun` is now the single definition, indices included, and its rule
+// is NEAREST THE END for both callers — agreeing on the longest run was still wrong (roborev 55258).
 
 /**
  * The dialog's OWN text: the option block the DETECTOR parsed, plus the lines above it.

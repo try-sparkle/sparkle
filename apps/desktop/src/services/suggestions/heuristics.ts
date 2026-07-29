@@ -98,11 +98,15 @@ export function pickerWindow(scrollback: string): string[] {
 
 /** The winning generic-menu run: its option NUMBERS and where its rows sit in `tail(scrollback)`.
  *
+ *  THE RULE: the run NEAREST THE END of the window wins, whatever its length.
+ *
  *  Exported with indices so the concierge's fingerprint can hash the block the detector actually
  *  chose. Sharing the PATTERN was not enough: the selection rule is a second definition, and the two
- *  disagreed — this keeps the LONGEST run (first-wins on ties) while a locator that kept the run
- *  nearest the end picked a different block, so the buttons and the fingerprinted question described
- *  different menus and nothing could catch it (roborev 55245). One definition, indices included. */
+ *  disagreed — this USED TO keep the longest run (first-wins on ties) while a locator that kept the
+ *  run nearest the end picked a different block, so the buttons and the fingerprinted question
+ *  described different menus and nothing could catch it (roborev 55245). Making them agree was only
+ *  half the fix: longest-wins is itself wrong, because a numbered plan printed above a live menu is
+ *  longer than the menu (roborev 55258). One definition, and it is the nearest-the-end one. */
 export interface GenericMenuRun {
   numbers: number[];
   /** Index of the run's first option row in `tail(scrollback)`. */
@@ -144,8 +148,12 @@ export function genericMenuRun(lines: readonly string[]): GenericMenuRun | null 
       cur = [];
       expected = 1;
     }
-    // >=, so a LATER run of the same or greater length replaces an earlier one.
-    if (cur.length >= 2 && cur.length >= 1) best = cur.slice();
+    // NO COMPARISON AGAINST `best` — that is the whole rule. Every run that reaches two options
+    // overwrites the previous winner regardless of length, so the LAST such run is what survives.
+    // Re-introducing a `cur.length >= best.length` guard here silently restores longest-wins: the
+    // live 2-option menu never beats a 3-item plan above it, which is exactly the mismatch that let
+    // a stale fingerprint authorise a press into a menu lacking the option pressed (roborev 55258).
+    if (cur.length >= 2) best = cur.slice();
   }
   if (best.length < 2) return null;
   return {

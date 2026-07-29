@@ -329,9 +329,10 @@ describe("detectClaudeCodePicker — captured Claude Code 2.1.220 screens", () =
 //
 // `genericMenuRun` is the ONE definition of "which numbered run is the menu", used both to emit the
 // buttons and — by the concierge's fingerprint — to locate the question. When those were two
-// implementations they disagreed: this keeps the LONGEST run, first-wins on ties, while a locator
+// implementations they disagreed: this kept the LONGEST run, first-wins on ties, while a locator
 // that kept the run nearest the END picked a different block, so the buttons and the fingerprinted
-// question described different menus and nothing could catch it.
+// question described different menus and nothing could catch it. Agreeing was only half the fix —
+// the shared rule is now NEAREST THE END, which is the one these tests pin (roborev 55258).
 describe("genericMenuRun — the single definition of which run is the menu", () => {
   // THE LIVE DIALOG, NOT THE BIGGEST LIST. A menu is only a menu when the last line asks a choice,
   // so the live one is by construction the run nearest that prompt. Keeping the LONGEST run instead
