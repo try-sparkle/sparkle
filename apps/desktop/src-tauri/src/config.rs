@@ -4900,6 +4900,71 @@ quit_app = 42
         assert_eq!(cfg.workers.max_concurrent, Some(7));
     }
 
+    /// TYPE FIDELITY, asserted on the BYTES rather than on the parsed struct.
+    ///
+    /// `effective()` would deserialize `max_concurrent = "64"` … no, it would REJECT it — which is
+    /// precisely how the unsettable-numbers defect surfaced ("invalid type: string \"64\", expected
+    /// u32"). The type was lost at the MCP tool boundary, where a schema-less `value` made clients
+    /// send the model's literal text; every hop from here down was already correct. These pin that
+    /// correctness so a future change to `json_to_toml_value` can't quietly start quoting scalars:
+    /// a number must render bare, a bool bare, and a string quoted.
+    #[test]
+    fn set_value_writes_each_json_type_with_the_right_toml_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        reset(ad).unwrap();
+
+        set_value(ad, "workers.max_concurrent", &serde_json::json!(64)).unwrap();
+        set_value(ad, "workflow.require_pr", &serde_json::json!(false)).unwrap();
+        set_value(ad, "workflow.default_branch", &serde_json::json!("dev")).unwrap();
+
+        let text = std::fs::read_to_string(global_path(ad)).unwrap();
+        // The template pads its `=` for alignment, and toml_edit preserves that padding, so compare
+        // against whitespace-normalised assignments rather than one exact spelling of the spacing.
+        let assignments: Vec<String> = text
+            .lines()
+            .map(|l| l.trim().split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let written = |needle: &str| assignments.iter().any(|l| l == needle);
+
+        // A number renders BARE. `= "64"` is the exact byte pattern of the reported bug.
+        assert!(written("max_concurrent = 64"), "number must be unquoted:\n{text}");
+        assert!(!written("max_concurrent = \"64\""), "number must not be quoted:\n{text}");
+        // A bool renders bare, not as the text "false".
+        assert!(written("require_pr = false"), "bool must be unquoted:\n{text}");
+        assert!(!written("require_pr = \"false\""), "bool must not be quoted:\n{text}");
+        // A string DOES render quoted — the fidelity runs both ways.
+        assert!(written("default_branch = \"dev\""), "string must be quoted:\n{text}");
+
+        // And the whole document still satisfies the schema with the values we meant.
+        let (cfg, _, hard) = effective(Some(&text), None);
+        assert!(!hard);
+        assert_eq!(cfg.workers.max_concurrent, Some(64));
+        assert!(!cfg.workflow.require_pr);
+        assert_eq!(cfg.workflow.default_branch, "dev");
+    }
+
+    /// The two JSON types the scalar writer does NOT accept, pinned as a deliberate contract rather
+    /// than left to be discovered. An OBJECT never arrives here — the control listener flattens it
+    /// to dotted scalar leaves first — and the config schema has no scalar-array key, so both are
+    /// refused with a message that names the accepted types instead of corrupting the file.
+    #[test]
+    fn set_value_refuses_array_and_object_values_by_design() {
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        reset(ad).unwrap();
+        let before = std::fs::read_to_string(global_path(ad)).unwrap();
+
+        for bad in [serde_json::json!([1, 2, 3]), serde_json::json!({"a": 1}), serde_json::json!(null)] {
+            let err = set_value(ad, "workers.max_concurrent", &bad).unwrap_err();
+            assert!(
+                err.contains("boolean, integer, or string"),
+                "refusal must name the accepted types, got: {err}"
+            );
+        }
+        assert_eq!(before, std::fs::read_to_string(global_path(ad)).unwrap());
+    }
+
     #[test]
     fn set_value_rejects_corrupting_writes_and_leaves_file_intact() {
         // Regression for roborev 16792/16793: an in-app write that would make config.toml
