@@ -211,6 +211,29 @@ describe("Composer — dictation wiring", () => {
     act(() => unmount());
     expect(useDictationStore.getState().insertTarget).toBeNull();
   });
+
+  it("does NOT steal focus from another editable element (e.g. the terminal) on a dictated segment (sparkle-d2ec)", () => {
+    const { inputRef } = renderComposer();
+    // A foreign editable element the user is actively typing in — stands in for the xterm terminal's
+    // <textarea> or the other composer. Focus it, then let a dictation segment commit.
+    const foreign = document.createElement("textarea");
+    document.body.appendChild(foreign);
+    foreign.focus();
+    expect(document.activeElement).toBe(foreign);
+
+    act(() => useDictationStore.getState().insert("hello"));
+
+    // The dictated text still lands in the composer (registered insert target). Read it via the
+    // composer's own ref — a bare screen.getByRole("textbox") would be ambiguous with the foreign
+    // textarea also in the document.
+    const ta = inputRef.current as HTMLTextAreaElement;
+    expect(ta.value).toContain("hello");
+    // …but focus must NOT have been yanked out of the terminal. With the old unconditional
+    // focusQuietly(inputRef?.current) it would move to the composer textarea; the guard prevents it.
+    expect(document.activeElement).toBe(foreign);
+    expect(document.activeElement).not.toBe(inputRef.current);
+    foreign.remove();
+  });
 });
 
 describe("Composer — auto-grow sizing baseline", () => {

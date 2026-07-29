@@ -2,6 +2,8 @@ import { lazy, Suspense, useEffect, useRef } from "react";
 import { AuthGate } from "./components/AuthGate";
 import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
+import { installInputFreezeTrace } from "./diagnostics/inputFreezeTrace";
+import { useDictationStore } from "./stores/dictationStore";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
 import { resolveEnvChiefPat, seedKeychainChiefPat } from "./services/chief";
@@ -124,6 +126,12 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
+  // Diagnostics: record first-responder + keyboard-capture transitions while the mic is live so a
+  // recurrence of the dictation input-freeze (sparkle-d2ec) is pinnable. Inert when dictation off.
+  useEffect(
+    () => installInputFreezeTrace({ isDictationEnabled: () => useDictationStore.getState().enabled }),
+    [],
+  );
   // NOTE: roster publishing lives in <RosterPublisher/> below, mounted inside AppBoot so it starts
   // after the boot-time cleanups rather than racing them.
 

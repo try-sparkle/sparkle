@@ -104,3 +104,35 @@ export function resetProgrammaticFocusForTest(): void {
   pendingEl = null;
   depth = 0;
 }
+
+/** True for an element the user TYPES INTO: `<input>`, `<textarea>`, or any contentEditable host
+ *  (the xterm terminal's key sink is a `<textarea class="xterm-helper-textarea">`, so it qualifies).
+ *  Pure and DOM-only so the focus-steal guard below is unit-testable. */
+export function isEditableTarget(el: Element | null | undefined): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === "TEXTAREA" || tag === "INPUT") return true;
+  return (el as HTMLElement).isContentEditable === true;
+}
+
+/** {@link focusQuietly}, but a NO-OP when the caret currently sits in a DIFFERENT editable element.
+ *
+ *  Use for a BACKGROUND focus pull — one driven by a timer or an incoming event rather than by the
+ *  user's own gesture — where bringing the caret back to `el` must never YANK it out of a field the
+ *  user is actively typing in. The motivating case is dictation (sparkle-d2ec): the composer pulled
+ *  focus to itself on EVERY committed segment, so while the mic was live a user typing in the
+ *  terminal (or any other box) had focus ripped away every couple of seconds — the terminal and the
+ *  composer both went dead to the keyboard while the mouse still worked, and only a restart (which
+ *  stops dictation) recovered. Skipping the pull when another editable element holds focus keeps
+ *  dictation from stealing the keyboard, while still refocusing when focus sits on a non-editable
+ *  surface (a mic button, the body) — the legitimate "the mic UI took focus, bring the caret back"
+ *  flow this function was added for.
+ *
+ *  Returns whether it actually focused. Safe on null. */
+export function focusQuietlyUnlessTypingElsewhere(el: HTMLElement | null | undefined): boolean {
+  if (!el) return false;
+  const active = el.ownerDocument?.activeElement ?? null;
+  if (active && active !== el && isEditableTarget(active)) return false;
+  focusQuietly(el);
+  return true;
+}

@@ -76,7 +76,7 @@ import { isComposerToggleKey } from "./composerToggle";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { arrowOverflowDirection } from "./composerArrowOverflow";
 import { useDictationStore } from "../stores/dictationStore";
-import { focusQuietly, isProgrammaticFocus } from "../services/programmaticFocus";
+import { focusQuietly, focusQuietlyUnlessTypingElsewhere, isProgrammaticFocus } from "../services/programmaticFocus";
 import { useSettingsStore } from "../stores/settingsStore";
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import {
@@ -447,7 +447,12 @@ export function Composer({
       // dictation (their explicit choice); the transcribed text still lands in the box and is there
       // when they reopen it. (Reopening on every transcript is what made the toggle feel
       // mic-dependent — see the terminal gesture-reclaim design, 2026-07-10.)
-      focusQuietly(inputRef?.current);
+      // Bring the caret back to this composer for the dictated insert — BUT never yank it out of a
+      // DIFFERENT editable element the user is actively typing in. Pulling focus on every committed
+      // segment left the terminal (and any focused field) dead to the keyboard while the mic ran, a
+      // global-looking freeze recoverable only by restart (sparkle-d2ec). Refocus still happens when
+      // focus sits on a non-editable surface (the mic UI, the body) — the case this pull exists for.
+      focusQuietlyUnlessTypingElsewhere(inputRef?.current);
       // Selection must be set after React commits the new value, or it snaps back. Mirror the
       // exact rAF pattern acceptGhost uses (and re-sync the ghost mirror's scrollTop, since moving
       // the caret can scroll the textarea programmatically without firing onScroll).
