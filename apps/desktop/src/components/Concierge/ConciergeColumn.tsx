@@ -44,6 +44,8 @@ export function ConciergeColumn({
   announcement = EMPTY_ANNOUNCEMENT,
   countdownSlot,
   approvalSlot,
+  mentionAgents,
+  preferredAgentId,
 }: ConciergeColumnProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
@@ -216,6 +218,8 @@ export function ConciergeColumn({
           interim={interim}
           registerInsert={registerInsert}
           onTextEdit={onTextEdit}
+          mentionAgents={mentionAgents}
+          preferredAgentId={preferredAgentId}
         />
       )}
     </section>

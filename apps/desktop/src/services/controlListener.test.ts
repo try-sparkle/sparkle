@@ -76,6 +76,12 @@ import {
   type ControlRequest,
 } from "./controlListener";
 import { useSelfReportMetrics } from "../stores/selfReportMetrics";
+// The thinking indicator's source of truth — asserted here because this file owns the one call site
+// that records it.
+import {
+  _resetConciergeActivityForTests,
+  useConciergeActivityStore,
+} from "./conciergeActivity";
 
 
 // The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
@@ -108,6 +114,7 @@ describe("controlListener", () => {
     setConfigCalls.length = 0;
     setConfigValuesCalls.length = 0;
     dispatchConciergeToolMock.mockClear();
+    _resetConciergeActivityForTests();
     // A BOOTED app: config has been read, and the human has set no per-tool overrides. Without the
     // hydrated flag the policy layer deliberately holds back `allow` for anything that can change
     // something, since it cannot yet tell "no rule" from "a rule we haven't loaded".
@@ -787,6 +794,67 @@ describe("controlListener", () => {
         op: "list_projects",
         data: [{ id: "p1" }],
       });
+    });
+
+    // THE THINKING INDICATOR'S ONLY SOURCE OF TRUTH (services/conciergeActivity). The concierge
+    // column tells the human "Reading Kraken Auth's terminal…" on the strength of this recording, so
+    // if the wiring is dropped the column silently reverts to three dots with nothing failing.
+    it("records the call for the thinking indicator, in flight and then settled", async () => {
+      let inFlight: unknown;
+      dispatchConciergeToolMock.mockImplementationOnce(async () => {
+        // Sampled INSIDE dispatch: the tense the human sees while the tool is running.
+        inFlight = useConciergeActivityStore.getState().latest;
+        return { ok: true, domain: "workspace", op: "list_projects", data: [] };
+      });
+      fire({
+        reqId: "t1a",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: toolPayload,
+      });
+      await flush();
+      expect(inFlight).toMatchObject({
+        domain: "workspace",
+        op: "list_projects",
+        outcome: "running",
+      });
+      expect(useConciergeActivityStore.getState().latest).toMatchObject({ outcome: "done" });
+    });
+
+    // THE REPLY'S OWN `ok` DECIDES THE TENSE. This dispatch is total, so a policy denial and an
+    // ask-tier tool awaiting the human's approval are ordinary resolved replies — and settling them
+    // as successes made the column announce "Merged PR #753" for a merge that never happened, above
+    // the very approval request it was still waiting on.
+    it.each([
+      ["a policy denial", { code: "denied" }],
+      ["an unapproved ask-tier tool", { code: "needs-approval" }],
+      ["a bad-args refusal", { code: "bad-args" }],
+    ])("settles %s as refused, not as done", async (_label, over) => {
+      dispatchConciergeToolMock.mockImplementationOnce(
+        async () =>
+          ({ ok: false, domain: "workflow", op: "merge_pr", message: "no", ...over }) as never,
+      );
+      fire({
+        reqId: "t1c",
+        op: "concierge_tool",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { domain: "workflow", op: "merge_pr", args: { number: 753 }, toolCallId: "tc" },
+      });
+      await flush();
+      expect(useConciergeActivityStore.getState().latest).toMatchObject({ outcome: "refused" });
+    });
+
+    // A refused caller must not be able to put a line in the human's thread. The recording sits
+    // AFTER the reserved-id check for exactly this reason.
+    it("records nothing for a caller the reserved-id gate refuses", async () => {
+      fire({
+        reqId: "t1b",
+        op: "concierge_tool",
+        callerAgentId: "sparkle:concierge2",
+        payload: toolPayload,
+      });
+      await flush();
+      expect(useConciergeActivityStore.getState().latest).toBeNull();
     });
 
     it("coerces a non-string domain/op to \"\" rather than handing the registry a number", async () => {

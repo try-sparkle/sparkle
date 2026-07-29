@@ -103,6 +103,66 @@ describe("dispatchConciergeAnswer", () => {
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
+  // ══ THE GATE THE HOST CANNOT ENFORCE (roborev 54569) ═════════════════════════════════════════
+  // ConciergeHost suppresses its `answersLivePicker` check for a message the user ADDRESSED to an
+  // agent by name. That check is only a MIRROR of the block below — it decides nothing — so the
+  // dispatcher went on matching the text and pressing the button. A host-level test cannot see it,
+  // because it mocks this function; the assertion has to be made here, against the real matcher and
+  // the real write primitive.
+  describe("neverPickerAnswer — an addressed message is never a keystroke", () => {
+    it("does NOT press a matching option, and writes no keystroke at all", async () => {
+      setPrompt(YN);
+      const r = await dispatchConciergeAnswer("agent-1", "yes", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+        neverPickerAnswer: true,
+      });
+      // Its OWN path, never a second use of ambiguous-picker: that path's copy claims the answer
+      // mapped to nothing and tells the user to answer with just the option, both of which are
+      // false here — which sent them round a loop with no stated exit (roborev 54665).
+      expect(r).toMatchObject({ ok: false, path: "addressed-at-picker", options: YN });
+      expect(writePtyChainedStrict).not.toHaveBeenCalled();
+      expect(submitPrompt).not.toHaveBeenCalled();
+    });
+
+    // The exact text that used to get through: terse, matching, and user-authored.
+    it("blocks a bare number that would have selected a menu row", async () => {
+      setPrompt(MENU);
+      const r = await dispatchConciergeAnswer("agent-1", "2", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+        neverPickerAnswer: true,
+      });
+      expect(r.ok).toBe(false);
+      expect(writePtyChainedStrict).not.toHaveBeenCalledWith("agent-1", "2\r");
+    });
+
+    // Same call WITHOUT the flag still presses it — so the row above is pinning the flag, not some
+    // unrelated change to the matcher.
+    it("…while the same send without the flag still takes the keystroke path", async () => {
+      setPrompt(YN);
+      const r = await dispatchConciergeAnswer("agent-1", "yes", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+      });
+      expect(r).toMatchObject({ ok: true, path: "picker-option" });
+      expect(writePtyChainedStrict).toHaveBeenCalledWith("agent-1", "y\r");
+    });
+
+    // With NO picker on screen the flag is inert — an addressed message is an ordinary free-text
+    // send, which is the overwhelmingly common case.
+    it("does not disturb a send when no picker is up", async () => {
+      setPrompt([]);
+      const r = await dispatchConciergeAnswer("agent-1", "ship the DMG", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+        neverPickerAnswer: true,
+      });
+      expect(r).toMatchObject({ ok: true, path: "free-text" });
+      expect(submitPrompt).toHaveBeenCalledWith("agent-1", "ship the DMG");
+    });
+  });
+
   it("sends free text via submitPrompt when no prompt is on screen", async () => {
     setPrompt([]);
     const r = await dispatchConciergeAnswer("agent-1", "add a test for the webhook", { authority: TEST_AUTHORITY });

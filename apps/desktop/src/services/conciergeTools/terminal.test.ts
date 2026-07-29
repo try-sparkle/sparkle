@@ -132,6 +132,11 @@ beforeEach(() => {
   scrollbackMock.mockReturnValue(null);
   searchHistoryMock.mockResolvedValue([]);
   invokeMock.mockResolvedValue("");
+  // Re-stubbed here, not merely cleared: `vi.clearAllMocks()` resets call HISTORY but keeps any
+  // implementation a test installed, so the one test that stubs a persisted open pane would
+  // otherwise leave every later test seeing that agent as "other-window" — a leak whose symptom
+  // (a liveness assertion failing in an unrelated test) points nowhere near its cause.
+  vi.mocked(readPersistedOpenAgentIds).mockReturnValue([]);
   forgetAgentTranscriptPath(AGENT);
   seedAgent("local");
 });

@@ -265,6 +265,9 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       userPrompt: true,
       display: "what is wrong here? · 1 image",
       namingBasis: "what is wrong here?",
+      // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+      // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+      neverPickerAnswer: false,
     });
   });
 
@@ -323,6 +326,9 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       userPrompt: true,
       display: "1 image",
       namingBasis: "",
+      // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+      // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+      neverPickerAnswer: false,
     });
   });
 });

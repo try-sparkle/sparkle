@@ -68,6 +68,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -95,8 +96,25 @@ import {
   composeDragReleasesManual,
   composeRenderH,
 } from "../../engine/composeBoxHeight";
+import { MentionPicker, MENTION_LISTBOX_ID, mentionOptionId } from "./MentionPicker";
+import {
+  backspaceMention,
+  insertMention,
+  isCompletedMention,
+  mentionQuery,
+  mentionRoster,
+  mentionsIn,
+  orderMentionAgents,
+  type ConciergeMention,
+  type MentionAgent,
+} from "./mentions";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
+
+/** A module-level empty roster, so a box mounted without `mentionAgents` gets the SAME array every
+ *  render. A `= []` default would mint a new one per render, and this list feeds the memo that
+ *  builds the picker's rows — a fresh identity each time defeats it. */
+const EMPTY_MENTION_AGENTS: readonly MentionAgent[] = [];
 
 /** What the box is FOR, painted in the placeholder slot whenever the mic makes no voice promise —
  *  i.e. master mute, which is the DEFAULT (ambient listening is opt-in, dictationStore
@@ -340,10 +358,19 @@ export function ComposeBox({
   interim = "",
   registerInsert,
   onTextEdit,
+  mentionAgents = EMPTY_MENTION_AGENTS,
+  preferredAgentId = null,
 }: {
-  /** Reports the trimmed text (empty only when something is attached). May return a promise
-   *  resolving FALSE when the send failed, in which case the box restores the draft (see submit). */
-  onSend: (text: string) => void | Promise<boolean>;
+  /** Reports the trimmed text (empty only when something is attached), plus the agents that text
+   *  ADDRESSES by name — `undefined` when it addresses none.
+   *
+   *  `undefined` rather than `[]` for an unaddressed send, matching what `attachments` does on a
+   *  file-less one: the mentions ride all the way onto the persisted thread message, and a thread
+   *  that grew an empty array per message would pay for a distinction it never draws.
+   *
+   *  May return a promise resolving FALSE when the send failed, in which case the box restores the
+   *  draft (see submit). */
+  onSend: (text: string, mentions?: ConciergeMention[]) => void | Promise<boolean>;
   onAttach: (kind: ConciergeAttachKind) => void;
   onRemoveAttachment?: (id: string) => void;
   /** Staged files, owned by the host — rendered as chips, cleared by the host on send. */
@@ -358,6 +385,16 @@ export function ComposeBox({
   /** The user TYPED (or deleted) — reports the new value. Not fired for dictated segments or the
    *  clear-on-send, so the host can see the box being emptied by hand. */
   onTextEdit?: (text: string) => void;
+  /** Every builder agent the "@" picker may offer. Supplied by the host from the cross-project feed
+   *  — this box has no store of its own (see the file header) and cannot ask who exists.
+   *
+   *  It is ALSO the roster a mention is resolved against, which is what makes a mention exactly as
+   *  live as the fleet: an agent that leaves this list stops being addressable, and the aim it was
+   *  carrying disappears with it rather than pointing at a corpse (see ./mentions). */
+  mentionAgents?: readonly MentionAgent[];
+  /** The agent a send would reach WITHOUT a mention — the selected build agent. Sorts to the top of
+   *  the picker, so "@" then Enter aims at the thing already in front of you. */
+  preferredAgentId?: string | null;
 }) {
   const [text, setText] = useState("");
   // The voice state behind the placeholder copy, read from the store rather than taken as a prop.
@@ -397,7 +434,17 @@ export function ComposeBox({
   }, [composeFocusSeq]);
   useEffect(() => {
     if (!registerInsert) return;
-    const append = (segment: string) => setText((prev) => appendDictated(prev, segment));
+    const append = (segment: string) =>
+      setText((prev) => {
+        const next = appendDictated(prev, segment);
+        // Follow the text with the caret. A dictated segment (or a draft handed back after a
+        // cancelled countdown) lands at the END, and leaving `caret` on the old offset would leave
+        // the mention query reading a stale slice of a string that has since grown — which is how a
+        // picker pops open over words nobody typed an "@" into. Cheap, and it keeps the one
+        // invariant this half depends on: `caret` is where the next character goes.
+        setCaret(next.length);
+        return next;
+      });
     registerInsert(append);
     return () => registerInsert(null);
   }, [registerInsert]);
@@ -437,6 +484,104 @@ export function ComposeBox({
     // (the textarea's own onChange already reports those).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── @-mentions: the picker over the box, and the pill it inserts ────────────────────────────
+  // Rules and reasoning live in ./mentions (pure, tested as data); this half owns the caret, the
+  // keyboard, and where the overlay hangs.
+  //
+  // THE CARET IS TRACKED IN STATE because the query is "what sits between the nearest `@` and the
+  // insertion point", and neither half of that is derivable from `text` alone — the same string
+  // means a different query depending on where the caret is. It is refreshed from the DOM on every
+  // event that can move it (typing, clicking, arrowing, selecting).
+  const [caret, setCaret] = useState(0);
+  const [selected, setSelected] = useState(0);
+  // The `@` the user explicitly dismissed with Escape. Recorded by ANCHOR rather than as a bare
+  // boolean so it retires itself: typing a NEW `@` produces a different anchor and gets its own
+  // picker, which is what "Escape closes this one" should mean. A boolean would suppress every
+  // subsequent mention in the message until something thought to clear it.
+  const [dismissedAnchor, setDismissedAnchor] = useState<number | null>(null);
+  // THE ONE ROSTER, built once and used for everything below — the picker's rows, resolving a send,
+  // and Backspace. `mentionRoster` both orders it and gives same-named agents uniquely addressable
+  // labels, and doing it HERE rather than trusting the prop is the point (roborev 54555): the
+  // ordering contract used to be a comment naming the host as its enforcer, which is not a contract.
+  // Nothing in this file may reach for the raw `mentionAgents` prop again.
+  const roster = useMemo(
+    () => mentionRoster(mentionAgents, preferredAgentId),
+    [mentionAgents, preferredAgentId],
+  );
+  const pending = mentionQuery(text, caret);
+  const matches =
+    pending &&
+    pending.anchor !== dismissedAnchor &&
+    // A finished mention closes its own list — without this the picker re-opens over the pill it
+    // just inserted, because `@Kraken Auth ` still matches "Kraken Auth" at the top tier. See
+    // ./mentions.isCompletedMention for why the trailing space, and not the exact match, is the tell.
+    !isCompletedMention(pending.query, roster)
+      ? orderMentionAgents(roster, pending.query, preferredAgentId)
+      : [];
+  const pickerOpen = matches.length > 0;
+  // Fresh rows restart the highlight at the top — adjusted DURING RENDER rather than in an effect,
+  // the same pattern CommandPalette uses, so there is no frame where the highlight points at a row
+  // that has already been filtered out. Keyed on the id LIST, not its length: narrowing from two
+  // matches to a different two must still reset.
+  // Joined on an ESCAPED NUL, never a raw one: that byte makes git treat the whole file as
+  // binary — no diffs, no review — and there is a repo-wide guard for it
+  // (services/sourceIsText.test.ts). The runtime string is identical. NUL rather than a space
+  // because an agent id is opaque, and a separator that could occur inside one would make two
+  // different lists compare equal and silently skip the highlight reset.
+  const matchKey = matches.map((a) => a.id).join("\u0000");
+  const [lastMatchKey, setLastMatchKey] = useState(matchKey);
+  if (matchKey !== lastMatchKey) {
+    setLastMatchKey(matchKey);
+    setSelected(0);
+  }
+  const active = matches[Math.min(selected, matches.length - 1)];
+
+  // A caret position we have to WRITE BACK to the textarea after a programmatic edit (choosing from
+  // the picker, or deleting a whole pill). React controls `value`, and setting it puts the caret at
+  // the end of the new string — which for a mention chosen mid-sentence is several words past where
+  // the user was. Applied in a layout effect so it lands before paint and the caret never visibly
+  // jumps to the end and back.
+  const restoreCaret = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const at = restoreCaret.current;
+    if (at === null) return;
+    restoreCaret.current = null;
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.setSelectionRange(at, at);
+    // Keep the caret in the box after a POINTER pick: the picker chooses on mousedown with the
+    // default prevented (see MentionPicker), so focus was never taken — but a box that was not
+    // focused to begin with (the user clicked the picker straight after a dictated segment landed)
+    // still needs it, or the words they type next go nowhere.
+    if (document.activeElement !== ta) focusQuietly(ta);
+  });
+
+  /** Apply an edit that moves the caret, and report it as the hand edit it is. */
+  const applyEdit = useCallback(
+    (next: { text: string; caret: number }) => {
+      setText(next.text);
+      setCaret(next.caret);
+      restoreCaret.current = next.caret;
+      // A mention insert and a pill deletion are both the USER editing the box, so they report like
+      // typing does — deleting the last pill can empty the box, and the host retires its
+      // capture-Chat aim on exactly that signal.
+      onTextEdit?.(next.text);
+    },
+    [onTextEdit],
+  );
+
+  const chooseMention = useCallback(
+    (agent: MentionAgent) => {
+      if (!pending || !agent.canAcceptInput) return;
+      applyEdit(insertMention(text, pending.anchor, caret, agent));
+      // NOT dismissed — the inserted literal ends in a space, so `mentionQuery` no longer sees an
+      // open query and the picker closes on its own. Marking it dismissed would additionally
+      // suppress a fresh `@` typed at the same offset later in the session.
+      setSelected(0);
+    },
+    [pending, applyEdit, text, caret],
+  );
 
   // ── Height: auto-grow to a ten-line cap, or whatever the user dragged to ────────────────────
   // The box was a fixed 42px with `resize: none`, so a paragraph scrolled invisibly above the
@@ -607,8 +752,20 @@ export function ComposeBox({
   const submit = () => {
     if (!canSend) return;
     const v = text.trim();
-    const outcome = onSend(v);
+    // Resolved HERE, at submit, off the trimmed text that is actually going out — never carried
+    // along in state. That is the whole point of deriving mentions (see ./mentions): what the user
+    // can read in the box at the moment they press Send is what the message is addressed to, with
+    // no second copy that could have drifted from it.
+    const mentions = mentionsIn(v, roster);
+    // ONE argument when nothing is addressed, not a second one holding `undefined`. An unaddressed
+    // send has to be indistinguishable from what this box has always sent — the host's `onSend` is
+    // the column's oldest contract and every consumer and test of it was written against the
+    // single-argument call. Passing an explicit `undefined` is a different call, and arity is
+    // observable (a spy asserted with `toHaveBeenCalledWith(text)` sees it and fails).
+    const outcome = mentions.length ? onSend(v, mentions) : onSend(v);
     setText("");
+    setCaret(0);
+    setDismissedAnchor(null);
     if (outcome && typeof outcome.then === "function") {
       void outcome.then((ok) => {
         if (!ok && v) setText((cur) => (cur === "" ? v : cur));
@@ -616,6 +773,53 @@ export function ComposeBox({
     }
   };
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // ── The picker owns these keys while it is open ────────────────────────────────────────────
+    // Ahead of the ⌘↩ submit check on purpose: none of them collide with it (the picker never
+    // claims a modified Enter, so ⌘↩ still sends even mid-mention), but the reader should see the
+    // narrower, conditional claim first.
+    if (pickerOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelected((i) => (i + 1) % matches.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelected((i) => (i - 1 + matches.length) % matches.length);
+        return;
+      }
+      // Bare Enter takes the highlighted row — the founder's "if I press enter it shows me the
+      // agent as a pill". A MODIFIED Enter is still Send: someone who has typed a whole message and
+      // hits ⌘↩ with a half-finished `@Bl` at the end meant to send, not to pick.
+      if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+        e.preventDefault();
+        if (active) chooseMention(active);
+        return;
+      }
+      if (e.key === "Escape" && pending) {
+        // Stop here: Escape inside the compose box otherwise reaches the surfaces around it (the
+        // attach group does the same), and closing this list is the whole of what was asked for.
+        e.preventDefault();
+        e.stopPropagation();
+        setDismissedAnchor(pending.anchor);
+        return;
+      }
+    }
+    // ── Backspace at a pill's trailing edge removes the WHOLE pill ─────────────────────────────
+    // Only for a COLLAPSED caret: with a selection, Backspace means "delete what I highlighted",
+    // and quietly widening that to a neighbouring mention would destroy text the user did not
+    // select. See ./mentions.backspaceMention for why half a name is the failure to avoid.
+    if (e.key === "Backspace" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      const ta = e.currentTarget;
+      if (ta.selectionStart === ta.selectionEnd) {
+        const edit = backspaceMention(text, ta.selectionStart, roster);
+        if (edit) {
+          e.preventDefault();
+          applyEdit(edit);
+          return;
+        }
+      }
+    }
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       submit();
@@ -628,6 +832,16 @@ export function ComposeBox({
       data-testid="concierge-compose"
       style={{
         flex: "none",
+        // The positioning context for the MENTION PICKER, which hangs off this box's TOP edge.
+        //
+        // Anchored to the ROOT, deliberately, and not to the textarea's `slotRef` wrapper below —
+        // even though that wrapper is already `position: relative` and looks like the obvious home.
+        // The height engine treats every non-textarea child of that wrapper as a PLACEHOLDER
+        // OVERLAY and measures it into `placeholderH`, a FLOOR under auto-grow (see the layout
+        // effect above). A picker in there would push the compose box to the height of its own
+        // list, on every keystroke of a query. Here it is outside that walk, and spanning the root
+        // also lines the list up with the composer's outer edges rather than with the textarea.
+        position: "relative",
         borderTop: `1px solid ${line}`,
         padding: "10px 12px 12px",
         // COMPOSE_SCRIM, not a literal: it is the plate every control in this row sits on, so the
@@ -637,6 +851,17 @@ export function ComposeBox({
         outlineOffset: -2,
       }}
     >
+      {/* Type "@" and the fleet appears. Renders nothing when there is nothing to offer, so a query
+          that matches no agent simply closes the list rather than parking an empty panel over the
+          thread — typing on is a better exit than a dead end the user has to dismiss. */}
+      {pickerOpen && (
+        <MentionPicker
+          agents={matches}
+          selected={Math.min(selected, matches.length - 1)}
+          onSelect={chooseMention}
+          onHover={setSelected}
+        />
+      )}
       {attachments.length > 0 && (
         <div
           data-testid="concierge-attachment-chips"
@@ -772,8 +997,22 @@ export function ComposeBox({
             // and the ⌘↩ hint stays on the Send button below rather than in this text.
             placeholder=""
             value={text}
+            // The mention picker's aria wiring. The list is a SIBLING that never takes focus (the
+            // query is the text still being typed), so the textarea is what has to announce it:
+            // `combobox` + `aria-controls` + an `aria-activedescendant` pointing at the highlighted
+            // row's id. This is the same pattern CommandPalette uses between its input and its
+            // listbox — there, though, the input is inside a modal dialog, and here it is the app's
+            // one composer, so every attribute is conditional on the list actually being open.
+            role={pickerOpen ? "combobox" : undefined}
+            aria-expanded={pickerOpen || undefined}
+            aria-controls={pickerOpen ? MENTION_LISTBOX_ID : undefined}
+            aria-activedescendant={pickerOpen && active ? mentionOptionId(active.id) : undefined}
             onChange={(e) => {
               setText(e.target.value);
+              // Read from the DOM, not inferred from the new string: an edit can move the caret
+              // anywhere (a paste, a middle-of-word deletion, an IME commit), and the query depends
+              // on where it actually landed.
+              setCaret(e.target.selectionStart ?? e.target.value.length);
               // One of the two things that resets the five-minute idle timer (the other is
               // a terminal keystroke, Terminal.tsx's onData). Deliberately on the USER's
               // edits only, for the same reason onTextEdit is: a dictated segment landing in
@@ -789,6 +1028,11 @@ export function ComposeBox({
               ownVoice();
               onKeyDown(e);
             }}
+            // EVERY other way the caret moves: arrowing, clicking into the middle of a word,
+            // dragging a selection, ⌘A. React's onSelect on a textarea is the DOM `selectionchange`
+            // for this element, so one handler covers all of them — without it, typing `@Bl`, then
+            // clicking away and back, would leave the query reading from a stale offset.
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
             // The MIRROR of the agent composer's surface claim (Composer.tsx `ownVoice`). Without
             // it the arbiter is one-way: once the user's cursor has been in an agent composer,
             // nothing short of the header ring brings dictation back here, so clicking into this

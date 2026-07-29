@@ -629,6 +629,11 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
       return "Not sent: nothing authorized this write.";
     case "pty-gone":
       return "Not sent: the agent's terminal has closed.";
+    // Unreachable from this tool today — `neverPickerAnswer` is set only for an @-addressed compose
+    // send — but the union is exhaustive here on purpose, so it gets an honest line rather than
+    // falling into the bare "Not sent." default if a caller ever sets it.
+    case "addressed-at-picker":
+      return "Not sent: the agent is waiting on a choice on screen, so a message can't go in right now.";
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
     default: {

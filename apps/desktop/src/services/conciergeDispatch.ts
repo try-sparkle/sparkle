@@ -80,6 +80,7 @@ export type ConciergeDispatchPath =
   | "queued" // the agent's PTY isn't up yet → held, flushed when the pane reports ready
   | "queue-full" // the agent is starting but its hold queue is full (refused, NOT delivered)
   | "ambiguous-picker" // a prompt is live but the answer didn't map to any option (refused)
+  | "addressed-at-picker" // an @-addressed MESSAGE arrived while a picker owns stdin (refused)
   | "empty" // nothing to dispatch (blank/whitespace answer)
   | "trial-spent" // the server says the free trial is spent (refused BEFORE delivery)
   | "expired" // held too long waiting for a PTY that never came up (NOT delivered)
@@ -101,7 +102,9 @@ export interface ConciergeDispatchResult {
   display?: string;
   /** The option that matched (present for path "picker-option"). */
   matchedLabel?: string;
-  /** The live options offered (present for "ambiguous-picker") so the UI can prompt the user to pick. */
+  /** The live options offered, so the UI can prompt the user to pick. Present for BOTH picker
+   *  refusals — "ambiguous-picker" and "addressed-at-picker" — since the second was split out of
+   *  the first and carries the same options (roborev 54665/54673). */
   options?: SuggestionButton[];
 }
 
@@ -143,6 +146,37 @@ export interface ConciergeDispatchOptions {
   /** What ghost-text and auto-naming learn from; "" deliberately skips naming. Defaults to the
    *  wire text. */
   namingBasis?: string;
+  /**
+   * This text must NEVER be collapsed into a picker keystroke, however well it matches an option
+   * on the agent's screen. Set for a message the user ADDRESSED to this agent by name
+   * (`@Kraken Auth yes` — see ConciergeHost's mention routing).
+   *
+   * ══ WHY THE CALLER CANNOT ENFORCE THIS ITSELF (roborev 54569) ═══════════════════════════════
+   * `answersLivePicker` is a MIRROR of the gate below, exported for callers that must know the
+   * disposition before they build a payload — it decides nothing. The host suppressed it for an
+   * addressed send and believed that made the message safe; it did not. The picker block below runs
+   * on whatever text arrives, so `@Kraken Auth yes` still reached `matchAnswerToOption`, still read
+   * as terse, and still wrote `y\r` — pressing a button in answer to a question the user never
+   * read, which is the least recoverable thing this path can do. A host-level test could not catch
+   * it either, because it mocks this function.
+   *
+   * The disposition therefore has to be declared TO the dispatcher, not decided beside it.
+   *
+   * It REFUSES rather than writing the text as free text, and that is deliberate. A live picker
+   * owns the agent's stdin: free text plus a carriage return typed at a select prompt can move or
+   * accept the highlighted row, so "send it as a message instead" would be a different accidental
+   * keystroke rather than a fix.
+   *
+   * The refusal takes its OWN path, `addressed-at-picker`, and does not share `ambiguous-picker`.
+   * Sharing was tried and was a dead end: that copy says the answer mapped to nothing and offers
+   * "answer with just the option", and for an addressed message both are false — the text mapped
+   * perfectly (which is WHY it was refused: an addressed message is a message, not a keystroke),
+   * and answering with just the option is what the user already did. It sent them round a loop
+   * whose only exit was guessing that the `@` was the problem. (roborev 54665; the follow-up
+   * 54673 then removed the "drop the @" remedy from the new copy too — see ConciergeHost's
+   * `refusalCopy`, where that advice could aim a bare "yes" at a different agent's picker.)
+   */
+  neverPickerAnswer?: boolean;
 }
 
 // WHOLE-PHRASE anchored (roborev 46311): the entire trimmed answer must be a member of the
@@ -329,6 +363,17 @@ export async function dispatchConciergeAnswer(
     // These two conditions — a live-option match plus terseness — are what `answersLivePicker`
     // above mirrors for callers that must know the disposition BEFORE they build a payload. Change
     // the gate here and change it there.
+    //
+    // `neverPickerAnswer` gets its OWN path, and reusing `ambiguous-picker` for it was a dead end
+    // (roborev 54665). That path's copy is "waiting on a choice I can't map that to — open it and
+    // pick, or answer with just the option", and BOTH halves are false here: the text mapped
+    // perfectly (that is why it was refused), and answering with just the option is exactly what the
+    // user did. So they retype the same thing, get a byte-identical refusal, and the only exit is
+    // guessing that the `@address` is the problem — which the copy never says. Naming the agent you
+    // mean is most natural precisely when several are asking at once, so this is not a rare corner.
+    if (opts.neverPickerAnswer) {
+      return { ok: false, path: "addressed-at-picker", agentId, options };
+    }
     if (opts.userPrompt && !isTerseAnswer(text, options)) {
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }

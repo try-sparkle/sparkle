@@ -308,6 +308,100 @@ describe("ConciergeThread — auto-follow", () => {
     expect(el.scrollTop).toBe(el.scrollHeight);
   });
 
+  // THE USER'S OWN SUBMIT. Every other case here is about protecting a reader from content they did
+  // not ask for; a message THEY sent is the opposite — it is an unambiguous "show me what happens
+  // next", and the founder reported it not happening ("when I submit a chat it doesn't scroll me
+  // down to the bottom of the thread"). Follow, once disarmed, was disarmed for good until the
+  // reader personally scrolled back to the bottom — and a trackpad flick that settles 30px short of
+  // the bottom disarms it silently, so this is the normal state of a column that has been read.
+  it("scrolls to the bottom on the user's own submit, even after they scrolled up", () => {
+    const { rerender } = render(
+      <ConciergeThread messages={msgs(3)} onNudgeClick={noop} onNudgeAction={noop} />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 400);
+    readerScrollsTo(el, 0); // reading the top of the thread: follow is off
+
+    // A sparkle reply must still leave them alone — that is the behaviour this must not break.
+    rerender(<ConciergeThread messages={msgs(4)} onNudgeClick={noop} onNudgeAction={noop} />);
+    expect(el.scrollTop).toBe(0);
+
+    // Now THEY send. The host appends a `you` bubble in the same tick the send leaves.
+    rerender(
+      <ConciergeThread
+        messages={[...msgs(4), { id: "you-1", kind: "you", text: "what's blocking the PR?" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+
+  // The re-arm has to be keyed on a NEW user message, not on the presence of one. ConciergeHost
+  // hands this component a fresh array on every feed tick, and a thread the user has ever typed in
+  // contains a `you` bubble forever — so a re-arm that fired on "there is a you message" would slam
+  // a reading user to the bottom several times a second, which is bead sparkle-y4ft all over again.
+  it("does not re-arm on a feed tick that repeats the same user message", () => {
+    const sent: ConciergeMessage[] = [
+      ...msgs(2),
+      { id: "you-1", kind: "you", text: "what's blocking the PR?" },
+    ];
+    const { rerender } = render(
+      <ConciergeThread messages={sent} onNudgeClick={noop} onNudgeAction={noop} />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 400);
+    readerScrollsTo(el, 120); // parked mid-thread, reading
+
+    rerender(
+      <ConciergeThread messages={[...sent]} onNudgeClick={noop} onNudgeAction={noop} />,
+    );
+    expect(el.scrollTop).toBe(120);
+
+    // And a reply to that message is still content they did not ask to be shown.
+    rerender(
+      <ConciergeThread
+        messages={[...sent, { id: "b1", kind: "sparkle", text: "checks are red" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    expect(el.scrollTop).toBe(120);
+  });
+
+  // The shape the column actually lives in: nudges are appended AFTER the chat, so the message the
+  // user just sent is not the last one in the array. A re-arm that only looked at `messages.at(-1)`
+  // would miss every submit made while any agent is surfaced — which is most of them.
+  it("re-arms on a submit even when nudges sit below the new bubble", () => {
+    const nudge = {
+      id: "n1",
+      kind: "nudge" as const,
+      band: "needs_you" as const,
+      projectName: "sparkle",
+      agentName: "Some Agent",
+      text: "static nudge text",
+      actions: [],
+    };
+    const { rerender } = render(
+      <ConciergeThread messages={[...msgs(2), nudge]} onNudgeClick={noop} onNudgeAction={noop} />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 400);
+    readerScrollsTo(el, 0);
+
+    rerender(
+      <ConciergeThread
+        messages={[...msgs(2), { id: "you-1", kind: "you", text: "ship it" }, nudge]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+
   // A single NudgeCard (badge + text + up to three buttons) can be taller than the slack. Measured
   // after layout, that one message was enough to decide the reader had scrolled away.
   it("keeps following when one appended message is taller than the follow threshold", () => {

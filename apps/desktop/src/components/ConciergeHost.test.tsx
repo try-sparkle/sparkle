@@ -703,6 +703,9 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         userPrompt: true,
         display: "yes",
         namingBasis: "yes",
+        // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+        // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+        neverPickerAnswer: false,
       }),
     );
   });
@@ -755,6 +758,9 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         userPrompt: true,
         display: "rebase onto main and re-run CI",
         namingBasis: "rebase onto main and re-run CI",
+        // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+        // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+        neverPickerAnswer: false,
       },
     );
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
@@ -879,7 +885,13 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
   it.each([
     ["agent-failed", /hit Retry/],
     ["cloud-agent", /use its own pane for now/],
-    ["ambiguous-picker", /open it and pick/],
+    // NOT /open it and pick/ any more: `addressed-at-picker` was split out of this path and its
+    // copy contains that phrase too, so the pattern stopped being path-unique and swapping the two
+    // `case` bodies would still have passed — the exact drift class this table exists to catch.
+    // "a choice I can't map that to" is this copy's alone (roborev 54673).
+    ["ambiguous-picker", /a choice I can't map that to/],
+    // Its sibling, under the same uniqueness rule, so the mapping is pinned in BOTH directions.
+    ["addressed-at-picker", /didn't send that to it as a message/],
     // /didn't send/ is voice-unique but appears in THREE prompt-side branches, so it pins the voice
     // without pinning the path→copy mapping. "pass it along" is pty-gone's alone (roborev 53018).
     ["pty-gone", /pass it along/],
@@ -998,6 +1010,9 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         userPrompt: true,
         display: "for the agent I aimed at",
         namingBasis: "for the agent I aimed at",
+        // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+        // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+        neverPickerAnswer: false,
       }),
     );
   });
@@ -1271,6 +1286,9 @@ describe("ConciergeHost — routing receipts", () => {
       userPrompt: true,
       display: "was that right?",
       namingBasis: "was that right?",
+      // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+      // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+      neverPickerAnswer: false,
     });
   });
 
@@ -1473,6 +1491,9 @@ describe("ConciergeHost — recommended actions", () => {
       userPrompt: true,
       display: "do the thing",
       namingBasis: "do the thing",
+      // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+      // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+      neverPickerAnswer: false,
     });
     // A suggestion click posts no receipt, so this is the one delivery that DOES say so itself.
     expect(await findInThread(/^Sent to CI Hardening\.$/)).toBeTruthy();

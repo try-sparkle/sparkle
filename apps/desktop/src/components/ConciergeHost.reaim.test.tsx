@@ -312,6 +312,9 @@ describe("ConciergeHost — the box re-aimed from one agent to another", () => {
         userPrompt: true,
         display: B_ACTION.value,
         namingBasis: B_ACTION.value,
+        // FALSE for every send in this file: none of them is @-addressed, so each keeps the
+        // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
+        neverPickerAnswer: false,
         authority: { kind: "suggestion", agentId: "ag2" },
       }),
     );

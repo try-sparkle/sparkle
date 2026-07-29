@@ -84,6 +84,7 @@ import {
 import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { routeMessage } from "../services/conciergeRouter";
+import { mentionFreeText, rosterFromMentions, type ConciergeMention } from "./Concierge/mentions";
 import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useUiStore } from "../stores/uiStore";
@@ -237,6 +238,26 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
       return approving
         ? `${name} is asking something I can't answer with a plain "approve" — open it to choose.`
         : `${name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
+    // ITS OWN LINE, not a second use of `ambiguous-picker` above (roborev 54665). That copy says the
+    // answer mapped to nothing and to "answer with just the option", and here both are false: the
+    // text mapped perfectly — which is WHY it was refused, since an addressed message is a message,
+    // not a keystroke — and answering with just the option is what the user did. Sharing the line
+    // sent them round a loop whose only exit was guessing that the `@` was the problem. This one
+    // states the real reason and the two real exits.
+    // ONE exit, not two. This line used to offer a second — "drop the @<name> and send just the
+    // option" — and that advice is only safe when the named agent also happens to be the column's
+    // current target. `send` resolves an UNADDRESSED message against `targetRef.current`, so with
+    // the address removed the bare "yes" is aimed at whatever the column is pointed at. The whole
+    // premise of naming an agent is that it is most natural when several are asking at once, which
+    // is exactly when the shown target is a DIFFERENT agent — and a terse "yes" landing on that
+    // agent's live picker gets framed as `y\r` and presses its button. That is the precise outcome
+    // `neverPickerAnswer` exists to prevent, reintroduced by the remedy text. Gating the second
+    // exit on `targetRef.current?.agentId === aim.agentId` would also work; it is not worth a
+    // branch and a threaded ref to keep an affordance that saves one click. (roborev 54673.)
+    case "addressed-at-picker":
+      return approving
+        ? `${name} is waiting on a choice on screen — open it and pick.`
+        : `${name} is waiting on a choice on screen, so I didn't send that to it as a message — open ${name} and pick.`;
     case "unauthorized":
       // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
       // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,
@@ -453,6 +474,65 @@ export interface ConciergePromptTarget {
   name: string;
 }
 
+/**
+ * An aim the user stated OUT LOUD, by naming an agent in the message itself (`@Blueprint UI/UX move
+ * it 5px`). Everything the send needs to honour that, captured at submit like every other aim.
+ *
+ * ══ WHY THIS IS ALLOWED TO SKIP THE ROUTER, WHEN `forceSparkle` IS ONLY ALLOWED ONE WAY ═════════
+ * `deliver`'s `forceSparkle` carries a warning that a `forceAgent` twin must never be added, because
+ * it "would type a paragraph into a live PTY on the strength of a latch". That warning stands, and
+ * this is not the thing it forbids. Three differences, and the third is the one that matters:
+ *
+ *   1. A LATCH is invisible state left over from an earlier action (the capture window's Chat ❯,
+ *      set once and consumed later), which is why it has to be retired the moment the words that
+ *      set it are gone. A mention is not state at all — it is DERIVED from the text being sent, at
+ *      the moment of sending (components/Concierge/mentions). It cannot outlive its own words
+ *      because it has no existence apart from them.
+ *   2. It is VISIBLE. The user typed the name, the picker offered it, and the pill is in the bubble.
+ *   3. **IT DOES NOT SKIP THE GATE.** This changes only WHO decides the destination — the user
+ *      instead of the classifier. It still arms an intent, still counts down in the banner, still
+ *      offers Cancel, and still posts a receipt. What the warning is really protecting is that no
+ *      heuristic verdict reaches a terminal unseen; a mention reaches it by exactly the same
+ *      countdown every routed send does. That is why there is still no `router` arm in
+ *      DispatchAuthority and must never be one.
+ *
+ * So: explicitness buys the user a skipped classify, never a skipped gate. If you are ever tempted
+ * to dispatch a mention directly, that is the line this comment exists to hold.
+ */
+interface ConciergeMentionAim {
+  /** The agent the message named. */
+  target: ConciergePromptTarget;
+  /** What the PTY receives — the address stripped off, attachment paths prefixed. The `@` must not
+   *  reach the terminal: the agent there is a Claude Code CLI, where a leading `@` opens its own
+   *  file-reference autocomplete (see mentions.mentionFreeText). */
+  payload: string;
+  /** The same without attachment paths — what the auto-namer reads. */
+  text: string;
+}
+
+/** How much of a relayed message is quoted back to the brain when it acknowledges the hand-off.
+ *  Bounded for the reason the router bounds its context line: a pasted essay would otherwise bill
+ *  unbounded metered input tokens on every mention. */
+const RELAY_QUOTE_CHARS = 240;
+
+/**
+ * What Sparkle is asked after it has relayed a message — the founder's headline requirement:
+ * *"the concierge sends it over to that builder agent, but ALSO still participates in the
+ * conversation… I want the concierge to be a thought partner."*
+ *
+ * A real brain turn, not a canned line. `postSparkle("Sent to X.")` would satisfy "says something"
+ * and miss the ask entirely: the point is that addressing an agent starts a conversation ABOUT that
+ * agent rather than ending one. The receipt under the bubble already states the bare fact of
+ * delivery, so this prompt asks for the half a receipt cannot give.
+ *
+ * Phrased in the user's voice because `buildSnapshot` wraps it in "The user says:" — writing it as
+ * an instruction to the assistant there would read as the user issuing stage directions.
+ */
+export function relayFollowUp(agentName: string, sent: string): string {
+  const quoted = oneLine(sent).slice(0, RELAY_QUOTE_CHARS);
+  return `(I just used the concierge to send "${quoted}" over to my build agent "${agentName}". Confirm briefly that it went, then stay with me on it — what else should I be thinking about, or want to take up with ${agentName}?)`;
+}
+
 export function ConciergeHost({
   feed,
   promptTarget = null,
@@ -639,6 +719,43 @@ export function ConciergeHost({
   useEffect(() => {
     targetRef.current = routingTarget;
   }, [routingTarget]);
+
+  // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
+  // Who the compose box's "@" picker may offer, and — the same list, which is the point — the roster
+  // a typed mention is RESOLVED against. One list, so an agent that is offerable and an agent that
+  // is addressable can never be two different populations.
+  //
+  // UNORDERED AND UNLABELLED, deliberately: `ComposeBox` runs `mentionRoster` on this once and uses
+  // the result for its picker, its resolve and its Backspace alike. This host briefly did the
+  // ordering instead, on a contract stated in a comment — which is not a contract (roborev 54555),
+  // and it left the consumer free to resolve against a list that had skipped the step. Ordering and
+  // duplicate-name labelling belong at the single place that turns text into an aim.
+  //
+  // EVERY agent in the feed, including the ones that cannot take a message: the picker lists those
+  // disabled with a reason rather than hiding them, because "no such agent" and "that one is a
+  // cloud agent" are different answers. `canAcceptInput` here is a snapshot for the LIST; the
+  // authoritative check is the one `deliver` makes at send time against the live store.
+  const mentionAgents = useMemo(
+    () =>
+      allAgents(feed).map((a) => ({
+        id: a.id,
+        name: a.name,
+        projectId: a.projectId,
+        projectName: a.projectName,
+        band: a.band,
+        since: a.since,
+        canAcceptInput: agentCanAcceptInput(a.id),
+      })),
+    [feed],
+  );
+  // …and the same list for the handlers, which are memoized on stable deps and run after render
+  // (the feedRef/targetRef pattern above). `send` resolves a mention off this rather than closing
+  // over a render-time value, so a message submitted after the fleet changed resolves against the
+  // fleet as it is NOW.
+  const mentionAgentsRef = useRef(mentionAgents);
+  useEffect(() => {
+    mentionAgentsRef.current = mentionAgents;
+  }, [mentionAgents]);
 
   // ══ HANDOFFS INTO THIS BOX ═══════════════════════════════════════════════════════════════════
   //
@@ -1248,11 +1365,18 @@ export function ConciergeHost({
        *  the whole gate at the one call site that matters most. Appended rather than inserted so
        *  the diff against a branch that also edits this file stays as small as possible. */
       authority: DispatchAuthority,
+      /** Forbid this text being collapsed into a picker keystroke — see
+       *  conciergeDispatch's `neverPickerAnswer`. TRUE only for a message the user ADDRESSED to
+       *  this agent by name; the mirror check in `send` cannot enforce it, because the gate lives
+       *  inside the dispatcher (roborev 54569). REQUIRED, so a future call site has to decide
+       *  rather than inherit a default that is wrong for it. */
+      neverPickerAnswer: boolean,
     ): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, {
           authority,
           userPrompt: true,
+          neverPickerAnswer,
           ...renderings,
         });
         // As in `approve`, `ok` gates the held branch: an ok:false queued result must not be
@@ -1416,6 +1540,11 @@ export function ConciergeHost({
        *  agent. A `forceAgent` twin would type a paragraph into a live PTY on the strength of a
        *  latch, which conciergeRouter's header rules out — do not add one. */
       forceSparkle: boolean,
+      /** The user NAMED the destination in the message ("@Kraken Auth ship it"). Overrules the
+       *  router toward that agent — see ConciergeMentionAim for why that is allowed here when
+       *  `forceSparkle` has no legal twin, and for the gate it does NOT skip. Null on every send
+       *  that names nobody, which is every send that existed before mentions. */
+      mentionAim: ConciergeMentionAim | null,
     ): Promise<boolean> => {
       // An agent that has since LEFT the feed is gone (closed, deleted, project unloaded), and
       // routing at it would report a delivery that cannot happen. Gone → the safe direction.
@@ -1425,7 +1554,46 @@ export function ConciergeHost({
       // telling the router turns a guaranteed delivery failure into a useful chat answer. One
       // shared predicate rather than a copy here, so the two can't drift.
       const canAcceptInput = aim ? agentCanAcceptInput(aim.agentId) : false;
-      const decision = forceSparkle
+      // ══ AN ADDRESSED MESSAGE, AND THE TWO WAYS IT CAN STILL FAIL ════════════════════════════
+      // `aim` and `canAcceptInput` above are the same two checks every send makes, so a mention
+      // that named an agent which has since closed — or one that can never take a prompt at all,
+      // like a cloud agent — has already been reduced to "no usable aim" by the time we get here.
+      // That leaves the message going to Sparkle, which is right (the recoverable direction), but
+      // it must not go there SILENTLY: the user typed a name and watched a pill appear, so the one
+      // thing they will not expect is a chat answer with no explanation. The receipt alone does not
+      // say it either — it names Sparkle, not the agent that turned out to be unreachable.
+      const addressed = mentionAim !== null;
+      const addressable = addressed && !!aim && canAcceptInput;
+      if (addressed && !addressable) {
+        postSparkle(
+          `${mentionAim.target.name} can't take a message right now, so I've kept this here instead.`,
+        );
+      }
+      // An address with NOTHING TO SAY is not a send. "@Kraken Auth" on its own strips to an empty
+      // wire payload, and writing an empty line into a live PTY is at best a stray newline at the
+      // agent's prompt. It is also almost certainly not what the user meant, so the concierge asks
+      // rather than either guessing or silently doing nothing.
+      if (addressable && mentionAim.text.trim() === "" && staged.length === 0) {
+        postSparkle(`You've got ${mentionAim.target.name} in mind — what should I send over?`);
+        setReceipt(id, {
+          target: "sparkle",
+          agentName: aim?.name,
+          agentId: aim?.agentId,
+          // Nothing to redirect: there is no instruction in this message to send anywhere.
+          redirectable: false,
+        });
+        return true;
+      }
+      const decision = addressable
+        ? ({
+            target: "agent",
+            reason: "you named this agent in the message",
+            // "heuristic" for the same reason `forceSparkle` claims it: tier 1 means deterministic
+            // and zero-cost, and no model was asked. Naming the agent yourself is as tier-1 as it
+            // gets — it is not a guess at all.
+            source: "heuristic",
+          } as const)
+        : forceSparkle
         ? ({
             target: "sparkle",
             reason: "you sent this from the capture window's Chat",
@@ -1455,8 +1623,15 @@ export function ConciergeHost({
         // DispatchAuthority and must never be one — a heuristic verdict is not a user gesture, and
         // the union having no legal variant for it is what makes the old behavior unrepresentable
         // rather than merely discouraged.
+        // What actually goes down the wire. For an ADDRESSED message that is the version with the
+        // `@…` stripped: the agent on the far end is a Claude Code CLI, where a leading `@` opens
+        // its own file-reference autocomplete, so relaying the address verbatim would pop a picker
+        // inside the agent's composer and strand the instruction behind it (mentions.
+        // mentionFreeText). Every other send is unchanged.
+        const wire = mentionAim && addressable ? mentionAim.payload : payload;
+        const namingBasis = mentionAim && addressable ? mentionAim.text : text;
         const armed = armIntent({
-          text: payload,
+          text: wire,
           // The BANNER and the live region quote this, never `payload`. `attachedPayload` prefixes
           // each attachment's quoted temp path, so quoting it would make the column announce
           // `I'll tell Kraken Auth: "'/var/folders/x9/T/sparkle-shot-1753.png' what is wrong here?"`
@@ -1493,11 +1668,14 @@ export function ConciergeHost({
               // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
               const ok = await promptAgent(
                 aim,
-                payload,
-                { display, namingBasis: text },
+                wire,
+                { display, namingBasis },
                 staged,
                 false,
                 authority,
+                // An ADDRESSED message is a message. Without this the dispatcher would still match
+                // it against a live picker and press a button (roborev 54569).
+                !!mentionAim && addressable,
               );
               // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in
               // the thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
@@ -1508,6 +1686,24 @@ export function ConciergeHost({
                   agentId: aim.agentId,
                   redirectable: true,
                 });
+                // ══ THE CONCIERGE STAYS IN THE CONVERSATION ═══════════════════════════════════
+                // The founder's headline requirement for this feature: "the concierge sends it over
+                // to that builder agent, but ALSO still participates in the conversation… I want
+                // the concierge to be a thought partner."
+                //
+                // Only for an ADDRESSED send. A message the ROUTER decided belonged to an agent is
+                // one the user wrote to that agent — following it with an unbidden chat turn would
+                // put a paragraph of commentary after every terse "yes" typed at a picker, and bill
+                // a brain turn for it. Naming an agent is different: it is a message sent THROUGH
+                // the concierge, which is a conversation the concierge is a party to.
+                //
+                // AFTER delivery, never at arm time. The countdown is cancellable, and a reply
+                // saying "sent it" over a send the user then stopped would be exactly the kind of
+                // small lie the receipt rules in this file exist to prevent.
+                //
+                // Quotes the DISPLAY rendering, never the wire: `payload` carries the attachments'
+                // temp paths, and this text reaches the brain's context (roborev 46925).
+                if (mentionAim && addressable) askSparkle(relayFollowUp(aim.name, display));
                 return true;
               }
               // A failed delivery must not cost the user their files any more than their words
@@ -1597,17 +1793,37 @@ export function ConciergeHost({
    * through the ordering fix itself, exactly the misdelivery the removed pinned-aim guard prevented.
    */
   const send = useCallback(
-    (text: string): Promise<boolean> => {
+    (text: string, mentions?: ConciergeMention[]): Promise<boolean> => {
       // The capture-Chat aim, consumed HERE for the same reason the aim itself is: everything that
       // must reflect SUBMIT happens synchronously, so a handoff landing while this send is still
       // queued cannot retroactively redirect it.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
+      // THE ADDRESSED AGENT, if the user named one. The FIRST mention only: a message goes to one
+      // terminal, and fanning it out to several would multiply an irreversible action across agents
+      // the user named in one sentence — every extra name is still drawn as a pill in the bubble, so
+      // nothing is hidden, and the receipt names the one that was actually used. (A deliberate
+      // multi-send belongs behind its own affordance, not behind a comma.)
+      //
+      // Resolved against the LIVE roster, so a mention naming an agent that has since closed simply
+      // fails to resolve and the message falls back to the auto-router — the recoverable direction,
+      // and the same answer `deliver` gives when an aim goes missing mid-flight.
+      const named = mentions?.[0];
+      const mentionedAgent = named
+        ? mentionAgentsRef.current.find((a) => a.id === named.agentId)
+        : undefined;
       // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
       // mic does not keep transcribing the room while the send is handled.
       maybePauseOnSubmit();
       const id = nextId("you");
-      const submitted = targetRef.current;
+      // A named agent OVERRIDES what happens to be selected — that is the whole point of naming one.
+      const submitted: ConciergePromptTarget | null = mentionedAgent
+        ? {
+            projectId: mentionedAgent.projectId,
+            agentId: mentionedAgent.id,
+            name: mentionedAgent.name,
+          }
+        : targetRef.current;
       // IS THIS A PICKER ANSWER? Asked BEFORE the payload is built, because the answer changes how
       // it is built. The prefix `attachedPayload` adds is quoted temp paths, and every arm of
       // `matchAnswerToOption` is anchored — so with a file staged and a picker on screen, "Yes"
@@ -1620,7 +1836,14 @@ export function ConciergeHost({
       // the next message. Holding them is the honest half: the picker answer is a keystroke, not a
       // message that could carry a file, so consuming them would silently cost the user the picking
       // for nothing. The chips stay on screen, which is also the only signal that they weren't sent.
-      const answersPicker = !!submitted && answersLivePicker(submitted.agentId, text);
+      //
+      // NEVER for an addressed message. `matchAnswerToOption` matches terse text against whatever
+      // picker is on the agent's screen, and a message that names its recipient is a MESSAGE — the
+      // user wrote a sentence at an agent, not a keystroke at a menu. Letting "@Kraken Auth yes"
+      // collapse into pressing "yes" on some unrelated prompt would answer a question they never
+      // read, which is the least recoverable thing this column can do.
+      const answersPicker =
+        !mentionedAgent && !!submitted && answersLivePicker(submitted.agentId, text);
       // Take the staged files in the SAME tick the text leaves, so the next message starts clean
       // and a second Send can't deliver the same attachments twice.
       const staged = answersPicker ? [] : takeAttachments();
@@ -1633,6 +1856,21 @@ export function ConciergeHost({
       // The temp paths must never reach any of them but the first (roborev 46911/46925).
       const payload = attachedPayload(text, staged);
       const display = attachedDisplay(text, staged);
+      // A FOURTH rendering, and only when the message is addressed: the same thing with the `@…`
+      // address taken off. It is a separate rendering rather than a change to `payload` because
+      // `payload` still has to carry the address everywhere else — Sparkle answering the message
+      // should see who it was aimed at, and a redirect replays it verbatim. Only the wire into the
+      // named agent's own terminal drops it (see ConciergeMentionAim).
+      //
+      // Built from the resolved mentions rather than the whole roster, so it strips exactly the
+      // spans that were recognised — no second, laxer notion of what a mention looks like.
+      const mentionAim: ConciergeMentionAim | null =
+        mentionedAgent && submitted
+          ? (() => {
+              const wire = mentionFreeText(text, rosterFromMentions(mentions ?? []));
+              return { target: submitted, payload: attachedPayload(wire, staged), text: wire };
+            })()
+          : null;
       // SNAPSHOT the staged files onto the message itself, in the same tick they are taken. They are
       // gone from the view model a line later (`takeAttachments` above), so a bubble that read the
       // live list would show the picture for one frame and then go blank — which is the state the
@@ -1641,14 +1879,24 @@ export function ConciergeHost({
       // grow an empty array on every message.
       setChat((prev) => [
         ...prev,
-        { id, kind: "you" as const, text: display, attachments: staged.length ? staged : undefined },
+        {
+          id,
+          kind: "you" as const,
+          text: display,
+          attachments: staged.length ? staged : undefined,
+          // Snapshotted onto the message for the same reason the files are: this bubble is the
+          // record of who the message went to, and resolving its pills against the live fleet later
+          // would erase them the moment that agent was closed. ALL of them, not just the one that
+          // was used — the user wrote those names and should see them back.
+          mentions: mentions?.length ? mentions : undefined,
+        },
       ]);
       // Remember BOTH: a redirect to the agent must replay the payload (paths included), a redirect
       // to Sparkle must replay the plain text.
       rememberSentText(sentTextRef.current, id, text);
       rememberSentText(sentPayloadRef.current, id, payload);
       return enqueue(
-        () => deliver(id, text, payload, display, submitted, staged, forceSparkle),
+        () => deliver(id, text, payload, display, submitted, staged, forceSparkle, mentionAim),
         false,
       );
     },
@@ -1708,10 +1956,17 @@ export function ConciergeHost({
           () =>
             // The user tapped redirect on this message's routing receipt. Authorized by that tap,
             // and named by the message it belongs to.
-            promptAgent(aim, replay, { display: text, namingBasis: text }, [], false, {
-              kind: "redirect",
-              receiptId: messageId,
-            }),
+            promptAgent(
+              aim,
+              replay,
+              { display: text, namingBasis: text },
+              [],
+              false,
+              { kind: "redirect", receiptId: messageId },
+              // A redirect replays a message the router already sent elsewhere; it is not an
+              // addressed send, so the picker path stays available to it exactly as before.
+              false,
+            ),
           false,
         );
         if (ok) setReceipt(messageId, { ...receipt, alsoSentTo: "agent", redirectable: false });
@@ -1939,6 +2194,10 @@ export function ConciergeHost({
         registerInsert={registerInsert}
         onTextEdit={onTextEdit}
         announcement={announcement}
+        // The "@" picker's list, and the roster a typed mention resolves against — relevance-
+        // ordered, because that order is what breaks a duplicate-name tie (see the memo).
+        mentionAgents={mentionAgents}
+        preferredAgentId={routingTarget?.agentId ?? null}
       />
       {/* The recommended-action pill. Mounted HERE — where its delivery wiring lives — but it
           renders over the target agent's terminal, which it reaches by portal (see
@@ -1966,10 +2225,17 @@ export function ConciergeHost({
           // delivered recommended action would be the one silent success in the column.
           // The user clicked a recommended-action pill — an explicit, targeted gesture.
           onDeliverPrompt={(t) =>
-            promptAgent(target, t, { display: t, namingBasis: t }, [], true, {
-              kind: "suggestion",
-              agentId: target.agentId,
-            })
+            promptAgent(
+              target,
+              t,
+              { display: t, namingBasis: t },
+              [],
+              true,
+              { kind: "suggestion", agentId: target.agentId },
+              // A recommended-action pill IS often a picker answer — that is much of what it is
+              // for — so it keeps the keystroke path.
+              false,
+            )
           }
           onFailure={postSparkle}
         />

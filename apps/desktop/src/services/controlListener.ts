@@ -31,6 +31,9 @@ import type { StatusBand } from "../engine/buildSections";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { getModelCatalog } from "./models";
 import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools/registry";
+// What the concierge is doing right now, for the thread's thinking indicator. Recorded from the one
+// call site that both sees every tool call and knows it came from the concierge.
+import { noteConciergeToolCall } from "./conciergeActivity";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
@@ -661,18 +664,38 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   // it is the registry's authority constructor that refuses on it, and that refusal is the one that
   // explains what a tool write needs.
   const toolCallId = typeof req.payload.toolCallId === "string" ? req.payload.toolCallId : "";
-  // Total by contract — it resolves to a reply for an unknown domain, bad args, or an internal
-  // error, so nothing here needs a catch of its own (dispatch's outer one stays as the backstop).
+  // TELL THE COLUMN WHAT THE CONCIERGE IS DOING (services/conciergeActivity → the thread's thinking
+  // indicator). Recorded HERE rather than inside the registry because this is the point at which the
+  // call is known to be the CONCIERGE'S: the reserved-caller check above has already run, so a
+  // refused near-miss caller can never put a line in the human's thread. Started before dispatch and
+  // settled in the `finally`, so the indicator's tense follows the real call and even a dispatch
+  // that somehow threw cannot strand the column mid-sentence.
   //
-  // `configuredToolPolicy` is what makes the human's per-tool allow/ask/deny settings load-bearing.
-  // Passing it here is the ONE wiring line the registry's policy seam was built for. Omitting it
-  // would silently fall back to `permissiveToolPolicy` — every tool allowed — which is why the
-  // default is a NAMED export rather than an inline `() => ({ tier: "allow" })`: a missing policy
-  // is visible in review instead of looking like the intended behaviour.
-  return dispatchConciergeTool(
-    { domain, op, args: req.payload.args, toolCallId },
-    { policy: configuredToolPolicy },
-  );
+  // SETTLED WITH THE REPLY'S OWN `ok`, which is the whole correctness of the line. This dispatch is
+  // TOTAL — a policy denial, an ask-tier tool awaiting the human's approval, `bad-args`,
+  // `unknown-op` and `internal-error` are all ordinary resolved replies — so a settle that assumed
+  // success reported a refused merge as "Merged PR #753", in the same column that was showing the
+  // approval request for it. `ok` starts FALSE so a throw settles as an attempt too.
+  const settleActivity = noteConciergeToolCall(domain, op, req.payload.args);
+  let ok = false;
+  try {
+    // Total by contract — it resolves to a reply for an unknown domain, bad args, or an internal
+    // error, so nothing here needs a catch of its own (dispatch's outer one stays as the backstop).
+    //
+    // `configuredToolPolicy` is what makes the human's per-tool allow/ask/deny settings
+    // load-bearing. Passing it here is the ONE wiring line the registry's policy seam was built for.
+    // Omitting it would silently fall back to `permissiveToolPolicy` — every tool allowed — which is
+    // why the default is a NAMED export rather than an inline `() => ({ tier: "allow" })`: a missing
+    // policy is visible in review instead of looking like the intended behaviour.
+    const reply = await dispatchConciergeTool(
+      { domain, op, args: req.payload.args, toolCallId },
+      { policy: configuredToolPolicy },
+    );
+    ok = reply.ok === true;
+    return reply;
+  } finally {
+    settleActivity(ok);
+  }
 }
 
 /** Did a handler's result represent a successful op? A `{ error }` reply (unknown op, thrown error)

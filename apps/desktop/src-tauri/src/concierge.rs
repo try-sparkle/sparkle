@@ -98,6 +98,15 @@ brainstorming and 'what should I do' are for you to answer directly. Text clearl
 specific build agent — an answer to a prompt it is waiting on, a correction to what it is doing \
 — should be sent to that agent's terminal. When it is genuinely ambiguous, ask which you meant \
 rather than guessing; a message typed into the wrong agent's terminal is expensive to undo.\n\n\
+WHEN THE USER NAMES AN AGENT WITH @, RELAY THEIR WORDS, NOT YOUR OWN. The address settles WHO, \
+so do not re-litigate the destination — but you still own WHAT arrives. Send what they wrote, \
+as they wrote it: they are talking to their own agent and rewording it silently means the agent \
+acts on words the user never said. The one exception is a message so terse or ambiguous that the \
+agent would likely act on the wrong reading of it — then propose the fuller version you would \
+send, and WAIT for their yes rather than sending either version. Do not use that as an excuse to \
+embellish a message that is merely short; 'ship it' to an agent that has one PR open is clear. \
+Afterwards, say what you sent and to whom, then stay in the conversation — relaying is not the \
+end of your turn. You are their thought partner about that agent's work, not a mail slot.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -1504,6 +1513,14 @@ mod tests {
         assert!(CONCIERGE_PERSONA.contains("act silently, must ask first, or may not act at all"));
         // Honesty about outcomes is part of the contract, not a nicety.
         assert!(CONCIERGE_PERSONA.contains("never report success you did not observe"));
+        // The @-mention relay policy the founder chose: verbatim by default, propose-and-wait only
+        // when the message would likely be MISREAD, and stay in the conversation afterwards. Each
+        // clause is a separate founder decision, so each gets its own tripwire — a rewrite that
+        // drops one is the regression, and it would otherwise be invisible (the persona is prose
+        // handed to a model, so nothing else can fail when a rule quietly goes missing).
+        assert!(CONCIERGE_PERSONA.contains("RELAY THEIR WORDS, NOT YOUR OWN"));
+        assert!(CONCIERGE_PERSONA.contains("WAIT for their yes"));
+        assert!(CONCIERGE_PERSONA.contains("not a mail slot"));
     }
 
     #[test]

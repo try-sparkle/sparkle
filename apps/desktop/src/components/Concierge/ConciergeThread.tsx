@@ -9,10 +9,12 @@ import { bandColor } from "../../engine/statusBandLabels";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
+import { ThinkingIndicator } from "./ThinkingIndicator";
 // The read-only strip a SENT message's files draw as, plus the one lightbox they open. It lives in
 // components/composer beside that lightbox rather than here — see its header for why.
 import { MessageAttachments } from "../composer/MessageAttachments";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
+import { splitMentionText, type ConciergeMention } from "./mentions";
 import type { ConciergeDigestMessage, ConciergeMessage, ConciergeNudge } from "./types";
 
 /** How close to the bottom still counts as "following", measured when the READER scrolls.
@@ -25,6 +27,71 @@ import type { ConciergeDigestMessage, ConciergeMessage, ConciergeNudge } from ".
  *  clientHeight/scrollHeight under non-integral zoom can leave a genuinely-bottomed container a few
  *  px off, and each such miss silently costs the reader the follow. Both sides are tested. */
 const FOLLOW_THRESHOLD_PX = 24;
+
+/** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
+ *
+ *  Scanned backwards rather than read off `messages.at(-1)`: ConciergeHost builds the array as
+ *  [...chat, ...nudges], so the bubble the user just sent is only last while nothing is surfaced —
+ *  and "something is surfaced" is the state the column normally lives in. Same reasoning the
+ *  content key's total-length term is written against. */
+function newestUserMessageId(messages: ConciergeMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.kind === "you") return m.id;
+  }
+  return "";
+}
+
+/**
+ * A user bubble's words, with any agent it ADDRESSED drawn as a pill rather than as raw `@text`.
+ *
+ * The founder's ask ends here: "if I press enter it shows me the agent as a pill in the chat." The
+ * composer cannot draw one — it is a plain `<textarea>`, and it stays one, because the rich
+ * placeholder overlay and the measured height engine both depend on that — so the SENT message is
+ * where the pill becomes visible, and it is also where it matters most: this bubble is the record
+ * of who a message went to.
+ *
+ * Split against the mentions RECORDED ON THE MESSAGE (see ConciergeUserMessage.mentions), never
+ * against the live roster, so a message keeps its pills after its agent is closed.
+ *
+ * Plain text renders exactly as it did before — one string, no wrapper — so a thread of ordinary
+ * messages is untouched by this and its whitespace behaviour cannot drift.
+ */
+function MentionedText({ text, mentions }: { text: string; mentions?: ConciergeMention[] }) {
+  if (!mentions?.length) return <>{text}</>;
+  return (
+    <>
+      {splitMentionText(text, mentions).map((part, i) =>
+        part.kind === "text" ? (
+          // The index IS the identity here: these parts are positional slices of one immutable
+          // string on a message that never re-renders with different content.
+          <span key={i}>{part.text}</span>
+        ) : (
+          <span
+            key={i}
+            data-testid="concierge-mention-pill"
+            data-agent-id={part.agentId}
+            style={{
+              // Tinted, not bordered — the same call the bubble itself makes (see its NO BORDER
+              // note): a fill is already a shape, and a hairline around a pill this small at 13px
+              // reads as noise. The teal is the attachment chip's tint, which is the established
+              // "something rode along with this message" signal in this column.
+              background: `color-mix(in srgb, ${C.teal} 18%, transparent)`,
+              color: C.cream,
+              borderRadius: 4,
+              padding: "1px 4px",
+              // Keep the address on one line: a pill broken across two lines stops reading as one
+              // object, and these are two or three words at most.
+              whiteSpace: "nowrap",
+            }}
+          >
+            {part.text}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
 
 export function ConciergeThread({
   messages,
@@ -52,6 +119,10 @@ export function ConciergeThread({
    *  scrolling. -1 is a value no scrollTop can hold, so the first event of a session always counts
    *  as the reader's. */
   const lastTopRef = useRef(-1);
+  /** The newest user-sent message id this component has already reacted to. `null` until the first
+   *  effect run, so a thread that MOUNTS with the user's last message in it (the persisted thread,
+   *  restored at launch) isn't mistaken for a fresh submit. */
+  const lastUserMessageIdRef = useRef<string | null>(null);
 
   // Auto-follow, but only when the reader is actually at the bottom (bead sparkle-y4ft). This used to
   // be an unconditional `scrollTop = scrollHeight` keyed on [messages, typing], which produced the
@@ -73,10 +144,37 @@ export function ConciergeThread({
   const last = messages.length > 0 ? messages[messages.length - 1]! : undefined;
   const totalLength = messages.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
   const contentKey = `${messages.length}:${last?.id ?? ""}:${totalLength}`;
+  const userMessageId = newestUserMessageId(messages);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // THE ONE THING THAT RE-ARMS THE FOLLOW BESIDES REACHING THE BOTTOM: the user's own submit.
+    //
+    // Everything above is about protecting a reader from content they did not ask for. A message
+    // THEY sent is the opposite — it is an unambiguous "show me what happens next" — and until this
+    // existed there was nothing that could re-arm the follow except personally scrolling back to the
+    // bottom. That is a one-way door in practice, which is the founder's report ("when I submit a
+    // chat it doesn't scroll me down to the bottom of the thread"): a trackpad flick that settles
+    // 30px short of the bottom is past FOLLOW_THRESHOLD_PX, so the follow dies silently and every
+    // later send — including the one they are watching for — lands below the fold.
+    //
+    // Keyed on a NEW user message id, never on "a user message exists". A thread the user has ever
+    // typed in contains a `you` bubble forever, and the host hands this component a fresh array
+    // several times a second; a presence test would re-arm on every feed tick and restore bead
+    // sparkle-y4ft's "clicking an item scrolls the column" in full.
+    //
+    // Deliberately NOT a `sending` prop from the host. The bubble IS the send — the host appends it
+    // in the same tick the message leaves (`ConciergeHost.send`) — so reading it here keeps the
+    // signal in this component's own inputs, with nothing to keep in step and no way for a prop to
+    // be left set after a send that failed.
+    const previousUserMessageId = lastUserMessageIdRef.current;
+    lastUserMessageIdRef.current = userMessageId;
+    const userJustSent =
+      previousUserMessageId !== null &&
+      userMessageId !== "" &&
+      userMessageId !== previousUserMessageId;
+    if (userJustSent) followRef.current = true;
     // Guard 2, the stick-to-bottom check — READ from the reader's own scrolling, not re-measured
     // here. Measuring after layout got both ends wrong: on mount `scrollTop` is 0 against a full
     // `scrollHeight`, so a thread that opens with any content is judged "scrolled up" and never
@@ -89,7 +187,11 @@ export function ConciergeThread({
     // on exactly that value reads as "didn't move" and the demotion is skipped — and the previous
     // bottom is the likeliest such value, since streaming moves the bottom one chunk at a time.
     lastTopRef.current = el.scrollTop;
-  }, [contentKey, typing]);
+    // `userMessageId` is in the deps even though a new bubble always moves `contentKey` too: the
+    // thread is CAPPED (stores/conciergeThreadStore evicts the oldest bubbles), so a send that
+    // evicts one message while adding another can leave the length unchanged, and the re-arm must
+    // not depend on the total-length term happening to differ.
+  }, [contentKey, typing, userMessageId]);
 
   return (
     <div
@@ -180,7 +282,7 @@ export function ConciergeThread({
                     text still carries the compact count ("look · 1 image"), which is what a
                     restored bubble falls back to once its base64 has been stripped. */}
                 <MessageAttachments attachments={m.attachments ?? []} />
-                {m.text}
+                <MentionedText text={m.text} mentions={m.mentions} />
               </div>
               {m.receipt && (
                 <RoutingReceipt
@@ -303,16 +405,9 @@ export function ConciergeThread({
           </div>
         );
       })}
-      {typing && (
-        <div
-          aria-hidden
-          aria-label="Sparkle is typing"
-          style={{ alignSelf: "flex-start", fontSize: 13, color: C.conciergeMuted }}
-        >
-          {/* index.css's existing "working on it" opacity breathe — no motion, reduced-motion safe. */}
-          <span className="sparkle-pulse">…</span>
-        </div>
-      )}
+      {/* The pulse, plus what the concierge is actually doing when it is doing something the app
+          observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
+      <ThinkingIndicator typing={typing} />
     </div>
   );
 }

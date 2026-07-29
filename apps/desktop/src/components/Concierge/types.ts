@@ -18,8 +18,14 @@ import type { Attachment } from "../composer/attachments";
 // the pure text rules the founder's strings are pinned against), and is re-exported here so the
 // column's contract still hands consumers one place to import from.
 import type { ProjectNeedsYou } from "./ScopeVitals";
+// The @-mention shapes live with the pure module that owns the matching rules (./mentions — no
+// React, no stores), for the same reason `Attachment` lives with the composer's model: one
+// declaration, so the composer that produces a mention and the bubble that draws it cannot drift
+// about what one is.
+import type { ConciergeMention, MentionAgent } from "./mentions";
 
 export type { ProjectNeedsYou };
+export type { ConciergeMention, MentionAgent };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
 // than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
@@ -72,6 +78,18 @@ export interface ConciergeUserMessage {
    *  stores/conciergeThreadStore), so a restored message renders its files as chips rather than
    *  blowing the localStorage quota with base64. */
   attachments?: Attachment[];
+  /** The agents this message ADDRESSED by name (`@Blueprint UI/UX …`), so the bubble can draw them
+   *  as pills instead of raw text.
+   *
+   *  A SNAPSHOT, like `attachments` above, and for a sharper reason than convenience: a sent message
+   *  is history. Resolving the pills against the live roster at render time would make a mention
+   *  decay into plain `@text` the moment its agent was closed — silently rewriting what the user is
+   *  scrolling back through. The record travels with the message so the thread always shows who was
+   *  addressed, whether or not they still exist.
+   *
+   *  `undefined` rather than `[]` on an unaddressed message, matching `attachments`: this thread is
+   *  persisted, and an empty array per message buys nothing the absent field doesn't. */
+  mentions?: ConciergeMention[];
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */
@@ -207,10 +225,14 @@ export interface ConciergeController {
    *  layer decides where it goes (services/conciergeRouter) — the column never decides, and no
    *  longer carries an affordance for the user to decide either.
    *
+   *  `mentions` is the EXPLICIT half of that decision, and the only thing that overrules the
+   *  router: the agents the text addresses by name. Absent when it addresses none — which is every
+   *  send this column has made until now, so nothing already implementing this callback changes.
+   *
    *  May return a promise resolving FALSE when the send did not land; the compose box then puts
    *  the draft back rather than making the user retype it. Returning nothing means "assume it
    *  landed" (the chat path, which can't fail visibly). */
-  onSend(text: string): void | Promise<boolean>;
+  onSend(text: string, mentions?: ConciergeMention[]): void | Promise<boolean>;
   /** The user tapped the redirect on a routing receipt: send that same message the OTHER way.
    *  Additive — the original delivery stands (see ConciergeReceipt). */
   onRedirect?(messageId: string): void;
@@ -246,6 +268,15 @@ export interface ConciergeColumnProps {
   registerInsert?: (append: ((text: string) => void) | null) => void;
   /** The user typed or deleted in the compose box (not a dictated segment, not the send clear). */
   onTextEdit?: (text: string) => void;
+  /** Every builder agent the compose box's "@" picker may offer, and the roster a mention is
+   *  resolved against. Handed down rather than read, like everything else here — this directory is
+   *  presentational and does not know the fleet exists.
+   *
+   *  ORDER IS MEANINGFUL: it breaks the tie when two agents share a name (see ./mentions
+   *  `findMentionSpans`), so the integration layer passes it relevance-first. */
+  mentionAgents?: readonly MentionAgent[];
+  /** The agent a send would reach WITHOUT a mention. Sorts to the top of the picker. */
+  preferredAgentId?: string | null;
   /** The last FINISHED line for the thread's hidden live region — a completed reply, a status
    *  notice, or a ROUTING RECEIPT ("→ Sent to Kraken Auth"). Never a streaming chunk: the region
    *  would then re-announce on every delta.
