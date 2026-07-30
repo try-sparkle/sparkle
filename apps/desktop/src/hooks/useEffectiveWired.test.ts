@@ -144,6 +144,48 @@ describe("useEffectiveWired — the subscription", () => {
     expect(result.current).toBe("off");
   });
 
+  // THE SUBSCRIPTION'S WIDTH, which is a different property from every row above and was unguarded.
+  //
+  // Those rows assert the VALUE and its reactivity, and all of them pass identically with the join done
+  // outside a `useProjectStore((s) => s.projects)` subscription — the value is the same either way. But
+  // that shape wakes every consumer on every `projects` identity replacement (status, rename, prompt,
+  // alerts, reorder — dozens of writes), which is a SILENT perf regression that nothing else surfaces,
+  // and it defeats MemoAgentSidebar. So the same commit that argued the untested half is the half that
+  // regresses had left its own other half untested (roborev 55591).
+  //
+  // A rename replaces the array and changes nothing about the far end, which is exactly the write this
+  // must not wake for.
+  it("does NOT re-render on a project write that leaves the far end alone", () => {
+    useCableStore.getState().patch("right");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useEffectiveWired();
+    });
+    expect(result.current).toBe("right");
+    const before = renders;
+
+    act(() => useProjectStore.getState().renameAgent("p1", "p1-a1", "Renamed"));
+    // The array identity changed; the answer did not.
+    expect(renders).toBe(before);
+    expect(result.current).toBe("right");
+  });
+
+  it("DOES re-render when that same kind of write changes the far end — the inverse guard", () => {
+    // Without this, the row above is satisfied by a hook that never wakes at all.
+    useCableStore.getState().patch("right");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useEffectiveWired();
+    });
+    const before = renders;
+
+    act(() => useProjectStore.setState({ projects: [mkProject("p1", null)] } as never));
+    expect(renders).toBeGreaterThan(before);
+    expect(result.current).toBe("off");
+  });
+
   it("gives every surface the SAME answer — that is the whole point", () => {
     // Three readers, one value. The bug was three readers and two values.
     useCableStore.getState().patch("right");

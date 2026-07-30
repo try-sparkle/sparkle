@@ -293,3 +293,26 @@ export function useConciergeThread(): ConciergeMessage[] {
  */
 export const setConciergeChat: ConciergeThreadState["setChat"] = (next) =>
   useConciergeThreadStore.getState().setChat(next);
+
+/**
+ * Drop the thread — the IDENTITY reset, and the production caller `clearChat` never had.
+ *
+ * This is the FOURTH per-human concierge store to be found outside `resetConciergeIdentityState`,
+ * and it is the largest of the four (roborev 55625). The other three are process-lifetime memory;
+ * this one is written to disk on purpose. It holds up to {@link CONCIERGE_THREAD_MAX} `you`/`sparkle`
+ * bubbles of up to {@link CONCIERGE_MSG_MAX_LEN} chars each — the human's own words and the model's
+ * replies, VERBATIM rather than the audit log's redacted display strings — under a `localStorage`
+ * key that is fixed, not keyed by user. Both halves that make residue reachable already exist: the
+ * reader is `useConciergeThread` in `ConciergeHost`, and the replay path is this store's own `merge`
+ * hook, which rehydrates the previous human's conversation on the next launch.
+ *
+ * CLEARING THE LIVE STATE IS NOT ENOUGH, AND THE ORDER IS LOAD-BEARING. `clearChat()` empties the
+ * store, which `persist` writes straight back out as `{"chat":[]}` — so the key survives, holding an
+ * empty thread. That is already residue-free, but `clearStorage()` removes the key outright, which is
+ * the state a human would recognise as "gone". It has to run AFTER the `set`, because the write
+ * `clearChat` triggers is synchronous: clearing storage first would simply be undone by it.
+ */
+export function clearConciergeThread(): void {
+  useConciergeThreadStore.getState().clearChat();
+  useConciergeThreadStore.persist.clearStorage();
+}

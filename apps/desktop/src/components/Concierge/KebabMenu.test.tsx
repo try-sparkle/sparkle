@@ -182,15 +182,18 @@ describe("KebabMenu — ONE CLICK, no menu in between", () => {
     expect(useUiStore.getState().settingsRequest).toBeNull();
   });
 
-  // THE MOUSE ROUTE, which is the scrim's — asserted so the division of labour is pinned rather than
-  // only described. If the scrim ever stops dismissing, this is where it shows up.
-  it("clicking the dialog's scrim dismisses it and clears the request", () => {
-    render(<KebabMenu />);
-    act(() => useUiStore.getState().openSettings("credits"));
-    fireEvent.click(screen.getByTestId("settings-backdrop"));
-    expect(screen.queryByTestId("settings-dialog")).toBeNull();
-    expect(useUiStore.getState().settingsRequest).toBeNull();
-  });
+  // NO ROW HERE FOR THE SCRIM, deliberately — and the previous commit's attempt is why it is worth
+  // stating. `SettingsDialog` is MOCKED in this file, so a row clicking `settings-backdrop` asserts
+  // the mock's own `onClick` (authored in that same commit) rather than the real wiring: delete the
+  // real backdrop's `onClick` and it stays green, which is exactly the claim it made. jsdom does no
+  // hit-testing either, and the mock's backdrop is a CHILD of the dialog rather than a `fixed; inset:
+  // 0` portal sibling, so nothing here can observe the covering that makes the mouse route the
+  // scrim's (roborev 55595).
+  //
+  // It was already covered where it can fail: `SettingsDialog.test.tsx`'s "fires onClose when the
+  // backdrop is clicked" predates all of this, and removing the real `onClick` reddens it. So the
+  // replacement row this file briefly grew was deleted rather than moved — the mock keeps its backdrop
+  // only so the focus rows above sit in production's DOM shape.
 });
 
 describe("KebabMenu — reused surfaces", () => {
@@ -235,6 +238,39 @@ describe("KebabMenu — reused surfaces", () => {
     // Not the kebab (whose trigger the user never touched) and not `<body>`.
     expect(document.activeElement).not.toBe(trigger());
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  // …AND WHEN THAT ELEMENT IS GONE BY THEN, which is the case the first version of the restore missed.
+  //
+  // The node is captured at open and used at close, an arbitrary interval later, and `.focus()` on a
+  // removed node is a SILENT no-op — so focus stays in the dialog and its unmount drops it on `<body>`:
+  // the defect the restore exists to fix, reintroduced invisibly. Not hypothetical for a caller this
+  // component names — `RefillLink` sits in the mic out-of-credits notice, which auto-deactivates after
+  // 5s, so the trigger is gone well before the user finishes with the Credits pane (roborev 55595).
+  // The row above cannot see it, because it keeps `other` mounted for the whole test.
+  it("falls back to the trigger when the element it would restore to has since unmounted", () => {
+    function Host({ showOther }: { showOther: boolean }) {
+      return (
+        <>
+          {showOther && <button type="button">elsewhere</button>}
+          <KebabMenu />
+        </>
+      );
+    }
+    const { rerender } = render(<Host showOther />);
+    screen.getByRole("button", { name: "elsewhere" }).focus();
+    act(() => useUiStore.getState().openSettings("credits"));
+    expect(screen.getByTestId("settings-dialog")).toBeTruthy();
+
+    // The deep-open trigger goes away WHILE the dialog is up — the 5s notice expiring.
+    act(() => rerender(<Host showOther={false} />));
+    expect(screen.queryByRole("button", { name: "elsewhere" })).toBeNull();
+
+    fireEvent.click(screen.getByText("close settings"));
+    expect(screen.queryByTestId("settings-dialog")).toBeNull();
+    // The whole point: focus is somewhere REAL, not stranded on the body.
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(trigger());
   });
 
   it("Escape dismisses the settings dialog", () => {

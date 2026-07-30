@@ -33,8 +33,31 @@ import {
   recordConciergeEvent,
   _resetConciergeEventLogForTests,
 } from "../stores/conciergeEventLog";
+import {
+  setConciergeChat,
+  useConciergeThreadStore,
+  clearConciergeThread,
+} from "../stores/conciergeThreadStore";
+import {
+  getConciergeSessionId,
+  setConciergeSessionId,
+  _resetConciergeForTests,
+} from "./concierge";
+import type { ConciergeMessage } from "../components/Concierge/types";
 
 const NOW = 1_700_000_000_000;
+
+/** The `localStorage` key `conciergeThreadStore`'s `persist` writes under. Spelled out rather than
+ *  imported because the DURABLE copy is the thing under test: reading the literal key is what a
+ *  fresh page load does, and a test that imported the name would follow a rename that broke it. */
+const THREAD_STORAGE_KEY = "sparkle-concierge-thread";
+
+function you(id: string, text: string): ConciergeMessage {
+  return { id, kind: "you", text };
+}
+function sparkle(id: string, text: string): ConciergeMessage {
+  return { id, kind: "sparkle", text };
+}
 
 function approvalRequest(): ConciergeApprovalRequest {
   return {
@@ -51,7 +74,7 @@ function approvalRequest(): ConciergeApprovalRequest {
   };
 }
 
-/** Put something in all three stores, the way the previous human's session would have. */
+/** Put something in every per-human store, the way the previous human's session would have. */
 function seedOneHumansSession(): void {
   noteConciergeAuditCall("call-1", "workspace", "add_project_from_folder", {
     path: "/Users/ada/Projects/secret-thing",
@@ -62,12 +85,19 @@ function seedOneHumansSession(): void {
     NOW,
   );
   openSubscription([], NOW);
+  setConciergeChat([
+    you("m1", "what is my bank routing number again"),
+    sparkle("m2", "I found it in the note you pasted earlier."),
+  ]);
+  setConciergeSessionId("session-belonging-to-user-a");
 }
 
 beforeEach(() => {
   _resetConciergeAuditForTests();
   clearConciergeApprovals();
   _resetConciergeEventLogForTests();
+  clearConciergeThread();
+  _resetConciergeForTests();
 });
 
 describe("resetConciergeIdentityState", () => {
@@ -78,6 +108,8 @@ describe("resetConciergeIdentityState", () => {
     expect(useConciergeApprovals.getState().entries.length).toBeGreaterThan(0);
     expect(latestEventSeq()).toBeGreaterThan(0);
     expect(listSubscriptions().length).toBeGreaterThan(0);
+    expect(useConciergeThreadStore.getState().chat.length).toBeGreaterThan(0);
+    expect(getConciergeSessionId()).not.toBeNull();
 
     resetConciergeIdentityState();
 
@@ -87,6 +119,8 @@ describe("resetConciergeIdentityState", () => {
     // `since: 0` read after the next sign-in is the actual leak path.
     expect(drainEvents({ since: 0 }).events).toHaveLength(0);
     expect(listSubscriptions()).toHaveLength(0);
+    expect(useConciergeThreadStore.getState().chat).toHaveLength(0);
+    expect(getConciergeSessionId()).toBeNull();
   });
 
   // THE EPOCH IS PART OF THE RESET, and this is the half a plain "the arrays are empty" assertion
@@ -115,5 +149,37 @@ describe("resetConciergeIdentityState", () => {
     expect(useConciergeApprovals.getState().entries.filter((e) => e.outcome === "pending")).toEqual(
       [],
     );
+  });
+
+  // THE DURABLE COPY IS THE HALF AN IN-MEMORY ASSERTION MISSES, and for this store it is the whole
+  // point: the other three are process-lifetime memory, while the thread is `persist`ed to a fixed,
+  // not-user-keyed `localStorage` name and replayed into the column by the store's own `merge` hook
+  // on the next launch (roborev 55625). Emptying `chat` without touching the disk copy would leave
+  // the previous human's conversation to come back at relaunch — the leak surviving the fix for it.
+  //
+  // Reading the raw key rather than the store is deliberate: this is what a fresh page load reads.
+  it("removes the thread's DURABLE copy, not just the live one", () => {
+    seedOneHumansSession();
+    // `persist` writes synchronously, so the previous human's words really are on "disk" here —
+    // which is what stops the null assertion below from passing vacuously.
+    expect(localStorage.getItem(THREAD_STORAGE_KEY)).toContain("bank routing number");
+
+    resetConciergeIdentityState();
+
+    expect(localStorage.getItem(THREAD_STORAGE_KEY)).toBeNull();
+  });
+
+  // THE COLUMN AND THE BRAIN MOVE TOGETHER. Clearing the visible thread while leaving
+  // `currentSessionId` pointing at the previous human's Claude session is the same leak made
+  // invisible: the next human's first turn resumes a conversation they cannot see and did not have.
+  // Asserted separately from the bulk case because a blank column reads as "reset" either way — only
+  // the session id distinguishes a real reset from a cosmetic one.
+  it("forgets the previous human's session, so the next turn cannot resume it", () => {
+    setConciergeSessionId("session-belonging-to-user-a");
+    expect(getConciergeSessionId()).toBe("session-belonging-to-user-a");
+
+    resetConciergeIdentityState();
+
+    expect(getConciergeSessionId()).toBeNull();
   });
 });

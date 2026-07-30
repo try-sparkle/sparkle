@@ -26,13 +26,34 @@
 // epoch a cursor from the previous session would silently re-base against the new empty log instead of
 // being refused as `log-restarted`.
 //
+// AND THEN A FOURTH, WHICH WAS THE BIGGEST ONE (roborev 55625). Each round of this has ended with a
+// header claiming the set was now complete, so the useful thing to record is not the count but the
+// SEARCH that finds them: grep for a store-level `clear…`/`reset…` export and check whether anything
+// in `apps/desktop/src` outside its own module calls it. Every instance so far had zero callers and
+// was found that way, never by reasoning about which stores "feel" per-human.
+//
+// The fourth was `conciergeThreadStore` — the VISIBLE conversation. It is worse than the three above
+// on the axis that matters: they are process-lifetime memory, and it is `persist`ed to `localStorage`
+// under a fixed, not-user-keyed name, so its residue survived quit and relaunch and was replayed into
+// the column by the store's own `merge` hook. It also holds the rawest text in the feature — the
+// human's own words, not a redaction of them.
+//
+// Its session is cleared with it, and that pairing is the point rather than two changes that happen
+// to land together: the thread is what the next human SEES and `currentSessionId` is what the model
+// REMEMBERS, and this codebase already argues the two must move as one ("a remembering brain with an
+// empty column reads as amnesia"). Dropping only the column would leave the next human's first turn
+// resuming the previous human's conversation with a blank screen in front of it — the same leak, now
+// invisible.
+//
 // So sign-out calls THIS, not a growing list of clears. A per-human concierge store added later is one
-// line here, covered by `conciergeIdentityReset.test.ts` — which exists, because the first version of
+// line here, covered by `conciergeIdentityReset.test.ts` — which exists, because an earlier version of
 // this comment promised a test that did not, and a false claim at the highest-authority location is
-// the defect this branch has spent the day correcting.
+// the defect this line of work has spent itself correcting.
 import { clearConciergeAudit } from "./conciergeAudit";
+import { resetConciergeSession } from "./concierge";
 import { clearConciergeApprovals } from "../stores/conciergeApprovals";
 import { clearConciergeEventLog } from "../stores/conciergeEventLog";
+import { clearConciergeThread } from "../stores/conciergeThreadStore";
 
 /**
  * Drop every piece of concierge state that belongs to the human who is signing out.
@@ -45,4 +66,6 @@ export function resetConciergeIdentityState(): void {
   clearConciergeAudit();
   clearConciergeApprovals();
   clearConciergeEventLog();
+  clearConciergeThread();
+  resetConciergeSession();
 }

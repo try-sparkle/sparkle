@@ -86,9 +86,18 @@ export function KebabMenu() {
     // WE opened it → the kebab trigger, as before (roborev 46081). Someone ELSE opened it → back to
     // whatever they were on, rather than either stranding focus on `<body>` or yanking it to a control
     // the user never touched.
-    const restore = settingsOpen
-      ? (triggerRef.current ?? focusBeforeOpen.current)
-      : focusBeforeOpen.current;
+    //
+    // CHECKED FOR STILL BEING ATTACHED, which is not defensive tidiness — a captured node is
+    // dereferenced an arbitrary interval later, and `.focus()` on a removed node is a silent no-op in
+    // both browsers and jsdom, so focus stays in the dialog and the unmount two lines down drops it on
+    // `<body>`. That is the very defect this restore exists to fix, reintroduced invisibly. It is
+    // reachable from a caller this code names: `RefillLink` lives in the mic out-of-credits notice,
+    // which auto-deactivates after 5s, so the button that deep-opened the Credits pane is gone long
+    // before the user finishes reading it (roborev 55595). The trigger is the one node guaranteed to
+    // still be here, so it is the fallback.
+    const prev = focusBeforeOpen.current;
+    const stillThere = prev !== null && document.contains(prev) ? prev : null;
+    const restore = (settingsOpen ? triggerRef.current : null) ?? stillThere ?? triggerRef.current;
     // Before the unmount, while the dialog still holds focus — moving it out first is what keeps the
     // removal from dropping focus on the floor.
     restore?.focus?.();

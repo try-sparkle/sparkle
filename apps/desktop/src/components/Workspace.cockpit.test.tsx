@@ -229,11 +229,25 @@ describe("the shell root carries the whole cockpit state", () => {
       } as never);
     });
     render(<Workspace />);
-    const sides = screen
-      .getAllByTestId("sidebar")
-      .map((el) => el.getAttribute("data-slot-side"));
-    expect(sides).toContain("left");
-    expect(sides).toContain("right");
+
+    // THE PRECONDITION, ASSERTED IN THE SAME ROW. The stub echoes `slotSide` unconditionally while the
+    // real component consults it ONLY when `project` is null — so without this the row would keep
+    // passing if the fixture ever drifted into resolving a left project, no longer exercising the state
+    // the setup above carefully builds. The "Nothing here yet" hint renders exactly when `leftProject`
+    // is null, so it IS that state, and it is observable (roborev 55591).
+    expect(screen.getByText("Nothing here yet")).toBeTruthy();
+
+    // BOUND TO THE COLUMN, not gathered into a set. `toContain` over both values was satisfiable for
+    // the "right" half by the stub's own default, and could not tell "the left slot got `slotSide`"
+    // from "the left slot resolved a left-assigned project" — the conflation the prop exists to break.
+    // Per-subtree means a swapped pair of props reddens too.
+    const leftPair = screen.getByTestId("terminal-stage-left").parentElement!;
+    expect(leftPair.querySelector('[data-testid="sidebar"]')?.getAttribute("data-slot-side")).toBe(
+      "left",
+    );
+    const outside = screen.getAllByTestId("sidebar").filter((el) => !leftPair.contains(el));
+    expect(outside).toHaveLength(1);
+    expect(outside[0]!.getAttribute("data-slot-side")).toBe("right");
   });
 
   // The whole point of the attribute: nothing else needs to change for the app to look wired, so a
