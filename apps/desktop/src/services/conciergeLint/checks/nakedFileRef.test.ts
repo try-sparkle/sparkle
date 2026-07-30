@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CheckPolicy, LintContext } from "../types";
-import { nakedFileRefCheck } from "./nakedFileRef";
+import { FILE_REF_RE, nakedFileRefCheck } from "./nakedFileRef";
 
 const ctx = (policy: Partial<CheckPolicy> = {}): LintContext => ({
   roster: [],
@@ -218,14 +218,37 @@ describe("nakedFileRefCheck", () => {
     expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
   });
 
-  // THE REGRESSION GUARD for that revert. A run of entities is exactly the input the widened pattern
-  // walked ~2^k paths on; this asserts the scan stays linear enough to be unnoticeable. Generous
-  // bound so it fails on catastrophe, not on a slow machine — the reverted pattern took minutes.
-  it("does not backtrack catastrophically on a run of HTML entities", () => {
-    const hostile = `See ${"&lt;div&gt;&lt;span&gt;".repeat(40)} and nothing else`;
-    const started = performance.now();
-    run(hostile);
-    expect(performance.now() - started).toBeLessThan(1000);
+  // THE EXPENSIVE HALF OF THAT MISS, pinned rather than left in prose (roborev 55895). The single
+  // -reference case above only costs its own reference. This one costs a DIFFERENT one: the
+  // unmatched entity path is also unmasked, so "Fixed", "src", "retry", "ts", "and" clear the
+  // four-word bar and silence `src/b.ts:9`, which is bare and genuinely naked. Asserted so a change
+  // to masking or word counting MOVES this test instead of drifting away from the doc.
+  it("lets an entity-encoded reference silence a different naked one — the cost of the miss", () => {
+    expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toEqual([]);
+  });
+
+  // THE REGRESSION GUARD for that revert — STRUCTURAL, because a timing guard cannot work here
+  // (roborev 55895). Running the hostile input would be the obvious test and it is unusable: the
+  // scan is SYNCHRONOUS, and Vitest's testTimeout is timer-based, so it cannot preempt CPU-bound
+  // sync code. A re-widened pattern would never reach the assertion — the worker wedges and CI burns
+  // to the workflow timeout with nothing pointing back at this test. The measurement in the revert
+  // commit (eight repetitions, not finished in ten minutes) is exactly why: any input big enough to
+  // demonstrate the catastrophe is far past the point where a duration can be reported.
+  //
+  // So assert the PROPERTY that made the pattern safe instead of its symptom. The old pattern was
+  // linear only because the separator alternatives were DISJOINT from the segment character class:
+  // no input position could be consumed as either, so there was one decomposition, not 2^k. Adding
+  // an alternative that both accept — an HTML entity, in the reverted change — is what created the
+  // ambiguity. This runs in microseconds and can never hang.
+  it("keeps the separator alternatives disjoint from the segment class (the anti-ReDoS property)", () => {
+    const src = FILE_REF_RE.source;
+    expect(src, "an entity alternative makes a position consumable as segment OR separator — the \
+exponential form this file reverted; see the header").not.toMatch(/&#\?/);
+    // The separators must stay single literal characters (optionally backslash-escaped), which is
+    // what keeps them un-ambiguous with the segment class.
+    for (const sep of ["\\\\?\\/", "\\\\?\\.", "\\\\?:"]) {
+      expect(src).toContain(sep);
+    }
   });
 
   it("resolves repeated identical references to their own occurrences", () => {
