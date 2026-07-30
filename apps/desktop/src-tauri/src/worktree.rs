@@ -212,8 +212,15 @@ const POST_EXIT_SETTLE: Duration = Duration::from_millis(250);
 /// and appending continues. For both callers that read this text — a failed `gh pr merge`, a failed
 /// `claude plugin install` — the reason a command failed is the LAST thing it wrote, so keeping the
 /// head would have guaranteed the loss of exactly the bytes the message exists to carry.
+/// The cap that governs in a build a user runs, defined UNCONDITIONALLY so nothing has to restate
+/// it. `review_cmd`'s row-ceiling test needs the release figure specifically — the `#[cfg(test)]`
+/// arm below is deliberately 8× smaller — and it used to hand-copy `4 << 20` with a "keep in step"
+/// comment. A number copied rather than referenced drifts silently in the unsafe direction: lower
+/// this and that test would keep asserting against the old value and keep passing, which reads as
+/// proof the ceiling is safe when it no longer is (roborev 55466).
+pub(crate) const RELEASE_DRAIN_BUF_CAP: usize = 4 << 20;
 #[cfg(not(test))]
-const DRAIN_BUF_CAP: usize = 4 << 20;
+const DRAIN_BUF_CAP: usize = RELEASE_DRAIN_BUF_CAP;
 /// Small enough that a test can reach it without writing 4 MiB. `cap_is_above_the_kept_whole_fixture`
 /// pins the relationship to the "kept whole" fixture, so a bigger fixture fails as a clear
 /// assertion rather than as a mystery `expect()` on the capped path.

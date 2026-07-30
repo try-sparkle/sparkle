@@ -54,6 +54,17 @@
 import { create } from "zustand";
 
 import type { ConciergeRiskClass } from "../services/conciergeTools/policy";
+// The concierge's drainable event log. Imported for ONE purpose: to announce that a question
+// reached the human and that they answered it. Nothing is read back from it, and nothing in this
+// file's behaviour depends on it — see `emitApprovalEvent`.
+import {
+  recordConciergeEvent,
+  type ApprovalRequestedEvent,
+  type ApprovalResolvedEvent,
+} from "./conciergeEventLog";
+
+/** The only two payloads this module ever emits. */
+type ApprovalEventPayload = ApprovalRequestedEvent | ApprovalResolvedEvent;
 
 // ---------------------------------------------------------------------------------------------
 // Windows and bounds
@@ -247,14 +258,38 @@ function isLive(e: ConciergeApproval, now: number): boolean {
   return e.expiresAt > now;
 }
 
-/** Lapse anything whose window has closed, then evict down to the retention cap. Pure. */
-function sweep(entries: readonly ConciergeApproval[], now: number): readonly ConciergeApproval[] {
-  const aged = entries.map((e) =>
-    (e.outcome === "pending" || e.outcome === "approved") && !isLive(e, now) && !e.spent
-      ? { ...e, outcome: "expired" as const }
-      : e,
-  );
-  if (aged.length <= MAX_RETAINED_APPROVALS) return aged;
+/**
+ * Lapse anything whose window has closed, then evict down to the retention cap. PURE — it computes
+ * the next ledger and reports which QUESTIONS died in the process; announcing them is
+ * {@link sweepAndAnnounce}'s job, so this stays callable from anywhere.
+ *
+ * `lapsed` is every way a question ENDS WITHOUT AN ANSWER, and it is deliberately narrower than "the
+ * entry changed":
+ *
+ *   • `pending → expired` (the TTL) — a resolution nobody ever announced. A reader that drained
+ *     `approval_requested` is waiting on the matching `approval_resolved` and would otherwise wait
+ *     forever on a card that is already dead.
+ *   • A PENDING entry evicted by the retention cap. Only reachable when the ledger is entirely
+ *     pending — a runaway caller rather than ordinary use — but the reader sees the same silence,
+ *     so it gets the same announcement. It is reported as `expired` because that is what it means
+ *     to the reader: the question is over and nobody answered it.
+ *
+ * NOT included: an APPROVED entry lapsing. Its `approval_resolved` was already emitted when the
+ * human pressed the button, and what expired is the GRANT, not the question. Announcing that as a
+ * second resolution would say the question expired, which is false.
+ */
+function sweep(
+  entries: readonly ConciergeApproval[],
+  now: number,
+): { entries: readonly ConciergeApproval[]; lapsed: readonly ConciergeApproval[] } {
+  const lapsed: ConciergeApproval[] = [];
+  const aged = entries.map((e) => {
+    if ((e.outcome !== "pending" && e.outcome !== "approved") || isLive(e, now) || e.spent) return e;
+    const expired = { ...e, outcome: "expired" as const };
+    if (e.outcome === "pending") lapsed.push(expired);
+    return expired;
+  });
+  if (aged.length <= MAX_RETAINED_APPROVALS) return { entries: aged, lapsed };
   // Evict the oldest RESOLVED entries first: a pending one is on the human's screen, and dropping
   // it would silently remove a question they can still see.
   const overflow = aged.length - MAX_RETAINED_APPROVALS;
@@ -264,9 +299,63 @@ function sweep(entries: readonly ConciergeApproval[], now: number): readonly Con
     if (e.outcome !== "pending") dropped.add(e);
   }
   const kept = aged.filter((e) => !dropped.has(e));
-  return kept.length <= MAX_RETAINED_APPROVALS
-    ? kept
-    : kept.slice(kept.length - MAX_RETAINED_APPROVALS);
+  if (kept.length <= MAX_RETAINED_APPROVALS) return { entries: kept, lapsed };
+  // Still over: there were not enough resolved entries to evict, so the oldest PENDING ones go. They
+  // leave the human's screen without an answer, which is exactly the silence above — announce them.
+  const survivors = kept.slice(kept.length - MAX_RETAINED_APPROVALS);
+  for (const e of kept.slice(0, kept.length - MAX_RETAINED_APPROVALS)) {
+    if (e.outcome === "pending") lapsed.push({ ...e, outcome: "expired" });
+  }
+  return { entries: survivors, lapsed };
+}
+
+/**
+ * Sweep, and ANNOUNCE every question that died of old age.
+ *
+ * A silent expiry is the same "silence is indistinguishable from not-yet" failure the event log
+ * exists to eliminate, applied to the one kind pair the log is centred on: a subscriber that drained
+ * `approval_requested` for a call and never receives the matching `approval_resolved` reads the
+ * stream as still-open while the card is gone from the human's screen (roborev 55405).
+ *
+ * The announcement runs BEFORE the caller commits the swept ledger, which is not observable: the
+ * event log neither reads this store nor is read by it, and nothing else runs in between. Emitting
+ * here rather than at each of the four call sites is what makes it impossible for a new sweep site
+ * to reintroduce the silence.
+ */
+function sweepAndAnnounce(
+  entries: readonly ConciergeApproval[],
+  now: number,
+): readonly ConciergeApproval[] {
+  const swept = sweep(entries, now);
+  for (const e of swept.lapsed) {
+    // Stamped at the moment the question actually died, not at the moment the sweep noticed. The
+    // log orders by `seq`, never by `at` (see conciergeEventLog property 1), so an out-of-order
+    // timestamp costs nothing and "it lapsed 40 minutes ago" is the true sentence.
+    emitApprovalEvent(
+      { kind: "approval_resolved", approvalId: e.id, domain: e.domain, op: e.op, outcome: "expired" },
+      Math.min(e.expiresAt, now),
+    );
+  }
+  return swept.entries;
+}
+
+/**
+ * SWEEP THE LEDGER FROM OUTSIDE — the non-render trigger the announcement needs to be worth anything.
+ *
+ * Everything else that sweeps is a WRITE: a new ask-tier call arrives, or a human presses a button.
+ * In the scenario the expiry announcement exists for — the concierge asks, nobody clicks, and no
+ * further approval traffic happens — none of those ever run, so the card would leave the human's
+ * screen at `expiresAt` and the event would never be emitted at all. The reader would still wait
+ * forever, and would now be doing it while being TOLD that a missing resolution means the question
+ * is open (roborev 55441).
+ *
+ * The events domain calls this before it drains, which makes the guarantee true where it is
+ * claimed: by the time a reader is answered, every question that has died is already in the log.
+ * Nothing renders off this, so writing here is safe — unlike {@link pendingApprovals}, which is
+ * computed during render and must stay a pure read.
+ */
+export function sweepConciergeApprovals(now: number = Date.now()): void {
+  commit(sweepAndAnnounce(useConciergeApprovals.getState().entries, now));
 }
 
 function commit(next: readonly ConciergeApproval[]): void {
@@ -299,7 +388,7 @@ export function requestApproval(
 ): ConciergeApproval | null {
   if (blank(request.id)) return null;
   const id = request.id.trim();
-  const swept = sweep(useConciergeApprovals.getState().entries, now);
+  const swept = sweepAndAnnounce(useConciergeApprovals.getState().entries, now);
   const existing = swept.find((e) => e.id === id);
   if (existing) {
     commit(swept);
@@ -324,8 +413,22 @@ export function requestApproval(
   };
   // Sweep AFTER appending, so the retention cap is applied to the list that actually gets stored —
   // sweeping first would let the ledger sit one entry over the cap indefinitely.
-  commit(sweep([...swept, entry], now));
+  commit(sweepAndAnnounce([...swept, entry], now));
+  // AFTER the commit, and ONLY on this arm — the two idempotent returns above are the same question
+  // already on screen, and an event for those would wake the concierge twice for one thing the human
+  // sees once. This arm is the only one that puts a NEW card in front of them.
+  emitApprovalEvent({ kind: "approval_requested", approvalId: entry.id, domain: entry.domain, op: entry.op }, now);
   return entry;
+}
+
+/** Record one approval event, best-effort. The ledger's correctness may never depend on the event
+ *  log being reachable, so a throw here is swallowed: this is an observer, not a participant. */
+function emitApprovalEvent(payload: ApprovalEventPayload, now: number): void {
+  try {
+    recordConciergeEvent(payload, now);
+  } catch {
+    // Deliberately silent — see above.
+  }
 }
 
 /**
@@ -348,7 +451,7 @@ export function denyApproval(id: string, now: number = Date.now()): boolean {
 
 function resolve(id: string, outcome: "approved" | "denied", now: number): boolean {
   if (blank(id)) return false;
-  const swept = sweep(useConciergeApprovals.getState().entries, now);
+  const swept = sweepAndAnnounce(useConciergeApprovals.getState().entries, now);
   const target = swept.find((e) => e.id === id.trim());
   if (!target || target.outcome !== "pending") {
     commit(swept);
@@ -365,6 +468,15 @@ function resolve(id: string, outcome: "approved" | "denied", now: number): boole
           }
         : e,
     ),
+  );
+  // THE EVENT THAT POLLING CANNOT PRODUCE. `pendingApprovals` — the read the approvals domain
+  // offers — shows what is waiting NOW, so a question asked and answered between two concierge
+  // turns leaves it looking exactly as it did before. This is the record of the answer itself.
+  // Emitted only on the arm that actually changed the entry: the early return above (no such id,
+  // or already answered) changed nothing and must announce nothing.
+  emitApprovalEvent(
+    { kind: "approval_resolved", approvalId: target.id, domain: target.domain, op: target.op, outcome },
+    now,
   );
   return true;
 }
@@ -389,7 +501,7 @@ export function claimApproval(
   fingerprint: string,
   now: number = Date.now(),
 ): boolean {
-  const swept = sweep(useConciergeApprovals.getState().entries, now);
+  const swept = sweepAndAnnounce(useConciergeApprovals.getState().entries, now);
   const spendable = (e: ConciergeApproval) =>
     e.outcome === "approved" && !e.spent && isLive(e, now);
 

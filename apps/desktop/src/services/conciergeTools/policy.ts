@@ -58,22 +58,26 @@
 // call site.
 
 import { LIFECYCLE_RISK, LIFECYCLE_OPS, type LifecycleOp, type LifecycleRisk } from "./lifecycle";
+import { REVIEW_OPS, REVIEW_RISK, type ReviewOp } from "./review";
 import {
   WORKFLOW_OPERATIONS,
   WORKFLOW_RISK,
   type WorkflowOperation,
   type WorkflowRiskClass,
 } from "./workflow";
+import { EVENTS_OPS, EVENTS_RISK, type EventsOp } from "./events";
 import {
   WORKSPACE_OPS,
   WORKSPACE_OP_RISK,
   type RiskClass as WorkspaceRiskClass,
   type WorkspaceOp,
 } from "./workspace";
+import { ATTACHMENTS_OPS, ATTACHMENTS_RISK, type AttachmentsOp } from "./attachments";
 import { BOARD_OPS, BOARD_RISK, type BoardOp } from "./board";
 import { APPROVALS_OPS, APPROVALS_RISK, type ApprovalsOp } from "./approvals";
 import { PLANS_OPS, PLANS_RISK, type PlansOp } from "./plans";
 import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
+import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 
 // ---------------------------------------------------------------------------------------------
 // The three values
@@ -108,6 +112,8 @@ export const POLICY_DECISION_LABEL: Record<PolicyDecision, string> = {
  * can cover every tool. Each arm keeps the meaning its originating domain gave it:
  *
  *  • `read-only`       — observes; changes nothing anywhere.
+ *  • `privacy-sensitive` — observes the HUMAN rather than the app: reads their screen or their
+ *    surroundings. Changes nothing, and still must be asked about.
  *  • `routine`         — local, reversible, or one click from undone.
  *  • `disruptive`      — interrupts work in flight; the records survive, the running state doesn't.
  *  • `rewrites-branch` — rewrites the agent's own history (a rebase). Reflog-recoverable, ids change.
@@ -122,6 +128,7 @@ export const POLICY_DECISION_LABEL: Record<PolicyDecision, string> = {
  */
 export type ConciergeRiskClass =
   | "read-only"
+  | "privacy-sensitive"
   | "routine"
   | "disruptive"
   | "rewrites-branch"
@@ -133,6 +140,7 @@ export type ConciergeRiskClass =
 /** One line per risk class, for the settings row and for the concierge explaining itself. */
 export const CONCIERGE_RISK_NOTE: Record<ConciergeRiskClass, string> = {
   "read-only": "Observes only — changes nothing.",
+  "privacy-sensitive": "Reads your screen — it may capture anything on it.",
   routine: "Local and reversible.",
   disruptive: "Stops work that is in flight.",
   "rewrites-branch": "Rewrites the agent's own commit history.",
@@ -151,9 +159,13 @@ export const CONCIERGE_RISK_NOTE: Record<ConciergeRiskClass, string> = {
  *  is, via `DOMAIN_BY_TOOL` and `NAMES_BY_DOMAIN` below. */
 export type ConciergeToolDomain =
   | "lifecycle"
+  | "review"
   | "terminal"
+  | "attachments"
   | "workflow"
+  | "events"
   | "workspace"
+  | "screenshot"
   | "board"
   | "approvals"
   | "plans"
@@ -163,9 +175,13 @@ export type ConciergeToolDomain =
 /** The domains in the order the pane lists them, with the heading each renders under. */
 export const CONCIERGE_TOOL_DOMAINS = [
   { id: "lifecycle", label: "Agent lifecycle" },
+  { id: "review", label: "Code review" },
   { id: "terminal", label: "Terminal" },
+  { id: "attachments", label: "Files & attachments" },
   { id: "workflow", label: "Git & pull requests" },
+  { id: "events", label: "Change notifications" },
   { id: "workspace", label: "Projects & window" },
+  { id: "screenshot", label: "Screenshots" },
   { id: "board", label: "Tasks & work graph" },
   { id: "approvals", label: "Approvals" },
   { id: "plans", label: "Plans" },
@@ -332,6 +348,14 @@ const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
   send_to_agent_terminal: "Type a message into an agent's terminal, as if you had typed it.",
 };
 
+/** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a
+ *  typecheck failure here rather than a settings row that silently falls back to a risk note. */
+const ATTACHMENTS_TOOL_SUMMARY: Record<AttachmentsOp, string> = {
+  list_attachments: "See which files are queued to ride along with an agent's next message.",
+  attach_to_message: "Attach a file from the project to an agent's next message.",
+  clear_attachments: "Un-stage the files queued for an agent (nothing is deleted).",
+};
+
 // ---------------------------------------------------------------------------------------------
 // Vocabulary translation + the exhaustive per-tool tables
 // ---------------------------------------------------------------------------------------------
@@ -352,6 +376,20 @@ const WORKSPACE_RISK_TO_CLASS: Record<WorkspaceRiskClass, ConciergeRiskClass> = 
   routine: "routine",
   disruptive: "disruptive",
   irreversible: "irreversible",
+};
+
+/** The screenshot domain publishes ONE risk word, and it maps to the class minted for it. Written as
+ *  a translation table like every other domain's rather than inlined, so a second screenshot risk
+ *  word (a camera? the clipboard?) cannot be added without deciding what it means here. */
+const SCREENSHOT_RISK_TO_CLASS: Record<ScreenshotRisk, ConciergeRiskClass> = {
+  "privacy-sensitive": "privacy-sensitive",
+};
+
+/** Row-sized summaries for the settings pane. Both say WHAT LANDS ON DISK, because that — not the
+ *  act of looking — is what the human is being asked to consent to. */
+const SCREENSHOT_TOOL_SUMMARY: Record<ScreenshotOp, string> = {
+  capture_window: "Save a picture of Sparkle's window to a file.",
+  capture_agent: "Save a picture of one agent's pane to a file.",
 };
 
 const WORKFLOW_RISK_TO_CLASS: Record<WorkflowRiskClass, ConciergeRiskClass> = {
@@ -397,9 +435,13 @@ const WORKFLOW_OP_RISK: Record<WorkflowOperation, WorkflowRiskClass> = (() => {
  */
 export type ConciergeToolName =
   | LifecycleOp
+  | ReviewOp
   | TerminalToolName
+  | AttachmentsOp
   | WorkflowOperation
+  | EventsOp
   | WorkspaceOp
+  | ScreenshotOp
   | BoardOp
   | ApprovalsOp
   | DiffOp
@@ -442,8 +484,18 @@ const RISK_OVERRIDES: Partial<Record<ConciergeToolName, ConciergeRiskClass>> = {
 
 const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...translateRisk(LIFECYCLE_RISK, LIFECYCLE_RISK_TO_CLASS),
+  // The review domain publishes the SAME four risk words as workspace, so it reuses that
+  // translation. `close_finding` is `disruptive` there, which derives to `ask` — see review.ts for
+  // why `disruptive` and not `irreversible` (roborev's `close --reopen` genuinely puts it back, so
+  // calling it irreversible would overstate the damage while landing on the same decision).
+  ...translateRisk(REVIEW_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(WORKSPACE_OP_RISK, WORKSPACE_RISK_TO_CLASS),
+  ...translateRisk(SCREENSHOT_RISK, SCREENSHOT_RISK_TO_CLASS),
   ...translateRisk(WORKFLOW_OP_RISK, WORKFLOW_RISK_TO_CLASS),
+  // The events domain publishes only `read-only` and `routine` — both members of workspace's
+  // vocabulary — so it reuses that translation rather than declaring a third identical one. Both map
+  // to `allow`, which is the point: finding out what changed is not something to ask permission for.
+  ...translateRisk(EVENTS_RISK, WORKSPACE_RISK_TO_CLASS),
   // The board domain publishes the SAME four risk words as workspace, so it reuses that
   // translation rather than declaring a second identical one.
   ...translateRisk(BOARD_RISK, WORKSPACE_RISK_TO_CLASS),
@@ -451,6 +503,9 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...translateRisk(PLANS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(DIFF_RISK, WORKSPACE_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
+  // The attachments domain publishes the same four risk words as workspace, so it reuses that
+  // translation rather than declaring a fifth identical one.
+  ...translateRisk(ATTACHMENTS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...APP_TOOL_RISK,
   // LAST, so a cross-domain correction wins over the domain's own word. See RISK_OVERRIDES.
   ...RISK_OVERRIDES,
@@ -459,9 +514,13 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
 /** Which domain each tool belongs to. Total for the same structural reason as `RISK_BY_TOOL`. */
 const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(LIFECYCLE_RISK, "lifecycle" as const),
+  ...constantOver(REVIEW_RISK, "review" as const),
   ...constantOver(WORKSPACE_OP_RISK, "workspace" as const),
+  ...constantOver(SCREENSHOT_RISK, "screenshot" as const),
   ...constantOver(WORKFLOW_OP_RISK, "workflow" as const),
+  ...constantOver(EVENTS_RISK, "events" as const),
   ...constantOver(TERMINAL_TOOL_RISK, "terminal" as const),
+  ...constantOver(ATTACHMENTS_RISK, "attachments" as const),
   ...constantOver(BOARD_RISK, "board" as const),
   ...constantOver(APPROVALS_RISK, "approvals" as const),
   ...constantOver(PLANS_RISK, "plans" as const),
@@ -474,7 +533,9 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
  *  here would be a second description that drifts from the code it describes. Those rows fall back
  *  to the risk note, which is a fact the domain DID publish. */
 const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
+  ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
+  ...ATTACHMENTS_TOOL_SUMMARY,
   ...APP_TOOL_SUMMARY,
   ...Object.fromEntries(WORKFLOW_OPERATIONS.map((op) => [op, WORKFLOW_RISK[op].summary])),
 };
@@ -482,9 +543,13 @@ const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
 /** The names, grouped by domain, in each domain's own declared order. */
 const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]> = {
   lifecycle: LIFECYCLE_OPS,
+  review: REVIEW_OPS,
   terminal: TERMINAL_TOOL_NAMES,
+  attachments: ATTACHMENTS_OPS,
   workflow: WORKFLOW_OPERATIONS,
+  events: EVENTS_OPS,
   workspace: WORKSPACE_OPS,
+  screenshot: SCREENSHOT_OPS,
   board: BOARD_OPS,
   approvals: APPROVALS_OPS,
   plans: PLANS_OPS,
@@ -509,6 +574,11 @@ export const DEFAULT_DECISION_BY_RISK: Record<ConciergeRiskClass, PolicyDecision
   "read-only": "allow",
   // Local, reversible, one click from undone — the concierge doing this unprompted is the point.
   routine: "allow",
+  // THE ONE `ask` THAT IS NOT ABOUT CONSEQUENCES. A screen capture changes nothing and destroys
+  // nothing; it is gated because of what it can SEE. `read-only` would be true on the letter and
+  // would derive to `allow`, which is how "the concierge may photograph my screen whenever it
+  // likes" becomes a default nobody chose. See conciergeTools/screenshot.ts.
+  "privacy-sensitive": "ask",
   // Everything below interrupts work, spends money, publishes, or destroys. The human rules on it.
   disruptive: "ask",
   "rewrites-branch": "ask",

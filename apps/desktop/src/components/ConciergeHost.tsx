@@ -954,8 +954,22 @@ export function ConciergeHost({
   // `routingTarget`, so glancing at the Plan board doesn't strand them. Draining is idempotent (the
   // entry empties), so re-running on a target change is harmless.
   const dropTargetAgentId = target?.agentId ?? null;
+  // SUBSCRIBE, don't just read on target change (roborev 55403).
+  //
+  // The drop path always CHANGED the target (the drop spawns and selects an agent), so an effect
+  // keyed only on `dropTargetAgentId` was enough for it. `attachments.attach_to_message` is the
+  // other writer and it does not: in the dominant case the human is already talking about agent X,
+  // so the target never moves, the effect never re-runs, and the queue is never drained. The tool
+  // meanwhile replied "Staged. 1 file(s) … they ride along with the next message" — the file
+  // reaching nobody while the user is told it is attached. Subscribing makes an ADD a re-render,
+  // which is the trigger the imperative read was missing.
+  const queuedForTarget = usePendingAttachmentsStore((s) =>
+    dropTargetAgentId ? s.pending[dropTargetAgentId] : undefined,
+  );
   useEffect(() => {
     if (!dropTargetAgentId) return;
+    // Still drained imperatively inside: the read empties the entry, so this stays idempotent
+    // whether it re-runs from a target change or from a queue write.
     const paths = usePendingAttachmentsStore.getState().drain(dropTargetAgentId);
     if (paths.length === 0) return;
     // Kinds, never paths — this log ships with support tickets (services/logSafePaths).
@@ -964,7 +978,9 @@ export function ConciergeHost({
       ...describePaths(paths),
     });
     attachPaths(paths);
-  }, [dropTargetAgentId, attachPaths]);
+    // `queuedForTarget` is a dependency for its EDGE, not its value — the drain above reads the
+    // store directly. Without it, a write to the queue for an already-aimed agent never re-runs this.
+  }, [dropTargetAgentId, attachPaths, queuedForTarget]);
 
   // The capture takeover's draft: text plus the shot, staged as chips, NEVER auto-sent.
   const composeHandoff = useComposeHandoffStore((s) => s.handoff);

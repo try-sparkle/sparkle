@@ -9,6 +9,7 @@ import { freezeUiPersistence } from "./satellite/uiPersistence";
 import { ErrorBoundary, AppErrorFallback } from "./components/ErrorBoundary";
 import { initLogger } from "./logger";
 import { startJankMonitor, installPerfDevtools } from "./perfTrace";
+import { startWatchdogHeartbeat } from "./watchdogHeartbeat";
 import { initAnalytics } from "./analytics";
 import { usageTelemetry } from "./services/usageTelemetry";
 import { flushCrashReports } from "./services/crashReporter";
@@ -73,6 +74,13 @@ const satelliteProjectId = parseSatelliteProjectId(search);
 // at module scope, before createRoot — where a malformed `__TAURI_INTERNALS__` would throw and blank
 // the app. If secondary app windows ever return, pass their label in; nothing else needs to change.
 if (isAppWindow) startJankMonitor();
+
+// The jank monitor's blind spot, covered from the other side. It can only report a stall AFTER it
+// ends, because the thread that writes the line is the thread that was blocked — so the freeze that
+// actually wedges the app is invisible to it by construction. This beats once a second from the
+// main thread; the Rust watchdog notices the silence and reports the hang WHILE it is still going,
+// and captures a stack. Same window gate as above, for the same reason.
+if (isAppWindow) startWatchdogHeartbeat();
 
 // Render counting is always on (a Map bump); the per-render LOG is gated off by default because
 // each line is a main-thread Tauri IPC (bead sparkle-abv2). This exposes the toggle and the

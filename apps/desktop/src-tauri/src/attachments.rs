@@ -564,6 +564,51 @@ fn load_blocking(path: &str) -> Result<LoadedAttachment, String> {
     })
 }
 
+/// What a caller needs in order to DECIDE about a path, with none of the bytes.
+///
+/// `load_attachment` cannot answer this. It echoes back the path it was HANDED (`path.to_owned()`),
+/// which is the string a symlink or a `..` lies with, and it reports no size at all — so a caller
+/// that must prove a path stays inside a directory, and must cap how big a file it accepts, has
+/// nothing to work from. This carries the three facts that decision needs and stops there: no read,
+/// no base64, no data URL.
+#[derive(Serialize)]
+pub struct AttachmentProbe {
+    /// The path with symlinks and `..` RESOLVED. Compare containment against this, never against
+    /// what the caller supplied — that is the entire reason this command exists.
+    real_path: String,
+    /// Size in bytes, of the resolved target.
+    size: u64,
+    /// False for a directory, a socket, a fifo — anything that is not a regular file.
+    is_file: bool,
+}
+
+/// Resolve + stat one path, without reading it.
+///
+/// The concierge's attachment gate (`services/conciergeTools/attachments.ts`) is the caller: a model
+/// names an absolute path and the gate has to establish that it really lands inside the project, is
+/// a regular file, and is not enormous. Every one of those is a question about the RESOLVED path.
+#[tauri::command]
+pub async fn probe_attachment(path: String) -> Result<AttachmentProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_blocking(&path))
+        .await
+        .map_err(|e| format!("probe_attachment task failed: {e}"))?
+}
+
+fn probe_blocking(path: &str) -> Result<AttachmentProbe, String> {
+    // The same second layer every other command in this file applies (see the containment block
+    // above). It is not the caller's gate — the TS side's project containment is far narrower — but
+    // without it a compromised webview could use this as an existence/size oracle over `~/.ssh` and
+    // any other tree the primary boundary is meant to keep it out of.
+    let roots = allowed_roots();
+    let real = validate_read_path(Path::new(path), &roots)?;
+    let meta = std::fs::metadata(&real).map_err(|e| format!("stat {path}: {e}"))?;
+    Ok(AttachmentProbe {
+        real_path: real.to_string_lossy().into_owned(),
+        size: meta.len(),
+        is_file: meta.is_file(),
+    })
+}
+
 /// Put an image file on the macOS clipboard as a PNG. Non-PNG inputs are converted to a
 /// temp PNG via `sips` first, so any supported image type ends up as a real bitmap on the
 /// pasteboard (paste into Slack/Preview/etc.), not a file reference.
@@ -1510,5 +1555,41 @@ mod tests {
         let hidden = root.join(".secret");
         std::fs::create_dir_all(&hidden).unwrap();
         assert!(validate_dir_path(&hidden, &roots).is_err());
+    }
+
+    // ── probe_attachment ────────────────────────────────────────────────────────────────────
+    //
+    // The probe's whole job is to hand back facts about the RESOLVED path. `load_attachment` echoes
+    // the path it was given, which is exactly the string a symlink lies with — so the assertion
+    // that matters is that a link is followed, not merely that a stat succeeded.
+
+    #[test]
+    fn probe_reports_the_resolved_target_of_a_symlink() {
+        let root = fresh_root(); // under the temp dir, which is an allowed root
+        let real = root.join("real.txt");
+        std::fs::write(&real, b"twelve bytes").unwrap();
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let got = probe_blocking(link.to_str().unwrap()).unwrap();
+        assert_eq!(got.real_path, real.canonicalize().unwrap().to_string_lossy());
+        assert_eq!(got.size, 12);
+        assert!(got.is_file);
+    }
+
+    #[test]
+    fn probe_marks_a_directory_as_not_a_file() {
+        let root = fresh_root();
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = probe_blocking(dir.to_str().unwrap()).unwrap();
+        assert!(!got.is_file);
+    }
+
+    #[test]
+    fn probe_refuses_a_path_it_cannot_reach() {
+        let root = fresh_root();
+        let missing = root.join("nope.txt");
+        assert!(probe_blocking(missing.to_str().unwrap()).is_err());
     }
 }

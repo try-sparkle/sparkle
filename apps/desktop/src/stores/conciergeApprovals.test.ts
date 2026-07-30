@@ -19,6 +19,7 @@ import {
   useConciergeApprovals,
   type ConciergeApprovalRequest,
 } from "./conciergeApprovals";
+import { _resetConciergeEventLogForTests, drainEvents } from "./conciergeEventLog";
 
 const T0 = 1_000_000;
 
@@ -47,7 +48,11 @@ function ask(
   return req;
 }
 
-beforeEach(() => clearConciergeApprovals());
+beforeEach(() => {
+  clearConciergeApprovals();
+  // The ledger announces into the shared event log, so cases must not read each other's events.
+  _resetConciergeEventLogForTests();
+});
 
 describe("conciergeApprovals — the ledger that makes `ask` mean something", () => {
   it("records a pending question and shows it to the human", () => {
@@ -210,6 +215,67 @@ describe("conciergeApprovals — the ledger that makes `ask` mean something", ()
       requestApproval(req, T0 + 1);
       requestApproval(req, T0 + 2);
       expect(pendingApprovals(useConciergeApprovals.getState().entries, T0 + 3)).toHaveLength(1);
+    });
+  });
+
+  // ANNOUNCING THE ENDING NOBODY CHOSE (roborev 55405). Every other way a question ends already
+  // emitted; the TTL lapsing it did not, so a reader waiting on `approval_resolved` for a call it
+  // saw requested waited on a card that was already gone.
+  //
+  // These assert on the EVENT LOG, never on `findApproval(...)?.outcome` — the entry flipping to
+  // `expired` is what the code did before this fix, so asserting it would prove nothing.
+  describe("a lapsed question announces itself", () => {
+    it("emits approval_resolved with outcome expired when the request TTL passes unanswered", () => {
+      ask("call-1", { domain: "workflow", op: "merge_pr", fingerprint: "fp-1" });
+      // Nobody clicks. The next thing to touch the ledger sweeps the dead question up.
+      const late = T0 + APPROVAL_REQUEST_TTL_MS + 1;
+      ask("call-2", { fingerprint: "fp-2" }, late);
+
+      expect(drainEvents({ since: 0, kinds: ["approval_resolved"] }).events).toMatchObject([
+        { approvalId: "call-1", domain: "workflow", op: "merge_pr", outcome: "expired" },
+      ]);
+    });
+
+    it("announces the lapse exactly once, however many times the ledger is swept afterwards", () => {
+      ask("call-1");
+      const late = T0 + APPROVAL_REQUEST_TTL_MS + 1;
+      claimApproval("someone-else", "fp-other", late);
+      claimApproval("someone-else", "fp-other", late + 1);
+      denyApproval("call-1", late + 2);
+
+      expect(drainEvents({ since: 0, kinds: ["approval_resolved"] }).events).toHaveLength(1);
+    });
+
+    // The other way a question disappears without an answer. Only reachable when the ledger is
+    // entirely pending (a runaway caller), but the reader sees the identical silence, so it gets
+    // the identical announcement (roborev 55441).
+    it("announces a PENDING entry the retention cap evicts, not just one the TTL lapses", () => {
+      for (let i = 0; i < MAX_RETAINED_APPROVALS + 2; i += 1) {
+        ask(`pending-${i}`, { fingerprint: `f-${i}` }, T0 + i);
+      }
+      const announced = drainEvents({ since: 0, kinds: ["approval_resolved"] }).events;
+      expect(announced.map((e) => (e as { approvalId: string }).approvalId)).toEqual([
+        "pending-0",
+        "pending-1",
+      ]);
+      expect(announced.every((e) => (e as { outcome: string }).outcome === "expired")).toBe(true);
+      // …and they really are gone from the ledger, so the announcement is not premature.
+      expect(useConciergeApprovals.getState().entries.some((e) => e.id === "pending-0")).toBe(false);
+    });
+
+    it("stays silent when an ANSWERED approval's GRANT lapses — that is not the question expiring", () => {
+      ask("call-1");
+      approveApproval("call-1", T0 + 1);
+      // The `approved` resolution was announced when the human pressed the button. The grant going
+      // stale afterwards is a different fact, and reporting it as `expired` would say the question
+      // was never answered.
+      claimApproval("nobody", "fp-none", T0 + 1 + APPROVAL_GRANT_TTL_MS + 1);
+
+      expect(
+        drainEvents({ since: 0, kinds: ["approval_resolved"] }).events.map(
+          (e) => (e as { outcome: string }).outcome,
+        ),
+      ).toEqual(["approved"]);
     });
   });
 

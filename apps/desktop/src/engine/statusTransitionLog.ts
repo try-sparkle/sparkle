@@ -23,6 +23,7 @@
 //     hot path — which runs for every agent on every chunk — builds no strings at all.
 import type { AgentTabStatus } from "@sparkle/ui";
 import { log } from "../logger";
+import { recordConciergeEvent } from "../stores/conciergeEventLog";
 
 /** The literal token every transition line starts with. The grep handle: it is a fixed string that
  *  appears nowhere else, so `grep "agent-status agent=<id>"` yields exactly one agent's history in
@@ -139,4 +140,57 @@ export function formatStatusTransition(ev: StatusTransitionEvent): string {
  */
 export function logStatusTransition(ev: StatusTransitionEvent): void {
   log.info(STATUS_TRANSITION_SCOPE, formatStatusTransition(ev));
+  recordStatusEvents(ev);
+}
+
+/**
+ * The same transition, ALSO recorded in the concierge's drainable event log.
+ *
+ * WHY HERE. This function is the single choke point every `StatusEngine.set` funnels through — the
+ * engine's own comment says a path added later cannot escape it — which makes it the one place an
+ * event source can be attached without the engine growing a second notion of what a transition is.
+ * The log line and the event carry the SAME facts from the SAME call, so they can never disagree
+ * about whether a flip happened.
+ *
+ * THREE KINDS OUT OF ONE INPUT, because the PRD asks about spawn and exit separately and the
+ * engine already distinguishes them:
+ *
+ *   • `spawn` (the constructor's initial publish, `from: null`) is the agent's session STARTING. It
+ *     is emitted as `agent_spawned` and NOT as `agent_status` — a "transition" out of nothing is not
+ *     a status change, and reporting one would have the concierge announce a flip that never
+ *     occurred.
+ *   • `process-exit` emits `agent_exited` IN ADDITION to the status change, not instead of it. The
+ *     status genuinely did change (to `done` or `errored`) and a reader watching `agent_status`
+ *     must still see it; a reader watching only `agent_exited` gets the fact it subscribed to.
+ *   • everything else is one `agent_status`.
+ *
+ * THE SCREEN VERDICT IS DELIBERATELY NOT CARRIED. Rule 1 at the top of this file keeps terminal
+ * content out of the log file; the event log is handed to a MODEL, which may quote it back, so it
+ * gets the stricter treatment — the classifier's verdict is diagnostic detail for a human grepping
+ * `sparkle.log`, and it is not something the concierge needs in order to know an agent moved.
+ *
+ * Best-effort, exactly like the `log.info` above it: this must never be able to break a state
+ * machine that is mid-transition. `recordConciergeEvent` cannot throw on these inputs, and the
+ * try/catch is the standing guarantee rather than a response to a known failure.
+ */
+function recordStatusEvents(ev: StatusTransitionEvent): void {
+  try {
+    if (ev.trigger === "spawn") {
+      recordConciergeEvent({ kind: "agent_spawned", agentId: ev.agentId, status: ev.to });
+      return;
+    }
+    recordConciergeEvent({
+      kind: "agent_status",
+      agentId: ev.agentId,
+      from: ev.from ?? "",
+      to: ev.to,
+      trigger: ev.trigger,
+    });
+    if (ev.trigger === "process-exit") {
+      recordConciergeEvent({ kind: "agent_exited", agentId: ev.agentId, status: ev.to });
+    }
+  } catch {
+    // Observing a transition may never cost the transition. Nothing to report to: `log.info` is the
+    // channel this module owns and it has already carried the line.
+  }
 }

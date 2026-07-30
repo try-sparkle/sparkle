@@ -7,6 +7,16 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FONT_MONO, TYPE, WEIGHT } from "../theme/scale";
+import {
+  noteConciergeAuditCall,
+  useConciergeAudit,
+  _resetConciergeAuditForTests,
+} from "../services/conciergeAudit";
+import {
+  clearConciergeApprovals,
+  requestApproval,
+  useConciergeApprovals,
+} from "../stores/conciergeApprovals";
 
 // Controls inside the panes persist to config.toml via these actions; mock so no IPC fires
 // when a pane mounts or a control is touched. PARTIAL (spreads the real module) because this
@@ -529,6 +539,68 @@ describe("SettingsDialog — Sparkle account", () => {
     expect(useAuthStore.getState().me).toBeNull();
     // The pane flips to the signed-out state after the reset.
     expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
+  });
+
+  // THE AUDIT LOG IS PER-HUMAN AND SURVIVED SIGN-OUT (roborev 55406). It is in-memory,
+  // process-lifetime state pruned only by its 200-entry cap, and its rows carry redacted-but-real
+  // detail — absolute paths, PR numbers, agent names, refusal sentences. `clearConciergeAudit` had
+  // documented itself as "the identity reset" since it was written and had ZERO callers; that was
+  // latent only while the record had no reader, and the audit pane — which lives in THIS dialog, one
+  // section over from this button — made it readable. Asserting the ENTRIES are gone, not that the
+  // function was called: a spy would pass against a `clearConciergeAudit` that did nothing.
+  it("clears the concierge audit log on sign-out — the next human must not inherit this one's record", async () => {
+    // Reset FIRST: the audit store is module state that outlives a test, and this suite retries, so
+    // without it a second attempt starts with the previous attempt's row and the arithmetic below
+    // stops meaning anything.
+    _resetConciergeAuditForTests();
+    noteConciergeAuditCall("call-1", "workspace", "add_project_from_folder", {
+      path: "/Users/ada/Projects/secret-thing",
+    })({ ok: true });
+    expect(useConciergeAudit.getState().entries).toHaveLength(1);
+
+    useAuthStore.setState({ loading: false, tokenPresent: true, me });
+    openAccountsPane();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(useAuthStore.getState().tokenPresent).toBe(false));
+    expect(useConciergeAudit.getState().entries).toHaveLength(0);
+  });
+
+  // THE SIBLING LEDGER, and the worse half of the same leak (roborev 55559). `clearConciergeApprovals`
+  // carried the identical self-documented "identity reset" contract and likewise had no production
+  // caller. Two things make it worse than the audit log: it retains `rawArgs` — the model's arguments
+  // VERBATIM, not the display-safe redaction — and a PENDING card is actionable rather than merely
+  // readable, so the next human could answer the previous one's queued question, and an
+  // approved-but-unspent grant would survive the identity change.
+  it("clears the concierge approvals ledger too, including a still-pending card", async () => {
+    clearConciergeApprovals();
+    requestApproval({
+      id: "call-1",
+      domain: "workflow",
+      op: "merge_pr",
+      summary: "Merge a pull request.",
+      riskClass: "mutates-main",
+      riskNote: "Changes the branch everything else is measured against.",
+      args: [],
+      rawArgs: { number: 753, token: "verbatim-not-redacted" },
+      configPath: "concierge.tools.merge_pr",
+      fingerprint: "fp-1",
+    });
+    // Still pending: nobody has answered it. This is the entry that is actionable, not just residue.
+    const staged = useConciergeApprovals.getState().entries;
+    expect(staged).toHaveLength(1);
+    expect(staged[0]!.outcome).toBe("pending");
+    // And the residue really is verbatim — this is what makes it worse than the audit log's rows,
+    // which are redacted by construction. If the ledger ever starts redacting `rawArgs`, this line
+    // fails and the reasoning above needs revisiting rather than quietly becoming false.
+    expect(JSON.stringify(staged[0]!.rawArgs)).toContain("verbatim-not-redacted");
+
+    useAuthStore.setState({ loading: false, tokenPresent: true, me });
+    openAccountsPane();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    await waitFor(() => expect(useAuthStore.getState().tokenPresent).toBe(false));
+    expect(useConciergeApprovals.getState().entries).toHaveLength(0);
   });
 
   it("disables the button and shows progress while sign-out is in flight", async () => {

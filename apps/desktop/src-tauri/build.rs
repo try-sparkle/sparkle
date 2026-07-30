@@ -68,11 +68,17 @@ fn main() {
         // panel.m: reclasses the tray popover + capture windows to non-activating NSPanels so the
         // Capture flow never activates Sparkle over the user's front app (see objc/panel.m).
         println!("cargo:rerun-if-changed=objc/panel.m");
+        // expire_notifications.m: removes attention banners the user never touched, which is what
+        // stops mac-notification-sys's per-notification 0.5s main-thread poll of
+        // `deliveredNotifications` (a synchronous XPC call) from running forever. See that file.
+        println!("cargo:rerun-if-changed=objc/expire_notifications.m");
         // The NSUserNotification deprecation warning is silenced in-file via a #pragma in
-        // force_present.m (survives independent of these build flags), so no -Wno flag here.
+        // force_present.m and expire_notifications.m (which survives independent of these build
+        // flags), so no -Wno flag here.
         cc::Build::new()
             .file("objc/force_present.m")
             .file("objc/panel.m")
+            .file("objc/expire_notifications.m")
             .flag("-fobjc-arc")
             .compile("sparkle_notify_present");
         // Foundation is already linked transitively, but make the category's dependency explicit.

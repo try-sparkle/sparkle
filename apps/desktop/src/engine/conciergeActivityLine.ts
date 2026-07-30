@@ -19,8 +19,12 @@
 // WHICH subject an op takes and WHAT to call it.
 import type { ConciergeToolDomain, TerminalOp } from "../services/conciergeTools/registry";
 import type { LifecycleOp } from "../services/conciergeTools/lifecycle";
+import type { ReviewOp } from "../services/conciergeTools/review";
+import type { AttachmentsOp } from "../services/conciergeTools/attachments";
 import type { WorkflowOperation } from "../services/conciergeTools/workflow";
+import type { EventsOp } from "../services/conciergeTools/events";
 import type { WorkspaceOp } from "../services/conciergeTools/workspace";
+import type { ScreenshotOp } from "../services/conciergeTools/screenshot";
 import type { BoardOp } from "../services/conciergeTools/board";
 import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 import type { DiffOp } from "../services/conciergeTools/diff";
@@ -172,6 +176,19 @@ const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
   spin_down_worker: phrase("Spinning down %s", "Spun down %s", AGENT),
 };
 
+/** The roborev ops. `%s` is never used: a finding id is a bare number the human has no way to
+ *  recognise, and roborev's own store is the only thing that could turn it into a name.
+ *
+ *  Typed over the domain's own op union like every other table here, so a new review op is a COMPILE
+ *  error rather than a silent fall through to the un-phrased "Using review · …" default. */
+const REVIEW_PHRASES: Record<ReviewOp, OpPhrase> = {
+  list_findings: phrase("Checking code review findings", "Checked code review findings"),
+  get_finding: phrase("Reading a review finding", "Read a review finding"),
+  // "Resolving", not "Closing": a human reading the column should not have to wonder whether an
+  // AGENT was just closed. `close_agent` already owns that verb one table up.
+  close_finding: phrase("Resolving a review finding", "Resolved a review finding"),
+};
+
 const TERMINAL_PHRASES: Record<TerminalOp, OpPhrase> = {
   read_agent_terminal: phrase("Reading %s's terminal", "Read %s's terminal", AGENT),
   get_agent_status: phrase("Checking on %s", "Checked on %s", AGENT),
@@ -179,6 +196,16 @@ const TERMINAL_PHRASES: Record<TerminalOp, OpPhrase> = {
   select_picker_option: phrase("Answering %s's prompt", "Answered %s's prompt", AGENT),
   send_control_key: phrase("Pressing a key in %s", "Pressed a key in %s", AGENT),
   send_to_agent_terminal: phrase("Writing to %s", "Wrote to %s", AGENT),
+};
+
+/** The file-attachment ops. Every one names the AGENT, never the file: a path is not a name the
+ *  human recognises, and the compose box's own chips are where they see what is attached. Saying
+ *  the path aloud here would also put a filesystem path in the same column the temp-path leak was
+ *  removed from (see `buildDisplay` in components/composer/attachments). */
+const ATTACHMENTS_PHRASES: Record<AttachmentsOp, OpPhrase> = {
+  list_attachments: phrase("Checking what's attached for %s", "Checked what's attached for %s", AGENT),
+  attach_to_message: phrase("Attaching a file for %s", "Attached a file for %s", AGENT),
+  clear_attachments: phrase("Clearing %s's attachments", "Cleared %s's attachments", AGENT),
 };
 
 const WORKFLOW_PHRASES: Record<WorkflowOperation, OpPhrase> = {
@@ -204,6 +231,23 @@ const WORKFLOW_PHRASES: Record<WorkflowOperation, OpPhrase> = {
   delete_agent_branch_if_merged: phrase("Tidying up %s's branch", "Tidied up %s's branch", AGENT),
 };
 
+/**
+ * The change-log ops. `%s` is never used: an event kind ("agent_status") and a subscription id
+ * ("sub-3") are both internal handles, and neither is a thing the human would recognise in a 360px
+ * column.
+ *
+ * The phrasing deliberately says "catching up on what changed" rather than anything about
+ * subscribing or cursors. What the human cares about is that the concierge went and found out; the
+ * mechanism is this app's problem, and naming it in the status line would be jargon in the one place
+ * there is no room for it.
+ */
+const EVENTS_PHRASES: Record<EventsOp, OpPhrase> = {
+  subscribe: phrase("Starting to watch for changes", "Started watching for changes"),
+  read_events: phrase("Catching up on what changed", "Caught up on what changed"),
+  unsubscribe: phrase("Stopping watching for changes", "Stopped watching for changes"),
+  list_subscriptions: phrase("Checking what it's watching", "Checked what it's watching"),
+};
+
 const WORKSPACE_PHRASES: Record<WorkspaceOp, OpPhrase> = {
   list_projects: phrase("Looking over your projects", "Looked over your projects"),
   select_project: phrase("Switching to %s", "Switched to %s", PROJECT),
@@ -221,6 +265,20 @@ const WORKSPACE_PHRASES: Record<WorkspaceOp, OpPhrase> = {
   search_history: phrase("Searching your history", "Searched your history"),
   jump_to_history_hit: phrase("Jumping to a moment in your history", "Jumped to a moment in your history"),
   quit_app: phrase("Quitting Sparkle", "Quit Sparkle"),
+};
+
+/**
+ * The screen-capture ops.
+ *
+ * These are the lines most worth getting right in this whole file. A capture is `ask`-tier because
+ * of what it can SEE (conciergeTools/screenshot.ts), so the human is being asked to consent to it —
+ * and the same 360px column shows this caption. "Taking a screenshot of Sparkle" says plainly that
+ * the app, not the whole screen, is the subject; a vaguer "Looking at the screen" would understate
+ * exactly the thing they are ruling on.
+ */
+const SCREENSHOT_PHRASES: Record<ScreenshotOp, OpPhrase> = {
+  capture_window: phrase("Taking a screenshot of Sparkle", "Took a screenshot of Sparkle"),
+  capture_agent: phrase("Taking a screenshot of %s", "Took a screenshot of %s", AGENT),
 };
 
 /** The work-graph ops. `%s` is never used here: a bead id is not a name the human recognises, and
@@ -271,9 +329,22 @@ const DOMAINS: Record<
   { icon: ConciergeActivityIcon; phrases: Record<string, OpPhrase | undefined> }
 > = {
   lifecycle: { icon: "agents", phrases: LIFECYCLE_PHRASES },
+  // Reuses the workflow glyph, like `diff`: a review finding is about a commit's fate, which is the
+  // same question the workflow ops answer from the other side.
+  review: { icon: "workflow", phrases: REVIEW_PHRASES },
   terminal: { icon: "terminal", phrases: TERMINAL_PHRASES },
+  // Reuses the terminal glyph: a staged file rides along with the next message typed at that
+  // agent, so it is the same act from the human's side.
+  attachments: { icon: "terminal", phrases: ATTACHMENTS_PHRASES },
   workflow: { icon: "workflow", phrases: WORKFLOW_PHRASES },
+  // Reuses the agents glyph: everything the log actually carries today is about AGENTS — their
+  // statuses, their spawns and exits, and the approvals their work provoked.
+  events: { icon: "agents", phrases: EVENTS_PHRASES },
   workspace: { icon: "workspace", phrases: WORKSPACE_PHRASES },
+  // Reuses the workspace glyph: a capture is a fact about the WINDOW — what the app currently looks
+  // like — which is the same subject the workspace ops act on. No new glyph is minted for it,
+  // consistent with `board` and `plans` above.
+  screenshot: { icon: "workspace", phrases: SCREENSHOT_PHRASES },
   board: { icon: "workspace", phrases: BOARD_PHRASES },
   approvals: { icon: "agents", phrases: APPROVALS_PHRASES },
   plans: { icon: "workspace", phrases: PLANS_PHRASES },

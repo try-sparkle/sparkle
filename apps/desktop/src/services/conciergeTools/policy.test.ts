@@ -41,8 +41,12 @@ import {
 } from "./policy";
 import { CONCIERGE_TERMINAL_TOOLS } from "./terminal";
 import { LIFECYCLE_OPS } from "./lifecycle";
+import { REVIEW_OPS } from "./review";
 import { WORKFLOW_OPERATIONS } from "./workflow";
+import { EVENTS_OPS } from "./events";
 import { WORKSPACE_OPS } from "./workspace";
+import { ATTACHMENTS_OPS } from "./attachments";
+import { SCREENSHOT_OPS } from "./screenshot";
 import { BOARD_OPS } from "./board";
 import { APPROVALS_OPS } from "./approvals";
 import { PLANS_OPS } from "./plans";
@@ -209,9 +213,13 @@ describe("the tool set is derived from the domains", () => {
     // module's domain union is the SETTINGS vocabulary, deliberately wider than the wire one.
     expect(CONCIERGE_TOOL_GROUPS.map((g) => g.domain)).toEqual([
       "lifecycle",
+      "review",
       "terminal",
+      "attachments",
       "workflow",
+      "events",
       "workspace",
+      "screenshot",
       "board",
       "approvals",
       "plans",
@@ -230,6 +238,7 @@ describe("the tool set is derived from the domains", () => {
     expect(of("workflow")).toEqual([...WORKFLOW_OPERATIONS]);
     expect(of("workspace")).toEqual([...WORKSPACE_OPS]);
     expect(of("terminal")).toEqual([...TERMINAL_TOOL_NAMES]);
+    expect(of("attachments")).toEqual([...ATTACHMENTS_OPS]);
   });
 
   it("the terminal seam agrees with the terminal domain's own descriptor list", () => {
@@ -256,9 +265,13 @@ describe("the tool set is derived from the domains", () => {
     expect(new Set(CONCIERGE_TOOL_NAMES).size).toBe(CONCIERGE_TOOL_NAMES.length);
     expect(CONCIERGE_TOOL_NAMES.length).toBe(
       LIFECYCLE_OPS.length +
+        REVIEW_OPS.length +
         TERMINAL_TOOL_NAMES.length +
+        ATTACHMENTS_OPS.length +
         WORKFLOW_OPERATIONS.length +
+        EVENTS_OPS.length +
         WORKSPACE_OPS.length +
+        SCREENSHOT_OPS.length +
         BOARD_OPS.length +
         APPROVALS_OPS.length +
         PLANS_OPS.length +

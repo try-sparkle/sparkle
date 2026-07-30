@@ -7,6 +7,7 @@ import { authIdentity } from "../services/entitlement";
 import { fetchTrial } from "../services/trialApi";
 import { useAuthStore } from "../stores/authStore";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
+import { resetConciergeIdentityState } from "../services/conciergeIdentityReset";
 import { useUiStore, type CategoryId } from "../stores/uiStore";
 import { ModalLayer } from "./ModalLayer";
 import { AiFeaturesMenu } from "./AiFeaturesMenu";
@@ -325,6 +326,13 @@ function AccountsPane({ onManageAccounts }: { onManageAccounts: () => void }) {
       // this process inherits the previous account's "credential saved" reading and the cloud
       // creation gate skips its no_auth prompt into a guaranteed 400 (roborev 46287).
       useCloudAuthStore.getState().reset();
+      // The concierge stores are per-HUMAN and were surviving sign-out (roborev 55406, 55559). Both
+      // had written themselves an "identity reset" function and neither was ever called, so user B
+      // signing in on this process inherited user A's audit history AND their approvals ledger —
+      // which holds `rawArgs` verbatim rather than redacted, and whose PENDING cards and unspent
+      // grants are actionable, not merely readable. One seam rather than a growing list of clears;
+      // see the module header for why that shape is deliberate.
+      resetConciergeIdentityState();
     } catch (e) {
       // signOut's contract is never-reject; if that drifts, don't let the rejection escape the
       // void'd click handler unlogged — the button re-enabling below makes retry the recovery.

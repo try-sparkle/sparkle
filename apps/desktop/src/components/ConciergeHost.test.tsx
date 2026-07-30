@@ -2408,6 +2408,35 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     expect(within(chipRow).getByText("dropped.png")).toBeTruthy();
   });
 
+  // THE CONCIERGE'S OWN WRITE, WHICH ARRIVES MID-MOUNT (roborev 55403).
+  //
+  // Every case above seeds the queue BEFORE render, so the target changes and the effect runs. The
+  // `attachments` domain's `attach_to_message` is the other writer and it does not move the target:
+  // the human is usually already talking about the agent being attached to. With the effect keyed
+  // only on the target id, nothing re-ran, the queue was never drained, and the tool still replied
+  // "Staged … they ride along with the next message". Assert the SIDE EFFECT — the file staged and
+  // a chip on screen — not that the queue emptied, which would pass on a drain that delivered
+  // nothing.
+  it("stages a file queued AFTER mount for the agent already aimed at", async () => {
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }}
+      />,
+    );
+    await flush();
+    expect(h.loadAttachmentPaths).not.toHaveBeenCalled();
+
+    // The concierge stages a file while the aim never moves.
+    await act(async () => {
+      usePendingAttachmentsStore.getState().add("ag1", ["/tmp/from-concierge.png"]);
+    });
+
+    await waitFor(() => expect(h.loadAttachmentPaths).toHaveBeenCalledWith(["/tmp/from-concierge.png"]));
+    const chipRow = await screen.findByTestId("concierge-attachment-chips");
+    expect(within(chipRow).getByText("from-concierge.png")).toBeTruthy();
+  });
+
   it("leaves another agent's queued drop alone", async () => {
     usePendingAttachmentsStore.getState().add("someone-else", ["/tmp/theirs.png"]);
     render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }} />);

@@ -76,14 +76,47 @@ describe("perfSpanAsync attribution", () => {
     expect(debugSpy).not.toHaveBeenCalled();
   });
 
-  it("demotes a 21s span to DEBUG as a suspend rather than claiming 21s of work", async () => {
+  // Relabelled, not demoted. The verdict still says "suspend" so nobody reads 21s as 21s of work,
+  // but it stays on a level the shipped build actually writes to the log file: `logger.ts` forwards
+  // only above debug (`debugForwardEnabled = import.meta.env.DEV`), so the old DEBUG line meant this
+  // was DELETED for every user whose log we read. The jank monitor had the identical bug and it cost
+  // a real diagnosis — a >=10s span is exactly the freeze worth keeping, and this is the one
+  // instrument that names the operation.
+  it("relabels a 21s span as a suspend but keeps it on a level the log file retains", async () => {
     spanOf(21_454);
     await perfSpanAsync("rehydrate", async () => 0, { event: "projects-changed" });
-    expect(infoSpy).not.toHaveBeenCalled();
-    expect(debugSpy).toHaveBeenCalledWith("perf", "span rehydrate (suspend)", {
+    expect(debugSpy).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith("perf", "span rehydrate (suspend)", {
       ms: 21_454,
       event: "projects-changed",
     });
+  });
+
+  // `classifySpan` tests the duration BEFORE `hiddenOverlap`, so a long hidden interval never
+  // reaches the `background` verdict — it lands in the `suspend` promotion instead, at INFO. An
+  // async span that merely awaits across a >10s occlusion (a poll, an IPC round-trip, a rehydrate
+  // while the user is away) is exactly that case, and it is FREQUENT and LEGITIMATE. Without a
+  // discriminator it renders in the shipped log identically to the 30s synchronous block the
+  // promotion exists to preserve. `hidden` is what tells the two apart, and it was being dropped —
+  // while the sibling jank line added in the same change deliberately carries it "for a reader to
+  // discount". The case was unpinned in either direction before this test.
+  it("marks a long ASYNC span that overlapped an occlusion as hidden, so a reader can discount it", async () => {
+    setHidden(true);
+    spanOf(21_454);
+    await perfSpanAsync("poll", async () => 0);
+    expect(debugSpy).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith("perf", "span poll (suspend)", {
+      ms: 21_454,
+      hidden: true,
+    });
+  });
+
+  // The neighbouring case that must NOT have changed: a long span with the window visible
+  // throughout is the genuine-block reading, and tagging it `hidden` would be a lie.
+  it("does not claim hidden for a long span the window stayed visible through", async () => {
+    spanOf(21_454);
+    await perfSpanAsync("poll", async () => 0);
+    expect(infoSpy).toHaveBeenCalledWith("perf", "span poll (suspend)", { ms: 21_454 });
   });
 
   it("demotes a span that ran while the window was hidden", async () => {
@@ -141,10 +174,27 @@ describe("perfSpan (synchronous) attribution", () => {
     expect(debugSpy).not.toHaveBeenCalled();
   });
 
-  it("still demotes a sync span that outlived a machine sleep", () => {
+  // The case with the most at stake. `perfSpan` is SYNCHRONOUS and passes `hiddenOverlap = false`,
+  // so a body that cleared the threshold could not have been throttled part-way through — it is far
+  // more likely a genuine main-thread block than a machine sleep. Sending that to a level the
+  // shipped build discards deleted the best evidence we had about long freezes.
+  it("keeps a 30s SYNC span in the log file, since it is more likely a block than a sleep", () => {
     spanOf(30_000);
     perfSpan("persist.merge", () => 0);
-    expect(infoSpy).not.toHaveBeenCalled();
-    expect(debugSpy).toHaveBeenCalledWith("perf", "span persist.merge (suspend)", { ms: 30_000 });
+    expect(debugSpy).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith("perf", "span persist.merge (suspend)", { ms: 30_000 });
+  });
+
+  // A SYNC span never takes the background discount, however hidden the window: `perfSpan` passes
+  // `hiddenOverlap = false` because a synchronous body cannot be throttled part-way through, so its
+  // cost is genuine main-thread work either way. Pinned here because the promotion above is
+  // deliberately narrow — only the `suspend` verdict moved — and this is the neighbouring case that
+  // must NOT have changed.
+  it("keeps an ordinary sync span on its plain INFO line even while hidden", () => {
+    setHidden(true);
+    spanOf(400);
+    perfSpan("persist.merge", () => 0);
+    expect(debugSpy).not.toHaveBeenCalled();
+    expect(infoSpy).toHaveBeenCalledWith("perf", "span persist.merge", { ms: 400 });
   });
 });

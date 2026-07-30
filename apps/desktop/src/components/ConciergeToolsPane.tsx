@@ -17,6 +17,7 @@ import {
 } from "../services/conciergeAiAccess";
 import { AI_ENHANCEMENTS_GRADIENT } from "./AiEnhancementsBadge";
 import { AiLockedNotice } from "./AiLockedNotice";
+import { ConciergeAuditPane } from "./ConciergeAuditPane";
 import { RefillLink } from "./OutOfCreditsNotice";
 import {
   CONCIERGE_TOOL_CATALOG,
@@ -73,8 +74,10 @@ import { SECTION_LABEL, tag } from "./labelTreatment";
 //
 // ONE BULK CONTROL, ONE CONFIRMATION. "Allow everything" is deliberately not split into a routine
 // tier and an everything tier: a second variant hands back exactly the decision the button exists
-// to skip. The irreversible tools are not hidden either — the confirmation names how many there
-// are, which is what the taxonomy is FOR. It is paired with "Reset all to defaults" so the whole
+// to skip. Nothing the grant covers is hidden either — the confirmation names how many irreversible
+// tools there are AND the ones that read the user's screen, which is what the taxonomy is FOR: the
+// risk classes exist so this sentence can be true, and a class the sentence omits is a class nobody
+// consented to. It is paired with "Reset all to defaults" so the whole
 // gesture is reversible in one, and a bulk apply writes an explicit rule per tool so every affected
 // row still reads "set by you" with its own Reset (see allowAllConciergeTools for why).
 //
@@ -115,6 +118,11 @@ export function ConciergeToolsPane() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       {gated && <AiEnhancementsGate remedy={access.remedy} />}
+      {/* WHAT IT DID, above what it MAY do — the same question in two tenses, and this is the tense
+          people arrive on this pane asking about ("why didn't it merge the PR?"). Ungated on
+          purpose: the record of what already happened does not stop being true when enhancements
+          go off, and it renders its own empty state when there is nothing to show. */}
+      <ConciergeAuditPane />
       {/* ABOVE the tool rows, and outside the gated block on purpose. Everything below this asks
           "what may the concierge do on its own"; this asks "what does MY selection do", which is
           true whether or not the paid half is running. */}
@@ -151,10 +159,18 @@ export function ConciergeToolsPane() {
           time, well after the message has gone. Off by default; auto-send itself works either way.
         </p>
       </section>
+      {/* THE TAXONOMY, AND IT HAS FOUR AXES RATHER THAN THREE. "Irreversible, outward-facing, or
+          metered" was the whole of it until the screenshot domain arrived, and every one of those
+          three words is FALSE about a screen capture: it destroys nothing, publishes nothing and
+          bills nothing — and it still asks, because of what it can SEE. A blurb that lists only the
+          first three mis-describes the very default `privacy-sensitive` was minted to create, which
+          is the one thing this box exists to get right. */}
       <div style={noticeBox}>
         Each tool is set on its own. Anything left on its default is decided by how risky it is —
-        reading and other reversible work happens silently, while anything irreversible,
-        outward-facing, or metered stops to ask you first. Nothing defaults to “Never”.
+        reading Sparkle’s own data and other reversible work happens silently, while anything
+        irreversible, outward-facing, or metered
+        {screenReadingClause(PRIVACY_TOOLS.length, "or that reads your screen")} stops to ask you
+        first. Nothing defaults to “Never”.
       </div>
       <BulkBar
         gated={gated}
@@ -223,6 +239,37 @@ const IRREVERSIBLE_EXAMPLES = IRREVERSIBLE_TOOLS.filter(
   (t, _i, all) => all.find((o) => o.domain === t.domain) === t,
 ).slice(0, 3);
 
+/** The tools that read the HUMAN rather than the app — a screen capture. DERIVED from the catalog
+ *  for the same reason the irreversible list is: the names ARE the sentence's content, and a
+ *  hand-typed list goes stale the first time a tool is reclassified.
+ *
+ *  ITS OWN TIER IN THE CONFIRMATION, not folded into the irreversible clause, because the
+ *  irreversible clause cannot carry it: "destroys something nothing here can put back" is simply
+ *  untrue of a screenshot, so a reader who checked the claim would (correctly) conclude the sentence
+ *  did not cover it. Until this existed, someone clicking through "Allow every concierge tool?" was
+ *  also handing over unprompted photographs of their screen and was told nothing about it — the copy
+ *  named the consequence axis and this class is the only one on the privacy axis. */
+const PRIVACY_TOOLS = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+
+/**
+ * The screen-reading clause, or nothing when no tool is on the privacy axis.
+ *
+ * A FUNCTION OF A COUNT, taking the count as an argument rather than reading `PRIVACY_TOOLS`, and
+ * that is the whole reason it exists (roborev 55526). Both call sites used to inline
+ * `PRIVACY_TOOLS.length > 0 && "…"`, which made the false arm unreachable from a test: the class is
+ * non-empty in the real catalog, so nothing could check that the sentence still READS correctly with
+ * the clause dropped ("…or metered stops to ask you first"). Passing the count in makes both arms
+ * directly assertable without contriving a catalog injection, and keeps one source for a string that
+ * appeared in three places and had drifted in two of them.
+ *
+ * `phrasing` differs between the sites — the blurb says "or that reads your screen", the reset-all
+ * confirmation "and anything that reads your screen" — so it stays a parameter; what must not differ
+ * is WHETHER the clause appears at all.
+ */
+export function screenReadingClause(privacyCount: number, phrasing: string): string {
+  return privacyCount > 0 ? ` — ${phrasing} —` : "";
+}
+
 /**
  * Set everything at once, in one place, above the rows it governs.
  *
@@ -290,6 +337,12 @@ function BulkBar({
  * hand those over silently. It names a few of them too — a bare number is a statistic, and a
  * statistic is easier to click past than "removing a project".
  *
+ * AND IT NAMES THE SCREEN-READING TOOLS SEPARATELY, on the same principle applied to the axis the
+ * irreversible clause cannot reach. "Destroys something nothing here can put back" is false about a
+ * screenshot, so that clause does not — and must not be read to — cover it. Granting everything
+ * hands over unprompted captures of the user's screen; a confirmation that mentioned only
+ * consequence-risk let that through in silence.
+ *
  * RESET-ALL CONFIRMS TOO, and that is not the second variant the header rules out — it is the same
  * gesture's safety. It discards every rule the human wrote, which for someone who spent ten minutes
  * tuning this pane is the destructive one of the pair, whatever its reassuring name suggests.
@@ -312,6 +365,11 @@ function BulkConfirm({
 }) {
   const allowAll = action === "allow-all";
   const examples = IRREVERSIBLE_EXAMPLES.map((t) => t.name).join(", ");
+  // Named in full rather than counted: there are two of them, and "capture_window, capture_agent"
+  // is both shorter and more informative than "2 screen-reading tools". Guarded on length so a
+  // future reclassification that empties the class removes the sentence instead of rendering
+  // "the 0 tools that".
+  const privacyNames = PRIVACY_TOOLS.map((t) => t.name).join(", ");
   return (
     <ModalShell width={440} zIndex={120} onCancel={onCancel}>
       <div data-testid="concierge-bulk-confirm" role="alertdialog" aria-label="Confirm bulk change">
@@ -324,12 +382,22 @@ function BulkConfirm({
               All {CONCIERGE_TOOL_CATALOG.length} tools will run silently, with no prompt. This
               includes {IRREVERSIBLE_TOOLS.length} irreversible tools — {examples} and others that
               destroy something nothing here can put back.
+              {PRIVACY_TOOLS.length > 0 && (
+                <>
+                  {" "}
+                  It also lets the concierge photograph your screen without asking ({privacyNames}).
+                  Those destroy nothing — but a capture takes in whatever else is on screen at that
+                  moment, not just Sparkle.
+                </>
+              )}
             </>
           ) : (
             <>
               This clears {ruleCount === 1 ? "the 1 rule" : `all ${ruleCount} rules`} you have set.
-              Every tool goes back to the decision its risk class implies — reading and routine work
-              silently, everything irreversible, outward-facing or metered asking you first.
+              Every tool goes back to the decision its risk class implies — reading Sparkle’s own
+              data and routine work silently, everything irreversible, outward-facing or metered
+              {screenReadingClause(PRIVACY_TOOLS.length, "and anything that reads your screen")}{" "}
+              asking you first.
             </>
           )}
         </p>
@@ -536,9 +604,15 @@ export const CONCIERGE_TOOLS_SEARCH_TERMS: readonly string[] = [
   "tune auto-send",
   "haiku",
   "concierge autonomy per-tool permission allow ask deny approve silently risk irreversible",
+  // The screen-reading tier, searched for by what it is rather than by its class name — "privacy"
+  // and "screenshot" are what someone types when they want to know whether it can see their screen.
+  "screenshot screen capture privacy reads your screen",
   // The copy affordances (PRD 1). Searched for by what people call it, not by the label alone —
   // "clipboard" and "select" are what someone types when they can't find the switch.
   "copy on selection clipboard copying select highlight copy answer markdown paste",
+  // The audit log. Searched for by the QUESTION rather than the feature name — nobody types "audit
+  // log" when what they want to know is why the concierge didn't do the thing they asked.
+  "audit log history what did it just do recent calls refused denied why didn't it",
   ...CONCIERGE_TOOL_GROUPS.map((g) => `${g.label} ${g.tools.map((t) => t.name).join(" ")}`),
 ];
 

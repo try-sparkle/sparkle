@@ -95,8 +95,18 @@ export function openTraceKinds(): string | undefined {
 // this span's timings has to be explicitly disclaimed today.
 //
 // The fix mirrors the jank monitor exactly. A span that cannot be main-thread work is RELABELLED,
-// never dropped: it moves from INFO to DEBUG with a verdict in the message, so the INFO stream is
-// the spans a human should act on and the raw sample survives for anyone who wants it.
+// never dropped: it keeps a verdict in the message so the stream a human acts on stays clean while
+// the raw sample survives for anyone who wants it.
+//
+// "NEVER DROPPED" IS A CLAIM ABOUT THE LEVEL, AND IT WAS FALSE FOR TWO RELEASES. This comment used
+// to say relabelling meant moving to DEBUG — but `logger.ts` forwards to the log file only above
+// debug in a shipped build (`debugForwardEnabled = import.meta.env.DEV`), so "relabelled" meant
+// DELETED for every user whose log we actually read. The jank monitor had the identical bug and it
+// cost a real diagnosis (see the note above SUSPEND_MS). `suspend` therefore emits at INFO here,
+// which matters most for `perfSpan`: its body is SYNCHRONOUS and passes `hiddenOverlap = false`, so
+// a span that clears the threshold could not have been throttled mid-flight and is far more likely a
+// genuine main-thread block than a wake. Only `background` — which an async span can reach
+// legitimately, and often — stays at debug.
 
 /** A span at or above this is a resume, not work — reuses the jank monitor's threshold and its
  *  reasoning (see SUSPEND_MS). Named separately only so the forward reference reads clearly. */
@@ -176,6 +186,34 @@ function emitSpan(
   const verdict = classifySpan(ms, hiddenOverlap);
   if (verdict === "report") {
     log.info("perf", `span ${name}`, { ms, ...meta });
+    return;
+  }
+  // `suspend` is the SAME censor the jank monitor had, on the sibling instrument this file insists
+  // must be kept in step — and it bites harder here. `perfSpan` is synchronous and passes
+  // `hiddenOverlap = false`, so a synchronous body that cleared SPAN_SUSPEND_MS could not have been
+  // throttled part-way through: it is far more likely a genuine main-thread block than a wake. That
+  // is the same class of freeze the jank fix exists to surface, on the one instrument that NAMES the
+  // operation — and it was being written at debug, which shipped builds discard. Info, always.
+  //
+  // `background` stays at debug: an async span may legitimately span a hidden interval, so those are
+  // wall-clock the app did not spend working, and there are a lot of them.
+  //
+  // But note the ordering inside `classifySpan`: it tests the duration BEFORE `hiddenOverlap`, so a
+  // long hidden interval never reaches the `background` verdict. An async span that merely awaits
+  // across a >10s occlusion — a poll, an IPC round-trip, a rehydrate while the user is away — lands
+  // here, in the promotion, not in the debug branch the paragraph above describes. Those are the
+  // frequent legitimate ones, and without a discriminator they read in the log exactly like the 30s
+  // synchronous block this promotion exists to preserve.
+  //
+  // So carry `hidden`, the way the sibling jank line does, and for the same stated reason: a reader
+  // needs to be able to discount it. The alternative — letting `background` win past the threshold —
+  // was rejected because it would re-censor the sync case, which is the whole point of the change.
+  if (verdict === "suspend") {
+    log.info("perf", `span ${name} (${verdict})`, {
+      ms,
+      ...(hiddenOverlap ? { hidden: true } : {}),
+      ...meta,
+    });
     return;
   }
   log.debug("perf", `span ${name} (${verdict})`, { ms, ...meta });
@@ -553,8 +591,23 @@ let jankRunning = false;
 // observed stall p99 is ~1s and the largest non-clustered gap is well under 10s, so this reclaims
 // the band without shadowing anything real.
 //
-// Misclassifying either way is cheap: a resume is still recorded (at debug) with its duration, so
-// a gap that lands on the wrong side of this line is relabeled, never lost.
+// MISCLASSIFYING IS ONLY CHEAP IF THE LOSER IS STILL RECORDED, AND FOR TWO RELEASES IT WAS NOT.
+// This comment used to read "a resume is still recorded (at debug) with its duration, so a gap
+// that lands on the wrong side of this line is relabeled, never lost." That was false in every
+// shipped build. `logger.ts` forwards to the log file only above debug (`debugForwardEnabled` is
+// `import.meta.env.DEV`), so "relabeled" meant DELETED for the users whose logs we actually read.
+//
+// The cost was a real diagnosis. On 2026-07-29 the app beachballed twice during a window resize and
+// the user waited a full minute before force-quitting. The log for that day holds 750 `jank stall`
+// lines whose maximum is 9866ms and whose p99 is 4520ms, with ZERO lines above 10000ms and ZERO
+// `resume after suspend` lines all day. A distribution does not stop dead 134ms below a
+// reclassification threshold on its own — that is a censored distribution, and the freeze that
+// mattered was on the far side of the censor. The instrument could not report its own worst case.
+//
+// So the threshold still SORTS, but it no longer SILENCES: every gap past it is logged at info,
+// with the same attribution the stall branch carries, at a level the shipped build keeps. Naming
+// WHICH of the two causes it was is not this instrument's job — see the note above
+// `startJankMonitor` on why, and `src-tauri/src/watchdog.rs` for the instrument that can.
 //
 // The span instrument applies the same threshold for the same reason — see SPAN_SUSPEND_MS. Keep
 // the two in step: they are one claim ("nothing this app does on the main thread lasts 10s")
@@ -601,6 +654,32 @@ export function classifyJankGap(
   return gapMs >= SUSPEND_MS ? "resume" : "stall";
 }
 
+// ── WHY THIS MODULE DOES NOT TRY TO NAME THE CAUSE OF A LONG GAP ───────────────────────────────
+//
+// The obvious next move here is a wall-vs-monotonic cross-check: `performance.now()` is monotonic
+// and `Date.now()` is wall-clock, so if the wall ran further than the monotonic clock, time passed
+// that this thread did not experience — a suspend — and if they agree, the thread lived through
+// every millisecond, which is what a block looks like. It is a tidy idea and it does not work here,
+// for a reason this file already records above: App Nap, display sleep and occlusion were producing
+// ~166 WARNs a day claiming 10s+ FREEZES. Those warns exist because the pause was visible as a large
+// gap in `performance.now()` — i.e. on this platform the monotonic clock keeps running through
+// exactly the pauses we are trying to recognise. The two clocks would therefore agree in both cases
+// and the check could only ever return one of its two answers. A classifier that structurally cannot
+// return one of its values is not a conservative classifier, it is a vacuous one.
+//
+// So responsibility is split along the line of what each instrument can actually know:
+//
+//   • THIS module RECORDS. It sees a gap and reports it, with attribution, at a level the shipped
+//     build keeps. It does not claim to know why, because from inside the blocked thread it cannot.
+//   • The RUST WATCHDOG (`src-tauri/src/watchdog.rs`) ADJUDICATES. It runs off the main thread, so
+//     it keeps ticking straight through a webview block and is itself frozen by a machine suspend.
+//     It observes the difference directly instead of inferring it, and it is the one that WARNs.
+//
+// `wallMs` still rides along on the line below — as evidence for a reader, not as a verdict. It
+// costs nothing and it is the measurement that would falsify the paragraph above: if a real suspend
+// ever shows up with `wallMs` far exceeding `ms`, then the monotonic clock does freeze on some path
+// after all, and a cross-check becomes worth building.
+
 /** Start a requestAnimationFrame loop that logs any inter-frame gap exceeding `thresholdMs` — i.e.
  *  every time the main thread was blocked long enough to drop frames (the visible "freeze"). Gaps
  *  accrued while the window was hidden are dropped (rAF is paused then, so the gap measures
@@ -622,6 +701,10 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
   if (jankRunning || typeof requestAnimationFrame !== "function") return;
   jankRunning = true;
   let last = perfNow();
+  // The wall-clock companion to `last`, so a past-SUSPEND_MS gap can be measured on both clocks at
+  // once and reported as `wallMs` alongside `ms`. Evidence for a reader, not a verdict — see the
+  // note above this function for why nothing here tries to name the cause from the two clocks.
+  let lastWall = Date.now();
   // Latched by the visibilitychange listener and cleared by the next tick that consumes it — see
   // classifyJankGap for why tick-time `document.hidden` is the wrong signal.
   let hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
@@ -665,7 +748,11 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
     const now = perfNow();
     const gap = now - last;
     last = now;
-    const verdict = classifyJankGap(gap, thresholdMs, hiddenSinceLastTick);
+    const nowWall = Date.now();
+    const wallGap = nowWall - lastWall;
+    lastWall = nowWall;
+    const wasHidden = hiddenSinceLastTick;
+    const verdict = classifyJankGap(gap, thresholdMs, wasHidden);
     hiddenSinceLastTick = typeof document !== "undefined" && document.hidden;
     // Close the open window BEFORE any gap rAF did not run across. A rollup that straddles one
     // would carry the whole paused interval in `sinceMs` — an 8-hour sleep makes a perfectly normal
@@ -683,9 +770,54 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
     // overwhelmingly just a healthy sub-threshold frame, and flushing on those would emit a line
     // per frame and destroy the coalescing entirely.
     if (verdict !== "stall" && gap >= thresholdMs) flushMinors(now - gap);
+    // THE OTHER DOOR THE LONG GAPS WERE ESCAPING THROUGH. `classifyJankGap` tests the hidden latch
+    // BEFORE the suspend threshold, so a gap past SUSPEND_MS that also overlapped an occlusion is
+    // "ignore" — recorded nowhere, at any level. That is not a hypothetical: queued
+    // `visibilitychange` events dispatch when the main thread unblocks, ahead of the next rAF, so a
+    // genuine long block that occludes the window on its way (a window resize or move — the exact
+    // reported symptom) latches `hidden` and silences itself.
+    //
+    // Dropping it is right for an ordinary backgrounded gap, which is why the verdict stands. But at
+    // this magnitude the cost of staying quiet is losing the only record of a freeze, so it is
+    // reported with `hidden: true` for a reader to discount, rather than deleted.
+    //
+    // It carries `during`/`rendered` for the same reason the `resume` branch below does, and with
+    // MORE at stake: this is the branch whose comment names the reported symptom outright, so it is
+    // the one most likely to be a real freeze — and it was the only long-gap branch emitting no
+    // attribution at all. A reader who found this line had the duration and nothing to chase.
+    if (verdict === "ignore" && wasHidden && gap >= SUSPEND_MS) {
+      const during = openTraceKinds();
+      const rendered = renderBurst(renderBase, renderTotalsByComponent());
+      log.info("perf", "long gap (window was hidden — may be a freeze that occluded)", {
+        ms: Math.round(gap),
+        wallMs: Math.round(wallGap),
+        hidden: true,
+        heapMb: heapMb(),
+        win: windowLabel,
+        ...(during ? { during } : {}),
+        ...(rendered ? { rendered } : {}),
+      });
+    }
     if (verdict === "resume") {
-      // Resume from suspend, not a freeze — record it (still useful to correlate) without the warn.
-      log.debug("perf", "resume after suspend", { ms: Math.round(gap), win: windowLabel });
+      // PAST SUSPEND_MS. Probably a wake — but "probably" is exactly the word that lost us a
+      // diagnosis when this branch logged at debug, which shipped builds discard. It is now always
+      // recorded, and it carries the SAME attribution the severe-stall branch carries: if this was
+      // in fact a blocked main thread, `during`/`rendered` are the only clue to what blocked it, and
+      // they were being thrown away precisely for the longest freezes.
+      const during = openTraceKinds();
+      const rendered = renderBurst(renderBase, renderTotalsByComponent());
+      // INFO, not debug, and never debug again — that one level is the whole bug. Not warn either:
+      // the majority of these really are wakes, the watchdog is what raises the alarm when one is
+      // not, and a warn per lid-close is the noise that got this branch demoted in the first place.
+      // Info is the level that is both kept and quiet.
+      log.info("perf", "long gap (suspend or main-thread block)", {
+        ms: Math.round(gap),
+        wallMs: Math.round(wallGap),
+        heapMb: heapMb(),
+        win: windowLabel,
+        ...(during ? { during } : {}),
+        ...(rendered ? { rendered } : {}),
+      });
     } else if (verdict === "stall") {
       if (gap >= JANK_SEVERE_MS) {
         // `during` attributes the stall to whatever interaction was mid-flight (kinds only, no

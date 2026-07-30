@@ -329,8 +329,19 @@ export interface SelfIdentity {
   isAgent: boolean;
   projectId: string | null;
   projectName: string | null;
-  /** What the caller is doing right now — its own `set_agent_activity` line for an agent, and for
-   *  the concierge the OBSERVED tool line the human's thinking indicator is showing. */
+  /** For an agent: its own `set_agent_activity` line.
+   *
+   *  For the concierge: the LAST TOOL CALL OBSERVED THIS APP RUN — which is not the same claim as
+   *  "what it is doing right now", and the difference is load-bearing (roborev 55358). The human's
+   *  thinking indicator applies two gates this cannot: it renders only while the concierge is
+   *  typing, and only when `latest.seq` is above the floor the CURRENT turn recorded, precisely so a
+   *  line left over from a previous turn — or from a proactive push nobody watched — is not
+   *  presented as live. That floor is per-turn state owned by the indicator, unreachable from this
+   *  layer, and `conciergeActivity` says so itself: "Consumers decide for themselves whether it is
+   *  recent enough to show (see `seq`)."
+   *
+   *  So this field is honest about a WEAKER thing: a call was observed, and this was the most recent
+   *  one, at some point since the app started. A caller must not read it as "this turn". */
   activity: string | null;
 }
 
@@ -340,7 +351,9 @@ function selfIdentity(req: ControlRequest): SelfIdentity | null {
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
     const project = projects.find((p) => p.id === selectedProjectId);
     // OBSERVED, never predicted — conciergeActivity records what dispatch actually ran, so this is
-    // the same sentence the human is reading in the column, not a second account of it.
+    // the same sentence the column renders, phrased by the same function. It is NOT gated to the
+    // current turn the way the indicator is (see the field's doc): no per-turn floor is readable
+    // here, so this is the last call seen this app run, which may be an old one.
     const latest = useConciergeActivityStore.getState().latest;
     return {
       id: CONCIERGE_CALLER_AGENT_ID,

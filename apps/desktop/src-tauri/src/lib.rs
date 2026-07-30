@@ -62,9 +62,11 @@ mod proc;
 mod project_window;
 mod pty;
 mod retention;
+mod review_cmd;
 mod roborev_probe;
 mod transcribe;
 mod screenshot;
+mod window_screenshot;
 mod setup;
 mod socket;
 mod sparkle_agent;
@@ -76,6 +78,7 @@ mod transcript;
 mod roster;
 mod trial;
 mod trial_remote;
+mod watchdog;
 mod worktree;
 mod notes;
 mod concierge;
@@ -234,6 +237,10 @@ pub fn run() {
             }
             // Attribute notifications to Sparkle's bundle id (best-effort; see attention.rs).
             attention::init_application();
+            // Watch the main thread from OFF the main thread, so a wedge can be reported while it
+            // is still happening. Started early: the stalls worth catching include startup ones,
+            // and nothing here depends on the rest of setup succeeding (see watchdog.rs).
+            watchdog::start(app.handle());
             // Stand up the local history store (prompts + responses, FTS5) in the app-data dir.
             // A failure here must not stop the app from booting — capture/search just won't work.
             match dev_identity::app_data_dir(app.handle()) {
@@ -272,6 +279,13 @@ pub fn run() {
                     Err(e) => tracing::warn!("hook-events retention: app_data_dir: {e}"),
                 });
             }
+            // Sweep the concierge's screenshot directory (`<temp>/sparkle-captures`). THE
+            // DETERMINISTIC HALF of that module's retention bound: pruning only inside a capture
+            // made retention a side effect of taking ANOTHER capture, so a session that
+            // photographed the screen once and then went quiet left the PNG in temp forever — the
+            // quiescent case, and the common one. Same background-thread treatment as the
+            // hook-events reap above and for the same reason: it stats a directory.
+            std::thread::spawn(window_screenshot::sweep_capture_dir);
             // Editable TOML config: load the global config.toml and watch it for live reload.
             // Best-effort — a failure here must not stop the app; the engine falls back to
             // built-in defaults (config::current_effective() returns defaults when never loaded).
@@ -458,6 +472,11 @@ pub fn run() {
             setup::install_roborev,
             setup::deactivate_roborev,
             setup::roborev_auth_selftest,
+            // roborev's review QUEUE, as opposed to its install lifecycle above — the commands
+            // behind the concierge's `review` domain. See review_cmd.rs.
+            review_cmd::roborev_list_findings,
+            review_cmd::roborev_show_finding,
+            review_cmd::roborev_close_finding,
             setup::install_lsp_server,
             claude_chat::claude_chat_send,
             claude_chat::claude_chat_cancel,
@@ -477,7 +496,10 @@ pub fn run() {
             display_span::fit_window_to_current_display,
             display_span::reset_window_size,
             screenshot::capture_screen_region,
+            window_screenshot::capture_main_window,
+            window_screenshot::capture_main_window_region,
             attachments::load_attachment,
+            attachments::probe_attachment,
             attachments::copy_image_to_clipboard,
             attachments::copy_file_to,
             attachments::copy_files_to_dir,
@@ -627,6 +649,7 @@ pub fn run() {
             support::desktop_list_tickets,
             attention::set_window_attention,
             attention::notify_attention,
+            watchdog::watchdog_heartbeat,
             attention_summary::summarize_attention,
             accounts::accounts_list,
             accounts::accounts_add,

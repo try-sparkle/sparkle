@@ -90,6 +90,15 @@ import {
   type LifecycleResult,
 } from "./lifecycle";
 import {
+  REVIEW_OPS,
+  REVIEW_RISK,
+  listFindings,
+  getFinding,
+  closeFinding,
+  type ReviewOp,
+  type ReviewResult,
+} from "./review";
+import {
   CONCIERGE_TERMINAL_TOOLS,
   getAgentStatus,
   readAgentTerminal,
@@ -100,6 +109,15 @@ import {
   type ControlKeyName,
   sendToAgentTerminal,
 } from "./terminal";
+import {
+  ATTACHMENTS_OPS,
+  ATTACHMENTS_RISK,
+  attachToMessage,
+  clearAttachments,
+  listAttachments,
+  type AttachmentsOp,
+  type AttachmentsResult,
+} from "./attachments";
 import {
   WORKFLOW_OPERATIONS,
   WORKFLOW_RISK,
@@ -123,6 +141,16 @@ import {
   type WorkflowOperation,
   type WorkflowResult,
 } from "./workflow";
+import {
+  EVENTS_OPS,
+  EVENTS_RISK,
+  listEventSubscriptions,
+  readEvents,
+  subscribe,
+  unsubscribe,
+  type EventsOp,
+  type EventsResult,
+} from "./events";
 import {
   WORKSPACE_OPS,
   WORKSPACE_OP_RISK,
@@ -189,6 +217,13 @@ import {
   type DiffOp,
   type DiffResult,
 } from "./diff";
+import {
+  SCREENSHOT_OPS,
+  captureWindow,
+  captureAgent,
+  type ScreenshotOp,
+  type ScreenshotResult,
+} from "./screenshot";
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
@@ -203,9 +238,13 @@ import type { HistoryHit } from "../history";
 /** The tool domains, exactly as they appear on the wire. */
 export const CONCIERGE_TOOL_DOMAINS = [
   "lifecycle",
+  "review",
   "terminal",
+  "attachments",
   "workflow",
+  "events",
   "workspace",
+  "screenshot",
   "board",
   "approvals",
   "plans",
@@ -400,6 +439,14 @@ function fromLifecycle<T>(ctx: OpContext, r: LifecycleResult<T>): ConciergeToolR
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
+/** review: same convention as board. The domain's own refusal codes (`roborev-daemon-down`,
+ *  `roborev-unregistered`, …) pass through as the code, which is the point of having four of them:
+ *  a caller that can branch on WHICH of roborev's supported-but-unavailable states it hit can name
+ *  the one remedy that applies, instead of saying "roborev is unavailable" four different times. */
+function fromReview<T>(ctx: OpContext, r: ReviewResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
 /** workflow: `{ ok, op, risk, data }` | `{ ok: false, …, kind, code, message, files? }`. The
  *  refusal's `code` passes straight through; conflicted paths are folded into the message, since a
  *  caller that has to say WHICH files conflicted cannot get them any other way. */
@@ -409,10 +456,32 @@ function fromWorkflow<T>(ctx: OpContext, r: WorkflowResult<T>): ConciergeToolRep
   return err(ctx, r.code, `${r.message}${files}`);
 }
 
+/** attachments: the lifecycle/board convention. Its refusal `reason` is the path-containment code
+ *  (`outside-project`, `symlink-escape`, `hidden-path`, `too-large`, …) and passes straight through,
+ *  which is the whole point of having one code per rejection reason — a caller that has to tell
+ *  "that file isn't in your project" from "that path is a link out of it" can still branch. */
+function fromAttachments<T>(ctx: OpContext, r: AttachmentsResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** events: the board convention. The refusal `reason` (`unknown-subscription`,
+ *  `unknown-event-kind`) passes through as the code, because a caller that must tell "your
+ *  subscription is gone" apart from "nothing happened" can only do it on that word. */
+function fromEvents<T>(ctx: OpContext, r: EventsResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
 /** workspace: `{ ok, op, risk, value }` | `{ ok: false, …, reason, message }`. Note `value`, not
  *  `data` — the one place the conventions differ in the SUCCESS arm too. */
 function fromWorkspace<T>(ctx: OpContext, r: WorkspaceResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.value) : err(ctx, r.reason, r.message);
+}
+
+/** screenshot: the board/diff convention. Its refusals carry the reason a capture could not be
+ *  taken — most often that the named agent is not the one on screen, which is a REFUSAL rather than
+ *  a wrong picture because every agent's pane occupies the same rect (see screenshot.ts). */
+function fromScreenshot<T>(ctx: OpContext, r: ScreenshotResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
 /** board: `{ ok, op, risk, data }` | `{ ok: false, …, reason, message }` — the lifecycle convention.
@@ -604,6 +673,70 @@ const LIFECYCLE_WRITE: Record<LifecycleOp, boolean> = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// REVIEW — roborev's findings. See review.ts for why the four "unavailable" states are four codes.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * READS may default their project; the WRITE must name one — the same asymmetry as the board's, for
+ * the same reason. `close_finding` is `ask`-tier, and an approval is fingerprinted over the model's
+ * RAW arguments: a close naming no project would be resolved against `selectedProjectId` on the
+ * RETRY turn, which can move in between (the concierge can move it itself with
+ * `workspace.select_project`). Requiring the id makes the approved call and the performed call the
+ * same call.
+ */
+const reviewScope = z.object({ projectId: z.string().min(1).optional() }).strict();
+
+/** `branch` widens the read past the checkout's current branch — optional, and never defaulted to
+ *  something machine-wide. `limit` may only LOWER the Rust-side cap; a hallucinated 5000 is clamped
+ *  there, and the applied cap comes back so a full page is still recognised as possibly truncated. */
+const listFindingsArgs = reviewScope.extend({
+  branch: z.string().min(1).optional(),
+  limit: z.number().int().positive().optional(),
+});
+
+const findingIdArgs = reviewScope.extend({
+  id: z.string().min(1, "a finding id is required"),
+});
+
+/**
+ * The close. `projectId` REQUIRED (see reviewScope) and `rationale` non-empty AT THE SCHEMA.
+ *
+ * The domain refuses a blank rationale too, and the duplication is deliberate: this schema turns it
+ * into a `bad-args` reply naming the field, which is what a model needs to fix its next call, while
+ * the domain's own guard is what protects every non-registry caller. Neither is redundant with the
+ * other — a blank rationale must never reach roborev, because roborev would ACCEPT it and record a
+ * close indistinguishable from one made without reading the finding.
+ */
+const closeFindingArgs = z
+  .object({
+    projectId: projectIdArg,
+    id: z.string().min(1, "a finding id is required"),
+    rationale: z
+      .string()
+      .min(1, "closing a finding needs a rationale — it is recorded on the review before the close"),
+  })
+  .strict();
+
+const REVIEW_ROUTES: Record<ReviewOp, Handler> = {
+  list_findings: route(listFindingsArgs, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) =>
+      fromReview(ctx, await listFindings(p.rootPath, { branch: a.branch, limit: a.limit })),
+    ),
+  ),
+  get_finding: route(findingIdArgs, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) =>
+      fromReview(ctx, await getFinding(p.rootPath, a.id)),
+    ),
+  ),
+  // The write resolves through `withProject` — no store fallback. See reviewScope.
+  close_finding: route(closeFindingArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromReview(ctx, await closeFinding(p.rootPath, a.id, a.rationale)),
+    ),
+  ),
+};
+
+// ---------------------------------------------------------------------------------------------
 // TERMINAL
 // ---------------------------------------------------------------------------------------------
 
@@ -730,6 +863,40 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
 const TERMINAL_WRITE: Record<string, boolean> = Object.fromEntries(
   CONCIERGE_TERMINAL_TOOLS.map((t) => [t.name, t.write]),
 );
+
+// ---------------------------------------------------------------------------------------------
+// ATTACHMENTS — hand an agent a FILE. See attachments.ts for the containment rules.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The paths, as a strict schema — and note what it does NOT do.
+ *
+ * It checks SHAPE only: a non-empty array of non-empty strings, bounded so a hallucinated
+ * thousand-element array is refused before a thousand IPC probes are issued. Every question about
+ * what a path MEANS — absolute, no `..`, inside the project, a real file, small enough — is the
+ * domain's, and the domain answers each with its own named refusal code. Restating any of them here
+ * would turn an explained refusal ("that path is a link out of your project") into a bare `bad-args`
+ * naming a field, which is precisely the trade `mergePrArgs` above is written to avoid.
+ */
+const attachArgs = z
+  .object({
+    agentId: agentIdArg,
+    paths: z
+      .array(z.string().min(1, "a path cannot be empty"))
+      .min(1, "name at least one absolute path")
+      .max(64, "that is more paths than this can take"),
+  })
+  .strict();
+
+const ATTACHMENTS_ROUTES: Record<AttachmentsOp, Handler> = {
+  list_attachments: route(agentOnly, (a, ctx) => fromAttachments(ctx, listAttachments(a.agentId))),
+  attach_to_message: route(attachArgs, async (a, ctx) =>
+    fromAttachments(ctx, await attachToMessage(a.agentId, a.paths)),
+  ),
+  clear_attachments: route(agentOnly, (a, ctx) =>
+    fromAttachments(ctx, clearAttachments(a.agentId)),
+  ),
+};
 
 // ---------------------------------------------------------------------------------------------
 // WORKFLOW
@@ -878,6 +1045,62 @@ const WORKFLOW_ROUTES: Record<WorkflowOperation, Handler> = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// EVENTS — the drainable log of what changed. See events.ts for why this is a cursor and not a push.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Kinds arrive as PLAIN STRINGS and are narrowed by the DOMAIN, not by this schema.
+ *
+ * A `z.enum` here would refuse a typo as `bad-args` naming the field — true, and useless. The
+ * domain's own refusal names the offending kind AND lists the seven real ones, which is the sentence
+ * a model can act on. Same reasoning as `mergePrArgs` forwarding its refused options.
+ */
+const eventKindsArg = z.array(z.string().min(1, "an event kind cannot be empty")).optional();
+
+const subscribeArgs = z.object({ kinds: eventKindsArg }).strict();
+
+const readEventsArgs = z
+  .object({
+    subscriptionId: z.string().min(1).optional(),
+    /** The cursor from a previous drain. Non-negative: seqs start at 1, so 0 means "everything". */
+    since: z.number().int().min(0, "a cursor is never negative").optional(),
+    /**
+     * Which RUN of the log the cursor came from — the `epoch` handed back with it.
+     *
+     * A plain string rather than a validated shape, and narrowed by the DOMAIN for the same reason
+     * `kinds` is: the useful answer to a stale epoch is "the log restarted, here is what this run
+     * holds", which `bad-args` cannot say. Optional, because a caller that kept no epoch still gets
+     * the `since > latestSeq` backstop.
+     */
+    epoch: z.string().min(1, "an epoch is never empty").optional(),
+    kinds: eventKindsArg,
+    limit: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const unsubscribeArgs = z
+  .object({ subscriptionId: z.string().min(1, "a subscription id is required") })
+  .strict();
+
+const EVENTS_ROUTES: Record<EventsOp, Handler> = {
+  subscribe: route(subscribeArgs, (a, ctx) => fromEvents(ctx, subscribe(a.kinds))),
+  read_events: route(readEventsArgs, (a, ctx) =>
+    fromEvents(
+      ctx,
+      readEvents({
+        subscriptionId: a.subscriptionId,
+        since: a.since,
+        epoch: a.epoch,
+        kinds: a.kinds,
+        limit: a.limit,
+      }),
+    ),
+  ),
+  unsubscribe: route(unsubscribeArgs, (a, ctx) => fromEvents(ctx, unsubscribe(a.subscriptionId))),
+  list_subscriptions: route(noArgs, (_a, ctx) => fromEvents(ctx, listEventSubscriptions())),
+};
+
+// ---------------------------------------------------------------------------------------------
 // WORKSPACE
 // ---------------------------------------------------------------------------------------------
 
@@ -981,6 +1204,40 @@ const WORKSPACE_ROUTES: Record<WorkspaceOp, Handler> = {
   quit_app: route(z.object({ confirm: confirmArg }).strict(), async (a, ctx) =>
     fromWorkspace(ctx, await quitApp({ confirm: a.confirm === true })),
   ),
+};
+
+// ---------------------------------------------------------------------------------------------
+// SCREENSHOT — the only domain that observes the human's SCREEN rather than the app's own data.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `capture_window` takes NO arguments, deliberately.
+ *
+ * There is no rect, no window id and no display to name: the Rust side reads the main window's own
+ * geometry. A rect argument here would turn the command into a general-purpose "photograph this
+ * part of the screen" primitive reachable from model-authored JSON — which is exactly what
+ * window_capture.rs's clamp exists to prevent, handed back through the front door.
+ */
+const SCREENSHOT_ROUTES: Record<ScreenshotOp, Handler> = {
+  capture_window: route(noArgs, async (_a, ctx) => fromScreenshot(ctx, await captureWindow())),
+  capture_agent: route(agentOnly, async (a, ctx) =>
+    fromScreenshot(ctx, await captureAgent(a.agentId)),
+  ),
+};
+
+/**
+ * Read vs write, per screenshot op.
+ *
+ * BOTH ARE `true`, and it is not a slip. Nothing about the app changes — but a capture WRITES A
+ * FILE holding a picture of the user's screen, and `write` is what the policy layer's approval
+ * fingerprinting treats as "this call did something in the world". Stated as an exhaustive
+ * `Record<ScreenshotOp, boolean>` for the same reason `LIFECYCLE_WRITE` is: a new op cannot be
+ * added without someone deciding, and the `?? true` fallback at the call site means the answer for
+ * an unclassified name is the one that gets ASKED about rather than waved through.
+ */
+const SCREENSHOT_WRITE: Record<ScreenshotOp, boolean> = {
+  capture_window: true,
+  capture_agent: true,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1192,6 +1449,11 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => LIFECYCLE_WRITE[op as LifecycleOp] ?? true,
     ops: LIFECYCLE_OPS,
   },
+  review: {
+    routes: REVIEW_ROUTES,
+    write: (op) => REVIEW_RISK[op as ReviewOp] !== "read-only",
+    ops: REVIEW_OPS,
+  },
   terminal: {
     routes: TERMINAL_ROUTES,
     // Unknown ops never reach here (the route lookup refuses first); default to `true` anyway, so
@@ -1199,15 +1461,33 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => TERMINAL_WRITE[op] ?? true,
     ops: CONCIERGE_TERMINAL_TOOLS.map((t) => t.name),
   },
+  attachments: {
+    routes: ATTACHMENTS_ROUTES,
+    write: (op) => ATTACHMENTS_RISK[op as AttachmentsOp] !== "read-only",
+    ops: ATTACHMENTS_OPS,
+  },
   workflow: {
     routes: WORKFLOW_ROUTES,
     write: (op) => WORKFLOW_RISK[op as WorkflowOperation]?.risk !== "read-only",
     ops: WORKFLOW_OPERATIONS,
   },
+  events: {
+    routes: EVENTS_ROUTES,
+    // `subscribe`/`unsubscribe` are `routine`, so they report as writes — honestly, since they do
+    // mutate the subscription ledger. Both still default to `allow` (policy.ts maps `routine` there),
+    // so nothing here asks the human's permission to find out what changed.
+    write: (op) => EVENTS_RISK[op as EventsOp] !== "read-only",
+    ops: EVENTS_OPS,
+  },
   workspace: {
     routes: WORKSPACE_ROUTES,
     write: (op) => WORKSPACE_OP_RISK[op as WorkspaceOp] !== "read-only",
     ops: WORKSPACE_OPS,
+  },
+  screenshot: {
+    routes: SCREENSHOT_ROUTES,
+    write: (op) => SCREENSHOT_WRITE[op as ScreenshotOp] ?? true,
+    ops: SCREENSHOT_OPS,
   },
   diff: {
     routes: DIFF_ROUTES,
@@ -1237,9 +1517,13 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
 /** Every domain's op list, for the MCP layer's enums and for tests that assert the two agree. */
 export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> = {
   lifecycle: DOMAINS.lifecycle.ops,
+  review: DOMAINS.review.ops,
   terminal: DOMAINS.terminal.ops,
+  attachments: DOMAINS.attachments.ops,
   workflow: DOMAINS.workflow.ops,
+  events: DOMAINS.events.ops,
   workspace: DOMAINS.workspace.ops,
+  screenshot: DOMAINS.screenshot.ops,
   board: DOMAINS.board.ops,
   approvals: DOMAINS.approvals.ops,
   plans: DOMAINS.plans.ops,

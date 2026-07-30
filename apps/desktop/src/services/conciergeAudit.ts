@@ -142,10 +142,28 @@ export function noteConciergeAuditCall(
   };
 }
 
-/** Newest first — the order a "what did it just do" surface reads in. */
-export function recentConciergeAudit(limit = 50): readonly ConciergeAuditEntry[] {
-  const entries = useConciergeAudit.getState().entries;
+/**
+ * Newest first, capped — the order a "what did it just do" surface reads in, as ONE implementation.
+ *
+ * PURE, over the array it is handed, because the pane is a React component (roborev 55406, 55545).
+ * The pane used to re-derive `[...entries].reverse().slice(0, N)` itself, which meant a change to
+ * this module's ordering contract — keeping entries newest-first so eviction can pop the tail — would
+ * leave this helper's tests green while the pane silently rendered oldest-first. Calling
+ * `recentConciergeAudit()` from the pane fixed the duplication but read the store imperatively, so
+ * `entries` was an invisible `useMemo` dependency that `react-hooks/exhaustive-deps` correctly called
+ * unnecessary. Taking the array as an argument makes the dependency real, and both callers still
+ * share the one rule.
+ */
+export function newestFirstCapped(
+  entries: readonly ConciergeAuditEntry[],
+  limit: number,
+): readonly ConciergeAuditEntry[] {
   return entries.slice(Math.max(0, entries.length - limit)).reverse();
+}
+
+/** The same rule against the live store, for a non-React caller. */
+export function recentConciergeAudit(limit = 50): readonly ConciergeAuditEntry[] {
+  return newestFirstCapped(useConciergeAudit.getState().entries, limit);
 }
 
 /** Test-only: reset the key counter too, so cases cannot see each other's keys. */

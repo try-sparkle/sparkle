@@ -27,11 +27,19 @@ vi.mock("../services/conciergeAiAccess", () => ({
   turnOnConciergeAi: () => turnOnConciergeAi(),
 }));
 
-import { ConciergeToolsPane, CONCIERGE_TOOLS_SEARCH_TERMS } from "./ConciergeToolsPane";
+import {
+  ConciergeToolsPane,
+  CONCIERGE_TOOLS_SEARCH_TERMS,
+  screenReadingClause,
+} from "./ConciergeToolsPane";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { ConciergeAiAccess } from "../services/conciergeAiAccess";
 import { matchesAny } from "../engine/settingsSearch";
+import {
+  noteConciergeAuditCall,
+  _resetConciergeAuditForTests,
+} from "../services/conciergeAudit";
 import {
   CONCIERGE_TOOL_CATALOG,
   CONCIERGE_TOOL_GROUPS,
@@ -98,6 +106,82 @@ describe("the pane lists every tool, grouped by domain", () => {
     const blob = CONCIERGE_TOOLS_SEARCH_TERMS.join(" ");
     for (const tool of CONCIERGE_TOOL_CATALOG) {
       expect(blob, tool.name).toContain(tool.name);
+    }
+  });
+});
+
+describe("the defaults blurb describes the taxonomy the pane actually implements", () => {
+  // This box is the only place the whole default policy is stated in one sentence, so it is the one
+  // place a new risk class can silently make the pane lie. It listed three consequence axes
+  // ("irreversible, outward-facing, or metered") when the screenshot domain added a fourth that is
+  // about none of them: a capture destroys, publishes and bills nothing, and still asks.
+  const blurb = () => screen.getByText(/Each tool is set on its own/);
+
+  it("names the screen-reading tier alongside the three consequence tiers", () => {
+    // A REAL GATE, not an assertion that the class is non-empty (roborev 55526). The previous
+    // version added `expect(privacy.length).toBeGreaterThan(0)` and a comment claiming it let an
+    // emptied class remove the clause — but that assertion FAILS when the class empties, exactly as
+    // the unconditional `toMatch` already did, so only the failure message changed. Written as a
+    // conditional it tracks the pane in both directions: emptying the class flips which branch is
+    // checked instead of turning the suite red for telling the truth.
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+
+    render(<ConciergeToolsPane />);
+    const text = blurb().textContent ?? "";
+    expect(text).toMatch(/irreversible, outward-facing, or metered/);
+    if (privacy.length > 0) expect(text).toMatch(/reads your screen/i);
+    else expect(text).not.toMatch(/reads your screen/i);
+  });
+
+  // THE FALSE ARM, which had no coverage at all (roborev 55526) — the class is non-empty in the real
+  // catalog, so rendering the pane can only ever exercise one branch. What matters and was unverified
+  // is that the sentence still READS correctly with the clause gone: the em-dashes and the spacing
+  // belong to the clause, so a naive `&&` that left a stray dash or ate the space would produce
+  // "metered- stops" or "meteredstops" and nothing would have caught it.
+  it("reads correctly with the clause dropped, for a catalog with nothing on the privacy axis", () => {
+    expect(screenReadingClause(0, "or that reads your screen")).toBe("");
+    expect(screenReadingClause(2, "or that reads your screen")).toBe(
+      " — or that reads your screen —",
+    );
+    // NOT a hand-assembled template literal (roborev 55545). The first version of this asserted
+    // `` `or metered${screenReadingClause(0, "x")} stops…` === "or metered stops…" ``, which is a JS
+    // tautology given the line above it — it could not fail for ANY change to ConciergeToolsPane.tsx,
+    // while claiming to guard the join. The join that actually ships is asserted below, against
+    // RENDERED output, in the arm the real catalog produces.
+  });
+
+  // THE JOIN, against what the component actually renders. Every other assertion in this file matches
+  // a pattern that stops short of the seam — /…or metered/ and /reads your screen/i both pass against
+  // "meteredstops" and "metered  stops" — so dropping the space in the JSX after the clause was a
+  // green regression at both call sites (roborev 55545). These two assertions span the seam.
+  it("joins the clause into a readable sentence in the blurb", () => {
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    render(<ConciergeToolsPane />);
+
+    const blurbText = (blurb().textContent ?? "").replace(/\s+/g, " ");
+    expect(blurbText).toContain(
+      privacy.length > 0
+        ? "irreversible, outward-facing, or metered — or that reads your screen — stops to ask you first."
+        : "irreversible, outward-facing, or metered stops to ask you first.",
+    );
+
+  });
+
+  it("does not promise that reads happen silently — one class of read does not", () => {
+    // The old wording ("reading and other reversible work happens silently") was the actual defect:
+    // a screen capture IS a read, and it is the one read that stops to ask.
+    render(<ConciergeToolsPane />);
+    const text = blurb().textContent ?? "";
+    expect(text).not.toContain("reading and other reversible work happens silently");
+    // Every privacy-sensitive tool's own row must agree with the blurb: it asks.
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+    expect(privacy.length).toBeGreaterThan(0);
+    for (const tool of privacy) {
+      expect(
+        within(rowFor(tool.name)).getByText(/Asks you first, every time/),
+        tool.name,
+      ).toBeTruthy();
     }
   });
 });
@@ -486,6 +570,25 @@ describe("the one bulk control at the top", () => {
     expect(irreversible.some((t) => text.includes(t.name))).toBe(true);
   });
 
+  it("also names the tools that READ YOUR SCREEN, derived from the catalog", () => {
+    // The taxonomy has four axes, and the irreversible clause covers three of them. A screen
+    // capture destroys nothing, publishes nothing and bills nothing, so "destroys something nothing
+    // here can put back" is FALSE about it — which is precisely why granting everything used to
+    // hand over unprompted photographs of the user's screen with the consent dialog silent on it.
+    render(<ConciergeToolsPane />);
+    fireEvent.click(allowBtn());
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+    expect(privacy.length, "the class must be non-empty or this test proves nothing").toBeGreaterThan(0);
+    const text = confirm().textContent ?? "";
+    // Every one of them by name, not a count: two names are shorter than "2 screen-reading tools"
+    // and say more. Derived, so a reclassification moves the copy rather than staling it.
+    for (const tool of privacy) expect(text, tool.name).toContain(tool.name);
+    expect(text).toMatch(/photograph your screen/i);
+    // And it is a SEPARATE sentence from the irreversible one — the reader must not have to take
+    // "irreversible" as covering a screenshot.
+    expect(text).toContain("irreversible tools");
+  });
+
   it("cancelling changes nothing", () => {
     render(<ConciergeToolsPane />);
     fireEvent.click(allowBtn());
@@ -519,6 +622,38 @@ describe("the one bulk control at the top", () => {
     fireEvent.click(within(confirm()).getByRole("button", { name: "Reset all" }));
     expect(resetAllConciergeTools).toHaveBeenCalledTimes(1);
     expect(allowAllConciergeTools).not.toHaveBeenCalled();
+  });
+
+  // The reset-all half of the join (roborev 55545). Same reasoning as the blurb's: /…or metered/ and
+  // /reads your screen/i both pass against "meteredasking" and "metered  asking", because neither
+  // pattern spans the seam the clause is joined at.
+  it("joins the clause into a readable sentence in the reset-all confirmation", () => {
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    render(<ConciergeToolsPane />);
+    fireEvent.click(resetAllBtn());
+
+    const text = (confirm().textContent ?? "").replace(/\s+/g, " ");
+    expect(text).toContain(
+      privacy.length > 0
+        ? "irreversible, outward-facing or metered — and anything that reads your screen — asking you first."
+        : "irreversible, outward-facing or metered asking you first.",
+    );
+  });
+
+  it("describes the WHOLE taxonomy when it puts every tool back on its default", () => {
+    // Reset-all promises "the decision its risk class implies". It listed three axes and there are
+    // four, so the promise was wrong about exactly the class whose default it restores to `ask`.
+    useSettingsStore.setState({ conciergeToolPolicy: { merge_pr: "deny" } });
+    render(<ConciergeToolsPane />);
+    // A real gate, for the same reason as the blurb's (roborev 55526).
+    const privacy = CONCIERGE_TOOL_CATALOG.filter((t) => t.riskClass === "privacy-sensitive");
+
+    fireEvent.click(resetAllBtn());
+    const text = confirm().textContent ?? "";
+    expect(text).toMatch(/irreversible, outward-facing or metered/);
+    if (privacy.length > 0) expect(text).toMatch(/reads your screen/i);
+    else expect(text).not.toMatch(/reads your screen/i);
   });
 
   it("is gated with the rows — the concierge that can't act can't be granted everything", () => {
@@ -583,5 +718,83 @@ describe("the gate closing CANCELS a pending bulk confirmation", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);
+  });
+});
+
+describe("the pane also answers 'what did it just DO?'", () => {
+  // The per-tool rows say what the concierge MAY do. Somebody arriving here because it did NOT do
+  // what they asked needs the other tense, and until the audit pane was mounted the record existed
+  // with no reader anywhere in the app. This asserts the WIRING by reading a real refusal off the
+  // screen — the pane's own tests cover how a row is drawn.
+  /** One refused call in the log, so there is a real row to find. */
+  function stageOneRefusal() {
+    _resetConciergeAuditForTests();
+    noteConciergeAuditCall("tc-1", "workflow", "merge_pr", { number: 753 })({
+      ok: false,
+      code: "needs-approval",
+      message: "merge_pr needs your go-ahead.",
+    });
+  }
+
+  it("renders the audit log, with a refused call's reason, above the policy rows", () => {
+    stageOneRefusal();
+
+    render(<ConciergeToolsPane />);
+    const audit = screen.getByTestId("concierge-audit-pane");
+    expect(within(audit).getByText("workflow.merge_pr")).toBeTruthy();
+    expect(within(audit).getByText("merge_pr needs your go-ahead.")).toBeTruthy();
+    // ABOVE, asserted rather than merely claimed in the title. The pane could render last and every
+    // line above would still pass; "what it did" belongs before "what it may do" because that is the
+    // question people arrive on this pane holding.
+    const firstRow = rowFor("merge_pr");
+    expect(
+      audit.compareDocumentPosition(firstRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+      "the audit pane must precede the tool rows in document order",
+    ).toBeTruthy();
+    // …and before the section headings the rows live under, not just before the rows.
+    const firstGroup = CONCIERGE_TOOL_GROUPS[0];
+    if (!firstGroup) throw new Error("the catalog has no groups");
+    const heading = screen.getByText(firstGroup.label);
+    expect(
+      audit.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING,
+      "the audit pane must precede the first domain heading too",
+    ).toBeTruthy();
+  });
+
+  it("is UNGATED — it still renders, with its rows, when AI enhancements are off", () => {
+    // The mount comment calls this "ungated on purpose": the record of what already happened does
+    // not stop being true when enhancements go off. Nothing asserted it, so moving the mount inside
+    // the `{gated && …}` block — or into one of the `opacity: gated ? 0.55 : 1` sections below —
+    // was a green regression.
+    stageOneRefusal();
+    aiAccess = { enabled: false, remedy: "enable-setting" };
+
+    render(<ConciergeToolsPane />);
+    // The gate really is up, so this is not passing for the wrong reason.
+    expect(screen.getByTestId("concierge-ai-gate")).toBeTruthy();
+    const audit = screen.getByTestId("concierge-audit-pane");
+    // CONTENT, not just the container: an empty shell would satisfy a bare existence check.
+    expect(within(audit).getByText("workflow.merge_pr")).toBeTruthy();
+    expect(within(audit).getByText("merge_pr needs your go-ahead.")).toBeTruthy();
+    // And it is not inside the gate banner or a greyed section — it is a sibling of them, at full
+    // opacity, because it is not a thing enhancements have any authority over.
+    expect(screen.getByTestId("concierge-ai-gate").contains(audit)).toBe(false);
+    // Walked UP as well as down: the `opacity: gated ? 0.55 : 1` treatment lives on the ANCESTOR
+    // sections, so an audit pane tucked inside one of them would render every row above and still be
+    // half-faded. Checking only the pane's own subtree would miss exactly that.
+    const chain: Element[] = [];
+    for (let el: Element | null = audit; el && el !== document.body; el = el.parentElement) {
+      chain.push(el);
+    }
+    for (const el of [...chain, ...audit.querySelectorAll("*")]) {
+      const opacity = (el as HTMLElement).style?.opacity;
+      expect(opacity === "" || opacity === "1", `${el.nodeName} was faded by the gate`).toBe(true);
+    }
+  });
+
+  it("shows the empty state — not a blank gap — when the concierge has done nothing yet", () => {
+    _resetConciergeAuditForTests();
+    render(<ConciergeToolsPane />);
+    expect(screen.getByTestId("concierge-audit-empty")).toBeTruthy();
   });
 });

@@ -76,6 +76,18 @@ const IDLE_SWEEP_MIN_BYTES = 2048;
 // Hand a link clicked in terminal output to the OS default browser. Shared by BOTH link paths —
 // WebLinksAddon (bare URLs in the output) and xterm core's OSC 8 handler (escape-sequence
 // hyperlinks) — because each ships a stock handler that dead-ends in the Tauri webview.
+/** How many Terminal instances are mounted right now.
+ *
+ * Exists to make the resize fan-out MEASURABLE. Every open pane stays laid out at full size
+ * (`paneVisibility.ts` uses `visibility: hidden`, never `display: none`) and each owns a
+ * ResizeObserver, so one window or divider resize changes every pane's box at once and does the
+ * fit/reflow/PTY-sync work below N times synchronously on the main thread — cost proportional to
+ * open panes × scrollback, not to what is on screen. Without this number in the log, a slow resize
+ * is indistinguishable from one slow pane, which is the difference between an O(1) and an O(N)
+ * problem. See the span in the observer callback.
+ */
+let liveTerminalCount = 0;
+
 function openLinkFromTerminal(event: MouseEvent, uri: string): void {
   event.preventDefault();
   openUrl(uri).catch((err) => console.error("Failed to open URL from terminal:", uri, err));
@@ -937,24 +949,43 @@ export function Terminal({
       // A ResizeObserver tick can still be queued when the component unmounts (ro.disconnect()
       // doesn't un-queue an already-dispatched callback); bail before touching the freed renderer.
       if (disposed) return;
-      try {
-        fit.fit();
-        // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
-        // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
-        syncPtySize(transport, term);
-        // Repaint the viewport. When the container grows (the pane becoming visible after
-        // display:none, or the window enlarging), rows newly brought into view can stay blank —
-        // xterm only repaints on resize when fit() actually changed the dimensions. applyRepaintPlan
-        // does a cheap refresh normally, OR drains a poisoned pane revealed by this very resize
-        // (no active toggle, no further output) with a full forceFullRepaint.
-        applyRepaintPlan();
-      } catch {
-        /* ignore transient fit errors while hidden */
-      }
+      // Instrumented because this is the per-pane half of a fan-out. A window or divider resize
+      // changes every mounted pane's box in one batch, so this body runs `panes` times back to back
+      // on the main thread, each doing a forced layout (fit) plus an xterm buffer reflow when the
+      // column count changes — over an 8000-line scrollback. `panes` is what turns a tolerable
+      // per-pane cost into a freeze, and it is the field that says so.
+      //
+      // Free at rest: perfSpan emits nothing below one frame (SPAN_MIN_MS), so a healthy resize
+      // stays silent and only a pane that actually ate a frame gets a line.
+      perfSpan(
+        "terminal-resize",
+        () => {
+          try {
+            fit.fit();
+            // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
+            // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
+            syncPtySize(transport, term);
+            // Repaint the viewport. When the container grows (the pane becoming visible after
+            // display:none, or the window enlarging), rows newly brought into view can stay blank —
+            // xterm only repaints on resize when fit() actually changed the dimensions.
+            // applyRepaintPlan does a cheap refresh normally, OR drains a poisoned pane revealed by
+            // this very resize (no active toggle, no further output) with a full forceFullRepaint.
+            applyRepaintPlan();
+          } catch {
+            /* ignore transient fit errors while hidden */
+          }
+        },
+        { panes: liveTerminalCount },
+      );
     });
     ro.observe(container);
+    // Join the census the span above reports. Paired with the decrement in this effect's cleanup so
+    // the count tracks live observers exactly — it is the fan-out width, so an over-count would
+    // overstate the very cost we are trying to measure.
+    liveTerminalCount += 1;
 
     return () => {
+      liveTerminalCount -= 1;
       disposed = true;
       // Flip the shared sentinel BEFORE disposing so any late callback in another effect (theme
       // re-render, a queued rAF/ResizeObserver tick) sees it and no-ops via safeFit/safeRefresh.

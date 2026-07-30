@@ -158,18 +158,101 @@ describe("startJankMonitor window labelling", () => {
     expect(lastMeta(warn)).toMatchObject({ ms: 1200, win: "w-7", during: "spawn" });
   });
 
-  it("labels the startup line and a suspend resume too", async () => {
+  it("labels the startup line and a past-SUSPEND_MS gap too", async () => {
     const { startJankMonitor } = await import("./perfTrace");
     startJankMonitor(150, "w-7");
     expect(info).toHaveBeenCalledTimes(1);
     expect(lastMeta(info)).toMatchObject({ win: "w-7" });
 
     tick(0);
-    tick(60_000); // past SUSPEND_MS — a wake, recorded as a debug resume rather than a warn.
+    tick(60_000); // past SUSPEND_MS — reported, but not as a freeze.
     expect(warn).not.toHaveBeenCalled();
-    // Same reason as the warn assertions above: if the resume stops being emitted, assert on the
-    // missing line rather than letting toMatchObject fail against an undefined meta.
-    expect(debug).toHaveBeenCalledTimes(1);
-    expect(lastMeta(debug)).toMatchObject({ win: "w-7" });
+    // Assert on the missing line rather than letting toMatchObject fail against an undefined meta.
+    expect(info).toHaveBeenCalledTimes(2);
+    expect(lastMeta(info)).toMatchObject({ win: "w-7", ms: 60_000 });
+  });
+
+  // ── THE CENSOR TEST ────────────────────────────────────────────────────────────────────────────
+  // This is the regression that cost a real diagnosis, so it gets an assertion of its own rather
+  // than riding on the label test above.
+  //
+  // A gap past SUSPEND_MS used to be logged with `log.debug`, and `logger.ts` forwards to the log
+  // file only above debug in a shipped build (`debugForwardEnabled = import.meta.env.DEV`). The
+  // result was a hard censor: on 2026-07-29 the app beachballed for over a minute during a window
+  // resize and the day's log held 750 stall lines with a MAXIMUM of 9866ms and not one line above
+  // 10000ms. The freeze that mattered was on the far side of the threshold and no record of it
+  // survived anywhere.
+  //
+  // Assert the SIDE EFFECT — that a forwarded (non-debug) line carrying the duration is emitted —
+  // not merely that some call happened. Against the old code `debug` took this line and `info` was
+  // still sitting at its single startup call, so this fails without the fix.
+  it("RECORDS a >=10s gap on a forwarded level — it must never go to debug again", async () => {
+    const { startJankMonitor } = await import("./perfTrace");
+    startJankMonitor(150, "w-7");
+    info.mockClear(); // drop the startup line; this test is about what the gap emits
+
+    tick(0);
+    tick(63_000); // the shape of the freeze that was lost: a full minute, past the threshold
+
+    expect(debug).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(lastMeta(info)).toMatchObject({ ms: 63_000, win: "w-7" });
+  });
+
+  // The OTHER door a long gap was escaping through, and the one that matters most for the reported
+  // symptom. `classifyJankGap` tests the hidden latch before the suspend threshold, so a >=10s gap
+  // that also overlapped an occlusion returned "ignore" and was recorded nowhere at any level.
+  // Queued visibilitychange events dispatch when the main thread unblocks, ahead of the next rAF, so
+  // a genuine long block that occludes the window on its way — a window resize or move, which is
+  // exactly what the user was doing — latched `hidden` and silenced itself.
+  it("still records a >=10s gap that latched hidden, flagged so a reader can discount it", async () => {
+    const { startJankMonitor } = await import("./perfTrace");
+    startJankMonitor(150, "w-7");
+    info.mockClear();
+
+    tick(0);
+    // The occlusion lands mid-block, exactly as a queued visibilitychange would.
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    tick(63_000);
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(lastMeta(info)).toMatchObject({ ms: 63_000, hidden: true, win: "w-7" });
+  });
+
+  // The flip side: an ordinary backgrounded gap is still dropped. Without this, the fix above would
+  // just be a regression to the bogus multi-second "stalls" the hidden latch was added to suppress.
+  it("still drops a SHORT hidden gap — the latch keeps doing its original job", async () => {
+    const { startJankMonitor } = await import("./perfTrace");
+    startJankMonitor(150, "w-7");
+    info.mockClear();
+
+    tick(0);
+    Object.defineProperty(document, "hidden", { value: true, configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    tick(3_000); // severe by the stall threshold, but far below SUSPEND_MS
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(info).not.toHaveBeenCalled();
+  });
+
+  // The other half of what was thrown away. A long gap may well BE a blocked main thread, and when
+  // it is, the render/interaction attribution is the only clue to what blocked it — the severe-stall
+  // branch has carried `during` for that reason since PR #489 while this branch carried nothing but
+  // a duration. Pinned here because the two branches build their meta separately and a merge that
+  // touches one is exactly where the other loses a field.
+  it("carries interaction attribution on a long gap, as the severe-stall branch does", async () => {
+    const { startJankMonitor, perfStart } = await import("./perfTrace");
+    startJankMonitor(150, "w-7");
+    perfStart("agent-1", "spawn");
+    info.mockClear();
+
+    tick(0);
+    tick(63_000);
+
+    expect(lastMeta(info)).toMatchObject({ ms: 63_000, during: "spawn" });
   });
 });
