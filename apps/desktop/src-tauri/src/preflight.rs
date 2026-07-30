@@ -660,21 +660,32 @@ pub async fn claude_session_info(
 /// transcript itself was never the thing that was lost (see `docs/superpowers/specs/
 /// 2026-07-27-concierge-control-design.md` §3, subsystem C).
 ///
-/// `config_dir` is None ON PURPOSE, and that is not the same "None" the worktree probe takes as a
-/// default. An agent spawn picks a Claude account and sets `CLAUDE_CONFIG_DIR` on the CHILD, so its
-/// probe must be told which account to look under. The concierge spawn sets no such var, so its
-/// transcripts land under whatever Sparkle's own process env resolves — exactly what `None` means
-/// here. If the concierge ever becomes account-aware, this argument has to move with it.
+/// `config_dir` IS the concierge's account, and it has to be, because the concierge spawn is now
+/// account-aware: `concierge_turn` sets `CLAUDE_CONFIG_DIR` on its child from the selected account
+/// (PRD/sparkle/account-rotation.md Phase 0), so the transcript lands under THAT account's tree.
+/// A probe that ignored it would read `$HOME/.claude` and answer about a different account
+/// entirely — finding nothing (an amnesiac concierge after every restart, which is the exact
+/// symptom subsystem C exists to prevent) or, worse, finding a stale id from the default account
+/// and seeding it, so the next turn spawns `--resume <foreign-id>`, fails, and burns a second
+/// `claude` on the self-heal.
+///
+/// This argument therefore moves WITH the spawn, exactly as the worktree probe's does: pass the
+/// same value `concierge_turn` was given. `None`/empty keeps the pre-accounts meaning — resolve
+/// from Sparkle's own process env — which is also what a build with no accounts configured sends.
 #[tauri::command]
 pub async fn concierge_session_info<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
+    config_dir: Option<String>,
 ) -> ClaudeSessionInfo {
     let Ok(cwd) = crate::dev_identity::app_data_dir(&app) else {
         return ClaudeSessionInfo::none();
     };
     let cwd = cwd.to_string_lossy().into_owned();
     tauri::async_runtime::spawn_blocking(move || {
-        ClaudeSessionInfo::from_probe(crate::claude::claude_session_info_sync(&cwd, None))
+        ClaudeSessionInfo::from_probe(crate::claude::claude_session_info_sync(
+            &cwd,
+            config_dir.as_deref(),
+        ))
     })
     .await
     .unwrap_or_else(|_| ClaudeSessionInfo::none())

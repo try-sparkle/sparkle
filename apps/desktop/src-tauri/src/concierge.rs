@@ -821,6 +821,37 @@ struct TurnOutcome {
     error_detail: Option<String>,
 }
 
+/// Assemble the `Command` for one concierge turn — everything up to (but not including) `.spawn()`.
+///
+/// Split out of [`spawn_turn`] so the child's ENVIRONMENT is assertable without launching a real
+/// `claude`: `Command::get_envs()` reports exactly what the child would receive. That is the only
+/// way to test the account binding as a side effect rather than as an intention — the fix here is
+/// precisely one `env` entry, and a test that checked the script string instead would have passed
+/// against the broken code, since `CLAUDE_CONFIG_DIR` was never in the script either.
+fn build_turn_command(script: &str, cwd: &std::path::Path, config_dir: Option<&str>) -> Command {
+    let mut cmd = Command::new(SHELL);
+    // NON-login shell: the login PATH is resolved once and injected (see
+    // `cached_login_shell_path`), so no per-turn dotfile-sourcing latency.
+    cmd.args(["-c", script]);
+    cmd.env("PATH", cached_login_shell_path());
+    // The chosen account, on the CHILD only. Without this the concierge inherited Sparkle's own
+    // (usually absent) `CLAUDE_CONFIG_DIR` and so always ran as `$HOME/.claude`, which is why
+    // authenticating a different account elsewhere never moved it off an exhausted login.
+    crate::claude::apply_spawn_config_dir(&mut cmd, config_dir);
+    cmd.current_dir(cwd);
+    // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Own process group, so cancel/supersede can take out claude AND its children in one signal.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
+}
+
 /// Spawn one concierge `claude` child and install it in the singleton slot under a fresh token,
 /// superseding (killing, whole group) any in-flight turn — the concierge always answers the
 /// LATEST snapshot; a reply to a stale one is noise. Returns the child's pipes + token. Never
@@ -831,6 +862,10 @@ fn spawn_turn(
     cwd: &std::path::Path,
     claude_path: &str,
     resume_session_id: Option<&str>,
+    // The Claude account this turn runs under, as that account's `CLAUDE_CONFIG_DIR`. Chosen by the
+    // frontend with the SAME `pickAccount` the build-agent spawn uses (services/accountSelection),
+    // and applied to the child only. `None`/empty = no override — see `apply_spawn_config_dir`.
+    config_dir: Option<&str>,
     // A user send, or the stale-resume retry continuing one — they install under different rules
     // (see may_install / continuation_install).
     kind: TurnKind,
@@ -856,25 +891,15 @@ fn spawn_turn(
         %claude_path, cwd = %cwd.display(),
         resume = resume_session_id.map(|s| !s.is_empty()).unwrap_or(false),
         control_surface = mcp_config.is_some(),
+        // The account this turn runs under. Logged as a BOOLEAN, not the path: the dir name is
+        // account-identifying, and the fact worth having in the log is whether the turn was pinned
+        // to a chosen account at all — "false" here is the signature of the bug this threading
+        // fixes (every turn silently on `$HOME/.claude`).
+        account_pinned = crate::claude::spawn_env_config_dir(config_dir).is_some(),
         "concierge_turn spawn"
     );
 
-    let mut cmd = Command::new(SHELL);
-    // NON-login shell: the login PATH is resolved once and injected (see
-    // `cached_login_shell_path`), so no per-turn dotfile-sourcing latency.
-    cmd.args(["-c", &script]);
-    cmd.env("PATH", cached_login_shell_path());
-    cmd.current_dir(cwd);
-    // No stdin: `-p` is one-shot, and a null stdin guarantees nothing can block on input.
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    // Own process group, so cancel/supersede can take out claude AND its children in one signal.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    let mut cmd = build_turn_command(&script, cwd, config_dir);
 
     let mut child = cmd
         .spawn()
@@ -1201,6 +1226,11 @@ pub async fn concierge_turn(
     app: AppHandle,
     prompt: String,
     resume_session_id: Option<String>,
+    // The chosen account's `CLAUDE_CONFIG_DIR` (Tauri maps JS `configDir` → this `config_dir`).
+    // The frontend resolves it with the same `pickAccount` the build-agent spawn uses, so one
+    // account selection now covers build agents, Improve Sparkle AND the concierge. Optional so an
+    // older frontend — or a build with no accounts configured — still spawns exactly as before.
+    config_dir: Option<String>,
 ) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("concierge_turn: prompt must be non-empty".into());
@@ -1258,6 +1288,7 @@ pub async fn concierge_turn(
     let blk_resume = resume_session_id.clone();
     let blk_cwd = cwd.clone();
     let blk_claude = claude_path.clone();
+    let blk_config_dir = config_dir.clone();
     let spawned = tauri::async_runtime::spawn_blocking(move || {
         spawn_turn(
             &blk_app,
@@ -1265,6 +1296,7 @@ pub async fn concierge_turn(
             &blk_cwd,
             &blk_claude,
             blk_resume.as_deref(),
+            blk_config_dir.as_deref(),
             TurnKind::Send,
             token,
         )
@@ -1342,7 +1374,23 @@ pub async fn concierge_turn(
                 "concierge_turn: turn failed with a resume session id; retrying once without --resume"
             );
             let (kind2, token2) = continuation_install(token);
-            match spawn_turn(&read_app, &prompt, &cwd, &claude_path, None, kind2, token2) {
+            // SAME account as the attempt that failed. The retry exists to drop a `--resume` the
+            // config dir no longer holds, and switching accounts is now one of the ways that
+            // happens: the session id belongs to the PREVIOUS account's transcript tree, so the
+            // first attempt fails and this retry starts a fresh session — which must be created
+            // under the account the user is actually on, not under whatever the child would
+            // inherit. Passing `config_dir` here is what makes an account switch self-heal into a
+            // fresh concierge conversation on the new account instead of a dead turn.
+            match spawn_turn(
+                &read_app,
+                &prompt,
+                &cwd,
+                &claude_path,
+                None,
+                config_dir.as_deref(),
+                kind2,
+                token2,
+            ) {
                 Ok((stdout2, stderr2, installed)) => {
                     let stderr_handle2 = drain_stderr(stderr2);
                     // Emit the retry under the ORIGINAL `id`: the self-heal is a transparent
@@ -1426,6 +1474,8 @@ pub async fn concierge_proactive_turn(
     app: AppHandle,
     prompt: String,
     resume_session_id: Option<String>,
+    // Same account binding as a user send — a push costs the same subscription. See `concierge_turn`.
+    config_dir: Option<String>,
 ) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("concierge_proactive_turn: prompt must be non-empty".into());
@@ -1454,6 +1504,7 @@ pub async fn concierge_proactive_turn(
     let blk_app = app.clone();
     let blk_prompt = prompt;
     let blk_resume = resume_session_id;
+    let blk_config_dir = config_dir;
     let spawned = tauri::async_runtime::spawn_blocking(move || {
         spawn_turn(
             &blk_app,
@@ -1461,6 +1512,7 @@ pub async fn concierge_proactive_turn(
             &cwd,
             &claude_path,
             blk_resume.as_deref(),
+            blk_config_dir.as_deref(),
             TurnKind::Proactive,
             token,
         )
@@ -1646,6 +1698,112 @@ mod tests {
         // spelling finds nothing and the assertion passes for the wrong reason.
         assert_eq!(with.matches("OWN COMMUNICATION GUIDELINES").count(), 1);
         assert!(crate::concierge_guidelines::injection_block("   \n  ").is_empty());
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` a built turn command would hand its child, or None if it sets none.
+    fn child_config_dir(cmd: &Command) -> Option<std::ffi::OsString> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_os_string())
+    }
+
+    /// THE PHASE-0 BUG, concierge half. This spawn set `PATH` and nothing else, so every turn ran
+    /// as `$HOME/.claude` — the `isDefault` account — and no amount of authenticating elsewhere
+    /// could move it. That is what produced 15 consecutive `You've hit your monthly spend limit` /
+    /// `You've hit your session limit` turn failures against an account the human had already
+    /// stopped using.
+    ///
+    /// Asserted on the CHILD ENVIRONMENT rather than the script, because that is where the fix
+    /// lives: `CLAUDE_CONFIG_DIR` is not in the script text either before or after, so a
+    /// string-matching test would pass against the broken code and prove nothing.
+    #[test]
+    fn the_turn_child_runs_under_the_chosen_account() {
+        let cmd = build_turn_command("exec claude -p x", std::path::Path::new("/tmp"), Some("/accounts/cd34"));
+        assert_eq!(
+            child_config_dir(&cmd).as_deref(),
+            Some(std::ffi::OsStr::new("/accounts/cd34")),
+            "the concierge must run under the account the user selected, not $HOME/.claude"
+        );
+    }
+
+    /// "No override" must mean SET NOTHING, not set empty — the default account records
+    /// `config_dir: ""` to mean exactly that (accounts.rs), and an empty value would make Claude
+    /// Code resolve a RELATIVE `projects/` against the cwd rather than falling back to
+    /// `$HOME/.claude`. Same rule `claude::resolve_session_config_dir` enforces on the read side.
+    #[test]
+    fn no_account_and_the_empty_default_both_leave_the_child_inheriting() {
+        for absent in [None, Some("")] {
+            let cmd = build_turn_command("exec claude -p x", std::path::Path::new("/tmp"), absent);
+            assert_eq!(
+                child_config_dir(&cmd),
+                None,
+                "config_dir {absent:?} must set no CLAUDE_CONFIG_DIR at all"
+            );
+        }
+    }
+
+    /// The argument list of the first `<name>(` call appearing in `src`, exclusive of the outer
+    /// parens and balanced across nested calls. Every failure to find one PANICS rather than
+    /// degrading to a wider slice — a source-scanning assertion that silently widens its window is
+    /// how such a test goes vacuous, and this one guards a single argument in a call whose
+    /// formatting is expected to change.
+    fn call_args<'a>(src: &'a str, name: &str) -> &'a str {
+        let open = src
+            .find(&format!("{name}("))
+            .unwrap_or_else(|| panic!("expected a `{name}(` call in the given source"))
+            + name.len()
+            + 1;
+        let mut depth = 1usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses after `{name}(` — the call never closes");
+    }
+
+    /// The account must survive the STALE-RESUME RETRY, and this is the case an account switch
+    /// actually lands on: the stored session id belongs to the previous account's transcript tree,
+    /// so `--resume` fails and the retry re-spawns without it. If that retry dropped the account,
+    /// the self-heal would quietly recreate the conversation back on `$HOME/.claude` — re-opening
+    /// the bug on the exact path a switch takes.
+    ///
+    /// Pinned in source because the retry runs inside a spawned reader thread holding an
+    /// `AppHandle`, which the sibling `Command::get_envs()` tests cannot reach. The window is
+    /// extracted by BALANCED PARENS from the retry's own `spawn_turn(` call, and every step
+    /// panics on a miss: an earlier version sliced to a literal `"{\n                Ok("` with
+    /// `unwrap_or(len)`, so any reindentation would have widened the window to the rest of the
+    /// file — which contains both `blk_config_dir.as_deref()` and this assertion's own literal, and
+    /// would therefore have passed even with the argument reverted to `None`.
+    #[test]
+    fn the_stale_resume_retry_keeps_the_account() {
+        let src = include_str!("concierge.rs");
+        let retry = src
+            .split("let (kind2, token2) = continuation_install(token);")
+            .nth(1)
+            .expect("the stale-resume retry must still spawn a continuation");
+        let args = call_args(retry, "spawn_turn");
+        assert!(
+            args.contains("config_dir.as_deref()"),
+            "the retry must re-spawn under the SAME account; passing None here would recreate the \
+             concierge session on $HOME/.claude after every account switch. Saw args: {args}"
+        );
+    }
+
+    /// The scanner the test above depends on must itself be right — a `call_args` that returned too
+    /// much would restore exactly the vacuousness it was written to remove.
+    #[test]
+    fn call_args_stops_at_the_matching_paren_and_spans_nested_calls() {
+        assert_eq!(call_args("f(a, g(b, c), d) then h(x)", "f"), "a, g(b, c), d");
+        assert_eq!(call_args("let v = spawn_turn(\n  a,\n  b.as_deref(),\n);", "spawn_turn"), "\n  a,\n  b.as_deref(),\n");
     }
 
     #[test]

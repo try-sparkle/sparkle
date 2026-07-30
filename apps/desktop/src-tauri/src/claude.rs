@@ -140,6 +140,36 @@ fn resolve_session_config_dir(explicit: Option<&str>, env: Option<PathBuf>) -> O
     }
 }
 
+/// The account config dir a SPAWN should export as `CLAUDE_CONFIG_DIR` on its child, or `None` to
+/// set nothing at all. The SPAWN-side counterpart of [`resolve_session_config_dir`], and it carries
+/// the same empty-means-unset rule for the same reason: the default account records `config_dir: ""`
+/// precisely to mean "export no `CLAUDE_CONFIG_DIR`" (see `accounts::Account::config_dir`), so an
+/// unconditional `cmd.env("CLAUDE_CONFIG_DIR", "")` would hand the child an EMPTY value — and
+/// Claude Code would resolve its config against a relative `projects/` under whatever the cwd
+/// happens to be, rather than falling back to `$HOME/.claude`. Setting nothing leaves the child
+/// inheriting ours, which is exactly what "no override" has always meant.
+///
+/// Mirrors the JS side's `opts.configDir ? export … : ""` in `claudeSpawn.ts` (an empty string is
+/// falsy there, so it likewise emits no export) — the two must agree, or the same account would
+/// mean different things to a build agent and to the concierge.
+pub(crate) fn spawn_env_config_dir(config_dir: Option<&str>) -> Option<&str> {
+    config_dir.filter(|s| !s.is_empty())
+}
+
+/// Apply the chosen account to a child process about to run `claude`: set `CLAUDE_CONFIG_DIR` on
+/// the CHILD ONLY (never `std::env::set_var` — Sparkle's own process env is shared by every other
+/// spawn and by the identity/usage readers), or leave it untouched when there is no override.
+///
+/// Shared by `concierge.rs` and `sparkle_improve.rs` so those two spawns cannot drift from each
+/// other or from the build-agent path. Both used to set only `PATH`, which pinned them to
+/// `$HOME/.claude` — the `isDefault` account — no matter which account the user had selected, so
+/// neither could be rotated off an exhausted login (PRD/sparkle/account-rotation.md §2).
+pub(crate) fn apply_spawn_config_dir(cmd: &mut std::process::Command, config_dir: Option<&str>) {
+    if let Some(dir) = spawn_env_config_dir(config_dir) {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+}
+
 /// True iff the agent's worktree already has a resumable `claude` conversation.
 /// Drives the `claude` vs `claude --continue` choice when (re)opening an agent.
 ///

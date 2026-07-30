@@ -303,30 +303,15 @@ export function pickAccount(
 ): Account | null {
   if (accounts.length === 0) return null;
 
-  const { pinnedAccountId, nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now() } = opts;
+  const { pinnedAccountId } = opts;
 
   if (pinnedAccountId) {
     const pinned = accounts.find((a) => a.id === pinnedAccountId);
     if (pinned) return pinned;
   }
 
-  // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
-  // full list so a spawn still happens (better a login prompt than a dead agent).
-  const signedIn = signedInIds ? new Set(signedInIds) : null;
-  const authed = signedIn ? accounts.filter((a) => signedIn.has(a.id)) : [];
-  const eligible = authed.length > 0 ? authed : accounts;
-
-  const usageById = new Map(usage.map((u) => [u.id, u]));
-  const ZERO: Usage = { id: "", tokens5h: 0, tokens7d: 0, exhaustedUntil: null };
-  const usageFor = (a: Account): Usage => usageById.get(a.id) ?? ZERO;
-
-  const isExhausted = (u: Usage) => u.exhaustedUntil != null && u.exhaustedUntil > now;
-  const isNearCap = (u: Usage) => u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
-
-  const candidates = eligible.filter((a) => {
-    const u = usageFor(a);
-    return !isExhausted(u) && !isNearCap(u);
-  });
+  const { eligible, candidates } = partitionAccounts(accounts, usage, opts);
+  const usageFor = usageLookup(usage);
 
   if (candidates.length === 0) {
     // Everyone is exhausted / near-cap: fall back rather than block. Prefer the default account.
@@ -342,6 +327,62 @@ export function pickAccount(
     if (ua.tokens5h !== ub.tokens5h) return ua.tokens5h < ub.tokens5h ? a : best;
     return best;
   });
+}
+
+/** Usage row per account, treating a missing row as "no usage yet" (the most headroom). */
+function usageLookup(usage: Usage[]): (a: Account) => Usage {
+  const usageById = new Map(usage.map((u) => [u.id, u]));
+  const ZERO: Usage = { id: "", tokens5h: 0, tokens7d: 0, exhaustedUntil: null };
+  return (a: Account) => usageById.get(a.id) ?? ZERO;
+}
+
+/** Split the account list the way {@link pickAccount} does, in ONE place.
+ *
+ *  - `eligible` — signed-in accounts, or the full list when that filter would empty it (better a
+ *    login prompt than a dead agent).
+ *  - `candidates` — those of `eligible` that are neither exhausted nor near a window cap. May be
+ *    empty, which is what drives `pickAccount`'s fall-back branch.
+ *
+ *  Extracted because a SECOND caller now needs the same judgement: sticky selection
+ *  ({@link eligibleAccounts}) has to ask "is the account I chose last time still a healthy pick?",
+ *  and re-deriving "healthy" there would be a second definition of eligibility, drifting from this
+ *  one the first time either changed. */
+function partitionAccounts(
+  accounts: Account[],
+  usage: Usage[],
+  opts: PickOptions = {},
+): { eligible: Account[]; candidates: Account[] } {
+  const { nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now() } = opts;
+
+  // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
+  // full list so a spawn still happens (better a login prompt than a dead agent).
+  const signedIn = signedInIds ? new Set(signedInIds) : null;
+  const authed = signedIn ? accounts.filter((a) => signedIn.has(a.id)) : [];
+  const eligible = authed.length > 0 ? authed : accounts;
+
+  const usageFor = usageLookup(usage);
+  const isExhausted = (u: Usage) => u.exhaustedUntil != null && u.exhaustedUntil > now;
+  const isNearCap = (u: Usage) => u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
+
+  const candidates = eligible.filter((a) => {
+    const u = usageFor(a);
+    return !isExhausted(u) && !isNearCap(u);
+  });
+  return { eligible, candidates };
+}
+
+/** The accounts auto-pick would consider RIGHT NOW: signed in, not exhausted, not near a cap.
+ *  `pickAccount` returns the best of these; this exposes the whole healthy set so a caller can ask
+ *  whether a PARTICULAR account is still a sound choice without re-implementing the rule.
+ *
+ *  Note it deliberately ignores `pinnedAccountId` — a pin overrides the judgement, it does not
+ *  change it. */
+export function eligibleAccounts(
+  accounts: Account[],
+  usage: Usage[],
+  opts: PickOptions = {},
+): Account[] {
+  return partitionAccounts(accounts, usage, opts).candidates;
 }
 
 // ── Persisted pin map (agentId → accountId) ───────────────────────────────────────────────────

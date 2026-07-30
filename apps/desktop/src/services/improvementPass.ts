@@ -26,6 +26,7 @@ import {
   type SubmitVerdict,
 } from "./sparkleAgent";
 import { registerSparkleTranscript } from "./sparkleTranscript";
+import { accountConfigDirFor } from "./accountSelection";
 import {
   assertWorkspaceIntegrity,
   createAgentWorktree,
@@ -656,6 +657,21 @@ export async function runImprovementPass(
     // which keeps the normal submitting path — never let a network blip mute a maintainer.
     const submit = await checkSubmitCapability().catch(() => null);
 
+    // WHICH ACCOUNT THIS PASS RUNS UNDER — resolved HERE, at the pass boundary, and not touched
+    // again for the life of the pass.
+    //
+    // That placement is the whole rule for this consumer (PRD/sparkle/account-rotation.md §6). A
+    // pass is one unattended `claude -p` child, and its account is fixed the moment that child is
+    // spawned; re-reading the selection mid-pass could not move the running process anyway, and
+    // would only put the pass's transcript and its account out of step. So a switch that happens
+    // while a pass is in flight changes NOTHING about that pass — it finishes on the account it
+    // started on — and takes effect on the next hourly pass, which is at most an hour away.
+    //
+    // Keyed by SPARKLE_AGENT_ID so the headless pass and the interactive Improve Sparkle pane
+    // resolve to the SAME account: they already share one worktree, and pinning the pane would be
+    // meaningless if the background pass ignored the pin.
+    const configDir = await accountConfigDirFor(SPARKLE_AGENT_ID);
+
     setStatus(SPARKLE_AGENT_ID, "working");
     const outcome = await new Promise<PassOutcome>((resolve, reject) => {
       const unlisteners: Array<() => void> = [];
@@ -725,6 +741,7 @@ export async function runImprovementPass(
             }),
             prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
             logDir: ws.logDir,
+            configDir: configDir ?? null,
           }).catch(fail);
         },
         fail,

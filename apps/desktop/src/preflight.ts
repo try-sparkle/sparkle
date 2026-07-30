@@ -125,10 +125,15 @@ export function claudeSessionInfo(
  *  project — but that dir is build-flavored (`-dev` in debug) and Tauri-resolved, so only Rust can
  *  name it. It resolves the path and runs the identical scan (`preflight::concierge_session_info`).
  *
+ *  It DOES take `configDir`, for the same reason {@link claudeHasSession} does: the concierge spawn
+ *  sets `CLAUDE_CONFIG_DIR` from the selected account, so the transcript lives under that account's
+ *  tree and a probe of the wrong tree answers about the wrong account. Pass the SAME value the turn
+ *  is spawned with. Omit it only where the spawn also omits it.
+ *
  *  This is what makes the concierge remember a conversation across an app restart: the transcript
  *  was never lost, only the POINTER to it. See services/concierge.ts's boot restore. */
-export function conciergeSessionInfo(): Promise<ClaudeSessionInfo> {
-  return invoke<ClaudeSessionInfo>("concierge_session_info");
+export function conciergeSessionInfo(configDir?: string | null): Promise<ClaudeSessionInfo> {
+  return invoke<ClaudeSessionInfo>("concierge_session_info", { configDir: configDir ?? null });
 }
 
 /** True if this worktree already has a prior `claude` conversation we can resume

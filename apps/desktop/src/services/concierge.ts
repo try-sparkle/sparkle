@@ -20,6 +20,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { conciergeAiEnabled } from "./conciergeTools/policyBinding";
 import { listen } from "@tauri-apps/api/event";
 import { conciergeSessionInfo, type ClaudeSessionInfo } from "../preflight";
+import {
+  accountConfigDirFor,
+  CONCIERGE_ACCOUNT_KEY,
+  type ResolvedConfigDir,
+} from "./accountSelection";
 
 /** Incremental assistant text for the turn `id` (`concierge:delta`). */
 export interface ConciergeDeltaEvent {
@@ -139,6 +144,58 @@ let currentSessionId: string | null = null;
  *  the caller passed us. A failed turn must be able to discard THAT without discarding the
  *  conversation the user has actually been having. */
 let fallbackSessionId: string | null = null;
+
+/** WHICH ACCOUNT the session pointers above belong to — the `configDir` in force when the session
+ *  was probed or last run. `undefined` means "no session is bound to an account yet".
+ *
+ *  A session id is not portable between accounts. Claude Code files transcripts under
+ *  `<config>/projects/<slug>`, so the id the concierge is holding exists in exactly ONE account's
+ *  tree; hand it to a child running under a different account and `--resume` simply fails. Before
+ *  the spawn was account-aware this could not happen — there was only ever one tree — so nothing
+ *  correlated the two. Now it can, and the failure is expensive and silent: the send path burns a
+ *  second `claude` on its self-heal and starts over, while a proactive push (which has no retry, by
+ *  design) is dropped with no trace.
+ *
+ *  So the account is remembered next to the id, and a change is handled BEFORE the turn rather than
+ *  discovered by failing one. */
+let sessionAccountConfigDir: string | null | undefined = undefined;
+
+/** Drop the session pointers if the account has moved out from under them, so no doomed `--resume`
+ *  is ever issued. Returns nothing; the caller reads `currentSessionId` afterwards as usual.
+ *
+ *  Losing the pointer means the next turn starts a FRESH conversation on the new account. That is
+ *  the honest outcome, not a regression: the old conversation is not lost, it is still sitting in
+ *  the old account's transcript tree and comes back if the account does. The alternative — issuing
+ *  the resume anyway — reaches the same fresh conversation, just one wasted `claude` process later,
+ *  and only on the path that happens to have a retry. */
+function rebindSessionToAccount(configDir: ResolvedConfigDir): void {
+  // UNRESOLVED IS NOT A CHANGE. `undefined` means the accounts backend could not be read at all —
+  // it does NOT mean "moved to the default account", which is `null`. Treating the two alike made
+  // a single IPC hiccup discard the live conversation pointer AND the on-disk fallback, the exact
+  // loss the error path exists to prevent, and then flip back on the next successful resolve. When
+  // we do not know the account, we change nothing: the turn spawns without an override (the
+  // pre-accounts behaviour) and the session survives to be judged on the next resolvable turn.
+  if (configDir === undefined) return;
+  if (sessionAccountConfigDir !== undefined && sessionAccountConfigDir !== configDir) {
+    if (currentSessionId !== null || fallbackSessionId !== null) {
+      console.info(
+        "concierge: account changed; looking for this account's own conversation " +
+          "(the previous one remains under the previous account).",
+      );
+    }
+    currentSessionId = null;
+    fallbackSessionId = null;
+    // AND RE-PROBE. The restore is memoized for the life of the page, so without this nothing would
+    // ever look in the new account's transcript tree — the concierge would start a brand-new
+    // conversation even when that account already holds one, which is the amnesia subsystem C
+    // exists to prevent, relocated from the restart path onto the switch path. Clearing the memo is
+    // safe: the restore only SEEDS (`currentSessionId === null && sessionEpoch === startedAt`), so
+    // it cannot overwrite live state, and a user reset leaves `sessionAccountConfigDir` undefined
+    // so it never reaches this branch.
+    restoring = null;
+  }
+  sessionAccountConfigDir = configDir;
+}
 
 /** Resolves once the internal Tauri listeners are registered; null until first needed. */
 let wiring: Promise<void> | null = null;
@@ -283,7 +340,20 @@ export function restoreConciergeSession(): Promise<void> {
         // Typed as possibly-absent on purpose: the Rust command always returns the struct, but this
         // module must survive a bridge that isn't there (a mocked invoke, a non-Tauri host) without
         // throwing a destructuring TypeError into the console on every page load.
-        const info: ClaudeSessionInfo | undefined = await conciergeSessionInfo();
+        // UNDER THE CONCIERGE'S OWN ACCOUNT, not Sparkle's ambient env. The spawn sets
+        // `CLAUDE_CONFIG_DIR` from the selected account, so the transcript this probe is looking for
+        // lives in THAT account's tree. Probing the default tree instead would either find nothing
+        // (an amnesiac concierge after every restart — the exact bug this restore exists to fix) or
+        // find a stale id belonging to a different account and seed it, which is worse: the next
+        // turn would spawn `--resume <foreign-id>`, fail, and self-heal into a fresh conversation
+        // having burnt two `claude` processes.
+        //
+        // Resolved here rather than passed in so every call site is correct by construction — this
+        // is called from three mount-time sites as well as the send path, and an argument would be
+        // one more thing each of them could get wrong. It is cheap: the account snapshot is
+        // TTL-cached and the selection is sticky.
+        const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+        const info: ClaudeSessionInfo | undefined = await conciergeSessionInfo(configDir);
         // `hasSession` is deliberately not consulted: the id is the thing we need, and a truthy id
         // already implies a transcript was found. Trusting `hasSession` separately would let the two
         // halves disagree (Rust pins that they cannot — see `session_info_halves_agree...`).
@@ -293,6 +363,8 @@ export function restoreConciergeSession(): Promise<void> {
         if (latestSessionId && currentSessionId === null && sessionEpoch === startedAt) {
           currentSessionId = latestSessionId;
           fallbackSessionId = latestSessionId;
+          // The id came out of THIS account's tree, so that is the account it belongs to.
+          sessionAccountConfigDir = configDir;
         }
       } catch (e) {
         console.warn("concierge: session restore failed; starting a fresh conversation:", e);
@@ -377,9 +449,28 @@ export async function startConciergeTurn(
     // FIRST turn after a restart start a fresh session, which is exactly the symptom (the user's
     // opening message is the one that most needs the prior context). Both are once-per-page and
     // cached, so this costs one extra IPC round-trip on the first turn only.
+    // ORDER IS THE CONTRACT HERE, so this is deliberately not one Promise.all.
+    //
+    // Account FIRST: `rebindSessionToAccount` may invalidate the memoized restore, and it has to do
+    // that BEFORE the restore runs or the re-probe lands a turn late — the user would get a fresh
+    // conversation on this turn and their real one only on the next. Cheap enough to serialize: the
+    // snapshot is TTL-cached and the selection is sticky, so on the hot path it is already resolved.
+    //
+    // Then wiring + restore together, and the restore resolves the same account internally — same
+    // cache, same sticky selection, so the tree it probes cannot disagree with the tree this turn
+    // spawns into.
+    const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    rebindSessionToAccount(configDir);
     await Promise.all([ensureWired(), restoreConciergeSession()]);
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
-    const id = await invoke<string>("concierge_turn", { prompt, resumeSessionId: resume ?? null });
+    // `configDir` binds this turn to an account. Before it existed the concierge always ran as
+    // `$HOME/.claude`, so an exhausted default account failed every turn with no way for the human
+    // to move it — see PRD/sparkle/account-rotation.md §2.
+    const id = await invoke<string>("concierge_turn", {
+      prompt,
+      resumeSessionId: resume ?? null,
+      configDir: configDir ?? null,
+    });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
     // resume target (esp. an explicit override) for a turn that never ran.
     if (resume) currentSessionId = resume;
@@ -424,11 +515,19 @@ export async function startConciergeTurn(
 export async function startProactiveConciergeTurn(prompt: string): Promise<string | null> {
   if (!prompt.trim()) return null;
   try {
+    // Same order, same reason, as `startConciergeTurn` — and it matters MORE here, not less: a push
+    // has no stale-resume retry by design (see `concierge_proactive_turn`), so a resume aimed at the
+    // wrong account's tree is never self-healed; the push just dies silently.
+    const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    rebindSessionToAccount(configDir);
     await Promise.all([ensureWired(), restoreConciergeSession()]);
     const resume = currentSessionId ?? undefined;
+    // Same account as a user send — a push spends the same subscription, so it must not be the one
+    // call that keeps burning an account the human has rotated away from.
     const id = await invoke<string>("concierge_proactive_turn", {
       prompt,
       resumeSessionId: resume ?? null,
+      configDir: configDir ?? null,
     });
     if (resume) currentSessionId = resume;
     if (typeof id !== "string") return null;
@@ -517,6 +616,9 @@ export function resetConciergeSession(): void {
   sessionEpoch++;
   currentSessionId = null;
   fallbackSessionId = null;
+  // No session, so no account owns one. Leaving a stale binding here would make the next turn look
+  // like an account CHANGE (and log one) when it is simply the first turn of a new conversation.
+  sessionAccountConfigDir = undefined;
   restoring ??= Promise.resolve();
 }
 
@@ -527,6 +629,7 @@ export function _resetConciergeForTests(): void {
   errorCallbacks.clear();
   currentSessionId = null;
   fallbackSessionId = null;
+  sessionAccountConfigDir = undefined;
   wiring = null;
   restoring = null;
   proactiveTurnIds.length = 0;

@@ -201,6 +201,38 @@ fn build_improve_exec(claude_path: &str, prompt: &str, persona: &str, log_dir: &
     format!("export PATH=\"$HOME/.local/bin:$PATH\"; {cmd}")
 }
 
+/// Assemble the `Command` for one improvement pass — everything up to (but not including)
+/// `.spawn()`. Split out of [`sparkle_improve_run`] for the same reason `concierge.rs` splits its
+/// own: the account binding IS an environment entry, so proving it requires reading
+/// `Command::get_envs()`. Asserting on the script string would prove nothing — `CLAUDE_CONFIG_DIR`
+/// has never appeared there, before this change or after it.
+fn build_pass_command(script: &str, cwd: &Path, config_dir: Option<&str>) -> Command {
+    let mut cmd = Command::new(SHELL);
+    // NON-login shell: we inject the login PATH ourselves (resolved once, cached — see
+    // `cached_login_shell_path`) instead of re-sourcing the user's dotfiles on every pass. The
+    // pass still shells out to `git`/`gh`/tests, so it gets the SAME full PATH `zsh -l` gave it,
+    // just without the per-run login-startup latency.
+    cmd.args(["-c", script]);
+    cmd.env("PATH", cached_login_shell_path());
+    // The account this pass runs under, on the CHILD only. Bound at SPAWN — which for this command
+    // is always a pass boundary, since a pass is a single one-shot `claude -p` and at most one runs
+    // at a time. A switch mid-pass therefore cannot reach the running child at all; it takes effect
+    // on the next hourly pass. See the module docs and PRD/sparkle/account-rotation.md §6.
+    crate::claude::apply_spawn_config_dir(&mut cmd, config_dir);
+    cmd.current_dir(cwd);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Own process group, so kill/cancel can take out claude AND its spawned children (git, gh,
+    // tests) in one signal — see kill_pass_group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
+}
+
 /// Pure containment check (mirrors `pty.rs::validate_spawn_inner`): `claude_path` must be a
 /// non-empty absolute path; `cwd` must canonicalize to a DIRECTORY strictly inside the managed
 /// worktrees dir (the base itself doesn't count — a pass belongs in a specific worktree); and
@@ -251,6 +283,10 @@ pub fn sparkle_improve_run(
     persona: String,
     prompt: String,
     log_dir: String,
+    // The chosen account's `CLAUDE_CONFIG_DIR` (Tauri maps JS `configDir` → this `config_dir`),
+    // resolved by the frontend through the SAME `pickAccount` the build-agent spawn uses. Optional
+    // so a build with no accounts configured spawns exactly as before.
+    config_dir: Option<String>,
 ) -> Result<(), String> {
     let worktrees = crate::dev_identity::app_data_dir(&app)
         .map_err(|e| format!("sparkle_improve_run: {e}"))?
@@ -260,26 +296,15 @@ pub fn sparkle_improve_run(
     let script = build_improve_exec(&claude_path, &prompt, &persona, &log_dir);
     // Log paths only — the script embeds the persona/prompt (which reference the log dir and
     // could quote user-visible strings), matching the "args may contain prompt text" caution.
-    tracing::info!(%claude_path, cwd = %real_cwd.display(), "sparkle_improve_run: starting hourly pass");
+    // The account is logged as a BOOLEAN, never the dir (it is account-identifying).
+    tracing::info!(
+        %claude_path,
+        cwd = %real_cwd.display(),
+        account_pinned = crate::claude::spawn_env_config_dir(config_dir.as_deref()).is_some(),
+        "sparkle_improve_run: starting hourly pass"
+    );
 
-    let mut cmd = Command::new(SHELL);
-    // NON-login shell: we inject the login PATH ourselves (resolved once, cached — see
-    // `cached_login_shell_path`) instead of re-sourcing the user's dotfiles on every pass. The
-    // pass still shells out to `git`/`gh`/tests, so it gets the SAME full PATH `zsh -l` gave it,
-    // just without the per-run login-startup latency.
-    cmd.args(["-c", &script]);
-    cmd.env("PATH", cached_login_shell_path());
-    cmd.current_dir(&real_cwd);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    // Own process group, so kill/cancel can take out claude AND its spawned children (git, gh,
-    // tests) in one signal — see kill_pass_group.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    let mut cmd = build_pass_command(&script, &real_cwd, config_dir.as_deref());
 
     // Claim the singleton slot BEFORE spawning so two racing invokes can't both launch.
     {
@@ -639,6 +664,48 @@ mod tests {
             arm_body.contains("stop_capture()") && arm_body.contains("end_in_flight_pass()"),
             "end_in_flight_pass must be called from within the RunEvent::Exit arm"
         );
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` a built pass command would hand its child, or None if it sets none.
+    fn child_config_dir(cmd: &Command) -> Option<std::ffi::OsString> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_os_string())
+    }
+
+    /// THE PHASE-0 BUG. The hourly pass set only `PATH` on its child, so `claude` resolved its
+    /// config from whatever the app process happened to carry — in practice nothing, i.e.
+    /// `$HOME/.claude`, the `isDefault` account. Signing into a different account anywhere else in
+    /// Sparkle could not move the pass off it, which is half of the human's "three separate
+    /// logins". This asserts the SIDE EFFECT (the child's environment), not the script text:
+    /// `CLAUDE_CONFIG_DIR` never appeared in the script, so a string assertion would have been
+    /// green against the broken code.
+    #[test]
+    fn the_pass_child_runs_under_the_chosen_account() {
+        let cmd = build_pass_command("exec claude -p x", Path::new("/tmp"), Some("/accounts/ab12"));
+        assert_eq!(
+            child_config_dir(&cmd).as_deref(),
+            Some(std::ffi::OsStr::new("/accounts/ab12")),
+            "the hourly pass must run under the account the user selected, not $HOME/.claude"
+        );
+    }
+
+    /// "No override" must mean SET NOTHING, not set empty. The default account records
+    /// `config_dir: ""` for exactly this meaning (accounts.rs), and an empty `CLAUDE_CONFIG_DIR`
+    /// makes Claude Code resolve a RELATIVE `projects/` against the cwd instead of falling back to
+    /// `$HOME/.claude` — the semantics `claude::resolve_session_config_dir` already guards on the
+    /// read side, preserved here on the spawn side.
+    #[test]
+    fn no_account_and_the_empty_default_both_leave_the_child_inheriting() {
+        for absent in [None, Some("")] {
+            let cmd = build_pass_command("exec claude -p x", Path::new("/tmp"), absent);
+            assert_eq!(
+                child_config_dir(&cmd),
+                None,
+                "config_dir {absent:?} must set no CLAUDE_CONFIG_DIR at all"
+            );
+        }
     }
 
     /// A temp base dir with a real worktree-ish child dir inside it, for validation tests.

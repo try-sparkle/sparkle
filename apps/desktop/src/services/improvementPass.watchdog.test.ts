@@ -78,6 +78,8 @@ import {
 } from "./sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { forgetAgentTranscriptPath, readAgentTerminal } from "./conciergeTools/terminal";
+import { invalidateAccountState } from "./accountSelection";
+import { setPin, clearAllPins } from "./accountStore";
 
 /** Let the pass's async preamble (preflight → repo → worktree → listeners → invoke) settle
  *  under fake timers: drain microtasks until the run invoke has been recorded. */
@@ -102,6 +104,10 @@ function resetHarness() {
   harness.invokeImpl = undefined;
   harness.listenImpl = undefined;
   harness.parkImpl = () => Promise.resolve({ parked: true, reason: "parked" });
+  // The account snapshot is module-level and TTL-cached, so an account planted by one test would
+  // otherwise be served to the next.
+  invalidateAccountState();
+  clearAllPins();
   vi.clearAllMocks();
   resetPassRetryForTests();
   useRuntimeStore.getState().setStatus(SPARKLE_AGENT_ID, "stopped");
@@ -884,5 +890,87 @@ describe("readable while a headless pass runs", () => {
     expect(read.attempts.find((a) => a.source === "transcript")?.why).toContain(
       "no transcript path is known",
     );
+  });
+});
+
+// ── Which Claude account the hourly pass runs under (PRD/sparkle/account-rotation.md Phase 0) ──
+//
+// THE BUG THIS COVERS. `sparkle_improve_run` was handed no account at all, so the pass authenticated
+// from `$HOME/.claude` — the `isDefault` account — no matter which account the human had selected.
+// That is one of the three separate logins they were forced to perform, and it meant an exhausted
+// default account silently killed the hourly improvement loop with no way to move it.
+//
+// Asserted on the INVOKE PAYLOAD, because that is the entire mechanism: `configDir` reaching Rust is
+// what binds the child, and nothing else in the pass observes the account.
+describe("improvement pass account binding", () => {
+  const ACCOUNTS = [
+    { id: "def", nickname: "Default", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
+    { id: "work", nickname: "Work", configDir: "/data/accounts/work", isDefault: false, createdAt: 2 },
+  ];
+
+  /** The accounts backend, layered under the harness default so the rest of the pass preamble
+   *  (preflight, submit-capability, …) keeps its normal `Promise.resolve()` behaviour. */
+  function withAccounts() {
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      return undefined;
+    };
+  }
+
+  /** The `configDir` the pass sent to Rust. */
+  function runConfigDir(): string | null | undefined {
+    const call = harness.invokes.find((c) => c.cmd === "sparkle_improve_run");
+    if (!call) throw new Error("expected a sparkle_improve_run invoke");
+    return (call.args as { configDir?: string | null }).configDir;
+  }
+
+  /** Drive one pass to completion so the latch is released for the next test. */
+  async function completePass(consent: "always" | "case_by_case" = "always") {
+    const pass = runImprovementPass(consent);
+    await untilRunInvoked();
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "done" } });
+    await pass;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs the pass under the selected account", async () => {
+    withAccounts();
+    await completePass();
+    expect(runConfigDir()).toBe("/home/.claude");
+  });
+
+  it("follows the account SWITCH on the next pass — the Phase 0 goal for this consumer", async () => {
+    withAccounts();
+    await completePass();
+    expect(runConfigDir()).toBe("/home/.claude");
+
+    // The human moves Improve Sparkle to another account. Keyed by SPARKLE_AGENT_ID, so this is the
+    // same pin the interactive pane honours — the two share a worktree and must not disagree.
+    setPin(SPARKLE_AGENT_ID, "work");
+    invalidateAccountState();
+    harness.invokes.length = 0;
+
+    await completePass();
+    expect(runConfigDir()).toBe("/data/accounts/work");
+  });
+
+  it("still runs the pass when the account backend is broken", async () => {
+    // Inheriting the default account is degraded; skipping the hourly pass entirely is worse.
+    harness.invokeImpl = (cmd) =>
+      cmd.startsWith("accounts_") ? Promise.reject(new Error("ipc down")) : undefined;
+    invalidateAccountState();
+    await withWarnSpy(async () => {
+      await completePass();
+    });
+    expect(runConfigDir()).toBeNull();
   });
 });

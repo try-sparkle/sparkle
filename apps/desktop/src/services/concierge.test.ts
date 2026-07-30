@@ -14,14 +14,19 @@ const harness = vi.hoisted(() => ({
   invokes: [] as Array<{ cmd: string; args: unknown }>,
   // Per-test overrides keyed by COMMAND/EVENT NAME; return undefined to use the default.
   // concierge_turn resolves with the turn's id now, so this is `unknown`, not `void`.
-  invokeImpl: undefined as ((cmd: string) => Promise<unknown> | undefined) | undefined,
+  // Takes `args` as well as `cmd` (mirroring improvementPass.watchdog.test.ts): the account tests
+  // below have to answer `concierge_session_info` DIFFERENTLY per configDir, which is the whole
+  // point of a per-account transcript tree and cannot be expressed from the command name alone.
+  invokeImpl: undefined as
+    | ((cmd: string, args?: unknown) => Promise<unknown> | undefined)
+    | undefined,
   listenImpl: undefined as ((name: string) => Promise<() => void> | undefined) | undefined,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((cmd: string, args?: unknown) => {
     harness.invokes.push({ cmd, args });
-    return harness.invokeImpl?.(cmd) ?? Promise.resolve();
+    return harness.invokeImpl?.(cmd, args) ?? Promise.resolve();
   }),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -46,6 +51,12 @@ import {
   startConciergeTurn,
   SUPERSEDED_DETAILS,
 } from "./concierge";
+import {
+  invalidateAccountState,
+  resetStickyAccounts,
+  CONCIERGE_ACCOUNT_KEY,
+} from "./accountSelection";
+import { setPin, clearAllPins } from "./accountStore";
 
 
 // The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
@@ -60,10 +71,14 @@ function openConciergeAiGate() {
 }
 
 /** The args of the nth `concierge_turn` invoke (0-based). */
-function turnArgs(n: number): { prompt: string; resumeSessionId: string | null } {
+function turnArgs(n: number): {
+  prompt: string;
+  resumeSessionId: string | null;
+  configDir: string | null;
+} {
   const call = harness.invokes.filter((c) => c.cmd === "concierge_turn").at(n);
   if (!call) throw new Error(`expected a concierge_turn invoke #${n}`);
-  return call.args as { prompt: string; resumeSessionId: string | null };
+  return call.args as { prompt: string; resumeSessionId: string | null; configDir: string | null };
 }
 
 describe("concierge service", () => {
@@ -73,6 +88,10 @@ describe("concierge service", () => {
     harness.invokes.length = 0;
     harness.invokeImpl = undefined;
     harness.listenImpl = undefined;
+    // The account snapshot is module-level and TTL-cached, and the sticky selection outlives it, so
+    // a choice made by one test would otherwise be served to the next.
+    invalidateAccountState();
+    resetStickyAccounts();
     _resetConciergeForTests();
   });
 
@@ -86,7 +105,13 @@ describe("concierge service", () => {
 
   it("invokes concierge_turn with the prompt and a null resume on the first turn", async () => {
     await startConciergeTurn("snapshot: all quiet");
-    expect(turnArgs(0)).toEqual({ prompt: "snapshot: all quiet", resumeSessionId: null });
+    // configDir is null here because this harness plants no accounts — see the account suite below
+    // for the case where one is selected.
+    expect(turnArgs(0)).toEqual({
+      prompt: "snapshot: all quiet",
+      resumeSessionId: null,
+      configDir: null,
+    });
     // The event listeners were wired before the invoke, so no early event can be missed.
     expect(harness.handlers.has("concierge:delta")).toBe(true);
     expect(harness.handlers.has("concierge:done")).toBe(true);
@@ -344,5 +369,164 @@ describe("concierge service", () => {
     // An explicit resume override + a failing invoke: the id must NOT be stored for a turn that never ran.
     await startConciergeTurn("hi", "explicit-sid");
     expect(getConciergeSessionId()).toBeNull();
+  });
+});
+
+// ── Which Claude account a turn runs under (PRD/sparkle/account-rotation.md Phase 0) ───────────
+//
+// THE BUG THIS COVERS. The concierge spawn set only PATH on its child, so every turn authenticated
+// from `$HOME/.claude` — the `isDefault` account — regardless of which account the human had
+// selected or signed into. When that account hit its limit, 15 consecutive turns failed with
+// `You've hit your monthly spend limit` / `You've hit your session limit` and NOTHING the human
+// could do moved the concierge off it. The fix is that `configDir` reaches the invoke; these assert
+// exactly that, on the payload, because the payload is the whole mechanism.
+describe("concierge account binding", () => {
+  const ACCOUNTS = [
+    { id: "def", nickname: "Default", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
+    { id: "work", nickname: "Work", configDir: "/data/accounts/work", isDefault: false, createdAt: 2 },
+  ];
+
+  beforeEach(() => {
+    openConciergeAiGate();
+    harness.handlers.clear();
+    harness.invokes.length = 0;
+    harness.listenImpl = undefined;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      return undefined;
+    };
+    clearAllPins();
+    invalidateAccountState();
+    resetStickyAccounts();
+    _resetConciergeForTests();
+  });
+
+  /** The `configDir` the boot restore probed with. */
+  function restoreConfigDir(): string | null | undefined {
+    const call = harness.invokes.find((c) => c.cmd === "concierge_session_info");
+    if (!call) throw new Error("expected a concierge_session_info invoke");
+    return (call.args as { configDir?: string | null }).configDir;
+  }
+
+  it("probes the SAME account's transcript tree that the turn will run under", async () => {
+    // The restore is the other half of the account binding, and getting it wrong is not a no-op:
+    // probing $HOME/.claude while the child writes to the selected account either finds nothing
+    // (an amnesiac concierge on every restart) or finds a FOREIGN id and seeds it — so the next
+    // turn spawns `--resume <foreign-id>`, fails, and burns a second claude on the self-heal.
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    await startConciergeTurn("hello");
+    expect(restoreConfigDir()).toBe("/data/accounts/work");
+    // …and it is the same account the turn itself ran under. Asserting both together is the point:
+    // a probe and a spawn that disagree is exactly the defect.
+    expect(turnArgs(0).configDir).toBe("/data/accounts/work");
+  });
+
+  it("starts a FRESH conversation when the account changes, rather than a doomed --resume", async () => {
+    await startConciergeTurn("first");
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "1", sessionId: "sess-on-def", text: "ok" },
+    });
+    expect(getConciergeSessionId()).toBe("sess-on-def");
+
+    // Move to another account. `sess-on-def` exists only in the previous account's transcript tree,
+    // so resuming it would fail; the send path would self-heal at the cost of a second claude, and
+    // a proactive push (no retry, by design) would just die. Dropping the pointer is what avoids
+    // both — assert the resume the turn ACTUALLY sends, not merely that the pointer moved.
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+
+    await startConciergeTurn("second");
+    expect(turnArgs(1).configDir).toBe("/data/accounts/work");
+    expect(turnArgs(1).resumeSessionId).toBeNull();
+  });
+
+  it("keeps resuming while the account stays put", async () => {
+    // The guard must be a CHANGE detector, not a blanket "never resume" — otherwise it would quietly
+    // end session continuity altogether and this suite's other assertions would not notice.
+    await startConciergeTurn("first");
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "1", sessionId: "sess-A", text: "ok" },
+    });
+    await startConciergeTurn("second");
+    expect(turnArgs(1).resumeSessionId).toBe("sess-A");
+  });
+
+  it("sends the selected account's config dir with every turn", async () => {
+    await startConciergeTurn("hello");
+    expect(turnArgs(0).configDir).toBe("/home/.claude");
+  });
+
+  it("follows the account SWITCH — the whole point of Phase 0", async () => {
+    await startConciergeTurn("before");
+    expect(turnArgs(0).configDir).toBe("/home/.claude");
+
+    // The human moves the concierge to another account. Before this change nothing they could do
+    // here changed the account the turn ran under; now the very next turn follows it.
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+
+    await startConciergeTurn("after");
+    expect(turnArgs(1).configDir).toBe("/data/accounts/work");
+  });
+
+  it("still starts the turn when the account backend is broken", async () => {
+    // Inheriting the default account is a degraded outcome; refusing to answer the user is a worse
+    // one. A rejecting accounts backend must cost the account choice, not the turn.
+    harness.invokeImpl = (cmd) =>
+      cmd.startsWith("accounts_") ? Promise.reject(new Error("ipc down")) : undefined;
+    invalidateAccountState();
+    await startConciergeTurn("hello");
+    expect(turnArgs(0).configDir).toBeNull();
+  });
+
+  it("does NOT discard the conversation when the account lookup merely hiccups", async () => {
+    // An unresolvable backend is not an account CHANGE. Reading it as one nulled the live pointer
+    // AND the on-disk fallback over a single failed invoke — the very loss the error path is
+    // written to prevent — and then flipped back on the next successful resolve. The contract is
+    // "a broken account backend costs you the account choice, not the work", and the work now
+    // includes the session pointer.
+    await startConciergeTurn("first");
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "1", sessionId: "sess-A", text: "ok" },
+    });
+
+    const good = harness.invokeImpl;
+    harness.invokeImpl = (cmd) =>
+      cmd.startsWith("accounts_") ? Promise.reject(new Error("ipc hiccup")) : good?.(cmd);
+    invalidateAccountState();
+
+    await startConciergeTurn("second");
+    expect(turnArgs(1).resumeSessionId).toBe("sess-A");
+    expect(getConciergeSessionId()).toBe("sess-A");
+  });
+
+  it("resumes the NEW account's own conversation after a switch, not a blank one", async () => {
+    // The restore is memoized for the life of the page, so dropping the pointer on a switch is only
+    // half the job: without re-probing, an account that ALREADY holds a conversation would be
+    // greeted with a brand-new one — the amnesia subsystem C exists to prevent, moved from the
+    // restart path onto the switch path (and onto Phase 2's rotation, which lands here every time).
+    harness.invokeImpl = (cmd, args) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      if (cmd === "concierge_session_info") {
+        // Each account's tree holds its own transcript — which is the fact the probe must read.
+        const dir = (args as { configDir?: string | null })?.configDir;
+        const id = dir === "/data/accounts/work" ? "sess-on-work" : "sess-on-def";
+        return Promise.resolve({ hasSession: true, latestSessionId: id });
+      }
+      return undefined;
+    };
+    await startConciergeTurn("first");
+    expect(turnArgs(0).resumeSessionId).toBe("sess-on-def");
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+
+    await startConciergeTurn("second");
+    expect(turnArgs(1).configDir).toBe("/data/accounts/work");
+    expect(turnArgs(1).resumeSessionId).toBe("sess-on-work");
   });
 });

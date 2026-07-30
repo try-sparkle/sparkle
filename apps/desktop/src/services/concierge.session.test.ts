@@ -78,6 +78,22 @@ function resumeOf(n: number): string | null {
 
 const probeCount = () => harness.invokes.filter((c) => c.cmd === "concierge_session_info").length;
 
+/** Wait until the transcript probe is ACTUALLY in flight (and therefore gated by `gateProbe`).
+ *
+ *  The "…while the probe was in flight" tests below hook that state, and they used to reach it by
+ *  assuming `restoreConciergeSession()` runs synchronously up to the probe. It no longer does — the
+ *  restore first resolves WHICH ACCOUNT to probe under, since the concierge spawn is account-aware
+ *  and the transcript lives in the selected account's tree. Any await before the probe breaks that
+ *  assumption, and it breaks it silently in the worst way: `release` is still the no-op default, so
+ *  the gate is never opened and the test hangs to its timeout rather than failing.
+ *
+ *  So establish the precondition instead of assuming it. Drains microtasks (not timers — nothing
+ *  here is timer-driven) and asserts, so a restore that stopped probing altogether fails loudly. */
+async function untilProbeInFlight() {
+  for (let i = 0; i < 50 && probeCount() === 0; i++) await Promise.resolve();
+  expect(probeCount()).toBeGreaterThan(0);
+}
+
 /** Deliver a Rust event to the module's internal listener. */
 function emit(name: "concierge:done" | "concierge:error", payload: unknown): void {
   const h = harness.handlers.get(name);
@@ -191,6 +207,7 @@ describe("concierge session restore (C1)", () => {
     harness.gateProbe = () => new Promise<void>((r) => (release = r));
     harness.diskSessionId = "sess-stale-on-disk";
     const restoring = restoreConciergeSession();
+    await untilProbeInFlight();
     // The listeners aren't wired by `restoreConciergeSession` alone, so drive the capture the way a
     // completed turn does.
     setConciergeSessionId("sess-live");
@@ -204,6 +221,7 @@ describe("concierge session restore (C1)", () => {
     harness.gateProbe = () => new Promise<void>((r) => (release = r));
     harness.diskSessionId = "sess-old";
     const restoring = restoreConciergeSession();
+    await untilProbeInFlight();
     resetConciergeSession();
     release();
     await restoring;
@@ -222,6 +240,7 @@ describe("concierge session restore (C1)", () => {
     harness.probeFails = true;
     harness.diskSessionId = "sess-old";
     const restoring = restoreConciergeSession();
+    await untilProbeInFlight();
     resetConciergeSession();
     release();
     await restoring;
