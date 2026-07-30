@@ -10,7 +10,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{assess_capture_health, rms_level, AudioHealth, Capture};
@@ -567,6 +567,71 @@ const FOCUS_BLUR_COALESCE_MS: u64 = 120;
 /// the safe tradeoff on the realtime thread. 32 segments is minutes of speech of headroom.
 const DECODE_QUEUE_CAP: usize = 32;
 
+/// How long the decode worker may block in one `recv` before re-checking its abort flag.
+///
+/// The worker used to sit in a plain blocking `recv` (`for samples in rx`), which meant `abort()`
+/// was UNOBSERVABLE while it waited: the flag was only read at the top of the next iteration, and
+/// the next iteration only came when a segment arrived or the channel CLOSED. That is precisely
+/// the deadlock this constant exists to break — see `DECODE_JOIN_TIMEOUT` for the incident.
+///
+/// This is an in-process atomic load on a timer, not a syscall poll: the cost of a tick is a
+/// wakeup and a relaxed load, and the worker only exists while a capture is live. 100 ms bounds
+/// the abort→exit latency well under the join timeout while staying invisible in CPU terms.
+const DECODE_ABORT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a teardown may wait for the decode worker to exit before DETACHING it instead.
+///
+/// ── THE INCIDENT THIS BOUNDS (spindump, sparkle 0.65.0 pid 27419) ─────────────────────────────
+/// Every teardown path here joins the worker, and every one of them justified that join as
+/// "bounded" / "near-instant" on the same premise: `Capture` holds the sole channel `Sender` (it
+/// is moved into the cpal callback closure in `build_capture`), so dropping the `Capture` first
+/// closes the channel, ends the worker's `for samples in rx`, and the join returns. A live sample
+/// disproved that premise. The main thread was at 6705 of 6705 samples blocked on this module's
+/// session `Mutex`; the thread HOLDING that mutex was in `set_focused` → `drop_glue<DecodeWorker>`
+/// → `pthread_join`; and the `parakeet-decode` thread it was joining was parked in `recv` →
+/// `semaphore_wait_trap`. `recv` blocking means the channel was still CONNECTED — the `Capture`
+/// drop had already returned and the Sender had NOT been freed. `Capture::drop` only stores
+/// `active=false` and calls `stream.pause()`; whether the callback closure (and the Sender inside
+/// it) is actually deallocated is up to cpal's `Stream` drop and CoreAudio's Dispose. The whole
+/// app hung on that assumption, and the user had to force-quit.
+///
+/// So the join must not depend on the channel closing AT ALL. `DECODE_ABORT_POLL` gives the worker
+/// its own exit signal, and this constant is the backstop for everything that signal cannot reach:
+/// a worker wedged inside a decode, an FFI call that never returns, a future edit that reintroduces
+/// a blocking wait.
+///
+/// THIS IS THE TOTAL, SPENT IN TWO PHASES — do not read it as a single wait-then-detach. It is
+/// split into `DECODE_DRAIN_BUDGET` (wait for an orderly exit; on the un-aborted `stop_dictation`
+/// path this is the drain) and then `DECODE_ABORT_GRACE` (having stored `abort`, wait for the
+/// worker to act on it). Only a worker that ignores even the abort is DETACHED — and it is detached
+/// with the abort already stored, so it exits if it ever unwedges rather than running forever. A
+/// leaked decode thread costs one thread and its `Arc`s; a join that never returns costs the entire
+/// application, because on every teardown path the caller is (or blocks) the main thread. That trade
+/// is not close.
+///
+/// Two seconds is generous against the work the worker can legitimately still be doing (one
+/// in-flight `Decoder::transcribe` of a ≤8 s segment) while staying far under the point at which a
+/// user reads the UI as hung. It is a CEILING and the split preserves it: in the leaked-Sender case
+/// this mechanism exists for, the deadline is hit on EVERY teardown rather than rarely, so growing
+/// the total would have been a routine main-thread stall (roborev 55788).
+const DECODE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long to wait for the worker to act on the abort we store when the drain budget expires,
+/// before giving up and detaching. Several `DECODE_ABORT_POLL` ticks, so a worker that is merely
+/// idling in `recv_timeout` is joined normally and only a genuinely wedged one is ever detached.
+///
+/// CARVED OUT OF `DECODE_JOIN_TIMEOUT`, not added to it — see `DECODE_DRAIN_BUDGET`. It is tempting
+/// to append it, and that is wrong: the caller is the main thread, and the leaked-Sender case this
+/// whole mechanism exists for hits the deadline on EVERY teardown rather than rarely, so any growth
+/// here is a routine main-thread stall, not a rare one.
+const DECODE_ABORT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long the worker is given to drain its queue BEFORE we abort it — the first phase of
+/// `DECODE_JOIN_TIMEOUT`, with `DECODE_ABORT_GRACE` as the second. The two must sum to
+/// `DECODE_JOIN_TIMEOUT` (pinned by `the_teardown_budget_is_carved_up_not_added_to`) so the total
+/// time a teardown can block its caller is unchanged by the abort-then-grace sequence.
+const DECODE_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+
 /// How a closed VAD segment's decode finished — the input to the on-device emit rule.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum DecodeOutcome {
@@ -741,9 +806,72 @@ impl DecodeEmitSink for AppEmitSink<'_> {
 /// the `Capture` BEFORE dropping the `DecodeWorker` so the join is bounded.
 struct DecodeWorker {
     handle: Option<std::thread::JoinHandle<()>>,
-    /// Set true before a fast/abandon teardown (app exit): the worker then skips decoding any
-    /// still-queued segments and just drains to the channel close, so the join is near-instant.
+    /// Set true to make the worker EXIT — promptly, and independently of whether the channel ever
+    /// closes. It used to mean only "skip decoding still-queued segments and drain to the channel
+    /// close", which made it useless in the one case that mattered: a worker blocked in `recv` on a
+    /// channel that never closed never reached the check at all. See `DECODE_JOIN_TIMEOUT`.
     abort: Arc<AtomicBool>,
+    /// Closed by the worker thread when its body returns, so a teardown can wait for the exit with a
+    /// DEADLINE instead of an unbounded `join()`. The worker holds the paired `Sender` and never
+    /// sends on it; the disconnect IS the signal, so this costs nothing while the worker runs and
+    /// needs no polling to observe. See `DECODE_JOIN_TIMEOUT` for why the deadline is load-bearing.
+    exited: Receiver<()>,
+}
+
+/// The decode worker's control flow, lifted out of the spawned closure so it can be TESTED.
+///
+/// It is separated for the same reason `should_expire` lives in Rust rather than Objective-C over in
+/// `attention.rs`: the defect this shape exists to prevent is invisible from the outside and fatal.
+/// The previous version was a plain `for samples in rx { if abort { continue } … }`, which has
+/// exactly one exit — the channel closing — and therefore ignores `abort` entirely while it waits.
+/// A live spindump caught this thread parked in `recv` while a teardown held the app's session mutex
+/// waiting to join it; the app hung and had to be force-quit. That bug is one keyword's difference
+/// from correct code and no integration test would have found it, so the loop is unit-tested here.
+///
+/// Returns when EITHER `abort` is set (within one `DECODE_ABORT_POLL` tick, whatever the channel is
+/// doing) OR the channel disconnects (an ordinary drain-to-close). `on_segment` runs the decode.
+/// `decode` and `emit` are SEPARATE on purpose, with the abort re-checked between them. The decode
+/// is the long, uninterruptible part (an FFI transducer call on a ≤8 s segment); the emit is what
+/// the user sees. Fusing them would leave the in-flight segment unbounded in the way that matters:
+/// `abort` would bound the LOOP while a decode that began before teardown still emitted its
+/// `dictation://partial` afterwards — landing a stale fragment after the `dictation://final` that
+/// ended the transcript, and re-arming auto-send over speech the user had finished (roborev 55788).
+/// Splitting them also keeps the guard in code a unit test can reach: the real emit needs an
+/// `AppHandle`, so a guard living inside the spawned closure could only ever be tested by copying
+/// it, which tests the copy.
+fn run_decode_loop<P>(
+    rx: &Receiver<Vec<f32>>,
+    abort: &AtomicBool,
+    mut decode: impl FnMut(Vec<f32>) -> P,
+    mut emit: impl FnMut(P),
+) {
+    loop {
+        // Checked BEFORE the wait as well as after, so an abort that landed while the previous
+        // segment was decoding exits without a further tick of latency.
+        if abort.load(Ordering::Acquire) {
+            return;
+        }
+        let samples = match rx.recv_timeout(DECODE_ABORT_POLL) {
+            Ok(samples) => samples,
+            // No segment this tick — loop back and re-read `abort`. This is the line that makes
+            // `abort` observable at all; a blocking `recv` here reintroduces the deadlock.
+            Err(RecvTimeoutError::Timeout) => continue,
+            // Channel closed: drain complete, nothing can ever arrive again.
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if abort.load(Ordering::Acquire) {
+            return; // fast teardown: abandon this segment and the rest of the backlog
+        }
+        let plan = decode(samples);
+        // Teardown may have begun WHILE that decode ran — it is the slow part, and the detach path
+        // is reached precisely when a worker is stuck in it. Drop the result rather than emit past
+        // the final. A lost trailing partial is a missing fragment; an emitted one is a fragment
+        // appended to a finished transcript.
+        if abort.load(Ordering::Acquire) {
+            return;
+        }
+        emit(plan);
+    }
 }
 
 impl DecodeWorker {
@@ -756,16 +884,17 @@ impl DecodeWorker {
         let (tx, rx) = sync_channel::<Vec<f32>>(DECODE_QUEUE_CAP);
         let abort = Arc::new(AtomicBool::new(false));
         let abort_worker = abort.clone();
+        // Moved into the worker and never sent on: its DROP (when the thread body returns) is what
+        // `Drop for DecodeWorker` waits on, so the wait is event-driven and has a deadline.
+        let (exited_tx, exited) = channel::<()>();
         let handle = std::thread::Builder::new()
             .name("parakeet-decode".into())
             .spawn(move || {
-                // Blocks in `recv` until the capture callback's Sender is dropped (channel close),
-                // at which point the `for` loop ends and the thread exits. Each segment is decoded
-                // off the realtime thread and emitted exactly as the inline `accept` path did.
-                for samples in rx {
-                    if abort_worker.load(Ordering::Acquire) {
-                        continue; // fast teardown: skip decode, just drain to the close
-                    }
+                let _exited_tx = exited_tx;
+                run_decode_loop(
+                    &rx,
+                    &abort_worker,
+                    |samples| {
                     // Panic firewall parity with the audio-thread handler: a panic inside the FFI
                     // decode (a poisoned recognizer mutex, a malformed segment) must not kill the
                     // worker — that would silently stop on-device transcription for the rest of the
@@ -794,14 +923,19 @@ impl DecodeWorker {
                     // re-derived here. This call and `AppEmitSink`'s three bodies are the part of the
                     // path tests cannot reach (they need a live `AppHandle`) — see DecodeEmitSink for
                     // exactly how far the coverage goes, which is less far than it first appears.
-                    apply_decode_plan(plan, &mut AppEmitSink(&app));
-                }
+                    plan
+                },
+                    // The emit half. `run_decode_loop` re-checks `abort` between the decode above
+                    // and this, so a segment whose decode outlived teardown never reaches here.
+                    |plan| apply_decode_plan(plan, &mut AppEmitSink(&app)),
+                );
             })
             .expect("spawn parakeet-decode worker");
-        (tx, DecodeWorker { handle: Some(handle), abort })
+        (tx, DecodeWorker { handle: Some(handle), abort, exited })
     }
 
-    /// Signal the worker to abandon any queued decodes and exit ASAP (app-exit fast teardown).
+    /// Signal the worker to abandon any queued decodes and EXIT — observed within one
+    /// `DECODE_ABORT_POLL` tick whether or not the decode channel ever closes.
     fn abort(&self) {
         self.abort.store(true, Ordering::Release);
     }
@@ -809,11 +943,67 @@ impl DecodeWorker {
 
 impl Drop for DecodeWorker {
     fn drop(&mut self) {
-        // Join so no decode/emit outlives teardown. Bounded: the channel is already closed by the
-        // time we get here (the Capture — sole Sender holder — was dropped first), so the worker
-        // only has to finish its current segment (or, if aborting, nothing) before `recv` ends.
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        // Join so no decode/emit outlives teardown — but NEVER unconditionally. This used to be a
+        // bare `h.join()`, justified by "the channel is already closed by the time we get here (the
+        // Capture — sole Sender holder — was dropped first)". A live spindump caught that premise
+        // false and the app deadlocked behind it; `DECODE_JOIN_TIMEOUT` documents the sample.
+        //
+        // So: wait for the worker's own exit signal with a deadline, and join only once we KNOW the
+        // body has returned (at which point `join` is a formality that cannot block). Past the
+        // deadline, detach instead — dropping the `JoinHandle` leaves the thread running and
+        // reparented, which costs one parked thread. Blocking here costs the whole app, because on
+        // most teardown paths the caller is (or blocks) the main thread.
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match self.exited.recv_timeout(DECODE_DRAIN_BUDGET) {
+            // Disconnected = the worker dropped its sender, i.e. its body returned. Join is free.
+            // This is the ordinary path for every teardown, aborted or not.
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+            }
+            // Nothing is ever SENT on this channel, so `Ok` is unreachable; treat it as "not yet
+            // exited" rather than joining on an assumption that has already failed us once.
+            //
+            // THE DEADLINE IS THE DRAIN BUDGET, AND ITS EXPIRY IS AN ABORT. `stop_dictation` is the
+            // one teardown that deliberately does NOT abort — it wants the worker to drain its
+            // queued partials so they land before the closing `dictation://final`. That is fine
+            // when the channel closes. When it does not (the leaked-Sender case this whole change
+            // exists for), the worker sees neither `Disconnected` nor `abort` and loops forever, so
+            // without the store below we would detach a thread that is still LIVE: waking at 10 Hz
+            // for the rest of the process, holding the transcriber and the `AppHandle`, and still
+            // able to `emit_partial` a stale fragment AFTER the final that ended the transcript.
+            // Aborting here bounds all of that — the drain got its budget, and now the worker exits.
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                self.abort.store(true, Ordering::Release);
+                // One more short wait, so the overwhelmingly likely outcome is still an orderly
+                // join rather than a detach: the worker observes the abort within a poll tick.
+                match self.exited.recv_timeout(DECODE_ABORT_GRACE) {
+                    Err(RecvTimeoutError::Disconnected) => {
+                        tracing::warn!(
+                            target: "dictation",
+                            timeout_secs = DECODE_JOIN_TIMEOUT.as_secs_f64(),
+                            "decode worker outlasted the drain deadline; aborted it and it exited \
+                             (its queued segments were abandoned)"
+                        );
+                        let _ = handle.join();
+                    }
+                    // It ignored even the abort — wedged inside a decode or an FFI call. Detach:
+                    // blocking here costs the whole app, because on most teardown paths the caller
+                    // is (or blocks) the main thread. The abort above is already stored, so the
+                    // thread will exit if it ever returns from whatever it is stuck in.
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            target: "dictation",
+                            timeout_secs = DECODE_JOIN_TIMEOUT.as_secs_f64(),
+                            grace_secs = DECODE_ABORT_GRACE.as_secs_f64(),
+                            "decode worker did not exit even after being aborted; detaching it \
+                             rather than blocking teardown (the app must stay responsive)"
+                        );
+                        drop(handle); // detach; it will exit if it ever unwedges
+                    }
+                }
+            }
         }
     }
 }
@@ -1063,6 +1253,35 @@ fn unpark_cloud_for_focus(cloud: &Mutex<Option<DeepgramSession>>, cloud_active: 
     cloud_active.store(true, Ordering::Relaxed);
 }
 
+/// A capture and its decode worker, removed from the session but NOT yet dropped.
+///
+/// Exists so a teardown decided under the session lock is *performed* outside it. Both drops are
+/// things that must never run while the lock is held: `Capture`'s drop pauses and disposes a cpal
+/// stream (CoreAudio, which the main thread also serves — sparkle-sfxu), and `DecodeWorker`'s drop
+/// waits on the decode thread. Doing the latter under the lock is what deadlocked the app; see
+/// `DECODE_JOIN_TIMEOUT` for the spindump.
+///
+/// DROP ORDER IS LOAD-BEARING, so it is written out explicitly below rather than left to field
+/// order. `capture` must go first — freeing the cpal callback closure and with it the decode
+/// channel's `Sender` — so the worker's wait then follows an already-closed channel, which is the
+/// fast path. (The worker's `abort` flag is what makes the teardown *correct* when that Sender is
+/// not freed; this ordering is what makes it *quick* when it is.) Relying on declaration order
+/// would have been silently wrong: `repr(Rust)` lets the compiler lay fields out in any order, and
+/// while drop order does follow the source, that is a subtlety one reordering edit away from a
+/// teardown that waits out a poll interval on every window blur for no visible reason.
+#[derive(Default)]
+struct CaptureLeftovers {
+    capture: Option<Capture>,
+    worker: Option<DecodeWorker>,
+}
+
+impl Drop for CaptureLeftovers {
+    fn drop(&mut self) {
+        drop(self.capture.take()); // closes the decode channel …
+        drop(self.worker.take()); // … so this wait is the fast path
+    }
+}
+
 impl DictationState {
     /// Stop any in-flight capture by dropping the cpal stream, so CoreAudio stops invoking the
     /// audio callback. Called on app exit () to quiesce the audio IOThread BEFORE
@@ -1070,15 +1289,16 @@ impl DictationState {
     /// . Unlike stop_dictation this skips finalize(): at exit the trailing segment is
     /// moot and we want the fastest possible teardown. Idempotent and poison-tolerant.
     pub fn stop_capture(&self) {
-        let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        // Fast teardown: tell the decode worker to abandon any queued segments, then drop the
-        // Capture (closes the decode channel) and drop the worker (joins near-instantly since it's
-        // aborting). Order matters — Capture holds the sole channel Sender, so it must drop first.
-        if let Some(w) = sess.decode_worker.as_ref() {
-            w.abort();
-        }
-        sess.capture = None;
-        sess.decode_worker = None;
+        let leftovers = {
+            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            // Fast teardown: tell the decode worker to abandon any queued segments, then TAKE both
+            // out of the session. They are dropped below, after the guard — never under the lock.
+            if let Some(w) = sess.decode_worker.as_ref() {
+                w.abort();
+            }
+            CaptureLeftovers { capture: sess.capture.take(), worker: sess.decode_worker.take() }
+        }; // release the session lock BEFORE the drops (see CaptureLeftovers)
+        drop(leftovers);
     }
 
     /// Build or release the cpal capture to match `armed && focused` (the only states that decide
@@ -1087,13 +1307,26 @@ impl DictationState {
     /// is cheap and doesn't disturb an in-flight cloud epoch. Pausing drops `Capture`, which stops
     /// CoreAudio invoking the callback and releases the OS mic (the macOS recording indicator goes
     /// off) — true "not capturing", not merely discarded frames.
-    fn reconcile_locked(sess: &mut DictationSession, app: &AppHandle) {
+    #[must_use = "the returned capture/worker MUST be dropped after the session lock is released"]
+    fn reconcile_locked(sess: &mut DictationSession, app: &AppHandle) -> CaptureLeftovers {
         // Same decision as the worker-side reconcile — both derive it from `plan_capture` so the two
-        // paths can't drift on when to build vs. tear down (sparkle-sfxu review). Safe to build/tear
-        // down INLINE here because reconcile_locked runs only on the main thread (via set_focused),
-        // where is_focused() is serviced inline and Capture::start doesn't self-block.
+        // paths can't drift on when to build vs. tear down (sparkle-sfxu review).
+        //
+        // This comment used to assert that tearing down INLINE here was safe "because
+        // reconcile_locked runs only on the main thread (via set_focused), where is_focused() is
+        // serviced inline and Capture::start doesn't self-block". BOTH halves of that were wrong,
+        // and a live spindump showed the app deadlocked on exactly this line. `note_focus_event`'s
+        // deferred-blur path spawns a thread that calls `set_focused(false)`, so this runs off-main
+        // routinely; and the inline teardown dropped a `DecodeWorker`, whose `Drop` did an
+        // unbounded `pthread_join`, WHILE HOLDING the session mutex the main thread's focus handler
+        // was waiting on. Main thread: 6705 of 6705 samples blocked on that mutex.
+        //
+        // So the teardown is no longer performed here. This function DECIDES; the caller drops what
+        // it hands back, after the guard is released. That is the same shape `reconcile_capture`
+        // (`ReconcileStep::Teardown`) and `stop_dictation` already use — this path was the last one
+        // that still tore down under the lock.
         match plan_capture(capture_should_be_live(sess.armed, sess.focused), sess.capture.is_some()) {
-            CapturePlan::Idle => {}
+            CapturePlan::Idle => CaptureLeftovers::default(),
             CapturePlan::Build => {
             // transcriber is always Some while armed; the guard is belt-and-suspenders.
             if let Some(transcriber) = sess.transcriber.clone() {
@@ -1120,21 +1353,24 @@ impl DictationState {
                     }
                 }
             }
+            CaptureLeftovers::default()
             }
             CapturePlan::Teardown => {
-            // Tell the worker to abandon its queued backlog BEFORE dropping it: this drop joins the
-            // worker thread while the caller still holds the session lock, so without the abort the
-            // join would block for the decode duration of up to DECODE_QUEUE_CAP queued segments,
-            // stalling other session ops on window blur. A paused capture's trailing partials are
-            // moot — same rationale as stop_capture (which also aborts first).
+            // Tell the worker to abandon its queued backlog before handing it back, so the caller's
+            // off-lock drop doesn't wait out the decode duration of up to DECODE_QUEUE_CAP queued
+            // segments. A paused capture's trailing partials are moot — same rationale as
+            // stop_capture (which also aborts first).
             if let Some(w) = sess.decode_worker.as_ref() {
                 w.abort();
             }
-            sess.capture = None; // drop -> stops the cpal stream, releases the OS mic, closes the decode channel
-            sess.decode_worker = None; // worker joins near-instantly (aborting) instead of draining the backlog
             // Park the cloud socket too, so a quick refocus reuses it instead of re-handshaking.
+            // Safe under the lock: pause() is a non-blocking channel send, not main-thread-dependent
+            // work — the same reasoning `reconcile_capture`'s Teardown arm states for doing it here.
             park_cloud_for_blur(&sess.cloud, &sess.cloud_active);
             tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+            // TAKEN, not dropped: the cpal stream teardown touches CoreAudio and the worker drop
+            // waits on a thread, and neither may happen while this lock is held.
+            CaptureLeftovers { capture: sess.capture.take(), worker: sess.decode_worker.take() }
             }
         }
     }
@@ -1306,16 +1542,22 @@ impl DictationState {
     /// meter, reset the wake-phase, and update the listening UI. Moving focus between two Sparkle
     /// windows keeps `focused` true, so no event fires and the mic stays live.
     pub fn set_focused(&self, app: &AppHandle, focused: bool) {
-        let changed = {
+        let (changed, leftovers) = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
             if sess.focused == focused {
-                false
+                (false, CaptureLeftovers::default())
             } else {
                 sess.focused = focused;
-                Self::reconcile_locked(&mut sess, app);
-                true
+                (true, Self::reconcile_locked(&mut sess, app))
             }
-        }; // release the lock before emitting
+        }; // release the lock before emitting AND before the teardown drops below
+        // THE DEADLOCK FIX. This drop waits on the decode thread and disposes a cpal stream; doing
+        // it inside the block above (which `reconcile_locked` used to) held the session mutex across
+        // an unbounded `pthread_join` and hung the whole app — main thread blocked here at 6705 of
+        // 6705 samples. `set_focused` is called from BOTH the main-thread focus handler and
+        // `note_focus_event`'s deferred-blur thread, so either one holding this lock for an
+        // unbounded time stalls the other. See `DECODE_JOIN_TIMEOUT`.
+        drop(leftovers);
         if changed {
             let _ = app.emit("dictation://focus", focused);
         }
@@ -2609,10 +2851,18 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
         (sess.transcriber.take(), cloud_session, worker)
     };                                  // release the session lock before the (slower) join/finalize
     tracing::info!(target: "dictation", "stop_dictation: capture dropped, finalizing");
-    // Join the decode worker BEFORE finalize. The capture (sole channel Sender) was dropped above,
-    // so the channel is closed: the worker drains any queued accept-path segments — emitting their
-    // `dictation://partial`s — then exits. Joining here guarantees those land BEFORE finalize's
-    // trailing segment and the closing `dictation://final`, preserving the old in-order emit.
+    // Wait for the decode worker BEFORE finalize. This is the one teardown that does NOT abort
+    // first: it wants the worker to drain its queued accept-path segments — emitting their
+    // `dictation://partial`s — so they land before finalize's trailing segment and the closing
+    // `dictation://final`, preserving the in-order emit.
+    //
+    // THAT DRAIN IS BEST-EFFORT WITHIN A BUDGET, not a guarantee — this comment used to claim the
+    // guarantee, and it was only ever true while the channel reliably closed here (the premise
+    // `DECODE_JOIN_TIMEOUT` documents as false). The drain gets `DECODE_DRAIN_BUDGET`; past it the
+    // worker is aborted and the REST OF THE BACKLOG IS DISCARDED, so the tail of a long dictation
+    // can be dropped rather than emitted. Reachable in practice: `DECODE_QUEUE_CAP` is 32 segments,
+    // so a slow machine or a burst can queue more decoding than the budget covers. The alternative
+    // is worse — this runs on the main thread, so an unbounded drain is a UI freeze (roborev 55788).
     drop(worker);
     // Flush the cloud stream first (if dictation was stopped mid-cloud) for its trailing final.
     if let Some(s) = cloud_session {
@@ -2643,6 +2893,12 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use super::{
+        run_decode_loop, DecodeWorker, DECODE_ABORT_GRACE, DECODE_ABORT_POLL,
+        DECODE_DRAIN_BUDGET, DECODE_JOIN_TIMEOUT,
+    };
+    use std::sync::mpsc::{channel, sync_channel};
+    use std::time::{Duration, Instant};
 
     /// THE REGRESSION TEST for "auto-send never arms on the on-device path".
     ///
@@ -2792,6 +3048,379 @@ mod tests {
             vec!["warn"],
             "a recovered panic warns and emits nothing else",
         );
+    }
+
+    // ---- decode-worker teardown: the app-wide deadlock (spindump, 0.65.0 pid 27419) ----------
+    //
+    // WHAT HUNG: the main thread sat at 6705 of 6705 samples blocked on the session Mutex in
+    // `set_focused`. The thread holding that mutex was in `drop_glue<DecodeWorker>` -> `pthread_join`.
+    // The `parakeet-decode` thread it was joining was parked in `recv` -> `semaphore_wait_trap` —
+    // i.e. the channel was still CONNECTED, because the Sender lives inside the cpal callback closure
+    // and had not been freed. Every teardown path called that join "bounded"; none of them were.
+    //
+    // Each test below wraps its wait in an explicit deadline. That is deliberate: against the code
+    // as it was, these do not merely fail, they HANG — which is exactly the property under test, and
+    // a hanging CI job is a far worse signal than a failing assertion.
+
+    /// Run `body` on a scratch thread and fail if it has not finished within `limit`.
+    /// Returns nothing on success; panics with `what` on timeout, so a regression is a red test
+    /// rather than a wedged test binary.
+    fn within(limit: Duration, what: &str, body: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = channel::<()>();
+        std::thread::spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(limit).is_ok(),
+            "{what} did not finish within {limit:?} — this is the deadlock, not a slow machine",
+        );
+    }
+
+    // THE REGRESSION TEST FOR THE HANG. The Sender is deliberately held alive for the whole test:
+    // that is the exact condition the spindump caught, and the condition every "the channel is
+    // already closed by the time we get here" comment wrongly assumed away. Against the previous
+    // `for samples in rx` loop this never returns.
+    #[test]
+    fn an_aborted_worker_exits_even_though_the_channel_never_closes() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_loop = abort.clone();
+        // Set the abort BEFORE the loop starts waiting, so this asserts the exit itself rather than
+        // racing the signal in.
+        abort.store(true, Ordering::Release);
+        within(Duration::from_secs(5), "an aborted decode loop", move || {
+            run_decode_loop(&rx, &abort_loop, |_| panic!("must not decode after abort"), |_: ()| {});
+        });
+        drop(tx); // held across the whole wait above — the point of the test
+    }
+
+    // The same thing with the abort arriving LATE, while the loop is already blocked in its wait.
+    // This is the live case: `abort()` is called by a teardown on another thread against a worker
+    // that is sitting idle on a still-open channel.
+    #[test]
+    fn an_abort_that_lands_while_the_worker_waits_is_still_observed() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_loop = abort.clone();
+        let (done_tx, done_rx) = channel::<()>();
+        let loop_thread = std::thread::spawn(move || {
+            run_decode_loop(&rx, &abort_loop, |_| panic!("no segments were sent"), |_: ()| {});
+            let _ = done_tx.send(());
+        });
+        // Let the loop actually reach its wait, so this asserts that a LATE abort is observed —
+        // the live case, where a teardown aborts a worker that is already parked.
+        std::thread::sleep(DECODE_ABORT_POLL * 2);
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the loop exited before it was aborted — the test is not exercising what it claims"
+        );
+        abort.store(true, Ordering::Release);
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a decode loop parked on a still-open channel never observed its abort — this is the \
+             deadlock: the Sender lives in the cpal callback closure and may never be freed"
+        );
+        loop_thread.join().expect("loop thread");
+        drop(tx); // held alive for the whole test on purpose
+    }
+
+    // The BEHAVIOUR THAT MUST NOT REGRESS while fixing the above. `stop_dictation` drops the worker
+    // WITHOUT aborting, relying on it draining every queued segment (emitting their partials) before
+    // it exits, so they land before the closing `final`. Exiting eagerly on close would silently
+    // drop the tail of a user's dictation.
+    #[test]
+    fn a_worker_that_was_not_aborted_drains_every_queued_segment_before_exiting() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(8);
+        let abort = Arc::new(AtomicBool::new(false));
+        for i in 0..5 {
+            tx.send(vec![i as f32]).expect("queue a segment");
+        }
+        drop(tx); // close the channel: an ordinary drain-to-close teardown
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_loop = seen.clone();
+        within(Duration::from_secs(5), "a draining decode loop", move || {
+            run_decode_loop(&rx, &abort, |s: Vec<f32>| s[0], |v| seen_loop.lock().unwrap().push(v));
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            "a non-aborted worker must decode the whole backlog, in order, before exiting"
+        );
+    }
+
+    // THE BACKSTOP. Even with an exit signal, a worker wedged inside a decode (or an FFI call that
+    // never returns) must not take the caller down with it. Dropping a `DecodeWorker` whose thread
+    // will never exit has to return on the deadline and DETACH, because on most teardown paths the
+    // caller is — or is blocking — the main thread.
+    #[test]
+    fn dropping_a_worker_that_never_exits_gives_up_instead_of_blocking_forever() {
+        let wedged = Arc::new(AtomicBool::new(true));
+        let wedged_thread = wedged.clone();
+        let (_exited_tx, exited) = channel::<()>();
+        // A thread that ignores every signal — it holds `_exited_tx` nowhere, so `exited` stays
+        // connected (never "exited") for as long as this test keeps `_exited_tx` alive.
+        let handle = std::thread::spawn(move || {
+            while wedged_thread.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let worker = DecodeWorker {
+            handle: Some(handle),
+            abort: Arc::new(AtomicBool::new(false)),
+            exited,
+        };
+        let started = Instant::now();
+        within(Duration::from_secs(20), "dropping a wedged worker", move || drop(worker));
+        let waited = started.elapsed();
+        assert!(
+            waited >= DECODE_JOIN_TIMEOUT,
+            "it must actually WAIT the deadline ({DECODE_JOIN_TIMEOUT:?}) for an orderly exit, not \
+             detach immediately — it gave up after {waited:?}",
+        );
+        assert!(
+            waited < DECODE_JOIN_TIMEOUT * 4,
+            "it must give up NEAR the deadline, not block on the thread — waited {waited:?}",
+        );
+        wedged.store(false, Ordering::Release); // let the detached thread go
+    }
+
+    // A worker that exits promptly must still be joined promptly — the deadline is a ceiling, not a
+    // delay. Without this, "wait 2s then detach" would pass the test above while making every
+    // ordinary window-blur teardown two seconds slower.
+    #[test]
+    fn dropping_a_worker_that_exits_promptly_does_not_wait_out_the_deadline() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(1);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_worker = abort.clone();
+        let (exited_tx, exited) = channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            run_decode_loop(&rx, &abort_worker, |_| {}, |()| {});
+        });
+        let worker = DecodeWorker { handle: Some(handle), abort, exited };
+        worker.abort();
+        let started = Instant::now();
+        within(Duration::from_secs(10), "dropping an exiting worker", move || drop(worker));
+        assert!(
+            started.elapsed() < DECODE_JOIN_TIMEOUT,
+            "an orderly exit must not be charged the full deadline (took {:?})",
+            started.elapsed(),
+        );
+        drop(tx);
+    }
+
+    // THE TEST FOR THE FREEZE ITSELF (bead sparkle-7sfdx). Everything above proves the worker can
+    // exit; this proves the SESSION LOCK IS NOT HELD while we wait for it, which is the property
+    // that actually froze the UI. The turnstile chain in the spindump was:
+    //     main (set_focused+56)  --waits-->  blur thread (set_focused+740, drop_glue -> join)
+    //                            --waits-->  parakeet-decode (recv, no turnstile owner)
+    // so any teardown that waits under the lock stalls every other taker of that mutex — the
+    // main-thread focus handler and the audio watchdog both take it.
+    //
+    // The worker here is deliberately WEDGED (it ignores abort), which forces the teardown to spend
+    // the full `DECODE_JOIN_TIMEOUT` before detaching. That makes the assertion deterministic rather
+    // than a timing race: the lock must be acquirable by another thread *during* that window.
+    // Against the previous code — `sess.decode_worker = None` inside the guard's scope — the lock
+    // stays held for the whole (there, unbounded) wait and this cannot pass.
+    //
+    // `stop_capture` is the subject because it takes no `AppHandle`, so it is reachable from a unit
+    // test; it shares the exact teardown shape with `reconcile_locked`, which the same change fixed.
+    #[test]
+    fn a_teardown_does_not_hold_the_session_lock_while_waiting_for_the_decode_worker() {
+        let wedged = Arc::new(AtomicBool::new(true));
+        let wedged_thread = wedged.clone();
+        let (_exited_tx, exited) = channel::<()>();
+        let handle = std::thread::spawn(move || {
+            while wedged_thread.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let state = DictationState::default();
+        state.0.lock().unwrap().decode_worker =
+            Some(DecodeWorker { handle: Some(handle), abort: Arc::new(AtomicBool::new(false)), exited });
+
+        // A second handle on the SAME session. `Arc<Mutex<DictationSession>>` is not `Send` by
+        // itself (the session holds a !Send cpal Stream); `DictationState` is, via its `unsafe impl`
+        // — so cross-thread sharing goes through that, exactly as the production code does.
+        let session = DictationState(state.0.clone(), state.1.clone());
+        let (tearing_down_tx, tearing_down_rx) = channel::<()>();
+        let teardown = std::thread::spawn(move || {
+            let _ = tearing_down_tx.send(());
+            state.stop_capture(); // takes the lock, takes the worker, drops it AFTER releasing
+        });
+        tearing_down_rx.recv_timeout(Duration::from_secs(5)).expect("teardown started");
+        // Give it time to be unambiguously inside the worker wait, while still leaving most of the
+        // deadline ahead of us — so a pass means "the lock was free mid-wait", not "we got in first".
+        std::thread::sleep(DECODE_ABORT_POLL * 3);
+
+        let (locked_tx, locked_rx) = channel::<()>();
+        std::thread::spawn(move || {
+            // Rebind so the closure captures the whole `DictationState` (which is `Send` via its
+            // `unsafe impl`) rather than precise-capturing the inner `Arc<Mutex<…>>`, which is not.
+            let session = session;
+            let _guard = session.0.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = locked_tx.send(());
+        });
+        assert!(
+            locked_rx.recv_timeout(DECODE_JOIN_TIMEOUT / 2).is_ok(),
+            "the session lock was still held while the teardown waited on the decode worker — this \
+             is the v0.65.0 hard-freeze: the main thread's focus handler takes this same mutex"
+        );
+
+        wedged.store(false, Ordering::Release);
+        teardown.join().expect("teardown thread");
+    }
+
+    // THE `stop_dictation` SHAPE (roborev 55754, High). Every other teardown aborts first; this one
+    // deliberately does not, because it wants the worker to drain its queued partials before the
+    // closing `dictation://final`. That is safe only while the channel closes — the exact premise
+    // this change proves false. So the un-aborted drop must ALSO terminate the worker when the
+    // `Sender` is still alive, or "mic off" leaks a live thread on every cycle: one that keeps
+    // waking, holds the transcriber and `AppHandle`, and can still emit a partial after the final.
+    //
+    // The drop-observer is the point. Asserting only that `drop` RETURNED would pass against a bare
+    // detach, which is precisely the defect: the caller is unblocked while the thread runs forever.
+    #[test]
+    fn dropping_an_un_aborted_worker_over_a_live_sender_still_terminates_the_thread() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_worker = abort.clone();
+        let (exited_tx, exited) = channel::<()>();
+        // Moved into the worker: while the thread runs it holds a strong ref, so the count falling
+        // back to 1 is positive evidence the thread actually RETURNED, not merely was detached.
+        let alive = Arc::new(());
+        let alive_worker = alive.clone();
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            let _alive = alive_worker;
+            run_decode_loop(&rx, &abort_worker, |_| {}, |()| {});
+        });
+        let worker = DecodeWorker { handle: Some(handle), abort, exited };
+
+        let started = Instant::now();
+        // NOTE: no `worker.abort()` — this is the stop_dictation path.
+        within(Duration::from_secs(20), "dropping an un-aborted worker", move || drop(worker));
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= DECODE_DRAIN_BUDGET,
+            "the drain must get its full budget before we abort it — gave up after {waited:?}"
+        );
+        assert!(
+            waited < DECODE_JOIN_TIMEOUT,
+            "an idling worker observes the abort within a poll tick, so the teardown must finish \
+             INSIDE the ceiling rather than spending the whole grace ({waited:?})"
+        );
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the decode thread is STILL RUNNING after teardown returned — a detached worker keeps \
+             waking, holds the transcriber and AppHandle, and can emit a partial after the final"
+        );
+        drop(tx); // the Sender was alive for the entire teardown — the whole point
+    }
+
+    // The budget is a CEILING that the abort-then-grace split must not inflate. The caller is the
+    // main thread and the leaked-Sender case hits this deadline on EVERY teardown, so a grace
+    // ADDED to the timeout (rather than carved out of it) would be a routine 25% longer stall.
+    #[test]
+    fn the_teardown_budget_is_carved_up_not_added_to() {
+        assert_eq!(
+            DECODE_DRAIN_BUDGET + DECODE_ABORT_GRACE,
+            DECODE_JOIN_TIMEOUT,
+            "the drain budget and the abort grace must SUM to the ceiling, not exceed it"
+        );
+        assert!(
+            DECODE_ABORT_GRACE >= DECODE_ABORT_POLL * 2,
+            "the grace must cover at least a couple of poll ticks or an idling worker gets detached"
+        );
+    }
+
+    // A worker aborted while it is INSIDE a decode must emit nothing when that decode returns.
+    // `abort` bounds the loop, which is not the same as bounding an in-flight segment — and the
+    // detach path is reached precisely when the worker is stuck in `on_segment`. Without the
+    // between-decode-and-emit check, the transcript lands after `dictation://final`, re-populating
+    // the composer and re-arming auto-send over speech the user already finished (roborev 55788).
+    #[test]
+    fn a_segment_still_decoding_when_teardown_begins_does_not_emit_after_the_final() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_loop = abort.clone();
+        let emitted = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let emitted_worker = emitted.clone();
+        let (in_decode_tx, in_decode_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+
+        let worker = std::thread::spawn(move || {
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                // Stands in for `Decoder::transcribe`: announce that we are inside the decode, then
+                // block until the test releases us — i.e. the decode outlives the teardown.
+                move |samples: Vec<f32>| {
+                    let _ = in_decode_tx.send(());
+                    let _ = release_rx.recv();
+                    samples[0]
+                },
+                move |v| emitted_worker.lock().unwrap().push(v),
+            );
+        });
+
+        tx.send(vec![42.0]).expect("queue a segment");
+        in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
+        abort.store(true, Ordering::Release); // teardown begins mid-decode
+        let _ = release_tx.send(()); // the decode now returns
+        worker.join().expect("worker thread");
+
+        assert!(
+            emitted.lock().unwrap().is_empty(),
+            "a decode that finished after teardown began emitted its result — in production that \
+             is a dictation://partial landing after dictation://final, appending a stale fragment \
+             to a finished transcript and re-arming auto-send"
+        );
+        drop(tx);
+    }
+
+    // The drain is best-effort within `DECODE_DRAIN_BUDGET`; past it the backlog is DISCARDED. That
+    // is a deliberate trade (the caller is the main thread), so pin it: what was emitted must be a
+    // PREFIX of the queue — in order, truncated — never reordered and never complete-by-accident.
+    // The pre-existing drain test uses a no-op `on_segment`, so it cannot tell these apart.
+    #[test]
+    fn a_drain_that_outruns_its_budget_is_truncated_to_a_prefix_not_reordered() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(8);
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_loop = abort.clone();
+        let seen = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let seen_worker = seen.clone();
+        for i in 0..6 {
+            tx.send(vec![i as f32]).expect("queue a segment");
+        }
+        let worker = std::thread::spawn(move || {
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                |s: Vec<f32>| {
+                    std::thread::sleep(Duration::from_millis(60)); // a slow decode
+                    s[0]
+                },
+                move |v| seen_worker.lock().unwrap().push(v),
+            );
+        });
+        // Abort partway through the backlog, as the drain budget's expiry does.
+        std::thread::sleep(Duration::from_millis(150));
+        abort.store(true, Ordering::Release);
+        worker.join().expect("worker thread");
+
+        let seen = seen.lock().unwrap().clone();
+        let full: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        assert!(!seen.is_empty(), "the drain should have made progress before the abort");
+        assert!(
+            seen.len() < full.len(),
+            "the abort must actually truncate the backlog, or this proves nothing (saw {seen:?})"
+        );
+        assert_eq!(seen[..], full[..seen.len()], "the drain must be an in-order PREFIX: {seen:?}");
+        drop(tx);
     }
 
     // ---- audio liveness watchdog ----------------------------------------------------------
