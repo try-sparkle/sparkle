@@ -23,6 +23,7 @@ import { registerStatusEngine, unregisterStatusEngine } from "../engine/engineRe
 import { snapshotScreen } from "../engine/screenSnapshot";
 import { bottomRowIndices } from "../engine/composerOcclusion";
 import { registerScrollback, serializeScrollback } from "../services/terminalScrollback";
+import { registerViewport } from "../services/terminalViewport";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { usePresenceStore } from "../stores/presenceStore";
@@ -34,7 +35,7 @@ import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
-import { TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
+import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
 import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { matchesChord } from "../keyboardHints/keybindings";
@@ -673,6 +674,15 @@ export function Terminal({
     const unregisterScrollback = registerScrollback(agentId, () =>
       serializeScrollback(term.buffer.active),
     );
+    // Expose the RENDERED SCREEN, which is a different question from the history above and must not
+    // be served by it: anything gating a WRITE (dictation routing) has to see what is on screen NOW,
+    // because `screenAwaitsInput` matched against 300 lines of history latches true on the session's
+    // first `(y/n)` and never clears. Both facts are read in ONE call so they can't straddle a `vim`
+    // launch and describe different instants.
+    const unregisterViewport = registerViewport(agentId, () => ({
+      text: snapshotScreen(term.buffer.active, term.rows),
+      alternateBuffer: term.buffer.active.type !== "normal",
+    }));
     // Let the parent move focus into the terminal imperatively (⌘J / composer minimize).
     //
     // terminal-focus: user-driven — this line PROVIDES the capability, it does not exercise it, so the
@@ -1223,6 +1233,7 @@ export function Terminal({
       // re-render, a queued rAF/ResizeObserver tick) sees it and no-ops via safeFit/safeRefresh.
       disposedRef.current = true;
       unregisterScrollback();
+      unregisterViewport();
       // The half-typed line dies with the PTY. Without this, an agent torn down mid-compose would
       // leave `drafts[agentId]` true forever, and the action pill would stay hidden on the fresh
       // terminal a "Start again" (or an account switch) remounts here.
@@ -1420,9 +1431,12 @@ export function Terminal({
           this attribute is ours. It sits on the xterm host rather than the outer pane on purpose —
           the pane also hosts the failure/loading overlays, and a "Start again" button is not a live
           PTY, so focusing it must not pause the mic. */}
+      {/* …and WHICH agent that caret belongs to, so dictation can aim a spoken phrase at this
+          terminal specifically. Same element as the surface marker so one `closest` from the
+          focused node answers both questions — see voice/dictationFocus.focusedTerminalAgentId. */}
       <div
         ref={containerRef}
-        {...{ [TERMINAL_SURFACE_ATTR]: "" }}
+        {...{ [TERMINAL_SURFACE_ATTR]: "", [TERMINAL_AGENT_ATTR]: agentId }}
         style={{ width: "100%", height: "100%", overflow: "hidden" }}
       />
       {/* Affordance over the still-blank terminal. Loading: from spawn until the first PTY byte

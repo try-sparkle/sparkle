@@ -28,6 +28,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   },
 }));
 
+const routeToTerminal = vi
+  .fn()
+  .mockResolvedValue({ kind: "delivered", agentId: "a1", text: "x" });
+vi.mock("./services/dictationTerminalSink", () => ({
+  routeDictationToTerminal: (...a: unknown[]) => routeToTerminal(...a),
+}));
+
 const invoke = vi.fn().mockResolvedValue(undefined);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...a: unknown[]) => invoke(...a),
@@ -57,6 +64,15 @@ const meWith = (balanceCents: number) => ({
 /** Emit a fake Tauri event — broadcast to every registered listener, like Tauri. */
 function emit(name: string, payload: unknown) {
   for (const cb of listeners[name] ?? []) cb({ payload });
+}
+
+/** Stands in for the real hook (useAmbientVoice): runs the phase machine, inserts composer-bound
+ *  text itself, and hands terminal-bound text BACK for the controller to type. `survives` models
+ *  what the wake/stop stripping left behind — `""` is a phrase that was purely a stop word. */
+function phaseMachine(survives?: string) {
+  return vi.fn((text: string, ctx: { terminal: boolean }) =>
+    ctx.terminal ? (survives ?? text) : undefined,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +223,7 @@ describe("createDictationController (hook logic without renderHook)", () => {
 
   it("dictation://partial forwards payload to onSegment", () => {
     emit("dictation://partial", "hello world");
-    expect(onSegment).toHaveBeenCalledWith("hello world");
+    expect(onSegment).toHaveBeenCalledWith("hello world", { terminal: false });
   });
 
   it("dictation://interim updates the live preview in the store", () => {
@@ -530,7 +546,7 @@ describe("multi-window routing (isWindowActive gate)", () => {
     const onSegment = vi.fn();
     const ctrl = await createDictationController({ onSegment, isWindowActive: () => true });
     emit("dictation://partial", "hello world");
-    expect(onSegment).toHaveBeenCalledWith("hello world");
+    expect(onSegment).toHaveBeenCalledWith("hello world", { terminal: false });
     ctrl.cleanup();
   });
 
@@ -542,7 +558,7 @@ describe("multi-window routing (isWindowActive gate)", () => {
     // One backend emission fans out to both windows' listeners (real Tauri behavior).
     emit("dictation://partial", "type me once");
     expect(activeSeg).toHaveBeenCalledTimes(1);
-    expect(activeSeg).toHaveBeenCalledWith("type me once");
+    expect(activeSeg).toHaveBeenCalledWith("type me once", { terminal: false });
     expect(bgSeg).not.toHaveBeenCalled(); // the fix: no duplicate into the background window
     active.cleanup();
     background.cleanup();
@@ -903,15 +919,15 @@ describe("multiple mounted composers (regression: dictation must not leak across
     emit("dictation://partial", "seg");
     // Both fire — Tauri does not route by pane; the active-gate above is what
     // confines the text to one composer.
-    expect(a).toHaveBeenCalledWith("seg");
-    expect(b).toHaveBeenCalledWith("seg");
+    expect(a).toHaveBeenCalledWith("seg", { terminal: false });
+    expect(b).toHaveBeenCalledWith("seg", { terminal: false });
 
     ctrlA.cleanup();
     ctrlB.cleanup();
   });
 });
 
-describe("dictation follows focus — the caret in a TERMINAL pauses routing", () => {
+describe("dictation follows focus — the caret in a TERMINAL redirects routing", () => {
   // THE REGRESSION THIS BLOCK EXISTS FOR. The mic used to keep transcribing while the caret sat in
   // a terminal: words landed in a composer the user was not looking at, the auto-send rail never
   // armed, and nothing on screen said why. Two subsystems disagreeing about the active target is
@@ -940,12 +956,30 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
   // Both assert `status`, which is the INPUT deriveMicPresentation reads to choose the copy, and both
   // fail against the previous code, which wrote "listening" unconditionally on these paths.
 
-  it("arming the mic while the caret is ALREADY in a terminal reads as paused, not as listening", async () => {
+  it("arming with the caret in a terminal that CAN take the phrase reads as listening", async () => {
+    // The complement of the case below, and why `armedStatus` had to grow its second term. With
+    // dictation woken, a committed phrase is TYPED at that agent's input line — so "paused" would
+    // describe the exact opposite of what the app is about to do.
+    useDictationStore.setState({ enabled: true, status: "idle", phase: "active" });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    await ctrl.toggle();
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("arming while the caret is in a terminal that CANNOT take the phrase reads as paused", async () => {
     // The pre-arm shape: armed by the user (`enabled` true — that is the mic button's own state and
     // `toggle` deliberately never writes it), status not yet settled. `toggle()` takes the arm branch.
     // `enabled` must be true here or deriveMicPresentation short-circuits to "off" and the paused copy
     // is moot — "off" and "paused" are different claims and only the second one needs a cause.
-    useDictationStore.setState({ enabled: true, status: "idle" });
+    // `phase: "passive"` is load-bearing and was previously left to whatever the store happened to
+    // hold: it is THE WAKE GATE, and it is the reason this terminal is not a destination. Without it
+    // the fixture drifts into the routing case above and this test asserts the opposite of the code.
+    useDictationStore.setState({ enabled: true, status: "idle", phase: "passive" });
     // MUTABLE on purpose: the caret has to be able to actually leave. A constant `() => "terminal"`
     // would keep `isRoutable()` false forever, so the resume half below could never fire and the
     // "recoverable" claim would be untestable — passing only because nothing ran.
@@ -1015,15 +1049,20 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
     ctrl.cleanup();
   });
 
-  it("a committed partial is DROPPED while the caret is in a terminal", async () => {
-    const onSegment = vi.fn();
+  it("a committed partial is aimed at the PTY, not the composer, while the caret is in a terminal", async () => {
+    // It used to be DROPPED here, which is what this feature replaces. It is now REDIRECTED: the
+    // phase machine still sees it (so the stop word works), but bound for the terminal.
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
+    const onSegment = phaseMachine();
     const ctrl = await createDictationController({
       onSegment,
       isWindowActive: () => true,
       focusOwner: () => "terminal",
     });
     emit("dictation://partial", "this belongs to the PTY, not the composer");
-    expect(onSegment).not.toHaveBeenCalled();
+    expect(onSegment).toHaveBeenCalledWith("this belongs to the PTY, not the composer", {
+      terminal: true,
+    });
     ctrl.cleanup();
   });
 
@@ -1036,12 +1075,16 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
       isWindowActive: () => true,
       focusOwner: () => owner,
     });
+    // `phase: "passive"` — un-woken, so the terminal is NOT a destination and the phrase really is
+    // swallowed. Without this the caret-in-terminal case now REDIRECTS, and the test would be
+    // asserting the opposite of the feature.
+    useDictationStore.setState({ phase: "passive", enabled: true, status: "idle" });
     emit("dictation://partial", "swallowed");
     expect(onSegment).not.toHaveBeenCalled();
     owner = "other";
     emit("dictation://partial", "delivered");
     expect(onSegment).toHaveBeenCalledTimes(1);
-    expect(onSegment).toHaveBeenCalledWith("delivered");
+    expect(onSegment).toHaveBeenCalledWith("delivered", { terminal: false });
     ctrl.cleanup();
   });
 
@@ -1069,13 +1112,17 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
     ctrl.cleanup();
   });
 
-  it("THE ONE GATE: text and speech-end are never in disagreement", async () => {
-    // The DONE-WHEN criterion, asserted directly. Whatever the caret is doing, the transcript and
-    // the rail's clock must make the SAME decision — one gate, not two that happen to agree. A
-    // regression that re-splits them (a second predicate on either listener) fails here.
+  it("ONE GATE PER DESTINATION: the rail arms for the composer and NEVER for a terminal", async () => {
+    // ══ THIS INVARIANT DELIBERATELY CHANGED ═══════════════════════════════════════════════════
+    // It used to read "text and speech-end are never in disagreement", which was right while a
+    // terminal was a dead end: nothing routed there, so nothing armed either. Now the text DOES
+    // route to a terminal while the rail must still NEVER arm for one — because the rail is what
+    // presses Enter, and the whole contract is that a human does that. So the two are the same
+    // decision only on the composer path, and the asymmetry is the feature, not a re-split gate.
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
     for (const owner of ["terminal", "other"] as const) {
       useDictationStore.setState({ speechEndSeq: 0 });
-      const onSegment = vi.fn();
+      const onSegment = phaseMachine();
       const ctrl = await createDictationController({
         onSegment,
         isWindowActive: () => true,
@@ -1083,11 +1130,11 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
       });
       emit("dictation://partial", "words");
       emit("dictation://speech-end", null);
-      const textRouted = onSegment.mock.calls.length > 0;
-      const clockArmed = useDictationStore.getState().speechEndSeq > 0;
-      expect(textRouted).toBe(clockArmed);
-      // …and the shared answer is the one the caret implies, so this can't pass by both being off.
-      expect(textRouted).toBe(owner === "other");
+      // The text ALWAYS lands somewhere, and the destination is the one the caret implies…
+      expect(onSegment).toHaveBeenCalledWith("words", { terminal: owner === "terminal" });
+      // …but the clock that would press Enter arms ONLY for the composer. This is the assertion
+      // that keeps a dictated phrase from ever being SUBMITTED into a live agent.
+      expect(useDictationStore.getState().speechEndSeq).toBe(owner === "other" ? 1 : 0);
       ctrl.cleanup();
     }
   });
@@ -1108,7 +1155,211 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
     ctrl.cleanup();
   });
 
-  it("moving the caret INTO a terminal flattens the live mic UI (mirrors a window blur)", async () => {
+  it("moving the caret into a terminal that CAN take the phrase keeps the billable relay UP", async () => {
+    // THE FEATURE, stated as the thing that must NOT happen. Tearing the relay down here is exactly
+    // what made a terminal caret a dead end: with no stream there is no transcription, so there is
+    // nothing left to type and the routing below could never fire. This is the assertion that would
+    // catch a well-meaning "restore the pause" change.
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    // `focusOwner: "other"` first, deliberately: the controller subscribes to a CHANGE, and no hook
+    // resets this field between tests — a fixture that starts already on "terminal" silently tests
+    // nothing, because the subscription never fires.
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle", focusOwner: "other" });
+    invoke.mockClear();
+    useDictationStore.getState().setFocusOwner("terminal");
+    expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+    // …and the UI says so, rather than going quiet over a live capture.
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("a committed phrase is TYPED INTO THE TERMINAL and never reaches the composer", async () => {
+    // The two destinations must stay mutually exclusive — the same phrase landing in both is the
+    // failure `isRoutable`'s `!isTerminalRoutable()` term exists to prevent.
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
+    const onSegment = phaseMachine();
+    routeToTerminal.mockClear();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "run the tests again");
+    expect(routeToTerminal).toHaveBeenCalledWith("run the tests again");
+    ctrl.cleanup();
+  });
+
+  // ══ THE STOP WORD MUST STILL WORK IN A TERMINAL (roborev 56038) ════════════════════════════
+  // `onSegment` is the ONLY driver of the wake/stop machine. Bypassing it on the terminal path meant
+  // the stop word was TYPED onto the agent's command line instead of ending the session — while the
+  // composer placeholder was telling the user to say it, and `phase` could never return to passive,
+  // so the billable relay had no voice way to close.
+  it("hands terminal-bound segments to the phase machine rather than around it", async () => {
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
+    const onSegment = phaseMachine();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "keep going");
+    expect(onSegment).toHaveBeenCalledWith("keep going", { terminal: true });
+    ctrl.cleanup();
+  });
+
+  it("types NOTHING when the phrase was consumed entirely by a stop word", async () => {
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
+    routeToTerminal.mockClear();
+    const ctrl = await createDictationController({
+      onSegment: phaseMachine(""), // the machine kept nothing back
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "that is all");
+    expect(routeToTerminal).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  // ══ A REFUSAL MUST NOT SWALLOW THE WORDS ═══════════════════════════════════════════════════
+  it("leaves the phrase in the composer when the terminal refuses it", async () => {
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle" });
+    // Through `insertTarget`, the REAL mechanism, rather than by replacing the `insert` action:
+    // `insert` is a silent no-op when no compose box has registered a target, so a hand-installed
+    // spy proves the call happened while proving nothing about whether the text landed anywhere
+    // (roborev 56057).
+    const insert = vi.fn();
+    useDictationStore.setState({ insertTarget: insert });
+    routeToTerminal.mockClear();
+    routeToTerminal.mockResolvedValueOnce({
+      kind: "refused",
+      agentId: "a1",
+      reason: "awaiting-input",
+    });
+    const ctrl = await createDictationController({
+      onSegment: phaseMachine(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "yes please");
+    // The delivery is awaited inside the listener's promise chain, so let it settle.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(insert).toHaveBeenCalledWith("yes please");
+    ctrl.cleanup();
+  });
+
+  it("does not claim a composer placement when no compose box is mounted to catch it", async () => {
+    // `insertTarget` is ONE app-wide slot and can be null — in which case the fallback silently
+    // dropped the phrase while logging that it had left it in the composer, re-creating the exact
+    // silent loss the fallback exists to close, and lying about it in the same breath.
+    useDictationStore.setState({ phase: "active", enabled: true, status: "idle", insertTarget: null });
+    routeToTerminal.mockClear();
+    routeToTerminal.mockResolvedValueOnce({
+      kind: "refused",
+      agentId: "a1",
+      reason: "awaiting-input",
+    });
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const ctrl = await createDictationController({
+      onSegment: phaseMachine(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "yes please");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(info).toHaveBeenCalledWith(
+      expect.stringContaining("no composer was mounted"),
+      expect.anything(),
+    );
+    info.mockRestore();
+    ctrl.cleanup();
+  });
+
+  it("THE WAKE GATE: an armed but un-woken mic types nothing into the terminal", async () => {
+    // Typing into a live agent is sharper than filling a compose box the user can read before
+    // sending, so it requires that dictation was actually woken — not merely left armed near an
+    // open terminal. Neither destination may receive the phrase in this state.
+    useDictationStore.setState({ phase: "passive", enabled: true, status: "idle" });
+    const onSegment = vi.fn();
+    routeToTerminal.mockClear();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "rm -rf node_modules");
+    expect(routeToTerminal).not.toHaveBeenCalled();
+    expect(onSegment).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  // ══ THE PHASE EDGE MUST NOT TOUCH THE STREAM (roborev 56061) ═══════════════════════════════
+  // Reconciling the status through the whole focus handler also re-entered the resume path, and the
+  // wake transition is the exact moment that guard starts passing: `setPhase("active")` fired a
+  // resume synchronously, then `onSegment` opened the relay again — two handshakes in one tick, and
+  // the relay debits a first minute UP FRONT, so the user paid twice for one wake word.
+  it("opens the billable relay ONCE on a wake, not twice", async () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      focusOwner: "other",
+    });
+    // `onResumeActive` IS the relay-open callback (the hook wires it to openCloudDictationWindow),
+    // so it is the observable this layer actually owns. Asserting on `start_cloud_stream` here would
+    // be vacuous: the controller never invokes it — the hook does.
+    const onResumeActive = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      onResumeActive,
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    // Arm the latch the app-level blur handler sets unconditionally — the ordinary state after any
+    // tab-away while the mic is armed-but-passive, which is what made the resume guard start passing.
+    emit("dictation://focus", false);
+    onResumeActive.mockClear();
+    // The wake transition itself. `onSegment` (in the hook) opens the relay for this transition; if
+    // the phase edge ALSO resumes, that is the second open and the second first-minute debit.
+    useDictationStore.getState().setPhase("active");
+    expect(onResumeActive).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  // ══ A BACKGROUND WINDOW MUST NOT TEAR DOWN THE FOCUSED WINDOW'S RELAY ══════════════════════
+  // `phase` is persisted and CROSS-WINDOW SYNCED, so a wake in one window rehydrates every other
+  // window's store and fires the phase edge there too. Routed through the full focus handler, a
+  // background window whose caret sits in a terminal fell into the pause branch and called
+  // `stop_cloud_stream` — one global backend resource — killing the relay the FOCUSED window had
+  // just opened, and dictation silently fell back to on-device (roborev 56061).
+  //
+  // I deleted this case once, on the reasoning that the `isWindowActive()` guard I had added was
+  // unfalsifiable. That conflated the GUARD with the BEHAVIOUR: the guard is indeed unfalsifiable
+  // once the stream calls leave this path, but the behaviour is not — this fails under the pre-fix
+  // code, where `tearDownOwnedStream` does not early-return because the synced phase is already
+  // "active" (roborev 56064).
+  it("does not tear down the relay from a window that is not focused", async () => {
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      focusOwner: "terminal",
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false, // this window is in the background
+      focusOwner: () => "terminal",
+    });
+    invoke.mockClear();
+    useDictationStore.getState().setPhase("active"); // the OTHER window's wake, synced into here
+    expect(invoke).not.toHaveBeenCalledWith("stop_cloud_stream");
+    ctrl.cleanup();
+  });
+
+  it("moving the caret into a terminal while dictation is FAULTED still tears the relay down", async () => {
     const ctrl = await createDictationController({
       onSegment: vi.fn(),
       isWindowActive: () => true,
@@ -1116,12 +1367,18 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
     });
     // `phase: "active"` so `tearDownOwnedStream` does NOT early-return — this case owns the
     // active-phase side of the terminal branch, and the relay teardown is the part only it can see.
+    // `status: "error"` is what makes this terminal a NON-destination while phase stays "active" —
+    // and phase must stay "active" or `tearDownOwnedStream` early-returns and the relay assertion
+    // below becomes unreachable. A faulted mic cannot type anywhere, so the old pause still applies.
     useDictationStore.setState({
       interim: "half a sentence",
       level: 0.8,
       speaking: true,
       onDeviceSpeech: true,
       phase: "active",
+      status: "error",
+      enabled: true,
+      focusOwner: "other", // see the sibling test: the subscription needs a real transition
     });
     invoke.mockClear();
     // The app-root tracker writes this; the controller subscribes to it.
@@ -1140,9 +1397,9 @@ describe("dictation follows focus — the caret in a TERMINAL pauses routing", (
     expect(s.interim).toBe("");
     expect(s.level).toBe(0);
     expect(s.speaking).toBe(false);
-    // Status → idle is what both mic surfaces read as "focus paused", so the ring and the composer
-    // stop claiming to listen at the same instant the gate stops routing.
-    expect(s.status).toBe("idle");
+    // The fault is NOT painted over: "idle" would drop the cause, and the error surface is the one
+    // presentation that states it.
+    expect(s.status).toBe("error");
     // NEITHER of these may move: the mic stays armed, and an active "Hey Sparkle" session must
     // survive clicking into a terminal and back without re-saying the wake word.
     expect(s.enabled).toBe(true);

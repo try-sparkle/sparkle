@@ -34,7 +34,16 @@ const { keyHandler, dataHandler, writes } = vi.hoisted(() => ({
 vi.mock("@xterm/xterm", () => {
   class Terminal {
     options: Record<string, unknown> = {};
-    buffer = { active: { type: "normal" } };
+    // Readable, not just shaped: `snapshotScreen` walks `length`/`getLine`, and a throwing provider
+    // is swallowed as `null` by `getAgentViewport` — which would make "the viewport is registered"
+    // unfalsifiable, passing identically whether the registration exists or not.
+    buffer = {
+      active: {
+        type: "normal",
+        length: 1,
+        getLine: (_i: number) => ({ translateToString: (_t?: boolean) => "$ " }),
+      },
+    };
     modes = { applicationCursorKeysMode: false };
     cols = 80;
     rows = 24;
@@ -113,7 +122,8 @@ vi.mock("../engine/statusEngine", () => ({
 vi.mock("../theme/theme", () => ({ useResolvedTheme: () => "dark" }));
 
 import { Terminal } from "./Terminal";
-import { TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
+import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
+import { getAgentViewport } from "../services/terminalViewport";
 import { SHORTCUT_DEFAULTS } from "../stores/keybindingsStore";
 import { resetCable, useCableStore } from "../stores/cableStore";
 import { resetTerminalFocusIntent } from "../services/terminalFocusIntent";
@@ -179,6 +189,33 @@ describe("the terminal surface marker", () => {
     expect((container.firstElementChild as HTMLElement).hasAttribute(TERMINAL_SURFACE_ATTR)).toBe(
       false,
     );
+  });
+
+  // ══ THE TERMINAL→REGISTRY EDGE (roborev 56022) ═════════════════════════════════════════════
+  // The dictation tests hand-register a viewport provider and hand-build the DOM, so they prove the
+  // SINK reads the registry — not that the real component ever fills it. Both wires below could be
+  // deleted from Terminal.tsx with every other test still green, while at runtime every dictated
+  // phrase refuses `no-terminal` / `no-viewport` with no symptom but "it doesn't work".
+  it("carries the agent id on the same element as the surface marker", async () => {
+    const { container } = render(<Terminal {...baseProps} />);
+    await waitFor(() => expect(keyHandler.fn).not.toBeNull());
+    const surface = container.querySelector(`[${TERMINAL_SURFACE_ATTR}]`);
+    // The SAME element, deliberately: `focusedTerminalAgentId` does one `closest` from the caret,
+    // so an id parked on a different node resolves null for every real focus.
+    expect(surface!.getAttribute(TERMINAL_AGENT_ATTR)).toBe(baseProps.agentId);
+  });
+
+  it("registers a readable viewport while mounted, and unregisters it on unmount", async () => {
+    const { unmount } = render(<Terminal {...baseProps} />);
+    await waitFor(() => expect(keyHandler.fn).not.toBeNull());
+    const view = getAgentViewport(baseProps.agentId);
+    expect(view).not.toBeNull();
+    expect(view!.alternateBuffer).toBe(false);
+    expect(view!.text).toContain("$");
+    // Unregistering matters as much as registering: a stale provider closed over a DISPOSED
+    // terminal is how a write gate starts reading a screen that no longer exists.
+    unmount();
+    expect(getAgentViewport(baseProps.agentId)).toBeNull();
   });
 });
 

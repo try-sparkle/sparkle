@@ -10,10 +10,12 @@ import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDict
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError } from "./voice/dictationCopy";
+import { routeDictationToTerminal } from "./services/dictationTerminalSink";
 import {
   armedStatus,
   dictationPauseReason,
   focusOwnerNow as readFocusOwnerFromDom,
+  terminalRoutingArmed as terminalRoutingArmedFor,
   type FocusOwner,
   type PauseReason,
 } from "./voice/dictationFocus";
@@ -39,7 +41,16 @@ export function cloudStreamCommandFor(
 // ---------------------------------------------------------------------------
 
 interface DictationOptions {
-  onSegment: (text: string) => void;
+  /**
+   * Hand a COMMITTED segment to the phase (wake/stop) machine.
+   *
+   * `ctx.terminal` says where the surviving text is bound. For the composer the callee inserts it
+   * and returns nothing; for a terminal it returns the text to type, or null/undefined when the
+   * phrase was consumed entirely by a wake/stop word. Routing the destination through the ONE
+   * machine — rather than short-circuiting past it — is what keeps the stop word working when the
+   * caret is in a terminal (roborev 56038).
+   */
+  onSegment: (text: string, ctx: { terminal: boolean }) => string | null | void;
   /** Called on focus REGAIN when a dictation session is still ACTIVE (phase === "active"), so the
    *  cloud stream resumes without the user re-saying the wake word. Optional (tests may omit it). */
   onResumeActive?: () => void;
@@ -108,13 +119,54 @@ export async function createDictationController(
   // webviews consumes the app-wide broadcast), while dictationPauseReason answers the user-facing
   // "is dictation paused, and why". They coincide on the window axis but are not the same question,
   // and only the first is meaningful while the mic is disarmed.
+  // --- THE SECOND DESTINATION -------------------------------------------------------------------
+  // A terminal used to be a place dictation STOPPED. It is now a place dictation GOES: a committed
+  // phrase is typed at the focused agent's own input line (services/dictationTerminalSink).
+  //
+  // THE WAKE GATE IS PART OF THIS, DELIBERATELY. Typing into a live agent is a much sharper action
+  // than filling a compose box the user can read and edit before sending, so it requires that
+  // dictation was actually WOKEN (`phase === "active"`), not merely left armed. An armed-but-passive
+  // mic near an open terminal must stay inert.
+  const terminalRoutingArmed = (): boolean => {
+    const s = useDictationStore.getState();
+    return terminalRoutingArmedFor({
+      enabled: s.enabled,
+      errored: s.status === "error",
+      woken: s.phase === "active",
+    });
+  };
+
   const focusPauseReason = (): PauseReason | null =>
     dictationPauseReason({
       windowFocused: isWindowActive(),
       focusOwner: focusOwnerNow(),
       enabled: useDictationStore.getState().enabled,
+      terminalRoutes: terminalRoutingArmed(),
     });
-  const isRoutable = () => isWindowActive() && focusPauseReason() === null;
+  // MAY A PHRASE GO TO THE COMPOSER? The original ONE GATE, with the terminal now excluded
+  // EXPLICITLY rather than by way of `dictationPauseReason`. That function no longer calls a
+  // routable terminal a pause (it isn't one — see `terminalRoutes`), so without this term the same
+  // committed phrase would land in the composer AND be typed into the terminal. The two
+  // destinations must stay mutually exclusive, and this is where that is enforced.
+  //
+  // `!isTerminalRoutable()`, NOT a blanket `focusOwnerNow() !== "terminal"`. The blanket form also
+  // silences a DISARMED mic whose caret happens to sit in a terminal — a case that never routed to a
+  // terminal and always routed to the composer, because a muted mic is OFF rather than paused
+  // (dictationPauseReason returns null on `!enabled`). Excluding exactly the state where the
+  // terminal is taking the phrase is what keeps this a widening, not a silent narrowing elsewhere.
+  const isRoutable = () =>
+    isWindowActive() && focusPauseReason() === null && !isTerminalRoutable();
+  /** MAY A PHRASE BE TYPED INTO THE FOCUSED TERMINAL? Requires the caret AND the wake gate. */
+  const isTerminalRoutable = () =>
+    isWindowActive() && focusOwnerNow() === "terminal" && terminalRoutingArmed();
+  /** Is the mic feeding EITHER destination? The relay's lifetime and the live meters key on this —
+   *  they care that capture is being consumed, not which box consumes it. */
+  const isCapturable = () => isRoutable() || isTerminalRoutable();
+  /** Is the caret in a terminal that CANNOT take the phrase? The status-claiming paths below used to
+   *  ask `focusOwnerNow() !== "terminal"` for this, which was the same question only while a terminal
+   *  was always a dead end. Now that it can receive, the honest term is "a terminal, and no route
+   *  out of it" — otherwise the UI would go quiet while it is actively typing. */
+  const terminalIsPaused = () => focusOwnerNow() === "terminal" && !terminalRoutingArmed();
 
   const { setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
@@ -165,10 +217,12 @@ export async function createDictationController(
     const now = Date.now();
     if (now - lastResumeAt < 300) return;
     const store = useDictationStore.getState();
-    // `isRoutable()`, not a bare `isWindowActive()`: a window that is focused but whose caret sits
-    // in a terminal is NOT somewhere the relay may resume into. Same predicate as the listeners, so
-    // the relay can never be open in a state where the events it produces would be dropped.
-    if (!isRoutable() || !store.enabled || store.status === "error" || store.phase !== "active") {
+    // `isCapturable()`, not a bare `isWindowActive()`: a window that is focused but has NO
+    // destination for the words is not somewhere the relay may resume into. Same predicate as the
+    // listeners, so the relay can never be open in a state where the events it produces are dropped.
+    // A terminal caret now qualifies — that is the whole feature — so this had to widen with it, or
+    // the stream would stay torn down and there would be nothing to type.
+    if (!isCapturable() || !store.enabled || store.status === "error" || store.phase !== "active") {
       return;
     }
     lastResumeAt = now;
@@ -191,13 +245,25 @@ export async function createDictationController(
   // What it does NOT touch, exactly as the window path doesn't: `enabled` (the mic stays armed —
   // this is a gate on top of the mute toggle, not the toggle) and `phase` (an ACTIVE "Hey Sparkle"
   // session must survive clicking into a terminal and back without re-saying the wake word).
-  const notifyFocusOwner = (owner: FocusOwner) => {
+  /**
+   * Bring `status` (and the live-UI fields that go with it) into line with the caret — and NOTHING
+   * else. Split out of {@link notifyFocusOwner} because a PHASE edge needs exactly this and must not
+   * touch the stream (roborev 56061): reconciling through the whole handler also re-entered
+   * `maybeResumeOwnedStream`, and the wake transition is the precise moment that guard starts
+   * passing, so `setPhase("active")` fired a resume synchronously and then `onSegment` opened the
+   * relay again — two `start_cloud_stream` invokes in one tick, two relay handshakes, and two
+   * first-minute debits for one wake word.
+   *
+   * A focus change still goes through `notifyFocusOwner`, which owns the stream decisions, because
+   * "the caret left" genuinely is a reason to close or resume one. "The phase flipped" is not.
+   */
+  const reconcileStatusForOwner = (owner: FocusOwner) => {
     const store = useDictationStore.getState();
+    if (owner === "terminal" && isTerminalRoutable()) {
+      if (store.status !== "error") store.setStatus("listening");
+      return;
+    }
     if (owner === "terminal") {
-      // Close the BILLABLE relay first (no-op unless this window owns one), then flatten the live
-      // UI. Status → idle is what both mic surfaces read as "focus paused", so the ring and the
-      // composer stop claiming to listen at the same instant the gate stops routing.
-      tearDownOwnedStream();
       store.setInterim("");
       store.setLevel(0);
       store.setSpeaking(false);
@@ -205,13 +271,44 @@ export async function createDictationController(
       if (store.status !== "error") store.setStatus("idle");
       return;
     }
-    // Left the terminal. Resume through the SAME guard a window refocus uses (streamTornDown +
-    // maybeResumeOwnedStream) rather than a second resume path, so the two can't drift: only a
-    // window that actually tore a stream down reopens one, and only once.
-    if (store.enabled && store.status !== "error" && isRoutable()) {
-      store.setStatus("listening");
-      maybeResumeOwnedStream();
+    if (store.enabled && store.status !== "error" && isRoutable()) store.setStatus("listening");
+  };
+
+  /**
+   * A focus change: the status decision PLUS the stream lifetime that only a focus change implies.
+   *
+   * DELEGATES the status half rather than restating it (roborev 56064). The two were written out
+   * twice, verbatim — same three-way owner test, same `status !== "error"` guards, same four
+   * flattened fields — with nothing enforcing agreement, which is how the next pause term or extra
+   * field lands in one copy and silently diverges the other. That is precisely the "gate and copy
+   * disagree" class this file's design exists to prevent, so it must not be reintroduced inside the
+   * fix for it. The split was needed; the duplication was not.
+   *
+   * State is identical to the old inline version: `tearDownOwnedStream` writes the same four fields
+   * to the same values and never touches `status`, and `maybeResumeOwnedStream` is internally
+   * guarded (`streamTornDown` + `isCapturable()` + enabled/error/phase), which subsumes the
+   * condition that used to wrap it.
+   */
+  const notifyFocusOwner = (owner: FocusOwner) => {
+    // ROUTING, NOT PAUSING. When the phrase can be typed into this terminal, entering it is not a
+    // handoff away from dictation at all — tearing the relay down here is precisely what would make
+    // the feature impossible, since there would be no transcription left to route.
+    if (owner === "terminal" && isTerminalRoutable()) {
+      reconcileStatusForOwner(owner);
+      return;
     }
+    if (owner === "terminal") {
+      // Close the BILLABLE relay (no-op unless this window owns one), then let the shared
+      // reconciliation flatten the live UI and say why.
+      tearDownOwnedStream();
+      reconcileStatusForOwner(owner);
+      return;
+    }
+    // Left the terminal. Resume through the SAME guard a window refocus uses, rather than a second
+    // resume path, so the two can't drift: only a window that actually tore a stream down reopens
+    // one, and only once.
+    reconcileStatusForOwner(owner);
+    maybeResumeOwnedStream();
   };
 
   // Register event listeners — each `listen()` returns an unsubscribe fn.
@@ -222,13 +319,62 @@ export async function createDictationController(
       // same phrase types into every open window's composer — and so does a window whose caret sits
       // in a terminal, where the composer the text would land in isn't the thing the user is typing
       // into at all.
+      // ══ THE TERMINAL DESTINATION ═══════════════════════════════════════════════════════════
+      // Checked BEFORE the composer gate and returning unconditionally, so exactly one destination
+      // ever sees a given phrase. Only COMMITTED text reaches here (`dictation://partial` is the
+      // committed-segment event; the live preview is `dictation://interim`), which is the contract
+      // the sink depends on — streaming a phrase the recognizer is still revising into a live PTY
+      // would type, and partly execute, words the speaker never finished saying.
+      if (isTerminalRoutable()) {
+        useDictationStore.getState().setModelProgress(null);
+        useDictationStore.getState().setInterim("");
+        // ══ THE WAKE/STOP MACHINE RUNS FIRST, ON THIS PATH TOO ═══════════════════════════════
+        // `onSegment` is the ONLY driver of the phase machine. An earlier version returned before
+        // calling it, which meant that with the caret in a terminal the STOP WORD was typed onto the
+        // agent's command line instead of ending the session — while the composer placeholder was
+        // simultaneously instructing the user to say it ("Say <stop word> to finish"), and `phase`
+        // could never return to passive, so the billable relay had no voice way to close (roborev
+        // 56038). Passing `{ terminal: true }` keeps ONE machine and lets the hook hand back only the
+        // text that survived the wake/stop stripping — null when the phrase was purely a stop word.
+        const toType = onSegment(e.payload, { terminal: true });
+        if (!toType) return;
+        // Fire-and-forget: the write is chained per-agent inside the sink, so ordering is preserved
+        // without this listener awaiting anything. The outcome is logged WITHOUT the transcript —
+        // dictation captures whatever was said near the mic, which is not all of it meant for a log.
+        void routeDictationToTerminal(toType).then((out) => {
+          if (out.kind === "delivered") return;
+          // ══ A REFUSAL PUTS THE WORDS IN THE COMPOSER, IT DOES NOT DROP THEM ═════════════════
+          // The refusing states (a live picker, a password prompt, an unreadable screen) are the
+          // LIKELY ones, and the user is watching a live meter and a placeholder that says "I'm
+          // listening". A phrase that simply vanishes there is indistinguishable from dictation
+          // being broken. The composer is the safe destination: it is a text box the user can read
+          // and edit, so nothing is executed and nothing is lost.
+          // `insertTarget` is ONE app-wide slot, registered by whichever compose box mounted last,
+          // and `insert` is a silent no-op when it is null (roborev 56057). Claiming "left in the
+          // composer" without checking would re-create the exact silent drop the fallback exists to
+          // close, and would say so in the log while it happened.
+          const placed = useDictationStore.getState().insertTarget !== null;
+          if (placed) useDictationStore.getState().insert(toType);
+          console.info(
+            placed
+              ? "[dictation] terminal declined; text left in the composer"
+              : "[dictation] terminal declined and no composer was mounted to catch it",
+            {
+              outcome: out.kind,
+              reason: out.kind === "refused" ? out.reason : undefined,
+              chars: toType.length,
+            },
+          );
+        });
+        return;
+      }
       if (!isRoutable()) return;
       // Capture started — clear any lingering model-download progress.
       useDictationStore.getState().setModelProgress(null);
       // A committed (final) segment supersedes the live preview — clear it so the interim text
       // doesn't briefly double up with the text that's about to land in the box.
       useDictationStore.getState().setInterim("");
-      onSegment(e.payload);
+      onSegment(e.payload, { terminal: false });
     }),
 
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
@@ -283,7 +429,9 @@ export async function createDictationController(
       // THE ONE GATE: broadcast to EVERY window, but only one dictation may route into drives the
       // waveform — without it a background window animates its meter off another window's capture
       // (sparkle-ozvr), and a terminal-paused one animates a meter for speech it is discarding.
-      if (!isRoutable()) return;
+      // `isCapturable`: a phrase on its way into a TERMINAL is still being consumed by this window,
+      // so a flat meter over that live capture would be the same half-state in the other direction.
+      if (!isCapturable()) return;
       // Capture started — clear any lingering model-download progress. This fires ~25×/sec, so
       // only write when there's actually progress to clear; an unconditional set(null) would churn
       // the store (and every subscriber) 25 times a second for a no-op.
@@ -300,7 +448,9 @@ export async function createDictationController(
     listen<boolean>("dictation://speaking", (e) => {
       // Same ONE GATE as the level meter: only a window dictation may route into animates its
       // waveform, so it never wiggles off voice activity it is not consuming (sparkle-ozvr).
-      if (!isRoutable()) return;
+      // `isCapturable`: speech routed into a TERMINAL is still being consumed by this window, and a
+      // flat meter over a live capture is the same half-state in the other direction.
+      if (!isCapturable()) return;
       setSpeaking(e.payload);
     }),
 
@@ -405,7 +555,7 @@ export async function createDictationController(
         useDictationStore.getState().error === null &&
         store.enabled &&
         isWindowActive() &&
-        focusOwnerNow() !== "terminal"
+        !terminalIsPaused()
       ) {
         store.setStatus("listening");
       }
@@ -432,8 +582,8 @@ export async function createDictationController(
         store.setSpeaking(false);
         store.setOnDeviceSpeech(false);
         if (store.status !== "error") store.setStatus("idle");
-      } else if (store.enabled && store.status !== "error" && focusOwnerNow() !== "terminal") {
-        // `focusOwnerNow() !== "terminal"`, not the full `isRoutable()`: this event IS the app
+      } else if (store.enabled && store.status !== "error" && !terminalIsPaused()) {
+        // `terminalIsPaused()`, not the full `isRoutable()`: this event IS the app
         // telling us focus returned, and `document.hasFocus()` can still be false for a beat when
         // it arrives — gating on the window term would drop the very signal it is reporting. The
         // terminal term has no such race (the caret is wherever it is), and without it, returning
@@ -474,8 +624,49 @@ export async function createDictationController(
   // "the caret moved" into "tear the relay down". Only real CHANGES act; the store setter already
   // suppresses no-op writes, and this second guard makes the handler idempotent against any other
   // store update.
+  //
+  // ══ PHASE IS AN INPUT TO THE STATUS, SO IT MUST WAKE THIS TOO (roborev 56057/56056) ═══════════
+  // Making a terminal a destination made `status` a function of `phase`, via the wake gate inside
+  // `terminalRoutingArmed`. But the only two writers of `status` were the arm effect (deps
+  // `[enabled]`) and this subscriber (focus only) — so a PHASE change with the caret sitting still
+  // left the copy pinned to whatever the last arm or focus event claimed, and it lied in BOTH
+  // directions:
+  //   passive → active (the mic pill's `setActive()`, which does not touch `enabled` when the mic
+  //     was already armed): the sink starts typing into the PTY while every surface still paints
+  //     "Listening paused: Your cursor is in a terminal".
+  //   active → passive (the stop word, on the path this branch added): the gates both shut, but
+  //     `status` stays "listening", so the surfaces paint "Mic paused. Say Hey Sparkle to activate"
+  //     over a pipeline that discards every word — including that wake word.
+  //
+  // THE TWO EDGES CARRY DIFFERENT AUTHORITY, and an earlier version of this fix got that wrong by
+  // routing both through `notifyFocusOwner` (roborev 56061). A FOCUS change owns stream lifetime —
+  // "the caret left" really is a reason to close or resume a relay — so it goes through the full
+  // handler. A PHASE change owns nothing but the status, and re-entering the handler for it opened
+  // the billable relay a second time on every wake word. They share ONE status decision
+  // (`reconcileStatusForOwner`) and differ only in the stream calls layered on top.
   const unsubscribeFocusOwner = useDictationStore.subscribe((s, prev) => {
-    if (s.focusOwner !== prev.focusOwner) notifyFocusOwner(s.focusOwner);
+    if (s.focusOwner !== prev.focusOwner) {
+      // A focus CHANGE: the store field IS the event, so it is the honest input here.
+      notifyFocusOwner(s.focusOwner);
+    } else if (s.phase !== prev.phase) {
+      // A PHASE change with the caret sitting still. STATUS ONLY, never the stream — see
+      // reconcileStatusForOwner. Routing this through the full handler double-opened the billable
+      // relay on every wake word, and let a background window (phase is a CROSS-WINDOW SYNCED slice)
+      // call `stop_cloud_stream` on the single global relay the FOCUSED window had just opened
+      // (roborev 56061). Both were the same root cause: reusing a handler that owns stream lifetime
+      // for an edge that has no business touching it.
+      //
+      // NO `isWindowActive()` TERM HERE, deliberately. The obvious extra guard — "only reconcile in
+      // the focused window" — is unfalsifiable once the stream calls are gone: what remains writes
+      // this window's OWN status, and a background window whose caret is in a terminal is already
+      // described by the `window` pause term, which outranks `terminal`. A guard whose removal no
+      // test can detect is the thing this branch keeps getting caught adding (roborev 55812).
+      //
+      // The caret is read LIVE rather than from the store's `focusOwner` mirror: that mirror is
+      // written only by the app-root focus tracker, so it can lag, and reconciling a stale value
+      // leaves the status exactly as wrong as no reconciliation at all.
+      reconcileStatusForOwner(focusOwnerNow());
+    }
   });
 
   const cleanup = () => {
@@ -510,7 +701,7 @@ export async function createDictationController(
       state.setError(null);
       // Not a bare "listening": see armedStatus. Arming with the caret already in a terminal must
       // read as paused-with-a-reason, not as an invitation to talk into a gate that drops everything.
-      state.setStatus(armedStatus(focusOwnerNow()));
+      state.setStatus(armedStatus(focusOwnerNow(), terminalRoutingArmed()));
       try {
         // The cloud-dictation preference is read LIVE at the wake→active transition (start_cloud_stream),
         // not frozen here, so toggling the menu mid-session takes effect without restarting.
@@ -580,7 +771,7 @@ export function useAmbientVoice(): void {
 
   // Stable segment handler: runs the phase machine against the live store phase.
   const lastTransitionAt = useRef(0);
-  const onSegment = useRef((seg: string) => {
+  const onSegment = useRef((seg: string, ctx: { terminal: boolean } = { terminal: false }) => {
     const store = useDictationStore.getState();
     // Read the configured words fresh each segment so a remap in Settings takes effect live.
     const { wakeWord, stopWord } = useSettingsStore.getState();
@@ -604,7 +795,14 @@ export function useAmbientVoice(): void {
       }
       if (r.phase === "passive") store.setInterim("");
     }
+    // ONE MACHINE, TWO DESTINATIONS. Everything above — the cooldown, the phase transition, the
+    // cloud-stream start/stop — is destination-independent and must stay that way: the stop word has
+    // to end the session whether the user is looking at the composer or at a terminal. Only the
+    // delivery of the SURVIVING text differs, and a terminal-bound segment is handed back for the
+    // caller to type (it owns the danger guards), rather than inserted here.
+    if (ctx.terminal) return r.insert ?? null;
     if (r.insert) store.insert(r.insert);
+    return null;
   });
 
   // Register the dictation event listeners once.
@@ -654,7 +852,20 @@ export function useAmbientVoice(): void {
       //
       // Through the shared `focusOwnerNow` seam, not an inline re-read: that duplication is what left
       // this path — the one that actually runs — without anything a test could reach.
-      store.setStatus(armedStatus(readFocusOwnerFromDom()));
+      // …and never about whether that terminal can RECEIVE the phrase. Passing the same term the
+      // routing gate uses is what stops this path claiming "paused" over a sink that is typing —
+      // arming from the mic pill sets `enabled` AND `phase: "active"` at once, so this is reachable
+      // with no focus change to correct it afterwards (roborev 56038).
+      store.setStatus(
+        armedStatus(
+          readFocusOwnerFromDom(),
+          terminalRoutingArmedFor({
+            enabled: store.enabled,
+            errored: store.status === "error",
+            woken: store.phase === "active",
+          }),
+        ),
+      );
       // Wait until the dictation listeners are attached before starting capture,
       // so the first VAD segment after launch isn't dropped.
       (controllerPromiseRef.current ?? Promise.resolve(null))

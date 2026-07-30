@@ -7,6 +7,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import {
   classifyFocusOwner,
   dictationPauseReason,
+  focusedTerminalAgentId,
+  TERMINAL_AGENT_ATTR,
   TERMINAL_SURFACE_ATTR,
   type FocusOwner,
   type PauseReason,
@@ -139,5 +141,54 @@ describe("dictationPauseReason — the single precedence decision", () => {
         }
       }
     }
+  });
+});
+
+describe("focusedTerminalAgentId", () => {
+  // The resolver that aims a dictated phrase. Its failure mode is SILENT: returning null makes every
+  // send refuse with "no terminal", which looks identical to dictation simply not working — so the
+  // hidden-textarea case below is the one that has to be pinned, not the easy one.
+  it("resolves through xterm's hidden helper textarea, which is what actually holds the caret", () => {
+    const el = mount(
+      `<div ${TERMINAL_SURFACE_ATTR}="" ${TERMINAL_AGENT_ATTR}="agent-7">
+         <div class="xterm"><textarea class="xterm-helper-textarea"></textarea></div>
+       </div>`,
+      "textarea",
+    ) as HTMLTextAreaElement;
+    el.focus();
+    // Guard the fixture itself: if focus() didn't take, a null result below would prove nothing.
+    expect(document.activeElement).toBe(el);
+    expect(focusedTerminalAgentId()).toBe("agent-7");
+  });
+
+  it("picks the terminal the caret is IN when two agents' panes are both mounted", () => {
+    // Every agent pane stays mounted and stacked, so "some terminal exists" is always true. The
+    // answer must come from the caret, not from whichever pane the query happens to hit first.
+    const host = document.createElement("div");
+    host.innerHTML =
+      `<div ${TERMINAL_SURFACE_ATTR}="" ${TERMINAL_AGENT_ATTR}="agent-a"><textarea id="a"></textarea></div>` +
+      `<div ${TERMINAL_SURFACE_ATTR}="" ${TERMINAL_AGENT_ATTR}="agent-b"><textarea id="b"></textarea></div>`;
+    document.body.appendChild(host);
+    (host.querySelector("#b") as HTMLTextAreaElement).focus();
+    expect(focusedTerminalAgentId()).toBe("agent-b");
+  });
+
+  it("is null when the caret is outside any terminal — never a default agent", () => {
+    const el = mount(
+      `<div ${TERMINAL_SURFACE_ATTR}="" ${TERMINAL_AGENT_ATTR}="agent-7"></div><input id="composer" />`,
+      "#composer",
+    ) as HTMLInputElement;
+    el.focus();
+    expect(focusedTerminalAgentId()).toBeNull();
+  });
+
+  it("is null for a terminal surface carrying no agent id, rather than an empty-string id", () => {
+    // An empty id would be passed straight to pasteIntoPty as an agent name.
+    const el = mount(
+      `<div ${TERMINAL_SURFACE_ATTR}="" ${TERMINAL_AGENT_ATTR}=""><textarea></textarea></div>`,
+      "textarea",
+    ) as HTMLTextAreaElement;
+    el.focus();
+    expect(focusedTerminalAgentId()).toBeNull();
   });
 });

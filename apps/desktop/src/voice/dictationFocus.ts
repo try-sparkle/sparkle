@@ -59,6 +59,70 @@ export function classifyFocusOwner(el: Element | null | undefined): FocusOwner {
   }
 }
 
+/** WHICH agent's terminal holds the caret — set beside {@link TERMINAL_SURFACE_ATTR} on the same
+ *  element, so one `closest` finds both. Separate from the surface marker because the surface marker
+ *  is a boolean the focus classifier tests for presence, and a value that is sometimes absent would
+ *  make `[data-terminal-surface]` stop matching a terminal whose id hasn't resolved yet. */
+export const TERMINAL_AGENT_ATTR = "data-terminal-agent-id";
+
+/**
+ * The agent whose terminal owns the caret, or null when none does.
+ *
+ * ══ WHY THE DOM, AND NOT THE CABLE ══════════════════════════════════════════════════════════════
+ * The cockpit's cable already names an agent, and reusing it would avoid a second source of truth —
+ * but it answers "what is the concierge MOUNTED to", which is only the same agent once clicking a
+ * terminal auto-mounts. It does not today. Routing dictated speech by the cable in the meantime
+ * would type into whichever agent the concierge was last aimed at, which can be a different pane
+ * from the one the user is looking at and typing in. The caret is the honest answer to "where is the
+ * user working", and it is the question this routes on.
+ *
+ * NULL IS "NO TERMINAL", never a default agent. An unresolvable caret must refuse, because the cost
+ * of guessing is a phrase typed into someone else's session.
+ */
+export function focusedTerminalAgentId(): string | null {
+  if (typeof document === "undefined") return null;
+  const el = document.activeElement;
+  if (!el || typeof el.closest !== "function") return null;
+  try {
+    // Scoped to the ATTRIBUTE, not to TERMINAL_SELECTOR: matching the wider selector and then
+    // reading the id off it would resolve null for xterm's helper textarea (which carries the caret
+    // but not our attribute) and quietly refuse every real dictation. `closest` walks ancestors, so
+    // the textarea finds the host div that does carry it.
+    const host = el.closest(`[${TERMINAL_AGENT_ATTR}]`);
+    return host?.getAttribute(TERMINAL_AGENT_ATTR) || null;
+  } catch {
+    return null;
+  }
+}
+
+export interface TerminalRoutingInput {
+  /** The mic's own on/off, as the user set it. */
+  enabled: boolean;
+  /** Is dictation in a fault state? A faulted mic types nowhere. */
+  errored: boolean;
+  /** THE WAKE GATE — has dictation been woken (`phase === "active"`), not merely armed? */
+  woken: boolean;
+}
+
+/**
+ * Can a committed phrase be typed into a focused terminal right now — the mic-state half of the
+ * question, with the caret half left to the caller.
+ *
+ * ══ WHY THIS IS A SHARED FUNCTION AND NOT AN INLINE `&&` ════════════════════════════════════════
+ * It had been inline in the controller only, so the PRODUCTION ARM PATH (the `enabled` effect —
+ * `toggle` has no caller in the app) never learned the term. The result was the precise contradiction
+ * this feature exists to delete, one layer over: arming from the mic pill with the caret already in a
+ * terminal wrote `status: "idle"`, so every surface rendered *"Listening paused: Your cursor is in a
+ * terminal"* while the sink was busy typing into that same terminal, and nothing corrected it because
+ * `notifyFocusOwner` fires only on a focus CHANGE and the caret never moved (roborev 56038).
+ *
+ * Anything that decides whether a terminal is a destination — the routing gate, the arm status, the
+ * paused COPY — calls this, so they cannot disagree.
+ */
+export function terminalRoutingArmed(i: TerminalRoutingInput): boolean {
+  return i.enabled && !i.errored && i.woken;
+}
+
 export interface DictationPauseInput {
   /** Is THIS window the active OS window? */
   windowFocused: boolean;
@@ -66,6 +130,18 @@ export interface DictationPauseInput {
   focusOwner: FocusOwner;
   /** Is the mic armed at all? A disarmed mic has no dictation to pause. */
   enabled: boolean;
+  /**
+   * Can a committed phrase actually be TYPED into the focused terminal right now?
+   *
+   * This is what turns a terminal from a PAUSE into a DESTINATION. The header above describes the
+   * terminal as "another keyboard owner" that dictation must yield to — true while there was nowhere
+   * for the words to go, and false once they can be typed at the agent's own input line.
+   *
+   * Defaults false so every existing caller keeps the original meaning: the caller that flips it
+   * (useDictation) is the one that also owns the delivery, so the copy can never claim to be routing
+   * into a terminal that nothing is writing to.
+   */
+  terminalRoutes?: boolean;
 }
 
 /** THE single precedence decision for "is dictation paused here, and why".
@@ -83,7 +159,10 @@ export interface DictationPauseInput {
 export function dictationPauseReason(i: DictationPauseInput): PauseReason | null {
   if (!i.enabled) return null;
   if (!i.windowFocused) return "window";
-  if (i.focusOwner === "terminal") return "terminal";
+  // A terminal that can RECEIVE the phrase is not a pause — the words have somewhere to go, so
+  // saying "dictation is paused, you're in a terminal" while typing into that very terminal would be
+  // the app narrating the opposite of what it is doing. See `terminalRoutes`.
+  if (i.focusOwner === "terminal" && !i.terminalRoutes) return "terminal";
   return null;
 }
 
@@ -139,8 +218,15 @@ export function dictationPauseReason(i: DictationPauseInput): PauseReason | null
  *  at arm time (`document.hasFocus()` can read false for a beat while the click that armed the mic
  *  is still settling), and treating that as a pause would show "you're in another window" to a user
  *  looking straight at it. The terminal term has no such race — the caret is wherever it is. */
-export function armedStatus(focusOwner: FocusOwner): "listening" | "idle" {
-  return focusOwner === "terminal" ? "idle" : "listening";
+export function armedStatus(
+  focusOwner: FocusOwner,
+  terminalRoutes = false,
+): "listening" | "idle" {
+  // Carries the same `terminalRoutes` term as dictationPauseReason, and MUST: this function exists
+  // because arming is not a focus transition, so it is the only thing that decides the status in
+  // that window. If it kept saying "idle" for a terminal that now receives phrases, arming with the
+  // caret already in one would paint "paused" over a pipeline that is actively typing.
+  return focusOwner === "terminal" && !terminalRoutes ? "idle" : "listening";
 }
 
 /** Who holds the caret RIGHT NOW, read from the live DOM, with the document-less (node/test) host

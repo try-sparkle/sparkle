@@ -28,8 +28,23 @@ vi.mock("@tauri-apps/api/event", () => ({
 const invoke = vi.fn().mockResolvedValue(undefined);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
+// The sink is the far end of the terminal path. Mocked so the REAL hook wiring in between —
+// `advance()` → the surviving text → the controller → here — is what the assertions travel through.
+const routeToTerminal = vi
+  .fn()
+  .mockResolvedValue({ kind: "delivered", agentId: "a1", text: "x" });
+vi.mock("./services/dictationTerminalSink", () => ({
+  routeDictationToTerminal: (...a: unknown[]) => routeToTerminal(...a),
+}));
+
 import { useDictationStore } from "./stores/dictationStore";
 import { useAmbientVoice } from "./useDictation";
+import { DEFAULT_STOP_WORD } from "./voice/voiceDefaults";
+
+/** Emit a real Tauri broadcast into every registered listener. */
+function emit(name: string, payload: unknown) {
+  for (const cb of listeners[name] ?? []) cb({ payload });
+}
 
 /** A real xterm helper textarea, focused — the exact shape the field focus-trace recorded while the
  *  mic was live (`activeElement=textarea .xterm-helper-textarea`). Not a stub: `classifyFocusOwner`
@@ -97,5 +112,76 @@ describe("arming the mic through the real path (setEnabled → the enabled effec
     useDictationStore.setState({ enabled: true });
     renderHook(() => useAmbientVoice());
     expect(useDictationStore.getState().status).toBe("listening");
+  });
+
+  // ══ THE TERMINAL IS A DESTINATION WHEN DICTATION IS WOKEN (roborev 56057) ═══════════════════
+  // The other half of the terminal case above, and the one that pins the `terminalRoutes` argument
+  // on THIS call site. Without it the argument is dead weight: the existing case runs with the
+  // store's default `phase: "passive"`, where the term is false either way, so deleting it left the
+  // suite green while restoring "Listening paused" over a sink busy typing.
+  it("claims LISTENING with the caret in a terminal once dictation is WOKEN", () => {
+    focusATerminal();
+    useDictationStore.setState({ enabled: true, phase: "active" });
+    renderHook(() => useAmbientVoice());
+    expect(useDictationStore.getState().status).toBe("listening");
+  });
+});
+
+// ══ THE REAL WAKE/STOP MACHINE ON THE TERMINAL PATH ═══════════════════════════════════════════
+// Every controller-level test injects a FAKE phase machine, so none of them proves that the real
+// hook returns the surviving text — mutate its `return r.insert ?? null` to `return null` and
+// terminal dictation types nothing, ever, with the whole suite green (roborev 56056). These drive
+// the genuine `advance()` through `useAmbientVoice`.
+describe("the stop word, said with the caret in a terminal", () => {
+  beforeEach(() => {
+    useDictationStore.setState({ enabled: true, phase: "active", status: "listening" });
+    routeToTerminal.mockClear();
+  });
+
+  /** Mount the hook and let the controller finish attaching. `createDictationController` awaits its
+   *  `listen()` calls before subscribing to the store, and the event mock registers callbacks
+   *  synchronously — so emitting straight after `renderHook` reaches the LISTENERS but outruns the
+   *  SUBSCRIBER, and the phase-edge reconciliation silently wouldn't be under test. */
+  async function mountVoice(): Promise<void> {
+    renderHook(() => useAmbientVoice());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it("ends the session instead of being typed at the agent", async () => {
+    focusATerminal();
+    await mountVoice();
+    act(() => {
+      emit("dictation://partial", DEFAULT_STOP_WORD);
+    });
+    // THE BUG THIS REPLACES: the stop word used to reach the sink and land on the command line,
+    // while the composer copy was telling the user to say it and `phase` could never go passive.
+    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(routeToTerminal).not.toHaveBeenCalled();
+  });
+
+  it("leaves the mic HONEST afterwards rather than claiming to listen over a shut gate", async () => {
+    // `status` is a function of `phase` now, and nothing recomputed it on a phase edge: both gates
+    // closed while the surfaces painted "Mic paused. Say Hey Sparkle to activate" over a pipeline
+    // discarding every word — including that wake word (roborev 56057/56056).
+    focusATerminal();
+    await mountVoice();
+    act(() => {
+      emit("dictation://partial", DEFAULT_STOP_WORD);
+    });
+    expect(useDictationStore.getState().status).toBe("idle");
+  });
+
+  it("still types the words that PRECEDE the stop word", async () => {
+    // The machine strips the stop word and keeps the remainder; the terminal path must deliver that
+    // remainder rather than dropping the whole utterance.
+    focusATerminal();
+    await mountVoice();
+    act(() => {
+      emit("dictation://partial", `run the tests ${DEFAULT_STOP_WORD}`);
+    });
+    expect(routeToTerminal).toHaveBeenCalledWith("run the tests");
   });
 });
