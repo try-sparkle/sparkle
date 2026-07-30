@@ -82,7 +82,8 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { FiAlertTriangle, FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
+// FiFile left with the chip row it belonged to — the shared AttachmentStrip draws the file glyph now.
+import { FiAlertTriangle, FiCamera, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
 // `C` ALONE, and the three tokens that left are the two halves of this merge, not an oversight:
 // FONT_WEIGHT / ON_GOLD_FILL went with the Send button when it moved into ./SendRail (the gold
 // rect's styling travelled verbatim, so SendRail imports them itself), and COMPOSE_SCRIM went with
@@ -114,6 +115,7 @@ import {
   type TextBlock,
 } from "../composer/attachments";
 import { nextId } from "../composer/attachmentsApi";
+import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
 import { TextPillModal } from "../composer/TextPillModal";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
@@ -1379,57 +1381,18 @@ export function ComposeBox({
           onShowAsText={() => showBlockAsText(openBlock)}
         />
       )}
-      {attachments.length > 0 && (
-        <div
-          data-testid="concierge-attachment-chips"
-          style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}
-        >
-          {attachments.map((a) => (
-            <span
-              key={a.id}
-              title={a.name}
-              style={{
-                ...attachStyle,
-                cursor: "default",
-                maxWidth: 170,
-                color: C.cream,
-                background: `color-mix(in srgb, ${C.teal} 10%, transparent)`,
-              }}
-            >
-              {a.dataUrl ? (
-                <img
-                  src={a.dataUrl}
-                  alt=""
-                  style={{ width: 16, height: 16, objectFit: "cover", borderRadius: 3 }}
-                />
-              ) : (
-                <FiFile size={12} aria-hidden />
-              )}
-              <span
-                style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
-              >
-                {a.name}
-              </span>
-              <button
-                type="button"
-                aria-label={`Remove ${a.name}`}
-                onClick={() => onRemoveAttachment?.(a.id)}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  border: "none",
-                  background: "transparent",
-                  color: C.conciergeMuted,
-                  cursor: "pointer",
-                  padding: 0,
-                }}
-              >
-                <FiX size={12} aria-hidden />
-              </button>
-            </span>
-          ))}
-        </div>
-      )}
+      {/* THE SAME STRIP THE TRANSCRIPT DRAWS, not a composer-shaped twin of it.
+          This was a hand-rolled chip row: a 16×16 image wedged beside the filename, `cursor:
+          default`, no click target and no lightbox — so the founder's screenshot was a real
+          thumbnail once SENT and a favicon-sized smudge while still a draft. Both surfaces now go
+          through composer/AttachmentStrip, which is also the only reason there is one lightbox and
+          not two. `onRemove` is what makes this copy the DRAFT one: it is still staged, so it can
+          still be taken back out. */}
+      <AttachmentStrip
+        attachments={attachments}
+        onRemove={onRemoveAttachment}
+        testId="concierge-attachment-chips"
+      />
       <div style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
         <AttachControl onAttach={onAttach} />
         {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the

@@ -219,7 +219,14 @@ describe("ConciergeHost — attach pickers", () => {
     mount();
     await attachViaUpload();
     expect(h.pick).toHaveBeenCalledWith("files");
-    expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
+    // A staged IMAGE is a PICTURE now (it shares the transcript's AttachmentStrip), so its name is
+    // its accessible name rather than body text. Asserted on the role+name so it holds for both
+    // shapes the strip can draw — a thumbnail and a named file chip.
+    expect(
+      within(screen.getByTestId("concierge-attachment-chips")).getByRole("button", {
+        name: "View shot.png",
+      }),
+    ).toBeTruthy();
   });
 
   // Both of the paperclip's actions, each on its own kind. They are revealed by hover here; the
@@ -391,7 +398,14 @@ describe("ConciergeHost — the thread, and clearing", () => {
     routeToAgent();
     type("look");
     await clickSend();
-    expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
+    // A staged IMAGE is a PICTURE now (it shares the transcript's AttachmentStrip), so its name is
+    // its accessible name rather than body text. Asserted on the role+name so it holds for both
+    // shapes the strip can draw — a thumbnail and a named file chip.
+    expect(
+      within(screen.getByTestId("concierge-attachment-chips")).getByRole("button", {
+        name: "View shot.png",
+      }),
+    ).toBeTruthy();
   });
 
   // A QUEUED send resolves ok:true — it is held, not lost — so the synchronous restore above never
@@ -410,7 +424,14 @@ describe("ConciergeHost — the thread, and clearing", () => {
     await act(async () => {
       h.deferred?.({ ok: false, path: "expired", agentId: "ag1", sent: "x", display: "look · 1 image" });
     });
-    expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
+    // A staged IMAGE is a PICTURE now (it shares the transcript's AttachmentStrip), so its name is
+    // its accessible name rather than body text. Asserted on the role+name so it holds for both
+    // shapes the strip can draw — a thumbnail and a named file chip.
+    expect(
+      within(screen.getByTestId("concierge-attachment-chips")).getByRole("button", {
+        name: "View shot.png",
+      }),
+    ).toBeTruthy();
   });
 
   it("each held send gets its own batch — a file-less queued send can't eat another's", async () => {
@@ -440,7 +461,14 @@ describe("ConciergeHost — the thread, and clearing", () => {
     await act(async () => {
       h.deferred?.({ ok: false, path: "expired", agentId: "ag1", sent: "x", display: "look · 1 image" });
     });
-    expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
+    // A staged IMAGE is a PICTURE now (it shares the transcript's AttachmentStrip), so its name is
+    // its accessible name rather than body text. Asserted on the role+name so it holds for both
+    // shapes the strip can draw — a thumbnail and a named file chip.
+    expect(
+      within(screen.getByTestId("concierge-attachment-chips")).getByRole("button", {
+        name: "View shot.png",
+      }),
+    ).toBeTruthy();
   });
 
   it("a queued APPROVE takes a slot too, so it can't eat a later send's files", async () => {
@@ -465,7 +493,14 @@ describe("ConciergeHost — the thread, and clearing", () => {
     await act(async () => {
       h.deferred?.({ ok: false, path: "expired", agentId: "ag1", sent: "x", display: "look · 1 image" });
     });
-    expect(screen.getByTestId("concierge-attachment-chips").textContent).toContain("shot.png");
+    // A staged IMAGE is a PICTURE now (it shares the transcript's AttachmentStrip), so its name is
+    // its accessible name rather than body text. Asserted on the role+name so it holds for both
+    // shapes the strip can draw — a thumbnail and a named file chip.
+    expect(
+      within(screen.getByTestId("concierge-attachment-chips")).getByRole("button", {
+        name: "View shot.png",
+      }),
+    ).toBeTruthy();
   });
 
   it("does NOT hand them back when the held send lands after all", async () => {

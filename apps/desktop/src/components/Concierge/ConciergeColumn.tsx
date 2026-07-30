@@ -30,6 +30,7 @@ import { ConciergeThread } from "./ConciergeThread";
 import { ConciergeTopRight } from "./KebabMenu";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { ScopeVitals } from "./ScopeVitals";
+import { KeyPill } from "./KeyPill";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
 import { FONT_UI, TYPE } from "../../theme/scale";
@@ -61,7 +62,7 @@ const WORDMARK_H = 17;
  *  bumped back into the other without a red test. */
 export const CONCIERGE_LIFT_Z = 3;
 
-/** The "[ESC] to unmount" hint's handle — shown ONLY while the cable is patched. Exported so the
+/** The "ESC to unmount" hint's handle — shown ONLY while the cable is patched. Exported so the
  *  suite identifies it structurally rather than by matching the copy, which is expected to be
  *  reworded. See its render site for why it is gated and not merely styled. */
 export const CONCIERGE_UNMOUNT_HINT_TESTID = "concierge-unmount-hint";
@@ -491,23 +492,23 @@ export function ConciergeColumn({
               fontVariantNumeric: "tabular-nums",
             }}
           >
-            <kbd
-              style={{
-                fontFamily: "inherit",
-                fontSize: "inherit",
-                // NO `opacity`. This hint only ever renders on the FLOODED plane (background is
-                // BLUEPRINT[mode].term while wired), where chromeContrast.test.ts records light
-                // `conciergeMuted` as the tightest ink in the column — 4.76:1, i.e. 0.26 of margin.
-                // An 0.9 opacity spends more than that: compositing #4f6284 at 0.9 over #d9e3f3
-                // measures ~3.93:1, under the suite's 4.5 floor, on the ONE glyph a reader must
-                // actually read to know which key to press. The contrast suite measures token pairs
-                // and cannot see an inline opacity, so nothing would have caught it (roborev 55535).
-                // The brackets already in the copy do the de-emphasis this was reaching for.
-              }}
-            >
-              [ESC]
-            </kbd>{" "}
-            to unmount
+            {/* A DRAWN KEY, not bracketed text. This was `[ESC]` inside a bare, borderless <kbd> —
+                square brackets standing in for a keycap the app had no component to draw. KeyPill
+                is that component; the brackets came out with it.
+
+                PURPLE, and purple ONLY HERE: the tone paints the pill's border and glyph, while
+                "to unmount" below keeps this row's muted ink. The hue is the open-PR badge's
+                (OpenPrMenu) — taken as a token, so the two stay in step if it is retuned. See
+                KeyPill's TONES for why the edge and the ink are different tokens of the same violet.
+
+                NO `opacity` here or in KeyPill. This hint only ever renders on the FLOODED plane
+                (background is BLUEPRINT[mode].term while wired), where chromeContrast.test.ts
+                records light `conciergeMuted` as the tightest ink in the column — 4.76:1, i.e. 0.26
+                of margin. An 0.9 opacity spends more than that: compositing #4f6284 at 0.9 over
+                #d9e3f3 measures ~3.93:1, under the suite's 4.5 floor, on the ONE glyph a reader must
+                actually read to know which key to press. The contrast suite measures token pairs and
+                cannot see an inline opacity, so nothing would have caught it (roborev 55535). */}
+            <KeyPill tone="violet">ESC</KeyPill> to unmount
           </span>
         </div>
       )}

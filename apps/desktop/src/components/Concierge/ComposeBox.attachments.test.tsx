@@ -3,7 +3,7 @@
 // The compose box's attachment surface (parity row #21, bead sparkle-4562.3): staged files render
 // as removable chips, an attachment alone is a sendable message, and the box paints the drag
 // affordance. The box owns none of this state — it renders what it is given.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
 import type { Attachment } from "./types";
@@ -53,11 +53,40 @@ describe("ComposeBox — attachment chips", () => {
   it("names every staged file, with a thumbnail for images only", () => {
     setup({ attachments: [shot, logFile] });
     const chips = screen.getByTestId("concierge-attachment-chips");
-    expect(chips.textContent).toContain("shot.png");
+    // A drawn image is a PICTURE, so its name is its accessible name, not body text — the same
+    // shape the transcript uses. A non-image is still named in the open.
+    expect(within(chips).getByRole("img", { name: "shot.png" })).toBeTruthy();
     expect(chips.textContent).toContain("build.log");
     const thumbs = chips.querySelectorAll("img");
     expect(thumbs).toHaveLength(1);
     expect(thumbs[0]?.getAttribute("src")).toBe(shot.dataUrl);
+  });
+
+  // THE DEFECT THIS FILE MISSED. The old row rendered a 16×16 <img> inside a filename chip with
+  // `cursor: default` and no handler — so "there is an <img> with the right src", which the case
+  // above already asserted, was true of a thumbnail nobody could see or open. These two assert what
+  // was actually missing: a thumbnail SIZED like one, and a click that opens the preview. Both fail
+  // against the previous markup.
+  it("draws the staged image at thumbnail size, not as a chip glyph", () => {
+    setup({ attachments: [shot] });
+    const img = within(screen.getByTestId("concierge-attachment-chips")).getByRole("img", {
+      name: "shot.png",
+    });
+    // The old row pinned width AND height to 16px inline. The shared strip sets a thumbnail height
+    // and lets the width follow the image, so a 16px height is the regression to catch.
+    expect(img.style.height).not.toBe("16px");
+    expect(parseInt(img.style.height, 10)).toBeGreaterThanOrEqual(48);
+  });
+
+  it("opens the preview when the staged thumbnail is clicked", () => {
+    setup({ attachments: [shot] });
+    // No lightbox until asked for — otherwise the assertion below could pass on a modal that is
+    // simply always mounted.
+    expect(screen.queryByTitle("Download…")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "View shot.png" }));
+    expect(screen.getByTitle("Download…")).toBeTruthy();
+    fireEvent.click(screen.getByTitle("Close"));
+    expect(screen.queryByTitle("Download…")).toBeNull();
   });
 
   it("each chip has a remove control that reports its id", () => {

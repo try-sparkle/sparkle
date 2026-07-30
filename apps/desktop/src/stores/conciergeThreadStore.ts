@@ -73,7 +73,7 @@ function isConversation(m: ConciergeMessage): m is Conversation {
  * restarts") shows up long after the screenshot that caused it.
  *
  * The name/path/kind survive, so a restored bubble still says WHAT was sent — it renders as a chip
- * instead of a thumbnail (MessageAttachments falls back on a missing `dataUrl`). Re-reading the
+ * instead of a thumbnail (AttachmentStrip falls back on a missing `dataUrl`). Re-reading the
  * pixels back off disk isn't an option worth the quota: the paths are temp files that may be gone.
  */
 function stripDataUrls(m: Conversation): Conversation {

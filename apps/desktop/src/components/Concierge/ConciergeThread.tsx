@@ -13,9 +13,11 @@ import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
 import { ThinkingIndicator } from "./ThinkingIndicator";
-// The read-only strip a SENT message's files draw as, plus the one lightbox they open. It lives in
+// The strip a SENT message's files draw as, plus the one lightbox they open. It lives in
 // components/composer beside that lightbox rather than here — see its header for why.
-import { MessageAttachments } from "../composer/MessageAttachments";
+// SHARED WITH THE DRAFT: the concierge compose box renders this same component, passing `onRemove`.
+// Omitting it here is what makes this copy read-only — a sent message has nothing to take back.
+import { AttachmentStrip } from "../composer/AttachmentStrip";
 // THE collapsed-text pill and its modal — the same components the BUILD-AGENT composer draws (via
 // components/composer/AttachmentRow), reused here rather than copied into a transcript-shaped twin (see
 // TextPill's header for why there is only one). As of this change those are the only two callers: the
@@ -397,7 +399,7 @@ export function ConciergeThread({
                   {/* ABOVE the words, the way every chat client shows what was sent with them. The
                       text still carries the compact count ("look · 1 image"), which is what a
                       restored bubble falls back to once its base64 has been stripped. */}
-                  <MessageAttachments attachments={m.attachments ?? []} />
+                  <AttachmentStrip attachments={m.attachments ?? []} />
                   <MentionedText text={m.text} mentions={m.mentions} />
                 </div>
                 {m.receipt && (

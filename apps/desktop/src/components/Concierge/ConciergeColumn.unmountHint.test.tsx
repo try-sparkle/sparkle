@@ -27,6 +27,7 @@ import type { ConciergeController, ConciergeViewModel, ConciergeWired } from "./
 import { enableAiEnhancementsForTests } from "../../testing/aiEnhancements";
 import { CONCIERGE_AI_FIELD } from "./conciergeAiLock";
 import { useSettingsStore } from "../../stores/settingsStore";
+import { C } from "../../theme/colors";
 
 beforeEach(() => {
   enableAiEnhancementsForTests();
@@ -62,6 +63,15 @@ function mount(wired?: ConciergeWired) {
 }
 
 const hint = () => screen.queryByTestId(CONCIERGE_UNMOUNT_HINT_TESTID);
+
+/** `#rrggbb` → the `rgb(r, g, b)` form jsdom serialises a style colour into. Asserted against a
+ *  TOKEN put through this, never a hard-coded string, so retuning the palette retunes the test. */
+function asRgb(hex: string): string {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex.trim());
+  if (!m) throw new Error(`asRgb expects #rrggbb, got "${hex}"`);
+  const [r, g, b] = m.slice(1).map((h) => parseInt(h, 16));
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 describe("mounted — the way out is on screen", () => {
   it.each(["left", "right"] as const)("shows the hint when mounted %s", (side) => {
@@ -109,7 +119,41 @@ describe("mounted — the way out is on screen", () => {
   // the one glyph naming the key spends more than that margin (measured ~3.93:1, under the repo's
   // 4.5 floor) and chromeContrast.test.ts cannot see it, because it measures token pairs and has no
   // visibility into inline opacity. So it is pinned HERE, where the element exists (roborev 55535).
-  it("does not thin the [ESC] glyph with an opacity the contrast suite cannot see", () => {
+  // ESC IS A DRAWN KEY, NOT BRACKETED TEXT. The hint used to render `[ESC]` inside a borderless
+  // <kbd> — square brackets doing the job of a keycap the app had no way to draw. These assert the
+  // SIDE EFFECT of that fix (a bordered pill exists, and the brackets are gone from the copy), not
+  // the precondition: both fail against the previous markup, which had no border and did contain
+  // "[". The tone comes from the palette token the open-PR badge uses, so a retune moves both.
+  it("draws ESC as a bordered key pill instead of wrapping it in square brackets", () => {
+    mount("right");
+    const kbd = hint()!.querySelector("kbd")!;
+    expect(kbd.textContent).toBe("ESC");
+    expect(kbd.style.border).toContain("1px solid");
+    // The literal brackets are the thing being replaced — anywhere in the hint, not just the kbd.
+    expect(hint()!.textContent).not.toContain("[");
+    expect(hint()!.textContent).not.toContain("]");
+  });
+
+  it("paints the PILL purple and leaves the trailing copy alone", () => {
+    mount("right");
+    const kbd = hint()!.querySelector("kbd")!;
+    // BRAND.violet — the open-PR badge's edge (OpenPrMenu). Read off the token rather than a hex so
+    // this test retunes with the palette instead of pinning a colour the design may move. jsdom
+    // serialises a hex border colour as rgb(), so the TOKEN is normalised the same way rather than
+    // the expectation being loosened to "has some border".
+    expect(kbd.style.border).toContain(asRgb(C.violet));
+    expect(kbd.style.color).toBe(C.violetInk);
+    // "to unmount" is NOT purple: the founder asked for the pill only. The row's own muted ink is
+    // set on the wrapper, so the assertion is that the kbd is the ONLY violet-inked node in there.
+    const violetNodes = Array.from(hint()!.querySelectorAll<HTMLElement>("*")).filter(
+      (el) => el.style.color === C.violetInk || el.style.color === C.violet,
+    );
+    expect(violetNodes).toEqual([kbd]);
+    expect(hint()!.style.color).not.toBe(C.violet);
+    expect(hint()!.style.color).not.toBe(C.violetInk);
+  });
+
+  it("does not thin the ESC glyph with an opacity the contrast suite cannot see", () => {
     mount("right");
     const kbd = hint()!.querySelector("kbd");
     expect(kbd).not.toBeNull();

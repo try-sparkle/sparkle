@@ -197,7 +197,7 @@ describe("conciergeThreadStore", () => {
       expect(raw.length).toBeLessThan(2_000);
 
       // The record itself survives, so a restored bubble still names what was sent (it renders as a
-      // chip rather than a thumbnail — MessageAttachments falls back on a missing dataUrl).
+      // chip rather than a thumbnail — AttachmentStrip falls back on a missing dataUrl).
       const out = persisted()[0];
       const atts = out?.kind === "you" ? out.attachments : undefined;
       expect(atts).toEqual([

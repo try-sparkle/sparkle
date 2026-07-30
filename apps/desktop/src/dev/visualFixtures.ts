@@ -40,6 +40,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
+import { useDictationStore } from "../stores/dictationStore";
 import { devBypassAuthEnabled } from "./devBypassAuth";
 
 /** The query parameter that turns fixtures on: `?visual=1`. */
@@ -239,7 +240,20 @@ interface PersistApi {
  */
 export function detachPersistence(): void {
   const noop = createJSONStorage(() => NOOP_STORAGE);
-  for (const store of [useProjectStore, useRuntimeStore]) {
+  // useDictationStore IS IN THIS LIST, and it is the one entry that is not obvious.
+  //
+  // `useCableStore` is absent because it is genuinely in-memory — there is nothing to detach. The
+  // dictation store is NOT: it persists under DICTATION_PERSIST_KEY with
+  // `partialize: (s) => ({ enabled: s.enabled, phase: s.phase })`, so the `__sparkleMic` handle
+  // below writing `enabled: true` would go straight through the live middleware to localStorage and
+  // OUTLIVE THE TAB — the exact clobber this function's header promises it prevents.
+  //
+  // Two consequences, neither cosmetic. The store defaults to `enabled: false` so a cold start does
+  // not prompt for microphone permission or kick off the ~482 MB model download; a persisted `true`
+  // makes the developer's next ordinary launch do both. And DICTATION_PERSIST_KEY is watched by the
+  // cross-window sync service on the browser `storage` event, so a harness tab could arm the mic in
+  // another window the developer has open right now. (roborev 56045)
+  for (const store of [useProjectStore, useRuntimeStore, useDictationStore]) {
     (store as unknown as PersistApi).persist?.setOptions({ storage: noop });
   }
 }
@@ -303,6 +317,30 @@ export function applyVisualFixtures(
         if (side === "off") useCableStore.getState().unbind();
         else useCableStore.getState().patch(side);
       };
+
+    // ── AND A HANDLE ON THE MIC, FOR THE SAME REASON ──────────────────────────────────────────
+    //
+    // The voice states (armed-and-listening, focus-paused, preparing, error) are real UI with real
+    // copy and NO visual coverage, because reaching them needs a backend: arming the mic opens a
+    // device and downloads a model, neither of which exists in a headless browser. This writes the
+    // two OBSERVATIONS the state derives from and lets the app's own derivation do the rest.
+    //
+    // Deliberately NOT a way to set the pause REASON. `focusOwner` stays the focus tracker's to
+    // write (voice/dictationFocusTracker, installed in App): a harness that set the reason directly
+    // would capture a notice the real focus path can no longer produce — which is how a surface
+    // ends up "verified" in a state the app cannot actually reach. Focus a terminal-marked element
+    // and the tracker classifies it, exactly as it does for a real xterm pane.
+    (window as unknown as { __sparkleMic?: (s: { enabled: boolean }) => void }).__sparkleMic = (s) => {
+      useDictationStore.setState({
+        enabled: s.enabled,
+        status: "idle",
+        // The tracker writes this too, but only on a window transition — and a headless page may
+        // never see one, which would leave the pause reading as "window" and mask the terminal case.
+        windowFocused: true,
+        error: null,
+        modelProgress: null,
+      });
+    };
   }
 
   return true;

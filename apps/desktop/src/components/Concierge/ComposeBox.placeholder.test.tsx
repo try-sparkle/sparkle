@@ -144,6 +144,84 @@ describe("ComposeBox — the wake phrase is a styled substring", () => {
     expect(bodyText()).not.toContain("I'm listening, so just start talking.");
   });
 
+  // THE TERMINAL PAUSE IS A TWO-LINE, CENTERED NOTICE (founder's copy), and every assertion below
+  // fails against the sentence it replaced ("Listening paused — your cursor is in a terminal. Click
+  // here to resume."), which was one left-aligned wrapped line with no bold.
+  describe("paused because the caret is in a TERMINAL", () => {
+    const inTerminal = () =>
+      act(() =>
+        useDictationStore.setState({
+          enabled: true,
+          status: "idle",
+          windowFocused: true,
+          focusOwner: "terminal",
+        } as never),
+      );
+
+    it("renders the two lines, and drops the 'cursor is in a terminal' explanation", () => {
+      inTerminal();
+      setup();
+      expect(screen.getByText("Listening paused")).toBeTruthy();
+      expect(screen.getByText("Click to re-engage the Sparkle Concierge")).toBeTruthy();
+      // The reason is GONE — the whole point of the rewrite, and the half a "contains 'Listening
+      // paused'" assertion would happily pass without.
+      expect(bodyText()).not.toContain("cursor is in a terminal");
+      expect(bodyText()).not.toContain("Click here to resume");
+    });
+
+    it("bolds ONLY the first line, and centers the whole block", () => {
+      inTerminal();
+      setup();
+      const headline = screen.getByText("Listening paused");
+      const action = screen.getByText("Click to re-engage the Sparkle Concierge");
+      expect(headline.style.fontWeight).toBeTruthy();
+      // The second line stays normal weight — "bold" was asked for on the first line only.
+      expect(action.style.fontWeight).toBe("");
+      // BOTH lines centered, not just one: the centering lives on the block that wraps them, so it
+      // is read off their shared parent rather than off either line.
+      const block = headline.parentElement!;
+      expect(block).toBe(action.parentElement);
+      expect(block.style.textAlign).toBe("center");
+      // Two separate lines, not one wrapped sentence — each must be its own block box.
+      expect(headline.style.display).toBe("block");
+      expect(action.style.display).toBe("block");
+    });
+
+    it("stays CLICK-THROUGH, so the gesture that resumes listening is untouched", () => {
+      // This is copy + layout only. The notice is painted over the textarea with pointerEvents:none
+      // and the click lands on the box beneath — giving the notice its own handler would MOVE the
+      // target and break resuming, which is the one thing this change must not do.
+      inTerminal();
+      setup();
+      expect(overlay()!.style.pointerEvents).toBe("none");
+      expect(overlay()!.querySelector("button")).toBeNull();
+      // Nothing inside re-enables pointer events either — the "Refill" link and the error's Dismiss
+      // do exactly that, so an inherited `none` on the overlay is not on its own sufficient.
+      for (const el of overlay()!.querySelectorAll<HTMLElement>("*")) {
+        expect(el.style.pointerEvents).not.toBe("auto");
+      }
+      // NOT asserted here: that clicking the box focuses it and resumes. jsdom's fireEvent.click
+      // does not move focus, so any such assertion would pass or fail on the harness rather than on
+      // this code. That half is verified in a real browser instead (see the branch's progress doc).
+    });
+
+    it("does NOT put the concierge wording on a pause with a different cause", () => {
+      // A window pause is a different story with a different remedy (it auto-resumes), and this
+      // surface must not speak for it. Guards the exact "one cause's wording for all" failure.
+      act(() =>
+        useDictationStore.setState({
+          enabled: true,
+          status: "idle",
+          windowFocused: false,
+          focusOwner: null,
+        } as never),
+      );
+      setup();
+      expect(bodyText()).toContain("Listening paused");
+      expect(bodyText()).not.toContain("Click to re-engage the Sparkle Concierge");
+    });
+  });
+
   it("shows the one-time model download honestly while preparing", () => {
     act(() =>
       useDictationStore.setState({ enabled: true, modelProgress: { done: 241, total: 482 } }),

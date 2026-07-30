@@ -24,6 +24,7 @@ import type { HistoryHit, RetentionTier } from "../../services/history";
 import { relativeTime, renderSnippet } from "../HistorySearch";
 import { defaultJumpDeps, jumpToHit, type JumpOutcome } from "./paletteJump";
 import { FONT_UI } from "../../theme/scale";
+import { KeyPill } from "./KeyPill";
 
 /** Shown on a row whose source agent no longer exists (closing an agent deletes its worktree,
  *  so there's nothing to reopen — say so honestly, same wording as HistorySearch). */
@@ -252,19 +253,9 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
               fontFamily: "inherit",
             }}
           />
-          <kbd
-            style={{
-              flex: "0 0 auto",
-              fontSize: 10,
-              color: C.muted,
-              border: `1px solid ${line}`,
-              borderRadius: 4,
-              padding: "2px 5px",
-              fontFamily: "inherit",
-            }}
-          >
-            esc
-          </kbd>
+          {/* Was a hand-rolled <kbd> whose style had already drifted from its twin below (2px vs
+              0px vertical padding). Both now come from KeyPill — the app's one keycap. */}
+          <KeyPill>esc</KeyPill>
         </div>
 
         <div id="concierge-palette-results" role="listbox" aria-label="History results" style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
@@ -406,18 +397,7 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
     >
       <FiSearch size={12} aria-hidden />
       Search
-      <kbd
-        style={{
-          fontSize: 10,
-          color: C.muted,
-          border: `1px solid ${line}`,
-          borderRadius: 4,
-          padding: "0px 4px",
-          fontFamily: "inherit",
-        }}
-      >
-        ⌘K
-      </kbd>
+      <KeyPill>⌘K</KeyPill>
     </button>
   );
 }

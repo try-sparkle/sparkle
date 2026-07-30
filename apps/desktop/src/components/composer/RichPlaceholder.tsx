@@ -23,6 +23,8 @@ import {
   MICROPHONE_SETTINGS_URL,
   MIC_HOT_PREFIX,
   MIC_HOT_SUFFIX,
+  PAUSED_TERMINAL_ACTION,
+  PAUSED_TERMINAL_HEADLINE,
   PREPARING_PREFIX,
   PREPARING_SUFFIX,
   WAKE_PREFIX,
@@ -308,9 +310,30 @@ export function VoicePlaceholderCopy({
     case "focusPaused":
       // Armed but NOT capturing (another window, the caret in a terminal, muted, or capture not
       // started yet). The mic can't hear anything, so — exactly like the sidebar's "Listening
-      // paused" caption — say so instead of inviting the wake word, and NAME THE CAUSE: "paused"
-      // on its own is what made the terminal case read as a broken mic rather than a deliberate
-      // one. The words come from the same module the sidebar's do, keyed on the same reason.
+      // paused" caption — say so instead of inviting the wake word. The words come from the same
+      // module the sidebar's do, keyed on the same reason.
+      //
+      // THE TERMINAL CASE IS A TWO-LINE, CENTERED NOTICE (founder's copy) and the other causes are
+      // NOT. That fork is deliberate, not an oversight: the cause is dropped here because on this
+      // surface the user already knows why the caret left, whereas the general pause still has to
+      // say what it is waiting for. Anything that is a real FAILURE never reaches this arm at all —
+      // it renders through `error`/`voiceErrorNotice`, which names its own cause.
+      //
+      // Clickability is UNCHANGED. The whole overlay is `pointerEvents: none`, so this block is
+      // painted over the textarea and the click lands on the textarea beneath — which is what
+      // resumes listening. Do not give these spans a handler or `pointerEvents: auto` "to make the
+      // notice clickable": that would MOVE the click target off the box and is the one way to break
+      // a behaviour this change is not supposed to touch.
+      if (pauseReason === "terminal") {
+        return (
+          <span style={{ display: "block", textAlign: "center" }}>
+            <span style={{ display: "block", fontWeight: FONT_WEIGHT.bold }}>
+              {PAUSED_TERMINAL_HEADLINE}
+            </span>
+            <span style={{ display: "block" }}>{PAUSED_TERMINAL_ACTION}</span>
+          </span>
+        );
+      }
       return <>{pausedComposerPlaceholder(pauseReason)}</>;
     default: {
       // Unreachable: every member above has an arm. This is the exhaustiveness guard — adding a

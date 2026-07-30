@@ -2102,7 +2102,11 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     );
     // …and the shot rides along as a removable chip, not as a temp path pasted into the text.
     const chipRow = screen.getByTestId("concierge-attachment-chips");
-    expect(within(chipRow).getByText("sparkle-shot-1753.png")).toBeTruthy();
+    // The shot draws as a THUMBNAIL (the strip is shared with the transcript), so the name is the
+    // item's accessible name rather than rendered text.
+    expect(
+      within(chipRow).getByRole("button", { name: "View sparkle-shot-1753.png" }),
+    ).toBeTruthy();
     expect(box().value).not.toContain("/tmp/");
   });
 

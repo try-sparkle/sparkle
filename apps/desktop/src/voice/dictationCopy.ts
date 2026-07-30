@@ -66,10 +66,32 @@ export const PAUSED_WINDOW_CAPTION =
  *  window does, so promising that it will would be the same lie in the other direction. */
 export const PAUSED_TERMINAL_CAPTION =
   "Listening paused: Your cursor is in a terminal. Click the message box to resume.";
-/** TERMINAL pause, composer. Same cause, but the remedy is "here" because this copy is painted
- *  inside the very box the user needs to click. */
+/** TERMINAL pause, BUILD-AGENT composer. Same cause, but the remedy is "here" because this copy is
+ *  painted inside the very box the user needs to click.
+ *
+ *  NOT the concierge's wording, deliberately — see the two constants below. This surface is a build
+ *  agent's own composer, so it must point at ITSELF; telling that box to "re-engage the Sparkle
+ *  Concierge" would send the user to a different column entirely. It also renders as a NATIVE
+ *  textarea placeholder on the fallback path (Composer.tsx), which cannot do two lines, bold, or
+ *  centering — so a single sentence is the only shape available to it. */
 export const PAUSED_TERMINAL_COMPOSER_PLACEHOLDER =
   "Listening paused — your cursor is in a terminal. Click here to resume.";
+
+/** TERMINAL pause, CONCIERGE composer — TWO LINES, not a sentence (founder's copy).
+ *
+ *  The reason is deliberately GONE. "Your cursor is in a terminal" was there because "paused" with
+ *  no cause read as a broken mic; the founder's judgement is that on this surface he already knows
+ *  why, so the notice only has to say WHAT HAPPENED and WHAT TO DO. That reasoning is specific to
+ *  the terminal-focus case and does NOT generalise: a HARD failure (no device, permission denied)
+ *  must still name itself, which it does through `voiceErrorNotice` on the `error` presentation —
+ *  a different branch entirely, untouched by this. The non-terminal focus pause keeps its own
+ *  sentence in PAUSED_COMPOSER_PLACEHOLDER above.
+ *
+ *  Split into two constants rather than one string with a newline because the rendering needs them
+ *  as separate elements — the first bold, both centered — and a `\n` in a JSX text node collapses
+ *  to a space. RichPlaceholder's `focusPaused` arm is the only consumer. */
+export const PAUSED_TERMINAL_HEADLINE = "Listening paused";
+export const PAUSED_TERMINAL_ACTION = "Click to re-engage the Sparkle Concierge";
 
 /** The sidebar caption for a focus-paused mic, by cause. `null` (paused for a reason we don't have
  *  a specific story for — e.g. capture simply hasn't started yet) keeps the long-standing window

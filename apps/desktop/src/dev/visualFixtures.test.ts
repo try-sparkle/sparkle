@@ -14,6 +14,7 @@ import {
 } from "./visualFixtures";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
+import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
 import type { Project } from "../types";
 import { createJSONStorage } from "zustand/middleware";
 
@@ -141,13 +142,14 @@ describe("seeding never reaches disk", () => {
   beforeEach(() => {
     flushProjectsPersist(); // drain anything an earlier test left pending
     const live = createJSONStorage(() => localStorage);
-    for (const store of [useProjectStore, useRuntimeStore]) {
+    for (const store of [useProjectStore, useRuntimeStore, useDictationStore]) {
       (store as unknown as { persist: { setOptions: (o: unknown) => void } }).persist.setOptions({
         storage: live,
       });
     }
     localStorage.removeItem(PROJECTS_PERSIST_KEY);
     localStorage.removeItem(RUNTIME_PERSIST_KEY);
+    localStorage.removeItem(DICTATION_PERSIST_KEY);
   });
 
   it("leaves the persisted project blob untouched", () => {
@@ -175,6 +177,34 @@ describe("seeding never reaches disk", () => {
       expect(localStorage.getItem(RUNTIME_PERSIST_KEY)).toBe(REAL);
     } finally {
       localStorage.removeItem(RUNTIME_PERSIST_KEY);
+    }
+  });
+
+  it("leaves the persisted MIC blob untouched — __sparkleMic writes a persisted field", () => {
+    // roborev 56045. The dictation store is persist-backed (`partialize` keeps `enabled`), and the
+    // `__sparkleMic` fixture handle writes exactly that field — so before it was added to
+    // detachPersistence's loop, arming the mic for a capture wrote `enabled: true` to localStorage
+    // and it OUTLIVED THE TAB. The default is `false` precisely so a cold start does not prompt for
+    // microphone permission or start the ~482 MB model download, and DICTATION_PERSIST_KEY is
+    // watched cross-window, so the escape could arm the mic in another live window too.
+    const REAL = JSON.stringify({ state: { enabled: false, phase: "passive" } });
+    localStorage.setItem(DICTATION_PERSIST_KEY, REAL);
+    try {
+      expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+      // The WRITE `__sparkleMic` makes, made directly. This suite runs in the NODE environment, so
+      // `window` does not exist and the handle — deliberately installed behind a `typeof window`
+      // guard — is not there to call. What has to hold is a property of the STORE, not of the
+      // handle: `enabled` is persisted, so any writer of it must find persistence already detached.
+      // Driving setState is therefore the same assertion with one less layer of indirection, and it
+      // stays true for the next fixture that writes this store.
+      useDictationStore.setState({ enabled: true });
+      // In memory the mic is armed, which is the whole point of the handle...
+      expect(useDictationStore.getState().enabled).toBe(true);
+      // ...and none of it reached storage.
+      expect(localStorage.getItem(DICTATION_PERSIST_KEY)).toBe(REAL);
+    } finally {
+      localStorage.removeItem(DICTATION_PERSIST_KEY);
+      useDictationStore.setState({ enabled: false });
     }
   });
 
