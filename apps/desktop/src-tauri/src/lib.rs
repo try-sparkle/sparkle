@@ -39,12 +39,14 @@ mod deps_bootstrap;
 mod dev_identity;
 mod dictation;
 mod display_span;
+mod fleet;
 mod folder_picker;
 mod frontmost;
 mod github;
 mod history;
 mod helper;
 mod hooks;
+mod inbox;
 mod judge;
 mod logging;
 mod mac_panel;
@@ -258,14 +260,29 @@ pub fn run() {
             // GONE (and then only past an age grace); a live agent's log is size-capped, never
             // deleted. Worktrees themselves are never touched — only listed, to learn which agent
             // ids are still live.
+            //
+            // The same pass also reaps `<app_data>/inbox` (the Level 2 message queue). Its TTL
+            // expired messages logically but never removed them, so every agent's Stop hook
+            // re-parsed that agent's whole history at every turn boundary, and a spun-down worker's
+            // queue lived on with nobody to drain it. Same fail-closed rule: a whole inbox is only
+            // deleted when liveness is KNOWN and the agent is not in it.
             {
                 let handle = app.handle().clone();
-                std::thread::spawn(move || match dev_identity::app_data_dir(&handle) {
-                    Ok(base) => match retention::reap_hook_events(
+                std::thread::spawn(move || {
+                    let base = match dev_identity::app_data_dir(&handle) {
+                        Ok(base) => base,
+                        Err(e) => {
+                            tracing::warn!("retention: app_data_dir: {e}");
+                            return;
+                        }
+                    };
+                    let worktrees = base.join("worktrees");
+                    let now = std::time::SystemTime::now();
+                    match retention::reap_hook_events(
                         &base.join("hook-events"),
-                        &base.join("worktrees"),
+                        &worktrees,
                         retention::HookEventsPolicy::default(),
-                        std::time::SystemTime::now(),
+                        now,
                     ) {
                         Ok(s) if s.deleted > 0 || s.truncated > 0 => tracing::info!(
                             deleted = s.deleted,
@@ -275,8 +292,22 @@ pub fn run() {
                         ),
                         Ok(_) => tracing::debug!("hook-events retention: nothing to reap"),
                         Err(e) => tracing::warn!("hook-events retention failed: {e}"),
-                    },
-                    Err(e) => tracing::warn!("hook-events retention: app_data_dir: {e}"),
+                    }
+                    match retention::reap_inbox(
+                        &inbox::inbox_dir(&base),
+                        &worktrees,
+                        retention::InboxPolicy::default(),
+                        now,
+                    ) {
+                        Ok(s) if s.deleted > 0 || s.truncated > 0 => tracing::info!(
+                            deleted = s.deleted,
+                            compacted = s.truncated,
+                            bytes_freed = s.bytes_freed,
+                            "inbox retention pass complete"
+                        ),
+                        Ok(_) => tracing::debug!("inbox retention: nothing to reap"),
+                        Err(e) => tracing::warn!("inbox retention failed: {e}"),
+                    }
                 });
             }
             // Sweep the concierge's screenshot directory (`<temp>/sparkle-captures`). THE
@@ -435,6 +466,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             notify_frontend_shown,
+            fleet::fleet_digest,
+            fleet::fleet_read_hook_stream,
+            fleet::fleet_read_transcript,
+            inbox::inbox_send,
+            inbox::inbox_broadcast,
+            inbox::inbox_status,
+            inbox::inbox_claim_for_idle,
             folder_picker::pick_folder,
             folder_picker::pick_files,
             pty::pty_spawn,

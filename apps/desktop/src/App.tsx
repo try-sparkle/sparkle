@@ -41,6 +41,7 @@ import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
+import { startFleetWatch } from "./services/fleetWatch";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
 // the agent panes. Lazy-load it (code-split) so an unauthenticated / unpaid first-run user, who
@@ -84,6 +85,35 @@ function RosterPublisher() {
   // Feed the floating helper island its P0/P1 counts. Mounted HERE, not in ConciergeHost, which
   // unmounts when no project is open — the island must stay correct regardless.
   useHelperVitalsPublisher();
+  return null;
+}
+
+// Level 0 of the fleet ladder, running CONTINUOUSLY — plus the idle-inbox delivery that depends on
+// it (services/fleetWatch). Without this mount both were capabilities with no caller: nothing polled
+// `fleet_digest`, and `inbox_claim_for_idle` had zero callers anywhere, so a message queued for an
+// agent that was already idle — one that has emitted its last `Stop` and will emit no more — was
+// delivered never.
+//
+// MAIN WINDOW ONLY, and for cost rather than correctness: the O_EXCL claim in `inbox.rs` makes
+// double delivery impossible however many windows race, but N windows each walking every worktree
+// every ten seconds is N times the work for the same answer. Deferred to idle like the rest of the
+// boot burst — the first digest reads files for every agent and nothing on the first screen needs it.
+// Paints no UI.
+function FleetWatch() {
+  const isMain = useIsMainWindow();
+  useEffect(() => {
+    if (!isMain) return;
+    let stop: (() => void) | undefined;
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      stop = startFleetWatch();
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [isMain]);
   return null;
 }
 
@@ -377,6 +407,7 @@ export function App() {
   return (
     <AppBoot>
       <RosterPublisher />
+      <FleetWatch />
       <LimitSync />
       <ApiRecovery />
       <DisplayRespan />

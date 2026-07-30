@@ -228,6 +228,18 @@ import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
 import { log } from "../../logger";
+import {
+  FLEET_OPS,
+  FLEET_RISK,
+  fleetDigest,
+  inboxBroadcast,
+  inboxSend,
+  inboxStatus,
+  readAgentStream,
+  readAgentTranscript,
+  type FleetOp,
+  type FleetResult,
+} from "./fleet";
 import type { AgentTab, Project } from "../../types";
 import type { HistoryHit } from "../history";
 
@@ -249,6 +261,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "approvals",
   "plans",
   "diff",
+  "fleet",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -1411,6 +1424,75 @@ const DIFF_ROUTES: Record<DiffOp, Handler> = {
   ),
 };
 
+function fromFleet<T>(ctx: OpContext, r: FleetResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** Level 0: `{ agents: [{agentId, projectId}], baseBranch?, windowMs? }`. */
+const fleetDigestArgs = z
+  .object({
+    agents: z
+      .array(z.object({ agentId: agentIdArg, projectId: z.string().min(1) }).strict())
+      .min(1, "name at least one agent"),
+    baseBranch: z.string().min(1).optional(),
+    windowMs: z.number().int().positive().optional(),
+  })
+  .strict();
+
+/** Level 1 paging. `maxBytes` is clamped Rust-side; a caller may not raise the ceiling. */
+const streamArgs = z
+  .object({
+    agentId: agentIdArg,
+    cursor: z.number().int().nonnegative().optional(),
+    maxBytes: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const transcriptArgs = z
+  .object({
+    transcriptPath: z.string().min(1, "pass hooks.transcriptPath from fleet_digest"),
+    cursor: z.number().int().nonnegative().optional(),
+    maxBytes: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const severityArg = z.enum(["fyi", "act"]).optional();
+
+const inboxSendArgs = z
+  .object({ agentId: agentIdArg, text: z.string().min(1, "an empty message is not a message"), severity: severityArg })
+  .strict();
+
+const inboxBroadcastArgs = z
+  .object({
+    agentIds: z.array(agentIdArg).min(1, "name at least one recipient"),
+    text: z.string().min(1, "an empty message is not a message"),
+    severity: severityArg,
+  })
+  .strict();
+
+const inboxStatusArgs = z.object({ agentIds: z.array(agentIdArg).min(1) }).strict();
+
+const FLEET_ROUTES: Record<FleetOp, Handler> = {
+  fleet_digest: route(fleetDigestArgs, async (a, ctx) =>
+    fromFleet(ctx, await fleetDigest(a.agents, { baseBranch: a.baseBranch, windowMs: a.windowMs })),
+  ),
+  read_agent_stream: route(streamArgs, async (a, ctx) =>
+    fromFleet(ctx, await readAgentStream(a.agentId, a.cursor, a.maxBytes)),
+  ),
+  read_agent_transcript: route(transcriptArgs, async (a, ctx) =>
+    fromFleet(ctx, await readAgentTranscript(a.transcriptPath, a.cursor, a.maxBytes)),
+  ),
+  inbox_send: route(inboxSendArgs, async (a, ctx) =>
+    fromFleet(ctx, await inboxSend(a.agentId, a.text, a.severity ?? "fyi")),
+  ),
+  inbox_broadcast: route(inboxBroadcastArgs, async (a, ctx) =>
+    fromFleet(ctx, await inboxBroadcast(a.agentIds, a.text, a.severity ?? "fyi")),
+  ),
+  inbox_status: route(inboxStatusArgs, async (a, ctx) =>
+    fromFleet(ctx, await inboxStatus(a.agentIds)),
+  ),
+};
+
 const PLANS_ROUTES: Record<PlansOp, Handler> = {
   list_plans: route(planScope, (a, ctx) =>
     withBoardProject(ctx, a.projectId, async (p) =>
@@ -1494,6 +1576,11 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => DIFF_RISK[op as DiffOp] !== "read-only",
     ops: DIFF_OPS,
   },
+  fleet: {
+    routes: FLEET_ROUTES,
+    write: (op) => FLEET_RISK[op as FleetOp] !== "read-only",
+    ops: FLEET_OPS,
+  },
   board: {
     routes: BOARD_ROUTES,
     write: (op) => BOARD_RISK[op as BoardOp] !== "read-only",
@@ -1528,6 +1615,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   approvals: DOMAINS.approvals.ops,
   plans: DOMAINS.plans.ops,
   diff: DOMAINS.diff.ops,
+  fleet: DOMAINS.fleet.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

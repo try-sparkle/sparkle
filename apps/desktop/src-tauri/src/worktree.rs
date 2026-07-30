@@ -144,7 +144,12 @@ pub(crate) fn apply_test_hook_isolation(cmd: &mut Command) {
 }
 
 /// carrying stderr (falling back to stdout) on failure.
-fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
+///
+/// `pub(crate)` so `fleet.rs` reads its Level 0 git observations through the SAME runner: the
+/// non-interactive env (`apply_noninteractive`) disables hooks, credential prompts and pagers, and
+/// a second git invocation elsewhere in the crate that forgot any one of those would hang the
+/// digest on a credential prompt instead of returning.
+pub(crate) fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     apply_noninteractive(&mut cmd);

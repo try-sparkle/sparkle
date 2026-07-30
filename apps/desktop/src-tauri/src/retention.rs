@@ -1,10 +1,16 @@
-//! Disk retention for the two directories Sparkle grows without any upper bound.
+//! Disk retention for the directories Sparkle grows without any upper bound.
 //!
-//! Both were measured unbounded in the field:
+//! All three were unbounded by construction:
 //!   - `<app_data>/hook-events/` — one `<agentId>.jsonl` per agent, appended to forever by
 //!     `resources/sparkle-hook.mjs`. Never reaped: 606 files / 107 MB, oldest 3+ weeks old.
 //!   - `<app_log_dir>/` — `tracing_appender::rolling::daily` rotates but never deletes:
 //!     523 MB total, with single days at 116 MB.
+//!   - `<app_data>/inbox/` — the Level 2 message queue (`inbox.rs`). Its `MAX_AGE_MS` expires a
+//!     message LOGICALLY but nothing ever removed the bytes, so every `Stop` hook in every agent
+//!     re-read and re-parsed that agent's ENTIRE message history at every turn boundary, and a
+//!     spun-down worker's queue and claims directory persisted forever with nobody left to drain
+//!     them. The store lives outside the worktree so it SURVIVES spin-down; "survives" was never
+//!     meant to be "unbounded".
 //!
 //! DELETION SAFETY is the whole design constraint here, because this code removes user files:
 //!   - Every function takes the directory to operate on as an argument and only ever considers
@@ -47,6 +53,34 @@ impl Default for HookEventsPolicy {
             orphan_max_age: Duration::from_secs(7 * 24 * 60 * 60),
             max_file_bytes: 8 * 1024 * 1024,
             keep_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+/// Retention rules for `<app_data>/inbox`.
+#[derive(Clone, Copy, Debug)]
+pub struct InboxPolicy {
+    /// Drop message and ack records — and the claim files that go with them — once the RECORD is at
+    /// least this old. Must be >= `inbox::MAX_AGE_MS`, or a still-deliverable message would be
+    /// reaped out from under the agent it was queued for.
+    pub max_record_age: Duration,
+    /// Delete a whole per-agent inbox (messages + acks + claims) once its agent id has no worktree
+    /// AND nothing in it has been touched for this long. The grace exists so an inbox written
+    /// moments before its worktree appears is never reaped.
+    pub orphan_max_age: Duration,
+    /// Hard ceiling on records kept per file, whatever the age rule says. Bounds a burst that all
+    /// lands inside the age window; the NEWEST records are the ones kept.
+    pub max_records_per_file: usize,
+}
+
+impl Default for InboxPolicy {
+    fn default() -> Self {
+        Self {
+            // Twice the delivery TTL. Derived from `MAX_AGE_MS` rather than written out, so raising
+            // the TTL can never leave the reaper deleting messages that are still deliverable.
+            max_record_age: Duration::from_millis(crate::inbox::MAX_AGE_MS as u64 * 2),
+            orphan_max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            max_records_per_file: 10 * crate::inbox::MAX_PER_AGENT,
         }
     }
 }
@@ -303,6 +337,393 @@ pub fn reap_hook_events(
             }
         }
     }
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// (2) inbox retention
+// ---------------------------------------------------------------------------
+
+/// The files that make up one agent's inbox, as found on disk.
+#[derive(Default)]
+struct InboxFiles {
+    /// `<agentId>.jsonl` — queued messages.
+    messages: Option<(PathBuf, u64, SystemTime)>,
+    /// `<agentId>.acks.jsonl` — acknowledgements the agent appended.
+    acks: Option<(PathBuf, u64, SystemTime)>,
+    /// `claims/<agentId>/`, with the mtime of its NEWEST claim file (`None` when it holds none).
+    /// The directory's own mtime is deliberately not used: it moves when the reaper itself removes
+    /// a file, so it would report activity that is only our own.
+    claims: Option<(PathBuf, Option<SystemTime>)>,
+}
+
+impl InboxFiles {
+    /// Age of the most recently touched RECORD in this inbox. `None` when nothing was stattable,
+    /// which the caller treats as "don't judge it" rather than "it's ancient".
+    fn newest_age(&self, now: SystemTime) -> Option<Duration> {
+        [
+            self.messages.as_ref().map(|(_, _, m)| *m),
+            self.acks.as_ref().map(|(_, _, m)| *m),
+            self.claims.as_ref().and_then(|(_, m)| *m),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|m| age(now, m))
+        .min()
+    }
+}
+
+/// What one compaction pass did, and — the part the claim reaper depends on — which record ids
+/// SURVIVED it.
+struct Compaction {
+    bytes_freed: u64,
+    rewritten: bool,
+    kept_ids: Vec<String>,
+}
+
+fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Did the file change under us between reading it and being ready to publish the rewrite?
+///
+/// Split out as a pure function so the STAT-FAILURE arm is testable — a filesystem that errors on
+/// stat is not something a unit test can arrange, the same reason `classify_worktrees_entry` above
+/// is split out. The happy/grew arms are additionally covered end-to-end through `compact_records`
+/// itself: `cap_protects` is invoked during planning, before the temp write and before this check,
+/// so a test predicate that appends a line lands it inside the window deterministically.
+///
+/// A stat failure counts as CHANGED: we cannot confirm the file is the one we read, and the
+/// conservative answer in a path that overwrites user data is to not publish.
+fn source_grew(current_len: std::io::Result<u64>, len_at_read: u64) -> bool {
+    match current_len {
+        Ok(len) => len != len_at_read,
+        Err(_) => true,
+    }
+}
+
+/// Rewrite `path` keeping only records at or after `min_ts`, and at most `max_records` of them.
+///
+/// Age comes from the RECORD's own `ts`, not the file's mtime: one append refreshes the mtime of
+/// every record in the file, so mtime cannot distinguish a stale record from a fresh one.
+///
+/// A line that does not parse as a record is KEPT. It is inert — `inbox::read_jsonl` already skips
+/// it — and we cannot date it, so dropping it would be deleting data on a guess.
+///
+/// `cap_protects(id)` names records the `max_records` cap may NOT drop. The age rule is safe by
+/// construction (an expired record is not deliverable), but the cap drops records that are still
+/// INSIDE the deliverable window — so for the messages file it is handed a predicate that protects
+/// anything unclaimed, i.e. anything `inbox_send` promised to deliver and no path has delivered yet.
+/// Whatever the cap does drop is logged: a silent truncation reads to the concierge as "the agent
+/// drained it".
+///
+/// Written to a temp sibling and renamed, exactly like `truncate_to_tail`, so a `Stop` hook reading
+/// the file mid-pass sees either the old inode or the new one and never a torn file. Unlike the
+/// hook-event case, though, a line lost to the swap is not recoverable: the messages file is
+/// appended by `inbox::enqueue` AFTER it has already returned `Ok(id)` to the concierge, and the
+/// acks file is appended by the agent's own shell, an entirely separate process. So two things
+/// narrow that window rather than one:
+///   1. The rewrite is SKIPPED ENTIRELY when nothing is due to be dropped — the overwhelming
+///      majority of passes never open the window at all.
+///   2. When it does rewrite, the source is re-stat'ed just before the rename and the swap is
+///      ABANDONED if the file grew. The next pass retries; a dropped ack would be permanent, and
+///      would leave `status_of` reporting `awaiting_ack >= 1` for the life of the record.
+fn compact_records(
+    path: &Path,
+    min_ts: i64,
+    max_records: usize,
+    cap_protects: &dyn Fn(&str) -> bool,
+) -> Result<Compaction, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read inbox log: {e}"))?;
+    let ids_of = |lines: &[&str]| -> Vec<String> {
+        lines.iter().filter_map(|l| crate::inbox::record_id_and_ts(l).map(|(id, _)| id)).collect()
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            dropped += 1;
+            continue;
+        }
+        match crate::inbox::record_id_and_ts(line) {
+            Some((_, ts)) if ts < min_ts => dropped += 1,
+            _ => kept.push(line),
+        }
+    }
+    if kept.len() > max_records {
+        let mut budget = kept.len() - max_records;
+        let mut capped: Vec<String> = Vec::new();
+        // Front-to-back over an append-only file, so the OLDEST droppable records go first.
+        kept.retain(|line| {
+            if budget == 0 {
+                return true;
+            }
+            // A line we cannot identify cannot be checked for deliverability, so it is protected —
+            // same reasoning as the age rule keeping unparseable lines.
+            let Some((id, _)) = crate::inbox::record_id_and_ts(line) else {
+                return true;
+            };
+            if cap_protects(&id) {
+                return true;
+            }
+            budget -= 1;
+            capped.push(id);
+            false
+        });
+        if !capped.is_empty() {
+            dropped += capped.len();
+            tracing::warn!(
+                path = %path.display(),
+                max_records,
+                ids = %capped.join(","),
+                "inbox retention: record cap dropped delivered records"
+            );
+        }
+    }
+    let kept_ids = ids_of(&kept);
+
+    if dropped == 0 {
+        return Ok(Compaction { bytes_freed: 0, rewritten: false, kept_ids });
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    for line in &kept {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let dir = path.parent().ok_or_else(|| "compact: no parent dir".to_string())?;
+    let tmp = dir.join(format!(
+        ".{}.{}.compact.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("inbox"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, out.as_bytes()).map_err(|e| format!("write compacted inbox: {e}"))?;
+
+    // Someone appended while we were rewriting. Publishing now would discard their line.
+    if source_grew(std::fs::metadata(path).map(|m| m.len()), raw.len() as u64) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::debug!(path = %path.display(), "inbox compaction abandoned: file grew mid-pass");
+        // The file still holds EVERY record we read, so the surviving-id set must say so — a claim
+        // reaped against the planned-but-unpublished set would re-deliver a record still on disk.
+        return Ok(Compaction {
+            bytes_freed: 0,
+            rewritten: false,
+            kept_ids: ids_of(&raw.lines().collect::<Vec<_>>()),
+        });
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("publish compacted inbox: {e}")
+    })?;
+    Ok(Compaction {
+        bytes_freed: (raw.len() as u64).saturating_sub(out.len() as u64),
+        rewritten: true,
+        kept_ids,
+    })
+}
+
+/// Nothing named here may be joined onto a path — these are the shapes that would escape the dir.
+fn usable_agent_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
+}
+
+/// Reap `<app_data>/inbox`.
+///
+/// - Every agent's `<id>.jsonl` and `<id>.acks.jsonl` is compacted down to records newer than
+///   `max_record_age` (and no more than `max_records_per_file` of them).
+/// - A claim file is deleted only when it is past `max_record_age` AND its message id did not
+///   survive compaction. **Both conditions matter.** A claim is the sole guard against the `Stop`
+///   hook and the app-side idle path both delivering the same message; deleting one while its
+///   message is still in the queue makes that message pending again and DOUBLE-DELIVERS it.
+/// - A whole per-agent inbox (messages, acks, claims dir) is deleted when the agent id has no
+///   worktree and nothing in it has been touched for `orphan_max_age`.
+///
+/// FAIL-CLOSED, same as `reap_hook_events`: when `live_agent_ids` cannot establish liveness, every
+/// agent reads as an orphan, so the whole-inbox DELETION arm is skipped entirely. Compaction still
+/// runs — it is keyed on record age alone and can never lose a recent message.
+///
+/// `now` is injected so the age policy is testable without sleeping.
+pub fn reap_inbox(
+    inbox_dir: &Path,
+    worktrees_base: &Path,
+    policy: InboxPolicy,
+    now: SystemTime,
+) -> Result<ReapStats, String> {
+    let mut stats = ReapStats::default();
+    let entries = match std::fs::read_dir(inbox_dir) {
+        Ok(rd) => rd,
+        // No inbox dir yet — nothing to do. Not an error.
+        Err(_) => return Ok(stats),
+    };
+    let live = live_agent_ids(worktrees_base);
+
+    // Gather the flat `<id>.jsonl` / `<id>.acks.jsonl` files. Only these two shapes are candidates;
+    // anything else in the directory is left alone, and symlinks never pass `plain_file`.
+    let mut agents: std::collections::BTreeMap<String, InboxFiles> = Default::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name == "claims" {
+            continue; // handled below, as a directory
+        }
+        let (agent_id, is_ack) = match name.strip_suffix(".acks.jsonl") {
+            Some(id) => (id, true),
+            None => match name.strip_suffix(".jsonl") {
+                Some(id) => (id, false),
+                None => continue,
+            },
+        };
+        if !usable_agent_id(agent_id) {
+            continue;
+        }
+        let Some((size, mtime)) = plain_file(&path) else {
+            continue; // directory, symlink, or unstattable — never a deletion candidate
+        };
+        let slot = agents.entry(agent_id.to_string()).or_default();
+        if is_ack {
+            slot.acks = Some((path, size, mtime));
+        } else {
+            slot.messages = Some((path, size, mtime));
+        }
+    }
+
+    // ...and the per-agent claims directories, which can outlive both files.
+    for entry in std::fs::read_dir(inbox_dir.join("claims")).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.file_type().is_symlink() || !md.is_dir() {
+            continue;
+        }
+        let Some(agent_id) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !usable_agent_id(agent_id) {
+            continue;
+        }
+        let agent_id = agent_id.to_string();
+        let newest_claim = std::fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| plain_file(&e.path()).map(|(_, m)| m))
+            .max();
+        agents.entry(agent_id).or_default().claims = Some((path, newest_claim));
+    }
+
+    let min_ts = epoch_ms(now).saturating_sub(policy.max_record_age.as_millis() as i64);
+
+    for (agent_id, files) in agents {
+        // --- orphan arm: delete the WHOLE inbox, but only when liveness is actually known ---
+        let is_orphan = match &live {
+            Some(ids) => !ids.contains(&agent_id),
+            None => false, // unknown liveness → treat as live → never delete
+        };
+        if is_orphan && files.newest_age(now).is_some_and(|a| a >= policy.orphan_max_age) {
+            for (path, size, _) in [files.messages.as_ref(), files.acks.as_ref()].into_iter().flatten()
+            {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        stats.deleted += 1;
+                        stats.bytes_freed += size;
+                    }
+                    Err(e) => tracing::warn!(path = %path.display(), "reap inbox file failed: {e}"),
+                }
+            }
+            if let Some((claims, _)) = &files.claims {
+                let n = std::fs::read_dir(claims).into_iter().flatten().flatten().count() as u32;
+                match std::fs::remove_dir_all(claims) {
+                    Ok(()) => stats.deleted += n,
+                    Err(e) => tracing::warn!(path = %claims.display(), "reap inbox claims failed: {e}"),
+                }
+            }
+            continue;
+        }
+
+        // --- compaction arm: safe whether or not liveness is known ---
+        // `None` means we could not read the message file, so we do not know which ids are still
+        // live and MUST NOT touch this agent's claims — see the double-delivery note above.
+        // The cap may only drop messages that have already been DELIVERED. An unclaimed, unexpired
+        // message is one `inbox_send` reported success for and nobody has shown the agent yet;
+        // dropping it would make the concierge believe a message it never delivered was drained.
+        // `MAX_PER_AGENT` bounds the unclaimed set at 50, well under any sane cap, so protecting
+        // them cannot wedge the cap open.
+        let agent_claims = inbox_dir.join("claims").join(&agent_id);
+        let cap_protects_undelivered = |id: &str| !crate::inbox::is_claimed(&agent_claims, id);
+
+        let mut surviving_ids: Option<Vec<String>> = match &files.messages {
+            Some((path, _, _)) => match compact_records(
+                path,
+                min_ts,
+                policy.max_records_per_file,
+                &cap_protects_undelivered,
+            ) {
+                Ok(c) => {
+                    if c.rewritten {
+                        stats.truncated += 1;
+                        stats.bytes_freed += c.bytes_freed;
+                    }
+                    Some(c.kept_ids)
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "compact inbox messages failed: {e}");
+                    None
+                }
+            },
+            // No message file at all: nothing can be delivered, so no claim can be a live one.
+            None => Some(Vec::new()),
+        };
+        if let Some((path, _, _)) = &files.acks {
+            // An ack is a record of something that already happened; nothing is owed a delivery, so
+            // the cap has nothing to protect here.
+            match compact_records(path, min_ts, policy.max_records_per_file, &|_| false) {
+                Ok(c) if c.rewritten => {
+                    stats.truncated += 1;
+                    stats.bytes_freed += c.bytes_freed;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(path = %path.display(), "compact inbox acks failed: {e}"),
+            }
+        }
+
+        let (Some((claims, _)), Some(kept)) = (&files.claims, surviving_ids.take()) else {
+            continue;
+        };
+        let kept: std::collections::HashSet<&str> = kept.iter().map(String::as_str).collect();
+        for entry in std::fs::read_dir(claims).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(id) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if kept.contains(id) {
+                continue; // its message is still queued — removing the claim re-delivers it
+            }
+            let Some((size, mtime)) = plain_file(&path) else {
+                continue;
+            };
+            if age(now, mtime) < policy.max_record_age {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    stats.deleted += 1;
+                    stats.bytes_freed += size;
+                }
+                Err(e) => tracing::warn!(path = %path.display(), "reap inbox claim failed: {e}"),
+            }
+        }
+        // An emptied claims dir would otherwise linger forever per agent. `remove_dir` is
+        // non-recursive, so it simply fails and leaves things alone if anything is still in there.
+        let _ = std::fs::remove_dir(claims);
+    }
+
     Ok(stats)
 }
 
@@ -714,6 +1135,519 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats, ReapStats::default());
+    }
+
+    // -- (2) inbox retention -----------------------------------------------
+
+    use crate::inbox;
+
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+
+    /// A test policy with short, obvious windows so the intent of each assertion is readable.
+    fn inbox_policy() -> InboxPolicy {
+        InboxPolicy {
+            max_record_age: 24 * HOUR,
+            orphan_max_age: 7 * DAY,
+            max_records_per_file: 100,
+        }
+    }
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+    }
+
+    fn msg_line(id: &str, ts: i64) -> String {
+        serde_json::to_string(&inbox::InboxMessage {
+            id: id.into(),
+            ts,
+            from: "concierge".into(),
+            text: format!("message {id}"),
+            severity: inbox::Severity::Fyi,
+        })
+        .unwrap()
+    }
+
+    fn ack_line(id: &str, ts: i64) -> String {
+        serde_json::to_string(&inbox::InboxAck { id: id.into(), ts, note: None }).unwrap()
+    }
+
+    /// Write whole JSONL lines and stamp the file's mtime `age_ago` in the past.
+    fn write_records(path: &Path, lines: &[String], now: SystemTime, age_ago: Duration) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = String::new();
+        for l in lines {
+            body.push_str(l);
+            body.push('\n');
+        }
+        std::fs::write(path, body).unwrap();
+        set_mtime(path, now - age_ago);
+    }
+
+    /// A delivered-message claim file, backdated to `age_ago`.
+    fn write_claim(claims: &Path, id: &str, now: SystemTime, age_ago: Duration) {
+        std::fs::create_dir_all(claims).unwrap();
+        std::fs::write(claims.join(id), b"").unwrap();
+        set_mtime(&claims.join(id), now - age_ago);
+    }
+
+    /// Ids currently in a messages/acks file, in order.
+    fn ids_in(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| inbox::record_id_and_ts(l).map(|(id, _)| id))
+            .collect()
+    }
+
+    fn ms(now: SystemTime, ago: Duration) -> i64 {
+        epoch_ms(now) - ago.as_millis() as i64
+    }
+
+    #[test]
+    fn an_expired_message_is_removed_from_the_file_while_a_recent_one_survives() {
+        // MAX_AGE_MS expires a message LOGICALLY; nothing removed the bytes, so every Stop hook
+        // re-read the agent's whole history at every turn boundary. The side effect to assert is
+        // that the FILE shrank — not merely that `pending` stopped returning the old message,
+        // which was already true before this change.
+        let root = tmpdir("inbox-compact");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(
+            &msgs,
+            &[msg_line("m-old", ms(now, 48 * HOUR)), msg_line("m-new", ms(now, HOUR))],
+            now,
+            HOUR,
+        );
+        let before = std::fs::metadata(&msgs).unwrap().len();
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats.truncated, 1, "the messages file was rewritten");
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(ids_in(&msgs), vec!["m-new".to_string()], "the expired record is gone from disk");
+        assert!(std::fs::metadata(&msgs).unwrap().len() < before);
+        // And the surviving message is still deliverable — compaction must not eat live work.
+        let p = inbox::pending(&root, "a1", epoch_ms(now));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].id, "m-new");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ack_log_is_compacted_by_age_the_same_way() {
+        let root = tmpdir("inbox-acks");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+
+        let acks = inbox::acks_path(&root, "a1");
+        write_records(
+            &acks,
+            &[ack_line("m-old", ms(now, 72 * HOUR)), ack_line("m-new", ms(now, 2 * HOUR))],
+            now,
+            HOUR,
+        );
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats.truncated, 1);
+        assert_eq!(ids_in(&acks), vec!["m-new".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_with_nothing_to_drop_is_left_byte_for_byte_intact() {
+        // The rewrite races an O_APPEND writer, so it must not happen on the overwhelming majority
+        // of passes where nothing is actually due.
+        let root = tmpdir("inbox-noop");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(&msgs, &[msg_line("m1", ms(now, HOUR))], now, HOUR);
+        let before = std::fs::read(&msgs).unwrap();
+        let before_mtime = std::fs::metadata(&msgs).unwrap().modified().unwrap();
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats, ReapStats::default(), "no rewrite, no deletions");
+        assert_eq!(std::fs::read(&msgs).unwrap(), before);
+        assert_eq!(std::fs::metadata(&msgs).unwrap().modified().unwrap(), before_mtime);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_claim_goes_but_a_live_messages_claim_stays_so_nothing_is_delivered_twice() {
+        // THE SHARPEST FAILURE MODE. A claim file is the only thing stopping the Stop hook and the
+        // app-side idle path from both delivering the same message. Reaping a claim whose message
+        // is still queued makes that message pending again — a DUPLICATE delivery, which is the
+        // exact bug `claim()` exists to prevent.
+        let root = tmpdir("inbox-claims");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(
+            &msgs,
+            &[msg_line("m-ancient", ms(now, 72 * HOUR)), msg_line("m-recent", ms(now, HOUR))],
+            now,
+            HOUR,
+        );
+        // BOTH claim files are old enough to look stale by mtime alone; only the one whose message
+        // is gone may be removed.
+        let claims = inbox::claims_dir(&root, "a1");
+        write_claim(&claims, "m-ancient", now, 72 * HOUR);
+        write_claim(&claims, "m-recent", now, 48 * HOUR);
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats.deleted, 1, "only the orphaned claim");
+        assert!(!claims.join("m-ancient").exists(), "a claim for a reaped message is dead weight");
+        assert!(
+            claims.join("m-recent").exists(),
+            "its message is still queued; dropping the claim would re-deliver it"
+        );
+        // Proven, not assumed: the still-queued message stays out of `pending`.
+        assert!(
+            inbox::pending(&root, "a1", epoch_ms(now)).is_empty(),
+            "m-recent must remain claimed — a second delivery path must find nothing to send"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_orphaned_agents_whole_inbox_is_removed() {
+        let root = tmpdir("inbox-orphan");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a-live");
+        let now = SystemTime::now();
+
+        // A spun-down worker: worktree gone, inbox untouched for weeks.
+        let gone_msgs = inbox::messages_path(&root, "a-gone");
+        let gone_acks = inbox::acks_path(&root, "a-gone");
+        let gone_claims = inbox::claims_dir(&root, "a-gone");
+        write_records(&gone_msgs, &[msg_line("m1", ms(now, 30 * DAY))], now, 30 * DAY);
+        write_records(&gone_acks, &[ack_line("m1", ms(now, 30 * DAY))], now, 30 * DAY);
+        write_claim(&gone_claims, "m1", now, 30 * DAY);
+
+        // A live agent whose inbox is equally ancient on disk but still holds a fresh message.
+        let live_msgs = inbox::messages_path(&root, "a-live");
+        write_records(
+            &live_msgs,
+            &[msg_line("m2-old", ms(now, 30 * DAY)), msg_line("m2-new", ms(now, HOUR))],
+            now,
+            30 * DAY,
+        );
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert!(!gone_msgs.exists(), "orphan messages removed");
+        assert!(!gone_acks.exists(), "orphan acks removed");
+        assert!(!gone_claims.exists(), "orphan claims dir removed");
+        assert_eq!(stats.deleted, 3, "two files plus the one claim");
+        assert_eq!(
+            ids_in(&live_msgs),
+            vec!["m2-new".to_string()],
+            "a live agent's inbox is compacted, never deleted — its pending message survives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fresh_orphan_inside_the_grace_is_kept() {
+        // Its worktree may still be mid-creation.
+        let root = tmpdir("inbox-orphan-fresh");
+        let worktrees = root.join("worktrees");
+        std::fs::create_dir_all(worktrees.join("proj")).unwrap();
+        let now = SystemTime::now();
+        let msgs = inbox::messages_path(&root, "a-new");
+        write_records(&msgs, &[msg_line("m1", ms(now, HOUR))], now, HOUR);
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats.deleted, 0);
+        assert!(msgs.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_never_deletes_when_the_worktrees_dir_is_unreadable() {
+        // FAIL-CLOSED. An unreadable worktrees dir makes EVERY agent look orphaned, so the deletion
+        // arm must be skipped wholesale. Compaction is keyed on record age alone and stays on —
+        // asserted here so this test cannot pass by the reaper simply doing nothing at all.
+        let root = tmpdir("inbox-failclosed");
+        let now = SystemTime::now();
+        let msgs = inbox::messages_path(&root, "a-looks-orphaned");
+        let claims = inbox::claims_dir(&root, "a-looks-orphaned");
+        write_records(
+            &msgs,
+            &[msg_line("m-old", ms(now, 90 * DAY)), msg_line("m-new", ms(now, HOUR))],
+            now,
+            90 * DAY,
+        );
+        write_claim(&claims, "m-new", now, 90 * DAY);
+
+        let missing = root.join("does-not-exist");
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &missing, inbox_policy(), now).unwrap();
+
+        assert!(msgs.exists(), "a possibly-live agent's inbox must survive unknown liveness");
+        assert!(claims.join("m-new").exists(), "and its live claim with it");
+        assert_eq!(stats.deleted, 0, "the deletion arm is skipped entirely");
+        assert_eq!(
+            ids_in(&msgs),
+            vec!["m-new".to_string()],
+            "compaction still runs — it can never lose a recent message"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_burst_of_delivered_messages_inside_the_age_window_is_capped_to_the_newest() {
+        let root = tmpdir("inbox-burst");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+        let policy = InboxPolicy { max_records_per_file: 3, ..inbox_policy() };
+
+        let lines: Vec<String> = (0..10).map(|i| msg_line(&format!("m{i}"), ms(now, HOUR))).collect();
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(&msgs, &lines, now, HOUR);
+        // All ten were delivered, so the cap is free to drop the oldest.
+        let claims = inbox::claims_dir(&root, "a1");
+        for i in 0..10 {
+            write_claim(&claims, &format!("m{i}"), now, Duration::from_secs(30));
+        }
+
+        reap_inbox(&inbox::inbox_dir(&root), &worktrees, policy, now).unwrap();
+
+        assert_eq!(ids_in(&msgs), vec!["m7".to_string(), "m8".into(), "m9".into()], "newest kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_record_cap_never_drops_a_message_that_was_never_delivered() {
+        // The age rule is safe by construction — an expired message is not deliverable. The CAP is
+        // not: it drops records that are still inside the window. `inbox_send` has already returned
+        // success for those, so dropping an unclaimed one loses a message the concierge believes it
+        // sent, and `status_of` reports the lower `pending` as "the agent drained it".
+        let root = tmpdir("inbox-cap-undelivered");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+        let policy = InboxPolicy { max_records_per_file: 2, ..inbox_policy() };
+
+        let lines: Vec<String> = (0..6).map(|i| msg_line(&format!("m{i}"), ms(now, HOUR))).collect();
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(&msgs, &lines, now, HOUR);
+        // Only the two oldest were ever delivered.
+        let claims = inbox::claims_dir(&root, "a1");
+        write_claim(&claims, "m0", now, Duration::from_secs(30));
+        write_claim(&claims, "m1", now, Duration::from_secs(30));
+
+        reap_inbox(&inbox::inbox_dir(&root), &worktrees, policy, now).unwrap();
+
+        assert_eq!(
+            ids_in(&msgs),
+            vec!["m2".to_string(), "m3".into(), "m4".into(), "m5".into()],
+            "the cap took the delivered pair and stopped; it may not exceed its budget by eating \
+             undelivered messages"
+        );
+        // The side effect that actually matters: every undelivered message is still deliverable.
+        let still_pending: Vec<String> =
+            inbox::pending(&root, "a1", epoch_ms(now)).into_iter().map(|m| m.id).collect();
+        assert_eq!(still_pending, vec!["m2".to_string(), "m3".into(), "m4".into(), "m5".into()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fresh_claim_survives_even_when_its_message_is_gone() {
+        // The OTHER half of the two-condition claim rule. `kept_ids` is not the only guard: a claim
+        // written moments ago must survive whatever happened to its message (reaped by age, dropped
+        // by the cap, a torn record, a short read), because the message could be re-appended or the
+        // read could have been wrong, and a missing claim is a duplicate delivery.
+        let root = tmpdir("inbox-fresh-claim");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(&msgs, &[msg_line("m-expired", ms(now, 72 * HOUR))], now, HOUR);
+        let claims = inbox::claims_dir(&root, "a1");
+        write_claim(&claims, "m-expired", now, Duration::from_secs(30)); // claimed 30s ago
+
+        let stats = reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(ids_in(&msgs), Vec::<String>::new(), "the message itself did age out");
+        assert!(
+            claims.join("m-expired").exists(),
+            "its claim is younger than max_record_age, so the age half of the rule keeps it"
+        );
+        assert_eq!(stats.deleted, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_grew_treats_an_unstattable_file_as_changed() {
+        // The arm a real filesystem cannot be made to produce on demand. The other two are covered
+        // end-to-end below.
+        assert!(!source_grew(Ok(4096), 4096), "unchanged → publish");
+        assert!(source_grew(Ok(4200), 4096), "someone appended → abandon this pass and retry later");
+        assert!(
+            source_grew(Err(std::io::Error::other("stat failed")), 4096),
+            "cannot confirm the file is the one we read → never publish over it"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_rewrite_keeps_every_record_and_reports_the_full_on_disk_id_set() {
+        // A line appended between the read and the rename would be discarded by the swap, and for
+        // an ack — written by the agent's own shell, a separate process — that loss is permanent:
+        // the claim survives, so `status_of` reports `awaiting_ack >= 1` forever.
+        //
+        // The subtler half is what the abandoned pass REPORTS. `kept_ids` must describe what is
+        // actually on disk, not the rewrite we planned and threw away: the caller reaps claims
+        // against it, so returning the shrunken planned set would make every claim the pass meant
+        // to drop reapable while its message is still queued — the double delivery `claim()`
+        // exists to prevent.
+        //
+        // `cap_protects` runs during planning, before the temp write and before the re-stat, so a
+        // predicate that appends lands the line inside the window deterministically.
+        use std::io::Write;
+        let root = tmpdir("inbox-abandon");
+        let now = SystemTime::now();
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(
+            &msgs,
+            &[
+                msg_line("m-old", ms(now, 72 * HOUR)), // planned drop: age
+                msg_line("m-a", ms(now, HOUR)),        // planned drop: cap
+                msg_line("m-b", ms(now, HOUR)),
+                msg_line("m-c", ms(now, HOUR)),
+            ],
+            now,
+            HOUR,
+        );
+        let before = std::fs::read_to_string(&msgs).unwrap();
+
+        let raced = std::cell::Cell::new(false);
+        let racing_writer = |_id: &str| {
+            if !raced.replace(true) {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&msgs).unwrap();
+                writeln!(f, "{}", msg_line("m-raced", ms(now, Duration::ZERO))).unwrap();
+            }
+            false // protects nothing, so the cap arm actually drops and forces the rewrite
+        };
+        let min_ts = epoch_ms(now) - (24 * HOUR).as_millis() as i64;
+
+        let c = compact_records(&msgs, min_ts, 2, &racing_writer).unwrap();
+
+        assert!(raced.get(), "the test's own precondition: the append happened mid-plan");
+        assert!(!c.rewritten, "the swap must be abandoned, not published");
+        assert_eq!(c.bytes_freed, 0);
+        assert_eq!(
+            c.kept_ids,
+            vec!["m-old".to_string(), "m-a".into(), "m-b".into(), "m-c".into()],
+            "an abandoned pass reports what is ON DISK — including the records it planned to drop \
+             — or their claims get reaped while the messages are still queued"
+        );
+        // Nothing was lost, and nothing was left behind.
+        let after = std::fs::read_to_string(&msgs).unwrap();
+        assert_eq!(after, format!("{before}{}\n", msg_line("m-raced", ms(now, Duration::ZERO))));
+        let strays: Vec<_> = std::fs::read_dir(inbox::inbox_dir(&root))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".compact.tmp"))
+            .collect();
+        assert!(strays.is_empty(), "the temp file must be cleaned up, got {strays:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unparseable_line_is_kept_because_we_cannot_date_it() {
+        let root = tmpdir("inbox-torn");
+        let worktrees = root.join("worktrees");
+        mkagent(&worktrees, "proj", "a1");
+        let now = SystemTime::now();
+        let msgs = inbox::messages_path(&root, "a1");
+        write_records(
+            &msgs,
+            &[
+                "{\"id\":\"torn\",".to_string(),
+                msg_line("m-old", ms(now, 72 * HOUR)),
+                msg_line("m-new", ms(now, HOUR)),
+            ],
+            now,
+            HOUR,
+        );
+
+        reap_inbox(&inbox::inbox_dir(&root), &worktrees, inbox_policy(), now).unwrap();
+
+        let body = std::fs::read_to_string(&msgs).unwrap();
+        assert!(body.contains("torn"), "a line we cannot date is not deleted on a guess");
+        assert!(!body.contains("m-old"), "but a datable expired record still goes");
+        assert!(body.contains("m-new"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_reap_ignores_symlinks_and_unrelated_files() {
+        let root = tmpdir("inbox-shapes");
+        let worktrees = root.join("worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        let dir = inbox::inbox_dir(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+
+        // Something valuable outside the inbox, with a symlink to it planted inside.
+        let outside = root.join("precious.jsonl");
+        write_records(&outside, &[msg_line("keep-me", ms(now, 90 * DAY))], now, 90 * DAY);
+        std::os::unix::fs::symlink(&outside, dir.join("evil.jsonl")).unwrap();
+        // And a file that is not part of the inbox at all.
+        let readme = dir.join("README.txt");
+        write_records(&readme, &[msg_line("x", ms(now, 90 * DAY))], now, 90 * DAY);
+
+        let stats = reap_inbox(&dir, &worktrees, inbox_policy(), now).unwrap();
+
+        assert_eq!(stats, ReapStats::default());
+        assert!(outside.exists(), "a symlink must never let us rewrite or unlink outside the dir");
+        assert_eq!(
+            ids_in(&outside),
+            vec!["keep-me".to_string()],
+            "and never let us compact the target either"
+        );
+        assert!(readme.exists(), "unrelated user files are left alone");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_inbox_dir_is_not_an_error() {
+        let root = tmpdir("inbox-nodir");
+        let stats = reap_inbox(
+            &inbox::inbox_dir(&root),
+            &root.join("worktrees"),
+            InboxPolicy::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(stats, ReapStats::default());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_default_compaction_window_outlives_the_delivery_ttl() {
+        // If these ever cross, the reaper deletes messages the queue still considers deliverable.
+        let p = InboxPolicy::default();
+        assert!(
+            p.max_record_age >= Duration::from_millis(crate::inbox::MAX_AGE_MS as u64),
+            "compaction must not outrun the TTL"
+        );
     }
 
     // -- (3) log retention -------------------------------------------------

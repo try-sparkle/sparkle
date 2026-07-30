@@ -77,6 +77,7 @@ import { BOARD_OPS, BOARD_RISK, type BoardOp } from "./board";
 import { APPROVALS_OPS, APPROVALS_RISK, type ApprovalsOp } from "./approvals";
 import { PLANS_OPS, PLANS_RISK, type PlansOp } from "./plans";
 import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
+import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 
 // ---------------------------------------------------------------------------------------------
@@ -170,6 +171,7 @@ export type ConciergeToolDomain =
   | "approvals"
   | "plans"
   | "diff"
+  | "fleet"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -186,6 +188,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "approvals", label: "Approvals" },
   { id: "plans", label: "Plans" },
   { id: "diff", label: "Diff" },
+  { id: "fleet", label: "Fleet awareness" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -446,6 +449,7 @@ export type ConciergeToolName =
   | ApprovalsOp
   | DiffOp
   | PlansOp
+  | FleetOp
   | AppToolName;
 
 /**
@@ -502,6 +506,11 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...translateRisk(APPROVALS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(PLANS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(DIFF_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Fleet publishes the same four risk words. The load-bearing rows are the two `routine` sends:
+  // a queued inbox message never touches a PTY and cannot interrupt a turn, so it auto-allows,
+  // while `send_to_agent_terminal` stays `disruptive` and asks. That asymmetry is what makes the
+  // non-interrupting channel the path of least resistance — and Level 3 correspondingly rare.
+  ...translateRisk(FLEET_RISK, WORKSPACE_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
   // The attachments domain publishes the same four risk words as workspace, so it reuses that
   // translation rather than declaring a fifth identical one.
@@ -525,6 +534,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(APPROVALS_RISK, "approvals" as const),
   ...constantOver(PLANS_RISK, "plans" as const),
   ...constantOver(DIFF_RISK, "diff" as const),
+  ...constantOver(FLEET_RISK, "fleet" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -554,6 +564,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   approvals: APPROVALS_OPS,
   plans: PLANS_OPS,
   diff: DIFF_OPS,
+  fleet: FLEET_OPS,
   app: APP_TOOL_NAMES,
 };
 

@@ -28,6 +28,7 @@ import type { ScreenshotOp } from "../services/conciergeTools/screenshot";
 import type { BoardOp } from "../services/conciergeTools/board";
 import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 import type { DiffOp } from "../services/conciergeTools/diff";
+import type { FleetOp } from "../services/conciergeTools/fleet";
 import type { PlansOp } from "../services/conciergeTools/plans";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
@@ -318,6 +319,18 @@ const DIFF_PHRASES: Record<DiffOp, OpPhrase> = {
   list_commits: phrase("Reading %s's commits", "Read %s's commits", AGENT),
 };
 
+/** Fleet awareness. The digest is deliberately described as reading rather than asking: it spends
+ *  no agent's turn, and the column saying "checking on the fleet" where it means "messaged 40
+ *  agents" would misrepresent the one property that matters about it. */
+const FLEET_PHRASES: Record<FleetOp, OpPhrase> = {
+  fleet_digest: phrase("Checking on every agent", "Checked on every agent"),
+  read_agent_stream: phrase("Reading %s's history", "Read %s's history", AGENT),
+  read_agent_transcript: phrase("Reading %s's transcript", "Read %s's transcript", AGENT),
+  inbox_send: phrase("Leaving %s a message", "Left %s a message", AGENT),
+  inbox_broadcast: phrase("Leaving several agents a message", "Left several agents a message"),
+  inbox_status: phrase("Checking who has read their messages", "Checked who has read their messages"),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -351,6 +364,7 @@ const DOMAINS: Record<
   // Reuses the workflow glyph: reading a diff is asking about the shape of landed work, which is the
   // same question the workflow ops answer from the other side.
   diff: { icon: "workflow", phrases: DIFF_PHRASES },
+  fleet: { icon: "agents", phrases: FLEET_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.
