@@ -263,10 +263,25 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
     // An earlier cut had NO precondition at all, on the reasoning that any "something dispatched"
     // check would pin AGENT DELIVERY, the half deliberately left open. That framed the choice as
     // binary and missed this third option. Without it the loop below iterates zero times and passes
-    // for any change that stops the send reaching a dispatcher — Send throwing before `deliver()`,
-    // no intent arming so `elapse()` is a no-op, mention resolution throwing, `agentCanAcceptInput`
-    // gating it off. None of those are the open routing question; they are ordinary breakage, and
-    // the row would have stayed green through all of them under a name implying it guards a misroute.
+    // for any change that stops the send reaching a sink at all — `Send` throwing before `deliver()`,
+    // no intent arming so `elapse()` is a no-op, mention resolution throwing. None of those are the
+    // open routing question; they are ordinary breakage, and the row would have stayed green through
+    // them under a name implying it guards a misroute.
+    //
+    // WHAT THIS DOES *NOT* COVER, since an earlier version of this comment claimed it did
+    // (roborev 56033): an UNREACHABLE agent. `agentCanAcceptInput` returning false is not silence —
+    // `deliver()` posts the "can't take a message" notice and falls through to Sparkle, so a sink
+    // still runs. That is correct rather than a gap: the message really does reach Sparkle, which is
+    // the designed recoverable direction, pinned by "says so when the named agent cannot take a
+    // message, and keeps the words" below. Listing it here was simply wrong.
+    //
+    // The suggested stronger form — require a sink to carry the user's own words, not merely to have
+    // been called — was built and then dropped, because three mutations failed to find a case where
+    // it and this count disagree (losing the words from `askSparkle`, forcing the unreachable path,
+    // and both together all still left the text on some sink). An assertion whose extra strength
+    // cannot be shown to catch anything is the guard-for-an-impossible-case the anti-bloat rule
+    // warns about, and shipping it on an unverified claim would repeat the overclaiming this finding
+    // is about.
     //
     // Counting BOTH sinks is what keeps it neutral: true today (dispatched to the named agent), true
     // under a future "subject mention → Sparkle" rule (a concierge turn instead), and true in the
