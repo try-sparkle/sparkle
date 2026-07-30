@@ -790,8 +790,43 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // and always failed with "unknown agent sparkle:concierge" — blaming a target it never named.
   const isConcierge = req.callerAgentId === CONCIERGE_CALLER_AGENT_ID;
   const asked = typeof req.payload.targetAgentId === "string" ? req.payload.targetAgentId.trim() : "";
-  const targetId = isConcierge ? asked : (req.callerAgentId || "").trim();
-  if (!targetId) return targetRequired("set_agent_goal_met", req);
+  const own = (req.callerAgentId || "").trim();
+  let targetId: string;
+  if (isConcierge) {
+    if (!asked) return targetRequired("set_agent_goal_met", req);
+    targetId = asked;
+  } else if (!own) {
+    // A NON-CONCIERGE CALLER WITH NO STAMPED ID cannot be helped by `targetRequired`, whose remedy
+    // is "pass an explicit targetAgentId" — a target from this caller is discarded two lines down,
+    // so a model that follows that advice retries forever on the same refusal. The real cause is
+    // upstream of the payload: the bridge had no id to stamp. Say that instead.
+    return {
+      ok: false,
+      code: "caller_unidentified",
+      error:
+        "set_agent_goal_met needs an identifiable caller: an agent may only mark its OWN goal, " +
+        "and this connection carries no agent id for the bridge to stamp (SPARKLE_AGENT_ID is " +
+        "unset on it). Passing a targetAgentId will not help — it is refused for any caller but " +
+        "the concierge.",
+    };
+  } else {
+    // NAMING A PEER IS REFUSED, NOT QUIETLY REDIRECTED. Silently falling back to `own` would mark
+    // the CALLER done on a call that meant someone else — and reply `{ ok: true }`, so nothing
+    // tells it. That is the exact false-"done"-on-an-unfinished-agent this tool exists to prevent,
+    // merely relocated onto the caller. The schema no longer offers agents the field (see
+    // mcp-control/src/server.ts), so this is the backstop for a payload that carries it anyway.
+    if (asked && asked !== own) {
+      return {
+        ok: false,
+        code: "target_refused",
+        error:
+          `set_agent_goal_met cannot mark ${asked}: an agent may only mark its OWN goal met. ` +
+          "Marking another agent's goal met stops it being auto-continued and renders it finished " +
+          "while it is still stalled. Omit targetAgentId to mark your own.",
+      };
+    }
+    targetId = own;
+  }
   const met = req.payload.met;
   if (typeof met !== "boolean") return { ok: false, error: "met must be a boolean" };
   const found = findAgent(targetId);

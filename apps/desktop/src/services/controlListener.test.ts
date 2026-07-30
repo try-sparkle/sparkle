@@ -1095,20 +1095,63 @@ describe("controlListener", () => {
       expect(res.agents[0]!.goal).toMatchObject({ text: "ship it", state: "unmet", met: false });
     });
 
-    it("marks the CALLER's goal met and IGNORES a target in the payload", async () => {
+    it("marks the CALLER's own goal met when it names nobody", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "mine");
+      fire({ reqId: "g3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      const agents = useProjectStore.getState().projects.flatMap((p) => p.agents);
+      expect(agents.find((a) => a.id === callerId)!.goal?.metAt).toBeDefined();
+    });
+
+    it("REFUSES an agent that names a peer — it does not quietly mark the caller instead", async () => {
       // Declaring a different, live agent finished latches its metAt: auto-continue stops and the
-      // stall surface renders it done. One wrong id must not be able to do that.
+      // stall surface renders it done. One wrong id must not be able to do that — but nor may the
+      // refusal be silent. Redirecting to the caller marks the WRONG agent done and replies
+      // `{ ok: true }`, so the caller is told it succeeded while its own goal is now falsely met:
+      // the same false-"done" failure, merely relocated onto whoever made the call.
       useProjectStore.getState().setAgentGoal(projectId, callerId, "mine");
       useProjectStore.getState().setAgentGoal(projectId, otherId, "theirs");
       fire({
-        reqId: "g3",
+        reqId: "g3b",
         op: "set_agent_goal_met",
         callerAgentId: callerId,
         payload: { met: true, targetAgentId: otherId },
       });
       await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "target_refused" });
       const agents = useProjectStore.getState().projects.flatMap((p) => p.agents);
-      expect(agents.find((a) => a.id === callerId)!.goal?.metAt).toBeDefined();
+      expect(agents.find((a) => a.id === otherId)!.goal?.metAt).toBeUndefined();
+      // The caller's own goal is untouched: the call meant someone else, so nothing was marked.
+      expect(agents.find((a) => a.id === callerId)!.goal?.metAt).toBeUndefined();
+    });
+
+    it("accepts an agent naming ITSELF — that is not a spoof, just a redundant argument", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "mine");
+      fire({
+        reqId: "g3c",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true, targetAgentId: callerId },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+    });
+
+    it("tells an UNIDENTIFIED caller the real cause, not to pass a target that would be discarded", async () => {
+      // `target_required` says "pass an explicit targetAgentId" — advice this caller cannot follow,
+      // because a target from any non-concierge caller is refused above. A model that obeys it
+      // retries forever on the same refusal. The cause is upstream of the payload: the bridge had
+      // no id to stamp (a shared-socket MCP child with no SPARKLE_AGENT_ID).
+      // A REAL goal on the target, so "untouched" below is a fact about the handler and not about
+      // an agent that had nothing to mark either way.
+      useProjectStore.getState().setAgentGoal(projectId, otherId, "theirs");
+      fire({ reqId: "g7", op: "set_agent_goal_met", callerAgentId: "", payload: { met: true, targetAgentId: otherId } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "caller_unidentified" });
+      expect(String((lastReply() as { error: string }).error)).toContain("identifiable caller");
+      // And it did NOT act on the target it was handed.
+      const agents = useProjectStore.getState().projects.flatMap((p) => p.agents);
       expect(agents.find((a) => a.id === otherId)!.goal?.metAt).toBeUndefined();
     });
 
