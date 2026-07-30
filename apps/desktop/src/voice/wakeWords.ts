@@ -2,7 +2,7 @@
 // No React, no Tauri — fully unit-testable. See the design spec
 // (docs/superpowers/specs/2026-06-24-hey-sparkle-always-listening-design.md).
 import { doubleMetaphone } from "double-metaphone";
-import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
+import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD, LEGACY_STOP_WORD } from "./voiceDefaults";
 
 /** User-configurable wake/stop words. When a word equals its built-in default, the tuned
  *  "sparkle" engine runs (unchanged); otherwise the generic per-token fuzzy matcher is used.
@@ -42,7 +42,20 @@ const TIER2 = [
 // "step". Those turned "make the sparkle top bar bigger" into a destructive mid-dictation stop
 // (sparkle-mun0). Entries are unambiguous non-words (no common English word), and "stomp" (a real,
 // far-off word) was removed for the same reason. The true "stop" is matched exactly and stays reliable.
-const STOP_VARIANTS = new Set(["stop", "stahp", "staap", "stope", "stawp", "stopp"]);
+// "stop" IS A DELIBERATELY RETAINED ALIAS. DO NOT DELETE IT.
+// The displayed phrase is "Sparkle, pause"; "Sparkle, stop" is accepted forever and shown nowhere.
+// It is in users' muscle memory, and silently retiring a working voice command produces the worst
+// possible failure mode: the human says the phrase that always worked, nothing happens, and there
+// is no feedback explaining why — so they conclude the microphone is broken. An accepted-but-
+// undisplayed alias costs one Set entry and prevents that entirely. There is no deprecation, no
+// warning and no legacy log line; it simply works. Pinned by the alias test in wakeWords.test.ts.
+// Pause entries follow the same rule as the stop ones: unambiguous non-words only, no fuzzy net.
+// "paws" is deliberately ABSENT — it is a real word, and sparkle-mun0 is what happens when a real
+// word gets in ("make the sparkle top bar bigger" ended capture mid-dictation).
+const STOP_VARIANTS = new Set([
+  "pause", "pauze", "paus", "pawz",
+  "stop", "stahp", "staap", "stope", "stawp", "stopp",
+]);
 
 const CANON = "sparkle";
 const CANON_MP = doubleMetaphone(CANON)[0]; // primary Double Metaphone code, computed at runtime
@@ -244,7 +257,13 @@ function stripStopSuffixDefault(segment: string): string {
 // the tuned engine, which is strictly more accurate than the generic path, so this is the
 // desired behavior, not a footgun.
 const isDefaultWake = (cfg: WakeConfig) => normalize(cfg.wakeWord) === normalize(DEFAULT_WAKE_WORD);
-const isDefaultStop = (cfg: WakeConfig) => normalize(cfg.stopWord) === normalize(DEFAULT_STOP_WORD);
+// The legacy phrase routes here too. A user who configured "Sparkle, stop" back when it WAS the
+// default has that string persisted in their settings; without this they would silently drop to the
+// generic matcher and lose the tuned engine's mishearing coverage, which is the kind of quiet
+// downgrade the retained alias exists to prevent.
+const isDefaultStop = (cfg: WakeConfig) =>
+  normalize(cfg.stopWord) === normalize(DEFAULT_STOP_WORD) ||
+  normalize(cfg.stopWord) === normalize(LEGACY_STOP_WORD);
 
 /** True when transcript token `t` is a fuzzy match for phrase token `p`.
  *  Length-gated so short words don't over-match. Both fuzzy nets misbehave at short lengths:

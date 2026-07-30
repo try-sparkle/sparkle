@@ -489,7 +489,7 @@ interface SettingsState {
    *  matcher (useDictation → wakeMachine) uses it. Config-mirrored, NOT persisted — re-read from
    *  the file each launch. */
   wakeWord: string;
-  /** Custom stop word (default "Sparkle, stop"). Mirrors [voice].stop_word. */
+  /** Custom stop word (default "Sparkle, pause"). Mirrors [voice].stop_word. */
   stopWord: string;
   /** When true (default), submitting a prompt drops active dictation back to passive wake-word
    *  listening (mic stays on). When false, dictation keeps listening. Mirrors [voice].pause_on_submit. */

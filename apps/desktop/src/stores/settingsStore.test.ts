@@ -685,7 +685,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     useSettingsStore.getState().hydrateFromConfig(eff);
     const s = useSettingsStore.getState();
     expect(s.wakeWord).toBe("Hey Sparkle");
-    expect(s.stopWord).toBe("Sparkle, stop");
+    expect(s.stopWord).toBe("Sparkle, pause");
     expect(s.pauseOnSubmit).toBe(true);
   });
 
@@ -730,7 +730,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     });
     const s = useSettingsStore.getState();
     expect(s.wakeWord).toBe("Hey Sparkle"); // whitespace-only → default
-    expect(s.stopWord).toBe("Sparkle, stop"); // empty → default
+    expect(s.stopWord).toBe("Sparkle, pause"); // empty → default
     expect(s.pauseOnSubmit).toBe(false); // a real boolean is still honored
   });
 });

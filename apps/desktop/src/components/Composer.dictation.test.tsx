@@ -259,7 +259,7 @@ describe("Composer — placeholder reflects audio state", () => {
     renderComposer();
     const body = document.body.textContent ?? "";
     expect(body).toContain("I'm listening, so just start talking.");
-    expect(body).toContain("Sparkle, stop"); // the cyan→blue gradient stop cue
+    expect(body).toContain("Sparkle, pause"); // the cyan→blue gradient stop cue
     expect(body).toContain("to finish.");
     expect(body).not.toContain("Hey Sparkle");
   });
@@ -275,7 +275,7 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).toContain("or you can type here instead");
     // It must NOT read as active dictation.
     expect(body).not.toContain("I'm listening, so just start talking.");
-    expect(body).not.toContain("Sparkle, stop");
+    expect(body).not.toContain("Sparkle, pause");
   });
 
   it("keeps the mic-hot copy on focus (it subsumes the typing hint)", () => {
@@ -303,7 +303,7 @@ describe("Composer — placeholder reflects audio state", () => {
     expect(body).not.toContain("Just say");
     expect(body).not.toContain("start listening as you talk");
     expect(body).not.toContain("I'm listening, so just start talking.");
-    expect(body).not.toContain("Sparkle, stop");
+    expect(body).not.toContain("Sparkle, pause");
     // The native textarea placeholder is likewise empty (no voice prompt leaks through it).
     const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
     expect(ta.placeholder).toBe("");

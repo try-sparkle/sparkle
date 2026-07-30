@@ -77,6 +77,41 @@ describe("matchesStop — requires 'sparkle' carrier + 'stop' (2-gram)", () => {
   }
 });
 
+describe("matchesStop — 'stop' is a RETAINED ALIAS and must never be removed", () => {
+  // READ THIS BEFORE DELETING ANYTHING BELOW.
+  // The UI displays only "Sparkle, pause". "Sparkle, stop" is accepted forever and shown nowhere.
+  // It is in users' muscle memory, and silently retiring a working voice command is the worst
+  // failure this feature can produce: the human says the phrase that always worked, nothing
+  // happens, and nothing on screen explains why — so they conclude the mic is broken. If you are
+  // here because "stop" looks like dead code now that the label says "pause": it is not dead, it
+  // is load-bearing for every user who learned the old phrase. Keep both.
+  it("accepts the displayed phrase", () => {
+    expect(matchesStop("Sparkle, pause")).toBe(true);
+  });
+  it("accepts the retained, undisplayed legacy phrase", () => {
+    expect(matchesStop("Sparkle, stop")).toBe(true);
+  });
+  it("accepts BOTH — neither one replaced the other", () => {
+    expect([matchesStop("sparkle pause"), matchesStop("sparkle stop")]).toEqual([true, true]);
+  });
+  it("treats a persisted legacy config as the default, not as a custom word", () => {
+    // Otherwise a user who saved "Sparkle, stop" back when it was the default drops to the
+    // generic matcher and quietly loses the tuned engine's mishearing coverage.
+    const legacy: WakeConfig = { ...DEFAULT_WAKE_CONFIG, stopWord: "Sparkle, stop" };
+    expect(matchesStop("sparkle stahp", legacy)).toBe(true);
+    expect(matchesStop("sparkle pause", legacy)).toBe(true);
+  });
+
+  // The pause token gets the same treatment as stop: curated non-word mishearings only, and the
+  // bare word must never end capture without the carrier.
+  for (const s of ["sparkle pauze", "sparkle paus", "sparkle pawz", "hey sparkle pause"]) {
+    it(`stops on "${s}"`, () => expect(matchesStop(s)).toBe(true));
+  }
+  for (const s of ["pause", "let's pause here", "I want to pause for a second", "sparkle paws"]) {
+    it(`does NOT stop on "${s}"`, () => expect(matchesStop(s)).toBe(false));
+  }
+});
+
 describe("matchesStop — near-match words after 'sparkle' must NOT falsely stop (sparkle-mun0)", () => {
   // Regression: a too-loose stop-token net (lev<=1 / shared "STP" metaphone) let ordinary words
   // that merely rhyme with "stop" end capture when they happened to follow the "sparkle" carrier —
@@ -148,7 +183,7 @@ describe("custom words — generic fuzzy matcher (non-default config)", () => {
 
   it("DEFAULT_WAKE_CONFIG carries the built-in words", () => {
     expect(DEFAULT_WAKE_CONFIG.wakeWord).toBe("Hey Sparkle");
-    expect(DEFAULT_WAKE_CONFIG.stopWord).toBe("Sparkle, stop");
+    expect(DEFAULT_WAKE_CONFIG.stopWord).toBe("Sparkle, pause");
   });
 
   // Passing the default config (or omitting it) is the tuned path — unchanged behavior.

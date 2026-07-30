@@ -11,7 +11,7 @@ describe("captionFor", () => {
     ));
   it("active + enabled + listening → stop hint", () =>
     expect(captionFor("active", true, true)).toBe(
-      "Actively listening: Just say Sparkle, stop to finish",
+      "Actively listening: Just say Sparkle, pause to finish",
     ));
   it("muted → no caption", () =>
     expect(captionFor("passive", false, false)).toBeNull());

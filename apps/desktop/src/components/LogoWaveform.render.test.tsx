@@ -193,13 +193,13 @@ describe("LogoWaveform — honest listening", () => {
     expect(wakeHintButton()).toBeNull();
   });
 
-  it("active + listening → 'Actively listening' status with the Sparkle, stop command", () => {
+  it("active + listening → 'Actively listening' status with the Sparkle, pause command", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<LogoWaveform />);
     const activeCaption = screen.queryByText((_c, el) => {
       if (el?.tagName !== "BUTTON") return false;
       const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
-      return /Actively listening/.test(t) && /Sparkle, stop/.test(t);
+      return /Actively listening/.test(t) && /Sparkle, pause/.test(t);
     });
     expect(activeCaption).not.toBeNull();
     // The passive wake hint must NOT show while actively dictating.

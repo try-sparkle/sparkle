@@ -616,7 +616,7 @@ pub struct CaptureConfig {
 pub struct VoiceConfig {
     /// Spoken phrase that wakes dictation (default "Hey Sparkle").
     pub wake_word: String,
-    /// Spoken phrase that ends active dictation (default "Sparkle, stop").
+    /// Spoken phrase that ends active dictation (default "Sparkle, pause").
     pub stop_word: String,
     /// When a prompt is submitted, drop from active dictation back to passive wake-word listening
     /// (the mic stays on). Default true = pause listening on submit.
@@ -784,7 +784,7 @@ impl Default for SparkleConfig {
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
             voice: VoiceConfig {
                 wake_word: "Hey Sparkle".into(),
-                stop_word: "Sparkle, stop".into(),
+                stop_word: "Sparkle, pause".into(),
                 pause_on_submit: true,
                 input_device_uid: None,
                 allow_virtual_input: false,
@@ -2549,7 +2549,7 @@ popover_shortcut = "ctrl+shift+r"
 # Spoken phrase that starts dictation.
 wake_word = "Hey Sparkle"
 # Spoken phrase that ends active dictation.
-stop_word = "Sparkle, stop"
+stop_word = "Sparkle, pause"
 # true  = submitting a prompt drops from active dictation back to passive wake-word listening
 #         (the mic stays on; say the wake word again to resume).
 # false = keep listening — stay in active dictation after a submit.
@@ -4821,7 +4821,7 @@ quit_app = 42
         // Absent [voice] section → the built-in wake/stop words + pause-on-submit default.
         let (cfg, _, _) = effective(None, None);
         assert_eq!(cfg.voice.wake_word, "Hey Sparkle");
-        assert_eq!(cfg.voice.stop_word, "Sparkle, stop");
+        assert_eq!(cfg.voice.stop_word, "Sparkle, pause");
         assert!(cfg.voice.pause_on_submit);
 
         // Global layer overrides each field independently.
@@ -4842,7 +4842,7 @@ quit_app = 42
         let g2 = "[voice]\nwake_word = \"Computer\"\n";
         let (cfg, _, _) = effective(Some(g2), None);
         assert_eq!(cfg.voice.wake_word, "Computer");
-        assert_eq!(cfg.voice.stop_word, "Sparkle, stop");
+        assert_eq!(cfg.voice.stop_word, "Sparkle, pause");
         assert!(cfg.voice.pause_on_submit);
     }
 

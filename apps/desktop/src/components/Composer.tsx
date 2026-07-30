@@ -109,7 +109,7 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
 // the exact same wording (single source of truth). The overlay below paints the stop phrase as a
 // styled span; the native-textarea fallback reuses micHotPlaceholder(stopWord) verbatim.
 
-/** The stop phrase (default "Sparkle, stop", or the user's custom word) in solid brand blue
+/** The stop phrase (default "Sparkle, pause", or the user's custom word) in solid brand blue
  *  (C.teal #2f6bff), matching the wake phrase. (The cyan→blue gradient fade was dropped per
  *  design feedback.) */
 function StopPhrase({ phrase = STOP_PHRASE }: { phrase?: string }) {
@@ -330,7 +330,7 @@ export function Composer({
   const micEnabled = useDictationStore((s) => s.enabled);
   // Capture being live is NOT the same as actively dictating. Split the mic-hot copy by PHASE so
   // the composer tells the truth: only the "active" phase (wake word heard) gets the "I'm
-  // listening, say Sparkle, stop" copy; the "passive" phase (still waiting for "Hey Sparkle")
+  // listening, say Sparkle, pause" copy; the "passive" phase (still waiting for "Hey Sparkle")
   // gets the wake-word copy that mirrors the sidebar. Bug fixed: previously ANY live capture
   // showed the active copy, so a passive (wake-word) session falsely read as "I'm listening".
   const phase = useDictationStore((s) => s.phase);
