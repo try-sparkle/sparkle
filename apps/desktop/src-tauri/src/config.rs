@@ -3309,6 +3309,13 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     if applied >= CONFIG_MIGRATION_VERSION {
         return Ok(());
     }
+    // EACH MIGRATION IS GATED ON ITS OWN REVISION (`applied < N`), never on the aggregate.
+    // This check only decides whether there is ANY work to do; it cannot decide WHICH work.
+    // Gating solely on it meant every version bump re-armed every earlier migration for exactly
+    // the population an upgrade touches — installs sitting at the previous version (roborev
+    // 55804). A user migrated by v1 who then deliberately re-pinned `max_concurrent = 20` had it
+    // silently deleted again, breaking the promise v1's own comment makes below. When you add v3,
+    // add `applied < 3` to it — do not rely on this gate.
 
     // v1 — adopt AUTO for installs still carrying the old hardcoded default.
     //
@@ -3320,7 +3327,8 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     // warns about nothing. Removing the LINE (not just the parsed value) is what makes this stick:
     // the next load sees no key at all, and a 20 the user sets later survives, because by then the
     // recorded revision has moved past this migration.
-    let is_legacy_default = doc
+    let is_legacy_default = applied < 1
+        && doc
         .get("workers")
         .and_then(|w| w.get("max_concurrent"))
         .and_then(|v| v.as_integer())
@@ -3370,7 +3378,8 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
     // Scope check, because this one is easy to over-apply: it changes only what the UI DISPLAYS.
     // The recogniser still answers to "stop" as a permanent undisplayed alias, so no user loses a
     // working voice command — see the retained-alias note beside `STOP_VARIANTS`.
-    let is_legacy_stop_word = doc
+    let is_legacy_stop_word = applied < 2
+        && doc
         .get("voice")
         .and_then(|v| v.get("stop_word"))
         .and_then(|v| v.as_str())
@@ -5079,6 +5088,46 @@ quit_app = 42
             cfg.voice.stop_word, "Sparkle, pause",
             "the upgraded install now displays the CURRENT phrase, not the retired one"
         );
+    }
+
+    // roborev 55804 (High): EVERY VERSION BUMP RE-ARMED EVERY EARLIER MIGRATION. The gate
+    // `if applied >= CONFIG_MIGRATION_VERSION` guards the whole function body, so raising the
+    // constant to 2 put every install sitting at `config_version = 1` — precisely the population
+    // an upgrade touches — back through the v1 block. A user migrated by v1 who then DELIBERATELY
+    // re-pinned `max_concurrent = 20` (a real choice; 20 was the old default and the ⋯ Advanced
+    // editor can produce it) had that line silently deleted again, breaking the guarantee v1's own
+    // doc comment makes: "a 20 the user sets later survives, because by then the recorded revision
+    // has moved past this migration."
+    //
+    // Nothing existing could catch it: every other migration test starts from a config with no
+    // `[meta]` (or from `reset`, which stamps the current max), so the `applied == 1` path was
+    // never exercised, and the v2 tests fixture `config_version = 1` with no `[workers]` key.
+    #[test]
+    fn a_version_bump_does_not_re_arm_an_already_applied_migration() {
+        // The exact shape of an upgrading install: v1 already ran, the user then chose 20 back,
+        // and the retired stop word is still on disk waiting for v2.
+        let dir = app_data_with(
+            "[workers]\nmax_concurrent = 20\n\
+             \n[voice]\nstop_word = \"Sparkle, stop\"\n\
+             \n[meta]\nconfig_version = 1\n",
+        );
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+        let (cfg, _, _) = effective(Some(&text), None);
+
+        // v2 must run…
+        assert_eq!(
+            cfg.voice.stop_word, "Sparkle, pause",
+            "the pending v2 migration still applies: {text}"
+        );
+        // …and v1 must NOT run again. This is the assertion that fails without per-migration
+        // gating: the user's deliberate 20 is silently reverted to auto.
+        assert_eq!(
+            cfg.workers.max_concurrent,
+            Some(20),
+            "an ALREADY-APPLIED migration must not re-run and eat a later choice: {text}"
+        );
+        assert!(text.contains("max_concurrent = 20"), "the line itself survives: {text}");
     }
 
     #[test]
