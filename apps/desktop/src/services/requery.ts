@@ -4,7 +4,7 @@
 import type { AgentTabStatus } from "@sparkle/ui";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { submitPrompt } from "../pty";
+import { submitPrompt, PtyGoneError } from "../pty";
 import { defaultStore, type KV } from "./windowRegistry";
 import { log } from "../logger";
 
@@ -90,21 +90,36 @@ export async function requeryOnReconnect(now: number, store?: KV): Promise<void>
 /** Send the status-update prompt to every open agent, gated by PTY status. */
 export async function requeryOpenAgents(): Promise<void> {
   const { projects } = useProjectStore.getState();
-  const { openAgentIds, status } = useRuntimeStore.getState();
-  const open = new Set(openAgentIds);
 
   for (const project of projects) {
     for (const agent of project.agents) {
-      if (!open.has(agent.id)) continue;
+      // Re-read liveness + status from the LIVE store immediately before each write, never from a
+      // snapshot captured at the top of the pass. `submitPrompt` awaits, so the loop yields between
+      // agents; a window close / worktree removal / spin-down that lands in that gap tears the PTY
+      // down (runtimeStore.close() drops the id from openAgentIds), and the not-yet-sent re-queries
+      // for that agent must be CANCELLED rather than fired into a dead PTY (sparkle-rsx4).
+      const rt = useRuntimeStore.getState();
+      if (!rt.isOpen(agent.id)) continue;
+      const st = rt.status[agent.id];
+      if (!st || !SAFE_TO_REQUERY.has(st)) continue;
       // Isolate each agent: a single dead PTY (a "done"/exited process whose write rejects)
       // must not abort the loop and strand every later agent's re-query.
       try {
-        const st = status[agent.id];
-        if (st && SAFE_TO_REQUERY.has(st)) {
-          await submitPrompt(agent.id, REQUERY_PROMPT);
-        }
+        await submitPrompt(agent.id, REQUERY_PROMPT);
       } catch (e) {
-        log.error("connectivity", `re-query failed for agent ${agent.id}`, e);
+        if (e instanceof PtyGoneError) {
+          // Expected lifecycle race, not a failure: the agent's PTY was reaped between the status
+          // read and the write — a "done"/idle pane whose process has already exited. Treat it as
+          // TERMINAL. Mark the agent `stopped` (a calm, GRAY, non-red state — the process simply
+          // isn't running) so it drops out of SAFE_TO_REQUERY and no later reconnect re-queries the
+          // dead PTY again, and log at DEBUG so this expected race stays out of the ERROR stream
+          // (it was spamming one ERROR per gone agent per reconnect — sparkle-rsx4).
+          useRuntimeStore.getState().setStatus(agent.id, "stopped");
+          log.debug("connectivity", `re-query skipped — agent ${agent.id}'s PTY is already gone`);
+        } else {
+          // A genuine, unexpected write failure — still worth the ERROR stream.
+          log.error("connectivity", `re-query failed for agent ${agent.id}`, e);
+        }
       }
     }
   }

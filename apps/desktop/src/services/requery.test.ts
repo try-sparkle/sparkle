@@ -5,7 +5,17 @@ import type { AgentTabStatus } from "@sparkle/ui";
 // Re-query talks to PTY agents via submitPrompt. Mock it so the dispatcher's
 // routing/filtering is what's under test.
 const submitPrompt = vi.fn();
-vi.mock("../pty", () => ({ submitPrompt: (...a: unknown[]) => submitPrompt(...a) }));
+vi.mock("../pty", () => ({
+  submitPrompt: (...a: unknown[]) => submitPrompt(...a),
+  // A stand-in for the real PtyGoneError: requery.ts does `e instanceof PtyGoneError`, and the
+  // tests below construct one to reject with, so both sides must share THIS class (the mocked one).
+  PtyGoneError: class PtyGoneError extends Error {
+    constructor(readonly id: string) {
+      super(`no such pty: ${id}`);
+      this.name = "PtyGoneError";
+    }
+  },
+}));
 // Silence the failure log so a deliberately-rejecting agent doesn't print to the test output.
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -21,6 +31,8 @@ import {
   REQUERY_CLAIM_WINDOW_MS,
 } from "./requery";
 import type { KV } from "./windowRegistry";
+import { PtyGoneError } from "../pty";
+import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 
@@ -59,6 +71,8 @@ function seed(agents: AgentTab[], open: string[], status: Record<string, AgentTa
 
 beforeEach(() => {
   submitPrompt.mockReset();
+  vi.mocked(log.error).mockClear();
+  vi.mocked(log.debug).mockClear();
 });
 
 describe("requeryOpenAgents — PTY (build/worker) agents", () => {
@@ -108,6 +122,64 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
     submitPrompt.mockRejectedValueOnce(new Error("pty dead"));
     await expect(requeryOpenAgents()).resolves.toBeUndefined();
     expect(submitPrompt).toHaveBeenCalledWith("b2", REQUERY_PROMPT);
+  });
+});
+
+describe("requeryOpenAgents — a PtyGoneError is TERMINAL, not a per-reconnect ERROR (sparkle-rsx4)", () => {
+  it("marks the agent stopped and does NOT re-query it on a later reconnect pass", async () => {
+    // A "done" pane whose underlying process has already exited: its PTY is gone, so the write
+    // rejects with PtyGoneError.
+    seed([agent("b1", "build")], ["b1"], { b1: "done" });
+    submitPrompt.mockRejectedValueOnce(new PtyGoneError("b1"));
+
+    await requeryOpenAgents(); // first reconnect: the PTY is discovered gone
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+
+    // SIDE EFFECT under test: the agent is now marked `stopped` (terminal, not a red error)...
+    expect(useRuntimeStore.getState().status.b1).toBe("stopped");
+
+    // ...so a SECOND reconnect must NOT fire another re-query into the dead PTY. Asserting the
+    // absence of the second call is what proves the loop actually stops for this agent — the whole
+    // point of treating PtyGoneError as terminal (mutation: drop the setStatus and this call fires).
+    submitPrompt.mockClear();
+    await requeryOpenAgents();
+    expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  it("logs a PtyGoneError at DEBUG, never ERROR (it is an expected lifecycle race)", async () => {
+    seed([agent("b1", "build")], ["b1"], { b1: "done" });
+    submitPrompt.mockRejectedValueOnce(new PtyGoneError("b1"));
+    await requeryOpenAgents();
+    expect(log.error).not.toHaveBeenCalled();
+    expect(log.debug).toHaveBeenCalled();
+  });
+
+  it("still logs a NON-PtyGone write failure at ERROR (a real failure is not silenced)", async () => {
+    seed([agent("b1", "build")], ["b1"], { b1: "idle" });
+    submitPrompt.mockRejectedValueOnce(new Error("something genuinely broke"));
+    await requeryOpenAgents();
+    expect(log.error).toHaveBeenCalled();
+    // A generic failure is NOT terminal — the agent keeps its live status, not demoted to stopped.
+    expect(useRuntimeStore.getState().status.b1).toBe("idle");
+  });
+
+  it("CANCELS a not-yet-sent re-query for an agent torn down mid-pass", async () => {
+    // Two open, idle agents. While b1's re-query is in flight (submitPrompt awaits), b2's pane is
+    // torn down — window close / worktree removal / spin-down all route through runtimeStore.close(),
+    // which drops b2 from openAgentIds. b2's not-yet-sent re-query MUST be cancelled, not fired into
+    // the torn-down PTY. Asserting b2 is never called is the side effect; it only holds because the
+    // loop re-reads liveness per agent instead of trusting a top-of-pass snapshot (mutation: read the
+    // snapshot and b2 gets a re-query).
+    seed([agent("b1", "build"), agent("b2", "build")], ["b1", "b2"], { b1: "idle", b2: "idle" });
+    submitPrompt.mockImplementationOnce(async () => {
+      useRuntimeStore.getState().close("b2");
+    });
+
+    await requeryOpenAgents();
+
+    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT);
+    expect(submitPrompt).not.toHaveBeenCalledWith("b2", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
   });
 });
 

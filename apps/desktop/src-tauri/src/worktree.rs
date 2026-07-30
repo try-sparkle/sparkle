@@ -1252,7 +1252,13 @@ pub async fn remove_repo_hooks_cmd(path: String) -> Result<(), String> {
 /// pass then starts from a base drifting further behind `origin/main`. These are the two locations
 /// agents are told to cut them (AGENTS.md); the `.wt-` dot prefix is load-bearing, keeping the glob
 /// from matching real source directories like `wt-real.ts` or `src/wt-foo/`.
-const AGENT_WORKTREE_IGNORES: [&str; 2] = [".claude/worktrees/", ".wt-*/"];
+// Includes `.sparkle-*/`: the hourly improvement pass cuts its OWN scratch worktrees/dirs under a
+// `.sparkle-` prefix (seen live as `.sparkle-improve-wt/`, `.sparkle-scratch/`), and those `??`
+// entries are exactly what made the app-owned worktree's park decline `dirty` every hour. A glob,
+// like `.wt-*/`, so a future name is covered; the trailing slash and the hyphen keep it off the
+// tracked `.sparkle/` config dir. Kept in step with `.gitignore` by
+// `scripts/tests/ignore-agent-worktrees.test.sh`.
+const AGENT_WORKTREE_IGNORES: [&str; 3] = [".claude/worktrees/", ".wt-*/", ".sparkle-*/"];
 
 /// Append any of `patterns` missing from the newline-delimited `existing`, or `None` when all are
 /// already present. Pure so the idempotency rule is unit-testable without a filesystem.
@@ -7609,10 +7615,16 @@ mod tests {
         std::fs::write(d.path().join(".wt-ci-node/f"), "x").unwrap();
         std::fs::create_dir_all(d.path().join(".claude/worktrees/x")).unwrap();
         std::fs::write(d.path().join(".claude/worktrees/x/f"), "x").unwrap();
+        // The improvement pass's OWN scratch, the `??` entries observed wedging the live park.
+        std::fs::create_dir_all(d.path().join(".sparkle-improve-wt")).unwrap();
+        std::fs::write(d.path().join(".sparkle-improve-wt/f"), "x").unwrap();
+        std::fs::create_dir_all(d.path().join(".sparkle-scratch")).unwrap();
+        std::fs::write(d.path().join(".sparkle-scratch/f"), "x").unwrap();
 
         // Baseline: without the fix this repo IS dirty — proves the assertion below can fail.
         let before = git(&root, &["status", "--porcelain"]).unwrap();
         assert!(before.contains(".wt-ci-node"), "expected dirt to start with: {before:?}");
+        assert!(before.contains(".sparkle-improve-wt"), "expected pass-scratch dirt: {before:?}");
 
         // Deliberately NOT ensure_gitignore: info/exclude alone must do it, since that is the half
         // that works on a worktree pinned to a branch predating the tracked rule.
@@ -7620,6 +7632,9 @@ mod tests {
         let after = git(&root, &["status", "--porcelain"]).unwrap();
         assert!(!after.contains(".wt-ci-node"), "scratch worktree still dirty: {after:?}");
         assert!(!after.contains(".claude/worktrees"), "still dirty: {after:?}");
+        // The exact strings the park declined on, hour after hour, now gone from the status read.
+        assert!(!after.contains(".sparkle-improve-wt"), "pass scratch worktree still dirty: {after:?}");
+        assert!(!after.contains(".sparkle-scratch"), "pass scratch dir still dirty: {after:?}");
         assert!(after.trim().is_empty(), "expected a clean tree, got {after:?}");
     }
 
@@ -7636,13 +7651,18 @@ mod tests {
         ensure_worktree_excludes(&root).unwrap();
         let ignored = |p: &str| git(&root, &["check-ignore", "-q", "--no-index", p]).is_ok();
 
-        // Ignored — the two paths agents are told to use.
+        // Ignored — the two paths agents are told to use, plus the pass's own `.sparkle-` scratch.
         assert!(ignored(".wt-ci-node/"), ".wt-*/ should be ignored");
         assert!(ignored(".claude/worktrees/x/"), ".claude/worktrees/ should be ignored");
+        assert!(ignored(".sparkle-improve-wt/"), ".sparkle-*/ should ignore the pass scratch worktree");
+        assert!(ignored(".sparkle-scratch/"), ".sparkle-*/ should ignore the pass scratch dir");
         // NOT ignored — real source that a bare `wt-*` would have swallowed.
         assert!(!ignored("wt-real.ts"), "a real source FILE must not be ignored");
         assert!(!ignored("src/wt-foo/"), "a real source DIRECTORY must not be ignored");
         assert!(!ignored("wt-foo/"), "an undotted top-level dir must not be ignored");
+        // The hyphen keeps the glob OFF the tracked `.sparkle/` config dir and off real source.
+        assert!(!ignored(".sparkle/config.toml"), "the tracked .sparkle/ config dir must not be ignored");
+        assert!(!ignored("sparkle-real.ts"), "an undotted source file must not be ignored");
     }
 
     #[test]
