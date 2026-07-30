@@ -29,6 +29,8 @@
 // The counter is kept alongside the tag for the synchronous case, where it is the cheaper answer,
 // and because nesting must not clear the flag early.
 
+import { isEditableElement } from "../engine/focusGuard";
+
 let depth = 0;
 /** The element the app most recently focused whose focus event has not arrived yet. ONE slot, not a
  *  set: only the latest app-initiated focus can still be in flight, and an unbounded set of tags is
@@ -117,15 +119,21 @@ export function resetProgrammaticFocusForTest(): void {
   depth = 0;
 }
 
-/** True for an element the user TYPES INTO: `<input>`, `<textarea>`, or any contentEditable host
- *  (the xterm terminal's key sink is a `<textarea class="xterm-helper-textarea">`, so it qualifies).
- *  Pure and DOM-only so the focus-steal guard below is unit-testable. */
-export function isEditableTarget(el: Element | null | undefined): boolean {
-  if (!el) return false;
-  const tag = el.tagName;
-  if (tag === "TEXTAREA" || tag === "INPUT") return true;
-  return (el as HTMLElement).isContentEditable === true;
-}
+/** True for an element the user TYPES INTO: a text `<input>`, a `<textarea>`, or any contentEditable
+ *  host (the xterm terminal's key sink is a `<textarea class="xterm-helper-textarea">`, so it
+ *  qualifies).
+ *
+ *  This DELEGATES to `engine/focusGuard`'s `isEditableElement` rather than re-deriving the rule.
+ *  It used to be a local copy that answered `true` for EVERY `<input>` — including `type="checkbox"`
+ *  / `"radio"` / `"range"` / `"button"`, and including `disabled` / `readOnly` fields — none of which
+ *  own a caret. The guard below reads this as "the user is typing over there, leave them alone", so
+ *  a caret parked on a settings checkbox permanently suppressed the dictation caret-return: every
+ *  segment still landed in the composer, but focus stayed on the checkbox, so the user's next Enter
+ *  toggled the checkbox instead of sending (roborev 54718/54719). Three near-copies of this DOM
+ *  predicate existed; `isEditableElement` is the one with `NON_TEXT_INPUT_TYPES`, `disabled` and
+ *  `readOnly` handling and its own unit tests, so it is now the only one. `focusGuard` imports
+ *  nothing, so depending on it here cannot cycle. */
+export const isEditableTarget = isEditableElement;
 
 /** {@link focusQuietly}, but a NO-OP when the caret currently sits in a DIFFERENT editable element.
  *

@@ -234,6 +234,44 @@ describe("Composer — dictation wiring", () => {
     expect(document.activeElement).not.toBe(inputRef.current);
     foreign.remove();
   });
+
+  // The OTHER half, and the one that fails silently. Only the suppression direction above was
+  // pinned, so deleting the `focusQuietlyUnlessTypingElsewhere(inputRef?.current)` call outright —
+  // or letting the guard degrade into an always-no-op — left the whole suite green while the caret
+  // simply stopped coming back, which is how the original freeze went unpinned (roborev 54718).
+  it("DOES reclaim the caret on a dictated segment when focus sits on a non-editable surface", () => {
+    const { inputRef } = renderComposer();
+    // The mic button: a non-editable surface that legitimately takes focus, which is exactly the
+    // case this focus pull was added for.
+    const mic = document.createElement("button");
+    document.body.appendChild(mic);
+    mic.focus();
+    expect(document.activeElement).toBe(mic);
+
+    act(() => useDictationStore.getState().insert("hello"));
+
+    expect((inputRef.current as HTMLTextAreaElement).value).toContain("hello");
+    expect(document.activeElement).toBe(inputRef.current);
+    mic.remove();
+  });
+
+  // A caret-less control is NOT somewhere the user can be "mid-sentence", so it must not suppress
+  // the pull. Before the shared-predicate fix, every <input> counted as editable, so a user who
+  // clicked a settings checkbox mid-dictation never got the caret back and their next Enter
+  // toggled the checkbox instead of sending (roborev 54718/54719).
+  it("reclaims the caret past a focused checkbox (a caret-less control)", () => {
+    const { inputRef } = renderComposer();
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    document.body.appendChild(box);
+    box.focus();
+    expect(document.activeElement).toBe(box);
+
+    act(() => useDictationStore.getState().insert("hello"));
+
+    expect(document.activeElement).toBe(inputRef.current);
+    box.remove();
+  });
 });
 
 describe("Composer — auto-grow sizing baseline", () => {

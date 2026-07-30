@@ -4,6 +4,7 @@
 // DOM caret (the first responder within the webview), and whether keystrokes are actually reaching
 // an editable target while the mic is live. It NEVER logs key values or field contents.
 
+import { isEditableElement } from "../engine/focusGuard";
 import { log } from "../logger";
 
 /** A PII-safe descriptor of a focus/event target: STRUCTURAL identity only — tag, id, filtered
@@ -35,15 +36,15 @@ export function describeFocusTarget(el: Element | null | undefined): string {
     .join(" ") + editable;
 }
 
-function isEditable(el: Element | null | undefined): boolean {
-  if (!el) return false;
-  const t = el.tagName;
-  return t === "INPUT" || t === "TEXTAREA" || (el as HTMLElement).isContentEditable === true;
-}
-
 export interface InputFreezeTraceDeps {
-  /** True while the mic is armed. Trace is inert otherwise (zero cost when dictation is off). */
-  isDictationEnabled: () => boolean;
+  /** True only while speech is ACTUALLY being routed into a box — `enabled && phase === "active"`.
+   *
+   *  Deliberately not bare `enabled`: that flag is the master mute ("mic hot"), it is PERSISTED
+   *  across relaunch, and it is true for a merely-hot-but-paused mic. Gating on it meant every user
+   *  who had ever turned dictation on kept tracing forever, and made the keydown warning assert a
+   *  live mic when nothing was listening (roborev 54719). Only the `active` phase can drive the
+   *  focus pull this trace exists to catch. */
+  isDictationActive: () => boolean;
   doc?: Document;
   win?: Window;
   now?: () => number;
@@ -62,22 +63,28 @@ export function installInputFreezeTrace(deps: InputFreezeTraceDeps): () => void 
   let lastNonEditableLogAt = 0;
 
   const onFocusIn = () => {
-    if (!deps.isDictationEnabled()) return;
+    if (!deps.isDictationActive()) return;
     const d = describeFocusTarget(doc.activeElement);
     if (d !== lastFocus) {
       lastFocus = d;
-      log.info("dictation", `focus-trace: activeElement=${d}`);
+      // DEBUG, not info: `log.info` always forwards to disk via `frontend_log`, and focusin fires
+      // for every click or tab onto any focusable element — an unthrottled per-event disk write and
+      // main-thread JSON render, which is exactly the cost `debugForwardEnabled` exists to gate
+      // (roborev 54719). Still capturable on demand via `setDebugForwarding(true)`.
+      log.debug("dictation", `focus-trace: activeElement=${d}`);
     }
   };
   const onKeyDown = (e: KeyboardEvent) => {
-    if (!deps.isDictationEnabled()) return;
-    if (isEditable(e.target as Element)) return;
+    if (!deps.isDictationActive()) return;
+    if (isEditableElement(e.target as Element)) return;
     const t = now();
     if (t - lastNonEditableLogAt < 1000) return; // throttle: at most one line per second
     lastNonEditableLogAt = t;
+    // Says what it OBSERVED (dictation actively routing) rather than asserting "mic live", which
+    // the old gate could not actually know — see `isDictationActive`.
     log.warn(
       "dictation",
-      `focus-trace: keydown while mic live reached NON-editable target=${describeFocusTarget(
+      `focus-trace: keydown while dictation ACTIVE reached NON-editable target=${describeFocusTarget(
         e.target as Element,
       )} defaultPrevented=${e.defaultPrevented} activeElement=${describeFocusTarget(doc.activeElement)}`,
     );
