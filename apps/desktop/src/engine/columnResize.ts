@@ -81,3 +81,44 @@ export function clampWidth(requested: number, min: number, max: number): ClampRe
 // keyboard paths. When the shell actually needs to arbitrate a shortfall, the rule can come back
 // WITH the caller that reads it and a test that asserts the rendered outcome (render at 1280px with
 // two pairs; assert the terminals, not the concierge, absorb it).
+
+// ── THE WINDOW IS A BOUND TOO ──────────────────────────────────────────────────────────────────
+//
+// A per-column ceiling that ignores the window is how a resize becomes UNRECOVERABLE. Raising the
+// build column's hard max to 1200 re-opened exactly the lockout its own comment claimed to prevent:
+// that column's pull tab is absolutely positioned at its pair-side edge, so on a 900–1100px window a
+// column dragged to 1200 puts its resize tab AND its overlay chevron past the viewport edge, with
+// `body { overflow: hidden }` and nothing to reflow them back. The width is persisted, so the state
+// survives relaunch and the only ways out are widening the window or editing localStorage
+// (roborev 55847).
+//
+// `reserve` is what must stay on screen beside the column: the other columns' minimums plus the seam
+// rails. The `min` floor is deliberate — on a window too narrow to satisfy even that, the answer is
+// the column's own minimum, never a value below it, because an inverted range is how a clamp starts
+// returning nonsense instead of a bound.
+
+/** THE BUILD COLUMN'S FLOOR — the width below which it stops being a column.
+ *
+ *  HERE, NOT IN `AgentSidebar`, because the callers that need it are the ones computing a ROW's
+ *  reserve, and they must not re-spell it. Putting it on the component made `Workspace` import the
+ *  component to learn a number, which every suite that mocks `./AgentSidebar` then had to re-declare —
+ *  and a constant two files declare separately is precisely the class of bug this branch keeps
+ *  re-finding (roborev 55910). This module already owns the row's other invariants. */
+export const BUILD_COLUMN_MIN_WIDTH = 160;
+/** What must stay for the terminal beside the build column — the floor its CSS clamp leaves it.
+ *  Matches the thin-column hazard `paneVisibility` already carries a backstop for: a terminal driven
+ *  to ~0 spawns its PTY at fallback dimensions. */
+export const TERMINAL_MIN_WIDTH = 320;
+
+/**
+ * The largest width a column may be dragged to given the live window — its hard ceiling, lowered so
+ * that `reserve` px are still left for everything else, and never below `min`.
+ */
+export function windowAwareMax(
+  hardMax: number,
+  windowWidth: number,
+  reserve: number,
+  min: number,
+): number {
+  return Math.max(min, Math.min(hardMax, windowWidth - reserve));
+}

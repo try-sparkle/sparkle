@@ -22,7 +22,7 @@
 // (position:fixed pinned to the slot) and really does hand its slot to a spacer; the keyboard
 // resize path clamps and persists. The layout half was verified by hand in the running app; see
 // PRD/feat/sidebar-pull-tabs.md for what was observed and what was not.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -172,9 +172,9 @@ describe("AgentSidebar — keyboard resize", () => {
   it("nudges the width with the arrow keys", () => {
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
-    expect(column().style.width).toBe("228px");
+    expect(column().dataset.width).toBe("228");
     fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-    expect(column().style.width).toBe("220px");
+    expect(column().dataset.width).toBe("220");
   });
 
   // PERSISTED ON A TRAILING TIMER, not per commit. `ColumnPullTab.commit` fires on every mousemove
@@ -218,7 +218,7 @@ describe("AgentSidebar — keyboard resize", () => {
     // for a column the user never touched.
     localStorage.setItem(WIDTH_KEY, "160");
     const { unmount } = render(<AgentSidebar project={mkProject()} />);
-    expect(column().style.width).toBe("160px");
+    expect(column().dataset.width).toBe("160");
     fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" }); // already at MIN_WIDTH
     localStorage.setItem(WIDTH_KEY, "999");
     unmount();
@@ -228,7 +228,7 @@ describe("AgentSidebar — keyboard resize", () => {
   it("jumps by a larger step with Shift held", () => {
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-    expect(column().style.width).toBe("252px");
+    expect(column().dataset.width).toBe("252");
   });
 
   it("MIRRORS the arrow direction with the pair", () => {
@@ -238,39 +238,140 @@ describe("AgentSidebar — keyboard resize", () => {
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-    expect(column().style.width).toBe("228px");
+    expect(column().dataset.width).toBe("228");
     fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
-    expect(column().style.width).toBe("220px");
+    expect(column().dataset.width).toBe("220");
   });
 
-  it("clamps to the same 160-480 range the drag clamps to", () => {
+  // THE CEILING IS WINDOW-RELATIVE NOW, so a row asserting an absolute one has to say which window it
+  // is on. jsdom defaults to 1024px, where the real ceiling is 424 — and that is CORRECT, not a test
+  // artifact: 424 + concierge 280 + terminal 320 exactly fills 1024. The old fixed 480 never fit there
+  // at all, which is the lockout roborev 55847 named. 2000px is a real external display.
+  const withWindow = (px: number, run: () => void) => {
+    const real = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: px, configurable: true });
+    try {
+      run();
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: real, configurable: true });
+    }
+  };
+
+  it("clamps to the same 160-1200 range the drag clamps to, on a window that can afford it", () => {
+    withWindow(2000, () => {
+      render(<AgentSidebar project={mkProject()} />);
+      // 160 → 1200 is 1040px, and a Shift step is 40px, so 40 presses no longer reach the ceiling.
+      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(column().dataset.width).toBe("1200");
+      // Already at the ceiling — another push must not exceed it.
+      fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
+      expect(column().dataset.width).toBe("1200");
+      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowLeft", shiftKey: true });
+      expect(column().dataset.width).toBe("160");
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      expect(column().dataset.width).toBe("160");
+    });
+  });
+
+  // THE OTHER HALF OF THE SAME RULE, and the one that keeps the raised ceiling from re-opening the
+  // lockout it was supposed to prevent: this column's pull tab is absolutely positioned at its
+  // pair-side edge, so a width the window cannot show puts the handle past the viewport with
+  // `overflow: hidden` and no way back except editing localStorage (roborev 55847).
+  // THE THIRD SEAM'S COPY OF THE STORED-vs-PAINTED ROW (roborev 55993). The shell mounts
+  // `ColumnPullTab` three times; the concierge's and the left pair's each got this row, and this one
+  // is the same defect on the same component. The divergence is NOT reachable by seeding localStorage
+  // — the mount-time seed validates against `MAX_WIDTH` and rejects an over-wide stored value — so it
+  // has to be built the way a user reaches it: set a width on a big window, then shrink the window.
+  it("keeps the stored width but resizes from the PAINTED one after the window shrinks", () => {
+    const real = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 2000, configurable: true });
+    try {
+      render(<AgentSidebar project={mkProject()} />);
+      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(column().dataset.width).toBe("1200");
+
+      act(() => {
+        Object.defineProperty(window, "innerWidth", { value: 1000, configurable: true });
+        window.dispatchEvent(new Event("resize"));
+      });
+
+      // THE PREFERENCE SURVIVES. `data-width` and `RENDERED_WIDTH` still carry the raw 1200, so
+      // re-docking to a display that can afford it gives the user their width back.
+      expect(column().dataset.width).toBe("1200");
+
+      // …and the seam now resizes from what is PAINTED. At 1000 the ceiling is
+      // `1000 - (280 concierge + 320 terminal) = 400`, so one 8px step inward lands on 392.
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      // Against the raw 1200, `clampWidth(1192, 160, 400)` pins to 400: the seam is dead for 800px of
+      // travel and the stored 1200 is destroyed by the first keypress.
+      expect(column().dataset.width).toBe("392");
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: real, configurable: true });
+    }
+  });
+
+  it("lowers that ceiling on a narrow window instead of putting its own handle off-screen", () => {
+    withWindow(900, () => {
+      render(<AgentSidebar project={mkProject()} />);
+      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      const w = Number(column().dataset.width);
+      // Concierge at its 280 minimum plus a 320 terminal must still fit beside it.
+      expect(w).toBeLessThanOrEqual(900 - 600);
+      expect(w).toBeGreaterThanOrEqual(160);
+    });
+  });
+
+  // THE WALL THE FOUNDER HIT, named as its own row: "I'm still blocked as to max width that I can make
+  // the builder columns." The ceiling was a bare `MAX_WIDTH = 480` constant, NOT a failed negotiation
+  // with the neighbour — the terminal beside this column is `flex: 1` against effectively no
+  // min-content, so it already yields space freely. Nothing was refusing to give; the clamp stopped
+  // asking. 480 also predates the five-column cockpit, where this is one of TWO builder columns.
+  //
+  // Asserted as "gets PAST the old wall" rather than "equals the new constant", so the row keeps
+  // meaning something if the ceiling is tuned again — and it fails against today's code, where 500 is
+  // unreachable by construction.
+  // THE CLAMP ITSELF, asserted — because the previous pass moved every width read onto `dataset.width`
+  // (the raw state) and left the actual fix, the docked column's CSS clamp, asserted NOWHERE. Reverting
+  // `width: RENDERED_WIDTH` to `width` kept the whole suite green, which is the vacuous shape that let
+  // the earlier High ship in the first place (roborev 55883).
+  it("bounds the PAINTED width against its own container, with a floor and a ceiling", () => {
     render(<AgentSidebar project={mkProject()} />);
-    for (let i = 0; i < 40; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-    expect(column().style.width).toBe("480px");
-    // Already at the ceiling — another push must not exceed it.
-    fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
-    expect(column().style.width).toBe("480px");
-    for (let i = 0; i < 40; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowLeft", shiftKey: true });
-    expect(column().style.width).toBe("160px");
-    fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-    expect(column().style.width).toBe("160px");
+    const w = column().style.width;
+    // The ceiling: never wider than the container minus a terminal worth keeping.
+    expect(w).toContain("calc(100% -");
+    // The FLOOR, which the first version dropped — without it the expression goes negative on a narrow
+    // container and the column paints at 0px.
+    expect(w).toContain("max(");
+    expect(w).toContain("160px");
+    // And it is a container-relative expression, not the frozen pixel value from state.
+    expect(w).not.toBe(`${column().dataset.width}px`);
+  });
+
+  it("widens PAST the old 480 wall, which is what the founder could not do", () => {
+    // On a window with room for it — which is the founder's case, and the case the fixed 480 blocked
+    // regardless of how much room there was. Narrow windows are the row above.
+    withWindow(2000, () => {
+      render(<AgentSidebar project={mkProject()} />);
+      for (let i = 0; i < 12; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(Number(column().dataset.width)).toBeGreaterThan(480);
+    });
   });
 
   it("restores a persisted width, and ignores a persisted value outside the clamp", () => {
     localStorage.setItem(WIDTH_KEY, "300");
     const { unmount } = render(<AgentSidebar project={mkProject()} />);
-    expect(column().style.width).toBe("300px");
+    expect(column().dataset.width).toBe("300");
     unmount();
 
     localStorage.setItem(WIDTH_KEY, "9000");
     render(<AgentSidebar project={mkProject()} />);
-    expect(column().style.width).toBe("220px");
+    expect(column().dataset.width).toBe("220");
   });
 
   it("leaves keys it does not own alone", () => {
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.keyDown(resizeTab(), { key: "a" });
-    expect(column().style.width).toBe("220px");
+    expect(column().dataset.width).toBe("220");
     expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
   });
 
@@ -289,7 +390,7 @@ describe("AgentSidebar — keyboard resize", () => {
     localStorage.setItem(WIDTH_KEY, "300");
     render(<AgentSidebar project={null} slotSide="left" />);
     // Did not seed from the right column's 300: it is at the default.
-    expect(column().style.width).toBe("220px");
+    expect(column().dataset.width).toBe("220");
 
     fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" }); // ← GROWS a left-pair column
     await new Promise((r) => setTimeout(r, 260));
@@ -322,7 +423,10 @@ describe("AgentSidebar — overlay mode", () => {
     // The layout does NOT reflow: a spacer of the column's docked width holds the slot open, so
     // the terminal beside it never changes size (and never re-measures its PTY).
     const slot = screen.getByTestId("agent-sidebar-slot");
-    expect(slot.style.width).toBe("300px");
+    // The docked width, still CSS-clamped against the container the same way the column is (jsdom
+    // serializes `min()` with its own spacing, so match the parts rather than the exact string).
+    expect(slot.style.width).toContain("300px");
+    expect(slot.style.width).toContain("calc(100% -");
     expect(slot.getAttribute("aria-hidden")).toBe("true");
   });
 

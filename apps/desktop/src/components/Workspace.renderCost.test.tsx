@@ -64,7 +64,12 @@ vi.mock("../services/sparkleAgent", async (orig) => ({
 // Module-level so the mock factories (hoisted above the imports) can reach them. `vi.hoisted` is
 // what makes that legal — a plain `const` here is still in the temporal dead zone when the factory
 // body is evaluated.
-const counts = vi.hoisted(() => ({ pane: 0, sidebar: 0, concierge: 0, tabs: 0 }));
+// `compare` is the one that can see the WRAPPER. `pane` counts the memoized LEAF, which bails out —
+// so it reported "ZERO pane renders" while the fibers ABOVE that leaf (PaneHost, Suspense,
+// ErrorBoundary, createPortal — one set per open pane) re-rendered at pointer rate (roborev 55316).
+// The comparator runs only when reconciliation actually REACHES the pane subtree, so counting its
+// calls measures the tree the drag walks rather than the leaf it stops at.
+const counts = vi.hoisted(() => ({ pane: 0, sidebar: 0, concierge: 0, tabs: 0, compare: 0 }));
 
 vi.mock("./AgentPane", async () => {
   const { memo, createElement } = await import("react");
@@ -75,7 +80,11 @@ vi.mock("./AgentPane", async () => {
     counts.pane += 1;
     return createElement("div", { "data-testid": `pane-${agent.id}` });
   };
-  return { AgentPane: memo(Inner, arePanePropsEqual as never) };
+  const countingCompare = (prev: unknown, next: unknown) => {
+    counts.compare += 1;
+    return (arePanePropsEqual as (a: unknown, b: unknown) => boolean)(prev, next);
+  };
+  return { AgentPane: memo(Inner, countingCompare as never) };
 });
 vi.mock("./AgentSidebar", () => ({
   AgentSidebar: () => {
@@ -173,19 +182,50 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
     expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
   });
 
-  it("costs ZERO pane renders with the LEFT pair open too", async () => {
-    // Two stages, two `AgentPaneList`s, and a `pairCount` the shell re-derives on every render. The
-    // five-column cockpit is where the report came from, so the bound has to hold there as well.
-    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+  // THE BOUND THE ONE ABOVE COULD NOT SEE, and the reason "ZERO pane renders" was a half-truth.
+  //
+  // `counts.pane` sits inside the leaf that `arePanePropsEqual` bails out of, so it was reporting zero
+  // while reconciliation still walked the whole list on every pointer event: one PaneHost + Suspense +
+  // ErrorBoundary + createPortal per open pane, 60 panes × 30 events (roborev 55316). The comparator
+  // is called only when React actually reaches the pane subtree, so it counts the walk rather than the
+  // stop. Memoizing `AgentPaneList` (and hoisting its three object-literal props out of the render)
+  // is what takes this to zero; against the pre-change code it is 1,800.
+  it("does not RECONCILE the pane tree either — the cost the leaf counter hid", async () => {
     await mount();
-    expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
-    const mounted = counts.pane;
-    expect(mounted).toBeGreaterThanOrEqual(PANES);
+    const settled = counts.compare;
 
     dragSteps(500, DRAG_STEPS);
 
-    expect(counts.pane - mounted).toBe(0);
+    expect(counts.compare - settled).toBe(0);
+    // The drag really happened, so the zero above is a bail-out and not a no-op.
     expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
+  });
+
+  it("costs ZERO pane renders with the LEFT pair open too", async () => {
+    // Two stages, two `AgentPaneList`s, and a `pairCount` the shell re-derives on every render. The
+    // five-column cockpit is where the report came from, so the bound has to hold there as well.
+    //
+    // AT A WINDOW THAT CAN SEAT FIVE COLUMNS. jsdom defaults to 1024, and the concierge's window-aware
+    // ceiling correctly pins it to 280 there — `320 + 6 + 280 + 6 + 360` does not fit in 1024 — so the
+    // drag below would be measuring that clamp instead of the render cost it exists to measure
+    // (roborev 55910). The single-pair rows above are unaffected: without a left pair the reserve is
+    // small enough that 1024 leaves the full 560.
+    const realWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 1600, configurable: true });
+    try {
+      useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+      await mount();
+      expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
+      const mounted = counts.pane;
+      expect(mounted).toBeGreaterThanOrEqual(PANES);
+
+      dragSteps(500, DRAG_STEPS);
+
+      expect(counts.pane - mounted).toBe(0);
+      expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    }
   });
 
   it("does not re-render the agent sidebar or the tab strips either", async () => {

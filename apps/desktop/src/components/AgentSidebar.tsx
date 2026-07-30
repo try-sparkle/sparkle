@@ -34,6 +34,8 @@ import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStat
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { ColumnPullTab } from "./ColumnPullTab";
+import { useWindowWidth } from "../hooks/useWindowWidth";
+import { BUILD_COLUMN_MIN_WIDTH, TERMINAL_MIN_WIDTH, windowAwareMax } from "../engine/columnResize";
 import { TERM_HAIRLINE } from "./terminalChrome";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
@@ -693,8 +695,46 @@ export function AgentSidebar({
 
   // Draggable column width — persisted to localStorage so it survives relaunch. Clamped to
   // a sane range so the column can't be dragged to nothing or take over the window.
-  const MIN_WIDTH = 160;
-  const MAX_WIDTH = 480;
+  //
+  // 480 WAS THE WALL THE FOUNDER HIT ("blocked as to max width I can make the builder columns"), and
+  // it was a bare constant, not a negotiation failure: the terminal beside this column is `flex: 1`
+  // against effectively no min-content (its panes are `position: absolute`), so it already yields
+  // space freely — nothing was refusing to give, the clamp simply stopped asking. 480 also predates
+  // the five-column cockpit, where this column is one of TWO builders and a laptop-width window can
+  // comfortably spare more than that for the one the user is reading.
+  //
+  // 1200 rather than "unbounded": a bound still has to exist so the column cannot be dragged over the
+  // concierge and the terminal entirely, which is unrecoverable without editing localStorage. This is
+  // "to taste" for any real window while keeping that floor of sanity.
+  //
+  // AND CLAMPED AGAINST THE LIVE WINDOW, because 1200 alone re-opened the very lockout the paragraph
+  // above claims to prevent (roborev 55847). This column's pull tab is absolutely positioned at its
+  // pair-side edge, so on a 900–1100px window — `tauri.conf.json` allows 900 — a column dragged to
+  // 1200 puts its resize tab AND its overlay chevron past the viewport edge, with `overflow: hidden`
+  // and nothing to reflow them back. The width persists, so the only ways out were widening the window
+  // or editing localStorage. The reserve is the concierge at its minimum plus a terminal worth
+  // showing; the restore path below reads this same value, so a width saved on a large display is
+  // rejected rather than restored onto a small one.
+  const MIN_WIDTH = BUILD_COLUMN_MIN_WIDTH;
+  const HARD_MAX_WIDTH = 1200;
+  const windowWidth = useWindowWidth();
+  const MAX_WIDTH = windowAwareMax(HARD_MAX_WIDTH, windowWidth, 280 + 320, MIN_WIDTH);
+  // TWO BOUNDS WITH DIFFERENT JOBS, because one of them cannot do the other's (roborev 55869).
+  //
+  // `MAX_WIDTH` above bounds the GESTURE — where the drag and the arrow keys stop. `RENDERED_WIDTH`
+  // below bounds the PAINT, in CSS, against this column's own live container. The JS bound alone was
+  // not enough, twice over: (1) it is recomputed as the window changes but the stored `width` was
+  // never reconciled against it, so a column set to 1200 on a large display kept rendering at 1200
+  // after the window shrank — handle off the viewport, `overflow: hidden`, no way back; and (2) its
+  // reserve describes a ONE-pair cockpit, while this component mounts twice once the left pair opens,
+  // so with two pairs the permitted maximum exceeded the space the pair actually had.
+  //
+  // A CSS `min()` against `100%` fixes both without a resize listener, a reconciling effect, or a
+  // measurement: the percentage resolves against `.paircols` — this column's real container, which is
+  // the PAIR and therefore already accounts for the sibling pair — and the browser re-evaluates it at
+  // layout, so a window resize brings the rendered width down on its own. The stored preference is
+  // left intact, so re-docking to a large display restores the width the user chose rather than
+  // discarding it. This is the same idiom `OVERLAY_WIDTH` above already uses, and for the same reason.
   // KEYED PER SIDE. `Workspace` mounts this component TWICE once the left pair is open (plus once
   // more in the satellite window) and each instance owns its own `width` state, so a single shared
   // key made the two race: whichever flushed last overwrote the other's value, and the plainest form
@@ -758,6 +798,29 @@ export function AgentSidebar({
     const id = setTimeout(() => localStorage.setItem(widthKey, String(width)), 200);
     return () => clearTimeout(id);
   }, [width, widthKey]);
+
+  // Derived here rather than beside the constants because it reads `width` state — see the two-bounds
+  // note above for why the paint gets its own bound.
+  // WITH A FLOOR, which the first version dropped — and `OVERLAY_WIDTH` above, the idiom this copies,
+  // has always carried one (`max(280px, min(480px, 100%))`). Without it the expression goes NEGATIVE on
+  // a narrow container and the used width resolves to 0: at defaults on a 1280px window with a left
+  // pair open the right pair holds 268px, so `min(220px, calc(268px - 320px))` painted the build column
+  // away entirely (roborev 55883). It also handed the terminal the only hard minimum in the row, which
+  // inverts engine/columnResize's documented collapse order — terminal collapses to a strip FIRST, then
+  // build. `max(MIN_WIDTH, …)` restores both: the column never paints below its own minimum, and the
+  // terminal goes on absorbing the shortfall the way that file says it must.
+  const RENDERED_WIDTH = `max(${MIN_WIDTH}px, min(${width}px, calc(100% - ${TERMINAL_MIN_WIDTH}px)))`;
+  // THE THIRD SEAM'S COPY OF THE SAME FIX (roborev 55993). The shell mounts `ColumnPullTab` at three
+  // boundaries; the concierge's and the left pair's already drag from what is PAINTED rather than what
+  // is STORED, and this one did not. `MAX_WIDTH` is reactive through `useWindowWidth` while `width` is
+  // deliberately never reconciled against it, so `width > MAX_WIDTH` is this column's normal steady
+  // state after a window shrink — at which point a tab handed the raw `width` starts its drag from a
+  // number that is not on screen: the seam goes dead for `width - MAX_WIDTH` px of travel,
+  // `aria-valuenow` sits outside `aria-valuemax`, and the first pointer-down commits the ceiling,
+  // destroying the very `sparkle-sidebar-width:<side>` preference the block above says survives a trip
+  // through a small display. `RENDERED_WIDTH` and `data-width` keep the RAW state, which is what makes
+  // that survival true.
+  const RENDERED_TAB_WIDTH = Math.min(width, MAX_WIDTH);
   useEffect(() => {
     // A debounce that only cancels is a way to LOSE a width. Same trio the concierge seam and
     // projectStore register, for the same reason: a native window close destroys the webview and
@@ -1888,14 +1951,17 @@ export function AgentSidebar({
       <div
         data-testid="agent-sidebar-slot"
         aria-hidden
-        style={{ width, flex: "0 0 auto", height: "100%" }}
+        style={{ width: RENDERED_WIDTH, flex: "0 0 auto", height: "100%" }}
       />
     )}
     <div
       data-testid="agent-sidebar-column"
       data-overlay={String(overlay)}
+      // The NUMBER, separate from the CSS `min()` in `width` — see RENDERED_WIDTH.
+      data-width={String(width)}
       style={{
-        width,
+        // CSS-clamped against this column's own container — see RENDERED_WIDTH.
+        width: RENDERED_WIDTH,
         flex: "0 0 auto",
         position: "relative",
         // THE HALF OF THE CIRCUIT THAT WAS NEVER WIRED — and the reason the selected row read as
@@ -2556,7 +2622,8 @@ export function AgentSidebar({
         }}
       >
         <ColumnPullTab
-          width={width}
+          // PAINTED, not stored — see RENDERED_TAB_WIDTH.
+          width={RENDERED_TAB_WIDTH}
           onWidth={commitWidth}
           min={MIN_WIDTH}
           max={MAX_WIDTH}
