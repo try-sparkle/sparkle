@@ -29,6 +29,7 @@ import { useAttentionNotifications } from "./useAttentionNotifications";
 import { useRosterPublisher } from "./useRosterPublisher";
 import { useHelperVitalsPublisher } from "./useHelperVitalsPublisher";
 import { useLimitSync } from "./hooks/useLimitSync";
+import { useApiRecovery } from "./services/apiRecoveryRunner";
 import { useDisplayRespan } from "./hooks/useDisplayRespan";
 import { useSettingsShortcut } from "./hooks/useSettingsShortcut";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -90,6 +91,22 @@ function RosterPublisher() {
 // an ACCOUNT, so one poller serves every open agent. Paints no UI.
 function LimitSync() {
   useLimitSync();
+  return null;
+}
+
+// Retries an agent that a transient Anthropic API error (529/500) knocked out mid-turn, on an
+// escalating ladder, instead of leaving a red row for a human to notice (services/apiRecoveryRunner).
+//
+// Mounted HERE, beside LimitSync, because the two answer adjacent halves of one question and must not
+// be confused: LimitSync handles ACCOUNT exhaustion, which no retry can fix and which benches the
+// account until its real reset; this handles VENDOR-side failure, which time alone does fix.
+// engine/apiRecovery classifies which is which and never pings the former.
+//
+// Sibling of the columns rather than inside ConciergeHost on purpose: ConciergeHost unmounts when no
+// project is open, and an agent that 529s must keep being retried regardless of what the window is
+// showing. Paints no UI.
+function ApiRecovery() {
+  useApiRecovery();
   return null;
 }
 
@@ -329,6 +346,7 @@ export function App() {
     <AppBoot>
       <RosterPublisher />
       <LimitSync />
+      <ApiRecovery />
       <DisplayRespan />
       <LastFocusedProjectTracker />
       {/* Historical: WindowSessionCapture recorded per-window geometry so a cold start could

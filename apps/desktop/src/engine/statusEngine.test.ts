@@ -412,6 +412,65 @@ describe("StatusEngine", () => {
     expect(last()).toBe("errored");
   });
 
+  // END-TO-END FOR THE MARKER FIX (sparkle-onzu, roborev 55416). The banner does not arrive bare:
+  // Claude Code records an API failure as a synthetic ASSISTANT message and the TUI prefixes those
+  // with "⏺ ", so every real 529 read GREEN until the anchor learned to strip it. Asserted at THIS
+  // level, not just on the pure matcher, because the shape that actually reaches a live agent is a
+  // banner in an UNTERMINATED tail — caught only by the partial-tail arrival diff, never by the
+  // completed-line loop.
+  it("goes errored on a ⏺-prefixed banner with NO trailing newline (the live shape)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+    // No trailing "\n" — this is the whole point. Verbatim the founder's screenshot.
+    engine.ingest("\r⏺ API Error: 529 Overloaded.");
+    expect(last()).toBe("errored");
+    engine.ingest(SPINNER);
+    expect(last()).toBe("errored"); // sticky until real progress
+  });
+
+  it("goes errored on a ⏺-prefixed banner as a completed line too", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest("\n⏺ API Error: 500 Internal server error.\n");
+    expect(last()).toBe("errored");
+  });
+
+  // The counterpart guard: a command's OUTPUT that merely reads like a banner must not paint the row
+  // red. `⎿` is the tool-RESULT marker, so this is an agent curling a failing endpoint or tailing a
+  // log — healthy work. Including `⎿` in the marker class would have reintroduced exactly the
+  // "logs the agent is reading" false-red this module deliberately avoids.
+  it("stays working when a TOOL RESULT contains an API-error-looking line", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+    engine.ingest("\n  ⎿  API Error: 500 Internal server error.\n");
+    expect(last()).toBe("working");
+    engine.ingest("\n  ⎿  API Error: 429 rate_limit_error\n");
+    expect(last()).toBe("working");
+  });
+
+  // ⚠️ PINNING A KNOWN RESIDUAL, at the level where it actually bites (roborev 55467).
+  //
+  // The test above closes the result-HEAD case only. The TUI marks just the FIRST line of a tool
+  // result with `⎿`; continuation lines are plain indented text, and this engine trims leading
+  // whitespace before anchoring — so line 2+ of a multi-line result that begins "API Error: …" DOES
+  // paint a healthy agent red. streamFailure.test.ts pins this on the matcher, where it is arguably
+  // by design; the harm is here, so the assertion belongs here too.
+  //
+  // THIS TEST ASSERTS THE BUG. If you close the residual — tool-result-block tracking, as
+  // streamFailure's header proposes — this goes red and points you at that rationale. Flip it to
+  // "working" then; do not delete it.
+  it("STILL goes errored on an UNMARKED continuation line of a tool result (known residual)", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(last()).toBe("working");
+    // A two-line result: the head wears `⎿`, the body does not. Think `curl` printing a status line
+    // and then a JSON error, or a tailed log.
+    engine.ingest("\n  ⎿  $ curl -sS https://example.test/v1\n     API Error: 500 Internal server error.\n");
+    expect(last()).toBe("errored");
+  });
+
   it("goes errored on a self-prompt loop (REPEATED pings) instead of staying working forever", () => {
     const { engine, last } = makeEngine();
     engine.ingest(SPINNER);

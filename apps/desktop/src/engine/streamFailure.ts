@@ -34,15 +34,89 @@
 // one is for STATUS — do not merge them.
 export const API_ERROR_PATTERNS: readonly RegExp[] = [/^api error\s*:/i];
 
+// TUI MESSAGE-MARKER GLYPHS, stripped before the `^` anchor is applied (sparkle-onzu).
+//
+// The banner does NOT reach us bare. Claude Code records an API failure as a synthetic ASSISTANT
+// message (`isApiErrorMessage: true` in its own transcript), and the TUI prefixes assistant messages
+// with "⏺ " and tool results with "⎿ " — so the line the PTY actually carries is
+// "⏺ API Error: 529 Overloaded.", which `^api error:` cannot match however well it is trimmed.
+// THE ABSENCE OF THIS STRIP is what kept every 529'd agent reading GREEN/GRAY: the anchor was applied
+// to a line still carrying "⏺ ", so it could never match. A module that fails CLOSED on purpose was
+// failing OPEN. (Attribution matters here because it was got wrong once: the cause was the missing
+// `⏺` strip, NOT the exclusion of the tool-result glyph `⎿`, which is correct and is kept below.
+// This glyph has already flip-flopped twice — do not "resolve" anything by re-adding `⎿`.)
+//
+// The evidence is in-repo and authoritative by this repo's own standard: engine/
+// capturedScreens.fixture.ts is a byte-for-byte replay of a real Claude Code 2.1.220 viewport
+// (captured via PTY + headless xterm, trailing spaces trimmed — the same surface `snapshotScreen()`
+// hands the classifier in production), and it renders assistant text as "⏺ I'll run that command."
+// and a tool result as "  ⎿  $ touch probe_ok.txt". Per that fixture's own header: absence in
+// `strings` is not evidence about the UI; only a captured screen is.
+//
+// DELIBERATELY NARROW — the ASSISTANT-message marker ONLY, and the exclusions are the whole point.
+//
+// NOT `⎿`, the TOOL-RESULT marker (roborev 55416). That glyph prefixes the output of a command the
+// agent RAN — the fixture renders it as "  ⎿  $ touch probe_ok.txt" — so stripping it would mean a
+// tool result whose first line happens to begin "API Error:" trips a sticky RED on a perfectly
+// healthy agent. That is not hypothetical: `curl` against a failing endpoint, a tailed server log, a
+// `cat` of a saved error payload, another agent's transcript, or debugging THIS module all produce
+// it. It is verbatim the false-positive class the header above says was deliberately dropped
+// ("they false-trip on prose and on logs the agent is reading"), and the guards do not cover it —
+// the completed-line path exempts classified tool EVENTS, but a result BODY is not an event, and the
+// partial-tail path (statusEngine, the `arrived` diff) has no event guard at all. Nothing shows a
+// real banner ever arriving behind `⎿` either: the banner is a synthetic ASSISTANT message
+// (`isApiErrorMessage: true`), so it wears `⏺`. Adding `⎿` would buy no detection and only cost
+// precision.
+//
+// ⚠️ WHAT EXCLUDING `⎿` DOES **NOT** BUY — stated plainly so the next reader does not over-trust it
+// (roborev 55440). The TUI marks only the FIRST line of a tool result with `⎿`; subsequent output
+// lines are plain indented text. This function trims leading whitespace before anchoring, so line 2+
+// of a MULTI-LINE result — a `curl` body, a tailed log, a `cat`ed payload — that begins
+// "API Error: 500 …" STILL trips a sticky red on a healthy agent. The `⎿` exclusion therefore closes
+// the result-HEAD case, NOT the "logs the agent is reading" class in general.
+//
+// That residual is PRE-EXISTING and unchanged by the marker work: a bare, unmarked "API Error: …"
+// line has always matched, and stripping `⏺` neither caused nor widened it. Closing it properly means
+// tracking an active tool-result block ("last `⎿` seen, still indented"), which risks suppressing a
+// GENUINE banner that lands while a block is open — a fail-open trade in a module that exists to fail
+// closed. Deliberately not attempted here; tracked on bead `sparkle-onzu`.
+//
+// NOT markdown bullets an agent authors in its own prose (`-`, `*`, `•`, `>`, `1.`) either: an agent
+// quoting a banner it read — or writing up this very bug — must not paint its own row red, and those
+// are exactly the shapes such prose takes.
+//
+// The COLON rule is untouched and still does the heavy lifting — "⏺ API Error handling: returns 500."
+// stays green because a word, not a colon, follows "API Error" (roborev 16182/16177/16171).
+// ANY number of markers, in ONE pass. `⏺+` alone collapses only ADJACENT glyphs, so a redraw that
+// leaves "⏺ ⏺ API Error: …" (glyph-SPACE-glyph) needs the repetition to span the separator too.
+// This used to be `/^⏺+\s*/` applied in a loop bounded at 3 passes, which failed OPEN past that
+// bound: "⏺ ⏺ ⏺ ⏺ API Error: 529" kept a glyph, so `classifyFromScrollback` returned null and the
+// retry ladder was skipped on an already-red row (roborev 55467). A bounded loop over an unbounded
+// input is the wrong shape — the group handles any count and cannot loop, so there is no bound left
+// to fail open past. Anchored with a literal glyph, so a non-matching line fails at position 0.
+const MESSAGE_MARKERS = /^(?:⏺\s*)+/;
+
+/** A frame with leading whitespace and any assistant-message markers removed, so the `^` anchor sees
+ *  the banner text itself. Pure.
+ *
+ *  EXPORTED so there is exactly ONE implementation of the marker rule (roborev 55440).
+ *  `engine/apiRecovery.classifyFromScrollback` had its own single-`replace` copy that claimed to match
+ *  this "exactly" and did not: on "⏺ ⏺ API Error: 529" it left a glyph behind, classified the failure
+ *  as null, and skipped the ladder entirely — while THIS function, which looped, had already painted
+ *  the row red. Red row, no retry, human waits: verbatim the split that feature exists to prevent.
+ *  Two copies of one rule will always drift; share it. */
+export function stripMarkers(frame: string): string {
+  return frame.trim().replace(MESSAGE_MARKERS, "").trim();
+}
+
 // The spinner redraws in place with carriage returns (no newline), so a single split-on-\n "line"
 // can carry several \r-separated frames with the banner fused onto one of them ("…esc to interrupt\r
 // API Error…", or a banner followed by another redraw). \r survives stripAnsi (it isn't an ESC
 // sequence). We test EVERY \r-frame (not just the last) against the anchored pattern, so the banner
-// is caught whichever frame it lands in (roborev 16169). Each frame is trimmed so leading spaces
-// don't defeat `^`; note trim() strips only whitespace, NOT box-draw/marker glyphs — the live banner
-// carries none, so a hypothetical "⎿ API Error" is out of scope here.
+// is caught whichever frame it lands in (roborev 16169). Each frame is trimmed AND marker-stripped
+// (see MESSAGE_MARKERS) so neither leading spaces nor the TUI's own "⏺ " defeats `^`.
 function frames(line: string): string[] {
-  return line.split("\r").map((f) => f.trim());
+  return line.split("\r").map((f) => stripMarkers(f));
 }
 
 /** The trimmed banner frames in a raw CHUNK, in order. Splits on \n as well as \r, because unlike
@@ -53,7 +127,14 @@ function frames(line: string): string[] {
  *  and the StatusEngine partial-banner check for why arrival-diffing (not a whole-buffer count) is
  *  what survives a verbatim-repeated banner (46899) and a MAX_PARTIAL-saturated buffer (46920). */
 export function apiErrorFramesIn(chunk: string): string[] {
-  return chunk.split(/[\r\n]/).map((f) => f.trim()).filter((f) => API_ERROR_PATTERNS.some((re) => re.test(f)));
+  // Marker-stripped like `frames()`, and for the same reason — the live banner arrives as
+  // "⏺ API Error: …" (see MESSAGE_MARKERS). The returned frames are ALSO what StatusEngine diffs and
+  // then echo-checks against the user's own just-submitted text, and stripping helps there too: a
+  // marker-free frame compares against that text more faithfully than one carrying the TUI's glyph.
+  return chunk
+    .split(/[\r\n]/)
+    .map((f) => stripMarkers(f))
+    .filter((f) => API_ERROR_PATTERNS.some((re) => re.test(f)));
 }
 
 /** How many banner frames a raw CHUNK contains. Count-only sugar over {@link apiErrorFramesIn}. */
