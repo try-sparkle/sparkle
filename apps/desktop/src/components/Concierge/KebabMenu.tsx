@@ -95,12 +95,40 @@ export function KebabMenu() {
     // which auto-deactivates after 5s, so the button that deep-opened the Credits pane is gone long
     // before the user finishes reading it (roborev 55595). The trigger is the one node guaranteed to
     // still be here, so it is the fallback.
+    // ATTACHED IS NOT FOCUSABLE, and `<body>` is the case that matters. `focusBeforeOpen` is
+    // `document.activeElement` at open time, which is `document.body` whenever nothing focusable held
+    // focus — click any non-interactive area and press ⌘, and that is exactly what we captured. Also
+    // note WKWebView (which Tauri on macOS is) does not focus a button on click, so the deep-open
+    // triggers routinely leave `<body>` active. `document.contains(document.body)` is `true`, so an
+    // attachment-only check hands back `<body>`, `body.focus()` is a silent no-op, and the unmount two
+    // lines down strands focus there — the very defect this restore exists to fix, on the most common
+    // path. Same for a node still attached but since hidden/`display:none`/`disabled`.
+    //
+    // So: reject `<body>` up front, then VERIFY THE OUTCOME rather than trusting `.focus()` to have
+    // worked. `.focus()` reports nothing, so checking `activeElement` afterwards is the only way to
+    // know, and the trigger is the one node guaranteed to still be here and focusable.
     const prev = focusBeforeOpen.current;
-    const stillThere = prev !== null && document.contains(prev) ? prev : null;
+    const stillThere =
+      prev !== null && prev !== document.body && document.contains(prev) ? prev : null;
     const restore = (settingsOpen ? triggerRef.current : null) ?? stillThere ?? triggerRef.current;
     // Before the unmount, while the dialog still holds focus — moving it out first is what keeps the
     // removal from dropping focus on the floor.
     restore?.focus?.();
+    // Did it actually take? `.focus()` is a silent no-op on anything unfocusable, so it has to be
+    // checked rather than assumed — but the check must compare against the INTENDED TARGET, not
+    // against "nowhere". At this point the dialog is still mounted and still holds focus
+    // (`setSettingsOpen(false)` is the next line), so a failed restore leaves `activeElement` on the
+    // dialog container — never `null` and never `<body>`. Testing for "nowhere" here therefore never
+    // fires in the case that matters (an attached-but-hidden/`display:none`/`disabled` node), which
+    // is exactly the hole roborev 55781 found in the first version of this guard.
+    //
+    // `contains` tolerates a target that forwards focus to a descendant.
+    if (
+      !restore ||
+      (document.activeElement !== restore && !restore.contains(document.activeElement))
+    ) {
+      triggerRef.current?.focus?.();
+    }
     setSettingsOpen(false);
     clearSettingsRequest();
   };

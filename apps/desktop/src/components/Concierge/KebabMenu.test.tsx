@@ -273,6 +273,68 @@ describe("KebabMenu — reused surfaces", () => {
     expect(document.activeElement).toBe(trigger());
   });
 
+  it("falls back to the trigger when nothing focusable was focused at open (the ⌘, path)", () => {
+    // THE COMMON CASE, and the one an attachment-only guard misses (roborev 55764). Nothing calls
+    // `.focus()` here, so `document.activeElement` at open time is `<body>` — which is what ⌘, on a
+    // click in dead space produces, and what WKWebView (Tauri on macOS) produces even for the
+    // deep-open buttons, since it does not focus a button on click.
+    //
+    // `document.contains(document.body)` is `true`, so a guard that only checks attachment restores
+    // to `<body>`, `body.focus()` does nothing, and the unmount strands focus. Asserting the OUTCOME
+    // (where focus ended up) rather than that a restore was attempted.
+    render(<KebabMenu />);
+    expect(document.activeElement === document.body || document.activeElement === null).toBe(true);
+
+    act(() => useUiStore.getState().openSettings("credits"));
+    expect(screen.getByTestId("settings-dialog")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("close settings"));
+    expect(screen.queryByTestId("settings-dialog")).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it("falls back to the trigger when the restore target is still ATTACHED but unfocusable", () => {
+    // THE ROW THAT PINS THE OUTCOME CHECK, and the one the `<body>` row above cannot.
+    //
+    // With `prev === document.body` the rejection already makes `restore` the trigger, so `.focus()`
+    // succeeds and the verification block is never entered — delete it and that row stays green
+    // (roborev 55781). This row is the case where the block is the ONLY thing that helps: a real,
+    // focusable, still-ATTACHED origin that becomes `disabled` while the dialog is open. It passes
+    // the `document.contains` check, so `restore` is that node, and `.focus()` on a disabled button
+    // is a silent no-op.
+    //
+    // Note what makes this subtle: at the moment of the check the dialog is still mounted and still
+    // holds focus, so `activeElement` is the dialog container — NOT `null`, NOT `<body>`. A check for
+    // "nowhere" reads false here and the fallback never fires. Only comparing against the intended
+    // target catches it.
+    function Host({ off }: { off: boolean }) {
+      return (
+        <>
+          <button type="button" disabled={off}>
+            elsewhere
+          </button>
+          <KebabMenu />
+        </>
+      );
+    }
+    const { rerender } = render(<Host off={false} />);
+    screen.getByRole("button", { name: "elsewhere" }).focus();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "elsewhere" }));
+
+    act(() => useUiStore.getState().openSettings("credits"));
+    expect(screen.getByTestId("settings-dialog")).toBeTruthy();
+
+    // Still mounted — just no longer focusable.
+    act(() => rerender(<Host off />));
+    expect(screen.getByRole("button", { name: "elsewhere" })).toBeTruthy();
+
+    fireEvent.click(screen.getByText("close settings"));
+    expect(screen.queryByTestId("settings-dialog")).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(trigger());
+  });
+
   it("Escape dismisses the settings dialog", () => {
     render(<KebabMenu />);
     fireEvent.click(trigger());
