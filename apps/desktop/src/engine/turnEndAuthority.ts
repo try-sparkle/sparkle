@@ -137,8 +137,8 @@ export function hasTurnEndAuthority(agentId: string): boolean {
 }
 
 /**
- * Has this agent's PTY exited? `undefined` when this window is not driving the agent — which is NOT
- * "it is alive", and callers must keep the two apart.
+ * Is this agent's process still ALIVE? `undefined` when this window is not driving the agent — which
+ * is NOT "it is alive", and callers must keep the two apart.
  *
  * THE ONLY READER OF `exited` IN THE APP, and it exists because a consumer needed a real death
  * signal and there was nowhere to get one. `services/agentLiveness` says so in as many words ("for a
@@ -148,13 +148,21 @@ export function hasTurnEndAuthority(agentId: string): boolean {
  * `unmerged` band is an overlay over idle/done/stopped, so the status itself cannot answer, and
  * without this reader that gate had no producer at all and refused the whole band (roborev 55298).
  *
+ * EXPORTED IN THE CONSUMER'S POLARITY — alive, not exited — deliberately (roborev 55338). It briefly
+ * read `hasExited`, whose shape (`boolean | undefined`) is IDENTICAL to the `processAlive` field it
+ * feeds, so the obvious wiring `processAlive: hasExited(id)` type-checked while meaning the exact
+ * opposite: an exited PTY would have reported alive and been typed into, and a live agent would have
+ * been reported `process-gone`. A polarity flip that compiles is not a hazard to document, it is one
+ * to delete.
+ *
  * Note the asymmetry with `hasTurnEndAuthority`, which folds `exited` into an OR: there, an exited
  * PTY is the strongest possible witness that a turn ended. Here it is the evidence that there is no
- * terminal left to type into. Same flag, opposite consequence, which is exactly why it needs its own
- * reader rather than being inferred from the other one.
+ * terminal left to type into. Same flag, opposite consequence, which is why it needs its own reader
+ * rather than being inferred from the other one.
  */
-export function hasExited(agentId: string): boolean | undefined {
-  return byAgent.get(agentId)?.exited;
+export function processAliveOf(agentId: string): boolean | undefined {
+  const a = byAgent.get(agentId);
+  return a === undefined ? undefined : !a.exited;
 }
 
 /**

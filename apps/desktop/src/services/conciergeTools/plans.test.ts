@@ -224,6 +224,9 @@ describe("promote_plan_to_build", () => {
       epicId: "e1",
       prdPath: "PRD/thing.md",
       mode: "epic",
+      // This is the concierge's TOOL layer, so the seed is machine-authored (roborev 55721). It bites
+      // on the reuse path, where the seed would otherwise release a resumed orchestrator's goal debt.
+      humanAuthored: false,
     });
     expect(r.ok && r.data).toEqual({ agentId: "agent-new", epicId: "e1", reused: false });
   });

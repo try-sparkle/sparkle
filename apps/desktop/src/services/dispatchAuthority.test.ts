@@ -26,14 +26,18 @@ const SAMPLES: Record<DispatchAuthorityKind, DispatchAuthority> = {
   "nudge-approve": { kind: "nudge-approve", agentId: "ag-2" },
   suggestion: { kind: "suggestion", agentId: "ag-3" },
   "concierge-tool": conciergeToolAuthority("call-1", { tier: "allow" })!,
+  "goal-continue": { kind: "goal-continue", agentId: "ag-4" },
 };
 
 describe("DISPATCH_AUTHORITY_KINDS", () => {
   it("lists every kind the union declares", () => {
     expect([...DISPATCH_AUTHORITY_KINDS].sort()).toEqual(Object.keys(SAMPLES).sort());
   });
-  it("covers the six user gestures the design names, plus the concierge tool arm", () => {
-    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(7);
+  it("covers the six user gestures the design names, plus the two machine arms", () => {
+    // `concierge-tool` (an AI tool call under a resolved policy) and `goal-continue` (the goal
+    // auto-continue runner) are the two writes NO human gesture authorizes. Each carries its own
+    // arm so the audit line names the real cause rather than borrowing another's.
+    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(8);
   });
   // The arm that must NEVER exist. A heuristic verdict is not a user gesture, and neither is an AI
   // deciding to call a tool — `concierge-tool` is admissible only because it carries the POLICY

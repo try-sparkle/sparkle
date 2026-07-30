@@ -92,9 +92,67 @@ export type DispatchAuthority =
    * Nor is "rather than by hand" advisory: `policy` is a {@link ToolPolicyStamp}, which nothing
    * outside this module can mint, so a hand-written literal does not compile.
    */
-  | { kind: "concierge-tool"; toolCallId: string; policy: ToolPolicyStamp };
+  | { kind: "concierge-tool"; toolCallId: string; policy: ToolPolicyStamp }
+  /**
+   * The GOAL auto-continue runner restarted a turn that ended with the goal unmet
+   * (services/goalContinuationRunner, deciding through engine/goalContinuation).
+   *
+   * Its OWN arm rather than a borrowed one, and the borrowing it replaces is the reason. The runner
+   * could mint a `concierge-tool` authority — `conciergeToolAuthority(id, {tier:"allow"})` needs
+   * nothing the runner doesn't have — and every gate below would pass. But the audit line is the
+   * whole point of this union: a "why did it type that?" complaint about an auto-continue would then
+   * be answered "a concierge tool call ran under an allow-tier policy", naming a tool call that never
+   * happened and a policy nobody configured. The write is real and it is machine-authored; the union
+   * says so plainly instead.
+   *
+   * Carries the agent id, which is the only thing there is to attribute it to — there is no gesture
+   * and no tool call. What makes it legal is not recorded here but in the DECISION: `decideContinuation`
+   * refuses unless the goal is live and unmet, the row has been continuously resting past
+   * `IDLE_SETTLE_MS`, some source actually witnessed the turn ending, the process is alive, and the
+   * retry bounds are unspent. This arm is the receipt for that decision, not a second copy of it.
+   */
+  | { kind: "goal-continue"; agentId: string };
 
 export type DispatchAuthorityKind = DispatchAuthority["kind"];
+
+/**
+ * Did a HUMAN author the text of this dispatch — as opposed to merely making it legal?
+ *
+ * A DIFFERENT QUESTION FROM AUTHORITY, and conflating the two cost a real guarantee (roborev 55588).
+ * Every arm of this union authorizes a write; only some of them mean a person composed the words.
+ * `projectStore.releaseGoalDebt` clears an agent's retry budget AND un-latches an escalation on the
+ * reasoning that "a human changed the picture", so it must key on THIS and not on the dispatch's
+ * `userPrompt` flag: `send_to_agent_terminal` passes `userPrompt: true` for prose the concierge LLM
+ * composed, so a machine nudge was clearing the very latch whose purpose is to hand the agent to a
+ * human — and `send_to_agent_terminal` is `disruptive`, so under a policy that allows disruptive
+ * writes that happened unattended, refilling MAX_CONTINUES_TOTAL indefinitely.
+ *
+ * The union's own docstrings already draw this line — the tool arm says outright "An AI tool call is
+ * NOT a user gesture … it is the same class of thing as the router's verdict" — so this only makes a
+ * stated distinction executable.
+ *
+ * A RECORD, NOT A SWITCH, and not an `Array`/`Set` of the human kinds either: a `Record` over
+ * `DispatchAuthorityKind` is exhaustive, so ADDING an arm to the union fails to compile here until
+ * someone decides which side of this line it sits on. That default-by-omission is exactly what went
+ * wrong once already, and the safe answer for a new arm is rarely obvious enough to guess.
+ */
+const HUMAN_AUTHORED: Record<DispatchAuthorityKind, boolean> = {
+  // A person typed, clicked, or let their own armed send run. The words are theirs.
+  mention: true,
+  approval: true, // the user approved THIS text before it went
+  countdown: true,
+  redirect: true,
+  "nudge-approve": true,
+  suggestion: true,
+  // MACHINE-AUTHORED. The policy that made the write legal may well have come from a human, but the
+  // prose did not, and it is the prose that constitutes "the human changed the picture".
+  "concierge-tool": false,
+  "goal-continue": false,
+};
+
+export function isHumanAuthored(a: DispatchAuthority): boolean {
+  return HUMAN_AUTHORED[a.kind];
+}
 
 /** The tool arm on its own. The concierge tool layer takes THIS, not the whole union: every other
  *  arm is a user gesture that a tool call has no business claiming, and most are constructible from
@@ -112,6 +170,7 @@ const AUTHORITY_REF_FIELD: Readonly<Record<DispatchAuthorityKind, string>> = Obj
   "nudge-approve": "agentId",
   suggestion: "agentId",
   "concierge-tool": "toolCallId",
+  "goal-continue": "agentId",
 });
 
 /**
@@ -147,6 +206,10 @@ const AUTHORITY_EXTRA_CHECK: Readonly<
   "nudge-approve": () => true,
   suggestion: () => true,
   "concierge-tool": (v) => v.policy === "allow" || v.policy === "approved",
+  // Nothing beyond the agent id. The legality of an auto-continue is decided by
+  // `engine/goalContinuation.decideContinuation` BEFORE this authority is built, and re-stating a
+  // slice of that decision here would be a second copy of it that can disagree with the first.
+  "goal-continue": () => true,
 });
 
 /**
@@ -237,6 +300,8 @@ export function authorityRef(a: DispatchAuthority): string {
       return a.agentId;
     case "concierge-tool":
       return a.toolCallId;
+    case "goal-continue":
+      return a.agentId;
     default: {
       const unhandled: never = a;
       void unhandled;
@@ -272,6 +337,8 @@ export function describeAuthority(a: DispatchAuthority): string {
       return a.policy === "approved"
         ? "the user approved this concierge tool call"
         : "a concierge tool call ran under an allow-tier policy";
+    case "goal-continue":
+      return "goal auto-continue resumed a turn that ended with the goal unmet";
     default: {
       const unhandled: never = a;
       void unhandled;

@@ -64,6 +64,25 @@ describe("sparkleControlProtocol — name yourself early, but never in a turn of
     expect(p).toMatch(/COST RULE wins/);
   });
 
+  it("teaches BOTH ends of set_agent_goal — set one, and mark it met", () => {
+    // The exit from auto-continue only works if the agent knows the tool exists BEFORE it is
+    // resumed. `engine/goalContinuation.continuePrompt` names it in the resume text, but an agent
+    // that never set a goal is never resumed in the first place — so the persona has to carry the
+    // "set one when you start" half too, or the whole mechanism stays dormant. And an agent that
+    // sets a goal and never marks it met is worse off than one with no goal at all: it gets
+    // restarted after finishing until the ceiling escalates a false alarm.
+    const p = sparkleControlProtocol();
+    // BOTH OPS BY NAME. This claimed to test "both ends" while asserting only /set_agent_goal/ and
+    // /met: true/ — a substring the wrong copy satisfies too (`set_agent_goal({ met: true })`, the
+    // pre-split form), so it proved neither end and let the stale briefing ship (roborev 55549).
+    expect(p).toMatch(/set_agent_goal\(\{ goal \}\)/);
+    expect(p).toMatch(/set_agent_goal_met\(\{ met: true \}\)/);
+    // The dead form must be gone: `set_agent_goal({ met: ... })` names an op signature that no
+    // longer exists, and this is the one call that stops an agent being auto-resumed.
+    expect(p).not.toMatch(/set_agent_goal\(\{ met/);
+    expect(p).toMatch(/resumed automatically/);
+  });
+
   it("warns that get_state is expensive and offers the narrowing scope", () => {
     const p = sparkleControlProtocol();
     expect(p).toMatch(/get_state\(\{ scope \}\)/);

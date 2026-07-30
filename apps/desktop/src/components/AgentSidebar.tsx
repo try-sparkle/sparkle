@@ -15,8 +15,19 @@ import {
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { TbPinFilled } from "react-icons/tb";
-// FiChevronsLeft/Right are §10's two pull tabs; FiTool is the "+ New Build Agent" icon.
-import { FiCloud, FiTool, FiHelpCircle, FiPlus, FiMinus } from "react-icons/fi";
+// FiPlus/FiMinus are the collapse/expand pull tabs; FiTool is the "+ New Build Agent" icon.
+// FiAlertTriangle/FiRepeat/FiTarget carry the never-idle overlay (stall / thrash / goal) — see
+// ./rowAttention and the chips in AgentRow. Icons, never emoji: this repo uses react-icons.
+import {
+  FiCloud,
+  FiTool,
+  FiHelpCircle,
+  FiPlus,
+  FiMinus,
+  FiAlertTriangle,
+  FiRepeat,
+  FiTarget,
+} from "react-icons/fi";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
@@ -95,6 +106,20 @@ import {
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
+import { withDismissedStallAttention, withStallAttention } from "../engine/stallEscalation";
+import { processAliveFor } from "../services/goalContinuationRunner";
+// The never-idle overlay: three pure cores, read ALONGSIDE `status` (never folded into it — see the
+// architecture note at the top of engine/agentStall.ts). ./rowAttention does the evidence-gathering
+// and the wording; nothing here re-decides a verdict.
+import { isStalled, stallReport } from "../engine/agentStall";
+import { thrashReportFor } from "../engine/agentThrash";
+import { hasUnmetGoal } from "../engine/agentGoal";
+import {
+  goalBadgeFor,
+  stallChipFor,
+  stallInputsFor,
+  thrashChipLabel,
+} from "./rowAttention";
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
 import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
@@ -366,11 +391,10 @@ export function AgentSidebar({
   const advanceAlerts = useProjectStore((s) => s.advanceAlerts);
   const dismissAlert = useProjectStore((s) => s.dismissAlert);
   const reenableAlert = useProjectStore((s) => s.reenableAlert);
-  useEffect(() => {
-    if (project) advanceAlerts(project.id, status);
-  }, [project?.id, status, advanceAlerts]);
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
+  // The PR-probe map, needed by the stall inputs at the SIDEBAR level (the row reads its own slice).
+  const workflowState = useRuntimeStore((s) => s.workflowState);
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
   // The status map the ROW COLOR and the SORT ORDER read, built in two overlay steps:
   //   (1) withUnmergedWork — a FINISHED agent (idle/done/stopped) that still has committed work not
@@ -382,18 +406,86 @@ export function AgentSidebar({
   // Order matters: unmerged BEFORE dismissal (`unmerged` isn't dismissible, and running it after
   // dismissal would re-redden a just-calmed row — see withUnmergedWork's header). Kept separate from
   // `status` so the badge / dock-notification consumers still read the true, un-dismissed status.
-  const effectiveStatus = useMemo(
+  //   (1b) withStallAttention — GRAY IS A TERMINAL STATE (the founder's rule, 2026-07-29): a row that
+  //       is resting but still owes work — an unmet goal, uncommitted changes, an open PR, unlanded
+  //       commits — leaves the calm tier for red `blocked`. It runs AFTER (1) so a
+  //       committed-but-unlanded row is already wearing `unmerged` and is visible to it, and BEFORE
+  //       (2) — but it honours the dismissal record itself, so an acknowledged row is skipped and
+  //       stays in its OWN band instead of being de-escalated to `idle` by (2), which would erase the
+  //       "Needs merge" label and the evidence that the branch exists. See engine/stallEscalation.
+  const calmStatus = useMemo(
     () =>
       project
-        ? withDismissedAlerts(
-            project.agents,
-            withUnmergedWork(project.agents, status, (id) =>
-              resolveStage(branchStatus[id], workflowStage[id]),
-            ),
+        ? withUnmergedWork(project.agents, status, (id) =>
+            resolveStage(branchStatus[id], workflowStage[id]),
           )
         : status,
     [project, status, branchStatus, workflowStage],
   );
+  // The stall question is asked about `calmStatus` — the PRE-escalation map — for the reason spelled
+  // out on AgentRowProps.calmSt: `stallReport` answers `active` for the red tier, so feeding it the
+  // escalated map would collapse every report to "nothing outstanding" and the escalation would erase
+  // its own justification.
+  const escalatedStatus = useMemo(() => {
+    if (!project) return status;
+    const escalated = withStallAttention(
+      project.agents,
+      calmStatus,
+      (id) => {
+        const agent = project.agents.find((x) => x.id === id);
+        if (agent === undefined) return undefined;
+        return stallReport(
+          stallInputsFor(calmStatus[id] ?? "stopped", Date.now(), agent.goal, {
+            bs: branchStatus[id],
+            ws: workflowState[id],
+            stageOverride: workflowStage[id],
+          }),
+        );
+      },
+      (id) => processAliveFor(id, status, openIds),
+    );
+    return escalated;
+  }, [project, calmStatus, status, branchStatus, workflowStage, workflowState, openIds]);
+  // The map the ROW PRESENTS: acknowledged escalations handed back to the band they came from.
+  //
+  // TWO MAPS, AND WHICH ONE EACH CONSUMER GETS IS THE WHOLE FIX (roborev 55423/55434). The episode
+  // recorder and the Dismiss/Re-enable control must see the PRE-undo map (`escalatedStatus`), because
+  // the counter only advances from what it is shown: fed the post-undo map it saw `unmerged` after a
+  // dismissal, never bumped `seq` past `dismissedSeq`, and the suppression became a permanent ratchet
+  // that no future stall could lift — while `trueSt` read `unmerged` too, so the Re-enable control
+  // vanished and the human could not even undo it. Only the row's COLOUR reads this one.
+  const presentedStatus = useMemo(
+    () =>
+      project
+        ? withDismissedStallAttention(project.agents, escalatedStatus, calmStatus)
+        : escalatedStatus,
+    [project, escalatedStatus, calmStatus],
+  );
+  const effectiveStatus = useMemo(
+    () => (project ? withDismissedAlerts(project.agents, presentedStatus) : status),
+    [project, presentedStatus, status],
+  );
+  // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
+  // — the input the "Dismiss Alert" feature reads. Declared HERE, below `escalatedStatus`, because a
+  // hook's dependency array is evaluated during render: referencing it from higher up the body would
+  // read a `const` in its temporal dead zone and throw.
+  //
+  // Fed the ESCALATED map, not the raw one. Every dismissal entry point takes a status, and handed
+  // the pre-escalation map they would see `idle`/`unmerged`, record no `blocked` episode, and render
+  // no Dismiss control — a red the human cannot acknowledge, which is exactly what forced the
+  // 2026-07-26 rollback of the last red `unmerged` (roborev 55318).
+  //
+  // Runs AFTER the worker-attention overlays so a worker's bubbled red counts as the orchestrator's
+  // episode too: a dismissed orchestrator re-alerts when the bubbled red *signature changes kind*
+  // (e.g. a worker goes waiting→errored). Note the limit — episodes key on the red kind, not worker
+  // identity — so a DIFFERENT worker later going red with the SAME kind leaves the bubbled signature
+  // unchanged and does not re-alert; acceptable, since the orchestrator-level signal ("a worker needs
+  // you, <kind>") hasn't changed. That limit now bites `blocked` hardest, since the stall escalation
+  // makes it the most-recurring red. advanceAlerts writes only on a real red-tier transition, so this
+  // is not a per-tick persist. No-ops before a project.
+  useEffect(() => {
+    if (project) advanceAlerts(project.id, escalatedStatus);
+  }, [project?.id, escalatedStatus, advanceAlerts]);
   // CONCIERGE BANDING NOTE (roborev 46341-M3): `effectiveStatus` above IS the published map.
   // `status` already carries both worker overlays (withUnstartedWorkerAttention +
   // withRedWorkerAttention, see its memo), and effectiveStatus adds withUnmergedWork +
@@ -2121,7 +2213,16 @@ export function AgentSidebar({
           // color, glyph, tooltip — so a dismissed row reads calm. The TRUE status is read separately
           // below only to decide the Dismiss/Re-enable button state.
           const st = effectiveStatus[a.id] ?? "stopped";
-          const trueSt = status[a.id] ?? "stopped";
+          // The TRUE (pre-dismissal) status, read from the ESCALATED map rather than the raw one.
+          //
+          // It fed `alertControlKind` and `dismissAlert` from `status` before, which silently made a
+          // stall escalation unacknowledgeable: the row rendered red from `effectiveStatus` while this
+          // line still said `idle`, so `alertControlKind` returned null, no Dismiss control appeared,
+          // and no `blocked` episode was ever recorded — a permanent red with no way to calm it, which
+          // is exactly what forced the 2026-07-26 rollback of the last red `unmerged` (roborev 55318).
+          // Every other row is unaffected: the escalated map differs from the raw one only where a
+          // resting row was relabelled `unmerged` or escalated.
+          const trueSt = escalatedStatus[a.id] ?? "stopped";
           // Resolve the status color to a light-mode-legible TEXT ink: the brand gray (idle,
           // blocked, done, stopped) and the brand green (working) are too light on the white
           // light sidebar, so statusInk darkens both in light mode while keeping them brand-color
@@ -2170,6 +2271,7 @@ export function AgentSidebar({
               depth={depth}
               isActive={isActive}
               st={st}
+              calmSt={calmStatus[a.id] ?? "stopped"}
               statusColor={color}
               isTabStop={a.id === tabStopId}
               dotColor={rollupOverrides ? ROLLUP_DOT_COLOR[rollup] : undefined}
@@ -3012,6 +3114,17 @@ type AgentRowProps = {
   depth: number;
   isActive: boolean;
   st: AgentTabStatus;
+  /**
+   * The row's status BEFORE `withStallAttention` escalated it — the one the stall question is asked
+   * about.
+   *
+   * Two statuses, and they must not be conflated. `st` drives the DOT, and once the escalation is
+   * composed a stalled row arrives here as `blocked`. `stallReport` answers `active` for the whole
+   * red tier, so asking it about `st` would return no causes at all: the row would go red and
+   * simultaneously lose the sentence saying WHY, which is the entire point of reddening it. So the
+   * colour reads `st` and the cause reads this. Equal to `st` for every row that was not escalated.
+   */
+  calmSt: AgentTabStatus;
   /** Is this row's worker subtree collapsed? `null` means "no disclosure here" — a row with no
    *  workers, or a worker row itself. Only a head with ≥1 worker gets a chevron. */
   subtreeCollapsed: boolean | null;
@@ -3120,6 +3233,7 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.depth === next.depth &&
     prev.isActive === next.isActive &&
     prev.st === next.st &&
+    prev.calmSt === next.calmSt &&
     prev.subtreeCollapsed === next.subtreeCollapsed &&
     prev.statusColor === next.statusColor &&
     prev.isTabStop === next.isTabStop &&
@@ -3148,6 +3262,7 @@ const AgentRow = memo(function AgentRow({
   depth,
   isActive,
   st,
+  calmSt,
   subtreeCollapsed,
   onToggleSubtree,
   statusColor,
@@ -3561,6 +3676,44 @@ const AgentRow = memo(function AgentRow({
   // count is identical in both and never jumps when the cursor moves on/off the row (see useRowClock).
   const clockNow = useRowClock(lastTouchAt);
 
+  // ── THE NEVER-IDLE OVERLAY ──────────────────────────────────────────────────────────────────────
+  // Idle-and-done, idle-and-stalled and thrashing all painted the SAME gray row, and that identity
+  // is the whole bug: a 153-minute stall looked exactly like an agent that had shipped its PR. Three
+  // pure cores answer it — engine/agentStall, engine/agentThrash, engine/agentGoal — and this is
+  // purely their rendering. No new `AgentTabStatus`: these are derived overlays read BESIDE `st`,
+  // the same shape `rollupDot` takes beside `status`, so every existing `idle` branch (bands, CTA
+  // gating, inMotion, the worker rollup) keeps its current meaning.
+  //
+  // DERIVED IN THE ROW, not threaded through props, for two reasons. `agentRowPropsEqual` is a
+  // hand-maintained exhaustive comparator and a data prop omitted from it silently freezes the row
+  // on stale data; and `thrashReportFor` reads a window-local, NON-REACTIVE registry, so it has to
+  // be sampled at render against a clock rather than captured into a memo upstream. `clockNow` is
+  // that clock: it ticks every 1s/5s for any row with an interaction to time from, which is every
+  // row that could possibly be thrashing (thrash requires submitted prompts).
+  //
+  // Reading the two git facts straight from the store — `bs` is already a prop, but the PR probe and
+  // the stage watermark are not, and rowAttention needs the RAW values to tell "false" from "never
+  // looked up". Passing a resolved stage would destroy exactly that distinction.
+  const wfState = useRuntimeStore((s) => s.workflowState[a.id]);
+  const stageOverride = useRuntimeStore((s) => s.workflowStage[a.id]);
+  const stall = stallReport(
+    // `calmSt`, NOT `st` — see the prop's docstring. Asking the stall question about an already-
+    // escalated row returns `active` and no causes, so the row would go red with nothing to say.
+    stallInputsFor(calmSt, clockNow, a.goal, { bs, ws: wfState, stageOverride }),
+  );
+  // `isStalled` is the gate, not `verdict !== "finished"`: it is true ONLY for a confident stall, so
+  // the `unknown` verdict — idle with git state we never read — raises nothing. A stall claim that
+  // fires on missing data trains the human to ignore the signal, which costs more than the stall.
+  const stallChip = isStalled(stall) ? stallChipFor(stall) : null;
+  // `goalOutstanding` gates the no-progress alarm only (three tool-less turns are just a
+  // conversation when nothing is outstanding). We genuinely know this — no goal means no goal work —
+  // so `false` here is evidence, not a fabrication.
+  const thrash = thrashReportFor(a.id, clockNow, {
+    goalOutstanding: hasUnmetGoal(a.goal, clockNow),
+  });
+  const thrashLabel = thrashChipLabel(thrash);
+  const goalBadge = goalBadgeFor(a.goal, clockNow);
+
   // Per-agent Claude model (bead sparkle-i6rw). Only claude-terminal kinds get the pill — think
   // (Chief chat) and shell (plain command) tabs never spawn `claude`, so a model is meaningless
   // there. Picking a model ALWAYS persists it (next spawn adds --model); when the agent's PTY is
@@ -3649,6 +3802,105 @@ const AgentRow = memo(function AgentRow({
       <FiHelpCircle size={11} />
     </span>
   ) : null;
+
+  // THE STALL CHIP — "this gray row is not done", and WHAT it still owes.
+  //
+  // Naming the cause is the entire point. "Stalled" on its own tells the reader to go investigate,
+  // and the investigation is the expensive part — so the VISIBLE text is the outstanding work
+  // ("PR unmerged", "uncommitted changes", "auto-continue gave up"), the word itself lives in the
+  // accessible name, and the engine's full sentence rides along as the tooltip.
+  //
+  // INK, and why this is not a second alarm. The row's DOT is untouched: `stallReport` returns
+  // `active` for the whole red tier (waiting/approval/blocked/errored), so this chip can only ever
+  // appear on a row the color system already calls calm — the gray rows nobody looks at, which are
+  // the target. Amber is the status token for "this is waiting on something" (packages/ui/tokens.ts)
+  // and is the right weight for a landing state that needs a human eventually. An ESCALATED goal
+  // takes DANGER instead, because it is categorically different: auto-continue has given up and
+  // handed the agent back, so nothing is coming for it at all.
+  const stallChipEl = stallChip ? (
+    <span
+      data-testid="row-stall"
+      title={stall.detail}
+      aria-label={stallChip.ariaLabel}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 3,
+        flex: "0 1 auto",
+        minWidth: 0,
+        maxWidth: "20ch",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        lineHeight: 1.4,
+        fontSize: 10,
+        fontWeight: stallChip.escalated ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
+        color: stallChip.escalated ? DANGER : C.amberInk,
+      }}
+    >
+      <FiAlertTriangle size={10} style={{ flex: "0 0 auto" }} />
+      {stallChip.text}
+    </span>
+  ) : null;
+
+  // THE THRASH CHIP — the opposite failure to the one above: an agent that never STOPS and never
+  // advances. It is not idle, so no gray-row surface would ever mention it; the live case (three
+  // `/compact`s in a row, the last one failing) reported `working` throughout and the founder found
+  // it by reading the terminal himself. `thrashChipLabel` returns null for BOTH a healthy agent and
+  // one this window has no hook events for — the second is "not observed", never "fine".
+  const thrashChipEl = thrashLabel ? (
+    <span
+      data-testid="row-thrash"
+      title={thrash?.detail}
+      aria-label={`Thrashing — ${thrashLabel}`}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 3,
+        flex: "0 0 auto",
+        lineHeight: 1.4,
+        fontSize: 10,
+        fontWeight: FONT_WEIGHT.semibold,
+        whiteSpace: "nowrap",
+        color: C.amberInk,
+      }}
+    >
+      <FiRepeat size={10} style={{ flex: "0 0 auto" }} />
+      {thrashLabel}
+    </span>
+  ) : null;
+
+  // THE GOAL CHIP, collapsed-row half. Only an ESCALATED goal earns space in the column — that is
+  // the "single most important thing on the screen for this row" case, and it is the one a human
+  // must not have to hover to find. Every other goal state (active with time remaining, met,
+  // expired) reads in the detail card below, where there is room for the goal's own words.
+  //
+  // Note the deliberate overlap with the stall chip: an escalated goal is ALSO a stall cause, so a
+  // resting escalated row shows both. That is not duplication — the stall chip says the row owes
+  // work, this says the goal itself has been handed back, and a WORKING agent (stall verdict
+  // `active`) gets only this one.
+  const goalChipEl =
+    goalBadge?.escalated ? (
+      <span
+        data-testid="row-goal-escalated"
+        title={`Goal: ${goalBadge.text} — ${goalBadge.label}`}
+        aria-label={`Goal escalated — ${goalBadge.text}`}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 3,
+          flex: "0 0 auto",
+          lineHeight: 1.4,
+          fontSize: 10,
+          fontWeight: FONT_WEIGHT.bold,
+          whiteSpace: "nowrap",
+          color: DANGER,
+        }}
+      >
+        <FiTarget size={10} style={{ flex: "0 0 auto" }} />
+        Goal escalated
+      </span>
+    ) : null;
 
   // The source-epic pill (spec §8): a small 4px-radius chip on orchestrator rows showing the epic
   // title (ellipsized ~18ch). Clicking it (stopPropagation so it doesn't select the agent) jumps to
@@ -3853,6 +4105,12 @@ const AgentRow = memo(function AgentRow({
                     onReenable={onReenableAlert}
                   />
                 )}
+                {/* Same overlay on the EXPANDED strip. The card stands in for the in-flow row while
+                    it is open, so omitting them here would make the signal vanish from the one row
+                    the user has actually stopped on. */}
+                {goalChipEl}
+                {stallChipEl}
+                {thrashChipEl}
                 {epicPill}
                 {cloudChip}
                 {pinChip}
@@ -3888,6 +4146,11 @@ const AgentRow = memo(function AgentRow({
                 />
                 {workerCountBadge}
                 {unjudgedAskChip}
+                {/* The never-idle overlay leads the metadata chips: it is the one thing on a calm
+                    row that changes what you do about it. See the chip definitions above. */}
+                {goalChipEl}
+                {stallChipEl}
+                {thrashChipEl}
                 {epicPill}
                 {cloudChip}
                 {pinChip}
@@ -3984,6 +4247,45 @@ const AgentRow = memo(function AgentRow({
         onLand={onLand}
         onRefresh={handleRefresh}
       />
+      {/* THE GOAL, in its own words, with its life state. The column can only afford the escalated
+          case (see goalChipEl); this is where "active · 3h 20m left" and the goal TEXT live, which
+          is what makes the row's chip actionable instead of merely alarming. The remaining time is a
+          bound on how long auto-continue may keep spending on it, not a deadline for the work. */}
+      {goalBadge && (
+        <DetailLine label="Goal">
+          <span
+            data-testid="card-goal"
+            style={{
+              color: goalBadge.escalated ? DANGER : C.muted,
+              fontSize: 12,
+              fontWeight: goalBadge.escalated ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {goalBadge.text} — {goalBadge.label}
+          </span>
+        </DetailLine>
+      )}
+      {/* The stall verdict's OWN sentence, unabbreviated. The chip on the row is a headline capped
+          at ~20 characters; this is the engine's full reading, including every cause beyond the
+          first that the chip could only count as "+N". Rendered only for a confident stall — an
+          `unknown` verdict says nothing here, exactly as it paints nothing on the row. */}
+      {stallChip && (
+        <DetailLine label="Stalled">
+          <span
+            data-testid="card-stall-detail"
+            style={{
+              color: stallChip.escalated ? DANGER : C.amberInk,
+              fontSize: 12,
+              minWidth: 0,
+            }}
+          >
+            {stall.detail}
+          </span>
+        </DetailLine>
+      )}
       {/* Bead/epic linkage — a worker shows the bead it's on; an orchestrator its epic. Moved here
           from the (now removed) collapsed worker-lines block so the collapsed row stays title + bar. */}
       {beadHover && (

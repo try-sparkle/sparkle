@@ -71,6 +71,23 @@ export interface SendToBuildArgs {
    *  epic's child tasks out across workers; "task" tells it to build THIS ONE bead on a single
    *  isolated worker branch without fanning out. `epicId` still names the target bead in both. */
   mode?: "epic" | "task";
+  /**
+   * Did a PERSON trigger this handoff? Defaults to `true` because every board click is one.
+   *
+   * IT MATTERS ONLY ON THE REUSE PATH, and that is exactly the path a machine can drive (roborev
+   * 55721). A brand-new orchestrator owes no goal debt, so the flag cannot change anything for it.
+   * But this function REUSES an orchestrator already bound to the epic — its own docstring
+   * advertises that a bound plan "RESUMES that agent" — and `promotePlanToBuild` is the concierge's
+   * tool layer. So an LLM calling `promote_plan_to_build` on an epic whose orchestrator is
+   * ESCALATED reached `appendPrompt` with the default and ran `releaseGoalDebt`: escalation
+   * un-latched, `totalContinues` zeroed, `goalDebt` dropped. `projectStore.releaseGoalDebt` says
+   * that bound must not be reachable from a machine dispatch, and here it was.
+   *
+   * The fourth site of one hole. The other three are in `conciergeDispatch` (direct send, queued
+   * flush, picker answer); this is the only production `appendPrompt` outside that file a concierge
+   * tool can drive.
+   */
+  humanAuthored?: boolean;
 }
 
 /** Build the orchestrator's seed prompt. For an epic: point at the spec (the PRD when there is one,
@@ -180,8 +197,12 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // nothing for the user to type and the caret is not ours to take.
   landInAgent(args.projectId, agentId);
 
-  // Seed the orchestrator's first message with the epic + PRD + beads protocol.
-  useProjectStore.getState().appendPrompt(args.projectId, agentId, buildSeedPrompt(args));
+  // Seed the orchestrator's first message with the epic + PRD + beads protocol. Authorship is
+  // forwarded rather than defaulted — see `SendToBuildArgs.humanAuthored` for why it is load-bearing
+  // on the REUSE path only.
+  useProjectStore
+    .getState()
+    .appendPrompt(args.projectId, agentId, buildSeedPrompt(args), "composer", args.humanAuthored ?? true);
 
   return agentId;
 }

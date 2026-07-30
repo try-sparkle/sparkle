@@ -144,7 +144,18 @@ export function spawnBuildAgentInProject(
     // and first prompt"): AgentPane drains it via `flushPendingSends` on ptyReady, which calls
     // `submitPrompt` AND `recordPromptSideEffects` — so the store update happens there, once, on
     // the delivery path. That is what makes the brief atomic *and* real.
-    queuePendingSend({ agentId: id, text: opts.prompt, userPrompt: true });
+    // `humanAuthored: true` — and the honest reason is that it cannot matter here, not that the
+    // brief is always typed by a person. It is NOT: the concierge's `spawn_build_agent` lifecycle
+    // tool passes a `prompt` its own model may have composed. What the flag governs is
+    // `projectStore.releaseGoalDebt`, and this send lands on an agent created microseconds ago —
+    // no goal, no `goalDebt`, and (since roborev 55588) a freshly-set clean goal is left
+    // reference-identical too. There is no debt for either answer to release.
+    //
+    // Stated rather than left implicit because it stops being true the moment spawn seeds an agent
+    // that INHERITS a goal or a debt (a reused id, a restored session). If that ever lands, thread
+    // the real `isHumanAuthored(authority)` down from the spawn caller instead of re-reading this
+    // comment as a licence.
+    queuePendingSend({ agentId: id, text: opts.prompt, userPrompt: true, humanAuthored: true });
   } else {
     // The caret is the half landInAgent deliberately leaves to the caller, and the EMPTY spawn has
     // earned it: the next thing the user does is type. A briefed spawn has not — sendToBuild skips

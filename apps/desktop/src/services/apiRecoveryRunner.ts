@@ -33,7 +33,7 @@ import {
   type ApiFailureClass,
   type ReviveDecision,
 } from "../engine/apiRecovery";
-import { hasExited } from "../engine/turnEndAuthority";
+import { processAliveOf } from "../engine/turnEndAuthority";
 import { agentCanAcceptInput } from "./conciergeDispatch";
 import { getAgentScrollback } from "./terminalScrollback";
 import { aiFeatureVisibleNow } from "./aiGate";
@@ -422,8 +422,14 @@ export interface ReviveDeps {
   /** Current status of an agent, or undefined if unknown. */
   statusOf: (agentId: string) => AgentTabStatus | undefined;
   canAcceptInput: (agentId: string) => boolean;
-  /** `engine/turnEndAuthority.hasExited` semantics: true = exited, false = alive, undefined = unknown. */
-  hasExited: (agentId: string) => boolean | undefined;
+  /** `engine/turnEndAuthority.processAliveOf` semantics — ALIVE-side, matching the `processAlive`
+   *  field it feeds: true = alive, false = the PTY is gone, undefined = nobody looked.
+   *
+   *  This was `hasExited` and inverted at the call site. Reading it in the consumer's polarity deletes
+   *  the flip rather than documenting it: the two shapes are both `boolean | undefined`, so the
+   *  obvious wiring type-checked while meaning the exact opposite — an exited PTY would report alive
+   *  and be typed into (roborev 55338). */
+  processAliveOf: (agentId: string) => boolean | undefined;
   /** Types the retry into the agent's terminal. Rejects if it did not land. */
   submit: (agentId: string, text: string) => Promise<void>;
   /** Called once per episode when the human has to take over. */
@@ -441,9 +447,20 @@ export interface SweepOutcome {
 /**
  * One pass over every live episode.
  *
- * The gate order matters: `enabled()` is checked FIRST and returns before any decision is computed,
- * so a user who turned autonomous typing off pays nothing and — more importantly — cannot have a
- * ping sent by a race between the toggle and an in-flight sweep.
+ * The gate order matters: `enabled()` is checked before any decision is computed, so a user who
+ * turned autonomous typing off pays nothing and — more importantly — cannot have a ping sent by a
+ * race between the toggle and an in-flight sweep.
+ *
+ * NOTHING RUNS AHEAD OF THE TOGGLE, and roborev 55628's Medium asked for something that did — a
+ * pre-pass paying a one-off "we spent a whole ladder" page, on the argument that the toggle bans
+ * TYPING and not TELLING. That argument was right about this gate and wrong about which mechanism
+ * needed it: main's `MAX_LADDERS_PER_OUTAGE` counter (PR #861) replaced the flag it was rescuing.
+ * The finding's harm was that the page was single-shot and stored on an object the next status
+ * change deletes, so skipping it DESTROYED it. `PING_BUDGET` has neither property: it is derived on
+ * every sweep from `pingLog`, which is module state on a 4h rolling window and outlives both the
+ * episode and the toggle. So the budget page is DEFERRED while typing is off and delivered by the
+ * first sweep after it comes back — no rescue needed, and `episodeCarryWindowMs`'s comment asks
+ * directly that no timing-based fix be reintroduced here.
  */
 export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]> {
   if (episodes.size === 0) return [];
@@ -466,7 +483,13 @@ export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]
       out.push({ agentId, decision: { action: "none", reason: "status-unknown" } });
       continue;
     }
-    const exited = deps.hasExited(agentId);
+    // KEEPS THIS BRANCH'S ALIVE-SIDE READER over main's `hasExited`. Not a preference: the field it
+    // feeds is `processAlive`, and both shapes are `boolean | undefined`, so the obvious wiring
+    // type-checks while meaning the exact opposite — an exited PTY reporting alive and being typed
+    // into. Main compensated with an inversion at this call site; this branch deleted the inversion
+    // by reading the question in the consumer's polarity (roborev 55338). Merging main's line here
+    // would restore the hazard AND break the un-inverted `processAlive: alive` below.
+    const alive = deps.processAliveOf(agentId);
     const decision = decideRevive({
       status,
       failure: episode.failure,
@@ -475,10 +498,10 @@ export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]
       attempts: episode.attempts,
       lastPingAt: episode.lastPingAt,
       canAcceptInput: deps.canAcceptInput(agentId),
-      // hasExited's `true` means the process is GONE, so processAlive is its inverse; `undefined`
-      // (nobody looked) must stay undefined so the engine can give its "liveness-unknown" refusal
-      // rather than the false "process-gone" one.
-      processAlive: exited === undefined ? undefined : !exited,
+      // No inversion: the reader is already alive-side. `undefined` (nobody looked) passes straight
+      // through so the engine gives its "liveness-unknown" refusal rather than the false
+      // "process-gone" one — the two are different claims and only one of them blames the agent.
+      processAlive: alive,
     });
     out.push({ agentId, decision });
 
@@ -552,7 +575,7 @@ export function liveDeps(now: number): ReviveDeps {
     now,
     statusOf: (id) => useRuntimeStore.getState().status[id],
     canAcceptInput: agentCanAcceptInput,
-    hasExited,
+    processAliveOf,
     // submitPrompt pastes + sends, and registers the text as user input for this agent first — which
     // this path NEEDS: without it our own prompt's echo can read as a self-prompt churn wedge to
     // engine/streamFailure and re-trip the very red we are clearing (see pty.submitPrompt).

@@ -108,10 +108,49 @@ describe("sendToBuild", () => {
     expect(id).toBe("build1");
     expect(addAgentMock).not.toHaveBeenCalled(); // reused: it's already this epic's orchestrator
     expect(openMock).toHaveBeenCalledWith("build1");
-    expect(appendPromptMock).toHaveBeenCalledWith("proj1", "build1", expect.stringContaining("epic-7"));
+    expect(appendPromptMock).toHaveBeenCalledWith(
+      "proj1",
+      "build1",
+      expect.stringContaining("epic-7"),
+      "composer",
+      // A board click IS a person, so the reuse seed releases this orchestrator's goal debt. This is
+      // the HUMAN sibling of the machine case below — without it, that one would pass against a flag
+      // hardcoded to `false`, which would silently break the human release instead.
+      true,
+    );
     expect(setAgentEpicIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
     // The human bead is linked on the reuse path too, so a re-hit Build It still routes delivery.
     expect(setAgentBeadIdMock).toHaveBeenCalledWith("proj1", "build1", "epic-7");
+  });
+
+  // ── THE FOURTH AUTHORSHIP HOLE (roborev 55721) ──────────────────────────────────────────────────
+  it("does not report a MACHINE-driven handoff as human-authored on the REUSE path", () => {
+    // Reuse is the only path where this can matter — a brand-new orchestrator owes no goal debt —
+    // and it is precisely the path a machine can drive: `promotePlanToBuild` is the concierge's tool
+    // layer, and its own docstring advertises that a plan already bound to an orchestrator RESUMES
+    // that agent. Seeding a reused orchestrator goes through `appendPrompt`, so with the default an
+    // LLM promoting an epic whose orchestrator was ESCALATED un-latched that escalation and refilled
+    // `totalContinues` — the bound `projectStore.releaseGoalDebt` documents as unreachable from a
+    // machine dispatch.
+    projects = [
+      {
+        id: "proj1",
+        agents: [
+          { id: "think1", kind: "think" },
+          { id: "build1", kind: "build", epicId: "epic-7" },
+        ],
+      },
+    ];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-7", prdPath: "PRD/x.md", humanAuthored: false });
+
+    expect(appendPromptMock).toHaveBeenCalledWith(
+      "proj1",
+      "build1",
+      expect.any(String),
+      "composer",
+      false,
+    );
   });
 
   // §13 — "Start"/"Build It" must LAND the user in the orchestrator. These four steps are the

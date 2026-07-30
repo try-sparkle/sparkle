@@ -1,48 +1,50 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  hasExited,
   hasTurnEndAuthority,
   noteProcessExit,
+  processAliveOf,
   resetTurnEndAuthority,
   trackAgent,
 } from "./turnEndAuthority";
 
-// `hasExited` is the producer engine/goalContinuation's `processAlive` gate had been missing: the
-// gate shipped with no source in the repo at all, so the first caller would have compiled without it
-// and silently refused every `unmerged` row (roborev 55298). These tests cover the reader; the rest
-// of this module's behaviour is exercised through its consumers.
-describe("hasExited — the only reader of the death signal", () => {
+// `processAliveOf` is the producer engine/goalContinuation's `processAlive` gate had been missing:
+// the gate shipped with no source in the repo at all, so the first caller would have compiled without
+// it and silently refused every `unmerged` row (roborev 55298). It is exported ALIVE-side rather than
+// exited-side because the identical-typed `hasExited` made the obvious wiring compile with the
+// opposite meaning (roborev 55338). These tests cover the reader; the rest of this module's behaviour
+// is exercised through its consumers.
+describe("processAliveOf — the only reader of the death signal", () => {
   beforeEach(() => resetTurnEndAuthority());
 
   it("is undefined for an agent this window does not drive — NOT 'alive'", () => {
     // The distinction the whole module is built on. `services/agentLiveness` refuses to answer this
     // question for the same reason, and a caller that reads "alive" from silence would type into a
     // terminal it never observed.
-    expect(hasExited("nobody-drives-me")).toBeUndefined();
+    expect(processAliveOf("nobody-drives-me")).toBeUndefined();
   });
 
-  it("is false for a tracked, still-running agent", () => {
+  it("is TRUE for a tracked, still-running agent", () => {
     const engine = {};
     trackAgent("a", engine);
-    expect(hasExited("a")).toBe(false);
+    expect(processAliveOf("a")).toBe(true);
   });
 
-  it("is true once the PTY exits", () => {
+  it("is FALSE once the PTY exits", () => {
     const engine = {};
     trackAgent("a", engine);
     noteProcessExit("a", engine);
-    expect(hasExited("a")).toBe(true);
+    expect(processAliveOf("a")).toBe(false);
   });
 
   it("reads the SAME flag hasTurnEndAuthority folds in — opposite consequence, one source", () => {
-    // An exited PTY is the strongest witness that a turn ended, AND the evidence there is nothing
-    // left to type into. Two answers from one fact is exactly why this needs its own reader rather
-    // than being inferred from the other predicate.
+    // An exited PTY is the strongest witness that a turn ENDED, and simultaneously the evidence that
+    // there is nothing left to type INTO. Two answers from one fact is exactly why this needs its own
+    // reader rather than being inferred from the other predicate — note they disagree here by design.
     const engine = {};
     trackAgent("a", engine);
     noteProcessExit("a", engine);
     expect(hasTurnEndAuthority("a")).toBe(true);
-    expect(hasExited("a")).toBe(true);
+    expect(processAliveOf("a")).toBe(false);
   });
 
   it("a NEW engine taking over the id clears a stale exit", () => {
@@ -52,10 +54,10 @@ describe("hasExited — the only reader of the death signal", () => {
     const first = {};
     trackAgent("a", first);
     noteProcessExit("a", first);
-    expect(hasExited("a")).toBe(true);
+    expect(processAliveOf("a")).toBe(false);
 
     const second = {};
     trackAgent("a", second);
-    expect(hasExited("a")).toBe(false);
+    expect(processAliveOf("a")).toBe(true);
   });
 });

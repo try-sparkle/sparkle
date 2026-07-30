@@ -745,6 +745,10 @@ const CONTROL_OPS: &[&str] = &[
     "get_state",
     "rename_agent",
     "set_agent_activity",
+    // An agent's GOAL — what it is trying to achieve, and whether it got there. Self-report like
+    // the two above, and the documented exit from auto-continue: the prompt Sparkle types into a
+    // resumed agent tells it to mark its goal met through this op.
+    "set_agent_goal",
     "set_theme",
     "get_config",
     "set_config",
@@ -762,10 +766,13 @@ const CONTROL_OPS: &[&str] = &[
     // done in Settings → "How Sparkle talks to you".
     "append_communication_guideline",
     // Intent, made readable to the other actor that can merge (see services/mergeGuard/types.ts).
-    // `set_agent_goal` is the readable half of a field that used to be write-only; claim/release
-    // let an agent say "I am landing this myself" somewhere the concierge's merge gate can see it.
-    // The claimant is the bridge-stamped caller — no payload names it.
-    "set_agent_goal",
+    // `set_agent_goal` belongs to this group too — it is the readable half of a field that used to
+    // be write-only — but it is listed ONCE, up in Phase 1, because it is also a self-report op and
+    // this array is length-ratcheted. Two branches independently added it under their own heading
+    // and the merge kept both, which is exactly what `control_all_ops_are_allowlisted` caught: a
+    // duplicate is harmless to `contains()` and would have gone unnoticed without the count.
+    // claim/release let an agent say "I am landing this myself" somewhere the concierge's merge gate
+    // can see it. The claimant is the bridge-stamped caller — no payload names it.
     "set_agent_goal_met",
     "claim_pr",
     "release_pr",
@@ -1807,7 +1814,7 @@ mod tests {
     fn control_all_ops_are_allowlisted() {
         for op in [
             // Phase 1.
-            "get_state", "rename_agent", "set_agent_activity", "set_theme", "get_config", "set_config",
+            "get_state", "rename_agent", "set_agent_activity", "set_agent_goal", "set_theme", "get_config", "set_config",
             // Phase 3 breadth ops.
             "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
             // Phase 4: the concierge tool surface (one generic op; domain/op ride in the payload).
@@ -1816,7 +1823,9 @@ mod tests {
             "append_communication_guideline",
             // Intent signals: an agent's readable goal, and its claim on a PR it means to land
             // itself. Added after PR #806 was merged out from under the agent holding it.
-            "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
+            // `set_agent_goal` is deliberately not repeated here — it is asserted once, in the
+            // Phase-1 line above, matching where CONTROL_OPS lists it.
+            "set_agent_goal_met", "claim_pr", "release_pr",
         ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }

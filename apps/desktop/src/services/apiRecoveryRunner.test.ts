@@ -34,7 +34,7 @@ function deps(over: Partial<ReviveDeps> = {}): ReviveDeps & { submit: ReturnType
     now: T0 + REVIVE_LADDER_MS[0]!,
     statusOf: () => "errored",
     canAcceptInput: () => true,
-    hasExited: () => false, // alive
+    processAliveOf: () => true, // alive
     submit,
     onEscalate: vi.fn(),
     enabled: () => true,
@@ -685,21 +685,21 @@ describe("sweepApiRecovery", () => {
     await sweepApiRecovery(unreachable);
     expect(unreachable.submit).not.toHaveBeenCalled();
 
-    const dead = deps({ hasExited: () => true });
+    const dead = deps({ processAliveOf: () => false });
     await sweepApiRecovery(dead);
     expect(dead.submit).not.toHaveBeenCalled();
   });
 
-  // hasExited returning undefined means "nobody looked", which must produce the honest
+  // processAliveOf returning undefined means "nobody looked", which must produce the honest
   // liveness-unknown refusal rather than the false "its process is gone".
   it("distinguishes an unprobed process from a dead one", async () => {
     noteAgentStatus(A, "errored", T0, () => BANNER_529);
-    const out = await sweepApiRecovery(deps({ hasExited: () => undefined }));
+    const out = await sweepApiRecovery(deps({ processAliveOf: () => undefined }));
     expect(out[0]!.decision).toEqual({ action: "none", reason: "liveness-unknown" });
 
     __resetApiRecovery();
     noteAgentStatus(A, "errored", T0, () => BANNER_529);
-    const dead = await sweepApiRecovery(deps({ hasExited: () => true }));
+    const dead = await sweepApiRecovery(deps({ processAliveOf: () => false }));
     expect(dead[0]!.decision).toEqual({ action: "none", reason: "process-gone" });
   });
 

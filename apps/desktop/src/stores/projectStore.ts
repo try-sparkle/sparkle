@@ -20,8 +20,10 @@ import {
   EMPTY_ALERT,
 } from "../engine/alertDismissal";
 import {
+  chargeGoalDebt,
   clearGoalMet,
   escalateGoal,
+  goalDebtOf,
   markGoalMet,
   newGoal,
   noteContinue,
@@ -171,11 +173,24 @@ export interface ProjectState {
   /** Set the agent's live "what I'm building now" activity narration (sparkle-control MCP
    *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name. */
   setAgentActivity: (projectId: string, agentId: string, activity: string) => void;
-  /** Set (or replace) the agent's GOAL — the standing objective that decides whether an idle turn
-   *  gets auto-continued (engine/goalContinuation) and whether an idle row reads "done" or
-   *  "stalled" (engine/agentStall). An empty string CLEARS the goal, which also disables
-   *  auto-continue for that agent — the safe way to opt out. */
-  setAgentGoal: (projectId: string, agentId: string, text: string, ttlMs?: number) => void;
+  /**
+   * Set / replace / clear an agent's GOAL — the standing objective that decides whether an idle turn
+   * gets auto-continued (engine/goalContinuation) and whether an idle row reads "done" or "stalled"
+   * (engine/agentStall). An empty string CLEARS it, which also disables auto-continue for that agent.
+   *
+   * `actor` decides how much the caller is TRUSTED with. `"human"` (the default) starts genuinely new
+   * text on a clean budget and releases any stashed debt — clearing really is an opt-out for them.
+   * `"agent"` carries the old goal's `totalContinues` and any escalation forward, ACROSS A CLEAR as
+   * well as across a rewording (see `GoalDebt` in engine/agentGoal), so no sequence of self-calls can
+   * launder either invariant. The agent-facing control op passes `"agent"`.
+   */
+  setAgentGoal: (
+    projectId: string,
+    agentId: string,
+    text: string,
+    ttlMs?: number,
+    actor?: "human" | "agent",
+  ) => void;
   /** Mark the current goal met (or un-mark it). This is the only thing that makes an idle agent
    *  legitimately finished, so it is the agent's own way to stop being resumed. */
   setAgentGoalMet: (projectId: string, agentId: string, met: boolean) => void;
@@ -183,10 +198,12 @@ export interface ProjectState {
    *  Advances the retry counters the escalation bound is read from. */
   noteAgentGoalContinue: (projectId: string, agentId: string, mark: string) => void;
   /** Hand the goal to the human — auto-continue has given up. Latched; only `resetAgentGoalRetries`
-   *  (a human acting) or a new goal clears it. */
+   *  or a HUMAN's new goal clears it. An AGENT's own `setAgentGoal` does not, however it rephrases or
+   *  clears first — see `GoalDebt` in engine/agentGoal for why that distinction is load-bearing. */
   escalateAgentGoal: (projectId: string, agentId: string, reason: string) => void;
   /** Clear the retry budget and any escalation, because a human acted on this agent. */
-  resetAgentGoalRetries: (projectId: string, agentId: string) => void;  /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
+  resetAgentGoalRetries: (projectId: string, agentId: string) => void;
+  /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
    *  epic pill immediately, before any of its workers bind to a bead). */
   setAgentEpicId: (projectId: string, agentId: string, epicId: string) => void;
   removeAgent: (projectId: string, agentId: string) => void;
@@ -278,7 +295,17 @@ export interface ProjectState {
   /** Record a submitted prompt: updates `lastPrompt` (pinned header) AND appends to
    *  `promptHistory` (capped). Returns the new entry's id so the caller can register the matching
    *  terminal scroll marker under the same key. */
-  appendPrompt: (projectId: string, agentId: string, text: string, source?: PromptSource) => string;
+  /** `humanAuthored` decides whether this send RELEASES the agent's goal debt (see
+   *  `releaseGoalDebt`). Defaults to true because every gesture-driven caller is a person typing or
+   *  clicking; the concierge's own tool layer passes false, because prose an LLM composed is not "a
+   *  human changed the picture" even when a human's policy authorized it (roborev 55588). */
+  appendPrompt: (
+    projectId: string,
+    agentId: string,
+    text: string,
+    source?: PromptSource,
+    humanAuthored?: boolean,
+  ) => string;
   /** Record that the user submitted a line straight into this agent's terminal — the DURABLE twin
    *  of interactionStore's in-memory `lastAt`. Stamps once and never moves, because the only
    *  question it answers is "has anyone ever briefed this?" (engine/newAgentAttention route 5). */
@@ -492,6 +519,53 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
 
 function mapAgent(p: Project, agentId: string, fn: (a: AgentTab) => AgentTab): Project {
   return { ...p, agents: p.agents.map((a) => (a.id === agentId ? fn(a) : a)) };
+}
+
+/**
+ * THE HUMAN'S RELEASE. Clears the retry budget, any escalation, and the stashed {@link GoalDebt}.
+ *
+ * WHY THIS IS A SHARED HELPER AND NOT INLINE IN `resetAgentGoalRetries` (roborev 55525). Carrying the
+ * debt across a goal clear closed a real laundering hole — but `resetAgentGoalRetries` had ZERO
+ * production callers and the only caller of `setAgentGoal` always passes `"agent"`, so BOTH documented
+ * release levers were dead code. The effect was worse than the hole: `chargeGoalDebt` floors every
+ * later goal at `Math.max(…, debt.totalContinues)`, so the first escalation made `decideContinuation`
+ * answer `already-escalated` for the life of the persisted `AgentTab`, across restarts. The old
+ * clear-then-set exploit had at least been an escape hatch; closing it without a release traded a
+ * recoverable exploit for an unrecoverable agent. And the agent-facing copy promised a human action
+ * that did not exist, which is the "a remedy string is an instruction" rule in AGENTS.md.
+ *
+ * So it is wired to what `resetGoalRetries` always SAID the trigger was — "a HUMAN changed the
+ * picture: they typed to the agent, or rewrote the goal". That is `appendPrompt` (every caller is a
+ * human-authored send: the composer, a picker answer, a suggestion click, the Build seed) and
+ * `noteTerminalBrief` (a line typed straight into the PTY).
+ *
+ * ⚠️ THE AUTO-CONTINUE PATH MUST NEVER REACH THIS. `goalContinuationRunner` dispatches with
+ * `userPrompt: false`, and `conciergeDispatch` gates `recordPromptSideEffects` — the only path from a
+ * dispatch to `appendPrompt` — on `userPrompt`. If that gate is ever loosened, auto-continue starts
+ * refilling its own budget on every restart and `MAX_CONTINUES_TOTAL` becomes vacuous. That is the
+ * whole bound this feature rests on, so check this note before changing how a dispatch records itself.
+ */
+function releaseGoalDebt(a: AgentTab): AgentTab {
+  // NOTHING OWED → THE SAME OBJECT, and the guard has to ask that literally (roborev 55588). It first
+  // asked only whether a goal EXISTED, which is not the same question: `resetGoalRetries` always
+  // allocates, so for every goal-bearing agent — including one at `totalContinues: 0` with no
+  // escalation — this returned a fresh object and the fast path never fired. That is not a missed
+  // micro-optimisation: `noteTerminalBrief` bails on it, so every submitted terminal line replaced
+  // the agent, its goal and its project, wrote the persisted `sparkle-projects` blob, broadcast
+  // cross-window sync and re-rendered the fleet — once per line, for exactly the agents the fleet is
+  // actually running. The pre-existing comment there says that must not happen, and my own docstring
+  // claimed it did not.
+  const g = a.goal;
+  const owesNothing =
+    a.goalDebt === undefined &&
+    (g === undefined ||
+      (g.continues === 0 &&
+        g.totalContinues === 0 &&
+        g.escalatedAt === undefined &&
+        g.mark === undefined));
+  if (owesNothing) return a;
+  const { goalDebt: _released, ...rest } = a;
+  return a.goal ? { ...rest, goal: resetGoalRetries(a.goal) } : rest;
 }
 
 /** localStorage key the project store persists under. Shared so cross-window sync
@@ -1175,7 +1249,7 @@ export const useProjectStore = create<ProjectState>()(
       // surface read — a second copy of the arithmetic here is exactly how those three fall out of
       // step about whether a goal is still outstanding.
 
-      setAgentGoal: (projectId, agentId, text, ttlMs) =>
+      setAgentGoal: (projectId, agentId, text, ttlMs, actor = "human") =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => {
@@ -1183,9 +1257,18 @@ export const useProjectStore = create<ProjectState>()(
               // Empty CLEARS — and clearing is the documented opt-out from auto-continue, so it
               // has to drop the whole record (counters included) rather than blank the text and
               // leave a goal that reads as unmet forever.
+              //
+              // BUT WHEN THE AGENT CLEARS, THE DEBT SURVIVES THE RECORD (roborev 55451). Dropping the
+              // goal drops the only place `totalContinues` and `escalatedAt` are stored, so
+              // clear-then-set was a two-call budget reset that also cancelled a human's escalation —
+              // the same hole the paraphrase guard below closes, one extra call away and taught
+              // verbatim by the agent-facing skill doc. `goalDebt` is that record outliving the goal;
+              // a HUMAN clear is a genuine release and drops it too.
               if (trimmed === "") {
-                const { goal: _dropped, ...rest } = a;
-                return rest;
+                const { goal: _dropped, goalDebt: _priorDebt, ...rest } = a;
+                if (actor !== "agent") return rest;
+                const debt = goalDebtOf(a.goal) ?? a.goalDebt;
+                return debt === undefined ? rest : { ...rest, goalDebt: debt };
               }
               // A goal whose TEXT is unchanged keeps its COUNTERS but RE-ARMS its lifecycle.
               //
@@ -1209,7 +1292,36 @@ export const useProjectStore = create<ProjectState>()(
                   goal: { ...rest, setAt: Date.now(), ttlMs: ttlMs ?? a.goal.ttlMs },
                 };
               }
-              return { ...a, goal: newGoal(trimmed, Date.now(), ttlMs) };
+              // GENUINELY NEW TEXT — new work, so a fresh budget… IF a human asked for it.
+              //
+              // WHEN THE AGENT ASKS, THE NEW GOAL INHERITS THE OLD ONE'S DEBTS. `set_agent_goal` is
+              // agent-reachable and free-tier, so without this the substrate's two load-bearing
+              // invariants were one paraphrase away from vacuous (roborev 55339):
+              // `MAX_CONTINUES_TOTAL` is documented as a bound "nothing the agent itself does" can
+              // reset, and an escalation is documented as the human's to take back. An agent
+              // auto-continued to the ceiling gets `continuePrompt` — which replays its goal text —
+              // restates it in slightly different words, and lands here with a zeroed budget and no
+              // escalation, back in the auto-continue pool. Repeatable forever, and it silently
+              // cancels an escalation a human already owns.
+              //
+              // So the agent-facing path carries `totalContinues` and the escalation forward across
+              // a text change, exactly as `clearGoalMet` is deliberately weaker than
+              // `resetGoalRetries`. The consecutive streak DOES reset: the work genuinely changed,
+              // and that counter is the "is restarting getting anywhere" signal, not the ceiling.
+              //
+              // The debt is read from `a.goal ?? a.goalDebt`, so it does not matter whether the agent
+              // overwrote its goal or cleared it first — both routes arrive here owing the same thing
+              // (roborev 55451). A HUMAN setting new goal text is a fresh budget by design, and that
+              // is also the moment the stashed debt is released.
+              const fresh = newGoal(trimmed, Date.now(), ttlMs);
+              if (actor === "agent") {
+                const debt = goalDebtOf(a.goal) ?? a.goalDebt;
+                const { goalDebt: _spent, ...restOfAgent } = a;
+                const charged = chargeGoalDebt(fresh, debt);
+                return { ...restOfAgent, goal: charged };
+              }
+              const { goalDebt: _released, ...human } = a;
+              return { ...human, goal: fresh };
             }),
           ),
         })),
@@ -1255,7 +1367,8 @@ export const useProjectStore = create<ProjectState>()(
       resetAgentGoalRetries: (projectId, agentId) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: resetGoalRetries(a.goal) } : a)),          ),
+            mapAgent(p, agentId, releaseGoalDebt),
+          ),
         })),
 
       setAgentEpicId: (projectId, agentId, epicId) =>
@@ -1639,21 +1752,35 @@ export const useProjectStore = create<ProjectState>()(
         })),
 
       noteTerminalBrief: (projectId, agentId) => {
-        // WRITE-ONCE. This fires per submitted line, and the persisted record must not churn on
-        // every Enter — the value is "was this ever briefed by hand", not "when last". Returning the
-        // same agent object when it is already stamped also keeps the store from notifying
-        // subscribers, so a hand-driven session does not re-render the fleet once per keystroke line.
-        const p0 = get().projects.find((p) => p.id === projectId);
-        if (p0?.agents.find((a) => a.id === agentId)?.terminalBriefedAt !== undefined) return;
+        // WRITE-ONCE FOR THE STAMP. This fires per submitted line, and the persisted record must not
+        // churn on every Enter — the value is "was this ever briefed by hand", not "when last".
+        // Returning the same agent object when there is nothing to do also keeps the store from
+        // notifying subscribers, so a hand-driven session does not re-render the fleet per line.
+        //
+        // BUT THE GOAL-DEBT RELEASE IS *NOT* WRITE-ONCE, and conflating the two was the bug waiting
+        // here (roborev 55525): a human typing into the terminal to unstick an ESCALATED agent has
+        // almost certainly briefed it before, so an early return on the stamp alone would skip the
+        // release on exactly the keystroke that was meant to perform it. So the bail-out asks about
+        // both facts. `releaseGoalDebt` returns the same object when nothing is owed, so the common
+        // path stays as cheap as it was.
+        const a0 = get()
+          .projects.find((p) => p.id === projectId)
+          ?.agents.find((a) => a.id === agentId);
+        const stamped = a0?.terminalBriefedAt !== undefined;
+        const owesNothing = a0 !== undefined && releaseGoalDebt(a0) === a0;
+        if (stamped && owesNothing) return;
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
-            mapAgent(p, agentId, (a) =>
-              a.terminalBriefedAt === undefined ? { ...a, terminalBriefedAt: Date.now() } : a,
-            ),
+            mapAgent(p, agentId, (a) => {
+              const released = releaseGoalDebt(a);
+              return a.terminalBriefedAt === undefined
+                ? { ...released, terminalBriefedAt: Date.now() }
+                : released;
+            }),
           ),
         }));
       },
-      appendPrompt: (projectId, agentId, text, source = "composer") => {
+      appendPrompt: (projectId, agentId, text, source = "composer", humanAuthored = true) => {
         const id = uuid();
         // A picker answer is recorded ONLY to advance promptCount for the naming ladder; it must not
         // become the pinned banner's "last prompt" (that surface, like the breadcrumb, is for real
@@ -1662,7 +1789,12 @@ export const useProjectStore = create<ProjectState>()(
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => ({
-              ...a,
+              // A HUMAN TYPING IS THE RELEASE (roborev 55525), but ONLY a human (roborev 55588).
+              // `resetGoalRetries` has always documented "they typed to the agent" as its trigger and
+              // simply had no caller, which left an escalated agent permanently un-continuable. The
+              // flag is what keeps machine-authored prose out: this action is also reached by the
+              // concierge's own tool layer, whose text an LLM wrote.
+              ...(humanAuthored ? releaseGoalDebt(a) : a),
               lastPrompt: isPicker ? a.lastPrompt : text,
               // Append newest-last, then cap PER SOURCE so the persisted record stays bounded without
               // letting picker volume evict real composer prompts (capPromptHistory). Dropdown reverses.

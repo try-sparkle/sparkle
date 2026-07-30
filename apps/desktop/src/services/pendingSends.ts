@@ -25,6 +25,25 @@ export interface PendingSend {
   /** The wire payload — what actually gets written to the PTY. */
   text: string;
   userPrompt: boolean;
+  /**
+   * Did a PERSON compose this text (`dispatchAuthority.isHumanAuthored`)? Decided at DISPATCH time
+   * and carried across the wait, for the same reason the two renderings below are.
+   *
+   * REQUIRED, AND DELIBERATELY NOT OPTIONAL-WITH-A-DEFAULT (roborev 55628, High). Every other field
+   * here has a SAFE default — an absent `display` means "same as text" and the worst case is a
+   * cosmetic regression. This one's unsafe default is the whole bug: `appendPrompt`'s `humanAuthored`
+   * parameter defaults to `true`, and a `true` here runs `projectStore.releaseGoalDebt`, which clears
+   * an agent's retry budget AND un-latches the escalation whose entire purpose is to hand that agent
+   * to a human. The direct send path got the authorship gate in this branch's previous commit; the
+   * flush path kept passing the whole entry and inherited the default, so a `send_to_agent_terminal`
+   * dispatch — `userPrompt: true` over prose the concierge LLM composed — cleared the latch as soon
+   * as it was queued and flushed. Queuing is not exotic on that path: a concierge nudging a
+   * just-spawned or just-restarted agent is exactly when the pane is still `starting`.
+   *
+   * So a new queue site must ANSWER the question rather than omit it. Default-by-omission is the
+   * failure `dispatchAuthority.HUMAN_AUTHORED` is a `Record` (not a `Set`) to prevent, one layer up.
+   */
+  humanAuthored: boolean;
   /** What the user-visible prompt surfaces show; undefined → same as `text`. */
   display?: string;
   /** What auto-naming and ghost-text learn from; undefined → same as `text`, "" → skip naming. */

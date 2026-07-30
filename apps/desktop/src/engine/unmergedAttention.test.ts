@@ -4,7 +4,8 @@ import { hasUnmergedCommittedWork, type WorkflowStageId } from "./workflowStage"
 import type { AgentTabStatus } from "../types";
 
 // The "unmerged committed work" band: committed (building_saved) up to — but not including — merged
-// with origin main. This is the signal that turns a FINISHED agent's dot red ("Needs merge").
+// with origin main. This is the signal that labels a FINISHED agent "Needs merge" -- GRAY since
+// 2026-07-26; engine/stallEscalation is what can later turn such a row into a red alarm.
 describe("hasUnmergedCommittedWork", () => {
   it("is TRUE for the committed-but-not-on-origin-main band (saved → local main)", () => {
     const band: WorkflowStageId[] = ["building_saved", "pushed", "pull_request", "merged_local"];
@@ -32,7 +33,7 @@ const stageMap =
     m[id];
 
 describe("withUnmergedWork", () => {
-  it("escalates a FINISHED agent (idle/done/stopped) with un-landed work to red `unmerged`", () => {
+  it("escalates a FINISHED agent (idle/done/stopped) with un-landed work to `unmerged`", () => {
     const status: Record<string, AgentTabStatus> = { i: "idle", d: "done", s: "stopped" };
     const out = withUnmergedWork(
       agents("i", "d", "s"),

@@ -2,9 +2,9 @@
 // rendered one-per-tab with a real `claude` PTY underneath. Live runtime state (status,
 // PTY handles) is NOT stored here — see stores/runtimeStore.ts.
 import type { AgentTabStatus } from "@sparkle/ui";
-import type { AgentGoal } from "./engine/agentGoal";
+import type { AgentGoal, GoalDebt } from "./engine/agentGoal";
 
-export type { AgentGoal };
+export type { AgentGoal, GoalDebt };
 
 export type Runtime = "local" | "cloud";
 
@@ -94,7 +94,14 @@ export interface AgentTab {
   // mid-task (an app restart ended fourteen build agents' turns at once on 2026-07-29), so the
   // goal has to survive the very event it exists to recover from. Optional, so legacy records need
   // no migration and read as "no goal" — which disables auto-continue for them, the safe default.
-  goal?: AgentGoal;  // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
+  goal?: AgentGoal;
+  // What the agent still OWES after clearing its own goal — see engine/agentGoal.GoalDebt for the
+  // two-call reset this exists to block. Written only when an AGENT clears a goal that had spent
+  // budget or been escalated; consumed by the next agent-set goal; dropped by either human lever
+  // (setAgentGoal by a human, resetAgentGoalRetries). Absent on the common path, so it adds nothing
+  // to the persisted blob for the fleet's ordinary agents.
+  goalDebt?: GoalDebt;
+  // Requested at spawn: "plan" launches the agent with `--permission-mode plan` so it researches
   // and proposes before editing. Only ever "plan" — ordinary mode is the ABSENCE of this, so we
   // never override a user who configured a different default in their own Claude Code settings.
   //

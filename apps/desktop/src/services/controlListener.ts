@@ -45,10 +45,16 @@ import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBindin
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
-import { goalStateOf } from "../engine/agentGoal";
+// The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
+// the roster sweep and the single-agent read cannot disagree about who is stalled.
+import { goalReading, stallReadingFor, thrashReadingFor } from "./agentGoalReading";
+// CALM FIRST, THEN ROLL UP — applied to the raw status map before any bucketing, so a row's own
+// status, its rollup dot and its stall verdict cannot disagree about a never-briefed agent.
+import { withNewAgentCalm } from "../engine/newAgentAttention";
+import { useInteractionStore } from "../stores/interactionStore";
 import { setPrClaim, releasePrClaim, fetchPrClaims, findClaim } from "./mergeGuard/prClaims";
 import type { ControlOp } from "../stores/selfReportMetrics";
-import type { AgentTab } from "../types";
+import type { AgentTab, AgentTabStatus } from "../types";
 
 const EVENT = "control:request";
 
@@ -176,14 +182,28 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // caller. Both gates matter — this op reaches agent lifecycle, git, the workspace and a PTY, so a
   // near-miss caller id must not get within reach of it. See the handler.
   concierge_tool: "privileged",
-  // FREE, like `set_agent_activity` and for the same reason: these are an agent's report about its
-  // OWN work. A worker that cannot say "I am landing this myself" is a worker whose intent stays
-  // invisible, which is the failure this whole surface exists to fix — gating it behind
-  // interactive-only would reintroduce #806 for exactly the agents most likely to be holding a PR.
-  // Neither op can touch another agent: the claimant is the bridge-stamped caller, and the registry
-  // refuses a release by anyone else.
+  // FREE because it is SELF-REPORT — an agent saying what it is trying to finish, the same class of
+  // thing as `set_agent_activity`. It also has to be reachable by an UNATTENDED worker: the
+  // auto-continue prompt tells a resumed agent to report through this family, and a tier that denied
+  // workers would make that instruction a dead end for exactly the agents it is aimed at.
+  //
+  // ⚠️ UNLIKE `claim_pr`/`release_pr` BELOW, THIS ONE IS TARGETABLE. It is in `PER_AGENT_OPS`, it is
+  // not caller-stamped, and it deliberately CAN reach another agent — a worker in the caller's own
+  // subtree. The closure that makes that safe is `mayWriteGoalFor`, not the tier: `free` here is a
+  // statement about WHO MAY CALL IT, and says nothing about whose goal they may write. Do not read
+  // the "neither op can touch another agent" note below as covering this entry; it does not, and a
+  // previous edit left it looking as though it did (roborev 55599).
   set_agent_goal: "free",
+  // Caller-stamped: an agent may only mark its OWN goal met (only the reserved concierge id may name
+  // a target), because declaring a different live agent finished latches its `metAt` and renders a
+  // possibly-stalled agent done.
   set_agent_goal_met: "free",
+  // FREE, like `set_agent_activity` and for the same reason: an agent's report about its OWN work. A
+  // worker that cannot say "I am landing this myself" is a worker whose intent stays invisible, which
+  // is the failure this whole surface exists to fix — gating it behind interactive-only would
+  // reintroduce #806 for exactly the agents most likely to be holding a PR. Neither of THESE TWO can
+  // touch another agent: the claimant is the bridge-stamped caller, and the registry refuses a release
+  // by anyone else.
   claim_pr: "free",
   release_pr: "free",
 };
@@ -284,6 +304,39 @@ function resolveTargetId(req: ControlRequest): string | undefined {
   if (typeof t === "string" && t) return t;
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return undefined;
   return req.callerAgentId;
+}
+
+/**
+ * May this caller write `targetId`'s GOAL? Yourself, your own worker subtree, or the concierge.
+ *
+ * See `handleSetGoal` for why the write half needs a closure at all: the goal text is replayed
+ * verbatim into the target's PTY by `continuePrompt`, and clearing a goal is the documented opt-out
+ * from auto-continue — so an unrestricted target is both an injection channel and a way to silence
+ * another agent's resume loop (roborev 55549).
+ *
+ * FAILS CLOSED on an unresolvable caller: no id means we cannot establish ownership, and the only
+ * safe answer to "does this anonymous caller own that agent" is no.
+ */
+function mayWriteGoalFor(req: ControlRequest, targetId: string): boolean {
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return true;
+  const caller = (req.callerAgentId || "").trim();
+  if (!caller) return false;
+  if (caller === targetId) return true;
+  // Walk UP from the target: an orchestrator owns its workers at any depth, matching how
+  // `rollupDot` folds a nested head's subtree into its parent. Bounded by the roster size so a
+  // corrupted parent cycle cannot spin here.
+  const byId = new Map(
+    useProjectStore
+      .getState()
+      .projects.flatMap((p) => p.agents)
+      .map((a) => [a.id, a] as const),
+  );
+  let cursor = byId.get(targetId)?.parentId ?? null;
+  for (let hops = 0; cursor && hops <= byId.size; hops++) {
+    if (cursor === caller) return true;
+    cursor = byId.get(cursor)?.parentId ?? null;
+  }
+  return false;
 }
 
 /** The name the human sees on the concierge — used as its `self.name` so the identity get_state
@@ -481,6 +534,71 @@ function callerMayAdminister(callerAgentId: string): boolean {
   return kind != null && kind !== "worker";
 }
 
+/**
+ * The GOAL / STALLED / THRASHING fields on one `get_state` row — compact, and absent when there is
+ * nothing to say.
+ *
+ * WHY THIS IS ON THE ROSTER AT ALL. The roster is the one call an orchestrator or the concierge
+ * makes routinely, and until now every gray row looked identical: an agent that stopped mid-write on
+ * a file and one that shipped its PR both read `idle`. Finding the first therefore meant a human
+ * remembering what each of ~35 agents was doing. These fields make that a SWEEP.
+ *
+ * WHY IT IS SO TERSE. Every byte here is permanently resident in the caller's context and is paid
+ * for on every call, over every agent. So the shape is deliberately the index rather than the
+ * article — `get_agent_status` carries the causes, the retry counters and the sentences:
+ *
+ *   • `goal` — only for an agent that HAS one; text + state + time left. `escalationReason` rides
+ *     along only when the state is `escalated`, because that is the row a human has to pick up.
+ *   • `stall` — only for a RESTING row (the `active` verdict is already implied by `status`), and as
+ *     the bare verdict string. `stallCauses` only when it is actually stalled.
+ *   • `thrashing` — only when a thrash reading exists AND says something is wrong. Its ABSENCE is
+ *     therefore two different facts (not watched / watched and fine), which is exactly why it is
+ *     never a `false`: a caller must not read "no field" as "confirmed healthy", and if it needs to
+ *     know which, `get_agent_status` distinguishes them.
+ */
+/** How much free-form goal prose a ROSTER row may carry. Short enough that twenty of them are noise
+ *  against a ~3.5k-token payload, long enough to recognise the objective. Truncation is marked with
+ *  an ellipsis so a reader can tell a capped string from a short one and go ask `get_agent_status`. */
+const ROSTER_TEXT_CAP = 120;
+
+function capForRoster(text: string): string {
+  return text.length <= ROSTER_TEXT_CAP ? text : `${text.slice(0, ROSTER_TEXT_CAP - 1)}…`;
+}
+
+function goalAndStallFields(
+  agent: AgentTab,
+  status: AgentTabStatus,
+  now: number,
+): Record<string, unknown> {
+  const goal = goalReading(agent.goal, now);
+  const stall = stallReadingFor(agent.id, status, agent.goal, now);
+  const thrash = thrashReadingFor(agent.id, agent.goal, now);
+  return {
+    ...(goal
+      ? {
+          goal: {
+            // CAPPED, because this payload's own rationale is a token budget and goal text is
+            // DESIGNED to be instruction-length: `AgentGoal.text` is documented as "replayed to the
+            // agent when auto-continue restarts it, so it has to read as an instruction", and
+            // `continuePrompt` interpolates it whole. Nothing bounds it on the write path either. So
+            // an orchestrator setting a 2KB objective on each of twenty workers turned a ~3.5k-token
+            // permanently-resident roster into ~15k (roborev 55308). This is the index, not the
+            // article — `get_agent_status` is per-agent, on demand, and carries the full strings.
+            text: capForRoster(goal.text),
+            state: goal.state,
+            remainingMs: goal.remainingMs,
+            ...(goal.escalationReason !== undefined
+              ? { escalationReason: capForRoster(goal.escalationReason) }
+              : {}),
+          },
+        }
+      : {}),
+    ...(stall.verdict === "active" ? {} : { stall: stall.verdict }),
+    ...(stall.verdict === "stalled" ? { stallCauses: stall.causes } : {}),
+    ...(thrash?.thrashing ? { thrashing: thrash.verdict } : {}),
+  };
+}
+
 /** get_state → the full agent roster (across every project) + the current theme preference. Status
  *  comes from the live runtimeStore (keyed by agentId globally); an agent with no live status reads
  *  as "stopped" (not running), the same default the sidebar uses.
@@ -531,7 +649,11 @@ function callerMayAdminister(callerAgentId: string): boolean {
  *  sibling worker is unobserved. Those are EVIDENCE — something under this row was seen asking, and
  *  a row nobody can see cannot un-ask it. `green` and `gray` are ABSENCE claims ("nothing under here
  *  needs you"), and an unobserved worker is exactly what falsifies them. Dropping an observed alarm
- *  to say "unknown" would trade this false negative for a worse one. */
+ *  to say "unknown" would trade this false negative for a worse one.
+ *
+ *  A row may also carry `goal`, `stall`/`stallCauses` and `thrashing` — see `goalAndStallFields` for
+ *  the shape and for why each is absent rather than empty. They are what make "who is stuck?" a
+ *  sweep over this reply instead of a human reading gray rows one at a time. */
 function handleGetState(req: ControlRequest): {
   agents: unknown[];
   self: SelfIdentity | null;
@@ -564,14 +686,31 @@ function handleGetState(req: ControlRequest): {
   // makes this field necessary: a caller must never conclude a head is calm because the worker that
   // disagrees was dropped from the reply (or, in the UI, folded out of sight).
   //
-  // `ownStatusOf` is left at its default (== `statusOf`) because this map is `runtimeStore.status`
-  // RAW — no `withRedWorkerAttention` has been composited into it, which is the case that parameter
-  // exists to defend against. It is also the same map the `status` field reports below, so a row's
-  // dot and its own-status are always derived from one source and cannot contradict each other.
-  const dotOf = rollupDotAccessor(
-    projects.flatMap((p) => p.agents),
-    (id) => status[id] ?? "stopped",
+  // ONE clock for the whole roster, so two rows can never disagree about whether a goal expired
+  // between them — and so the calm map below and the goal readings share a single `now`.
+  const now = Date.now();
+  const allAgents = projects.flatMap((p) => p.agents);
+  // CALM FIRST, THEN ROLL UP (roborev 55028's rule in useRosterPublisher, and roborev 55525 for
+  // getting it wrong here). `withNewAgentCalm` rewrites a spawned-but-never-briefed agent's `idle` /
+  // `blocked` to `new`, and it has to be applied to the RAW map before anything is bucketed or
+  // folded. Correcting only the row's own `status` — which is what this surface did first — moved the
+  // contradiction instead of removing it: `bandOfStatus("new")` is `done` while the uncorrected
+  // `blocked` still bucketed as `needs_you`, so one row said calm-gray and "something here needs you"
+  // at the same time, and because the same map feeds `descendantsOf`, an unbriefed WORKER bubbled a
+  // red dot into its head's row. That false "an agent needs you" is precisely what
+  // engine/newAgentAttention exists to remove.
+  const calmStatus = withNewAgentCalm(
+    allAgents,
+    status,
+    now,
+    useInteractionStore.getState().lastAt,
   );
+  // `ownStatusOf` is left at its default (== `statusOf`) because no `withRedWorkerAttention` has been
+  // composited into this map, which is the case that parameter exists to defend against. It is also
+  // the same map the `status` field reports below, so a row's dot and its own-status are always
+  // derived from one source and cannot contradict each other. KEEP THAT TRUE: if you correct the
+  // status a row reports, correct the map this reads, not the row.
+  const dotOf = rollupDotAccessor(allAgents, (id) => calmStatus[id] ?? "stopped");
   // DIRECT children per head, `kind === "worker"` ONLY (roborev 54843) — matching
   // `rollupDotAccessor`'s own rule that only worker rows are folded into a parent's dot. Building
   // this from every child regardless of kind let a non-worker child (which cannot itself change the
@@ -627,7 +766,13 @@ function handleGetState(req: ControlRequest): {
       // sent a user chasing a bug that did not exist.
       name: agentDisplayName(a),
       kind: a.kind,
-      status: status[a.id] ?? "stopped",
+      // FROM THE SHARED CALMED MAP (roborev 55451, then 55525). `stall` is omitted when the verdict
+      // is `active` on the documented grounds that "`active` is already implied by `status`", so
+      // publishing the RAW status here made the row self-contradictory for a briefless, freshly
+      // spawned agent: `status: "idle"` with an unmet goal and no `stall` key. Reading `calmStatus`
+      // — the same map `dotOf` above and `stallReadingFor` below resolve to — is what makes all
+      // three agree.
+      status: calmStatus[a.id] ?? "stopped",
       // What the row's disc says once its workers are counted — "green" | "red" | "orange" | "gray"
       // (engine/workerRollup). ADDITIVE: `status` above keeps meaning the agent's OWN PTY state, so
       // nothing that already branches on it is redefined. Read this one to answer "is anything under
@@ -642,27 +787,23 @@ function handleGetState(req: ControlRequest): {
       liveness: livenessOf(a.id, status, openIds),
       parentId: a.parentId,
       activity: a.activity ?? null,
-      // The agent's OBJECTIVE and whether it has been MET — see engine/agentGoal. Readable here
-      // because it was write-only: on 2026-07-29 PR #806's owning agent had the goal "get it
-      // merged", and a concierge able to read that would not have merged the PR out from under it.
-      // Flattened rather than passed whole: `met` is the field every consumer actually branches on,
-      // and the retry counters are engine bookkeeping a caller must not reason about.
-      // `state` and not just `met`. ESCALATED is the one state that cannot be reconstructed from the
-      // other fields — `expired` is derivable from setAt+ttlMs, but a goal auto-continue has GIVEN
-      // UP on and handed to a human reads identically to one still being retried if all you have is
-      // `met: false`. That is the highest-value row for a human and precisely what this surface
-      // exists to let the concierge sweep for. `met` stays for compatibility; the retry counters
-      // really are engine bookkeeping and stay out.
-      goal: a.goal
-        ? {
-            text: a.goal.text,
-            state: goalStateOf(a.goal, Date.now()),
-            met: a.goal.metAt !== undefined,
-            setAt: a.goal.setAt,
-            ttlMs: a.goal.ttlMs,
-            ...(a.goal.escalationReason ? { escalationReason: a.goal.escalationReason } : {}),
-          }
-        : null,
+      // THE SWEEP FIELDS. Without them, finding the agent that stopped mid-task means a human
+      // noticing a gray row by eye — `status` cannot tell "idle and finished" from "idle and
+      // stalled", and both render identically. With them, a concierge or an orchestrator can scan
+      // the roster it is already paying for and ask "who is stuck?".
+      //
+      // COMPACT AND ABSENT-BY-DEFAULT, because this payload is the single largest thing the control
+      // API puts into a context window (~3.5k tokens for a big roster) and it is PERMANENT. So: no
+      // prose, no sub-objects for a row with nothing to say, and nothing at all for the common case
+      // of an agent with no goal that is not resting. `get_agent_status` is where the full readings
+      // (causes, detail sentences, retry counters) live — this is the index, not the article.
+      // THE CALMED MAP, like `status` and `dotOf` (roborev 55588). This still passed the RAW status,
+      // so the "one derivation" claim above was two derivations that merely agreed: the row's status
+      // came from `calmStatus` while its `stall` came from `stallReadingFor` re-deriving the
+      // correction internally. They coincide today because `correctedStatusFor` is idempotent, but
+      // nothing pinned that — change the inputs here (a filtered list, a different clock) and the
+      // fields silently disagree again, which is the defect this was meant to fix.
+      ...goalAndStallFields(a, calmStatus[a.id] ?? "stopped", now),
     })),
   );
   const agents = all.filter((a) => {
@@ -768,17 +909,55 @@ function handleSetActivity(req: ControlRequest): Record<string, unknown> {
  * The op this adds is the READ half's other end: the model was set-able in-app but unreachable from
  * an agent, and unreadable by the concierge. An empty `goal` clears it, which is the documented
  * opt-out from auto-continue.
+ *
+ * IT ROUTES, IT DOES NOT DECIDE — and the `"agent"` actor below is the whole reason that matters.
+ * This op defaults to the CALLER and is free-tier, so every rule about what a goal DOES has to live
+ * in `projectStore` + `engine/agentGoal`, where the actor distinction can be enforced once:
+ *   • empty/whitespace text CLEARS the goal. It must never reach `newGoal`, which THROWS on empty
+ *     rather than driving twenty restarts with a prompt reading "GOAL: " and nothing after it.
+ *   • the same text again keeps the retry counters but re-arms the lifecycle (`setAt`, `metAt`), so
+ *     an agent re-stating its objective each round neither refills its budget nor stays stuck `met`.
+ *   • GENUINELY NEW text from an AGENT inherits the old goal's `totalContinues` and any escalation —
+ *     across a clear as well as a rewording (`GoalDebt`). Without that, `MAX_CONTINUES_TOTAL` and a
+ *     human's escalation were both one free tool call from vacuous (roborev 55339, 55451).
  */
 function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   if (!targetId) return targetRequired("set_agent_goal", req);
+  // THE WRITE HALF NEEDS THE SAME CLOSURE THE `met` HALF HAS (roborev 55549). `set_agent_goal_met` is
+  // caller-stamped because touching another live agent's goal state is a confused-deputy hole — and the
+  // SETTER reaches the same state by another door, so leaving it freely targetable made that guard
+  // decorative:
+  //   • `set_agent_goal {targetAgentId: B, goal: ""}` drops B's goal, which IS the documented opt-out
+  //     from auto-continue — so A can silence B's resume loop and change how B's row reads.
+  //   • worse, `continuePrompt` replays `goal.text` VERBATIM into B's terminal on every restart, so a
+  //     targeted set is an unauthenticated cross-agent prompt-injection channel into B's PTY.
+  //
+  // Scoped rather than caller-stamped outright, because an ORCHESTRATOR setting goals on its own
+  // workers is a legitimate advertised use and already inside the trust boundary — it spawns them and
+  // writes to their terminals by design. What is NOT legitimate is reaching a sibling or an unrelated
+  // agent's fleet. So: yourself, your own worker subtree, or the concierge (whose reserved id the
+  // bridge stamps server-side, and which is the human-driven surface).
+  if (!mayWriteGoalFor(req, targetId)) {
+    return {
+      ok: false,
+      code: "not_yours",
+      error: `agent ${targetId} is not yours to set a goal on — its text is replayed into that agent's terminal, so only the agent itself, an orchestrator above it, or the concierge may write it.`,
+    };
+  }
   const goal = req.payload.goal;
   if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };
   const ttlMs = typeof req.payload.ttlMs === "number" && req.payload.ttlMs > 0 ? req.payload.ttlMs : undefined;
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
-  useProjectStore.getState().setAgentGoal(found.projectId, targetId, goal, ttlMs);
-  return { ok: true };
+  // `"agent"`: see the docstring. Everything reaching this handler came off the control socket.
+  useProjectStore.getState().setAgentGoal(found.projectId, targetId, goal, ttlMs, "agent");
+  // Report the goal AS IT NOW STANDS, read back out of the store rather than echoed from the args.
+  // The store may have done something other than what the caller literally asked (a re-asserted goal
+  // keeps its counters; an empty text dropped it), and the caller is about to tell a human what
+  // happened. `cleared` distinguishes the two without the caller having to compare texts.
+  const reading = goalReading(findAgent(targetId)?.agent.goal, Date.now());
+  return reading ? { ok: true, goal: reading } : { ok: true, cleared: true };
 }
 
 /**
@@ -854,8 +1033,16 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // goal record, so a bare `{ ok: true }` would tell the caller it is done while the concierge goes
   // on reading `goal: null` — false assurance, on the one field that decides whether an idle agent
   // is finished or stalled.
+  //
+  // TYPED, not just prose. A caller that has to string-match an error message to tell "you asked for
+  // something impossible" from "the app broke" will get it wrong, and this is the refusal an agent
+  // hits on the one path it is instructed to take (`continuePrompt` tells it to mark its goal met).
   if (!found.agent?.goal) {
-    return { ok: false, error: "no goal to mark — set one with set_agent_goal first." };
+    return {
+      ok: false,
+      code: "no_goal",
+      error: "no goal to mark — set one with set_agent_goal first.",
+    };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);
   return { ok: true, met };

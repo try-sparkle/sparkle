@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { migratePersisted, mergePreservingLiveWorkers, useProjectStore } from "./projectStore";
 import { goalStateOf } from "../engine/agentGoal";
-import { MAX_CONTINUES_WITHOUT_PROGRESS, decideContinuation } from "../engine/goalContinuation";
+import { conciergeToolAuthority, isHumanAuthored } from "../services/dispatchAuthority";
+import {
+  MAX_CONTINUES_TOTAL,
+  MAX_CONTINUES_WITHOUT_PROGRESS,
+  decideContinuation,
+} from "../engine/goalContinuation";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(): AgentTab {
@@ -94,6 +99,236 @@ describe("setAgentGoal", () => {
     store().escalateAgentGoal("p1", "a1", "gave up");
     store().setAgentGoal("p1", "a1", "hard");
     expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
+  });
+});
+
+describe("the AGENT's own set is weaker than the human's", () => {
+  beforeEach(seed);
+
+  it("a self-set NEW goal cannot launder a spent retry budget", () => {
+    // THE HOLE (roborev 55339). `set_agent_goal` is agent-reachable and free-tier, and only IDENTICAL
+    // text preserved the counters — so a one-word paraphrase reached `newGoal()` and zeroed
+    // `totalContinues`, making the ceiling `MAX_CONTINUES_TOTAL` documents as unreachable-by-the-agent
+    // vacuous. Repeatable forever: continue to the ceiling, reword, twenty more.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().setAgentGoal("p1", "a1", "land the pull request", undefined, "agent");
+    expect(agent().goal?.text).toBe("land the pull request");
+    expect(agent().goal?.totalContinues).toBe(MAX_CONTINUES_TOTAL);
+    // The consecutive streak DOES reset — the work genuinely changed, and that counter answers "is
+    // restarting getting anywhere", not "how much has this cost".
+    expect(agent().goal?.continues).toBe(0);
+  });
+
+  it("a self-set NEW goal cannot cancel an escalation a human owns", () => {
+    store().setAgentGoal("p1", "a1", "hard thing");
+    store().escalateAgentGoal("p1", "a1", "three tries, no progress");
+    store().setAgentGoal("p1", "a1", "hard thing, take two", undefined, "agent");
+    expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
+    expect(agent().goal?.escalationReason).toBe("three tries, no progress");
+  });
+
+  it("...but a HUMAN setting new text does start clean — that is the point of the distinction", () => {
+    store().setAgentGoal("p1", "a1", "hard thing");
+    burn(4);
+    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().setAgentGoal("p1", "a1", "different work entirely");
+    expect(agent().goal?.totalContinues).toBe(0);
+    expect(goalStateOf(agent().goal, Date.now())).toBe("unmet");
+  });
+
+  it("nor can it launder the budget by CLEARING first — the debt outlives the record", () => {
+    // THE HOLE (roborev 55451). The guard above only covered overwriting the text. Every bound in
+    // goalContinuation is read off the goal record and nowhere else, so `set_agent_goal {goal: ""}`
+    // deleted the debt outright — and the agent-facing skill doc teaches both halves of the sequence.
+    // Two free-tier calls put the agent back in the pool with a full ceiling.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().setAgentGoal("p1", "a1", "", undefined, "agent"); //  1. clear
+    expect(agent().goal).toBeUndefined();
+    store().setAgentGoal("p1", "a1", "land the PR", undefined, "agent"); //  2. set it again
+    expect(agent().goal?.totalContinues).toBe(MAX_CONTINUES_TOTAL);
+    // And the bound the counter exists for actually bites — asserting the SIDE EFFECT, not the field.
+    expect(
+      decideContinuation({
+        goal: agent().goal,
+        status: "idle",
+        now: Date.now() + 60_000,
+        idleSince: Date.now(),
+        hasTurnEndAuthority: true,
+        canAcceptInput: true,
+        mark: "stuck",
+        processAlive: true,
+      }).action,
+    ).toBe("escalate");
+  });
+
+  it("clear-then-set cannot cancel an escalation either", () => {
+    store().setAgentGoal("p1", "a1", "hard thing");
+    store().escalateAgentGoal("p1", "a1", "three tries, no progress");
+    store().setAgentGoal("p1", "a1", "", undefined, "agent");
+    store().setAgentGoal("p1", "a1", "hard thing", undefined, "agent");
+    expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
+    expect(agent().goal?.escalationReason).toBe("three tries, no progress");
+  });
+
+  it("a CLEAN goal cleared by the agent stashes nothing — the common path stays empty", () => {
+    // Keeps this out of the persisted blob for the fleet's ordinary agents, and keeps a later
+    // agent-set goal genuinely fresh rather than charged with a zero it never owed.
+    store().setAgentGoal("p1", "a1", "quick thing");
+    store().setAgentGoal("p1", "a1", "", undefined, "agent");
+    expect(agent().goalDebt).toBeUndefined();
+    expect("goalDebt" in agent()).toBe(false);
+  });
+
+  it("a HUMAN clearing the goal RELEASES the debt — their clear is a real opt-out", () => {
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().setAgentGoal("p1", "a1", ""); // human, no actor argument
+    expect(agent().goalDebt).toBeUndefined();
+    store().setAgentGoal("p1", "a1", "land the PR", undefined, "agent");
+    expect(agent().goal?.totalContinues).toBe(0);
+  });
+
+  it("resetAgentGoalRetries releases a debt stashed with no goal present", () => {
+    // The human's lever has to reach every place the debt is written, or it is partial: reset, then
+    // let the agent set a goal, and the ceiling it just cleared comes straight back.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().setAgentGoal("p1", "a1", "", undefined, "agent");
+    expect(agent().goalDebt?.totalContinues).toBe(MAX_CONTINUES_TOTAL);
+    store().resetAgentGoalRetries("p1", "a1"); // …with no goal on the agent at all
+    expect(agent().goalDebt).toBeUndefined();
+    store().setAgentGoal("p1", "a1", "land the PR", undefined, "agent");
+    expect(agent().goal?.totalContinues).toBe(0);
+  });
+
+  it("A HUMAN TYPING releases the debt end-to-end — auto-continue works again", () => {
+    // roborev 55525, the regression that closing the laundering hole created. `resetAgentGoalRetries`
+    // had ZERO production callers and the only `setAgentGoal` caller always passes "agent", so both
+    // documented releases were dead code: the first escalation pinned the agent at
+    // `already-escalated` for the life of its persisted record, across restarts. The old exploit had
+    // at least been an escape hatch. THE ASSERTION IS THE SIDE EFFECT — that `decideContinuation`
+    // resumes — not that a field changed, because the field was never the thing that was broken.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().escalateAgentGoal("p1", "a1", "gave up");
+    const ask = () =>
+      decideContinuation({
+        goal: agent().goal,
+        status: "idle",
+        now: Date.now() + 60_000,
+        idleSince: Date.now(),
+        hasTurnEndAuthority: true,
+        canAcceptInput: true,
+        mark: "stuck",
+        processAlive: true,
+      });
+    const before = ask();
+    expect(before.action).toBe("none"); // latched: already escalated
+    // Narrowed rather than cast — `reason` only exists on the non-continue arms, and asserting WHICH
+    // refusal it is matters: "none" alone would also be satisfied by a fixture that simply failed one
+    // of the gates, which would make the release assertion below prove nothing.
+    if (before.action === "none") expect(before.reason).toBe("already-escalated");
+
+    // The human types to the agent. This is the trigger `resetGoalRetries` always documented.
+    store().appendPrompt("p1", "a1", "try it this way instead");
+
+    expect(agent().goalDebt).toBeUndefined();
+    expect(agent().goal?.totalContinues).toBe(0);
+    expect(goalStateOf(agent().goal, Date.now())).toBe("unmet");
+    expect(ask().action).toBe("continue");
+  });
+
+  it("…and so does a line typed straight into the terminal, even on an ALREADY-briefed agent", () => {
+    // The write-once stamp must not swallow the release. A human unsticking an escalated agent has
+    // almost certainly briefed it before, so bailing out on `terminalBriefedAt` alone would skip the
+    // release on exactly the keystroke meant to perform it.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    store().noteTerminalBrief("p1", "a1"); // briefed EARLIER — the stamp is already set
+    const stampedAt = agent().terminalBriefedAt;
+    expect(stampedAt).toEqual(expect.any(Number));
+    burn(MAX_CONTINUES_TOTAL);
+    store().escalateAgentGoal("p1", "a1", "gave up");
+
+    store().noteTerminalBrief("p1", "a1"); // …and types again, now to unstick it
+
+    expect(agent().goal?.totalContinues).toBe(0);
+    expect(goalStateOf(agent().goal, Date.now())).toBe("unmet");
+    // The stamp itself stays write-once — it answers "was this EVER briefed", not "when last".
+    expect(agent().terminalBriefedAt).toBe(stampedAt);
+  });
+
+  it("a MACHINE-authored send must not release it — that bound is the whole feature", () => {
+    // roborev 55588. My first version of this test called noteAgentGoalContinue N times and asserted
+    // the counter went up and goalDebt was undefined — both TRUE BEFORE the change, neither touching
+    // appendPrompt or the authorship gate. It could not have gone red if the gate were removed, which
+    // is the exact vacuous-assertion failure it was written to prevent.
+    //
+    // The seam that carries the bound is `appendPrompt`'s `humanAuthored` flag, which
+    // conciergeDispatch derives from `dispatchAuthority.isHumanAuthored`. `send_to_agent_terminal`
+    // dispatches with `userPrompt: true` for prose the concierge LLM composed, so keying the release
+    // on `userPrompt` let a MACHINE clear the escalation latch whose entire purpose is to hand the
+    // agent to a human — and that op is `disruptive`, so under a policy allowing disruptive writes it
+    // happened unattended, refilling the ceiling indefinitely.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    store().escalateAgentGoal("p1", "a1", "gave up");
+
+    // Machine-authored: the concierge's own tool layer writing prose it composed.
+    store().appendPrompt("p1", "a1", "continue", "composer", false);
+
+    expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
+    expect(agent().goal?.totalContinues).toBe(MAX_CONTINUES_TOTAL);
+    expect(
+      decideContinuation({
+        goal: agent().goal, status: "idle", now: Date.now() + 60_000, idleSince: Date.now(),
+        hasTurnEndAuthority: true, canAcceptInput: true, mark: "stuck", processAlive: true,
+      }).action,
+    ).toBe("none");
+
+    // …and the SIBLING case: the same call, human-authored, DOES release. Without this the test above
+    // would pass against a release that never fires for anyone.
+    store().appendPrompt("p1", "a1", "try it this way instead", "composer", true);
+    expect(goalStateOf(agent().goal, Date.now())).toBe("unmet");
+    expect(agent().goal?.totalContinues).toBe(0);
+  });
+
+  it("isHumanAuthored draws the line the union already documents", () => {
+    // A Record over every authority kind, so ADDING an arm fails to compile until someone decides
+    // which side it is on — the default-by-omission is what went wrong the first time.
+    expect(isHumanAuthored({ kind: "suggestion", agentId: "a1" })).toBe(true);
+    expect(isHumanAuthored({ kind: "nudge-approve", agentId: "a1" })).toBe(true);
+    expect(isHumanAuthored({ kind: "countdown", intentId: "i1" })).toBe(true);
+    // The two machine arms. The union's own docstring says it: "An AI tool call is NOT a user gesture".
+    expect(isHumanAuthored({ kind: "goal-continue", agentId: "a1" })).toBe(false);
+    const tool = conciergeToolAuthority("call-1", { tier: "allow" });
+    expect(tool).not.toBeNull();
+    if (tool) expect(isHumanAuthored(tool)).toBe(false);
+  });
+
+  it("a nothing-owed agent is left REFERENCE-IDENTICAL, so a typed line does not churn the blob", () => {
+    // roborev 55588. `releaseGoalDebt`'s fast path asked only whether a goal EXISTED, but
+    // `resetGoalRetries` always allocates — so every goal-bearing agent got a fresh object, which made
+    // `noteTerminalBrief`'s write-once bail never fire: one persisted-blob write, cross-window
+    // broadcast and fleet re-render PER SUBMITTED LINE, for exactly the agents being actively driven.
+    store().setAgentGoal("p1", "a1", "land the PR"); // clean goal: nothing owed
+    store().noteTerminalBrief("p1", "a1"); // stamp it
+    const before = useProjectStore.getState().projects;
+    store().noteTerminalBrief("p1", "a1"); // …and type again
+    expect(useProjectStore.getState().projects).toBe(before);
+  });
+
+  it("the debt cannot be diluted by repeated clear/set cycles", () => {
+    // `chargeGoalDebt` takes the MAX, so the bound can only ever tighten. Without that, a cycle that
+    // spends one continue and re-clears could walk the stored total DOWN.
+    store().setAgentGoal("p1", "a1", "land the PR");
+    burn(MAX_CONTINUES_TOTAL);
+    for (let i = 0; i < 3; i++) {
+      store().setAgentGoal("p1", "a1", "", undefined, "agent");
+      store().setAgentGoal("p1", "a1", `attempt ${i}`, undefined, "agent");
+    }
+    expect(agent().goal?.totalContinues).toBe(MAX_CONTINUES_TOTAL);
   });
 });
 

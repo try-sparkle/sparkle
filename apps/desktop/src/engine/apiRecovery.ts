@@ -300,7 +300,7 @@ export interface ReviveInput {
   /** `services/conciergeDispatch.agentCanAcceptInput` — fails closed for an unknown agent. */
   canAcceptInput: boolean;
   /**
-   * Is the agent's PROCESS still alive (`engine/turnEndAuthority.hasExited`)?
+   * Is the agent's PROCESS still alive (`engine/turnEndAuthority.processAliveOf`)?
    *
    * REQUIRED, and required-but-nullable rather than optional, for the reason
    * `goalContinuation.ContinuationInput.processAlive` spells out at length: `errored` is reachable

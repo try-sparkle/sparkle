@@ -132,6 +132,11 @@ export function stallReport(input: StallInput): StallReport {
   // old wall is engine/stallEscalation: the escalation lands on `blocked`, which fires no badge and
   // no banner and can be dismissed. The volume concern is real and recorded there, with the one-line
   // revert, rather than being answered by making this surface lie again.
+  //
+  // BE HONEST ABOUT THE ORDER OF ARRIVAL: that mitigation is not composed into the rendered maps yet
+  // (see the note at the top of unmergedAttention). So today this surface reports every `unmerged`
+  // row as stalled while nothing recolours it — the reports are consumed by the control surfaces and
+  // the concierge, not yet by the sidebar's colour. Whoever wires it inherits the volume decision.
   const hasUnlandedWork = input.hasUnlandedWork ?? (status === "unmerged" ? true : undefined);
 
   const causes: StallCause[] = [];
@@ -151,10 +156,21 @@ export function stallReport(input: StallInput): StallReport {
   // most likely to cross the TTL.
   if (goalState === "expired") causes.push("expired-goal");
   if (hasOpenPr === true) causes.push("open-pr");
-  // NOT reported alongside `open-pr`, which is the same fact in its more actionable form: an agent
-  // with an open PR has unlanded commits BY CONSTRUCTION, so listing both produced a sentence that
-  // said it twice — "it has an open PR that nobody merged and it has committed work that never
-  // reached main" (roborev 55298). One outstanding thing, one clause.
+  // FOLDED INTO `open-pr` WHENEVER BOTH HOLD. An agent with an open PR has unlanded commits by
+  // construction, so reporting both said the same fact twice — "it has an open PR that nobody merged
+  // and it has committed work that never reached main" (roborev 55298).
+  //
+  // This was briefly scoped to the INFERRED case only, on the argument that a caller asserting
+  // `true` makes the stronger claim "there are commits the PR does not contain". That distinction
+  // does not exist: the only production producer (`rowAttention.stallInputsFor`) always supplies the
+  // field explicitly once there is any git reading, and its value is `hasUnmergedCommittedWork(stage)`
+  // — a stage-BAND predicate whose band includes `pull_request`. So it is derived from the same fact
+  // the PR is, and the "explicit" path existed only for test callers while production got the
+  // duplicate sentence back (roborev 55379).
+  //
+  // "Commits beyond the PR" is a real and different question — `ahead` versus the PR head — and
+  // nothing in the repo computes it. When something does, it belongs here as its OWN input rather
+  // than as a re-reading of this one.
   if (hasUnlandedWork === true && hasOpenPr !== true) causes.push("unlanded-work");
   if (hasUncommittedChanges === true) causes.push("uncommitted-changes");
 

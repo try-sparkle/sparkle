@@ -542,7 +542,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
     await dispatchConciergeAnswer("a1", "held too long", { authority: TEST_AUTHORITY, userPrompt: true });
     // Age the entry past the TTL by re-queueing it with an old timestamp.
     resetPendingSends();
-    queuePendingSend({ agentId: "a1", text: "held too long", userPrompt: true, at: 0 });
+    queuePendingSend({ agentId: "a1", text: "held too long", userPrompt: true, humanAuthored: true, at: 0 });
     const seen: { path: string; sent?: string }[] = [];
     const off = onDeferredSendOutcome((r) => seen.push({ path: r.path, sent: r.sent }));
     const results = await flushPendingSends("a1");
@@ -563,6 +563,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
       text: "'/tmp/shot.png' look",
       display: "look · 1 image",
       userPrompt: true,
+      humanAuthored: true,
       at: 0,
     });
     const seen: { path: string; display?: string }[] = [];
@@ -595,8 +596,8 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
 describe("abandonPendingSends — a hold the PTY will never satisfy (roborev 46485-M)", () => {
   it("reports every held entry as `abandoned` and empties the queue", async () => {
     setPaneReady("a1", false);
-    queuePendingSend({ agentId: "a1", text: "first", userPrompt: true });
-    queuePendingSend({ agentId: "a1", text: "second", userPrompt: true });
+    queuePendingSend({ agentId: "a1", text: "first", userPrompt: true, humanAuthored: true });
+    queuePendingSend({ agentId: "a1", text: "second", userPrompt: true, humanAuthored: true });
     const seen: Array<{ path: string; sent?: string; ok: boolean }> = [];
     const off = onDeferredSendOutcome((r) => seen.push({ path: r.path, sent: r.sent, ok: r.ok }));
     abandonPendingSends("a1");
@@ -617,8 +618,8 @@ describe("abandonPendingSends — a hold the PTY will never satisfy (roborev 464
   });
 
   it("touches only the named agent's queue", () => {
-    queuePendingSend({ agentId: "a1", text: "mine", userPrompt: true });
-    queuePendingSend({ agentId: "a2", text: "yours", userPrompt: true });
+    queuePendingSend({ agentId: "a1", text: "mine", userPrompt: true, humanAuthored: true });
+    queuePendingSend({ agentId: "a2", text: "yours", userPrompt: true, humanAuthored: true });
     abandonPendingSends("a1");
     expect(pendingSendCount("a1")).toBe(0);
     expect(pendingSendCount("a2")).toBe(1);

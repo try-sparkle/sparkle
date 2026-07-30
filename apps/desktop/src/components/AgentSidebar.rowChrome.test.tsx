@@ -914,10 +914,24 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     seedExpanded(status, {}, { a1: "building_saved", w1: "building_saved", w2: "building_saved" });
 
   it("keeps the head's dot gray rather than promoting it to green", () => {
+    // Unchanged, and the stall escalation deliberately does NOT fire here: this head's worker is
+    // `working`, so its subtree is IN MOTION and it is not stalled — the same refusal
+    // withRedWorkerAttention makes with the same predicate. Painting it red would say "needs you to
+    // unstick it" about a subtree visibly making progress (roborev 55423/55434). The escalation is
+    // covered by the sibling case below, where the workers are idle.
     const project = seedUnmerged({ a1: "idle", w1: "working", w2: "idle" });
     render(<AgentSidebar project={project} />);
     const dot = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!;
     expect(dot.style.background).toBe(asRgb(AGENT_STATUS.idle.color));
+  });
+
+  it("but a head whose whole subtree is RESTING with unlanded work goes red", () => {
+    // The other half, so the in-motion refusal above cannot silently disable the escalation wholesale.
+    // Nothing here is working: the head owes unlanded commits and nobody is finishing them.
+    const project = seedUnmerged({ a1: "idle", w1: "idle", w2: "idle" });
+    render(<AgentSidebar project={project} />);
+    const dot = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!;
+    expect(dot.style.background).toBe(asRgb(AGENT_STATUS.blocked.color));
   });
 
   it("counts it under Done, not Running", () => {

@@ -58,7 +58,12 @@
 // restart anything.
 
 import { PtyGoneError, submitPrompt, writePtyChainedStrict } from "../pty";
-import { describeAuthority, isDispatchAuthority, type DispatchAuthority } from "./dispatchAuthority";
+import {
+  describeAuthority,
+  isDispatchAuthority,
+  isHumanAuthored,
+  type DispatchAuthority,
+} from "./dispatchAuthority";
 import { frameSubmit } from "./relayGate";
 import { log } from "../logger";
 import { getAgentScrollback } from "./terminalScrollback";
@@ -418,7 +423,7 @@ export async function dispatchConciergeAnswer(
       // Only a USER's answer is a turn: a machine-authored relay ("approve") must not write a
       // history entry, because that entry counts toward the naming ladder's promptCount and would
       // consume the first-turn deferral a self-reporting agent relies on.
-      if (opts.userPrompt) recordPickerAnswer(agentId, match.label);
+      if (opts.userPrompt) recordPickerAnswer(agentId, match.label, isHumanAuthored(opts.authority));
       // `display` is the LABEL, not the keystroke frame: `sent` here is "2\r" / "y\r", which is
       // the one thing no user-facing surface should ever quote back (roborev 49293/49294 —
       // `display` is documented as present whenever `sent` is, and this was the return that broke
@@ -456,7 +461,12 @@ export async function dispatchConciergeAnswer(
   const display = opts.display ?? text;
   try {
     await submitPrompt(agentId, text);
-    if (opts.userPrompt) recordPromptSideEffects(agentId, text, opts);
+    // `userPrompt` says "record this as a prompt"; `isHumanAuthored` says "a person wrote it". They
+    // are NOT the same question, and `send_to_agent_terminal` is where they part company: it passes
+    // `userPrompt: true` for prose the concierge LLM composed. Only the second may release an agent's
+    // goal debt (roborev 55588).
+    if (opts.userPrompt)
+      recordPromptSideEffects(agentId, text, opts, isHumanAuthored(opts.authority));
     return { ok: true, path: "free-text", agentId, sent: text, display };
   } catch (err) {
     if (err instanceof PtyGoneError) {
@@ -473,6 +483,13 @@ export async function dispatchConciergeAnswer(
             agentId,
             text,
             userPrompt: opts.userPrompt === true,
+            // AUTHORSHIP RIDES ALONG TOO (roborev 55628). Same argument as the renderings below and
+            // the same failure shape: the flush re-runs the side effects, so a decision this call
+            // site has in hand and does not carry gets re-invented downstream — and the invented
+            // answer here is `appendPrompt`'s `humanAuthored = true` default, which releases the
+            // agent's goal debt. Deriving it at flush time is not an option: the flush has no
+            // authority (see its own note on why re-deriving one there would be inventing it).
+            humanAuthored: isHumanAuthored(opts.authority),
             // Carry the other two renderings across the wait: the flush below re-runs the side
             // effects, and a queued attachment send must not degrade to the raw payload just
             // because it was held for a few seconds (roborev 46911/46925).
@@ -564,7 +581,12 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
     let r: ConciergeDispatchResult;
     try {
       await submitPrompt(agentId, entry.text);
-      if (entry.userPrompt) recordPromptSideEffects(agentId, entry.text, entry);
+      // `entry.humanAuthored`, NOT the parameter default (roborev 55628). The gate that keeps
+      // machine-composed prose from clearing a human's escalation latch went onto the direct path
+      // and missed this one, which re-opened the hole for any concierge send that had to wait for a
+      // starting PTY. The entry carries the answer precisely so this line does not have to guess.
+      if (entry.userPrompt)
+        recordPromptSideEffects(agentId, entry.text, entry, entry.humanAuthored);
       r = { ok: true, path: "free-text", agentId, sent: entry.text, display };
     } catch (err) {
       if (!(err instanceof PtyGoneError)) throw err;
@@ -616,13 +638,22 @@ export function isTerseAnswer(text: string, options: SuggestionButton[]): boolea
 /** A picker ANSWER, once its keystroke has landed. It is not a prompt — no marker, no trial debit,
  *  no auto-naming — but it IS recorded with source "picker" exactly as the composer recorded it,
  *  because components/promptHistory.ts's contract is "hidden from display surfaces, still counted
- *  by the naming ladder". Best-effort: an agent whose project can't be resolved records nothing. */
-function recordPickerAnswer(agentId: string, label: string): void {
+ *  by the naming ladder". Best-effort: an agent whose project can't be resolved records nothing.
+ *
+ *  `humanAuthored` is threaded for the THIRD time in this file, and this was the path still open
+ *  after the other two were closed (roborev 55691). It is not a theoretical hole: this branch is
+ *  taken when a dispatch's text is terse and matches a live option, and `isTerseAnswer` accepts a
+ *  bare number, an exact label, or a whole-phrase yes/no — precisely the shape
+ *  `sendToAgentTerminal` produces when the concierge answers a permission prompt with "approve".
+ *  Reaching `appendPrompt` with the default meant an LLM's "yes" cleared `escalatedAt`, `continues`,
+ *  `totalContinues` and `goalDebt`, refilling the very bound `projectStore.releaseGoalDebt` warns
+ *  no machine dispatch may reach. */
+function recordPickerAnswer(agentId: string, label: string, humanAuthored: boolean): void {
   const project = useProjectStore
     .getState()
     .projects.find((p) => p.agents.some((a) => a.id === agentId));
   if (!project) return;
-  useProjectStore.getState().appendPrompt(project.id, agentId, label, "picker");
+  useProjectStore.getState().appendPrompt(project.id, agentId, label, "picker", humanAuthored);
 }
 
 /** Everything that used to hang off the composer's onSubmitPrompt, run once a USER prompt is
@@ -633,6 +664,9 @@ function recordPromptSideEffects(
   agentId: string,
   text: string,
   renderings: Pick<ConciergeDispatchOptions, "display" | "namingBasis"> = {},
+  /** Did a PERSON compose this text? Forwarded to `appendPrompt`, which releases the agent's goal
+   *  retry budget and escalation only for a human send. See dispatchAuthority.isHumanAuthored. */
+  humanAuthored = true,
 ): void {
   // Debit one free-trial prompt on the server. Self-gates: a no-op for entitled users, and it
   // never throws (see trialMeter).
@@ -667,7 +701,9 @@ function recordPromptSideEffects(
   if (!project) return;
   // Record the TRIMMED display text: leading/trailing whitespace would otherwise land in the
   // pinned header while naming (below) used the trimmed form — two readings of the same prompt.
-  const promptId = useProjectStore.getState().appendPrompt(project.id, agentId, shown);
+  const promptId = useProjectStore
+    .getState()
+    .appendPrompt(project.id, agentId, shown, "composer", humanAuthored);
   markAgentPrompt(agentId, promptId);
   // Fire-and-forget: no-ops if the name is pinned or no API key is configured. Gated on the
   // auto-rename AI feature, and skipped for an empty basis so the naming model is never asked to

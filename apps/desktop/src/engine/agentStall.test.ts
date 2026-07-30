@@ -91,7 +91,7 @@ describe("the other kinds of outstanding work", () => {
         hasUncommittedChanges: true,
       }),
     );
-    // `unlanded-work` is folded into `open-pr` when both hold — see the dedupe note below.
+    // `unlanded-work` folds into `open-pr` — see the dedupe note in the module.
     expect(r.causes).toEqual(["unmet-goal", "open-pr", "uncommitted-changes"]);
     expect(r.detail).toContain(" and ");
   });
@@ -155,9 +155,20 @@ describe("the unmerged band — the most common gray row", () => {
     // only `idle` this cause was filtered out before `hasOpenPr` was ever consulted.
     const r = stallReport(unmergedRow({ hasOpenPr: true }));
     expect(r.verdict).toBe("stalled");
-    // `unlanded-work` is NOT listed beside it: an agent with an open PR has unlanded commits by
-    // construction, so reporting both said the same fact twice — "it has an open PR that nobody
-    // merged and it has committed work that never reached main" (roborev 55298).
+    // `unlanded-work` is NOT listed beside it HERE, because it was inferred from the band and an agent
+    // with an open PR has unlanded commits by construction — reporting both said the same fact twice
+    // (roborev 55298). The fold is unconditional; see the next test.
+    expect(r.causes).toEqual(["open-pr"]);
+    expect(r.detail).not.toContain("never reached main");
+  });
+
+  it("folds even an EXPLICIT hasUnlandedWork into the open PR — same fact, one clause", () => {
+    // The fold is unconditional on purpose. Scoping it to the inferred case created a distinction
+    // that does not exist in production: the only producer derives `hasUnlandedWork` from the same
+    // stage band the PR is in, so "explicit" carried no extra information and the duplicated sentence
+    // came back for every open-PR row (roborev 55379). "Commits beyond the PR" is a real question and
+    // needs its own input, not a re-reading of this one.
+    const r = stallReport(unmergedRow({ hasOpenPr: true, hasUnlandedWork: true }));
     expect(r.causes).toEqual(["open-pr"]);
     expect(r.detail).not.toContain("never reached main");
   });

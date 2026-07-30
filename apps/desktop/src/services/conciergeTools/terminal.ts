@@ -73,6 +73,14 @@ import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import { isRedStatus } from "../windowStatus";
 import { isObserved, type AgentLiveness } from "../agentLiveness";
 import {
+  goalReading,
+  stallReadingFor,
+  thrashReadingFor,
+  type GoalReading,
+} from "../agentGoalReading";
+import type { StallReport } from "../../engine/agentStall";
+import type { ThrashReport } from "../../engine/agentThrash";
+import {
   findKnownAgent,
   knownAgentLiveness,
   type KnownAgentSource,
@@ -223,6 +231,31 @@ export interface AgentStatusReport {
   liveness: AgentLiveness;
   /** `liveness === "local"`. The one flag a caller needs before treating `needsYou` as a fact. */
   observed: boolean;
+  /**
+   * The agent's GOAL — what it is trying to achieve, and where that goal is in its life.
+   *
+   * ABSENT when the agent has no goal, deliberately, rather than a zero-filled record. "It has no
+   * goal" is a real and common answer (it disables auto-continue and it means an idle row cannot be
+   * called stalled on goal grounds), and a caller reads it from the key being missing.
+   */
+  goal?: GoalReading;
+  /**
+   * Is this agent idle-and-FINISHED or idle-and-STALLED — `engine/agentStall`.
+   *
+   * ABSENT when there is no status to judge (an unknown agent, or one this window never observed).
+   * A stall verdict is a claim about an agent's state, and there is no honest verdict to give about
+   * a row we could not read; `unknown` inside the report means something narrower ("idle, and its
+   * git state was not read"), so reusing it for "no status at all" would collapse two facts.
+   */
+  stall?: StallReport;
+  /**
+   * Is it looping on a command, or out of usable context — `engine/agentThrash`.
+   *
+   * ABSENT when this window has seen no hook events for the agent. THAT IS NOT "HEALTHY": the
+   * accumulator is fed by the pane that drives the agent, so an agent whose pane lives in another
+   * window has no reading here at all. Treat the missing key as "not watched", never as calm.
+   */
+  thrash?: ThrashReport;
   /** One sentence explaining what this report does and does not establish. Always present. */
   detail: string;
 }
@@ -693,6 +726,24 @@ export function getAgentStatus(agentId: string): AgentStatusReport {
   // The red-COLOR tier (waiting|approval|blocked|errored), asked of the shared predicate so this
   // can't drift from what the sidebar paints.
   const needsYou = isRedStatus(status);
+  // ── GOAL / STALL / THRASH — the three readings that tell a GRAY row apart from a done one ─────
+  //
+  // One clock for all three, so a goal reported `unmet` can never sit beside a stall report that
+  // read it as `expired` a millisecond later.
+  const now = Date.now();
+  // `agent.tab` is the roster row; the other two `findKnownAgent` arms (the Sparkle agent, and an
+  // observed-only id) have no AgentTab and therefore no goal, which reads as "no goal" — correct,
+  // rather than inventing a synthetic row to hang one on.
+  const goal = goalReading(agent?.tab?.goal, now);
+  // `stallReadingFor` needs a STATUS to judge, and `status` is `undefined` for an unknown agent or
+  // one this window never observed. There is no honest verdict there, so the field is omitted
+  // rather than filled with a guess — see AgentStatusReport.stall.
+  const stall =
+    status === undefined ? undefined : stallReadingFor(agentId, status, agent?.tab?.goal, now);
+  // `undefined` when no hook event for this agent has been seen here. Passed through unchanged:
+  // synthesising a healthy report for an unwatched agent is the exact false negative this whole
+  // report's `observed` flag exists to prevent (see AgentStatusReport.thrash).
+  const thrash = thrashReadingFor(agentId, agent?.tab?.goal, now);
   return {
     agentId,
     // KNOWN AND OBSERVED CAN NO LONGER DISAGREE, and that is an invariant, not a side effect of
@@ -710,6 +761,9 @@ export function getAgentStatus(agentId: string): AgentStatusReport {
     needsYou,
     liveness,
     observed: isObserved(liveness),
+    ...(goal ? { goal } : {}),
+    ...(stall ? { stall } : {}),
+    ...(thrash ? { thrash } : {}),
     detail: statusDetail(agent?.source, liveness, status, needsYou),
   };
 }
@@ -918,7 +972,7 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "get_agent_status",
     description:
-      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Check `observed` first: when it is false there was no live status to read, so `needsYou: false` means NOT OBSERVED rather than calm — relay `detail` instead of reporting the agent as fine. Read-only. " +
+      "An agent's live status, whether it is stuck waiting on the human, and whether it can accept input right now. Check `observed` first: when it is false there was no live status to read, so `needsYou: false` means NOT OBSERVED rather than calm — relay `detail` instead of reporting the agent as fine. Also reports `goal` (its objective, that goal's state, time left and retry counters), `stall` (is a resting row FINISHED or STALLED, with the causes and a sentence), and `thrash` (is it looping on a command or out of context). Each of those three is ABSENT rather than empty when there is nothing to report, and absent means NOT OBSERVED, never healthy: no `goal` key means it has no goal, no `stall` key means there was no status to judge, and no `thrash` key means no hook events for it were seen here. Read-only. " +
       SPARKLE_AGENT_TOOL_NOTE,
     write: false,
   },

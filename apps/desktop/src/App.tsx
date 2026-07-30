@@ -41,6 +41,7 @@ import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
+import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startFleetWatch } from "./services/fleetWatch";
 
 // The Workspace subtree pulls in the heavy authenticated UI — xterm, markdown rendering, modals,
@@ -144,6 +145,18 @@ function SettingsShortcut() {
 // an ACCOUNT, so one poller serves every open agent. Paints no UI.
 function LimitSync() {
   useLimitSync();
+  return null;
+}
+
+// Restarts an agent whose TURN ENDED with its goal unmet — the fix for the 37 stalls / 23.6 lost
+// agent-hours measured on 2026-07-29, the longest a single agent idle for 153 minutes mid-task
+// (see engine/goalContinuation for the log that commissioned it). Mounted ONCE, app-wide, in the
+// same shape as <LimitSync/>: a goal belongs to an AGENT and one sweep serves the whole fleet, so a
+// per-pane timer would not just duplicate the work — it would duplicate the SENDS. The runner's own
+// single-owner election keeps a torn-off satellite window from restarting the same agent. Paints no
+// UI.
+function GoalContinuation() {
+  useEffect(() => startGoalContinuationRunner(), []);
   return null;
 }
 
@@ -409,6 +422,7 @@ export function App() {
       <RosterPublisher />
       <FleetWatch />
       <LimitSync />
+      <GoalContinuation />
       <ApiRecovery />
       <DisplayRespan />
       <LastFocusedProjectTracker />

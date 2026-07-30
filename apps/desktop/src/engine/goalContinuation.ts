@@ -125,7 +125,9 @@ export interface ContinuationInput {
    * silent-forever state this module exists to abolish, with no test able to see it. Spelling it
    * `boolean | undefined` means "I looked and it is gone" and "I did not look" both stay
    * expressible, but forgetting to say is a compile error. The producer is
-   * `engine/turnEndAuthority.hasExited`, which returns exactly this shape.
+   * `engine/turnEndAuthority.processAliveOf`, which is exported in THIS polarity on purpose — an
+   * earlier `hasExited` had the identical type and the opposite meaning, so the obvious wiring
+   * compiled and inverted the gate (roborev 55338).
    */
   processAlive: boolean | undefined;
   /** The current progress mark (see {@link progressMark}). */

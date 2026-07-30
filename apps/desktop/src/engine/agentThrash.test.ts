@@ -145,6 +145,21 @@ describe("a repeat only counts when the turn between did nothing", () => {
     expect(r.repeatedCommand).toEqual({ text: "/compact", count: 3 });
   });
 
+  it("an INTERRUPTED working turn is not a loop — tools ran, the Stop just never came", () => {
+    // The regression the submit-time clear introduced (roborev 55314). The human presses ESC, so no
+    // Stop arrives and `lastTurnRanTool` is never written — but `toolInCurrentTurn` saw the work, and
+    // the rule now reads both. Without this the row said "it is looping, not working" about an agent
+    // that ran a tool on every one of those turns.
+    const events: HookEvent[] = [];
+    for (let i = 0; i < REPEAT_LIMIT + 1; i++) {
+      events.push({ event: "UserPromptSubmit", prompt: "pnpm test", ts: T0 + i });
+      events.push({ event: "PreToolUse", tool: "Bash", ts: T0 + i }); // work, then interrupted
+    }
+    const r = thrashReport(run(events), T0 + 99, {});
+    expect(r.repeatedCommand).toBeUndefined();
+    expect(r.verdict).toBe("healthy");
+  });
+
   it("real work in the middle breaks an existing run", () => {
     const events = [
       ...turn("stuck", []),
@@ -241,6 +256,43 @@ describe("context pressure", () => {
     const r = thrashReport(run(events), T0 + COMPACT_WINDOW_MS * 3, {});
     expect(r.recentCompactions).toBe(1);
     expect(r.verdict).toBe("healthy");
+  });
+
+  it("the PRODUCTION stream accumulates the no-tool streak across compactions", () => {
+    // The fixture shaped like what actually arrives (roborev 55314). The earlier fixtures interleaved
+    // PreCompact and Stop with NO SessionStart between them, which is not the stream Claude Code
+    // produces — and the compaction arm used to zero `turnsWithoutTool`, so `no-progress` could never
+    // reach its limit for a compacting agent at all. A compaction is not progress.
+    const events: HookEvent[] = [];
+    for (let i = 0; i < NO_TOOL_TURN_LIMIT; i++) {
+      const ts = T0 + i * 1_000;
+      events.push({ event: "UserPromptSubmit", prompt: `/compact ${i}`, ts });
+      events.push({ event: "PreCompact", ts });
+      events.push({ event: "SessionStart", source: "compact", ts });
+      events.push({ event: "Stop", ts });
+    }
+    const state = run(events);
+    expect(state.turnsWithoutTool).toBe(NO_TOOL_TURN_LIMIT);
+    // Read PAST the compaction window, so `context-pressure` has aged out and cannot mask the verdict
+    // under test. Asserting `.thrashing` at T0+9s was vacuous: three compactions 1s apart already trip
+    // COMPACT_PRESSURE_LIMIT, so it was true against the UNFIXED reducer too (roborev 55379).
+    const past = thrashReport(state, T0 + COMPACT_WINDOW_MS + 60_000, { goalOutstanding: true });
+    expect(past.recentCompactions).toBe(0);
+    expect(past.verdict).toBe("no-progress");
+    expect(past.thrashing).toBe(true);
+  });
+
+  it("a mid-turn AUTO-compaction does not charge a working turn as tool-less", () => {
+    // An auto-compaction fires mid-turn, so clearing `toolInCurrentTurn` there erased the evidence
+    // that the open turn had already run tools and the following Stop pushed the streak the wrong way.
+    const events: HookEvent[] = [
+      { event: "UserPromptSubmit", prompt: "build it", ts: T0 },
+      { event: "PreToolUse", tool: "Edit", ts: T0 },
+      { event: "PreCompact", ts: T0 + 1 },
+      { event: "SessionStart", source: "compact", ts: T0 + 2 },
+      { event: "Stop", ts: T0 + 3 },
+    ];
+    expect(run(events).turnsWithoutTool).toBe(0);
   });
 
   it("names the cause ahead of the symptom", () => {

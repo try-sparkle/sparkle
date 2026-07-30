@@ -4,11 +4,23 @@
 //
 // `unmerged` IS GRAY, not red, and this header used to say red. It stopped being red on 2026-07-26
 // because 27 of 51 agents on a real fleet sat in this band and the wall of red carried no
-// information (the derivation is at packages/ui/tokens.ts:150-157). What makes such a row leave the
-// calm tier NOW is engine/stallEscalation, which asks a narrower question — is there EVIDENCE of
-// outstanding work — and escalates to `blocked` rather than recolouring this status. So: this module
-// still decides "has this agent got unlanded commits", and that module decides "does that make the
-// row an alarm". Keep the two separate; collapsing them is what produced the undismissable red.
+// information (the derivation is at packages/ui/tokens.ts:150-157).
+//
+// What can take such a row out of the calm tier is engine/stallEscalation, which escalates to
+// `blocked` rather than recolouring this status. So this module decides "has this agent got unlanded
+// commits" and that one decides "does that make the row an alarm". Keep them separate; collapsing
+// them is what produced the undismissable red.
+//
+// TWO THINGS TO BE PRECISE ABOUT, because a reader will otherwise assume the comfortable version:
+//   • It is NOT wired yet. `withStallAttention` has no production caller — the composition sites
+//     (AgentSidebar.effectiveStatus, useAttentionNotifications.publishedStatusFor) still end at
+//     withDismissedAlerts(withUnmergedWork(...)). Until that lands, nothing takes an `unmerged` row
+//     out of the calm tier, and the mitigation agentStall's comment defers to does not run.
+//   • Its predicate is not NARROWER than this band, it is coextensive with it: agentStall defaults
+//     `hasUnlandedWork` from `status === "unmerged"` and `unlanded-work` is in stallEscalation's
+//     OUTSTANDING set, so once composed, EVERY live row this module writes goes red. That is the
+//     27-of-51 volume, chosen deliberately under the founder's 2026-07-29 rule; the one-line revert
+//     is dropping `unlanded-work` from OUTSTANDING.
 //
 // This is a pure status-map overlay in the same family as engine/alertDismissal.withDismissedAlerts
 // and engine/workerAttention.*: it takes the live status map and returns a (possibly new) map,
@@ -25,7 +37,9 @@
 // `unmerged` row (you can't dismiss it) — but a *dismissed* red row de-escalates to idle/stopped,
 // and if this ran AFTER dismissal it would immediately re-escalate that just-calmed row back to red.
 // Running unmerged first (on the true resting statuses) then dismissal keeps the two concerns clean:
-// a dismissed waiting/errored row stays calm, and a genuinely-finished-with-unmerged-work row is red.
+// a dismissed waiting/errored row stays calm, and a genuinely-finished-with-unmerged-work row is
+// labelled `unmerged` (gray, "Needs merge") -- whether that becomes an ALARM is stallEscalation's
+// call, made from evidence, and it composes after this and after dismissal.
 import type { AgentTabStatus } from "../types";
 import { hasUnmergedCommittedWork, type WorkflowStageId } from "./workflowStage";
 
@@ -34,7 +48,7 @@ import { hasUnmergedCommittedWork, type WorkflowStageId } from "./workflowStage"
 const RESTING: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["idle", "done", "stopped"]);
 
 /**
- * Overlay the `unmerged` red status onto every FINISHED agent that still has committed work not yet
+ * Overlay the `unmerged` status onto every FINISHED agent that still has committed work not yet
  * landed on main. `stageOf(id)` resolves the agent's current workflow stage (the same
  * `resolveStage(branchStatus[id], workflowStage[id])` the sidebar uses); `hasUnmergedCommittedWork`
  * decides the band. An agent missing from `statusMap` defaults to `stopped` (matching the sidebar's

@@ -61,6 +61,9 @@ import {
 import { useProjectStore } from "../../stores/projectStore";
 import { useInteractionStore } from "../../stores/interactionStore";
 import { NEW_AGENT_GRACE_MS } from "../../engine/newAgentAttention";
+// The thrash accumulator is module-level and window-local: fed here so a case can distinguish "no
+// hook events seen" (no reading at all) from a real repeating-command verdict.
+import { noteThrashEvent, resetThrashTracking } from "../../engine/agentThrash";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import {
   conciergeToolAuthority,
@@ -145,6 +148,44 @@ function seedFreshAgent(status?: string, over: Record<string, unknown> = {}) {
   } as never);
 }
 
+/** A fixed "now" for the goal cases, so a goal's remaining time is arithmetic rather than a race. */
+const NOW = Date.now();
+
+/** Re-stub the mocked runtime store with EXTRA maps (branch status, workflow stage/state) that
+ *  `agentGoalReading.stallEvidenceFor` reads. `seedAgent` only sets status + attentionScreen, which
+ *  is the "nothing has been polled" case — this is how a test says something WAS polled. */
+function seedRuntime(status: string | undefined, extra: Record<string, unknown>) {
+  runtimeStateMock.mockReturnValue({
+    attentionScreen: {},
+    status: status ? { [AGENT]: status } : {},
+    ...extra,
+  } as never);
+}
+
+/** Seed the one agent WITH a goal on its record. The goal is written as the persisted shape
+ *  (engine/agentGoal.AgentGoal) rather than through the store action, so a case can express a met /
+ *  escalated / expired goal directly instead of driving the lifecycle to get there. */
+function seedGoalAgent(goal: Record<string, unknown>, status?: string) {
+  useProjectStore.setState({
+    projects: [
+      {
+        id: "p1",
+        name: "sparkle",
+        path: "/tmp/p1",
+        agents: [
+          {
+            id: AGENT,
+            name: "Retry logic",
+            runtime: "local",
+            goal: { ttlMs: 4 * 3_600_000, continues: 0, totalContinues: 0, ...goal },
+          } as never,
+        ],
+      } as never,
+    ],
+  });
+  seedRuntime(status, {});
+}
+
 /** Put a captured ask-screen on the runtime store (tier b). */
 function seedAttentionScreen(text: string, status = "waiting") {
   runtimeStateMock.mockReturnValue({
@@ -181,6 +222,9 @@ beforeEach(() => {
   // (a liveness assertion failing in an unrelated test) points nowhere near its cause.
   vi.mocked(readPersistedOpenAgentIds).mockReturnValue([]);
   forgetAgentTranscriptPath(AGENT);
+  // Module-level and window-local, like the transcript registry above: without this a loop staged
+  // by one case would leave every later case reading a thrashing agent.
+  resetThrashTracking();
   // THE INTERACTION RECORD IS NOW A LEAK BETWEEN CASES, for the same reason the mock above is
   // re-stubbed rather than cleared. `getAgentStatus` reads `interactionStore.lastAt[agentId]` when it
   // judges whether an agent has ever been BRIEFED, and a delivered prompt now records an interaction
@@ -813,6 +857,145 @@ describe("getAgentStatus", () => {
     seedFreshAgent("blocked", { createdAt: undefined });
     expect(getAgentStatus(AGENT).needsYou).toBe(true);
     expect(getAgentStatus(AGENT).status).toBe("blocked");
+  });
+
+  // ── GOAL / STALL / THRASH ───────────────────────────────────────────────────────────────────
+  //
+  // The three readings that tell a GRAY row apart from a finished one. `status` alone cannot: an
+  // agent that stopped mid-write on a file and one that shipped its PR both render `idle`, which is
+  // how a 153-minute stall stayed invisible. Every assertion below is on what the REPORT carries,
+  // never on the engine's arithmetic (that has its own suites next door) — and the absent-field
+  // cases matter most: an omitted key here means NOT OBSERVED, and a caller that reads it as calm
+  // is the failure this whole surface exists to end.
+
+  describe("goal", () => {
+    it("reports an unmet goal's text, state, time left and retry counters", () => {
+      seedGoalAgent({ text: "land the PR", setAt: NOW - 60_000, ttlMs: 4 * 3_600_000, continues: 2, totalContinues: 5 }, "idle");
+      const s = getAgentStatus(AGENT);
+      expect(s.goal).toMatchObject({
+        text: "land the PR",
+        state: "unmet",
+        continues: 2,
+        totalContinues: 5,
+      });
+      expect(s.goal!.remainingMs).toBeGreaterThan(0);
+      // Not the raw record: a model must not have to do date arithmetic to learn the state.
+      expect(s.goal).not.toHaveProperty("setAt");
+    });
+
+    // ABSENT, not a zero-filled record — "it has no goal" is read from the key being missing.
+    it("omits the goal entirely for an agent that has none", () => {
+      seedAgent("local", "idle");
+      const s = getAgentStatus(AGENT);
+      expect("goal" in s).toBe(false);
+    });
+
+    it("reports a met goal as met", () => {
+      seedGoalAgent({ text: "ship it", setAt: NOW - 60_000, metAt: NOW - 1_000 }, "idle");
+      expect(getAgentStatus(AGENT).goal!.state).toBe("met");
+    });
+
+    it("reports an escalated goal WITH the reason the human now owns", () => {
+      seedGoalAgent(
+        { text: "fix the flake", setAt: NOW - 60_000, escalatedAt: NOW - 5_000, escalationReason: "Auto-continued 3 times with no progress." },
+        "idle",
+      );
+      const s = getAgentStatus(AGENT);
+      expect(s.goal!.state).toBe("escalated");
+      expect(s.goal!.escalationReason).toMatch(/no progress/);
+    });
+
+    // The TTL is a bound on SPEND, and an expired goal is still unfinished work.
+    it("reports a goal past its TTL as expired", () => {
+      seedGoalAgent({ text: "keep the build green", setAt: NOW - 5 * 3_600_000, ttlMs: 3_600_000 }, "idle");
+      expect(getAgentStatus(AGENT).goal!.state).toBe("expired");
+    });
+  });
+
+  describe("stall", () => {
+    it("calls an idle agent with an unmet goal STALLED, and names the cause", () => {
+      seedGoalAgent({ text: "land the PR", setAt: NOW - 60_000 }, "idle");
+      const s = getAgentStatus(AGENT);
+      expect(s.stall!.verdict).toBe("stalled");
+      expect(s.stall!.causes).toContain("unmet-goal");
+      expect(s.stall!.detail).toMatch(/land the PR/);
+    });
+
+    // "No evidence of work" is not "evidence of no work". With no git state read, the honest answer
+    // for a goal-less idle row is `unknown` — and reporting it as `finished` is what would tell the
+    // human an agent that stopped mid-task was done.
+    it("answers unknown — not finished — for an idle agent whose git state was never read", () => {
+      seedAgent("local", "idle");
+      const s = getAgentStatus(AGENT);
+      expect(s.stall!.verdict).toBe("unknown");
+      expect(s.stall!.causes).toEqual([]);
+    });
+
+    it("reads uncommitted changes off the branch status as outstanding work", () => {
+      seedAgent("local", "idle");
+      seedRuntime("idle", { branchStatus: { [AGENT]: { ahead: 0, behind: 0, dirty: true, filesChanged: 3, insertions: 9, deletions: 1 } } });
+      expect(getAgentStatus(AGENT).stall!.causes).toContain("uncommitted-changes");
+    });
+
+    // A worktree parked on another branch carries ITS dirt, so attributing it here would claim a
+    // stall on work this agent never did. Unknown, not a cause — and not a clean bill either.
+    it("does NOT attribute a PARKED worktree's dirt to this agent", () => {
+      seedAgent("local", "idle");
+      seedRuntime("idle", {
+        branchStatus: { [AGENT]: { ahead: 0, behind: 0, dirty: true, filesChanged: 3, insertions: 9, deletions: 1, worktreeOnBranch: false } },
+      });
+      const s = getAgentStatus(AGENT);
+      expect(s.stall!.causes).not.toContain("uncommitted-changes");
+      expect(s.stall!.verdict).toBe("unknown");
+    });
+
+    it("says a working agent is active rather than judging it", () => {
+      seedGoalAgent({ text: "land the PR", setAt: NOW - 60_000 }, "working");
+      expect(getAgentStatus(AGENT).stall!.verdict).toBe("active");
+    });
+
+    // There is no status to judge, so there is no verdict to give. Omitted rather than guessed.
+    it("omits the stall reading entirely for an agent with no observed status", () => {
+      seedAgent("local");
+      expect("stall" in getAgentStatus(AGENT)).toBe(false);
+    });
+
+    it("omits the stall reading for an unknown agent id", () => {
+      expect("stall" in getAgentStatus("ghost-agent")).toBe(false);
+    });
+  });
+
+  describe("thrash", () => {
+    // THE ONE THAT MUST NOT READ AS HEALTHY. The accumulator is fed by the pane driving the agent,
+    // so an agent mounted in another window has NO reading — and `thrashing: false` there would be
+    // calm published on no evidence.
+    it("omits the thrash reading for an agent this window has never watched", () => {
+      seedAgent("local", "idle");
+      const s = getAgentStatus(AGENT);
+      expect("thrash" in s).toBe(false);
+    });
+
+    it("reports a repeated command once the hook stream shows the loop", () => {
+      seedAgent("local", "working");
+      // Three identical submissions with no tool call in between — the observed /compact spiral.
+      for (let i = 0; i < 3; i++) {
+        noteThrashEvent(AGENT, { event: "UserPromptSubmit", prompt: "/compact", ts: NOW + i } as never);
+        noteThrashEvent(AGENT, { event: "Stop", ts: NOW + i } as never);
+      }
+      const s = getAgentStatus(AGENT);
+      expect(s.thrash!.thrashing).toBe(true);
+      expect(s.thrash!.verdict).toBe("repeating-command");
+      expect(s.thrash!.repeatedCommand).toMatchObject({ text: "/compact" });
+    });
+
+    it("reports a watched, working agent as healthy — the reading is present and calm", () => {
+      seedAgent("local", "working");
+      noteThrashEvent(AGENT, { event: "UserPromptSubmit", prompt: "build the thing", ts: NOW } as never);
+      noteThrashEvent(AGENT, { event: "PreToolUse", tool: "Edit", ts: NOW } as never);
+      const s = getAgentStatus(AGENT);
+      expect(s.thrash!.thrashing).toBe(false);
+      expect(s.thrash!.verdict).toBe("healthy");
+    });
   });
 });
 

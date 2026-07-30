@@ -13,7 +13,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SuggestionButton } from "./suggestions/types";
 
 const h = vi.hoisted(() => ({
-  appendPrompt: vi.fn((_p: string, _a: string, _text: string, _source?: string) => "prompt-1"),
+  appendPrompt: vi.fn(
+    (_p: string, _a: string, _text: string, _source?: string, _humanAuthored?: boolean) =>
+      "prompt-1",
+  ),
   record: vi.fn((_text: string) => {}),
   maybeAutoName: vi.fn(async (_p: string, _a: string, _basis: string) => {}),
   markAgentPrompt: vi.fn(),
@@ -51,6 +54,7 @@ vi.mock("../stores/promptHistoryStore", () => ({
 
 import { PtyGoneError } from "../pty";
 import { dispatchConciergeAnswer, flushPendingSends } from "./conciergeDispatch";
+import { conciergeToolAuthority } from "./dispatchAuthority";
 import { resetPendingSends } from "./pendingSends";
 
 /** Any valid authority. These suites predate the dispatch authority gate and exercise DELIVERY,
@@ -106,7 +110,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     });
 
     // The pinned header and history dropdown render this verbatim.
-    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", DISPLAY);
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", DISPLAY, "composer", true);
     // Ghost text and the naming model learn from what was TYPED.
     expect(h.record).toHaveBeenCalledWith(TYPED);
     expect(h.maybeAutoName).toHaveBeenCalledWith("p1", "a1", TYPED);
@@ -124,14 +128,14 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     });
 
     expect(h.maybeAutoName).not.toHaveBeenCalled();
-    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "1 image");
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "1 image", "composer", true);
     for (const s of surfacedStrings()) expect(s).not.toContain(SHOT);
   });
 
   it("defaults both renderings to the wire text when nothing was attached", async () => {
     await dispatchConciergeAnswer("a1", "just words", { authority: TEST_AUTHORITY, userPrompt: true });
 
-    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "just words");
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "just words", "composer", true);
     expect(h.record).toHaveBeenCalledWith("just words");
     expect(h.maybeAutoName).toHaveBeenCalledWith("p1", "a1", "just words");
   });
@@ -159,9 +163,39 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     h.paneState.mockReturnValue("ready");
     await flushPendingSends("a1");
 
-    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", DISPLAY);
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", DISPLAY, "composer", true);
     expect(h.maybeAutoName).toHaveBeenCalledWith("p1", "a1", TYPED);
     for (const s of surfacedStrings()) expect(s).not.toContain(SHOT);
+  });
+
+  // ── AUTHORSHIP MUST SURVIVE THE HOLD TOO (roborev 55628, High) ─────────────────────────────────
+  // A FOURTH thing is decided at dispatch time and read at flush time, and it was the one not being
+  // carried: did a PERSON compose this text. `appendPrompt`'s `humanAuthored` parameter defaults to
+  // `true` and a `true` runs `projectStore.releaseGoalDebt` — clearing the agent's retry budget and
+  // un-latching the escalation that exists to hand it to a human. The previous commit closed that on
+  // the direct path and left the flush passing the bare entry, so the default answered for it.
+  //
+  // Not an exotic window: `send_to_agent_terminal` dispatches `userPrompt: true` over LLM-composed
+  // prose, and the concierge nudges agents precisely when their pane is still `starting`.
+  //
+  // The sibling assertion is the test ABOVE, which drives the same flush with a human authority and
+  // demands `true` — so this cannot be satisfied by a flag that is simply always `false`.
+  it("does NOT report a QUEUED machine-authored send as human-authored when it flushes", async () => {
+    const tool = conciergeToolAuthority("call-1", { tier: "allow" });
+    expect(tool).not.toBeNull(); // a null authority would make the dispatch below refuse, not pass
+
+    h.paneState.mockReturnValue("starting");
+    h.submitPrompt.mockRejectedValueOnce(new PtyGoneError("not up"));
+    const queued = await dispatchConciergeAnswer("a1", "keep going", {
+      authority: tool!,
+      userPrompt: true,
+    });
+    expect(queued.path).toBe("queued");
+
+    h.paneState.mockReturnValue("ready");
+    await flushPendingSends("a1");
+
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "keep going", "composer", false);
   });
 
   it("a PICKER answer reports the option LABEL, never the keystroke frame", async () => {
@@ -176,6 +210,30 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
     expect(r.path).toBe("picker-option");
     expect(r.display).toBe("Yes, proceed");
     expect(r.sent).not.toBe(r.display);
+    // The HUMAN half of the pair below: a person clicking a suggestion pill does release the debt.
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "Yes, proceed", "picker", true);
+  });
+
+  // ── THE THIRD INSTANCE OF THE SAME HOLE (roborev 55691) ────────────────────────────────────────
+  it("does NOT report a machine-authored PICKER answer as human-authored", async () => {
+    // The path the other two fixes did not cover. It is reached exactly when a dispatch's text is
+    // terse and matches a live option — and `isTerseAnswer` accepts a bare number, an exact label,
+    // or a whole-phrase yes/no, which is precisely what `sendToAgentTerminal` sends when the
+    // concierge answers a permission prompt. So an LLM's "yes" was clearing `escalatedAt`,
+    // `continues`, `totalContinues` and `goalDebt` — refilling the bound `releaseGoalDebt` says no
+    // machine dispatch may reach.
+    const { detectTerminalPrompts } = await import("./suggestions/heuristics");
+    (detectTerminalPrompts as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce([
+      { id: "1", label: "Yes, proceed", value: "y\n", kind: "terminal", source: "heuristic" },
+    ]);
+    const tool = conciergeToolAuthority("call-2", { tier: "allow" });
+    expect(tool).not.toBeNull();
+
+    const r = await dispatchConciergeAnswer("a1", "yes", { authority: tool!, userPrompt: true });
+
+    // Same path as the human case above — only the authorship differs.
+    expect(r.path).toBe("picker-option");
+    expect(h.appendPrompt).toHaveBeenCalledWith("p1", "a1", "Yes, proceed", "picker", false);
   });
 
   it("reports a safe `display` on every outcome the concierge quotes back", async () => {

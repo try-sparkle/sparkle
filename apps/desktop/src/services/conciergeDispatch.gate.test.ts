@@ -46,6 +46,11 @@ const SAMPLES: Record<string, DispatchAuthority> = {
   // Built through the FACTORY, which is now the only thing that can build it: the arm's `policy` is
   // a branded stamp, so an inline literal no longer typechecks anywhere — including here.
   "concierge-tool": conciergeToolAuthority("call-1", { tier: "allow" })!,
+  // The other non-gesture arm: goal auto-continue restarting a turn that ended with the goal unmet
+  // (services/goalContinuationRunner). What makes it legal is the decision in
+  // engine/goalContinuation, not anything on the authority — so the gate simply has to DELIVER for
+  // it, which is what this walk asserts.
+  "goal-continue": { kind: "goal-continue", agentId: "a1" },
 };
 
 afterEach(() => {

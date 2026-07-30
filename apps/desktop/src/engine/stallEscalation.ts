@@ -43,16 +43,20 @@
 // the taxonomy.
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { StallCause, StallReport } from "./agentStall";
+import { isAlertSuppressed, type AgentAlertRecord } from "./alertDismissal";
+import { isInMotion, type MotionAgent } from "./inMotion";
 
 /**
  * The calm (gray) statuses this overlay may escalate.
  *
- * `idle` and `unmerged` only, and that is not an oversight. `agentStall.stallReport` answers
- * `active` for `done`/`stopped` — the process is gone — so a report can never say "stalled" about
- * one, and escalating a dead agent would be a DIFFERENT claim than `blocked` makes: "clean this up",
- * not "unstick it". A stopped agent holding a dirty worktree therefore still renders gray, which the
- * founder's rule arguably also forbids; that case needs its own answer (and probably its own words
- * on the row) rather than being smuggled in under a label that says the wrong thing.
+ * `idle` and `unmerged` only. Excluding `done`/`stopped` here is NOT sufficient to exclude dead
+ * processes, and believing it was is the trap this module fell into (roborev 55318): `withUnmergedWork`
+ * relabels `done`/`stopped` rows that hold unlanded commits to `unmerged`, and this overlay runs
+ * AFTER it — so every persisted tab with an unlanded branch arrives here already wearing a status
+ * that is in this set, and `stallReport` answers `stalled` on the band's own evidence. The row was
+ * painted "needs you to unstick it" about an agent whose PTY is gone, which is verbatim the claim
+ * this docstring said must not be made. A status the upstream overlay has overwritten cannot answer
+ * a liveness question; `aliveOf` does, and it is why that parameter exists.
  *
  * `new` needs no exclusion of its own: an unbriefed agent has no outstanding work, so no report
  * about it is ever `stalled`. That leaves engine/newAgentAttention's careful "spawned but never
@@ -96,26 +100,108 @@ export function mustLeaveCalm(report: StallReport | undefined): boolean {
  * Pure, and in the same shape as `unmergedAttention.withUnmergedWork`: returns the SAME reference
  * when nothing changes (no render churn) and never mutates the input.
  *
- * COMPOSE ORDER: run this AFTER `withUnmergedWork`, so a committed-but-unlanded row has already been
- * labelled `unmerged` and is visible to `ESCALATABLE`; and BEFORE `alertDismissal.withDismissedAlerts`,
- * so a human who dismisses the row can still calm it — `blocked` IS in the dismissible set, which is
- * what stops this from being the undismissable red that sank the 2026-07-26 version.
+ * COMPOSE ORDER: after `withUnmergedWork` (so a committed-but-unlanded row is already wearing
+ * `unmerged` and is visible to `ESCALATABLE`), then feed the result to the alert-episode recorder,
+ * then {@link withDismissedStallAttention}, and only then `alertDismissal.withDismissedAlerts` for
+ * the ordinary reds. This function escalates UNCONDITIONALLY — acknowledgement is undone by that
+ * second pass, for the reason recorded on it.
+ *
+ * THREE THINGS A CALLER MUST GET RIGHT, each of which was a real defect:
+ *
+ *  1. `aliveOf` is REQUIRED, and `engine/turnEndAuthority.processAliveOf` is the producer. A `false`
+ *     refuses escalation. Without it, dead persisted tabs relabelled `unmerged` upstream were painted
+ *     "needs you to unstick it" (roborev 55318).
+ *  2. `reportOf` MUST be built from the agent's OWN pre-escalation status. Feed it this function's
+ *     OUTPUT and the reports collapse: `stallReport` answers `active` for the whole red tier, so a
+ *     row that escalated to `blocked` would report no causes at all — the row would go red and
+ *     simultaneously lose the sentence saying WHY, which is the entire value of the escalation.
+ *  3. The ALERT path must be fed this function's OUTPUT, with acknowledged rows undone afterwards by
+ *     {@link withDismissedStallAttention} rather than by a check in here. `alertControlKind`, `advanceAlerts` and
+ *     `dismissAlert` all take a status, and if they are handed the raw map they see `idle`/`unmerged`,
+ *     return `null`, and render no Dismiss control — a red the human cannot acknowledge, which is
+ *     exactly the undismissable `unmerged` red that had to be rolled back on 2026-07-26 (roborev
+ *     55318). `blocked` is in the dismissible set; that only helps if the control sees it.
  *
  * `reportOf` returns `undefined` for an agent this window has no stall reading for, and that never
  * escalates: a window that did not look must not paint the row red on its ignorance.
  */
-export function withStallAttention<T extends { id: string }>(
+export function withStallAttention<T extends MotionAgent & { id: string; alert?: AgentAlertRecord }>(
   agents: readonly T[],
   statusMap: Record<string, AgentTabStatus>,
   reportOf: (id: string) => StallReport | undefined,
+  aliveOf: (id: string) => boolean | undefined,
 ): Record<string, AgentTabStatus> {
   let out: Record<string, AgentTabStatus> | null = null;
   const ensure = (): Record<string, AgentTabStatus> => (out ??= { ...statusMap });
   for (const a of agents) {
     const st = statusMap[a.id];
     if (st === undefined || !ESCALATABLE.has(st)) continue;
+    // A KNOWN-DEAD process is never escalated. `undefined` still escalates: an `idle` row is derived
+    // from a live PTY's own output, and refusing on absent evidence here would re-open the gray lie
+    // this module exists to close (the opposite trade-off from `goalContinuation`, which fails closed
+    // because a wrong "yes" there SPENDS money; a wrong "yes" here only colours a dot).
+    if (aliveOf(a.id) === false) continue;
+    // AN ORCHESTRATOR WHOSE SUBTREE IS WORKING IS NOT STALLED, and this is the same refusal
+    // `withRedWorkerAttention` makes with the same predicate (roborev 55423/55434). A head resting at
+    // `idle`/`unmerged` while one of its workers is `working` was painted "needs you to unstick it"
+    // about a subtree visibly making progress — precisely the false alarm this module's header says it
+    // must avoid, and the class of red that made the previous version worthless. The row's own status
+    // cannot see this: delegation is work the PARENT is not doing itself.
+    if (isInMotion(a.id, agents, statusMap)) continue;
     if (!mustLeaveCalm(reportOf(a.id))) continue;
     ensure()[a.id] = ESCALATED_STATUS;
   }
   return out ?? statusMap;
+}
+
+/**
+ * Return the rows whose escalation the human has ACKNOWLEDGED to the band they came from.
+ *
+ * Run this AFTER `withStallAttention` and after `advanceAlerts` has seen the escalated map. Compose
+ * it INSTEAD of letting `withDismissedAlerts` handle an escalated row, because that path
+ * de-escalates `blocked` to `idle` unconditionally: a dismissed row that came from `unmerged` would
+ * come back as `idle`, losing its "Needs merge" label, losing its ordering band, and — because
+ * `agentStall` reads `status === "unmerged"` as the EVIDENCE of unlanded work — making the next stall
+ * report read `unknown` instead of `stalled`. One acknowledgement would have erased the fact that the
+ * branch exists, which is the false calm this module was written to abolish (roborev 55318).
+ *
+ * WHY THIS IS A SEPARATE PASS, and not a check inside the escalation above. It WAS such a check, and
+ * that inverted the whole `alertDismissal` design (roborev 55379). The episode counter only advances
+ * from the status a row actually PRESENTS, so an escalation that skips itself when suppressed never
+ * presents `blocked`, `seq` never moves past `dismissedSeq`, and the suppression becomes a ratchet no
+ * new stall can lift. Worse, `isAlertSuppressed` does not say WHICH red was acknowledged — only that
+ * the dismissal matches the current episode — so a `waiting` alarm dismissed weeks ago left
+ * `dismissedSeq === seq` forever and silently suppressed the row's first-ever stall. Escalating
+ * unconditionally and undoing it here keeps the counter honest: the record always sees `blocked`, so
+ * a dismissal is about THIS alarm and a genuinely new episode still re-raises it.
+ */
+export function withDismissedStallAttention<T extends { id: string; alert?: AgentAlertRecord }>(
+  agents: readonly T[],
+  escalatedMap: Record<string, AgentTabStatus>,
+  calmMap: Record<string, AgentTabStatus>,
+): Record<string, AgentTabStatus> {
+  let out: Record<string, AgentTabStatus> | null = null;
+  const ensure = (): Record<string, AgentTabStatus> => (out ??= { ...escalatedMap });
+  for (const a of agents) {
+    if (escalatedMap[a.id] !== ESCALATED_STATUS) continue;
+    // Only a row THIS pass escalated: an agent whose own status is genuinely `blocked` (statusEngine's
+    // stall timer, improvementPass) is not ours to restore, and `calmMap` would say `blocked` for it
+    // anyway, so the guard is about intent rather than about the value.
+    const calm = calmMap[a.id];
+    if (calm === undefined || calm === ESCALATED_STATUS) continue;
+    // THE DISMISSAL MUST BE ABOUT THIS ALARM. `isAlertSuppressed` only says "the acknowledgement
+    // matches the current episode"; it never says WHICH red was acknowledged. So an agent that went
+    // `waiting` once, had it dismissed, and recovered carries `dismissedSeq === seq` FOREVER (leaving
+    // red clears `lastRed` without moving `seq`), and its first-ever stall would have been undone on
+    // the strength of an acknowledgement about something else entirely (roborev 55379/55423).
+    //
+    // `lastRed` is the episode's own kind, so requiring it to BE the escalated status is what ties the
+    // acknowledgement to this alarm. Escalating unconditionally is what keeps that field truthful:
+    // the recorder is handed the pre-undo map, so a genuinely stalled row always presents `blocked`
+    // to it.
+    if (a.alert?.lastRed !== ESCALATED_STATUS) continue;
+    if (!isAlertSuppressed(a.alert, ESCALATED_STATUS)) continue;
+    ensure()[a.id] = calm;
+  }
+  return out ?? escalatedMap;
 }

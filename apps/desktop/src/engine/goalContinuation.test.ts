@@ -52,8 +52,15 @@ describe("the baseline actually continues", () => {
     // The prompt must carry the GOAL — a bare "continue" is what produces "continue what?" after a
     // context compaction or a relaunch.
     expect(d.prompt).toContain("Ship the auto-continue PR");
-    // ...and an exit the agent can reach, or it gets resumed forever after genuinely finishing.
-    expect(d.prompt).toContain("set_agent_goal");
+    // ...and an exit the agent can ACTUALLY reach, or it gets resumed forever after genuinely
+    // finishing. THE DISTINGUISHING TOKEN, not the shared prefix: this asserted
+    // `toContain("set_agent_goal")`, which `set_agent_goal_met` also satisfies — so it was true for
+    // the correct copy AND for the broken one, and that is precisely how the op split landed with
+    // this prompt naming a call shape the MCP schema rejects, suite green (roborev 55549).
+    expect(d.prompt).toContain("set_agent_goal_met");
+    // And NOT the old single-op form, which no longer exists: `set_agent_goal with met: true` would
+    // be refused with "goal must be a string" if an agent followed it literally.
+    expect(d.prompt).not.toContain("set_agent_goal with");
   });
 });
 

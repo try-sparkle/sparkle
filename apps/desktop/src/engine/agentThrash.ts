@@ -167,13 +167,19 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
     case "SessionStart": {
       const fresh = ev.source === "startup" || ev.source === "clear";
       if (fresh) return { ...initialThrashState(), turnOpen: true };
-      return {
-        ...state,
-        turnOpen: true,
-        toolInCurrentTurn: false,
-        turnsWithoutTool: 0,
-        lastTurnRanTool: false,
-      };
+      // A COMPACTION INVALIDATES NOTHING THIS MODULE COUNTS, so it changes nothing (roborev 55314).
+      // The first version of this arm reset the turn bookkeeping, which was still too much in two
+      // directions:
+      //   • `turnsWithoutTool: 0` — a post-compaction SessionStart arrives in the MIDDLE of the loop
+      //     this module was built for (`/compact` → PreCompact → SessionStart{compact}), so zeroing
+      //     the streak there meant `no-progress` could never reach its limit for a compacting agent
+      //     at all. A compaction is not progress; it must not read as progress.
+      //   • `toolInCurrentTurn: false` — an AUTO-compaction fires mid-turn, so clearing it erased the
+      //     evidence that the open turn had already run tools, and the following Stop charged a
+      //     working turn as tool-less.
+      // Nor is the turn reopened: `turnOpen` is already true mid-turn, and a manual `/compact` is a
+      // submission that opens one. Setting it here would let a doubled Stop bank a phantom turn.
+      return state;
     }
     case "PreToolUse":
     case "PostToolUse":
@@ -215,7 +221,17 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
  * getting somewhere (fine); identical text plus nothing is a loop (not fine).
  */
 function repeatOf(state: ThrashState, text: string): ThrashState {
-  if (state.lastCommand === text && !state.lastTurnRanTool) {
+  // BOTH flags, because the claim is "did anything run SINCE THE LAST SUBMISSION" and the two cover
+  // different halves of it: `lastTurnRanTool` is written at Stop and answers for turns that CLOSED,
+  // `toolInCurrentTurn` answers for a turn still open. Reading only the first inverted the rule for
+  // an interrupted working turn (roborev 55314): prompt → PreToolUse → the human presses ESC so no
+  // Stop ever arrives → the same prompt again, three times, and the row reported "it is looping, not
+  // working" about an agent that ran a tool on every one of those turns. That is the same false
+  // positive this function's docstring says would condemn the sibling feature, reached through a
+  // different door. The `/compact` case still trips, because there no tool ran in the open turn
+  // either.
+  const workHappened = state.lastTurnRanTool || state.toolInCurrentTurn;
+  if (state.lastCommand === text && !workHappened) {
     return { ...state, repeatCount: state.repeatCount + 1 };
   }
   return { ...state, lastCommand: text, repeatCount: 1 };

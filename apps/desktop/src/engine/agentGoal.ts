@@ -182,3 +182,81 @@ export function clearGoalMet(goal: AgentGoal): AgentGoal {
   const { metAt: _m, ...rest } = goal;
   return { ...rest, continues: 0 };
 }
+
+/**
+ * What an agent still OWES after its goal record is gone.
+ *
+ * THE HOLE THIS CLOSES (roborev 55451). Every bound in engine/goalContinuation — `already-escalated`,
+ * `MAX_CONTINUES_TOTAL`, `MAX_CONTINUES_WITHOUT_PROGRESS` — is read off the `AgentGoal` record and
+ * NOWHERE ELSE. So deleting the record deletes the debt, and `set_agent_goal` is agent-reachable and
+ * free-tier, with an empty string documented as "clears it". Two calls, no cleverness:
+ *
+ *   1. `set_agent_goal {goal: ""}`      → record dropped: budget spent AND escalation both gone
+ *   2. `set_agent_goal {goal: "…"}`     → no prior goal, so the inherit-the-debts branch cannot fire
+ *
+ * …and the agent is back in the auto-continue pool with a full ceiling and a human's escalation
+ * silently cancelled, repeatable forever. Carrying the debt forward across a text change (which the
+ * `actor === "agent"` branch of `setAgentGoal` already did) is not enough on its own, because the
+ * clear path erases the very record that branch reads.
+ *
+ * So the debt OUTLIVES the goal. It is deliberately the narrow set — the two latched facts a human
+ * owns — and never `continues`, which is the "is restarting getting anywhere" signal and is supposed
+ * to reset when the work genuinely changes.
+ */
+export interface GoalDebt {
+  /** Auto-continues spent under the cleared goal. Feeds `MAX_CONTINUES_TOTAL` on the next goal. */
+  totalContinues: number;
+  /** The escalation the human was handed, if any. Latched across the clear for the same reason it is
+   *  latched within a goal: taking it back is the human's call, not the agent's. */
+  escalatedAt?: number;
+  escalationReason?: string;
+}
+
+/**
+ * The debt to remember when a goal is cleared — or `undefined` when there is nothing to remember.
+ *
+ * Returning `undefined` for a clean goal matters: it keeps the stored field absent on the overwhelming
+ * common path (an agent that never auto-continued and was never escalated), so this does not add a
+ * `{ totalContinues: 0 }` to every agent in the persisted blob.
+ */
+export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
+  if (goal === undefined) return undefined;
+  if (goal.totalContinues === 0 && goal.escalatedAt === undefined) return undefined;
+  return {
+    totalContinues: goal.totalContinues,
+    ...(goal.escalatedAt !== undefined
+      ? {
+          escalatedAt: goal.escalatedAt,
+          ...(goal.escalationReason !== undefined
+            ? { escalationReason: goal.escalationReason }
+            : {}),
+        }
+      : {}),
+  };
+}
+
+/**
+ * Charge a freshly-created goal with an outstanding {@link GoalDebt}.
+ *
+ * `debt` may be `undefined` (nothing owed) — the caller passes whatever it has and gets back a goal
+ * either way, so no call site needs its own branch. The debt is the FLOOR, not an overwrite: a
+ * `totalContinues` already on the goal wins if it is higher, so this can only ever tighten the bound.
+ * An escalation on either side latches, matching {@link escalateGoal}.
+ *
+ * THIS IS AN AGENT-FACING PATH, so it must never be usable as a reset — see {@link clearGoalMet}.
+ */
+export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): AgentGoal {
+  if (debt === undefined) return goal;
+  const escalatedAt = goal.escalatedAt ?? debt.escalatedAt;
+  const escalationReason = goal.escalationReason ?? debt.escalationReason;
+  return {
+    ...goal,
+    totalContinues: Math.max(goal.totalContinues, debt.totalContinues),
+    ...(escalatedAt !== undefined
+      ? {
+          escalatedAt,
+          ...(escalationReason !== undefined ? { escalationReason } : {}),
+        }
+      : {}),
+  };
+}

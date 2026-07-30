@@ -99,6 +99,66 @@ export function hasUnmergedCommittedWork(stage: WorkflowStageId): boolean {
   return idx >= stageIndex("building_saved") && idx < stageIndex("merged");
 }
 
+/** The git facts an "is there unlanded work?" question needs, each with its own "we never looked" arm. */
+export interface UnlandedInputs {
+  /** `runtimeStore.branchStatus[id]` — ahead/behind/dirty. Absent until the first poll lands. */
+  bs?: BranchStatus | undefined;
+  /** `runtimeStore.workflowState[id]` — reachability + the best-effort GitHub PR probe. */
+  ws?: WorkflowState | undefined;
+  /** `runtimeStore.workflowStage[id]` — the persisted monotonic stage watermark, if any. */
+  stageOverride?: WorkflowStageId | undefined;
+}
+
+/**
+ * Is there committed work that never reached main? `true` / `false` / `undefined` ("not looked up").
+ *
+ * ONE IMPLEMENTATION, TWO SURFACES (roborev 55525). This lived only in the sidebar's evidence
+ * gatherer while `agentGoalReading.readUnlanded` — which feeds `get_state`'s `stall`/`stallCauses` and
+ * `get_agent_status` — answered from the stage watermark alone. For the new-work cycle that meant the
+ * sidebar reported `stalled` / `unlanded-work` while the control surface reported `finished` for the
+ * SAME agent at the SAME moment, which is the disagreement `agentGoalReading`'s own header exists to
+ * forbid, on the surface a concierge actually sweeps.
+ *
+ * `resolveStage` has a FLOOR — handed nothing it returns the bottom stage, which
+ * `hasUnmergedCommittedWork` reads as `false`. That default is right for a progress bar and wrong
+ * here: it would manufacture "nothing unlanded" for every agent whose branch has simply not been
+ * polled. So at least one real reading is required before consulting it.
+ */
+export function unlandedWorkEvidence(ev: UnlandedInputs): boolean | undefined {
+  if (ev.bs === undefined && ev.stageOverride === undefined) return undefined;
+  // LIVE COMMITS OUTRANK THE WATERMARK (roborev 55334). `resolveStage` takes the MAX of the
+  // git-derived stage and the persisted watermark, and the watermark is monotonic. So the new-work
+  // cycle — merge PR #1, keep working on the same branch, commit three more times — had
+  // `stageOverride: "merged"` outranking `ahead: 3`, and the row rendered pixel-identical to a shipped
+  // agent while carrying three unlanded commits. `deriveLiveStage` handles this case explicitly;
+  // `resolveStage` deliberately does not, so the caller must.
+  //
+  // BUT `ahead` DOES NOT RETURN TO ZERO WHEN WORK LANDS (roborev 55456). It is
+  // `rev-list --left-right --count <base>...<branch>`, so it only reaches 0 once the branch TIP is an
+  // ancestor of the base. A squash/rebase merge defeats that permanently: the work is in main, the tip
+  // is not, and `ahead` stays N forever. Unguarded, this paints a landed agent red `blocked` with
+  // nothing able to clear it — a manufactured POSITIVE, costlier than the stall it was chasing.
+  //
+  // So it yields to direct reachability: `landed` is the squash case by name (Rust
+  // `merge_adds_nothing` — tip not an ancestor, merging adds nothing), `inOriginMain`/`inLocalMain` the
+  // ancestor case. Each is `true` only from a reading that ran, so this yields to evidence, never a gap.
+  //
+  // ⚠️ `prState === "merged"` IS DELIBERATELY NOT IN THAT LIST. It is the state of the branch's PR, not
+  // of the branch: merge PR #1, keep committing, and until a second PR exists the probe still answers
+  // "merged" while commits sit unlanded. Vetoing on it would restore the false negative above — a calm
+  // gray row over outstanding work, which the founder's rule names a bug on its face. `deriveLiveStage`
+  // carries its own ⚠️ about how narrowly this field may be trusted; reachability is the durable signal.
+  //
+  // No `worktreeOnBranch` gate: `BranchStatus` documents that `dirty` is the SOLE field parking
+  // corrupts, because every other one is computed from the branch REF and is immune to what got
+  // checked out into the tree. Gating `ahead` on it would discard sound evidence and re-open this hole
+  // for a parked worktree — a real state here (sparkle-rhgm), not a hypothetical.
+  const alreadyInBase =
+    ev.ws?.landed === true || ev.ws?.inOriginMain === true || ev.ws?.inLocalMain === true;
+  if (!alreadyInBase && ev.bs !== undefined && ev.bs.ahead > 0) return true;
+  return hasUnmergedCommittedWork(resolveStage(ev.bs, ev.stageOverride));
+}
+
 // Everything we know about a unit of work at poll time, fed into the live stage derivation below.
 export interface LiveStageInputs {
   // "build" | "worker" | etc. Only "worker" uses the parent-branch / parent-reached-main signals.

@@ -304,7 +304,11 @@ export async function promotePlanToBuild(
   // throw into this domain's own refusal vocabulary, so the concierge gets `at-capacity` rather than
   // a generic `action-failed` it cannot reason about.
   try {
-    const agentId = sendToBuild({ projectId, epicId, prdPath, mode: "epic" });
+    // `humanAuthored: false` — this is the concierge's TOOL layer, not a board click (roborev
+    // 55721). It matters on the reuse path `already` is read for two lines up: seeding a REUSED
+    // orchestrator through `appendPrompt` releases its goal debt, so an LLM promoting an epic whose
+    // orchestrator is escalated would un-latch the escalation that exists to hand it to a human.
+    const agentId = sendToBuild({ projectId, epicId, prdPath, mode: "epic", humanAuthored: false });
     return ok("promote_plan_to_build", { agentId, epicId, reused: Boolean(already) });
   } catch (e) {
     if (e instanceof AtCapacityError) {
