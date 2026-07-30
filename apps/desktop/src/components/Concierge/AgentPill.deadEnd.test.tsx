@@ -19,6 +19,7 @@
 //
 // The cases are named (a)–(d) in the titles: they are the states a pill can be in, and the
 // contract is that every one of them is visible to the reader.
+import { StrictMode } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentPill, AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
@@ -197,6 +198,75 @@ describe("the failed state is about a MOMENT, never sticky", () => {
     expect(retry.getAttribute("aria-controls")).toBe(
       screen.getByTestId("concierge-agent-pill-live").id,
     );
+  });
+});
+
+describe("the reveal is a side effect, so it runs ONCE per click", () => {
+  it("calls the opener ONCE under StrictMode, which re-invokes impure state updaters", () => {
+    // WHY StrictMode AND NOT A PLAIN RENDER. A plain test render calls a `setState` updater exactly
+    // once, so `toHaveBeenCalledTimes(1)` holds whether the navigation sits in the handler or
+    // inside the updater — vacuous, and it cannot see the bug. This row was written that way first
+    // and a mutation putting the call back in the updater kept it green.
+    //
+    // StrictMode deliberately double-invokes updaters in development to surface exactly this
+    // impurity. The hazard is real outside tests too: React re-invokes updaters whenever it
+    // discards and replays a render (interrupted concurrent render, Suspense retry), so an updater
+    // that navigated would re-select the project tab and tear down the Sparkle overlay twice for
+    // one click. This codebase already designs around it for dictated sends (voice/useAutoSend:
+    // "updaters here stay out of it entirely"), and a version of this handler shipped with the
+    // call inline in the updater (roborev 55618).
+    //
+    // WHY THE OPENER MUST RETURN false HERE. With a successful reveal the count goes 0 → 0; React
+    // bails on the unchanged value, never re-renders, and so never double-invokes — a `() => true`
+    // version of this row cannot fail either, for a subtler reason than the plain-render one. The
+    // miss is what makes the state actually change (0 → 1) and the second invocation observable.
+    const onOpenAgent = vi.fn(() => false);
+    render(
+      <StrictMode>
+        <AgentPillProvider value={ctx({ onOpenAgent })}>
+          <AgentPill agentId="b78f9f8c" fallbackName="@Build 8" />
+        </AgentPillProvider>
+      </StrictMode>,
+    );
+
+    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
+
+    expect(onOpenAgent).toHaveBeenCalledTimes(1);
+    // First miss reads "is closed", not the second-miss wording — the count advanced by exactly 1.
+    const notice = screen.getByTestId("concierge-agent-pill-notice");
+    expect(notice.textContent).toMatch(/Build 8 is closed/i);
+    expect(notice.textContent).not.toMatch(/still/i);
+  });
+});
+
+describe("expanding an explanation is not the same fact as a failed reveal", () => {
+  it("a re-resolving agent is NOT labelled closed by the disclosure it was expanded with", () => {
+    // The unresolved pill's toggle and the resolved pill's miss counter mean different things, and
+    // sharing one number let the first be read as the second: expand a closed pill, let a feed tick
+    // re-add its agent (project reopened, cross-window sync), and the resolved branch inherited the
+    // "1" as a failed attempt — rendering a live, in-roster agent as "is closed" with nothing ever
+    // having been attempted (roborev 55618).
+    const value = ctx({ agents: [] });
+    const r = render(
+      <AgentPillProvider value={value}>
+        <AgentPill agentId="b78f9f8c" fallbackName="@Build 8" />
+      </AgentPillProvider>,
+    );
+    fireEvent.click(screen.getByTestId("concierge-agent-pill-closed"));
+    expect(screen.getByTestId("concierge-agent-pill-notice").textContent).toMatch(/closed/i);
+
+    // The agent comes back.
+    r.rerender(
+      <AgentPillProvider value={ctx({ agents: [BUILD8] })}>
+        <AgentPill agentId="b78f9f8c" fallbackName="@Build 8" />
+      </AgentPillProvider>,
+    );
+
+    // A live pill again — teal, dotted, openable — and NOT a word about it being closed.
+    expect(screen.getByTestId("concierge-agent-pill")).toBeTruthy();
+    expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
+    expect(screen.queryByTestId("concierge-agent-pill-notice")).toBeNull();
+    expect(visible()).not.toMatch(/closed/i);
   });
 });
 

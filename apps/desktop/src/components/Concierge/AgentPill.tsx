@@ -238,13 +238,22 @@ function NoticeAction({ label, onClick }: { label: string; onClick: () => void }
  */
 export function AgentPill({ agentId, fallbackName }: { agentId: string; fallbackName: string }) {
   const { agents, onOpenAgent, onSeeHistory } = useContext(AgentPillContext);
-  // Consecutive failed reveals. Per-pill, so one explained pill does not open every other pill's
-  // notice in the thread — and a COUNT rather than a boolean, because a boolean could not tell a
-  // repeat miss from the first one: `setShowClosed(true)` on an already-true state is an
-  // identical-value update, React bails out, and the reader's retry click paints and announces
-  // NOTHING. That is the dead end this file exists to remove, one step further out (roborev 55590).
+  // TWO SEPARATE STATES, because they mean different things and one counter could not.
+  //
+  // `misses` — consecutive FAILED REVEALS on a resolved pill. A count rather than a boolean because
+  // a boolean cannot distinguish a repeat miss from the first: setting `true` on an already-`true`
+  // state is an identical-value update, React bails out, and the reader's retry click paints and
+  // announces NOTHING (roborev 55590).
+  //
+  // `expanded` — whether an UNRESOLVED pill's explanation is showing. Nothing was attempted; it is
+  // a pure disclosure toggle.
+  //
+  // Sharing one counter between them was a false-claim bug (roborev 55618): a pill clicked to
+  // expand while unresolved carried `misses = 1` into the resolved branch when a feed tick re-added
+  // its agent, and rendered a live, in-roster agent as "…is closed" with no attempt ever made.
+  // Per-pill either way, so one explained pill does not open every other pill's notice.
   const [misses, setMisses] = useState(0);
-  const showClosed = misses > 0;
+  const [expanded, setExpanded] = useState(false);
   const noticeId = useId();
   const agent = agents.find((a) => a.id === agentId);
   // The LIVE name whenever the id resolves — that is what makes a renamed agent's pill rename
@@ -305,17 +314,17 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
           type="button"
           data-testid="concierge-agent-pill-closed"
           data-agent-id={agentId}
-          aria-expanded={showClosed}
+          aria-expanded={expanded}
           aria-controls={noticeId}
           title={closedSentence(name)}
           // A GENUINE DISCLOSURE, unlike the resolved pill below: nothing is attempted, so this
           // toggles its explanation open and shut and `aria-expanded` describes it correctly.
-          onClick={() => setMisses((n) => (n > 0 ? 0 : 1))}
+          onClick={() => setExpanded((v) => !v)}
           style={{ ...quiet, border: "none", cursor: "pointer", textDecoration: "underline dotted" }}
         >
           @{name}
         </button>
-        <LiveNotice id={noticeId} open={showClosed} action={historyAction}>
+        <LiveNotice id={noticeId} open={expanded} action={historyAction}>
           {closedSentence(name)}
         </LiveNotice>
       </span>
@@ -327,6 +336,7 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
   // between the render that drew this pill and the click that lands on it, and both early exits on
   // the reveal path are silent.
   const target = { agentId: agent.id, projectId: agent.projectId };
+  const showClosed = misses > 0;
   return (
     <span style={{ display: "inline" }}>
       <button
@@ -354,7 +364,19 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
         // second failure changes the sentence ("…is still closed.") and every failure re-keys the
         // notice, so the live region is genuinely updated rather than re-rendered identically and
         // silently dropped (roborev 55590).
-        onClick={() => setMisses((n) => (onOpenAgent(target) ? 0 : n + 1))}
+        //
+        // THE REVEAL RUNS IN THE HANDLER, NEVER INSIDE THE UPDATER. React re-invokes a state
+        // updater whenever it discards and replays a render (an interrupted concurrent render, a
+        // Suspense retry, StrictMode's double-invoke), so an updater that performs the navigation
+        // would run `openProjectTab` TWICE for one click — re-selecting a project tab and tearing
+        // down the Sparkle overlay a second time. This codebase already designs around exactly this
+        // hazard for dictated sends (voice/useAutoSend: "updaters here stay out of it entirely"),
+        // and a version of this handler shipped with the call inline in the updater (roborev 55618).
+        // The updater below is pure: it only folds an already-decided outcome.
+        onClick={() => {
+          const landed = onOpenAgent(target);
+          setMisses((n) => (landed ? 0 : n + 1));
+        }}
         style={
           showClosed
             ? { ...quiet, border: "none", cursor: "pointer", textDecoration: "underline dotted" }
