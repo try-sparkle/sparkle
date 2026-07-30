@@ -120,8 +120,8 @@ describe("findMentionSpans — a mention is the literal, bounded like a token", 
     expect(findMentionSpans("@Auth--v2", [dash])).toEqual([]);
   });
 
-  it("strips a sentence-final mention without eating the full stop", () => {
-    expect(mentionFreeText("ship it, @Kraken Auth.", FLEET)).toBe("ship it,.");
+  it("keeps a sentence-final mention's name, and does not eat the full stop", () => {
+    expect(mentionFreeText("ship it, @Kraken Auth.", FLEET)).toBe("ship it, Kraken Auth.");
   });
 
   // An UNLABELLED duplicate still resolves by array order — this function has no opinion about
@@ -326,12 +326,48 @@ describe("mentionsIn — what a send carries", () => {
 });
 
 describe("mentionFreeText — the @ must never reach the PTY", () => {
-  it("strips the address and collapses the gap it leaves", () => {
-    expect(mentionFreeText("Tell @Kraken Auth to ship it", FLEET)).toBe("Tell to ship it");
+  // ══ AN ADDRESS IS A PREFIX; A NAME IN A SENTENCE IS A SUBJECT ═════════════════════════════════
+  // These two rows are the whole rule, and the first one used to assert the BUG — it expected
+  // "Tell to ship it", a sentence with its object deleted, written irreversibly into a terminal.
+  // The distinction is POSITIONAL, not ordinal: only a mention with nothing but whitespace before
+  // it is an envelope. See the founder's two corrupted messages in the block below.
+  it("keeps the NAME of a mention that does not lead the message", () => {
+    expect(mentionFreeText("Tell @Kraken Auth to ship it", FLEET)).toBe("Tell Kraken Auth to ship it");
   });
 
   it("strips a leading mention and trims", () => {
     expect(mentionFreeText("@Kraken Auth ship it", FLEET)).toBe("ship it");
+  });
+
+  // ══ THE TWO MESSAGES THIS ACTUALLY CORRUPTED, verbatim ════════════════════════════════════════
+  // Both reached an agent's terminal as a sentence with a hole in it; the first left the agent
+  // stopping to ask what its target was. In each the mention is the SUBJECT of the clause, so
+  // deleting it removes the only noun the instruction refers to.
+  it("survives as plain text when the mention is the subject, not a routing prefix", () => {
+    const findings = agent({ id: "r1", name: "Resolve Stranded Dictation Findings" });
+    expect(mentionFreeText("Same issue with @Resolve Stranded Dictation Findings", [findings])).toBe(
+      "Same issue with Resolve Stranded Dictation Findings",
+    );
+  });
+
+  it("survives mid-sentence, with the rest of the sentence intact around it", () => {
+    const status = agent({ id: "s1", name: "Status Check (sparkle-desktop)" });
+    expect(
+      mentionFreeText(
+        "Why is @Status Check (sparkle-desktop) just sitting there? It looks like it has unmerged work.",
+        [status],
+      ),
+    ).toBe(
+      "Why is Status Check (sparkle-desktop) just sitting there? It looks like it has unmerged work.",
+    );
+  });
+
+  // The sigil is the ONLY thing that must never survive — it is what opens the CLI's file picker.
+  // Asserting the name alone would pass against a rendering that kept "@Kraken Auth" whole.
+  it("drops the sigil from a subject mention, keeping nothing but the name", () => {
+    const wire = mentionFreeText("Same issue with @Kraken Auth", FLEET);
+    expect(wire).not.toContain("@");
+    expect(wire).toBe("Same issue with Kraken Auth");
   });
 
   it("leaves text with no mentions exactly alone", () => {
@@ -357,13 +393,21 @@ describe("mentionFreeText — the @ must never reach the PTY", () => {
     expect(mentionFreeText("@Kraken Auth ship  it  now", FLEET)).toBe("ship  it  now");
   });
 
-  // One space, not both sides — otherwise "a @X b" would lose the word break between a and b.
-  it("keeps the word break when a mention sits between two words", () => {
-    expect(mentionFreeText("a @Kraken Auth b", FLEET)).toBe("a b");
+  // The space-eating below applies ONLY to a consumed leading address — a mention that survives
+  // keeps the spaces around it, because its name is now sitting where the pill was.
+  it("keeps both word breaks around a surviving mention", () => {
+    expect(mentionFreeText("a @Kraken Auth b", FLEET)).toBe("a Kraken Auth b");
   });
 
-  it("eats the space BEFORE a mention that ends the message", () => {
-    expect(mentionFreeText("tell @Kraken Auth", FLEET)).toBe("tell");
+  it("keeps the name of a mention that ends the message", () => {
+    expect(mentionFreeText("tell @Kraken Auth", FLEET)).toBe("tell Kraken Auth");
+  });
+
+  // A consumed leading address must not leave the wire starting with whitespace — the trim does
+  // this, which is why the old per-span space-eating could go. Uses a TAB and extra spaces so the
+  // assertion is about the removal's own gap and not about a single tidy space.
+  it("leaves no leading whitespace behind when it consumes the address", () => {
+    expect(mentionFreeText("@Kraken Auth \t ship it", FLEET)).toBe("ship it");
   });
 
   it("is empty when the message was nothing but an address", () => {

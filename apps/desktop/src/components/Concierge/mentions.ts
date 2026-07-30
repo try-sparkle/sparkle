@@ -262,8 +262,15 @@ export function mentionsIn(text: string, agents: readonly MentionAgent[]): Conci
   return out;
 }
 
-/** What the AGENT receives: the same message with the ADDRESS removed and every other mention
- *  reduced to a plain name.
+/** What the AGENT receives: the same message with a LEADING address removed and every other
+ *  mention — including one that opens a clause rather than the message — reduced to a plain name.
+ *
+ *  "LEADING" IS THE WHOLE TEST, and it is positional rather than ordinal. A mention is an envelope
+ *  only when nothing but whitespace precedes it; anywhere else it is the sentence's subject and
+ *  deleting it leaves a hole (see the block comment at the branch below for the two messages this
+ *  corrupted). The routing rule is untouched and still reads `mentions[0]` — whether a name is the
+ *  DESTINATION and whether it is CONSUMED FROM THE TEXT are different questions, and conflating
+ *  them is what caused the bug.
  *
  *  THE `@` MUST NOT REACH THE PTY, and this is not a tidiness preference. The agent on the other end
  *  of that terminal is a Claude Code CLI, where a leading `@` on a token opens its own file-reference
@@ -289,7 +296,6 @@ export function mentionsIn(text: string, agents: readonly MentionAgent[]): Conci
 export function mentionFreeText(text: string, agents: readonly MentionAgent[]): string {
   const spans = findMentionSpans(text, agents);
   if (spans.length === 0) return text;
-  const gap = (i: number) => text[i] === " " || text[i] === "\t";
   let out = "";
   let at = 0;
   for (const [i, s] of spans.entries()) {
@@ -305,23 +311,43 @@ export function mentionFreeText(text: string, agents: readonly MentionAgent[]): 
     // Claude Code CLI's file-reference autocomplete), and that is fully served by dropping the
     // sigil. The NAME is content: the user wrote it because the instruction depends on it.
     //
-    // The first span is the address because the host routes `mentions[0]`, and both lists are in
-    // first-appearance order — so span zero is exactly the name that became the destination.
-    if (i > 0) {
+    // ══ AN ADDRESS IS A PREFIX. A NAME IN A SENTENCE IS A SUBJECT (and this told them apart by
+    //    ORDINAL, which is not what distinguishes them) ═══════════════════════════════════════════
+    // The rule above was "span zero is the address, because the host routes `mentions[0]`". The
+    // routing half of that is true and unchanged. The TEXT half was wrong, and silently corrupted
+    // the founder's messages twice in an hour:
+    //
+    //   "Same issue with @Resolve Stranded Dictation Findings"   → "Same issue with"
+    //   "Why is @Status Check (sparkle-desktop) just sitting there?"
+    //                                                            → "Why is just sitting there?"
+    //
+    // Both reached a terminal as a sentence with a hole in it, and the first left an agent asking
+    // what its target was. Being FIRST is not what makes a mention an envelope — being a PREFIX is.
+    // `@Kraken Auth ship it` opens with an address and reads correctly without it; "Same issue with
+    // @X" names its subject mid-sentence, and deleting that destroys the only noun in the clause.
+    //
+    // So the test is POSITIONAL: only a mention with nothing but whitespace before it is consumed.
+    // Every other mention — later spans as before, and now a first span that does not lead — keeps
+    // its NAME and loses only its sigil, which is all this function ever needed to do (the `@` is
+    // what opens the CLI's file picker; the name is content the user wrote). A pill means nothing
+    // inside a PTY, so the plain name is the right rendering there.
+    const leads = text.slice(0, s.start).trim() === "";
+    if (i > 0 || !leads) {
       out += text.slice(at, s.start);
       out += text.slice(s.start + MENTION_SIGIL.length, s.end);
       at = s.end;
       continue;
     }
-    // Prefer eating the space AFTER the mention (`@Kraken Auth ship it` → `ship it`); fall back to
-    // the one BEFORE it when the mention ends the line or the message (`tell @Kraken Auth` →
-    // `tell`). Never both, or "a @X b" would lose the word break entirely.
-    let start = s.start;
-    let end = s.end;
-    if (gap(end)) end += 1;
-    else if (gap(start - 1)) start -= 1;
-    out += text.slice(at, start);
-    at = end;
+    // A CONSUMED ADDRESS LEADS, so everything before it is whitespace and everything the removal
+    // could leave behind is at the ENDS — which `out.trim()` below already handles.
+    //
+    // This used to eat one adjacent space here, choosing the side by whether the mention ended the
+    // message. That mattered while an INTERIOR mention could be deleted: "a @X b" had to not become
+    // "ab". It cannot any more — an interior mention keeps its name — so the rule is now unreachable
+    // and its own example is a surviving mention. Left in place it would read as load-bearing and
+    // send the next reader looking for a case that no longer exists.
+    out += text.slice(at, s.start);
+    at = s.end;
   }
   out += text.slice(at);
   // Only the ends: a message that was nothing but an address collapses to "", and a leading address
@@ -621,10 +647,15 @@ export interface DictatedAddress {
  *
  *   **The segment must BEGIN the message, and "sparkle" must be its first word.**
  *
- * That is the ADDRESSING POSITION the rest of this module already recognises. `mentionFreeText` and
- * `ConciergeHost.send` both treat `mentions[0]` — the FIRST span — as the envelope, and every other
- * span as content. So the head of the message is where an address goes, and a "sparkle" anywhere else
- * is a word in a sentence. Concretely:
+ * That is the ADDRESSING POSITION the rest of this module already recognises — and `mentionFreeText`
+ * now agrees with it exactly: it consumes a mention only when nothing but whitespace precedes it,
+ * and every other span keeps its name. (It used to consume `mentions[0]` by ORDINAL, which is a
+ * different rule that happens to coincide whenever the address leads. Where they diverged it deleted
+ * the subject of a sentence.) `ConciergeHost.send` still routes `mentions[0]`, because WHICH agent a
+ * message is for and WHICH span is an envelope are separate questions.
+ *
+ * So the head of the message is where an address goes, and a "sparkle" anywhere else is a word in a
+ * sentence. Concretely:
  *
  *   • "Sparkle, what's the status?" into an empty box  → `@Sparkle what's the status?`   ✅ pill
  *   • "the sparkle desktop app is slow"                → unchanged, plain prose           ✅ no pill

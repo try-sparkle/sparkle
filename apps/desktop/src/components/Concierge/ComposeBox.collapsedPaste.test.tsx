@@ -438,9 +438,10 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
 // ── A PILL'S CONTENTS ARE CONTENT, NEVER AN ENVELOPE ──────────────────────────────────────────
 // Mentions are resolved from the VISIBLE textarea, not from the composed body (roborev 55730).
 // Scanning the body would let a pasted log aim the message: the host routes `mentions[0]` straight
-// at that agent's terminal, and it renders the wire text through `mentionFreeText`, which DELETES
-// the addressing span — so a mention found inside a pill would have the paste itself rewritten on
-// the way out, breaking the one guarantee the pill exists to keep.
+// at that agent's terminal, and it renders the wire text through `mentionFreeText`, which REWRITES
+// every span it resolves (deleting a leading address, taking the sigil off the rest) — so a mention
+// found inside a pill would have the paste itself altered on the way out, breaking the one guarantee
+// the pill exists to keep.
 describe("ComposeBox — a mention inside a collapsed paste is not an address", () => {
   const PASTE_WITH_MENTION = `${LONG}@Docs said the schema changed\nand then it broke\n`;
 

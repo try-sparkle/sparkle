@@ -204,6 +204,38 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
     expect(h.dispatchConciergeAnswer.mock.calls[0]![1]).toBe("ship the DMG");
   });
 
+  // ══ THE OTHER SHAPE, AND THE ONE THAT CORRUPTED REAL MESSAGES ═══════════════════════════════════
+  // The row above is a mention used as an ADDRESS — a prefix, consumed. This is a mention used as
+  // the SUBJECT of the sentence, which must survive as its plain name. Deleting it sent
+  // "Same issue with" and "Why is just sitting there?" into live terminals; the first left the agent
+  // stopping to ask what its target was.
+  //
+  // Pinned HERE as well as in mentions.test.ts because this is the layer the corruption was seen at:
+  // the unit rule and the bytes that actually reach the dispatcher are different facts, and only
+  // this one would have caught a caller that stripped a second time on the way to the wire.
+  it("keeps a subject mention's name in the bytes that reach the terminal", async () => {
+    mount();
+    await send("Why is @Kraken Auth just sitting there? It looks like it has unmerged work.");
+    await elapse();
+    const wire = h.dispatchConciergeAnswer.mock.calls[0]![1] as string;
+    expect(wire).toBe("Why is Kraken Auth just sitting there? It looks like it has unmerged work.");
+    // The sigil is still the one thing that may never survive — asserting the sentence alone would
+    // pass against a wire that relayed "@Kraken Auth" verbatim and opened the CLI's file picker.
+    expect(wire).not.toContain("@");
+  });
+
+  // It is still ROUTED at the agent it names, wherever in the sentence that name sits. Routing reads
+  // `mentions[0]` and always did; the bug was that the TEXT rule borrowed that ordinal to decide
+  // what to delete. This row is what stops a future fix from "solving" the hole by dropping the
+  // mid-sentence mention as a destination.
+  it("still delivers to a subject mention's agent, not to the selected one", async () => {
+    mount();
+    await send("Why is @Kraken Auth just sitting there?");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag2");
+  });
+
   // Explicitness buys a skipped CLASSIFY, never a skipped GATE. This is the line the "no forceAgent
   // twin" warning in deliver() is really protecting.
   it("still arms a cancellable countdown rather than dispatching outright", async () => {

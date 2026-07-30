@@ -1208,9 +1208,12 @@ export function ConciergeHost({
   //   • the PTY needs the sigil GONE — a leading `@` opens the Claude Code CLI's file-reference
   //     autocomplete and strands the instruction behind a picker (bead sparkle-kaz1l);
   //   • the BRAIN needs the NAMES KEPT — `askSparkle(replay)` is the "Also ask Sparkle" arm, and
-  //     `mentionFreeText` deletes the addressing span wholesale rather than just its sigil. Stripping
-  //     for that consumer asked Sparkle "ship the DMG" about a message the user aimed at a named
-  //     agent, contradicting this file's own invariant that Sparkle should see who it was aimed at.
+  //     `mentionFreeText` deletes a LEADING addressing span wholesale rather than just its sigil.
+  //     Stripping for that consumer asked Sparkle "ship the DMG" about a message the user aimed at a
+  //     named agent, contradicting this file's own invariant that Sparkle should see who it was
+  //     aimed at. (A mention that does NOT lead now survives as its plain name, so the two
+  //     renderings coincide for those — the split is still required for the addressed case, which is
+  //     the common one.)
   //
   // Capped through the same helper as the other two so all three evict together.
   const sentWireRef = useRef<Map<string, string>>(new Map());

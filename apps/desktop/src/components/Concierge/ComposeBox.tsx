@@ -1044,8 +1044,9 @@ export function ComposeBox({
     // thread or a log that happens to contain "@Docs" while an agent is addressable as Docs, and the
     // send silently aims at that agent's terminal instead of being routed. It also breaks the
     // guarantee this feature exists for — the host renders the wire text through `mentionFreeText`,
-    // which DELETES the addressing span and strips the sigil off the rest, so a mention found inside
-    // a pill would have the paste itself rewritten on its way out. A pill's contents are content,
+    // which REWRITES every span it resolves (deleting a leading address outright, and taking the
+    // sigil off the rest), so a mention found inside a pill would have the paste itself altered on
+    // its way out. A pill's contents are content,
     // never an envelope. For a box with no pills this is exactly what it always was.
     //
     // `text`, not `typed`: the two differ only in edge whitespace (see `typed` above), which cannot
