@@ -44,6 +44,10 @@ import {
   type ConciergeViewModel,
 } from "./Concierge";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
+// The two ALARM controls the card draws (Mute, [x]). Imported rather than re-spelled: the card
+// fires them and this file handles them, and a literal on each side is a silent no-op waiting to
+// happen — the handler would simply never match.
+import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./Concierge/NudgeCard";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
 import type { AgentTabStatus } from "../types";
 import { bandCountLabel } from "../engine/statusBandLabels";
@@ -461,15 +465,27 @@ function strandedAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return unrepresentedAgents(feed).filter((a) => a.parentRowId === null);
 }
 
+/** The LABELLED buttons a card carries — things the AGENT can be told to do, which today is Approve
+ *  and only Approve.
+ *
+ *  "SHOW ME" AND "MUTE" ARE BOTH GONE FROM THIS LIST, for different reasons, and neither is a
+ *  deletion (see the header of Concierge/NudgeCard):
+ *   • Show me was removed outright. The card now renders the agent as a real `AgentPill` that
+ *     navigates, and the whole card remains a click target, so a third copy of the same affordance
+ *     was pure width in a column whose scarcest resource is width.
+ *   • Mute moved to a CONTROL on the card rather than an action in this list, alongside the new [x].
+ *     Both are properties of the ALARM — every card has them regardless of what its agent is doing —
+ *     whereas an entry here is a property of the agent's current work. `NudgeCard` fires them
+ *     through the same `onNudgeAction` channel under `NUDGE_MUTE_ACTION` / `NUDGE_DISMISS_ACTION`,
+ *     so nothing about the wiring changed, only where they are drawn.
+ *
+ *  Approve stays a labelled button on purpose: it is a one-tap relay into a live terminal, there is
+ *  no other place in the app to do it from, and an icon would make an irreversible action ambiguous. */
 function actionsFor(a: ConciergeAgent): ConciergeNudgeAction[] {
-  const show: ConciergeNudgeAction = { id: "show", label: "Show me" };
-  const mute: ConciergeNudgeAction = { id: "mute", label: "Mute", kind: "ghost" };
-  // The primary (gold) action is Approve when the agent is blocked on an approval prompt (one-tap
-  // relay into its terminal); otherwise it's Show me. Show me is plain when Approve is the primary.
   if (a.status === "approval") {
-    return [{ id: "approve", label: "Approve", kind: "primary" }, show, mute];
+    return [{ id: "approve", label: "Approve", kind: "primary" }];
   }
-  return [{ ...show, kind: "primary" }, mute];
+  return [];
 }
 
 function agentToNudge(a: ConciergeAgent): ConciergeNudge {
@@ -2741,13 +2757,47 @@ export function ConciergeHost({
       onNudgeAction: (n: ConciergeNudge, actionId: string) => {
         const a = resolveAgent(n.id);
         if (!a) return;
-        if (actionId === "show") {
-          // The card's own affordance has to keep the same promise its click does.
-          revealAgent(a);
-        } else if (actionId === "approve") {
+        if (actionId === "approve") {
           void approve(a);
-        } else if (actionId === "mute") {
+        } else if (actionId === NUDGE_MUTE_ACTION) {
           useSparklePrefsStore.getState().setInterruptPreference(a.id, "mute");
+        } else if (actionId === NUDGE_DISMISS_ACTION) {
+          // THE [x]. The app's existing per-EPISODE acknowledgement, not a mute and not a local
+          // "hide this card" flag — those are the two things it must not be:
+          //   • A local flag would have to live somewhere, and this card is DERIVED from the feed
+          //     on every tick (there is no card record to mark), so it would mean inventing a
+          //     parallel dismissed-set that nothing else in the app can see or clear.
+          //   • `dismissAlert` is already in this feed's own status chain (`withDismissedAlerts`,
+          //     inside publishedStatusFor), so the acknowledgement de-escalates the red and the
+          //     card retracts on the very next tick — the same mechanism, and the same record, the
+          //     Build column's row control writes. Dismissing here calms the row there, which is
+          //     what a reader who acknowledged an alarm expects and would otherwise have to do
+          //     twice.
+          // ACKNOWLEDGE WHAT THE CARD STOOD FOR, not only the agent it names (roborev 55986).
+          //
+          // On the rollup shape this design deliberately keeps — an IDLE orchestrator carrying a red
+          // worker's band — the card names the orchestrator. Dismissing only that de-escalates its
+          // red, which makes the worker un-represented, so the very next tick raises a new,
+          // near-identical card naming the worker. The reader who reflexively acknowledged one alarm
+          // gets it straight back under a different name, and has to click [x] once per red
+          // descendant. That is whack-a-mole, and it is worse than the alarm.
+          //
+          // `representedBy` is the feed's own answer to "who speaks for me", so this dismisses the
+          // exact set the card was standing in for — no parent walk re-derived here, and nothing
+          // dismissed that some OTHER row still speaks for.
+          const store = useProjectStore.getState();
+          // `getState()` rather than a subscribed selector, matching this file's other store writes
+          // from handlers: the action's identity is stable, and subscribing would add a dep to the
+          // controller memo that re-creates every callback on any project write.
+          // `a.status` is the PUBLISHED status the card was raised on, which is what
+          // `advanceAlertRecord` has to see for the dismissal to match THIS episode rather than
+          // seeding a different one. Same for each descendant, which carries its own.
+          store.dismissAlert(a.projectId, a.id, a.status);
+          for (const other of allAgents(feedRef.current)) {
+            if (other.representedBy === a.id) {
+              store.dismissAlert(other.projectId, other.id, other.status);
+            }
+          }
         }
       },
     }),

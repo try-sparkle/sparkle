@@ -237,8 +237,43 @@ function NoticeAction({ label, onClick }: { label: string; onClick: () => void }
  * under them. Here, the pill is a live control the reader is about to click — it should describe
  * the agent as it is now, not as it was mentioned.
  */
-export function AgentPill({ agentId, fallbackName }: { agentId: string; fallbackName: string }) {
-  const { agents, onOpenAgent, onSeeHistory } = useContext(AgentPillContext);
+export function AgentPill({
+  agentId,
+  fallbackName,
+  onOpen,
+}: {
+  agentId: string;
+  fallbackName: string;
+  /**
+   * A STRONGER reveal than the context's, for a surface that needs one. Overrides `onOpenAgent`
+   * entirely (and, being supplied, is itself proof the surface is wired).
+   *
+   * IT EXISTS FOR THE NUDGE CARD, and the reason is specific rather than a matter of taste. The
+   * context's opener is `openProjectTab`, which selects and mounts — enough for a top-level agent,
+   * whose row the Build column always draws. It is NOT enough for a WORKER: a missing
+   * `collapsedOrchestrators` entry reads as collapsed and a leftover band filter can hide the head
+   * entirely, so the click lands on a screen where the named agent is not drawn (roborev
+   * 53679/53734). `ConciergeHost.revealAgent` is the path that closes both gates, and since a nudge
+   * card now names the WORKER that owns the red — rather than the orchestrator that relayed it —
+   * that is the common case here, not the exotic one.
+   *
+   * RETURNS NOTHING, and that is NOT an oversight — it is the difference between this and
+   * `onOpenAgent` (roborev 55988). `onOpenAgent`'s `false` means "nothing on screen changed", which
+   * this pill turns into a visible "…is closed". A caller that owns the reveal has taken over that
+   * reporting (`ConciergeHost.revealAgent` speaks through the column's one announcer), so this pill
+   * deliberately renders no notice at all — see `ownsOutcome` below. Typing this as `=> boolean`
+   * would therefore have advertised a contract the component does not keep: a caller honouring it
+   * would return `false`, nothing would render, and the reader would get a completely silent dead
+   * click. `void` makes that unrepresentable rather than merely documented.
+   */
+  onOpen?: (target: { agentId: string; projectId: string }) => void;
+}) {
+  const { agents, onOpenAgent: contextOpen, onSeeHistory } = useContext(AgentPillContext);
+  // Is there ANY route out of this pill? Either opener will do — a supplied `onOpen` is itself proof
+  // the surface is wired. The two are deliberately NOT merged into one callable: they have different
+  // return contracts (see `onOpen` above), and collapsing them is what would let a caller-owned
+  // reveal's outcome be read as a context reveal's.
+  const canOpen = onOpen !== undefined || contextOpen !== undefined;
   // TWO SEPARATE STATES, because they mean different things and one counter could not.
   //
   // `misses` — consecutive FAILED REVEALS on a resolved pill. A count rather than a boolean because
@@ -278,7 +313,7 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
   // EVERY pill fell through to "…is closed" — a false claim about a perfectly live agent, on the
   // only path that actually reaches a reader. The earlier fix guarded the mirror-image
   // configuration (a roster with no opener), which no production surface constructs (roborev 55590).
-  if (!onOpenAgent) {
+  if (!canOpen) {
     return (
       <span
         data-testid="concierge-agent-pill-unwired"
@@ -337,7 +372,23 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
   // between the render that drew this pill and the click that lands on it, and both early exits on
   // the reveal path are silent.
   const target = { agentId: agent.id, projectId: agent.projectId };
-  const showClosed = misses > 0;
+  // A CALLER-OWNED REVEAL REPORTS ITS OWN OUTCOME, so this pill must not also mount a live region.
+  //
+  // `LiveNotice` is deliberately always mounted (a `role="status"` created with its text already
+  // inside it is commonly not announced — see its docstring). That is right for a pill inside a
+  // REPLY, which appears once and stays. It is wrong for a pill on a surface that is permanently on
+  // screen: the concierge column owns exactly ONE announcer, and a nudge card is derived from the
+  // feed and drawn for as long as its agent is red — so a card carrying this region put a second,
+  // competing polite region in the column, which is precisely what
+  // `ConciergeThread.roleLabels` ("adds no live region of its own") exists to forbid. With several
+  // cards up it was several.
+  //
+  // `onOpen` is the exact signal: a caller that supplies its own reveal has taken responsibility for
+  // saying whether it landed (`ConciergeHost.revealAgent` reports through the column's announcer),
+  // so there is nothing left here to announce and the miss/retry state is unreachable by
+  // construction. The pill degrades to what it is on that path — a button that opens an agent.
+  const ownsOutcome = onOpen !== undefined;
+  const showClosed = !ownsOutcome && misses > 0;
   return (
     <span style={{ display: "inline" }}>
       <button
@@ -349,7 +400,10 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
         // collapses the notice, so advertising it as expandable would promise assistive tech a
         // control that cannot be un-expanded (roborev 55590). `aria-controls` still holds — it does
         // own that region — and the known-closed pill above, which IS a toggle, keeps both.
-        aria-controls={noticeId}
+        // OMITTED ENTIRELY when the caller owns the outcome: the region is not rendered in that
+        // case, and `aria-controls` pointing at an id that is not in the document is a dangling
+        // reference assistive tech reports as a broken relationship rather than ignoring.
+        {...(ownsOutcome ? {} : { "aria-controls": noticeId })}
         // The bare live name is what the pill SHOWS, even when two agents share it — the id already
         // decides where the click lands, so the disambiguating "(project)" suffix `mentionRoster`
         // adds for the composer would only be chrome here. The project belongs in the tooltip, where
@@ -375,7 +429,14 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
         // and a version of this handler shipped with the call inline in the updater (roborev 55618).
         // The updater below is pure: it only folds an already-decided outcome.
         onClick={() => {
-          const landed = onOpenAgent(target);
+          // The caller-owned path reports its own outcome, so there is nothing to fold here — and
+          // nothing that could be folded, since it returns void. The context path keeps the miss
+          // ladder it was built for.
+          if (onOpen) {
+            onOpen(target);
+            return;
+          }
+          const landed = contextOpen!(target);
           setMisses((n) => (landed ? 0 : n + 1));
         }}
         style={
@@ -398,9 +459,11 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
       >
         {!showClosed && <span style={dot(agent.band)} aria-hidden />}@{agent.name}
       </button>
-      <LiveNotice id={noticeId} open={showClosed} contentKey={misses} action={historyAction}>
-        {missSentence(misses, name)}
-      </LiveNotice>
+      {!ownsOutcome && (
+        <LiveNotice id={noticeId} open={showClosed} contentKey={misses} action={historyAction}>
+          {missSentence(misses, name)}
+        </LiveNotice>
+      )}
     </span>
   );
 }

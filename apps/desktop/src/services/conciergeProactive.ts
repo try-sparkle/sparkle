@@ -110,15 +110,25 @@ function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
 
 /**
  * The surfacing gate — in scope (per the pin), not muted, not already spoken for by an ancestor's
- * row, and in the `needs_you` band.
+ * row, not merely RELAYING someone else's red while working, and in the `needs_you` band.
  *
  * THE SAME POPULATION `ConciergeHost.accountedAgents` renders, and the host now delegates here so
  * there is exactly one implementation. Two copies would drift, and the drift would be visible: the
  * brain would announce a count the column does not show.
+ *
+ * `redIsInherited` is the newest term and the one worth naming, because it also governs what the
+ * PUSH says out loud. The channel exists to speak first, unprompted — so a sentence naming a busy
+ * orchestrator as the thing that needs him is the most expensive kind of wrong this app can be: it
+ * interrupts, it is checkable in one click, and it is false. See `ConciergeAgent.redIsInherited`.
  */
 export function accountedNeedsYou(feed: ConciergeFeed): ConciergeAgent[] {
   return allAgents(feed).filter(
-    (a) => a.inScope && !a.muted && !a.representedElsewhere && a.band === "needs_you",
+    (a) =>
+      a.inScope &&
+      !a.muted &&
+      !a.representedElsewhere &&
+      !a.redIsInherited &&
+      a.band === "needs_you",
   );
 }
 

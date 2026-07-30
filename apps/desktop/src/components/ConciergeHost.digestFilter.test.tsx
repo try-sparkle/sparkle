@@ -106,6 +106,7 @@ import { publishedStatusFor } from "../useAttentionNotifications";
 import { resolveStage } from "../engine/workflowStage";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -362,9 +363,11 @@ describe("the stated count equals the rows the click leaves standing", () => {
     render(<ConciergeHost feed={feedFrom([p], status)} />);
     expect(screen.queryByText(/2 Need you in web/)).toBeNull();
     expect(promises()).toEqual([]);
-    // Not silence, and not a promise either: two cards, each with its own "Show me".
+    // Not silence, and not a promise either: two cards, each naming (and navigating to) its own
+    // agent. That affordance used to be a "Show me" button; since the one-line rewrite it is the
+    // card's `AgentPill`, so the count is of CARDS.
     expect(screen.queryByTestId("concierge-rowless-digest")).toBeNull();
-    expect(screen.queryAllByText(/ — .+ in .+\.$/)).toHaveLength(2);
+    expect(screen.queryAllByTestId(NUDGE_CARD_TESTID)).toHaveLength(2);
   });
 
   // The partial version, which is the one that actually happens: a red worker paints its
@@ -459,9 +462,14 @@ describe("the stated count equals the rows the click leaves standing", () => {
 // the population that owes rows.
 // ─────────────────────────────────────────────────────────────────────────────
 describe("rowless agents digest like everything else", () => {
-  /** The nudge cards on screen, by the agent each names ("<statusLabel> — <name> in <project>."). */
+  /** The nudge cards on screen, by the agent each names — read off the card's `AgentPill`, which is
+   *  both the name on screen and the thing the reader clicks. It used to be matched out of the
+   *  card's prose sentence; that sentence is gone with the one-line rewrite (Concierge/NudgeCard). */
   const cardNames = () =>
-    screen.queryAllByText(/ — .+ in .+\.$/).map((el) => /— (.+) in /.exec(el.textContent!)![1]!);
+    screen
+      .queryAllByTestId(NUDGE_CARD_TESTID)
+      .map((el) => el.querySelector('[data-testid^="concierge-agent-pill"]')?.textContent ?? "")
+      .map((t) => t.replace(/^@/, ""));
 
   /** Four blocked workers under an orchestrator that is still moving — gap 3, once per worker. This
    *  is the shape that produced four cards. */

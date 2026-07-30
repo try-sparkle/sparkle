@@ -20,6 +20,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import type { ConciergeMessage } from "./types";
+import { NUDGE_CARD_TESTID } from "./NudgeCard";
 
 afterEach(() => cleanup());
 
@@ -133,7 +134,9 @@ describe("the thread prints no authorship captions", () => {
     // …and the messages themselves are still all there, so the assertions above are not vacuous.
     expect(screen.getByText("Two agents are waiting on you.")).toBeTruthy();
     expect(screen.getByText("Approve the first one.")).toBeTruthy();
-    expect(screen.getByText("A build warning needs your call.")).toBeTruthy();
+    // The nudge is present as its one LINE. Its `text` is not drawn any more — see
+    // Concierge/NudgeCard — so the card is identified the way every other suite identifies it.
+    expect(screen.getByTestId(NUDGE_CARD_TESTID)).toBeTruthy();
   });
 
   it("really did render every branch the no-caption assertions sweep", () => {

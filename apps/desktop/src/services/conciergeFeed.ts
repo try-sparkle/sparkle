@@ -118,11 +118,58 @@ export interface ConciergeAgent {
    *  Mute and scope are deliberately NOT consulted: they are applied to the agent itself, and a
    *  user who muted an orchestrator muted its build, workers included. */
   representedElsewhere: boolean;
+  /** WHO speaks for it — the ancestor {@link representedElsewhere} found, or null when nobody does.
+   *
+   *  The same fact as the boolean, kept as an ID because a boolean cannot answer the question a
+   *  surface acting on a rollup card has to ask: WHICH agents is this card standing in for?
+   *
+   *  The concrete failure (roborev 55986). The nudge card's new [x] dismisses the agent the card
+   *  names. On the rollup shape — an idle orchestrator carrying a red worker's band, which this
+   *  design deliberately keeps — the card names the ORCHESTRATOR. Dismissing only that
+   *  de-escalates its red, which makes the worker un-represented, so the very next tick raises a
+   *  new, near-identical card naming the worker. The reader who reflexively acknowledged one alarm
+   *  gets it straight back under a different name, once per red descendant. Acknowledging a rollup
+   *  has to acknowledge what was rolled up, and this is the field that makes that reachable without
+   *  the consumer re-deriving the parent walk. */
+  representedBy: string | null;
   /** This agent reads `working` only because its WORKERS do — engine/workerRollup promoted it in
    *  publishedStatusFor. Consumers that diff status over time must not read the promotion as the
    *  head starting and finishing work of its own: the away-recap did exactly that and reported one
    *  unit of work twice, as the worker AND the orchestrator standing in for it. */
   rolledUpGreen: boolean;
+  /** The MIRROR IMAGE of {@link rolledUpGreen}: this agent reads RED only because a worker under it
+   *  does, while it is itself `working`. The band is real — the row must go red so the subtree is
+   *  findable — but this agent is a ROUTING HOP, not the subject of the alert.
+   *
+   *  WHY IT EXISTS (founder, 2026-07-30, with screenshots). The column showed
+   *  "Needs you — Cockpit Column Resize" while that agent was seven commits ahead and mid-rebase.
+   *  `engine/workerAttention.withRedWorkerAttention` bubbles a worker's ASK unconditionally — in
+   *  motion or not, which is right, a busy sibling must not hide a question — and the write lands on
+   *  any parent that is not itself asking, `working` included. `representedElsewhere` then saw the
+   *  worker's band matched by its ancestor and suppressed the worker's own card. Net effect: the one
+   *  card on screen named the one agent in the pair that did NOT need him, and the one that did was
+   *  silent. His verdict is the reason this is a defect rather than a nuance: "a stale alert that
+   *  says BLOCKED about a working agent is worse than no alert, because it trains him to ignore the
+   *  real ones."
+   *
+   *  READ OFF THE PRE-BUBBLE STATUS, not off a second rollup pass. `own` (the same chain minus the
+   *  worker bubbles) and the raw merged map cannot disagree about the value `working`: of the three
+   *  overlays between them, `withNewAgentCalm` maps errored/idle → `new`, `withUnmergedWork` maps
+   *  done/stopped → `unmerged`, and `withDismissedAlerts` de-escalates a red → `idle`. None produces
+   *  `working`, and none consumes it. So this is exact, and it costs no extra composeRollup.
+   *
+   *  ONLY `working` COUNTS, and the narrowness is the point. An IDLE orchestrator with a red worker
+   *  is not a routing hop — it is resting, so its row is a fair place to knock, and that rollup is
+   *  what the head's row is FOR. What disqualifies an agent from being the subject of an alert is
+   *  that it is visibly, currently producing output: the exact thing the founder saw when he clicked
+   *  through and the exact thing that makes the sentence false.
+   *
+   *  CONSEQUENCE, chosen rather than inherited: a hop's red descendants surface under the ORDINARY
+   *  in-scope/mute gates, so a hop whose only red descendant is muted or out of the pin's scope goes
+   *  quiet instead of relaying. That is the correct direction — the alternative is telling the
+   *  founder that a working agent needs him on behalf of a worker he asked not to be interrupted
+   *  about — and it is pinned by a test rather than left to be rediscovered. */
+  redIsInherited: boolean;
 }
 
 /** How many agents sit in each band. Every band is counted — a surface that only cares about
@@ -353,29 +400,43 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
   // over this same flattened list, put its red).
   const bandById = new Map<string, StatusBand>();
   const parentById = new Map<string, string | null>();
+  /** The routing hops — see `ConciergeAgent.redIsInherited`. Collected in the same pass that bands
+   *  the fleet, because `isRepresented` below has to consult it: an ancestor that is only RELAYING a
+   *  red does not speak for the worker that owns it, and treating it as though it did is what left
+   *  the owner with no surface of its own. */
+  const inheritedRed = new Set<string>();
   for (const a of allAgents) {
-    bandById.set(a.id, conciergeBand(derived[a.id] ?? DEFAULT_STATUS));
+    const band = conciergeBand(derived[a.id] ?? DEFAULT_STATUS);
+    bandById.set(a.id, band);
     parentById.set(a.id, a.parentId);
+    if (band === "needs_you" && mergedStatus[a.id] === "working") inheritedRed.add(a.id);
   }
 
-  /** Does a present ancestor already carry this agent's band? See `ConciergeAgent.representedElsewhere`.
+  /** WHICH present ancestor already carries this agent's band, or null. See
+   *  `ConciergeAgent.representedElsewhere` for the rule, and `representedBy` for why the ANSWER is an
+   *  id rather than a boolean: a surface that acts on a rollup card has to be able to reach the
+   *  agents that card is standing in for.
    *
    *  Walks the chain rather than checking only the parent so a deeper nesting can't silently open the
    *  same hole, and carries a `seen` set because `parentId` is persisted data — a cycle in it must
    *  not hang the feed. An ABSENT ancestor ends the walk with `false`: a bubble aimed at an agent
    *  that is not in the fleet lands nowhere, which is the very case this exists to catch. */
-  const isRepresented = (agent: { id: string; parentId: string | null }): boolean => {
+  const representedBy = (agent: { id: string; parentId: string | null }): string | null => {
     const band = bandById.get(agent.id);
     const seen = new Set<string>([agent.id]);
     let pid = agent.parentId;
     while (pid !== null && !seen.has(pid)) {
       seen.add(pid);
       const parentBand = bandById.get(pid);
-      if (parentBand === undefined) return false; // parent not in the fleet — nothing speaks for it
-      if (parentBand === band) return true;
+      if (parentBand === undefined) return null; // parent not in the fleet — nothing speaks for it
+      // A HOP DOES NOT REPRESENT. Its band matches only because this agent's own red was bubbled
+      // ONTO it while it was working, so counting it as "already spoken for" hands the alert to an
+      // ancestor that is busy and silences the agent that owns it. Keep walking: a further ancestor
+      // that is genuinely resting in this band still speaks for it.
+      if (parentBand === band && !inheritedRed.has(pid)) return pid;
       pid = parentById.get(pid) ?? null;
     }
-    return false;
+    return null;
   };
 
   const counts = emptyCounts();
@@ -411,7 +472,9 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       // A rowless agent an ancestor already speaks for. See `representedElsewhere` — this is what
       // stops one piece of work being counted twice (the red worker AND the orchestrator that
       // inherited its red), which is what made the vitals line and the thread disagree.
-      const representedElsewhere = !topLevel && isRepresented(a);
+      const speaker = topLevel ? null : representedBy(a);
+      const representedElsewhere = speaker !== null;
+      const redIsInherited = inheritedRed.has(a.id);
       projectCounts[band]++;
       // The scoped view applies the SAME gates to every band (in scope per the pin, not muted, not
       // already spoken for), so "3 Running" shrinks when you pin exactly the way "3 Need you" does.
@@ -421,7 +484,13 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
       // three gates — so the vitals number and the items the thread accounts for are one population
       // by construction, not two computations that happen to agree. `counts` above stays the raw
       // truth (every agent, once per agent), which is what the per-project tab badges read.
-      if (inScope && !muted && !representedElsewhere) {
+      // `redIsInherited` joins the gate for the same reason `representedElsewhere` is in it: both
+      // mark an agent that is NOT the one this piece of work belongs to, and counting either would
+      // state a number the thread does not show items for. The two are exact complements here — a
+      // hop is excluded, and the descendant it was standing in for stops being represented and is
+      // counted in its place — so the total is unchanged and the vitals line still equals what
+      // column one accounts for.
+      if (inScope && !muted && !representedElsewhere && !redIsInherited) {
         scopedCounts[band]++;
         projectScoped[band]++;
       }
@@ -430,6 +499,8 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         name: displayName(a),
         // This row is `working` only because its workers are. See ConciergeAgent.rolledUpGreen.
         rolledUpGreen: rolledUpGreen.has(a.id),
+        // …and this row is RED only because a worker is, while it works on. See redIsInherited.
+        redIsInherited,
         projectId: p.id,
         projectName: p.name,
         kind: a.kind,
@@ -443,6 +514,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         topLevel,
         parentRowId,
         representedElsewhere,
+        representedBy: speaker,
       };
     });
     agents.sort(compareAgents);

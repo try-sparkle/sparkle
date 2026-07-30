@@ -80,6 +80,7 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 import { ConciergeHost } from "./ConciergeHost";
 import { useUiStore } from "../stores/uiStore";
 import { buildConciergeFeed } from "../services/conciergeFeed";
+import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 import { bandCountLabel } from "../engine/statusBandLabels";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
@@ -127,12 +128,19 @@ const openIds = (projects: Project[]) => projects.flatMap((p) => p.agents.map((a
 const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =>
   buildConciergeFeed({ projects, status, openAgentIds: openIds(projects) });
 
-/** The nudge cards on screen, by the agent name each one names. NudgeCard renders
- *  "<statusLabel> — <name> in <project>." — see ConciergeHost.agentToNudge. */
+/** The nudge cards on screen, by the agent name each one names.
+ *
+ *  READ OFF THE PILL, not off the card's sentence. The card used to render
+ *  "<statusLabel> — <name> in <project>." and this matched that prose with a regex; since the
+ *  one-line rewrite (founder, 2026-07-30) the name is an `AgentPill`, which is also the thing the
+ *  reader actually clicks. Taking the name from the pill keeps these cases asserting what is on
+ *  screen rather than an internal id, and it fails loudly if the pill ever stops resolving — which
+ *  would leave every card in this suite naming an agent the click cannot reach. */
 const cardNames = (): string[] =>
   screen
-    .queryAllByText(/ — .+ in .+\.$/)
-    .map((el) => /— (.+) in /.exec(el.textContent!)![1]!);
+    .queryAllByTestId(NUDGE_CARD_TESTID)
+    .map((el) => el.querySelector('[data-testid^="concierge-agent-pill"]')?.textContent ?? "")
+    .map((t) => t.replace(/^@/, ""));
 
 /** Every item column one accounts for: the cards, plus each digest line's stated count — BOTH
  *  variants of line, since a rowless line stands for its agents just as a row-promising one does.
@@ -340,7 +348,9 @@ describe("no red agent falls through the floor", () => {
     render(<ConciergeHost feed={feed} />);
     // A singleton, so it is a card rather than a line — that is the point of this case.
     expect(cardNames()).toEqual(["w1"]);
-    fireEvent.click(screen.getByText(/ — w1 in web\.$/));
+    // The CARD, not a phrase inside it. This used to click the card's prose sentence, which the
+    // one-line rewrite removed; clicking the card element is what the case is named for anyway.
+    fireEvent.click(screen.getByTestId(NUDGE_CARD_TESTID));
 
     expect(useUiStore.getState().isOrchestratorCollapsed("orch")).toBe(false);
     expect(useUiStore.getState().statusFilter.running).toBe(true);

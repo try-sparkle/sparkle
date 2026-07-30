@@ -228,6 +228,7 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import { log } from "../logger";
 import type { Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -374,7 +375,10 @@ describe("ConciergeHost", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     expect(screen.getAllByText(/CI Hardening/).length).toBeGreaterThan(0);
     expect(inThread("Approve")).toBeTruthy();
-    expect(inThread("Show me")).toBeTruthy();
+    // NO "Show me" any more — the card names the agent as a clickable `AgentPill`, and a button
+    // that navigates to the same place is the same affordance twice (founder, 2026-07-30). The
+    // pill's own reveal is asserted below.
+    expect(queryInThread("Show me")).toBeNull();
   });
 
   it("Approve relays the answer into the agent's terminal", async () => {
@@ -415,10 +419,13 @@ describe("ConciergeHost", () => {
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
   });
 
-  it("Show me opens the source project's TAB and selects the agent", () => {
+  it("the agent PILL opens the source project's TAB and selects the agent", () => {
+    // What "Show me" used to do, now carried by the thing that names the agent. Routed through the
+    // card's own reveal rather than the pill context's plainer opener, because this card usually
+    // names a WORKER and a worker's row has to be un-hidden before the reader can see it.
     h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(inThread("Show me"));
+    fireEvent.click(within(thread()).getByTestId("concierge-agent-pill"));
     expect(h.openProjectTab).toHaveBeenCalledWith("p1", "ag1");
   });
 
@@ -427,22 +434,27 @@ describe("ConciergeHost", () => {
     // Surfacing the `done` band is 27 nudge cards nobody can dismiss.
     h.feed = feedWith("unmerged", "done");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    expect(screen.queryByText("Show me")).toBeNull();
-    expect(screen.queryByText("Mute")).toBeNull();
+    expect(screen.queryByTestId(NUDGE_CARD_TESTID)).toBeNull();
   });
 
   it("surfaces `blocked` — it bands Needs-you now, with the same red as an approval", () => {
     h.feed = feedWith("blocked");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    // One band label on the card, not a "P1" badge in a second alarm color.
-    expect(screen.getAllByText("Needs you").length).toBeGreaterThan(0);
+    // ONE red treatment, stated once — the card's lead word — and never a "P1" badge in a second
+    // alarm color. (`blocked` used to render its own amber tier; that tier is gone.)
+    expect(within(thread()).getByTestId(NUDGE_CARD_TESTID)).toBeTruthy();
+    expect(inThread("BLOCKED:")).toBeTruthy();
     expect(screen.queryByText("P1")).toBeNull();
   });
 
   it("Mute records a do-not-interrupt preference for the agent", () => {
     h.feed = feedWith("blocked");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.click(inThread("Mute"));
+    // Mute is an icon control on the card's one line now rather than a labelled button, and it is
+    // ALWAYS rendered (painted on hover) precisely so it stays reachable like this — by its
+    // accessible name, without a pointer. Dropping it would have deleted the do-not-interrupt
+    // feature outright: this is its only call site in the app.
+    fireEvent.click(within(thread()).getByLabelText("Mute alerts about CI Hardening"));
     expect(h.setInterruptPreference).toHaveBeenCalledWith("ag1", "mute");
   });
 

@@ -378,3 +378,25 @@ body {
   opacity: 0.5;
   cursor: default;
 }
+
+/* The nudge card's QUIET control (Mute). It is always in the DOM — tab-reachable, and read out by a
+   screen reader — and only its paint waits for hover or keyboard focus, so the card at rest is the
+   one line the founder specified while nothing was actually removed from the app.
+
+   Here rather than in the component for the reason the settings links above are: `NudgeCard` styles
+   inline, and an inline style cannot express `:hover` or `:focus-within`. Hover alone would not do:
+   a keyboard user never produces one, so the control would be focusable and invisible — worse than
+   either extreme. Both selectors, or neither.
+
+   `:focus-visible` on the control itself is the third case and is NOT redundant with the
+   `:focus-within` on the card: the two coincide today, but a future control outside this card's
+   subtree would lose its reveal, and a focus ring on a transparent button is a ring around nothing. */
+.nudge-card-quiet {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.nudge-card:hover .nudge-card-quiet,
+.nudge-card:focus-within .nudge-card-quiet,
+.nudge-card-quiet:focus-visible {
+  opacity: 1;
+}

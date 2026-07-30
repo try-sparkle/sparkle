@@ -18,6 +18,7 @@ import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import type { ConciergeController, ConciergeNudge, ConciergeViewModel } from "./types";
 import { enableAiEnhancementsForTests } from "../../testing/aiEnhancements";
+import { NUDGE_CARD_TESTID } from "./NudgeCard";
 
 // PRECONDITION, stated rather than inherited: every assertion below is about the column's PAID
 // half — the thread and the compose box — which the column replaces with an upsell whenever the AI
@@ -34,7 +35,11 @@ const nudge: ConciergeNudge = {
   projectName: "drodio-website",
   agentName: "OG Image Pipeline",
   text: "A build warning needs your call.",
-  actions: [{ id: "show", label: "Show me", kind: "primary" }],
+  // Approve is the ONE labelled action a card still carries. "Show me" and "Mute" left this list
+  // when the card became a single line: the agent's name is now a clickable `AgentPill` (so a
+  // navigating button beside it was the same affordance twice) and Mute became an icon control
+  // alongside the new [x]. See Concierge/NudgeCard and ConciergeHost.actionsFor.
+  actions: [{ id: "approve", label: "Approve", kind: "primary" }],
 };
 
 const model: ConciergeViewModel = {
@@ -75,7 +80,12 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();
     expect(screen.getByText("Thanks, keep me posted.")).toBeTruthy();
     expect(screen.getByText("All projects calm · nothing needs you")).toBeTruthy();
-    expect(screen.getByText("A build warning needs your call.")).toBeTruthy();
+    // THE NUDGE, by its one line — a lead word, the agent as a pill, the project. Its `text` is
+    // deliberately NOT on screen: the card used to repeat the whole alert as prose under itself,
+    // which is the duplication the one-line rewrite removed (founder, 2026-07-30).
+    expect(screen.getByTestId(NUDGE_CARD_TESTID)).toBeTruthy();
+    expect(screen.getByText("in drodio-website")).toBeTruthy();
+    expect(screen.queryByText("A build warning needs your call.")).toBeNull();
     // No authorship labels anywhere — alignment carries who's talking.
     expect(screen.queryByText("You")).toBeNull();
   });
@@ -83,11 +93,14 @@ describe("ConciergeColumn — view-model → rendered output", () => {
   it("nudge gestures route through the controller from inside the thread", () => {
     const c = controller();
     render(<ConciergeColumn model={model} controller={c} />);
-    fireEvent.click(screen.getByText("A build warning needs your call."));
+    fireEvent.click(screen.getByTestId(NUDGE_CARD_TESTID));
     expect(c.onNudgeClick).toHaveBeenCalledWith(nudge);
-    fireEvent.click(screen.getByText("Show me"));
-    expect(c.onNudgeAction).toHaveBeenCalledWith(nudge, "show");
-    expect(c.onNudgeClick).toHaveBeenCalledTimes(1); // the action did not double as a card click
+    fireEvent.click(screen.getByText("Approve"));
+    expect(c.onNudgeAction).toHaveBeenCalledWith(nudge, "approve");
+    // …and so does the [x], which is a control on the card rather than one of its actions.
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+    expect(c.onNudgeAction).toHaveBeenCalledWith(nudge, "dismiss");
+    expect(c.onNudgeClick).toHaveBeenCalledTimes(1); // no action doubled as a card click
   });
 
   it("composing routes onSend through the controller", () => {
