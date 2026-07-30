@@ -50,6 +50,7 @@ const defaultSpawnImpl = async (args: {
   parentAgentId: string;
   task: string;
   beadId?: string;
+  goal?: string;
 }) => {
   const id = useProjectStore.getState().addAgent(args.projectId, {
     kind: "worker",
@@ -60,6 +61,10 @@ const defaultSpawnImpl = async (args: {
     // which would have hidden the whole bead-claim guard from these tests.
     beadId: args.beadId,
   })!;
+  // The real spawnWorker also persists the GOAL at creation (workerSpawn.ts). Mirrored here for the
+  // same reason as beadId above: a mock that drops a field the real one records would leave every
+  // suite green while no worker's objective is ever persisted (roborev 55743).
+  if (args.goal) useProjectStore.getState().setAgentGoal(args.projectId, id, args.goal);
   const branch = `sparkle/agent-${id}`;
   const worktree = `/wt/${id}`;
   useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
@@ -141,6 +146,48 @@ describe("orchestrationListener", () => {
     expect(result.workerId).toBeTruthy();
     expect(result.branch).toMatch(/^sparkle\/agent-/);
     expect(result.worktree).toMatch(/^\/wt\//);
+  });
+
+  // The bridge→spawnWorker hop was the last untested link in the goal chain: goalGate covers the
+  // rules, tools.test the wire payload, bridge.rs the forwarded set, workerSpawn the persistence —
+  // and deleting `goal: req.payload.goal` here left every one of them green (roborev 55743).
+  it("spawn_worker carries the payload's goal through to the worker record", async () => {
+    const goal = "nested groups parse and parser.test.ts passes";
+    fire({
+      reqId: "goal1",
+      op: "spawn_worker",
+      buildAgentId: buildId,
+      projectId,
+      payload: { task: "refactor the parser", goal },
+    });
+    await flush();
+    // The SIDE EFFECT: the objective is on the record, so something other than the worker can check
+    // whether it finished. Asserting the call args instead would pass even if the hop dropped it.
+    const worker = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.parentId === buildId)!;
+    expect(worker.goal?.text).toBe(goal);
+    expect(worker.goal?.metAt).toBeUndefined();
+  });
+
+  it("spawn_worker under an override leaves the worker goalless rather than inventing a goal", async () => {
+    // An override means there is NO criterion. Synthesizing one from its reason would make an
+    // unverifiable worker look verifiable — and goallessness is what the unlanded-work surface keys
+    // on to find these, so it has to stay observable.
+    fire({
+      reqId: "goal2",
+      op: "spawn_worker",
+      buildAgentId: buildId,
+      projectId,
+      payload: { task: "spike the crash", goalOverrideReason: "no completion criterion exists yet" },
+    });
+    await flush();
+    const worker = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.parentId === buildId)!;
+    expect(worker.goal).toBeUndefined();
   });
 
   it("spawn_worker reply uses spawnWorker's authoritative identity, not a racy store re-read (sparkle-yk3x)", async () => {

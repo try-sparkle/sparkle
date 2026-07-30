@@ -608,6 +608,48 @@ fn wait_pending(
     }
 }
 
+/// The DATA payload a frontend round-trip op forwards, or the client-facing error naming the missing
+/// required field. Pure — no app handle, no socket, no clock — so the exact set of forwarded fields
+/// is directly assertable. It is a separate fn precisely because the payload is the only channel
+/// carrying a worker's goal to the side that persists it, and a field silently missing from here is
+/// invisible at every other layer (the old inline version dropped everything it did not name).
+fn frontend_op_payload(op: &str, req: &Value) -> Result<Value, &'static str> {
+    // A stated field that is blank or whitespace-only is treated as ABSENT rather than forwarded.
+    // Downstream, an empty goal is fully live — agentGoal.newGoal throws on it — so forwarding `""`
+    // would turn a caller's blank into a hard error far from its cause.
+    let non_blank = |key: &str| {
+        req.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match op {
+        "spawn_worker" => {
+            let task = non_blank("task").ok_or("missing task")?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("task".to_string(), json!(task));
+            // Identity fields stay bridge-injected; everything below is data the caller stated.
+            //
+            // `goal` is the objectively verifiable completion criterion; `goalOverrideReason` is the
+            // recorded absence of one. Their RULES live in mcp-orchestrator/src/goalGate.ts and are
+            // deliberately NOT re-implemented here: two copies of that predicate in two languages
+            // would drift, and the orchestrator tool is the sanctioned path. This layer forwards.
+            for key in ["beadId", "goal", "goalOverrideReason"] {
+                if let Some(v) = non_blank(key) {
+                    payload.insert(key.to_string(), json!(v));
+                }
+            }
+            Ok(Value::Object(payload))
+        }
+        "spin_down" => {
+            let worker_id = non_blank("workerId").ok_or("missing workerId")?;
+            Ok(json!({ "workerId": worker_id }))
+        }
+        _ => Ok(json!({})), // list_workers needs no payload
+    }
+}
+
 /// Handle a frontend round-trip op: register a fresh reqId BEFORE emitting (so a fast frontend
 /// reply can't race ahead of registration), emit the Tauri event with the AUTHORITATIVE identity
 /// from this socket's build-agent handle, then await the reply. The caller's message never carries
@@ -623,27 +665,9 @@ fn handle_frontend_op(
 ) -> String {
     // Validate required fields BEFORE the app handle check so a malformed request fails fast
     // (no 600s hang) regardless of whether a Tauri app is present.
-    let payload = match op {
-        "spawn_worker" => {
-            let task = req.get("task").and_then(|t| t.as_str()).unwrap_or("");
-            if task.is_empty() {
-                return json!({ "id": id, "ok": false, "error": "missing task" }).to_string();
-            }
-            // Forward an optional beadId so the frontend can link the worker to the bead it
-            // implements (Think→Plan→Build). Identity fields stay bridge-injected; this is data.
-            match req.get("beadId").and_then(|b| b.as_str()) {
-                Some(bead_id) => json!({ "task": task, "beadId": bead_id }),
-                None => json!({ "task": task }),
-            }
-        }
-        "spin_down" => {
-            let worker_id = req.get("workerId").and_then(|w| w.as_str()).unwrap_or("");
-            if worker_id.is_empty() {
-                return json!({ "id": id, "ok": false, "error": "missing workerId" }).to_string();
-            }
-            json!({ "workerId": worker_id })
-        }
-        _ => json!({}), // list_workers needs no payload
+    let payload = match frontend_op_payload(op, req) {
+        Ok(p) => p,
+        Err(e) => return json!({ "id": id, "ok": false, "error": e }).to_string(),
     };
     let app = match app {
         Some(a) => a,
@@ -1714,6 +1738,53 @@ mod tests {
         assert_eq!(v3["error"], "missing workerId");
         // No pending entries were registered (no hanging round-trips started)
         assert!(pending.lock().unwrap().is_empty(), "no pending entries from validation failures");
+    }
+
+    /// The ONE property: a spawn's stated GOAL survives the bridge and reaches the side that
+    /// persists it. The payload used to be a fixed two-arm `json!` that named only `task`/`beadId`,
+    /// so a goal validated by the orchestrator's gate was dropped here and never became an
+    /// AgentGoal — a gate whose result never lands is decorative. This asserts the forwarded SET,
+    /// not merely that the call succeeded, so a field quietly falling out fails here.
+    #[test]
+    fn spawn_worker_payload_forwards_the_goal_and_the_override_reason() {
+        let req = serde_json::json!({
+            "op": "spawn_worker",
+            "task": "refactor the parser",
+            "goal": "nested groups parse and parser.test.ts passes",
+            "beadId": ".1",
+        });
+        let p = frontend_op_payload("spawn_worker", &req).expect("valid spawn");
+        assert_eq!(
+            p,
+            serde_json::json!({
+                "task": "refactor the parser",
+                "beadId": ".1",
+                "goal": "nested groups parse and parser.test.ts passes",
+            }),
+            "task, beadId and goal must all reach the frontend"
+        );
+
+        // The recorded-absence path carries its reason instead of a goal.
+        let ovr = serde_json::json!({
+            "task": "spike the crash",
+            "goalOverrideReason": "no completion criterion exists yet",
+        });
+        let p2 = frontend_op_payload("spawn_worker", &ovr).expect("valid spawn");
+        assert_eq!(p2["goalOverrideReason"], "no completion criterion exists yet");
+        assert!(p2.get("goal").is_none(), "no goal key when none was stated");
+    }
+
+    /// A blank stated field is ABSENT, not forwarded: `agentGoal.newGoal` throws on empty text, so
+    /// forwarding `""` would turn a caller's blank into a hard error far from its cause. Also pins
+    /// that a whitespace-only `task` is still "missing task" rather than a spawn with a blank task.
+    #[test]
+    fn spawn_worker_payload_treats_blank_fields_as_absent() {
+        let req = serde_json::json!({ "task": "do it", "goal": "   ", "beadId": "" });
+        let p = frontend_op_payload("spawn_worker", &req).expect("valid spawn");
+        assert_eq!(p, serde_json::json!({ "task": "do it" }), "blank goal/beadId must not be forwarded");
+
+        assert_eq!(frontend_op_payload("spawn_worker", &serde_json::json!({ "task": "  \t " })), Err("missing task"));
+        assert_eq!(frontend_op_payload("spin_down", &serde_json::json!({ "workerId": " " })), Err("missing workerId"));
     }
 
     #[test]

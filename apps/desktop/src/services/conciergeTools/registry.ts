@@ -227,6 +227,9 @@ import {
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
+// The SAME predicate spawn_worker gates on — one copy, shared, so the two dispatch surfaces cannot
+// drift into enforcing different definitions of "a goal".
+import { validateWorkerGoal } from "@sparkle/core";
 import { log } from "../../logger";
 import {
   FLEET_OPS,
@@ -768,11 +771,46 @@ const readTerminalArgs = z
   })
   .strict();
 
+/**
+ * ── EVERY SEND STATES A GOAL, OR DECLARES ITSELF NOT WORK ─────────────────────────────────────────
+ * `goal` is OPTIONAL AT THE SCHEMA and REQUIRED BY THE GATE — see goalGate's header for why the
+ * schema cannot be the enforcer. The failure this closes is not a bad goal; it is a FORGOTTEN one. `set_agent_goal` already existed as a separate
+ * call and was routinely skipped: a real message sent on 2026-07-30 assigned an agent multi-part work
+ * in prose and left its `AgentGoal` empty, so `goalStateOf` read `none`, auto-continue stayed
+ * disabled, and nothing could tell that agent apart from one that had merely stopped. Making the goal
+ * part of THIS call is the fix — stating it is no longer a second thing to remember.
+ *
+ * `notWork` is the escape hatch for the sends that genuinely carry no objective (answering a
+ * question, a nudge, asking something). It must carry a reason so the choice is RECORDED rather than
+ * inferred: nothing here guesses intent from the message text, because a model that can label its own
+ * intent can mislabel work as chatter.
+ *
+ * The RULES live in `@sparkle/core`'s `validateWorkerGoal` — the same predicate `spawn_worker` uses.
+ * Deliberately not re-stated here: two copies would drift, and this is a second SURFACE, not a second
+ * policy.
+ */
 const sendTerminalArgs = z
   .object({
     agentId: agentIdArg,
     text: z.string().min(1, "there is nothing to send"),
     userPrompt: z.boolean().optional(),
+    // Optional at the schema, required by the gate — same reasoning as spawn_worker's `goal`
+    // (roborev 55743): a required key made the documented `notWork` form fail zod before the handler
+    // ran, so the caller got "goal: Required" instead of the message that teaches what a goal is.
+    goal: z
+      .string()
+      .optional()
+      .describe(
+        "REQUIRED unless you pass notWork. The objectively verifiable completion criterion this " +
+          "send advances — what will be TRUE when it is met, checkable by someone else.",
+      ),
+    notWork: z
+      .object({ reason: z.string() })
+      .optional()
+      .describe(
+        "This send assigns no work (an answer, a nudge, a question). Omit `goal` when using this; " +
+          "the reason is stated on the call, and the agent's goal is left untouched.",
+      ),
   })
   .strict();
 
@@ -850,6 +888,22 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
   ),
   get_agent_status: route(agentOnly, (a, ctx) => ok(ctx, getAgentStatus(a.agentId))),
   send_to_agent_terminal: route(sendTerminalArgs, async (a, ctx) => {
+    // THE GOAL GATE, first — before authority is built and before anything reaches a PTY. Cheapest
+    // possible refusal: no authority, no store read, no I/O, so a send stating no objective costs
+    // nothing. `a.text` is passed as the "task" so a goal that merely echoes the message is refused
+    // (an echo adds no checkable fact). This ordering is the EXISTING contract, not a change to it:
+    // zod arg validation already runs before the authority check.
+    const goalVerdict = validateWorkerGoal(a.goal, a.text, a.notWork, {
+      // NAME THIS SURFACE, not spawn_worker's. The refusal is the caller's only route to this
+      // contract — none of the three model-facing descriptions of this tool mention `goal`/`notWork` —
+      // so a message naming `goalOverride` sent the caller to a key `.strict()` rejects, and its
+      // second refusal repeated the same advice: a loop with no successful send (roborev 55826/55836).
+      tool: "send_to_agent_terminal",
+      overrideParam: "notWork",
+    });
+    if (!goalVerdict.ok) {
+      return err(ctx, REGISTRY_CODES.badArgs, `Not sent: ${goalVerdict.message}`);
+    }
     // THE ONLY constructor, from the toolCallId ON THE WIRE. Null for a denied tool, an ask-tier
     // tool nobody approved, and a blank id — all three are refusals, and none of them reach a PTY.
     // (The policy tiers are already refused above, so a null here means the id was unusable.)
@@ -865,9 +919,55 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
         "Not sent: nothing authorized this write. A concierge tool write needs a tool-call id and a resolved allow/approved policy.",
       );
     }
+    // WRITE THE `notWork` REASON DOWN. Unlike spawn_worker — where the accountability is the computed
+    // fact that the worker has no goal — this path deliberately leaves the agent's PRIOR goal intact,
+    // so nothing about the record distinguishes "chatter was sent" from "work dispatched with no
+    // objective". The log entry IS the audit trail the escape hatch is justified by; without it the
+    // reason is validated and thrown away, and calling it "recorded" is false (roborev 55826/55836).
+    if (goalVerdict.override) {
+      log.info("concierge-tools", "terminal send declared not-work", {
+        agentId: a.agentId,
+        reason: goalVerdict.override.reason,
+        toolCallId: ctx.toolCallId,
+      });
+    }
     const r = await sendToAgentTerminal(a.agentId, a.text, authority, {
       userPrompt: a.userPrompt,
     });
+    // Record the goal only once the work was actually DELIVERED. Ordered after the send on purpose:
+    // `sendToAgentTerminal` legitimately refuses (an unanswered prompt on screen, a dead PTY), and
+    // setting a goal for work that never arrived would make an agent accountable for something it was
+    // never told to do — a false unmet goal that auto-continue would then try to drive. The residual
+    // risk is the mirror image (a crash between send and set leaves delivered work goalless), and that
+    // is the better failure: a missing goal is visible, a fabricated one is not.
+    if (r.ok && goalVerdict.goal) {
+      const project = useProjectStore
+        .getState()
+        .projects.find((p) => p.agents.some((ag) => ag.id === a.agentId));
+      const existing = project?.agents.find((ag) => ag.id === a.agentId)?.goal;
+      if (!project) {
+        // NOT SILENT. `send_to_agent_terminal` deliberately supports the built-in Improve Sparkle
+        // agent (`__sparkle_self__` and its labelled variants), which by design is in no project — so
+        // this branch is reachable in normal use, and a bare no-op would accept a goal, report
+        // success, and record nothing. Say so instead of pretending it landed.
+        log.warn("concierge-tools", "goal not recorded — agent is not in any project", {
+          agentId: a.agentId,
+        });
+      } else if (existing?.escalatedAt) {
+        // DO NOT CLOBBER AN ESCALATED GOAL. Recording a goal is now a side effect of every work send,
+        // and `setAgentGoal` with CHANGED text goes through `newGoal`, which zeroes continues/
+        // totalContinues and drops escalatedAt/escalationReason. An escalated goal is one auto-
+        // continue already gave up on and handed to the HUMAN; silently un-escalating it from a
+        // routine send both defeats the retry bound and takes the item off the human's plate without
+        // anyone deciding to. Clearing an escalation stays a deliberate act (resetAgentGoalRetries).
+        log.warn("concierge-tools", "goal not replaced — the agent's goal is escalated to the human", {
+          agentId: a.agentId,
+          escalationReason: existing.escalationReason,
+        });
+      } else {
+        useProjectStore.getState().setAgentGoal(project.id, a.agentId, goalVerdict.goal);
+      }
+    }
     return r.ok ? ok(ctx, r) : err(ctx, r.path, r.detail);
   }),
 };

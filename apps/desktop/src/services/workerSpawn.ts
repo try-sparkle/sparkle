@@ -25,6 +25,13 @@ export async function spawnWorker(args: {
   parentAgentId: string;
   task: string;
   beadId?: string;
+  /** The worker's objectively verifiable completion criterion, stated by whoever dispatched the
+   *  work. Set on the tab AT CREATION rather than by a later `set_agent_goal` call: an agent that
+   *  dies between spawn and that call is a goalless worker, and a goalless worker cannot be told
+   *  apart from one that merely stopped (which is what engine/goalContinuation needs to decide
+   *  whether to restart it). Absent only under a recorded override — see
+   *  mcp-orchestrator/src/goalGate.ts for what is and is not enforced. */
+  goal?: string;
 }): Promise<SpawnedWorker> {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === args.projectId);
@@ -56,6 +63,15 @@ export async function spawnWorker(args: {
   // Null means "no such project" — already rejected above; keep the check so the rollback/worktree
   // machinery below can never run against a phantom worker id.
   if (!workerId) throw new Error(`unknown project ${args.projectId}`);
+
+  // Record the goal IMMEDIATELY — same synchronous block as the tab, before the first await. The
+  // worktree cut below is a real `git worktree` call taking seconds, and an app quit or crash inside
+  // that window would otherwise persist a worker tab with a task and no objective: the exact
+  // goalless worker the dispatch gate exists to prevent, created by the gate's own success path.
+  // Guarded on non-blank because `setAgentGoal` treats an empty string as CLEAR the goal (and
+  // agentGoal.newGoal throws on it), so a blank must not reach it.
+  const goal = args.goal?.trim();
+  if (goal) useProjectStore.getState().setAgentGoal(args.projectId, workerId, goal);
 
   // Fail-closed rollback (sparkle-a670): drop the orphan tab and — when the worktree was already
   // cut — remove it from disk so no half-registered worktree leaks.

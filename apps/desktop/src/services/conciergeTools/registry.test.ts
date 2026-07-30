@@ -451,7 +451,7 @@ describe("dispatchConciergeTool — normalization", () => {
       display: "",
     });
     const r = await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
     );
     expect(refusal(r).code).toBe("ambiguous-picker");
   });
@@ -729,7 +729,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const projectId = seedProject();
     const agentId = seedBuild(projectId);
     const r = await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "carry on" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "carry on", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
     );
     expect(r.ok).toBe(true);
     expect(authorityUsed()).toEqual({
@@ -749,12 +749,201 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
       approvedForToolCallId: q.toolCallId,
     });
     await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "ok" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "ok", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
       { policy },
     );
     // The two are different facts — a standing policy versus a human answering this prompt — and the
     // audit line has to be able to say which.
     expect(authorityUsed()).toMatchObject({ policy: "approved" });
+  });
+
+  // ── THE GOAL GATE ON THE SEND PATH ──────────────────────────────────────────────────────────────
+  // `set_agent_goal` was a SEPARATE call and was routinely skipped, so agents were assigned work in
+  // prose and left with `goalStateOf === "none"`. These assert the two side effects that matter:
+  // nothing reaches the PTY without a stated goal, and a stated goal actually lands on the record.
+  it("refuses a send that states no goal — nothing reaches the terminal", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "go fix the parser and land it", goal: "" },
+      }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+    // The property: the message never got typed. A refusal that still sent would be worthless.
+    expect(dispatchAnswerMock).not.toHaveBeenCalled();
+  });
+
+  // ── THE REFUSAL MUST BE FOLLOWABLE ON THE SURFACE THAT EMITTED IT ──────────────────────────────
+  // The shared message was written for spawn_worker and relayed verbatim here, so it named the wrong
+  // tool and told the caller to pass `goalOverride` — a key sendTerminalArgs.strict() REJECTS. The
+  // caller's next attempt earned "Unrecognized key: goalOverride" whose message again said
+  // `goalOverride`: a loop with no path to a successful send, and this refusal is the only place the
+  // contract is stated (roborev 55826/55836). A `/goal/i` assertion passed against the wrong text.
+  it("names THIS tool and THIS surface's override parameter, never spawn_worker's", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "go fix the parser and land it", goal: "" },
+      }),
+    );
+    const { message } = refusal(r);
+    expect(message).toContain("send_to_agent_terminal");
+    expect(message).toContain("notWork");
+    // The two that made it a loop.
+    expect(message).not.toContain("goalOverride");
+    expect(message).not.toContain("spawn_worker");
+  });
+
+  it("the parameter the refusal names is one the schema actually accepts", async () => {
+    // The loop-detector. Even a correctly-named remedy is worthless if the schema rejects it, so
+    // follow the advice literally and assert the call SUCCEEDS.
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const refused = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "just checking in", goal: "" },
+      }),
+    );
+    const named = refusal(refused).message.includes("notWork") ? "notWork" : "";
+    expect(named).toBe("notWork");
+    // Do exactly what it said.
+    const followed = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: {
+          agentId,
+          text: "just checking in",
+          goal: "",
+          notWork: { reason: "answering a question the agent asked" },
+        },
+      }),
+    );
+    expect(followed.ok).toBe(true);
+    expect(dispatchAnswerMock).toHaveBeenCalled();
+  });
+
+  it("refuses a narrative status report as a goal, so prose cannot pass as a criterion", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const narrative =
+      "The mount is still only half-fixed. What's landed makes the mount visible and correct — the " +
+      "concierge floods, the row bolds, Escape unmounts, no stale binding. It does not yet route: " +
+      "shellResolve.ts still contains zero references to wired, so a mounted message goes wherever " +
+      "the cable-blind auto-router sends it. That's the next piece.";
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "carry on", goal: narrative },
+      }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+    expect(dispatchAnswerMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT replace an ESCALATED goal, so a routine send cannot un-escalate an agent", async () => {
+    // Recording a goal is a side effect of every work send, and setAgentGoal with CHANGED text runs
+    // newGoal — which zeroes the retry counters and drops escalatedAt. An escalated goal is one
+    // auto-continue gave up on and handed to the human; a routine send must not take it back off
+    // their plate or refill the retry budget (roborev 55826).
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const store = useProjectStore.getState();
+    store.setAgentGoal(projectId, agentId, "the original objective that was escalated");
+    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts");
+    const before = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!.goal!;
+    expect(before.escalatedAt).toBeTruthy();
+
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "here is more work", goal: "a completely different criterion passes" },
+      }),
+    );
+
+    // The send still happens — this is not a refusal, it is a refusal to OVERWRITE.
+    expect(r.ok).toBe(true);
+    const after = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!.goal!;
+    expect(after.escalatedAt).toBe(before.escalatedAt);
+    expect(after.text).toBe(before.text);
+  });
+
+  it("refuses an omitted goal, not merely an empty one", async () => {
+    // Every other send test passes `goal: ""` explicitly, so all of them pass identically whether the
+    // schema marks `goal` required or optional — reverting `.optional()` would leave them green
+    // (roborev 55836). This one OMITS the key, which is the shape the schema change exists for.
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const r = await dispatchConciergeTool(
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "do the thing" } }),
+    );
+    expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+    expect(refusal(r).message).toContain("notWork");
+    expect(dispatchAnswerMock).not.toHaveBeenCalled();
+  });
+
+  it("records a stated goal on the target agent once the send succeeds", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const goal = "nested groups parse and parser.test.ts passes";
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "please handle the nested-group case", goal },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(dispatchAnswerMock).toHaveBeenCalled();
+    // The side effect: the criterion is on the RECORD, so something other than the agent can check
+    // whether it finished. Born unmet — a goal that arrived "met" would read as already done.
+    const agent = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === agentId)!;
+    expect(agent.goal?.text).toBe(goal);
+    expect(agent.goal?.metAt).toBeUndefined();
+  });
+
+  it("a notWork send is delivered and leaves the agent's goal untouched", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: {
+          agentId,
+          text: "yes, go ahead",
+          goal: "",
+          notWork: { reason: "answering a question the agent asked" },
+        },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(dispatchAnswerMock).toHaveBeenCalled();
+    // No goal invented from the reason: an unverifiable send must not look verifiable.
+    const agent = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === agentId)!;
+    expect(agent.goal).toBeUndefined();
   });
 
   it("a BLANK toolCallId refuses the write: there is nothing to attribute it to", async () => {
@@ -763,7 +952,15 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const r = await dispatchConciergeTool({
       domain: "terminal",
       op: "send_to_agent_terminal",
-      args: { agentId, text: "sneak this in" },
+      args: {
+        agentId,
+        text: "sneak this in",
+        // Goal args supplied so this case tests AUTHORITY, not argument validity — arg validation
+        // runs first, so an unpatched call would refuse as `bad-args` and never reach the check
+        // this test names.
+        goal: "",
+        notWork: { reason: "authority fixture, not a work assignment" },
+      },
       toolCallId: "   ",
     });
     expect(refusal(r).code).toBe(REGISTRY_CODES.unauthorized);
@@ -775,7 +972,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const agentId = seedBuild(projectId);
     const policy: ConciergeToolPolicy = () => ({ tier: "deny", reason: "not that agent" });
     const r = await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
       { policy },
     );
     expect(refusal(r).code).toBe(REGISTRY_CODES.denied);
@@ -787,7 +984,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const agentId = seedBuild(projectId);
     const policy: ConciergeToolPolicy = () => ({ tier: "ask", approvedByUser: false });
     const r = await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "hi", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
       { policy },
     );
     expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
@@ -798,7 +995,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const projectId = seedProject();
     const agentId = seedBuild(projectId);
     const r = await dispatchConciergeTool(
-      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "" } }),
+      call({ domain: "terminal", op: "send_to_agent_terminal", args: { agentId, text: "", goal: "", notWork: { reason: "authority/normalization fixture, not a work assignment" } } }),
     );
     expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
     expect(dispatchAnswerMock).not.toHaveBeenCalled();

@@ -104,6 +104,69 @@ describe("spawnWorker", () => {
   // in one render), so AgentPane's settleSwitchTrace never runs and the trace dangles — reported by
   // openTraceKinds() as an in-flight interaction on every later jank warning, several times a minute
   // during a fan-out. Suppressing the selection in the store leaves no trace to settle.
+  // ── THE GOAL REACHES THE PERSISTED TAB ────────────────────────────────────────────────────────
+  // The ONE property: a goal stated at dispatch is recorded on the worker record, so something other
+  // than the worker can later decide whether it finished. Asserts the persisted SIDE EFFECT (the tab's
+  // `goal`), not that spawnWorker accepted the argument — passing an arg it ignores would still pass a
+  // "called with" assertion. Fails against the previous implementation, which had no `goal` at all.
+  it("persists a stated goal on the worker record at creation", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" })
+        : Promise.resolve(undefined),
+    );
+
+    const goal = "nested groups parse and parser.test.ts passes";
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "refactor the parser",
+      goal,
+    });
+
+    const worker = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === workerId)!;
+    expect(worker.goal?.text).toBe(goal);
+    // Born unmet and un-escalated: a fresh goal is what LICENSES auto-continue, so a goal that
+    // arrived already "met" would make the worker look finished the moment it was created.
+    expect(worker.goal?.metAt).toBeUndefined();
+    expect(worker.goal?.escalatedAt).toBeUndefined();
+  });
+
+  it("leaves the worker goalless when none was stated, rather than inventing one", async () => {
+    // The override path (work with no verifiable criterion) must NOT synthesize a goal: a goalless
+    // worker is a fact downstream needs to see, and a placeholder would make an unverifiable worker
+    // look verifiable. A blank goal must also read as absent — setAgentGoal treats "" as CLEAR and
+    // agentGoal.newGoal throws on it, so a blank reaching the store would be a crash, not a no-op.
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" })
+        : Promise.resolve(undefined),
+    );
+
+    const bare = await spawnWorker({ projectId, parentAgentId: buildId, task: "spike the crash" });
+    const blank = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "spike again",
+      goal: "   ",
+    });
+
+    const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agents.find((a) => a.id === bare.workerId)!.goal).toBeUndefined();
+    expect(agents.find((a) => a.id === blank.workerId)!.goal).toBeUndefined();
+  });
+
   it("opens no dangling switch trace (the selection never moves)", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");

@@ -28,7 +28,16 @@ export interface OrchestrationRequest {
   op: "spawn_worker" | "list_workers" | "spin_down";
   buildAgentId: string;
   projectId: string;
-  payload: { task?: string; workerId?: string; beadId?: string };
+  // `goal` is the worker's objectively verifiable completion criterion; `goalOverrideReason` is the
+  // recorded absence of one (see mcp-orchestrator/src/goalGate.ts). Both are forwarded by
+  // bridge.rs's `frontend_op_payload`; exactly one of them is present on a spawn that passed the gate.
+  payload: {
+    task?: string;
+    workerId?: string;
+    beadId?: string;
+    goal?: string;
+    goalOverrideReason?: string;
+  };
 }
 
 let unlisten: UnlistenFn | undefined;
@@ -232,6 +241,11 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
       parentAgentId: req.buildAgentId,
       task: req.payload.task ?? "",
       beadId: req.payload.beadId,
+      // Carried through so the worker's objective is persisted at creation. Absent only when the
+      // dispatch used a recorded override (`goalOverrideReason`), which is deliberately NOT
+      // substituted in as a goal — an override means there is no criterion, and inventing one from
+      // its reason would make an unverifiable worker look verifiable.
+      goal: req.payload.goal,
     });
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
     const worker = project?.agents.find((a) => a.id === workerId);
