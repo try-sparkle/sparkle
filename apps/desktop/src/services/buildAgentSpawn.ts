@@ -15,7 +15,7 @@ import { landInAgent } from "./landInAgent";
 import { createBeadFull } from "./tasks";
 import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
 import { localAgentCapacity } from "./agentCapacity";
-import { queuePendingSend } from "./pendingSends";
+import { attachBrief } from "./agentBrief";
 import { markProjectVisited } from "./sessionProjects";
 import { markProjectOpen } from "./projectTabs";
 import { isTornOut } from "./satelliteWindows";
@@ -130,7 +130,8 @@ export function spawnBuildAgentInProject(
   }
   landInAgent(project.id, id);
   if (opts.prompt) {
-    // QUEUE the brief for the PTY — do NOT call `appendPrompt` here.
+    // ATTACH the brief for the LAUNCH ARGV — do NOT call `appendPrompt`, and no longer
+    // `queuePendingSend` either.
     //
     // `appendPrompt` is pure bookkeeping: it moves `lastPrompt` and appends to `promptHistory`, and
     // writes nothing to the terminal. Seeding it directly would have been strictly WORSE than the
@@ -140,22 +141,19 @@ export function spawnBuildAgentInProject(
     // at an empty prompt forever, with the pinned header confidently showing the brief that was
     // never sent.
     //
-    // `queuePendingSend` is the buffer built for precisely this window ("the seconds between spawn
-    // and first prompt"): AgentPane drains it via `flushPendingSends` on ptyReady, which calls
-    // `submitPrompt` AND `recordPromptSideEffects` — so the store update happens there, once, on
-    // the delivery path. That is what makes the brief atomic *and* real.
-    // `humanAuthored: true` — and the honest reason is that it cannot matter here, not that the
-    // brief is always typed by a person. It is NOT: the concierge's `spawn_build_agent` lifecycle
-    // tool passes a `prompt` its own model may have composed. What the flag governs is
-    // `projectStore.releaseGoalDebt`, and this send lands on an agent created microseconds ago —
-    // no goal, no `goalDebt`, and (since roborev 55588) a freshly-set clean goal is left
-    // reference-identical too. There is no debt for either answer to release.
+    // `queuePendingSend` was the previous answer, and it delivered the text but LOST THE SUBMIT on
+    // five of five spawns: it writes into the PTY on `ptyReady`, which fires when `pty_spawn`
+    // returns — before claude's TUI is reading stdin at all. The brief sat at the prompt with the
+    // cursor after it until a human pressed Enter, while the reply said `briefed: true`. The full
+    // measurement, and why an idle-output or fixed-delay heuristic cannot fix it, is in the header
+    // of services/agentBrief.
     //
-    // Stated rather than left implicit because it stops being true the moment spawn seeds an agent
-    // that INHERITS a goal or a debt (a reused id, a restored session). If that ever lands, thread
-    // the real `isHumanAuthored(authority)` down from the spawn caller instead of re-reading this
-    // comment as a licence.
-    queuePendingSend({ agentId: id, text: opts.prompt, userPrompt: true, humanAuthored: true });
+    // `attachBrief` hands it to the pane's launch instead, which emits it as claude's positional
+    // prompt — the same mechanism worker agents have always used, and one claude submits itself at
+    // startup. There is no paste, no carriage return, and so no window in which the submit can be
+    // dropped. The prompt side-effects still happen on the delivery path, once (AgentPane), which is
+    // what keeps the brief atomic *and* real.
+    attachBrief(id, opts.prompt);
   } else {
     // The caret is the half landInAgent deliberately leaves to the caller, and the EMPTY spawn has
     // earned it: the next thing the user does is type. A briefed spawn has not — sendToBuild skips

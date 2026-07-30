@@ -634,10 +634,12 @@ const discardArgs = z
   .strict();
 
 const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
-  spawn_build_agent: route(spawnArgs, (a, ctx) =>
+  spawn_build_agent: route(spawnArgs, async (a, ctx) =>
     fromLifecycle(
       ctx,
-      spawnBuildAgent({
+      // Awaited: `briefed` is now an OBSERVATION of the brief's delivery, not a restatement of the
+      // input, so the op has to wait for that outcome before it can answer honestly.
+      await spawnBuildAgent({
         projectId: a.projectId,
         runtime: a.runtime ?? "local",
         prompt: a.prompt,
@@ -649,8 +651,8 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   ),
   // Routed rather than omitted so the model gets lifecycle's honest "this bills per minute and needs
   // a goal up front" refusal instead of an `unknown-op` that reads like a bug.
-  spawn_cloud_build_agent: route(spawnArgs, (a, ctx) =>
-    fromLifecycle(ctx, spawnBuildAgent({ projectId: a.projectId, runtime: "cloud" })),
+  spawn_cloud_build_agent: route(spawnArgs, async (a, ctx) =>
+    fromLifecycle(ctx, await spawnBuildAgent({ projectId: a.projectId, runtime: "cloud" })),
   ),
   preview_close: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewClose(a.agentId))),
   preview_discard: route(agentOnly, (a, ctx) => fromLifecycle(ctx, previewDiscard(a.agentId))),

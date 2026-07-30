@@ -192,9 +192,9 @@ describe("LIFECYCLE_RISK", () => {
 
 // ── Spawn ───────────────────────────────────────────────────────────────────────────────────────
 describe("spawnBuildAgent", () => {
-  it("creates the agent and returns its id", () => {
+  it("creates the agent and returns its id", async () => {
     const pid = seedProject();
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.op).toBe("spawn_build_agent");
@@ -212,9 +212,9 @@ describe("spawnBuildAgent", () => {
   // *"Build 17 is not the name of the agent right now … that doesn't mean anything to me because I
   // can't see it."* The value is still useful to the model; what changed is that nothing downstream
   // can now mistake it for identity.
-  it("returns the placeholder name as PROVISIONAL, never as the agent's identity", () => {
+  it("returns the placeholder name as PROVISIONAL, never as the agent's identity", async () => {
     const pid = seedProject();
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const live = useProjectStore
@@ -232,21 +232,21 @@ describe("spawnBuildAgent", () => {
     expect(typeof r.data.agentId).toBe("string");
   });
 
-  it("refuses (typed) with no project open — nothing is created", () => {
-    const r = spawnBuildAgent();
+  it("refuses (typed) with no project open — nothing is created", async () => {
+    const r = await spawnBuildAgent();
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("no-project");
     expect(useProjectStore.getState().projects).toHaveLength(0);
   });
 
-  it("refuses a spawn past the machine's worker-capacity cap instead of queueing or crashing", () => {
+  it("refuses a spawn past the machine's worker-capacity cap instead of queueing or crashing", async () => {
     const pid = seedProject();
     useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
-    const first = spawnBuildAgent({ projectId: pid });
+    const first = await spawnBuildAgent({ projectId: pid });
     expect(first.ok).toBe(true);
     const before = useProjectStore.getState().projects[0]!.agents.length;
-    const second = spawnBuildAgent({ projectId: pid });
+    const second = await spawnBuildAgent({ projectId: pid });
     expect(second.ok).toBe(false);
     if (second.ok) return;
     expect(second.reason).toBe("at-capacity");
@@ -255,13 +255,13 @@ describe("spawnBuildAgent", () => {
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(before);
   });
 
-  it("counts workers under other build agents toward the machine-wide cap", () => {
+  it("counts workers under other build agents toward the machine-wide cap", async () => {
     const pid = seedProject();
     const build = seedBuild(pid);
     seedWorker(pid, build);
     useSettingsStore.setState({ maxConcurrentWorkers: 2, effectiveMaxConcurrentWorkers: 2 });
     expect(localAgentCapacity()).toMatchObject({ used: 2, limit: 2, atCapacity: true });
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("at-capacity");
@@ -270,7 +270,7 @@ describe("spawnBuildAgent", () => {
   // roborev 54175-3: the budget counts ROWS (a dormant row starts a process the moment its project
   // tab is opened, which is why it is counted), but only rows in `openAgentIds` have a process NOW.
   // The reading reports both, and the refusal must not claim the dormant ones are running.
-  it("separates rows-that-count (used) from rows-with-a-live-process (live)", () => {
+  it("separates rows-that-count (used) from rows-with-a-live-process (live)", async () => {
     const pid = seedProject();
     const a = seedBuild(pid);
     seedBuild(pid);
@@ -283,7 +283,7 @@ describe("spawnBuildAgent", () => {
   // openAgentIds is PERSISTED, so on the first render after a restart every previously-open row is
   // in it while no pane exists — the half of the condition the old test never exercised, which is
   // exactly how `live === used` could assert N running processes that weren't there.
-  it("does not count an open row in a project tab the user has never visited as live", () => {
+  it("does not count an open row in a project tab the user has never visited as live", async () => {
     const dormantPid = seedProject();
     const dormant = seedBuild(dormantPid);
     const currentPid = useProjectStore.getState().addProject("Current", "/tmp/current");
@@ -296,14 +296,14 @@ describe("spawnBuildAgent", () => {
     expect(localAgentCapacity()).toMatchObject({ used: 2, live: 2 });
   });
 
-  it("still says WHY the dormant rows count when they are open-but-unvisited, not merely unopened", () => {
+  it("still says WHY the dormant rows count when they are open-but-unvisited, not merely unopened", async () => {
     const dormantPid = seedProject();
     const dormant = seedBuild(dormantPid);
     const currentPid = useProjectStore.getState().addProject("Current", "/tmp/current");
     const here = seedBuild(currentPid);
     useRuntimeStore.setState({ openAgentIds: [dormant, here] });
     useSettingsStore.setState({ maxConcurrentWorkers: 2, effectiveMaxConcurrentWorkers: 2 });
-    const r = spawnBuildAgent({ projectId: currentPid });
+    const r = await spawnBuildAgent({ projectId: currentPid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("at-capacity");
@@ -318,12 +318,12 @@ describe("spawnBuildAgent", () => {
   // closed-tab projects were observed with a running-agent count equal to their full roster — so
   // the sentence sent a human hunting for processes that would start later when they were already
   // up. `live` measures "has a mounted pane in THIS window", and the copy may not claim more.
-  it("does not tell the human that off-screen agents have not started yet", () => {
+  it("does not tell the human that off-screen agents have not started yet", async () => {
     const pid = seedProject();
     seedBuild(pid);
     seedBuild(pid); // neither has a mounted pane in this window
     useSettingsStore.setState({ maxConcurrentWorkers: 2, effectiveMaxConcurrentWorkers: 2 });
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("at-capacity");
@@ -339,7 +339,7 @@ describe("spawnBuildAgent", () => {
   // BUG 2. Rust's `Bound` exists precisely to stop the app mis-attributing the ceiling — its own
   // comment says routing a tie to the RAM branch gives "advice that cannot work". That attribution
   // never reached the human: the refusal asserted "derived from installed RAM" unconditionally.
-  it("names the CPU bound rather than blaming RAM on a core-bound machine", () => {
+  it("names the CPU bound rather than blaming RAM on a core-bound machine", async () => {
     const pid = seedProject();
     seedBuild(pid);
     // An 18-core / 128 GiB machine: RAM holds 81, cores drive 36. CPU binds — see config.rs
@@ -350,7 +350,7 @@ describe("spawnBuildAgent", () => {
       concurrencyBound: "cpu",
       concurrencyBasis: "CPU-bound: 18 cores × 2 agents per core",
     });
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("at-capacity");
@@ -358,7 +358,7 @@ describe("spawnBuildAgent", () => {
     expect(r.message).not.toMatch(/derived from installed RAM/i);
   });
 
-  it("names the pin, not the hardware, when a config.toml ceiling is what binds", () => {
+  it("names the pin, not the hardware, when a config.toml ceiling is what binds", async () => {
     const pid = seedProject();
     seedBuild(pid);
     useSettingsStore.setState({
@@ -367,7 +367,7 @@ describe("spawnBuildAgent", () => {
       concurrencyBound: "pinned",
       concurrencyBasis: "pinned to 32 in config.toml ([workers].max_concurrent)",
     });
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.message).toMatch(/pinned to 32 in config\.toml/);
@@ -377,7 +377,7 @@ describe("spawnBuildAgent", () => {
   // BUG 3: "at-capacity: 46 of 32 slots" while the derivation said 36. A cap that lies about itself
   // is worse than a wrong cap — the number in the message must BE the number the gate compared
   // against, for every combination of the two store fields.
-  it("reports exactly the cap it enforces", () => {
+  it("reports exactly the cap it enforces", async () => {
     const pid = seedProject();
     for (const [request, machine] of [
       [32, 36], // a pin below what the machine derives — the reported situation
@@ -404,8 +404,8 @@ describe("spawnBuildAgent", () => {
       const enforced = Math.min(request, machine);
       // Fill to exactly the enforced cap through the SHARED path, then confirm one more is refused —
       // i.e. the gate really binds at the number it prints, not one either side of it.
-      for (let i = 0; i < enforced; i++) expect(spawnBuildAgent({ projectId: p }).ok).toBe(true);
-      const r = spawnBuildAgent({ projectId: p });
+      for (let i = 0; i < enforced; i++) expect((await spawnBuildAgent({ projectId: p })).ok).toBe(true);
+      const r = await spawnBuildAgent({ projectId: p });
       expect(r.ok).toBe(false);
       if (r.ok) return;
       expect(localAgentCapacity().limit).toBe(enforced);
@@ -420,10 +420,10 @@ describe("spawnBuildAgent", () => {
     expect(pid).toBeTruthy();
   });
 
-  it("refuses (typed) when the project vanishes mid-spawn — nothing was created", () => {
+  it("refuses (typed) when the project vanishes mid-spawn — nothing was created", async () => {
     const pid = seedProject();
     spawnOverride = () => null; // spawnBuildAgentInProject's "project closed in another window" branch
-    const r = spawnBuildAgent({ projectId: pid });
+    const r = await spawnBuildAgent({ projectId: pid });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.op).toBe("spawn_build_agent");
@@ -431,9 +431,9 @@ describe("spawnBuildAgent", () => {
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
   });
 
-  it("returns a typed 'not supported' for a CLOUD spawn rather than spending the user's money", () => {
+  it("returns a typed 'not supported' for a CLOUD spawn rather than spending the user's money", async () => {
     const pid = seedProject();
-    const r = spawnBuildAgent({ projectId: pid, runtime: "cloud" });
+    const r = await spawnBuildAgent({ projectId: pid, runtime: "cloud" });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.op).toBe("spawn_cloud_build_agent");
@@ -986,7 +986,7 @@ describe("typed results", () => {
     const results = [
       previewClose(id),
       previewDiscard(id),
-      spawnBuildAgent({ projectId: pid, runtime: "cloud" }),
+      await spawnBuildAgent({ projectId: pid, runtime: "cloud" }),
       await closeAgent(id),
     ];
     for (const r of results) {

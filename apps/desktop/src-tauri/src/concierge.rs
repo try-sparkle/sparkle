@@ -123,8 +123,15 @@ not on the roster you were given, write its plain name with no link. A link that
 nothing merely fails to open — a link carrying the WRONG id opens the wrong agent, which is far \
 worse. Write ONLY the agent's short name inside the link — not its task, not what it is doing.\n\n\
 THIS APPLIES HARDEST TO AN AGENT YOU JUST STARTED, because that is the case where a name is \
-guaranteed to go stale. `spawn_build_agent` replies with `agentId` and `provisionalName` (and \
-`nameIsProvisional: true`). The provisional name is a spawn-time placeholder like 'Build 17' that \
+guaranteed to go stale. `spawn_build_agent` replies with `agentId`, `agentExists`, and — when the \
+agent still exists — `provisionalName` (with `nameIsProvisional: true`). CHECK `agentExists` FIRST. \
+When it is false the agent was closed (or its project was) while the spawn was still starting it, \
+so the row is GONE and `provisionalName` is absent: do NOT render a pill for it, do NOT call \
+`send_to_agent_terminal` or `close_agent` on that id, and do not describe it as running. Say it was \
+closed before it got its brief, and offer to start a fresh one. An id from the reply is not proof \
+the agent is there — this one field is what tells you, and a pill built from a dead id opens \
+nothing while looking exactly like a working one. The provisional name is a spawn-time placeholder \
+like 'Build 17' that \
 the agent replaces within seconds by naming itself after its work, so quoting it as bare text tells \
 the user about a name that no longer exists anywhere on their screen — they cannot find it, and \
 they have to ask you which agent you meant. Announce a spawn as \
@@ -1895,6 +1902,15 @@ mod tests {
         // work exists to end. There is no type system spanning the two, so this is the seam.
         assert!(CONCIERGE_PERSONA.contains("provisionalName"));
         assert!(CONCIERGE_PERSONA.contains("nameIsProvisional"));
+        // `agentExists` is the field that says the spawned row is GONE (closed, or its project was,
+        // while it was still starting). It exists ONLY to be read by the model following this
+        // string, so a payload change that never reaches the persona is inert: the model would keep
+        // rendering a pill from a dead id — which opens nothing while looking exactly like a working
+        // one — and keep firing follow-up ops at it. Same seam as the two above, same reason.
+        assert!(CONCIERGE_PERSONA.contains("agentExists"));
+        // …and the RULE, not just the field name: knowing the flag exists is useless without being
+        // told what false means and what not to do about it.
+        assert!(CONCIERGE_PERSONA.contains("do NOT render a pill"));
         // …and the REASON, not just the field name. A placeholder quoted as identity is stale within
         // seconds, so the instruction has to say what to do instead: reference the id.
         assert!(CONCIERGE_PERSONA.contains("spawn_build_agent"));

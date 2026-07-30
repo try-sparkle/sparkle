@@ -31,6 +31,7 @@ import {
 } from "../engine/agentGoal";
 import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
+import { clearBrief } from "../services/agentBrief";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 import { useUiStore } from "./uiStore";
@@ -741,12 +742,23 @@ function withTombstones(
  *  re-attached, provided its parent build agent still exists in that snapshot (so we never resurrect
  *  a worker whose orchestrator was deliberately closed). Everything else takes the persisted value,
  *  preserving the store's action functions (which the persisted JSON never carries). Pure + exported
- *  for direct unit testing. */
+ *  for direct unit testing.
+ *
+ *  PURE ONLY WHILE `onDropped` IS OMITTED, and that is the point. The merge DESTROYS agent rows that
+ *  arrive tombstoned from another window, and those rows own per-agent state (an undelivered brief)
+ *  that has to be torn down. An earlier cut did the teardown inside the merge, which made a function
+ *  documented as pure quietly effectful — so calling it to PREVIEW or diff a rehydrate would have
+ *  irreversibly destroyed live briefs (roborev 55888). The callback keeps the default pure for every
+ *  test and hypothetical caller, and lets the ONE real caller (the persist `merge` hook) do the
+ *  teardown explicitly, where it is visible. */
 export function mergePreservingLiveWorkers(
   persistedState: unknown,
   currentState: ProjectState,
   pendingRemovals: ReadonlySet<string> = EMPTY_PENDING_ADDS,
+  /** Receives the ids of agent rows this merge DROPPED (tombstoned elsewhere). Omit for a pure merge. */
+  onDropped?: (ids: string[]) => void,
 ): ProjectState {
+  const dropped: string[] | undefined = onDropped ? [] : undefined;
   const persisted = (persistedState ?? undefined) as Partial<ProjectState> | undefined;
   const merged = { ...currentState, ...(persisted ?? {}) } as ProjectState;
   const currentProjects = currentState.projects ?? [];
@@ -777,8 +789,8 @@ export function mergePreservingLiveWorkers(
       const cur = currentProjects.find((c) => c.id === id);
       // Present only in memory (the snapshot's writer hadn't seen this project yet) — keep ours,
       // minus any agent that has since been tombstoned.
-      if (!ppMaybe) return withoutRemovedAgents(cur as Project, isRemoved);
-      return mergeProject(ppMaybe, cur, isRemoved);
+      if (!ppMaybe) return withoutRemovedAgents(cur as Project, isRemoved, dropped);
+      return mergeProject(ppMaybe, cur, isRemoved, dropped);
     });
 
   // …and the array itself: when every project came back as its live reference (a no-op rehydrate),
@@ -795,6 +807,7 @@ export function mergePreservingLiveWorkers(
   // must not yank the user off the project they just created (it carries its own older selection).
   // Deliberately narrow — when both sides know the project, the snapshot's selection still wins, as
   // before. Mirrors the per-agent selectedAgentId rule inside mergeProject.
+  if (onDropped && dropped && dropped.length) onDropped(dropped);
   const liveSel = currentState.selectedProjectId;
   if (
     liveSel != null &&
@@ -845,10 +858,31 @@ function mergeTombstones(
   return out;
 }
 
-/** Drop tombstoned agents from a project, returning the SAME object when nothing changed. */
-function withoutRemovedAgents(p: Project, isRemoved: (id: string) => boolean): Project {
+/** Drop tombstoned agents from a project, returning the SAME object when nothing changed.
+ *
+ *  THIS IS A ROW-DESTRUCTION PATH — the third, alongside `removeAgent` and `removeProject`. It is
+ *  reached when an agent closed in ANOTHER WINDOW arrives as a tombstone, since `isRemoved` is the
+ *  union of this window's and the persisted snapshot's `removedIds`. It therefore owes the same
+ *  per-agent teardown as an explicit close (roborev 55876).
+ *
+ *  It REPORTS the dropped ids rather than tearing them down itself, so this stays a pure function of
+ *  its inputs. An earlier cut called `clearBrief` inline, which quietly made the whole merge
+ *  effectful while `mergePreservingLiveWorkers` was still documented as pure — so a future caller
+ *  invoking the merge to PREVIEW or diff a rehydrate would have irreversibly destroyed live briefs
+ *  (roborev 55888). The one production caller performs the teardown; every test caller gets the pure
+ *  behaviour by not asking for it. */
+function withoutRemovedAgents(
+  p: Project,
+  isRemoved: (id: string) => boolean,
+  dropped?: string[],
+): Project {
   const agents = p.agents.filter((a) => !isRemoved(a.id));
-  return agents.length === p.agents.length ? p : { ...p, agents };
+  if (agents.length === p.agents.length) return p;
+  if (dropped) {
+    const kept = new Set(agents.map((a) => a.id));
+    for (const a of p.agents) if (!kept.has(a.id)) dropped.push(a.id);
+  }
+  return { ...p, agents };
 }
 
 /** True for an object with no richer prototype than plain `{}` (or a null prototype). Anything else —
@@ -917,11 +951,12 @@ function mergeProject(
   ppIn: Project,
   curIn: Project | undefined,
   isRemoved: (id: string) => boolean,
+  dropped?: string[],
 ): Project {
   // Removal tombstone (sparkle-close-resurrect): an agent closed in ANY window but still carried by
   // a concurrent writer's stale snapshot must NOT be re-added ("× closes the terminal but the row
   // comes back"). Filter tombstoned ids out of the incoming snapshot before anything else.
-  const pp = withoutRemovedAgents(ppIn, isRemoved);
+  const pp = withoutRemovedAgents(ppIn, isRemoved, dropped);
   const cur = curIn;
   {
     if (!cur) return pp;
@@ -973,6 +1008,14 @@ function mergeProject(
     // evicted acknowledged build agents. The old pending-add shields are strictly subsumed: a
     // just-created agent is just one more absence the union already keeps.
     const survivors = cur.agents.filter((a) => !present.has(a.id) && !isRemoved(a.id));
+    // THIS is where a live in-memory row is actually destroyed by a cross-window tombstone: it is
+    // absent from the incoming snapshot AND tombstoned, so the union deliberately does not re-add it.
+    // Record those ids for the caller's per-agent teardown (an undelivered brief). Note the drop does
+    // NOT happen in `withoutRemovedAgents` for this shape — the snapshot never carried the row at all
+    // — which is exactly why the first cut of this accumulation reported nothing.
+    if (dropped) {
+      for (const a of cur.agents) if (!present.has(a.id) && isRemoved(a.id)) dropped.push(a.id);
+    }
     const mergedAgents = survivors.length > 0 ? [...baseAgents, ...survivors] : baseAgents;
     // Nav-bug fix (Unit A): `selectedAgentId` is LIVE per-window navigation state, not something a
     // concurrent writer's snapshot should reset. A cross-window rehydrate that predates a just-added
@@ -1066,6 +1109,13 @@ export const useProjectStore = create<ProjectState>()(
           // so a removal that isn't recorded would be undone by any window still holding the project.
           const doomed = [id, ...(gone?.agents ?? []).map((a) => a.id)];
           registerLocalRemovals(doomed);
+          // Destroying a project destroys its agents WITHOUT going through `removeAgent`, so the
+          // per-agent teardown there has to be repeated here. An undelivered brief is one of those:
+          // without this, closing a project while `spawnBuildAgent` is inside its wait leaves the
+          // waiter unsettled, so the op sits out the whole bound and answers "unconfirmed — check
+          // that it picked up the task", pointing the human at an agent AND a project that no longer
+          // exist, while the held entry outlives the row for the life of the process.
+          (gone?.agents ?? []).forEach((a) => clearBrief(a.id, "project closed"));
           return { projects, selectedProjectId, removedIds: withTombstones(s.removedIds, doomed) };
         });
         // Drop the concierge pin if it named THIS project. The pin is persisted and load-bearing
@@ -1397,6 +1447,13 @@ export const useProjectStore = create<ProjectState>()(
           // would otherwise linger forever — and could keep naming a since-removed account. Uses
           // the same `doomed` list, so a closed build agent's workers are cleared with it.
           doomed.forEach((id) => clearPin(id));
+          // An UNLAUNCHED opening brief dies with its agent, and it has to be told so. Nothing else
+          // settles it: the pane's unmount is not a close (a tab switch unmounts too, and that brief
+          // is still deliverable), so without this the concierge's `awaitBriefDelivery` sits out its
+          // whole bound and reports "unconfirmed" for an agent that is simply gone — and the held
+          // entry outlives the row, so `hasUndeliveredBrief` keeps answering true for a dead id.
+          // Uses the same `doomed` list, so a closed build agent's workers are covered too.
+          doomed.forEach((id) => clearBrief(id, "agent closed"));
           return {
           // The tombstone is also PERSISTED (sparkle-pckz): the union merge never infers deletion
           // from absence, so this is the only thing that carries the close to other windows.
@@ -1836,7 +1893,14 @@ export const useProjectStore = create<ProjectState>()(
       // `removedIds` from the blob, plus this window's not-yet-persisted local removals.
       merge: (persisted, current) => {
         return perfSpan("persist.merge", () =>
-          mergePreservingLiveWorkers(persisted, current, pendingLocalRemovals),
+          // THE one caller that performs the merge's per-agent teardown. A row tombstoned in another
+          // window is destroyed here, so its undelivered brief must be settled — otherwise a
+          // `spawnBuildAgent` waiting on delivery sits out its whole bound and answers "unconfirmed"
+          // about an agent that exists in no window (roborev 55876). Passed in rather than done
+          // inside the merge so the merge itself stays pure for every other caller (roborev 55888).
+          mergePreservingLiveWorkers(persisted, current, pendingLocalRemovals, (ids) => {
+            for (const id of ids) clearBrief(id, "agent closed in another window");
+          }),
         );
       },
     },

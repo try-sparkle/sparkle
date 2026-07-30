@@ -56,6 +56,7 @@ import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
 import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
+import { awaitBriefDelivery } from "../agentBrief";
 import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
 import { isTornOut } from "../satelliteWindows";
 import { atCapacitySentence } from "../agentCapacity";
@@ -267,16 +268,66 @@ export interface SpawnedBuildAgent {
    *  the name existed nowhere on their screen and they had to ask which agent was meant. The value
    *  is still useful (it is what the row says before the first rename), but nothing may quote it as
    *  identity. `agentId` is the durable handle, and a reference is built from that. */
-  provisionalName: string;
+  provisionalName?: string;
+  /**
+   * Does the agent this reply describes STILL EXIST?
+   *
+   * False only for `briefDelivery: "agent-closed"` — the agent was closed (or its project was) while
+   * the spawn was waiting on brief delivery, so `agentId` names a row that is gone.
+   *
+   * Spelled out as a field because the PROSE being right is not enough. The reply is read by a
+   * language model whose documented rule is to reference an agent as `[@Name](sparkle-agent:<id>)`,
+   * and this file's own `provisionalName` note records that a field the model can quote WILL be
+   * quoted. With a live-looking `agentId` + `provisionalName` in the payload, an accurate sentence
+   * still invites a pill for a nonexistent agent, or a follow-up `send_to_agent_terminal` /
+   * `close_agent` on a dead id — the same "names a control on a deleted row" trap this outcome was
+   * introduced to close, relocated from the copy into the data (roborev 55865). `provisionalName` is
+   * therefore OMITTED for that outcome: there is no row left to have a name.
+   */
+  agentExists: boolean;
   /** Always true — spelled out in the payload rather than left to the field name, because the reply
    *  is read by a language model and a flag it can see beats a convention it must infer. */
   nameIsProvisional: true;
   /** The capacity reading AFTER the spawn, so the concierge can say "that's 3 of 8". */
   capacity: CapacityReading;
-  /** True when a brief was seeded with the spawn. Reported back so the caller can tell a briefed
-   *  agent from an empty one WITHOUT re-reading the terminal — and so "did my prompt land?" is
-   *  answered by the reply rather than by inference. */
+  /**
+   * True ONLY when the brief was OBSERVED to reach the agent — never merely because a prompt was
+   * passed in.
+   *
+   * This field used to be `Boolean(input.prompt)`, and that made it a lie the whole system trusted.
+   * The brief was written into the agent's PTY after spawn, which lost the SUBMIT every time (see
+   * services/agentBrief for the measurements): the text sat at the agent's prompt with the cursor
+   * after it until a human pressed Enter, while this said `true`. On five of five concierge spawns in
+   * one evening, two agents sat idle 20+ minutes and one woke with no objective at all — it ran eight
+   * forensic checks and correctly reported it had no goal. A spawn that reports success while leaving
+   * the agent briefless is worse than one that fails loudly.
+   *
+   * Now it means: claude was exec'd with the brief as its positional prompt, so claude submits it
+   * itself at startup. When that could not be confirmed, this is FALSE and `briefDelivery` says why.
+   */
   briefed: boolean;
+  /**
+   * The brief's delivery outcome, spelled out rather than left for the reader to infer from
+   * `briefed` — this reply is read by a language model, and a flag it can see beats a convention it
+   * must work out (the same reasoning as `nameIsProvisional`).
+   *
+   *  • "submitted"     — delivered and submitted. The only value that pairs with `briefed: true`.
+   *  • "no-brief"      — none was asked for. A deliberate state (an empty agent), NOT a failure.
+   *  • "launch-failed" — the agent's pane will never launch it (spawn error, or no claude on PATH).
+   *                      The row SURVIVES and the brief is still attached, so "Start again" sends it.
+   *  • "agent-closed"  — the agent was closed or discarded before its brief went out. Kept separate
+   *                      from "launch-failed" because the two leave OPPOSITE worlds: here the row is
+   *                      gone and the brief with it, so a retry remedy would name a control on a
+   *                      deleted row (roborev 55850).
+   *  • "unconfirmed"   — no launch and no failure within the wait. The brief may yet go out, so this
+   *                      is explicitly not "failed" — but it is not success either, and nothing may
+   *                      upgrade it to one.
+   */
+  briefDelivery: "submitted" | "no-brief" | "launch-failed" | "agent-closed" | "unconfirmed";
+  /** Present only when `briefed` is false and a brief WAS asked for: what to tell the human, in the
+   *  concierge's own voice, so an undelivered brief surfaces as a thing to act on instead of a
+   *  silence. Absent when there was nothing to deliver or delivery succeeded. */
+  briefFailure?: string;
   /** The mode the agent actually started in. Echoed because "build" is represented by the absence
    *  of a flag, so silence would otherwise be ambiguous between "build" and "not applied". */
   mode: "plan" | "build";
@@ -316,7 +367,9 @@ export interface SpawnBuildAgentInput {
  * worktree + PTY on mount, plus the best-effort bead), reached through the shared
  * `spawnBuildAgentInProject` so there is only ever one of it.
  */
-export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResult<SpawnedBuildAgent> {
+export async function spawnBuildAgent(
+  input: SpawnBuildAgentInput = {},
+): Promise<LifecycleResult<SpawnedBuildAgent>> {
   if (input.runtime === "cloud") {
     return refuse(
       "spawn_cloud_build_agent",
@@ -451,15 +504,82 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
       .projects.find((p) => p.id === project.id)
       ?.agents.find((a) => a.id === agentId)?.name ?? "Build agent";
   log.debug("concierge-lifecycle", "spawned a build agent", { agentId, projectId: project.id });
+  // ══ WAIT FOR THE BRIEF TO ACTUALLY GO OUT, THEN REPORT WHAT HAPPENED ══════════════════════════
+  //
+  // The reply is only allowed to claim `briefed: true` once the launch carrying the brief has run
+  // (services/agentBrief). This awaits the launch EVENT — it is not a sleep, and there is
+  // deliberately no fixed delay anywhere on this path: a magic duration would be too short on a
+  // loaded machine and wasted on an idle one, and the measurements show even "output has been quiet
+  // for 2.5s" fires too early to be trusted. The bound inside `awaitBriefDelivery` exists only to
+  // stop waiting on silence, and its outcome is "unconfirmed" rather than success.
+  //
+  // No brief asked for → resolves immediately with nothing held, so an empty spawn is as fast as it
+  // ever was.
+  const delivery = input.prompt
+    ? await awaitBriefDelivery(agentId)
+    : ({ state: "no-brief" } as const);
+  // THE REMEDY MUST BE AN ACTION THAT ACTUALLY WORKS under the conditions that triggered it — this
+  // repo treats a wrong remedy string as a bug, not phrasing.
+  //
+  // `launch-failed` means the agent's TERMINAL never started (spawn error, or no claude on PATH), so
+  // it is NOT "running with no objective" — an earlier draft said that, and it described the wrong
+  // state entirely. The row exists and its brief is still attached, so "Start again" is the correct
+  // action: `noteBriefFailed` deliberately RETAINS the brief precisely so a retry re-emits it.
+  // OBSERVED AT REPLY TIME, never inferred from the delivery state.
+  //
+  // This was `delivery.state !== "agent-closed"`, which is a proxy for the question, not the answer —
+  // and it is wrong in exactly the cases that matter. Any path that destroys an agent row WITHOUT
+  // calling `clearBrief` (the cross-window tombstone merge is one: `withoutRemovedAgents` drops rows
+  // whenever the union of this window's and the persisted snapshot's `removedIds` says so) leaves
+  // the delivery reading `unconfirmed`, so the inferred flag would ship `agentExists: true` plus a
+  // live `provisionalName` for a deleted row — the very "live-looking handle for a dead id" this
+  // field was added to prevent, reached through a different door (roborev 55876).
+  //
+  // Asking the store costs one lookup and is true for EVERY deletion path, including ones not yet
+  // written. That is the difference between an invariant a comment asserts and one the code checks.
+  const agentExists = useProjectStore
+    .getState()
+    .projects.find((p) => p.id === project.id)
+    ?.agents.some((a) => a.id === agentId) === true;
+  // THE ROW BEING GONE OUTRANKS THE DELIVERY OUTCOME, and this ordering is load-bearing.
+  //
+  // Making `agentExists` observed created a combination the copy never anticipated: `unconfirmed`
+  // TOGETHER WITH `agentExists: false` — which is not a corner but the whole reason the flag is
+  // observed (a row destroyed by any path that doesn't settle the brief leaves the delivery reading
+  // `unconfirmed`). Keyed on `delivery.state` alone, that reply told the human to "check that it
+  // picked up the task" about an agent that no longer exists, beside `agentExists: false` and a
+  // persona instruction to say it was closed. Same remedy-copy defect as the three before it,
+  // relocated into the one sentence still left unconditional (roborev 55888).
+  //
+  // So: if the row is gone, say so — whatever the delivery outcome was. Only a SURVIVING row gets
+  // the outcome-specific wording, because only then is there something to go and look at.
+  const briefFailure = !agentExists
+    ? "That agent is gone — it was closed before its opening brief went in, so nothing is running " +
+      "and the brief went with it. Say the word and I'll start a fresh one with the same brief."
+    : delivery.state === "launch-failed"
+      ? // The row survives and `noteBriefFailed` retained the brief, so the retry really does send it.
+        `I created the agent, but its terminal didn't start — ${delivery.reason} — so its opening ` +
+        `brief hasn't gone in yet. Its brief is still attached, so "Start again" on that agent will ` +
+        `send it; nothing needs re-typing.`
+      : delivery.state === "unconfirmed"
+        ? // The row is still THERE (checked above), so "go look at it" is an action they can take.
+          "I created the agent, but I couldn't confirm its opening brief went in. Check that it " +
+          "picked up the task before relying on it."
+        : undefined;
   return ok("spawn_build_agent", {
     agentId,
     projectId: project.id,
-    provisionalName,
+    // Omitted entirely when the row is gone: a name is a thing a row has, and this one no longer
+    // exists. Read BEFORE the removal, so keeping it would quote a name nothing can resolve.
+    ...(agentExists ? { provisionalName } : {}),
     /** Spelled out in the payload, not only in this file's comments: the reply is read by a language
      *  model, and a flag it can see is worth more than a naming convention it has to infer. */
     nameIsProvisional: true,
+    agentExists,
     capacity: localAgentCapacity(),
-    briefed: Boolean(input.prompt),
+    briefed: delivery.state === "submitted" && Boolean(input.prompt),
+    briefDelivery: delivery.state,
+    ...(briefFailure ? { briefFailure } : {}),
     mode: input.mode === "plan" ? "plan" : "build",
     model: isDefaultModel(input.model) ? DEFAULT_MODEL_ID : input.model!,
   });

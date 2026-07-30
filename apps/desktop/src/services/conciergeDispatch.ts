@@ -660,7 +660,11 @@ function recordPickerAnswer(agentId: string, label: string, humanAuthored: boole
  *  DELIVERED (see the side-effects note in the file header). Best-effort by construction: an agent
  *  whose project can't be resolved simply gets no history entry, and an unmounted terminal no
  *  marker — neither is a reason to fail a send that already landed. */
-function recordPromptSideEffects(
+/** Exported for the BRIEF-AT-LAUNCH path (AgentPane): a brief delivered as claude's positional
+ *  prompt never passes through `submitPrompt`, so it has to record the same five side-effects here
+ *  or the pinned header, prompt history and auto-naming would all be blind to the agent's opening
+ *  instruction — the exact blindness `engine/newAgentAttention.isBriefless` then misreads. */
+export function recordPromptSideEffects(
   agentId: string,
   text: string,
   renderings: Pick<ConciergeDispatchOptions, "display" | "namingBasis"> = {},

@@ -63,7 +63,66 @@ export function liveWebglPermitCount(): number {
   return live.size;
 }
 
+// ---------------------------------------------------------------------------
+// The one-way "WebGL is not usable here" latch.
+//
+// Terminal refuses to KEEP a renderer whose canvas it cannot find, because such a renderer can be
+// neither watched for context loss nor released. But refusing per-attach is not enough on its own:
+// the addon has to be CONSTRUCTED before its canvas can exist, and constructing it allocates a
+// webgl2 context we then cannot release (releaseGlContext needs the canvas). attachWebgl re-runs on
+// every activation, so a PERSISTENT probe failure — an xterm bump that moves where the canvas is
+// created, which is the whole reason the probe can fail — would construct and strand one
+// unreleasable context per agent switch, unbounded. The permit cap cannot throttle that, because
+// the permit is handed straight back.
+//
+// So repeated failures latch for the process: every later attach bails before allocating anything.
+//
+// BUT NOT ON THE FIRST FAILURE. The latch is process-wide and one-way, so a false positive costs the
+// entire session's terminal rendering — every pane drops to the DOM renderer — while a missed latch
+// costs one stranded context. That asymmetry means the trigger has to distinguish "the xterm build
+// puts its canvas somewhere we don't look" from a one-off: a pane that happened to probe while
+// detached or before layout. Nothing in the probe itself can tell those apart, so we use evidence:
+//
+//   · TWO DISTINCT agents failed → systemic. A build-shape mismatch fails for every pane, so the
+//     second pane confirms it immediately, and no single pane's bad luck can ever trip it.
+//   · THREE failures total → latch regardless of distinctness. This bounds the leak when only one
+//     agent is open: without it, a single pane failing forever would strand a context per
+//     activation, which is the very leak this exists to stop.
+//
+// Worst case is 3 stranded contexts (of a measured budget of 16) before WebGL is given up, instead
+// of one per agent switch, unbounded.
+// THE EVIDENCE UNIT IS A PANE, NOT AN ATTACH. Terminal calls attachWebgl twice for a pane that
+// mounts active (once from the mount effect, once from the visibility effect), so counting attaches
+// would let ONE unlucky pane spend two evidence points on its first mount and arm the latch on its
+// next hide/show — precisely the single-pane false positive the threshold exists to rule out.
+// Terminal guarantees at most one note per mounted pane (its own per-instance guard), so these
+// counters count panes.
+const failedAgents = new Set<string>();
+let failureCount = 0;
+
+export function noteWebglCanvasUnfindable(label: string): void {
+  failedAgents.add(label);
+  failureCount++;
+}
+
+// Counter-evidence. A successful probe is DIRECT proof that this xterm build puts its canvas where
+// we look — it refutes the systemic hypothesis the latch is testing. Under that hypothesis failures
+// are consecutive, so a success in between means the earlier failures were one-offs and must not
+// accumulate toward a permanent, session-wide disable. Without this, two unrelated blips hours and
+// thousands of successful attaches apart would arm the latch just as readily as two consecutive
+// ones, with no way back (resetWebglPermits is test-only).
+export function noteWebglCanvasFound(): void {
+  failedAgents.clear();
+  failureCount = 0;
+}
+
+export function isWebglCanvasUnfindable(): boolean {
+  return failedAgents.size >= 2 || failureCount >= 3;
+}
+
 // Test-only: the registry is module-global state, so suites must start from zero.
 export function resetWebglPermits(): void {
   live.clear();
+  failedAgents.clear();
+  failureCount = 0;
 }

@@ -5,6 +5,9 @@ import {
   releaseWebglPermit,
   liveWebglPermitCount,
   resetWebglPermits,
+  noteWebglCanvasUnfindable,
+  noteWebglCanvasFound,
+  isWebglCanvasUnfindable,
 } from "./webglContextRegistry";
 
 beforeEach(() => resetWebglPermits());
@@ -66,5 +69,50 @@ describe("webglContextRegistry", () => {
     // limit still evicts.
     expect(MAX_WEBGL_CONTEXTS).toBeGreaterThanOrEqual(2);
     expect(MAX_WEBGL_CONTEXTS).toBeLessThanOrEqual(8);
+  });
+});
+
+// The latch that gives up on WebGL for the whole process. Its trigger is a deliberate asymmetry:
+// firing wrongly costs EVERY pane its renderer for the session; not firing costs one stranded
+// context. So one failure is never enough evidence.
+describe("the canvas-unfindable latch", () => {
+  it("does not arm on a single failure", () => {
+    noteWebglCanvasUnfindable("agent-a");
+    expect(isWebglCanvasUnfindable()).toBe(false);
+  });
+
+  it("arms once TWO DISTINCT agents have failed — that is what makes it systemic", () => {
+    noteWebglCanvasUnfindable("agent-a");
+    expect(isWebglCanvasUnfindable()).toBe(false);
+    noteWebglCanvasUnfindable("agent-b");
+    expect(isWebglCanvasUnfindable()).toBe(true);
+  });
+
+  it("arms on the THIRD failure of a single agent — bounding the leak when only one is open", () => {
+    // Without this clause a lone repeatedly-failing pane would strand a context per activation,
+    // which is the exact leak the latch exists to stop.
+    noteWebglCanvasUnfindable("solo");
+    noteWebglCanvasUnfindable("solo");
+    expect(isWebglCanvasUnfindable()).toBe(false);
+    noteWebglCanvasUnfindable("solo");
+    expect(isWebglCanvasUnfindable()).toBe(true);
+  });
+
+  it("a SUCCESSFUL probe clears the tally — the trigger is consecutive failures, not a lifetime sum", () => {
+    noteWebglCanvasUnfindable("agent-a");
+    noteWebglCanvasFound();
+    noteWebglCanvasUnfindable("agent-b");
+    // Two distinct agents have failed overall, but a working probe sat between them, which refutes
+    // the systemic hypothesis. Still disarmed.
+    expect(isWebglCanvasUnfindable()).toBe(false);
+  });
+
+  it("starts disarmed, and resetWebglPermits disarms it again", () => {
+    expect(isWebglCanvasUnfindable()).toBe(false);
+    noteWebglCanvasUnfindable("x");
+    noteWebglCanvasUnfindable("y");
+    expect(isWebglCanvasUnfindable()).toBe(true);
+    resetWebglPermits();
+    expect(isWebglCanvasUnfindable()).toBe(false);
   });
 });

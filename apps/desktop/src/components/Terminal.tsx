@@ -56,6 +56,9 @@ import {
   acquireWebglPermit,
   releaseWebglPermit,
   liveWebglPermitCount,
+  noteWebglCanvasUnfindable,
+  noteWebglCanvasFound,
+  isWebglCanvasUnfindable,
   type WebglPermit,
 } from "./webglContextRegistry";
 import { safeUnlisten } from "../services/safeUnlisten";
@@ -273,6 +276,9 @@ export function Terminal({
   const webglCanvasRef = useRef<GlCanvasLike | null>(null);
   // Our slot in the process-wide concurrent-context cap; handed back on every teardown path.
   const webglPermitRef = useRef<WebglPermit | null>(null);
+  // True once THIS pane's canvas probe has failed. Keeps a single pane to one stranded context and
+  // one piece of latch evidence, no matter how many times attachWebgl re-runs for it.
+  const probeFailedRef = useRef(false);
   // Unsubscriber for our immediate webglcontextlost listener.
   const webglLostUnlistenRef = useRef<(() => void) | null>(null);
   // Lets the context-loss callbacks — registered once at attach and living for the addon's whole
@@ -404,6 +410,15 @@ export function Terminal({
     // GPU context and no texture atlas and therefore CANNOT produce corrupted glyphs. Slightly less
     // crisp box-drawing is the entire cost; taking a context we don't have budget for would evict
     // somebody else's and corrupt THEIR pane.
+    // THIS pane already failed the probe. Bail before allocating anything: another addon means
+    // another context we cannot release. This also makes the evidence unit a PANE rather than an
+    // attach — attachWebgl runs twice for a pane that mounts active (mount effect + visibility
+    // effect), and counting both would let one unlucky pane arm the process-wide latch by itself.
+    if (probeFailedRef.current) return;
+    // Some other panes already failed; WebGL is given up for the process (see
+    // noteWebglCanvasUnfindable). Bail before allocating anything — this effect re-runs on every
+    // activation.
+    if (isWebglCanvasUnfindable()) return;
     const permit = acquireWebglPermit(agentId);
     if (!permit) {
       // Logged so a recurrence is self-diagnosing. If this appears, more panes believe they are
@@ -439,12 +454,43 @@ export function Terminal({
       // teardownWebgl) and to watch for loss.
       webglCanvasRef.current = findWebglCanvas(term.element ?? null);
       if (!webglCanvasRef.current) {
-        // The probe found no webgl2 canvas even though the addon attached. That means we CANNOT
-        // release this context on teardown and CANNOT watch it for loss — i.e. the original leak is
-        // back, silently. Most likely cause: xterm changed how/where it creates its canvas. Loud on
-        // purpose; a silent no-op here is exactly how this bug survived unnoticed.
-        console.warn("webgl attached but its canvas was not found; context cannot be released", agentId);
+        // The probe found no webgl2 canvas even though the addon attached, so we can neither watch
+        // this context for loss nor release it. BOTH failure modes are severe and silent:
+        //
+        //   · unreleasable → the context leaks, which is what exhausted the engine's 16-context
+        //     budget and got the visible terminal's context evicted in the first place;
+        //   · unwatchable  → on loss, xterm's own path takes over. It preventDefaults and waits 3s,
+        //     and if the engine restores the context first it calls _initializeWebGLState() and
+        //     _requestRedrawViewport() — which empties the glyph atlas but NEVER clears the
+        //     renderer's per-cell model. _updateModel then skips every cell as already-drawn, so
+        //     nothing is uploaded into the empty atlas and the pane goes SOLID BLACK, permanently,
+        //     recoverable only by a remount. onContextLoss never fires either, because the restore
+        //     cleared its timer, so nothing in the app ever learns.
+        //
+        // So a renderer we cannot manage is strictly worse than no renderer: xterm's DOM renderer
+        // has no atlas and no model cache and therefore cannot fail either way. Give it up.
+        // Record the failure BEFORE tearing down. Enough of these latches WebGL off for the whole
+        // process (see noteWebglCanvasUnfindable) — deliberately NOT on the first one, because a
+        // process-wide latch on a one-off timing failure would cost every pane its renderer.
+        // Exactly ONE note per mounted pane, so the threshold counts panes and not attaches.
+        probeFailedRef.current = true;
+        noteWebglCanvasUnfindable(agentId);
+        // Say which of the two things just happened: a single unmanageable pane, or WebGL being
+        // given up session-wide. The second is far more consequential and must not read like the
+        // first in the log.
+        console.warn(
+          isWebglCanvasUnfindable()
+            ? "webgl canvas not found repeatedly; DISABLING WebGL process-wide, all panes now use the DOM renderer"
+            : "webgl canvas not found; this pane uses the DOM renderer (cannot watch or release it)",
+          agentId,
+        );
+        teardownWebgl();
+        return;
       }
+      // A successful probe refutes the "this build hides its canvas" hypothesis, so it clears any
+      // accumulated one-off failures — the latch should need CONSECUTIVE failures, not a lifetime
+      // tally.
+      noteWebglCanvasFound();
       // THE FIX THAT MAKES CORRUPTED GLYPHS IMPOSSIBLE RATHER THAN MERELY RARER. Listen for
       // webglcontextlost ourselves and fall back within the same event dispatch, instead of waiting
       // out the addon's 3-second restore timer while it renders from a dead atlas. See

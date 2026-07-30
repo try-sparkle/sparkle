@@ -139,6 +139,14 @@ import {
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
 import { useProjectStore } from "../../stores/projectStore";
 import { takePendingSends, resetPendingSends } from "../pendingSends";
+import {
+  BRIEF_DELIVERY_TIMEOUT_MS,
+  briefForLaunch,
+  hasUndeliveredBrief,
+  noteBriefFailed,
+  noteBriefLaunched,
+  resetAgentBriefs,
+} from "../agentBrief";
 import { wasProjectVisited, resetVisitedProjects } from "../sessionProjects";
 import { assembleBuildSpawn } from "../orchestrationLaunch";
 import { useRuntimeStore } from "../../stores/runtimeStore";
@@ -173,6 +181,7 @@ beforeEach(() => {
   // The pending-send queue is module-level state, so a spawn that queued a brief would otherwise
   // leak into the next test's assertions about what was (or was not) queued.
   resetPendingSends();
+  resetAgentBriefs();
   // Visited-project tracking is module-level too, and it is half the pane-mount gate — a project
   // marked visited by one test would mask a missing mount guarantee in the next.
   resetVisitedProjects();
@@ -1122,27 +1131,245 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     return useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
   }
 
-  // ASSERTED ON THE DELIVERY QUEUE, NOT THE STORE ROW — this is the whole lesson of roborev 55057.
-  // An earlier version of this test checked `lastPrompt`/`promptHistory`, which `appendPrompt` sets
-  // without writing anything to the PTY. It passed against an implementation that recorded the brief
-  // and never sent it, and because `newAgentAttention.isBriefless` keys off those same two fields,
-  // that implementation would have produced a falsely CALM agent idling at an empty prompt forever —
-  // strictly worse than the false red it was meant to fix. The queue is where a real send lives.
-  it("queues the brief for the PTY, so it is actually delivered and not merely recorded", async () => {
-    const projectId = seedProject();
-    const r = await dispatchConciergeTool(
-      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, prompt: "Fix the parser" } }),
+  /**
+   * Dispatch a spawn and PLAY THE PART OF THE AgentPane: once the agent row exists, report the
+   * launch that carries its brief (or its failure, when `outcome` says so).
+   *
+   * This scaffolding exists because `briefed` is now an OBSERVATION rather than an echo of the input.
+   * A test that dispatches a briefed spawn and never launches anything gets `unconfirmed` — which is
+   * the honest answer, and the whole point. So the pane's half of the handshake has to be acted out
+   * here, which also pins the ORDERING: the op does not answer until delivery is settled.
+   */
+  async function spawnWithPane(
+    args: Record<string, unknown>,
+    outcome: "launch" | "fail" | "silence" = "launch",
+  ) {
+    const dispatched = dispatchConciergeTool(
+      call({ domain: "lifecycle", op: "spawn_build_agent", args }),
     );
+    if (outcome !== "silence") {
+      // Yield until the spawn's synchronous half has created the row and attached the brief. Bounded,
+      // and a real send never depends on this — it is the test standing in for a mounting pane.
+      for (let i = 0; i < 100; i++) {
+        const held = useProjectStore
+          .getState()
+          .projects.flatMap((p) => p.agents)
+          .find((a) => a.kind === "build" && hasUndeliveredBrief(a.id));
+        if (held) {
+          if (outcome === "launch") noteBriefLaunched(held.id);
+          else noteBriefFailed(held.id, "claude not found");
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    return dispatched;
+  }
+
+  // ASSERTED ON THE DELIVERY ROUTE AND ITS OBSERVED OUTCOME, NOT THE STORE ROW AND NOT THE INPUT.
+  //
+  // This test has now failed the same feature twice, in two different ways, and both are worth
+  // keeping in mind:
+  //
+  //   1. It once checked `lastPrompt`/`promptHistory`, which `appendPrompt` sets without writing
+  //      anything to the PTY (roborev 55057) — green against an implementation that recorded the
+  //      brief and never sent it.
+  //   2. It then checked the PENDING-SEND QUEUE, which was a real send path — but the send it
+  //      performed delivered the text and LOST THE SUBMIT, every single time. The brief sat at the
+  //      agent's prompt with the cursor after it until a human pressed Enter. `briefed: true` was
+  //      returned regardless, so five of five concierge spawns in one evening reported success while
+  //      leaving the agent dead in the water; the same population came back from a force-quit with
+  //      empty activity and no work started.
+  //
+  // Both versions asserted something UPSTREAM of submission. So this one asserts submission itself:
+  // the brief rides claude's argv (which claude submits at startup), the racy queue is empty, and
+  // `briefed` flips only once the launch carrying it has been OBSERVED.
+  it("delivers the brief as launch argv and reports briefed only once submission is observed", async () => {
+    const projectId = seedProject();
+    const r = await spawnWithPane({ projectId, prompt: "Fix the parser" });
     expect(r.ok).toBe(true);
 
     const agentId = agentsOf(projectId).find((a) => a.kind === "build")!.id;
-    const { due } = takePendingSends(agentId);
-    expect(due.map((d) => d.text)).toEqual(["Fix the parser"]);
-    // userPrompt drives recordPromptSideEffects on the flush path — that is what writes the store
-    // row, ONCE, on delivery. Seeding the row here as well would double-record it.
-    expect(due[0]!.userPrompt).toBe(true);
-    // …and the reply says so, so the caller need not re-read the terminal to find out.
-    expect(r.ok && (r.data as { briefed: boolean }).briefed).toBe(true);
+    // NOT queued for a post-ready PTY paste — that route is what lost the submit.
+    expect(takePendingSends(agentId).due).toEqual([]);
+    // The brief was consumed by a launch, so it cannot be re-sent on a later relaunch.
+    expect(hasUndeliveredBrief(agentId)).toBe(false);
+    // …and the reply says SUBMITTED, in a field the reader cannot mistake for the input echo.
+    const data = r.ok ? (r.data as { briefed: boolean; briefDelivery: string }) : null;
+    expect(data?.briefed).toBe(true);
+    expect(data?.briefDelivery).toBe("submitted");
+  });
+
+  // THE HONEST FAILURE. A spawn that reports success while leaving the agent briefless is worse than
+  // one that fails loudly: the concierge told the founder an agent was confirmed-working when it was
+  // sitting dead with its brief unsent. So a pane that will never launch the brief must come back as
+  // `briefed: false` with something the human can act on — never as silence.
+  it("reports an honest failure when the pane will never launch the brief", async () => {
+    const projectId = seedProject();
+    const r = await spawnWithPane({ projectId, prompt: "Fix the parser" }, "fail");
+    // The SPAWN still succeeded — the agent exists — so this is not a refusal. The BRIEF failed, and
+    // the payload has to distinguish those two facts rather than collapse them.
+    expect(r.ok).toBe(true);
+    const data = r.ok
+      ? (r.data as { briefed: boolean; briefDelivery: string; briefFailure?: string })
+      : null;
+    expect(data?.briefed).toBe(false);
+    expect(data?.briefDelivery).toBe("launch-failed");
+    // THE REMEDY MUST BE AN ACTION THAT WORKS, and must not describe the wrong state. A
+    // `launch-failed` means the TERMINAL never started, so the agent is NOT "running with no
+    // objective" — an earlier draft of this copy said exactly that, describing a state the agent is
+    // not in. "Start again" is the real action, and it works because `noteBriefFailed` retains the
+    // brief (asserted in agentBrief.test.ts) — the two have to stay in step or the remedy becomes the
+    // instruction that produces a silently briefless agent.
+    expect(data?.briefFailure).toMatch(/terminal didn't start/i);
+    expect(data?.briefFailure).toMatch(/start again/i);
+    expect(data?.briefFailure).toMatch(/still attached/i);
+    expect(data?.briefFailure).not.toMatch(/running with no objective/i);
+    // And the brief really is still deliverable, so that sentence is true rather than reassuring.
+    const agentId = agentsOf(projectId).find((a) => a.kind === "build")!.id;
+    expect(hasUndeliveredBrief(agentId)).toBe(true);
+  });
+
+  // CLOSING THE AGENT MID-WAIT MUST NOT PRODUCE THE RETRY REMEDY.
+  //
+  // `spawn_build_agent` now waits up to 20s for delivery, and `projectStore.removeAgent` clears the
+  // brief — so a human (or a concierge `close_agent`) closing the just-spawned agent inside that
+  // window is a REACHABLE path, and it was the one the copy got wrong. Both outcomes once reported
+  // `launch-failed`, so this case answered "its brief is still attached, so Start again on that
+  // agent will send it" — naming a control on a row that had just been deleted, about a brief that
+  // had just been dropped (roborev 55850). Exactly the remedy-copy trap this change exists to close.
+  it("does not offer a retry when the agent was closed before its brief went out", async () => {
+    const projectId = seedProject();
+    const dispatched = spawnWithPane({ projectId, prompt: "Fix the parser" }, "silence");
+    // Close it mid-wait, through the real store path that production uses.
+    let agentId: string | undefined;
+    for (let i = 0; i < 100; i++) {
+      agentId = agentsOf(projectId).find((a) => a.kind === "build")?.id;
+      if (agentId) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(agentId, "expected the spawned build agent").toBeTruthy();
+    useProjectStore.getState().removeAgent(projectId, agentId!);
+
+    const r = await dispatched;
+    expect(r.ok).toBe(true);
+    const data = r.ok
+      ? (r.data as { briefed: boolean; briefDelivery: string; briefFailure?: string })
+      : null;
+    expect(data?.briefed).toBe(false);
+    expect(data?.briefDelivery).toBe("agent-closed");
+    // The remedy must not point at a deleted row or claim the brief survived.
+    expect(data?.briefFailure).not.toMatch(/start again/i);
+    expect(data?.briefFailure).not.toMatch(/still attached/i);
+    expect(data?.briefFailure).toMatch(/closed before/i);
+    // And it resolved from the close rather than sitting out the whole bound.
+    expect(hasUndeliveredBrief(agentId!)).toBe(false);
+    // THE PAYLOAD MUST SAY SO TOO, not just the prose. The reply is read by a model whose rule is to
+    // reference an agent as [@Name](sparkle-agent:<id>), so a live-looking handle beside an accurate
+    // sentence still yields a pill for a nonexistent agent, or a follow-up op fired at a dead id.
+    const payload = r.ok ? (r.data as { agentExists: boolean; provisionalName?: string }) : null;
+    expect(payload?.agentExists).toBe(false);
+    expect(payload?.provisionalName).toBeUndefined();
+  });
+
+  // `removeAgent` is NOT the only path that destroys agent rows — `removeProject` filters the
+  // project out and its agents go with it, never calling `removeAgent`. The first cut of
+  // `agent-closed` cleared briefs only in `removeAgent` and asserted (wrongly, in a docstring) that
+  // it was "the one choke point", so closing a PROJECT mid-wait fell straight back into the failure
+  // the state exists to remove: the waiter never settled, the op sat out its whole bound, and it
+  // answered "unconfirmed — check that it picked up the task" about an agent AND a project that no
+  // longer existed (roborev 55865).
+  it("reports agent-closed when the whole PROJECT is closed mid-wait, not unconfirmed", async () => {
+    const projectId = seedProject();
+    const dispatched = spawnWithPane({ projectId, prompt: "Fix the parser" }, "silence");
+    let agentId: string | undefined;
+    for (let i = 0; i < 100; i++) {
+      agentId = agentsOf(projectId).find((a) => a.kind === "build")?.id;
+      if (agentId) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(agentId, "expected the spawned build agent").toBeTruthy();
+    useProjectStore.getState().removeProject(projectId);
+
+    const r = await dispatched;
+    const data = r.ok
+      ? (r.data as { briefDelivery: string; agentExists: boolean; briefFailure?: string })
+      : null;
+    expect(data?.briefDelivery).toBe("agent-closed");
+    expect(data?.agentExists).toBe(false);
+    expect(data?.briefFailure).not.toMatch(/start again/i);
+    expect(hasUndeliveredBrief(agentId!)).toBe(false);
+  });
+
+  // `agentExists` MUST BE OBSERVED, NOT INFERRED FROM THE DELIVERY STATE.
+  //
+  // It started as `delivery.state !== "agent-closed"`, which is a proxy for the question rather than
+  // the answer — and wrong in exactly the case that matters. Any row destruction that does NOT clear
+  // the brief (the cross-window tombstone merge is one) leaves the delivery reading `unconfirmed`,
+  // so an inferred flag ships `agentExists: true` with a live `provisionalName` for a deleted row:
+  // the same live-looking-handle-for-a-dead-id this field exists to prevent, through another door
+  // (roborev 55876).
+  //
+  // So this test deletes the row DIRECTLY — no `removeAgent`, no `removeProject`, nothing that
+  // settles the brief — which is precisely the shape of a path nobody has written yet.
+  it("observes whether the agent still exists, even when nothing cleared its brief", async () => {
+    const projectId = seedProject();
+    vi.useFakeTimers();
+    let r;
+    try {
+      const pending = spawnWithPane({ projectId, prompt: "Fix the parser" }, "silence");
+      let agentId: string | undefined;
+      for (let i = 0; i < 100; i++) {
+        agentId = agentsOf(projectId).find((a) => a.kind === "build")?.id;
+        if (agentId) break;
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(agentId, "expected the spawned build agent").toBeTruthy();
+      // Excise the row without going through any teardown that knows about briefs.
+      useProjectStore.setState((s) => ({
+        projects: s.projects.map((p) =>
+          p.id === projectId ? { ...p, agents: p.agents.filter((a) => a.id !== agentId) } : p,
+        ),
+      }));
+      await vi.advanceTimersByTimeAsync(BRIEF_DELIVERY_TIMEOUT_MS + 1);
+      r = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+    const data = r.ok
+      ? (r.data as { briefDelivery: string; agentExists: boolean; provisionalName?: string })
+      : null;
+    // Nothing settled the brief, so the delivery outcome is honestly "unconfirmed"…
+    expect(data?.briefDelivery).toBe("unconfirmed");
+    // …but the payload must NOT hand back a usable handle for a row that is gone.
+    expect(data?.agentExists).toBe(false);
+    expect(data?.provisionalName).toBeUndefined();
+    // AND THE SENTENCE HAS TO AGREE WITH THE FLAG. `unconfirmed` + `agentExists: false` is exactly
+    // this scenario, and keying the copy on the delivery state alone told the human to go inspect an
+    // agent that no longer exists — the same remedy-copy defect as "Start again" on a deleted row,
+    // relocated into the last unconditional sentence (roborev 55888). The earlier version of this
+    // test asserted the flag and never read the prose, so nothing caught it.
+    const failure = r.ok ? (r.data as { briefFailure?: string }).briefFailure : undefined;
+    expect(failure).not.toMatch(/check that it picked up/i);
+    expect(failure).toMatch(/gone/i);
+  });
+
+  // Silence is not success. When no launch and no failure arrives, the op says "unconfirmed" — the
+  // brief may still go out, so this is explicitly not a failure, but nothing may upgrade it either.
+  it("never upgrades an unobserved brief into a success", async () => {
+    const projectId = seedProject();
+    // Drive the give-up bound with fake timers so the assertion needs no real clock and no sleep.
+    vi.useFakeTimers();
+    try {
+      const pending = spawnWithPane({ projectId, prompt: "Fix the parser" }, "silence");
+      await vi.advanceTimersByTimeAsync(BRIEF_DELIVERY_TIMEOUT_MS + 1);
+      const r = await pending;
+      const data = r.ok ? (r.data as { briefed: boolean; briefDelivery: string }) : null;
+      expect(data?.briefed).toBe(false);
+      expect(data?.briefDelivery).toBe("unconfirmed");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // A queued brief is only ever delivered by an AgentPane's ptyReady flush, and Workspace mounts
@@ -1150,24 +1377,32 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
   // spawning into a project the user hasn't opened would queue a brief nothing can drain — the queue
   // does not self-age, so it would sit there with no delivery and no expiry, while the reply claimed
   // briefed: true (roborev 55088). The spawn therefore has to make the target current.
-  it("makes the target project current, so a pane exists to flush the brief", async () => {
+  it("makes the target project current, so a pane exists to launch the brief", async () => {
     const alpha = seedProject("Alpha", "/tmp/alpha");
     const beta = seedProject("Beta", "/tmp/beta");
     useProjectStore.setState({ selectedProjectId: alpha } as never);
 
-    const r = await dispatchConciergeTool(
-      call({
-        domain: "lifecycle",
-        op: "spawn_build_agent",
-        args: { projectId: beta, prompt: "Fix the parser" },
-      }),
-    );
+    // `silence` here on purpose: this test is about NAVIGATION, and the brief must still be sitting
+    // attached and un-launched when we look at it. Timers are faked so the op's give-up bound does
+    // not hold the test up — nothing about the delivery depends on a duration.
+    vi.useFakeTimers();
+    let r;
+    try {
+      const pending = spawnWithPane({ projectId: beta, prompt: "Fix the parser" }, "silence");
+      // The navigation is synchronous, so it is already done before the brief-delivery wait.
+      expect(useProjectStore.getState().selectedProjectId).toBe(beta);
+      expect(wasProjectVisited(beta)).toBe(true);
+      const agentId = agentsOf(beta).find((a) => a.kind === "build")!.id;
+      // The brief is attached to the LAUNCH, waiting for the pane that this navigation guarantees —
+      // it is not sitting in the pending-send queue whose flush lost the submit.
+      expect(briefForLaunch(agentId, false)).toBe("Fix the parser");
+      expect(takePendingSends(agentId).due).toEqual([]);
+      await vi.advanceTimersByTimeAsync(BRIEF_DELIVERY_TIMEOUT_MS + 1);
+      r = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
     expect(r.ok).toBe(true);
-    expect(useProjectStore.getState().selectedProjectId).toBe(beta);
-    expect(wasProjectVisited(beta)).toBe(true);
-
-    const agentId = agentsOf(beta).find((a) => a.kind === "build")!.id;
-    expect(takePendingSends(agentId).due.map((d) => d.text)).toEqual(["Fix the parser"]);
   });
 
   // markProjectOpen must be PAIRED with the selection. Selecting a project whose tab is closed
@@ -1180,9 +1415,7 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     useProjectStore.setState({ selectedProjectId: alpha } as never);
     useUiStore.setState({ openProjectIds: [alpha], pinnedProjectId: null } as never);
 
-    await dispatchConciergeTool(
-      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId: beta, prompt: "go" } }),
-    );
+    await spawnWithPane({ projectId: beta, prompt: "go" });
     expect(useUiStore.getState().openProjectIds).toContain(beta);
     expect(useProjectStore.getState().selectedProjectId).toBe(beta);
   });
@@ -1283,11 +1516,14 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
     expect(refusal(r).message).not.toMatch(/close or finish/i);
   });
 
-  it("does not pre-write the prompt row — the flush path owns that, exactly once", async () => {
+  // The DELIVERY path owns the prompt row, exactly once. Pre-writing it here is the roborev 55057
+  // failure: `newAgentAttention.isBriefless` keys off `lastPrompt`/`promptHistory`, so seeding them
+  // at spawn makes an agent that never got its brief read as CALM — a falsely-quiet row idling at an
+  // empty prompt while the pinned header confidently shows a brief that was never sent. Since the
+  // brief now goes out as launch argv, AgentPane records these on the ptyReady path instead.
+  it("does not pre-write the prompt row — the delivery path owns that, exactly once", async () => {
     const projectId = seedProject();
-    await dispatchConciergeTool(
-      call({ domain: "lifecycle", op: "spawn_build_agent", args: { projectId, prompt: "Fix the parser" } }),
-    );
+    await spawnWithPane({ projectId, prompt: "Fix the parser" });
     const agent = agentsOf(projectId).find((a) => a.kind === "build")!;
     expect(agent.lastPrompt).toBe("");
     expect(agent.promptHistory).toEqual([]);
@@ -1374,19 +1610,13 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
 
   it("settles brief, name, model and mode together in a single call", async () => {
     const projectId = seedProject();
-    const r = await dispatchConciergeTool(
-      call({
-        domain: "lifecycle",
-        op: "spawn_build_agent",
-        args: {
-          projectId,
-          prompt: "Audit the auth flow",
-          name: "Auth Audit",
-          model: "claude-haiku-4-5",
-          mode: "plan",
-        },
-      }),
-    );
+    const r = await spawnWithPane({
+      projectId,
+      prompt: "Audit the auth flow",
+      name: "Auth Audit",
+      model: "claude-haiku-4-5",
+      mode: "plan",
+    });
     expect(r.ok).toBe(true);
     const agent = agentsOf(projectId).find((a) => a.kind === "build")!;
     expect([agent.name, agent.model, agent.permissionMode]).toEqual([
@@ -1394,7 +1624,11 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
       "claude-haiku-4-5",
       "plan",
     ]);
-    expect(takePendingSends(agent.id).due.map((d) => d.text)).toEqual(["Audit the auth flow"]);
+    // The brief went out with the launch (argv), so the racy PTY queue is empty and the brief is
+    // no longer pending — one call settled all four things.
+    expect(takePendingSends(agent.id).due).toEqual([]);
+    expect(hasUndeliveredBrief(agent.id)).toBe(false);
+    expect(r.ok && (r.data as { briefDelivery: string }).briefDelivery).toBe("submitted");
   });
 
   // The store field is inert unless the launcher reads it, and build agents take a DIFFERENT spawn

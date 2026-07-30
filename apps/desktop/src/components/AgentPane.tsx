@@ -63,7 +63,12 @@ import { PinnedPrompt } from "./PinnedPrompt";
 import { composerPrompts } from "./promptHistory";
 import { Terminal, type TerminalApi } from "./Terminal";
 import { registerPromptMarker } from "../services/terminalMarkers";
-import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
+import {
+  abandonPendingSends,
+  flushPendingSends,
+  recordPromptSideEffects,
+} from "../services/conciergeDispatch";
+import { briefForLaunch, noteBriefFailed, noteBriefLaunched } from "../services/agentBrief";
 import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
 import { isTypingInProgress } from "../engine/focusGuard";
 import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
@@ -193,6 +198,10 @@ function AgentPaneInner({
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
+  /** The opening brief THIS launch put in claude's argv, or undefined when it carried none (an
+   *  unbriefed agent, or a resume — which deliberately re-runs nothing). Set in prepare(), consumed
+   *  by the readiness effect so only a launch that actually carried the brief reports it delivered. */
+  const launchBriefRef = useRef<string | undefined>(undefined);
   // Multi Claude Max account support: the accounts available (for the badge dropdown) and the one
   // THIS spawn runs under (its CLAUDE_CONFIG_DIR). `chosenAccountIdRef` mirrors the chosen id for the
   // rate-limit failover callback (which runs outside render). Empty accounts → no badge, default spawn.
@@ -763,6 +772,12 @@ function AgentPaneInner({
             maxConcurrentWorkers: enforcedWorkerCap(useSettingsStore.getState()),
             guardrails: useSettingsStore.getState().guardrailsEnabled,
           });
+          // Read the held brief for THIS launch (undefined when resuming, or when the agent was
+          // spawned empty). Remembered in a ref so the readiness effect below reports the
+          // observation only for a launch that actually CARRIED the brief — a later relaunch, which
+          // resumes and therefore emits no positional prompt, must not be mistaken for delivery.
+          const launchBrief = briefForLaunch(agent.id, resume);
+          launchBriefRef.current = launchBrief;
           setSpawn({
             ...assembleBuildSpawn({
               claudePath: claude.path,
@@ -778,6 +793,13 @@ function AgentPaneInner({
               // are the only ones that can carry the field — threading it only into the generic
               // branch below meant the flag was never emitted at all (roborev 55057).
               permissionMode: agent.permissionMode,
+              // THE OPENING BRIEF, as claude's positional prompt — which claude submits itself at
+              // startup. This is where the "brief arrived but never submitted" bug is fixed: the
+              // brief used to be pasted into the PTY once `ptyReady` fired, and `ptyReady` fires
+              // when `pty_spawn` returns, which is before claude's TUI reads stdin at all — so the
+              // text landed at the prompt and the Enter was swallowed, every time. Undefined on
+              // resume and for an unbriefed agent. See services/agentBrief for the measurements.
+              initialPrompt: launchBrief,
               // Merge the app-level sparkle-control MCP into the SAME --mcp-config as the orchestrator
               // server (never dropping the orchestrator), so a Build agent both fans out workers AND
               // drives its own UI. Omitted when the control bridge was unavailable this spawn.
@@ -930,7 +952,13 @@ function AgentPaneInner({
   // session on a pane that may never unmount. Telling them wins: the concierge names the agent and
   // says to send it again once it's running, which is exactly what a successful Retry allows.
   useEffect(() => {
-    if (phase === "error" || phase === "no-claude") abandonPendingSends(agent.id);
+    if (phase === "error" || phase === "no-claude") {
+      abandonPendingSends(agent.id);
+      // Same reasoning for the opening brief, which no longer rides pendingSends: this pane will
+      // never launch it, so the concierge's `spawn_build_agent` must be told rather than left
+      // waiting on a delivery that cannot arrive. Reported, never dropped.
+      noteBriefFailed(agent.id, phase === "no-claude" ? "claude not found" : "agent spawn failed");
+    }
   }, [phase, agent.id]);
 
   // Flush any prompt the user sent while this agent's PTY was still coming up (services/
@@ -939,6 +967,30 @@ function AgentPaneInner({
   // this pane reports ready — no-op when nothing is held for this agent.
   useEffect(() => {
     if (!ptyReady) return;
+    // THE BRIEF'S DELIVERY OBSERVATION, and the whole reason `briefed: true` can now be trusted.
+    //
+    // `ptyReady` means `pty_spawn` returned — the child was exec'd. For a launch that carried the
+    // brief in its argv (see `launchBrief` in prepare()) that is exactly the fact worth reporting:
+    // claude is running WITH the prompt in its arguments and submits it itself, so there is no
+    // paste and no Enter left to lose. Note it is deliberately NOT enough to say a brief PASTED
+    // here had submitted — that is precisely the claim the old code made and lost five times out of
+    // five, because at this instant claude's TUI is not reading stdin yet.
+    const delivered = launchBriefRef.current ? noteBriefLaunched(agent.id) : undefined;
+    launchBriefRef.current = undefined;
+    // An argv brief bypasses `submitPrompt`, so record the prompt side-effects it would have done:
+    // pinned header, prompt history, ghost-text corpus and auto-naming basis. Without this the row
+    // reads as briefless (engine/newAgentAttention) even though the agent is working on the brief.
+    //
+    // `humanAuthored` is LEFT AT ITS DEFAULT, and the honest reason is that it cannot matter here —
+    // not that a brief is always typed by a person. It is NOT: `spawn_build_agent` takes a `prompt`
+    // the concierge's own model may have composed. What the flag governs is
+    // `projectStore.releaseGoalDebt`, and this fires on an agent whose PTY has only just come up —
+    // no goal, no `goalDebt`, so there is no debt for either answer to release. (This reasoning
+    // moved here from the `queuePendingSend` call it replaced; it stops being true the moment spawn
+    // seeds an agent that INHERITS a goal or a debt — a reused id, a restored session. If that ever
+    // lands, thread the real `isHumanAuthored(authority)` down from the spawn caller rather than
+    // reading this comment as a licence.)
+    if (delivered) recordPromptSideEffects(agent.id, delivered);
     void flushPendingSends(agent.id).catch((e) =>
       console.warn("flushPendingSends failed", e),
     );

@@ -41,6 +41,17 @@ vi.mock("@xterm/xterm", () => {
       // a few frames (display:none→flex). >0 means laid-out/paintable (the reveal path's check).
       Object.defineProperty(el, "clientWidth", { get: () => widthCtl.value, configurable: true });
       Object.defineProperty(el, "clientHeight", { value: 380, configurable: true });
+      // xterm's WebglAddon appends its own webgl2 canvas here. Terminal locates it to release the
+      // GPU context and to watch for webglcontextlost, and REFUSES to keep a renderer whose canvas
+      // it cannot find (an unwatchable renderer goes solid black on context loss). A mock without
+      // this canvas is not a WebGL-rendered terminal, so it cannot exercise the WebGL paths below.
+      const glCanvas = document.createElement("canvas");
+      Object.defineProperty(glCanvas, "getContext", {
+        value: (id: string) =>
+          id === "webgl2" ? { getExtension: () => ({ loseContext: () => {} }) } : null,
+        configurable: true,
+      });
+      el.appendChild(glCanvas);
       parent.appendChild(el);
       this.element = el;
     }

@@ -74,8 +74,7 @@ export function controlMcpPaths(): Promise<McpPaths> {
   return invoke<McpPaths>("control_mcp_paths");
 }
 
-/** Pure assembler: given a started bridge + resolved paths, produce the build agent's PTY spawn.
- *  No initialPrompt — the user drives the build agent from the composer. */
+/** Pure assembler: given a started bridge + resolved paths, produce the build agent's PTY spawn. */
 export function assembleBuildSpawn(opts: {
   claudePath: string;
   resume: boolean;
@@ -103,6 +102,19 @@ export function assembleBuildSpawn(opts: {
    *  creates `kind: "build"`. Omitting it here meant `--permission-mode plan` was never emitted for
    *  any agent that could have it, while the spawn reply still claimed mode "plan" (roborev 55057). */
   permissionMode?: "plan";
+  /**
+   * The agent's OPENING BRIEF, emitted as claude's positional prompt so claude submits it itself at
+   * startup. Undefined → an empty agent the human drives from the composer (the "+ New Build Agent"
+   * behaviour), which is a deliberate state and not a missing brief.
+   *
+   * This is the fix for the brief that arrived but never submitted. The brief used to be written into
+   * the PTY after `onReady`, which fires when `pty_spawn` returns — i.e. before claude's TUI reads
+   * stdin — so the text landed at the prompt and the carriage return was swallowed, on five of five
+   * spawns. Delivered as argv there is no paste and no Enter to lose. `buildClaudeExec` drops it on
+   * resume (a resumed conversation already holds the mission), so a reopen never re-runs the brief.
+   * Measurements: services/agentBrief header.
+   */
+  initialPrompt?: string;
 }): { command: string; args: string[]; cwd: string } {
   // Always load the orchestrator server; MERGE the control server in when wired, so BOTH ride in the
   // single --mcp-config claude accepts (dropping either would silently disable those tools).
@@ -134,6 +146,7 @@ export function assembleBuildSpawn(opts: {
     resumeSessionId: opts.resumeSessionId,
     model: opts.model,
     permissionMode: opts.permissionMode,
+    initialPrompt: opts.initialPrompt,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }

@@ -19,17 +19,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
-const { addonCtors, disposeSpy, loseContext, lostListeners, clearTextureAtlas, refresh } =
-  vi.hoisted(() => ({
-    addonCtors: { count: 0 },
-    disposeSpy: vi.fn(),
-    loseContext: vi.fn(),
-    // Every webglcontextlost listener registered on a mock canvas, so a test can dispatch the event
-    // the way the engine would.
-    lostListeners: [] as Array<() => void>,
-    clearTextureAtlas: vi.fn(),
-    refresh: vi.fn(),
-  }));
+const {
+  addonCtors,
+  disposeSpy,
+  loseContext,
+  lostListeners,
+  clearTextureAtlas,
+  refresh,
+  termDispose,
+  canvasPresent,
+} = vi.hoisted(() => ({
+  addonCtors: { count: 0 },
+  disposeSpy: vi.fn(),
+  loseContext: vi.fn(),
+  // Every webglcontextlost listener registered on a mock canvas, so a test can dispatch the event
+  // the way the engine would.
+  lostListeners: [] as Array<() => void>,
+  clearTextureAtlas: vi.fn(),
+  refresh: vi.fn(),
+  termDispose: vi.fn(),
+  // Lets a test model an xterm whose WebGL canvas cannot be located.
+  canvasPresent: { value: true },
+}));
 
 // A canvas that answers getContext("webgl2") — jsdom's real canvas returns null for WebGL, so the
 // component could never find a context to release without this. Registers its webglcontextlost
@@ -75,7 +86,7 @@ vi.mock("@xterm/xterm", () => {
         configurable: true,
       });
       el.appendChild(layer);
-      el.appendChild(makeGlCanvas());
+      if (canvasPresent.value) el.appendChild(makeGlCanvas());
       parent.appendChild(el);
       this.element = el;
     }
@@ -93,7 +104,7 @@ vi.mock("@xterm/xterm", () => {
       return "";
     }
     write(): void {}
-    dispose(): void {}
+    dispose = termDispose;
   }
   return { Terminal };
 });
@@ -146,6 +157,7 @@ import {
   MAX_WEBGL_CONTEXTS,
   liveWebglPermitCount,
   resetWebglPermits,
+  isWebglCanvasUnfindable,
 } from "./webglContextRegistry";
 
 const baseProps = {
@@ -163,7 +175,10 @@ beforeEach(() => {
   loseContext.mockClear();
   clearTextureAtlas.mockClear();
   refresh.mockClear();
+  termDispose.mockClear();
   lostListeners.length = 0;
+  canvasPresent.value = true;
+  // Also clears the process-wide canvas-unfindable latch.
   resetWebglPermits();
   vi.stubGlobal(
     "ResizeObserver",
@@ -348,6 +363,156 @@ describe("webglcontextlost fallback", () => {
     render(<Terminal {...baseProps} agentId="b" active />);
     // If the loss path leaked its permit, MAX_WEBGL_CONTEXTS losses would leave no pane able to
     // ever get a WebGL renderer again.
+    expect(addonCtors.count).toBe(1);
+  });
+});
+
+// THE SOLID BLACK PANE. A pane whose context is lost must reach a renderer that actually paints,
+// WITHOUT the remount the human had to perform by hand.
+//
+// Why it went black rather than showing garbage — from @xterm/addon-webgl 0.19.0:
+//   webglcontextrestored → clearTimeout(timer); removeTerminalFromCache(); _initializeWebGLState();
+//                          _requestRedrawViewport()
+//   clearTextureAtlas()      = _charAtlas.clearTexture() + _clearModel(true) + redraw
+//   _requestRedrawViewport() = _onRequestRedraw.fire({start:0, end:rows-1})   ← and NOTHING else
+// On restore the atlas is emptied but the per-cell MODEL is never cleared, so _updateModel skips
+// every cell, nothing is uploaded into the empty atlas, and the GPU draws nothing — permanently,
+// because the restore also cleared the 3s timer so onContextLoss never fires. Disposing inside the
+// LOSS dispatch (below) means that restore path is never reached at all.
+describe("a mounted terminal whose WebGL context is lost", () => {
+  it("REPAINTS the full viewport without a remount", () => {
+    render(<Terminal {...baseProps} agentId="a" active />);
+    expect(addonCtors.count).toBe(1);
+    refresh.mockClear();
+    termDispose.mockClear();
+
+    lostListeners.forEach((fn) => fn());
+
+    // The whole point: recovery must not require the remount the human did by hand...
+    expect(termDispose).not.toHaveBeenCalled();
+    // ...and the repaint must cover the WHOLE viewport (rows-1 == 23). A partial range leaves the
+    // rest of the pane black, which is the bug.
+    expect(refresh).toHaveBeenCalledWith(0, 23);
+  });
+});
+
+// SCROLLBACK. Not asserted here on purpose. The buffer — viewport and scrollback — is xterm CORE
+// state, so no jsdom mock of xterm can demonstrate that the fallback preserves it: the component
+// cannot mutate the mock's buffer either way, which would make any such assertion vacuous by
+// construction. It is established instead by reading @xterm/addon-webgl 0.19.0: `clearScrollback`
+// appears zero times, `buffer.active` only in read paths (e.g. cursorY), and the teardown's
+// `removeTerminalFromCache` splices the shared glyph-ATLAS array and disposes the atlas, never the
+// buffer. `term.dispose()` is separately asserted above never to run on this path.
+
+// A renderer we cannot manage is strictly worse than no renderer: it can be neither watched for
+// context loss nor released, so it is exposed to exactly the black-pane path above with nothing to
+// rescue it. The DOM renderer has no atlas and no model cache and cannot fail that way.
+describe("when the WebGL canvas cannot be found", () => {
+  it("REFUSES to keep the renderer, and does not drive it on the reveal repaint", () => {
+    canvasPresent.value = false;
+
+    render(<Terminal {...baseProps} agentId="a" active />);
+
+    // The addon must be constructed before its canvas can exist, so the contract is "never KEEP".
+    expect(disposeSpy).toHaveBeenCalled();
+    expect(liveWebglPermitCount()).toBe(0);
+    // The discriminating assertion: under the old warn-and-keep behavior webglRef stayed set, so
+    // the become-active reveal repaint drove clearTextureAtlas on the very renderer we cannot
+    // manage. After the refusal webglRef is null, so forceFullRepaint(null, term) is a bare
+    // refresh. `termDispose not called` would NOT discriminate — it is true on every attach path.
+    expect(clearTextureAtlas).not.toHaveBeenCalled();
+    // And the pane still renders — refusing WebGL means the DOM renderer, not a dead pane.
+    expect(refresh).toHaveBeenCalledWith(0, 23);
+  });
+
+  it("LATCHES after repeated failures — and the suppression is the LATCH, not a dead effect", () => {
+    // The control comes first: with a findable canvas, an off/on cycle really does re-run
+    // attachWebgl and construct another addon. Without establishing that, a later "count stayed 1"
+    // could equally mean the effect never re-ran, and the test would pass with the latch deleted.
+    const healthy = render(<Terminal {...baseProps} agentId="control" active />);
+    expect(addonCtors.count).toBe(1);
+    healthy.rerender(<Terminal {...baseProps} agentId="control" active={false} />);
+    healthy.rerender(<Terminal {...baseProps} agentId="control" active />);
+    expect(addonCtors.count).toBe(2); // activation DOES re-attach — the loop below has teeth
+    healthy.unmount();
+    resetWebglPermits();
+    addonCtors.count = 0;
+
+    // Two distinct agents fail the probe → systemic, so the latch arms.
+    canvasPresent.value = false;
+    render(<Terminal {...baseProps} agentId="a" active />);
+    render(<Terminal {...baseProps} agentId="b" active />);
+    expect(isWebglCanvasUnfindable()).toBe(true);
+    const afterLatch = addonCtors.count;
+
+    // Now make the canvas findable again and hammer activations. If the latch is what suppresses
+    // construction, the count cannot move — even though attachWebgl is being re-entered and would
+    // now succeed. This is the assertion the earlier version of this test could not make.
+    canvasPresent.value = true;
+    const { rerender } = render(<Terminal {...baseProps} agentId="c" active />);
+    for (let i = 0; i < 20; i++) {
+      rerender(<Terminal {...baseProps} agentId="c" active={false} />);
+      rerender(<Terminal {...baseProps} agentId="c" active />);
+    }
+    expect(addonCtors.count).toBe(afterLatch);
+    expect(liveWebglPermitCount()).toBe(0);
+  });
+
+  it("does NOT latch on a single one-off failure — one unlucky pane must not disable the session", () => {
+    // A process-wide, one-way latch costs every pane its renderer if it fires wrongly, while a
+    // missed latch costs one stranded context. So one failure is not enough evidence.
+    canvasPresent.value = false;
+    const { rerender } = render(<Terminal {...baseProps} agentId="unlucky" active />);
+    expect(isWebglCanvasUnfindable()).toBe(false);
+
+    // ...not even across hide/show cycles. attachWebgl runs TWICE for a pane that mounts active
+    // (mount effect + visibility effect) and again on every activation, so counting ATTACHES rather
+    // than PANES would let this one pane spend the whole evidence budget on itself and disable
+    // WebGL for the session. Rendering once would not have caught that.
+    for (let i = 0; i < 5; i++) {
+      rerender(<Terminal {...baseProps} agentId="unlucky" active={false} />);
+      rerender(<Terminal {...baseProps} agentId="unlucky" active />);
+      expect(isWebglCanvasUnfindable()).toBe(false);
+    }
+
+    // ...and a pane that probes fine afterwards still gets WebGL.
+    canvasPresent.value = true;
+    addonCtors.count = 0;
+    render(<Terminal {...baseProps} agentId="healthy" active />);
+    expect(addonCtors.count).toBe(1);
+  });
+
+  it("does not accumulate evidence across a SUCCESSFUL probe — failures must be consecutive", () => {
+    // A successful probe is direct proof this build puts its canvas where we look, refuting the
+    // systemic hypothesis. Two unrelated blips separated by a working pane must not add up to a
+    // permanent, session-wide disable.
+    canvasPresent.value = false;
+    render(<Terminal {...baseProps} agentId="blip-1" active />);
+
+    canvasPresent.value = true;
+    render(<Terminal {...baseProps} agentId="working" active />); // counter-evidence
+
+    canvasPresent.value = false;
+    render(<Terminal {...baseProps} agentId="blip-2" active />);
+
+    // Two distinct agents failed, but not consecutively — still disarmed.
+    expect(isWebglCanvasUnfindable()).toBe(false);
+  });
+
+  it("never arms on the HEALTHY paths — hide, unmount and context-loss all route through teardown", () => {
+    // teardownWebgl is shared by hide / unmount / context-loss. An over-eager latch set anywhere in
+    // it would permanently disable WebGL for the session, and every other test in this file resets
+    // the latch in beforeEach, so nothing else here would notice.
+    const { rerender, unmount } = render(<Terminal {...baseProps} agentId="a" active />);
+    rerender(<Terminal {...baseProps} agentId="a" active={false} />); // hide
+    rerender(<Terminal {...baseProps} agentId="a" active />); // show
+    lostListeners.forEach((fn) => fn()); // context loss
+    unmount(); // unmount
+    expect(isWebglCanvasUnfindable()).toBe(false);
+
+    // And WebGL is still attempted for the next pane.
+    addonCtors.count = 0;
+    render(<Terminal {...baseProps} agentId="next" active />);
     expect(addonCtors.count).toBe(1);
   });
 });

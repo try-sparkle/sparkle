@@ -122,6 +122,52 @@ describe("mergePreservingLiveWorkers — shared removal tombstones (sparkle-pckz
     expect(ids(merged)).toEqual(["b1"]);
   });
 
+  // THE MERGE IS A ROW-DESTRUCTION PATH, so it owes the same per-agent teardown as an explicit
+  // close: an agent closed in ANOTHER window is deleted here, and its undelivered opening brief has
+  // to be settled or the concierge's `spawnBuildAgent` sits out its whole bound and answers
+  // "unconfirmed" about an agent that exists in no window (roborev 55876).
+  //
+  // Reported through a callback rather than done inside the merge, so the merge stays PURE for every
+  // other caller — including a hypothetical one previewing or diffing a rehydrate, which would
+  // otherwise irreversibly destroy live briefs while calling a function documented as pure
+  // (roborev 55888). Both directions are asserted below, because a teardown that fires too widely is
+  // worse than the stale entry it prevents.
+  it("reports the agents it dropped, so their held briefs can be torn down", () => {
+    const b1 = agent({ id: "b1", kind: "build" });
+    const b2 = agent({ id: "b2", kind: "build" });
+    const current = currentState([project("p1", [b1, b2])]);
+    const persisted = {
+      projects: [project("p1", [b1])],
+      selectedProjectId: "p1",
+      removedIds: { b2: 1_784_000_000_000 },
+    };
+
+    const dropped: string[] = [];
+    const merged = mergePreservingLiveWorkers(persisted, current, undefined, (droppedIds) =>
+      dropped.push(...droppedIds),
+    );
+
+    expect(ids(merged)).toEqual(["b1"]);
+    // Exactly the tombstoned agent — NOT the survivor. `b1` losing its brief here would destroy the
+    // objective of an agent that is still running, which is strictly worse than leaking an entry.
+    expect(dropped).toEqual(["b2"]);
+  });
+
+  it("stays PURE when no teardown callback is supplied", () => {
+    const b1 = agent({ id: "b1", kind: "build" });
+    const b2 = agent({ id: "b2", kind: "build" });
+    const current = currentState([project("p1", [b1, b2])]);
+    const persisted = {
+      projects: [project("p1", [b1])],
+      selectedProjectId: "p1",
+      removedIds: { b2: 1_784_000_000_000 },
+    };
+
+    // The merge still drops the row (that is its job) — it simply performs no side effect while
+    // doing so, which is what makes it safe to call for a preview or a diff.
+    expect(ids(mergePreservingLiveWorkers(persisted, current))).toEqual(["b1"]);
+  });
+
   it("drops a live in-memory PROJECT the incoming snapshot tombstoned", () => {
     const p1 = project("p1", []);
     const p2 = project("p2", []);
