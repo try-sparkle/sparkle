@@ -231,8 +231,17 @@ impl Chosen {
             if self.provisional.iter().any(|h| h.path == p && h.window == window) {
                 continue;
             }
-            if self.provisional.len() >= DRAGGED_CAP {
-                self.provisional.pop_front();
+            // The cap is PER WINDOW and evicts only within this window. A global `pop_front()` would
+            // discard the oldest entry in the whole deque — potentially another window's LIVE hover —
+            // which is the same unrecoverable revocation the scoping above exists to prevent (pointer
+            // already inside, no further `Enter`, and `Over` only re-stamps entries that still exist).
+            // Harmless before the scoping change, because each `Enter` cleared the set globally so
+            // eviction could only touch the drag being recorded; not harmless now.
+            while self.provisional.iter().filter(|h| h.window == window).count() >= DRAGGED_CAP {
+                let Some(oldest) = self.provisional.iter().position(|h| h.window == window) else {
+                    break;
+                };
+                self.provisional.remove(oldest);
             }
             self.provisional.push_back(Hovered {
                 path: p,
@@ -1127,6 +1136,73 @@ mod tests {
         assert!(
             validate_read_path(&f, &roots).is_err(),
             "a window that went away mid-drag must not strand the hover grant"
+        );
+    }
+
+    // ── Window scoping, at the RULE level ───────────────────────────────────────────────────────
+    //
+    // The global-registry tests above pin `forget_dragged` and `note_chosen` across two labels, but
+    // every `Chosen`-level test drives a single `"main"`, so `note_dragged`'s own scoping and
+    // `refresh_dragged`'s filter were unpinned: reverting either left the suite green. Same defect as
+    // the last two rounds, one level down.
+
+    #[test]
+    fn a_drag_entering_one_window_leaves_another_windows_hover_alone() {
+        // The helper island / capture panel can appear under the cursor mid-drag and take an `Enter`.
+        // If that cleared the set globally it would wipe the main window's live hover with no further
+        // `Enter` coming to re-register it — the unrecoverable case.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/over-main.txt")], t, "main");
+        c.note_dragged(vec![p("/tmp/over-helper.txt")], t, "helper");
+
+        assert!(
+            c.contains(&p("/tmp/over-main.txt"), t),
+            "an Enter on another window must not revoke this window's hover"
+        );
+        assert!(c.contains(&p("/tmp/over-helper.txt"), t), "and the new hover is granted");
+    }
+
+    #[test]
+    fn an_over_on_one_window_does_not_keep_another_windows_hover_alive() {
+        // The mutation that WIDENS the grant rather than narrowing it. Without the filter, an `Over`
+        // anywhere over Sparkle re-stamps every window's entries, so a hover stranded by a lost
+        // `Leave` is renewed indefinitely and `PROVISIONAL_TTL` stops being a backstop at all.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/stranded-on-main.txt")], t, "main");
+
+        let much_later = t + PROVISIONAL_TTL * 2;
+        c.refresh_dragged(much_later, "helper");
+
+        assert!(
+            !c.contains(&p("/tmp/stranded-on-main.txt"), much_later),
+            "an Over on a DIFFERENT window must not renew this one's stamp"
+        );
+    }
+
+    #[test]
+    fn a_huge_drag_on_one_window_cannot_evict_another_windows_hover() {
+        // `DRAGGED_CAP` used to be a global bound evicted with `pop_front()` — the oldest entry in the
+        // whole deque, which after window-scoping can be another window's LIVE hover. Harmless before
+        // scoping (each Enter cleared the set, so eviction only touched the drag being recorded);
+        // silently revoking afterwards, which is the failure the scoping exists to prevent.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/precious.txt")], t, "main");
+
+        let flood: Vec<PathBuf> = (0..=DRAGGED_CAP).map(|i| p(&format!("/tmp/f{i}.txt"))).collect();
+        c.note_dragged(flood, t, "helper");
+
+        assert!(
+            c.contains(&p("/tmp/precious.txt"), t),
+            "a huge drag over another window must not evict this window's hover"
+        );
+        // The cap still bounds the flooding window: it kept the LAST DRAGGED_CAP of its own paths.
+        assert!(!c.contains(&p("/tmp/f0.txt"), t), "the flood's own oldest entry was evicted");
+        assert!(
+            c.contains(&p(&format!("/tmp/f{DRAGGED_CAP}.txt")), t),
+            "and its newest was kept"
         );
     }
 
