@@ -6,6 +6,9 @@ import {
   apiRecoveryEpisode,
   episodeCarryWindowMs,
   forgetAgent,
+  apiRecoveryPingCount,
+  PING_BUDGET_WINDOW_MS,
+  PING_BUDGET,
   nextRetryDueAt,
   noteAgentStatus,
   sweepApiRecovery,
@@ -16,7 +19,7 @@ import {
   REVIVE_LADDER_MS,
   REVIVE_PROMPT_MARKER,
   revivePrompt,
-  SPENT_LADDER_REASON,
+  BUDGET_SPENT_REASON,
 } from "../engine/apiRecovery";
 
 const A = "agent-1";
@@ -377,51 +380,99 @@ describe("sweepApiRecovery", () => {
     expect(submit2).toHaveBeenCalledOnce();
   });
 
-  it("pages once AND starts a fresh ladder when the re-fail after ping 11 is SLOW", async () => {
-    // Collapsing the window at exhaustion killed this: a re-fail more than 2 minutes after the last
-    // ping was refused, `attempts` AND `escalated` reset, so the ladder restarted at rung 0 and the
-    // human was never told — and a long outage could cycle 11 pings → restart → 11 pings forever.
-    // Rung 11 is only ever reached in sustained outages, where a slow re-fail (Claude Code's own
-    // internal backoff) is the norm, so this was the common case, not an exotic one.
-    noteAgentStatus(A, "errored", T0, () => BANNER_529);
+
+
+
+
+
+  // ── RETRYING MUST BE BOUNDED (roborev 55566) ───────────────────────────────────────────────────
+  // The restart path had NO terminating bound: 11 pings -> restart -> 11 pings, indefinitely, on
+  // exactly the sustained-outage path rung 11 is reached from. Two mechanisms were tried and BOTH
+  // failed, which is why the bound now counts pings rather than anything about the episode:
+  //   * "page once" is inert in production — liveDeps.onEscalate is a deliberate no-op, because the
+  //     row is already red and the notification fires via the status path;
+  //   * a per-episode ladder COUNTER only travels through a carry, and a carry lapses once lastPingAt
+  //     stops advancing, so a fresh episode restarts the count. Verified: it cycled one ladder later.
+  it("bounds retry pings to PING_BUDGET inside the rolling window", async () => {
     const submit = vi.fn(async () => {});
     let clock = T0;
-    for (let i = 0; i < REVIVE_LADDER_MS.length; i++) {
-      clock += REVIVE_LADDER_MS[i]!;
-      await sweepApiRecovery(deps({ now: clock, submit }));
-      noteAgentStatus(A, "working", clock + 100, () => "");
-      // Fast re-fails up the ladder; the SLOW one is the last, which is the case that matters.
-      const gap = i === REVIVE_LADDER_MS.length - 1 ? 5 * 60_000 : 1_000;
-      if (i === REVIVE_LADDER_MS.length - 1) expect(gap).toBeGreaterThan(EPISODE_CARRY_MS);
-      noteAgentStatus(A, "errored", clock + gap, () => BANNER_529);
-      clock += gap;
+    noteAgentStatus(A, "errored", clock, () => BANNER_529);
+    // Drive far more ladders than the budget allows, asserting the invariant CONTINUOUSLY. Checking
+    // only the total at the end cannot express this: the window legitimately rolls during a multi-hour
+    // run, so the bound is "never more than PING_BUDGET within any window", not a lifetime cap.
+    for (let ladder = 0; ladder < 6; ladder++) {
+      for (let i = 0; i < REVIVE_LADDER_MS.length; i++) {
+        clock += REVIVE_LADDER_MS[i]!;
+        await sweepApiRecovery(deps({ now: clock, submit }));
+        expect(apiRecoveryPingCount(A, clock)).toBeLessThanOrEqual(PING_BUDGET);
+        noteAgentStatus(A, "working", clock + 100, () => "");
+        const gap = i === REVIVE_LADDER_MS.length - 1 ? 5 * 60_000 : 1_000;
+        noteAgentStatus(A, "errored", clock + gap, () => BANNER_529);
+        clock += gap;
+      }
     }
-    // AMBIGUOUS (roborev 55534): the ladder is spent and the re-fail was slow, so we cannot tell
-    // "the last retry failed" from "the last retry worked and this is new". Neither pure answer is
-    // right — inheriting rung 11 gives a possibly-new 529 zero retries plus a false "outlasting the
-    // ladder"; starting fresh loses the spent-ladder page entirely, because ping 11 clears `errored`
-    // itself so no sweep ever sees attempts >= length while errored. So: fresh ladder, and one page.
-    expect(apiRecoveryEpisode(A)).toMatchObject({
-      attempts: 0,
-      escalated: false,
-      pendingSpentPage: true,
-    });
+    // Six ladders' worth of opportunity (66 rungs) produced at most two ladders' worth of pings per
+    // window — the unbounded version sent all 66.
+    expect(submit.mock.calls.length).toBeLessThan(REVIVE_LADDER_MS.length * 6);
+    expect(apiRecoveryPingCount(A, clock)).toBeLessThanOrEqual(PING_BUDGET);
+  });
 
+  it("STOPS pinging once the budget is spent, and says so once", async () => {
+    const submit = vi.fn(async () => {});
     const onEscalate = vi.fn();
-    const submit2 = vi.fn(async () => {});
-    await sweepApiRecovery(deps({ now: clock + REVIVE_LADDER_MS[0]!, submit: submit2, onEscalate }));
-    // The human is told — but with an honest reason, NOT the "outage is outlasting the ladder" claim,
-    // which would be a false statement about a failure seconds old.
-    expect(onEscalate).toHaveBeenCalledOnce();
-    expect(onEscalate.mock.calls[0]![1]).toBe(SPENT_LADDER_REASON);
-    expect(onEscalate.mock.calls[0]![1]).not.toMatch(/outlasting the ladder/);
-    // ...and the possibly-new failure still gets retried, which the inherit-rung-11 version refused.
-    expect(submit2).toHaveBeenCalledOnce();
-    expect(submit2).toHaveBeenCalledWith(A, revivePrompt(1));
+    // Spend the budget outright, then assert nothing more is sent however many sweeps run.
+    noteAgentStatus(A, "errored", T0, () => BANNER_529);
+    const ep = apiRecoveryEpisode(A) as { attempts: number; lastPingAt: number | undefined };
+    for (let n = 0; n < PING_BUDGET; n++) {
+      Object.assign(ep, { attempts: 0, lastPingAt: undefined });
+      await sweepApiRecovery(deps({ now: T0 + REVIVE_LADDER_MS[0]! + n, submit, onEscalate }));
+    }
+    expect(submit).toHaveBeenCalledTimes(PING_BUDGET);
+    expect(apiRecoveryPingCount(A, T0 + 60_000)).toBe(PING_BUDGET);
 
-    // Paged ONCE, not on every sweep.
-    await sweepApiRecovery(deps({ now: clock + 60 * 60_000, submit: submit2, onEscalate }));
+    const spent = submit.mock.calls.length;
+    for (const t of [1, 5, 30, 60]) {
+      Object.assign(ep, { attempts: 0, lastPingAt: undefined });
+      await sweepApiRecovery(deps({ now: T0 + t * 60_000, submit, onEscalate }));
+    }
+    expect(submit.mock.calls.length).toBe(spent);
     expect(onEscalate).toHaveBeenCalledOnce();
+    expect(onEscalate.mock.calls[0]![1]).toBe(BUDGET_SPENT_REASON);
+  });
+
+  it("lets an agent retry again once the window has rolled past its old pings", async () => {
+    // Bounded PRESSURE, not a permanent ban: an outage can outlast the window, and an agent that had
+    // trouble hours ago should not be refused its first retry.
+    const submit = vi.fn(async () => {});
+    noteAgentStatus(A, "errored", T0, () => BANNER_529);
+    const ep = apiRecoveryEpisode(A) as { attempts: number; lastPingAt: number | undefined };
+    for (let n = 0; n < PING_BUDGET; n++) {
+      Object.assign(ep, { attempts: 0, lastPingAt: undefined });
+      await sweepApiRecovery(deps({ now: T0 + REVIVE_LADDER_MS[0]! + n, submit }));
+    }
+    expect(submit).toHaveBeenCalledTimes(PING_BUDGET);
+
+    const later = T0 + PING_BUDGET_WINDOW_MS + 60_000;
+    expect(apiRecoveryPingCount(A, later)).toBe(0);
+    Object.assign(ep, { attempts: 0, lastPingAt: undefined, escalated: false });
+    await sweepApiRecovery(deps({ now: later, submit }));
+    expect(submit).toHaveBeenCalledTimes(PING_BUDGET + 1);
+  });
+
+  it("does not let a closed agent's spent budget be inherited by a reused id", async () => {
+    const submit = vi.fn(async () => {});
+    noteAgentStatus(A, "errored", T0, () => BANNER_529);
+    const ep = apiRecoveryEpisode(A) as { attempts: number; lastPingAt: number | undefined };
+    for (let n = 0; n < PING_BUDGET; n++) {
+      Object.assign(ep, { attempts: 0, lastPingAt: undefined });
+      await sweepApiRecovery(deps({ now: T0 + REVIVE_LADDER_MS[0]! + n, submit }));
+    }
+    forgetAgent(A); // pane closed / project unloaded
+    expect(apiRecoveryPingCount(A, T0 + 60_000)).toBe(0);
+
+    noteAgentStatus(A, "errored", T0 + 60_000, () => BANNER_529);
+    await sweepApiRecovery(deps({ now: T0 + 60_000 + REVIVE_LADDER_MS[0]!, submit }));
+    expect(submit).toHaveBeenCalledTimes(PING_BUDGET + 1);
   });
 
   it("sends the rung-0 ping when ping 11 SUCCEEDED and a new outage arrives much later", async () => {
@@ -452,7 +503,10 @@ describe("sweepApiRecovery", () => {
     await sweepApiRecovery(deps({ now: newFailure + REVIVE_LADDER_MS[0]!, submit: submit2, onEscalate }));
     expect(submit2).toHaveBeenCalledOnce();
     expect(submit2).toHaveBeenCalledWith(A, revivePrompt(1));
-    expect(onEscalate.mock.calls[0]?.[1]).not.toMatch(/outlasting the ladder/);
+    // Crucially it is NOT given the false "outage is outlasting the ladder" give-up.
+    expect(onEscalate.mock.calls.map((c) => String(c[1])).join(" ")).not.toMatch(
+      /outlasting the ladder/,
+    );
   });
 
   it("STILL carries at exhaustion when the re-fail is immediate, so escalation survives", async () => {
@@ -697,23 +751,24 @@ describe("episodeCarryWindowMs", () => {
     expect(deepestPending).toBeGreaterThan(episodeCarryWindowMs(1));
   });
 
-  it("collapses to the floor once the prior episode ESCALATED, not merely when spent", () => {
-    // The gate is `escalated`, not exhaustion (roborev 55517). The harm a wide window enables is a
-    // SILENT swallow, and the silence comes from inheriting `escalated: true` — while it is false a
-    // carry PRODUCES the page. Keying on exhaustion instead killed the escalation whenever the re-fail
-    // took longer than the floor, which is the common case at rung 11.
+  it("collapses to the floor when the ladder is SPENT or the episode already ESCALATED", () => {
+    // Both are cases where a WIDE window would let an old, finished episode absorb a later unrelated
+    // failure — inheriting a spent rung count (zero retries for a new 529) or a set `escalated` (the
+    // page suppressed, red in silence). The wide window only has a job while rungs remain.
     const spent = REVIVE_LADDER_MS.length;
-    expect(episodeCarryWindowMs(spent, false)).toBeGreaterThan(EPISODE_CARRY_MS);
-    expect(episodeCarryWindowMs(spent, true)).toBe(EPISODE_CARRY_MS);
-    // And it holds at every rung, not just the last.
+    expect(episodeCarryWindowMs(spent, false)).toBe(EPISODE_CARRY_MS);
+    expect(episodeCarryWindowMs(spent + 5, false)).toBe(EPISODE_CARRY_MS);
     for (let a = 1; a <= spent; a++) {
       expect(episodeCarryWindowMs(a, true)).toBe(EPISODE_CARRY_MS);
     }
+    // ...and stays wide for every rung that still has a successor, which is what 55457 was about.
+    expect(episodeCarryWindowMs(spent - 1, false)).toBeGreaterThan(EPISODE_CARRY_MS);
   });
 
   it("clamps past the end of the ladder rather than reading off it", () => {
     expect(episodeCarryWindowMs(REVIVE_LADDER_MS.length + 5)).toBe(
       episodeCarryWindowMs(REVIVE_LADDER_MS.length),
     );
+    expect(Number.isFinite(episodeCarryWindowMs(1_000))).toBe(true);
   });
 });

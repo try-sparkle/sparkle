@@ -448,12 +448,27 @@ export const REVIVE_PROMPT_MARKER = "This is automatic retry ";
  * re-print (roborev 55534). Deliberately does NOT claim the outage outlasted the ladder, which is what
  * the exhaustion reason says and would be a false statement about a failure seconds old.
  *
+ * WORDED FOR THE AMBIGUITY, not against it (roborev 55566). It used to say "without this settling",
+ * which is false on the very path the constant exists to serve: when ping 11 DID settle it and the
+ * agent worked for 45 minutes before an unrelated failure. It now asserts only what is known in both
+ * branches — that retries happened earlier and the agent is failing now. A test pins that it makes no
+ * claim about those retries having failed.
+ *
  * Lives here beside the other reasons rather than in the runner so all the copy the human can be shown
  * is in one file, and the runner keeps no strings of its own.
  */
+/**
+ * Told to the human when an agent has used up its whole retry budget — we are done trying and the row
+ * stays red. Distinct from the exhaustion reason (which is about ONE ladder) because this is the
+ * across-ladders stop, and distinct from {@link SPENT_LADDER_REASON} (which announces a RESTART).
+ */
+export const BUDGET_SPENT_REASON =
+  `This agent has been auto-retried as much as is useful and is still failing. ` +
+  `Leaving it red — it needs you now.`;
+
 export const SPENT_LADDER_REASON =
-  `Auto-retried ${REVIVE_LADDER_MS.length} times without this settling, and it has failed again. ` +
-  `Retrying from the start, but this one may need you.`;
+  `Auto-retried ${REVIVE_LADDER_MS.length} times earlier, and this agent is failing again. ` +
+  `Starting a fresh ladder, but it may need you.`;
 
 export function revivePrompt(attempt: number): string {
   return (
