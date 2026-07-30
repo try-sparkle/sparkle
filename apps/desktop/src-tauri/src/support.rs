@@ -511,6 +511,36 @@ pub async fn desktop_list_tickets() -> Result<Vec<TicketStatus>, String> {
 mod tests {
     use super::*;
 
+    // ── Event-loop offload guards ───────────────────────────────────────────────────────────────
+    //
+    // A non-async `#[tauri::command]` runs INLINE on the Tauri event-loop thread, so the blocking
+    // `ureq` round-trips below (bounded at HTTP_TIMEOUT = 30s) would beachball the whole UI on a
+    // flaky network — worst of all `desktop_list_tickets`, which fires every 60s AND on every
+    // window focus. These coercions only type-check while each command returns a future: revert a
+    // `pub async fn` to `pub fn` and its return type becomes a plain `Result`, which is not a
+    // `Future`, and the build breaks here. The rest of this module's tests are pure-function tests
+    // (redaction, parsing), so without these guards such a regression would pass silently.
+    //
+    // No network is touched: calling an `async fn` only CONSTRUCTS its future — the body does not
+    // run until polled, and these futures are dropped unpolled.
+
+    fn assert_async_command<A, Fut: std::future::Future>(_f: fn(A) -> Fut) {}
+    fn assert_async_command0<Fut: std::future::Future>(_f: fn() -> Fut) {}
+
+    #[test]
+    fn http_commands_stay_off_the_event_loop() {
+        assert_async_command(support_chat_send);
+        assert_async_command(desktop_create_ticket);
+        // The worst offender: polled every 60s and on every window focus.
+        assert_async_command0(desktop_list_tickets);
+    }
+
+    #[test]
+    fn read_recent_logs_stays_off_the_event_loop() {
+        // Tailing + regex-redacting up to 200 KB of logs is blocking filesystem work.
+        assert_async_command(read_recent_logs::<tauri::Wry>);
+    }
+
     // Fixtures below assemble their fake, secret-SHAPED strings at runtime from split pieces, so no
     // literal secret-shaped string ever appears in this source file. That keeps the public-mirror
     // leak-check gate (scripts/publish-public.sh) strict — it greps the exported source text — while

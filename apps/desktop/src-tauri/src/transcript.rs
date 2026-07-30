@@ -157,6 +157,53 @@ fn join_text_blocks(v: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// Compile-time guard that a one-argument `#[tauri::command]` is still an `async fn`.
+    ///
+    /// A non-async `#[tauri::command]` runs INLINE on the Tauri event-loop thread, so any blocking
+    /// IO inside it freezes the entire UI (menu bar, window drag, every `invoke` from every
+    /// window). Coercing the command to `fn(A) -> Fut where Fut: Future` only type-checks while it
+    /// returns a future: revert `pub async fn` to `pub fn` and the return type becomes a plain
+    /// `Result`/`bool`, which is not a `Future`, and THIS STOPS COMPILING. Every other test here
+    /// drives the *sync core*, so without this guard such a regression would pass silently.
+    fn assert_async_command<A, Fut: std::future::Future>(_f: fn(A) -> Fut) {}
+
+    #[test]
+    fn read_transcript_last_assistant_stays_async() {
+        assert_async_command(read_transcript_last_assistant);
+    }
+
+    #[test]
+    fn async_command_reads_end_to_end() {
+        // Scope, stated honestly: drives the real `async` command rather than the sync core, so the
+        // command is reachable and its Ok/Err travel back out through the await correctly. The
+        // `err.starts_with("read ")` assertion below is the one genuine bit of wiring coverage — it
+        // distinguishes the inner `Err` from the task-failure wrapper.
+        //
+        // It does NOT prove the body reached the blocking pool. An earlier comment claimed a broken
+        // JoinError mapping "shows up here"; it does not (roborev 55742). Rewrite the body as
+        // `pub async fn read_transcript_last_assistant(p) -> Result<String, String> {
+        // read_transcript_last_assistant_sync(p) }` — blocking IO inline on an async worker — and
+        // this test still passes. The compile-time coercion guard above is what holds the shape.
+        let dir = std::env::temp_dir().join(format!("sparkle_transcript_async_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, FIXTURE).unwrap();
+
+        let out = tauri::async_runtime::block_on(read_transcript_last_assistant(
+            path.to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        assert_eq!(out, "Part one.\n\nPart two.");
+
+        // An unreadable path still surfaces the inner Err (not a task-failure string).
+        let missing = dir.join("nope.jsonl").to_string_lossy().to_string();
+        let err = tauri::async_runtime::block_on(read_transcript_last_assistant(missing)).unwrap_err();
+        assert!(err.starts_with("read "), "expected the inner read error, got: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // Two assistant turns separated by a tool_result user turn; the final assistant message mixes
     // text and a tool_use block. Mirrors the real `~/.claude/projects/.../<session>.jsonl` shape.
     const FIXTURE: &str = concat!(

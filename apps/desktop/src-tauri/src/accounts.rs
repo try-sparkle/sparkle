@@ -1881,6 +1881,72 @@ fn claude_signed_in_sync(config_dir: Option<String>) -> bool {
 mod tests {
     use super::*;
 
+    // ── Event-loop offload guards ───────────────────────────────────────────────────────────────
+    //
+    // A non-async `#[tauri::command]` runs INLINE on the Tauri event-loop thread. These four all do
+    // real blocking filesystem work — `accounts_usage` walks every account's transcript tree and
+    // `accounts_identities` opens `accounts.json` PLUS every account's own `.claude.json` — so
+    // running them inline would freeze the UI. The coercion only type-checks while the command
+    // returns a future: revert a `pub async fn` to `pub fn` and its return type becomes a plain
+    // `Result`/`bool`, which is not a `Future`, and the build breaks here. Every other test in this
+    // module drives the pure `*_at` / `*_sync` cores, so without these guards a revert to inline
+    // blocking IO would pass silently.
+    //
+    // The commands taking an `AppHandle` can't be *invoked* without a running Tauri app, but the
+    // guard is a compile-time check and needs no instance.
+
+    fn assert_async_command<A, Fut: std::future::Future>(_f: fn(A) -> Fut) {}
+
+    #[test]
+    fn every_async_command_stays_off_the_event_loop() {
+        // EXHAUSTIVE by intent, not a sample: every `async` command in this module belongs here, so
+        // the list must be extended whenever one is added. The first version of this guard covered
+        // only the four JSON readers while its comment read as a complete inventory of the module's
+        // at-risk commands — the three heavy scanners below were unguarded, so reverting any of them
+        // to `pub fn` still compiled and the whole suite stayed green. That is precisely the
+        // regression this test exists to prevent (roborev 55742).
+        assert_async_command(accounts_list);
+        assert_async_command(accounts_usage);
+        assert_async_command(accounts_identities);
+        assert_async_command(claude_signed_in);
+        // Heavy filesystem scanners — each walks every account's transcript tree.
+        assert_async_command(accounts_spend);
+        assert_async_command(accounts_limit_events);
+        // Documented in-module as "the heaviest read in this module by a wide margin".
+        assert_async_command(accounts_ceilings);
+    }
+
+    #[test]
+    fn claude_signed_in_drives_the_async_command_end_to_end() {
+        // Scope, stated honestly: this drives the real `async` command rather than the sync core, so
+        // the command is reachable and its result travels back out through the await correctly.
+        //
+        // It does NOT prove the work happened on the blocking pool, and it does NOT exercise the
+        // JoinError arm — an earlier name and comment here claimed both (roborev 55742). Neither
+        // claim held: rewrite the body as `pub async fn claude_signed_in(d) -> bool {
+        // claude_signed_in_sync(d) }` — no `spawn_blocking`, blocking IO inline on an async worker —
+        // and this test still passes, as does the coercion guard above. The `false` case below comes
+        // from a missing `.claude.json`, not from a task failure, so `unwrap_or(false)` could become
+        // `unwrap()` invisibly.
+        //
+        // Left as an end-to-end reachability test rather than fabricating that coverage: forcing a
+        // real JoinError needs a panicking closure, and asserting the thread identity needs
+        // production code to report it. Both are worth doing when something depends on them; the
+        // compile-time guard above is what actually holds the `async` shape in place today.
+        let base = unique_dir("signed-in-async");
+        write_claude_json(&base, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
+        assert!(tauri::async_runtime::block_on(claude_signed_in(Some(
+            base.to_string_lossy().into_owned()
+        ))));
+        // A dir with no .claude.json → false, through the same async path.
+        let empty = unique_dir("signed-in-async-empty");
+        assert!(!tauri::async_runtime::block_on(claude_signed_in(Some(
+            empty.to_string_lossy().into_owned()
+        ))));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
     fn unique_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sparkle-accounts-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
