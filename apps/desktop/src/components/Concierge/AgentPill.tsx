@@ -257,14 +257,20 @@ export function AgentPill({
    * card now names the WORKER that owns the red — rather than the orchestrator that relayed it —
    * that is the common case here, not the exotic one.
    *
-   * RETURNS NOTHING, and that is NOT an oversight — it is the difference between this and
+   * ANY VALUE RETURNED IS SILENTLY DISCARDED, and this is the difference between this prop and
    * `onOpenAgent` (roborev 55988). `onOpenAgent`'s `false` means "nothing on screen changed", which
    * this pill turns into a visible "…is closed". A caller that owns the reveal has taken over that
    * reporting (`ConciergeHost.revealAgent` speaks through the column's one announcer), so this pill
-   * deliberately renders no notice at all — see `ownsOutcome` below. Typing this as `=> boolean`
-   * would therefore have advertised a contract the component does not keep: a caller honouring it
-   * would return `false`, nothing would render, and the reader would get a completely silent dead
-   * click. `void` makes that unrepresentable rather than merely documented.
+   * deliberately renders no notice at all — see `ownsOutcome` below.
+   *
+   * THE `void` HERE IS A CONVENTION THE COMPILER WILL NOT ENFORCE (roborev 56002). TypeScript's
+   * void-return bivariance makes `() => boolean` assignable to `() => void`, so a caller CAN still
+   * write `onOpen={() => { …; return false; }}` and typecheck clean — and that `false` would be
+   * thrown away exactly as the old `=> boolean` signature threw it away. An earlier version of this
+   * comment claimed `void` made the mistake "unrepresentable"; it does not, and asserting a
+   * compiler guarantee that does not exist is worse than the signature it was explaining, because
+   * the next author trusts the type instead of reading this. The signature is here to say what the
+   * component does with the value; the guarantee is this paragraph, not the type.
    */
   onOpen?: (target: { agentId: string; projectId: string }) => void;
 }) {

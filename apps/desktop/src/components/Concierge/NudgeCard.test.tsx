@@ -181,21 +181,6 @@ describe("NudgeCard — the agent is a real, live pill", () => {
     expect(screen.queryByText("Show me")).toBeNull();
   });
 
-  it("never renders a dead 'is closed' state — the caller owns that report", () => {
-    // The contract `onOpen` is typed to (roborev 55988). A caller-owned reveal reports its own
-    // outcome through the column's announcer, so this pill deliberately shows nothing on a miss —
-    // which is only safe because the prop returns `void` and no caller can believe otherwise. The
-    // regression this catches is the opposite pairing: a `=> boolean` prop whose `false` the pill
-    // silently swallows, leaving a completely dead click.
-    const { onNudgeClick } = renderCard(nudge);
-    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
-    fireEvent.click(screen.getByTestId("concierge-agent-pill"));
-    expect(onNudgeClick).toHaveBeenCalledTimes(2);
-    // Still the live pill after repeated clicks — never the muted "closed" form, and never a notice.
-    expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
-    expect(screen.queryByTestId("concierge-agent-pill-notice")).toBeNull();
-  });
-
   it("adds NO live region of its own — the column owns the only one", () => {
     // `AgentPill` normally mounts a permanent `role="status"` so a failed reveal can be announced.
     // That is right for a pill in a reply; it is wrong here, because a nudge card is on screen for

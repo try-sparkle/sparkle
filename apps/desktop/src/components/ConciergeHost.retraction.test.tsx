@@ -251,6 +251,30 @@ describe("[x] acknowledges the alarm, not just the agent named on the card", () 
     ]);
   });
 
+  // THE SAME BUG ONE LEVEL DOWN (roborev 56000). `representedBy` names the NEAREST ancestor that
+  // speaks for an agent, so on a three-deep chain the leaf points at `mid`, not at the head the card
+  // names. Dismissing only the DIRECT representees left the leaf red with both its ancestors' alarms
+  // now suppressed — nothing spoke for it, so the next tick raised a fresh card naming it. The first
+  // two cases here could not see that: one is depth 1 and the other depth 0.
+  it("dismisses a rollup's whole subtree, not just the agents pointing straight at the head", () => {
+    const p = projectOf("p1", "sparkle-desktop", [
+      tab("orch"),
+      worker("mid", "orch"),
+      worker("leaf", "mid"),
+    ]);
+    const feed = feedFrom([p], { orch: "idle", mid: "waiting", leaf: "waiting" });
+    // The premise: ONE card, naming the head, and the leaf pointing at `mid` rather than at it.
+    expect(cardSubjects(feed)).toEqual(["orch"]);
+    const byId = Object.fromEntries(feed.projects[0]!.agents.map((a) => [a.id, a]));
+    expect(byId["leaf"]!.representedBy).toBe("mid");
+    expect(byId["mid"]!.representedBy).toBe("orch");
+
+    render(<ConciergeHost feed={feed} />);
+    fireEvent.click(screen.getByTestId("concierge-nudge-dismiss"));
+
+    expect(dismissed().map((d) => d.agentId).sort()).toEqual(["leaf", "mid", "orch"]);
+  });
+
   it("dismisses only the named agent when the card speaks for nobody else", () => {
     // The narrow case, so the fix cannot quietly become "dismiss the whole subtree": a leaf card
     // must not acknowledge alarms the reader never saw.

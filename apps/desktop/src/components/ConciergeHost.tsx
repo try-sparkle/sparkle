@@ -2795,10 +2795,35 @@ export function ConciergeHost({
           // `a.status` is the PUBLISHED status the card was raised on, which is what
           // `advanceAlertRecord` has to see for the dismissal to match THIS episode rather than
           // seeding a different one. Same for each descendant, which carries its own.
-          store.dismissAlert(a.projectId, a.id, a.status);
-          for (const other of allAgents(feedRef.current)) {
-            if (other.representedBy === a.id) {
-              store.dismissAlert(other.projectId, other.id, other.status);
+          // THE TRANSITIVE CLOSURE, not one hop (roborev 56000). `representedBy` names the NEAREST
+          // ancestor that speaks for an agent, so on `orch (idle) → mid (waiting) → leaf (waiting)`
+          // the leaf points at `mid`, not at `orch`. Dismissing only the direct representees left
+          // the leaf red with both its ancestors' alarms now suppressed — so nothing spoke for it,
+          // and the next tick raised a fresh card naming it. That is the same whack-a-mole one
+          // nesting level down, and multi-level nesting is a supported shape.
+          //
+          // Swept to a fixed point rather than recursed, and bounded by the agent count, so a cycle
+          // in the persisted `parentId` chain cannot spin here — the same defensive posture
+          // `conciergeFeed.representedBy` takes with its `seen` set.
+          const fleet = allAgents(feedRef.current);
+          const spokenFor = new Set<string>([a.id]);
+          for (let pass = 0; pass < fleet.length; pass++) {
+            let grew = false;
+            for (const other of fleet) {
+              if (
+                other.representedBy !== null &&
+                spokenFor.has(other.representedBy) &&
+                !spokenFor.has(other.id)
+              ) {
+                spokenFor.add(other.id);
+                grew = true;
+              }
+            }
+            if (!grew) break;
+          }
+          for (const agent of fleet) {
+            if (spokenFor.has(agent.id)) {
+              store.dismissAlert(agent.projectId, agent.id, agent.status);
             }
           }
         }
