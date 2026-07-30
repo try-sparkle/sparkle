@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { migratePersistedUi, OLD_COMPOSER_DEFAULT } from "./composerPersist";
 import { STATUS_BANDS } from "../engine/buildSections";
+import { SEND_MODES } from "../voice/sendMode";
 
 const SNAP = 72;
 
@@ -31,6 +32,80 @@ describe("migratePersistedUi", () => {
       SNAP,
     );
     expect(out).toMatchObject({ composerHeight: SNAP, zoom: 1.2, composerMinimized: true });
+  });
+});
+
+// ── v3: the auto-send SWITCH became the send TRAY's position ────────────────────────────────────
+//
+// This is the upgrade path, and it is the half a migration test usually skips. A fresh install is
+// covered by the store's own default; what needs proving is that a blob written by the PREVIOUS
+// build lands somewhere sensible. Someone who deliberately armed auto-send and then relaunched into
+// a microphone-off tray would dictate, watch nothing happen, and have nothing on screen telling them
+// their setting had been dropped — a silent reset is worse than a visible migration.
+describe("v3 — the armed boolean becomes a tray position", () => {
+  it("ARMED becomes Speak, which is the position that actually counts down", () => {
+    // Not `ptt`: push-to-talk sends on a key RELEASE and runs no countdown at all, so landing an
+    // upgrading user there hands them a mode they never chose and whose gesture nobody showed them.
+    const out = migratePersistedUi({ conciergeAutoSend: true }, 2, SNAP);
+    expect(out?.conciergeSendMode).toBe("speak");
+  });
+
+  it("DISARMED becomes Send", () => {
+    const out = migratePersistedUi({ conciergeAutoSend: false }, 2, SNAP);
+    expect(out?.conciergeSendMode).toBe("send");
+  });
+
+  it("drops the retired key, so a dead boolean cannot be carried forward forever", () => {
+    // uiStore's merge is shallow and passes unknown keys through untouched, so without the delete
+    // the old flag would sit in every blob indefinitely, contradicting the new field for anyone who
+    // later moved the tray.
+    const out = migratePersistedUi({ conciergeAutoSend: true }, 2, SNAP);
+    expect(out && "conciergeAutoSend" in out).toBe(false);
+  });
+
+  it("leaves the mode UNSET when the blob never had the old key — the store's default applies", () => {
+    const out = migratePersistedUi({ zoom: 1.2 }, 2, SNAP);
+    expect(out && "conciergeSendMode" in out).toBe(false);
+    expect(out?.zoom).toBe(1.2);
+  });
+
+  it("COERCES an unrecognised position to Send, on every rehydrate, not just at v3", () => {
+    // Ungated on purpose, like the statusFilter repair: a blob written by a partial rollout (or by a
+    // future value that got rolled back) is already at v3 and would skip a version-gated repair. The
+    // direction is fail-closed — the mic mapping must never be handed a value it resolves to "live".
+    expect(migratePersistedUi({ conciergeSendMode: "shout" }, 3, SNAP)?.conciergeSendMode).toBe("send");
+    expect(migratePersistedUi({ conciergeSendMode: 7 }, 3, SNAP)?.conciergeSendMode).toBe("send");
+    expect(migratePersistedUi({ conciergeSendMode: null }, 3, SNAP)?.conciergeSendMode).toBe("send");
+  });
+
+  it("leaves every REAL position alone", () => {
+    // The other half: a repair that clobbers valid values would pass the row above and silently
+    // reset everyone to Send on launch.
+    for (const m of ["send", "ptt", "speak"]) {
+      expect(migratePersistedUi({ conciergeSendMode: m }, 3, SNAP)?.conciergeSendMode).toBe(m);
+    }
+  });
+
+  it("the accepted list IS the app's list — the literals here cannot drift from SEND_MODES", () => {
+    // composerPersist spells the three positions as literals because a value import of
+    // voice/sendMode would close a runtime cycle (it reaches components/MicButton → theme/colors,
+    // and theme/theme imports uiStore, which imports this). A hand-copied list needs the pin the
+    // status-band list already has: add a fourth position and, without this, the migration would
+    // coerce it to Send on every launch and nothing would fail.
+    for (const m of SEND_MODES) {
+      expect(migratePersistedUi({ conciergeSendMode: m }, 3, SNAP)?.conciergeSendMode).toBe(m);
+    }
+  });
+
+  it("does not re-run on a blob already at v3 — a later choice is the user's to keep", () => {
+    // The armed boolean can only be translated ONCE. Re-running it would take someone who upgraded,
+    // moved the tray to Send, and relaunched, and put them back on Speak with a live microphone.
+    const out = migratePersistedUi(
+      { conciergeAutoSend: true, conciergeSendMode: "send" },
+      3,
+      SNAP,
+    );
+    expect(out?.conciergeSendMode).toBe("send");
   });
 });
 

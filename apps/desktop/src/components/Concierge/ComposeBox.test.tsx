@@ -137,6 +137,40 @@ describe("ComposeBox — the box names no destination", () => {
     expect(screen.getByRole("button", { name: "Send" }).getAttribute("title")).toContain("\u2318\u21a9");
   });
 
+  // ── THE SEND CHORD IS DECIDED BY voice/sendMode, AND THIS BOX ASKS IT ────────────────────────
+  //
+  // The tray PAINTS a keycap chip from `chicletFor` and this textarea HANDLES the keystroke, in two
+  // different files. `chordSends` exists so they cannot disagree — but it shipped exported, unit
+  // tested, and wired to NOTHING, while this handler still spelled out `Enter && (metaKey ||
+  // ctrlKey)` with no knowledge of the mode. The rows below are the wiring, not the rule.
+  it("sends on ⌘↩ and ⌃↩, and not on a bare ↩", () => {
+    const { onSend } = setup();
+    fireEvent.change(box(), { target: { value: "ship it" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("REFUSES ⌘↩ in Push to talk, where ⌘ means TALK", () => {
+    // One meaning per chord per mode. Before this the two paths STACKED: the composer submitted on
+    // the ⌘↩ keydown, and then releasing ⌘ fired the hold's own send an instant later — two messages
+    // from one gesture, in the mode whose entire promise is that you decide when the message goes.
+    const { onSend } = setup({ sendMode: "ptt" } as never);
+    fireEvent.change(box(), { target: { value: "ship it" } });
+    fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("…and still sends on ⌘↩ in Speak, so the refusal is the MODE and not a blanket off-switch", () => {
+    // The other half. A change that simply stopped honouring ⌘↩ would pass the row above and break
+    // the shortcut everywhere, which no test would have caught.
+    const { onSend } = setup({ sendMode: "speak" } as never);
+    fireEvent.change(box(), { target: { value: "ship it" } });
+    fireEvent.keyDown(box(), { key: "Enter", metaKey: true });
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
   // A tooltip alone hides the shortcut from keyboard and touch users (roborev 53016).
   it("declares the send shortcut to assistive tech, not just on hover", () => {
     setup();

@@ -16,6 +16,7 @@ import {
   type AutoSendState,
 } from "./autoSendTimer";
 import { thresholdMs } from "./confidence";
+import { SWEEP_FLOOR_MS, sweepThresholdMs } from "./sendMode";
 
 /** An armed rail holding `text`, with silence started at `t`. The common setup, spelled once. */
 function counting(text: string, t: number): AutoSendState {
@@ -352,3 +353,34 @@ describe("announcements", () => {
 });
 
 
+
+
+// ── THE SWEEP FLOOR IS ENFORCED HERE, not merely promised by the tray ───────────────────────────
+//
+// `sweepThresholdMs` (voice/sendMode) is the ladder's rung for a tier, never faster than
+// SWEEP_FLOOR_MS. The floor was shipped as an exported constant with its own unit test while this
+// module still called `thresholdMs` directly — so nothing in the running app enforced it. The two
+// agree today, because the ladder's fastest rung IS 1s; a retune below a second is exactly the case
+// the floor exists for, and is exactly the case a same-value assertion cannot see.
+describe("the countdown never runs faster than the sweep floor", () => {
+  it("computes its deadline from sweepThresholdMs, not the raw ladder", () => {
+    // Asserted as a RELATIONSHIP rather than against the literal 1000: with `high` at 1s the two
+    // functions return the same number, so a row comparing to a constant would pass against either
+    // import and prove nothing about which one this module calls.
+    const s = counting("Ship the release.", 0); // a finished sentence → `high`
+    expect(s.tier).toBe("high");
+    expect(remainingMs(s, 0)).toBe(sweepThresholdMs(s.tier));
+    // …and the fraction the tray sweeps is measured against the same floored total.
+    expect(remainingFraction(s, sweepThresholdMs(s.tier) / 2)).toBeCloseTo(0.5, 5);
+  });
+
+  it("fires no earlier than the floor for every tier the ladder can produce", () => {
+    // The broad one. Whatever the ladder is retuned to, an armed countdown must still give the user
+    // a full second of visible sweep — below that it is a flicker between two frames, not a
+    // countdown, and the chance to stop it never really existed.
+    for (const tier of ["high", "normal", "low", "verylow"] as const) {
+      const s: AutoSendState = { ...counting("Ship it.", 0), tier };
+      expect(evaluate(s, SWEEP_FLOOR_MS - 1).action).toBe("wait");
+    }
+  });
+});

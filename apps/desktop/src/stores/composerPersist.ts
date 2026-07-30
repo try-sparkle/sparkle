@@ -11,6 +11,12 @@
 // `statusFilter`, is REPAIRED rather than trusted: a blob written by a partial rollout — or hand-
 // edited — could carry a filter with a missing or non-boolean band, and a single `undefined` there
 // reads as falsy and would silently hide a third of the user's agents with no visible cause.
+//
+// v3: the auto-send rail's boolean armed switch became the send tray's three-position mode
+// (voice/sendMode). The two are the same decision — "does this go on its own?" — so carrying the
+// old preference across is not a courtesy, it is the difference between an upgrade and a silent
+// reset: someone who deliberately armed auto-send would otherwise relaunch into `send`, dictate,
+// and watch nothing happen, with no message anywhere saying their setting had been dropped.
 
 import { STATUS_BANDS } from "../engine/buildSections";
 
@@ -77,6 +83,37 @@ export function migratePersistedUi(
     // Drop the retired ordering preference. Version-gated because it only ever needs to happen once.
     const { agentOrdering: _agentOrdering, ...rest } = next;
     next = rest;
+  }
+  if (version < 3) {
+    // ARMED → "speak", DISARMED → "send". `speak` (not `ptt`) is the honest translation: the old
+    // switch armed a countdown that fires on its own when you stop talking, and that is exactly
+    // what `speak` is. `ptt` sends on a key RELEASE and has no countdown at all, so landing an
+    // upgrading user there would hand them a mode they never chose and whose gesture they have
+    // never been shown.
+    //
+    // A blob with no `conciergeAutoSend` at all (a fresh-ish install written before the key
+    // existed) leaves `conciergeSendMode` unset, so the store's own default applies. Deleting the
+    // retired key is what keeps `merge` from carrying a dead boolean forward forever.
+    const { conciergeAutoSend, ...rest } = next;
+    next = conciergeAutoSend === undefined
+      ? rest
+      : { ...rest, conciergeSendMode: conciergeAutoSend ? "speak" : "send" };
+  }
+  // The tray position is REPAIRED on every rehydrate, deliberately NOT version-gated — same
+  // reasoning as the filter repair below, but a sharper failure. uiStore's merge is shallow, so an
+  // unrecognised `conciergeSendMode` (a partial rollout, a hand-edited blob, a future value rolled
+  // back) hydrates verbatim, and the mic mapping has to do SOMETHING with it. Coercing here means
+  // the one thing it can never do is take the microphone live on a value nobody recognises, with no
+  // pill reading selected to explain it. Fail closed, twice: `micIntentForMode` also defaults to
+  // "off" rather than "active", because a single guard for "spends credits and captures audio" is
+  // one guard too few.
+  //
+  // Spelled as literals rather than importing SEND_MODES: voice/sendMode reaches components/MicButton
+  // for `MicIntent`, and this module is loaded by uiStore, which theme/theme.ts imports — the value
+  // import would close that into a runtime cycle. Pinned against the real list by a test.
+  if (next.conciergeSendMode !== undefined
+      && !["send", "ptt", "speak"].includes(next.conciergeSendMode as string)) {
+    next = { ...next, conciergeSendMode: "send" };
   }
   // The filter repair runs on EVERY rehydrate, deliberately NOT version-gated. uiStore's merge is a
   // shallow one, so a persisted `statusFilter` REPLACES the default object wholesale rather than

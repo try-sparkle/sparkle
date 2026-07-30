@@ -477,12 +477,14 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // to stay off, or the app quietly resumes writing their clipboard on every drag after the next
     // relaunch — a setting that un-sets itself is worse than no setting.
     "conciergeCopyOnSelection",
-    // The auto-send rail's armed state (PRD 1 §4). Persisted DELIBERATELY, and note it is the
-    // mirror of the line above rather than a copy of it: this one defaults to OFF, because a
-    // preference that makes the app dispatch irreversible instructions on your behalf has to be
-    // switched on by hand — but once someone HAS switched it on, silently disarming it every
-    // relaunch would be its own broken promise. Persisted either way; only the default differs.
-    "conciergeAutoSend",
+    // Where the send tray is parked (voice/sendMode). Persisted DELIBERATELY, and note it is the
+    // mirror of the line above rather than a copy of it: this one defaults to "send" — microphone
+    // off, nothing counting — because a position that makes the app dispatch irreversible
+    // instructions on your behalf has to be picked by hand. But once someone HAS picked Speak,
+    // silently resetting it every relaunch would be its own broken promise. Persisted either way;
+    // only the default differs. (It replaced a boolean `conciergeAutoSend`; composerPersist's v3
+    // migration carries an armed blob across rather than dropping the preference.)
+    "conciergeSendMode",
     // Opt-in for the background Haiku grader (PRD §4e). Persisted so a deliberate opt-in is not
     // re-asked every launch — and it is a SEPARATE switch from the rail above on purpose: arming
     // auto-send costs nothing, while this spends the user's own Claude subscription quota.

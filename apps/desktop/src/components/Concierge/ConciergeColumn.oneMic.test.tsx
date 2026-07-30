@@ -81,6 +81,15 @@ function micGlyphs(container: HTMLElement): Element[] {
  *  is what matters — not for the count, which those extra header controls would make meaningless. */
 function voiceControls(container: HTMLElement): Element[] {
   return Array.from(container.querySelectorAll("button")).filter((b) => {
+    // THE SEND TRAY IS NOT A VOICE CONTROL THAT DRIFTED BACK IN — it is the SEND control, and two of
+    // its three positions are named for what the microphone does in them ("Push to talk", "Speak").
+    // The broad name match below cannot tell those apart from a re-added mic button, and narrowing
+    // the regex instead would blind it to a real one called "Speak". So the tray is excluded by
+    // IDENTITY, and the row below asserts the thing that actually regressed: no mic GLYPH inside it.
+    //
+    // The defect this file pins was two mic glyphs on screen at once — one in the header, one beside
+    // Send, both operating the same phase. A send control that names its modes is not that.
+    if (b.closest('[data-testid="send-mode-tray"]')) return false;
     const name = `${b.getAttribute("aria-label") ?? ""} ${b.getAttribute("title") ?? ""}`;
     return /mic|voice|dictat|listen|speak|talk to sparkle/i.test(name);
   });
@@ -112,6 +121,18 @@ describe("ConciergeColumn — exactly one mic", () => {
       for (const c of found) {
         expect(c.compareDocumentPosition(thread) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       }
+    });
+  }
+
+  for (const [label, state] of MIC_STATES) {
+    it(`the send tray carries no mic glyph of its own while ${label}`, () => {
+      // The other half of the exclusion above. The tray sits exactly where the removed mic button
+      // sat, so if a glyph is ever put back it will be put back INSIDE it — where `voiceControls`
+      // now refuses to look. This looks there.
+      const { container } = renderColumn(state);
+      const tray = container.querySelector('[data-testid="send-mode-tray"]');
+      expect(tray).not.toBeNull();
+      expect(micGlyphs(tray as HTMLElement)).toHaveLength(0);
     });
   }
 

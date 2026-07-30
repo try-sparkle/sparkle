@@ -1,6 +1,6 @@
 // The wiring that makes the auto-send rail actually fire (PRD 1 §4).
 //
-// `autoSendTimer` is a pure reducer and `SendRail` is a pure component; between them there was
+// `autoSendTimer` is a pure reducer and `SendModeTray` is a pure component; between them there was
 // nothing. This hook is that middle: it owns the state, feeds the reducer the facts it needs, ticks
 // it, performs the send, and hands the rail its model.
 //
@@ -44,7 +44,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useDictationStore } from "../stores/dictationStore";
-import type { SendRailModel } from "../components/Concierge/SendRail";
+import type { SendTrayModel } from "../components/Concierge/SendModeTray";
 import {
   autoSendAnnouncement,
   evaluate,
@@ -58,7 +58,7 @@ import {
   setArmed as setArmedState,
   type AutoSendState,
 } from "./autoSendTimer";
-import { thresholdMs } from "./confidence";
+import { sweepThresholdMs } from "./sendMode";
 import {
   noteManualSendDuringCountdown,
   noteUserSend,
@@ -68,7 +68,7 @@ import {
 /**
  * How often a running countdown re-evaluates and repaints.
  *
- * 100ms, not a frame loop. The fill is a CSS transition between model updates (see SendRail), so
+ * 100ms, not a frame loop. The sweep is a CSS transition between model updates (see SendModeTray), so
  * this only has to be often enough that the transition targets stay smooth and that a threshold the
  * elapsed time has just passed is honoured promptly. A rAF loop would repaint 10× as often to move
  * the same bar and would keep a timer alive on a column that is idle most of the time.
@@ -143,7 +143,7 @@ export function useAutoSend({
   targetName,
   onFire,
   onAnnounce,
-}: UseAutoSendArgs): SendRailModel {
+}: UseAutoSendArgs): SendTrayModel {
   const [state, setState] = useState<AutoSendState>(initialState);
   // Repaint clock. Bumped by the tick so `remainingFraction` is recomputed as time passes — the
   // state itself does not change while a countdown merely runs.
@@ -339,7 +339,7 @@ export function useAutoSend({
       if (decision.action === "fire") {
         const sample = {
           tier: s.tier,
-          thresholdMs: thresholdMs(s.tier),
+          thresholdMs: sweepThresholdMs(s.tier),
           elapsedSilenceMs: elapsedMs(s, now),
           keptTalkingAfterReeval: reeval.current.keptTalking,
           graceApplied: reeval.current.graceApplied,

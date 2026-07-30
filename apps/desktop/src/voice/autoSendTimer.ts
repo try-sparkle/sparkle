@@ -50,7 +50,13 @@
 // Pure except for `now` and one `setTimeout`, both injectable — so every rule below is testable
 // with a fake clock and no React.
 
-import { confidence, thresholdMs, type Confidence } from "./confidence";
+import { confidence, type Confidence } from "./confidence";
+// THE FLOOR IS APPLIED HERE, at the one place the deadline is computed, rather than being a number
+// the tray happens to respect. `sweepThresholdMs` is the ladder's rung for a tier, never faster than
+// SWEEP_FLOOR_MS. Importing `thresholdMs` directly instead would leave the floor as a promise no
+// code kept: the ladder's fastest rung is 1s today, so the two agree until someone retunes it —
+// and a retune below a second is exactly the case the floor exists for.
+import { sweepThresholdMs } from "./sendMode";
 
 export type { Confidence };
 
@@ -156,7 +162,7 @@ export function noteTranscript(
   if (next.silenceStartedAt === null) return next;
   const elapsed = now - next.silenceStartedAt;
   // The grace window only exists while the threshold is genuinely behind the elapsed time.
-  if (elapsed < thresholdMs(tier)) next.fireNoEarlierThan = null;
+  if (elapsed < sweepThresholdMs(tier)) next.fireNoEarlierThan = null;
   else if (state.fireNoEarlierThan === null) next.fireNoEarlierThan = now + THRESHOLD_DROP_GRACE_MS;
   return next;
 }
@@ -210,7 +216,7 @@ export function elapsedMs(state: AutoSendState, now: number): number {
  */
 export function remainingMs(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return Infinity;
-  const byThreshold = state.silenceStartedAt + thresholdMs(state.tier) - now;
+  const byThreshold = state.silenceStartedAt + sweepThresholdMs(state.tier) - now;
   const byGrace = state.fireNoEarlierThan === null ? -Infinity : state.fireNoEarlierThan - now;
   // The grace window can only DELAY. A drop-guard that had expired must not pull the deadline in
   // ahead of the threshold.
@@ -227,7 +233,7 @@ export function remainingMs(state: AutoSendState, now: number): number {
  */
 export function remainingFraction(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return 1;
-  const total = thresholdMs(state.tier);
+  const total = sweepThresholdMs(state.tier);
   if (total <= 0) return 0;
   const left = Math.max(0, state.silenceStartedAt + total - now);
   return Math.min(1, left / total);

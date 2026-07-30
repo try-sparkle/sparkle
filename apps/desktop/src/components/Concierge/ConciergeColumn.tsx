@@ -149,7 +149,9 @@ export function ConciergeColumn({
   preferredAgentId,
   copyOnSelection = true,
   autoSend,
-  onToggleAutoSend,
+  sendMode,
+  onSendModeChange,
+  trayInert,
   onComposedText,
   registerSubmit,
   onOpenAgent,
@@ -555,7 +557,9 @@ export function ConciergeColumn({
           mentionAgents={mentionAgents}
           preferredAgentId={preferredAgentId}
           autoSend={autoSend}
-          onToggleAutoSend={onToggleAutoSend}
+          sendMode={sendMode}
+          onSendModeChange={onSendModeChange}
+          trayInert={trayInert}
           onComposedText={onComposedText}
           registerSubmit={registerSubmit}
         />

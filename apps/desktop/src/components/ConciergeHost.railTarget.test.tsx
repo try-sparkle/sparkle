@@ -82,6 +82,12 @@ vi.mock("../services/aiGate", () => ({
   aiFeatureNow: () => false,
   useHasAiCredits: () => true,
   aiEnhancementsEnabled: () => true,
+  // The tray parks at Speak in `beforeEach`, and a Speak position ARMS the real microphone through
+  // the shipped `useMicActions` — which refuses while out of credits (`shouldBlockMicArm`). The
+  // default test user is the anonymous trial, so without a stocked balance every row below would run
+  // against a mic the app was right to leave off. Vitest also throws on ACCESS to an export a
+  // factory omits, so this has to be here whether or not the balance matters to the assertion.
+  hasAiCredits: () => true,
 }));
 
 const RUNTIME = {
@@ -147,16 +153,17 @@ const SELECTED: ConciergePromptTarget = {
 };
 
 const box = () => screen.getByLabelText("Message") as HTMLTextAreaElement;
-/** The rail's arming switch. Its accessible name IS the destination while armed (see SendRail). */
-const railSwitch = () => screen.getByRole("switch");
+/** The tray's Speak position. Its accessible name IS the destination while a countdown runs
+ *  (see SendModeTray) — that is the mis-route safety net this file exercises. */
+const speakPill = () => screen.getByRole("button", { name: /^Speak/ });
 
 beforeEach(() => {
   enableAiEnhancementsForTests();
   setConciergeChat(() => []);
-  // ARMED, because the rail only names a destination when it is: disarmed it reads "Auto-send".
+  // PARKED AT SPEAK, because the tray only names a destination while it is counting down.
   // This is also the state the reported damage happened under — armed plus an inherited target is
   // dictated speech reaching a PTY with no deliberate act at all.
-  useUiStore.setState({ conciergeAutoSend: true });
+  useUiStore.setState({ conciergeSendMode: "speak" });
   h.dispatchConciergeAnswer.mockClear();
   h.routeMessage.mockReset();
   h.routeMessage.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
@@ -164,7 +171,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const i of armedIntents()) cancelIntent(i.id);
   cleanup();
-  useUiStore.setState({ conciergeAutoSend: false });
+  useUiStore.setState({ conciergeSendMode: "send" });
   vi.clearAllMocks();
 });
 
@@ -184,10 +191,10 @@ async function type(text: string) {
   });
 }
 
-/** What the rail says right now. */
+/** What the tray says this send would reach, right now. */
 async function railTarget(): Promise<string> {
-  const name = railSwitch().getAttribute("aria-label") ?? "";
-  return name.replace(/^Auto-send to /, "");
+  const name = speakPill().getAttribute("aria-label") ?? "";
+  return name.replace(/^Speak → /, "");
 }
 
 describe("the rail names the CONCIERGE unless the user named an agent", () => {
@@ -261,10 +268,10 @@ describe("the rail names the agent the TEXT addresses, not the one on screen", (
   it("draws the destination as visible text too", async () => {
     mount();
     await type("@Kraken Auth ship the DMG");
-    expect(screen.getByTestId("concierge-send-rail").textContent).toContain("Kraken Auth");
+    expect(screen.getByTestId("send-mode-tray").textContent).toContain("Kraken Auth");
     await type("ship the DMG");
-    expect(screen.getByTestId("concierge-send-rail").textContent).toContain("Concierge");
-    expect(screen.getByTestId("concierge-send-rail").textContent).not.toContain("Kraken Auth");
+    expect(screen.getByTestId("send-mode-tray").textContent).toContain("Concierge");
+    expect(screen.getByTestId("send-mode-tray").textContent).not.toContain("Kraken Auth");
   });
 });
 
@@ -279,7 +286,10 @@ describe("the label and the destination are computed the same way", () => {
     expect(promised).toBe("Kraken Auth");
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      // PRESS THE SELECTED POSITION. The tray is parked at Speak here, so Speak is what sends —
+      // pressing the unselected Send pill would move the tray instead, which is the tray's whole
+      // point (one control, one press target) and would silently send nothing.
+      fireEvent.click(speakPill());
       for (let i = 0; i < 6; i++) await Promise.resolve();
     });
     await act(async () => {
@@ -299,7 +309,10 @@ describe("the label and the destination are computed the same way", () => {
     expect(await railTarget()).toBe("Concierge");
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      // PRESS THE SELECTED POSITION. The tray is parked at Speak here, so Speak is what sends —
+      // pressing the unselected Send pill would move the tray instead, which is the tray's whole
+      // point (one control, one press target) and would silently send nothing.
+      fireEvent.click(speakPill());
       for (let i = 0; i < 6; i++) await Promise.resolve();
     });
     await act(async () => {

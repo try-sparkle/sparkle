@@ -142,6 +142,7 @@ import { log } from "../logger";
 import { maybePauseOnSubmit } from "../services/dictationControls";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useAutoSend, notifyManualSend } from "../voice/useAutoSend";
+import { useSendMode } from "../voice/useSendMode";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { usePresenceStore, type PresenceMode } from "../stores/presenceStore";
@@ -862,10 +863,11 @@ export function ConciergeHost({
   }, [mentionAgents]);
 
   // ══ THE AUTO-SEND RAIL (PRD 1 §4) ════════════════════════════════════════════════════════════
-  // Armed state is a persisted PRESENTATION preference, read here rather than in the column for the
-  // same reason `copyOnSelection` is: nothing under components/Concierge touches a store.
-  const autoSendArmed = useUiStore((s) => s.conciergeAutoSend);
-  const setAutoSendArmed = useUiStore((s) => s.setConciergeAutoSend);
+  // The tray's POSITION is a persisted presentation preference, read here rather than in the column
+  // for the same reason `copyOnSelection` is: nothing under components/Concierge touches a store.
+  // `useSendMode` also drives the MICROPHONE from that position and owns the push-to-talk hold, so
+  // the tray and the mic glyph cannot end up telling different stories about the same microphone.
+  // It is declared BELOW `composerSubmitRef`, since a push-to-talk release sends through it.
   // What the compose box currently holds, whatever wrote it. The box owns the text; the rail needs
   // to see it to pick a tier, and dictated text is the only kind it ever fires on.
   const [composedText, setComposedText] = useState("");
@@ -878,6 +880,13 @@ export function ConciergeHost({
   const registerSubmit = useCallback((fn: (() => boolean) | null) => {
     composerSubmitRef.current = fn;
   }, []);
+
+  // THE TRAY. A push-to-talk RELEASE sends through the box's own submit for exactly the reason the
+  // countdown does (above): sending from out here would leave the dictated words sitting in the
+  // textarea behind the message they were supposed to be.
+  const sendTray = useSendMode({
+    onSend: useCallback(() => composerSubmitRef.current?.() ?? false, []),
+  });
 
   /**
    * True only for the instants inside an auto-fire.
@@ -929,7 +938,10 @@ export function ConciergeHost({
   }, [composedText, mentionAgents, routingTarget?.agentId]);
 
   const autoSendRail = useAutoSend({
-    armed: autoSendArmed,
+    // ARMED IS NOW A TRAY POSITION, not a switch: only `speak` counts down, and only while the
+    // tray is being addressed (see voice/useSendMode — an inert tray must not count invisibly and
+    // then fire when colour returns).
+    armed: sendTray.armed,
     // OWNERSHIP GATE, and it is load-bearing rather than defensive. `speechEndSeq` is GLOBAL —
     // bumped for every utterance in the focused window whichever surface owns the mic — while the
     // cancel signal is not: `useConciergeDictation` returns interim `""` unless the concierge owns
@@ -2985,11 +2997,13 @@ export function ConciergeHost({
         // be two different answers. Change one, change the other.
         mentionAgents={mentionAgents}
         preferredAgentId={routingTarget?.agentId ?? null}
-        // ── THE AUTO-SEND RAIL (PRD §4) ──────────────────────────────────────────────────────
-        // The model is DATA, not a slot, and carries no live region of its own: the rail's arm and
-        // fire lines go through `announcement` above like everything else in this column.
+        // ── THE SEND TRAY (PRD §4) ───────────────────────────────────────────────────────────
+        // The countdown model is DATA, not a slot, and carries no live region of its own: the arm
+        // and fire lines go through `announcement` above like everything else in this column.
         autoSend={autoSendRail}
-        onToggleAutoSend={setAutoSendArmed}
+        sendMode={sendTray.mode}
+        onSendModeChange={sendTray.setMode}
+        trayInert={sendTray.inert}
         onComposedText={onComposedText}
         registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME

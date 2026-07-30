@@ -9,6 +9,9 @@ import type { Runtime } from "../types";
 // type import is erased at compile time, so it can't. The default below is spelled inline for the
 // same reason (rather than calling allBandsVisible()).
 import type { StatusBand } from "../engine/buildSections";
+// TYPE-ONLY for the same reason as StatusBand above: voice/sendMode pulls in components/MicButton
+// for `MicIntent`, which reaches theme/colors — and theme/theme.ts imports this store.
+import type { SendMode } from "../voice/sendMode";
 import { assignToSide, pruneAssignment, type PairSide } from "../engine/pairs";
 
 // Settings-dialog category ids. Defined HERE (not SettingsDialog.tsx) so the store never depends
@@ -392,19 +395,26 @@ interface UiState {
   conciergeCopyOnSelection: boolean;
   setConciergeCopyOnSelection: (v: boolean) => void;
   /**
-   * The auto-send rail is armed: speech ending starts a countdown that SENDS on its own (PRD §4).
+   * Where the concierge's send tray is parked — Send · Push to talk · Speak (voice/sendMode).
    *
-   * DEFAULT OFF, unlike the copy preference above, and the asymmetry is the point. Copying something
-   * you highlighted is recoverable — the worst case is a clipboard you did not want. An auto-send is
-   * not: it delivers an irreversible instruction to an agent with no undo, no hold and no post-send
-   * countdown, which is exactly what §4 specifies ("when it sends, it sends"). A feature that can
-   * dispatch work on your behalf has to be switched on deliberately, once, by you.
+   * IT REPLACED a boolean `conciergeAutoSend`, and the replacement is a widening rather than a
+   * rename: the old switch could say "a countdown is armed" but had nothing to say about the
+   * MICROPHONE, so the mic's state lived in a different control and the two could contradict each
+   * other on screen. Here the position IS the mic state (`micIntentForMode`), so there is exactly
+   * one place that answers "what happens when I stop talking". Upgrading blobs are carried across
+   * by the v3 migration in ./composerPersist.
    *
-   * Persisted so arming survives a relaunch — someone who dictates this way wants it every session,
-   * and the rail states its own state plainly whenever it is armed.
+   * DEFAULT "send", i.e. microphone off and nothing counting — the same default the boolean had,
+   * for the same reason. Copying something you highlighted is recoverable; an auto-send is not, as
+   * it delivers an irreversible instruction to an agent with no undo, no hold and no post-send
+   * countdown. A feature that can dispatch work on your behalf has to be switched on deliberately,
+   * once, by you.
+   *
+   * Persisted so the choice survives a relaunch — someone who dictates this way wants it every
+   * session, and the tray states its own position plainly at all times.
    */
-  conciergeAutoSend: boolean;
-  setConciergeAutoSend: (v: boolean) => void;
+  conciergeSendMode: SendMode;
+  setConciergeSendMode: (v: SendMode) => void;
   /**
    * Grade each auto-send with a background Haiku call, to tune the heuristics (PRD §4e).
    *
@@ -618,8 +628,8 @@ export const useUiStore = create<UiState>()(
       conciergeCopyOnSelection: true,
       setConciergeCopyOnSelection: (v) => set({ conciergeCopyOnSelection: v }),
       // OFF by default — see the field's doc for why this one is not symmetric with the above.
-      conciergeAutoSend: false,
-      setConciergeAutoSend: (v) => set({ conciergeAutoSend: v }),
+      conciergeSendMode: "send",
+      setConciergeSendMode: (v) => set({ conciergeSendMode: v }),
       // OFF by default — it spends the user's own Claude subscription. See the field's doc.
       conciergeAutoSendTuner: false,
       setConciergeAutoSendTuner: (v) => set({ conciergeAutoSendTuner: v }),
@@ -662,7 +672,9 @@ export const useUiStore = create<UiState>()(
       // via the usual shallow merge — no migration needed for the new field.)
       // v2: drops the retired `agentOrdering` preference and repairs `statusFilter` into a
       // complete record, so a partial blob can't hide a band with no visible cause.
-      version: 2,
+      // v3: the boolean `conciergeAutoSend` became the three-position `conciergeSendMode`. An
+      // armed blob lands on "speak" rather than silently resetting to microphone-off.
+      version: 3,
       migrate: (persisted, version) =>
         migratePersistedUi(persisted as Record<string, unknown>, version, COMPOSER_SNAP) as unknown as UiState,
       // Strip the transient keys on the way IN as well. `partialize` only stops us WRITING them;

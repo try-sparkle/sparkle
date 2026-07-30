@@ -141,14 +141,15 @@ import {
   type MentionAgent,
 } from "./mentions";
 import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
-import { SendRail, type SendRailModel } from "./SendRail";
+import { SendModeTray, type SendTrayModel } from "./SendModeTray";
+import { DEFAULT_SEND_CHORD, chordSends, type SendChord, type SendMode } from "../../voice/sendMode";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
 
-/** The rail a box mounted WITHOUT auto-send wiring draws: off, aimed nowhere, nothing counting.
- *  Module-level so it is the same object every render — the rail is memo-friendly and a fresh
- *  literal per render would defeat that for no gain. */
-const DISARMED_RAIL: SendRailModel = {
+/** The countdown a box mounted WITHOUT auto-send wiring draws: nothing. Module-level so it is the
+ *  same object every render — the tray is memo-friendly and a fresh literal per render would defeat
+ *  that for no gain. */
+const IDLE_COUNTDOWN: SendTrayModel = {
   phase: "disarmed",
   targetName: "",
   tier: "verylow",
@@ -459,7 +460,10 @@ export function ComposeBox({
   mentionAgents = EMPTY_MENTION_AGENTS,
   preferredAgentId = null,
   autoSend,
-  onToggleAutoSend,
+  sendMode = "send",
+  onSendModeChange,
+  trayInert = false,
+  sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
   registerSubmit,
 }: {
@@ -509,14 +513,24 @@ export function ComposeBox({
   /** The agent a send would reach WITHOUT a mention — the selected build agent. Sorts to the top of
    *  the picker, so "@" then Enter aims at the thing already in front of you. */
   preferredAgentId?: string | null;
-  /** The auto-send rail's live state (PRD §4), supplied by the host from voice/autoSendTimer.
+  /** The auto-send countdown's live state (PRD §4), supplied by the host from voice/autoSendTimer.
    *
-   *  OPTIONAL, and its absence means DISARMED rather than absent: the rail is where the Send button
-   *  lives now, so it renders either way. A host that has not wired auto-send up yet gets a Send
-   *  button with an inert off-switch beside it, which is exactly what a disarmed rail is. */
-  autoSend?: SendRailModel;
-  /** The user flipped the rail's arming switch. Absent → the switch is inert (see `autoSend`). */
-  onToggleAutoSend?: (armed: boolean) => void;
+   *  OPTIONAL, and its absence means NOTHING IS COUNTING rather than no tray: the tray is where
+   *  Send lives now, so it renders either way. A host that has not wired auto-send up yet gets a
+   *  three-position tray whose Speak position simply never counts down. */
+  autoSend?: SendTrayModel;
+  /** Where the send tray is parked. Absent → `send`, i.e. microphone off, nothing counting — the
+   *  same default a box with no voice wiring at all should show. */
+  sendMode?: SendMode;
+  /** The user moved the tray. Absent → the tray's positions are inert (see `sendMode`). */
+  onSendModeChange?: (next: SendMode) => void;
+  /** A live PTY owns the keyboard, so the tray is NOT BEING ADDRESSED — it goes flat grey while
+   *  still showing which mode is selected. Decided by the host from voice/dictationFocus; see
+   *  voice/sendMode `trayInert` for why "is the composer focused" is a different question. */
+  trayInert?: boolean;
+  /** Which keystroke sends, so the tray's keycap chiclets follow the setting instead of asserting
+   *  a default the handler might not honour. Defaults to what this box actually implements. */
+  sendChord?: SendChord;
   /**
    * The box's contents changed, WHATEVER put them there — typed, dictated, or restored after a
    * failed send.
@@ -1220,7 +1234,15 @@ export function ComposeBox({
         }
       }
     }
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    // THE SEND CHORD IS DECIDED BY voice/sendMode, not spelled out here. The tray PAINTS a keycap
+    // chip from `chicletFor` and this line HANDLES the keystroke, and they are two different files —
+    // a chip advertising a chord the handler does not honour is the exact defect this control was
+    // built to fix, so both sides ask the same function.
+    //
+    // The mode is load-bearing rather than decorative: in Push to talk `⌘` means TALK, so `⌘↩` must
+    // NOT also send. It used to, and the two paths then stacked — the composer submitted on the
+    // keydown and the hold's own release fired a second send an instant later.
+    if (chordSends(sendMode, sendChord, e)) {
       e.preventDefault();
       submit();
     }
@@ -1672,19 +1694,23 @@ export function ComposeBox({
           )}
         </div>
       </div>
-      {/* THE SEND RAIL — its own full-width row BENEATH the textarea, carrying the Send button.
-          Send used to sit to the RIGHT of the textarea in the row above; it moved because the rail
-          cannot fit beside the box. The concierge column's minimum is 320px, and a ~190px rail
-          there would leave ~120px of typing room. Nothing about the button changed but its
-          position: same gold rect, same 42px, same `aria-label="Send"` and same ⌘↩ shortcut, so
-          every existing query and keybinding still finds it.
+      {/* THE SEND TRAY — its own full-width row BENEATH the textarea, and the ONLY press target.
+          Send used to sit to the RIGHT of the textarea; it moved because the tray cannot fit beside
+          the box. The concierge column's minimum is 320px, and a ~190px strip there would leave
+          ~120px of typing room.
 
-          Rendered ALWAYS, armed or not. The rail is where Send lives now, so it is not conditional
-          on the auto-send feature being on — a disarmed rail is just a Send button with an off
-          switch beside it (see ./SendRail). */}
-      <SendRail
-        model={autoSend ?? DISARMED_RAIL}
-        onToggleArmed={(next) => onToggleAutoSend?.(next)}
+          It replaced a Send button plus a separate auto-send arming switch — two controls asking
+          one question. The Send POSITION keeps `aria-label="Send"` in every mode and still sends on
+          ⌘↩, so every existing query and keybinding finds it exactly where it was (./SendModeTray).
+
+          Rendered ALWAYS. The tray is where Send lives now, so it is not conditional on the voice
+          feature being on — a box with no voice wiring simply shows a tray parked at Send. */}
+      <SendModeTray
+        mode={sendMode}
+        onModeChange={(next) => onSendModeChange?.(next)}
+        model={autoSend ?? IDLE_COUNTDOWN}
+        inert={trayInert}
+        chord={sendChord}
         onSend={submit}
         canSend={canSend}
         // The rail is drawn on whatever ground THIS box is on, so it needs the same flag the box's

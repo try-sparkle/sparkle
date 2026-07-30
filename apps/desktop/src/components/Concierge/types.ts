@@ -29,11 +29,12 @@ import type { ConciergeMention, MentionAgent } from "./mentions";
 // The rail's view-model lives with the component that RENDERS it, for the same reason `Attachment`
 // lives with the composer's model and the mention shapes live with ./mentions: one declaration, so
 // the host that builds a rail state and the strip that draws it cannot drift about what one is.
-import type { SendRailModel } from "./SendRail";
+import type { SendTrayModel } from "./SendModeTray";
+import type { SendMode } from "../../voice/sendMode";
 
 export type { ProjectNeedsYou };
 export type { ConciergeMention, MentionAgent };
-export type { SendRailModel };
+export type { SendTrayModel };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
 // than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
@@ -447,20 +448,24 @@ export interface ConciergeColumnProps {
    *  Like the countdown it must carry NO live region of its own: `announcement` above is the
    *  column's only one, and a second `aria-live` node would double-announce. */
   approvalSlot?: ReactNode;
-  /** The auto-send rail's live state (PRD §4), handed to the compose box.
+  /** The auto-send countdown's live state (PRD §4), handed to the compose box.
    *
    *  DATA, not a slot — unlike `countdownSlot`/`approvalSlot` above. Those are slots because their
-   *  contents subscribe to module-level registries; the rail is drawn from a plain view-model the
-   *  host already holds, and it has to sit INSIDE the compose box (it carries the Send button), so
-   *  a slot would mean handing the box a node it cannot lay out.
+   *  contents subscribe to module-level registries; the countdown is drawn from a plain view-model
+   *  the host already holds, and it has to sit INSIDE the compose box (the tray it sweeps is the
+   *  box's own bottom bar), so a slot would mean handing the box a node it cannot lay out.
    *
-   *  Absent → the rail renders disarmed. Like the two slots it carries NO live region: the arm and
-   *  fire lines go through `announcement` above. */
-  autoSend?: SendRailModel;
-  /** The user flipped the rail's arming switch. Absent → the switch is inert. */
-  onToggleAutoSend?: (armed: boolean) => void;
-  /** The compose box's contents changed, whatever wrote them — the rail's only view of what it
-   *  would send. Distinct from `onTextEdit`, which is narrower on purpose; see ComposeBox. */
+   *  Absent → nothing counts. Like the two slots it carries NO live region: the arm and fire lines
+   *  go through `announcement` above. */
+  autoSend?: SendTrayModel;
+  /** Where the send tray is parked (voice/sendMode). Absent → `send`. */
+  sendMode?: SendMode;
+  /** The user moved the tray. Absent → the tray's positions are inert. */
+  onSendModeChange?: (next: SendMode) => void;
+  /** A live PTY owns the keyboard, so the tray is not being addressed and goes flat grey. */
+  trayInert?: boolean;
+  /** The compose box's contents changed, whatever wrote them — the countdown's only view of what
+   *  it would send. Distinct from `onTextEdit`, which is narrower on purpose; see ComposeBox. */
   onComposedText?: (text: string) => void;
   /** Receives the compose box's submit, so an expired countdown fires the SAME path the button
    *  does — clearing the box and resolving mentions exactly as a manual send would.

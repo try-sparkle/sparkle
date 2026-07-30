@@ -368,7 +368,7 @@ describe("ConciergeHost — dictated input", () => {
     // "Auto-send" that stops listening after one message is not hands-free.
     vi.useFakeTimers();
     try {
-      useUiStore.setState({ conciergeAutoSend: true });
+      useUiStore.setState({ conciergeSendMode: "speak" });
       useDictationStore.setState({ speechEndSeq: 0 });
       h.dictation.micLive = true;
       const c = mount();
@@ -386,7 +386,7 @@ describe("ConciergeHost — dictated input", () => {
       expect(h.maybePauseOnSubmit).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      useUiStore.setState({ conciergeAutoSend: false });
+      useUiStore.setState({ conciergeSendMode: "send" });
       useDictationStore.setState({ speechEndSeq: 0 });
     }
   });
