@@ -15,6 +15,19 @@
 // Sixty-two pane renders inside one 4.7-second stall. That is the shape this file exists to keep out
 // of the drag path.
 //
+// WHAT THIS FILE CANNOT SEE, AND WHERE THAT LIVES INSTEAD. The bounds here are REACT work: renders
+// and reconciliation. The other half of what a drag costs is the terminal fan-out — every open pane
+// stays laid out at full size (paneVisibility.ts) and owns a ResizeObserver, so one layout change
+// used to make all sixty run a forced layout plus an xterm reflow over an 8000-line scrollback
+// (bead sparkle-atp1: 55 panes → ~27s of main-thread block per fan-out). That cost is structurally
+// invisible from here for two independent reasons: `AgentPane` is stubbed below, so no xterm ever
+// mounts under this shell; and jsdom has no layout engine, so the drag moves a number in a store and
+// never changes an element's box — no ResizeObserver would fire even if a real pane were mounted.
+// It is measured, at the same 60 panes and the same 30-step drag shape, in
+// `Terminal.resizeFanout.test.tsx`, which mounts sixty real Terminals and fires the observers
+// directly. Do not try to fold that measurement in here; it would have to fake the very signal it
+// claims to observe.
+//
 // HOW THE PANE COUNT IS HONEST. The stub below is wrapped in `memo(..., arePanePropsEqual)` — the
 // REAL comparator, imported from its own leaf module. So a counted render means Workspace handed the
 // pane props the real predicate calls different, which is exactly what makes the real pane re-render.

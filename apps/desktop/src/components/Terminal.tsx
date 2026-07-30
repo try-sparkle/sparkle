@@ -293,6 +293,17 @@ export function Terminal({
   // paintable consumes this with a full repaint — so we pay the (cold-repaint) cost once per
   // poisoning episode instead of on every settle. Become-active also clears it on reveal.
   const poisonedRef = useRef(false);
+  // Latest `active`, read by the (agentId-keyed) mount effect's ResizeObserver without
+  // re-subscribing. It is the ON-SCREEN signal: AgentPane passes the same boolean to
+  // `paneVisibilityStyle(visible)` that it passes here, so `active === false` is exactly the pane
+  // that is `visibility: hidden`. The effect's own `active` closure is captured at mount and would
+  // be stale forever, which is why this is a ref and not the prop.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  // Set when the ResizeObserver observed a box change on a HIDDEN pane and deliberately skipped the
+  // fit/reflow/repaint (see the observer below). The become-active reveal effect — which already
+  // re-fits and force-repaints unconditionally — is what pays that debt, and clears this.
+  const resizeDirtyRef = useRef(false);
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
@@ -996,6 +1007,19 @@ export function Terminal({
     // poisonedRef / forceFullRepaint).
     const isPaintable = () => !!term.element && term.element.clientWidth > 0;
 
+    // Whether a repaint of this pane would be SEEN — i.e. it is laid out AND it is the pane on
+    // screen. Both halves are load-bearing, and `isPaintable` alone is NOT enough:
+    //
+    //   `isPaintable` dates from the display:none era, when a backgrounded pane collapsed to a 0×0
+    //   box and "measurable" and "on screen" were the same question. paneVisibility.ts retired that
+    //   (every pane stays `display: flex` at full size, hidden only by `visibility`), and a
+    //   `visibility: hidden` element keeps its layout box — so `clientWidth > 0` is TRUE for all
+    //   sixty backgrounded panes. Gating the fan-out on it alone would have been a no-op.
+    //
+    // `activeRef` is the half that says on-screen; `isPaintable` is still the half that says the
+    // box is real (a mid-teardown or pre-layout pane must not be treated as visible either).
+    const isOnScreen = () => activeRef.current && isPaintable();
+
     // Apply the settle/resize repaint plan: a full forceFullRepaint to drain cache-poisoned cells
     // (once, when poisoned AND paintable), else a cheap refresh that marks rows dirty. Shared by
     // the output-settle timer AND the ResizeObserver — so a pane revealed by a *resize* (not the
@@ -1187,15 +1211,41 @@ export function Terminal({
     container.addEventListener("mouseup", onMouseUp);
     container.addEventListener("mousedown", onMouseDown);
 
-    const ro = new ResizeObserver(() => {
-      // A ResizeObserver tick can still be queued when the component unmounts (ro.disconnect()
-      // doesn't un-queue an already-dispatched callback); bail before touching the freed renderer.
-      if (disposed) return;
-      // Instrumented because this is the per-pane half of a fan-out. A window or divider resize
-      // changes every mounted pane's box in one batch, so this body runs `panes` times back to back
-      // on the main thread, each doing a forced layout (fit) plus an xterm buffer reflow when the
-      // column count changes — over an 8000-line scrollback. `panes` is what turns a tolerable
-      // per-pane cost into a freeze, and it is the field that says so.
+    // ── The resize fan-out (bead sparkle-atp1) ──────────────────────────────────────────────────
+    // MEASURED, from one day of a real session's log: at 43 open panes this body cost 167ms per pane
+    // (~7.2s per fan-out); at 55 panes, 499ms per pane (~27.4s). 1,245 spans summed to 299 SECONDS of
+    // main-thread block across ~29 fan-outs, and the worst watchdog wedge of the day — 59.5s —
+    // contained 106 of these spans totalling 52.9s, i.e. 89% of a one-minute freeze was this.
+    //
+    // The cost is structural, not a slow pane: every open pane stays laid out at full size
+    // (paneVisibility.ts), so ONE window or divider change ticks every pane's observer, and each tick
+    // did a forced layout, an xterm buffer reflow over the 8000-line scrollback, and a repaint.
+    // At most two panes (one per pair) are ever on screen, so ~52 of 54 of those were invisible work.
+    //
+    // Two things cut it, in this order:
+    //   1. a VISIBILITY gate — an off-screen pane does the one part that is observable from off
+    //      screen (keep the PTY's wrap column right) and defers the rest to its reveal;
+    //   2. a per-pane rAF COALESCE — several observer ticks inside one frame do one pass, not one
+    //      pass each (a pointer drag emits dozens of events per second).
+    let resizeFrame = 0;
+    let framePending = false;
+
+    const runResize = () => {
+      resizeFrame = 0;
+      framePending = false;
+      // The `disposed` bail the observer body used to carry, re-checked HERE because the work now
+      // runs a frame LATER than the tick that asked for it. `ro.disconnect()` cannot un-queue an
+      // already-scheduled frame any more than it could un-queue an already-dispatched callback, so
+      // this is what keeps a queued pass off a freed renderer (the #231/#258 class of bug).
+      // `disposed` is this effect's own sentinel; `disposedRef` also catches a teardown driven from
+      // elsewhere in the component. The cleanup cancels the frame as well — belt and suspenders,
+      // because cancelAnimationFrame cannot help a frame already being dispatched.
+      if (disposed || disposedRef.current) return;
+      // Instrumented because this is the per-pane half of that fan-out: `panes` is what turns a
+      // tolerable per-pane cost into a freeze, and it is the field that says so. The outer span name
+      // is unchanged so the historical samples above stay comparable; the three inner spans are new,
+      // and answer the question the single span could not — whether the time goes to the forced
+      // layout (`fit`), the PTY round-trip (`syncPty`), or the repaint/GPU upload (`repaint`).
       //
       // Free at rest: perfSpan emits nothing below one frame (SPAN_MIN_MS), so a healthy resize
       // stays silent and only a pane that actually ate a frame gets a line.
@@ -1203,22 +1253,59 @@ export function Terminal({
         "terminal-resize",
         () => {
           try {
-            fit.fit();
+            if (!isOnScreen()) {
+              // OFF SCREEN — the ~52-of-54 case, and the whole win. Do NOTHING but record the debt:
+              // no forced layout, no `term.resize()` (which is what re-wraps 8000 lines), no repaint,
+              // and no PTY round-trip. The become-active effect settles all of it on reveal.
+              //
+              // THE PTY SIZE IS DEFERRED TOO, DELIBERATELY — and this is the part that is easy to get
+              // wrong (roborev 56073 caught the first version doing it). Pushing the live size to the
+              // child while xterm stays at the old one makes the two disagree for as long as the pane
+              // stays hidden, and a hidden pane KEEPS INGESTING OUTPUT (the onOutput handler writes to
+              // the buffer with no visibility gate). A TUI that reads the tty width — which is exactly
+              // what the agent CLI in every one of these panes does — would then emit box drawing,
+              // column alignment and absolute cursor addressing computed for the NEW width into a grid
+              // still sized to the old one. Those rows are baked into the buffer as they are written;
+              // the reveal's `fit()` only rejoins soft-wrapped lines, it cannot re-interpret escape
+              // sequences that already landed on the wrong rows. That is the mirror image of the
+              // thin-column bug terminalSize.ts exists to prevent, and it is permanent in scrollback.
+              //
+              // So the invariant is: what the child was told and what xterm is sized to never diverge
+              // for a pane that can receive output. Both move together, once, on reveal.
+              resizeDirtyRef.current = true;
+              return;
+            }
+            // ON SCREEN — unchanged behaviour, now decomposed into its three stages.
+            perfSpan("terminal-resize.fit", () => fit.fit(), { panes: liveTerminalCount });
             // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
             // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
-            syncPtySize(transport, term);
+            perfSpan("terminal-resize.syncPty", () => syncPtySize(transport, term), {
+              panes: liveTerminalCount,
+            });
             // Repaint the viewport. When the container grows (the pane becoming visible after
             // display:none, or the window enlarging), rows newly brought into view can stay blank —
             // xterm only repaints on resize when fit() actually changed the dimensions.
             // applyRepaintPlan does a cheap refresh normally, OR drains a poisoned pane revealed by
             // this very resize (no active toggle, no further output) with a full forceFullRepaint.
-            applyRepaintPlan();
+            perfSpan("terminal-resize.repaint", () => applyRepaintPlan(), {
+              panes: liveTerminalCount,
+            });
           } catch {
             /* ignore transient fit errors while hidden */
           }
         },
         { panes: liveTerminalCount },
       );
+    };
+
+    const ro = new ResizeObserver(() => {
+      // A ResizeObserver tick can still be queued when the component unmounts (ro.disconnect()
+      // doesn't un-queue an already-dispatched callback); bail before scheduling anything.
+      if (disposed) return;
+      // Per-pane dedupe: N ticks inside one frame schedule ONE pass for this pane.
+      if (framePending) return;
+      framePending = true;
+      resizeFrame = requestAnimationFrame(runResize);
     });
     ro.observe(container);
     // Join the census the span above reports. Paired with the decrement in this effect's cleanup so
@@ -1241,6 +1328,10 @@ export function Terminal({
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
       ro.disconnect();
+      // Drop the coalesced resize pass if one is queued for a frame that will now land after
+      // teardown. `runResize` re-checks `disposed` anyway; cancelling just means we don't burn the
+      // frame at all.
+      if (resizeFrame) cancelAnimationFrame(resizeFrame);
       container.removeEventListener("mouseup", onMouseUp);
       container.removeEventListener("mousedown", onMouseDown);
       if (settleRepaintTimer) window.clearTimeout(settleRepaintTimer);
@@ -1304,6 +1395,11 @@ export function Terminal({
   // fit + size-sync is enough; syncPtySize itself no-ops if the box is somehow still unmeasured, and
   // the ResizeObserver remains the long-term backstop for any late layout.
   //
+  // That single fit is ALSO where a resize this pane skipped while hidden gets paid (sparkle-atp1).
+  // The observer keeps the PTY's wrap column current off screen but does not reflow xterm's buffer;
+  // the reflow lands here, once, for the one pane the user is actually looking at — instead of N
+  // times, synchronously, for panes nobody can see.
+  //
   // The repaint IS still needed: while hidden this pane ran on the DOM renderer (its WebGL context is
   // released when backgrounded — see attach/detachWebgl), so on reveal WebGL re-attaches with an
   // EMPTY model and only forceFullRepaint (clearTextureAtlas) rasterizes the buffered output into it.
@@ -1323,8 +1419,20 @@ export function Terminal({
     let handle = 0;
     handle = requestAnimationFrame(() => {
       if (cancelled || disposedRef.current) return;
+      // PAY THE DEFERRED RESIZE. While this pane was hidden its ResizeObserver skipped the
+      // fit/reflow and recorded the debt on `resizeDirtyRef` (see the observer above). This re-fit
+      // is what settles it — it already ran unconditionally on every reveal, which is why the gate
+      // could defer the work rather than needing a second mechanism to catch up. Clearing the flag
+      // here is what makes "revealed" and "no longer stale" the same event.
+      //
+      // `deferredResize` is reported on the span because it is the field that separates the two
+      // reveals that now cost different amounts: one that merely re-attaches WebGL, and one that
+      // also owes a buffer reflow the resize handed forward. Without it the fix would move cost from
+      // `terminal-resize` to `Terminal.revealFit` invisibly.
+      const deferredResize = resizeDirtyRef.current;
+      resizeDirtyRef.current = false;
       // safeFit() bails if disposed and swallows the not-laid-out / torn-down-core throw itself.
-      safeFit();
+      perfSpan("Terminal.revealFit", () => safeFit(), { deferredResize });
       // Pane reveal / agent change — not the user asking, so this must NOT re-aim dictation.
       composerFocusRequest.reveal({
         onRequestFocus: onRequestFocusRef.current,
