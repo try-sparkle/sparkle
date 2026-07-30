@@ -178,6 +178,10 @@ export function SendModeTray({
   // pill all the time is three keycaps competing with the three labels that are the actual content.
   const [revealed, setRevealed] = useState<SendMode | null>(null);
 
+  // The pill nodes, so an arrow step can move DOM focus with the selection. Selection and focus have
+  // to stay the same fact — see the arrow handler.
+  const pills = useRef<Partial<Record<SendMode, HTMLButtonElement | null>>>({});
+
   return (
     <div
       data-testid="send-mode-tray"
@@ -301,20 +305,36 @@ export function SendModeTray({
               if (pressSends) onSend();
               else if (!selected) onModeChange(m);
             }}
-            // ← / → step the tray one position while it has keyboard focus — the standard gesture
-            // for a segmented control, and the only way to reach Push to talk without a pointer.
+            // ← / → step the tray one position — the standard gesture for a segmented control, and
+            // the only way to reach Push to talk without a pointer.
+            //
+            // IT STEPS FROM *THIS* PILL, not from the selected one, and focus follows the move
+            // (the roving-tabindex pattern). Stepping from `mode` while focus sat elsewhere was
+            // incoherent AND unsafe: with Send selected and the focus ring on Speak, `←` was
+            // swallowed by the clamp while `→` armed the microphone at a position two pills from
+            // what the user was looking at, and a screen reader announced nothing because
+            // `aria-pressed` changed on an unfocused element (roborev 56071).
             //
             // CLAMPED, NEVER WRAPPING (voice/sendMode `stepSendMode`): wrapping would put `send`
             // (microphone off, nothing listening) one keypress from `speak` (microphone live,
-            // auto-sending) with the overshoot invisible. Held here rather than on the group so the
-            // focused pill stays the thing that moves, and so the textarea's own arrow keys — where
-            // `→` already accepts a ghost completion — are untouched.
+            // auto-sending) with the overshoot invisible. Bound per-pill rather than on the group so
+            // the textarea's own arrow keys — where `→` already accepts a ghost completion — are
+            // untouched.
             onKeyDown={(e) => {
               if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
               e.preventDefault();
-              const next = stepSendMode(mode, e.key === "ArrowRight" ? 1 : -1);
-              if (next !== mode) onModeChange(next);
+              const next = stepSendMode(m, e.key === "ArrowRight" ? 1 : -1);
+              if (next === m) return; // clamped at an end — visibly inert, nothing moves
+              onModeChange(next);
+              pills.current[next]?.focus();
             }}
+            ref={(el) => {
+              pills.current[m] = el;
+            }}
+            // ROVING TABINDEX: one stop for the whole tray, on the selected position, so Tab moves
+            // THROUGH this control rather than into three separate stops — and so the pill the
+            // arrows start from is the one Tab lands on.
+            tabIndex={selected ? 0 : -1}
             onMouseEnter={() => setRevealed(m)}
             onMouseLeave={() => setRevealed((r) => (r === m ? null : r))}
             onFocus={() => setRevealed(m)}

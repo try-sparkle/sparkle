@@ -10,9 +10,17 @@
 // out a clock would make the deliberate mode feel laggier than the automatic one (Speak). That
 // asymmetry is stated in ./sendMode `modeCountsDown` and this is the other half of it.
 //
-// TWO WAYS A HOLD IS ABANDONED, and both are about ⌘ being the OS's modifier as well as ours:
-// a second key pressed while ⌘ is down (the gesture was a CHORD — ⌘V, ⌘A, ⌘Z — not speech), and a
-// window blur. Neither sends.
+// THREE WAYS A HOLD IS ABANDONED, and they are all about ⌘ being the OS's modifier as well as ours:
+// a second KEY pressed while ⌘ is down (⌘V, ⌘A, ⌘Z), a POINTER gesture while ⌘ is down (⌘-click,
+// ⌘-scroll, a context menu — none of which emit a keydown, and a click inside the app emits no blur
+// either), and a window blur. None of them send.
+//
+// WHAT IS DELIBERATELY *NOT* A REASON TO ABANDON: a short hold, or a hold during which nothing was
+// dictated. Both were proposed as extra evidence that the gesture "was really speech", and both
+// would break the mode: `chordSends` makes ⌘↩ inert in Push to talk on purpose, so the RELEASE is
+// the only way a typed draft can leave the box here. Gating it on a minimum duration or a
+// transcript delta would leave someone who typed a message in this mode with no send path at all —
+// a worse failure than the one being guarded against, and a silent one.
 //
 // WHY THE WINDOW-BLUR ABANDON IS NOT DEFENSIVE. While ⌘ is held, every stray letter becomes an OS
 // chord — ⌘Q, ⌘W, ⌘Tab. ⌘Tab in particular switches application WITHOUT ever delivering the
@@ -96,20 +104,32 @@ export function usePushToTalk({
       cbs.current.onHoldEnd();
     };
 
-    // See the header: ⌘Tab never delivers its keyup, so blur is the only end this hold will get.
-    const blur = () => {
+    // ⌘-CLICK IS A CHORD TOO, and it reaches none of the branches above: a mouse press delivers no
+    // `keydown`, and a click INSIDE the app fires no `blur` either — so ⌘-click (open-in-new-window,
+    // multi-select, a context menu) held the gesture open and then dispatched the draft on ⌘-up.
+    // Same failure as ⌘V, reached by mouse. A pointer gesture while ⌘ is down means ⌘ was being used
+    // as a MODIFIER, not as the talk key, so the hold is abandoned exactly as a second keydown does.
+    const abandon = () => {
       if (!held.current) return;
       held.current = false;
       cbs.current.onAbandon();
     };
+    // See the header: ⌘Tab never delivers its keyup, so blur is the only end that hold will get.
+    const blur = abandon;
 
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     window.addEventListener("blur", blur);
+    window.addEventListener("mousedown", abandon);
+    window.addEventListener("wheel", abandon, { passive: true });
+    window.addEventListener("contextmenu", abandon);
     return () => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
       window.removeEventListener("blur", blur);
+      window.removeEventListener("mousedown", abandon);
+      window.removeEventListener("wheel", abandon);
+      window.removeEventListener("contextmenu", abandon);
     };
   }, [active, inert]);
 }

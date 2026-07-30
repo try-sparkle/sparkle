@@ -2,7 +2,12 @@
 // composer height, so the size you drag it to sticks across tabs and relaunches.
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import { migratePersistedUi, repairActiveSpecial, repairStatusFilter } from "./composerPersist";
+import {
+  migratePersistedUi,
+  repairActiveSpecial,
+  repairSendMode,
+  repairStatusFilter,
+} from "./composerPersist";
 import type { Runtime } from "../types";
 // TYPE-ONLY import, deliberately: engine/buildSections → engine/workflowStage → theme/colors, and
 // theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
@@ -701,6 +706,12 @@ export const useUiStore = create<UiState>()(
         for (const key of TRANSIENT_UI_KEYS) delete stored[key];
         if ("activeSpecial" in stored) stored.activeSpecial = repairActiveSpecial(stored.activeSpecial);
         if ("statusFilter" in stored) stored.statusFilter = repairStatusFilter(stored.statusFilter);
+        // The send tray's position, repaired on EVERY rehydrate for the same reason as the two
+        // above — `migrate` only runs on a version mismatch, so a corrupt blob already at the
+        // current version would otherwise hydrate verbatim and leave the tray with no pill reading
+        // selected and dead arrow keys (roborev 56071).
+        if ("conciergeSendMode" in stored)
+          stored.conciergeSendMode = repairSendMode(stored.conciergeSendMode);
         return { ...current, ...(stored as Partial<UiState>) };
       },
     },

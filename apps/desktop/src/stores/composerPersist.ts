@@ -69,6 +69,29 @@ export function repairActiveSpecial(raw: unknown): "sparkle" | null {
   return raw === "sparkle" ? "sparkle" : null;
 }
 
+/**
+ * Coerce a persisted send-tray position into one the app recognises, defaulting to `send`.
+ *
+ * CALLED FROM `merge`, NOT ONLY FROM THE MIGRATION, and that distinction is the whole point. zustand
+ * runs `migrate` ONLY when the stored version differs from the configured one — so a blob written by
+ * a partial rollout, a hand edit, or a future value that got rolled back is already at the current
+ * version, skips `migrate` entirely, and hydrates verbatim. A repair that lives only in the migrator
+ * is unreachable for exactly the population it names. `repairActiveSpecial` and `repairStatusFilter`
+ * are both wired into `merge` for this reason; this one was not, and its comment and its test both
+ * claimed "on every rehydrate" while the test called the migrator directly (roborev 56071).
+ *
+ * FAIL CLOSED. An unrecognised value must never resolve to a live microphone: it would spend credits
+ * and capture audio with no pill reading selected to explain it. `micIntentForMode` defaults to
+ * "off" as a second guard, because one guard for that is one too few.
+ *
+ * Spelled as literals rather than importing SEND_MODES: voice/sendMode reaches components/MicButton
+ * for `MicIntent`, and this module is loaded by uiStore, which theme/theme.ts imports — a value
+ * import would close that into a runtime cycle. Pinned against the real list by a test.
+ */
+export function repairSendMode(raw: unknown): string {
+  return typeof raw === "string" && ["send", "ptt", "speak"].includes(raw) ? raw : "send";
+}
+
 export function migratePersistedUi(
   persisted: PersistedUi | undefined,
   version: number,
@@ -99,21 +122,11 @@ export function migratePersistedUi(
       ? rest
       : { ...rest, conciergeSendMode: conciergeAutoSend ? "speak" : "send" };
   }
-  // The tray position is REPAIRED on every rehydrate, deliberately NOT version-gated — same
-  // reasoning as the filter repair below, but a sharper failure. uiStore's merge is shallow, so an
-  // unrecognised `conciergeSendMode` (a partial rollout, a hand-edited blob, a future value rolled
-  // back) hydrates verbatim, and the mic mapping has to do SOMETHING with it. Coercing here means
-  // the one thing it can never do is take the microphone live on a value nobody recognises, with no
-  // pill reading selected to explain it. Fail closed, twice: `micIntentForMode` also defaults to
-  // "off" rather than "active", because a single guard for "spends credits and captures audio" is
-  // one guard too few.
-  //
-  // Spelled as literals rather than importing SEND_MODES: voice/sendMode reaches components/MicButton
-  // for `MicIntent`, and this module is loaded by uiStore, which theme/theme.ts imports — the value
-  // import would close that into a runtime cycle. Pinned against the real list by a test.
-  if (next.conciergeSendMode !== undefined
-      && !["send", "ptt", "speak"].includes(next.conciergeSendMode as string)) {
-    next = { ...next, conciergeSendMode: "send" };
+  // Version-mismatched blobs get the repair here; blobs ALREADY at the current version get it from
+  // uiStore's `merge`, which is the path that actually runs on an ordinary launch. See
+  // `repairSendMode` for why both call sites are needed.
+  if ("conciergeSendMode" in next) {
+    next = { ...next, conciergeSendMode: repairSendMode(next.conciergeSendMode) };
   }
   // The filter repair runs on EVERY rehydrate, deliberately NOT version-gated. uiStore's merge is a
   // shallow one, so a persisted `statusFilter` REPLACES the default object wholesale rather than

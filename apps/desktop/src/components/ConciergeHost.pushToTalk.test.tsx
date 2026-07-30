@@ -354,10 +354,18 @@ describe("release sends immediately, and sends everything", () => {
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
     expect(box().value).toBe("ship the");
 
-    // …the segment commits: the words reach the box and the interim clears.
-    type("ship the staging branch");
+    // THE COMMIT, IN THE ORDER THE APP ACTUALLY PRODUCES IT. `useDictation`'s `dictation://partial`
+    // handler runs `setInterim(""); onSegment(payload);` — the interim clears FIRST, and only then
+    // do the words reach the composer. Writing it the other way round (insert, then clear) is a
+    // sequence the app never produces, and it made this row pass against an implementation that
+    // sent before the insert had landed (roborev 56078). Both statements are inside one `act` so
+    // the clear cannot flush a render before the insert is queued, exactly as in production.
     await act(async () => {
       useDictationStore.getState().setInterim("");
+      fireEvent.change(box(), {
+        target: { value: "ship the staging branch", selectionStart: 23, selectionEnd: 23 },
+      });
+      await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
 
@@ -382,6 +390,7 @@ describe("release sends immediately, and sends everything", () => {
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
     await act(async () => {
       useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
@@ -426,10 +435,52 @@ describe("release sends immediately, and sends everything", () => {
     act(() => fireEvent.keyDown(window, { key: "Meta" }));
     await act(async () => {
       useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
     expect(box().value).toBe("ship the");
+  });
+
+  it("⌘-CLICK does not send — a pointer gesture means ⌘ was a modifier", async () => {
+    // The hole the keydown guard could not see: a mouse press delivers no keydown, and a click
+    // INSIDE the app fires no blur either, so ⌘-click (open-in-new-window, multi-select) held the
+    // gesture open and dispatched the draft on ⌘-up. Everyday macOS gesture, same irreversible send.
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("not a message");
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.mouseDown(window);
+      fireEvent.keyUp(window, { key: "Meta" });
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(box().value).toBe("not a message");
+  });
+
+  it("LEAVING Push to talk mid-settle cancels the send and leaves the new mode's mic alone", async () => {
+    // The wait can outlive the gesture by up to PARTIAL_SETTLE_CAP_MS. Without the cancel, a user
+    // who released and then moved the tray got a message dispatched a second and a half later, from
+    // a mode they were no longer in — and `finish` dropped the mic the NEW mode had just armed,
+    // leaving the tray reading "Speak" over a muted microphone.
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("ship the");
+    act(() => useDictationStore.getState().setInterim("staging"));
+    act(() => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.keyUp(window, { key: "Meta" });
+    });
+    act(() => fireEvent.click(pill("speak")));
+    await act(async () => {
+      useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    // …and Speak's microphone is still live, not muted by a stale finish.
+    expect(mic()).toEqual({ enabled: true, phase: "active" });
   });
 
   it("an ABANDONED hold never waits on a partial — it was never going to send", async () => {
@@ -443,6 +494,7 @@ describe("release sends immediately, and sends everything", () => {
     });
     await act(async () => {
       useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
     expect(h.startConciergeTurn).not.toHaveBeenCalled();

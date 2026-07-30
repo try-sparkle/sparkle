@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { migratePersistedUi, OLD_COMPOSER_DEFAULT } from "./composerPersist";
+import { readFileSync } from "node:fs";
+import { migratePersistedUi, repairSendMode, OLD_COMPOSER_DEFAULT } from "./composerPersist";
 import { STATUS_BANDS } from "../engine/buildSections";
 import { SEND_MODES } from "../voice/sendMode";
 
@@ -69,20 +70,34 @@ describe("v3 — the armed boolean becomes a tray position", () => {
     expect(out?.zoom).toBe(1.2);
   });
 
-  it("COERCES an unrecognised position to Send, on every rehydrate, not just at v3", () => {
-    // Ungated on purpose, like the statusFilter repair: a blob written by a partial rollout (or by a
-    // future value that got rolled back) is already at v3 and would skip a version-gated repair. The
-    // direction is fail-closed — the mic mapping must never be handed a value it resolves to "live".
-    expect(migratePersistedUi({ conciergeSendMode: "shout" }, 3, SNAP)?.conciergeSendMode).toBe("send");
-    expect(migratePersistedUi({ conciergeSendMode: 7 }, 3, SNAP)?.conciergeSendMode).toBe("send");
-    expect(migratePersistedUi({ conciergeSendMode: null }, 3, SNAP)?.conciergeSendMode).toBe("send");
+  it("COERCES an unrecognised position to Send", () => {
+    // Fail-closed: the mic mapping must never be handed a value it resolves to "live".
+    expect(repairSendMode("shout")).toBe("send");
+    expect(repairSendMode(7)).toBe("send");
+    expect(repairSendMode(null)).toBe("send");
+    expect(repairSendMode(undefined)).toBe("send");
+  });
+
+  it("the repair is reachable from the path that ACTUALLY runs on an ordinary launch", () => {
+    // zustand runs `migrate` ONLY on a version mismatch, so a blob written by a partial rollout, a
+    // hand edit, or a rolled-back future value is already at the current version and skips it
+    // entirely. A repair living only in the migrator is unreachable for exactly the population it
+    // names — which is what this coercion was, while its own comment and test title claimed
+    // otherwise and the test called the migrator directly (roborev 56071).
+    //
+    // `repairActiveSpecial` and `repairStatusFilter` are both wired into uiStore's `merge` for this
+    // reason. This asserts the wiring, not just the function: read the source rather than mock a
+    // store rehydrate, because what regressed was a missing CALL SITE, not a broken repair.
+    const uiStoreSrc = readFileSync(new URL("./uiStore.ts", import.meta.url), "utf8");
+    const merge = uiStoreSrc.slice(uiStoreSrc.indexOf("merge: (persisted, current)"));
+    expect(merge.slice(0, merge.indexOf("},"))).toContain("repairSendMode");
   });
 
   it("leaves every REAL position alone", () => {
     // The other half: a repair that clobbers valid values would pass the row above and silently
     // reset everyone to Send on launch.
     for (const m of ["send", "ptt", "speak"]) {
-      expect(migratePersistedUi({ conciergeSendMode: m }, 3, SNAP)?.conciergeSendMode).toBe(m);
+      expect(repairSendMode(m)).toBe(m);
     }
   });
 
@@ -93,7 +108,7 @@ describe("v3 — the armed boolean becomes a tray position", () => {
     // status-band list already has: add a fourth position and, without this, the migration would
     // coerce it to Send on every launch and nothing would fail.
     for (const m of SEND_MODES) {
-      expect(migratePersistedUi({ conciergeSendMode: m }, 3, SNAP)?.conciergeSendMode).toBe(m);
+      expect(repairSendMode(m)).toBe(m);
     }
   });
 

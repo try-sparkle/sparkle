@@ -6,7 +6,7 @@
 // beside it. Every row below asserts something that control could not do: park at one of three
 // positions, refuse a press in the mode that sends on release, draw a keycap that follows the
 // setting, or go flat grey while still showing which mode is selected.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SendModeTray, type SendModeTrayProps, type SendTrayModel } from "./SendModeTray";
@@ -116,12 +116,34 @@ describe("← / → step the tray, clamped", () => {
     // Wrapping would put "microphone off, nothing listening" one keypress from "microphone live,
     // auto-sending", with the overshoot that produced it invisible.
     const { onModeChange } = mount({ mode: "send" });
+    act(() => pill("send").focus());
     fireEvent.keyDown(pill("send"), { key: "ArrowLeft" });
     expect(onModeChange).not.toHaveBeenCalled();
     cleanup();
     const b = mount({ mode: "speak" });
     fireEvent.keyDown(pill("speak"), { key: "ArrowRight" });
     expect(b.onModeChange).not.toHaveBeenCalled();
+  });
+
+  it("steps from the FOCUSED pill, not the selected one, and focus follows the move", () => {
+    // The incoherent-and-unsafe case: Send selected, focus ring on Speak. Stepping from `mode` made
+    // `←` a no-op (clamped at Send) while `→` armed the microphone at a position two pills from what
+    // the user was looking at — and a screen reader announced nothing, because `aria-pressed`
+    // changed on an unfocused element (roborev 56071).
+    const { onModeChange } = mount({ mode: "send" });
+    act(() => pill("speak").focus());
+    fireEvent.keyDown(pill("speak"), { key: "ArrowLeft" });
+    // Stepping from SPEAK, so ← lands on ptt — not swallowed by Send's clamp.
+    expect(onModeChange).toHaveBeenCalledWith("ptt");
+  });
+
+  it("keeps the tray to ONE tab stop, on the selected position", () => {
+    // Roving tabindex: Tab moves THROUGH this control rather than into three separate stops, and the
+    // pill the arrows start from is the one Tab lands on.
+    mount({ mode: "ptt" });
+    expect(pill("ptt").tabIndex).toBe(0);
+    expect(pill("send").tabIndex).toBe(-1);
+    expect(pill("speak").tabIndex).toBe(-1);
   });
 
   it("leaves every other key to the surface it came from", () => {

@@ -129,6 +129,15 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   const settling = useRef<(() => void) | null>(null);
   useEffect(() => () => settling.current?.(), []);
 
+  // LEAVING PUSH TO TALK CANCELS A PENDING RELEASE. The wait can outlive the gesture by up to
+  // PARTIAL_SETTLE_CAP_MS, and before this a user who released and then moved the tray got a message
+  // dispatched a second and a half after they had left the mode — from a mode they were no longer
+  // in. Same for the tray going inert: a live PTY owns the keyboard, and a send nobody is looking at
+  // is exactly what the inert state exists to prevent (roborev 56078).
+  useEffect(() => {
+    if (mode !== "ptt" || inert) settling.current?.();
+  }, [mode, inert]);
+
   /**
    * End the hold: send (or not), then drop the mic back to armed-but-not-routing.
    *
@@ -139,10 +148,20 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    * keyup's own tick when an interim is outstanding delivers a TRUNCATED phrase — or, if the user
    * spoke one short sentence and let go, an empty box and no message at all.
    *
-   * So a release with an interim outstanding waits for that interim to CLEAR — the signal that the
-   * segment committed into the box — and sends the whole phrase then. That is not a delay anyone
-   * chose: there is no timer to expire, nothing to wait out, and the common case (no interim, or the
-   * on-device path, which has no interim results at all) still sends in the keyup's own tick.
+   * So a release with an interim outstanding waits for that interim to CLEAR, then yields one
+   * macrotask, and sends the whole phrase after that. That is not a delay anyone chose: there is no
+   * timer to expire, nothing to wait out, and the common case (no interim, or the on-device path,
+   * which has no interim results at all) still sends in the keyup's own tick.
+   *
+   * THE MACROTASK IS THE WHOLE FIX, not a hedge. `interim` clearing is NOT "the segment reached the
+   * box" — it is emitted immediately BEFORE the insert: `useDictation`'s `dictation://partial`
+   * handler runs `setInterim(""); onSegment(payload);`, and zustand notifies subscribers
+   * SYNCHRONOUSLY inside `set()`. So a subscriber that sends on the clear runs before `onSegment`
+   * appends anything, and `ComposeBox.submit` reads `text` from React state as of the last render —
+   * which is the pre-insert value. The observable result was the exact truncation this wait exists
+   * to prevent, made worse: "ship the" goes out, the box is cleared, and the committed tail lands in
+   * an emptied composer. A microtask is not enough either; `submit` needs the insert's RE-RENDER to
+   * have flushed, so this yields a full macrotask (roborev 56078).
    *
    * THE CAP IS A BACKSTOP, NOT A POLICY. If the commit never arrives — a dropped socket, a capture
    * torn down mid-utterance — the message must not be stranded forever, so after
@@ -159,7 +178,12 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
       const finish = () => {
         settling.current = null;
         if (send) onSendRef.current();
-        applyIntent(micIntentForMode("ptt"));
+        // RE-READ the live position rather than hard-coding "ptt". `finish` can now run up to
+        // PARTIAL_SETTLE_CAP_MS after the release, and hard-coding it dropped a mic that a mode the
+        // user had since picked had just armed — the tray reading "Speak" over a muted microphone,
+        // which is the two-controls-disagreeing failure this hook exists to delete, and one the
+        // reconcile effect would not repair because `mode` did not change again (roborev 56078).
+        applyIntent(micIntentForMode(useUiStore.getState().conciergeSendMode));
       };
       if (!send || !useDictationStore.getState().interim) {
         finish();
@@ -178,7 +202,9 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         finish();
       };
       wait.unsub = useDictationStore.subscribe((s) => {
-        if (!s.interim) settle(); // the segment committed — the phrase is whole now
+        // The interim cleared, so the insert is about to run — see the doc above. Yield a macrotask
+        // so it and its render land first, then send.
+        if (!s.interim) setTimeout(settle, 0);
       });
       wait.timer = setTimeout(settle, PARTIAL_SETTLE_CAP_MS);
       settling.current = () => {
