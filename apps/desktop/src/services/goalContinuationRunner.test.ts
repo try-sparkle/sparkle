@@ -25,13 +25,32 @@ vi.mock("./conciergeDispatch", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./conciergeDispatch")>();
   return {
     ...actual,
-    dispatchConciergeAnswer: vi.fn(async (agentId: string, text: string) => ({
-      ok: true,
-      path: "free-text" as const,
-      agentId,
-      sent: text,
-      display: text,
-    })),
+    // THE STUB HONOURS THE `userPrompt` CONTRACT, and that is what makes the escalation test below
+    // mean anything. The real `dispatchConciergeAnswer` calls `recordPromptSideEffects` — and so
+    // `appendPrompt` — only when `userPrompt` is true; `promptHistory.length` is one third of the
+    // progress mark. A stub that ignored the flag (the previous one did) left every assertion about
+    // the mark testing the stub's silence rather than the runner's behaviour: flipping the runner to
+    // `userPrompt: true` could not fail any of them.
+    dispatchConciergeAnswer: vi.fn(
+      async (
+        agentId: string,
+        text: string,
+        opts?: { userPrompt?: boolean; authority?: { kind: string } },
+      ) => {
+        if (opts?.userPrompt) {
+          const store = useProjectStore.getState();
+          const project = store.projects.find((p) => p.agents.some((a) => a.id === agentId));
+          if (project) store.appendPrompt(project.id, agentId, text);
+        }
+        return {
+          ok: true,
+          path: "free-text" as const,
+          agentId,
+          sent: text,
+          display: text,
+        };
+      },
+    ),
   };
 });
 
@@ -300,6 +319,40 @@ describe("escalation", () => {
       useProjectStore.getState().noteAgentGoalContinue(projectId, agentId, FRESH_MARK);
     }
   }
+
+  it("escalates after REAL sends — the resume must not count as its own progress", async () => {
+    // THE SIDE EFFECT, not the precondition. `burnRetries` hand-writes FRESH_MARK, so every other
+    // test in this block ASSUMES the thing that actually matters: that a real auto-continue leaves
+    // the progress mark where it was. Nothing proved it. If the resume were dispatched as a user
+    // prompt it would enter `promptHistory`, `promptHistoryLength` would tick on every attempt, the
+    // mark would move, `consecutive` would reset forever and this escalation could NEVER fire —
+    // the bound would be vacuous and a permanently-stuck agent would be restarted without limit.
+    //
+    // This is the stall-side half of engine/agentOriginated's rule: Sparkle's own resume is not
+    // evidence the agent is progressing, exactly as (on the thrash side) it is not evidence the
+    // agent is looping. One definition, both directions.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    // Drive real sweeps: each settled sweep sends, and re-arms the idle clock behind it.
+    let now = T0;
+    for (let i = 0; i < 3; i++) {
+      await sweepGoalContinuations({ now, ownsProject: ownsEverything });
+      now += 46_000;
+      await sweepGoalContinuations({ now, ownsProject: ownsEverything });
+      now += 46_000;
+    }
+    expect(sendMock).toHaveBeenCalledTimes(3);
+
+    // The mark never moved across three genuine sends — which is the whole claim.
+    expect(goalOf(projectId, agentId)!.mark).toBe(FRESH_MARK);
+    expect(goalOf(projectId, agentId)!.continues).toBe(3);
+
+    // So the bound is reachable, and the human is told.
+    await sweepGoalContinuations({ now, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: now + 46_000, ownsProject: ownsEverything });
+    expect(sendMock).toHaveBeenCalledTimes(3); // no fourth restart
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
 
   it("hands the agent to the human — latched on the goal AND announced", async () => {
     const { projectId, agentId, agentName } = seed({ goal: "land the PR" });

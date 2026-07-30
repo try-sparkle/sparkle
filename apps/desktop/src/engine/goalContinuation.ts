@@ -26,6 +26,7 @@
 // decision lives in services/goalContinuationRunner.
 import type { AgentTabStatus } from "@sparkle/ui";
 import { type AgentGoal, goalStateOf } from "./agentGoal";
+import { RESUME_PROMPT_MARKER } from "./agentOriginated";
 
 /**
  * How long a row must sit CONTINUOUSLY idle before an auto-continue is allowed.
@@ -246,10 +247,19 @@ function isRestingStatus(status: AgentTabStatus): boolean {
  * way out would be the bounds firing, which reports a false escalation to the human. Naming the
  * op that marks the goal met makes finishing a thing the agent can do, so the common case ends
  * cleanly instead of by exhaustion.
+ *
+ * IT OPENS WITH A SHARED CONSTANT, and that is load-bearing rather than tidiness. This string is
+ * SYSTEM-AUTHORED: no human and no agent chose to send it, a timer did — so `engine/agentThrash`
+ * must not count it as a repeated command and this module must not count it as progress (see
+ * engine/agentOriginated for the one statement of that rule). The thrash detector recognises
+ * Sparkle's own send by this opening, so the sender and the recogniser have to be ONE string rather
+ * than two copies of one. Reword it here and `agentOriginated.test.ts` fails; that is the point —
+ * the alternative is the detector going silently blind, which is how agent 0bf08c64 came to be
+ * badged "It is looping, not working" through 46 minutes of real work.
  */
 export function continuePrompt(goal: AgentGoal): string {
   return (
-    `Your turn ended but your goal is not met yet, so you are being resumed automatically. ` +
+    `${RESUME_PROMPT_MARKER} automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
     // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
@@ -273,7 +283,15 @@ export function continuePrompt(goal: AgentGoal): string {
  * call would run on every idle sweep across a 64-agent fleet, and one that costs an LLM call would
  * cost more than the stall. Each input moves only when the agent genuinely did something:
  *
- *   • `promptHistoryLength` — someone (human or auto-continue) sent it work.
+ *   • `promptHistoryLength` — a HUMAN sent it work. Explicitly NOT the auto-continue: that send
+ *                             passes `userPrompt: false` precisely so it stays out of
+ *                             `promptHistory` and therefore out of this mark. A resume is Sparkle
+ *                             talking to itself, and counting it here would make the mark move on
+ *                             every attempt, reset the consecutive streak forever, and leave
+ *                             `MAX_CONTINUES_WITHOUT_PROGRESS` unable to fire at all. This is the
+ *                             stall-side half of the rule stated in engine/agentOriginated — the
+ *                             thrash side of the same rule is that the resume must not count as a
+ *                             repeated COMMAND. One definition, two detectors, opposite failures.
  *   • `activity`            — the agent re-narrated what it is building (sparkle-control
  *                             set_agent_activity), which it only does at real phase boundaries.
  *   • `aiTitle`             — Claude Code re-derived the session title from the whole

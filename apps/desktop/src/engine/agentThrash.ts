@@ -40,6 +40,7 @@
 //
 // PURE REDUCER. `reduceThrash` is data-in-data-out over one event; the clock arrives on the event
 // (`ts`) or as a parameter. No timers, no I/O — so a four-compaction spiral is tested as arithmetic.
+import { isSystemAuthoredPrompt } from "./agentOriginated";
 import type { HookEvent } from "./hookEvents";
 
 /** Identical consecutive commands before we call it repetition.
@@ -135,6 +136,34 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
   switch (ev.event) {
     case "UserPromptSubmit": {
       const text = (ev.prompt ?? "").trim();
+      // SPARKLE'S OWN AUTO-RESUME BANNER IS NOT AN AGENT ACTION, so it is excluded from repetition
+      // ENTIRELY — it does not extend a run, does not start one, and does not reset one. The turn
+      // bookkeeping below still proceeds, because a resume really does open a turn the agent works
+      // in; it is only the "did the agent choose to submit this" tally that must not see it.
+      //
+      // WHY THIS AND NOT THE `workHappened` GUARD BELOW. `repeatOf` already declines to call
+      // identical text a loop when a tool ran in between, and that guard was written for exactly
+      // this prompt (see its docstring). It is not enough, and the second false positive proved it:
+      // on 2026-07-30 agent 0bf08c64 was badged `repeating-command` — "Submitted [...] 3 times in a
+      // row. It is looping, not working." — through 46 continuous minutes of writing tests and
+      // running typecheck and vitest. The guard depends on OBSERVING the intervening work, and this
+      // registry is fed from AgentPane's watcher (see fleetVerdict's note), so an unmounted pane, a
+      // remount, or any dropped PreToolUse leaves three resumes looking adjacent. Inferring a loop
+      // from evidence we merely failed to see is the same error as the badge itself.
+      //
+      // Excluding the banner at the source does not depend on seeing anything: the text is
+      // system-authored, therefore it carries no information about the agent either way, therefore
+      // it belongs in no tally. That holds under partial observation, which the guard never did.
+      // The guard STAYS — it still covers a human typing the same thing repeatedly — but it is no
+      // longer what stands between this feature and condemning its own sibling.
+      if (isSystemAuthoredPrompt(text)) {
+        // `lastTurnRanTool` is NOT cleared on this path, deliberately, and this is the one place the
+        // resume differs from an unobserved prompt. Clearing it would destroy the work evidence
+        // `repeatOf` reads, so a resume landing between two genuine human submissions would make a
+        // WORKING agent more likely to read as looping — reintroducing the very false positive this
+        // arm exists to remove, through the back door.
+        return { ...state, turnOpen: true, toolInCurrentTurn: false };
+      }
       // A repeat is only a repeat if we can SEE the text. An event with no prompt (older logs,
       // a redacted payload) must not silently extend or reset a run — leaving both alone is the
       // honest handling of "we didn't observe this one".
@@ -215,6 +244,14 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
  * have been reported `repeating-command` — "It is looping, not working" — which is the precise
  * inverse of the judgement this module exists to make, fired on the healthy path. A human typing
  * "continue" three times hit the same thing.
+ *
+ * THE AUTO-CONTINUE PROMPT NO LONGER REACHES THIS FUNCTION AT ALL. It is excluded upstream, in the
+ * `UserPromptSubmit` arm, because this guard was not sufficient for it: the guard needs to SEE the
+ * intervening work, and under partial observation (an unmounted pane, a dropped `PreToolUse`) it
+ * does not — which is how the false positive recurred on 2026-07-30 against an agent that had been
+ * working continuously for 46 minutes. What remains here is the case the guard is genuinely right
+ * for: a HUMAN typing the same thing repeatedly, which is a real action that really does carry
+ * information, so it must be judged on evidence rather than suppressed.
  *
  * The evidence to separate the two was already in the state and simply unused: the `/compact` case
  * ran NO tools in each repeated turn. So identical text plus real work is a retry loop that is

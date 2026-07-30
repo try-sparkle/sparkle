@@ -14,6 +14,7 @@ import {
   thrashReportFor,
   type ThrashState,
 } from "./agentThrash";
+import { continuePrompt } from "./goalContinuation";
 
 const T0 = 1_700_000_000_000;
 
@@ -104,19 +105,86 @@ describe("repeated commands", () => {
   });
 });
 
-describe("a repeat only counts when the turn between did nothing", () => {
+describe("the auto-resume banner is excluded from repetition ENTIRELY", () => {
+  // THE REAL STRING, produced by the real sender. The previous version of this test hand-wrote a
+  // truncated approximation of the banner, so it could not have caught the 2026-07-30 recurrence
+  // even in principle — it was testing a string that nothing sends. `continuePrompt` is now the
+  // fixture, and `agentOriginated.test.ts` guards the round trip from the other side.
+  const RESUME = continuePrompt({
+    text: "land the retry PR",
+    setAt: 0,
+    ttlMs: 4 * 3_600_000,
+    continues: 0,
+    totalContinues: 0,
+  });
+
   it("this feature's OWN auto-continue prompt does not read as a loop", () => {
     // goalContinuation.continuePrompt is a pure function of goal.text, so every auto-continue for
     // one goal submits a byte-identical string and MAX_CONTINUES_TOTAL permits twenty of them. An
     // agent restarted three times that edited, tested and committed in each turn used to be
     // reported "It is looping, not working" — the precise inverse judgement, on the healthy path
     // of the sibling feature (roborev 55259).
-    const prompt = "Your turn ended but your goal is not met yet, so you are being resumed...";
-    const events = [0, 1, 2, 3].flatMap(() => turn(prompt, ["Edit", "Bash"]));
+    const events = [0, 1, 2, 3].flatMap(() => turn(RESUME, ["Edit", "Bash"]));
     const r = thrashReport(run(events), T0, { goalOutstanding: true });
     expect(r.verdict).toBe("healthy");
     expect(r.repeatedCommand).toBeUndefined();
   });
+
+  it("stays healthy even when the intervening work is NEVER OBSERVED — agent 0bf08c64", () => {
+    // THE ACTUAL 2026-07-30 REGRESSION, and the one the `workHappened` guard could not stop. The
+    // agent was working continuously for 46 minutes — writing retraction tests, running typecheck
+    // and vitest — but this registry is fed from AgentPane's watcher, so an unmounted pane or a
+    // dropped PreToolUse leaves the resumes looking adjacent with no work between them. The old
+    // guard read that absence of evidence as evidence of a loop and badged the row
+    // `repeating-command`; the human relayed "it is looping and burning turns" to the founder about
+    // an agent that was doing real work the whole time.
+    //
+    // Note there is not a single tool event in this stream: that is the point. The verdict must not
+    // depend on our having seen the work, because the banner carries no information either way.
+    const events = [0, 1, 2, 3, 4].flatMap((i) => turn(RESUME, [], T0 + i * 60_000));
+    const r = thrashReport(run(events), T0 + 300_000, { goalOutstanding: true });
+    expect(r.repeatedCommand).toBeUndefined();
+    expect(r.verdict).not.toBe("repeating-command");
+    expect(r.detail).not.toContain("looping");
+  });
+
+  it("does not let a resume LAUNDER a real loop — the human's repeats still count across it", () => {
+    // The exclusion must be inert, not amnesic. If a resume RESET the run, an agent looping on
+    // /compact that happened to be auto-continued between repeats would be scrubbed clean and the
+    // detector would go quiet on exactly the case it was built for. The resume is skipped over; the
+    // human's own submissions on either side of it still form one run.
+    const events = [
+      ...turn("/compact", []),
+      ...turn(RESUME, []),
+      ...turn("/compact", []),
+      ...turn(RESUME, []),
+      ...turn("/compact", []),
+    ];
+    const r = thrashReport(run(events), T0, {});
+    expect(r.verdict).toBe("repeating-command");
+    expect(r.repeatedCommand).toEqual({ text: "/compact", count: REPEAT_LIMIT });
+  });
+
+  it("does not erase work evidence — a resume between two human repeats keeps them healthy", () => {
+    // The mirror of the test above. `lastTurnRanTool` survives the resume arm, so a human who types
+    // the same thing twice around a resume, having had real work happen, is still judged on that
+    // work rather than on a flag the resume wiped.
+    const events = [...turn("run it", ["Bash"]), ...turn(RESUME, []), ...turn("run it", ["Bash"])];
+    expect(thrashReport(run(events), T0, { goalOutstanding: true }).verdict).toBe("healthy");
+  });
+
+  it("still counts resumed turns toward NO-PROGRESS — a resume is not progress either", () => {
+    // The exclusion is scoped to REPETITION, deliberately. An agent resumed repeatedly that runs no
+    // tools at all is going nowhere, and that is a true finding the detector must keep making — the
+    // rule is that the banner is not evidence FOR a loop, not that it is evidence AGAINST one.
+    const events = [0, 1, 2].flatMap((i) => turn(RESUME, [], T0 + i * 60_000));
+    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    expect(r.turnsWithoutTool).toBe(NO_TOOL_TURN_LIMIT);
+    expect(r.verdict).toBe("no-progress");
+  });
+});
+
+describe("a repeat only counts when the turn between did nothing", () => {
 
   it("a human typing 'continue' three times while the agent works is healthy", () => {
     const events = [0, 1, 2].flatMap(() => turn("continue", ["Bash"]));
