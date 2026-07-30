@@ -55,12 +55,18 @@ function watch(doc: Document): void {
  *  performs — including the ones the user asked for.
  *
  *  That last part is the rule, and it reads backwards until you see why: a plain `.focus()` cannot
- *  express "the user asked for this box". The ⌘J chord un-minimizes a composer whose textarea is
- *  not rendered yet, so the caret lands a render later from some other call; and when the caret is
- *  ALREADY in the box, `.focus()` dispatches nothing at all. Both cases silently lose the claim.
- *  So surfaces are NAMED BY THE CALL SITE, never inferred from the focus event — see
- *  SparkleAgentPane's `onUserRequestFocus` and ComposeBox's composeFocusSeq effect, each of which
- *  calls `setVoiceSurface` outright and then focuses quietly like everything else.
+ *  express "the user asked for this box". The motivating case was historical — the ⌘J chord
+ *  un-minimizing a composer whose textarea was not rendered yet, so the caret landed a render later
+ *  from some other call. No pane has a composer now (see SparkleAgentPane), so that exact sequence is
+ *  gone, but the SECOND half of the problem is structural and permanent: when the caret is ALREADY in
+ *  the box, `.focus()` dispatches nothing at all, so there is no event to carry a claim on. Both
+ *  cases silently lose it.
+ *
+ *  So surfaces are NAMED BY THE CALL SITE, never inferred from the focus event. The live sites that
+ *  do this are Concierge/ComposeBox's composeFocusSeq effect, MicButton (which names the surface it
+ *  is arming), and LogoWaveform — each calls `setVoiceSurface` outright and then focuses quietly like
+ *  everything else. (SparkleAgentPane's `onUserRequestFocus` used to be the canonical example and is
+ *  no longer a caller at all; it went with that pane's composer.)
  *
  *  Safe on null, so call sites keep their optional-chaining shape. */
 export function focusQuietly(el: HTMLElement | null | undefined): void {
@@ -86,10 +92,16 @@ export function focusQuietly(el: HTMLElement | null | undefined): void {
  *  Note what this does NOT try to answer: "did the user ASK for this box". That is a different
  *  question, it cannot be recovered from a focus event, and trying to carry it here as a latch was
  *  a mistake — an unfulfilled ask has no natural expiry and no target, so it ends up promoting some
- *  later, unrelated app-driven focus (roborev 54259). Both places that need it say so structurally
- *  instead, at the point where the user's gesture is still identifiable: SparkleAgentPane's
- *  `onUserRequestFocus` (the ⌘J chord) and ComposeBox's composeFocusSeq effect, whose every caller
- *  is a user gesture. Each names its own surface outright. */
+ *  later, unrelated app-driven focus (roborev 54259). The places that need it say so structurally
+ *  instead, at the point where the user's gesture is still identifiable: ComposeBox's composeFocusSeq
+ *  effect (whose every caller is a user gesture), MicButton's arm handlers, and LogoWaveform. Each
+ *  names its own surface outright.
+ *
+ *  This USED to say "both places", naming SparkleAgentPane's `onUserRequestFocus` as one of exactly
+ *  two. That call site no longer exists — it was removed with that pane's composer, and the pane now
+ *  passes Terminal no focus callbacks at all — so a reader looking for the second surface-naming site
+ *  would not have found one. Cited as evidence that this design is sound, a dangling reference is
+ *  worse than no example (roborev 55606). */
 export function isProgrammaticFocus(el?: HTMLElement | null): boolean {
   if (el && pendingEl === el) {
     pendingEl = null;

@@ -60,6 +60,7 @@ import {
   COMPOSER_SNAP,
   COMPOSER_DEFAULT,
   COMPOSER_BAR,
+  COMPOSER_Z,
   COMPOSER_SNAP_THRESHOLD,
   COMPOSER_MINIMIZE_THRESHOLD,
   COMPOSER_RESTORE_THRESHOLD,
@@ -1359,7 +1360,10 @@ export function Composer({
         right: 0,
         bottom: 0,
         height: minimized ? COMPOSER_BAR : autoHeight,
-        zIndex: 5,
+        // Shared, not a literal: the Sparkle pane's terminal drop region is a sibling that spans
+        // the whole pane, and this number is the only thing keeping a drop on THIS box from being
+        // read as a drop on the terminal. See COMPOSER_Z in stores/uiStore.
+        zIndex: COMPOSER_Z,
         display: "flex",
         flexDirection: "column",
         // Minimized → no chrome: the strip is transparent so only the little gradient pull tab

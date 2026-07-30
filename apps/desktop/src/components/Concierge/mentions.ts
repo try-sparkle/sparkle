@@ -479,6 +479,58 @@ export function isCompletedMention(query: string, agents: readonly MentionAgent[
   return agents.some((a) => labelOf(a).toLowerCase() === done);
 }
 
+// ══ THE CONCIERGE IS ADDRESSABLE TOO ═════════════════════════════════════════════════════════════
+
+/**
+ * The agent id a mention of the concierge itself carries.
+ *
+ * NOT a real agent id, and it deliberately cannot collide with one: `agentCanAcceptInput`,
+ * `agentStillExists` and the feed all key on uuids, so this string resolves to nothing in any of
+ * them. That is the SAFE direction and the reason the value is spelled this way rather than, say,
+ * `"sparkle"` — `ConciergeHost.deliver` builds a `mentionAim` only when the first mention resolves
+ * to a live feed agent, so a `@Sparkle` mention leaves the aim null and the message falls through to
+ * the ordinary router exactly as an unaddressed one does. Nothing is misdelivered while the host's
+ * own `@Sparkle` routing is still being written; the pill is simply legible ahead of it.
+ */
+export const SPARKLE_MENTION_ID = "sparkle-concierge";
+
+/** What the concierge is ADDRESSED as. The founder's word, and the one already all over this app's
+ *  voice copy (the wake phrase is "Hey Sparkle"), so there is nothing else it could be. */
+export const SPARKLE_MENTION_NAME = "Sparkle";
+
+/**
+ * The concierge as a mention target.
+ *
+ * `band: "done"` and no `since`, which is not a status claim — it is where this row should SORT.
+ * Nothing about the concierge "needs you" or is "running", and `orderMentionAgents` puts `done` after
+ * both, so a build agent that actually wants attention still outranks it and `preferredAgentId`
+ * still wins the top slot. The concierge is always reachable, so it never needs to compete.
+ *
+ * `canAcceptInput: true` because it genuinely can — it is the one destination in this column that is
+ * never a dead PTY — and because a `false` here would render the picker row disabled with "Can't
+ * take a message", which is the opposite of true.
+ *
+ * A module CONSTANT, not a factory: `mentionRoster` is memoized on its inputs upstream, and a fresh
+ * object per call would defeat that for the picker's rows.
+ */
+export const SPARKLE_MENTION_AGENT: MentionAgent = {
+  id: SPARKLE_MENTION_ID,
+  name: SPARKLE_MENTION_NAME,
+  projectId: "",
+  // Read only by `withMentionLabels`, and only in the collision case: a build agent that a human
+  // also named "Sparkle" makes both addresses ambiguous, and the two then read as
+  // `@Sparkle (the concierge)` and `@Sparkle (whatever project)`. Rare, and correct when it happens.
+  projectName: "the concierge",
+  band: "done",
+  canAcceptInput: true,
+};
+
+/** Does this mention address the concierge rather than a build agent? The one place the id is
+ *  compared, so no consumer has to re-spell the sentinel. */
+export function isSparkleMention(mention: { agentId: string }): boolean {
+  return mention.agentId === SPARKLE_MENTION_ID;
+}
+
 /**
  * THE ONE ROSTER every other function here should be handed: relevance-ordered and uniquely
  * addressable.
@@ -493,12 +545,29 @@ export function isCompletedMention(query: string, agents: readonly MentionAgent[
  *
  * The empty query is load-bearing and reads as a mistake inlined: it means "filter nothing, order
  * everything", which is exactly what a resolve pass wants and exactly what a reader deletes.
+ *
+ * ══ THE CONCIERGE IS IN HERE, AND IT BELONGS IN *THIS* FUNCTION ══════════════════════════════════
+ * `SPARKLE_MENTION_AGENT` is appended to whatever the caller hands over, so `@Sparkle` is offered by
+ * the picker, drawn as a pill, and resolved by a send on exactly the same terms as any build agent.
+ *
+ * The alternative — leave this function agent-only and add the concierge in a second, composer-local
+ * roster — was rejected for the reason this function exists at all (roborev 54555). Its whole job is
+ * that there is no roster in play anywhere that has skipped a step, and two near-identical roster
+ * builders is precisely how one consumer ends up resolving against a list the others don't have. A
+ * mention that the picker offers but a send cannot resolve is the silent wrong-aim class of bug.
+ *
+ * Consequence worth stating: typing a bare `@` in a workspace with NO build agents now opens the
+ * picker with one row instead of not opening at all. That is right — under a mount, plain text goes
+ * to the patched terminal and `@Sparkle` is how you reach the concierge, so the concierge must be
+ * the one thing that is always addressable.
  */
 export function mentionRoster(
   agents: readonly MentionAgent[],
   preferredId?: string | null,
 ): MentionAgent[] {
-  return withMentionLabels(orderMentionAgents(agents, "", preferredId));
+  return withMentionLabels(
+    orderMentionAgents([...agents, SPARKLE_MENTION_AGENT], "", preferredId),
+  );
 }
 
 // ══ EDITING ══════════════════════════════════════════════════════════════════════════════════════
@@ -527,6 +596,80 @@ export function insertMention(
   const literal = `${MENTION_SIGIL}${labelOf(agent)} `;
   const next = text.slice(0, anchor) + literal + text.slice(caret);
   return { text: next, caret: anchor + literal.length };
+}
+
+/** A dictated segment that turned out to be ADDRESSED to the concierge. */
+export interface DictatedAddress {
+  /** The words after the address — what the message actually says, with the vocative comma the
+   *  speaker paused for removed. Empty when the whole segment was just the name. */
+  rest: string;
+}
+
+/**
+ * Is this dictated segment addressing the concierge — i.e. should the word "sparkle" become an
+ * `@Sparkle` pill instead of landing as prose?
+ *
+ * ══ THE FOUNDER'S ASK, AND THE TRAP INSIDE IT ═══════════════════════════════════════════════════
+ * "While dictating, saying the word 'sparkle' should insert an @Sparkle pill, so speech and typing
+ * produce the same artifact." You cannot say "@" out loud, so without this there is no spoken way to
+ * reach the concierge once the column is patched to a terminal — every dictated word would go to the
+ * agent's PTY.
+ *
+ * But "sparkle" is also this app's own name, so it turns up in ordinary dictated prose ("the sparkle
+ * desktop app keeps crashing"). Pilling EVERY utterance of it would mangle that prose, so the rule
+ * has to be narrow. It is exactly one thing:
+ *
+ *   **The segment must BEGIN the message, and "sparkle" must be its first word.**
+ *
+ * That is the ADDRESSING POSITION the rest of this module already recognises. `mentionFreeText` and
+ * `ConciergeHost.send` both treat `mentions[0]` — the FIRST span — as the envelope, and every other
+ * span as content. So the head of the message is where an address goes, and a "sparkle" anywhere else
+ * is a word in a sentence. Concretely:
+ *
+ *   • "Sparkle, what's the status?" into an empty box  → `@Sparkle what's the status?`   ✅ pill
+ *   • "the sparkle desktop app is slow"                → unchanged, plain prose           ✅ no pill
+ *   • "…and tell sparkle about it" appended to a draft → unchanged, plain prose           ✅ no pill
+ *
+ * ══ WHY THE WAKE AND STOP PHRASES CANNOT COLLIDE WITH THIS ═════════════════════════════════════
+ * This is the part worth checking before touching the rule, because it looks like a collision and is
+ * not. The shipped wake phrase is "Hey Sparkle" and the stop phrase is "Sparkle, stop"
+ * (voice/voiceDefaults), and BOTH are consumed by `voice/wakeMachine.advance` — which strips the
+ * matched phrase and hands on only the remainder — BEFORE anything reaches a composer's insert
+ * target. So by the time a segment arrives here, "Hey Sparkle, move it 5px" is already "move it 5px",
+ * and "Sparkle, stop" is already "" (and dictation has gone passive). Neither can be seen by this
+ * function, so neither can be turned into a pill.
+ *
+ * The one residual gap is a user who REBINDS their wake word to a bare "Sparkle": `advance` would
+ * then strip it as the wake phrase and no pill would be inserted. That is a degradation to today's
+ * behaviour, not a corruption of it, and it is the wake word doing its job.
+ *
+ * ══ THE REMAINING FALSE POSITIVE, AND WHY IT IS THE SAFE ONE ═══════════════════════════════════
+ * An utterance that BEGINS with "Sparkle" used as a noun — "Sparkle desktop needs a fix" as the first
+ * thing said into an empty box — does get a pill. Two things make that the right trade:
+ *
+ *   1. It is VISIBLE and cheap to undo. The pill is drawn in the composer (./MentionMirror) before
+ *      anything is sent, and one Backspace at its edge deletes the whole token (`backspaceMention`).
+ *   2. It fails toward the RECOVERABLE destination. A pill routes the message to the concierge, which
+ *      writes nothing to a terminal; a MISSED pill routes it into a live PTY, which cannot be walked
+ *      back. Requiring the vocative comma would have cut the false positives — but Deepgram's
+ *      punctuation is not reliable, so "Sparkle what's the status" would have missed, and that error
+ *      lands on the irreversible side.
+ *
+ * Pure and total: returns null for every segment this does not apply to, which is most of them.
+ */
+export function dictatedSparkleAddress(current: string, segment: string): DictatedAddress | null {
+  // The box must be EMPTY for this segment to be the head of the message. Whitespace counts as
+  // empty — a stray space is not something the user is addressing anybody with.
+  if (current.trim() !== "") return null;
+  const said = segment.trimStart();
+  // The name, then a boundary that is not more name. The lookahead is what keeps "Sparkle's" and
+  // "Sparklers" out: an apostrophe or a letter means the speaker said a different word, and pilling
+  // the first seven characters of it would leave a dangling "'s" after the address.
+  const head = /^sparkle(?=$|[\s,.:;!?])/i.exec(said);
+  if (!head) return null;
+  // Drop the vocative punctuation the speaker paused for: "Sparkle, move it" addresses the concierge
+  // and says "move it", not ", move it". `insertMention` supplies the single separating space.
+  return { rest: said.slice(head[0].length).replace(/^[\s,.:;!?]+/, "") };
 }
 
 /**

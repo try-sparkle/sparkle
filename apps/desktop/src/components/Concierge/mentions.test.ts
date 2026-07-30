@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   backspaceMention,
+  dictatedSparkleAddress,
   findMentionSpans,
   insertMention,
   isCompletedMention,
@@ -16,6 +17,8 @@ import {
   mentionRoster,
   withMentionLabels,
   splitMentionText,
+  SPARKLE_MENTION_AGENT,
+  SPARKLE_MENTION_ID,
   type MentionAgent,
 } from "./mentions";
 
@@ -134,8 +137,11 @@ describe("findMentionSpans — a mention is the literal, bounded like a token", 
 });
 
 describe("mentionRoster — the one list every other function is handed", () => {
+  /** The roster minus the concierge, which every case below is about the AGENTS in. */
+  const agentsOf = (r: MentionAgent[]) => r.filter((a) => a.id !== SPARKLE_MENTION_ID);
+
   it("keeps every agent", () => {
-    expect(mentionRoster(FLEET)).toHaveLength(2);
+    expect(agentsOf(mentionRoster(FLEET))).toHaveLength(2);
   });
 
   it("puts the agent in view first", () => {
@@ -147,9 +153,108 @@ describe("mentionRoster — the one list every other function is handed", () => 
   it("labels duplicates as well as ordering them", () => {
     const web = agent({ id: "w", name: "Docs", projectName: "web" });
     const mobile = agent({ id: "m", name: "Docs", projectName: "mobile" });
-    expect(mentionRoster([web, mobile]).map((a) => a.label).sort()).toEqual([
+    expect(agentsOf(mentionRoster([web, mobile])).map((a) => a.label).sort()).toEqual([
       "Docs (mobile)",
       "Docs (web)",
+    ]);
+  });
+
+  // ── The concierge is a mention target too ─────────────────────────────────────────────────────
+  // Here rather than in a composer-local second roster, on purpose: this function exists so that no
+  // consumer can resolve against a list the others don't have (see its doc). A `@Sparkle` the picker
+  // offers but a send cannot resolve is the silent wrong-aim class of bug.
+  it("always offers the concierge, even with no build agents at all", () => {
+    expect(mentionRoster([]).map((a) => a.id)).toEqual([SPARKLE_MENTION_ID]);
+  });
+
+  it("never lets the concierge outrank a real agent, or the one in view", () => {
+    // `band: "done"` and no `since` are a SORT position, not a status claim — a running agent and
+    // the preferred agent both come first, so "@" then Enter still aims at what you were looking at.
+    expect(mentionRoster(FLEET).at(-1)!.id).toBe(SPARKLE_MENTION_ID);
+    expect(mentionRoster(FLEET, "a2")[0]!.id).toBe("a2");
+  });
+
+  it("offers it as choosable, since it is the one destination that is never a dead PTY", () => {
+    expect(mentionRoster([]).find((a) => a.id === SPARKLE_MENTION_ID)!.canAcceptInput).toBe(true);
+  });
+
+  it("resolves `@Sparkle` in the text to it, so a send carries it as an ordinary mention", () => {
+    expect(mentionsIn("@Sparkle what broke?", mentionRoster(FLEET))).toEqual([
+      { agentId: SPARKLE_MENTION_ID, name: "Sparkle" },
+    ]);
+  });
+
+  // A human who names a build agent "Sparkle" makes the bare address ambiguous, and the existing
+  // duplicate rule takes over: BOTH get a project suffix, so each is still addressable and neither
+  // silently swallows the other's aim.
+  it("disambiguates a build agent a human also called Sparkle", () => {
+    const rival = agent({ id: "r", name: "Sparkle", projectName: "web" });
+    expect(
+      mentionRoster([rival])
+        .map((a) => a.label)
+        .sort(),
+    ).toEqual(["Sparkle (the concierge)", "Sparkle (web)"]);
+  });
+});
+
+// ══ SPEAKING AN ADDRESS ══════════════════════════════════════════════════════════════════════════
+// You cannot say "@" out loud, so without this there is no spoken way to reach the concierge once the
+// column is patched to a terminal. The rule is narrow because "sparkle" is this app's own name and
+// turns up in ordinary dictated prose; the position it is scoped to — the head of the message — is
+// the same one `mentions[0]` already treats as the envelope.
+describe("dictatedSparkleAddress — when a spoken 'sparkle' is an ADDRESS", () => {
+  it("takes it at the head of an empty box, dropping the vocative comma", () => {
+    expect(dictatedSparkleAddress("", "Sparkle, what is the status?")).toEqual({
+      rest: "what is the status?",
+    });
+  });
+
+  it("takes the bare name on its own", () => {
+    expect(dictatedSparkleAddress("", "Sparkle")).toEqual({ rest: "" });
+  });
+
+  it("is case-insensitive — a transcript's capitalisation is not a signal", () => {
+    expect(dictatedSparkleAddress("", "sparkle ship it")).toEqual({ rest: "ship it" });
+  });
+
+  it("treats a whitespace-only box as empty", () => {
+    expect(dictatedSparkleAddress("   ", "Sparkle ship it")).toEqual({ rest: "ship it" });
+  });
+
+  it("accepts the other sentence punctuation a transcript might put there", () => {
+    expect(dictatedSparkleAddress("", "Sparkle. Ship it")).toEqual({ rest: "Ship it" });
+    expect(dictatedSparkleAddress("", "Sparkle: ship it")).toEqual({ rest: "ship it" });
+    expect(dictatedSparkleAddress("", "Sparkle? ship it")).toEqual({ rest: "ship it" });
+  });
+
+  // ── and every way it must DECLINE ────────────────────────────────────────────────────────────
+  it("declines mid-sentence — the word is prose there, not an envelope", () => {
+    expect(dictatedSparkleAddress("", "the sparkle desktop app keeps crashing")).toBeNull();
+  });
+
+  it("declines when anything is already in the box", () => {
+    expect(dictatedSparkleAddress("fix the crash", "Sparkle, and tell me when")).toBeNull();
+  });
+
+  it("declines a longer word that merely starts with it", () => {
+    expect(dictatedSparkleAddress("", "Sparklers are on sale")).toBeNull();
+    expect(dictatedSparkleAddress("", "Sparkle's release notes are wrong")).toBeNull();
+  });
+
+  it("declines an empty segment", () => {
+    expect(dictatedSparkleAddress("", "")).toBeNull();
+    expect(dictatedSparkleAddress("", "   ")).toBeNull();
+  });
+
+  // The composer feeds the result straight through `insertMention`, so the two have to compose into
+  // exactly the literal a PICKED mention produces — that is the whole "speech and typing produce the
+  // same artifact" requirement, asserted here on the pure halves.
+  it("composes with insertMention into the literal the picker writes", () => {
+    const addressed = dictatedSparkleAddress("", "Sparkle, ship it")!;
+    const inserted = insertMention("", 0, 0, SPARKLE_MENTION_AGENT);
+    expect(`${inserted.text}${addressed.rest}`).toBe("@Sparkle ship it");
+    expect(mentionsIn(`${inserted.text}${addressed.rest}`, mentionRoster([]))).toEqual([
+      { agentId: SPARKLE_MENTION_ID, name: "Sparkle" },
     ]);
   });
 });

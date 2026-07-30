@@ -55,6 +55,7 @@ import {
 import { C } from "../../theme/colors";
 import { bandColor } from "../../engine/statusBandLabels";
 import { stripMentionSigil } from "./agentRefs";
+import { MENTION_PILL_FILL } from "./MentionPill";
 import type { MentionAgent } from "./mentions";
 
 export interface AgentPillContextValue {
@@ -385,9 +386,12 @@ export function AgentPill({ agentId, fallbackName }: { agentId: string; fallback
                 border: "none",
                 cursor: "pointer",
                 // The attachment chip's teal wash — the column's established "something rode along
-                // with this message" tint, and the exact fill the sent-message pill uses, so the
-                // two forms of mention read as one vocabulary.
-                background: `color-mix(in srgb, ${C.teal} 18%, transparent)`,
+                // with this message" tint, and the exact fill the sent-message and COMPOSER pills
+                // use, so every form of mention reads as one vocabulary. Taken from the constant
+                // rather than re-spelled: this was the third copy of the same `color-mix`, and a
+                // shade of drift between them fails nothing and is exactly what the founder's "make
+                // mentions symmetrical" ask rules out.
+                background: MENTION_PILL_FILL,
                 color: C.cream,
               }
         }

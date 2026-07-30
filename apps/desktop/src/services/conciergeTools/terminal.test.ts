@@ -59,6 +59,7 @@ import {
   sendControlKey,
 } from "./terminal";
 import { useProjectStore } from "../../stores/projectStore";
+import { useInteractionStore } from "../../stores/interactionStore";
 import { NEW_AGENT_GRACE_MS } from "../../engine/newAgentAttention";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import {
@@ -180,6 +181,17 @@ beforeEach(() => {
   // (a liveness assertion failing in an unrelated test) points nowhere near its cause.
   vi.mocked(readPersistedOpenAgentIds).mockReturnValue([]);
   forgetAgentTranscriptPath(AGENT);
+  // THE INTERACTION RECORD IS NOW A LEAK BETWEEN CASES, for the same reason the mock above is
+  // re-stubbed rather than cleared. `getAgentStatus` reads `interactionStore.lastAt[agentId]` when it
+  // judges whether an agent has ever been BRIEFED, and a delivered prompt now records an interaction
+  // (`recordPromptSideEffects` → `touch(agentId)`, added so Improve Sparkle's elapsed timer resets
+  // when the concierge prompts it — it has no AgentTab, so the `appendPrompt` path returns early for
+  // it). Every dispatch case in this file therefore writes an interaction for AGENT, and the
+  // `seedFreshAgent` cases below assert on a *briefless* agent — so without this reset their fixture
+  // is falsified by whichever case ran before them, and they fail with "expected 'idle' to be 'new'"
+  // pointing nowhere near the cause. This store is a module singleton; vi.clearAllMocks cannot touch
+  // it.
+  useInteractionStore.getState().forget(AGENT);
   seedAgent("local");
 });
 

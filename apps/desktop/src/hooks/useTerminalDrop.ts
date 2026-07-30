@@ -23,6 +23,13 @@
 // ARE ACCEPTED on this path as on every other. Image-ness decides one thing only: the wording of the
 // confirmation.
 //
+// A pasted path also READS NOTHING, and that is not a detail. The other way to take a dropped file
+// — loading it as an attachment tile — goes through the Rust attachment loader, which refuses any
+// path outside $HOME/$TMPDIR/Volumes or under a dot-directory and then leaves the user with a log
+// line and no file. That is what made a .txt dropped on the SPARKLE pane's terminal vanish while
+// .pngs dropped on a build agent's terminal pasted fine, and why that pane's terminal now routes
+// here too (services/dndTargets.SPARKLE_TERMINAL_DND_TARGET) instead of to the composer beneath it.
+//
 // WHICH AGENT. Tauri's onDragDropEvent is webview-GLOBAL: the payload carries a cursor position and
 // no target element, and with dragDropEnabled on there are no HTML5 drop events to lean on. So the
 // terminal stage marks itself `data-dnd-target="terminal-stage"` and we hit-test the position
@@ -53,13 +60,16 @@ import { safeUnlisten } from "../services/safeUnlisten";
 import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
 
-/** True when this drag position belongs to the terminal: over the stage, and NOT over the
- *  "+ New Build Agent" button nested inside it (that button's own listener owns those drops).
- *  Pure apart from the DOM hit-test, so the precedence rule is testable on its own. */
-export function isTerminalDropPosition(position: { x: number; y: number }): boolean {
+/** True when this drag position belongs to the terminal: over `target` — the terminal stage for a
+ *  build agent's pane, the Sparkle pane's own terminal box for that one (services/dndTargets) — and
+ *  NOT over the "+ New Build Agent" button nested inside it (that button's own listener owns those
+ *  drops). Pure apart from the DOM hit-test, so the precedence rule is testable on its own. */
+export function isTerminalDropPosition(
+  position: { x: number; y: number },
+  target: string = TERMINAL_STAGE_DND_TARGET,
+): boolean {
   return (
-    isOverDndTarget(position, TERMINAL_STAGE_DND_TARGET) &&
-    !isOverDndTarget(position, NEW_BUILD_AGENT_DND_TARGET)
+    isOverDndTarget(position, target) && !isOverDndTarget(position, NEW_BUILD_AGENT_DND_TARGET)
   );
 }
 
@@ -100,11 +110,16 @@ export interface TerminalDrop {
  * put the caret in the terminal, so the user can type the ask straight onto the text they can see
  * sitting there. Read through a ref, so passing an inline arrow doesn't re-subscribe the listener
  * on every render.
+ *
+ * `target` names the `data-dnd-target` region this pane's terminal occupies. It defaults to the
+ * workspace terminal stage every build agent's pane is stacked in; the Sparkle pane passes its own,
+ * because its terminal is a sibling of a catch-all composer rather than the stage itself.
  */
 export function useTerminalDrop(
   enabled: boolean,
   agentId: string | null,
   onPasted?: () => void,
+  target: string = TERMINAL_STAGE_DND_TARGET,
 ): TerminalDrop {
   const [dropActive, setDropActive] = useState(false);
   const [dropped, setDropped] = useState<TerminalDropResult | null>(null);
@@ -134,12 +149,12 @@ export function useTerminalDrop(
           if (!live) return;
           const p = event.payload;
           if (p.type === "enter" || p.type === "over") {
-            setDropActive(isTerminalDropPosition(p.position));
+            setDropActive(isTerminalDropPosition(p.position, target));
           } else if (p.type === "leave") {
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
-            if (!isTerminalDropPosition(p.position)) {
+            if (!isTerminalDropPosition(p.position, target)) {
               // Silent when some other target owns the drop; speaks only for a drop that matched
               // no target at all (services/dndTargets.reportDropWithNoTarget).
               reportDropWithNoTarget(p.position);
@@ -196,6 +211,6 @@ export function useTerminalDrop(
       // torn down (and the Tauri teardown race is swallowed).
       void safeUnlisten(unlistenPromise);
     };
-  }, [enabled, agentId]);
+  }, [enabled, agentId, target]);
   return { dropActive, dropped, dismiss };
 }

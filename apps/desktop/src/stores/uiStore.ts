@@ -67,6 +67,22 @@ export const COMPOSER_BAR = 22;
 export const COMPOSER_SNAP_THRESHOLD = 24;
 export const COMPOSER_MINIMIZE_THRESHOLD = 40;
 export const COMPOSER_RESTORE_THRESHOLD = 24;
+/**
+ * Stacking order of the composer overlay, and WHO ELSE DEPENDS ON IT.
+ *
+ * The composer is an absolutely-positioned strip across the bottom of its pane, and in the Sparkle
+ * pane the terminal's drop region is a sibling box spanning the WHOLE pane — so the two overlap
+ * completely along that strip and only paint order decides which one a drop lands on
+ * (`document.elementFromPoint` returns the topmost element, and the drop hooks resolve ownership by
+ * walking up from it). That made "the compose box keeps its own drops" an accident of two literals
+ * in two files: raise the terminal box above this and a file dropped on the compose box would paste
+ * a shell-quoted path into the PTY instead of becoming a tile, silently (roborev 55575).
+ *
+ * So the number is shared and the dependency is written down: SparkleAgentPane derives its
+ * terminal region's z-index from this and must stay BELOW it. `SparkleAgentPane.drop.test.tsx`
+ * asserts that ordering against the rendered DOM.
+ */
+export const COMPOSER_Z = 5;
 
 // Terminal text-size factor (Cmd +/- and the ⋯ menu "Text size"). Applied as a multiplier
 // on the terminal font size only (see Terminal.tsx), so the text scales while the UI chrome

@@ -105,15 +105,19 @@ import {
 import { MentionPicker, MENTION_LISTBOX_ID, mentionOptionId } from "./MentionPicker";
 import {
   backspaceMention,
+  dictatedSparkleAddress,
   insertMention,
   isCompletedMention,
   mentionQuery,
   mentionRoster,
   mentionsIn,
   orderMentionAgents,
+  SPARKLE_MENTION_AGENT,
+  SPARKLE_MENTION_ID,
   type ConciergeMention,
   type MentionAgent,
 } from "./mentions";
+import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
 import { SendRail, type SendRailModel } from "./SendRail";
 
 const line = `color-mix(in srgb, ${C.muted} 25%, transparent)`;
@@ -170,6 +174,28 @@ export const CONCIERGE_TEXTAREA_TEXT_WIDTH = 360 - 24 - 63 - 8 - 26;
 const PLACEHOLDER_INSET = { top: 11, left: 13, right: 13, bottom: 11 };
 /** Must match the textarea's own type ramp below, or the overlay won't sit on row one. */
 const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 };
+
+/**
+ * The textarea's TEXT GEOMETRY, in one object because two elements have to agree on it exactly.
+ *
+ * The mention mirror (./MentionMirror) paints the pill fills behind the real text, so every property
+ * here that moves a glyph — the type ramp, the padding, the border that the padding is measured from
+ * — must be identical on both or the fills slide off the words they belong to. Spreading one object
+ * into both makes that structural; two lists of the same six properties would drift the first time
+ * anybody tuned the padding, and it would drift SILENTLY (a misaligned pill still renders).
+ *
+ * `borderRadius` rides along because it is part of the same box, not because the mirror needs it.
+ */
+const COMPOSE_TEXT_METRICS: CSSProperties = {
+  fontFamily: "inherit",
+  fontSize: 13,
+  lineHeight: PLACEHOLDER_TYPE.lineHeight,
+  padding: "10px 12px",
+  // The border is `transparent` rather than absent on purpose — see the textarea's own note below;
+  // the placeholder overlay's geometry and the auto-grow measurement are both taken off this box.
+  border: "1px solid transparent",
+  borderRadius: 6,
+};
 
 const attachStyle: CSSProperties = {
   fontSize: 12,
@@ -531,11 +557,43 @@ export function ComposeBox({
     // no focus event fires at all (roborev 54259).
     ownVoiceRef.current();
   }, [composeFocusSeq]);
+  // The live roster, readable from the dictation callback below without re-registering it.
+  //
+  // Declared HERE and filled where `roster` is built (further down, with the rest of the mention
+  // wiring), because this effect depends only on `registerInsert` — see the note inside `append`. The
+  // same forward-declare-and-assign shape `ownVoiceRef` uses just below.
+  const rosterRef = useRef<readonly MentionAgent[]>(EMPTY_MENTION_AGENTS);
   useEffect(() => {
     if (!registerInsert) return;
     const append = (segment: string) =>
       setText((prev) => {
-        const next = appendDictated(prev, segment);
+        // ── SPEAKING AN ADDRESS ──────────────────────────────────────────────────────────────────
+        // You cannot say "@" out loud, so without this there is no spoken way to reach the concierge
+        // once this column is patched to a terminal. Saying "Sparkle, …" at the head of a message
+        // produces the SAME literal the picker would have inserted — `insertMention`, not a
+        // hand-rolled string — so speech and typing leave the box in identical states: one pill, one
+        // `ConciergeMention` on the send, one trailing space with the caret after it.
+        //
+        // The rule is deliberately narrow (head of the message only) and the reasoning, including
+        // why the wake and stop phrases cannot collide with it, is in mentions.dictatedSparkleAddress.
+        //
+        // Resolved against the roster REF, not the captured `roster`: this effect re-runs only when
+        // `registerInsert` changes, so closing over the render-time list would go stale the moment
+        // the fleet did — and in the one case that matters (a build agent a human also named
+        // "Sparkle") the roster's entry is the LABELLED `@Sparkle (the concierge)`, which is the only
+        // spelling that still resolves to an aim.
+        const addressed = dictatedSparkleAddress(prev, segment);
+        const next = addressed
+          ? appendDictated(
+              insertMention(
+                "",
+                0,
+                0,
+                rosterRef.current.find((a) => a.id === SPARKLE_MENTION_ID) ?? SPARKLE_MENTION_AGENT,
+              ).text,
+              addressed.rest,
+            )
+          : appendDictated(prev, segment);
         // Follow the text with the caret. A dictated segment (or a draft handed back after a
         // cancelled countdown) lands at the END, and leaving `caret` on the old offset would leave
         // the mention query reading a stale slice of a string that has since grown — which is how a
@@ -608,6 +666,9 @@ export function ComposeBox({
     () => mentionRoster(mentionAgents, preferredAgentId),
     [mentionAgents, preferredAgentId],
   );
+  // …and the same list for the dictation callback, which is registered once and must not re-register
+  // on every fleet change (see `rosterRef` above).
+  rosterRef.current = roster;
   const pending = mentionQuery(text, caret);
   const matches =
     pending &&
@@ -780,16 +841,25 @@ export function ComposeBox({
     // notice, the tallest copy in the slot and the only one carrying controls (Dismiss / Open
     // System Settings) that must not be clipped out of reach.
     //
-    // Everything in the slot that is not the textarea IS an overlay, so no marker attribute is
-    // needed; at most one failure overlay and the decorative one are up at once, and the taller
-    // wins. Releasing `bottom` first is the same collapse-then-measure trick as above and is
-    // load-bearing for the same reason: scrollHeight can never report LESS than the box we already
-    // sized, so measuring it in place would ratchet the floor up and never let it back down.
+    // Every PLACEHOLDER overlay in the slot is measured, and the taller of them wins (at most one
+    // failure overlay and the decorative one are up at once). Releasing `bottom` first is the same
+    // collapse-then-measure trick as above and is load-bearing for the same reason: scrollHeight can
+    // never report LESS than the box we already sized, so measuring it in place would ratchet the
+    // floor up and never let it back down.
+    //
+    // NOT EVERY NON-TEXTAREA CHILD IS A PLACEHOLDER ANY MORE. This used to say "no marker attribute
+    // is needed", which was true while placeholders were the only overlays here. The MENTION MIRROR
+    // (./MentionMirror) is now a sibling too, and it is the opposite kind of thing: it mirrors the
+    // CONTENT, so its natural height tracks the text rather than standing in for empty space. Feeding
+    // it in as a floor would add the textarea's chrome on top of a height that already includes the
+    // padding — growing the box by about a line for any draft with text in it, and overriding a
+    // persisted drag height while doing so. It opts out by attribute; nothing else does.
     const slot = slotRef.current;
     let overlayH = 0;
     if (slot) {
       for (const el of Array.from(slot.children)) {
         if (el === ta || !(el instanceof HTMLElement)) continue;
+        if (el.hasAttribute(MENTION_MIRROR_SKIP_ATTR)) continue;
         const prevBottom = el.style.bottom;
         el.style.bottom = "auto";
         overlayH = Math.max(overlayH, el.scrollHeight);
@@ -1272,20 +1342,32 @@ export function ComposeBox({
               // and the auto-grow measurement is taken off its box, so deleting a pixel of border
               // would shift the painted copy off row one and silently mis-size the box. Transparent
               // costs nothing and keeps that geometry exactly where it was.
+              //
+              // The type ramp, the padding and that border now come from COMPOSE_TEXT_METRICS,
+              // because the MENTION MIRROR behind this element has to match them exactly or its pill
+              // fills sit off the words they belong to (see that constant).
+              ...COMPOSE_TEXT_METRICS,
               background: "transparent",
-              border: "1px solid transparent",
-              borderRadius: 6,
               color: "inherit",
-              padding: "10px 12px",
-              fontSize: 13,
-              lineHeight: PLACEHOLDER_TYPE.lineHeight,
-              fontFamily: "inherit",
               outline: "none",
-              // BELOW the overlays (zIndex 2) so a control inside one of them — Refill, Dismiss —
-              // can actually receive its click instead of being buried under the textarea.
+              // ABOVE the mention mirror (zIndex 0), whose pill fills read through this element's
+              // transparent background, and BELOW the placeholder overlays (zIndex 2) so a control
+              // inside one of them — Refill, Dismiss — can actually receive its click instead of
+              // being buried under the textarea.
               position: "relative",
               zIndex: 1,
             }}
+          />
+          {/* THE PILLS. Painted behind the textarea, so a completed `@Kraken Auth` reads as a pill
+              while the message is still being written — the founder's report was that it only became
+              one after Send. Skipped by the height measurement above (it mirrors the content, so it
+              is not a placeholder floor) and inert to the pointer; see ./MentionMirror for why this
+              is a mirror rather than a contenteditable. */}
+          <MentionMirror
+            text={text}
+            agents={roster}
+            metrics={COMPOSE_TEXT_METRICS}
+            textareaRef={textareaRef}
           />
           {/* The two FAILURE states each take the slot over as their OWN sibling overlay, because
               each carries a control the decorative (aria-hidden) overlay would bury: aria-hidden

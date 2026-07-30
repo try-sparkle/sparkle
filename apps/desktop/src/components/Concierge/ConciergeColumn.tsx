@@ -32,7 +32,7 @@ import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { ScopeVitals } from "./ScopeVitals";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
-import { FONT_UI } from "../../theme/scale";
+import { FONT_UI, TYPE } from "../../theme/scale";
 
 /** Nothing announced yet. Module-level so the default prop is referentially stable. */
 const EMPTY_ANNOUNCEMENT: ConciergeAnnouncement = { seq: 0, text: "" };
@@ -60,6 +60,11 @@ const WORDMARK_H = 17;
  *  values are asserted against each other in ConciergeColumn.wired.test.tsx, so neither can be
  *  bumped back into the other without a red test. */
 export const CONCIERGE_LIFT_Z = 3;
+
+/** The "[ESC] to unmount" hint's handle — shown ONLY while the cable is patched. Exported so the
+ *  suite identifies it structurally rather than by matching the copy, which is expected to be
+ *  reworded. See its render site for why it is gated and not merely styled. */
+export const CONCIERGE_UNMOUNT_HINT_TESTID = "concierge-unmount-hint";
 
 /** rev4's `.pill`: a squared 19px chip, not a capsule. The direction draws boxes. */
 const pillStyle = (edge: string) =>
@@ -443,6 +448,66 @@ export function ConciergeColumn({
           It deliberately carries NO live region of its own — the single announcer below is fed by
           the host when an intent arms (a second region double-announces). */}
       {countdownSlot}
+      {/* THE WAY OUT OF THE MOUNT. Mounted, the human's typing goes to a build agent's terminal
+          rather than to the concierge — a big change in where their words land, and Escape is the
+          only gesture that undoes it. So the affordance is ON SCREEN while the state is live rather
+          than learned once: the founder's placement is this row, directly above the composer (the
+          one carrying the `>_ …` activity line), right-justified.
+
+          GATED ON `isWired`, which is the whole point — a hint offering an exit from a state you are
+          no longer in asserts the cable is still patched when it isn't, the same stale signal the
+          unmount gestures exist to clear. It appears on mount and vanishes on unmount, with no
+          state of its own: it is a projection of `wired`, like every other consequence of the cable
+          (MAPPING.md — one value, every visual consequence follows from it).
+
+          AND GATED ON `!aiLock`, matching both its neighbours (ConciergeUnavailable above,
+          ComposeBox below). `aiLock && isWired` is REACHABLE, because the cable is patched by a
+          sidebar row click and that gesture knows nothing about the concierge AI entitlement: the
+          column floods to terminal material, the thread is replaced by ConciergeAiLocked, and THERE
+          IS NO COMPOSER AT ALL. Un-gated, the hint would sit at the bottom of that column offering
+          "the way out" of a typing-routes-elsewhere state whose input surface does not exist — an
+          affordance with nothing behind it, which is the one thing this file's own rules forbid, and
+          it would break the founder's placement ("directly above the composer") by construction
+          (roborev 55535). */}
+      {!aiLock && isWired && (
+        <div style={{ display: "flex", justifyContent: "flex-end", padding: "0 12px 4px" }}>
+          <span
+            data-testid={CONCIERGE_UNMOUNT_HINT_TESTID}
+            // Not a button. Escape is the gesture; drawing a control here would invite a click that
+            // does the same thing two ways and take a tab stop for a key that already works.
+            style={{
+              // TYPE.small (12), not a bare 11. The scale's own doc calls `small` "secondary UI:
+              // chips, HINTS, metadata" — which is exactly this row's register — and theme/scale's
+              // ratchet holds the off-scale fontSize count at zero, so a literal here was both a
+              // CI failure and a real drift away from the one type scale.
+              fontSize: TYPE.small,
+              color: C.conciergeMuted,
+              whiteSpace: "nowrap",
+              // Matches the activity line's register on the row it shares — muted, small, and
+              // subordinate to the conversation above it.
+              fontVariantNumeric: "tabular-nums",
+            }}
+          >
+            <kbd
+              style={{
+                fontFamily: "inherit",
+                fontSize: "inherit",
+                // NO `opacity`. This hint only ever renders on the FLOODED plane (background is
+                // BLUEPRINT[mode].term while wired), where chromeContrast.test.ts records light
+                // `conciergeMuted` as the tightest ink in the column — 4.76:1, i.e. 0.26 of margin.
+                // An 0.9 opacity spends more than that: compositing #4f6284 at 0.9 over #d9e3f3
+                // measures ~3.93:1, under the suite's 4.5 floor, on the ONE glyph a reader must
+                // actually read to know which key to press. The contrast suite measures token pairs
+                // and cannot see an inline opacity, so nothing would have caught it (roborev 55535).
+                // The brackets already in the copy do the de-emphasis this was reaching for.
+              }}
+            >
+              [ESC]
+            </kbd>{" "}
+            to unmount
+          </span>
+        </div>
+      )}
       {/* The column's ONE live region. Visually hidden, polite, and fed only completed lines, so a
           screen-reader user hears the reply once — not once per chunk (roborev 52648/53010).
           Routing receipts land here too: with the send-target toggle gone this is the only way a

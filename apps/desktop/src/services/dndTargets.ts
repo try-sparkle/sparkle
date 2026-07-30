@@ -18,7 +18,8 @@ export const NEW_BUILD_AGENT_DND_TARGET = "new-build-agent";
  *  panel I'm talking to" is the target a user actually aims at; the compose box alone is a ~90px
  *  strip and missing it silently did nothing. Still SCOPED to the column rather than the whole
  *  window because two other window-global drop listeners are live at the same time
- *  (useNewBuildAgentDrop and the Sparkle pane's Composer); an unscoped listener would
+ *  (useNewBuildAgentDrop, and historically the Sparkle pane's Composer — which is gone now that
+ *  Improve Sparkle mounts the concierge like any other build agent); an unscoped listener would
  *  double-attach. The box the files land in paints the affordance (Concierge/ComposeBox). */
 export const CONCIERGE_COLUMN_DND_TARGET = "concierge-column";
 
@@ -31,6 +32,26 @@ export const CONCIERGE_COLUMN_DND_TARGET = "concierge-column";
  *  its own box. The stage doesn't need the carve-out anyway: useTerminalDrop only listens while an
  *  agent pane is visible, and no agent pane is visible while the Sparkle pane is. */
 export const TERMINAL_STAGE_DND_TARGET = "terminal-stage";
+
+/** The SPARKLE pane's terminal — the box the Sparkle self-improve agent's CLI renders in, ABOVE
+ *  its compose box.
+ *
+ *  It needs a target of its own because it is the one terminal in the app that is not inside
+ *  TERMINAL_STAGE_DND_TARGET's owner: the Sparkle pane renders a Terminal and a catch-all Composer
+ *  as siblings, and that composer claimed everything dropped anywhere in the pane. So a file
+ *  dropped ON THE TERMINAL there did not paste its path the way it does on every other agent's
+ *  terminal — it was loaded as a chat attachment instead, which reads the file, which the
+ *  attachment loader can REFUSE (`refusing to read a path outside allowed directories` for
+ *  anything under a dot-directory or outside $HOME/$TMPDIR/Volumes). The refusal is logged and
+ *  nothing else happens, so the file simply vanished. Observed exactly that way: pngs dropped on a
+ *  build agent's terminal pasted fine, a .txt dropped on the Sparkle pane's terminal produced
+ *  `dropped 1 file(s) into chat` followed by `load dropped file failed`, and the user read the
+ *  difference as "images work, .txt doesn't".
+ *
+ *  A pasted path reads nothing, so no loader can refuse it — which is why routing this box to the
+ *  terminal-drop hook fixes the disappearance rather than just relocating it. The compose box
+ *  itself is NOT part of this region and still takes its own drops as tiles. */
+export const SPARKLE_TERMINAL_DND_TARGET = "sparkle-terminal";
 
 /**
  * How far past the viewport a reported position must land before we conclude it CANNOT be CSS
@@ -130,8 +151,14 @@ export function isOverDndTarget(position: { x: number; y: number }, target: stri
  *
  *  NOT every drop target belongs here — TERMINAL_STAGE_DND_TARGET owns its drops and is
  *  deliberately absent; see its comment above for why adding it would break the Sparkle pane's
- *  composer. */
-export const FILE_DROP_TARGETS = [NEW_BUILD_AGENT_DND_TARGET, CONCIERGE_COLUMN_DND_TARGET] as const;
+ *  composer. SPARKLE_TERMINAL_DND_TARGET is the narrow region that CAN be listed: it covers the
+ *  Sparkle pane's terminal box only, never the compose box below it, so standing down over it
+ *  hands the terminal its own drops without the composer refusing drops on itself. */
+export const FILE_DROP_TARGETS = [
+  NEW_BUILD_AGENT_DND_TARGET,
+  CONCIERGE_COLUMN_DND_TARGET,
+  SPARKLE_TERMINAL_DND_TARGET,
+] as const;
 
 /** True when the drag position is over ANY surface that accepts the file itself. */
 export function isOverFileDropTarget(position: { x: number; y: number } | undefined): boolean {
@@ -141,12 +168,15 @@ export function isOverFileDropTarget(position: { x: number; y: number } | undefi
 
 /** Every surface that HANDLES a drop. Deliberately wider than FILE_DROP_TARGETS, which is the
  *  narrower "surfaces the window-global listeners must stand DOWN over" — the terminal stage owns
- *  its drops without anyone standing down, and the Sparkle pane's catch-all Composer renders inside
- *  it, so a drop there is claimed even though the position matches no other target. */
+ *  its drops without anyone standing down. It ALSO used to cover the Sparkle pane's catch-all
+ *  Composer, which rendered inside that stage; that composer is gone (Improve Sparkle mounts the
+ *  concierge instead), so no catch-all is registered today and a drop outside these targets really
+ *  is dead — see registerCatchAllDropTarget. */
 const ALL_DND_TARGETS = [
   NEW_BUILD_AGENT_DND_TARGET,
   CONCIERGE_COLUMN_DND_TARGET,
   TERMINAL_STAGE_DND_TARGET,
+  SPARKLE_TERMINAL_DND_TARGET,
 ] as const;
 
 /** Last position already reported, so the four window-global listeners that each decline the same
@@ -163,8 +193,11 @@ let catchAllDropTargets = 0;
  * Declare a window-global listener that accepts ANY drop not claimed by a `data-dnd-target`
  * surface, and get back its deregister fn.
  *
- * The Sparkle pane's Composer is exactly that: while it is the active pane it takes drops on the
- * sidebar, the tab strip, the top bar — anywhere outside FILE_DROP_TARGETS. `ALL_DND_TARGETS`
+ * The Sparkle pane's Composer was exactly that: while it was the active pane it took drops on the
+ * sidebar, the tab strip, the top bar — anywhere outside FILE_DROP_TARGETS. NOTHING REGISTERS ONE
+ * TODAY: that composer was stripped when Improve Sparkle became a mounted build agent, so the
+ * counter sits at 0 and reportDropWithNoTarget's warning is once again telling the truth. Kept
+ * because the false-alarm shape below is a property of the mechanism, not of that one caller. `ALL_DND_TARGETS`
  * cannot see it, because a catch-all HAS no marked region; it only lists the terminal stage the
  * composer happens to render inside, which covers the drops that were never at risk anyway. So
  * without this, every successful catch-all drop outside the stage made

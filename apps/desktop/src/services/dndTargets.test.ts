@@ -18,6 +18,7 @@ import {
   CONCIERGE_COLUMN_DND_TARGET,
   FILE_DROP_TARGETS,
   NEW_BUILD_AGENT_DND_TARGET,
+  SPARKLE_TERMINAL_DND_TARGET,
   dragPositionScale,
   isOverDndTarget,
   isOverFileDropTarget,
@@ -342,10 +343,15 @@ describe("isOverFileDropTarget", () => {
     expect(isOverFileDropTarget(undefined)).toBe(false);
   });
 
-  it("covers exactly the two targets, so a new one can't be half-added", () => {
+  it("covers exactly the surfaces that own their drops, so a new one can't be half-added", () => {
+    // The Sparkle pane's TERMINAL is the third: it pastes a dropped path into its own PTY
+    // (hooks/useTerminalDrop), so the catch-all composer rendered directly below it must stand
+    // down. Dropping it from this list is what re-creates the bug — the composer takes the file,
+    // loads it, and the loader's refusal makes it disappear.
     expect([...FILE_DROP_TARGETS]).toEqual([
       NEW_BUILD_AGENT_DND_TARGET,
       CONCIERGE_COLUMN_DND_TARGET,
+      SPARKLE_TERMINAL_DND_TARGET,
     ]);
   });
 });

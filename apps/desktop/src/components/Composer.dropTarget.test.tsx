@@ -66,6 +66,7 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import {
   CONCIERGE_COLUMN_DND_TARGET,
   NEW_BUILD_AGENT_DND_TARGET,
+  SPARKLE_TERMINAL_DND_TARGET,
   reportDropWithNoTarget,
 } from "../services/dndTargets";
 import { log } from "../logger";
@@ -76,10 +77,22 @@ const button = document.createElement("button");
 button.setAttribute("data-dnd-target", NEW_BUILD_AGENT_DND_TARGET);
 const conciergeBox = document.createElement("div");
 conciergeBox.setAttribute("data-dnd-target", CONCIERGE_COLUMN_DND_TARGET);
+// The Sparkle pane's TERMINAL box — the third surface that owns its drops. This composer renders in
+// that same pane, directly below this box, which is why it has to hit-test the region rather than
+// assume "my pane, my drop".
+const sparkleTerminal = document.createElement("div");
+sparkleTerminal.setAttribute("data-dnd-target", SPARKLE_TERMINAL_DND_TARGET);
 let overButton = false;
 let overConciergeBox = false;
+let overSparkleTerminal = false;
 document.elementFromPoint = vi.fn(() =>
-  overButton ? button : overConciergeBox ? conciergeBox : document.body,
+  overButton
+    ? button
+    : overConciergeBox
+      ? conciergeBox
+      : overSparkleTerminal
+        ? sparkleTerminal
+        : document.body,
 );
 
 const fire = (payload: unknown) => act(() => captured.handler!({ payload }));
@@ -91,6 +104,7 @@ beforeEach(() => {
   vi.mocked(log.info).mockClear();
   overButton = false;
   overConciergeBox = false;
+  overSparkleTerminal = false;
   captured.handler = null;
   useDictationStore.setState({ insertTarget: null, enabled: true, status: "idle", interim: "" });
   useUiStore.getState().setComposerMinimized(false);
@@ -138,6 +152,31 @@ describe("Composer — new-build-agent drop target", () => {
     fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
     expect(loadAttachment).not.toHaveBeenCalled();
     expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  // THE TERMINAL RIGHT ABOVE THIS BOX. Both surfaces live in the Sparkle pane, and this composer's
+  // catch-all used to take the whole pane — so a file dropped on the terminal was loaded here as a
+  // chat tile instead of pasted into the CLI. Loading reads the file, and the loader refuses paths
+  // outside the allowed roots or under a dot-directory, which is how a dropped .txt could vanish
+  // with only a log line. The paste half is asserted in SparkleAgentPane.drop.test.tsx; this is the
+  // half that keeps the file from ALSO landing here.
+  it("ignores a drop on the Sparkle pane's terminal (it pastes the path itself)", async () => {
+    renderComposer();
+    overSparkleTerminal = true;
+    fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
+    expect(loadAttachment).not.toHaveBeenCalled();
+    expect(screen.queryByText("notes.txt")).toBeNull();
+  });
+
+  it("suppresses the drop-here visual over the Sparkle terminal, so only one surface lights up", () => {
+    renderComposer();
+    const dropHint = () =>
+      (screen.getByRole("textbox") as HTMLTextAreaElement).placeholder.startsWith("Drop the file");
+    fire({ type: "enter", position: { x: 400, y: 400 }, paths: ["/tmp/notes.txt"] });
+    expect(dropHint()).toBe(true);
+    overSparkleTerminal = true;
+    fire({ type: "over", position: { x: 10, y: 10 } });
+    expect(dropHint()).toBe(false);
   });
 
   it("suppresses the drop-here visual over the concierge box too", () => {

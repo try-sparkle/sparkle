@@ -821,14 +821,25 @@ export function AgentSidebar({
   // Stable so the memoized SparkleAgentRow doesn't re-render on unrelated status flips (sparkle-alrm.3).
   // Improve Sparkle is per-window: reveal THIS window's own copy in place (its own worktree/branch/
   // conversation keyed by sparkleAgentId). No cross-window focus/broadcast. See services/sparkleReveal.
+  //
+  // AND IT MOUNTS, like every other build row. Founder, 2026-07-29: "I also want this same mounting
+  // functionality to work for the improve sparkle agent at the bottom of the build column. It should
+  // work the same way." Its own pane's composer is gone (SparkleAgentPane), so patching the cable is
+  // now the ONLY way to talk to this agent — a click that seated the pane without patching would
+  // leave it with no input surface but the raw terminal.
+  //
+  // `patchCable(pairSide)` and NOT `selectAndWire`: that helper calls `selectAgent(project.id, id)`,
+  // and this id is not one of the project's agents. Same side, same reducer, same ONE LIVE CIRCUIT —
+  // just without writing a foreign id into the project's selection.
   const onSelectSparkle = useCallback(() => {
     handleImproveSparkleClick({
       activateLocal: () => {
         setActiveSpecial("sparkle");
         open(sparkleAgentId);
+        patchCable(pairSide);
       },
     });
-  }, [setActiveSpecial, open, sparkleAgentId]);
+  }, [setActiveSpecial, open, sparkleAgentId, patchCable, pairSide]);
   // Land an agent's work into its integration target: a worker → its orchestrator's branch; a build
   // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
   // tracker then advances to On Main on the next poll. Best-effort feedback via console for now

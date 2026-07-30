@@ -70,6 +70,7 @@ import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
 import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
+import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
 import type { SuggestionButton } from "./suggestions/types";
@@ -636,6 +637,22 @@ function recordPromptSideEffects(
   // Debit one free-trial prompt on the server. Self-gates: a no-op for entitled users, and it
   // never throws (see trialMeter).
   void recordTrialSend();
+  // A DELIVERED USER PROMPT IS AN INTERACTION WITH THAT AGENT — recorded here, ABOVE the project
+  // lookup below, because it is true of any agent the concierge can reach and not only of ones that
+  // own a project tab.
+  //
+  // This is the last side effect still owed from a composer's onSubmitPrompt, and it arrived late
+  // because the pane that needed it was the last to keep a composer. The sidebar's elapsed timer
+  // reads `max(promptHistory.at, interactionStore.lastAt[id])`: a project agent's prompt resets it
+  // via the `appendPrompt` below, but IMPROVE SPARKLE has no AgentTab, so `!project` returns early
+  // and nothing downstream of here runs for it. Its old pane-local composer called `touch()` itself
+  // for exactly that reason; with that composer gone and the concierge the only way in, the timer
+  // would climb while the user was actively prompting the agent — the reported bug, relocated
+  // (roborev 54812, and the AGENTS.md "a fix that changes WHEN something happens" rule).
+  //
+  // Harmless where it is redundant: the timer takes the max of the two sources, and Terminal.onData
+  // already touches this same key when the user types into a terminal directly.
+  useInteractionStore.getState().touch(agentId);
   // Each surface gets the rendering meant for it (see ConciergeDispatchOptions). Both fall back to
   // the wire text, which is exactly right when nothing was attached.
   const shown = (renderings.display ?? text).trim();

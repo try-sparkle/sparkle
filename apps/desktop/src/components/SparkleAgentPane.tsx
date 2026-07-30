@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
@@ -14,18 +14,21 @@ import {
   submitBlockedReason,
   SPARKLE_PROJECT_ID,
 } from "../services/sparkleAgent";
-import { useInteractionStore } from "../stores/interactionStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useUiStore } from "../stores/uiStore";
+import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
+import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
+import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
-import { Terminal, type TerminalApi } from "./Terminal";
-import { Composer } from "./Composer";
+import { Terminal } from "./Terminal";
 import { Onboarding } from "./Onboarding";
+import { TerminalDropOverlay } from "./TerminalDropOverlay";
+import { TerminalDropPill } from "./TerminalDropPill";
+import { useTerminalDrop } from "../hooks/useTerminalDrop";
+import { SPARKLE_TERMINAL_DND_TARGET } from "../services/dndTargets";
 import { paneVisibilityStyle } from "./paneVisibility";
-import { focusQuietly } from "../services/programmaticFocus";
-import { useDictationStore } from "../stores/dictationStore";
+import { isTypingInProgress } from "../engine/focusGuard";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -52,21 +55,54 @@ interface SpawnCmd {
  * per-window — each window runs its own copy off a distinct worktree/branch cut from the single
  * shared clone — so the id keys this pane's worktree, PTY, and status independently of other
  * windows'. Closing the pane keeps the worktree, so reopening in the same window resumes.
+ *
+ * NO PER-PANE COMPOSER — you TALK to this agent by MOUNTING the concierge to its row, exactly as
+ * with every other build agent (founder, 2026-07-29: "the improved Sparkle agent has some old
+ * composer window functionality that should be stripped out so that it works like other build
+ * agents do"). This pane was the LAST holdout: AgentPane's composer went when the concierge became
+ * the one compose surface, and this one kept a private copy of the mic / screenshot / Send row, so
+ * Improve Sparkle had two ways in while everything else had one. What stays is the CONSENT BANNER
+ * at the top — that is the pane's own control surface, not a compose surface, and the founder was
+ * explicit it stays.
+ *
+ * The consequences of not having a composer, all of them deliberate:
+ *  - The terminal is the pane's input surface for anyone typing directly, so it takes the caret on
+ *    reveal (guarded by isTypingInProgress, so it never steals a half-typed concierge message).
+ *  - The ⌘J "focus the composer" chord finds nothing here and is swallowed, same as in AgentPane.
+ *    In particular this pane no longer names itself as the dictation surface: revealing it must not
+ *    move the mic off the concierge box.
+ *  - The pinned prompt is a static label. It used to echo the last composer send; with the concierge
+ *    owning the send, this pane holds no prompt of its own to show.
  */
 export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agentId: string }) {
   const [phase, setPhase] = useState<Phase>("preparing");
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
-  const [lastPrompt, setLastPrompt] = useState("");
   // Why this machine can't open PRs, if it can't (null = it can, or we couldn't tell). Set during
   // prepare() so the pane says the same thing the agent was told — see submitBlockedReason.
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const setStatus = useRuntimeStore((s) => s.setStatus);
-  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const termFocusRef = useRef<(() => void) | null>(null);
-  const terminalApiRef = useRef<TerminalApi | null>(null);
-  const composerMinimized = useUiStore((s) => s.composerMinimized);
+  const terminalBoxRef = useRef<HTMLDivElement | null>(null);
+  // A file dropped ON THIS TERMINAL pastes its (shell-quoted) path at the CLI's input line, exactly
+  // like a build agent's terminal — a drop lands where it was dropped. Before this, the pane
+  // composer's catch-all listener took the whole pane, so a terminal drop was loaded as an
+  // attachment — and the loader refuses paths outside $HOME/$TMPDIR/Volumes or under a
+  // dot-directory, which is how a dropped .txt could disappear with only a log line. See
+  // hooks/useTerminalDrop.
+  //
+  // That composer is now GONE (see the pane doc comment), so the terminal is the pane's ONLY drop
+  // surface — there is no longer a sibling compose box to split drops with. The claim on the
+  // terminal box stays explicit anyway: it is what scopes the drag-over scrim to the terminal and
+  // anchors the "pasted, not sent" pill, both of which outlived the composer.
+  const focusTerminalForDrop = useCallback(() => termFocusRef.current?.(), []);
+  const terminalDrop = useTerminalDrop(
+    visible,
+    agentId,
+    focusTerminalForDrop,
+    SPARKLE_TERMINAL_DND_TARGET,
+  );
 
   const prepare = async () => {
     setPhase("preparing");
@@ -150,16 +186,78 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Focus follows the minimized state: minimized → terminal (answer Claude's menus),
-  // restored → composer (type in the box). Mirrors AgentPane.
+  // ── JOINING THE REGISTRIES THE CONCIERGE SEND PATH DEPENDS ON ───────────────────────────────
+  //
+  // This pane never registered with paneReadiness/paneControl, and that was HARMLESS ONLY WHILE IT
+  // OWNED A COMPOSER: the composer's `preparing={!ptyReady}` was this pane's private queue, holding
+  // an eager send and flushing it on the preparing→ready transition, and its `onRestartAgent` was
+  // this pane's private dead-PTY heal. Both are gone, and the concierge is now the only way in — so
+  // without these effects `paneState(agentId)` stays `"unmounted"` forever, `wasStarting` in
+  // conciergeDispatch is always false, and a prompt sent while this pane is still coming up
+  // (worktree creation → repo prepare → Claude preflight, all slow) HARD-FAILS as `pty-gone` and is
+  // discarded rather than held. Removing the composer without this would have relocated the very
+  // bug the composer's queue existed to prevent (roborev 55564).
+  //
+  // Same three publications AgentPane makes, for the same reasons:
+  //  • readiness, so "still coming up" (queue) is distinguishable from "the process exited" (fail
+  //    truthfully). A GIVEN-UP pane publishes `failed`, so a prompt sent after it settles there
+  //    fails instead of re-queuing into a hold nobody will drain; a successful Retry republishes.
+  //  • the respawn lever, WHICH IS ALSO WHAT MAKES THE CONCIERGE'S OWN REMEDY COPY TRUE. On a dead
+  //    PTY it says "Start it again and I'll pass it along" — an instruction the user could not
+  //    follow here once the composer's restart went, because `restartPane` had nothing registered.
+  //  • on unmount: drop the entries and REPORT anything still held, rather than silently losing a
+  //    delivery the concierge already promised.
+  useEffect(() => {
+    if (phase === "error" || phase === "no-claude") setPaneFailed(agentId);
+    else setPaneReady(agentId, ptyReady);
+  }, [agentId, ptyReady, phase]);
+  // `prepare` is re-created every render, so the registry gets a ref that always calls the latest.
+  // A full RE-PREPARE, not `Terminal.restart()`: the exec string in `args` was built by the last
+  // prepare (consent mode, --add-dir, resume-vs-fresh all baked in), so only going through prepare
+  // rebuilds it. Synced in an effect, never during render.
+  const prepareRef = useRef(prepare);
+  useEffect(() => {
+    prepareRef.current = prepare;
+  });
+  useEffect(() => {
+    registerPaneRestart(agentId, () => void prepareRef.current());
+    return () => unregisterPaneRestart(agentId);
+  }, [agentId]);
+  useEffect(
+    () => () => {
+      unregisterPane(agentId);
+      abandonPendingSends(agentId);
+    },
+    [agentId],
+  );
+  // Flush anything held while this pane's PTY was coming up. No-op when nothing is held.
+  useEffect(() => {
+    if (!ptyReady) return;
+    void flushPendingSends(agentId).catch((e) => console.warn("flushPendingSends failed", e));
+  }, [ptyReady, agentId]);
+  // A spawn that ERRORS or finds no Claude never flips ptyReady, so a held prompt would dangle with
+  // no outcome. Report it the moment the pane gives up (roborev 46311) — the pane may never unmount.
+  useEffect(() => {
+    if (phase === "error" || phase === "no-claude") abandonPendingSends(agentId);
+  }, [phase, agentId]);
+
+  // The visible, ready pane takes the caret: with no composer over it, the terminal IS this pane's
+  // input surface for anyone who wants to type directly. Verbatim the rule AgentPane follows, and
+  // it REPLACES the old composerMinimized dance (minimized → terminal, restored → composer), which
+  // described a box that no longer exists.
+  //
+  // …but NEVER out from under a HALF-TYPED message. `ptyReady` flips asynchronously after spawn, so
+  // a user composing in the concierge box while this agent finishes starting would otherwise have
+  // the caret yanked mid-sentence — against the premise that the concierge is the one compose
+  // surface. Re-checked inside the rAF, not just at effect time, because the frame lands later.
   useEffect(() => {
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
-      if (composerMinimized) termFocusRef.current?.();
-      else focusQuietly(composerInputRef.current);
+      if (isTypingInProgress()) return;
+      termFocusRef.current?.();
     });
     return () => cancelAnimationFrame(raf);
-  }, [composerMinimized, visible, ptyReady]);
+  }, [visible, ptyReady]);
 
   return (
     <div
@@ -173,7 +271,14 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
         background: C.forest,
       }}
     >
-      <PinnedPrompt prompt={lastPrompt || "Sparkle Improvement Agent — making Sparkle better from your usage"} />
+      {/* A static label, not an echo of the last send: the concierge owns the send now, so this pane
+          has no prompt of its own to pin. (No `history` / "Send to Composer" either — there is no
+          composer to send to, which is exactly what AgentPane's PinnedPrompt says of itself.) */}
+      <PinnedPrompt prompt="Sparkle Improvement Agent — making Sparkle better from your usage" />
+      {/* THE CONSENT ROW STAYS. Founder, 2026-07-29, on the screenshot: "I don't want you to strip
+          out the top functionality here." It is how the user answers "Can we use your logs & crash
+          reports to automatically improve Sparkle?", it gates what leaves the machine (see the Rust
+          upload gate), and it has nothing to do with composing a message. */}
       <SparkleConsentBanner />
       {/* Submission is the last step of every pass and the one most likely to be unavailable — a
           public user has read-only access to the upstream repo. Saying so HERE, before the agent
@@ -208,7 +313,28 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       {phase === "no-claude" && <Onboarding onRetry={() => void prepare()} />}
       {phase === "ready" && spawn && (
         <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
-          <div style={{ position: "absolute", inset: 0, padding: 6 }}>
+          {/* The terminal's own drop region (useTerminalDrop above). Tauri's drag events are
+              window-global and carry no target element, so the hit test needs a marked box.
+
+              THIS BOX SPANS THE WHOLE PANE, and with the pane composer gone it is the pane's ONLY
+              drop surface — there is no second surface to divide the pane with, so nothing here
+              depends on paint order any more. It used to: the box was deliberately z-ordered just
+              BELOW `COMPOSER_Z` so a drop on the compose box overlaying this strip resolved to the
+              composer rather than pasting a path into the PTY (roborev 55575). That composer was
+              stripped when Improve Sparkle moved to the mounted concierge, and this pane was its
+              last render site, so the ordering it was ranked against no longer exists.
+
+              THE EXPLICIT z-index STAYS, for the other half of what it always bought: it makes this
+              box a STACKING CONTEXT, which is what traps the `inset: 0` drag-over scrim inside the
+              terminal region instead of letting it paint across the consent banner and pinned prompt
+              above it. The value only has to be a real number for that; it is no longer derived from
+              anything. `SparkleAgentPane.drop.test.tsx` asserts the containment, not the number. */}
+          <div
+            ref={terminalBoxRef}
+            data-dnd-target={SPARKLE_TERMINAL_DND_TARGET}
+            style={{ position: "absolute", inset: 0, padding: 6, zIndex: 1 }}
+          >
+            {terminalDrop.dropActive && <TerminalDropOverlay agentName="Sparkle" />}
             <Terminal
               agentId={agentId}
               projectId={SPARKLE_PROJECT_ID}
@@ -218,52 +344,33 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               cwd={spawn.cwd}
               resuming={spawn.resuming}
               active={visible}
-              // This pane kept its Composer, so a plain drag over a mouse-tracking TUI is
-              // reclaimed as a text selection while that composer is open (roborev 46485-M).
-              composerOverlay
+              // NO `composerOverlay`. That prop exists to reclaim a plain drag over a
+              // mouse-tracking TUI as a text selection *while a composer is open over the terminal*
+              // (roborev 46485-M, terminalSelectionReclaim). This pane was its last consumer; with
+              // the composer gone the terminal owns the whole stage and its own mouse mode again,
+              // which is how AgentPane has always mounted it.
               onStatus={(s) => setStatus(agentId, s)}
               onReady={() => setPtyReady(true)}
-              // Pane reveal / agent change: incidental, so quiet — it must not re-aim dictation.
-              onRequestFocus={() => focusQuietly(composerInputRef.current)}
-              // The ⌘J chord: the user naming the box they want, so dictation goes with them. Said
-              // OUTRIGHT here rather than inferred from the focus event downstream, because the
-              // caret may not arrive until the un-minimize re-render — and by then the focus is
-              // indistinguishable from the reveal effect's (roborev 54259).
-              onUserRequestFocus={() => {
-                useDictationStore.getState().setVoiceSurface("agent");
-                focusQuietly(composerInputRef.current);
-              }}
+              // NO `onRequestFocus` / `onUserRequestFocus` either: both handed the caret to the
+              // composer, and the ⌘J one additionally named THIS pane as the dictation surface.
+              // With nothing to focus, the chord is swallowed (Terminal returns false either way)
+              // and revealing this pane can no longer take the mic off the concierge box.
               focusRef={termFocusRef}
-              apiRef={terminalApiRef}
             />
           </div>
-          <Composer
-            agentId={agentId}
-            active={visible}
-            // `preparing` (not `disabled`): a send before the PTY is up must QUEUE and flush on
-            // ready, which is also what makes the dead-PTY restart below deliver its re-queued
-            // prompt — the flush effect keys on this transition. `disabled` would hard-block the
-            // send instead, stranding anything queued by a restart.
-            preparing={!ptyReady}
-            inputRef={composerInputRef}
-            onSubmitPrompt={(t) => {
-              setLastPrompt(t);
-              // THE COMPOSER SEND HAS TO COUNT AS AN INTERACTION, and for this pane it only does
-              // if we say so. The sidebar's elapsed timer reads
-              // `max(lastPrompt.at, interactionStore.lastAt[id])`; a project agent's Send lands in
-              // its tab's `promptHistory`, but Improve Sparkle has no AgentTab and therefore no
-              // promptHistory, so without this its timer would reset on raw terminal typing
-              // (Terminal.onData touches the store) and NOT on a Send from the box right below it —
-              // i.e. the timer would keep climbing while you were actively prompting the agent.
-              useInteractionStore.getState().touch(agentId);
-            }}
-            // Same self-heal as AgentPane: a send that finds the PTY gone respawns the agent and
-            // the queued prompt lands on the new PTY.
-            onRestartAgent={() => {
-              setPtyReady(false);
-              terminalApiRef.current?.restart();
-            }}
-          />
+          {/* What a drop pasted into this terminal — and that it has NOT been sent. Same pill the
+              build-agent panes use (see useTerminalDrop / TerminalDropPill). This OUTLIVES the
+              stripped composer: the pill reports on the terminal paste, not on a compose surface. */}
+          {terminalDrop.dropped && (
+            <TerminalDropPill
+              count={terminalDrop.dropped.count}
+              images={terminalDrop.dropped.images}
+              delivered={terminalDrop.dropped.delivered}
+              agentName="Sparkle"
+              anchorRef={terminalBoxRef}
+              onDismiss={terminalDrop.dismiss}
+            />
+          )}
         </div>
       )}
     </div>

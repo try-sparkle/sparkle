@@ -63,7 +63,11 @@ import {
   useTerminalDrop,
   type TerminalDrop,
 } from "./useTerminalDrop";
-import { NEW_BUILD_AGENT_DND_TARGET, TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
+import {
+  NEW_BUILD_AGENT_DND_TARGET,
+  SPARKLE_TERMINAL_DND_TARGET,
+  TERMINAL_STAGE_DND_TARGET,
+} from "../services/dndTargets";
 
 // The hit test uses document.elementFromPoint (unimplemented in jsdom). The "+ New Build Agent"
 // button is nested INSIDE the stage in the real DOM, so the button element's closest() must find
@@ -187,6 +191,13 @@ describe("pasting a drop into the agent's own terminal", () => {
     expect(panes["agent-a"]!.dropped).toEqual({ count: 2, images: 0, delivered: true });
   });
 
+  it("pastes a .txt whose path has a space as ONE quoted token", async () => {
+    // The reported case, end to end through the hook: nothing about the extension changes the
+    // payload, and the quoting is what keeps a two-word directory from becoming two arguments.
+    await fireAt({ type: "drop", position: at, paths: ["/Users/me/My Notes/todo.txt"] });
+    expect(pastedInto("agent-a")).toEqual(["'/Users/me/My Notes/todo.txt' "]);
+  });
+
   it("counts a mixed drop honestly, so the copy never calls a .csv an image", async () => {
     await fireAt({ type: "drop", position: at, paths: ["/tmp/a.png", "/tmp/notes.txt"] });
     expect(panes["agent-a"]!.dropped).toEqual({ count: 2, images: 1, delivered: true });
@@ -261,6 +272,35 @@ describe("a paste that does not land", () => {
     captured.paste.mockRejectedValue(new Error("IPC exploded"));
     await fireAt({ type: "drop", position: at, paths: ["/tmp/a.png"] });
     expect(panes["agent-a"]!.dropped).toEqual({ count: 1, images: 1, delivered: false });
+  });
+});
+
+// THE SPARKLE PANE'S TERMINAL is not inside the workspace stage — it is a sibling of a catch-all
+// composer — so it names its own region and the hook has to claim THAT one. Getting this wrong is
+// invisible at the unit level unless the assertion is on the bytes: a hook that keeps hit-testing
+// the stage registers a listener, sees the drop, and silently writes nothing.
+describe("a pane that names its own drop region", () => {
+  const SPARKLE_TARGET = SPARKLE_TERMINAL_DND_TARGET;
+  const sparkleEl = document.createElement("div");
+  sparkleEl.setAttribute("data-dnd-target", SPARKLE_TARGET);
+
+  function SparklePane() {
+    useTerminalDrop(true, "sparkle", undefined, SPARKLE_TARGET);
+    return null;
+  }
+
+  it("pastes a drop on ITS region, not the workspace stage's", async () => {
+    render(<SparklePane />);
+    document.elementFromPoint = vi.fn(() => sparkleEl);
+    await fireAt({ type: "drop", position: at, paths: ["/tmp/notes.txt"] });
+    expect(pastedInto("sparkle")).toEqual(["/tmp/notes.txt "]);
+  });
+
+  it("declines a drop on the workspace stage, which belongs to a build agent's pane", async () => {
+    render(<SparklePane />);
+    cursorOver = "stage"; // the default elementFromPoint stub: the terminal STAGE, not this region
+    await fireAt({ type: "drop", position: at, paths: ["/tmp/notes.txt"] });
+    expect(captured.paste).not.toHaveBeenCalled();
   });
 });
 

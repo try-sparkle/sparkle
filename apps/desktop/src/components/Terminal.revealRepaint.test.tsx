@@ -99,6 +99,18 @@ vi.mock("../engine/statusEngine", () => ({
 // useResolvedTheme uses matchMedia (absent in jsdom); stub it to a fixed value.
 vi.mock("../theme/theme", () => ({ useResolvedTheme: () => "dark" }));
 
+// `perfSpan` is spied CALLING THROUGH — spread the real module and wrap, never replace. A stub that
+// dropped `fn()` would silently disable the reveal repaint itself and every assertion above would
+// start failing for a reason that has nothing to do with what it claims to test.
+const { spans } = vi.hoisted(() => ({ spans: [] as string[] }));
+vi.mock("../perfTrace", async (orig) => ({
+  ...(await orig<typeof import("../perfTrace")>()),
+  perfSpan: (name: string, fn: () => unknown) => {
+    spans.push(name);
+    return fn();
+  },
+}));
+
 import { Terminal } from "./Terminal";
 import { resizePty } from "../pty";
 
@@ -115,6 +127,7 @@ const baseProps = {
 beforeEach(() => {
   clearTextureAtlas.mockClear();
   refresh.mockClear();
+  spans.length = 0;
   vi.mocked(resizePty).mockClear();
   widthCtl.value = 720; // default: laid out. Individual tests override to model a delayed reveal.
   // jsdom has no ResizeObserver; Terminal constructs one on mount.
@@ -157,6 +170,25 @@ describe("Terminal reveal repaint", () => {
 
     // The fix: becoming active must force a full repaint via clearTextureAtlas. A regression to
     // a bare term.refresh() on the reveal path would leave this uncalled and fail the test.
+    expect(clearTextureAtlas).toHaveBeenCalled();
+  });
+
+  it("TIMES the reveal repaint under `Terminal.revealRepaint`, without swallowing it", () => {
+    // The reveal repaint is what switching agents actually spends its time on, and until this span
+    // existed the logs could not say how much: `Terminal.attachWebgl` was timed, the repaint next to
+    // it was not, so a measured ~286ms switch had ~19ms of accounted-for work in it. This pins the
+    // instrument so it cannot be dropped by a future edit to the reveal effect.
+    const { rerender } = render(<Terminal {...baseProps} active={false} />);
+    clearTextureAtlas.mockClear();
+    spans.length = 0;
+
+    rerender(<Terminal {...baseProps} active={true} />);
+
+    // The span is emitted for the REVEAL repaint specifically…
+    expect(spans).toContain("Terminal.revealRepaint");
+    // …and it WRAPS the repaint rather than replacing it. Without this, a wrapper that forgot to
+    // call through would satisfy the line above while silently reintroducing the blank-top-half bug
+    // the rest of this file exists to prevent.
     expect(clearTextureAtlas).toHaveBeenCalled();
   });
 

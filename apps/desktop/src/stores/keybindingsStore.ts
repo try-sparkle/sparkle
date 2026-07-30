@@ -21,7 +21,23 @@ export const SHORTCUT_DEFAULTS: Record<ShortcutId, KeyBinding> = {
 // so a tap binding there would silently never fire — the capture UI rejects taps for it.
 export const SHORTCUT_LABELS: Record<ShortcutId, { title: string; blurb: string; allowsTap: boolean }> = {
   toggleHints: { title: "Show shortcut hints", blurb: "Pops the gold chiclet overlay over clickable controls.", allowsTap: true },
-  toggleComposer: { title: "Composer ⇄ Terminal", blurb: "Improve-Sparkle pane only: move focus between its prompt box and terminal. (Builder agents have no terminal composer — the Sparkle box is the composer.)", allowsTap: false },
+  // THE COPY FOLLOWED THE BOX. This used to read "Improve-Sparkle pane only: move focus between its
+  // prompt box and terminal. (Builder agents have no terminal composer — the Sparkle box is the
+  // composer.)" — true while the Improve Sparkle pane carried its own composer, and false the moment
+  // that was stripped so the pane works like every other build agent: there is no per-pane prompt box
+  // left to move focus to, in ANY pane. This blurb is rendered in ⋯ Settings → Shortcuts
+  // (KeyboardShortcutsMenu), so leaving it would have promised the user a surface that no longer
+  // exists. The chord is still intercepted in the terminal and still swallowed there, which is the
+  // one part of the old description that is still true; wiring it to something useful (or retiring it)
+  // is a follow-up, not a copy change. See PRD/sparkle/improve-sparkle-mounting.md.
+  // NAMES NO TEXT SURFACE, on purpose. The first rewrite explained what the chord *no longer* does
+  // ("It no longer moves focus to a prompt box: panes have no composer of their own…"), which was
+  // true but made the copy's correctness rest on a reader parsing the negation — and made its guard
+  // rest on a regex parsing it too, which is a losing game (roborev 55606 defeated two cuts of it).
+  // Settings copy should say what a shortcut DOES. Since no pane has a prompt box, compose box or
+  // composer, the blurb simply never mentions one, and `keybindingsStore.labels.test.ts` can then
+  // assert the invariant directly: any wording that promises such a surface has to name it.
+  toggleComposer: { title: "Hold the terminal's keystrokes", blurb: "Held in the terminal so the chord never reaches the running process. To talk to an agent, click its row to mount Sparkle to it.", allowsTap: false },
 };
 
 interface KeybindingsState {

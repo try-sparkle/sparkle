@@ -593,7 +593,12 @@ export function Terminal({
 
     // The terminal is a real terminal: every keystroke reaches the PTY, so Claude's menus
     // (number picks, arrows, Enter, Esc) all work directly. Two chords are intercepted here:
-    //   • ⌘J bounces focus back to the composer (restoring it if minimized) instead of the PTY.
+    //   • ⌘J is INTERCEPTED AND SWALLOWED, WITH NO FOCUS DESTINATION LEFT. It used to bounce focus
+    //     back to the composer (restoring it if minimized); no pane has a composer any more — this
+    //     is now the only place the chord does anything, and what it does is keep the keystroke away
+    //     from the running process. Do not read the branch below as a focus move; see
+    //     SHORTCUT_LABELS.toggleComposer, which describes the same behaviour to the user, and
+    //     PRD/sparkle/improve-sparkle-mounting.md for the retirement follow-up.
     //   • ⌘C copies the current selection ourselves — xterm's selection isn't a native DOM
     //     selection, so without this the OS native copy finds nothing and just beeps. With no
     //     selection we pass ⌘C through unchanged.
@@ -602,10 +607,17 @@ export function Terminal({
       // effect without remounting the terminal.
       const toggle = useKeybindingsStore.getState().bindings.toggleComposer;
       if (isComposerToggleKey(e, toggle)) {
+        // BOTH CALLS ARE INERT TODAY, and retained rather than deleted only so the ⌘J retirement is
+        // one decision in one place instead of a slow amputation across three files:
+        //  • `setComposerMinimized(false)` — nothing renders off that flag now; its one remaining
+        //    reader is shouldReclaimPlainDrag, whose `composerOverlay` is false for every pane.
+        //  • `composerFocusRequest.chord(…)` — both refs are undefined for every caller (AgentPane
+        //    never passed them; SparkleAgentPane stopped when its composer went), so the map's chord
+        //    branch runs and reaches nothing. It is kept because the chord/reveal DISTINCTION is
+        //    still the contract if anything is ever wired here again — pinned by
+        //    Terminal.composerFocusRequest.test.ts.
+        // The `return false` is the part that still matters: it stops the chord reaching the PTY.
         useUiStore.getState().setComposerMinimized(false);
-        // The chord IS the user asking for the composer, so dictation follows them there. Its own
-        // callback, because the caret may not land until the un-minimize re-render and nothing
-        // downstream could tell that focus apart from the reveal effect's.
         composerFocusRequest.chord({
           onRequestFocus: onRequestFocusRef.current,
           onUserRequestFocus: onUserRequestFocusRef.current,
@@ -1092,7 +1104,15 @@ export function Terminal({
       // disposedRef guards the deferred frame (#231/#258).
       handle = requestAnimationFrame(() => {
         if (cancelled || disposedRef.current) return;
-        forceFullRepaint(webglRef.current, term);
+        // TIMED, because this was the last unmeasured part of what switching agents costs. The
+        // attach beside it is instrumented (`Terminal.attachWebgl`, p50 19ms in the field) but the
+        // repaint that rasterizes the whole buffered scrollback into that freshly-attached, EMPTY
+        // WebGL model was not — so "a switch takes ~286ms with a quiet main thread; where does it
+        // go?" could not be answered from the logs at all. It matters more than the attach: this is
+        // an 8000-line clearTextureAtlas + refresh, and it is paid once per REVEAL, which is once
+        // per agent the pointer would cross under a hover-to-preview. See
+        // PRD/sparkle/terminal-switch-latency.md for the measurement this closes the gap in.
+        perfSpan("Terminal.revealRepaint", () => forceFullRepaint(webglRef.current, term));
         poisonedRef.current = false; // the reveal repaint cleared any cache-poisoned cells
       });
     });

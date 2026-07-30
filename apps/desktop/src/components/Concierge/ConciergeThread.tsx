@@ -18,6 +18,7 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
 import { MessageAttachments } from "../composer/MessageAttachments";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import { splitMentionText, type ConciergeMention } from "./mentions";
+import { MentionPill } from "./MentionPill";
 import type {
   ConciergeCopyKind,
   ConciergeDigestMessage,
@@ -56,14 +57,21 @@ function newestUserMessageId(messages: ConciergeMessage[]): string {
 /**
  * A user bubble's words, with any agent it ADDRESSED drawn as a pill rather than as raw `@text`.
  *
- * The founder's ask ends here: "if I press enter it shows me the agent as a pill in the chat." The
- * composer cannot draw one — it is a plain `<textarea>`, and it stays one, because the rich
- * placeholder overlay and the measured height engine both depend on that — so the SENT message is
- * where the pill becomes visible, and it is also where it matters most: this bubble is the record
- * of who a message went to.
+ * THIS IS NO LONGER THE FIRST PLACE THE PILL APPEARS, and the correction matters because the old
+ * note here was load-bearing prose. It read: "the composer cannot draw one — it is a plain
+ * `<textarea>`, and it stays one … so the SENT message is where the pill becomes visible." The
+ * premise was right and the conclusion was wrong, and the founder reported the gap: a completed
+ * `@Kraken Auth` sat in the compose box as plain text and only became a pill after Send.
+ *
+ * The textarea IS still a plain textarea (the rich placeholder overlay and the measured height
+ * engine both depend on that, and neither moved). What changed is that the composer paints its
+ * pills BEHIND it — see ./MentionMirror. So the pill is now visible from the moment the mention is
+ * completed, and this bubble is where it becomes a RECORD rather than where it is first seen.
  *
  * Split against the mentions RECORDED ON THE MESSAGE (see ConciergeUserMessage.mentions), never
- * against the live roster, so a message keeps its pills after its agent is closed.
+ * against the live roster, so a message keeps its pills after its agent is closed. That is the one
+ * place this surface deliberately differs from the composer's: there, the roster is live, because a
+ * draft's aim must track the fleet it will actually be delivered to.
  *
  * Plain text renders exactly as it did before — one string, no wrapper — so a thread of ordinary
  * messages is untouched by this and its whitespace behaviour cannot drift.
@@ -78,26 +86,12 @@ function MentionedText({ text, mentions }: { text: string; mentions?: ConciergeM
           // string on a message that never re-renders with different content.
           <span key={i}>{part.text}</span>
         ) : (
-          <span
-            key={i}
-            data-testid="concierge-mention-pill"
-            data-agent-id={part.agentId}
-            style={{
-              // Tinted, not bordered — the same call the bubble itself makes (see its NO BORDER
-              // note): a fill is already a shape, and a hairline around a pill this small at 13px
-              // reads as noise. The teal is the attachment chip's tint, which is the established
-              // "something rode along with this message" signal in this column.
-              background: `color-mix(in srgb, ${C.teal} 18%, transparent)`,
-              color: C.cream,
-              borderRadius: 4,
-              padding: "1px 4px",
-              // Keep the address on one line: a pill broken across two lines stops reading as one
-              // object, and these are two or three words at most.
-              whiteSpace: "nowrap",
-            }}
-          >
+          // The SHARED pill (./MentionPill) — the same component the composer paints behind its
+          // textarea. It used to be six style properties inlined here, which is how the sent pill
+          // and the composer pill would have drifted a shade apart with nothing failing.
+          <MentionPill key={i} agentId={part.agentId}>
             {part.text}
-          </span>
+          </MentionPill>
         ),
       )}
     </>

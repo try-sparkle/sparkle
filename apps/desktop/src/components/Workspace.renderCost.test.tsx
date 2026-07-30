@@ -109,62 +109,19 @@ vi.mock("./StatusStrip", () => ({ StatusStrip: () => null }));
 vi.mock("./NewCloudAgentDialog", () => ({ NewCloudAgentDialog: () => null }));
 
 import { Workspace } from "./Workspace";
-import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { useSettingsStore } from "../stores/settingsStore";
-import { useAuthStore } from "../stores/authStore";
-import { useConnectionStore } from "../stores/connectionStore";
-import { resetVisitedProjects } from "../services/sessionProjects";
-import { resetCable } from "../stores/cableStore";
-import type { AgentTab, Project } from "../types";
-
-/** The pane count the founder's report was taken at. Sixty agents is a real cockpit, not a stress
- *  test — the jank log named 62 pane renders in one stall. */
-const PANES = 60;
-
-function mkAgent(id: string): AgentTab {
-  return {
-    id, name: id, kind: "build", parentId: null, runtime: "local",
-    worktreePath: null, branch: null, baseBranch: null, lastPrompt: "",
-    promptHistory: [], namePinned: false, autoNameBasis: null,
-    autoNameVariants: null, shellCommand: null,
-  };
-}
-function mkProject(id: string, name: string, agents: AgentTab[]): Project {
-  return {
-    id, name, rootPath: `/tmp/${id}`, defaultBranch: null,
-    createdAt: new Date(0).toISOString(), selectedAgentId: agents[0]!.id, agents,
-  };
-}
-
-const agentIds = Array.from({ length: PANES }, (_, i) => `a${i}`);
+import { PANES, resetCockpit, seedCockpit } from "./Workspace.costHarness";
 
 beforeEach(() => {
   counts.pane = 0;
   counts.sidebar = 0;
   counts.concierge = 0;
   counts.tabs = 0;
-  localStorage.clear();
-  useProjectStore.setState({
-    projects: [mkProject("p1", "Alpha", agentIds.map(mkAgent))],
-    selectedProjectId: "p1",
-  } as never);
-  useRuntimeStore.setState({ openAgentIds: agentIds, status: {} } as never);
-  useUiStore.setState({
-    activeSpecial: null, workMode: "build", pinnedProjectId: null, openProjectIds: null,
-    pairAssignment: {}, leftProjectId: null,
-  } as never);
-  useSettingsStore.setState({ beadsEnabled: true } as never);
-  useAuthStore.setState({ me: null, tokenPresent: false, loading: false } as never);
-  useConnectionStore.setState({ isOnline: true } as never);
-  resetVisitedProjects();
-  resetCable();
+  seedCockpit();
 });
 afterEach(() => {
   cleanup();
-  resetCable();
-  localStorage.clear();
+  resetCockpit();
 });
 
 const dots = () => screen.getByTestId("concierge-pull-tab-dots");

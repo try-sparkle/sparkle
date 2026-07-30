@@ -71,12 +71,20 @@ function type(value: string, caret = value.length) {
   fireEvent.select(ta);
 }
 
+/** The ids a bare "@" offers. The CONCIERGE is one of them — `mentionRoster` appends it, so
+ *  `@Sparkle` is offered, pilled and resolved on exactly the same terms as a build agent (see that
+ *  function's doc for why it belongs in the one roster rather than in a second composer-local one).
+ *  Named here so the cases below can talk about the fleet without re-counting it each time. */
+const SPARKLE = "sparkle-concierge";
+const offeredIds = () => options().map((o) => o.getAttribute("data-agent-id"));
+
 describe("ComposeBox — typing @ opens the picker", () => {
-  it("shows the whole fleet on a bare @", () => {
+  it("shows the whole fleet on a bare @, plus the concierge", () => {
     setup();
     expect(picker()).toBeNull();
     type("@");
-    expect(options()).toHaveLength(2);
+    expect(offeredIds()).toHaveLength(3);
+    expect(offeredIds()).toEqual(expect.arrayContaining(["a1", "a2", SPARKLE]));
   });
 
   it("narrows as the query grows — the founder's '@Bl'", () => {
@@ -105,10 +113,14 @@ describe("ComposeBox — typing @ opens the picker", () => {
     expect(picker()).toBeNull();
   });
 
-  it("does not open when the box knows of no agents at all", () => {
+  // This used to assert the picker did NOT open with an empty fleet. It opens now, with exactly one
+  // row, and that is the behaviour rather than a slipped expectation: under a mount plain text goes to
+  // the patched terminal and `@Sparkle` is how you reach the concierge, so the concierge has to be the
+  // one thing that is always addressable — including on a fresh install with nothing built yet.
+  it("offers the concierge alone when the box knows of no build agents", () => {
     setup({ mentionAgents: [] });
     type("@");
-    expect(picker()).toBeNull();
+    expect(offeredIds()).toEqual([SPARKLE]);
   });
 
   it("puts the agent already in view at the top of the list", () => {
@@ -122,13 +134,19 @@ describe("ComposeBox — keyboard", () => {
   it("arrows move the highlight, wrapping at both ends", () => {
     setup();
     type("@");
-    expect(options()[0]!.getAttribute("aria-selected")).toBe("true");
+    // Read off the list rather than hardcoded, so this stays about the WRAP rather than about how
+    // many rows a bare "@" happens to offer (the concierge is one of them — see offeredIds).
+    const rows = options().length;
+    const highlighted = () => options().findIndex((o) => o.getAttribute("aria-selected") === "true");
+    expect(highlighted()).toBe(0);
     fireEvent.keyDown(box(), { key: "ArrowDown" });
-    expect(options()[1]!.getAttribute("aria-selected")).toBe("true");
-    fireEvent.keyDown(box(), { key: "ArrowDown" });
-    expect(options()[0]!.getAttribute("aria-selected")).toBe("true");
+    expect(highlighted()).toBe(1);
+    // Down off the bottom comes back to the top…
+    for (let i = 1; i < rows; i += 1) fireEvent.keyDown(box(), { key: "ArrowDown" });
+    expect(highlighted()).toBe(0);
+    // …and up off the top goes to the bottom.
     fireEvent.keyDown(box(), { key: "ArrowUp" });
-    expect(options()[1]!.getAttribute("aria-selected")).toBe("true");
+    expect(highlighted()).toBe(rows - 1);
   });
 
   it("Enter inserts the highlighted agent as a pill and closes the list", () => {
