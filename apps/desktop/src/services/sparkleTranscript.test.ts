@@ -1,9 +1,9 @@
 // Making the Improve Sparkle agent READABLE with no pane mounted.
 //
-// The assertion that matters is not "the helper called the invoke" — it is that a subsequent
-// `readAgentTerminal` for that agent comes back with the transcript's CONTENT instead of
-// `source: "none"`. That end-to-end shape is the whole point: the user was hand-relaying this
-// agent's analysis because every tier of the read chain was empty for it.
+// The assertion that matters is not "the helper stored something" — it is that a subsequent
+// `readAgentTerminal` for that agent comes back with the CURRENT session's content instead of
+// `source: "none"` or, worse, the previous session's. That end-to-end shape is the whole point: the
+// user was hand-relaying this agent's analysis because every tier of the read chain was empty for it.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
@@ -22,19 +22,31 @@ vi.mock("../stores/runtimeStore", () => ({
 }));
 
 import { registerSparkleTranscript } from "./sparkleTranscript";
-import { forgetAgentTranscriptPath, readAgentTerminal } from "./conciergeTools/terminal";
+import {
+  forgetAgentTranscriptPath,
+  noteAgentTranscriptPath,
+  readAgentTerminal,
+} from "./conciergeTools/terminal";
 import { SPARKLE_AGENT_ID } from "./sparkleAgent";
 
 const WORKTREE = "/app-data/sparkle-self/worktrees/__sparkle_self__";
-const TRANSCRIPT = "/home/u/.claude/projects/-app-data-sparkle-self/abc.jsonl";
+const LAST_HOUR = "/home/u/.claude/projects/-app-data-sparkle-self/pass-1.jsonl";
+const THIS_HOUR = "/home/u/.claude/projects/-app-data-sparkle-self/pass-2.jsonl";
 
-/** Route the two commands this path uses; anything else resolves undefined. */
-function routeInvokes(opts: { path?: string | null; lastAssistant?: string } = {}) {
-  invokeMock.mockImplementation(async (cmd: string) => {
-    if (cmd === "claude_latest_session_path") return opts.path === undefined ? TRANSCRIPT : opts.path;
-    if (cmd === "read_transcript_last_assistant") return opts.lastAssistant ?? "";
+/**
+ * Stand in for the worktree's project directory. `newest` is what `claude_latest_session_path`
+ * resolves right now — the thing that CHANGES as a new pass starts writing — and `contents` maps each
+ * file to its last assistant turn.
+ */
+function fakeProjectDir(dir: { newest: string | null; contents: Record<string, string> }) {
+  invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
+    if (cmd === "claude_latest_session_path") return dir.newest;
+    if (cmd === "read_transcript_last_assistant") {
+      return dir.contents[(args as { path: string }).path] ?? "";
+    }
     return undefined;
   });
+  return dir;
 }
 
 beforeEach(() => {
@@ -44,13 +56,12 @@ beforeEach(() => {
 
 describe("registerSparkleTranscript", () => {
   it("makes an unmounted Improve Sparkle agent readable, with the transcript's content", async () => {
-    routeInvokes({ lastAssistant: "Here are the three proposals I'd prioritise…" });
+    fakeProjectDir({ newest: THIS_HOUR, contents: { [THIS_HOUR]: "Here are the three proposals…" } });
 
     // BEFORE: every tier is empty, which is exactly the reported bug.
-    const before = await readAgentTerminal(SPARKLE_AGENT_ID);
-    expect(before.source).toBe("none");
+    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).source).toBe("none");
 
-    await registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
 
     // AFTER: the read answers, from the transcript, and SAYS that is where it came from — the
     // freshness label is load-bearing, since this is what the agent last SAID, not its live screen.
@@ -60,42 +71,65 @@ describe("registerSparkleTranscript", () => {
     expect(after.text).toContain("three proposals");
   });
 
+  // THE REGRESSION THAT ROBOREV 55363 CAUGHT. Registration happens BEFORE the pass spawns, and the
+  // pass spawns with no `--resume` — so at registration time the newest file is LAST hour's. If the
+  // file is chosen then, every mid-pass read returns the previous pass's closing message for the whole
+  // hour: the wrong conversation, labelled as this agent's. One registration, two reads, and the
+  // second must follow the directory.
+  it("reads the session being written NOW, not the one that was newest at registration", async () => {
+    const dir = fakeProjectDir({
+      newest: LAST_HOUR,
+      contents: { [LAST_HOUR]: "last hour: I opened PR #700", [THIS_HOUR]: "this hour: reading the logs" },
+    });
+
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).text).toContain("last hour");
+
+    // The pass spawns and Claude starts writing a brand-new session file. Nothing re-registers.
+    dir.newest = THIS_HOUR;
+
+    const during = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(during.text).toContain("this hour");
+    expect(during.text).not.toContain("last hour");
+  });
+
   it("resolves the path from the WORKTREE, never from the agent id", async () => {
-    routeInvokes({ lastAssistant: "x" });
-    await registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    fakeProjectDir({ newest: THIS_HOUR, contents: { [THIS_HOUR]: "x" } });
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    await readAgentTerminal(SPARKLE_AGENT_ID);
     const call = invokeMock.mock.calls.find(([c]) => c === "claude_latest_session_path");
     expect(call?.[1]).toMatchObject({ worktreePath: WORKTREE });
   });
 
-  // The first-ever run: Claude has not written a transcript yet. That is the normal state, not an
-  // error, and it must leave the read reporting honestly rather than registering a bogus path.
-  it("registers nothing when there is no transcript yet", async () => {
-    routeInvokes({ path: null });
-    await expect(registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE)).resolves.toBeNull();
-    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).source).toBe("none");
+  // The first-ever run: Claude has not written a transcript in this worktree yet. That is the normal
+  // state, not an error, and the read must keep reporting honestly.
+  it("reports nothing when the worktree has no transcript yet", async () => {
+    fakeProjectDir({ newest: null, contents: {} });
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    const read = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(read.source).toBe("none");
+    expect(read.attempts.find((a) => a.source === "transcript")?.ok).toBe(false);
   });
 
-  // Every caller is on a spawn path that must not fail for a read convenience.
-  it("never throws when the resolve fails", async () => {
+  // A tier is best-effort; one failing IPC must not fail the read (that would blind the concierge).
+  it("survives a failed resolve without throwing", async () => {
     invokeMock.mockRejectedValue(new Error("no such command"));
-    await expect(registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE)).resolves.toBeNull();
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    const read = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(read.source).toBe("none");
+    expect(read.attempts.find((a) => a.source === "transcript")?.why).toContain("no such command");
   });
 
-  // A worktree accrues one transcript per session, so the newest file changes over the agent's
-  // life; a path pinned at first launch would serve a stale conversation forever.
-  it("re-registers the newest transcript rather than pinning the first", async () => {
-    routeInvokes({ lastAssistant: "older" });
-    await registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
-
-    const NEWER = "/home/u/.claude/projects/-app-data-sparkle-self/def.jsonl";
-    invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
-      if (cmd === "claude_latest_session_path") return NEWER;
-      if (cmd === "read_transcript_last_assistant")
-        return (args as { path: string }).path === NEWER ? "newer" : "older";
-      return undefined;
+  // Writer (1) is a Stop event behind a session gate; writer (2) is an mtime scan with no gate. When
+  // an agent somehow has both, the better evidence has to win.
+  it("lets an exact Stop-event path outrank the worktree scan", async () => {
+    fakeProjectDir({
+      newest: THIS_HOUR,
+      contents: { [THIS_HOUR]: "from the scan", [LAST_HOUR]: "from the Stop event" },
     });
-    await registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    registerSparkleTranscript(SPARKLE_AGENT_ID, WORKTREE);
+    noteAgentTranscriptPath(SPARKLE_AGENT_ID, LAST_HOUR);
 
-    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).text).toContain("newer");
+    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).text).toContain("from the Stop event");
   });
 });

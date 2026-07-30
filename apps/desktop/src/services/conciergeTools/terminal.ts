@@ -253,40 +253,81 @@ export interface ConciergeSendResult {
 // Transcript paths — the seam for tier (d)
 // ---------------------------------------------------------------------------------------------
 
-// `read_transcript_last_assistant` takes a PATH, and a Stop hook event is the only place one is ever
-// known. This tiny registry is where that path is parked so tier (d) has something to read, without
-// this module reaching into the hook plumbing itself.
+// `read_transcript_last_assistant` takes a PATH, and this module will not invent one — a fabricated
+// `~/.claude/projects/<slug>/<id>.jsonl` fails confusingly, and the slug rule belongs to Rust
+// (src-tauri/src/claude.rs), not here. So tier (d) reads only what a caller in APP CODE has handed
+// over, in one of the two forms below, and skips itself (saying why) when it has neither.
 //
-// THE ONE WRITER is `components/AgentPane.noteTranscriptFromStop`, wired as the REQUIRED
-// `noteTranscript` field of `engine/hookEvents.HookEventHandlerDeps` — so the hand-off cannot be
-// dropped without a compile error, and it sits behind that handler's session gate (a background
-// `claude` sharing a worktree's log must not register ITS transcript against this agent). Read that
-// helper's doc comment before changing anything here; the two are a pair.
+// It also does not accept a path from the CALLER of the read: `ReadAgentTerminalOptions` is the tool
+// ARGUMENT surface, so a `transcriptPath` override there was a model-supplied arbitrary-file read
+// landing in an LLM context. That stays removed — see the note on that interface.
 //
-// This registry is also the ONLY source. Tier (d) does not guess a path — a fabricated
-// `~/.claude/projects/<slug>/<id>.jsonl` would fail confusingly, and slug derivation is exactly the
-// kind of guess this module shouldn't make — and it no longer accepts one from the caller either:
-// `ReadAgentTerminalOptions` is the tool ARGUMENT surface, so an override there was a model-supplied
-// arbitrary-file read landing in an LLM context. With no entry, tier (d) skips itself and says why.
+// TWO WRITERS, TWO DIFFERENT SAFETY PROPERTIES. Both are app code; neither takes a model's word for
+// anything. What they differ on is which file, and how they know it is the right one:
 //
-// NOTHING CLEARS IT TODAY. `forgetAgentTranscriptPath` exists for a caller that genuinely knows an
+//  1. AN EXACT PATH — `noteAgentTranscriptPath`, from `components/AgentPane.noteTranscriptFromStop`,
+//     wired as the REQUIRED `noteTranscript` field of `engine/hookEvents.HookEventHandlerDeps` (so the
+//     hand-off cannot be dropped without a compile error). Its safety property is Claude Code's own
+//     Stop event: the path names the session that just spoke, and the handler's session gate rejects a
+//     background `claude` sharing the worktree's log. Read that helper's doc comment before changing
+//     anything here; the two are a pair.
+//
+//  2. A WORKTREE — `noteAgentTranscriptWorktree`, for an agent with NO pane, hence no hook events
+//     (today: the app-owned Improve Sparkle agent — see services/sparkleTranscript). Nothing tells us
+//     which session is live, so the file is resolved AT READ TIME as the newest transcript in that
+//     worktree's project dir. Its safety property is weaker and worth stating exactly:
+//       • The worktree is one the app itself created; no id-to-path guessing, nothing a model said.
+//       • "Newest at read time" is the live session while an agent is running, because the file being
+//         written has the freshest mtime. That is the whole point of resolving late: this used to
+//         resolve ONCE at spawn time, which — since the improvement pass runs with no `--resume` and
+//         therefore writes a brand-new `<uuid>.jsonl` every hour — pinned the PREVIOUS pass's
+//         transcript forever, and handed the concierge the wrong conversation (not a stale view of
+//         the right one) for the whole pass.
+//       • RESIDUAL RACE, accepted knowingly: a *different* `claude` invoked with that same cwd writes
+//         into the same project dir and can hold the newest mtime, and unlike writer (1) there is no
+//         session gate to reject it. A mtime floor does not help (a sibling post-dates any floor a
+//         registration could set), and pinning the session id the pass reports on
+//         `sparkle_improve:done` cannot help mid-flight, which is when the read is asked for — and
+//         would reintroduce a stale pin outranking a live resolution, i.e. this exact bug. The
+//         exposure is bounded: it requires the agent to spawn its own `claude` in the app's own
+//         worktree, and the result is mislabelled provenance rather than a read of an arbitrary file.
+//
+// Writer (1) WINS when both are registered, because an exact session-gated path is strictly better
+// evidence than a directory scan. No agent has both today.
+//
+// NOTHING CLEARS EITHER MAP TODAY. The `forget*` exports are for a caller that genuinely knows an
 // agent is gone, and there isn't one — the pane's unmount cleanup is the wrong place twice over (it
 // fires on a project switch, and tier (d) exists to serve UNMOUNTED agents). The cost is one short
-// string per agent id opened this process. Stated plainly here so nobody reads the export as
+// string per agent id opened this process. Stated plainly here so nobody reads the exports as
 // evidence of a lifecycle that doesn't exist.
 const transcriptPaths = new Map<string, string>();
+const transcriptWorktrees = new Map<string, string>();
 
 /** Remember where this agent's session transcript lives, enabling tier (d) of the read chain.
- *  Called from AgentPane's `noteTranscriptFromStop` — see the block above. */
+ *  Called from AgentPane's `noteTranscriptFromStop` — see writer (1) in the block above. */
 export function noteAgentTranscriptPath(agentId: string, path: string): void {
   if (path.trim() === "") return;
   transcriptPaths.set(agentId, path);
 }
 
-/** Forget an agent's transcript path. No production caller today (see the block above); used by
- *  tests resetting between cases, and available for a real agent-close seam when one exists. */
+/**
+ * Remember which WORKTREE an agent runs in, so tier (d) can resolve its newest transcript at READ
+ * time — the only route for an agent with no pane and therefore no Stop events.
+ *
+ * See writer (2) in the block above for what this does and does not guarantee. Deliberately stores
+ * the directory and not a file: resolving once, at registration, is what made a long-running agent
+ * permanently one session behind.
+ */
+export function noteAgentTranscriptWorktree(agentId: string, worktreePath: string): void {
+  if (worktreePath.trim() === "") return;
+  transcriptWorktrees.set(agentId, worktreePath);
+}
+
+/** Forget an agent's transcript path AND worktree. No production caller today (see the block above);
+ *  used by tests resetting between cases, and available for a real agent-close seam when one exists. */
 export function forgetAgentTranscriptPath(agentId: string): void {
   transcriptPaths.delete(agentId);
+  transcriptWorktrees.delete(agentId);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,18 +544,31 @@ async function readHistoryTier(
 /**
  * Tier (d): the last thing the agent SAID, from Claude Code's own session transcript.
  *
- * The path comes from the REGISTRY and from nowhere else. A caller-supplied override was the one
+ * The file comes from the REGISTRY and from nowhere else — an exact path if a Stop event gave us one,
+ * otherwise the newest transcript in a registered worktree, resolved HERE rather than at registration
+ * so a long-running agent is never read one session behind. A caller-supplied override was the one
  * place in this module where an argument became a filesystem path — see the note on
  * `ReadAgentTerminalOptions` for why that is not a knob a tool argument gets to turn.
  */
 async function readTranscriptTier(agentId: string): Promise<TierResult> {
-  const path = transcriptPaths.get(agentId);
+  const path = transcriptPaths.get(agentId) ?? (await resolveWorktreeTranscript(agentId));
   if (!path) {
-    return { why: "no transcript path is known for this agent (see noteAgentTranscriptPath)" };
+    return {
+      why: "no transcript path is known for this agent (see noteAgentTranscriptPath / noteAgentTranscriptWorktree)",
+    };
   }
   const text = await invoke<string>("read_transcript_last_assistant", { path });
   if (!text || text.trim() === "") return { why: "the transcript has no assistant turn yet" };
   return { text };
+}
+
+/** Writer (2)'s half of tier (d): the newest transcript in this agent's registered worktree, or null
+ *  when it has no worktree registered — or has one Claude has not yet written a session for, which is
+ *  the normal state of a brand-new agent rather than a fault. */
+async function resolveWorktreeTranscript(agentId: string): Promise<string | null> {
+  const worktreePath = transcriptWorktrees.get(agentId);
+  if (!worktreePath) return null;
+  return (await invoke<string | null>("claude_latest_session_path", { worktreePath })) ?? null;
 }
 
 // ---------------------------------------------------------------------------------------------

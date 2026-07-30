@@ -155,19 +155,8 @@ export function claudeLatestSessionId(
   return invoke<string | null>("claude_latest_session_id", { worktreePath, configDir });
 }
 
-/** The FULL PATH of the worktree's newest Claude transcript, or null.
- *
- *  Sibling of {@link claudeLatestSessionId}, which returns only the stem: `--resume` wants the stem,
- *  a READER wants the path, and turning one into the other means re-deriving Claude Code's
- *  `<projects-root>/<slug>/` layout at the call site. The concierge's terminal module explicitly
- *  refuses to make that guess (a fabricated path fails confusingly, and the slug rule is not its to
- *  own), so the rule stays in Rust and this hands the path over whole.
- *
- *  The caller for this is an agent whose terminal pane may not be mounted — see
- *  `noteAgentTranscriptPath` in services/conciergeTools/terminal. */
-export function claudeLatestSessionPath(
-  worktreePath: string,
-  configDir?: string,
-): Promise<string | null> {
-  return invoke<string | null>("claude_latest_session_path", { worktreePath, configDir });
-}
+// NO `claudeLatestSessionPath` WRAPPER HERE, deliberately. The Rust command of that name exists (it
+// is the sibling of `claude_latest_session_id`: `--resume` wants the stem, a READER wants the path),
+// but its single caller is tier (d) of services/conciergeTools/terminal, which invokes it inline
+// alongside `read_transcript_last_assistant` — the two are one read. A wrapper here would be a second
+// name for a call this module has no other use for, and preflight is where startup CHECKS live.

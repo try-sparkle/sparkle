@@ -98,10 +98,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
         setPhase("no-claude");
         return;
       }
-      // Register this worktree's transcript so the concierge can READ this agent once the pane is
-      // unmounted (tier (d) — see services/sparkleTranscript). Fire-and-forget: it must not delay or
-      // fail a spawn.
-      void registerSparkleTranscript(agentId, wt.path);
+      // Register this worktree so the concierge can READ this agent once the pane is unmounted
+      // (tier (d) — see services/sparkleTranscript). The worktree, not a file: which session is live
+      // changes over this agent's life, so tier (d) resolves that at read time.
+      registerSparkleTranscript(agentId, wt.path);
       const resume = await claudeHasSession(wt.path).catch(() => false);
       // Consent gates what the agent may do (bead sparkle-4xwk.1). Read at prepare() time — the
       // spawned command is built here, so a consent change while a session is already running is

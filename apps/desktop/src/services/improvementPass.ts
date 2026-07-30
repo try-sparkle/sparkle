@@ -625,9 +625,12 @@ export async function runImprovementPass(
       return; // `finally` still clears the passRunning latch.
     }
     // READABLE WITHOUT A PANE. This pass has no PTY, so the concierge's live tiers are all empty for
-    // it — registering the transcript is the only thing that makes "what is Improve Sparkle doing?"
-    // answerable while an hourly pass is mid-flight. Awaited but never fatal (see the helper).
-    void registerSparkleTranscript(SPARKLE_AGENT_ID, wt.path);
+    // it — registering the worktree is the only thing that makes "what is Improve Sparkle doing?"
+    // answerable while an hourly pass is mid-flight. It is the WORKTREE and not a resolved file
+    // precisely because of where this line sits: the pass has not spawned yet, and it spawns with no
+    // `--resume`, so the newest transcript right now is the PREVIOUS pass's. Tier (d) picks the file
+    // when it reads (roborev 55363).
+    registerSparkleTranscript(SPARKLE_AGENT_ID, wt.path);
     // THE REFUSAL TEXT IS RETRACTED THE MOMENT IT STOPS BEING TRUE. Nothing else clears it, and it
     // is not merely cosmetic residue: `attentionScreen` is tier (b) of `readAgentTerminal`, so a
     // stale "can't start a pass — push that branch" would be handed to the concierge as this agent's

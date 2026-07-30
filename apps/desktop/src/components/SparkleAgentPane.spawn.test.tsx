@@ -29,6 +29,10 @@ vi.mock("../preflight", () => ({
   checkClaude: vi.fn(() => Promise.resolve({ installed: true, path: "/usr/local/bin/claude" })),
   claudeHasSession: vi.fn(() => Promise.resolve(false)),
 }));
+// Mocked to assert the WIRING. The helper's own behaviour (worktree → tier (d) → the agent's words)
+// is covered end-to-end in services/sparkleTranscript.test.ts; what was unguarded is that this pane
+// calls it at all — the suite went green with both call sites deleted (roborev 55363).
+vi.mock("../services/sparkleTranscript", () => ({ registerSparkleTranscript: vi.fn() }));
 // Keep the REAL persona/prompt builders (they're what we assert on); mock only the Tauri call.
 vi.mock("../services/sparkleAgent", async (importOriginal) => {
   const real = await importOriginal<typeof import("../services/sparkleAgent")>();
@@ -46,6 +50,7 @@ import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsSto
 // The vi.mock above spreads importOriginal, so these are the real exported constants — the
 // same ones the headless mirror asserts on, so a reword cannot desynchronize the two suites.
 import { GH_AUTH_ASK_USER, GH_AUTH_UNATTENDED_STOP } from "../services/sparkleAgent";
+import { registerSparkleTranscript } from "../services/sparkleTranscript";
 
 const LOG_DIR = "/app-data/logs/sparkle";
 
@@ -112,5 +117,14 @@ describe("SparkleAgentPane — spawn arg assembly per consent mode", () => {
     const { exec } = await spawned();
     expect(exec).toContain(`--add-dir '${LOG_DIR}'`);
     expect(exec).toContain("MUST NOT submit a PR on your own");
+  });
+
+  it("registers its WORKTREE so the concierge can still read this agent unmounted", async () => {
+    // The pane is where the user talks to this agent, and it is unmounted the moment they look
+    // anywhere else — at which point tiers (a)-(c) of the concierge's read chain are all empty for
+    // it. The worktree, not a resolved file: a fresh spawn writes a new transcript AFTER this point,
+    // so a file pinned here would be the previous session's for the whole session.
+    await spawned();
+    expect(registerSparkleTranscript).toHaveBeenCalledWith("__sparkle_self__", "/wt/sparkle-self");
   });
 });

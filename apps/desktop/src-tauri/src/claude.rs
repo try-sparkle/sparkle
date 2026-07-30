@@ -449,6 +449,64 @@ mod tests {
         claude_projects_root(None, Some(home)).unwrap()
     }
 
+    /// Stamp an explicit mtime, so "newest wins" is asserted against a KNOWN order. Writing two files
+    /// back-to-back and trusting the clock makes the assertion depend on filesystem timestamp
+    /// granularity — it would pass here and be a coin flip on a coarser one.
+    fn set_mtime(path: &Path, secs_after_epoch: u64) {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_after_epoch);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+    }
+
+    /// The concierge reads an app-owned agent through this: the FULL path of the newest transcript in
+    /// a worktree. "Newest" is what makes it correct for an agent that starts a fresh session every
+    /// pass (the improvement pass passes no `--resume`), and resolving it late — at read time — is what
+    /// keeps a long-running agent from being read one session behind (roborev 55363).
+    #[test]
+    fn claude_latest_session_path_returns_the_newest_transcript_as_a_full_path() {
+        let home = unique_home("latest-path");
+        let dir = claude_session_dir_for(&home_root(&home), "/wt/sparkle-self");
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("pass-1.jsonl");
+        let newer = dir.join("pass-2.jsonl");
+        std::fs::write(&older, b"{}\n").unwrap();
+        std::fs::write(&newer, b"{}\n").unwrap();
+        // Deliberately NOT in filename order: an implementation that sorted by name would pass a
+        // fixture where the newer file also sorts last.
+        set_mtime(&older, 2_000);
+        set_mtime(&newer, 1_000);
+        assert_eq!(
+            claude_latest_session_path_in(None, Some(&home), "/wt/sparkle-self"),
+            Some(older.to_string_lossy().into_owned())
+        );
+
+        // Now the other pass writes, as it does the moment a new session starts.
+        set_mtime(&newer, 3_000);
+        assert_eq!(
+            claude_latest_session_path_in(None, Some(&home), "/wt/sparkle-self"),
+            Some(newer.to_string_lossy().into_owned())
+        );
+    }
+
+    /// The first-ever run of an agent, and the sibling case of a directory holding non-transcripts.
+    /// Both are None rather than an error: the caller's honest answer is "nothing to read yet".
+    #[test]
+    fn claude_latest_session_path_is_none_until_a_transcript_exists() {
+        let home = unique_home("latest-path-empty");
+        // No project directory at all.
+        assert_eq!(claude_latest_session_path_in(None, Some(&home), "/wt/fresh"), None);
+
+        // Directory exists, but nothing in it is a transcript.
+        let dir = claude_session_dir_for(&home_root(&home), "/wt/fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("subdir.jsonl")).unwrap();
+        assert_eq!(claude_latest_session_path_in(None, Some(&home), "/wt/fresh"), None);
+
+        // And with no home and no config dir there is no root to scan.
+        assert_eq!(claude_latest_session_path_in(None, None, "/wt/fresh"), None);
+    }
+
     #[test]
     fn claude_projects_root_treats_an_empty_config_dir_as_unset() {
         let home = Path::new("/home/me");

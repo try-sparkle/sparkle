@@ -12,7 +12,10 @@ const harness = vi.hoisted(() => ({
   // Per-test overrides, keyed by COMMAND/EVENT NAME (not call order, so a future extra
   // invoke/listen in the pass preamble can't silently absorb a planted rejection). Reset in
   // beforeEach; return undefined to fall through to the default behavior.
-  invokeImpl: undefined as ((cmd: string) => Promise<void> | undefined) | undefined,
+  // Takes `args` and may resolve a VALUE, not just void: the transcript-read assertions below need a
+  // command's return (a resolved path, a transcript's text), which the default `Promise.resolve()`
+  // cannot express.
+  invokeImpl: undefined as ((cmd: string, args?: unknown) => Promise<unknown> | undefined) | undefined,
   listenImpl: undefined as ((name: string) => Promise<() => void> | undefined) | undefined,
   // Same override shape for the fresh-base parking step, so a test can make it reject. Typed as the
   // service's own ParkOutcome, not `unknown`: the pass reads `park.parked` / `park.reason`, so a
@@ -25,7 +28,7 @@ const harness = vi.hoisted(() => ({
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((cmd: string, args?: unknown) => {
     harness.invokes.push({ cmd, args });
-    return harness.invokeImpl?.(cmd) ?? Promise.resolve();
+    return harness.invokeImpl?.(cmd, args) ?? Promise.resolve();
   }),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -74,6 +77,7 @@ import {
   SPARKLE_PROJECT_ID,
 } from "./sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { forgetAgentTranscriptPath, readAgentTerminal } from "./conciergeTools/terminal";
 
 /** Let the pass's async preamble (preflight → repo → worktree → listeners → invoke) settle
  *  under fake timers: drain microtasks until the run invoke has been recorded. */
@@ -101,6 +105,10 @@ function resetHarness() {
   vi.clearAllMocks();
   resetPassRetryForTests();
   useRuntimeStore.getState().setStatus(SPARKLE_AGENT_ID, "stopped");
+  useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, "");
+  // The transcript registry is module-level state that OUTLIVES a test, so a pass in one case would
+  // otherwise leave this agent readable in the next — which is precisely the assertion below.
+  forgetAgentTranscriptPath(SPARKLE_AGENT_ID);
 }
 
 /** The two warnings the park guard can emit, quoted from improvementPass.ts. Shared so the positive
@@ -805,5 +813,63 @@ describe("connectivity re-attempt", () => {
       cmd === "sparkle_improve_run" ? Promise.reject(new Error("getaddrinfo ENOTFOUND")) : undefined;
     await runImprovementPass("always", true);
     expect(passRetryDueAt()).toBe(Date.now() + IMPROVEMENT_RETRY_MS);
+  });
+});
+
+// THE WIRING, not the helper. `services/sparkleTranscript` had its own unit tests and the whole suite
+// still went green with BOTH of its call sites deleted (roborev 55363) — the vacuous shape AGENTS.md
+// calls the #1 fleet-wide finding. What has to hold is the end-to-end fact the user asked for: while
+// an hourly pass is running, with no pane and no PTY anywhere, `read_agent_terminal` on the Improve
+// Sparkle agent returns what that agent is saying.
+describe("readable while a headless pass runs", () => {
+  const TRANSCRIPT = "/home/u/.claude/projects/-wt-sparkle-self/this-pass.jsonl";
+  const SAID = "I looked at the logs and I'd prioritise the park refusal.";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHarness();
+    // A worktree Claude has run in: the resolve answers, and the transcript has an assistant turn.
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "claude_latest_session_path") return Promise.resolve(TRANSCRIPT);
+      if (cmd === "read_transcript_last_assistant") return Promise.resolve(SAID);
+      return undefined;
+    };
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("answers a concierge read from the transcript once the pass has started", async () => {
+    // Nothing is readable before the pass — no pane, no ask-screen, no registration.
+    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).source).toBe("none");
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    const read = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(read.source).toBe("transcript");
+    expect(read.text).toContain("park refusal");
+
+    // …and the file was found via THE PASS'S OWN worktree, not a path derived from the agent id.
+    expect(harness.invokes).toEqual(
+      expect.arrayContaining([
+        { cmd: "claude_latest_session_path", args: { worktreePath: "/wt/sparkle-self" } },
+      ]),
+    );
+
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "done" } });
+    await pass;
+  });
+
+  it("stays unreadable when the pass refuses to start", async () => {
+    // A refusal returns before the registration, and must not leave the agent looking readable —
+    // tier (b) carries the refusal text in that case, which is the honest answer.
+    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+    await withWarnSpy(async () => {
+      await runImprovementPass("always");
+    });
+    expectNoRunInvoked();
+    expect((await readAgentTerminal(SPARKLE_AGENT_ID)).source).toBe("attention-screen");
+    expect(harness.invokes.map((c) => c.cmd)).not.toContain("claude_latest_session_path");
   });
 });
