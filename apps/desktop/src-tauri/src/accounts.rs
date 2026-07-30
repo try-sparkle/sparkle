@@ -1883,14 +1883,23 @@ mod tests {
 
     // ── Event-loop offload guards ───────────────────────────────────────────────────────────────
     //
-    // A non-async `#[tauri::command]` runs INLINE on the Tauri event-loop thread. These four all do
-    // real blocking filesystem work — `accounts_usage` walks every account's transcript tree and
-    // `accounts_identities` opens `accounts.json` PLUS every account's own `.claude.json` — so
-    // running them inline would freeze the UI. The coercion only type-checks while the command
-    // returns a future: revert a `pub async fn` to `pub fn` and its return type becomes a plain
-    // `Result`/`bool`, which is not a `Future`, and the build breaks here. Every other test in this
-    // module drives the pure `*_at` / `*_sync` cores, so without these guards a revert to inline
-    // blocking IO would pass silently.
+    // EVERY `async` `#[tauri::command]` in this module is asserted below. Add a new one and add its
+    // assertion here — this comment is the ENTIRE maintenance contract, because nothing else
+    // enforces the count.
+    //
+    // Say it exactly once, and here. An earlier version of this header enumerated "these four" with
+    // their individual IO justifications while the test ten lines below claimed to be exhaustive:
+    // two inventory statements that disagreed, with no way to tell which governed. That is not a
+    // cosmetic problem — it is the artifact that let three heavy scanners go unguarded in the first
+    // place (roborev 55742, then 55762 for the half-applied fix). Per-command justifications now
+    // live inline next to their assertions, so there is one inventory, in one place.
+    //
+    // Why it matters: a non-async `#[tauri::command]` runs INLINE on the Tauri event-loop thread, so
+    // a command doing real blocking filesystem work would freeze the UI. The coercion only
+    // type-checks while the command returns a future: revert a `pub async fn` to `pub fn` and its
+    // return type becomes a plain `Result`/`bool`, which is not a `Future`, and the build breaks
+    // here. Every other test in this module drives the pure `*_at` / `*_sync` cores, so without
+    // these guards such a revert would pass silently.
     //
     // The commands taking an `AppHandle` can't be *invoked* without a running Tauri app, but the
     // guard is a compile-time check and needs no instance.
@@ -1906,10 +1915,12 @@ mod tests {
         // to `pub fn` still compiled and the whole suite stayed green. That is precisely the
         // regression this test exists to prevent (roborev 55742).
         assert_async_command(accounts_list);
+        // Walks every account's transcript tree.
         assert_async_command(accounts_usage);
+        // Opens `accounts.json` PLUS every account's own `.claude.json`.
         assert_async_command(accounts_identities);
         assert_async_command(claude_signed_in);
-        // Heavy filesystem scanners — each walks every account's transcript tree.
+        // Also transcript-tree scanners.
         assert_async_command(accounts_spend);
         assert_async_command(accounts_limit_events);
         // Documented in-module as "the heaviest read in this module by a wide margin".
