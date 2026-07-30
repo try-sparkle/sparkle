@@ -78,9 +78,14 @@
 // Every one of those was a mapping from parsed text back to source. Matching the source directly
 // deletes the mapping, so there is no invariant left to be wrong about — which is why this is a
 // deletion and not a fourth translation. What remains is one narrow, stated tolerance:
-// {@link FILE_REF_RE} accepts a `\` before each path character, so an escaped path is detected and
-// masked by the same pattern. An ENTITY inside a path (`src/retry&#46;ts:88`) is still not
-// detected; that is a documented false negative, in the direction this check always chooses.
+// {@link FILE_REF_RE} accepts a `\` before each path character AND an HTML entity in place of one,
+// so both an escaped and an entity-encoded path are detected and masked by the same pattern.
+//
+// ENTITIES ARE COVERED FOR THE SAME REASON THE SEPARATORS ARE (roborev 55875). Calling this a
+// self-contained "documented false negative" was wrong: an unmatched reference is also UNMASKED, so
+// on `Fixed src/retry&#46;ts:12 and src/b.ts:9` the first reference survives masking and its own
+// segments ("Fixed", "src", "retry", "ts", "and") clear the four-word bar for the SECOND reference —
+// silencing `src/b.ts:9`, which is bare and genuinely naked. A miss here never costs only itself.
 //
 // ══ A TABLE ROW IS NOT A SENTENCE, SO THE CHECK SKIPS IT ═══════════════════════════════════════
 // The bar of four words is calibrated for prose, and a table cell is terse BY CONSTRUCTION — that
@@ -134,7 +139,7 @@ export const DEFAULT_MIN_EXPLANATION_WORDS = 4;
  * bar. Detection and masking are the same regex precisely so they cannot disagree like that.
  */
 export const FILE_REF_RE =
-  /(?:(?:\\?[A-Za-z0-9_.@-])+\\?\/)+(?:\\?[A-Za-z0-9_.@-])+\\?\.[A-Za-z][A-Za-z0-9]*\\?:\d+(?:\\?[:-]\d+)?/g;
+  /(?:(?:\\?[A-Za-z0-9_.@-]|&#?[A-Za-z0-9]{1,8};)+(?:\\?\/|&#?[A-Za-z0-9]{1,8};))+(?:\\?[A-Za-z0-9_.@-]|&#?[A-Za-z0-9]{1,8};)+(?:\\?\.|&#?[A-Za-z0-9]{1,8};)[A-Za-z][A-Za-z0-9]*(?:\\?:|&#?[A-Za-z0-9]{1,8};)\d+(?:\\?[:-]\d+)?/g;
 
 /** What a reference is replaced by before words are counted: a private-use character, written as an
  *  escape so it is visible in the source. It cannot match {@link WORD_RE}, so a reference's own

@@ -197,7 +197,10 @@ describe("nakedFileRefCheck", () => {
     // ("src", "a", "ts") were counted as explanation for the second reference and pushed it over the
     // bar — silencing a reference that is genuinely naked. With both masked, "Fixed" and "and" are
     // all that remain, and both references are correctly reported.
-    expect(run("Fixed src/a\\.ts:12 and src/b.ts:9").violations.length).toBeGreaterThan(0);
+    // EXACT, not toBeGreaterThan(0) (roborev 55875): the weaker form passes on the very regression
+    // it guards — if src/b.ts:9 stopped being reported while the escaped one still was, the count is
+    // 1 and the test stays green. The property is that BOTH fire once masking works.
+    expect(run("Fixed src/a\\.ts:12 and src/b.ts:9").violations).toHaveLength(2);
   });
 
   it("does not resolve an escaped reference onto a different identical occurrence", () => {
@@ -208,8 +211,19 @@ describe("nakedFileRefCheck", () => {
     expect(run(reply).violations).toHaveLength(1);
   });
 
-  it("does not detect a path whose characters are entity-encoded — the documented miss", () => {
-    expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
+  // WAS a pinned false negative; it is now DETECTED (roborev 55875). The miss was never
+  // self-contained: an unmatched reference is also unmasked, so its segments explained away a
+  // different, genuinely naked reference on the same line.
+  it("detects a path whose characters are entity-encoded", () => {
+    for (const ref of ["See src/retry&#46;ts:88", "See src&#47;retry.ts:88", "See src/retry&period;ts:88"]) {
+      expect(run(ref).violations, `must detect: ${ref}`).toHaveLength(1);
+    }
+  });
+
+  it("masks an entity-encoded reference so it cannot explain a DIFFERENT one on the same line", () => {
+    // The compounding case the doc used to deny: unmasked, "Fixed src retry ts and" clears the
+    // four-word bar and silences src/b.ts:9, which is bare. Both must fire.
+    expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toHaveLength(2);
   });
 
   it("resolves repeated identical references to their own occurrences", () => {
