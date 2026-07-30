@@ -96,6 +96,7 @@ import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { routeMessage } from "../services/conciergeRouter";
 import {
+  isSparkleMention,
   mentionFreeText,
   mentionRoster,
   mentionsIn,
@@ -2150,9 +2151,30 @@ export function ConciergeHost({
       // fails to resolve and the message falls back to the auto-router — the recoverable direction,
       // and the same answer `deliver` gives when an aim goes missing mid-flight.
       const named = mentions?.[0];
-      const mentionedAgent = named
-        ? mentionAgentsRef.current.find((a) => a.id === named.agentId)
-        : undefined;
+      // ══ @Sparkle IS A REAL DESTINATION, NOT AN UNRESOLVABLE NAME ════════════════════════════════
+      // The concierge is a first-class target of this box — `mentionRoster` offers `@Sparkle` in the
+      // picker, and dictating the word "Sparkle" inserts that pill — but the concierge is not a FEED
+      // agent, so looking it up in `mentionAgentsRef` was always going to miss. It fell through as
+      // "named nobody", which is a lie about a name the user explicitly chose from a picker.
+      //
+      // Recognised here and routed deterministically to Sparkle below (bead sparkle-kaz1l). This is
+      // the founder's rule — "an explicit address routes THAT message, everything else follows the
+      // mount" — and it is the reason the concierge had to become a roster citizen rather than a
+      // special case downstream: a special case leaves the next surface with the same hole.
+      const conciergeAddressed = named ? isSparkleMention(named) : false;
+      const mentionedAgent =
+        named && !conciergeAddressed
+          ? mentionAgentsRef.current.find((a) => a.id === named.agentId)
+          : undefined;
+      // NO GUARD HERE FOR "named but unresolvable", deliberately, and it is worth saying why since it
+      // is the obvious thing to add. `named` exists only when the COMPOSER's roster recognised the
+      // span, and this lookup uses the same feed — one render, one source — so a recognised name is
+      // always found. A name matching nobody never becomes a mention at all; it stays prose and goes
+      // to the router (see "falls back to the router when the name matches nobody in the fleet").
+      // `@Sparkle` was the sole exception, because `mentionRoster` appends the concierge for the
+      // picker while `mentionAgents` does not carry it — which is exactly the bug fixed above, not a
+      // class of bug needing a general fallback. The resolvable-but-unreachable case (agent closed or
+      // cloud) does have a voice: `deliver`'s `addressed && !addressable` explains it by name.
       // Same courtesy the agent composer extends: honor the pause-on-submit voice setting so the
       // mic does not keep transcribing the room while the send is handled.
       //
@@ -2255,10 +2277,47 @@ export function ConciergeHost({
       ]);
       // Remember BOTH: a redirect to the agent must replay the payload (paths included), a redirect
       // to Sparkle must replay the plain text.
+      //
+      // ══ THE REMEMBERED PAYLOAD IS MENTION-FREE, BECAUSE IT IS A WIRE INTO A PTY ═════════════════
+      // `redirect`'s "Also ask <agent>" hands this exact string to `promptAgent`, and that is the
+      // THIRD way this box reaches a live terminal — the one that does not go through `mentionAim`.
+      // So the `@…`-stripping that the addressed path gets for free never applied to a replay, and
+      // any mentioned message redirected into an agent typed the sigil verbatim into a Claude Code
+      // CLI, where a leading `@` opens its file-reference autocomplete and strands the instruction
+      // behind a picker the user never asked for (bead sparkle-kaz1l).
+      //
+      // `@Sparkle` was the sharp edge — it always falls to Sparkle, so its receipt always offers the
+      // redirect — but the hazard was never specific to it: `@Kraken Auth` redirected to a different
+      // agent carried its sigil too. Stripped HERE, once, at the point the replay is recorded, rather
+      // than at the two call sites that consume it, so a fourth consumer cannot reintroduce it.
+      //
+      // The DISPLAY copy (`sentTextRef`) keeps its names: it feeds the bubble and the Sparkle-bound
+      // replay, neither of which is a terminal, and the names are content the user wrote.
       rememberSentText(sentTextRef.current, id, text);
-      rememberSentText(sentPayloadRef.current, id, payload);
+      rememberSentText(
+        sentPayloadRef.current,
+        id,
+        mentions?.length
+          ? attachedPayload(mentionFreeText(text, rosterFromMentions(mentions)), staged)
+          : payload,
+      );
       return enqueue(
-        () => deliver(id, text, payload, display, submitted, staged, forceSparkle, mentionAim),
+        () =>
+          deliver(
+            id,
+            text,
+            payload,
+            display,
+            submitted,
+            staged,
+            // `@Sparkle` forces the concierge route exactly as the capture window's Chat does. It is
+            // deterministic and zero-cost: the user named the destination, so there is nothing for
+            // the router to classify and no reason to spend a call on it. Critically this also stops
+            // `submitted` — still the MOUNTED/selected agent, deliberately, because an explicit
+            // address must not drop the mount — from being handed to `routeMessage` as a candidate.
+            forceSparkle || conciergeAddressed,
+            mentionAim,
+          ),
         false,
       );
     },

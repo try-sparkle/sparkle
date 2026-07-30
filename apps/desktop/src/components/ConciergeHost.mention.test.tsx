@@ -452,3 +452,61 @@ describe("ConciergeHost — a message that names a SECOND agent", () => {
     await waitFor(() => expect(screen.getAllByTestId("concierge-mention-pill")).toHaveLength(2));
   });
 });
+
+// ══ @Sparkle IS A DESTINATION, AND ITS SIGIL MUST NEVER REACH A TERMINAL ══════════════════════════
+//
+// Bead sparkle-kaz1l. Dictating the word "Sparkle" inserts an `@Sparkle` pill (the founder asked for
+// speech and typing to produce the same thing), and `mentionRoster` offers `@Sparkle` in the picker —
+// but the concierge is not a FEED agent, so resolving that mention against the feed roster always
+// missed. The message fell through as "named nobody".
+//
+// THE REACHABLE HARM WAS THE REDIRECT, NOT THE ROUTER. `routeMessage` can no longer return
+// `target: "agent"` at all (see conciergeRouter's header), so an @Sparkle message was never
+// misrouted by classification. But it always lands on Sparkle, so its receipt always offers
+// "Also ask <agent>" — and `redirect` replays the REMEMBERED PAYLOAD straight into `promptAgent`,
+// the one wire into a PTY that never passed through `mentionAim`'s stripping. One tap typed
+// `@Sparkle what is the status?` into a Claude Code CLI, where the leading `@` opens its
+// file-reference autocomplete and strands the instruction behind a picker nobody asked for.
+//
+// So there are two assertions worth making, and the second is the one that would have caught it.
+describe("ConciergeHost — @Sparkle addresses the concierge", () => {
+  it("never dispatches to an agent, however the router is feeling", async () => {
+    // The router is pointed AT the agent to prove the address wins deterministically. In production
+    // `routeMessage` cannot say "agent", so this is a stricter fixture than reality — the point is
+    // that @Sparkle does not depend on that guarantee holding.
+    h.routeMessage.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
+  it("does not spend a router call on a destination the user stated", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    expect(h.routeMessage).not.toHaveBeenCalled();
+  });
+
+  // THE ONE THAT CATCHES THE BUG. Send to Sparkle, then take the receipt's own redirect into a real
+  // agent — the exact two taps a user makes — and assert on the bytes that reached the dispatcher.
+  it("carries NO @ into the terminal when its receipt is redirected to an agent", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    const redirect = await waitFor(() =>
+      screen.getByRole("button", { name: /^Also ask / }),
+    );
+    await act(async () => {
+      fireEvent.click(redirect);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    const wire = h.dispatchConciergeAnswer.mock.calls[0]![1] as string;
+    // The instruction survives; only the sigil is gone. Asserting the absence of "@" ALONE would
+    // pass against a wire that lost the whole sentence, which is the other way to strand it.
+    expect(wire).not.toContain("@");
+    expect(wire).toContain("what is the status of the build?");
+  });
+});
