@@ -7,6 +7,7 @@
 // openProjectTab, and that cycle would otherwise run through this function.
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { sideOf } from "../engine/pairs";
 import { useUiStore } from "../stores/uiStore";
 import { markProjectOpen } from "./projectTabs";
 
@@ -60,7 +61,10 @@ export function selectAndOpen(projectId: string, agentId: string): boolean {
   useUiStore.getState().setActiveSpecial(null);
   // Every agent's pane is a terminal now, surfaced under the Build chevron — switch to it so the
   // revealed agent is actually shown (rather than sitting behind the Plan board).
-  useUiStore.getState().setWorkMode("build");
+  // THE REVEALED AGENT'S OWN COLUMN. Switching a window-global mode used to yank whichever pair
+  // happened to render the board out of Plan; the agent lives in exactly one pair, and that is the
+  // only one whose chevron this reveal has any business moving.
+  useUiStore.getState().setWorkMode(sideOf(useUiStore.getState().pairAssignment, projectId), "build");
   useRuntimeStore.getState().open(agentId);
   useProjectStore.getState().selectAgent(projectId, agentId);
   return true;

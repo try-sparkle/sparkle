@@ -171,7 +171,7 @@ beforeEach(() => {
     statusFilter: allBands(),
     collapsedOrchestrators: {},
     autoExpandedOrchestrators: {},
-    workMode: "build",
+    workModeBySide: { left: "build", right: "build" },
     activeSpecial: null,
     openProjectIds: null,
     pinnedProjectId: null,
@@ -597,10 +597,75 @@ describe("orchestrator subtrees", () => {
 
 // ── chevron ──────────────────────────────────────────────────────────────────────────────────
 describe("setWorkMode", () => {
+  // "Show me the board" is TWO writes — the mode, and making the Improve-Sparkle pane yield, since
+  // Workspace gates the board on `!sparkleActive`. This op reported success while the stage was
+  // unchanged, and `reconcileWorkMode` bails on its first line whenever a special is up, so nothing
+  // recovered it. The docstring asserted that reconciler would handle it; it is the one thing that
+  // could not (roborev 55878).
+  // THE ALREADY-IN-PLAN CASE, which is how a user actually reaches this state: open the board,
+  // then click Improve Sparkle — `onSelectSparkle` never touches the mode, so the column stays in
+  // Plan while the pane covers its board. A mode-equality no-op check refuses here and reports
+  // "nothing to do" about a view that is not on screen, while the chevron (which calls
+  // openPlanBoard unconditionally) recovers it — same request, two answers.
+  it("recovers a covered board even though the column is ALREADY in Plan", () => {
+    useUiStore.setState({
+      workModeBySide: { left: "build", right: "plan" },
+      activeSpecial: "sparkle",
+    } as never);
+
+    const v = value(setWorkMode("plan"));
+
+    expect(v.priorWorkMode).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
+  // THE MIRROR, and the more common state of the two: "build" is the default, and selecting
+  // Improve Sparkle never touches the mode — so a column sitting in Build with the pane over its
+  // terminal is the ordinary case. Gating the visibility question on `mode === "plan"` fixed one
+  // branch of a symmetric problem and left this one refusing "already in build mode" about a stage
+  // that is not on screen. It also matters because no other concierge tool means "leave Improve
+  // Sparkle" without also selecting an agent.
+  it("recovers a covered Build stage even though the column is ALREADY in Build", () => {
+    useUiStore.setState({
+      workModeBySide: { left: "build", right: "build" },
+      activeSpecial: "sparkle",
+    } as never);
+
+    const v = value(setWorkMode("build"));
+
+    expect(v.priorWorkMode).toBe("build");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+  });
+
+  // ...and it is still a genuine no-op when the board IS the visible surface, so an idempotent
+  // request does not start reporting success for work it did not do.
+  it("still refuses as a no-op when the column is in Plan and the board is showing", () => {
+    useUiStore.setState({
+      workModeBySide: { left: "build", right: "plan" },
+      activeSpecial: null,
+    } as never);
+
+    const r = setWorkMode("plan");
+
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("no-op");
+  });
+
+  it("makes the Improve-Sparkle pane yield when it switches a column INTO Plan", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+
+    const v = value(setWorkMode("plan"));
+
+    expect(v.workMode).toBe("plan");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
   it("switches the chevron and reports the mode it replaced", () => {
     const v = value(setWorkMode("plan"));
     expect(v).toEqual({ priorWorkMode: "build", workMode: "plan" });
-    expect(useUiStore.getState().workMode).toBe("plan");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
   });
 
   it("leaves the pane's overlay to the sidebar's own reconciler", () => {
@@ -621,7 +686,7 @@ describe("setWorkMode", () => {
         expect(bad.message).toContain("plan");
       }
     }
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 });
 
@@ -655,16 +720,16 @@ describe("revealRow", () => {
 // ── selection: the one disruptive op ─────────────────────────────────────────────────────────
 describe("selectRow", () => {
   it("lands the human on the row — selection, pane, chevron, overlay and scroll", () => {
-    useUiStore.setState({ activeSpecial: "board", workMode: "plan" } as never);
+    useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "plan" } } as never);
     const v = value(selectRow("b3"));
     expect(v.agentId).toBe("b3");
     expect(v.projectId).toBe("p1");
     expect(v.priorWorkMode).toBe("plan");
-    expect(v.priorActiveSpecial).toBe("board");
+    expect(v.priorActiveSpecial).toBe("sparkle");
     expect(v.switchedProject).toBe(false);
     const ui = useUiStore.getState();
     expect(ui.activeSpecial).toBeNull();
-    expect(ui.workMode).toBe("build");
+    expect(ui.workModeBySide.right).toBe("build");
     expect(ui.revealAgentId).toBe("b3");
     expect(proj("p1").selectedAgentId).toBe("b3");
     expect(useRuntimeStore.getState().openAgentIds).toContain("b3");

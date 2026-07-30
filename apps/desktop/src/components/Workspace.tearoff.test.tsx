@@ -154,7 +154,7 @@ beforeEach(() => {
   useRuntimeStore.setState({ openAgentIds: ["a1", "b1"], status: {} } as never);
   useUiStore.setState({
     activeSpecial: null,
-    workMode: "build",
+    workModeBySide: { left: "build", right: "build" },
     pinnedProjectId: null,
     // Closable tabs: `null` = never seeded, i.e. every project is open. Reset per test so one
     // block's close can't decide another's tab bar (uiStore is a module singleton).

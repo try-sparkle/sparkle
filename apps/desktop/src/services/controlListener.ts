@@ -21,6 +21,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
+import { sideOf } from "../engine/pairs";
 import {
   useRuntimeStore,
   mergeOpenAgentIds,
@@ -1427,8 +1428,24 @@ function handleSetZoom(req: ControlRequest): Record<string, unknown> {
  *  agent (runtimeStore.open), selects it, and clears the special view. Global. Privileged. */
 function handleNavigate(req: ControlRequest): Record<string, unknown> {
   const view = req.payload.view;
-  if (view === "sparkle" || view === "board") {
+  if (view === "sparkle") {
     useUiStore.getState().setActiveSpecial(view);
+    return { ok: true };
+  }
+  // "board" IS STILL A VALID VIEW ON THE WIRE — the contract is frozen and mirrored in bridge.rs
+  // CONTROL_OPS and apps/mcp-control, so it must keep working. What changed is underneath: the
+  // board is per-column state now, not a window-global special view, so this projects the request
+  // onto the column the scoped project actually occupies rather than setting one global that the
+  // primary pair was the only reader of.
+  if (view === "board") {
+    const ui = useUiStore.getState();
+    const { projects, selectedProjectId } = useProjectStore.getState();
+    const scoped = projects.find((p) => p.id === selectedProjectId) ?? null;
+    // openPlanBoard, not setWorkMode: this op means "show me the board", and with the Sparkle pane
+    // up a bare mode write moves the chevron while the stage keeps showing Sparkle — and still
+    // returns ok. Before the per-column split this path wrote `activeSpecial = "board"`, which
+    // REPLACED "sparkle"; the split is what dropped that, so this is a regression, not a gap.
+    ui.openPlanBoard(sideOf(ui.pairAssignment, scoped?.id ?? ""));
     return { ok: true };
   }
   if (view === "agent") {

@@ -120,9 +120,10 @@ export function openProjectTab(projectId: string, agentId?: string | null): bool
   // means. (The agent branch below is different — a reveal has to SHOW the agent, so selectAndOpen
   // leaves every overlay, board included, and switches to Build.)
   //
-  // The two states have to move together: `boardActive` requires `activeSpecial === "board"`, so
-  // dropping the Sparkle pane while `workMode` is still "plan" would leave Plan selected with a
-  // Build pane on screen — a chevron that lies about what you are looking at (roborev 46291-L).
+  // The two states have to move together: a column's board IS its `workMode === "plan"`, so
+  // dropping the Sparkle pane while this project's column is still in Plan would leave Plan
+  // selected with a Build pane on screen — a chevron that lies about what you are looking at
+  // (roborev 46291-L). Scoped to the column this project actually occupies.
   //
   // UNCONDITIONAL, including when `projectId` is already selected. "Am I already on that tab?" is
   // not answerable from an id here: `addProject` selects the project it creates, so the add/clone
@@ -132,7 +133,8 @@ export function openProjectTab(projectId: string, agentId?: string | null): bool
   // that before calling in (components/ProjectTabsBar).
   if (ui.activeSpecial === "sparkle") {
     ui.setActiveSpecial(null);
-    if (ui.workMode === "plan") ui.setWorkMode("build");
+    const side = sideOf(ui.pairAssignment, projectId);
+    if (ui.workModeBySide[side] === "plan") ui.setWorkMode(side, "build");
   }
   // With an agent asked for, the reveal is the point: a tab selection alone, while the agent the
   // caller named is gone, is not "it worked". Without one, selecting the tab IS the whole job.

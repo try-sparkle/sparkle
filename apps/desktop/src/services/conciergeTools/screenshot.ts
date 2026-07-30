@@ -58,6 +58,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { useProjectStore } from "../../stores/projectStore";
+import { sideOf } from "../../engine/pairs";
 import { useUiStore } from "../../stores/uiStore";
 import { TERMINAL_STAGE_DND_TARGET } from "../dndTargets";
 
@@ -206,10 +207,15 @@ export function paneBlocker(agentId: string): PaneBlocker | null {
   if (state.selectedProjectId !== project.id) {
     return { kind: "project-not-selected", projectName: project.name ?? "that project" };
   }
-  // A special view (Improve Sparkle, the board) is stacked over the same stage, so the panes are
-  // there but nothing of the agent is painted.
-  const special = useUiStore.getState().activeSpecial;
-  if (special) return { kind: "special-view-showing", special };
+  // A full-stage view is over the same stage, so the panes are there but nothing of the agent is
+  // painted. TWO sources now, not one: the Improve-Sparkle pane is still window-global, while the
+  // Plan board belongs to the column this agent's project occupies. Reading only `activeSpecial`
+  // would photograph a board and report it as the agent's terminal.
+  const ui = useUiStore.getState();
+  if (ui.activeSpecial) return { kind: "special-view-showing", special: ui.activeSpecial };
+  if (ui.workModeBySide[sideOf(ui.pairAssignment, project.id)] === "plan") {
+    return { kind: "special-view-showing", special: "board" };
+  }
   if (project.selectedAgentId !== agentId) return { kind: "another-agent-showing" };
   return null;
 }

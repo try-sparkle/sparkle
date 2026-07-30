@@ -17,6 +17,7 @@ import { safeUnlisten } from "../services/safeUnlisten";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import type { PairSide } from "../engine/cable";
 import { useUiStore } from "../stores/uiStore";
 import { useShallow } from "zustand/react/shallow";
 import { sendToBuild, sendToBuildBlockedReason } from "../services/sendToBuild";
@@ -92,7 +93,10 @@ const NO_AGENTS: AgentTab[] = [];
  * Delivered) as columns of cards. Clicking a card opens a detail overlay. There are deliberately
  * no drag handles, status dropdowns, or any edit controls — nothing here mutates a bead.
  */
-export function BoardView({ project }: { project: Project }) {
+// `side` is REQUIRED, deliberately. It defaulted to "right" for one commit and that is precisely
+// how the satellite's board silently read a different column than its own sidebar wrote — a
+// required prop surfaces every call site at compile time instead.
+export function BoardView({ project, side }: { project: Project; side: PairSide }) {
   const snapshot = useBeadsStore((s) => s.byProject[project.id]);
   const error = useBeadsStore((s) => s.error[project.id]);
   // Which bead's detail overlay is open (null = none). Cleared when the board unmounts.
@@ -205,7 +209,10 @@ export function BoardView({ project }: { project: Project }) {
   // Client-side: we narrow the ALREADY-bucketed columns rather than re-querying, so the poll and the
   // store's fetch are untouched and the 5-column bucketing stays intact. Unlike boardFocusBeadId this
   // filter PERSISTS across polls (it is a view mode, not a one-shot) — cleared by the banner's Clear.
-  const boardAgentFilter = useUiStore((s) => s.boardAgentFilter);
+  // THIS COLUMN'S filter. Two boards can be mounted at once (one per pair), and a single global
+  // string had both of them narrowing to whatever the last pill clicked — including across two
+  // different projects. See uiStore.boardAgentFilterBySide.
+  const boardAgentFilter = useUiStore((s) => s.boardAgentFilterBySide[side]);
   const displayBoard = useMemo(() => {
     if (!board || !boardAgentFilter) return board;
     const label = `agent:${boardAgentFilter}`;
@@ -276,7 +283,7 @@ export function BoardView({ project }: { project: Project }) {
           <span style={{ color: C.muted }}>·</span>
           <button
             type="button"
-            onClick={() => useUiStore.getState().setBoardAgentFilter(null)}
+            onClick={() => useUiStore.getState().setBoardAgentFilter(side, null)}
             style={{
               background: "transparent",
               border: "none",

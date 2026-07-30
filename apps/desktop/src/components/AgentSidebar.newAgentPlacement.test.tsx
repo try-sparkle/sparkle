@@ -36,7 +36,7 @@ const project: Project = {
 beforeEach(() => {
   useSettingsStore.getState().setAllAiFeatures(true);
   useAuthStore.setState({ me: entitledMe, tokenPresent: true, loading: false });
-  useUiStore.setState({ workMode: "build" });
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" } });
 });
 afterEach(() => cleanup());
 

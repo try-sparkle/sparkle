@@ -1238,15 +1238,30 @@ describe("controlListener", () => {
     fire({ reqId: "nav1", op: "navigate", callerAgentId: callerId, payload: { view: "board" } });
     await flush();
     expect(lastReply()).toEqual({ ok: true });
-    expect(useUiStore.getState().activeSpecial).toBe("board");
+    // The wire contract still accepts "board"; underneath it now opens the scoped project's own
+    // column rather than setting a window-global special view.
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
 
     fire({ reqId: "nav2", op: "navigate", callerAgentId: otherId, payload: { view: "sparkle" } });
     await flush();
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  // Same two-write rule as the chevron and the concierge tool: `navigate {view:"board"}` means
+  // "show me the board", and before the per-column split it wrote `activeSpecial = "board"`, which
+  // REPLACED "sparkle". The split dropped that, so a bare mode write left the Sparkle terminal on
+  // screen while the op returned ok (roborev 55878).
+  it("navigate to the board makes the Improve-Sparkle pane yield", async () => {
+    useUiStore.getState().setActiveSpecial("sparkle");
+    fire({ reqId: "navb", op: "navigate", callerAgentId: callerId, payload: { view: "board" } });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
   it("navigate to an agent opens+selects it and clears the special view", async () => {
-    useUiStore.getState().setActiveSpecial("board");
+    useUiStore.getState().setActiveSpecial("sparkle");
     fire({ reqId: "nav3", op: "navigate", callerAgentId: callerId, payload: { view: "agent", agentId: otherId } });
     await flush();
     expect(lastReply()).toEqual({ ok: true });

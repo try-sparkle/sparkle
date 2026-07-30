@@ -15,8 +15,10 @@
 //     so in a long column the row they selected could sit below the fold.
 //
 // The four steps are not independently optional, which is the whole argument for one function:
-//   1. setActiveSpecial(null) — leave the Plan board / Improve-Sparkle pane. Selecting an agent
-//      while a special view is up changes NOTHING on screen; the special view owns the pane.
+//   1. Leave the Plan board AND the Improve-Sparkle pane. Selecting an agent while either is up
+//      changes NOTHING on screen; whichever is up owns the pane. These are two separate pieces of
+//      state now — the board is the target column's own `workMode`, not the window-global
+//      `activeSpecial` — so this step has to clear BOTH or the board half silently stops working.
 //   2. selectAgent            — decide which pane renders.
 //   3. open                   — mount that pane / drive the PTY launch.
 //   4. requestRevealAgent     — scroll the row on screen (AgentSidebar's AgentRow consumes it).
@@ -32,6 +34,7 @@
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { sideOf } from "../engine/pairs";
 
 /**
  * Put `agentId` in front of the user: leave any special view, select it, open it, and scroll its
@@ -42,7 +45,10 @@ import { useUiStore } from "../stores/uiStore";
  * phantom id would scroll to a row that does not exist.
  */
 export function landInAgent(projectId: string, agentId: string): void {
-  useUiStore.getState().setActiveSpecial(null);
+  const ui = useUiStore.getState();
+  ui.setActiveSpecial(null);
+  // The agent lives in exactly one column; that is the only board this hand-off may close.
+  ui.setWorkMode(sideOf(ui.pairAssignment, projectId), "build");
   useProjectStore.getState().selectAgent(projectId, agentId);
   useRuntimeStore.getState().open(agentId);
   useUiStore.getState().requestRevealAgent(agentId);

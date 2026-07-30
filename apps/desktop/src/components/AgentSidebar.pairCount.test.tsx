@@ -65,7 +65,7 @@ beforeEach(() => {
   // anything (roborev 55376).
   vi.mocked(openProjectTab).mockClear();
   useUiStore.setState({
-    workMode: "build", pairAssignment: {}, leftProjectId: null, collapsedOrchestrators: {},
+    workModeBySide: { left: "build", right: "build" }, pairAssignment: {}, leftProjectId: null, collapsedOrchestrators: {},
   } as never);
 });
 afterEach(cleanup);

@@ -43,11 +43,12 @@ describe("landInAgent", () => {
   // "Start"/"Build It" ON the board, so this is not an edge case there, it is the only case.
   it("leaves the Plan board — otherwise the pane never switches and the selection is invisible", () => {
     const { pid, a } = seed();
-    useUiStore.setState({ activeSpecial: "board" });
+    // "On the board" is the project's own column being in Plan now, not a global enum value.
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
 
     landInAgent(pid, a);
 
-    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
   it("leaves the Improve-Sparkle pane for the same reason", () => {

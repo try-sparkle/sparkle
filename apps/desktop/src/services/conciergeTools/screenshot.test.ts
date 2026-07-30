@@ -81,6 +81,10 @@ function mountStage(rect = { x: 240, y: 60, width: 1160, height: 900 }): HTMLEle
 }
 
 beforeEach(() => {
+  // Both columns out of Plan. The board-covers-the-pane case below parks one IN Plan, and this
+  // store is a module singleton — without an explicit reset that leaks into every later case as a
+  // phantom "special-view-showing" blocker.
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" } } as never);
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(CAPTURE);
   seed();
@@ -239,7 +243,7 @@ describe("capture_agent captures the agent it was asked for, or nothing", () => 
   });
 
   it("refuses, WITHOUT capturing, when a full-stage view covers the panes", async () => {
-    useUiStore.setState({ activeSpecial: "board" });
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
 
     const r = await captureAgent(AGENT);
 

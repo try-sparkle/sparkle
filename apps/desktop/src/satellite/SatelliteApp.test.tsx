@@ -102,7 +102,7 @@ beforeEach(() => {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
   useProjectStore.setState({ projects: [mkProject("p1", "Alpha", [mkAgent("a1")])] } as never);
   useRuntimeStore.setState({ openAgentIds: ["a1"], status: {} } as never);
-  useUiStore.setState({ activeSpecial: null, workMode: "build" } as never);
+  useUiStore.setState({ activeSpecial: null, workModeBySide: { left: "build", right: "build" } } as never);
   useSettingsStore.setState({ beadsEnabled: false } as never);
 });
 afterEach(() => {

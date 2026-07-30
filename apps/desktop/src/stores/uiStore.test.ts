@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { STATUS_BANDS } from "../engine/buildSections";
 import {
   useUiStore,
   ZOOM_MIN,
@@ -136,20 +137,69 @@ describe("uiStore statusFilter", () => {
 describe("uiStore workMode", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ workMode: "build" });
+    // activeSpecial too: the yield-pairing cases below seed it, and a field left set here is
+    // exactly how a phantom pass leaks into a later case in this file.
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: null });
   });
 
-  it("defaults workMode to 'build' (Build tab on launch)", () => {
-    expect(useUiStore.getState().workMode).toBe("build");
+  it("defaults BOTH columns to 'build' (Build tab on launch)", () => {
+    expect(useUiStore.getState().workModeBySide).toEqual({ left: "build", right: "build" });
   });
 
   it("setWorkMode switches between plan/build", () => {
-    useUiStore.getState().setWorkMode("plan");
-    expect(useUiStore.getState().workMode).toBe("plan");
-    useUiStore.getState().setWorkMode("build");
-    expect(useUiStore.getState().workMode).toBe("build");
+    useUiStore.getState().setWorkMode("right", "plan");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+    useUiStore.getState().setWorkMode("right", "build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
+  // THE PROPERTY THE OLD SINGLE `workMode` COULD NOT HAVE. Each column's chevron — and therefore
+  // its Plan board — is independent: writing one side must carry the other side's value through
+  // untouched, in both directions and from either starting point.
+  it("writes ONLY the named side, leaving the other column's mode alone", () => {
+    useUiStore.getState().setWorkMode("left", "plan");
+    expect(useUiStore.getState().workModeBySide).toEqual({ left: "plan", right: "build" });
+
+    useUiStore.getState().setWorkMode("right", "plan");
+    expect(useUiStore.getState().workModeBySide).toEqual({ left: "plan", right: "plan" });
+
+    // ...and closing one board does not close the other.
+    useUiStore.getState().setWorkMode("right", "build");
+    expect(useUiStore.getState().workModeBySide).toEqual({ left: "plan", right: "build" });
+  });
+
+  // THE TWO ACTIONS THAT PAIR THE MODE WITH THE YIELD. `setWorkMode` alone only moves the
+  // chevron; every entry point meaning "show me this surface" goes through these, which is what
+  // stops the chevron and the concierge tool from answering the same request differently. The
+  // yield is SCOPED: there is one Improve-Sparkle pane and it sits in the primary pair's stage, so
+  // the other column must not reach across the window to close it.
+  it("openPlanBoard sets the mode AND yields the shared surface — but only for the pane's own pair", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" });
+    useUiStore.getState().openPlanBoard("left");
+    expect(useUiStore.getState().workModeBySide.left).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+
+    useUiStore.getState().openPlanBoard("right");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
+  // The mirror, and the more common of the two: "build" is the default and selecting Improve
+  // Sparkle never touches the mode, so a column sitting in Build with the pane over its terminal
+  // is the ordinary case. Without this action that state had no way back.
+  it("showBuildStage sets the mode AND yields the shared surface — but only for the pane's own pair", () => {
+    useUiStore.setState({
+      activeSpecial: "sparkle",
+      workModeBySide: { left: "plan", right: "plan" },
+    });
+    useUiStore.getState().showBuildStage("left");
+    expect(useUiStore.getState().workModeBySide.left).toBe("build");
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+
+    useUiStore.getState().showBuildStage("right");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
 });
 
 describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
@@ -177,18 +227,32 @@ describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
 describe("uiStore boardAgentFilter (FEEDBACK pill → board filter handoff)", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ boardAgentFilter: null });
+    useUiStore.setState({ boardAgentFilterBySide: { left: null, right: null } });
   });
 
-  it("defaults to null", () => {
-    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+  it("defaults to null on BOTH columns", () => {
+    expect(useUiStore.getState().boardAgentFilterBySide).toEqual({ left: null, right: null });
   });
 
   it("setBoardAgentFilter stores an agent id and clears back to null", () => {
-    useUiStore.getState().setBoardAgentFilter("agent-7");
-    expect(useUiStore.getState().boardAgentFilter).toBe("agent-7");
-    useUiStore.getState().setBoardAgentFilter(null);
-    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+    useUiStore.getState().setBoardAgentFilter("right", "agent-7");
+    expect(useUiStore.getState().boardAgentFilterBySide.right).toBe("agent-7");
+    useUiStore.getState().setBoardAgentFilter("right", null);
+    expect(useUiStore.getState().boardAgentFilterBySide.right).toBeNull();
+  });
+
+  // Both pairs can hold a board open at once, and both BoardViews read this. A single global string
+  // meant a LEFT row's FEEDBACK pill also narrowed the RIGHT column's board — across two projects,
+  // to an agent id that board has never heard of, so it simply emptied.
+  it("filters ONLY the named column, leaving the other column's board unfiltered", () => {
+    useUiStore.getState().setBoardAgentFilter("left", "agent-7");
+    expect(useUiStore.getState().boardAgentFilterBySide).toEqual({ left: "agent-7", right: null });
+
+    useUiStore.getState().setBoardAgentFilter("right", "agent-9");
+    expect(useUiStore.getState().boardAgentFilterBySide).toEqual({ left: "agent-7", right: "agent-9" });
+
+    useUiStore.getState().setBoardAgentFilter("right", null);
+    expect(useUiStore.getState().boardAgentFilterBySide).toEqual({ left: "agent-7", right: null });
   });
 });
 
@@ -448,10 +512,10 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
   afterEach(() => {
     localStorage.clear();
     useUiStore.setState({
-      workMode: "build",
+      workModeBySide: { left: "build", right: "build" },
       buildAgentHover: false,
       boardFocusBeadId: null,
-      boardAgentFilter: null,
+      boardAgentFilterBySide: { left: null, right: null },
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
@@ -468,10 +532,10 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // No `as never`: the point of writing them literally is that tsc verifies these names still
     // exist on UiState, so a rename cannot leave a stale string here asserting nothing.
     useUiStore.setState({
-      workMode: "plan",
+      workModeBySide: { left: "build", right: "plan" },
       buildAgentHover: true,
       boardFocusBeadId: "epic-42",
-      boardAgentFilter: "agent-x",
+      boardAgentFilterBySide: { left: null, right: "agent-x" },
       settingsRequest: "accounts",
       composeFocusSeq: 7,
       revealAgentId: "a-42",
@@ -500,10 +564,10 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
   afterEach(() => {
     localStorage.clear();
     useUiStore.setState({
-      workMode: "build",
+      workModeBySide: { left: "build", right: "build" },
       buildAgentHover: false,
       boardFocusBeadId: null,
-      boardAgentFilter: null,
+      boardAgentFilterBySide: { left: null, right: null },
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
@@ -524,10 +588,10 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
         version: 1,
         state: {
           themePref: "dark",
-          workMode: "plan",
+          workModeBySide: { left: "build", right: "plan" },
           buildAgentHover: true,
           boardFocusBeadId: "epic-42",
-          boardAgentFilter: "agent-x",
+          boardAgentFilterBySide: { left: null, right: "agent-x" },
           settingsRequest: "accounts",
           composeFocusSeq: 7,
           revealAgentId: "a-42",
@@ -545,10 +609,10 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(useUiStore.getState().themePref).toBe("dark");
     // ...and every transient one comes back at its store default instead.
     const s = useUiStore.getState();
-    expect(s.workMode).toBe("build");
+    expect(s.workModeBySide).toEqual({ left: "build", right: "build" });
     expect(s.buildAgentHover).toBe(false);
     expect(s.boardFocusBeadId).toBeNull();
-    expect(s.boardAgentFilter).toBeNull();
+    expect(s.boardAgentFilterBySide).toEqual({ left: null, right: null });
     expect(s.settingsRequest).toBeNull();
     expect(s.composeFocusSeq).toBe(0);
     expect(s.revealAgentId).toBeNull();
@@ -684,5 +748,59 @@ describe("uiStore revealAgentId — the request expires", () => {
     // …and the expiry it did NOT cancel is still armed.
     vi.advanceTimersByTime(REVEAL_REQUEST_TTL_MS);
     expect(useUiStore.getState().revealAgentId).toBeNull();
+  });
+});
+
+// THE REPAIR HAS TO RUN ON THE BLOBS THAT ACTUALLY EXIST — at the CURRENT version.
+//
+// This is the integration half of composerPersist's unit tests, and the two are not
+// interchangeable: those call `migratePersistedUi` directly, which proves the function works but
+// says nothing about whether anything CALLS it. zustand runs `migrate` only when the stored version
+// differs from the configured one, so the first shipped attempt at this repair was wired somewhere
+// unreachable for every blob already at the current version — i.e. all of them. `version: 2` below
+// is the whole point of the test; write `version: 1` and it passes against the broken code.
+describe("uiStore rehydrate — a retired persisted value is repaired at the CURRENT version", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ activeSpecial: null });
+  });
+
+  it('maps a persisted activeSpecial "board" to null without a version bump', async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ version: 2, state: { themePref: "dark", activeSpecial: "board" } }),
+    );
+
+    await useUiStore.persist.rehydrate();
+
+    // The blob really was read (so this isn't passing by rehydrate having been skipped)...
+    expect(useUiStore.getState().themePref).toBe("dark");
+    // ...and the retired value did not survive it.
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
+  it('leaves a persisted "sparkle" alone at the current version', async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ version: 2, state: { themePref: "dark", activeSpecial: "sparkle" } }),
+    );
+
+    await useUiStore.persist.rehydrate();
+
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+  });
+
+  // The same unreachability applied to the pre-existing statusFilter repair, whose comment made the
+  // same "runs on EVERY rehydrate" claim. It does now.
+  it("completes a short statusFilter at the current version", async () => {
+    localStorage.setItem(
+      "sparkle-ui",
+      JSON.stringify({ version: 2, state: { statusFilter: { needs_you: true } } }),
+    );
+
+    await useUiStore.persist.rehydrate();
+
+    const filter = useUiStore.getState().statusFilter as Record<string, boolean>;
+    for (const b of STATUS_BANDS) expect(filter[b.id]).toBe(true);
   });
 });

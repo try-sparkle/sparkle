@@ -52,7 +52,7 @@ function mkProject(agents: AgentTab[]): Project {
 
 beforeEach(() => {
   useRuntimeStore.setState({ branchStatus: {}, status: {} });
-  useUiStore.setState({ workMode: "build" });
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" } });
 });
 afterEach(cleanup);
 

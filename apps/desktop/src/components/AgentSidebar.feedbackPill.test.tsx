@@ -80,7 +80,7 @@ beforeEach(() => {
   useUiStore.setState({
     collapsedOrchestrators: {},
     activeSpecial: null,
-    workMode: "build",
+    workModeBySide: { left: "build", right: "build" },
     boardAgentFilter: null,
     statusFilter: allBandsVisible(),
   } as never);
@@ -89,7 +89,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   useBeadsStore.setState({ byProject: {} } as never);
-  useUiStore.setState({ workMode: "build", activeSpecial: null, boardAgentFilter: null } as never);
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: null, boardAgentFilterBySide: { left: null, right: null } } as never);
 });
 
 describe("the FEEDBACK pill", () => {
@@ -122,17 +122,36 @@ describe("the FEEDBACK pill", () => {
     expect(pillOf("Alpha")).toBeNull();
   });
 
-  it("clicking it flips to the Plan board and filters it to this agent — the three setters", () => {
+  it("clicking it flips THIS COLUMN to the Plan board and filters it to this agent", () => {
     render(<AgentSidebar project={seed([
       bead({ id: "p1-f1", title: "Feedback one", labels: ["agent:a1"] }),
     ])} />);
     const pill = pillOf("Alpha")!;
     fireEvent.click(pill);
-    // The observable side effect of the three setters, each a real change from its default:
+    // The observable side effect of both setters, each a real change from its default. There used
+    // to be a third (`activeSpecial = "board"`): the board is a column's own `workMode === "plan"`
+    // now, so the mode IS the board and the second global is gone.
     const ui = useUiStore.getState();
-    expect(ui.workMode).toBe("plan");
-    expect(ui.activeSpecial).toBe("board");
-    expect(ui.boardAgentFilter).toBe("a1");
+    expect(ui.workModeBySide.right).toBe("plan");
+    // ...and the OTHER column is untouched — a left-pair row's pill cannot open the right's board.
+    expect(ui.workModeBySide.left).toBe("build");
+    expect(ui.boardAgentFilterBySide.right).toBe("a1");
+  });
+
+  // The pill means "show me the board", and the filter it records is useless against a board the
+  // Improve-Sparkle pane is covering — the column moves to Plan, the filter is stored, and the
+  // stage keeps showing the Sparkle terminal.
+  it("makes the Improve-Sparkle pane yield so the filtered board is actually on screen", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    render(<AgentSidebar project={seed([
+      bead({ id: "p1-f1", title: "Feedback one", labels: ["agent:a1"] }),
+    ])} />);
+
+    fireEvent.click(pillOf("Alpha")!);
+
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useUiStore.getState().boardAgentFilterBySide.right).toBe("a1");
   });
 
   it("is DRAWN not filled (mono/micro, bordered, no fill) but reads as an action (cursor:pointer)", () => {

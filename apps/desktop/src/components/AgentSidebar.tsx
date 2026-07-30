@@ -39,7 +39,7 @@ import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { SPARKLE_PANE_SIDE, useUiStore } from "../stores/uiStore";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -127,7 +127,7 @@ import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm"
  *  resolves — a new array identity each time would re-arm its grace timer forever. */
 const NO_AGENTS: readonly AgentTab[] = [];
 import { AlertToggleButton } from "./AlertToggleButton";
-import { reconcileWorkMode } from "../engine/workMode";
+import { reconcileWorkMode, type WorkMode } from "../engine/workMode";
 import { PlanBuildToggle, BUILD_INK } from "./PlanBuildToggle";
 import { StatusDot } from "./StatusDot";
 import { FittedAgentName, AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
@@ -318,6 +318,7 @@ export function NewBuildAgentButton({
 export function AgentSidebar({
   project,
   slotSide = "right",
+  forcePairSide,
   showSparkleRow = true,
 }: {
   project: Project | null;
@@ -331,6 +332,14 @@ export function AgentSidebar({
    *  column's width. Exactly the cross-column clobber the per-side key removed, one case further out
    *  (roborev 55490). The slot knows its own side; this is the only thing it is asked. */
   slotSide?: PairSide;
+  /** Override the derived pair side outright. ONLY a satellite passes this, and it must: a
+   *  satellite is a single column, but this component otherwise derives its side from the project's
+   *  PERSISTED pair assignment — so a project the user had assigned to the left pair resolves
+   *  "left" inside a satellite whose only board reads "right". Every per-side write this column
+   *  makes (the mode, the FEEDBACK filter) then lands on a side nothing in that window renders, and
+   *  the control does nothing at all. The main window must NOT pass this: there the assignment map
+   *  is the correct answer, and it is what keeps a project moving between pairs consistent. */
+  forcePairSide?: PairSide;
   /** Hide the pinned Improve-Sparkle row. Only a SATELLITE window passes false, and it must: the
    *  Sparkle agent's id is keyed to the window label (`sparkleAgentIdFor`), and a satellite would
    *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
@@ -501,7 +510,10 @@ export function AgentSidebar({
   const pairAssignment = useUiStore((s) => s.pairAssignment);
   // With no project there is nothing to ask the map, and `sideOf("")` answers "right" — so the empty
   // left column has to fall back to the side of the SLOT it was mounted in. See `slotSide`.
-  const pairSide = project ? sideOf(pairAssignment, project.id) : slotSide;
+  // `forcePairSide` first: a satellite is one column and the persisted assignment map is simply not
+  // about that window. Otherwise the map is the single answer to "where does this project live",
+  // falling back to the slot's own side when there is no project to ask (see slotSide).
+  const pairSide = forcePairSide ?? (project ? sideOf(pairAssignment, project.id) : slotSide);
   const patchCable = useCableStore((s) => s.patch);
   // DOES THIS PAIR HOLD THE CABLE? Read from the one enum, never mirrored into local state — the
   // rows use it to open their concierge end (engine/rowGeometry), which is the second half of the
@@ -523,10 +535,20 @@ export function AgentSidebar({
 
   // Which chevron is selected. Drives both the strip's coloring (active = brand, others grayscale)
   // and which agents the sidebar list shows. Defaults to Build; not persisted across launches.
-  // Lifted into uiStore (workMode/setWorkMode) so other components — e.g. ThinkPanel's "Make a
-  // Plan" button — can switch tabs. Behavior is identical to the old local useState.
-  const mode = useUiStore((s) => s.workMode);
-  const setMode = useUiStore((s) => s.setWorkMode);
+  // Lifted into uiStore so other components — e.g. ThinkPanel's "Make a Plan" button — can switch
+  // tabs.
+  //
+  // SCOPED TO **THIS COLUMN'S** PAIR, and that is the bug fix, not a refinement. Both sidebars read
+  // one global `workMode`, so the two chevrons were the same control wearing two coats of paint:
+  // pressing Plan on the left lit the right column's chevron too and opened the right column's
+  // board. `pairSide` above is already the honest answer to "which column am I" — reading and
+  // writing the mode through it is what makes the chevron actually belong to the column it is
+  // drawn in. Same shape as the mount cable, where only the paint knew which side it was on.
+  const mode = useUiStore((s) => s.workModeBySide[pairSide]);
+  const setWorkMode = useUiStore((s) => s.setWorkMode);
+  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
+  const showBuildStage = useUiStore((s) => s.showBuildStage);
+  const setMode = useCallback((m: WorkMode) => setWorkMode(pairSide, m), [setWorkMode, pairSide]);
   // Which status bands the column currently shows (the filter chips above the ladder).
   const statusFilter = useUiStore((s) => s.statusFilter);
   const toggleStatusBand = useUiStore((s) => s.toggleStatusBand);
@@ -866,8 +888,14 @@ export function AgentSidebar({
   // (same as the "+ New Build Agent" button). Plan stays a pure mode switch: it has no agent concept
   // and only opens the read-only Tasks board in the main pane.
   const onPickPlan = () => {
-    setMode("plan");
-    setActiveSpecial("board");
+    // ONE WRITE FOR THE BOARD, to THIS column. It used to also set the window-global
+    // `activeSpecial = "board"`, which is what made the board a singleton — that global was the
+    // thing the (single, right-pair) renderer actually read, so this column's identity was lost the
+    // moment the chevron was pressed. The column's own mode is now the only truth for its own board.
+    // ...via openPlanBoard, NOT `setMode("plan")`. Entering Plan also has to make the Sparkle pane
+    // yield, or this is a dead control while it is up — and that pairing lives in the store so it
+    // cannot drift out of one of the three paths that mean "show me the board" (roborev 55878).
+    openPlanBoard(pairSide);
   };
   // Spawn a build agent AND auto-create a bead for it, so every piece of build work is tracked
   // from the start (it floors at "Planned" until code work begins). Shared with the Workspace
@@ -893,9 +921,22 @@ export function AgentSidebar({
     return id;
   };
   const onPickBuild = () => {
-    const alreadyHere = mode === "build" && activeSpecial === null;
-    setMode("build");
-    setActiveSpecial(null);
+    // SCOPE THE READ THE SAME WAY THE WRITE IS SCOPED. `activeSpecial` is window-global but the
+    // pane occupies exactly ONE pair's stage, so "is my stage covered" is a per-column question.
+    // Reading the bare global here — while `showBuildStage` only clears it for the pane-owning
+    // pair — made `alreadyHere` permanently false in the LEFT column whenever Improve Sparkle was
+    // up: second-click-spawn went dead, and every press instead re-ran the "switching INTO Build"
+    // branch, re-selecting the first rendered row and yanking the cable off whatever the user had
+    // patched. A scoped write with an unscoped read is the same class of split as the singleton
+    // this branch removed, just one layer down.
+    const paneCoversMe = pairSide === SPARKLE_PANE_SIDE && activeSpecial !== null;
+    const alreadyHere = mode === "build" && !paneCoversMe;
+    // showBuildStage, not setMode + setActiveSpecial: the pairing lives in the store so this
+    // chevron and the concierge's `set_work_mode("build")` cannot answer the same request
+    // differently. It also SCOPES the yield to the pane-owning pair, where this used to clear the
+    // window-global unconditionally — a left column's Build press reaching across to close a
+    // right-pair surface, the mirror of the bug openPlanBoard's scoping prevents.
+    showBuildStage(pairSide);
     if (!project) return;
     if (alreadyHere) {
       // Second click on the active chevron: spawn a fresh build agent (≡ the + button).
@@ -1007,7 +1048,7 @@ export function AgentSidebar({
     if (!fresh) return;
     // Read the mode FRESH (not the render-scope value): now that AgentRow is memoized, the
     // `onClose` closure that reaches here may have been captured a few renders ago (sparkle-alrm.3).
-    const freshMode = useUiStore.getState().workMode;
+    const freshMode = useUiStore.getState().workModeBySide[pairSide];
     // Selection must land on a row the user can actually SEE. With the filter chips, the first
     // agent in array order can easily be one the user has hidden, and selecting a hidden row leaves
     // the main pane showing an agent with no corresponding row in the column.
@@ -1445,11 +1486,10 @@ export function AgentSidebar({
   // mode they can't leave.
   useEffect(() => {
     if (beadsEnabled) return;
-    if (activeSpecial === "board" || mode === "plan") {
-      setActiveSpecial(null);
-      setMode("build");
-    }
-  }, [beadsEnabled, activeSpecial, mode, setActiveSpecial, setMode]);
+    // Only THIS column is rescued, and only if it is the one parked in Plan. Reading the global
+    // `activeSpecial === "board"` here used to drag the other column out of Plan as well.
+    if (mode === "plan") setMode("build");
+  }, [beadsEnabled, mode, setMode]);
   // Top-level agents (group heads + orphaned workers), matching the list's isTopLevel logic, PLUS a
   // parentId→children bucket built in the SAME single pass. Both are memoized on `project` so a PTY
   // status tick (which never touches the agent SET, only runtimeStore.status) reuses them instead of
@@ -1928,8 +1968,9 @@ export function AgentSidebar({
               bottom: 0,
               height: "auto",
               width: OVERLAY_WIDTH,
-              // See components/layers.ts: above the (isolated) terminal stage, below Plan mode's
-              // board. Both sides of that ordering live in that one module.
+              // See components/layers.ts: above the terminal stage AND above a column's Plan
+              // board, which is now just what fills that terminal slot. Both sides of that
+              // ordering live in that one module.
               zIndex: SIDEBAR_OVERLAY_Z,
               boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
             }
@@ -3918,8 +3959,15 @@ const AgentRow = memo(function AgentRow({
       onClick={(e) => {
         e.stopPropagation();
         const ui = useUiStore.getState();
-        ui.setWorkMode("plan");
-        ui.setActiveSpecial("board");
+        // The epic pill lives on a row in THIS column, so the board it opens is THIS column's.
+        // `paneSide` is the row's own pair (handed down from the sidebar's `pairSide`) — using it
+        // is what stops a left-column pill from opening the epic in the right column's board.
+        //
+        // openPlanBoard, not a bare setWorkMode: this means "show me the board", and the payload
+        // below is a ONE-SHOT that BoardView consumes on mount — against a board the Sparkle pane
+        // is covering, the handoff is spent on a surface that never renders and the overlay simply
+        // never opens (roborev 55887).
+        ui.openPlanBoard(paneSide);
         ui.setBoardFocusBeadId(epicPillData.id);
       }}
       title={`Epic ${epicPillData.id} · ${epicPillData.title} — open in Plan`}
@@ -3971,9 +4019,17 @@ const AgentRow = memo(function AgentRow({
         onClick={(e) => {
           e.stopPropagation();
           const ui = useUiStore.getState();
-          ui.setWorkMode("plan");
-          ui.setActiveSpecial("board");
-          ui.setBoardAgentFilter(a.id);
+          // THIS ROW'S OWN COLUMN, like epicPill above. This landed on main written against the
+          // window-global mode + `activeSpecial: "board"`, which is the singleton this branch
+          // removes — left as-is it would open the left column's feedback in the RIGHT column's
+          // board, which is the reported bug wearing a different hat.
+          // openPlanBoard for the same reason as the epic pill above — this pill means "show me
+          // the board", and a bare mode write leaves the Sparkle pane covering it while the filter
+          // is silently recorded against a surface that is not on screen.
+          ui.openPlanBoard(paneSide);
+          // BOTH writes take the row's own column. Migrating only the mode left the payload
+          // window-global, so a left row's pill still narrowed the right column's board.
+          ui.setBoardAgentFilter(paneSide, a.id);
         }}
         title={`${feedbackCount} feedback ${feedbackCount === 1 ? "bead" : "beads"} from this agent — open in Plan`}
         style={{

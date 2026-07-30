@@ -19,6 +19,7 @@ import { clearWindowProject, findWindowForProject } from "./windowRegistry";
 import { useProjectStore } from "../stores/projectStore";
 import { landInAgent } from "./landInAgent";
 import { useComposeHandoffStore } from "../stores/composeHandoffStore";
+import { sideOf } from "../engine/pairs";
 import { useUiStore } from "../stores/uiStore";
 import {
   routeToOwningWindow,
@@ -148,7 +149,10 @@ export function dispatchBuild(payload: CaptureSendPayload): void {
     // No `route`: Build wants the concierge's ordinary aim, which the selection above has just
     // pointed at this agent.
   });
-  useUiStore.getState().setWorkMode("build");
+  // The capture landed in ONE project's build agent — switch that project's column, not both.
+  useUiStore
+    .getState()
+    .setWorkMode(sideOf(useUiStore.getState().pairAssignment, payload.projectId), "build");
   log.info("capture", "capture→build handed off to the concierge compose box", {
     projectId: payload.projectId,
     agentId,

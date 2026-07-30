@@ -49,7 +49,7 @@ describe("freezeUiPersistence", () => {
 
     // …and now a write this window makes must not reach the blob. `setActiveSpecial` is the
     // realistic trigger: SatelliteApp calls it on mount to clear an inherited "sparkle" view.
-    useUiStore.getState().setActiveSpecial("board");
+    useUiStore.getState().setActiveSpecial("sparkle");
     expect(JSON.parse(localStorage.getItem(KEY)!).state.pinnedProjectId).toBe("p-main");
     expect(JSON.parse(localStorage.getItem(KEY)!).state.activeSpecial).toBeUndefined();
   });

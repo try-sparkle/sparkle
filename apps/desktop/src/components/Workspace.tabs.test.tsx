@@ -135,7 +135,7 @@ beforeEach(() => {
   useRuntimeStore.setState({ openAgentIds: ["a1", "b1"], status: {} } as never);
   useUiStore.setState({
     activeSpecial: null,
-    workMode: "build",
+    workModeBySide: { left: "build", right: "build" },
     pinnedProjectId: null,
     // Closable tabs: `null` = never seeded, i.e. every project is open. Reset per test so one
     // block's close can't decide another's tab bar (uiStore is a module singleton).
@@ -410,8 +410,7 @@ describe("Workspace — depth layers + calm desaturation", () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () => {
-      useUiStore.getState().setActiveSpecial("board");
-      useUiStore.getState().setWorkMode("plan");
+      useUiStore.getState().setWorkMode("right", "plan");
     });
     // The agent behind the board is still P2, but nothing of its terminal is on screen — and the
     // stage now holds the board. Graying here would gray the board (roborev 46254-M1).
@@ -433,32 +432,30 @@ describe("Workspace — depth layers + calm desaturation", () => {
   });
 });
 
-describe("Workspace — Plan mode collapses columns 2+3", () => {
+describe("Workspace — Plan mode fills that column’s terminal slot", () => {
   it("shows no Plan column in Build mode", () => {
     render(<Workspace />);
     expect(screen.queryByTestId("plan-column")).toBeNull();
     expect(screen.getByTestId("sidebar")).toBeTruthy();
   });
 
-  it("lays one wide Plan column over the panes, which stay mounted", async () => {
+  it("lays the board over its own column’s panes, which stay mounted", async () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () => {
-      useUiStore.getState().setActiveSpecial("board");
-      useUiStore.getState().setWorkMode("plan");
+      useUiStore.getState().setWorkMode("right", "plan");
     });
     expect(screen.getByTestId("plan-column")).toBeTruthy();
     expect(screen.getByTestId("board")).toBeTruthy();
     // The panes are covered, not torn down — their PTYs must survive a mode flip.
     expect(screen.getByTestId("pane-a1")).toBeTruthy();
     expect(screen.getByTestId("pane-a1").dataset.visible).toBe("false");
-    // The board paints at the SHARED layer, not an inline number of its own. With the Build column
-    // floated out by the overlay pull tab it is a sibling of this board, and if it out-ranks the
-    // board it paints through it and covers the PlanBuildToggle — the only way back to Build. The
-    // ordering itself is asserted in AgentSidebar.pullTabs.test.tsx; this pins the board's end of it
-    // so an inline z-index re-edit here can't slip past that assertion.
+    // The board paints at the SHARED layer, not an inline number of its own. It fills the
+    // terminal's slot, so a Build column floated out over that terminal must paint OVER it — the
+    // ordering itself is asserted in AgentSidebar.pullTabs.test.tsx; this pins the board's end of
+    // it so an inline z-index re-edit here can't slip past that assertion.
     expect(Number(screen.getByTestId("plan-column").style.zIndex)).toBe(PLAN_COLUMN_Z);
-    expect(PLAN_COLUMN_Z).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+    expect(PLAN_COLUMN_Z).toBeLessThan(SIDEBAR_OVERLAY_Z);
   });
 
   it("leaves the terminal stage un-isolated so its full-window modals still escape it", () => {
@@ -475,16 +472,19 @@ describe("Workspace — Plan mode collapses columns 2+3", () => {
     expect(screen.getByTestId("terminal-stage").style.isolation).toBe("");
   });
 
-  it("the Plan column's Build chevron splits the columns back apart", async () => {
+  it("switching the column back to Build drops the board and re-shows the pane", async () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () => {
-      useUiStore.getState().setActiveSpecial("board");
-      useUiStore.getState().setWorkMode("plan");
+      useUiStore.getState().setWorkMode("right", "plan");
     });
-    fireEvent.click(screen.getByTitle("Build mode — your Build orchestrator agents"));
+    // The board carried a DUPLICATE PlanBuildToggle when it covered the Build column and took the
+    // sidebar's header with it. It fills only the terminal slot now, so the sidebar's own toggle is
+    // still on screen and is the single way back — and this suite stubs the sidebar, so the mode
+    // change is driven directly rather than through a control the real column owns.
+    await act(async () => useUiStore.getState().setWorkMode("right", "build"));
     expect(screen.queryByTestId("plan-column")).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
     expect(useUiStore.getState().activeSpecial).toBeNull();
     expect(screen.getByTestId("pane-a1").dataset.visible).toBe("true");
   });
@@ -492,7 +492,7 @@ describe("Workspace — Plan mode collapses columns 2+3", () => {
   it("stays out of Plan mode when the Beads tool is off (no board to show)", async () => {
     useSettingsStore.setState({ beadsEnabled: false } as never);
     render(<Workspace />);
-    await act(async () => useUiStore.getState().setActiveSpecial("board"));
+    await act(async () => useUiStore.getState().setWorkMode("right", "plan"));
     expect(screen.queryByTestId("plan-column")).toBeNull();
   });
 });
@@ -514,7 +514,7 @@ describe("Workspace — cloud re-attach is attempted once, and retried when it n
     const calls = reattach.mock.calls.length;
     // A re-render must not re-list: re-listing resurrects a cloud tab the user deliberately removed.
     act(() => {
-      useUiStore.setState({ workMode: "plan" } as never);
+      useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
     });
     expect(reattach.mock.calls.length).toBe(calls);
   });

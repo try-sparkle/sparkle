@@ -89,7 +89,7 @@ beforeEach(() => {
   // the pair's side decides which edge the tab sits on AND which way its arrows grow. Without this
   // the clamp cases inherit a left pair and drive the width the wrong way — passing or failing on
   // test ORDER, which is exactly the class of leak `resetCable` was added elsewhere for.
-  useUiStore.setState({ workMode: "build", pairAssignment: {}, leftProjectId: null } as never);
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, pairAssignment: {}, leftProjectId: null } as never);
 });
 afterEach(cleanup);
 
@@ -372,14 +372,19 @@ describe("AgentSidebar — overlay mode", () => {
   });
 
   it("stays UNDER Workspace's plan-column so Plan mode still covers it", () => {
-    // Workspace lays `plan-column` (position:absolute, inset:0, zIndex 5) over columns ②+③ in Plan
-    // mode. That wrapper is `position: relative` with `z-index: auto`, so it is NOT a stacking
-    // context and would not contain a bigger number here: a floating column above the board would
-    // paint straight through it, covering the PlanBuildToggle that is the way back to Build.
+    // Workspace renders `plan-column` inside a pair's TERMINAL stage — it fills that column's
+    // terminal slot rather than covering both columns. Neither the ②+③ wrapper nor the stage is a
+    // stacking context, so these two numbers compete directly and the order is the whole contract.
     //
-    // Both numbers are read from the ONE module both sides import. A hand-copied `5` here would
+    // THE FLOATED COLUMN WINS. It used to be the board, back when the board covered the Build
+    // column and carried the only PlanBuildToggle; losing that toggle behind a floated sidebar was
+    // the bug the old ordering prevented. The board no longer takes the sidebar's header away, so
+    // floating the Build column over the terminal — an explicit user gesture — must show that
+    // column, whether the terminal slot currently holds a terminal or a board.
+    //
+    // Both numbers are read from the ONE module both sides import. A hand-copied literal here would
     // keep passing after someone changed the board's layer and would let the bug back in silently.
-    expect(SIDEBAR_OVERLAY_Z).toBeLessThan(PLAN_COLUMN_Z);
+    expect(PLAN_COLUMN_Z).toBeLessThan(SIDEBAR_OVERLAY_Z);
     // It must still beat the terminal stage, a `z-index: auto` sibling later in DOM order.
     expect(SIDEBAR_OVERLAY_Z).toBeGreaterThan(0);
     // ...and both must stay inside the window layers.ts documents: above the stage's own overlays

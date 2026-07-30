@@ -58,7 +58,7 @@ let scrolled: { el: Element; opts: unknown }[];
 
 beforeEach(() => {
   useRuntimeStore.setState({ branchStatus: {}, status: {} });
-  useUiStore.setState({ workMode: "build", revealAgentId: null });
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, revealAgentId: null });
   scrolled = [];
   Object.defineProperty(Element.prototype, "scrollIntoView", {
     configurable: true,

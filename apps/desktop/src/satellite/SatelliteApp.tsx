@@ -34,6 +34,8 @@ import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { planBoardUp } from "../engine/planBoard";
+import type { PairSide } from "../engine/cable";
 import { useSettingsStore } from "../stores/settingsStore";
 import { AgentSidebar } from "../components/AgentSidebar";
 import { PlanBuildToggle } from "../components/PlanBuildToggle";
@@ -50,6 +52,10 @@ import {
   releaseSatellite,
   settleSatellite,
 } from "../services/satelliteWindows";
+
+/** A satellite hosts one project in one column — the primary side. Named rather than inlined so
+ *  the four reads below are visibly the SAME side, not four independent guesses. */
+const SATELLITE_PAIR_SIDE: PairSide = "right";
 
 const AgentPane = lazy(() => import("../components/AgentPane").then((m) => ({ default: m.AgentPane })));
 const BoardView = lazy(() => import("../components/BoardView").then((m) => ({ default: m.BoardView })));
@@ -96,10 +102,15 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   const projects = useProjectStore((s) => s.projects);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const open = useRuntimeStore((s) => s.open);
-  const activeSpecial = useUiStore((s) => s.activeSpecial);
   const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
-  const workMode = useUiStore((s) => s.workMode);
-  const setWorkMode = useUiStore((s) => s.setWorkMode);
+  // A satellite window hosts exactly ONE project in ONE column, so it is always the primary
+  // ("right") side of the per-column mode map. It has no second pair to be confused with — the
+  // singleton the map replaced was only ever a problem in the two-pair cockpit.
+  const workMode = useUiStore((s) => s.workModeBySide[SATELLITE_PAIR_SIDE]);
+  // Both chevrons go through the store actions that own the mode-plus-yield pairing; nothing here
+  // writes a bare `setWorkMode`, which is why that selector is gone.
+  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
+  const showBuildStage = useUiStore((s) => s.showBuildStage);
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const zoomIn = useUiStore((s) => s.zoomIn);
   const zoomOut = useUiStore((s) => s.zoomOut);
@@ -237,7 +248,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   }, [closing, projects.length, project]);
 
   const activeAgentId = project?.selectedAgentId ?? null;
-  const boardActive = activeSpecial === "board" && !!project && beadsEnabled;
+  const boardActive = planBoardUp(workMode, !!project, beadsEnabled);
 
   // Only THIS project's open agents ever mount here — the whole point of the ownership split. No
   // visited-set bookkeeping either: a satellite shows one project, so there is no tab you can leave.
@@ -248,12 +259,10 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   }, [project, openAgentIds, closing]);
 
   const onPickPlan = () => {
-    setWorkMode("plan");
-    setActiveSpecial("board");
+    openPlanBoard(SATELLITE_PAIR_SIDE);
   };
   const onPickBuild = () => {
-    setWorkMode("build");
-    setActiveSpecial(null);
+    showBuildStage(SATELLITE_PAIR_SIDE);
   };
 
   return (
@@ -269,7 +278,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
     >
       <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
         {/* ② Builder agents. `showSparkleRow={false}`: Improve Sparkle is main's agent. */}
-        <AgentSidebar project={closing ? null : project} showSparkleRow={false} />
+        <AgentSidebar project={closing ? null : project} showSparkleRow={false} forcePairSide={SATELLITE_PAIR_SIDE} />
         {/* ③ The terminal stage. */}
         <div
           data-testid="terminal-stage"
@@ -351,7 +360,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
             </div>
             <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
               <Suspense fallback={<PaneFallback />}>
-                <BoardView project={project} />
+                <BoardView project={project} side={SATELLITE_PAIR_SIDE} />
               </Suspense>
             </div>
           </div>

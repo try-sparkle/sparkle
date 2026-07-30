@@ -214,14 +214,14 @@ beforeEach(() => {
 
 describe("BoardView", () => {
   it("starts polling on mount and stops on unmount", () => {
-    const { unmount } = render(<BoardView project={project} />);
+    const { unmount } = render(<BoardView project={project} side="right" />);
     expect(startPolling).toHaveBeenCalledWith("p1", "/tmp/demo");
     unmount();
     expect(stopPolling).toHaveBeenCalledWith("p1");
   });
 
   it("renders the four columns with their cards bucketed correctly", () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // Column headers, addressed by lane so they cannot be confused with card text — the terminal
     // lane and the terminal STAGE badge are both "Shipped", deliberately (one vocabulary).
     expect(screen.getByTestId("lane-label-backlog").textContent).toContain("Backlog");
@@ -241,7 +241,7 @@ describe("BoardView", () => {
   });
 
   it("renders each card's unified progress stage label (mapped from bead status)", () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // short stage labels: open→Planned, in_progress→Unsaved, closed→Merged, delivered→Shipped.
     expect(screen.getAllByText("Planned").length).toBeGreaterThanOrEqual(2); // two backlog beads
     expect(screen.getByText("Unsaved")).toBeTruthy(); // the in-progress bead
@@ -256,7 +256,7 @@ describe("BoardView", () => {
 
   it("shows the loading state when there is no snapshot yet", () => {
     snapshot = undefined;
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     expect(screen.getByText("Loading tasks…")).toBeTruthy();
   });
 
@@ -267,7 +267,7 @@ describe("BoardView", () => {
       loadedAt: Date.now(),
     };
     error = "bd blew up";
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // Error surfaces but the (empty) board still renders.
     expect(screen.getByText("bd blew up")).toBeTruthy();
     // The three non-definable lanes (Backlog, Blocked, Being built) show the empty hint; the two
@@ -302,7 +302,7 @@ describe("BoardView", () => {
     // Raw-textContent matcher: the description preserves newlines (whiteSpace: pre-wrap), so we
     // match the literal string rather than the whitespace-normalized form getByText uses.
     const fullDesc = (_: string, el: Element | null) => el?.textContent === long;
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // Before click, the full description text is not present (only a truncated preview).
     expect(screen.queryByText(fullDesc)).toBeNull();
     fireEvent.click(screen.getByText("Detailed task"));
@@ -315,7 +315,7 @@ describe("BoardView", () => {
   });
 
   it("has no free-form edit controls — no inputs, selects, or textareas", () => {
-    const { container } = render(<BoardView project={project} />);
+    const { container } = render(<BoardView project={project} side="right" />);
     // No edit controls anywhere on the board (buttons exist: cards open detail, epics get Start).
     expect(container.querySelector("input")).toBeNull();
     expect(container.querySelector("select")).toBeNull();
@@ -330,7 +330,7 @@ describe("BoardView", () => {
   });
 
   it("counts each column", () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // Backlog header lives in a row that also shows its count (2). Scope the lookup to that header.
     const backlogHeader = screen.getByText("Backlog").parentElement as HTMLElement;
     expect(within(backlogHeader).getByText("2")).toBeTruthy();
@@ -365,7 +365,7 @@ describe("BoardView — Build It (epic handoff)", () => {
   it("at capacity, refuses without claiming the bead — and says why", async () => {
     blockedReasonMock.mockReturnValue("This machine has 8 of its 8 agent slots taken.");
     snapshot = epicSnapshot("Ship the app.");
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
     const statusRow = screen.getByText("not started").parentElement as HTMLElement;
     fireEvent.click(within(statusRow).getByText("Build It"));
@@ -384,7 +384,7 @@ describe("BoardView — Build It (epic handoff)", () => {
   // "Starting this plan…" for a one-bead handoff (roborev 55145). So: assert what the HANDLERS pass.
   it("each handoff tells the preflight which KIND of build it is", async () => {
     snapshot = epicSnapshot("Ship the app.");
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
     const statusRow = screen.getByText("not started").parentElement as HTMLElement;
     fireEvent.click(within(statusRow).getByText("Build It"));
@@ -421,7 +421,7 @@ describe("BoardView — Build It (epic handoff)", () => {
       ++call > 1 ? "This machine has 8 of its 8 agent slots taken." : null,
     );
 
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Epic one")); // open the detail overlay
     fireEvent.click(screen.getByTitle("Claim and build all 2 epics that share this PRD"));
 
@@ -458,7 +458,7 @@ describe("BoardView — Build It (epic handoff)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Another small task"));
     fireEvent.click(
       screen.getByTitle(
@@ -484,7 +484,7 @@ describe("BoardView — Build It (epic handoff)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("One small task")); // open the detail overlay
     fireEvent.click(
       screen.getByTitle(
@@ -504,7 +504,7 @@ describe("BoardView — Build It (epic handoff)", () => {
 
   it("shows the status pill + Build It on an epic and hands off with the parsed PRD path", async () => {
     snapshot = epicSnapshot("Ship the app.\n\nPRD file: PRD/2026-06-27-build-the-app.md");
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app")); // open the epic's detail overlay
     expect(screen.getByText("not started")).toBeTruthy(); // rollup of an epic with no children
     // The backlog card ALSO carries a "Build It" (renamed from Start), so scope the click to the
@@ -528,7 +528,7 @@ describe("BoardView — Build It (epic handoff)", () => {
     // The "no linked PRD" hard block was removed (unify Build It affordances): a PRD-less epic now
     // hands off with prdPath null and sendToBuild seeds off `bd show <epicId>` instead of blocking.
     snapshot = epicSnapshot("no PRD link in this body");
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build the app"));
     const statusRow = screen.getByText("not started").parentElement as HTMLElement;
     fireEvent.click(within(statusRow).getByText("Build It"));
@@ -573,7 +573,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("Start refuses at capacity WITHOUT claiming, so the card keeps its button", async () => {
     blockedReasonMock.mockReturnValue("This machine has 8 of its 8 agent slots taken.");
     startSnapshot({});
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build It"));
 
     await waitFor(() => expect(screen.getByText(/8 of its 8 agent slots/)).toBeTruthy());
@@ -585,7 +585,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
 
   it("claims the epic then hands off to Build with the parsed PRD path", async () => {
     startSnapshot({});
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build It"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
     expect(claimBead).toHaveBeenCalledWith("/tmp/demo", "p1-e1");
@@ -600,7 +600,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
 
   it("passes prdPath null for a PRD-less epic instead of blocking", async () => {
     startSnapshot({ description: "no prd reference" });
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Build It"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
     expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null });
@@ -608,7 +608,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
 
   it("disables Start (tooltip decomposing…) while the epic has zero children", () => {
     startSnapshot({ withChild: false });
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     const start = screen.getByText("Build It") as HTMLButtonElement;
     expect(start.disabled).toBe(true);
     expect(start.title).toContain("decomposing…");
@@ -619,7 +619,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
 
   it("disables Start and shows a click-to-clear badge while labeled decomposing", async () => {
     startSnapshot({ labels: ["decomposing"] });
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     expect((screen.getByText("Build It") as HTMLButtonElement).disabled).toBe(true);
     // The badge itself clears the label (the user's way out of a stuck decompose).
     fireEvent.click(screen.getByText("decomposing…"));
@@ -630,7 +630,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
 
   it("shows a decompose-failed chip whose click clears the label so the next sweep retries", async () => {
     startSnapshot({ labels: ["decompose-failed"] });
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText(/decompose failed/i));
     await waitFor(() =>
       expect(labelBead).toHaveBeenCalledWith("/tmp/demo", "remove", "p1-e1", "decompose-failed"),
@@ -649,14 +649,14 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     expect(screen.queryByText("Build It")).toBeNull();
   });
 });
 
 describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
   it("shows the Define CTA for an undefined Done column and NOT for Backlog/In Progress", async () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     await waitFor(() => expect(getConfig).toHaveBeenCalledWith("/tmp/demo"));
     // Undefined Done/Delivered → centered blue Define CTA in the column body.
     expect(screen.getByText("Define “Done”")).toBeTruthy();
@@ -667,7 +667,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
   });
 
   it("opens the Define modal for the matching stage when a Done/Delivered header is clicked", async () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // The Done column TITLE is a button (Backlog/In Progress titles are plain text). Its accessible
     // name is the label; the "Define what …" hover lives on the title attribute.
     const doneHeader = screen.getByRole("button", { name: "Done" });
@@ -683,7 +683,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
   });
 
   it("opens the Delivered modal from its empty-state CTA button", async () => {
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     await waitFor(() => expect(screen.getByText("Define “Shipped”")).toBeTruthy());
     fireEvent.click(screen.getByText("Define “Shipped”"));
     expect(screen.getByTestId("define-modal").textContent).toContain("define-modal:delivered");
@@ -696,7 +696,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     await waitFor(() => expect(screen.getByText("defined")).toBeTruthy());
     expect(screen.queryByText("Define “Done”")).toBeNull();
   });
@@ -715,7 +715,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     // Compact progress chip appears ("0 of 1" met) — no Mark control yet.
     await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
     expect(screen.queryByText("Mark as Done")).toBeNull();
@@ -739,7 +739,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
     fireEvent.click(screen.getByText("0 of 1")); // expand popover
     fireEvent.click(screen.getAllByRole("checkbox")[0]!); // tick the manual criterion → allMet
@@ -762,7 +762,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
       },
       loadedAt: Date.now(),
     };
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     await waitFor(() => expect(screen.getByText("0 of 1")).toBeTruthy());
     fireEvent.click(screen.getByText("0 of 1"));
     fireEvent.click(screen.getAllByRole("checkbox")[0]!);
@@ -773,7 +773,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
 
   it("starts the delivery monitor only once Delivered is defined, and stops it on unmount", async () => {
     defineDelivered();
-    const { unmount } = render(<BoardView project={project} />);
+    const { unmount } = render(<BoardView project={project} side="right" />);
     await waitFor(() =>
       expect(startDeliveryMonitor).toHaveBeenCalledWith(
         "/tmp/demo",
@@ -794,7 +794,7 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
   afterEach(() => {
     // The filter lives in the real uiStore singleton (a module-level store), so clear it or it leaks
     // into every later suite in this file and silently hides their beads.
-    useUiStore.getState().setBoardAgentFilter(null);
+    useUiStore.getState().setBoardAgentFilter("right", null);
   });
 
   function labeledSnapshot() {
@@ -811,8 +811,8 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
   // board) renders BOTH beads, which fails the `queryByText(...).toBeNull()` below.
   it("with boardAgentFilter set, renders ONLY beads labeled agent:<id> and hides the rest", () => {
     labeledSnapshot();
-    useUiStore.getState().setBoardAgentFilter("agent-x");
-    render(<BoardView project={project} />);
+    useUiStore.getState().setBoardAgentFilter("right", "agent-x");
+    render(<BoardView project={project} side="right" />);
     // The matching bead is shown…
     expect(screen.getByText("My feedback bead")).toBeTruthy();
     // …and the non-matching one is HIDDEN. This is the assertion the filter exists to satisfy.
@@ -821,19 +821,19 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
 
   it("shows a clearable banner naming the agent, and Clear restores the full board", () => {
     labeledSnapshot();
-    useUiStore.getState().setBoardAgentFilter("agent-x");
-    render(<BoardView project={project} />);
+    useUiStore.getState().setBoardAgentFilter("right", "agent-x");
+    render(<BoardView project={project} side="right" />);
     const banner = screen.getByTestId("board-agent-filter-banner");
     expect(banner.textContent).toContain("agent-x");
     // Clear drops the filter → the store goes null AND the hidden bead comes back.
     fireEvent.click(within(banner).getByText("Clear"));
-    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+    expect(useUiStore.getState().boardAgentFilterBySide.right).toBeNull();
     expect(screen.getByText("Someone elses bead")).toBeTruthy();
   });
 
   it("renders the full board (and NO banner) when no filter is set", () => {
     labeledSnapshot();
-    render(<BoardView project={project} />);
+    render(<BoardView project={project} side="right" />);
     expect(screen.queryByTestId("board-agent-filter-banner")).toBeNull();
     expect(screen.getByText("My feedback bead")).toBeTruthy();
     expect(screen.getByText("Someone elses bead")).toBeTruthy();

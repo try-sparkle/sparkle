@@ -54,7 +54,9 @@
 // concierge command palette (historyStore), and workspace.ts already exposes `search_history`.
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { REVEAL_REQUEST_TTL_MS, useUiStore, type WorkMode } from "../../stores/uiStore";
+import { REVEAL_REQUEST_TTL_MS, SPARKLE_PANE_SIDE, useUiStore, type WorkMode } from "../../stores/uiStore";
+import { sideOf } from "../../engine/pairs";
+import type { PairSide } from "../../engine/cable";
 import {
   BUILD_SECTIONS,
   STATUS_BANDS,
@@ -220,6 +222,17 @@ function scopedProject(): Project | null {
 }
 
 /**
+ * Which COLUMN these tools are talking about. The work mode is per-pair now, so "the Build column"
+ * is only a well-defined phrase once you know which pair the scoped project sits in — reading a
+ * window-global mode here used to report (and set) the wrong column's chevron whenever the scoped
+ * project lived in the left pair. `sideOf` defaults to the primary side, which is also the right
+ * answer when nothing is scoped.
+ */
+function scopedSide(): PairSide {
+  return sideOf(useUiStore.getState().pairAssignment, scopedProject()?.id ?? "");
+}
+
+/**
  * Whose subtree is this? Keyed by `parentId` over EVERY child, whatever its kind.
  *
  * This is AgentSidebar's `childrenByParent` (AgentSidebar.tsx:1109), byte for byte — same key, same
@@ -316,7 +329,7 @@ function columnView(project: Project): ColumnView {
     return rollup ? rollup.stage : stageOf(id);
   };
 
-  const mode = ui.workMode;
+  const mode = ui.workModeBySide[scopedSide()];
   const bands = ui.statusFilter;
   const topLevel = topLevelAgents(agents, mode);
   const childRows = (head: AgentTab): AgentTab[] => renderedChildren(head, kids);
@@ -386,8 +399,11 @@ export interface SidebarViewState {
   projectId: string | null;
   projectName: string | null;
   workMode: WorkMode;
-  /** Which special view owns the main pane, if any — a selected row is not visible behind one. */
-  activeSpecial: "sparkle" | "board" | null;
+  /** Which special view owns the main pane, if any — a selected row is not visible behind one.
+   *  "board" USED to be reported here; it is not a window-global any more, because each column has
+   *  its own Plan board. Read `workMode === "plan"` above for that — it is this column's answer,
+   *  where the old field could only give the window's. */
+  activeSpecial: "sparkle" | null;
   bands: BandVisibility;
   /** Per-band totals over the UNFILTERED top-level rows, so a band that is switched off still
    *  reports how many rows turning it back on would reveal — the same count the chips show. */
@@ -411,7 +427,7 @@ export function readSidebarView(): SidebarViewResult<SidebarViewState> {
   const ui = useUiStore.getState();
   const project = scopedProject();
   const base = {
-    workMode: ui.workMode,
+    workMode: ui.workModeBySide[scopedSide()],
     activeSpecial: ui.activeSpecial,
     bands: { ...ui.statusFilter },
     expandedOrchestrators: Object.entries(ui.collapsedOrchestrators)
@@ -794,9 +810,12 @@ export interface WorkModeChange {
  * `hiddenReason: "plan-mode"` rather than pretending the filter did it. Reversible, and the result
  * carries the mode it replaced.
  *
- * It deliberately does NOT touch `activeSpecial`. The chevron and the pane are reconciled by
- * engine/workMode.reconcileWorkMode inside the sidebar's own effect; writing both from here would
- * be a second reconciler racing the first.
+ * Switching to PLAN goes through `uiStore.openPlanBoard`, which also makes the Improve-Sparkle pane
+ * yield. This docstring used to claim the opposite — that touching `activeSpecial` was deliberately
+ * left to `engine/workMode.reconcileWorkMode` in the sidebar's effect — and that was wrong in the
+ * one case it mattered: `reconcileWorkMode` returns null on its FIRST line whenever a special view
+ * is up, so the named reconciler is precisely the thing that cannot run here. The op reported
+ * success while the stage was unchanged and the caller had no signal the view never appeared.
  */
 export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
   if (mode !== "plan" && mode !== "build") {
@@ -810,11 +829,29 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
       `"${mode}" is not a work mode — the chevrons are "plan" and "build".`,
     );
   }
-  const priorWorkMode = useUiStore.getState().workMode;
-  if (priorWorkMode === mode) {
+  const side = scopedSide();
+  const priorWorkMode = useUiStore.getState().workModeBySide[side];
+  // "ALREADY IN THAT MODE" IS ONLY A NO-OP IF THE MODE'S SURFACE IS ACTUALLY ON SCREEN.
+  //
+  // A column can sit in Plan while showing the Improve-Sparkle pane — indeed that is the ordinary
+  // way to get there (open the board, then click Improve Sparkle; `onSelectSparkle` never touches
+  // the mode). Refusing here would report "nothing to do" about a view the caller cannot see, and
+  // would leave the pane up — while the CHEVRON, which calls `openPlanBoard` unconditionally,
+  // recovers the board on a second press. Same request, two answers: exactly the drift
+  // `openPlanBoard` exists to prevent, relocated into this guard.
+  // NOT gated on `mode === "plan"`. The pane covers whichever surface the column is showing, so
+  // the Build half has the identical hole — and it is the more common one, since "build" is the
+  // default and selecting Improve Sparkle never touches the mode. Gating this on Plan was fixing
+  // one branch of a symmetric problem.
+  const surfaceHidden =
+    side === SPARKLE_PANE_SIDE && useUiStore.getState().activeSpecial !== null;
+  if (priorWorkMode === mode && !surfaceHidden) {
     return refuse("set_work_mode", "no-op", `The column is already in ${mode} mode.`);
   }
-  useUiStore.getState().setWorkMode(mode);
+  // Both branches go through the store action that owns the mode-plus-yield pairing, so neither
+  // can drift from the chevron the way this call site twice did.
+  if (mode === "plan") useUiStore.getState().openPlanBoard(side);
+  else useUiStore.getState().showBuildStage(side);
   return ok("set_work_mode", { priorWorkMode, workMode: mode });
 }
 
@@ -938,7 +975,7 @@ export function selectRow(
   const ui = useUiStore.getState();
   const scoped = scopedProject();
   const priorSelection = scoped ? { projectId: scoped.id, agentId: scoped.selectedAgentId } : null;
-  const priorWorkMode = ui.workMode;
+  const priorWorkMode = ui.workModeBySide[scopedSide()];
   const priorActiveSpecial = ui.activeSpecial;
   const switchedProject = scoped?.id !== project.id;
 

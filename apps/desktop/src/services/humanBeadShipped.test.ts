@@ -61,6 +61,10 @@ vi.mock("../stores/uiStore", () => ({
       setActiveSpecial: vi.fn(),
       requestRevealAgent: vi.fn(),
       requestComposeFocus: vi.fn(),
+      // landInAgent leaves the board by switching the project's own column out of Plan, so it
+      // needs both of these — see the note in sendToBuild.test.ts.
+      setWorkMode: vi.fn(),
+      pairAssignment: {},
     }),
   },
 }));

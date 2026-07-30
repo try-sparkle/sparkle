@@ -50,8 +50,9 @@ const project = (agents: AgentTab[]): Project => ({
 beforeEach(() => {
   useProjectStore.setState({ projects: [project([agent("a-worker", "worker"), agent("a-build", "build")])] });
   useRuntimeStore.setState({ openAgentIds: [] });
-  // Start from the worst case for visibility: parked on the Plan board, chevron on Build.
-  useUiStore.setState({ activeSpecial: "board", workMode: "build" });
+  // "Parked on the board with the chevron on Build" USED to be the worst case here, and it is now
+  // unrepresentable: a column's board IS its `workMode === "plan"`, so the two cannot disagree.
+  useUiStore.setState({ activeSpecial: null, workModeBySide: { left: "build", right: "build" } });
   useSettingsStore.getState().setAllAiFeatures(true);
   useAuthStore.setState({
     me: { clerkUserId: "u", entitled: true, balanceCents: 20000, tokenVersion: 1 },
@@ -62,30 +63,32 @@ beforeEach(() => {
 
 describe("selectAndOpen — reveals a cross-window-focused agent", () => {
   it("leaves the special overlay and switches the chevron to Build, opening the agent", () => {
-    useUiStore.setState({ activeSpecial: "board", workMode: "plan" });
+    // On the board (right column in Plan) with the Sparkle pane also up — the reveal must clear
+    // BOTH, and they are separate pieces of state now rather than one `activeSpecial` enum.
+    useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "plan" } });
     selectAndOpen("p1", "a-worker");
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-worker");
     expect(useRuntimeStore.getState().openAgentIds).toContain("a-worker");
   });
 
   it("switches the chevron to Build for a build/worker/shell agent", () => {
-    useUiStore.setState({ activeSpecial: "sparkle", workMode: "plan" });
+    useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "plan" } });
     selectAndOpen("p1", "a-build");
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a-build");
   });
 
   it("BAILS on a gone agent — no overlay drop, no mode change, no phantom selection", () => {
-    // roborev 46353: there is nothing to reveal, so touching anything would leave activeSpecial
-    // and workMode disagreeing (Plan board dropped, plan chevron still selected) and push a
-    // phantom id into the open set.
-    useUiStore.setState({ activeSpecial: "board", workMode: "plan" });
+    // roborev 46353: there is nothing to reveal, so touching anything would drop the overlay and
+    // the column's Plan mode for a reveal that never happens, and push a phantom id into the open
+    // set. Both must be left exactly as they were.
+    useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "plan" } });
     selectAndOpen("p1", "ghost");
-    expect(useUiStore.getState().activeSpecial).toBe("board");
-    expect(useUiStore.getState().workMode).toBe("plan");
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).not.toBe("ghost");
   });
 });

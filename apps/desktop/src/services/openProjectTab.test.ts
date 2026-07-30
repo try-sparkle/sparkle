@@ -46,8 +46,7 @@ beforeEach(() => {
   // Closable tabs: `null` = never seeded, i.e. every project is open (uiStore is a module
   // singleton, so the closed-tab cases below must not leak into the rest of the file).
   useUiStore.setState({ openProjectIds: null } as never);
-  useUiStore.getState().setActiveSpecial("board");
-  useUiStore.getState().setWorkMode("plan");
+  useUiStore.getState().setWorkMode("right", "plan");
 });
 
 // Closable tabs: openProjectTab reopens the tab for the surfaces that route through IT. It is not
@@ -90,7 +89,7 @@ describe("openProjectTab", () => {
     expect(useRuntimeStore.getState().isOpen("a2")).toBe(true);
     // selectAndOpen's reveal contract: no special view, Build mode, so the agent is actually shown.
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
   it("is a no-op for an unknown project id", () => {
@@ -110,18 +109,17 @@ describe("openProjectTab", () => {
     // boardActive requires activeSpecial === "board", so clearing the Sparkle pane while the
     // chevron still reads Plan would leave the two states disagreeing (roborev 46291-L).
     useUiStore.getState().setActiveSpecial("sparkle");
-    useUiStore.getState().setWorkMode("plan");
+    useUiStore.getState().setWorkMode("right", "plan");
     openProjectTab("p2");
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
   it("KEEPS the Plan board — it is a per-project view, so it re-targets the new project", () => {
-    useUiStore.getState().setActiveSpecial("board");
-    useUiStore.getState().setWorkMode("plan");
+    useUiStore.getState().setWorkMode("right", "plan");
     openProjectTab("p2");
-    expect(useUiStore.getState().activeSpecial).toBe("board");
-    expect(useUiStore.getState().workMode).toBe("plan");
+    // The board is the column's `workMode`, so "keeps the board" IS "keeps the column in Plan".
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
   });
 
   it("clears the overlay even for a project that is ALREADY selected", () => {
@@ -130,10 +128,10 @@ describe("openProjectTab", () => {
     // is current. Inferring "same tab, do nothing" from equal ids here would strand the user on
     // the Sparkle pane in exactly those cases; the tab bar owns that decision instead.
     useUiStore.getState().setActiveSpecial("sparkle");
-    useUiStore.getState().setWorkMode("plan");
+    useUiStore.getState().setWorkMode("right", "plan");
     openProjectTab("p1"); // p1 is the selected project
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
   it("reveals an agent in the project you are ALREADY on", () => {
@@ -142,7 +140,7 @@ describe("openProjectTab", () => {
     useUiStore.getState().setActiveSpecial("sparkle");
     openProjectTab("p1", "a1"); // p1 is the selected project
     expect(useUiStore.getState().activeSpecial).toBeNull();
-    expect(useUiStore.getState().workMode).toBe("build");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
     expect(useRuntimeStore.getState().isOpen("a1")).toBe(true);
     expect(useProjectStore.getState().projects.find((p) => p.id === "p1")?.selectedAgentId).toBe("a1");
   });

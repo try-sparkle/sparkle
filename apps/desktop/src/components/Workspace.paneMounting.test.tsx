@@ -154,7 +154,7 @@ beforeEach(() => {
   } as never);
   useRuntimeStore.setState({ openAgentIds: AGENTS, status: {} } as never);
   useUiStore.setState({
-    activeSpecial: null, workMode: "build", pinnedProjectId: null, openProjectIds: null,
+    activeSpecial: null, workModeBySide: { left: "build", right: "build" }, pinnedProjectId: null, openProjectIds: null,
     pairAssignment: {}, leftProjectId: null,
   } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);

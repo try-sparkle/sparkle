@@ -2,7 +2,7 @@
 // composer height, so the size you drag it to sticks across tabs and relaunches.
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
-import { migratePersistedUi } from "./composerPersist";
+import { migratePersistedUi, repairActiveSpecial, repairStatusFilter } from "./composerPersist";
 import type { Runtime } from "../types";
 // TYPE-ONLY import, deliberately: engine/buildSections → engine/workflowStage → theme/colors, and
 // theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
@@ -36,10 +36,10 @@ export type CategoryId =
  *  uses this shape on the write side and `merge` deletes them on the read side; a key present in one
  *  place and missing from the other is how a transient flag comes back to life on the next launch. */
 const TRANSIENT_UI_KEYS = [
-  "workMode",
+  "workModeBySide",
   "buildAgentHover",
   "boardFocusBeadId",
-  "boardAgentFilter",
+  "boardAgentFilterBySide",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -145,6 +145,25 @@ export type ThemePref = "auto" | "light" | "dark";
 // launch, exactly as the old local useState default did.
 export type WorkMode = "plan" | "build";
 
+// PER COLUMN, NOT PER WINDOW. This was a single `workMode: WorkMode` for both pairs, and paired
+// with a global `activeSpecial === "board"` it made the Plan board a SINGLETON: the left column's
+// Plan chevron wrote a global that only the RIGHT pair rendered, so pressing Plan on the left
+// opened the board on the right AND clobbered whatever the right column had open. Same shape as
+// the mount-cable bug — a per-column feature carrying a decorative per-column appearance while one
+// global held the truth.
+//
+// A column's mode is now the ONLY truth for that column's board: the board is up in a pair iff
+// `workModeBySide[side] === "plan"`. That deliberately collapses the old duplicate truth (mode +
+// `activeSpecial: "board"`), which had to be written in lockstep at five call sites and silently
+// diverged whenever one of them was missed.
+export type WorkModeBySide = Record<PairSide, WorkMode>;
+
+export const DEFAULT_WORK_MODE_BY_SIDE: WorkModeBySide = { left: "build", right: "build" };
+
+/** The pair whose stage hosts the one Improve-Sparkle pane. Named so `openPlanBoard`'s scoping
+ *  reads as a fact about the layout rather than a bare "right" nobody can check. */
+export const SPARKLE_PANE_SIDE: PairSide = "right";
+
 interface UiState {
   composerHeight: number;
   setComposerHeight: (h: number) => void;
@@ -166,12 +185,16 @@ interface UiState {
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
-  // Which special (non-project) view is in focus, if any. "sparkle" = the self-improvement
-  // agent pinned bottom-left. "board" = the read-only Tasks Kanban for the current project.
-  // null = a normal project agent (or nothing) is active. Persisted so the active view survives
-  // relaunch. Selecting a normal agent clears this back to null.
-  activeSpecial: "sparkle" | "board" | null;
-  setActiveSpecial: (v: "sparkle" | "board" | null) => void;
+  // Which special (non-project) view is in focus, if any. "sparkle" = the self-improvement agent
+  // pinned bottom-left. null = a normal project agent (or nothing) is active. Persisted so the
+  // active view survives relaunch. Selecting a normal agent clears this back to null.
+  //
+  // "board" USED TO LIVE HERE and no longer does. The Tasks Kanban is per-COLUMN state, and a
+  // window-global field cannot express it: whichever column wrote "board" last owned the only
+  // board on screen. Read `workModeBySide[side] === "plan"` instead. What remains here is
+  // genuinely window-global — there is exactly one Improve-Sparkle pane, in the primary pair.
+  activeSpecial: "sparkle" | null;
+  setActiveSpecial: (v: "sparkle" | null) => void;
   // App theme preference. "auto" follows the OS appearance; "light"/"dark" force it.
   // Persisted in the same `sparkle-ui` blob; read synchronously at boot (see theme/theme.ts)
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.
@@ -201,21 +224,36 @@ interface UiState {
   /** Show ONLY this band — the helper island's chiclets. Writes the same `statusFilter` the chips
    *  render, so the resulting state is visible and clearable exactly like a hand-toggled one. */
   isolateStatusBand: (b: StatusBand) => void;
-  // Active sidebar workflow mode (Plan/Build chevrons). Shared so non-sidebar components can
-  // switch tabs. NOT persisted (see partialize) — resets to "build" each launch like the old local state.
-  workMode: WorkMode;
-  setWorkMode: (m: WorkMode) => void;
+  // Active sidebar workflow mode (Plan/Build chevrons), KEYED BY PAIR SIDE — see WorkModeBySide.
+  // Each build column owns its own chevron and its own Plan board; one column's mode is invisible
+  // to the other. Shared so non-sidebar components can switch a column's tab. NOT persisted (see
+  // partialize) — resets to "build" each launch like the old local state.
+  workModeBySide: WorkModeBySide;
+  setWorkMode: (side: PairSide, m: WorkMode) => void;
+  /** Put a column into Plan **and** make its board actually visible — see openPlanBoard. Every
+   *  entry point that means "show me the board" must use this rather than `setWorkMode(side,
+   *  "plan")`, which only moves the chevron. */
+  openPlanBoard: (side: PairSide) => void;
+  /** The mirror: put a column into Build **and** make its stage actually visible. Same rule —
+   *  anything meaning "show me the terminal/rows" uses this, not a bare `setWorkMode`. */
+  showBuildStage: (side: PairSide) => void;
   // One-shot "open this bead's detail when the board shows it" handoff (spec §8: clicking an
   // orchestrator's epic pill jumps to the Plan board with that epic's DetailOverlay open). Set by
   // the pill, consumed-then-cleared by BoardView once the bead is present. Transient — NOT persisted.
   boardFocusBeadId: string | null;
   setBoardFocusBeadId: (id: string | null) => void;
-  // One-shot "open the Plan board filtered to just this agent's feedback" handoff, mirroring
-  // boardFocusBeadId above. Set by an agent row's FEEDBACK pill (AgentSidebar), consumed by BoardView
-  // which narrows the displayed beads to those labeled `agent:<id>`. The id is the build-agent's a.id.
+  // One-shot "open the Plan board filtered to just this agent's feedback" handoff. Set by an agent
+  // row's FEEDBACK pill (AgentSidebar), consumed by BoardView which narrows the displayed beads to
+  // those labeled `agent:<id>`. The id is the build-agent's a.id.
   // Transient — NOT persisted (see partialize): a relaunch must never restore a filtered board.
-  boardAgentFilter: string | null;
-  setBoardAgentFilter: (id: string | null) => void;
+  //
+  // KEYED BY SIDE, for the same reason the mode is. Both pairs can hold a board open at once now,
+  // and both BoardViews read this — so a single global string meant a LEFT row's pill also narrowed
+  // the RIGHT column's board. Across two projects that is worse than a stray filter: the other
+  // board filters on an agent id belonging to a project it isn't showing, matches nothing, and
+  // renders empty under "Showing feedback from agent <id>" with no visible cause in that column.
+  boardAgentFilterBySide: Record<PairSide, string | null>;
+  setBoardAgentFilter: (side: PairSide, id: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -416,12 +454,51 @@ export const useUiStore = create<UiState>()(
         set({ statusFilter: { needs_you: true, running: true, done: true } }),
       isolateStatusBand: (b) =>
         set({ statusFilter: { needs_you: b === "needs_you", running: b === "running", done: b === "done" } }),
-      workMode: "build",
-      setWorkMode: (m) => set({ workMode: m }),
+      workModeBySide: { ...DEFAULT_WORK_MODE_BY_SIDE },
+      // Writes ONLY the named side. The other side's entry is carried through untouched — that
+      // non-clobbering is the whole point of the map, and it is what the per-column board test
+      // asserts by keeping two different boards open at once.
+      // ENTERING PLAN IS TWO WRITES, AND THIS IS THE ONLY PLACE THAT KNOWS THAT.
+      //
+      // A column's board is gated on `!sparkleActive` (Workspace) because the board and the
+      // Improve-Sparkle pane render into the same stage and are no longer two values of one enum.
+      // So a caller that sets the mode alone gets a HALF state: the chevron, the row list and the
+      // filter bar all move to Plan while the stage keeps showing the Sparkle terminal — and
+      // `reconcileWorkMode` returns null while a special is up, so nothing recovers it.
+      //
+      // That was found twice, on three different call sites (the chevron, the `navigate` wire op,
+      // and the concierge's `set_work_mode`), which is the tell that it should never have been two
+      // writes at the call site. It is one action now, and the fix cannot drift out of a path again.
+      //
+      // Scoped to the pane-owning side: there is exactly ONE Improve-Sparkle pane and it lives in
+      // the primary pair's stage, so a left column entering Plan must not close it.
+      openPlanBoard: (side) => {
+        get().setWorkMode(side, "plan");
+        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
+      },
+      // THE MIRROR, and it needs to exist for the same reason. The Improve-Sparkle pane covers
+      // WHICHEVER surface the column is showing, so "show me the Build stage" is the same two
+      // writes as "show me the board" — the first version of this pairing was applied only to the
+      // Plan half, which left `set_work_mode("build")` refusing as a no-op while the pane sat on
+      // the terminal. That state is the MORE common one: "build" is the default, and selecting
+      // Improve Sparkle never touches the mode.
+      showBuildStage: (side) => {
+        get().setWorkMode(side, "build");
+        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
+      },
+      setWorkMode: (side, m) =>
+        set((s) =>
+          s.workModeBySide[side] === m ? {} : { workModeBySide: { ...s.workModeBySide, [side]: m } },
+        ),
       boardFocusBeadId: null,
       setBoardFocusBeadId: (id) => set({ boardFocusBeadId: id }),
-      boardAgentFilter: null,
-      setBoardAgentFilter: (id) => set({ boardAgentFilter: id }),
+      boardAgentFilterBySide: { left: null, right: null },
+      setBoardAgentFilter: (side, id) =>
+        set((st) =>
+          st.boardAgentFilterBySide[side] === id
+            ? {}
+            : { boardAgentFilterBySide: { ...st.boardAgentFilterBySide, [side]: id } },
+        ),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       newAgentRuntime: "local",
@@ -594,9 +671,24 @@ export const useUiStore = create<UiState>()(
       // before a key was excluded — or hand-edited — restores it at launch. Observed with
       // zeroCreditBannerDismissed: dismiss the $0 banner once and every later launch starts
       // dismissed, still at zero balance, with AI extras silently dark and nothing to undo it.
+      //
+      // THE REPAIRS BELONG HERE, NOT IN `migrate`. zustand calls `migrate` ONLY when the stored
+      // version differs from the configured one (middleware.js: `deserializedStorageValue.version
+      // !== options.version`). So a repair wired through `migrate` is UNREACHABLE for every blob
+      // already at the current version — which is exactly the population that needs it. The
+      // `activeSpecial: "board"` repair shipped that way first and was inert: `version` stayed 2,
+      // every affected blob was written at 2, migrate was skipped, and `"board"` merged straight
+      // back in. `merge` is the hook zustand runs on EVERY rehydrate, so a repair here is
+      // unconditional in fact and not just in the comment.
+      //
+      // Applied only to keys the blob ACTUALLY carries, so one that never had them does not gain
+      // them — the store's own defaults already answer, and inventing keys here would defeat the
+      // "unknown keys pass through untouched" contract above.
       merge: (persisted, current) => {
         const stored = { ...(persisted as Record<string, unknown>) };
         for (const key of TRANSIENT_UI_KEYS) delete stored[key];
+        if ("activeSpecial" in stored) stored.activeSpecial = repairActiveSpecial(stored.activeSpecial);
+        if ("statusFilter" in stored) stored.statusFilter = repairStatusFilter(stored.statusFilter);
         return { ...current, ...(stored as Partial<UiState>) };
       },
     },

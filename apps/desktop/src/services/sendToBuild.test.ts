@@ -31,6 +31,7 @@ vi.mock("../stores/runtimeStore", () => ({
 
 // sendToBuild reaches these through services/landInAgent, which is left REAL so these tests prove
 // the real hand-off (not a mock of it) does all four steps.
+const setWorkModeMock = vi.fn();
 const setActiveSpecialMock = vi.fn();
 const requestRevealAgentMock = vi.fn();
 const requestComposeFocusMock = vi.fn();
@@ -40,6 +41,12 @@ vi.mock("../stores/uiStore", () => ({
       setActiveSpecial: setActiveSpecialMock,
       requestRevealAgent: requestRevealAgentMock,
       requestComposeFocus: requestComposeFocusMock,
+      // LEAVING THE BOARD IS `setWorkMode` NOW, not `setActiveSpecial`. The board is per-column
+      // state (uiStore.workModeBySide), so landInAgent resolves the project's pair from the
+      // assignment map — a mock missing either of these throws inside sideOf rather than failing
+      // an assertion, which is a far more confusing way to learn the mock went stale.
+      setWorkMode: setWorkModeMock,
+      pairAssignment: {},
     }),
   },
 }));
@@ -163,9 +170,12 @@ describe("sendToBuild", () => {
 
       sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: "PRD/feature.md" });
 
-      // Both Build It handlers are clicked FROM the board, so activeSpecial is "board" and the
-      // board owns the pane. Without this the selection below is invisible.
+      // Both Build It handlers are clicked FROM the board, which owns that column's pane. Without
+      // leaving it the selection below is invisible. TWO calls, because the board and the
+      // Improve-Sparkle pane are separate state now: the pane is `activeSpecial`, and the board is
+      // the project's own column dropping out of Plan.
       expect(setActiveSpecialMock).toHaveBeenCalledWith(null);
+      expect(setWorkModeMock).toHaveBeenCalledWith("right", "build");
       expect(selectAgentMock).toHaveBeenCalledWith("proj1", "build-new");
       expect(openMock).toHaveBeenCalledWith("build-new");
       expect(requestRevealAgentMock).toHaveBeenCalledWith("build-new");

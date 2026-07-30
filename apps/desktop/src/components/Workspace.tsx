@@ -30,7 +30,6 @@ import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
-import { PlanBuildToggle } from "./PlanBuildToggle";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
@@ -74,10 +73,7 @@ import {
   sideOf,
   type PairAssignment,
 } from "../engine/pairs";
-import { firstVisibleAgentId } from "../engine/agentOrdering";
-import { firstLadderRowId } from "../engine/ladderSelection";
-import { resolveStage, rollupStages } from "../engine/workflowStage";
-import { publishedStatusFor } from "../useAttentionNotifications";
+import { planBoardUp } from "../engine/planBoard";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
@@ -503,9 +499,7 @@ export function Workspace() {
   const open = useRuntimeStore((s) => s.open);
   const reconcile = useRuntimeStore((s) => s.reconcile);
   const activeSpecial = useUiStore((s) => s.activeSpecial);
-  const workMode = useUiStore((s) => s.workMode);
-  const setWorkMode = useUiStore((s) => s.setWorkMode);
-  const setActiveSpecial = useUiStore((s) => s.setActiveSpecial);
+  const workModeBySide = useUiStore((s) => s.workModeBySide);
   const pinnedProjectId = useUiStore((s) => s.pinnedProjectId);
   // Resolve the pin DEFENSIVELY: it is persisted and load-bearing (it scopes the concierge vitals),
   // but a project can be deleted from another webview or a stale blob can name one that no longer
@@ -1215,11 +1209,18 @@ export function Workspace() {
   // project open, and only when the Beads tool ([tools].beads) is enabled — off means the board is
   // used nowhere (the Plan chevron hides and mode reconciles away from it).
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
-  const boardActive = activeSpecial === "board" && !!project && beadsEnabled;
-  // PRD §3: "Plan mode: columns 2 + 3 collapse into one wide column of Plan cards." Build splits
-  // them back. The agent column stays MOUNTED (display:none) rather than unmounting — it owns live
-  // effects (alert episodes, branch polling, the close prompt) that must not restart on a mode flip.
-  const planCollapsed = boardActive;
+  // ONE QUESTION, ASKED ONCE PER COLUMN — with that column's own mode and its own project. These
+  // two booleans are independent by construction, which is the fix: both pairs can hold different
+  // boards open at the same time, and neither can close or overwrite the other's.
+  // `&& !sparkleActive` RESTORES AN INVARIANT THE SPLIT REMOVED. The board and the Improve-Sparkle
+  // pane used to be two values of ONE enum, so they were mutually exclusive by construction —
+  // setting either cleared the other. They are independent state now, and both render into this
+  // same stage, so without this the Sparkle pane mounts INVISIBLY BEHIND the board (it paints at
+  // TERMINAL_PANE_Z, the board at PLAN_COLUMN_Z) and clicking Improve Sparkle from the board looks
+  // like it did nothing. Gating the RENDER rather than forcing the column out of Plan keeps the
+  // user's Plan choice: leaving Sparkle brings their board back.
+  const boardActive = planBoardUp(workModeBySide.right, !!project, beadsEnabled) && !sparkleActive;
+  const leftBoardActive = planBoardUp(workModeBySide.left, !!leftProject, beadsEnabled);
 
   // Is the selected agent actually ON SCREEN? `project.selectedAgentId` stays non-null while the
   // Plan board or the Improve Sparkle pane is showing, and while the agent's tab isn't open at all.
@@ -1266,44 +1267,11 @@ export function Workspace() {
     return isCalmBand(p?.agents.find((a) => a.id === activeAgentId)?.status);
   }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, boardActive]);
 
-  // Plan/Build handlers for the collapsed Plan column's header. Deliberately simpler than the
-  // sidebar's copy: there is no "second click spawns an agent" stage to honor from Plan.
-  const onPickPlanCollapsed = () => {
-    setWorkMode("plan");
-    setActiveSpecial("board");
-  };
-  const onPickBuildCollapsed = () => {
-    setWorkMode("build");
-    setActiveSpecial(null);
-    if (!project) return;
-    // Land on the row the Build column ACTUALLY renders first, so the pane matches the mode. Uses
-    // the ladder + the live status filter — plain array order would happily select a row the user
-    // has filtered out of sight, leaving a terminal with no row beside it (roborev 53428/53439).
-    const stageFor = (id: string) =>
-      resolveStage(useRuntimeStore.getState().branchStatus[id], useRuntimeStore.getState().workflowStage[id]);
-    const headStageFor = (id: string) => {
-      const kids = project.agents.filter((a) => a.parentId === id);
-      const rollup = rollupStages(kids.map((w) => stageFor(w.id)));
-      return rollup ? rollup.stage : stageFor(id);
-    };
-    const published = publishedStatusFor(
-      project.agents,
-      useRuntimeStore.getState().status,
-      new Set(useRuntimeStore.getState().openAgentIds),
-      useRuntimeStore.getState().lastObserved,
-      stageFor,
-    );
-    const next =
-      firstLadderRowId(
-        project.agents,
-        "build",
-        headStageFor,
-        (id) => published[id] ?? "stopped",
-        useUiStore.getState().statusFilter,
-      ) ?? firstVisibleAgentId(project.agents, "build");
-    useProjectStore.getState().selectAgent(project.id, next);
-    if (next) open(next);
-  };
+  // NO PLAN/BUILD HANDLERS HERE ANY MORE. The board used to render its own duplicate of the
+  // segmented toggle, because it covered the build column and took its header away with it. It
+  // takes only the TERMINAL's slot now, so the sidebar's own toggle stays on screen and is the one
+  // way back to Build — with the richer "land on the first rendered row" logic this copy was
+  // shadowing (AgentSidebar.onPickBuild).
 
   // Only computed while the prompt is up (it's the prompt's copy), but a plain call is cheaper than
   // the memo that would guard it.
@@ -1395,9 +1363,14 @@ export function Workspace() {
             children are given in the SAME [build, terminal] order as the right pair and the
             terminal ends up outboard.
 
-            It carries no Sparkle pane, no Plan board and no onboarding hints: those are single
-            surfaces that belong to the primary (right) pair, and duplicating them would put two of
-            each on screen with no way to say which one a click meant. */}
+            It carries no Sparkle pane and no onboarding hints: those really are single surfaces
+            that belong to the primary (right) pair, and duplicating them would put two of each on
+            screen with no way to say which one a click meant.
+
+            IT DOES CARRY ITS OWN PLAN BOARD, and that sentence used to include one — which was the
+            bug, not the design. The board is per-PROJECT and per-COLUMN, so "which one did a click
+            mean" has an obvious answer (the column you clicked in); it is not a single surface the
+            way the Sparkle pane is. See PlanBoardSlot. */}
         {pairCount === 2 && (
           <Pair
             side="left"
@@ -1428,6 +1401,11 @@ export function Workspace() {
                   <strong>Move to the left pair</strong> in its build column header.
                 </Hint>
               )}
+              {/* THE LEFT COLUMN'S OWN PLAN BOARD. This pair used to carry none at all — the
+                  comment above said so — which is why pressing Plan here opened the board on the
+                  right. It is its own element with its own project; nothing about it is shared
+                  with the right pair's board. */}
+              {leftBoardActive && leftProject && <PlanBoardSlot project={leftProject} side="left" />}
             </div>
           </Pair>
         )}
@@ -1620,41 +1598,11 @@ export function Workspace() {
                 </button>
               </Hint>
             )}
+            {/* The right pair's board — same component, same slot, its own project. Last in the
+                stage so it lays over the empty-state hints as well as the panes. */}
+            {boardActive && project && <PlanBoardSlot project={project} side="right" />}
           </div>
 
-          {/* PRD §3 — Plan mode: columns ② + ③ collapse into ONE wide column of Plan cards, with
-              the segmented toggle as its header so the way back to Build is exactly where it was.
-              An overlay (not a swap) so the panes underneath keep their PTYs and their layout. */}
-          {planCollapsed && project && (
-            <div
-              data-testid="plan-column"
-              style={{
-                position: "absolute",
-                inset: 0,
-                display: "flex",
-                flexDirection: "column",
-                background: C.deepForest,
-                // Must stay above the sidebar's overlay panel, which is a sibling here — see
-                // components/layers.ts for the ordering contract and why it matters.
-                zIndex: PLAN_COLUMN_Z,
-              }}
-            >
-              <div style={{ paddingTop: 12 }}>
-                <PlanBuildToggle
-                  mode={workMode}
-                  beadsEnabled={beadsEnabled}
-                  onPickPlan={onPickPlanCollapsed}
-                  onPickBuild={onPickBuildCollapsed}
-                  style={{ margin: "0 12px 8px", maxWidth: 320 }}
-                />
-              </div>
-              <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
-                <Suspense fallback={<PaneFallback />}>
-                  <BoardView project={project} />
-                </Suspense>
-              </div>
-            </div>
-          )}
         </Pair>
       </div>
 
@@ -1675,8 +1623,11 @@ export function Workspace() {
         panes={live}
         pairAssignment={pairAssignment}
         stages={{ left: leftStage, right: rightStage }}
+        // A column showing its board has no visible agent pane — EACH side answers that for
+        // itself now. The left used to always show its pane, because the left could not have a
+        // board; with one, an unhidden pane would sit live behind it.
         visibleAgentId={{
-          left: leftActiveAgentId,
+          left: leftBoardActive ? null : leftActiveAgentId,
           right: sparkleActive || boardActive ? null : activeAgentId,
         }}
         // Calm is the RIGHT pair's treatment: it follows the agent the concierge is looking at, and
@@ -1723,6 +1674,48 @@ export function Workspace() {
           onCancel={() => setClosing(false)}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * A column's Plan board, filling THAT column's terminal slot.
+ *
+ * WHERE THIS RENDERS IS THE FIX. It used to be a single block inside the RIGHT pair, positioned
+ * `absolute; inset: 0` over the pair — so it covered the build column too ("columns ②+③ collapse
+ * into one wide column", the old PRD §3 reading) and, being written once in one pair, it could only
+ * ever appear on the right no matter which column's chevron was pressed.
+ *
+ * Now each pair renders its own, INSIDE its own terminal stage. Two consequences the old shape
+ * could not give:
+ *   - The board replaces the TERMINAL, in place, at the terminal's exact geometry. The build column
+ *     beside it stays visible — and since the sidebar owns the Plan/Build toggle as its header, the
+ *     way back to Build is exactly where it always was, with no duplicate toggle to render.
+ *   - Two of these can be on screen at once, showing different projects, with no shared state.
+ *
+ * `inset: 0` inside the stage (not over the pair) and PLAN_COLUMN_Z to sit above the portalled
+ * agent panes, which paint at TERMINAL_PANE_Z. The pane for a board-showing column is also hidden
+ * outright (`visibleAgentId` below goes null), so this is belt-and-braces rather than a race.
+ */
+function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) {
+  return (
+    <div
+      data-testid="plan-column"
+      data-plan-board-project={project.id}
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        flexDirection: "column",
+        background: C.deepForest,
+        zIndex: PLAN_COLUMN_Z,
+      }}
+    >
+      <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+        <Suspense fallback={<PaneFallback />}>
+          <BoardView project={project} side={side} />
+        </Suspense>
+      </div>
     </div>
   );
 }

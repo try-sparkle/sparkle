@@ -34,11 +34,33 @@ export interface PersistedUi {
 // Coerce whatever is on disk into a complete {band: boolean} record. A missing or non-boolean entry
 // defaults to VISIBLE — the safe direction: showing a row the user filtered out is a minor
 // annoyance they can re-hide, while hiding one they expected to see looks like data loss.
-function repairStatusFilter(raw: unknown): Record<string, boolean> {
+export function repairStatusFilter(raw: unknown): Record<string, boolean> {
   const src = (raw ?? {}) as Record<string, unknown>;
   const out: Record<string, boolean> = {};
   for (const k of STATUS_BAND_KEYS) out[k] = typeof src[k] === "boolean" ? (src[k] as boolean) : true;
   return out;
+}
+
+/**
+ * Coerce a persisted `activeSpecial` to a value this build still renders.
+ *
+ * `activeSpecial` is PERSISTED (deliberately absent from uiStore's TRANSIENT_UI_KEYS), and it used
+ * to carry a third value, `"board"`. The Plan board is per-column state now (`workModeBySide`), so
+ * `"board"` names a view nothing renders — but a blob written before that change merges it straight
+ * back in as a TRUTHY value, and nothing clears it: `openProjectTab` only clears `"sparkle"`. The
+ * damage is all silent — no sidebar row reads as selected, `reconcileWorkMode` is permanently
+ * neutered, and `capture_agent` refuses every screenshot with `special-view-showing: "board"` —
+ * until the user happens to press Build.
+ *
+ * CALLED FROM uiStore's `merge`, NOT from this file's `migratePersistedUi`. That distinction is the
+ * whole point: zustand runs `migrate` ONLY when the stored version differs from the configured one
+ * (middleware.js — `deserializedStorageValue.version !== options.version`). Every blob that can
+ * carry `activeSpecial: "board"` was written at the CURRENT version, so a repair wired through
+ * `migrate` is unreachable for exactly the population it exists to fix. `merge` runs on every
+ * rehydrate. It is also applied here for a version-mismatched blob, so both paths are covered.
+ */
+export function repairActiveSpecial(raw: unknown): "sparkle" | null {
+  return raw === "sparkle" ? "sparkle" : null;
 }
 
 export function migratePersistedUi(
@@ -64,5 +86,11 @@ export function migratePersistedUi(
   // column with no visible cause and nothing failing — precisely what this repair exists to stop.
   // Running it unconditionally costs one object rebuild per launch and closes that hole for good.
   next = { ...next, statusFilter: repairStatusFilter(next.statusFilter) };
+  // Same unconditional treatment, same reason — see repairActiveSpecial. Only applied when the key
+  // is actually present, so a blob that never carried one is passed through untouched (the store
+  // default already answers null) rather than gaining a key it did not have.
+  if ("activeSpecial" in next) {
+    next = { ...next, activeSpecial: repairActiveSpecial(next.activeSpecial) };
+  }
   return next;
 }

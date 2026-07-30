@@ -43,7 +43,7 @@ const project: Project = {
 
 beforeEach(() => {
   useRuntimeStore.setState({ branchStatus: {}, status: {} });
-  useUiStore.setState({ workMode: "build" });
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" } });
   vi.clearAllMocks();
 });
 afterEach(() => cleanup());

@@ -92,7 +92,7 @@ beforeEach(() => {
   useRuntimeStore.setState({ branchStatus: {}, status: {} });
   // Mode lives in the singleton uiStore now; reset to the Build default so the worker/build
   // agents under test are listed (Think mode would filter them out).
-  useUiStore.setState({ workMode: "build" });
+  useUiStore.setState({ workModeBySide: { left: "build", right: "build" } });
   // AT REST, EXPLICITLY. Clicks in this file land inside a row's hover card, and that bubbles to the
   // row — which patches the cable, which opens every row's CONCIERGE end (engine/rowGeometry). The
   // cable store is module state, so without this the geometry assertions below would read whatever
@@ -611,7 +611,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
     container.querySelector<HTMLElement>('[data-hint="improve"]')!;
 
   it("takes the terminal plane when active — the same token a selected agent row takes", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: "sparkle" } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const row = sparkleRow(container);
     expect(row.style.background).toBe("var(--c-forest)");
@@ -620,7 +620,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   });
 
   it("is transparent when inactive, so it sits on the column's own plane", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     expect(sparkleRow(container).style.background).toBe("transparent");
   });
@@ -644,7 +644,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   // not reinstate the hairline, and do NOT drop the fillets to "simplify" — that last one silently
   // reintroduces the 1.08:1 no-selected-state failure the whole history is about.
   it("marks the active row with the build rows' square edge, not a rail or an outline", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: "sparkle" } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const row = sparkleRow(container);
     expect(row.style.borderRadius).toBe("6px 0 0 6px");
@@ -653,7 +653,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   });
 
   it("rounds fully when inactive, like an unselected build row", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     expect(sparkleRow(container).style.borderRadius).toBe("6px");
   });
@@ -662,7 +662,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   // absolutely-positioned quarter-discs, one above the right edge and one below, painting the
   // terminal color everywhere except a concave cut — the same pair a selected agent row draws.
   it("draws the concave fillets that make the selection perceivable", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: "sparkle" } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: "sparkle" } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     const fillets = sparkleRow(container).querySelectorAll<HTMLElement>('[aria-hidden][style*="radial-gradient"]');
     expect(fillets).toHaveLength(2);
@@ -670,7 +670,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   });
 
   it("draws no fillets when it is not the selected row", () => {
-    useUiStore.setState({ workMode: "build", activeSpecial: null } as never);
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial: null } as never);
     const { container } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
     expect(
       sparkleRow(container).querySelectorAll('[aria-hidden][style*="radial-gradient"]'),
@@ -683,7 +683,7 @@ describe("AgentSidebar — the Improve Sparkle row is a plane when active, never
   // group. Two renderings of one fact, the smaller one in a vocabulary nothing else uses.
   it("draws no divider rule above itself, active or not", () => {
     for (const activeSpecial of ["sparkle", null]) {
-      useUiStore.setState({ workMode: "build", activeSpecial } as never);
+      useUiStore.setState({ workModeBySide: { left: "build", right: "build" }, activeSpecial } as never);
       const { container, unmount } = render(<AgentSidebar project={mkProject([mkAgent()])} />);
       expect(sparkleRow(container).style.borderTop).toBe("");
       unmount();

@@ -108,7 +108,7 @@ beforeEach(() => {
   } as never);
   useRuntimeStore.setState({ openAgentIds: [] } as never);
   useUiStore.getState().setActiveSpecial(null);
-  useUiStore.getState().setWorkMode("build");
+  useUiStore.getState().setWorkMode("right", "build");
   // Closable tabs: `null` = never seeded, i.e. every project is open (uiStore is a module singleton,
   // so the closed-tab cases below must not leak into the rest of the file).
   useUiStore.setState({ openProjectIds: null } as never);
