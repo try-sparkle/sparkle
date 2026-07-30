@@ -17,6 +17,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
 import { PILL_MIN_LINES, pillPreview } from "../composer/attachments";
+import { COMPOSE_MENTION_PILL_TESTID } from "./MentionMirror";
 import type { MentionAgent } from "./mentions";
 
 afterEach(() => cleanup());
@@ -461,5 +462,53 @@ describe("ComposeBox — a mention inside a collapsed paste is not an address", 
     fireEvent.click(send());
     // Addressed — and the body still leads with the verbatim paste.
     expect(onSend).toHaveBeenCalledWith(`${LONG}\n\n@Docs`, [{ agentId: "a1", name: "Docs" }]);
+  });
+});
+
+// ── THE VERBATIM RESTORE OUTRANKS THE SPOKEN-ADDRESS RULE ──────────────────────────────────────
+// `append` serves two callers through one function: DICTATION (a spoken segment, which
+// `appendDictated` trims because Deepgram pads its segments) and ConciergeHost.restoreDraft (an
+// already-composed body coming back after a failed send, flagged `{ verbatim: true }`). The whole
+// safety argument for that merge is ORDERING — the verbatim early return sits ABOVE the
+// spoken-address block — and until this row nothing pinned it.
+//
+// It is not a hypothetical collision. `dictatedSparkleAddress` fires when `current.trim() === ""`,
+// which is EXACTLY the state of the box on a restore (`submit` clears it before the promise
+// settles), and it resolves to the built-in SPARKLE_MENTION_AGENT, so no roster entry is required
+// to reach it. If the two blocks are ever reordered — or a third insert path is added above the
+// guard — a failed send of "Sparkle, ship this diff: …" comes back as "@Sparkle ship this diff: …":
+// the vocative deleted, the body run through the trimming path (re-opening roborev 55793's dedent
+// of a pasted diff), and `mentionsIn` then aiming the retry at a mention the user never wrote.
+describe("ComposeBox — a restored draft opening with 'Sparkle,' is TEXT, not an address", () => {
+  /** The shape that collides: a spoken-address lead-in on a body whose remainder is a collapsed
+   *  paste, so both the rewrite and the trim would be visible in one assertion. */
+  const SPOKEN_LEAD = `Sparkle, ship this diff:\n${LONG}`;
+
+  it("restores it byte-for-byte, paints no mention pill, and re-sends it unaddressed", () => {
+    let append: ((text: string, opts?: { verbatim?: boolean }) => void) | null = null;
+    // A roster IS present — the reordered code would resolve against it (or fall back to the
+    // built-in), so an empty roster would make this row pass for the wrong reason.
+    const { onSend } = setup({
+      mentionAgents: [DOCS],
+      registerInsert: (fn) => {
+        append = fn;
+      },
+    });
+
+    act(() => append?.(SPOKEN_LEAD, { verbatim: true }));
+
+    // 1. Byte-identical. `toBe` on the WHOLE string, not a startsWith: the reorder's damage is at
+    //    both ends — "Sparkle," deleted at the head, LONG's trailing newline trimmed at the tail.
+    expect(box().value).toBe(SPOKEN_LEAD);
+    // 2. Nothing was turned into an artifact. The word is prose here.
+    expect(screen.queryAllByTestId(COMPOSE_MENTION_PILL_TESTID)).toHaveLength(0);
+
+    // 3. And the retry goes out UNADDRESSED — one argument, the way an unaddressed send always
+    //    looks. This is the half that would silently misroute: the host aims `mentions[0]` at that
+    //    agent's terminal and renders the wire text through `mentionFreeText`.
+    fireEvent.click(send());
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0]).toHaveLength(1);
+    expect(onSend.mock.calls[0]?.[0]).toBe(SPOKEN_LEAD);
   });
 });
