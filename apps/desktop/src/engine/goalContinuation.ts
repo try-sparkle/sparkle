@@ -250,7 +250,15 @@ export function continuePrompt(goal: AgentGoal): string {
     `Your turn ended but your goal is not met yet, so you are being resumed automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
-    `If the goal IS in fact met, say so and mark it met (sparkle-control: set_agent_goal with ` +
+    // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
+    // `set_agent_goal`'s schema is `{ targetAgentId?, goal, ttlMs? }` — there is no `met`, and
+    // `goal` is required. An agent that obeyed either failed zod validation or, if it invented a
+    // goal string to satisfy it, landed in `setAgentGoal` → `newGoal`, which builds a fresh record
+    // that is never born met and CLEARS any existing `metAt`. Either way it could not stop being
+    // resumed, and burned continues until the bound escalated to a human with a false "still
+    // unmet" — the exact outcome this prompt exists to prevent. `set_agent_goal_met` is the op;
+    // no `targetAgentId`, which agents are not offered.
+    `If the goal IS in fact met, say so and mark it met (sparkle-control: set_agent_goal_met with ` +
     `met: true) so you stop being resumed. If you are blocked on something only the human can ` +
     `resolve, say what you need — do not sit idle.`
   );

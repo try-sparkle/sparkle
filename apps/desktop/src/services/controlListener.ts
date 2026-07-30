@@ -781,7 +781,13 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // Agent-to-agent spoofing is the threat: marking a DIFFERENT live agent met latches its `metAt`,
   // so auto-continue never restarts it and `agentStall` renders it "done" — a false "done" on a
   // stalled agent, which is the failure the goal feature exists to end. So an agent may only mark
-  // its OWN goal, and a `targetAgentId` in its payload is ignored rather than honoured.
+  // its OWN goal, and a non-self `targetAgentId` in its payload is REFUSED — not ignored.
+  //
+  // The distinction is the whole fix. Ignoring the field meant marking the CALLER instead and
+  // replying `{ ok: true }`: the same false "done", relocated onto whoever made the call, with a
+  // success reply so nothing told it. "Passing it is harmless" was also the reasoning that put the
+  // field back in the agent-facing schema once already. It is withheld there now (mcp-control's
+  // server.ts); this branch is the backstop for a payload that carries it regardless.
   //
   // The concierge is the exception, and it has to be: it is the human-driven surface that sweeps
   // for stalls, it has no agent row to default to, and closing out a finished agent's goal is the

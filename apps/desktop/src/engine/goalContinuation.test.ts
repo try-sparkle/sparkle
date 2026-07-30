@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_GOAL_TTL_MS,
   escalateGoal,
@@ -12,6 +14,7 @@ import {
   IDLE_SETTLE_MS,
   MAX_CONTINUES_TOTAL,
   MAX_CONTINUES_WITHOUT_PROGRESS,
+  continuePrompt,
   decideContinuation,
   progressMark,
   type ContinuationInput,
@@ -340,5 +343,56 @@ describe("goal state machine", () => {
   it("escalating twice keeps the first reason", () => {
     const once = escalateGoal(newGoal("g", T0), T0 + 1, "first");
     expect(escalateGoal(once, T0 + 2, "second").escalationReason).toBe("first");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// `continuePrompt` names a control op, and that op has to EXIST.
+//
+// This is the only instruction an agent ever receives about how to get out of auto-continue, so an
+// op name in it is not documentation — it is the exit. It named `set_agent_goal with met: true`,
+// which cannot work: `set_agent_goal` requires a `goal` and has no `met`, so an agent that obeyed
+// either failed validation or clobbered its own goal record with a fresh, never-met one. It could
+// not stop being resumed, and burned continues until the bound escalated to a human with a false
+// "still unmet" — precisely what the prompt exists to prevent.
+//
+// The allowlist is in RUST (`bridge.rs`) and the prompt is in TypeScript, with no shared type
+// between them, so nothing but reading the source keeps the two in step. Same technique as
+// `agentGoalShape.test.ts` and the CONTROL_KEYS pins: parse, don't import.
+// ---------------------------------------------------------------------------------------------
+
+describe("continuePrompt names an op the control surface actually has", () => {
+  /** The string literals of `const CONTROL_OPS: &[&str] = &[ … ];` in the Rust bridge. */
+  function controlOps(): string[] {
+    const source = readFileSync(
+      fileURLToPath(new URL("../../src-tauri/src/bridge.rs", import.meta.url)),
+      "utf8",
+    );
+    const start = source.indexOf("const CONTROL_OPS: &[&str] = &[");
+    if (start < 0) throw new Error("could not find CONTROL_OPS in bridge.rs — was it renamed?");
+    const end = source.indexOf("];", start);
+    if (end < 0) throw new Error("unterminated CONTROL_OPS literal");
+    const ops = [...source.slice(start, end).matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
+    // A parse that silently found nothing would make every assertion below vacuous.
+    if (ops.length < 5) throw new Error(`CONTROL_OPS parse found only ${ops.length} ops`);
+    return ops;
+  }
+
+  it("points at set_agent_goal_met — the op that can actually mark a goal met", () => {
+    const prompt = continuePrompt(newGoal("land the guardrails", T0));
+    expect(prompt).toContain("set_agent_goal_met");
+    // `set_agent_goal` is a PREFIX of `set_agent_goal_met`, so a bare `toContain` would pass on the
+    // broken text too. Pin the wrong pairing itself: the op followed by a `met:` argument it has no
+    // field for.
+    expect(prompt).not.toMatch(/set_agent_goal\b(?!_met)[^.]*met:/);
+  });
+
+  it("every op it names is in the Rust allowlist", () => {
+    const ops = controlOps();
+    const named = [...continuePrompt(newGoal("g", T0)).matchAll(/sparkle-control:\s*([a-z_]+)/g)].map(
+      (m) => m[1]!,
+    );
+    expect(named.length).toBeGreaterThan(0);
+    for (const op of named) expect(ops, `${op} is not in CONTROL_OPS`).toContain(op);
   });
 });
