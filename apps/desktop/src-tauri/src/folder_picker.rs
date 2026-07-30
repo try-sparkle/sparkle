@@ -335,6 +335,14 @@ pub async fn pick_files(
     })
     .await
     .unwrap_or_else(|e| Err(format!("The file picker task failed to run: {e}")))
+    .inspect(|paths| {
+        // A native panel is the OTHER way the OS tells us the user chose a file, so these paths
+        // get the same provenance as a drag-drop. Without this the picker carries the identical
+        // silent-discard bug as the drop did (bead sparkle-zviq) — it only ever looked healthy
+        // because picked files usually live under `$HOME`, which containment already allowed.
+        // Registering here is what makes "drag it in" and "click upload" actually equivalent.
+        crate::attachments::note_user_chosen_paths(paths.iter().map(std::path::PathBuf::from));
+    })
 }
 
 /// The blocking half of both commands: dispatch the panel to the main thread and wait for it.

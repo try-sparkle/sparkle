@@ -190,8 +190,8 @@ async function elapseCountdowns() {
 beforeEach(() => {
   h.deferred = undefined; // no stale subscription answering for an unmounted host
   vi.clearAllMocks();
-  h.pick.mockResolvedValue([shot]);
-  h.loadPaths.mockResolvedValue([shot]);
+  h.pick.mockResolvedValue({ attachments: [shot], failed: [] });
+  h.loadPaths.mockResolvedValue({ attachments: [shot], failed: [] });
   h.dispatch.mockResolvedValue({ ok: true, path: "free-text" });
   h.route.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
   h.startConciergeTurn.mockResolvedValue(null);
@@ -226,7 +226,7 @@ describe("ConciergeHost — attach pickers", () => {
   // the host running the right picker for the action that was chosen.
   it("each revealed action runs its own picker kind", async () => {
     mount();
-    h.pick.mockResolvedValue([]);
+    h.pick.mockResolvedValue({ attachments: [], failed: [] });
     fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Screenshot" }));
@@ -480,9 +480,12 @@ describe("ConciergeHost — the sent attachment stays visible in the bubble", ()
   it("shows a non-image as a named chip, never as a thumbnail", async () => {
     // The picker is a knob in this suite (see the mock): what it returns is what gets staged, so a
     // `file` record here exercises the non-image arm without needing a second attach button.
-    h.pick.mockResolvedValue([
-      { id: "f1", kind: "file", path: "/tmp/notes.pdf", name: "notes.pdf" } satisfies Attachment,
-    ]);
+    h.pick.mockResolvedValue({
+      attachments: [
+        { id: "f1", kind: "file", path: "/tmp/notes.pdf", name: "notes.pdf" } satisfies Attachment,
+      ],
+      failed: [],
+    });
     mount();
     await attachViaUpload();
     type("read this");

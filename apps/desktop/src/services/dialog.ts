@@ -63,32 +63,66 @@ export async function pickProjectFolder(
   }
 }
 
-/** Prompt the user to pick one or more FILES. Returns their absolute paths.
+/** What a file pick produced: the chosen paths, and — only when the panel could not be PRESENTED —
+ *  a user-facing reason.
+ *
+ *  A CANCEL is `{ paths: [] }` with no error. A failure is `{ paths: [], error }`. The two used to
+ *  be indistinguishable (see below), which is a silent failure by construction. */
+export interface PickFilesResult {
+  paths: string[];
+  /** Set only when the picker could not be opened at all. Never set for a cancel. */
+  error?: string;
+}
+
+/** Prompt the user to pick one or more FILES.
  *
  * `extensions` narrows the panel (e.g. `["png","jpg"]`); omit it for an unfiltered picker. The
  * filter is best-effort on the Rust side — a macOS that no longer honours it shows every file
  * rather than failing, which is the right way for a cosmetic narrowing to degrade.
  *
- * Returns `[]` for ALL of "the user cancelled", "the picker could not be opened", and "there is no
- * native dialog here" — every caller treats an empty list as "nothing was attached", so a refused
- * panel leaves the user exactly where a cancel would. The failure is logged, never thrown: a failed
- * attach must not take down a compose box the user is mid-thought in.
+ * This used to return a bare `string[]`, collapsing "the user cancelled", "the picker could not be
+ * opened" and "there is no native dialog here" into one empty list. That made a refused panel
+ * indistinguishable from a cancel, so the caller had nothing to report and the user got silence —
+ * the same defect as the drop path (bead sparkle-zviq), just on the other side of the box. The
+ * failure is still never THROWN: a failed attach must not take down a compose box the user is
+ * mid-thought in. It is returned instead, so the caller can say what happened.
  *
  * Unlike `pickProjectFolder` there is no browser-preview fallback: a typed path prompt cannot stand
  * in for a file picker (the file has to exist and be readable by the Rust loader), and the browser
  * preview has no attachment pipeline to feed. */
-export async function pickFiles(title: string, extensions?: readonly string[]): Promise<string[]> {
-  if (!inTauri()) return [];
+export async function pickFiles(
+  title: string,
+  extensions?: readonly string[],
+): Promise<PickFilesResult> {
+  if (!inTauri()) {
+    // Not a cancel — clicking the button in the browser preview genuinely cannot do anything, and
+    // saying so beats a button that silently no-ops.
+    return { paths: [], error: "Attaching files needs the desktop app." };
+  }
   try {
     const result = await invoke<string[] | null>("pick_files", {
       title,
       extensions: extensions?.length ? [...extensions] : null,
     });
-    return Array.isArray(result) ? result.filter((p) => typeof p === "string" && p) : [];
+    return { paths: Array.isArray(result) ? result.filter((p) => typeof p === "string" && p) : [] };
   } catch (e) {
     console.error("File picker failed to open:", e);
-    return [];
+    // Pass the command's OWN message through. `folder_picker.rs` centralizes this copy
+    // (`PresentError::message()`) and the cases are genuinely different: a panel macOS refused to
+    // vend says "this usually clears on a retry"; a panel that opened but returned no usable URL
+    // says "please try again"; a non-macOS build says the picker doesn't exist there. Collapsing all
+    // three into "could not be opened" states a wrong reason as THE reason and throws away the
+    // recovery advice — the same defect as saying nothing, which is what this change is about.
+    // A Tauri `Err(String)` arrives as the bare string.
+    return { paths: [], error: rejectionMessage(e) ?? "The file picker could not be opened." };
   }
+}
+
+/** The user-facing text out of a rejection, or null if there is none worth showing. */
+function rejectionMessage(e: unknown): string | null {
+  if (typeof e === "string" && e.trim()) return e.trim();
+  if (e instanceof Error && e.message.trim()) return e.message.trim();
+  return null;
 }
 
 /** Last path segment — used as a friendly default project name. */

@@ -19,18 +19,26 @@ const shot: Attachment = {
 };
 const logFile: Attachment = { id: "f1", kind: "file", path: "/tmp/build.log", name: "build.log" };
 
-function setup(over: { attachments?: Attachment[]; dropActive?: boolean } = {}) {
+function setup(
+  over: {
+    attachments?: Attachment[];
+    dropActive?: boolean;
+    attachNotice?: string | null;
+  } = {},
+) {
   const onSend = vi.fn();
   const onRemoveAttachment = vi.fn();
+  const onDismissAttachNotice = vi.fn();
   render(
     <ComposeBox
       onSend={onSend}
       onAttach={vi.fn()}
       onRemoveAttachment={onRemoveAttachment}
+      onDismissAttachNotice={onDismissAttachNotice}
       {...over}
     />,
   );
-  return { onSend, onRemoveAttachment };
+  return { onSend, onRemoveAttachment, onDismissAttachNotice };
 }
 
 const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
@@ -115,3 +123,36 @@ function renderWith(dropActive: boolean) {
     />,
   );
 }
+
+// The box promises, under the drag, that the file will land. When it doesn't, the box is where the
+// user is looking — so that is where it has to be told (bead sparkle-zviq).
+describe("ComposeBox — attach failure notice", () => {
+  it("renders nothing when there is no notice", () => {
+    setup();
+    expect(screen.queryByTestId("concierge-attach-notice")).toBeNull();
+  });
+
+  it("states the failure where the chip would have appeared", () => {
+    setup({ attachNotice: "Couldn't attach notes.txt — Sparkle isn't allowed to read that folder." });
+    const notice = screen.getByTestId("concierge-attach-notice");
+    expect(notice.textContent).toContain("notes.txt");
+    // The REASON is rendered, not just the name — that is the half that ends the bug report.
+    expect(notice.textContent).toMatch(/allowed to read that folder/i);
+    // An alert, so a screen reader announces it rather than leaving it to be noticed.
+    expect(notice.getAttribute("role")).toBe("alert");
+  });
+
+  it("reports the dismissal to the owner of the state", () => {
+    const { onDismissAttachNotice } = setup({ attachNotice: "Couldn't attach notes.txt — Sparkle isn't allowed to read that folder." });
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss attachment error" }));
+    expect(onDismissAttachNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the notice ABOVE the staged chips, not in place of them", () => {
+    // A partial failure renders both; the notice must not displace the files that DID land.
+    setup({ attachments: [logFile], attachNotice: "Couldn't attach notes.txt — permission denied." });
+    const notice = screen.getByTestId("concierge-attach-notice");
+    const chips = screen.getByTestId("concierge-attachment-chips");
+    expect(notice.compareDocumentPosition(chips) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});

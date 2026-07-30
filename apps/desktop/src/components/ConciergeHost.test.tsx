@@ -71,14 +71,15 @@ const h = vi.hoisted(() => ({
   dictationInsert: null as ((text: string) => void) | null,
   // Stands in for the Rust round trip behind a dropped file. Returns a real-shaped Attachment so a
   // staged drop renders a chip the way it does in the app.
-  loadAttachmentPaths: vi.fn(async (paths: string[]) =>
-    paths.map((path) => ({
+  loadAttachmentPaths: vi.fn(async (paths: string[]) => ({
+    attachments: paths.map((path) => ({
       id: `att-${path}`,
       kind: "file" as const,
       path,
       name: path.split("/").pop()!,
     })),
-  ),
+    failed: [] as string[],
+  })),
   brain: {} as {
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; text: string }) => void;
@@ -291,14 +292,15 @@ afterEach(() => {
   h.agentCanAcceptInput.mockReturnValue(true);
   // resetAllMocks above strips this one's implementation too, and an undefined return here is not a
   // quiet no-op: `attachPaths` calls `.then` on it and the whole passive effect throws.
-  h.loadAttachmentPaths.mockImplementation(async (paths: string[]) =>
-    paths.map((path) => ({
+  h.loadAttachmentPaths.mockImplementation(async (paths: string[]) => ({
+    attachments: paths.map((path) => ({
       id: `att-${path}`,
       kind: "file" as const,
       path,
       name: path.split("/").pop()!,
     })),
-  );
+    failed: [] as string[],
+  }));
 });
 
 /** Point the router at the agent for the next send(s). The router itself is exhaustively tested in

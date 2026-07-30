@@ -52,37 +52,53 @@ describe("pickAttachments — screenshot", () => {
   it("captures a region and stages it as an image attachment", async () => {
     h.captureScreenRegion.mockResolvedValue({ path: "/tmp/s.png", dataUrl: "data:image/png;base64,AAA" });
     const out = await pickAttachments("screenshot");
-    expect(out).toHaveLength(1);
-    expect(out[0]?.kind).toBe("image");
-    expect(out[0]?.path).toBe("/tmp/s.png");
+    expect(out.attachments).toHaveLength(1);
+    expect(out.attachments[0]?.kind).toBe("image");
+    expect(out.attachments[0]?.path).toBe("/tmp/s.png");
     expect(h.pickFiles).not.toHaveBeenCalled();
   });
 
   it("stages nothing when the user presses Esc (the capture resolves null)", async () => {
     h.captureScreenRegion.mockResolvedValue(null);
-    expect(await pickAttachments("screenshot")).toEqual([]);
+    expect(await pickAttachments("screenshot")).toEqual({ attachments: [], failed: [] });
   });
 
-  it("stages nothing (rather than rejecting) when the capture throws", async () => {
-    h.captureScreenRegion.mockRejectedValue(new Error("no screen-recording permission"));
-    expect(await pickAttachments("screenshot")).toEqual([]);
+  it("stages nothing (rather than rejecting) when the capture throws, and reports the REAL reason", async () => {
+    // A message `screenshot.rs` actually produces. The earlier version of this test invented
+    // "no screen-recording permission" as the rejection, which let the code substitute a permission
+    // story for the real message and still pass — a denied recording grant does not reject at all
+    // (screencapture exits 0 writing no file, which surfaces as a quiet cancel).
+    h.captureScreenRegion.mockRejectedValue(new Error("screencapture exited with exit status: 1"));
+    const out = await pickAttachments("screenshot");
+    expect(out.attachments).toEqual([]);
+    // Nothing was staged, so the box must SAY so — the whole bug this seam grew from was an
+    // attach that failed with no user-visible trace at all (bead sparkle-zviq).
+    expect(out.error).toBeTruthy();
+    // The reason it HAS must survive: a raw message the user can search for beats a guessed cause,
+    // which is this module's own stated rule for `humanReason`.
+    expect(out.error).toContain("screencapture exited with exit status: 1");
+    // The permission may be offered as a HINT after it, never in place of it.
+    expect(out.error).toMatch(/screen.recording/i);
+    // And it must name the right operation — "the file picker could not be opened" is a wrong
+    // reason presented as the reason, the same defect in a louder font.
+    expect(out.error).not.toMatch(/file picker/i);
   });
 });
 
 describe("pickAttachments — image / files", () => {
   it("opens an image picker narrowed to the image extensions and loads every pick", async () => {
-    h.pickFiles.mockResolvedValue(["/tmp/a.png", "/tmp/b.png"]);
+    h.pickFiles.mockResolvedValue({ paths: ["/tmp/a.png", "/tmp/b.png"] });
     const out = await pickAttachments("image");
-    expect(out.map((a) => a.path)).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+    expect(out.attachments.map((a) => a.path)).toEqual(["/tmp/a.png", "/tmp/b.png"]);
     const [title, extensions] = h.pickFiles.mock.calls[0] as [string, string[]];
     expect(title).toMatch(/image/i);
     expect(extensions).toContain("png");
   });
 
   it("opens an UNFILTERED picker for files", async () => {
-    h.pickFiles.mockResolvedValue(["/tmp/log.txt"]);
+    h.pickFiles.mockResolvedValue({ paths: ["/tmp/log.txt"] });
     const out = await pickAttachments("files");
-    expect(out.map((a) => a.path)).toEqual(["/tmp/log.txt"]);
+    expect(out.attachments.map((a) => a.path)).toEqual(["/tmp/log.txt"]);
     const [title, extensions] = h.pickFiles.mock.calls[0] as [string, string[] | undefined];
     expect(title).toMatch(/file/i);
     expect(extensions).toBeUndefined();
@@ -91,15 +107,37 @@ describe("pickAttachments — image / files", () => {
 
 describe("pickAttachments — cancels and failures", () => {
   it("stages nothing when the picker is cancelled (an empty list)", async () => {
-    h.pickFiles.mockResolvedValue([]);
-    expect(await pickAttachments("files")).toEqual([]);
+    h.pickFiles.mockResolvedValue({ paths: [] });
+    expect(await pickAttachments("files")).toEqual({ attachments: [], failed: [] });
   });
 
-  // pickFiles already swallows a refused panel into [], so this is defence in depth: the compose box
-  // must survive a picker that rejects no matter which layer stopped catching.
-  it("stages nothing (rather than rejecting) when the picker throws", async () => {
+  // THE PATH THAT ACTUALLY HAPPENS. `pickFiles` catches an unopenable panel internally and
+  // REPORTS it — it does not throw — so this, not the catch below, is how a refused picker reaches
+  // the user. It used to return a bare `[]`, indistinguishable from a cancel, which left the
+  // picker exactly as silent as the drop was (bead sparkle-zviq).
+  it("reports a panel that could not be opened, rather than looking like a cancel", async () => {
+    h.pickFiles.mockResolvedValue({ paths: [], error: "The file picker could not be opened." });
+    const out = await pickAttachments("files");
+    expect(out.attachments).toEqual([]);
+    expect(out.error).toBe("The file picker could not be opened.");
+  });
+
+  // Defence in depth: the box must survive a picker that rejects, no matter which layer stopped
+  // catching. Distinct from the case above, which is the one the production seam produces.
+  it("stages nothing (rather than rejecting) when the picker throws, keeping its reason", async () => {
     h.pickFiles.mockRejectedValue(new Error("picker unavailable"));
-    expect(await pickAttachments("files")).toEqual([]);
+    const out = await pickAttachments("files");
+    expect(out.attachments).toEqual([]);
+    expect(out.error).toContain("picker unavailable");
+  });
+
+  // A CANCEL and a FAILURE both stage nothing, and the box must tell them apart: complaining at a
+  // user who simply changed their mind is its own bug.
+  it("reports NO error when the user merely cancelled", async () => {
+    h.pickFiles.mockResolvedValue({ paths: [] });
+    const out = await pickAttachments("files");
+    expect(out.error).toBeUndefined();
+    expect(out.failed).toEqual([]);
   });
 });
 
@@ -127,7 +165,41 @@ describe("loadAttachmentPaths", () => {
       return att({ id: "att-" + path, path, name: path, kind: "file", dataUrl: undefined });
     });
     const out = await loadAttachmentPaths(["/tmp/ok1", "/tmp/bad", "/tmp/ok2"]);
-    expect(out.map((a) => a.path)).toEqual(["/tmp/ok1", "/tmp/ok2"]);
+    expect(out.attachments.map((a) => a.path)).toEqual(["/tmp/ok1", "/tmp/ok2"]);
+  });
+
+  // THE REPORTED BUG (bead sparkle-zviq). A `.txt` dragged from `/private/tmp` was refused by the
+  // Rust containment check and then discarded here in silence — the box had already lit up under
+  // the drag, so the user was told it would land and then had to notice it hadn't. The failure has
+  // to come BACK, named, or nothing downstream can say a word about it.
+  it("names the file it could not attach instead of discarding it silently", async () => {
+    h.loadAttachment.mockRejectedValue(
+      new Error("refusing to read a path outside allowed directories: /private/tmp/notes.txt"),
+    );
+    const out = await loadAttachmentPaths(["/private/tmp/notes.txt"]);
+    expect(out.attachments).toEqual([]);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0]!.name).toBe("notes.txt");
+    // The REASON travels too. The app knew exactly why it refused and said nothing; that silence,
+    // not the refusal, is what cost the user an hour.
+    expect(out.failed[0]!.reason).toMatch(/allowed to read that folder/i);
+    // ...and it must not smuggle the absolute path into user-facing copy.
+    expect(out.failed[0]!.reason).not.toContain("/private/tmp");
+  });
+
+  it("reports every failure in a batch, not just the first", async () => {
+    h.loadAttachment.mockImplementation(async (path: string) => {
+      if (path.endsWith(".txt")) throw new Error("EACCES");
+      return att({ id: "att-" + path, path, name: path, kind: "file", dataUrl: undefined });
+    });
+    const out = await loadAttachmentPaths(["/tmp/a.txt", "/tmp/b.png", "/tmp/c.txt"]);
+    expect(out.attachments.map((a) => a.path)).toEqual(["/tmp/b.png"]);
+    expect(out.failed.map((f) => f.name)).toEqual(["a.txt", "c.txt"]);
+  });
+
+  it("reports no failures when every file loads", async () => {
+    const out = await loadAttachmentPaths(["/tmp/ok1", "/tmp/ok2"]);
+    expect(out.failed).toEqual([]);
   });
 });
 

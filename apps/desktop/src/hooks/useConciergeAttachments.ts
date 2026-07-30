@@ -31,6 +31,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   loadAttachmentPaths,
   pickAttachments,
+  type AttachOutcome,
 } from "../services/conciergeAttach";
 import {
   CONCIERGE_COLUMN_DND_TARGET,
@@ -48,6 +49,14 @@ export interface ConciergeAttachments {
   attachments: Attachment[];
   /** A file drag is currently over the compose box. */
   dropActive: boolean;
+  /** Set when an attach attempt lost files, cleared on the next attempt or by `dismissNotice`.
+   *
+   *  A drop that fails MUST say so. This surface promised the user their file was coming — the box
+   *  lights up under the drag — and then discarded it, leaving them to notice an absence (bead
+   *  sparkle-zviq). Whatever else fails here, it fails out loud. */
+  attachNotice: string | null;
+  /** Clear the failure notice (the user acknowledged it). */
+  dismissNotice: () => void;
   /** Run the picker for `kind` and stage whatever it returns (a cancel stages nothing). */
   attach: (kind: ConciergeAttachKind) => void;
   /** Stage already-resolved paths (the drop path, and any future handoff). */
@@ -69,9 +78,32 @@ export interface ConciergeAttachments {
   restore: (atts: Attachment[]) => void;
 }
 
+/** What the user reads when files were lost — the NAME and the REASON.
+ *
+ *  Both halves are load-bearing. The name says which file to retry; the reason is what the app
+ *  already knew and withheld. "Couldn't attach notes.txt — Sparkle isn't allowed to read that
+ *  folder" would have ended this bug report in seconds, and it was sitting in an ERROR log line
+ *  nobody reads. A bare "couldn't attach it" reproduces the silence in a louder font.
+ *
+ *  Failures are grouped BY REASON rather than listed one per line: a multi-file drop usually fails
+ *  for one cause, and repeating it per file buries the cause in the names. */
+function noticeFor(outcome: AttachOutcome): string | null {
+  if (outcome.error) return outcome.error;
+  const { failed } = outcome;
+  if (failed.length === 0) return null;
+  if (failed.length === 1) return `Couldn't attach ${failed[0]!.name} — ${failed[0]!.reason}.`;
+
+  const byReason = new Map<string, string[]>();
+  for (const f of failed) byReason.set(f.reason, [...(byReason.get(f.reason) ?? []), f.name]);
+  return [...byReason]
+    .map(([reason, names]) => `Couldn't attach ${names.join(", ")} — ${reason}.`)
+    .join(" ");
+}
+
 export function useConciergeAttachments(): ConciergeAttachments {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dropActive, setDropActive] = useState(false);
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
   // Mirror of the list that is readable synchronously (see the header note on take()).
   const ref = useRef<Attachment[]>([]);
 
@@ -88,21 +120,34 @@ export function useConciergeAttachments(): ConciergeAttachments {
     [apply],
   );
 
-  const attach = useCallback(
-    (kind: ConciergeAttachKind) => {
-      // pickAttachments never rejects (a refused picker resolves empty), so there is nothing to
-      // catch and nothing the user has to acknowledge when they simply cancelled.
-      void pickAttachments(kind).then(add);
+  const dismissNotice = useCallback(() => setAttachNotice(null), []);
+
+  /** Stage what loaded and report what didn't. The notice is set from EVERY attempt, including the
+   *  successful ones (where it clears) — so a retry that works visibly retracts the complaint. */
+  const settle = useCallback(
+    (outcome: AttachOutcome) => {
+      add(outcome.attachments);
+      setAttachNotice(noticeFor(outcome));
     },
     [add],
+  );
+
+  const attach = useCallback(
+    (kind: ConciergeAttachKind) => {
+      // pickAttachments never rejects (a refused picker resolves an outcome carrying `error`), so
+      // there is nothing to catch here — but a cancel resolves empty and must stay silent, which
+      // is why the empty outcome produces no notice.
+      void pickAttachments(kind).then(settle);
+    },
+    [settle],
   );
 
   const attachPaths = useCallback(
     (paths: string[]) => {
       if (paths.length === 0) return;
-      void loadAttachmentPaths(paths).then(add);
+      void loadAttachmentPaths(paths).then(settle);
     },
-    [add],
+    [settle],
   );
 
   const remove = useCallback(
@@ -174,6 +219,8 @@ export function useConciergeAttachments(): ConciergeAttachments {
   return {
     attachments,
     dropActive,
+    attachNotice,
+    dismissNotice,
     attach,
     attachPaths,
     attachReady: add,

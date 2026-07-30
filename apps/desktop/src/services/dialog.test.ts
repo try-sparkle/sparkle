@@ -76,8 +76,9 @@ describe("pickProjectFolder", () => {
 describe("pickFiles", () => {
   it("returns every chosen path and passes the extension filter through", async () => {
     invoke.mockResolvedValue(["/tmp/a.png", "/tmp/b.png"]);
-    const paths = await pickFiles("Attach images", ["png", "jpg"]);
-    expect(paths).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+    const picked = await pickFiles("Attach images", ["png", "jpg"]);
+    expect(picked.paths).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+    expect(picked.error).toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("pick_files", {
       title: "Attach images",
       extensions: ["png", "jpg"],
@@ -97,27 +98,63 @@ describe("pickFiles", () => {
     });
   });
 
-  it("returns an empty list when the user cancels", async () => {
+  // A cancel is NOT a failure, and the difference is the whole point of the return shape: the
+  // caller must be able to stay quiet for a user who changed their mind while still reporting a
+  // panel that could not open.
+  it("returns an empty list and NO error when the user cancels", async () => {
     invoke.mockResolvedValue([]);
-    expect(await pickFiles("Attach files")).toEqual([]);
+    expect(await pickFiles("Attach files")).toEqual({ paths: [] });
   });
 
-  it("returns an empty list rather than throwing when the picker cannot be opened", async () => {
-    // The production failure mode, now on the file path too.
+  it("REPORTS a picker that cannot be opened, rather than throwing or looking like a cancel", async () => {
+    // The production failure mode, now on the file path too. This used to resolve a bare `[]`,
+    // which the caller could not tell from a cancel — so a refused panel said nothing to the user,
+    // the same silent failure as the drop path (bead sparkle-zviq). The reason comes BACK now.
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    invoke.mockRejectedValue("macOS could not open the file picker.");
-    await expect(pickFiles("Attach files")).resolves.toEqual([]);
+    // Verbatim from `folder_picker.rs`'s `PresentError::message()`; a Tauri `Err(String)` rejects
+    // with the bare string.
+    invoke.mockRejectedValue(
+      "macOS could not open the file picker. This usually clears on a retry; if it keeps happening, restarting Sparkle fixes it.",
+    );
+    const picked = await pickFiles("Attach files");
+    expect(picked.paths).toEqual([]);
+    // Pinned, not merely truthy. Asserting truthiness passed with the reason REPLACED by a generic
+    // "could not be opened", throwing away both which failure it was and the recovery advice the
+    // Rust side wrote for it — a wrong reason stated as the reason.
+    expect(picked.error).toBe(
+      "macOS could not open the file picker. This usually clears on a retry; if it keeps happening, restarting Sparkle fixes it.",
+    );
     expect(err).toHaveBeenCalled();
+  });
+
+  it("passes a DIFFERENT picker failure through as itself", async () => {
+    // The cases are not interchangeable: this panel opened fine and handed back no usable URL
+    // (`MissingUrl`), so "could not be opened" would be false as well as unhelpful.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockRejectedValue("The file picker returned no usable path. Please try again.");
+    expect((await pickFiles("Attach files")).error).toBe(
+      "The file picker returned no usable path. Please try again.",
+    );
+  });
+
+  it("falls back to its own wording when the rejection carries no message", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    invoke.mockRejectedValue(new Error("   "));
+    expect((await pickFiles("Attach files")).error).toBe("The file picker could not be opened.");
   });
 
   it("drops a non-string or empty entry rather than staging a bogus path", async () => {
     invoke.mockResolvedValue(["/tmp/a.png", "", null, 7, "/tmp/b.png"]);
-    expect(await pickFiles("Attach files")).toEqual(["/tmp/a.png", "/tmp/b.png"]);
+    expect((await pickFiles("Attach files")).paths).toEqual(["/tmp/a.png", "/tmp/b.png"]);
   });
 
-  it("returns an empty list outside Tauri, where there is no native panel", async () => {
+  it("says so outside Tauri, where there is no native panel to open", async () => {
+    // Not a cancel either: clicking Attach in the browser preview genuinely cannot do anything, and
+    // a button that silently no-ops is the defect this file is being changed to remove.
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-    expect(await pickFiles("Attach files")).toEqual([]);
+    const picked = await pickFiles("Attach files");
+    expect(picked.paths).toEqual([]);
+    expect(picked.error).toBeTruthy();
     expect(invoke).not.toHaveBeenCalled();
   });
 });

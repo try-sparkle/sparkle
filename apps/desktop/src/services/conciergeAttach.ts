@@ -19,9 +19,11 @@
 // "nothing was attached" — a failed attach must not take down a compose box the user is mid-thought
 // in. Failures are logged.
 import { pickFiles } from "./dialog";
+import { pathKind, scrubPaths } from "./logSafePaths";
 import { captureScreenRegion } from "../screenshot";
 import {
   IMAGE_EXTENSIONS,
+  basename,
   buildSendPayload,
   type Attachment,
 } from "../components/composer/attachments";
@@ -29,19 +31,70 @@ import { loadAttachment, screenshotAttachment } from "../components/composer/att
 import type { ConciergeAttachKind } from "../components/Concierge/types";
 import { log } from "../logger";
 
-/** Load dropped/picked paths into Attachment records. A file that can't be read is dropped (with a
- *  log line) rather than failing the whole batch — one unreadable path must not cost the user the
- *  other four they just picked. */
-export async function loadAttachmentPaths(paths: string[]): Promise<Attachment[]> {
+/** What a load attempt produced: the files that made it, and the ones that did not.
+ *
+ *  The failures are RETURNED rather than only logged because this used to swallow them entirely —
+ *  a `.txt` the user dragged in was refused by the Rust containment check, discarded, and the only
+ *  trace was a log line nobody reads (bead sparkle-zviq). The user watched the box light up and
+ *  then had to notice an absence. A user-initiated action that fails has to say so. */
+/** One file that did not attach, and WHY. The reason matters as much as the name: the app knew
+ *  exactly why it refused ("outside allowed directories") and said nothing, which is what cost the
+ *  user an hour. `reason` is path-scrubbed — the name is already stated, and the raw Rust message
+ *  interpolates the absolute path into every failure. */
+export interface AttachFailure {
+  name: string;
+  reason: string;
+}
+
+export interface AttachOutcome {
+  /** The files that loaded, in the order they were given. */
+  attachments: Attachment[];
+  /** The ones that didn't, each with its reason. Empty on a fully successful load. */
+  failed: AttachFailure[];
+  /** Set when the operation failed as a WHOLE, before any file could be named (a picker that
+   *  could not be presented). Distinct from `failed`, which names individual files. */
+  error?: string;
+}
+
+/** Load dropped/picked paths into Attachment records. A file that can't be read is reported in
+ *  `failed` rather than failing the whole batch — one unreadable path must not cost the user the
+ *  other four they just picked, but it must not vanish either. */
+export async function loadAttachmentPaths(paths: string[]): Promise<AttachOutcome> {
   const loaded = await Promise.all(
     paths.map((path) =>
-      loadAttachment(path).catch((e) => {
-        log.error("composer", "concierge: load attachment failed", { path, e });
-        return null;
+      loadAttachment(path).catch((e: unknown) => {
+        // Log the KIND and a path-stripped reason, never the path — this log ships with support
+        // tickets (services/logSafePaths), and `load_attachment` interpolates the path we gave it
+        // into every one of its failure messages.
+        const raw = e instanceof Error ? e.message : String(e);
+        const reason = scrubPaths(raw, path);
+        log.error("composer", "concierge: load attachment failed", {
+          kind: pathKind(path),
+          reason,
+        });
+        return { failure: { name: basename(path), reason: humanReason(reason) } };
       }),
     ),
   );
-  return loaded.filter((a): a is Attachment => a !== null);
+  return {
+    attachments: loaded.filter((a): a is Attachment => !("failure" in a)),
+    failed: loaded.flatMap((a) => ("failure" in a ? [a.failure] : [])),
+  };
+}
+
+/** Turn a Rust failure message into something worth reading in a compose box.
+ *
+ *  Unmapped reasons pass THROUGH rather than collapsing to "couldn't attach it": a raw message the
+ *  user can search for beats a tidy one that says nothing, and this whole bug was the app knowing
+ *  the reason and withholding it. */
+function humanReason(scrubbed: string): string {
+  const r = scrubbed.toLowerCase();
+  // Should no longer reach a DRAGGED file (attachments.rs records OS-chosen paths), so if a user
+  // ever sees this again it means the provenance registration did not fire — say so precisely.
+  if (r.includes("outside allowed directories")) return "Sparkle isn't allowed to read that folder";
+  if (r.includes("no such file")) return "the file no longer exists";
+  if (r.includes("permission denied")) return "permission denied";
+  return scrubbed;
 }
 
 /**
@@ -52,21 +105,46 @@ export async function loadAttachmentPaths(paths: string[]): Promise<Attachment[]
  * used (src-tauri/src/screenshot.rs), not a clipboard read: it is a real capture affordance, so the
  * button keeps its literal promise.
  */
-export async function pickAttachments(kind: ConciergeAttachKind): Promise<Attachment[]> {
+export async function pickAttachments(kind: ConciergeAttachKind): Promise<AttachOutcome> {
   try {
     if (kind === "screenshot") {
       // Blocks in Rust while the crosshair is up; Esc resolves null (a quiet no-op).
       const shot = await captureScreenRegion();
-      return shot ? [screenshotAttachment(shot.path, shot.dataUrl)] : [];
+      return {
+        attachments: shot ? [screenshotAttachment(shot.path, shot.dataUrl)] : [],
+        failed: [],
+      };
     }
+    // `pickFiles` REPORTS a panel it could not present rather than throwing — it catches
+    // everything internally and used to return a bare `[]`, which made an unopenable picker
+    // indistinguishable from a cancel and left this path as silent as the drop used to be. The
+    // reason has to come back through the return value; the catch below cannot see it.
     const picked =
       kind === "image"
         ? await pickFiles("Attach images", [...IMAGE_EXTENSIONS])
         : await pickFiles("Attach files");
-    return await loadAttachmentPaths(picked);
+    if (picked.error) return { attachments: [], failed: [], error: picked.error };
+    return await loadAttachmentPaths(picked.paths);
   } catch (e) {
     log.error("composer", "concierge: attach picker failed", { kind, e });
-    return [];
+    // A failure with no filenames to name reports itself without one — but it still reports the
+    // reason it HAS. Naming the operation and then substituting a guessed cause is the same defect
+    // as silence: the first draft of this said "Sparkle may not have screen-recording permission"
+    // for every screenshot failure, which is a cause this code cannot observe. `screenshot.rs`
+    // rejects only with `failed to launch screencapture: …` or `screencapture exited with …`; a
+    // DENIED recording grant makes `screencapture` exit 0 without writing a file, which arrives as
+    // `Ok(None)` and is treated as a quiet cancel above. So the guess was attached to the paths
+    // least likely to be a permission problem while the real message was thrown away. The
+    // permission is offered as a HINT after the actual reason, never in place of it.
+    const reason = scrubPaths(e instanceof Error ? e.message : String(e));
+    return {
+      attachments: [],
+      failed: [],
+      error:
+        kind === "screenshot"
+          ? `Couldn't take the screenshot — ${reason}. If this keeps happening, check Sparkle's screen-recording permission.`
+          : `The file picker could not be opened — ${reason}.`,
+    };
   }
 }
 

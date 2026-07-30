@@ -75,7 +75,7 @@ import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiCamera, FiFile, FiPaperclip, FiUpload, FiX } from "react-icons/fi";
 // `C` ALONE, and the three tokens that left are the two halves of this merge, not an oversight:
 // FONT_WEIGHT / ON_GOLD_FILL went with the Send button when it moved into ./SendRail (the gold
 // rect's styling travelled verbatim, so SendRail imports them itself), and COMPOSE_SCRIM went with
@@ -401,6 +401,8 @@ export function ComposeBox({
   onRemoveAttachment,
   attachments = [],
   dropActive = false,
+  attachNotice = null,
+  onDismissAttachNotice,
   interim = "",
   registerInsert,
   onTextEdit,
@@ -428,6 +430,10 @@ export function ComposeBox({
   attachments?: Attachment[];
   /** A native file drag is over this box (the host hit-tests the window-global event). */
   dropActive?: boolean;
+  /** Set when an attach attempt lost files — the box states it instead of leaving the user to
+   *  notice that nothing arrived (bead sparkle-zviq). */
+  attachNotice?: string | null;
+  onDismissAttachNotice?: () => void;
   /** Live, uncommitted transcript; rendered as a ghost line, never submitted. */
   interim?: string;
   /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
@@ -1011,6 +1017,48 @@ export function ComposeBox({
           onSelect={chooseMention}
           onHover={setSelected}
         />
+      )}
+      {/* Sits ABOVE the chips, where the chip the user expected would have appeared — the notice
+          has to land where the absence is, not in a corner of the window. It persists until
+          acknowledged or until a later attach succeeds: a self-dismissing toast is exactly what
+          this bug already did once (something happened, the user didn't catch it). */}
+      {attachNotice && (
+        <div
+          role="alert"
+          data-testid="concierge-attach-notice"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            marginBottom: 8,
+            padding: "5px 8px",
+            borderRadius: 6,
+            // TYPE.small, matching the chips it sits above — the notice is secondary UI in the same
+            // register, and an off-scale size here trips the type ratchet (theme/scale.test.ts).
+            fontSize: 12,
+            color: C.dangerInk,
+            background: `color-mix(in srgb, ${C.dangerInk} 12%, transparent)`,
+          }}
+        >
+          <FiAlertTriangle size={12} aria-hidden style={{ flexShrink: 0 }} />
+          <span style={{ flex: 1, minWidth: 0 }}>{attachNotice}</span>
+          <button
+            type="button"
+            aria-label="Dismiss attachment error"
+            onClick={onDismissAttachNotice}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              border: "none",
+              background: "transparent",
+              color: C.dangerInk,
+              cursor: "pointer",
+              padding: 0,
+            }}
+          >
+            <FiX size={12} aria-hidden />
+          </button>
+        </div>
       )}
       {attachments.length > 0 && (
         <div

@@ -255,6 +255,10 @@ export interface ConciergeViewModel {
   /** True while a native file drag is over the compose box — lights the drop affordance. The
    *  webview drag event is window-global, so only the integration layer can hit-test it. */
   dropActive?: boolean;
+  /** Set when an attach attempt lost files — rendered above the chips until the user dismisses it
+   *  or a later attempt succeeds. The affordance above promises the drop will land, so the one
+   *  case it doesn't has to be stated rather than left for the user to spot (bead sparkle-zviq). */
+  attachNotice?: string | null;
   /** How many open pull requests are ready to merge, across every in-scope project — the header's
    *  PR pill. Absent or zero renders NO pill: a "0 ready" chip is chrome asserting the absence of
    *  a thing, and the header consolidated precisely to stop carrying those. */
@@ -301,6 +305,8 @@ export interface ConciergeController {
   onAttach(kind: ConciergeAttachKind): void;
   /** Drop one staged attachment by id. Optional: a column mounted without attachments has none. */
   onRemoveAttachment?(id: string): void;
+  /** The user acknowledged the attach-failure notice. */
+  onDismissAttachNotice?(): void;
   /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
    *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
   onDigestClick?(digest: ConciergeDigestMessage): void;

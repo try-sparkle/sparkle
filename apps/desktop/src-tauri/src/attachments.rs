@@ -7,11 +7,12 @@
 //! Clipboard + save flows are macOS-only (the app is macOS-only) and shell out to the
 //! built-in `sips` / `osascript` rather than pull in a clipboard crate.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
@@ -113,15 +114,249 @@ fn is_contained_and_visible(candidate: &Path, roots: &[PathBuf]) -> bool {
     false
 }
 
+// ── User-chosen paths (provenance, NOT location) ────────────────────────────────────────────────
+//
+// Containment alone is the wrong test for "may we read this file", and it silently ate the user's
+// files: a `.txt` dragged from `/private/tmp` was refused, because `std::env::temp_dir()` on macOS
+// is the per-user `$TMPDIR` under `/var/folders`, NOT `/tmp`. The drop was accepted by the UI,
+// classified, logged — and then discarded with only a log line (bead sparkle-zviq). The picker had
+// the identical hole; it merely looked fine because picked files usually sit under `$HOME`.
+//
+// Widening the roots cannot fix this, only move it: `/Users/Shared`, `/opt`, and any path reached
+// through a hidden component (`~/.claude/...`) are all files a user can legitimately hand us, and
+// there is no root list that both admits them and still means anything.
+//
+// So the real question is PROVENANCE, not location: did the OPERATING SYSTEM tell us the user
+// chose this file? A path that arrived on a real drag-drop event or came back from a native file
+// panel is user intent by construction. Both are observed HERE, in Rust — the webview cannot add to
+// this registry, so it remains no help at all to a compromised webview trying to read `~/.ssh/
+// id_rsa`, which is the entire threat this module's containment rule exists to stop. Containment
+// stays as the rule for every path the webview supplies on its own.
+//
+// ORDERING, and why there are TWO tiers.
+//
+// Tauri emits the JS `tauri://drag-drop` event BEFORE it runs our global window-event listener (see
+// `manager/window.rs`), so registering only on `Drop` risks racing the frontend's `load_attachment`
+// call. `Enter` carries the same paths and fires when the drag first crosses the window, hundreds
+// of milliseconds of human time ahead of the release, which removes that race.
+//
+// But `Enter` is NOT consent. `draggingEntered:` fires for any drag that crosses this window,
+// including one on its way to another app entirely — so registering Enter paths durably would mean
+// dragging `~/.ssh/id_rsa` PAST Sparkle en route to Terminal permanently granted the exact
+// arbitrary-read primitive the containment rule exists to deny. The user never handed us that file.
+//
+// So the tiers are:
+//   - PROVISIONAL (`Enter`): readable only while the drag is over the window. A drag that leaves
+//     without dropping is discarded on `Leave`, and each new `Enter` replaces the set.
+//   - DURABLE (`Drop`, and the native file panel): the user actually handed us these. Kept, because
+//     a thread attachment can be downloaded or copied to the clipboard long after it was attached
+//     and expiring it would break those exactly the way containment broke the drop.
+//
+// PROVISIONAL ALSO EXPIRES, because `Leave` is not guaranteed to arrive. It is the only thing that
+// clears a hover, and the app opens several windows (project_window.rs, helper.rs,
+// capture_window.rs); a window destroyed mid-drag never delivers `draggingExited:` for its view. A
+// grant that survives one lost event for the life of the process is the same session-long grant the
+// tiers exist to remove, merely conditioned on a rarer trigger. So each provisional entry carries a
+// stamp and is ignored once stale.
+//
+// The stamp is REFRESHED on `Over`, which is why the TTL can be short without ever expiring under a
+// live drag: macOS fires `draggingUpdated:` continuously while the drag is over the window, so a
+// real hover keeps renewing itself no matter how long the user deliberates, and the clock only truly
+// starts when the OS stops talking to us — exactly the condition a missed `Leave` describes.
+//
+// The residual exposure is a compromised webview reading a path during the seconds it is hovered.
+// That is bounded by the drag itself and is the price of closing the ordering race; a durable grant
+// for a drag that never landed is not.
+
+/// How many DURABLE choices we remember — bounded so a long session can't grow this without limit.
+/// FIFO: the oldest choice is forgotten first.
+const USER_CHOSEN_CAP: usize = 512;
+
+/// How many paths one in-flight drag may make provisionally readable. A drag carries a single
+/// Finder selection, so this only has to survive a large multi-file drag.
+const DRAGGED_CAP: usize = 512;
+
+/// How long after the OS last mentioned a hovered path we keep honouring it. `Over` refreshes the
+/// stamp continuously during a real drag, so this is not a limit on how long a user may hover — it
+/// is the window in which a MISSED `Leave` stays exploitable. Generous enough to cover the gap
+/// between the last `Over` and the frontend's post-`Drop` read (milliseconds), short enough that a
+/// lost event is a blip rather than a session.
+const PROVISIONAL_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct Chosen {
+    /// Handed to us for real — a completed drop, or a native panel.
+    durable: VecDeque<PathBuf>,
+    /// Hovering right now, each with the last time the OS told us so. Cleared on Leave, superseded
+    /// on Drop, and ignored once older than `PROVISIONAL_TTL` in case Leave never comes.
+    provisional: VecDeque<(PathBuf, Instant)>,
+}
+
+// The tier rules as PURE methods over already-canonicalized paths. The public fns below are thin
+// wrappers that take the global lock. Split this way so the rules can be tested against a LOCAL
+// `Chosen`: they are all about what the registry FORGETS, and testing that through the process-wide
+// registry would have concurrent tests clearing each other's state mid-assertion.
+impl Chosen {
+    /// A drag is over the window. Replaces rather than appends: each Enter is a new drag, and the
+    /// previous one either dropped (already durable) or left (already irrelevant). Appending would
+    /// keep every file ever hovered readable until the cap evicted it.
+    fn note_dragged(&mut self, real: Vec<PathBuf>, now: Instant) {
+        self.provisional.clear();
+        for p in real {
+            if self.provisional.iter().any(|(q, _)| *q == p) {
+                continue;
+            }
+            if self.provisional.len() >= DRAGGED_CAP {
+                self.provisional.pop_front();
+            }
+            self.provisional.push_back((p, now));
+        }
+    }
+
+    /// The drag is still over us (`Over`). Renew the stamps: the OS is telling us this hover is
+    /// live, which is the only evidence that distinguishes a real drag from a lost `Leave`.
+    fn refresh_dragged(&mut self, now: Instant) {
+        for entry in &mut self.provisional {
+            entry.1 = now;
+        }
+    }
+
+    /// The drag left without dropping — it was never for us.
+    fn forget_dragged(&mut self) {
+        self.provisional.clear();
+    }
+
+    /// A completed drop, or a native panel: consent. Supersedes the provisional set.
+    fn note_chosen(&mut self, real: Vec<PathBuf>) {
+        for p in real {
+            remember_into(&mut self.durable, p, USER_CHOSEN_CAP);
+        }
+        self.provisional.clear();
+    }
+
+    fn contains(&self, real: &Path, now: Instant) -> bool {
+        self.durable.iter().any(|p| p == real)
+            || self.provisional.iter().any(|(p, seen)| {
+                p == real && now.saturating_duration_since(*seen) <= PROVISIONAL_TTL
+            })
+    }
+}
+
+fn chosen() -> &'static Mutex<Chosen> {
+    static PATHS: OnceLock<Mutex<Chosen>> = OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(Chosen::default()))
+}
+
+/// Canonicalize, skipping what can't be resolved: a path we can't canonicalize can't be matched at
+/// read time anyway. Canonicalizing on the way IN is what closes the symlink-swap window — a link
+/// repointed between the drag and the read resolves to a target that was never registered.
+fn canonical_all<I: IntoIterator<Item = PathBuf>>(paths: I) -> Vec<PathBuf> {
+    paths.into_iter().filter_map(|p| p.canonicalize().ok()).collect()
+}
+
+/// A drag is now OVER the window (`DragDropEvent::Enter`). Provisional only — see the tier note.
+fn note_dragged_paths<I: IntoIterator<Item = PathBuf>>(paths: I) {
+    let real = canonical_all(paths);
+    if let Ok(mut c) = chosen().lock() {
+        c.note_dragged(real, Instant::now());
+    }
+}
+
+/// The drag is still over the window (`DragDropEvent::Over`) — renew the provisional stamps.
+fn refresh_dragged_paths() {
+    if let Ok(mut c) = chosen().lock() {
+        c.refresh_dragged(Instant::now());
+    }
+}
+
+/// The drag left without dropping (`DragDropEvent::Leave`) — it was never for us.
+fn forget_dragged_paths() {
+    if let Ok(mut c) = chosen().lock() {
+        c.forget_dragged();
+    }
+}
+
+/// Record paths the user genuinely chose through the OS: a completed DROP, or a native file panel.
+pub fn note_user_chosen_paths<I: IntoIterator<Item = PathBuf>>(paths: I) {
+    let real = canonical_all(paths);
+    if let Ok(mut c) = chosen().lock() {
+        c.note_chosen(real);
+    }
+}
+
+/// Which tier each drag phase grants. This lives HERE, not at the `on_window_event` call site,
+/// because it IS the security property: `Enter` → provisional, `Drop` → consent, `Leave` → forget.
+/// Wired up in `lib.rs`, the whole rule was a match arm no test could reach, so re-collapsing it to
+/// the pre-fix `Enter { paths, .. } | Drop { paths, .. } =>` — which made a drag merely crossing the
+/// window a permanent read grant — would have left the suite green. `dispatch_drag` below is the
+/// testable form.
+pub fn note_drag_event(event: &tauri::DragDropEvent) {
+    match dispatch_drag(event) {
+        DragGrant::Provisional(paths) => note_dragged_paths(paths),
+        DragGrant::Renew => refresh_dragged_paths(),
+        DragGrant::Durable(paths) => note_user_chosen_paths(paths),
+        DragGrant::Forget => forget_dragged_paths(),
+        DragGrant::Ignore => {}
+    }
+}
+
+/// What a drag phase grants. Named so a test can assert the MAPPING without a live registry, an
+/// event loop, or a real window.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DragGrant {
+    /// Readable while hovered, discarded if the drag leaves (`Enter`).
+    Provisional(Vec<PathBuf>),
+    /// Still hovering — renew the provisional stamps (`Over`).
+    Renew,
+    /// Consent: the user let go over us (`Drop`).
+    Durable(Vec<PathBuf>),
+    /// The drag left without dropping (`Leave`).
+    Forget,
+    /// A variant this Tauri version does not have yet.
+    Ignore,
+}
+
+fn dispatch_drag(event: &tauri::DragDropEvent) -> DragGrant {
+    match event {
+        tauri::DragDropEvent::Enter { paths, .. } => DragGrant::Provisional(paths.clone()),
+        tauri::DragDropEvent::Over { .. } => DragGrant::Renew,
+        tauri::DragDropEvent::Drop { paths, .. } => DragGrant::Durable(paths.clone()),
+        tauri::DragDropEvent::Leave => DragGrant::Forget,
+        _ => DragGrant::Ignore,
+    }
+}
+
+/// The bookkeeping half of the registries, split out so the eviction rule can be tested against a
+/// LOCAL queue. Testing it through the global registry would mean a test that pushes a full cap of
+/// entries, which evicts whatever the concurrently-running tests just registered.
+fn remember_into(q: &mut VecDeque<PathBuf>, real: PathBuf, cap: usize) {
+    if q.contains(&real) {
+        return;
+    }
+    if q.len() >= cap {
+        q.pop_front();
+    }
+    q.push_back(real);
+}
+
+/// True when `real` (already canonicalized) is one the user handed us, or one currently being
+/// dragged over the window. A poisoned lock reads as "not chosen" — fail-closed, falling back to
+/// plain containment.
+fn is_user_chosen(real: &Path) -> bool {
+    let now = Instant::now();
+    chosen().lock().map(|c| c.contains(real, now)).unwrap_or(false)
+}
+
 /// Validate a path we're about to READ (it must already exist). Canonicalizing first resolves
 /// symlinks and `..`, so `~/Downloads/../.ssh/id_rsa` is caught, and closes the check-vs-use
-/// window (we return the real path for the caller to read). Rejects anything outside the allowed
-/// roots or reaching a hidden component.
+/// window (we return the real path for the caller to read). Accepts a path the user chose through
+/// the OS (see the provenance note above); otherwise rejects anything outside the allowed roots or
+/// reaching a hidden component.
 fn validate_read_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     let real = path
         .canonicalize()
         .map_err(|e| format!("cannot access {}: {e}", path.display()))?;
-    if is_contained_and_visible(&real, roots) {
+    if is_contained_and_visible(&real, roots) || is_user_chosen(&real) {
         Ok(real)
     } else {
         Err(format!("refusing to read a path outside allowed directories: {}", path.display()))
@@ -496,6 +731,316 @@ mod tests {
         let sneaky = root.join("sub").join("..").join(".ssh").join("id_rsa");
         std::fs::create_dir_all(root.join("sub")).unwrap();
         assert!(validate_read_path(&sneaky, &roots).is_err());
+    }
+
+    // ── Provenance: a path the OS told us the user chose ────────────────────────────────────────
+    //
+    // These share one process-global registry, so each test uses its own `fresh_root()` and never
+    // asserts on the registry's size — only on its own paths. Registration is additive, so
+    // concurrent tests cannot make each other pass or fail.
+
+    #[test]
+    fn read_accepts_a_user_chosen_path_outside_every_root() {
+        // THE REPORTED BUG (sparkle-zviq), as a test: a `.txt` at a location no root covers —
+        // `/private/tmp` on the real machine — dragged in by hand.
+        let outside = fresh_root(); // a real dir that is NOT in the allowed list
+        let roots = vec![fresh_root()];
+        let f = outside.join("sparkle-hang.txt");
+        touch(&f);
+
+        // Before the OS tells us the user chose it, containment is the only rule and refuses it.
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "precondition: an unchosen path outside every root must still be refused"
+        );
+
+        note_user_chosen_paths([f.clone()]);
+
+        let got = validate_read_path(&f, &roots).expect("a user-dragged file must be readable");
+        assert_eq!(got, f.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn load_blocking_reads_a_dragged_txt_from_slash_tmp() {
+        // The user's exact case, driven through the REAL command body rather than the validator:
+        // `/private/tmp/sparkle-hang.txt`, dragged onto the concierge, refused and discarded.
+        // `/tmp` is deliberate — it is NOT `std::env::temp_dir()` on macOS (that is the per-user
+        // `$TMPDIR` under `/var/folders`), which is the whole reason this failed.
+        let dir = PathBuf::from("/tmp").join(format!("sparkle-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("sparkle-hang.txt");
+        std::fs::write(&f, b"notes the user dragged in").unwrap();
+
+        // Only assert the refusal when `/tmp` really is outside the roots. If `TMPDIR` is unset,
+        // `std::env::temp_dir()` IS `/tmp` and containment would already allow it — a machine where
+        // the bug cannot reproduce, and asserting a refusal there would be asserting the wrong
+        // thing rather than finding a regression.
+        let tmp_is_a_root = std::env::temp_dir()
+            .canonicalize()
+            .map(|t| f.canonicalize().map(|r| r.starts_with(&t)).unwrap_or(false))
+            .unwrap_or(false);
+        if !tmp_is_a_root {
+            assert!(
+                load_blocking(f.to_str().unwrap()).is_err(),
+                "precondition: containment alone refuses a /tmp file (this WAS the bug)"
+            );
+        }
+
+        note_user_chosen_paths([f.clone()]);
+
+        let loaded = load_blocking(f.to_str().unwrap())
+            .expect("a .txt the user dragged in from /tmp must attach");
+        assert_eq!(loaded.name, "sparkle-hang.txt");
+        // A text file rides along as a file tile — no inline preview, but a real attachment.
+        assert!(loaded.data_url.is_none(), "a .txt is a file tile, not an image preview");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The Enter/Drop tiers ────────────────────────────────────────────────────────────────────
+    //
+    // Driven against a LOCAL `Chosen`, not the process-wide registry: every rule here is about what
+    // the registry FORGETS, and a test that clears provisional state globally would wipe whatever a
+    // concurrently-running test had just registered. The global wrappers are three lines each, and
+    // `load_blocking_reads_a_dragged_txt_from_slash_tmp` covers the durable path end to end.
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn a_drag_that_leaves_without_dropping_grants_nothing() {
+        // The hover-through: a drag from Finder to ANOTHER app that merely crosses this window.
+        // `draggingEntered:` fires for it, so a durable grant here would mean dragging
+        // `~/.ssh/id_rsa` past Sparkle en route to Terminal hands a compromised webview an
+        // arbitrary read for the life of the process. The user never gave us that file.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t);
+        // Readable WHILE hovering — that is what closes the race with the JS drop event.
+        assert!(c.contains(&p("/home/me/.ssh/id_rsa"), t), "readable during the drag");
+
+        c.forget_dragged();
+        assert!(
+            !c.contains(&p("/home/me/.ssh/id_rsa"), t),
+            "a drag that left without dropping must not leave a lasting grant"
+        );
+    }
+
+    #[test]
+    fn a_hover_whose_leave_never_arrives_expires_on_its_own() {
+        // `Leave` is the ONLY thing that clears a hover, and it is not guaranteed: a window
+        // destroyed mid-drag never delivers `draggingExited:` for its view. Without a TTL that one
+        // lost event restores the session-long grant the tiers exist to remove — the same
+        // arbitrary-read primitive, just via a rarer trigger.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t);
+
+        // No Leave, no Drop, no Over — the OS simply stopped talking about this drag.
+        assert!(
+            !c.contains(&p("/home/me/.ssh/id_rsa"), t + PROVISIONAL_TTL + Duration::from_secs(1)),
+            "a hover the OS stopped reporting must stop being readable"
+        );
+    }
+
+    #[test]
+    fn a_live_hover_stays_readable_however_long_the_user_deliberates() {
+        // The other half of the TTL: `Over` fires continuously during a real drag, so the clock only
+        // starts when the OS goes quiet. If the TTL expired under a live hover instead, a user who
+        // held a file over the window while finding the right spot would be back to the original
+        // bug — an accepted drop that silently refuses to load.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/notes.txt")], t);
+
+        // Still dragging, well past the TTL, with the OS reporting it the whole time.
+        let mut hovering = t;
+        for _ in 0..10 {
+            hovering += PROVISIONAL_TTL;
+            c.refresh_dragged(hovering);
+            assert!(
+                c.contains(&p("/tmp/notes.txt"), hovering),
+                "a hover the OS is still reporting stays readable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_path_outlives_the_drag_that_delivered_it() {
+        // The mirror of the test above: a real drop IS consent, and the grant has to survive, or a
+        // thread attachment could not be downloaded or copied to the clipboard afterwards.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/dropped.txt")], t);
+        c.note_chosen(vec![p("/tmp/dropped.txt")]); // the Drop
+        c.forget_dragged(); // a later, unrelated drag leaves
+
+        // Long after the provisional TTL would have lapsed: consent does not expire, or a thread
+        // attachment could not be downloaded an hour later.
+        assert!(
+            c.contains(&p("/tmp/dropped.txt"), t + Duration::from_secs(3600)),
+            "a dropped file stays readable after the drag is over"
+        );
+    }
+
+    #[test]
+    fn a_new_drag_replaces_the_previous_hover_grant() {
+        // Each Enter is a new drag; the previous one either dropped (already durable) or left. If
+        // Enter appended instead of replacing, every file ever hovered would stay readable until
+        // the cap evicted it — the durable-grant bug wearing a different hat.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/first.txt")], t);
+        c.note_dragged(vec![p("/tmp/second.txt")], t);
+
+        assert!(c.contains(&p("/tmp/second.txt"), t), "the current drag is readable");
+        assert!(
+            !c.contains(&p("/tmp/first.txt"), t),
+            "the previous drag's paths must not persist into the next one"
+        );
+    }
+
+    #[test]
+    fn a_drop_does_not_strand_the_provisional_set() {
+        // Drop supersedes the hover it completes. Leaving provisional populated would keep every
+        // path of the last drag readable indefinitely, since only Leave clears it and Leave does
+        // not fire after a successful drop.
+        let t = Instant::now();
+        let mut c = Chosen::default();
+        c.note_dragged(vec![p("/tmp/a.txt"), p("/tmp/b.txt")], t);
+        c.note_chosen(vec![p("/tmp/a.txt")]); // only a.txt was actually dropped
+
+        assert!(c.contains(&p("/tmp/a.txt"), t), "the dropped file is granted");
+        assert!(
+            !c.contains(&p("/tmp/b.txt"), t),
+            "a path that was hovered but not dropped must not survive the drop"
+        );
+    }
+
+    // ── The WIRING, not just the rules ──────────────────────────────────────────────────────────
+    //
+    // Every test above drives `Chosen` directly, which proves the tiers are implemented correctly
+    // and nothing at all about which drag phase reaches which tier. That mapping was a match at the
+    // `on_window_event` call site — unreachable from any test — so re-merging the arms into the
+    // pre-fix `Enter { paths, .. } | Drop { paths, .. } =>` would have left the suite green while
+    // dragging `~/.ssh/id_rsa` past the window was once again a permanent grant.
+
+    fn drag_position() -> tauri::PhysicalPosition<f64> {
+        tauri::PhysicalPosition { x: 0.0, y: 0.0 }
+    }
+
+    #[test]
+    fn entering_grants_only_provisionally_and_dropping_is_consent() {
+        assert_eq!(
+            dispatch_drag(&tauri::DragDropEvent::Enter {
+                paths: vec![p("/home/me/.ssh/id_rsa")],
+                position: drag_position(),
+            }),
+            DragGrant::Provisional(vec![p("/home/me/.ssh/id_rsa")]),
+            "a drag merely crossing the window must NOT be durable consent"
+        );
+        assert_eq!(
+            dispatch_drag(&tauri::DragDropEvent::Drop {
+                paths: vec![p("/tmp/notes.txt")],
+                position: drag_position(),
+            }),
+            DragGrant::Durable(vec![p("/tmp/notes.txt")]),
+            "letting go over us IS consent"
+        );
+    }
+
+    #[test]
+    fn leaving_forgets_and_hovering_renews() {
+        assert_eq!(
+            dispatch_drag(&tauri::DragDropEvent::Leave),
+            DragGrant::Forget,
+            "a drag that leaves without dropping must drop its grant"
+        );
+        assert_eq!(
+            dispatch_drag(&tauri::DragDropEvent::Over { position: drag_position() }),
+            DragGrant::Renew,
+            "Over is the OS confirming the hover is live — it must renew the TTL"
+        );
+    }
+
+    #[test]
+    fn read_still_rejects_a_neighbour_of_a_user_chosen_path() {
+        // Choosing one file must not open its directory: the registry admits exactly the paths the
+        // OS named, so a compromised webview can't walk from a dragged file to its siblings.
+        let outside = fresh_root();
+        let roots = vec![fresh_root()];
+        let chosen = outside.join("dragged.txt");
+        let neighbour = outside.join("secret.txt");
+        touch(&chosen);
+        touch(&neighbour);
+
+        note_user_chosen_paths([chosen.clone()]);
+
+        assert!(validate_read_path(&chosen, &roots).is_ok(), "the chosen file is readable");
+        assert!(
+            validate_read_path(&neighbour, &roots).is_err(),
+            "a sibling the user never chose must stay refused"
+        );
+    }
+
+    #[test]
+    fn read_rejects_a_symlink_swapped_after_the_user_chose_it() {
+        // The check-vs-use window: we canonicalize at registration AND at read, so repointing the
+        // link between the drop and the read resolves to a target that was never chosen.
+        let outside = fresh_root();
+        let roots = vec![fresh_root()];
+        let real_target = outside.join("innocent.txt");
+        let secret = outside.join("secret.txt");
+        touch(&real_target);
+        touch(&secret);
+        let link = outside.join("link.txt");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        note_user_chosen_paths([link.clone()]);
+        assert!(validate_read_path(&link, &roots).is_ok(), "the chosen target is readable");
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(
+            validate_read_path(&link, &roots).is_err(),
+            "a link repointed after the choice must not carry the choice to its new target"
+        );
+    }
+
+    #[test]
+    fn user_chosen_registry_is_bounded_and_forgets_oldest_first() {
+        // The registry grows on every drag ENTER, so an unbounded one would be a slow leak.
+        let mut q = VecDeque::new();
+        remember_into(&mut q, PathBuf::from("/a/first.txt"), 3);
+        for n in 0..3 {
+            remember_into(&mut q, PathBuf::from(format!("/a/filler-{n}.txt")), 3);
+        }
+        assert_eq!(q.len(), 3, "the cap must hold");
+        assert!(
+            !q.contains(&PathBuf::from("/a/first.txt")),
+            "the oldest choice must be evicted once the cap is passed"
+        );
+        assert!(
+            q.contains(&PathBuf::from("/a/filler-2.txt")),
+            "the newest choice must survive"
+        );
+    }
+
+    #[test]
+    fn re_choosing_a_path_does_not_consume_a_second_slot() {
+        // A drag that hovers re-registers on every Enter, so a duplicate must not push the queue
+        // along — otherwise one lingering drag evicts every other file the user chose.
+        let mut q = VecDeque::new();
+        remember_into(&mut q, PathBuf::from("/a/keep.txt"), 2);
+        for _ in 0..5 {
+            remember_into(&mut q, PathBuf::from("/a/hovering.txt"), 2);
+        }
+        assert!(
+            q.contains(&PathBuf::from("/a/keep.txt")),
+            "a repeated Enter must not evict an earlier choice"
+        );
+        assert_eq!(q.len(), 2);
     }
 
     #[test]

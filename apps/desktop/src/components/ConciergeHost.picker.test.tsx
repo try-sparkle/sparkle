@@ -64,7 +64,13 @@ vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() })
 // The REAL attachedPayload/attachedDisplay — only the picker seam is stubbed.
 vi.mock("../services/conciergeAttach", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
-  return { ...real, pickAttachments: h.pick, loadAttachmentPaths: vi.fn() };
+  return {
+    ...real,
+    pickAttachments: h.pick,
+    // Resolves an OUTCOME, not undefined: attachPaths chains off this, so a bare vi.fn() makes
+    // the drop effect throw rather than quietly no-op.
+    loadAttachmentPaths: vi.fn(async () => ({ attachments: [], failed: [] })),
+  };
 });
 vi.mock("../stores/runtimeStore", () => {
   const S = { status: { ag1: "approval" }, workflowState: {}, branchStatus: {}, workflowStage: {} };
@@ -136,7 +142,7 @@ const sentText = () => h.dispatch.mock.calls.map((c) => c[1]);
  *  so the actions have to be REVEALED first — hover is the mouse path (focus is the keyboard one;
  *  ComposeBox.test.tsx covers both). What this suite cares about is only that a file is staged. */
 async function attachImage() {
-  h.pick.mockResolvedValue([shot]);
+  h.pick.mockResolvedValue({ attachments: [shot], failed: [] });
   fireEvent.mouseEnter(screen.getByTestId("concierge-attach"));
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Upload" }));

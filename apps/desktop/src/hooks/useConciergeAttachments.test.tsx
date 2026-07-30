@@ -39,6 +39,7 @@ vi.mock("../logger", () => ({
 import { useConciergeAttachments, type ConciergeAttachments } from "./useConciergeAttachments";
 import { CONCIERGE_COLUMN_DND_TARGET, NEW_BUILD_AGENT_DND_TARGET } from "../services/dndTargets";
 import type { Attachment } from "../components/composer/attachments";
+import type { AttachFailure } from "../services/conciergeAttach";
 
 const file = (id: string): Attachment => ({
   id,
@@ -46,6 +47,11 @@ const file = (id: string): Attachment => ({
   path: "/tmp/" + id,
   name: id,
 });
+
+/** The successful shape of an AttachOutcome — the loader/picker now report failures too. */
+const ok = (attachments: Attachment[]) => ({ attachments, failed: [] as AttachFailure[] });
+/** One named failure with its reason — what the loader now hands back. */
+const bad = (name: string, reason = "the file no longer exists") => ({ name, reason });
 
 let api: ConciergeAttachments;
 function Host() {
@@ -75,8 +81,8 @@ beforeEach(() => {
   document.elementFromPoint = vi.fn(() =>
     cursorOver === "box" ? boxEl : cursorOver === "button" ? buttonEl : document.body,
   );
-  captured.pick.mockResolvedValue([]);
-  captured.loadPaths.mockResolvedValue([]);
+  captured.pick.mockResolvedValue(ok([]));
+  captured.loadPaths.mockResolvedValue(ok([]));
   render(<Host />);
 });
 afterEach(() => cleanup());
@@ -88,7 +94,7 @@ describe("staging attachments", () => {
   });
 
   it("stages what the picker returned, for the kind the user clicked", async () => {
-    captured.pick.mockResolvedValue([file("a")]);
+    captured.pick.mockResolvedValue(ok([file("a")]));
     await act(async () => {
       api.attach("image");
       await Promise.resolve();
@@ -98,7 +104,7 @@ describe("staging attachments", () => {
   });
 
   it("appends across successive picks rather than replacing", async () => {
-    captured.pick.mockResolvedValueOnce([file("a")]).mockResolvedValueOnce([file("b")]);
+    captured.pick.mockResolvedValueOnce(ok([file("a")])).mockResolvedValueOnce(ok([file("b")]));
     await act(async () => {
       api.attach("files");
       await Promise.resolve();
@@ -121,7 +127,7 @@ describe("staging attachments", () => {
 
 describe("remove / take / restore", () => {
   const stage = async (...ids: string[]) => {
-    captured.pick.mockResolvedValue(ids.map(file));
+    captured.pick.mockResolvedValue(ok(ids.map(file)));
     await act(async () => {
       api.attach("files");
       await Promise.resolve();
@@ -187,7 +193,7 @@ describe("drag and drop onto the compose box", () => {
   });
 
   it("attaches files dropped anywhere on the column", async () => {
-    captured.loadPaths.mockResolvedValue([file("a"), file("b")]);
+    captured.loadPaths.mockResolvedValue(ok([file("a"), file("b")]));
     cursorOver = "box";
     await fire({ type: "drop", position: at, paths: ["/tmp/a", "/tmp/b"] });
     expect(captured.loadPaths).toHaveBeenCalledWith(["/tmp/a", "/tmp/b"]);
@@ -199,11 +205,86 @@ describe("drag and drop onto the compose box", () => {
     // Finder hands the whole selection over in a single drop payload; taking paths[0] (or
     // otherwise losing the tail) would silently drop files the user watched themselves select.
     const many = ["/tmp/a.png", "/tmp/b.png", "/tmp/c.log", "/tmp/d.csv"];
-    captured.loadPaths.mockResolvedValue(many.map((p, i) => file(String.fromCharCode(97 + i))));
+    captured.loadPaths.mockResolvedValue(ok(many.map((p, i) => file(String.fromCharCode(97 + i)))));
     cursorOver = "box";
     await fire({ type: "drop", position: at, paths: many });
     expect(captured.loadPaths).toHaveBeenCalledWith(many);
     expect(api.attachments.map((x) => x.id)).toEqual(["a", "b", "c", "d"]);
+  });
+});
+
+// THE REPORTED BUG (bead sparkle-zviq): the box lights up under the drag, the drop is classified
+// and logged, and then the file is discarded with nothing said. A user-initiated action that fails
+// must never leave the user to notice an absence.
+describe("a drop that loses files says so", () => {
+  it("raises a notice naming the file that did not attach", async () => {
+    captured.loadPaths.mockResolvedValue({
+      attachments: [],
+      failed: [bad("notes.txt", "Sparkle isn't allowed to read that folder")],
+    });
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/private/tmp/notes.txt"] });
+    expect(api.attachments).toEqual([]);
+    expect(api.attachNotice).toMatch(/notes\.txt/);
+    // The REASON, not just the name. The app knew why it refused and said nothing — a notice that
+    // repeats the silence in a louder font fixes nothing.
+    expect(api.attachNotice).toMatch(/allowed to read that folder/i);
+  });
+
+  it("stays silent when every dropped file attached", async () => {
+    captured.loadPaths.mockResolvedValue(ok([file("a")]));
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/tmp/a"] });
+    expect(api.attachNotice).toBeNull();
+  });
+
+  it("still stages the files that DID load alongside the notice", async () => {
+    // A partial failure must not cost the user the rest of the batch, and must not hide it either.
+    captured.loadPaths.mockResolvedValue({
+      attachments: [file("a")],
+      failed: [bad("bad.txt", "permission denied")],
+    });
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/tmp/a", "/tmp/bad.txt"] });
+    expect(api.attachments.map((x) => x.id)).toEqual(["a"]);
+    expect(api.attachNotice).toMatch(/bad\.txt/);
+    expect(api.attachNotice).toMatch(/permission denied/i);
+  });
+
+  it("retracts the notice once a later drop succeeds", async () => {
+    captured.loadPaths.mockResolvedValue({ attachments: [], failed: [bad("bad.txt")] });
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/tmp/bad.txt"] });
+    expect(api.attachNotice).toMatch(/bad\.txt/);
+
+    captured.loadPaths.mockResolvedValue(ok([file("a")]));
+    await fire({ type: "drop", position: at, paths: ["/tmp/a"] });
+    expect(api.attachNotice).toBeNull();
+  });
+
+  it("clears the notice when the user dismisses it", async () => {
+    captured.loadPaths.mockResolvedValue({ attachments: [], failed: [bad("bad.txt")] });
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/tmp/bad.txt"] });
+    expect(api.attachNotice).not.toBeNull();
+    await act(async () => api.dismissNotice());
+    expect(api.attachNotice).toBeNull();
+  });
+
+  it("reports a picker failure that names no file at all", async () => {
+    captured.pick.mockResolvedValue({
+      attachments: [],
+      failed: [],
+      error: "The file picker could not be opened.",
+    });
+    await act(async () => api.attach("files"));
+    expect(api.attachNotice).toBe("The file picker could not be opened.");
+  });
+
+  it("says nothing when the picker was merely cancelled", async () => {
+    captured.pick.mockResolvedValue(ok([]));
+    await act(async () => api.attach("files"));
+    expect(api.attachNotice).toBeNull();
   });
 });
 
@@ -228,5 +309,20 @@ describe("drop scoping", () => {
     cursorOver = "box";
     await fire({ type: "drop", position: at, paths: [] });
     expect(captured.loadPaths).not.toHaveBeenCalled();
+  });
+});
+
+describe("a multi-file failure names every file but states the cause once", () => {
+  it("groups several failures under their shared reason, stating it once", async () => {
+    captured.loadPaths.mockResolvedValue({
+      attachments: [],
+      failed: [bad("a.txt", "permission denied"), bad("b.txt", "permission denied")],
+    });
+    cursorOver = "box";
+    await fire({ type: "drop", position: at, paths: ["/tmp/a.txt", "/tmp/b.txt"] });
+    expect(api.attachNotice).toMatch(/a\.txt/);
+    expect(api.attachNotice).toMatch(/b\.txt/);
+    // Stated ONCE — repeating it per file buries the cause in the list of names.
+    expect(api.attachNotice!.match(/permission denied/gi)).toHaveLength(1);
   });
 });

@@ -714,6 +714,8 @@ export function ConciergeHost({
   const {
     attachments,
     dropActive,
+    attachNotice,
+    dismissNotice: dismissAttachNotice,
     attach,
     attachPaths,
     attachReady,
@@ -2216,6 +2218,7 @@ export function ConciergeHost({
       onRedirect: (messageId: string) => void redirect(messageId),
       onAttach: attach,
       onRemoveAttachment: removeAttachment,
+      onDismissAttachNotice: dismissAttachNotice,
       onCopied,
       // PRD §3 (cross-project surfacing): clicking a nudge card "opens that project's tab,
       // switches to Build, and selects the referenced agent". openProjectTab does all three — the
@@ -2343,6 +2346,7 @@ export function ConciergeHost({
       redirect,
       attach,
       removeAttachment,
+      dismissAttachNotice,
       onCopied,
     ],
   );
@@ -2431,6 +2435,7 @@ export function ConciergeHost({
       typing,
       attachments,
       dropActive,
+      attachNotice,
       needsYouFilter: needsYouIsolated,
     };
   }, [
@@ -2441,6 +2446,7 @@ export function ConciergeHost({
     needsYouByProject,
     attachments,
     dropActive,
+    attachNotice,
     needsYouIsolated,
   ]);
 

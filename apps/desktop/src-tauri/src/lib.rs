@@ -142,6 +142,25 @@ pub fn run() {
         //   - frontmost (spec §4.6): drives the floating helper island's visibility. Coalescing
         //     stops the island flashing on during an internal window switch.
         .on_window_event(|window, event| {
+            // A real OS drag-drop is the ONLY trustworthy signal that the user chose a file: the
+            // paths come from the window server, not from the webview. Recording them here is what
+            // lets `load_attachment` read a file the containment rule would otherwise refuse — a
+            // `.txt` dragged from `/private/tmp` used to be accepted by the UI and then silently
+            // discarded (bead sparkle-zviq). See attachments.rs' provenance note.
+            //
+            // Enter and Drop are DIFFERENT claims, and conflating them is a security bug: Enter
+            // fires for any drag crossing this window, including one headed for another app, so a
+            // durable grant there would let a file merely dragged PAST Sparkle be read for the life
+            // of the process. Enter is provisional (cleared on Leave), Drop is consent. Registering
+            // on Enter at all is what removes the race with the JS event, which Tauri emits before
+            // it runs this listener. See attachments.rs' tier note.
+            // The per-phase rule lives in `attachments::note_drag_event`, not here: as match arms at
+            // this call site nothing could test it, so re-merging Enter into Drop (the pre-fix
+            // shape, which made a drag crossing the window a permanent grant) would have gone
+            // unnoticed by a green suite.
+            if let tauri::WindowEvent::DragDrop(drag) = event {
+                attachments::note_drag_event(drag);
+            }
             if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
                 let label = window.label();

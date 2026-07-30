@@ -473,6 +473,8 @@ export function ConciergeColumn({
           onRemoveAttachment={controller.onRemoveAttachment}
           attachments={model.attachments}
           dropActive={model.dropActive}
+          attachNotice={model.attachNotice}
+          onDismissAttachNotice={controller.onDismissAttachNotice}
           interim={interim}
           registerInsert={registerInsert}
           onTextEdit={onTextEdit}
