@@ -416,6 +416,19 @@ function describeSpan(ms: number): string {
 }
 
 /**
+ * Told to the human when an agent has used up its whole retry budget — we are done trying and the row
+ * stays red. Distinct from the exhaustion reason on {@link decideRevive}, which is about ONE ladder
+ * running out of rungs; this is the across-ladders stop.
+ *
+ * Claims only what is known. A predecessor said "without this settling", which was false on the very
+ * path it served — the last retry may well have worked before an unrelated failure arrived (roborev
+ * 55566). That constant is now deleted rather than reworded, since nothing announces a restart any more.
+ */
+export const BUDGET_SPENT_REASON =
+  `This agent has been auto-retried as much as is useful and is still failing. ` +
+  `Leaving it red — it needs you now.`;
+
+/**
  * What we actually type into the agent's terminal.
  *
  * Three properties, each learned from the failure mode it prevents:
@@ -441,34 +454,6 @@ function describeSpan(ms: number): string {
  *  feature a round (roborev 55440). Change the prompt's wording and this constant must move with it —
  *  a test asserts the prompt contains it. */
 export const REVIVE_PROMPT_MARKER = "This is automatic retry ";
-
-/**
- * Told to the human when a ladder was spent and the agent failed again LATER — late enough that we
- * cannot tell whether the last retry worked and a new outage arrived, or the same one took a while to
- * re-print (roborev 55534). Deliberately does NOT claim the outage outlasted the ladder, which is what
- * the exhaustion reason says and would be a false statement about a failure seconds old.
- *
- * WORDED FOR THE AMBIGUITY, not against it (roborev 55566). It used to say "without this settling",
- * which is false on the very path the constant exists to serve: when ping 11 DID settle it and the
- * agent worked for 45 minutes before an unrelated failure. It now asserts only what is known in both
- * branches — that retries happened earlier and the agent is failing now. A test pins that it makes no
- * claim about those retries having failed.
- *
- * Lives here beside the other reasons rather than in the runner so all the copy the human can be shown
- * is in one file, and the runner keeps no strings of its own.
- */
-/**
- * Told to the human when an agent has used up its whole retry budget — we are done trying and the row
- * stays red. Distinct from the exhaustion reason (which is about ONE ladder) because this is the
- * across-ladders stop, and distinct from {@link SPENT_LADDER_REASON} (which announces a RESTART).
- */
-export const BUDGET_SPENT_REASON =
-  `This agent has been auto-retried as much as is useful and is still failing. ` +
-  `Leaving it red — it needs you now.`;
-
-export const SPENT_LADDER_REASON =
-  `Auto-retried ${REVIVE_LADDER_MS.length} times earlier, and this agent is failing again. ` +
-  `Starting a fresh ladder, but it may need you.`;
 
 export function revivePrompt(attempt: number): string {
   return (

@@ -64,8 +64,12 @@ export interface ReviveEpisode {
 }
 
 /**
- * How many complete ladders' worth of retries one agent may receive inside {@link PING_BUDGET_WINDOW_MS}
- * before we stop and hand it to the human.
+ * How many complete ladders one agent may EXHAUST inside {@link PING_BUDGET_WINDOW_MS} before we stop
+ * retrying it and hand it to the human.
+ *
+ * NAMED FOR THE WINDOW, NOT AN OUTAGE (roborev 55612). A predecessor was called
+ * `MAX_LADDERS_PER_OUTAGE`, which promised a per-outage bound that does not exist anywhere — nothing
+ * here can tell one outage from the next.
  *
  * A BOUND IS REQUIRED, AND IT MUST NOT DEPEND ON EPISODE IDENTITY (roborev 55566). Restarting a
  * spent-but-ambiguous ladder at rung 0 gave the feature no terminating bound at all: on a sustained
@@ -74,24 +78,68 @@ export interface ReviveEpisode {
  * is a deliberate no-op, since the row is already red and the notification fires via the status path —
  * so a page was never going to bound anything.
  *
- * A per-episode ladder COUNTER was tried first and does not work either, which is why this is a budget
- * instead. The counter can only travel through a carry, and a carry is time-bounded: after the give-up
- * `lastPingAt` stops advancing, so the window lapses, `recentlyEnded` is dropped, and a brand-new
- * episode opens with the count reset — cycling resumes one ladder later. Anything keyed on episode
- * identity has this hole. Counting the PINGS THEMSELVES has no such dependency.
+ * TWO LAYERS, and the reason for each (roborev 55863).
+ *
+ *   - THIS counter answers "is retrying still useful": it charges only ladders that ran ALL the way
+ *     out, so a ladder that revived the agent costs nothing and cannot deny a later, unrelated outage
+ *     its own retries. But it DEPENDS ON EPISODE IDENTITY - `attempts` advances only through a carry,
+ *     so if every re-error lands outside `episodeCarryWindowMs` (a request that takes three minutes to
+ *     529 out is enough), no ladder ever completes and this counter never charges anything.
+ *   - {@link PING_BUDGET} is therefore kept underneath it as an UNCONDITIONAL CEILING. It counts raw
+ *     pings, depends on nothing about episodes, and is what actually guarantees retrying terminates -
+ *     including in exactly the rung-0-forever case above, which this counter alone cannot see.
+ *
+ * Neither is redundant: drop the ceiling and a sustained outage whose re-errors are slow pings
+ * forever; drop the counter and two successful ladders deny the next outage its retries.
  */
-export const MAX_LADDERS_PER_OUTAGE = 2;
+export const MAX_LADDERS_PER_WINDOW = 2;
 
-/** Total retry pings one agent may receive per {@link PING_BUDGET_WINDOW_MS}. */
-export const PING_BUDGET = REVIVE_LADDER_MS.length * MAX_LADDERS_PER_OUTAGE;
+/** The most retry pings this bound can cost an agent per window — the arithmetic ceiling, useful for
+ *  reasoning about worst-case pressure. Not itself the guard; see {@link exhaustedLadders}.
+ *
+ *  PINNED BY VALUE in a test (roborev 55612) for the reason `REVIVE_LADDER_MS` is pinned: an assertion
+ *  written in terms of this constant, checking a log the same constant's guard writes, is tautological
+ *  — it cannot notice the MAGNITUDE changing. Raising the multiplier from 2 to 3 is a 50% increase in
+ *  retry pressure on a red agent and used to pass the whole file. */
+export const PING_BUDGET = REVIVE_LADDER_MS.length * MAX_LADDERS_PER_WINDOW;
 
-/** Rolling window the {@link PING_BUDGET} is measured over. Wider than two ladders (1h27m each) so a
- *  genuinely sustained outage exhausts the budget rather than skating under it, while an agent that
- *  had trouble hours ago starts clean. */
+/** Rolling window the budget is measured over. Wider than two ladders (1h27m each) so a genuinely
+ *  sustained outage exhausts it rather than skating under it, while an agent that had trouble hours
+ *  ago starts clean. */
 export const PING_BUDGET_WINDOW_MS = 4 * 60 * 60_000;
 
-/** When each recent retry ping was sent, per agent, oldest first. Pruned to the rolling window on every
- *  read. This — not any episode field — is what makes retrying terminate. */
+/**
+ * When each EXHAUSTED ladder finished, per agent, oldest first.
+ *
+ * WHY EXHAUSTED LADDERS AND NOT PINGS (roborev 55612). Counting every ping charged an agent for
+ * retries that WORKED: two ladders that each revived it — say ping 8, then ping 11 — still spent the
+ * whole allowance, so a third, plainly transient 529 arriving ninety minutes later got ZERO retries
+ * and a page asserting it "has been auto-retried as much as is useful and is still failing", which is
+ * false about that failure. That is the same harm 55534 identified for the inherit-rung-11 path, just
+ * moved to agent scope. A ladder that revived the agent cost nothing and should be charged nothing;
+ * only a ladder that ran all the way out is evidence retrying is not working.
+ */
+const exhaustedLadders = new Map<string, number[]>();
+
+/** Agents already told that retrying is over. Cleared the moment the budget is no longer spent, so
+ *  it latches the PAGE to the COUNTER rather than to a clock of its own. */
+const budgetPaged = new Set<string>();
+
+/** Ladders this agent has exhausted inside the rolling window, pruning as it reads. */
+function recentExhausted(agentId: string, now: number): number[] {
+  const kept = (exhaustedLadders.get(agentId) ?? []).filter((t) => now - t <= PING_BUDGET_WINDOW_MS);
+  if (kept.length === 0) exhaustedLadders.delete(agentId);
+  else exhaustedLadders.set(agentId, kept);
+  return kept;
+}
+
+/** Test/diagnostic read of the rolling exhausted-ladder count. */
+export function apiRecoveryLadderCount(agentId: string, now: number): number {
+  return recentExhausted(agentId, now).length;
+}
+
+/** Every retry ping sent to this agent inside the window - the UNCONDITIONAL ceiling's ledger. Keyed
+ *  on nothing but the agent, so it holds when the ladder counter cannot (roborev 55863). */
 const pingLog = new Map<string, number[]>();
 
 /** Pings sent to this agent inside the rolling window, pruning as it reads. */
@@ -175,19 +223,21 @@ export const EPISODE_CARRY_MS = 2 * 60_000;
  * escalate on the first sweep with the page SUPPRESSED. Zero rungs, no notification, red until a human
  * looks (roborev 55517).
  *
- * WHAT THE WINDOW DOES AND DOES NOT DECIDE — read this before changing either. `noteAgentStatus` sorts
- * a re-entry into three cases, and only the third is this function's call:
- *   1. `attempts < length` and inside the window → RESUME the ladder at the next rung. The everyday
- *      case; this is what the whole carry mechanism exists for.
- *   2. `attempts >= length` and inside the window → the ladder is spent. Within EPISODE_CARRY_MS the
- *      re-fail is plainly our own retry failing, so resume at the spent count and let `decideRevive`
- *      escalate. Beyond it the outcome is genuinely ambiguous (ping 11 may have worked), so RESTART at
- *      rung 0 — bounded by MAX_LADDERS_PER_OUTAGE, which is the only thing making retries terminate.
- *   3. Outside the window → a NEW episode with a fresh ladder and the ladder count reset.
- * An earlier revision of this comment argued that collapsing the window at exhaustion was wrong
- * because it would "cycle 11 pings → restart → 11 pings forever with the human never told". That
- * objection was real and is now answered by the COUNTER rather than by the window: see
- * MAX_LADDERS_PER_OUTAGE. Do not reintroduce a timing-based fix for it.
+ * WHAT THE WINDOW DECIDES — three outcomes. (An earlier list said "exactly TWO", which dropped a
+ * REACHABLE case rather than the unreachable one it meant to remove — roborev 55854.)
+ *   1. `attempts < length` and INSIDE the window → RESUME the ladder at the next rung. The everyday
+ *      case, and what the whole carry mechanism exists for.
+ *   2. `attempts < length` and OUTSIDE it → a NEW episode at rung 0. This is "the agent genuinely
+ *      recovered, then failed again an hour later", and it is the case the `lastRung * 2` scaling
+ *      above exists to get right — it must not be mistaken for our own ping failing.
+ *   3. `attempts >= length` (or already escalated) → the window IS the floor, so only an immediate
+ *      re-fail carries, which is plainly our own ping failing: it resumes at the spent count and
+ *      `decideRevive` gives up. Anything slower falls into case 2.
+ * An earlier revision argued that collapsing at exhaustion was wrong because it would "cycle 11 pings
+ * → restart → 11 pings forever". The cycling is real and is answered by PING_BUDGET, NOT by this
+ * window — do not reintroduce a timing-based fix for it. Note also that the budget bounds retry
+ * PRESSURE (≤ PING_BUDGET per PING_BUDGET_WINDOW_MS); it does not make retrying stop forever, since
+ * pings resume once the rolling window sheds an entry.
  *
  * The other way over-carrying bit is guarded at the call site: an ACCOUNT limit arriving mid-ladder
  * must not keep the inherited `retryable` verdict, so a carry re-scans for `terminal` and upgrades.
@@ -196,9 +246,10 @@ export const EPISODE_CARRY_MS = 2 * 60_000;
  */
 export function episodeCarryWindowMs(attempts: number, escalated = false): number {
   if (attempts <= 0 || escalated || attempts >= REVIVE_LADDER_MS.length) return EPISODE_CARRY_MS;
-  const lastRung = REVIVE_LADDER_MS[Math.min(attempts, REVIVE_LADDER_MS.length) - 1];
-  if (lastRung === undefined) return EPISODE_CARRY_MS;
-  return Math.max(EPISODE_CARRY_MS, lastRung * 2);
+  // In range by construction: the guard above excludes <= 0 and >= length, so `attempts - 1` indexes a
+  // real rung. A `Math.min` clamp and an `undefined` check used to sit here; the exhaustion arm made
+  // both unreachable, and the test that named the clamp went vacuous with them (roborev 55612).
+  return Math.max(EPISODE_CARRY_MS, REVIVE_LADDER_MS[attempts - 1]! * 2);
 }
 
 /** The widest window {@link episodeCarryWindowMs} can return — how long a just-ended episode is worth
@@ -225,7 +276,9 @@ export function apiRecoveryEpisodes(): ReadonlyMap<string, Readonly<ReviveEpisod
 export function __resetApiRecovery(): void {
   episodes.clear();
   recentlyEnded.clear();
+  exhaustedLadders.clear();
   pingLog.clear();
+  budgetPaged.clear();
 }
 
 /** Test-only: how many just-ended episodes are being remembered for a possible carry. Exported
@@ -344,20 +397,13 @@ export function noteAgentStatus(
         ? "terminal"
         : prior.failure
       : classifyFromScrollback(readScrollback(agentId));
-    // A CARRIED-BUT-SPENT LADDER IS AMBIGUOUS, AND BOTH PURE ANSWERS ARE WRONG (roborev 55534).
-    //
-    // Ping 11 clears `errored` itself, so `escalated` is still false when the episode is filed away and
-    // NO sweep ever observes `attempts >= length` while errored on that path. Consequences of the two
-    // obvious choices, both of which this branch has now shipped and had reviewed:
-    //   • Inherit `attempts: 11` — then if ping 11 actually WORKED and an unrelated 529 arrives 45
-    //     minutes later, the next sweep escalates instantly with "the outage is outlasting the ladder"
-    //     (a false claim about a failure seconds old) and the new, plainly transient error gets ZERO
-    //     retries. Exactly the stall this module exists to end.
-    //   • Start fresh at rung 0 — then the spent-ladder page is never sent at all, and a genuinely
-    //     sustained outage cycles 11 pings → restart → 11 pings with the human never told.
-    // So decouple the two things: page ONCE about the ladder we spent, and give the possibly-new
-    // failure its own full ladder. `escalated` stays false so this episode can still page on its own
-    // exhaustion — two pages 87 minutes apart is correct, not noise.
+    // A CARRIED-BUT-SPENT LADDER only ever reaches here on an IMMEDIATE re-fail, because
+    // `episodeCarryWindowMs` collapses to the floor at exhaustion. That is the case where the re-fail is
+    // plainly our own ping failing, so resuming at the spent count is right: `decideRevive` then returns
+    // its give-up escalation and no further rung is spent. Anything slower is not a carry at all — it is
+    // a NEW episode with a fresh ladder, and the repeated-ladder pressure that implies is bounded by
+    // PING_BUDGET rather than by anything in this function. (An earlier revision paged here and
+    // restarted at rung 0; both that page and its rationale are gone — see PING_BUDGET, roborev 55612.)
     const resumed = carry;
     episodes.set(agentId, {
       erroredSince: now,
@@ -413,7 +459,9 @@ export function forgetAgent(agentId: string): void {
   recentlyEnded.delete(agentId);
   // The budget goes with it: this id is gone (pane closed, project unloaded), and a REUSED id must not
   // inherit a stranger's spent budget and be refused its first retry.
+  exhaustedLadders.delete(agentId);
   pingLog.delete(agentId);
+  budgetPaged.delete(agentId);
 }
 
 /** The edges a sweep needs. Injected so the whole runner is testable without a PTY or a store. */
@@ -454,10 +502,10 @@ export interface SweepOutcome {
  * NOTHING RUNS AHEAD OF THE TOGGLE, and roborev 55628's Medium asked for something that did — a
  * pre-pass paying a one-off "we spent a whole ladder" page, on the argument that the toggle bans
  * TYPING and not TELLING. That argument was right about this gate and wrong about which mechanism
- * needed it: main's `MAX_LADDERS_PER_OUTAGE` counter (PR #861) replaced the flag it was rescuing.
+ * needed it: main's `MAX_LADDERS_PER_WINDOW` counter (PR #861) replaced the flag it was rescuing.
  * The finding's harm was that the page was single-shot and stored on an object the next status
- * change deletes, so skipping it DESTROYED it. `PING_BUDGET` has neither property: it is derived on
- * every sweep from `pingLog`, which is module state on a 4h rolling window and outlives both the
+ * change deletes, so skipping it DESTROYED it. The ladder budget has neither property: it is derived on
+ * every sweep from `exhaustedLadders`, module state on a 4h rolling window that outlives both the
  * episode and the toggle. So the budget page is DEFERRED while typing is off and delivered by the
  * first sweep after it comes back — no rescue needed, and `episodeCarryWindowMs`'s comment asks
  * directly that no timing-based fix be reintroduced here.
@@ -519,24 +567,48 @@ export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]
     }
     if (decision.action !== "ping") continue;
 
-    // THE TERMINATING BOUND (roborev 55566). Counted on the pings themselves rather than on any episode
-    // field, because every episode-keyed bound leaks: the state can only travel through a carry, and a
-    // carry lapses once `lastPingAt` stops advancing, after which a fresh episode starts the count over.
-    // Escalate once when the budget is gone and send nothing further.
-    const sent = recentPings(agentId, deps.now);
-    if (sent.length >= PING_BUDGET) {
-      if (!episode.escalated) {
-        episode.escalated = true;
+    // THE TERMINATING BOUND (roborev 55566). Kept OUT of the episode, because every episode-keyed bound
+    // leaks: that state can only travel through a carry, and a carry lapses once `lastPingAt` stops
+    // advancing, after which a fresh episode starts the count over.
+    //
+    // Charged in EXHAUSTED LADDERS, not pings (roborev 55612) — a ladder that revived the agent cost
+    // nothing and must not count against its next, unrelated outage.
+    const spent = recentExhausted(agentId, deps.now);
+    const pinged = recentPings(agentId, deps.now);
+    // The ladder counter is the useful signal; the raw ping ceiling is the one that cannot be evaded.
+    // Without it, an outage whose re-errors land outside the carry window completes no ladder, charges
+    // nothing, and pings forever at a rung-0 cadence (roborev 55863, High).
+    if (spent.length >= MAX_LADDERS_PER_WINDOW || pinged.length >= PING_BUDGET) {
+      // Paged once per WINDOW rather than once per episode: `escalated` lives on the episode, and an
+      // agent that recovers on its own and re-errors opens a new one, which used to re-page for every
+      // such episode while asserting the "says so once" property (roborev 55612).
+      // Latched on the COUNTER, not on time-since-last-page: those two windows drift, and a drifted
+      // latch swallowed the SECOND give-up entirely (roborev 55863). Cleared below whenever the budget
+      // is no longer spent, so the next give-up pages again.
+      if (!budgetPaged.has(agentId)) {
+        budgetPaged.add(agentId);
         log.warn("apiRecovery", "retry budget spent, leaving it red", {
           agentId,
-          pings: sent.length,
+          exhaustedLadders: spent.length,
+          pings: pinged.length,
           windowMs: PING_BUDGET_WINDOW_MS,
         });
         deps.onEscalate(agentId, BUDGET_SPENT_REASON, episode);
       }
+      episode.escalated = true;
       continue;
     }
-    pingLog.set(agentId, [...sent, deps.now]);
+
+    // A ladder that ran all the way out is the only retry cost worth charging — see `exhaustedLadders`.
+    // Recorded when the LAST rung is sent, not when `decideRevive` later gives up: on the path that
+    // matters, our own ping clears `errored` and the episode restarts before any sweep ever observes
+    // `attempts >= length`, so a give-up-time hook records nothing at all (found by test).
+    budgetPaged.delete(agentId); // under budget again, so a later give-up is allowed to page
+    pingLog.set(agentId, [...pinged, deps.now]);
+    if (decision.attempt >= REVIVE_LADDER_MS.length) {
+      const prior = recentExhausted(agentId, deps.now);
+      exhaustedLadders.set(agentId, [...prior, deps.now]);
+    }
 
     // Record the attempt BEFORE awaiting the write. If the write throws we must not retry the same
     // rung immediately on the next sweep — that would turn a dead PTY into a tight loop, which is the
