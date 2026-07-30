@@ -185,6 +185,9 @@ pub struct WatchdogState {
     /// to the whole episode: a wedge that began while backgrounded is a weaker claim even if the
     /// window is visible again by the time we report the recovery.
     hidden: bool,
+    /// Has this episode already produced a stack? An episode that has NOT is still owed one, and
+    /// `Restate` will ask again — see `Effect::Restate { wants_stack }`.
+    captured: bool,
 }
 
 /// What a tick decided to do.
@@ -201,7 +204,10 @@ pub enum Effect {
     /// Heartbeats have stopped for `stalled_ms`. First line of an episode.
     ReportNew { stalled_ms: u64, hidden: bool },
     /// Still silent. `stalled_ms` is measured from when the beats stopped, not from the last line.
-    Restate { stalled_ms: u64, hidden: bool },
+    ///
+    /// `wants_stack` is true while this episode has not managed a capture yet. It is the fix for a
+    /// rate limiter that could be spent by the wrong event: see `may_capture_hidden`.
+    Restate { stalled_ms: u64, hidden: bool, wants_stack: bool },
     /// Beats resumed. `hung_for_ms` is the TRUE total, from the moment they stopped.
     ///
     /// `hidden` is not decoration here — it is the difference between an eight-hour wedge and an
@@ -271,6 +277,14 @@ fn apply_baseline(last_beat: &AtomicU64, effect: &Effect) {
     }
 }
 
+/// Record that this episode got its stack, so later restates stop asking.
+///
+/// Separate from `step` because whether a capture actually happened is an I/O outcome (the rate
+/// limiter may refuse, the dump dir may be missing), and `step` is pure.
+pub fn note_captured(state: &mut WatchdogState) {
+    state.captured = true;
+}
+
 /// How long to wait before the Nth restate. Exponential, capped — see `RESTATE_MAX`.
 fn restate_delay_ms(restates: u32) -> u64 {
     let base = RESTATE_EVERY.as_millis() as u64;
@@ -335,13 +349,14 @@ pub fn step(state: &mut WatchdogState, input: TickInput) -> Effect {
         state.last_report_ms = input.now_ms;
         state.restates = 0;
         state.hidden = input.hidden;
+        state.captured = false;
         return Effect::ReportNew { stalled_ms, hidden: input.hidden };
     }
 
     if input.now_ms.saturating_sub(state.last_report_ms) >= restate_delay_ms(state.restates) {
         state.last_report_ms = input.now_ms;
         state.restates = state.restates.saturating_add(1);
-        return Effect::Restate { stalled_ms, hidden: state.hidden };
+        return Effect::Restate { stalled_ms, hidden: state.hidden, wants_stack: !state.captured };
     }
     Effect::Quiet
 }
@@ -404,27 +419,11 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     // visible hang's stack and a backgrounded wedge is never left without evidence.
                     // Hidden captures are additionally rate-limited: the pool bounds files kept, not
                     // the five-second whole-process `sample` run itself. See `may_capture_hidden`.
-                    let allowed = if hidden {
-                        let ok = may_capture_hidden(
-                            LAST_HIDDEN_CAPTURE_MS.load(Ordering::Relaxed),
-                            after,
-                            HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64,
-                        );
-                        if ok {
-                            LAST_HIDDEN_CAPTURE_MS.store(after, Ordering::Relaxed);
-                        }
-                        ok
-                    } else {
-                        true
-                    };
-                    if allowed {
-                        if let Some(dir) = &hangs_dir {
-                            let (target, keep) = dump_target(dir, hidden);
-                            capture_stack_into(&target, after, keep);
-                        }
+                    if try_capture(hangs_dir.as_deref(), hidden, after, &LAST_HIDDEN_CAPTURE_MS) {
+                        note_captured(&mut state);
                     }
                 }
-                Effect::Restate { stalled_ms, hidden } => {
+                Effect::Restate { stalled_ms, hidden, wants_stack } => {
                     if is_reportable_evidence(hidden) {
                         tracing::warn!(
                             target: "watchdog",
@@ -438,6 +437,18 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                             hidden,
                             "still no heartbeat from a hidden webview"
                         );
+                    }
+                    // PERSISTENCE EARNS THE STACK. If this episode was refused a capture when it
+                    // opened — the rate limiter had just been spent, most likely by an ordinary
+                    // cmd-tab — ask again now. Without this the refusal was PERMANENT for the
+                    // episode, because `ReportNew` fires exactly once, so a benign backgrounding
+                    // could spend the slot a real wedge needed and the wedge would end with an
+                    // `info` line and no evidence. Persisting is precisely what a wedge does and a
+                    // cmd-tab does not, so retrying here spends the budget on the right event.
+                    if wants_stack
+                        && try_capture(hangs_dir.as_deref(), hidden, after, &LAST_HIDDEN_CAPTURE_MS)
+                    {
+                        note_captured(&mut state);
                     }
                 }
                 Effect::Recovered { hung_for_ms, hidden } => {
@@ -468,6 +479,41 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         hidden_hang_after_ms = HIDDEN_HANG_AFTER.as_millis() as u64,
         "main-thread watchdog started (off-thread)"
     );
+}
+
+/// Capture a stack if policy allows it, returning whether one was actually taken.
+///
+/// Visible episodes always capture. Hidden ones are rate-limited (`may_capture_hidden`), because the
+/// pool bounds files KEPT while the expensive part is the five-second whole-process `sample` run.
+/// The limiter is consumed only when a capture really happens, so a refused attempt leaves the slot
+/// for the next asker — which is what lets a persisting episode retry from `Restate`.
+fn try_capture(
+    dir: Option<&std::path::Path>,
+    hidden: bool,
+    now_ms: u64,
+    last_hidden: &AtomicU64,
+) -> bool {
+    let Some(dir) = dir else { return false };
+    if hidden
+        && !may_capture_hidden(
+            last_hidden.load(Ordering::Relaxed),
+            now_ms,
+            HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64,
+        )
+    {
+        // STORE ONLY ON SUCCESS. Consuming the interval here instead would push the next allowed
+        // capture out by a further full interval on every refusal, which defeats the `Restate`
+        // retry this helper exists to enable — the episode would keep asking and keep being
+        // refused. Injected rather than reading the static directly so a test can assert exactly
+        // that: the pure predicate alone cannot distinguish the two.
+        return false;
+    }
+    if hidden {
+        last_hidden.store(now_ms, Ordering::Relaxed);
+    }
+    let (target, keep) = dump_target(dir, hidden);
+    capture_stack_into(&target, now_ms, keep);
+    true
 }
 
 /// Delete all but the newest `keep` dumps in one pool. Best-effort.
@@ -676,7 +722,7 @@ mod tests {
         for effect in [
             Effect::Quiet,
             Effect::ReportNew { stalled_ms: 5_000, hidden: false },
-            Effect::Restate { stalled_ms: 5_000, hidden: false },
+            Effect::Restate { stalled_ms: 5_000, hidden: false, wants_stack: false },
             Effect::Recovered { hung_for_ms: 5_000, hidden: false },
         ] {
             apply_baseline(&last_beat, &effect);
@@ -711,6 +757,102 @@ mod tests {
     // Silence from a hidden WKWebView is DOCUMENTED behaviour (throttled or stopped timers), not a
     // symptom. So a hidden episode is a timestamp to correlate against, never a claim — and above
     // all it must not spend the finite dump budget, because a false capture evicts a real one.
+    // ── PERSISTENCE EARNS THE STACK (the rate limiter's blind spot) ───────────────────────────
+    // The limiter allows one hidden capture per 30 min. But `ReportNew` fires exactly ONCE per
+    // episode, so a refusal at open used to be PERMANENT: if an ordinary cmd-tab spent the slot at
+    // T, a real backgrounded wedge opening at T+5min was skipped and never retried, however long it
+    // lasted — ending with an `info` line and no evidence. And the benign event wins by frequency:
+    // backgrounding past 10 min is routine, a wedge is rare, so the common case routinely spends
+    // the budget the rare case needs. That is the same cost as zeroing MAX_HIDDEN_HANG_DUMPS, which
+    // this module already treats as a defect worth a two-pool design.
+    //
+    // The fix is to let the episode keep asking while it still owes a stack. Persisting is exactly
+    // what a wedge does and a cmd-tab does not, so the retry spends the budget on the right event.
+
+    #[test]
+    fn an_episode_denied_its_stack_keeps_asking_on_every_restate() {
+        let mut state = WatchdogState::default();
+        // Episode opens. Suppose the loop could NOT capture (limiter just spent by a cmd-tab), so
+        // `note_captured` is never called.
+        assert!(matches!(
+            step(&mut state, input(16_000, 10_000, VISIBLE)),
+            Effect::ReportNew { .. }
+        ));
+        let mut asked = 0;
+        for t in (17_000..=200_000).step_by(1_000) {
+            if let Effect::Restate { wants_stack, .. } = step(&mut state, input(t, 10_000, VISIBLE)) {
+                assert!(wants_stack, "an episode with no stack must keep asking");
+                asked += 1;
+            }
+        }
+        assert!(asked >= 3, "expected several retry opportunities, got {asked}");
+    }
+
+    // The converse — once a capture lands, restates must STOP asking, or a long wedge re-samples
+    // itself every restate and floods the pool it was given.
+    #[test]
+    fn once_the_stack_is_taken_the_restates_stop_asking() {
+        let mut state = WatchdogState::default();
+        step(&mut state, input(16_000, 10_000, VISIBLE));
+        note_captured(&mut state); // the loop got its stack
+
+        for t in (17_000..=200_000).step_by(1_000) {
+            if let Effect::Restate { wants_stack, .. } = step(&mut state, input(t, 10_000, VISIBLE)) {
+                assert!(!wants_stack, "already captured — must not ask again");
+            }
+        }
+    }
+
+    // A NEW episode is owed its own stack, even right after one that got captured.
+    #[test]
+    fn a_fresh_episode_is_owed_its_own_stack() {
+        let mut state = WatchdogState::default();
+        step(&mut state, input(16_000, 10_000, VISIBLE));
+        note_captured(&mut state);
+        // Recover, then wedge again.
+        assert!(matches!(step(&mut state, input(20_000, 20_000, VISIBLE)), Effect::Recovered { .. }));
+        assert!(matches!(step(&mut state, input(40_000, 30_000, VISIBLE)), Effect::ReportNew { .. }));
+        let mut saw = false;
+        for t in (41_000..=120_000).step_by(1_000) {
+            if let Effect::Restate { wants_stack, .. } = step(&mut state, input(t, 30_000, VISIBLE)) {
+                assert!(wants_stack, "the second episode carried the first one's captured flag");
+                saw = true;
+            }
+        }
+        assert!(saw);
+    }
+
+    // The limiter must be CONSUMED only by a capture that actually happened. An earlier version of
+    // this test asserted `may_capture_hidden` — an unchanged pure predicate — so it passed against
+    // the pre-commit tree and would still pass with the `store` moved above the refusal check.
+    // These drive `try_capture` itself and assert the SIDE EFFECT on the injected limiter state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_hidden_capture_leaves_the_interval_untouched() {
+        let interval = HIDDEN_CAPTURE_MIN_INTERVAL.as_millis() as u64;
+        let last = AtomicU64::new(1_000);
+        // No dump dir: the capture cannot happen, so nothing may be consumed.
+        assert!(!try_capture(None, true, 1_000 + interval * 2, &last));
+        assert_eq!(last.load(Ordering::Relaxed), 1_000, "a capture that did not happen consumed the slot");
+
+        // Inside the window: refused, and the ORIGINAL spend must still govern — otherwise every
+        // refused Restate retry would push the next allowed capture out another full interval and
+        // the retry loop could never succeed.
+        let dir = std::env::temp_dir().join(format!("-{}", std::process::id()));
+        assert!(!try_capture(Some(&dir), true, 1_000 + interval / 2, &last));
+        assert_eq!(last.load(Ordering::Relaxed), 1_000, "a REFUSED attempt consumed the interval");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A visible episode is never rate-limited, so it must not touch the hidden limiter at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_visible_capture_never_touches_the_hidden_limiter() {
+        let last = AtomicU64::new(1_000);
+        assert!(!try_capture(None, false, 99_000, &last), "no dir means no capture");
+        assert_eq!(last.load(Ordering::Relaxed), 1_000);
+    }
+
     #[test]
     fn a_hidden_episode_is_reported_quietly() {
         assert!(!is_reportable_evidence(true), "info, not warn — silence while hidden is expected");
