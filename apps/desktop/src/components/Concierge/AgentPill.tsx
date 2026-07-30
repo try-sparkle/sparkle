@@ -20,7 +20,38 @@
 // projection already carries a LIVE name and a LIVE band, refreshed by the same feed tick that
 // drives the build rows — so binding the pill to it means a renamed agent's pill renames itself,
 // and a second roster (with its own staleness) never comes into existence.
-import { createContext, useContext, type CSSProperties } from "react";
+//
+// ══ EVERY CLICK PRODUCES A VISIBLE RESULT ═══════════════════════════════════════════════════════
+// A pill embeds a hard agent id, and agents get closed and discarded underneath it. Two paths used
+// to end in nothing at all happening when the reader clicked, and a dead link that fails silently
+// is worse than no link — the reader cannot tell whether the agent is gone or whether the click
+// registered. Observed on a pill labelled "Remove BYOK".
+//
+//   • THE ID NO LONGER RESOLVES. The pill rendered a muted span whose only explanation lived in a
+//     `title` tooltip — hover-only, so a CLICK did nothing at all.
+//   • THE ID RESOLVES BUT THE REVEAL DOES NOT LAND. `openProjectTab` returns early on an unknown
+//     project and `selectAndOpen` on a missing agent (`services/agentReveal`). Both are silent, so
+//     a pill whose agent was closed after the reply was rendered looks live, is clicked, and does
+//     nothing.
+//
+// ══ WHY THERE IS NO "OPEN IN ANOTHER WINDOW" STATE ══════════════════════════════════════════════
+// Worth writing down, because it is the obvious extra state and it is NOT reachable here.
+// `buildConciergeFeed` maps exactly `projects[].agents` from projectStore; the cross-window roster
+// it merges contributes STATUSES only, never additional agents (`services/conciergeFeed`). And
+// projectStore is itself cross-window synced, so it already holds every window's projects. So an id
+// that resolves in the roster is always an agent this window can mount, and a pre-click "this lives
+// elsewhere" test would come out true only when the agent had actually been CLOSED — which is what
+// `HistorySearch` already calls it. Guessing before the attempt would therefore have put a false
+// sentence on screen; the failure is detected from the attempt's OUTCOME instead, and named
+// honestly (roborev 55522).
+import {
+  createContext,
+  useContext,
+  useId,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { C } from "../../theme/colors";
 import { bandColor } from "../../engine/statusBandLabels";
 import { stripMentionSigil } from "./agentRefs";
@@ -29,15 +60,35 @@ import type { MentionAgent } from "./mentions";
 export interface AgentPillContextValue {
   /** The live roster. Empty means "nothing resolves", which is the correct default. */
   agents: readonly MentionAgent[];
-  /** Open this agent. Carries the project id too, because the agent may live in a project that is
-   *  not the open one and the reveal path needs both.
+  /** Open this agent, and report whether the reveal actually LANDED. Carries the project id too,
+   *  because the agent may live in a project that is not the open one and the reveal path needs
+   *  both.
+   *
+   *  THE RETURN VALUE IS THE CONTRACT. `false` means nothing on screen changed — the project or the
+   *  agent was gone by the time the click arrived — and the pill turns that into a sentence rather
+   *  than leaving the reader looking at an unchanged screen. A handler that cannot fail returns
+   *  `true`.
+   *
+   *  OPTIONAL, and its absence is NOT the same as a failed open. "This surface has no reveal path"
+   *  is a fact about the surface; "that agent is closed" is a fact about the agent, and rendering
+   *  the first as the second would label a live agent closed on any column that did not wire an
+   *  opener (roborev 55548). With no opener the pill degrades to inert prose, exactly as it does
+   *  with no history route.
    *
    *  AN OBJECT, NOT TWO POSITIONAL STRINGS (roborev 54894). The call crosses into
    *  `openProjectTab(projectId, agentId)`, whose parameters are in the OPPOSITE order and are also
    *  both `string` — so a swap typechecks cleanly, and its only symptom is `openProjectTab` hitting
    *  its unknown-project early return and the click silently doing nothing. Named fields make the
    *  mistake unrepresentable instead of merely tested-for. */
-  onOpenAgent: (target: { agentId: string; projectId: string }) => void;
+  onOpenAgent?: (target: { agentId: string; projectId: string }) => boolean;
+  /** Search the prompt history of an agent that can no longer be opened. A closed agent's prompts
+   *  outlive it (`services/history`), which is exactly how the discarded BYOK agent ids were
+   *  recovered — so this is what turns the dead end into a destination.
+   *
+   *  It is ALSO the opt-in switch for interactivity: with no route to offer, an unresolvable pill
+   *  stays plain prose rather than becoming a button wired to nothing, which is the dead link in a
+   *  new costume. SupportModal and agent replies render `<Markdown>` without it. */
+  onSeeHistory?: (target: { agentId: string; name: string }) => void;
 }
 
 /** A STABLE empty default — a module const, not an inline literal, so every `<Markdown>` outside the
@@ -45,7 +96,7 @@ export interface AgentPillContextValue {
  *
  *  Defaulting to "resolves nothing" is also the safe direction: a surface that has not opted in
  *  renders an agent link as inert prose rather than as a button wired to a no-op. */
-const EMPTY: AgentPillContextValue = { agents: [], onOpenAgent: () => {} };
+const EMPTY: AgentPillContextValue = { agents: [] };
 
 const AgentPillContext = createContext<AgentPillContextValue>(EMPTY);
 
@@ -78,6 +129,101 @@ const base: CSSProperties = {
   verticalAlign: "baseline",
 };
 
+/** The muted form the non-navigating state wears: same words, no teal wash. */
+const quiet: CSSProperties = {
+  ...base,
+  color: C.conciergeMuted,
+  background: "transparent",
+  padding: "1px 0",
+};
+
+/** What a pill that cannot be opened says. One sentence, non-alarming — a closed agent is the
+ *  normal end of an agent's life, not an error the reader caused — and it NAMES the agent, because
+ *  the reader needs to know which of several pills in a paragraph they just clicked. The wording
+ *  matches `HistorySearch`'s existing "This agent was closed", so the app says it one way. */
+const closedSentence = (name: string) => `${name} is closed.`;
+
+/** The same sentence for a REPEATED miss, so a retry that fails again is not a silent no-op: the
+ *  wording changes on the second attempt, and the notice is re-keyed on every one (see LiveNotice),
+ *  which is what makes an identical outcome register as a live-region update at all.
+ *
+ *  What this does and does not promise, stated because the boundary matters: attempt 2 changes both
+ *  the visible text and the announcement; attempts 3+ re-announce and re-render the notice but show
+ *  the same words. A running tally in the sentence would make every click textually distinct and is
+ *  deliberately not done — "Build 8 is still closed. (4)" reads as an error count the reader is
+ *  accumulating, when the fact being reported has not changed. */
+const missSentence = (misses: number, name: string) =>
+  misses > 1 ? `${name} is still closed.` : closedSentence(name);
+
+/**
+ * The always-mounted live region, with the notice inside it.
+ *
+ * MOUNTED EVEN WHEN EMPTY, deliberately. A `role="status"` element created with its text already
+ * inside it is commonly NOT announced — notably by VoiceOver in a WebKit webview, which is what
+ * this app renders in. A live region has to exist BEFORE its content changes for the change to be
+ * announced, so the region is always here and only its contents appear on click. Getting this wrong
+ * would leave "every click produces a visible result" true for sighted readers and false for
+ * everyone else (roborev 55522).
+ *
+ * INLINE ELEMENTS ONLY. This renders inside `<Markdown>`, i.e. inside a `<p>`, where a `<div>` is
+ * invalid nesting that React will happily emit and the browser will silently reparent — moving the
+ * notice out of the paragraph it explains.
+ */
+function LiveNotice({
+  id,
+  open,
+  contentKey,
+  children,
+  action,
+}: {
+  id: string;
+  open: boolean;
+  /** Bumped on every fresh attempt. Re-keying REPLACES the region's child rather than updating it
+   *  in place, which is what makes a repeated identical outcome register as a change at all — see
+   *  the retry contract on the pill's click handler. */
+  contentKey?: number;
+  children: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <span id={id} role="status" data-testid="concierge-agent-pill-live">
+      {open && (
+        <span
+          key={contentKey}
+          data-testid="concierge-agent-pill-notice"
+          style={{ ...base, marginLeft: 6, color: C.conciergeMuted, whiteSpace: "normal" }}
+        >
+          {children}
+          {action}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** The one affordance inside a notice. A `<button>`, not a link: nothing here has an href. */
+function NoticeAction({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      data-testid="concierge-agent-pill-notice-action"
+      onClick={onClick}
+      style={{
+        border: "none",
+        background: "transparent",
+        padding: 0,
+        marginLeft: 4,
+        cursor: "pointer",
+        color: C.cream,
+        textDecoration: "underline",
+        font: "inherit",
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 /**
  * One agent reference.
  *
@@ -91,52 +237,144 @@ const base: CSSProperties = {
  * the agent as it is now, not as it was mentioned.
  */
 export function AgentPill({ agentId, fallbackName }: { agentId: string; fallbackName: string }) {
-  const { agents, onOpenAgent } = useContext(AgentPillContext);
+  const { agents, onOpenAgent, onSeeHistory } = useContext(AgentPillContext);
+  // Consecutive failed reveals. Per-pill, so one explained pill does not open every other pill's
+  // notice in the thread — and a COUNT rather than a boolean, because a boolean could not tell a
+  // repeat miss from the first one: `setShowClosed(true)` on an already-true state is an
+  // identical-value update, React bails out, and the reader's retry click paints and announces
+  // NOTHING. That is the dead end this file exists to remove, one step further out (roborev 55590).
+  const [misses, setMisses] = useState(0);
+  const showClosed = misses > 0;
+  const noticeId = useId();
   const agent = agents.find((a) => a.id === agentId);
-  // Applied here rather than trusted from the caller: the persona ASKS the model for `[@Name](…)`,
-  // and an instruction to a language model is a request, not a schema. The pill draws its own
-  // sigil, so a compliant model would otherwise render "@@Name".
-  const name = stripMentionSigil(fallbackName);
+  // The LIVE name whenever the id resolves — that is what makes a renamed agent's pill rename
+  // itself instead of preserving the label the message was written with. `stripMentionSigil` is
+  // applied to the fallback rather than trusted from the caller: the persona ASKS the model for
+  // `[@Name](…)`, and an instruction to a language model is a request, not a schema, so a compliant
+  // model would otherwise render "@@Name".
+  const name = agent ? agent.name : stripMentionSigil(fallbackName);
 
-  if (!agent) {
+  const historyAction = onSeeHistory ? (
+    <NoticeAction label="See what it did" onClick={() => onSeeHistory({ agentId, name })} />
+  ) : undefined;
+
+  // ── THIS SURFACE IS NOT WIRED, SO ITS ROSTER IS NOT AUTHORITATIVE ─────────────────────────────
+  // `onOpenAgent` is the signal that a real host is supplying this context. Without it the pill may
+  // make NO claim about the agent's lifecycle, because "the id is not in the roster I was given" is
+  // only evidence of anything when there was a real roster to look in.
+  //
+  // THIS IS THE REACHABLE CASE, and it was the one still getting it wrong. SupportModal and agent
+  // replies render `<Markdown>` with no provider at all, so they get `EMPTY` (`agents: []`) and
+  // EVERY pill fell through to "…is closed" — a false claim about a perfectly live agent, on the
+  // only path that actually reaches a reader. The earlier fix guarded the mirror-image
+  // configuration (a roster with no opener), which no production surface constructs (roborev 55590).
+  if (!onOpenAgent) {
     return (
       <span
-        data-testid="concierge-agent-pill-inert"
+        data-testid="concierge-agent-pill-unwired"
         data-agent-id={agentId}
-        // Named, not silent. The reader is looking at a message that references an agent they can
-        // no longer open; "nothing happens when I click" is a worse answer than a sentence.
-        title="That agent is no longer open, so this can't be opened."
-        style={{ ...base, color: C.conciergeMuted, background: "transparent", padding: "1px 0" }}
+        {...(agent ? { "data-band": agent.band } : {})}
+        style={quiet}
       >
-        @{name}
+        {agent && <span style={dot(agent.band)} aria-hidden />}@{name}
       </span>
     );
   }
 
+  // ── THE ID DOES NOT RESOLVE ───────────────────────────────────────────────────────────────────
+  // Known closed before the click, so there is nothing to attempt. Justified here in a way it is
+  // not above: the surface IS wired, so its roster is the live fleet and an absence means absence.
+  if (!agent) {
+    // Without a history route there is nothing a click could usefully do, so the pill stays inert
+    // prose rather than becoming a button that does nothing — see `onSeeHistory`'s doc.
+    if (!onSeeHistory) {
+      return (
+        <span
+          data-testid="concierge-agent-pill-closed"
+          data-agent-id={agentId}
+          title={closedSentence(name)}
+          style={quiet}
+        >
+          @{name}
+        </span>
+      );
+    }
+    return (
+      <span style={{ display: "inline" }}>
+        <button
+          type="button"
+          data-testid="concierge-agent-pill-closed"
+          data-agent-id={agentId}
+          aria-expanded={showClosed}
+          aria-controls={noticeId}
+          title={closedSentence(name)}
+          // A GENUINE DISCLOSURE, unlike the resolved pill below: nothing is attempted, so this
+          // toggles its explanation open and shut and `aria-expanded` describes it correctly.
+          onClick={() => setMisses((n) => (n > 0 ? 0 : 1))}
+          style={{ ...quiet, border: "none", cursor: "pointer", textDecoration: "underline dotted" }}
+        >
+          @{name}
+        </button>
+        <LiveNotice id={noticeId} open={showClosed} action={historyAction}>
+          {closedSentence(name)}
+        </LiveNotice>
+      </span>
+    );
+  }
+
+  // ── IT RESOLVES ───────────────────────────────────────────────────────────────────────────────
+  // Attempt the reveal and believe the OUTCOME rather than the roster: an agent can be closed
+  // between the render that drew this pill and the click that lands on it, and both early exits on
+  // the reveal path are silent.
+  const target = { agentId: agent.id, projectId: agent.projectId };
   return (
-    <button
-      type="button"
-      data-testid="concierge-agent-pill"
-      data-agent-id={agent.id}
-      data-band={agent.band}
-      // The bare live name is what the pill SHOWS, even when two agents share it — the id already
-      // decides where the click lands, so the disambiguating "(project)" suffix `mentionRoster`
-      // adds for the composer would only be chrome here. The project belongs in the tooltip, where
-      // it answers "which of these four is this one" without widening every pill to carry it.
-      title={`Open ${agent.name} in ${agent.projectName}`}
-      onClick={() => onOpenAgent({ agentId: agent.id, projectId: agent.projectId })}
-      style={{
-        ...base,
-        border: "none",
-        cursor: "pointer",
-        // The attachment chip's teal wash — the column's established "something rode along with
-        // this message" tint, and the exact fill the sent-message pill uses, so the two forms of
-        // mention read as one vocabulary.
-        background: `color-mix(in srgb, ${C.teal} 18%, transparent)`,
-        color: C.cream,
-      }}
-    >
-      <span style={dot(agent.band)} aria-hidden />@{agent.name}
-    </button>
+    <span style={{ display: "inline" }}>
+      <button
+        type="button"
+        data-testid={showClosed ? "concierge-agent-pill-closed" : "concierge-agent-pill"}
+        data-agent-id={agent.id}
+        data-band={agent.band}
+        // NO `aria-expanded`. This button is a RETRY, not a disclosure: activating it never
+        // collapses the notice, so advertising it as expandable would promise assistive tech a
+        // control that cannot be un-expanded (roborev 55590). `aria-controls` still holds — it does
+        // own that region — and the known-closed pill above, which IS a toggle, keeps both.
+        aria-controls={noticeId}
+        // The bare live name is what the pill SHOWS, even when two agents share it — the id already
+        // decides where the click lands, so the disambiguating "(project)" suffix `mentionRoster`
+        // adds for the composer would only be chrome here. The project belongs in the tooltip, where
+        // it answers "which of these four is this one" without widening every pill to carry it.
+        title={showClosed ? missSentence(misses, name) : `Open ${agent.name} in ${agent.projectName}`}
+        // ALWAYS RE-ATTEMPTS, and derives the state from the FRESH outcome. An earlier version made
+        // the first click on an explained pill merely dismiss the notice and return, which meant
+        // that after the reader reopened the project the pill still claimed the agent was closed
+        // and swallowed the very click meant to retry (roborev 55548). A failed reveal is a fact
+        // about one MOMENT, so it is never sticky.
+        //
+        // COUNTING the misses rather than flagging them is what keeps the RETRY visible too: the
+        // second failure changes the sentence ("…is still closed.") and every failure re-keys the
+        // notice, so the live region is genuinely updated rather than re-rendered identically and
+        // silently dropped (roborev 55590).
+        onClick={() => setMisses((n) => (onOpenAgent(target) ? 0 : n + 1))}
+        style={
+          showClosed
+            ? { ...quiet, border: "none", cursor: "pointer", textDecoration: "underline dotted" }
+            : {
+                ...base,
+                border: "none",
+                cursor: "pointer",
+                // The attachment chip's teal wash — the column's established "something rode along
+                // with this message" tint, and the exact fill the sent-message pill uses, so the
+                // two forms of mention read as one vocabulary.
+                background: `color-mix(in srgb, ${C.teal} 18%, transparent)`,
+                color: C.cream,
+              }
+        }
+      >
+        {!showClosed && <span style={dot(agent.band)} aria-hidden />}@{agent.name}
+      </button>
+      <LiveNotice id={noticeId} open={showClosed} contentKey={misses} action={historyAction}>
+        {missSentence(misses, name)}
+      </LiveNotice>
+    </span>
   );
 }

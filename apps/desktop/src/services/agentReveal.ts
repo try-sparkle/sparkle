@@ -17,7 +17,18 @@ import { markProjectOpen } from "./projectTabs";
  *  sidebar only paints the current mode's rows). Selecting alone would leave the agent filtered out
  *  of view — the "it's red somewhere but I can't find it" report. So leave any special overlay and
  *  switch the chevron to the agent's kind first, so the agent is actually surfaced and shown. */
-export function selectAndOpen(projectId: string, agentId: string): void {
+/**
+ * Returns whether the reveal actually LANDED — false means nothing on screen changed.
+ *
+ * The bail below is correct and stays, but it used to be invisible to the caller, and a caller that
+ * cannot tell a reveal from a no-op cannot tell the user either. That is how a concierge agent pill
+ * became a dead link: it called through here, the id was gone, and the click produced nothing at
+ * all with no way for the pill to know (see Concierge/AgentPill). Reporting the outcome is what
+ * lets a caller say "that agent is closed" instead of appearing to do something.
+ *
+ * Every existing caller ignores the value and is unaffected.
+ */
+export function selectAndOpen(projectId: string, agentId: string): boolean {
   const agent = useProjectStore
     .getState()
     .projects.find((p) => p.id === projectId)
@@ -25,7 +36,7 @@ export function selectAndOpen(projectId: string, agentId: string): void {
   // A gone agent means there is nothing to reveal: bail BEFORE touching any overlay, so a stale
   // id can't drop the Plan board while leaving workMode on plan (roborev 46353), and never enters
   // `openAgentIds` as a phantom.
-  if (!agent) return;
+  if (!agent) return false;
   // A revealed agent's project MUST have a tab, or the shell shows that agent while the tab bar has
   // no tab for it and every tab reads aria-selected="false" — and it self-heals the wrong way, since
   // the next × treats a selection with no tab as stale and yanks the user elsewhere
@@ -52,6 +63,7 @@ export function selectAndOpen(projectId: string, agentId: string): void {
   useUiStore.getState().setWorkMode("build");
   useRuntimeStore.getState().open(agentId);
   useProjectStore.getState().selectAgent(projectId, agentId);
+  return true;
 }
 
 /** Does this (projectId, agentId) pair still name a real agent? Every cross-webview broadcast is

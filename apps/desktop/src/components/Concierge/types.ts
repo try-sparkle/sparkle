@@ -380,9 +380,18 @@ export interface ConciergeColumnProps {
    *  partial re-implementations of that sequence are a documented source of "it's red somewhere but
    *  I can't find it" bugs.
    *
-   *  Absent means pills still RENDER (with their live name and status dot) but do nothing when
-   *  clicked, which is the right default for a surface that has not wired the reveal path. */
-  onOpenAgent?: (target: { agentId: string; projectId: string }) => void;
+   *  RETURNS whether the reveal LANDED. `false` means the click changed nothing on screen — the
+   *  project or the agent was gone by the time it arrived — and the pill turns that into a sentence
+   *  instead of failing silently, which is the bug the return value exists for.
+   *
+   *  Absent means pills still RENDER (with their live name and status dot) but report a failed
+   *  open when clicked, which is the honest default for a surface that has not wired the reveal
+   *  path — it cannot navigate, so it must not pretend it did. */
+  onOpenAgent?: (target: { agentId: string; projectId: string }) => boolean;
+  /** Search the prompt history of an agent that can no longer be opened — the destination that
+   *  replaces the dead end. Absent → an unresolvable pill stays plain prose rather than becoming a
+   *  button with nowhere to go. */
+  onSeeAgentHistory?: (target: { agentId: string; name: string }) => void;
   /** The last FINISHED line for the thread's hidden live region — a completed reply, a status
    *  notice, or a ROUTING RECEIPT ("→ Sent to Kraken Auth"). Never a streaming chunk: the region
    *  would then re-announce on every delta.

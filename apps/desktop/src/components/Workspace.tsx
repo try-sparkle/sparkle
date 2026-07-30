@@ -1362,6 +1362,9 @@ export function Workspace() {
           promptTarget={promptTarget}
           promptTargetShown={promptTargetShown}
           searchSlot={<PaletteTrigger onOpen={palette.openPalette} />}
+          // The palette is the only surface that renders `historyStore`, so "See what it did" on a
+          // closed agent's pill has to open it — seeding the query alone would paint nothing.
+          onOpenHistory={palette.openPalette}
         />
         {/* THE CONCIERGE BOUNDARY IS DRAGGABLE NOW. This column shipped at a hardcoded 360 with no
             way to move it, while the agent column beside it had a full resize strip — so of the

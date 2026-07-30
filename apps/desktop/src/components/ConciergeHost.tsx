@@ -50,6 +50,8 @@ import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
 import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
+import { agentExists } from "../services/agentReveal";
+import { useHistoryStore } from "../stores/historyStore";
 import {
   onConciergeDelta,
   onConciergeDone,
@@ -552,6 +554,7 @@ export function ConciergeHost({
   promptTargetShown = true,
   width,
   searchSlot,
+  onOpenHistory,
 }: {
   /** The cross-project status-band feed, built once by Workspace (see the file header). */
   feed: ConciergeFeed;
@@ -571,6 +574,11 @@ export function ConciergeHost({
   width?: number;
   /** The shell's ⌘K palette trigger, rendered under the scope/vitals line (PRD §4). */
   searchSlot?: ReactNode;
+  /** Open the ⌘K command palette — the ONLY live consumer of `historyStore` (the sidebar's
+   *  `<HistorySearch>` mount was removed). Without it, "See what it did" on a closed agent's pill
+   *  writes a query nothing renders, which is the dead click one level down. Owned by `Workspace`,
+   *  which holds `useCommandPalette`. */
+  onOpenHistory?: () => void;
 }) {
   // Which side the cable is patched into, or "off". Drives the column's flood + lift.
   // THE PROJECTED SIDE, shared with the shell root and the row joints (hooks/useEffectiveWired).
@@ -886,9 +894,43 @@ export function ConciergeHost({
     ({ agentId, projectId }: { agentId: string; projectId: string }) => {
       // Destructured by NAME on both sides, so the order flip into `openProjectTab(projectId,
       // agentId)` — two strings, silently swappable — cannot happen here (roborev 54894).
-      openProjectTab(projectId, agentId);
+      // ASK FIRST, THEN ACT. `openProjectTab` reports the miss only AFTER it has opened and
+      // selected the project (and possibly dropped the Sparkle pane), so calling it blind would
+      // yank the reader to another tab and then tell them the click accomplished nothing — a
+      // notice that contradicts what just happened on screen (roborev 55548). Checking up front is
+      // also the established pattern for this exact decision (paletteJump, useAttentionNotifications).
+      if (!agentExists(projectId, agentId)) return false;
+      // RETURNED, not discarded: both of that path's early exits are silent, and the pill turns a
+      // `false` into "…is closed" rather than leaving the reader looking at an unchanged screen.
+      return openProjectTab(projectId, agentId);
     },
     [],
+  );
+
+  /**
+   * The destination that replaces a dead pill: a closed agent's PROMPTS outlive the agent.
+   *
+   * `history_search` is FTS over every recorded prompt and response, retained independently of the
+   * agent record (services/history), and it returns the agent's name alongside each hit — which is
+   * exactly how the discarded BYOK agent ids were recovered after none of them appeared in the
+   * roster.
+   *
+   * IT OPENS THE PALETTE, and that is not optional garnish. Seeding `historyStore.query` alone
+   * renders nothing: the sidebar's `<HistorySearch>` mount was REMOVED (see AgentSidebar — "the
+   * full-text search bar that used to sit here is GONE"), and the only live consumer of that store
+   * is `<CommandPalette>`, which renders nothing while closed and clears the query on its next
+   * close. Writing the query without opening the palette would have been this very bug relocated
+   * one level down — an affordance that looks live and produces no visible change (roborev 55522).
+   *
+   * By NAME rather than by id: the id is an internal uuid that appears in no recorded prompt text,
+   * so searching it would reliably return nothing.
+   */
+  const seeAgentHistory = useCallback(
+    ({ name }: { agentId: string; name: string }) => {
+      useHistoryStore.getState().setQuery(name);
+      onOpenHistory?.();
+    },
+    [onOpenHistory],
   );
 
   // ══ HANDOFFS INTO THIS BOX ═══════════════════════════════════════════════════════════════════
@@ -2505,6 +2547,9 @@ export function ConciergeHost({
         // project's tab, selects it, clears the Sparkle overlay and reveals the agent. Partial
         // re-implementations of that sequence are what its header warns about.
         onOpenAgent={openAgentFromPill}
+        // …and the state that is NOT a navigation: a pill that cannot be opened names the agent and
+        // routes to the prompt history that outlived it, instead of the click producing nothing.
+        onSeeAgentHistory={seeAgentHistory}
       />
       {/* The recommended-action pill. Mounted HERE — where its delivery wiring lives — but it
           renders over the target agent's terminal, which it reaches by portal (see

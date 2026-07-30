@@ -148,6 +148,7 @@ export function ConciergeColumn({
   onComposedText,
   registerSubmit,
   onOpenAgent,
+  onSeeAgentHistory,
 }: ConciergeColumnProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
@@ -164,8 +165,16 @@ export function ConciergeColumn({
   // keystroke in the compose box, which is the exact cost `<Markdown>`'s memo exists to avoid.
   // `mentionAgents` is already memoized upstream, so this changes only when the fleet does.
   const agentPills = useMemo<AgentPillContextValue>(
-    () => ({ agents: mentionAgents ?? [], onOpenAgent: onOpenAgent ?? (() => {}) }),
-    [mentionAgents, onOpenAgent],
+    () => ({
+      agents: mentionAgents ?? [],
+      // PASSED THROUGH UNDEFINED when the column has no reveal path wired, rather than defaulted to
+      // a handler. Neither a silent no-op nor a `() => false` is right: the first is the dead click,
+      // and the second makes the pill announce that a perfectly live agent is closed. Absent means
+      // absent, and the pill renders inert prose for it (roborev 55548).
+      onOpenAgent,
+      onSeeHistory: onSeeAgentHistory,
+    }),
+    [mentionAgents, onOpenAgent, onSeeAgentHistory],
   );
   return (
     <section

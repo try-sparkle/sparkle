@@ -290,10 +290,16 @@ describe("ThinkingIndicator — agent references", () => {
    *  MOUNTED BEFORE ANY CALL IS RECORDED, deliberately: the indicator snapshots the activity counter
    *  on the false→true edge and ignores anything at or below it, so a test that records first would
    *  put its own call below the floor and assert on a line the component is right to suppress. */
-  function harness(agents: MentionAgent[], onOpenAgent: (t: never) => void = () => {}) {
+  // `=> true` — the opener REPORTS whether the reveal landed, and these rows are about the pill's
+  // live form. An opener that returns false is read as "that agent is closed", which would take
+  // every pill here into the explained state instead of the one being asserted (see AgentPill).
+  function harness(agents: MentionAgent[], onOpenAgent: (t: never) => boolean = () => true) {
     const ui = (a: MentionAgent[]) => (
       <AgentPillProvider
-        value={{ agents: a, onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => void }}
+        value={{
+          agents: a,
+          onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => boolean,
+        }}
       >
         <ThinkingIndicator typing />
       </AgentPillProvider>
@@ -303,7 +309,11 @@ describe("ThinkingIndicator — agent references", () => {
   }
 
   const pill = () => document.querySelector('[data-testid="concierge-agent-pill"]');
-  const inertPill = () => document.querySelector('[data-testid="concierge-agent-pill-inert"]');
+  // `-closed`, not the `-inert` this was written against: an unresolvable pill is now NAMED as
+  // closed, and is interactive on any surface that supplies a history route (see AgentPill). This
+  // harness supplies none, so the degraded form here is still plain, non-interactive prose — which
+  // is exactly what these rows assert.
+  const inertPill = () => document.querySelector('[data-testid="concierge-agent-pill-closed"]');
 
   it("says 'Starting a new agent' with no reference while the id does not exist yet", () => {
     const h = harness([rosterAgent()]);

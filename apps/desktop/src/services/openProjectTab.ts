@@ -74,9 +74,24 @@ export function selectProjectOnItsSide(projectId: string): void {
   else useProjectStore.getState().selectProject(projectId);
 }
 
-export function openProjectTab(projectId: string, agentId?: string | null): void {
+/**
+ * Returns whether the REVEAL LANDED — i.e. whether the caller got what it asked for.
+ *
+ * NOT "whether the screen changed", which an earlier version of this comment claimed and the code
+ * does not support: with an `agentId` that no longer exists, this still opens and selects the
+ * project (and may drop the Sparkle pane) before `selectAndOpen` reports the miss, so a `false` can
+ * follow a very visible navigation. A caller that must not move the user before it knows should
+ * check `agentExists` FIRST — the pattern `paletteJump` and `useAttentionNotifications` already
+ * follow, and what `ConciergeHost.openAgentFromPill` does (roborev 55548).
+ *
+ * Both early exits below are silent by design, and a caller that cannot see them cannot tell the
+ * user either; the concierge agent pill's dead click came through exactly this path. Every
+ * pre-existing caller ignores the value and behaves identically.
+ */
+export function openProjectTab(projectId: string, agentId?: string | null): boolean {
   const store = useProjectStore.getState();
-  if (!store.projects.some((p) => p.id === projectId)) return; // unknown/deleted project — no-op
+  // unknown/deleted project — no-op
+  if (!store.projects.some((p) => p.id === projectId)) return false;
   markProjectOpen(projectId);
   // SELECT IT IN THE PAIR THAT ACTUALLY HOLDS IT (engine/pairs).
   //
@@ -119,7 +134,9 @@ export function openProjectTab(projectId: string, agentId?: string | null): void
     ui.setActiveSpecial(null);
     if (ui.workMode === "plan") ui.setWorkMode("build");
   }
-  if (agentId) selectAndOpen(projectId, agentId);
+  // With an agent asked for, the reveal is the point: a tab selection alone, while the agent the
+  // caller named is gone, is not "it worked". Without one, selecting the tab IS the whole job.
+  return agentId ? selectAndOpen(projectId, agentId) : true;
 }
 
 /**

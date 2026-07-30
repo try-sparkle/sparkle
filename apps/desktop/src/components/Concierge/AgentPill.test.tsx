@@ -29,7 +29,10 @@ function agent(over: Partial<MentionAgent> & { id: string; name: string }): Ment
 const KRAKEN = agent({ id: "agent-7", name: "Kraken Auth", band: "needs_you" });
 
 function ctx(over: Partial<AgentPillContextValue> = {}): AgentPillContextValue {
-  return { agents: [KRAKEN], onOpenAgent: vi.fn(), ...over };
+  // `() => true` — the opener REPORTS whether the reveal landed, and these rows are about the
+  // successful path. A handler returning undefined reads as "it did not land", which is the point
+  // of the return value (see AgentPill.deadEnd.test.tsx).
+  return { agents: [KRAKEN], onOpenAgent: vi.fn(() => true), ...over };
 }
 
 function mountPill(value: AgentPillContextValue, agentId: string, fallbackName: string) {
@@ -95,7 +98,7 @@ describe("AgentPill — resolved", () => {
   });
 
   it("opens the agent WITH its project id, which the reveal path needs", () => {
-    const onOpenAgent = vi.fn();
+    const onOpenAgent = vi.fn(() => true);
     mountPill(ctx({ onOpenAgent }), "agent-7", "@Kraken Auth");
     fireEvent.click(screen.getByTestId("concierge-agent-pill"));
     // Named fields, not positional strings: `openProjectTab` takes (projectId, agentId) — the
@@ -105,30 +108,46 @@ describe("AgentPill — resolved", () => {
   });
 });
 
-describe("AgentPill — unresolved", () => {
+// The testid here is `-closed`, not the `-inert` this block used to assert. The rename is the
+// point, not incidental: a pill whose id no longer resolves is now INTERACTIVE on any surface that
+// supplies a history route (see AgentPill.deadEnd.test.tsx), because a click that produces nothing
+// is the bug. "Inert" would be a lie about three of the four states.
+//
+// These cases keep the OTHER half of that contract: `ctx()` here supplies no `onSeeHistory`, which
+// is the shape of every surface outside the concierge column — and there the pill must stay plain
+// prose rather than become a button wired to nothing.
+describe("AgentPill — unresolved, with no history route", () => {
   it("is inert, explains itself, and still reads as the agent's name", () => {
     // The founder's criterion: a closed or discarded agent renders inert with a tooltip, not a dead
     // link. The reader is looking at real history; the sentence must still make sense.
     mountPill(ctx(), "agent-gone", "@Retired Agent");
-    const inert = screen.getByTestId("concierge-agent-pill-inert");
+    const inert = screen.getByTestId("concierge-agent-pill-closed");
     expect(inert.tagName).not.toBe("BUTTON");
     expect(inert.textContent).toContain("@Retired Agent");
-    expect(inert.getAttribute("title")).toMatch(/no longer open/i);
+    // Names the agent AND its state — the wording the reveal path spells out in full.
+    expect(inert.getAttribute("title")).toBe("Retired Agent is closed.");
     expect(screen.queryByTestId("concierge-agent-pill")).toBeNull();
   });
 
   it("does not call the opener when clicked", () => {
     const onOpenAgent = vi.fn();
     mountPill(ctx({ onOpenAgent }), "agent-gone", "@Retired Agent");
-    fireEvent.click(screen.getByTestId("concierge-agent-pill-inert"));
+    fireEvent.click(screen.getByTestId("concierge-agent-pill-closed"));
     expect(onOpenAgent).not.toHaveBeenCalled();
   });
 
   it("renders inert with NO provider at all, so other markdown surfaces are unaffected", () => {
     // SupportModal and agent replies render <Markdown> outside the concierge column. An agent link
     // there must degrade, never throw and never render a button wired to nothing.
+    //
+    // `-unwired`, NOT `-closed`: with no provider there is no roster, so the pill has no grounds to
+    // say anything about the agent's lifecycle — and Kraken Auth is in fact alive. See AgentPill's
+    // "this surface is not wired" branch (roborev 55590).
     render(<Markdown text={`Ask [@Kraken Auth](${agentRefHref("agent-7")}) about it.`} />);
-    expect(screen.getByTestId("concierge-agent-pill-inert").textContent).toContain("@Kraken Auth");
+    const plain = screen.getByTestId("concierge-agent-pill-unwired");
+    expect(plain.textContent).toContain("@Kraken Auth");
+    expect(plain.tagName).not.toBe("BUTTON");
+    expect(document.body.textContent).not.toMatch(/closed/i);
   });
 });
 
@@ -138,7 +157,7 @@ describe("degradation of a non-plain link text", () => {
     // string children made the fallback "", so an unresolvable pill rendered as a bare "@"
     // mid-sentence — "Ask @ about it." — defeating the degradation contract (roborev 54894).
     mountMarkdown(ctx(), `Ask [**@Retired Agent**](${agentRefHref("agent-gone")}) about it.`);
-    const inert = screen.getByTestId("concierge-agent-pill-inert");
+    const inert = screen.getByTestId("concierge-agent-pill-closed");
     expect(inert.textContent).toBe("@Retired Agent");
     expect(document.body.textContent).not.toContain("Ask @ about");
   });
