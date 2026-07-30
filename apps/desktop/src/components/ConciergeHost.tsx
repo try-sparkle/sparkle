@@ -56,12 +56,14 @@ import {
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
+  onConciergeIdentityReset,
   startConciergeTurn,
   startProactiveConciergeTurn,
   isProactiveTurn,
   isSupersededDetail,
 } from "../services/concierge";
 import {
+  clearConciergeLiveness,
   conciergeSawAnswerText,
   noteConciergeFailed,
   noteConciergeProgress,
@@ -1388,10 +1390,34 @@ export function ConciergeHost({
       // warnings aloud buries the sentence that says what to do.
       announce(notice.headline);
     });
+    // THE TURN STATE THAT `done`/`error` OWN, WHEN NEITHER IS COMING (roborev 55813).
+    //
+    // services/concierge gates the fan-out on identity, so a turn the previous human started has its
+    // terminal event DROPPED — right for the content, and it would strand every teardown above. This
+    // component stays mounted across sign-out, `typing` is plain `useState`, and `noteConciergeSettled`
+    // is the only thing that unlatches UNAVAILABLE; none of it is store state
+    // `resetConciergeIdentityState` can reach. Without this the spinner keeps running for the next
+    // human over an empty column, a latched "your concierge isn't answering" can arrive about a turn
+    // they never sent, and their first send is stamped "never answered" on the previous human's bubble.
+    //
+    // A lifecycle signal rather than a synthesised `done`, because "your turn finished" and "the turn
+    // was abandoned" are different claims — this one carries no id and no text, so there is nothing of
+    // the previous human's left to render.
+    const offReset = onConciergeIdentityReset(() => {
+      setTyping(false);
+      // `clearConciergeLiveness`, not `noteConciergeSettled`: the turn did not settle, and an identity
+      // boundary must not preserve a field a turn boundary would.
+      clearConciergeLiveness();
+      awaitingBubbleRef.current = null;
+      // Every partial reply, not just the abandoned turn's — the ids belong to the previous human and
+      // no `done` is coming for any of them to drain the map.
+      brainTextRef.current = {};
+    });
     return () => {
       offDelta();
       offDone();
       offError();
+      offReset();
     };
   }, [announce]);
 

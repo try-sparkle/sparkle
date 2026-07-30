@@ -55,6 +55,7 @@ import {
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
+  onConciergeIdentityReset,
   resetConciergeSession,
   restoreConciergeSession,
   setConciergeSessionId,
@@ -547,6 +548,65 @@ describe("concierge session restore (C1)", () => {
       await restoreConciergeSession();
 
       expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("never retires the id the module is CURRENTLY holding (roborev 55813)", async () => {
+      // "Not current" is not the same as "a different human". `sessionEpoch` moves on
+      // `setConciergeSessionId` too — the exported "learns the session from outside the event
+      // stream" seam — so a deliberate set during an in-flight turn made that turn's `done` look
+      // pre-reset, and an unconditional retire then deny-listed the LIVE conversation. It kept
+      // working for the rest of the run and was refused for ever after the next launch: silent,
+      // permanent, and with no way to undo it.
+      harness.diskSessionId = null;
+      await startConciergeTurn("still talking");
+      setConciergeSessionId("sess-live");
+
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-live", text: "…" });
+
+      // The pointer is the weak assertion; the durable one is that a relaunch can still seed it.
+      expect(getConciergeSessionId()).toBe("sess-live");
+      _resetConciergeForTests({ keepRetiredSessions: true });
+      harness.diskSessionId = "sess-live";
+      await restoreConciergeSession();
+
+      expect(getConciergeSessionId()).toBe("sess-live");
+    });
+
+    it("tells subscribers the turn was ABANDONED, since its terminal event never arrives", async () => {
+      // The other half of the fan-out gate. Refusing the `done` is right for its content, but
+      // `done`/`error` are the only two signals that stand the host's typing indicator down and
+      // unlatch its liveness escalation — neither of which is store state the identity reset can
+      // reach. Silence alone left the spinner running for the next human over an empty column.
+      const doneSeen: string[] = [];
+      let abandoned = 0;
+      const offDone = onConciergeDone((d) => doneSeen.push(d.id));
+      const offReset = onConciergeIdentityReset(() => {
+        abandoned += 1;
+      });
+      harness.diskSessionId = null;
+      await startConciergeTurn("user A's question");
+
+      resetConciergeSession();
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-user-a", text: "A's private answer" });
+
+      expect(doneSeen).toEqual([]); // the content is still refused…
+      expect(abandoned).toBe(1); // …and the host is told, exactly once.
+      offDone();
+      offReset();
+    });
+
+    it("unsubscribing really stops the abandonment signal", async () => {
+      // The host tears this down on unmount alongside the other three. A returned no-op would leak
+      // a closure over a stale `setTyping` for the life of the process.
+      let abandoned = 0;
+      const offReset = onConciergeIdentityReset(() => {
+        abandoned += 1;
+      });
+      offReset();
+
+      resetConciergeSession();
+
+      expect(abandoned).toBe(0);
     });
 
     it("still restores a DIFFERENT session after a relaunch — retirement is per-id, not a kill switch", async () => {

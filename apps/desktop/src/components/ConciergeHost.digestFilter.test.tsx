@@ -46,6 +46,7 @@ vi.mock("../services/concierge", async (importOriginal) => {
     onConciergeDelta: () => () => {},
     onConciergeDone: () => () => {},
     onConciergeError: () => () => {},
+    onConciergeIdentityReset: () => () => {},
   };
 });
 vi.mock("../services/conciergeDispatch", () => ({

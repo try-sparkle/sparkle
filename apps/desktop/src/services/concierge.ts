@@ -315,6 +315,29 @@ function turnIsCurrent(id: string): boolean {
   return startedAt === undefined || startedAt === sessionEpoch;
 }
 
+/**
+ * "The conversation you were rendering is over, and its terminal event is not coming."
+ *
+ * THE FAN-OUT GATE NEEDS THIS TO BE HONEST (roborev 55813). `done` and `error` are the only two
+ * signals that tear the host's per-turn state down — the typing indicator, the liveness latch, the
+ * awaiting-bubble marker — and none of that is store state `resetConciergeIdentityState` can reach.
+ * So dropping a pre-reset turn's terminal event, which is right for its CONTENT, silently strands
+ * all three: the spinner keeps running for the next human over an empty column, and if the liveness
+ * bound elapses they get a sticky "your concierge isn't answering" about a turn they never sent.
+ *
+ * A lifecycle signal rather than a doctored event, because the two say different things. Delivering
+ * a text-free `done` would tell the host "your turn finished"; this says "the turn was abandoned" —
+ * carrying no id and no text, so there is nothing of the previous human's to render.
+ */
+const resetCallbacks = new Set<Callback<void>>();
+
+export function onConciergeIdentityReset(cb: () => void): () => void {
+  resetCallbacks.add(cb);
+  return () => {
+    resetCallbacks.delete(cb);
+  };
+}
+
 function dispatch<T>(callbacks: Set<Callback<T>>, event: T): void {
   for (const cb of callbacks) {
     try {
@@ -360,7 +383,18 @@ function ensureWired(): Promise<void> {
               // session — a first turn with no resume target, or the stale-resume self-heal — ends on
               // an id `resetConciergeSession` never saw, so nothing put it on the deny-list. Its
               // transcript is now the newest on disk, and the next launch would seed it.
-              retireSessionIds(ev.payload.sessionId);
+              //
+              // UNLESS THE MODULE STILL HOLDS THAT ID (roborev 55813). `sessionEpoch` also moves on
+              // `setConciergeSessionId`, so "not current" does not always mean "a different human" —
+              // a deliberate set during an in-flight turn moves it too. Retiring there would
+              // deny-list the LIVE conversation: it would keep working this run and then be refused
+              // for ever after the next relaunch, silently and with no way to undo it.
+              if (
+                ev.payload.sessionId !== currentSessionId &&
+                ev.payload.sessionId !== fallbackSessionId
+              ) {
+                retireSessionIds(ev.payload.sessionId);
+              }
             } else if (!isRetiredConciergeSession(ev.payload.sessionId)) {
               currentSessionId = ev.payload.sessionId;
               fallbackSessionId = ev.payload.sessionId;
@@ -777,6 +811,10 @@ export function resetConciergeSession(): void {
   // like an account CHANGE (and log one) when it is simply the first turn of a new conversation.
   sessionAccountConfigDir = undefined;
   restoring ??= Promise.resolve();
+  // LAST, so a subscriber tearing its state down observes the reset as already complete. Any turn
+  // still in flight has just been orphaned by the epoch bump, and its terminal event will be
+  // dropped — see {@link onConciergeIdentityReset} for why silence alone would strand the host.
+  dispatch(resetCallbacks, undefined);
 }
 
 /**
@@ -791,6 +829,7 @@ export function _resetConciergeForTests(opts?: { keepRetiredSessions?: boolean }
   deltaCallbacks.clear();
   doneCallbacks.clear();
   errorCallbacks.clear();
+  resetCallbacks.clear();
   currentSessionId = null;
   fallbackSessionId = null;
   sessionAccountConfigDir = undefined;

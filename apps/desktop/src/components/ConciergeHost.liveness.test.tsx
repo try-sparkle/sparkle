@@ -35,6 +35,8 @@ const h = vi.hoisted(() => ({
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; sessionId: string; text: string }) => void;
     error?: (e: { id: string; detail: string }) => void;
+    /** "A different human is here now" — carries no id and no text, on purpose. */
+    reset?: () => void;
   },
 }));
 
@@ -62,6 +64,10 @@ vi.mock("../services/concierge", async (importOriginal) => {
     },
     onConciergeError: (cb: NonNullable<typeof h.brain.error>) => {
       h.brain.error = cb;
+      return () => {};
+    },
+    onConciergeIdentityReset: (cb: NonNullable<typeof h.brain.reset>) => {
+      h.brain.reset = cb;
       return () => {};
     },
   };
@@ -348,5 +354,67 @@ describe("the proactive push channel drives none of this", () => {
     // ...including standing the indicator down, which is what makes the row above a placement test
     // and not just "the guard returns early sometimes".
     expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeNull();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// A DIFFERENT HUMAN SIGNS IN MID-TURN (roborev 55813).
+//
+// services/concierge gates the delta/done/error fan-out on identity, so a turn the previous human
+// started has its terminal event DROPPED. That is right for the CONTENT — it is their answer, and
+// the column has just been emptied — but `done`/`error` are also the only two signals that stand the
+// indicator down, unlatch the liveness escalation, and release the awaiting-bubble marker. None of
+// that is store state `resetConciergeIdentityState` can reach, and this component stays mounted
+// across sign-out.
+//
+// So the gate needs a lifecycle signal beside it. These rows pin what the next human must NOT
+// inherit: a spinner over an empty column, a sticky "isn't answering" about a turn they never sent.
+describe("sign-out mid-turn leaves the next human nothing to inherit", () => {
+  it("stands the typing indicator down even though the turn's `done` is refused", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me?");
+    // Stated, not assumed: a row that starts with no indicator would pass vacuously.
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).not.toBeNull();
+
+    // The human signs out. The turn is still in flight, so services/concierge bumps the epoch and
+    // will swallow the `done` when it lands.
+    act(() => h.brain.reset?.());
+
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeNull();
+  });
+
+  it("clears a LATCHED unavailable, so B is not told about a turn A sent", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me?");
+    // A real failure, so `failure` and `failureRun` are whatever the production path writes. The
+    // latch itself is seeded rather than driven: `reduceTick` is the only thing that sets it and it
+    // needs the 500ms interval to run, which is the timing suite's subject, not this one's. What is
+    // under test here is what the RESET does to the state, however it was reached.
+    act(() => h.brain.error?.({ id: "f0", detail: "boom" }));
+    act(() => useConciergeLivenessStore.setState({ unavailableLatched: true }));
+    expect(useConciergeLivenessStore.getState().unavailableLatched).toBe(true);
+    expect(useConciergeLivenessStore.getState().failure).not.toBeNull();
+
+    act(() => h.brain.reset?.());
+
+    expect(useConciergeLivenessStore.getState().unavailableLatched).toBe(false);
+    // The whole detector, not just the latch: `failure` is what the sticky strip QUOTES, so leaving
+    // it behind would show B the previous human's verbatim error the next time anything escalates.
+    expect(useConciergeLivenessStore.getState().failure).toBeNull();
+    expect(useConciergeLivenessStore.getState().failureRun).toBe(0);
+  });
+
+  it("does not stamp the next human's first send onto the previous human's bubble", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("A's question");
+    // A's bubble is outstanding — no `done` ever arrives for it, so nothing on the normal paths
+    // releases `awaitingBubbleRef`.
+    act(() => h.brain.reset?.());
+
+    // B's first message. If the marker still held A's bubble, this send would stamp it "never
+    // answered" — a receipt on a message B cannot see, about a question B did not ask.
+    await send("B's question");
+
+    expect(threadText()).not.toContain("never answered");
   });
 });

@@ -35,6 +35,7 @@ vi.mock("../services/concierge", () => ({
     };
   },
   onConciergeError: () => () => {},
+  onConciergeIdentityReset: () => () => {},
   startConciergeTurn: vi.fn(() => Promise.resolve("1")),
   startProactiveConciergeTurn: vi.fn((prompt: string) => {
     h.pushes.push(prompt);

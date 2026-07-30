@@ -173,7 +173,22 @@ export function useConciergeLiveness(): ConciergeLivenessReading {
   };
 }
 
+/**
+ * A DIFFERENT HUMAN IS HERE NOW — forget everything this detector observed.
+ *
+ * Called from the host's identity-reset subscription (roborev 55813). Distinct from
+ * {@link noteConciergeSettled} even though the two produce the same eight fields today, because they
+ * are answering different questions and only one of them is allowed to preserve anything:
+ * `reduceSettled` spreads `...s` on purpose — it is a TURN ending, so a field describing the
+ * conversation rather than the turn would rightly survive it. At an identity boundary nothing may
+ * survive, so this REPLACES the state outright. Keeping them the same call would mean the next field
+ * added to `ConciergeLivenessState` leaks one human's signal to the next, silently and by default.
+ */
+export function clearConciergeLiveness(): void {
+  useConciergeLivenessStore.setState(IDLE_LIVENESS, true);
+}
+
 /** Test-only: return the detector to its resting state so cases cannot see each other's turns. */
 export function _resetConciergeLivenessForTests(): void {
-  useConciergeLivenessStore.setState(IDLE_LIVENESS, true);
+  clearConciergeLiveness();
 }
