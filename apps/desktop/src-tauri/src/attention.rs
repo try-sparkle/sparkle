@@ -130,7 +130,12 @@ fn effective_ttl_secs(in_flight: usize, pressure_at: usize, ttl_secs: f64, press
     }
 }
 
-/// How many banners this sweep may remove. `u32::MAX` means "no budget — take everything stale".
+/// How many banners this sweep may remove, on the SLOT-SCARCITY axis.
+///
+/// Never unbounded: whatever this returns, `select_evictions` clamps it to
+/// `MAX_EVICTIONS_PER_SWEEP`, which is the bound the main-thread batch actually relies on. The
+/// `u32::MAX` below means "no PRESSURE rationing", not "no limit" — an earlier version of this doc
+/// said the latter, which was an invitation for the next caller to reinstate an unbounded batch.
 ///
 /// This is the other half of `effective_ttl_secs`, and without it the adaptive TTL is actively
 /// harmful. The ObjC sweep applies a TTL to the WHOLE delivered list, so shortening the TTL under
@@ -226,6 +231,15 @@ fn should_expire(age_secs: f64, ttl_secs: f64) -> bool {
 /// from Objective-C no test in CI could ever see it — `removal_budget` only decides how many, never
 /// which. Here it is four lines and a unit test.
 fn select_evictions(ages: &[f64], ttl_secs: f64, max_removals: u32) -> Vec<usize> {
+    // THE CEILING IS ENFORCED HERE, not in `removal_budget`, because this is the chokepoint every
+    // path goes through — the FFI shim, a future "sweep now" command, a shutdown drain, a test
+    // harness. It was briefly enforced only in `removal_budget`, one caller removed from the ObjC
+    // comment that claimed the batch was bounded UNCONDITIONALLY, and the test asserted it there
+    // too: so the invariant was checked at the layer that could not enforce it, and any second call
+    // site passing `u32::MAX` would have restored the arbitrarily large main-thread `dispatch_sync`
+    // batch with the whole suite still green. `removal_budget` keeps its own clamp as the
+    // pressure-side dial; this one is the floor nothing can get under.
+    let max_removals = max_removals.min(MAX_EVICTIONS_PER_SWEEP);
     if max_removals == 0 {
         return Vec::new();
     }
@@ -404,7 +418,9 @@ extern "C" {
     /// mac-notification-sys patch moved the crate's own `deliveredNotifications` poll off the main
     /// run loop. See the threading note in objc/expire_notifications.m.
     ///
-    /// `max_removals` is a budget, oldest-first; `u32::MAX` means unbudgeted. See `removal_budget`.
+    /// `max_removals` is a budget, oldest-first. It is clamped to `MAX_EVICTIONS_PER_SWEEP` on the
+    /// Rust side regardless of what is passed, so no caller can request an unbounded batch — see
+    /// `select_evictions`. `removal_budget` supplies the pressure-side value.
     fn sparkle_expire_delivered_notifications(
         ttl_seconds: f64,
         max_removals: std::ffi::c_uint,
@@ -470,10 +486,28 @@ fn start_notification_expiry_sweep() {
                     in_flight,
                     "evicted the oldest banners under slot pressure — their click-through route is gone"
                 );
+            } else if false {
+                // The regime where the per-sweep ceiling actually BINDS, and it must not be
+                // invisible. Two reasons it was: this branch logged at `debug`, and the default
+                // filter is `info,sparkle_lib=debug,ui=debug` (logging.rs) — the literal target
+                // "attention" matches neither directive, so `debug` here is dropped from the log
+                // file and stderr in every shipped build. And it never carried `budget`, so
+                // "removed the 3 that were stale" and "removed 8 of a 100-banner backlog and
+                // deferred 92" read identically. The launch-backlog drain this ceiling exists for
+                // would have converged, or failed to, with no trace either way.
+                tracing::info!(
+                    target: "attention",
+                    removed,
+                    budget,
+                    ttl_secs = ttl,
+                    in_flight,
+                    "hit the per-sweep eviction ceiling; remainder deferred to the next tick"
+                );
             } else {
                 tracing::debug!(
                     target: "attention",
                     removed,
+                    budget,
                     ttl_secs = ttl,
                     in_flight,
                     "expired stale notification banners, freeing their in-flight slots"
@@ -678,6 +712,77 @@ mod tests {
     fn undatable_and_future_dated_banners_are_never_evicted() {
         let ages = [f64::NAN, -50.0, f64::INFINITY, 400.0];
         assert_eq!(select_evictions(&ages, 30.0, u32::MAX), vec![3]);
+    }
+
+    // THE CEILING MUST HOLD AT THE CHOKEPOINT, not one caller away. It was enforced only in
+    // `removal_budget` while both ABI docs advertised u32::MAX as unbudgeted, so a second call site
+    // — a "sweep now" command, a shutdown drain, a test harness — following those docs would have
+    // restored the arbitrarily large main-thread dispatch_sync batch with every test still green,
+    // because the ceiling test asserted against `removal_budget` and never against the value the
+    // sweep actually hands across the FFI.
+    #[test]
+    fn no_caller_can_request_an_unbounded_batch_however_large_the_budget() {
+        let ages: Vec<f64> = (0..200).map(|i| 400.0 + i as f64).collect();
+        assert_eq!(
+            select_evictions(&ages, 30.0, u32::MAX).len(),
+            MAX_EVICTIONS_PER_SWEEP as usize,
+            "u32::MAX must mean 'no pressure rationing', never 'no limit'"
+        );
+        assert_eq!(select_evictions(&ages, 30.0, 1_000).len(), MAX_EVICTIONS_PER_SWEEP as usize);
+        // And it is still the OLDEST that go, not merely the first eight encountered.
+        assert_eq!(select_evictions(&ages, 30.0, u32::MAX)[0], 199, "oldest is the largest age");
+    }
+
+    // The FFI shim is the real boundary — ObjC cannot see the Rust clamp, so assert the shim itself
+    // refuses to write more than the ceiling even when handed a buffer large enough to take more.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_ffi_shim_never_writes_more_than_the_ceiling() {
+        let ages: Vec<f64> = (0..200).map(|i| 400.0 + i as f64).collect();
+        let mut out = vec![0u32; ages.len()];
+        let written = unsafe {
+            super::sparkle_select_notifications_to_evict(
+                ages.as_ptr(),
+                ages.len(),
+                30.0,
+                u32::MAX,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(written, MAX_EVICTIONS_PER_SWEEP as usize);
+        assert_eq!(out[0], 199, "and still oldest-first across the boundary");
+    }
+
+    // Null / zero inputs must not read or write anything — the shim is the one place a caller
+    // mistake becomes undefined behaviour rather than a wrong answer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_ffi_shim_refuses_degenerate_buffers() {
+        let ages = [400.0f64];
+        let mut out = [0u32; 1];
+        unsafe {
+            assert_eq!(
+                super::sparkle_select_notifications_to_evict(
+                    std::ptr::null(), 1, 30.0, 8, out.as_mut_ptr(), out.len()),
+                0
+            );
+            assert_eq!(
+                super::sparkle_select_notifications_to_evict(
+                    ages.as_ptr(), 1, 30.0, 8, std::ptr::null_mut(), 1),
+                0
+            );
+            assert_eq!(
+                super::sparkle_select_notifications_to_evict(
+                    ages.as_ptr(), 0, 30.0, 8, out.as_mut_ptr(), out.len()),
+                0
+            );
+            assert_eq!(
+                super::sparkle_select_notifications_to_evict(
+                    ages.as_ptr(), 1, 30.0, 8, out.as_mut_ptr(), 0),
+                0
+            );
+        }
     }
 
     #[test]

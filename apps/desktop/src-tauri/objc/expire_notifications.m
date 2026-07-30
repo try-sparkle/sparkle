@@ -79,7 +79,12 @@ extern size_t sparkle_select_notifications_to_evict(const double *ages, size_t c
                                                     unsigned int *out, size_t outCap);
 
 // Remove delivered notifications the Rust selector picks: stale ones, oldest first, at most
-// `maxRemovals`. Returns how many were removed. Pass `UINT_MAX` for "no budget".
+// `maxRemovals`. Returns how many were removed.
+//
+// There is NO value of `maxRemovals` that means unbounded — the Rust selector clamps whatever it is
+// given to MAX_EVICTIONS_PER_SWEEP. An earlier version of this comment offered UINT_MAX as "no
+// budget", which would have invited a future caller to restore the arbitrarily large main-thread
+// batch the ceiling exists to prevent.
 //
 // ── THREADING: CALL THIS FROM A BACKGROUND THREAD, NOT MAIN ───────────────────────────────────
 // An earlier version of this file demanded the opposite ("MAIN THREAD ONLY"), on the reasoning that
