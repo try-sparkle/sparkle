@@ -861,15 +861,28 @@ describe("readable while a headless pass runs", () => {
     await pass;
   });
 
-  it("stays unreadable when the pass refuses to start", async () => {
-    // A refusal returns before the registration, and must not leave the agent looking readable —
-    // tier (b) carries the refusal text in that case, which is the honest answer.
+  it("registers nothing when the pass refuses to start", async () => {
+    // The registration sits AFTER the park gate, so a refusal must leave tier (d) with nothing —
+    // the refusal text (tier (b)) is the honest answer, and a transcript from a worktree this pass
+    // never ran in would be last hour's conversation dressed as this one.
+    //
+    // ASSERTED THROUGH TIER (d) WITH TIER (b) CLEARED, which is the whole point (roborev 55513): the
+    // read stops at the freshest hit, so while the ask-screen holds the refusal text, tier (d) is
+    // skipped as "not needed" and never consulted. Every assertion about it is then true whether the
+    // registration happened or not — including the one this test used to make. Clearing the
+    // ask-screen first is what forces the chain down to the tier under test.
     harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
     await withWarnSpy(async () => {
       await runImprovementPass("always");
     });
     expectNoRunInvoked();
     expect((await readAgentTerminal(SPARKLE_AGENT_ID)).source).toBe("attention-screen");
-    expect(harness.invokes.map((c) => c.cmd)).not.toContain("claude_latest_session_path");
+
+    useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, "");
+    const read = await readAgentTerminal(SPARKLE_AGENT_ID);
+    expect(read.source).toBe("none");
+    expect(read.attempts.find((a) => a.source === "transcript")?.why).toContain(
+      "no transcript path is known",
+    );
   });
 });
