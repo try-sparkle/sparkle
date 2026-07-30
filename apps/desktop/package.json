@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "screenshot": "node scripts/screenshot.mjs",
     "measure:webgl": "node scripts/measure-webgl-context-limit.mjs",
+    "measure:webgl-garbage": "node scripts/measure-webgl-garbage-frames.mjs",
     "measure:webgl-fleet": "node scripts/measure-webgl-fleet-jank.mjs",
     "visual:capture": "node scripts/visual/capture.mjs",
     "visual:compare": "node scripts/visual/compare.mjs",

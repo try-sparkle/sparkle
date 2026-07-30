@@ -214,3 +214,108 @@ export function onWebglContextLostImmediately(
     }
   };
 }
+
+// DEFECT #3: THE SILENT-EVICTION WINDOW — the hole the other two fixes leave open.
+//
+// DEFECT #2 above closed the addon's 3-second timer by listening for `webglcontextlost` ourselves.
+// But that still REACTS TO AN EVENT, and the event is not synchronous with the loss. The measurement
+// in measure-webgl-context-limit.mjs is explicit about this: when the engine evicts a context to make
+// room for a new one, `isContextLost()` flips to true IMMEDIATELY, while `webglcontextlost` is
+// dispatched on a LATER task. Every frame painted in between is painted through a dead context.
+//
+// And nothing anywhere checks. `renderRows` in addon-webgl 0.19.0 is, in full:
+//
+//     renderRows(e, t) {
+//       if (!this._isAttached) { ...; this._refreshCharAtlas(); this._isAttached = true }
+//       for (const i of this._renderLayers) i.handleGridChanged(this._terminal, e, t);
+//       this._glyphRenderer.value && this._rectangleRenderer.value && (
+//         this._glyphRenderer.value.beginFrame() ? (...) : this._updateModel(e, t),
+//         this._rectangleRenderer.value.renderBackgrounds(),
+//         this._glyphRenderer.value.render(this._model), ...)
+//     }
+//
+// There is no `isContextLost()` guard — the string does not appear in the bundle at all. On a lost
+// context every GL call silently no-ops and every texture read returns nothing, so the glyph pass
+// draws the RIGHT cells, at the RIGHT positions, in the RIGHT colors, with the WRONG glyphs. That is
+// the reported signature exactly, and it is strictly worse than drawing nothing: a blank pane reads
+// as broken, a garbage pane reads as data.
+//
+// WHY THE CONTEXT CAP DOES NOT ALREADY PREVENT THIS. The registry caps the renderers WE allocate at
+// MAX_WEBGL_CONTEXTS, but the engine's budget of 16 is process-wide and counts every context the app
+// holds — canvases outside xterm, and contexts whose canvases are dropped but not yet collected. A
+// cap on our share cannot bound a budget we do not solely own, so "never reach the limit" is a
+// probability argument, not a guarantee. This is the guarantee.
+//
+// So we guard the DRAW ITSELF rather than racing the notification: check `isContextLost()` on the
+// way into renderRows and, if the context is gone, paint NOTHING and tear down. A frame that is
+// never drawn cannot be drawn wrong, whatever order the events arrive in.
+//
+// This reaches through to `addon._renderer`, which is private. That is deliberate and load-bearing:
+// the property is unmangled in the shipped bundle (the same bundle we already read `_core` out of),
+// and if a future xterm bump moves it we warn and return a no-op rather than throwing — the pane
+// keeps its renderer and degrades to the event-driven path, which is where we were before.
+type GuardableRenderer = { renderRows?: (start: number, end: number) => unknown };
+type GuardableAddon = { _renderer?: GuardableRenderer };
+type LostCheckable = { isContextLost?: () => boolean };
+
+export function guardWebglDrawPath(
+  addon: unknown,
+  canvas: GlCanvasLike | null | undefined,
+  onLost: () => void,
+): () => void {
+  const renderer = (addon as GuardableAddon | null | undefined)?._renderer;
+  const original = renderer?.renderRows;
+  if (!renderer || typeof original !== "function") {
+    console.warn(
+      "Terminal: xterm WebglAddon._renderer.renderRows not found; a lost context can paint one or more garbage frames before the event fires (xterm internals changed?)",
+    );
+    return () => {};
+  }
+
+  let gl: LostCheckable | null = null;
+  try {
+    gl = canvas?.getContext("webgl2") as LostCheckable | null;
+  } catch {
+    gl = null;
+  }
+  if (typeof gl?.isContextLost !== "function") {
+    console.warn(
+      "Terminal: webgl2 context exposes no isContextLost(); cannot guard the draw path against silent eviction",
+    );
+    return () => {};
+  }
+
+  const checkable = gl;
+  let fired = false;
+  const guarded = function guardedRenderRows(this: unknown, start: number, end: number) {
+    let lost = false;
+    try {
+      lost = checkable.isContextLost?.() === true;
+    } catch {
+      // A context so far gone it cannot even answer is not one we should draw through.
+      lost = true;
+    }
+    if (lost) {
+      // Draw nothing. Tear down exactly once — teardown disposes the addon, so this wrapper should
+      // not be reachable again, but a re-entrant refresh must not fire a second fallback.
+      if (!fired) {
+        fired = true;
+        onLost();
+      }
+      return undefined;
+    }
+    return original.call(this, start, end);
+  };
+  renderer.renderRows = guarded;
+
+  return () => {
+    // NEVER un-guard a renderer whose context we have already seen dead. Un-wrapping restores the
+    // ORIGINAL renderRows — an unguarded glyph pass — onto a context that is gone, so any later
+    // frame paints exactly the garbage this function exists to prevent. Teardown disposes the addon
+    // right after this, so leaving the wrapper installed costs nothing and closes that window.
+    if (fired) return;
+    // Restore only if OUR wrapper is still installed. If something re-wrapped after us, blindly
+    // assigning `original` back would silently drop their wrapper as well as ours.
+    if (renderer.renderRows === guarded) renderer.renderRows = original;
+  };
+}

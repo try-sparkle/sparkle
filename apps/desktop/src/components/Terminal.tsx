@@ -50,6 +50,7 @@ import {
   releaseGlContext,
   findWebglCanvas,
   onWebglContextLostImmediately,
+  guardWebglDrawPath,
   type GlCanvasLike,
 } from "./terminalWebgl";
 import {
@@ -281,6 +282,7 @@ export function Terminal({
   const probeFailedRef = useRef(false);
   // Unsubscriber for our immediate webglcontextlost listener.
   const webglLostUnlistenRef = useRef<(() => void) | null>(null);
+  const webglDrawGuardRef = useRef<(() => void) | null>(null);
   // Lets the context-loss callbacks — registered once at attach and living for the addon's whole
   // lifetime — call the CURRENT detachWebgl without being re-registered on every render.
   const detachWebglRef = useRef<(() => void) | null>(null);
@@ -368,6 +370,11 @@ export function Terminal({
     //    dispatches webglcontextlost — our own listener would otherwise re-enter this teardown.
     webglLostUnlistenRef.current?.();
     webglLostUnlistenRef.current = null;
+    // Un-wrap renderRows too, for the same reason and in the same breath: the guard closes over
+    // this pane's context, so leaving it installed on a renderer we are about to dispose would keep
+    // that context reachable and re-enter teardown on the next frame.
+    webglDrawGuardRef.current?.();
+    webglDrawGuardRef.current = null;
     const webgl = webglRef.current;
     const canvas = webglCanvasRef.current;
     webglCanvasRef.current = null;
@@ -500,6 +507,14 @@ export function Terminal({
       // out the addon's 3-second restore timer while it renders from a dead atlas. See
       // onWebglContextLostImmediately for the addon source this works around.
       webglLostUnlistenRef.current = onWebglContextLostImmediately(webglCanvasRef.current, () =>
+        detachWebglRef.current?.(),
+      );
+      // ...and guard the DRAW ITSELF, because the listener above is still a race. Eviction flips
+      // isContextLost() synchronously but dispatches webglcontextlost on a LATER task, so frames
+      // painted in between go through a dead context: right cells, right colors, wrong glyphs. This
+      // is what makes corruption IMPOSSIBLE rather than merely rare — a frame that is never drawn
+      // cannot be drawn wrong, no matter when the event lands. See guardWebglDrawPath.
+      webglDrawGuardRef.current = guardWebglDrawPath(webgl, webglCanvasRef.current, () =>
         detachWebglRef.current?.(),
       );
       // NOTE: we deliberately do NOT force a repaint here. attachWebgl is only ever called when this

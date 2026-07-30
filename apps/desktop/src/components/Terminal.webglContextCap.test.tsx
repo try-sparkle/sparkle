@@ -28,6 +28,9 @@ const {
   refresh,
   termDispose,
   canvasPresent,
+  contextLost,
+  innerRenderRows,
+  addonInstances,
 } = vi.hoisted(() => ({
   addonCtors: { count: 0 },
   disposeSpy: vi.fn(),
@@ -40,6 +43,15 @@ const {
   termDispose: vi.fn(),
   // Lets a test model an xterm whose WebGL canvas cannot be located.
   canvasPresent: { value: true },
+  // Models the engine having EVICTED this context. Eviction flips isContextLost() synchronously but
+  // dispatches webglcontextlost on a later task, so a test can set this WITHOUT firing the event —
+  // which is exactly the window the draw guard exists to cover.
+  contextLost: { value: false },
+  // The real addon's inner draw call. Counting it is how we tell "painted a garbage frame" from
+  // "painted nothing".
+  innerRenderRows: vi.fn(),
+  // Live addon instances, so a test can drive the draw path the way the compositor would.
+  addonInstances: [] as Array<{ _renderer: { renderRows: (s: number, e: number) => unknown } }>,
 }));
 
 // A canvas that answers getContext("webgl2") — jsdom's real canvas returns null for WebGL, so the
@@ -49,6 +61,7 @@ function makeGlCanvas(): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   const gl = {
     getExtension: (name: string) => (name === "WEBGL_lose_context" ? { loseContext } : null),
+    isContextLost: () => contextLost.value,
   };
   Object.defineProperty(canvas, "getContext", {
     value: (id: string) => (id === "webgl2" ? gl : null),
@@ -122,8 +135,13 @@ vi.mock("@xterm/addon-web-links", () => ({
 // Counts constructions — one construction == one GPU context allocated.
 vi.mock("@xterm/addon-webgl", () => ({
   WebglAddon: class {
+    // The real addon holds its WebglRenderer here (unmangled in the shipped bundle), and renderRows
+    // is the method that actually paints. The guard wraps this; without the guard, calling it while
+    // the context is lost is what puts mojibake on screen.
+    _renderer = { renderRows: innerRenderRows };
     constructor() {
       addonCtors.count++;
+      addonInstances.push(this);
     }
     onContextLoss(_cb: () => void): void {}
     clearTextureAtlas = clearTextureAtlas;
@@ -169,6 +187,15 @@ const baseProps = {
   onStatus: () => {},
 };
 
+// Drive one frame through the CURRENT addon's renderer, the way xterm's render service would. Reads
+// _renderer.renderRows live rather than caching it, because the guard replaces that property — a
+// cached reference would call straight past the thing under test.
+function renderRowsNow(): void {
+  const addon = addonInstances[addonInstances.length - 1];
+  if (!addon) throw new Error("no WebglAddon was constructed — the pane never attached a renderer");
+  addon._renderer.renderRows(0, 23);
+}
+
 beforeEach(() => {
   addonCtors.count = 0;
   disposeSpy.mockClear();
@@ -178,6 +205,9 @@ beforeEach(() => {
   termDispose.mockClear();
   lostListeners.length = 0;
   canvasPresent.value = true;
+  contextLost.value = false;
+  innerRenderRows.mockClear();
+  addonInstances.length = 0;
   // Also clears the process-wide canvas-unfindable latch.
   resetWebglPermits();
   vi.stubGlobal(
@@ -523,5 +553,76 @@ describe("when the WebGL canvas cannot be found", () => {
     addonCtors.count = 0;
     render(<Terminal {...baseProps} agentId="next" active />);
     expect(addonCtors.count).toBe(1);
+  });
+});
+
+// DEFECT #3 — THE SILENT-EVICTION WINDOW, and the reason the founder still saw mojibake with the
+// context cap, the explicit loseContext() release and the immediate webglcontextlost listener all
+// shipped and working.
+//
+// Those three fixes bound how OFTEN a context is lost and how FAST we react once told. None of them
+// governs the interval between the loss and being told. The engine evicts the oldest context to make
+// room for a new one; measure-webgl-context-limit.mjs records that `isContextLost()` flips true in
+// that same tick while `webglcontextlost` is dispatched on a LATER task. Every frame in between is
+// painted through a dead context — and addon-webgl 0.19.0's renderRows has no isContextLost() check
+// anywhere (the string is absent from the whole bundle), so it runs the full glyph pass: right
+// cells, right positions, right colors, wrong glyphs.
+//
+// Garbage is worse than blank. A blank pane reads as broken; a garbage pane reads as data.
+describe("a context evicted SILENTLY, before any webglcontextlost event", () => {
+  it("paints NOTHING rather than a garbage frame", () => {
+    render(<Terminal {...baseProps} agentId="a" active />);
+    innerRenderRows.mockClear();
+
+    // The engine evicts us to make room for someone else. No event has been dispatched yet — this is
+    // the window, and it is the whole point that we never touch lostListeners here.
+    contextLost.value = true;
+    expect(lostListeners.length).toBeGreaterThan(0); // a listener EXISTS; it just has not fired
+
+    renderRowsNow();
+
+    // The frame was suppressed. Without the guard the real renderer would have run its glyph pass
+    // against a dead atlas, which is precisely the mojibake in the report.
+    expect(innerRenderRows).not.toHaveBeenCalled();
+  });
+
+  it("tears the renderer down from the draw path, without waiting for the event", () => {
+    render(<Terminal {...baseProps} agentId="a" active />);
+    disposeSpy.mockClear();
+    loseContext.mockClear();
+
+    contextLost.value = true;
+    renderRowsNow();
+
+    // Falling back is what makes the recovery permanent for this pane: the DOM renderer has no
+    // texture atlas, so it cannot produce a corrupted glyph at all.
+    expect(disposeSpy).toHaveBeenCalled();
+    expect(loseContext).toHaveBeenCalled();
+  });
+
+  it("keeps drawing normally while the context is HEALTHY — the guard is not a blanket mute", () => {
+    // The counter-evidence test. A guard that suppressed every frame would pass both tests above
+    // while rendering an empty terminal forever.
+    render(<Terminal {...baseProps} agentId="a" active />);
+    innerRenderRows.mockClear();
+
+    renderRowsNow();
+
+    expect(innerRenderRows).toHaveBeenCalled();
+    expect(disposeSpy).not.toHaveBeenCalled();
+  });
+
+  it("suppresses EVERY frame in the window, and tears down only once", () => {
+    // The window is not one frame. Until the event lands the compositor keeps asking for frames, and
+    // each one is another chance to paint garbage.
+    render(<Terminal {...baseProps} agentId="a" active />);
+    innerRenderRows.mockClear();
+    disposeSpy.mockClear();
+
+    contextLost.value = true;
+    for (let i = 0; i < 30; i++) renderRowsNow();
+
+    expect(innerRenderRows).not.toHaveBeenCalled();
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
   });
 });
