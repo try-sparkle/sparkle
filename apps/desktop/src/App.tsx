@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef } from "react";
 import { AuthGate } from "./components/AuthGate";
 import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
-import { installInputFreezeTrace } from "./diagnostics/inputFreezeTrace";
+import { installInputFreezeTrace, traceGates } from "./diagnostics/inputFreezeTrace";
 import { installDictationFocusTracker } from "./voice/dictationFocusTracker";
 import { useDictationStore } from "./stores/dictationStore";
 import { useApplyTheme } from "./theme/theme";
@@ -214,19 +214,12 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
-  // Diagnostics: record first-responder + keyboard-capture transitions while speech is actually
-  // being routed, so a recurrence of the dictation input-freeze (sparkle-d2ec) is pinnable.
-  // `enabled && phase === "active"`, NOT bare `enabled`: `enabled` is the persisted master mute, so
-  // gating on it left the trace running forever for anyone who had ever switched the mic on, and
-  // only the `active` phase can drive the focus pull this exists to catch (roborev 54719).
+  // Diagnostics: record first-responder + keyboard-capture transitions so a recurrence of the
+  // dictation input-freeze (sparkle-d2ec) is pinnable. The focus stream and the keydown fingerprint
+  // are gated differently — `traceGates` owns that derivation and is unit-tested, rather than an
+  // inline closure nothing could pin (roborev 54719/56006).
   useEffect(
-    () =>
-      installInputFreezeTrace({
-        isDictationActive: () => {
-          const s = useDictationStore.getState();
-          return s.enabled && s.phase === "active";
-        },
-      }),
+    () => installInputFreezeTrace({ dictationState: () => traceGates(useDictationStore.getState()) }),
     [],
   );
   // DICTATION FOLLOWS FOCUS. Records who holds the caret (and whether this window is active) into
