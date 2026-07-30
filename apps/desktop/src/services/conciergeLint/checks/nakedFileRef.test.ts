@@ -211,19 +211,21 @@ describe("nakedFileRefCheck", () => {
     expect(run(reply).violations).toHaveLength(1);
   });
 
-  // WAS a pinned false negative; it is now DETECTED (roborev 55875). The miss was never
-  // self-contained: an unmatched reference is also unmasked, so its segments explained away a
-  // different, genuinely naked reference on the same line.
-  it("detects a path whose characters are entity-encoded", () => {
-    for (const ref of ["See src/retry&#46;ts:88", "See src&#47;retry.ts:88", "See src/retry&period;ts:88"]) {
-      expect(run(ref).violations, `must detect: ${ref}`).toHaveLength(1);
-    }
+  // A PINNED FALSE NEGATIVE, restored after the fix for it was reverted (roborev 55885). Widening
+  // the pattern to accept entities made it exponentially backtrackable AND matched ordinary prose;
+  // see the header. The miss stays until something decodes entities before the scan.
+  it("does not detect a path whose characters are entity-encoded — the documented miss", () => {
+    expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
   });
 
-  it("masks an entity-encoded reference so it cannot explain a DIFFERENT one on the same line", () => {
-    // The compounding case the doc used to deny: unmasked, "Fixed src retry ts and" clears the
-    // four-word bar and silences src/b.ts:9, which is bare. Both must fire.
-    expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toHaveLength(2);
+  // THE REGRESSION GUARD for that revert. A run of entities is exactly the input the widened pattern
+  // walked ~2^k paths on; this asserts the scan stays linear enough to be unnoticeable. Generous
+  // bound so it fails on catastrophe, not on a slow machine — the reverted pattern took minutes.
+  it("does not backtrack catastrophically on a run of HTML entities", () => {
+    const hostile = `See ${"&lt;div&gt;&lt;span&gt;".repeat(40)} and nothing else`;
+    const started = performance.now();
+    run(hostile);
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it("resolves repeated identical references to their own occurrences", () => {

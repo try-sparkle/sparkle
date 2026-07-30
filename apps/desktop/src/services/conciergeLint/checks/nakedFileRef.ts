@@ -78,14 +78,29 @@
 // Every one of those was a mapping from parsed text back to source. Matching the source directly
 // deletes the mapping, so there is no invariant left to be wrong about — which is why this is a
 // deletion and not a fourth translation. What remains is one narrow, stated tolerance:
-// {@link FILE_REF_RE} accepts a `\` before each path character AND an HTML entity in place of one,
-// so both an escaped and an entity-encoded path are detected and masked by the same pattern.
+// {@link FILE_REF_RE} accepts a `\` before each path character, so an escaped path is detected and
+// masked by the same pattern.
 //
-// ENTITIES ARE COVERED FOR THE SAME REASON THE SEPARATORS ARE (roborev 55875). Calling this a
-// self-contained "documented false negative" was wrong: an unmatched reference is also UNMASKED, so
-// on `Fixed src/retry&#46;ts:12 and src/b.ts:9` the first reference survives masking and its own
-// segments ("Fixed", "src", "retry", "ts", "and") clear the four-word bar for the SECOND reference —
-// silencing `src/b.ts:9`, which is bare and genuinely naked. A miss here never costs only itself.
+// AN ENTITY INSIDE A PATH (`src/retry&#46;ts:88`) IS NOT DETECTED — and the honest statement of that
+// miss has two halves, because a previous version of this comment got the second one wrong in each
+// direction (roborev 55875, then 55885).
+//
+// It is NOT self-contained. An unmatched reference is also UNMASKED, so on
+// `Fixed src/retry&#46;ts:12 and src/b.ts:9` its own segments ("Fixed", "src", "retry", "ts", "and")
+// clear the four-word bar for the SECOND reference and silence `src/b.ts:9`, which is genuinely
+// naked. Calling it a miss "in the direction this check always chooses" understated it.
+//
+// It is ALSO NOT WORTH FIXING BY WIDENING THIS PATTERN, which is what the fix for that attempted and
+// had to be reverted. Accepting `&#?[A-Za-z0-9]{1,8};` in both the segment class and the separator
+// made an entity consumable as either, i.e. the textbook exponential `(?:E+E)+`: ~25-30 consecutive
+// entities that do not end in `.ext:digits` — ordinary HTML-escaped markup like
+// `&lt;div&gt;&lt;span&gt;…` — walked ~2^k paths and HUNG the lint pass, on every reply, with no
+// input bound. The same widening also matched `See&nbsp;the&nbsp;log&nbsp;42` as a reference (an
+// entity satisfied every separator, so condition #2 stopped holding), and because detection and
+// masking share this regex those four real words were masked out of the count too.
+//
+// So the miss stands, deliberately. A real fix decodes entities BEFORE scanning — a separate pass
+// with its own offset story — and is not a grammar change here.
 //
 // ══ A TABLE ROW IS NOT A SENTENCE, SO THE CHECK SKIPS IT ═══════════════════════════════════════
 // The bar of four words is calibrated for prose, and a table cell is terse BY CONSTRUCTION — that
@@ -139,7 +154,7 @@ export const DEFAULT_MIN_EXPLANATION_WORDS = 4;
  * bar. Detection and masking are the same regex precisely so they cannot disagree like that.
  */
 export const FILE_REF_RE =
-  /(?:(?:\\?[A-Za-z0-9_.@-]|&#?[A-Za-z0-9]{1,8};)+(?:\\?\/|&#?[A-Za-z0-9]{1,8};))+(?:\\?[A-Za-z0-9_.@-]|&#?[A-Za-z0-9]{1,8};)+(?:\\?\.|&#?[A-Za-z0-9]{1,8};)[A-Za-z][A-Za-z0-9]*(?:\\?:|&#?[A-Za-z0-9]{1,8};)\d+(?:\\?[:-]\d+)?/g;
+  /(?:(?:\\?[A-Za-z0-9_.@-])+\\?\/)+(?:\\?[A-Za-z0-9_.@-])+\\?\.[A-Za-z][A-Za-z0-9]*\\?:\d+(?:\\?[:-]\d+)?/g;
 
 /** What a reference is replaced by before words are counted: a private-use character, written as an
  *  escape so it is visible in the source. It cannot match {@link WORD_RE}, so a reference's own
