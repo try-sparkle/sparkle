@@ -259,8 +259,21 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
     mount();
     await send("Why is @Kraken Auth just sitting there?");
     await elapse();
-    // No "something was dispatched" precondition, deliberately: that would pin AGENT DELIVERY, which
-    // is the half being left open. The router aim above is what makes the bare loop discriminating.
+    // ══ THE MESSAGE WENT SOMEWHERE — destination-agnostic, so it pins nothing (roborev 56019) ═════
+    // An earlier cut had NO precondition at all, on the reasoning that any "something dispatched"
+    // check would pin AGENT DELIVERY, the half deliberately left open. That framed the choice as
+    // binary and missed this third option. Without it the loop below iterates zero times and passes
+    // for any change that stops the send reaching a dispatcher — Send throwing before `deliver()`,
+    // no intent arming so `elapse()` is a no-op, mention resolution throwing, `agentCanAcceptInput`
+    // gating it off. None of those are the open routing question; they are ordinary breakage, and
+    // the row would have stayed green through all of them under a name implying it guards a misroute.
+    //
+    // Counting BOTH sinks is what keeps it neutral: true today (dispatched to the named agent), true
+    // under a future "subject mention → Sparkle" rule (a concierge turn instead), and true in the
+    // mention-ignored case this row exists to catch (dispatched to ag1, which the loop then fails).
+    expect(
+      h.dispatchConciergeAnswer.mock.calls.length + h.startConciergeTurn.mock.calls.length,
+    ).toBeGreaterThan(0);
     for (const call of h.dispatchConciergeAnswer.mock.calls) expect(call[0]).not.toBe("ag1");
   });
 
