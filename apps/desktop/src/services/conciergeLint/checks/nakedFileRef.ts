@@ -35,10 +35,17 @@
 // bullets and short paragraphs, where a line already is the unit a reader reads.
 //
 // ══ WHY THE WORDS ARE COUNTED ON THE RAW SOURCE LINE, NOT ON THE PROSE SPAN ═════════════════════
-// DETECTION is per prose span, so fences, code spans and blockquotes stay excluded. COUNTING is on
-// the original source line, and the difference is not academic: any inline markup splits a
+// The parser decides WHERE to look — `proseSpans` hands back the ranges that are prose, so fences,
+// code spans and blockquotes are already gone. AUTOLINKED URLs are a WEAKER guarantee and the
+// difference matters here (roborev 55870): `mdast.ts` drops autolink runs only from OFFSET-ALIGNED
+// spans, and a node containing any escape or entity is emitted whole and unaligned, skipping that
+// removal. So `See \_here\_ https://host/o/r/blob/main/src/retry.ts:88` is one unaligned node, the
+// source scan finds the path INSIDE the URL, and the check fires on a bare link. Documented as an
+// accepted false positive rather than papered over — it needs a fix in `mdast.ts` (dropping the runs
+// without splitting), not a second grammar here. Everything after that reads the
+// SOURCE those ranges cover, and the difference is not academic: any inline markup splits a
 // paragraph into several mdast text nodes, and words inside an `inlineCode` node are not prose at
-// all. Counting per span would have read
+// all. Counting per node would have read
 //
 //     Every `retryBackoff` call resets src/retry.ts:88
 //
@@ -46,6 +53,34 @@
 // identifiers and bolded names are what concierge replies are mostly made of. Counting the raw
 // line reads four and stays quiet. The cost is that markup and link destinations count as words,
 // which errs toward silence — the direction this check prefers.
+//
+// ══ SCANNING THE SOURCE IS THE POINT, AND IT COST THREE ATTEMPTS TO GET HERE ═══════════════════
+// The reference is now MATCHED against `text.slice(span.start, span.end)` rather than against
+// `span.value`, so a match's index IS a source offset and there is nothing to translate. That is
+// the whole fix, and it is worth recording what it replaces, because each predecessor sounded
+// reasonable and each was wrong in a way its own tests did not show:
+//
+//   1. "Count on the span when the offsets are misaligned." Silently reinstated per-text-node
+//      counting on exactly the lines most likely to reach it — `The **retry backoff** resets &amp;
+//      retries at src/retry.ts:88` reads three words on the ref's node and seven on its source
+//      line, so the check fired on a line that explains itself.
+//   2. "An escape or an entity never adds or removes a newline, so count newlines in the value and
+//      walk that many lines forward." FALSE for a character reference that decodes TO a line
+//      ending: micromark exempts codes 9/10/12/13 from its replacement, so `&#10;` — the standard
+//      idiom for a line break inside a GFM table cell — puts a newline in `value` that the source
+//      does not have, and the walk overshoots onto a later line.
+//   3. "The matched text is verbatim in the source, so `indexOf` finds it." FALSE for markdown
+//      escapes: `_`, `.` and `-` are all escapable, and `src/retry\_helper.ts:88` parses to
+//      `src/retry_helper.ts:88`, which the source does not contain. The search then either missed
+//      (silence on a naked reference) or landed on a DIFFERENT identical occurrence later in the
+//      node and judged that line instead.
+//
+// Every one of those was a mapping from parsed text back to source. Matching the source directly
+// deletes the mapping, so there is no invariant left to be wrong about — which is why this is a
+// deletion and not a fourth translation. What remains is one narrow, stated tolerance:
+// {@link FILE_REF_RE} accepts a `\` before each path character, so an escaped path is detected and
+// masked by the same pattern. An ENTITY inside a path (`src/retry&#46;ts:88`) is still not
+// detected; that is a documented false negative, in the direction this check always chooses.
 //
 // ══ A TABLE ROW IS NOT A SENTENCE, SO THE CHECK SKIPS IT ═══════════════════════════════════════
 // The bar of four words is calibrated for prose, and a table cell is terse BY CONSTRUCTION — that
@@ -83,9 +118,23 @@ export const DEFAULT_MIN_EXPLANATION_WORDS = 4;
  *
  * Requires a directory segment AND an alphabetic extension AND a line number — three independent
  * conditions, each one removing a whole class of coincidental colon-digit text.
+ *
+ * Every character may carry a leading `\` — the segment characters AND the separators (`/`, the
+ * extension `.`, the `:` before the line number) — because this runs over RAW MARKDOWN (see the
+ * scanning section in the header) and escaping punctuation is a routine model habit: `\_` to
+ * suppress emphasis inside an identifier, and often `\.` or `\/` from a model that escapes
+ * generically rather than selectively.
+ *
+ * COVERING THE SEPARATORS TOO IS NOT A DETAIL (roborev 55870). Tolerating escapes only INSIDE
+ * segments left `src/retry_helper\.ts:88` undetected — the segment class consumes `retry_helper\.ts`
+ * and then the literally-spelled `\.` has no bare `.` left to match. That is a silent miss of the
+ * same kind this pattern exists to remove, and it is worse than a plain miss: the unmatched
+ * reference is also UNMASKED, so on `Fixed \.ts style at src/a\.ts:12 and src/b.ts:9` its segments
+ * ("src", "a", "ts") count as explanation for the OTHER reference on the line and push it over the
+ * bar. Detection and masking are the same regex precisely so they cannot disagree like that.
  */
 export const FILE_REF_RE =
-  /(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\.[A-Za-z][A-Za-z0-9]*:\d+(?:[:-]\d+)?/g;
+  /(?:(?:\\?[A-Za-z0-9_.@-])+\\?\/)+(?:\\?[A-Za-z0-9_.@-])+\\?\.[A-Za-z][A-Za-z0-9]*\\?:\d+(?:\\?[:-]\d+)?/g;
 
 /** What a reference is replaced by before words are counted: a private-use character, written as an
  *  escape so it is visible in the source. It cannot match {@link WORD_RE}, so a reference's own
@@ -108,48 +157,11 @@ function lineAt(source: string, index: number): string {
   return source.slice(from, to === -1 ? source.length : to);
 }
 
-/**
- * Where a reference sits in the ORIGINAL source, or `null` when that cannot be established.
- *
- * ══ THE INVARIANT, AND THE TWO IT REPLACES ══════════════════════════════════════════════════════
- * This is the third attempt at "which line is this reference on", and the first two both rested on
- * a claim that turned out to be false or too weak. Recorded, because each was reasonable-sounding:
- *
- *   • "Count on the span when the offsets are misaligned." That silently reinstated per-text-node
- *     counting on exactly the lines most likely to reach it — `The **retry backoff** resets &amp;
- *     retries at src/retry.ts:88` reads three words on the ref's node and seven on its source line,
- *     so the check fired on a line that explains itself.
- *   • "Resolving an escape or an entity never adds or removes a newline, so count newlines in the
- *     parsed value and walk that many lines forward." FALSE for a numeric character reference that
- *     decodes TO a line ending: micromark exempts codes 9/10/12/13 from its `�` replacement,
- *     so `&#10;` and `&NewLine;` put a newline in `value` that the source does not have. `&#10;` is
- *     the standard idiom for a line break inside a GFM table cell, so this is not exotic. The walk
- *     then overshoots onto a LATER line and judges the wrong text, in either direction and with no
- *     signal that it happened.
- *
- * The invariant that actually holds is about the REFERENCE, not about the encoding: a
- * {@link FILE_REF_RE} match is drawn from `[A-Za-z0-9_.@/-]`, `:` and digits, and markdown neither
- * escapes nor entity-encodes any of those. So the matched text appears VERBATIM in the source, and
- * `indexOf` finds it — for aligned and unaligned spans alike, with no branch between them.
- *
- * `searchFrom` advances past each hit so repeated identical references resolve to their own
- * occurrences rather than all collapsing onto the first, and the bound at `span.end` keeps the
- * search inside this span.
- *
- * `null` means "could not be located" — reachable only if a model entity-encodes a character inside
- * the path itself (`src/retry&#46;ts:88`). The caller stays SILENT on it. A false negative, which is
- * the direction this check always chooses; guessing a line and counting the wrong words is how the
- * two attempts above produced false positives.
- */
-function findRefInSource(
-  text: string,
-  span: ProseSpan,
-  ref: string,
-  searchFrom: number,
-): number | null {
-  const at = text.indexOf(ref, Math.max(searchFrom, span.start));
-  if (at === -1 || at + ref.length > span.end) return null;
-  return at;
+/** The source text this span covers. A text node contains no other nodes by construction, so this
+ *  is the same prose the parser saw — differing from `span.value` only where markdown escaped or
+ *  entity-encoded a character. See the scanning section in this file's header. */
+function sourceOf(text: string, span: ProseSpan): string {
+  return text.slice(span.start, span.end);
 }
 
 /**
@@ -180,17 +192,13 @@ export const nakedFileRefCheck: Check = {
       // A private scanner per span: `FILE_REF_RE` is also used by `.replace` below, and String
       // .replace resets a global regex's `lastIndex` — sharing one instance across the two would
       // rewind this loop forever.
+      // Scan the SOURCE this span covers, not its parsed value: `m.index` is then a real source
+      // offset by construction, for aligned and unaligned spans alike. See the header.
+      const source = sourceOf(text, span);
       const scanner = new RegExp(FILE_REF_RE.source, "g");
-      let searchFrom = span.start;
       let m: RegExpExecArray | null;
-      while ((m = scanner.exec(span.value)) !== null) {
-        // The ORIGINAL source line, always — so inline markup that split the paragraph into
-        // several text nodes cannot hide the explanation. See `findRefInSource`.
-        const at = findRefInSource(text, span, m[0], searchFrom);
-        // Unlocatable: stay silent rather than count the wrong line. See `findRefInSource`.
-        if (at === null) continue;
-        searchFrom = at + m[0].length;
-        const line = lineAt(text, at);
+      while ((m = scanner.exec(source)) !== null) {
+        const line = lineAt(text, span.start + m.index);
         // A table row is terse by construction and its header row is the explanation — the word
         // bar is calibrated for prose and does not apply. See this file's header.
         if (isTableRow(line)) continue;

@@ -166,6 +166,52 @@ describe("nakedFileRefCheck", () => {
     expect(run(reply).violations).toEqual([]);
   });
 
+  // ══ MARKDOWN ESCAPES INSIDE THE PATH ═════════════════════════════════════════════════════════
+  // `\_` in an identifier is a routine model habit for suppressing emphasis, and it decodes away —
+  // so the parsed value holds a path the SOURCE does not contain. Matching the source directly
+  // (plus FILE_REF_RE's `\\?` tolerance) is what makes these work.
+  it("detects a reference whose path carries a markdown escape", () => {
+    expect(run("See src/retry\\_helper.ts:88").violations).toHaveLength(1);
+  });
+
+  it("does not let an escaped path's own segments count as its explanation", () => {
+    // Unmasked, "apps desktop src services retry helper ts" is seven words and would sail over the
+    // bar. The mask has to recognise the escaped form too, or the check goes quiet on a bare path.
+    expect(run("apps/desktop/src/services/retry\\_helper.ts:88").violations).toHaveLength(1);
+  });
+
+  // roborev 55870: the tolerance covered characters INSIDE segments but not the separators, so a
+  // generically-escaping model produced a reference the pattern could not match at all.
+  it("detects a reference whose SEPARATORS carry markdown escapes", () => {
+    for (const ref of [
+      "See src/retry_helper\\.ts:88",
+      "See src\\/retry.ts:88",
+      "See src/retry.ts\\:88",
+    ]) {
+      expect(run(ref).violations, `must detect: ${ref}`).toHaveLength(1);
+    }
+  });
+
+  it("masks a separator-escaped reference so it cannot explain a DIFFERENT one on the same line", () => {
+    // The compounding failure: an unmatched reference is also UNMASKED, so its own segments
+    // ("src", "a", "ts") were counted as explanation for the second reference and pushed it over the
+    // bar — silencing a reference that is genuinely naked. With both masked, "Fixed" and "and" are
+    // all that remain, and both references are correctly reported.
+    expect(run("Fixed src/a\\.ts:12 and src/b.ts:9").violations.length).toBeGreaterThan(0);
+  });
+
+  it("does not resolve an escaped reference onto a different identical occurrence", () => {
+    // Line 1 is naked and line 2 explains itself. Searching the source for the DECODED text misses
+    // line 1 entirely and lands on line 2, reading six words and reporting nothing at all.
+    const reply =
+      "See src/retry\\_helper.ts:88\nThe retry backoff resets there at src/retry_helper.ts:88";
+    expect(run(reply).violations).toHaveLength(1);
+  });
+
+  it("does not detect a path whose characters are entity-encoded — the documented miss", () => {
+    expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
+  });
+
   it("resolves repeated identical references to their own occurrences", () => {
     // Both lines carry the same reference text. Line 1 explains itself, line 2 does not — so a
     // search that always found the FIRST occurrence would report zero instead of one.
