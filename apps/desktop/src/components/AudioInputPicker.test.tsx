@@ -25,7 +25,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { AudioInputPicker } from "./AudioInputPicker";
-import { useAudioInputStore } from "../stores/audioInputStore";
+import { useAudioInputStore, resetAudioInputStore } from "../stores/audioInputStore";
 import { useDictationStore } from "../stores/dictationStore";
 import {
   ALLOW_VIRTUAL_ACTIVE_WARNING,
@@ -88,7 +88,7 @@ beforeEach(() => {
     if (cmd === "get_audio_input_settings") return Promise.resolve(settings);
     return Promise.resolve(undefined);
   });
-  useAudioInputStore.setState({ devices: [], chosenUid: null, allowVirtual: false, bound: null, intentEpoch: 0, grantFailed: false });
+  resetAudioInputStore();
 });
 afterEach(() => cleanup());
 

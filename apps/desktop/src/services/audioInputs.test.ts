@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  ALLOW_VIRTUAL_FAILED,
   boundDeviceCaption,
   isDeviceSelectable,
   refreshAudioInputs,
@@ -33,7 +34,7 @@ import {
   subscribeBoundDevice,
   type AudioInput,
 } from "./audioInputs";
-import { useAudioInputStore } from "../stores/audioInputStore";
+import { useAudioInputStore, resetAudioInputStore } from "../stores/audioInputStore";
 
 const BUILTIN: AudioInput = {
   uid: "builtin-mic",
@@ -59,11 +60,11 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockResolvedValue(undefined);
   for (const k of Object.keys(listeners)) delete listeners[k];
-  // `grantPending` is reset here like any other field — which is the entire reason it lives in the
-  // store rather than in a module-level `let` (roborev 55411). As module state no `beforeEach`
-  // could reach it, so one test leaving a grant unsettled turned every later grant in this file
-  // into a silent no-op, and those tests then passed against state they had not produced.
-  useAudioInputStore.setState({ devices: [], chosenUid: null, allowVirtual: false, bound: null, intentEpoch: 0, grantFailed: false, grantPending: false });
+  // ONE helper, not a hand-listed setState. `grantPending` lives in the store rather than in a
+  // module-level `let` precisely so a reset can reach it (roborev 55411) — and hand-listing let one
+  // suite forget it anyway (roborev 55871). A test that leaves a grant unsettled would otherwise
+  // turn every later grant in the file into a silent no-op, passing off state it never produced.
+  resetAudioInputStore();
 });
 
 describe("setAudioInput — the choice reaches the BACKEND, not just the store", () => {
@@ -239,6 +240,28 @@ describe("setAllowVirtualInput — the advanced opt-in reaches the backend", () 
     // the grant the reconcile just proved had landed — a remedy that inverts the user's intent, the
     // sparkle-8bvh failure mode. `grantFailed` may only mean "we could not confirm".
     expect(useAudioInputStore.getState().grantFailed).toBe(false);
+  });
+
+  it("a backend that answers NO is a refusal, not an unreachable backend", async () => {
+    // The third reconcile outcome, and the one that had no test at all (roborev 55871). `actual`
+    // resolving `{ allowVirtual: false }` means the backend responded and DECLINED — materially
+    // different from `actual === null`, which means it would not say. Both fail closed, correctly,
+    // but the notice used to assert "Sparkle's audio backend didn't respond" for both, which is
+    // simply false here: it answered. Pinning this path is what keeps the copy honest.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_audio_input_settings") {
+        return Promise.resolve({ chosenUid: null, allowVirtual: false });
+      }
+      return Promise.reject(new Error("the write itself was refused"));
+    });
+
+    await setAllowVirtualInput(true);
+
+    expect(useAudioInputStore.getState().allowVirtual).toBe(false);
+    expect(useAudioInputStore.getState().grantFailed).toBe(true);
+    // The notice must not describe HOW it failed, because this path and the unreachable-backend
+    // path share one string and only one of them involves a backend that stayed silent.
+    expect(ALLOW_VIRTUAL_FAILED).not.toMatch(/didn't respond|no response|unreachable/i);
   });
 
   it("and still fails CLOSED when the backend will not say", async () => {

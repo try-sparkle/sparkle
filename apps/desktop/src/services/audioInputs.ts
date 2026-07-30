@@ -110,9 +110,17 @@ export const BOUND_VIRTUAL_WARNING =
  * so the reassuring version was a claim about the backend made with no evidence — on the one
  * control protecting the "we listen to your microphone" promise (roborev 55351). The failure arm
  * re-reads the backend instead, and this string only reports what we actually observed.
+ *
+ * IT ALSO MAKES NO CLAIM ABOUT THE BACKEND'S BEHAVIOUR, which the previous wording did: it said
+ * "Sparkle's audio backend didn't respond" and was raised on BOTH reconcile outcomes — including
+ * the one where the backend answered perfectly well and the answer was `allowVirtual: false`. On
+ * that path the sentence was simply false, about the backend, on the privacy control (roborev
+ * 55871). What is true of every path that reaches here is the state the user can see: the opt-in is
+ * off. So that is all it says, and the remedy stays safe because the box it points at is always
+ * unchecked when this shows — following it retries the grant rather than undoing one.
  */
 export const ALLOW_VIRTUAL_FAILED =
-  "Couldn't confirm this — Sparkle's audio backend didn't respond. Check the box again.";
+  "Sparkle couldn't turn this on — it's still off. Check the box again to retry.";
 
 /**
  * The caption for the live device — `Listening: MacBook Pro Microphone` while capture is genuinely

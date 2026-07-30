@@ -92,3 +92,27 @@ export const useAudioInputStore = create<AudioInputState>()((set) => ({
   setGrantFailed: (grantFailed) => set({ grantFailed }),
   setGrantPending: (grantPending) => set({ grantPending }),
 }));
+
+/**
+ * Put every field back to its initial value. For test `beforeEach` hooks.
+ *
+ * ONE helper rather than a hand-listed `setState` per suite, because the hand-listed version has
+ * already failed in the way that matters: `grantPending` was added to this store precisely so a
+ * suite's reset could reach it, and only one of the three call sites was updated — leaving the
+ * picker suite, which is where in-flight grants are actually held open, able to carry a stale
+ * `true` from one test into the next (roborev 55871). `setState` MERGES, so an omitted field is
+ * silently retained rather than reset to a default, and the failure is invisible: the next grant
+ * returns at the dedupe guard having invoked nothing while store-based assertions pass off state a
+ * previous test left behind. A field added here now resets everywhere by construction.
+ */
+export function resetAudioInputStore(): void {
+  useAudioInputStore.setState({
+    devices: [],
+    chosenUid: null,
+    allowVirtual: false,
+    bound: null,
+    intentEpoch: 0,
+    grantFailed: false,
+    grantPending: false,
+  });
+}

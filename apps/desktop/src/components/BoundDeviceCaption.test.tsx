@@ -26,7 +26,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: (u: string) => openUrl(u)
 import { act } from "@testing-library/react";
 import { BoundDeviceCaption } from "./BoundDeviceCaption";
 import { LogoWaveform } from "./LogoWaveform";
-import { useAudioInputStore } from "../stores/audioInputStore";
+import { useAudioInputStore, resetAudioInputStore } from "../stores/audioInputStore";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAudioInputSync, BOUND_VIRTUAL_WARNING } from "../services/audioInputs";
@@ -51,7 +51,7 @@ async function renderHost() {
 
 beforeEach(() => {
   for (const k of Object.keys(listeners)) delete listeners[k];
-  useAudioInputStore.setState({ devices: [], chosenUid: null, allowVirtual: false, bound: null });
+  resetAudioInputStore();
   // Armed AND capturing, so the caption's default register is the present-tense "Listening:".
   useDictationStore.setState({ enabled: true, status: "listening", phase: "passive", error: null, modelProgress: null, outOfCreditsNotice: false });
   useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 } });
