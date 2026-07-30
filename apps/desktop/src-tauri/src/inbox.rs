@@ -145,6 +145,32 @@ fn validate_all(agent_ids: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` if `agent_id` must not be allowed to reach a path join — the caller then fails
+/// closed (empty/zero), having read nothing.
+///
+/// This exists because validating at the COMMAND is a guarantee one deleted line wide. `inbox_status`
+/// rightly refuses a bad batch loudly and before the thread hop, so a crafted id never occupies a
+/// blocking-pool slot — but `status_of` and `pending` are `pub`, take a bare `&str`, and build paths
+/// from it. Anything that reads "redundant, the command already checks" during a refactor or a merge
+/// resolution silently reopens a traversal, with the whole suite still green. Defence at the sink is
+/// what survives that, and it extends the guarantee to callers that were never routed through a
+/// command at all.
+///
+/// Silent rather than `Result` on purpose: these two are infallible by design (an agent with no inbox
+/// legitimately reports all-zero, which is why `status_of` does not return `Result` today), and the
+/// only entry point taking untrusted input already answers loudly. `validate_agent_id` rejects only
+/// shapes no real agent id has — empty, `/`, `\`, `..`, NUL — so the quiet path is unreachable for a
+/// well-formed caller. The `warn` is what makes it diagnosable rather than merely safe.
+fn refuse_escape(what: &str, agent_id: &str) -> bool {
+    match validate_agent_id(agent_id) {
+        Ok(()) => false,
+        Err(e) => {
+            tracing::warn!(sink = what, "inbox: refusing id that would escape the inbox dir: {e}");
+            true
+        }
+    }
+}
+
 /// `<app_data>/inbox` — deliberately OUTSIDE the worktree.
 ///
 /// `spin_down_worker` deletes a worker's worktree, so an inbox stored at `<worktree>/.sparkle/`
@@ -250,6 +276,9 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 
 /// Messages still worth delivering: not expired, not already claimed.
 pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
+    if refuse_escape("pending", agent_id) {
+        return Vec::new();
+    }
     let claims = claims_dir(app_data, agent_id);
     read_jsonl::<InboxMessage>(&messages_path(app_data, agent_id))
         .into_iter()
@@ -293,7 +322,22 @@ pub fn enqueue(
 }
 
 /// Delivery/ack counts for one agent.
+///
+/// Fails CLOSED on an id that would escape the inbox dir — see [`refuse_escape`]. The loud refusal
+/// belongs to `inbox_status`, which rejects the whole batch before the thread hop; this is the
+/// backstop that keeps the guarantee if that line is ever removed, and that covers any future caller
+/// of this `pub` fn which never had one.
 pub fn status_of(app_data: &Path, agent_id: &str, now: i64) -> InboxStatus {
+    if refuse_escape("status_of", agent_id) {
+        return InboxStatus {
+            agent_id: agent_id.to_string(),
+            pending: 0,
+            delivered: 0,
+            acknowledged: 0,
+            awaiting_ack: 0,
+            pending_ids: Vec::new(),
+        };
+    }
     let claims = claims_dir(app_data, agent_id);
     let msgs = read_jsonl::<InboxMessage>(&messages_path(app_data, agent_id));
     let acks = read_jsonl::<InboxAck>(&acks_path(app_data, agent_id));
@@ -696,21 +740,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<InboxMessage>(&json).unwrap(), m);
     }
 
-    /// EVERY `#[tauri::command]` in this module must be `pub async fn`, because a sync Tauri command
-    /// runs on the MAIN THREAD and `concierge_tool` — every control read and write the concierge makes
-    /// — is a frontend round-trip that needs that thread's event loop to answer. `services/fleetWatch`
-    /// drives `inbox_status`/`inbox_claim_for_idle` on a ~10s beat, so a synchronous command here puts
-    /// recurring blocking disk I/O directly in front of the concierge's ability to see or talk to any
-    /// agent. The observed symptom of that starvation is `bridge request timeout: concierge_tool`.
+    /// The BATCH half of the traversal guard: `inbox_status` must refuse a whole batch, not serve the good
+    /// ids and drop the bad one, and must do it before the thread hop so a crafted id never occupies a
+    /// blocking-pool slot.
     ///
-    /// Asserted against this file's own SOURCE because there is no runtime handle to check: the defect
-    /// is a missing `async` keyword, invisible to every behavioural test, and it was the actual shape
-    /// of the original bug (all four commands shipped sync). A reviewer removing `async` to "simplify"
-    /// gets a red test naming the consequence instead of a control surface that goes dark under load.
-    /// `inbox_status` takes ids straight from concierge TOOL ARGUMENTS — LLM-controlled, not trusted UI
-    /// state — and was the one command that reached `messages_path`/`acks_path`/`claims_dir` without
-    /// validating. A traversal-shaped id resolved outside the inbox dir, and the returned counts made it
-    /// a probe for any `*.jsonl` file's existence and record shape.
+    /// Scoped deliberately: this covers all-or-nothing batch semantics ONLY. It exercises `validate_all`
+    /// in isolation, and `validate_all` is a loop over the pre-existing `validate_agent_id` — so on its
+    /// own it would pass against the code as it stood BEFORE the traversal was closed, which proves
+    /// nothing about the traversal. The test that proves the traversal is shut is
+    /// `the_read_sinks_refuse_a_traversal_id_and_read_nothing_outside_the_inbox_dir`, which asserts the
+    /// side effect (no file outside the inbox dir is read) instead of the validator.
     #[test]
     fn a_status_batch_containing_a_traversal_id_is_refused_whole() {
         // The positive control comes first: a legitimate batch must still pass, or this test would also
@@ -724,6 +763,61 @@ mod tests {
                 "a batch containing {bad:?} must be refused whole, not partly served"
             );
         }
+    }
+
+    /// The SINK half, and the one that actually proves the traversal is shut: a read sink handed a
+    /// traversal-shaped id must read NOTHING outside the inbox dir.
+    ///
+    /// Asserts the side effect, not the validator. The fixture plants a real, well-formed message at
+    /// exactly the path an UNGUARDED `status_of`/`pending` resolves to — one directory above the inbox
+    /// — so deleting either guard makes this test report the planted record instead of zero. That is
+    /// the property the command-layer check cannot carry on its own: it is one deletable line, and
+    /// both sinks are `pub` fns taking a bare `&str`.
+    #[test]
+    fn the_read_sinks_refuse_a_traversal_id_and_read_nothing_outside_the_inbox_dir() {
+        let base = tmp("escape");
+        let escaping = "../evil";
+        std::fs::create_dir_all(inbox_dir(&base)).unwrap();
+
+        let record = serde_json::to_string(&InboxMessage {
+            id: "leaked".into(),
+            ts: 1_000,
+            from: "somewhere-else".into(),
+            text: "a record from outside the inbox".into(),
+            severity: Severity::Fyi,
+        })
+        .unwrap();
+
+        // The plant lands where an unguarded read would look: `<base>/inbox/../evil.jsonl`.
+        let planted = messages_path(&base, escaping);
+        std::fs::write(&planted, format!("{record}\n")).unwrap();
+        assert_eq!(
+            planted.parent().unwrap().canonicalize().unwrap(),
+            base.canonicalize().unwrap(),
+            "the fixture must sit OUTSIDE the inbox dir or this test proves nothing"
+        );
+
+        // Positive control: those same bytes ARE readable through a legitimate id, so the zeros below
+        // are the guard refusing — not an unreadable fixture or a record that fails to parse.
+        std::fs::write(messages_path(&base, "a1"), format!("{record}\n")).unwrap();
+        assert_eq!(status_of(&base, "a1", 1_000).pending, 1, "fixture must be readable via a valid id");
+        assert_eq!(pending(&base, "a1", 1_000).len(), 1);
+
+        let s = status_of(&base, escaping, 1_000);
+        assert_eq!(
+            (s.pending, s.delivered, s.acknowledged, s.awaiting_ack),
+            (0, 0, 0, 0),
+            "status_of read {} — the counts are a probe for any *.jsonl on disk",
+            planted.display()
+        );
+        assert!(s.pending_ids.is_empty(), "leaked ids out of {}", planted.display());
+        assert!(
+            pending(&base, escaping, 1_000).is_empty(),
+            "pending read {}",
+            planted.display()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Scan Rust source for `#[tauri::command]` fns, returning `(total_commands, sync_signatures)`.
