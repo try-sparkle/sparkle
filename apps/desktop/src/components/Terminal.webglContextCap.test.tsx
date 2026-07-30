@@ -465,6 +465,13 @@ describe("when the WebGL canvas cannot be found", () => {
     const { rerender } = render(<Terminal {...baseProps} agentId="unlucky" active />);
     expect(isWebglCanvasUnfindable()).toBe(false);
 
+    // Declining to latch is only SAFE because the pane itself stops re-allocating. An addon has to
+    // be CONSTRUCTED before its canvas can be probed, and a construction we then cannot release
+    // strands a webgl2 context for the life of the process — so "we chose not to disable WebGL"
+    // must not silently mean "this pane leaks a context per activation instead". The latch
+    // assertion below cannot see that: it stays false either way. This is the direct bound.
+    const afterFirst = addonCtors.count;
+
     // ...not even across hide/show cycles. attachWebgl runs TWICE for a pane that mounts active
     // (mount effect + visibility effect) and again on every activation, so counting ATTACHES rather
     // than PANES would let this one pane spend the whole evidence budget on itself and disable
@@ -473,6 +480,8 @@ describe("when the WebGL canvas cannot be found", () => {
       rerender(<Terminal {...baseProps} agentId="unlucky" active={false} />);
       rerender(<Terminal {...baseProps} agentId="unlucky" active />);
       expect(isWebglCanvasUnfindable()).toBe(false);
+      // The per-instance probeFailedRef guard, not the process-wide latch, is what holds this line.
+      expect(addonCtors.count).toBe(afterFirst);
     }
 
     // ...and a pane that probes fine afterwards still gets WebGL.
@@ -482,7 +491,7 @@ describe("when the WebGL canvas cannot be found", () => {
     expect(addonCtors.count).toBe(1);
   });
 
-  it("does not accumulate evidence across a SUCCESSFUL probe — failures must be consecutive", () => {
+  it("does not arm the SYSTEMIC clause across a successful probe — those failures must be consecutive", () => {
     // A successful probe is direct proof this build puts its canvas where we look, refuting the
     // systemic hypothesis. Two unrelated blips separated by a working pane must not add up to a
     // permanent, session-wide disable.

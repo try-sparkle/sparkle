@@ -487,9 +487,13 @@ export function Terminal({
         teardownWebgl();
         return;
       }
-      // A successful probe refutes the "this build hides its canvas" hypothesis, so it clears any
-      // accumulated one-off failures — the latch should need CONSECUTIVE failures, not a lifetime
-      // tally.
+      // A successful probe refutes the "this build hides its canvas" hypothesis, so it clears that
+      // hypothesis's evidence — the distinct-agent and consecutive-failure tallies. It deliberately
+      // does NOT draw down the outstanding-leak estimate, and does NOT disarm a latch that has
+      // already armed: a working probe does not un-strand the contexts earlier failures leaked, nor
+      // undo a decision already taken. (That estimate decays on ELAPSED TIME, not on successes —
+      // successes accrue per hide/show while leaks accrue per pane, so counting them would key the
+      // decay to how fast the human switches agents. See the registry.)
       noteWebglCanvasFound();
       // THE FIX THAT MAKES CORRUPTED GLYPHS IMPOSSIBLE RATHER THAN MERELY RARER. Listen for
       // webglcontextlost ourselves and fall back within the same event dispatch, instead of waiting
