@@ -51,7 +51,13 @@ import {
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
-import { unbindsOnKey, unbindsOnPointerDown, type PairSide } from "../engine/cable";
+import {
+  clearsSelectionOnKey,
+  releaseStillArmed,
+  unbindsOnKey,
+  unbindsOnPointerDown,
+  type PairSide,
+} from "../engine/cable";
 import {
   pairCountFor,
   projectsOnSide,
@@ -650,29 +656,25 @@ export function Workspace() {
   const overlay = useCableStore((s) => s.overlay);
   const unbind = useCableStore((s) => s.unbind);
 
-  // UNBIND GESTURE 1 — ESCAPE returns the concierge to floating middle.
+  // UNBIND GESTURE 1 — ESCAPE — lives BELOW, with the pair resolution it needs.
   //
-  // On `window`, not the shell root, because the press that most needs to unbind is the one made
-  // while focus is inside a terminal or the compose box, and a root-level React handler only sees
-  // what bubbles through React's tree. NOT preventDefault'd and NOT stopped: Escape is a busy key,
-  // and unbinding is an additional meaning for it, not a claim on it. `unbindsOnKey` gates on
-  // `wired !== "off"`, so while nothing is patched this listener decides nothing at all.
-  //
-  // …AND ONLY WHEN NOTHING ELSE IS CLAIMING THE PRESS. Fifteen components treat Escape as "close
-  // me", and this listener is on `window`, so with a cable patched one Escape aimed at a modal
-  // also unbound — two state changes for one press (roborev 54697). `dismissibleOpen` asks the DOM
-  // whether such a surface is open rather than threading state from fifteen places; a dialog is
-  // identified the way it already identifies itself to assistive tech.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const dismissibleOpen =
-        document.querySelector('[role="dialog"], [role="menu"], [data-dismissible-open="true"]') !=
-        null;
-      if (unbindsOnKey(useCableStore.getState(), e.key, { dismissibleOpen })) unbind();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [unbind]);
+  // It is the odd one out in this block and the displacement is deliberate: Escape is now a
+  // two-step release whose SECOND step clears the active build row in each on-screen pair, so the
+  // listener has to see `leftProjectId`/`rightProjectId`, which are resolved further down this
+  // component. Find it beside them, under "ESCAPE — THE PROGRESSIVE RELEASE".
+
+  /** WHEN an Escape-release sequence was armed — i.e. when an Escape unwired the cable — or null.
+   *
+   *  This is what makes the second rung reachable ONLY by a second Escape, instead of by every
+   *  Escape pressed while nothing is patched (which is the app's default state — see the listener
+   *  below, and roborev 55373). A ref rather than state on purpose: nothing renders from it, and a
+   *  re-render between the two presses must not reset it.
+   *
+   *  A TIMESTAMP RATHER THAN A BOOLEAN, so the latch expires. It was a boolean, and the event-based
+   *  clears turned out not to cover the case the feature is most about: xterm cancels propagation on
+   *  every key it sends to the PTY, so a whole keyboard-only terminal session disarmed nothing
+   *  (roborev 55491). `engine/cable`'s `releaseStillArmed` reads it. */
+  const releaseArmedAtRef = useRef<number | null>(null);
 
   // UNBIND GESTURE 2 — clicking anywhere that is NOT a build agent row does the same thing.
   //
@@ -687,6 +689,13 @@ export function Workspace() {
   // the very cable the click just patched.
   useEffect(() => {
     const onDown = (e: PointerEvent) => {
+      // ANY pointer press ends an Escape-release sequence. Two reasons, and both matter: a press is
+      // the user moving on to something else, so a later Escape is a fresh press rather than "the
+      // second one"; and this gesture ALSO unbinds — arming from here would let a click-away make
+      // the next Escape blank the terminal column, which is the very over-reach the latch exists to
+      // prevent. Disarmed unconditionally, before the predicate, because a press that does NOT
+      // unbind (on the wired row, inside Sparkle) is just as much "the user moved on".
+      releaseArmedAtRef.current = null;
       if (unbindsOnPointerDown(useCableStore.getState(), e.target)) unbind();
     };
     window.addEventListener("pointerdown", onDown, true);
@@ -770,6 +779,144 @@ export function Workspace() {
   useEffect(() => {
     if (rightProjectId !== null && rightProjectId !== currentProjectId) selectProject(rightProjectId);
   }, [rightProjectId, currentProjectId, selectProject]);
+
+  // ── ESCAPE — THE PROGRESSIVE RELEASE ────────────────────────────────────────────────────────
+  //
+  // Founder's ask, in two sentences: *"pressing Escape once detaches the concierge from the build
+  // row"* — confirmed working — and *"pressing Escape AGAIN detaches the ACTIVE BUILD ROW itself.
+  // After the second Escape there is no active build row at all, and the terminal column shows
+  // nothing."* A third press does nothing rather than escalating further.
+  //
+  // ONE LISTENER, TWO RUNGS, AND RUNG 2 IS REACHABLE ONLY THROUGH RUNG 1.
+  //
+  // `releaseArmed` is the latch that makes that true, and it exists because the first version of
+  // this was WRONG in a way worth spelling out (roborev 55373). That version fired rung 2 whenever
+  // `wired === "off"`, reasoning that "not attached" means "the next thing to release is the row".
+  // But `wired === "off"` is `CABLE_REST` — the app's DEFAULT — so it does not mean "you already
+  // pressed Escape once", it means "no cable has ever been patched". Every Escape pressed anywhere,
+  // at any time, blanked the terminal column. Escape is the most common key in an agent terminal
+  // (vim, `less`, interrupting Claude Code) and `Terminal.tsx` lets it bubble, so the user would
+  // have deselected the very agent whose terminal they were typing in.
+  //
+  // So rung 2 now requires POSITIVE EVIDENCE that a release is under way: it fires only on an
+  // Escape that follows an Escape which actually unwired. That makes it strictly NARROWER than rung
+  // 1 — the safe direction, since rung 1's reach is behavior the founder has already confirmed.
+  //
+  // THE LATCH IS CLEARED BY ANYTHING THAT IS NOT THE SECOND HALF OF THE GESTURE: rung 2 firing (a
+  // third press finds it disarmed); any pointer press (the user moved on — and click-away unbinding
+  // must not arm a rung the keyboard did not); any keydown that is not Escape *and that reaches this
+  // listener*; and focus leaving the window. It also EXPIRES after RELEASE_ARM_WINDOW_MS.
+  //
+  // THAT LIST IS NOT EXHAUSTIVE AND MUST NOT BE READ AS SUCH — an earlier draft said it was, and the
+  // gap was the surface this whole feature is about (roborev 55491). xterm's handler ends in
+  // `CoreBrowserTerminal.cancel()`, which calls `preventDefault()` AND `stopPropagation()` for every
+  // key it turns into a PTY sequence, so ordinary typing in a focused terminal never reaches a
+  // `window` listener and clears nothing. A latch armed before an hour of keyboard-only work was
+  // still armed after it. The EXPIRY is what closes that, and it is deliberately a wall clock rather
+  // than one more event to subscribe to: it cannot be defeated by the next component that decides to
+  // cancel its own keydowns.
+  //
+  // AUTOREPEAT IS EXCLUDED SEPARATELY, at the top of the handler. A held Escape delivers a second
+  // keydown after the OS repeat delay, and that one is not a second decision by the user.
+  //
+  // RE-PATCHING THE CABLE IS *NOT* ON THAT LIST, and an earlier draft of this comment claimed it was
+  // (roborev 55478). Nothing clears the latch on patch: `releaseArmedAtRef` is local to this component
+  // and `cableStore.patch` never touches it. What actually keeps a stale latch harmless is the
+  // `wired === "off"` term inside `clearsSelectionOnKey` — while a cable is patched, rung 2 cannot
+  // fire at all, and the Escape that would unpatch it is rung 1. Patching by hand also goes through
+  // a row press, which disarms. Do not relax that `wired === "off"` term on the belief that a
+  // clear-on-patch is backing it up; there isn't one.
+  //
+  // WHY IT LISTENS ON `window`: the press that most needs to be heard is the one made while focus
+  // is inside a terminal or the compose box, and a root-level React handler only sees what bubbles
+  // through React's tree. NOT preventDefault'd and NOT stopped — Escape is a busy key, and this is
+  // an additional meaning for it, not a claim on it.
+  //
+  // …AND ONLY WHEN NOTHING ELSE IS CLAIMING THE PRESS. Fifteen components treat Escape as "close
+  // me", so with a cable patched one Escape aimed at a modal also unbound — two state changes for
+  // one press (roborev 54697). That hazard is strictly worse on the second rung: emptying the
+  // terminal column behind a dialog the user was only dismissing is a change they did not ask for
+  // and cannot see happen. Both rungs are gated on the same reading, and rung 2 additionally
+  // declines a press another handler has already claimed via `preventDefault` — several
+  // Escape-owning surfaces (SelectionPopup, PinnedPrompt, the version popover) carry no dialog role
+  // for the DOM probe to find, and `defaultPrevented` is the signal they do leave behind.
+  //
+  // BOTH PAIRS, NOT JUST THE CURRENT PROJECT. "No active build row AT ALL" is a statement about the
+  // cockpit, and the cockpit shows up to two pairs; clearing only `rightProjectId` would leave the
+  // left pair's row selected and its terminal populated, which is visibly not what was asked for.
+  // Projects that are not on screen are deliberately left alone — deselecting them would lose the
+  // user's place in a tab they never touched.
+  //
+  // THE VISUALS ARE NOT MINE. This wires the key handling and writes the state; how the cable, the
+  // flood and the connector look at each step belongs to the agent that owns the cockpit chrome.
+  useEffect(() => {
+    const disarm = () => {
+      releaseArmedAtRef.current = null;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      // AN AUTOREPEAT IS NOT A SECOND PRESS. Holding Escape a beat too long delivers keydown #2 after
+      // the OS repeat delay (~500ms, and configurable down to ~120ms on macOS); by then rung 1 has
+      // unwired, so `unbindsOnKey` is false and the repeat fell straight through to rung 2 and blanked
+      // the terminal column. Nothing could disarm in between, because the repeat IS an Escape
+      // (roborev 55491). Skipped before the branch below so a held non-Escape key does not churn the
+      // ref either. This is the one disarm rule that costs the user nothing at all.
+      if (e.repeat) return;
+      // ANY OTHER KEY ENDS THE SEQUENCE — this is what gives the latch a LIFETIME.
+      //
+      // Without it the latch was cleared only by a pointer press, so "the second Escape" was not the
+      // NEXT press, it was any later Escape, arbitrarily far away and in a different context: unwire
+      // the cable, then keep working from the keyboard alone (typing in the composer or a PTY clears
+      // nothing), and the next Escape — leaving insert mode in vim, dismissing `less`, interrupting
+      // Claude Code — blanked the terminal column. That is the same destructive outcome the latch
+      // exists to prevent, merely gated behind one earlier and unrelated press (roborev 55478).
+      //
+      // BARE MODIFIER PRESSES DISARM TOO, so tapping Shift between the two Escapes drops a release
+      // the user did intend. That is the FAIL-CLOSED direction and it is the one to be wrong in: the
+      // cost is pressing Escape once more, against emptying a terminal column nobody asked to empty.
+      if (e.key !== "Escape") {
+        releaseArmedAtRef.current = null;
+        return;
+      }
+      const dismissibleOpen =
+        document.querySelector('[role="dialog"], [role="menu"], [data-dismissible-open="true"]') !=
+        null;
+      const cable = useCableStore.getState();
+      // RUNG 1 — unwire the concierge from the row it is patched into, and ARM the second rung.
+      if (unbindsOnKey(cable, e.key, { dismissibleOpen })) {
+        unbind();
+        // ARM ONLY ON A PRESS NOBODY ELSE HAD ALREADY CLAIMED. Rung 2 declines a `defaultPrevented`
+        // press; arming had to as well, or an Escape claimed by one of the surfaces the DOM probe
+        // cannot see (SelectionPopup, PinnedPrompt, the version popover — no dialog role,
+        // `preventDefault` only) would unbind AND arm, and the user's next Escape at that same
+        // surface would clear the row. Unbinding still happens either way: rung 1's reach is
+        // behavior the founder has confirmed, and only the ARMING is new (roborev 55478).
+        releaseArmedAtRef.current = e.defaultPrevented ? null : Date.now();
+        return;
+      }
+      // RUNG 2 — clear the active build row itself, in every pair on screen.
+      const armed = releaseStillArmed(releaseArmedAtRef.current, Date.now()) && !e.defaultPrevented;
+      if (!clearsSelectionOnKey(cable, e.key, { dismissibleOpen, releaseArmed: armed })) return;
+      // DISARM FIRST. A third press must find nothing to do, and that promise should not rest on
+      // `selectAgent` happening to no-op on an unchanged selection — it should rest on this rung
+      // being unreachable again until the user re-patches and presses Escape afresh.
+      releaseArmedAtRef.current = null;
+      const { selectAgent } = useProjectStore.getState();
+      for (const id of [leftProjectId, rightProjectId]) {
+        if (id !== null) selectAgent(id, null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    // FOCUS LEAVING THE WINDOW ENDS THE SEQUENCE TOO. An Escape pressed after cmd-tabbing away and
+    // back is a fresh press, not the back half of a gesture begun before the user left — and the
+    // keydowns they made in the other app never reached this listener to disarm it.
+    window.addEventListener("blur", disarm);
+    document.addEventListener("visibilitychange", disarm);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", disarm);
+      document.removeEventListener("visibilitychange", disarm);
+    };
+  }, [unbind, leftProjectId, rightProjectId]);
 
   // The window is titled "Sparkle", full stop — NOT the selected project's name.
   //

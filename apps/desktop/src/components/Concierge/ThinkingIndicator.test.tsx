@@ -3,7 +3,7 @@
 // The thinking indicator. The founder asked for more than three dots; the constraint on "more" is
 // that every word of it be something the app OBSERVED. These tests are mostly about the cases where
 // it must say less: no turn, no activity, or activity that belongs to a different turn.
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -27,6 +27,26 @@ import {
   noteConciergeSettled,
 } from "../../services/conciergeLiveness";
 import { useProjectStore } from "../../stores/projectStore";
+import { AgentPillProvider } from "./AgentPill";
+import type { MentionAgent } from "./mentions";
+
+/** A real project + agent in the store, so the recorder's id→name lookup genuinely resolves.
+ *
+ *  Seeded through the STORE's own `addAgent` rather than hand-built, because the thing under test is
+ *  whether a spawn's reply resolves against the live roster — a fixture object would assert the
+ *  fixture. */
+function seedSpawn(): { projectId: string; agentId: string; storeName: string } {
+  const projectId = useProjectStore.getState().addProject("web", "/tmp/web");
+  const agentId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+  // The spawn-time placeholder the store mints ("Build 1"). Read rather than hard-coded: it is the
+  // very value this feature exists to stop anyone from quoting as identity, so a test that spelled
+  // it out would be asserting the placeholder it is trying to make irrelevant.
+  const storeName = useProjectStore
+    .getState()
+    .projects.find((p) => p.id === projectId)!
+    .agents.find((a) => a.id === agentId)!.name;
+  return { projectId, agentId, storeName };
+}
 
 beforeEach(() => {
   useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
@@ -241,5 +261,159 @@ describe("ThinkingIndicator — the wait", () => {
   it("keeps its original accessible name when nothing has happened yet", () => {
     render(<ThinkingIndicator typing />);
     expect(indicator()?.getAttribute("aria-label")).toBe("Sparkle is typing");
+  });
+});
+
+// ── THE SPAWN LINE IS A LIVE REFERENCE, NOT A NAME ─────────────────────────────────────────────
+//
+// The failure that produced this feature: the concierge said "Build 17" as plain text, and by the
+// time the founder read it the agent had renamed itself — so the name pointed at nothing they could
+// see, and was not clickable either. *"Build 17 is not the name of the agent right now … When you
+// tell me Build 17, that doesn't mean anything to me because I can't see it."*
+//
+// The fix is structural: the line carries an ID, and the renderer resolves it to the CURRENT name on
+// every render. These are about that resolution — above all the rename.
+describe("ThinkingIndicator — agent references", () => {
+  const rosterAgent = (over: Partial<MentionAgent> = {}): MentionAgent =>
+    ({
+      id: "a1",
+      name: "Build 17",
+      band: "running",
+      projectId: "p1",
+      projectName: "web",
+      ...over,
+    }) as MentionAgent;
+
+  /** Mount the way ConciergeColumn does — the thread wrapped in the pill roster — and hand back a
+   *  re-render that can swap the ROSTER, which is how a rename reaches the pill in production.
+   *
+   *  MOUNTED BEFORE ANY CALL IS RECORDED, deliberately: the indicator snapshots the activity counter
+   *  on the false→true edge and ignores anything at or below it, so a test that records first would
+   *  put its own call below the floor and assert on a line the component is right to suppress. */
+  function harness(agents: MentionAgent[], onOpenAgent: (t: never) => void = () => {}) {
+    const ui = (a: MentionAgent[]) => (
+      <AgentPillProvider
+        value={{ agents: a, onOpenAgent: onOpenAgent as (t: { agentId: string; projectId: string }) => void }}
+      >
+        <ThinkingIndicator typing />
+      </AgentPillProvider>
+    );
+    const r = render(ui(agents));
+    return { rerender: (a: MentionAgent[] = agents) => r.rerender(ui(a)) };
+  }
+
+  const pill = () => document.querySelector('[data-testid="concierge-agent-pill"]');
+  const inertPill = () => document.querySelector('[data-testid="concierge-agent-pill-inert"]');
+
+  it("says 'Starting a new agent' with no reference while the id does not exist yet", () => {
+    const h = harness([rosterAgent()]);
+    noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId: "p1" });
+    h.rerender();
+    expect(activityText()).toBe("Starting a new agent");
+    // Honest: there is genuinely nothing to open yet, so nothing pretends to be openable.
+    expect(pill()).toBeNull();
+    expect(inertPill()).toBeNull();
+  });
+
+  // ══ THE TEST THE WHOLE DESIGN EXISTS FOR ══════════════════════════════════════════════════════
+  // Render a reference, RENAME the agent, re-render, confirm the pill followed — in place, with no
+  // remount and nothing rewritten. This is what makes a reference written at any time still correct:
+  // the id never changes, the name may change freely.
+  it("follows a rename IN PLACE — the same pill, new words", () => {
+    const { projectId, agentId } = seedSpawn();
+    const h = harness([rosterAgent({ id: agentId, projectId, name: "Build 17" })]);
+    const settle = noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId });
+    settle(true, { agentId, projectId });
+    h.rerender();
+
+    expect(activityText()).toBe("Started @Build 17");
+    const first = pill();
+    expect(first).not.toBeNull();
+    expect(first?.getAttribute("data-agent-id")).toBe(agentId);
+
+    // The agent names itself after its work — which is what happens seconds after every spawn.
+    h.rerender([rosterAgent({ id: agentId, projectId, name: "Concierge Drag-Drop Fix" })]);
+
+    expect(activityText()).toBe("Started @Concierge Drag-Drop Fix");
+    // IN PLACE: the very same DOM node, re-lettered. A pill that unmounted and remounted would read
+    // identically to a human and would NOT be the "watch it rename" that was asked for — and it
+    // would prove nothing about the id binding, since a fresh node could equally have come from a
+    // rewritten line.
+    expect(pill()).toBe(first);
+    expect(pill()?.getAttribute("data-agent-id")).toBe(agentId);
+    // Nothing about the RECORDED line changed — only the roster did. That is the proof the reference
+    // is an id resolved at render time rather than a name captured when the call was made.
+    expect(first?.getAttribute("data-agent-id")).toBe(agentId);
+  });
+
+  it("clicks through to the agent the id names, carrying its project", () => {
+    const { projectId, agentId } = seedSpawn();
+    const onOpenAgent = vi.fn();
+    const h = harness([rosterAgent({ id: agentId, projectId })], onOpenAgent as never);
+    const settle = noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId });
+    settle(true, { agentId, projectId });
+    h.rerender();
+    expect(pill()).not.toBeNull();
+    fireEvent.click(pill()!);
+    expect(onOpenAgent).toHaveBeenCalledWith({ agentId, projectId });
+  });
+
+  // *"If the ID does not resolve — agent closed or discarded — render the reference as inert plain
+  // text with an indication it is gone. NEVER render a dead link, and never fall back to guessing a
+  // different agent."* Here the agent is gone from the STORE, so the line degrades to the indefinite
+  // noun before it ever reaches a pill — there is no name to draw one over.
+  it("degrades to indefinite words, with no pill at all, when the agent is gone", () => {
+    const h = harness([]);
+    const settle = noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId: "p1" });
+    settle(true, { agentId: "vanished", projectId: "p1" });
+    h.rerender();
+    expect(activityText()).toBe("Started a new agent");
+    expect(pill()).toBeNull();
+    expect(inertPill()).toBeNull();
+  });
+
+  // The agent existed when the call settled but has since left the ROSTER — closed while the line is
+  // still on screen. The pill is the inert form: named, explained, and not a dead link.
+  it("goes inert rather than dead when the agent leaves the roster mid-line", () => {
+    const { projectId, agentId, storeName } = seedSpawn();
+    const h = harness([rosterAgent({ id: agentId, projectId, name: "Build 17" })]);
+    const settle = noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId });
+    settle(true, { agentId, projectId });
+    h.rerender();
+    expect(pill()).not.toBeNull();
+
+    h.rerender([]); // the user closes it
+    expect(pill()).toBeNull();
+    expect(inertPill()).not.toBeNull();
+    // TWO NAME SOURCES, and this is where they separate. The LIVE pill showed the roster's name
+    // ("Build 17"); with the agent gone from the roster there is nothing live left to read, so the
+    // inert form falls back to the name the line was RECORDED with — the store's placeholder. That
+    // is the correct fallback: it is what the reader was already looking at a moment ago.
+    expect(inertPill()?.textContent).toBe(`@${storeName}`);
+  });
+
+  // A line whose subject is not an agent must never render a control: a pill built from a project id
+  // would open an agent that does not exist — or, worse, one that does.
+  it("renders a project subject as plain words", () => {
+    const projectId = useProjectStore.getState().addProject("web", "/tmp/web");
+    const h = harness([rosterAgent({ id: projectId })]);
+    noteConciergeToolCall("workspace", "select_project", { projectId });
+    h.rerender();
+    expect(activityText()).toBe("Switching to web");
+    expect(pill()).toBeNull();
+  });
+
+  // The sighted reader and the announced text must say the same thing — the accessible name is the
+  // plain sentence, pill or no pill.
+  it("announces the sentence in plain words even when it renders a control", () => {
+    const { projectId, agentId, storeName } = seedSpawn();
+    const h = harness([rosterAgent({ id: agentId, projectId, name: "Build 17" })]);
+    const settle = noteConciergeToolCall("lifecycle", "spawn_build_agent", { projectId });
+    settle(true, { agentId, projectId });
+    h.rerender();
+    // A complete sentence with no markup and no sigil — the announced text is the plain form of the
+    // line, which is the whole reason `text` is kept alongside the split pieces.
+    expect(indicator()?.getAttribute("aria-label")).toBe(`Started ${storeName}`);
+    expect(indicator()?.getAttribute("aria-live")).toBe("polite");
   });
 });

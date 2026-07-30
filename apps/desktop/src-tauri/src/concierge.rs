@@ -120,7 +120,18 @@ you. The app renders that link as a clickable pill the user taps to jump to the 
 name is a dead end for them. NEVER invent, guess, or reuse an id: if the agent you are naming is \
 not on the roster you were given, write its plain name with no link. A link that resolves to \
 nothing merely fails to open — a link carrying the WRONG id opens the wrong agent, which is far \
-worse.\n\n\
+worse. Write ONLY the agent's short name inside the link — not its task, not what it is doing.\n\n\
+THIS APPLIES HARDEST TO AN AGENT YOU JUST STARTED, because that is the case where a name is \
+guaranteed to go stale. `spawn_build_agent` replies with `agentId` and `provisionalName` (and \
+`nameIsProvisional: true`). The provisional name is a spawn-time placeholder like 'Build 17' that \
+the agent replaces within seconds by naming itself after its work, so quoting it as bare text tells \
+the user about a name that no longer exists anywhere on their screen — they cannot find it, and \
+they have to ask you which agent you meant. Announce a spawn as \
+[@Build 17](sparkle-agent:<agentId>) using the id from the reply. The pill re-reads the agent's \
+CURRENT name every time it is rendered, so it will show the placeholder at first and then rename \
+itself in front of the user as the agent settles on a real name — which is exactly the visibility \
+they want. The same rule makes an old message safe: a reference you wrote an hour ago still shows \
+whatever the agent is called now, so you never need to track or correct a rename.\n\n\
 REMEMBER HOW THEY WANT YOU TO TALK. When the user states a preference about YOUR OWN output — how \
 you write, what you lead with, what to stop doing — call `append_communication_guideline` with it \
 as one imperative sentence, and then tell them you saved it. Those rules are added to these \
@@ -1669,6 +1680,26 @@ mod tests {
         // A WRONG id opens the wrong agent, which is worse than no link at all — so the refusal to
         // guess is part of the contract, not advice.
         assert!(CONCIERGE_PERSONA.contains("NEVER invent, guess, or reuse an id"));
+        // The pill shows the agent's SHORT NAME and nothing else — a standing rule in the user's
+        // communication guidelines that kept being broken because the model was working from name
+        // strings rather than ids.
+        assert!(CONCIERGE_PERSONA.contains("not its task, not what it is doing"));
+    }
+
+    #[test]
+    fn persona_names_the_spawn_reply_fields_it_tells_the_model_to_use() {
+        // ══ A CROSS-LANGUAGE CONTRACT, ASSERTED BECAUSE NOTHING ELSE COULD CATCH IT ══════════════
+        // The spawn's reply is built in TypeScript (services/conciergeTools/lifecycle.ts) and read
+        // by a model following THIS string. Rename the field there and nothing fails: the persona
+        // keeps naming a key that no longer exists, and the model — told to use a field it cannot
+        // find — falls back to whatever prose it can, which is exactly the "Build 17" failure this
+        // work exists to end. There is no type system spanning the two, so this is the seam.
+        assert!(CONCIERGE_PERSONA.contains("provisionalName"));
+        assert!(CONCIERGE_PERSONA.contains("nameIsProvisional"));
+        // …and the REASON, not just the field name. A placeholder quoted as identity is stale within
+        // seconds, so the instruction has to say what to do instead: reference the id.
+        assert!(CONCIERGE_PERSONA.contains("spawn_build_agent"));
+        assert!(CONCIERGE_PERSONA.contains("sparkle-agent:<agentId>"));
     }
 
     #[test]

@@ -49,6 +49,7 @@ import {
   conciergeActivityLine,
   type ConciergeActivityIcon,
 } from "../../engine/conciergeActivityLine";
+import { AgentPill } from "./AgentPill";
 
 /** Feather glyphs, one per tool domain (no emoji as icons — house rule). Small and monochrome: this
  *  is a status line in a 360px column, not a badge. */
@@ -171,7 +172,25 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
           data-testid={THINKING_ACTIVITY_TESTID}
           style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
         >
-          {line.text}
+          {/* THE SUBJECT IS A LIVE CONTROL WHEN IT IS AN AGENT, not just words.
+              The founder's ask for a spawn: *"once you have the agent ID … that would render as a
+              pill so I would see it as Build 17 or whatever. And then as it renames, I would see it
+              rename."* `AgentPill` binds to the ID and re-reads the roster on every render, so the
+              rename lands IN PLACE here — no remount, nothing rewritten, the same pill changing its
+              own words. That works because this component already sits inside `AgentPillProvider`
+              (ConciergeColumn wraps ConciergeThread, which renders this): the roster arrives by
+              CONTEXT, and a context update reaches a consumer regardless of any memo above it.
+              Without a ref — an unresolved agent, or a subject that is a project or a PR — the line
+              renders exactly as it always did, as plain words. */}
+          {line.agentRef ? (
+            <>
+              {line.agentRef.before}
+              <AgentPill agentId={line.agentRef.agentId} fallbackName={line.agentRef.name} />
+              {line.agentRef.after}
+            </>
+          ) : (
+            line.text
+          )}
         </span>
       )}
       {elapsed && (

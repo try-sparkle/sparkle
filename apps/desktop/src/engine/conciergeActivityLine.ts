@@ -50,12 +50,33 @@ export interface ConciergeToolActivity {
   /** Monotonic, per app run. The indicator uses it to tell activity from THIS turn apart from a
    *  call left over from the last one — see ThinkingIndicator. */
   seq: number;
+  /** The subject's AGENT ID, when the subject is an agent that still resolves — null otherwise.
+   *
+   *  Carried BESIDE `subject` rather than replacing it, and the redundancy is the point: `subject`
+   *  is what the sentence says, and this is what a click would open. A line that has the name but
+   *  not the id is still a correct sentence; it simply cannot be a pill. Keeping them separate is
+   *  what stops the id from ever being rendered as words when resolution fails. */
+  agentId?: string | null;
 }
 
-/** The rendered line: a glyph family and one sentence. */
+/** The rendered line: a glyph family and one sentence.
+ *
+ *  `agentRef` is present only when the sentence names an agent the reader could open — the pieces
+ *  either side of the subject plus the name itself, so the component can draw a live pill where the
+ *  name goes without re-deriving the split (slicing it back out of `text` by offset is the same
+ *  answer arrived at fragilely). `text` is ALWAYS the complete plain sentence, including the name,
+ *  because it is what the screen reader is given and what a test can assert in one string. */
 export interface ConciergeActivityLine {
   icon: ConciergeActivityIcon;
   text: string;
+  agentRef?: {
+    agentId: string;
+    /** The name as it stood when the call was recorded. The pill re-resolves the id and prefers the
+     *  LIVE name; this is only what it falls back to if the agent has gone since. */
+    name: string;
+    before: string;
+    after: string;
+  };
 }
 
 /**
@@ -96,9 +117,24 @@ type WithoutSubject<T extends string> = T extends SubjectTemplate ? never : T;
  * bearing half: `P` is inferred from the intersection's first member, and the second collapses to
  * `never` for a template with `%s`, so the subject-less overload cannot accept one — leaving the
  * three-argument overload, which demands the noun.
+ *
+ * ══ THE TENSES ARE GUARDED INDEPENDENTLY, AND THAT IS NEW ═══════════════════════════════════════
+ * The first cut required BOTH tenses to carry `%s` or neither, which read as tidiness and was
+ * actually a constraint on meaning — it made the one phrase shape this feature needs
+ * unrepresentable. `spawn_build_agent` is the case: the call CREATES its own subject, so while it is
+ * in flight there is genuinely no agent to name ("Starting a new agent"), and only once it replies
+ * does an id exist to name one with ("Started @Kraken Auth"). A rule that forces a `%s` into the
+ * present tense too would have the column naming an agent that does not exist yet.
+ *
+ * So each tense is checked on its own, and the noun is demanded when EITHER carries a slot. The
+ * asymmetric shape stays honest at both ends: an unresolvable subject still degrades to "Started a
+ * new agent" rather than to "Started ".
  */
-function phrase<P extends string>(present: P & WithoutSubject<P>, past: string): OpPhrase;
-function phrase(present: SubjectTemplate, past: SubjectTemplate, indefinite: string): OpPhrase;
+function phrase<P extends string, Q extends string>(
+  present: P & WithoutSubject<P>,
+  past: Q & WithoutSubject<Q>,
+): OpPhrase;
+function phrase(present: string, past: string, indefinite: string): OpPhrase;
 function phrase(present: string, past: string, indefinite?: string): OpPhrase {
   return { present, past, indefinite };
 }
@@ -114,7 +150,18 @@ const PR = "the PR";
  *  describe is a typecheck failure rather than a silent fallback. Same technique the registry's
  *  route tables use, for the same reason. */
 const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
-  spawn_build_agent: phrase("Starting a new agent", "Started a new agent"),
+  // PROGRESSIVE DISCLOSURE, and the asymmetry between the two tenses is the whole feature.
+  //
+  // The founder's ask: *"once you have the agent ID, it would say starting agent 12345 except that
+  // would render as a pill so I would see it as Build 17 or whatever. And then as it renames, I
+  // would see it rename."* Before the reply lands there is no agent — the call is what creates it —
+  // so the present tense names nothing and says so. Once it lands, the id exists, the subject
+  // resolves through it (see `conciergeActivityResultSubject`), and the past tense hands the
+  // component a pill that tracks every later rename in place.
+  //
+  // `a new agent` is not decoration: a spawn that succeeds and is then closed before its own reply
+  // is rendered resolves to nothing, and "Started a new agent" is the true sentence for that.
+  spawn_build_agent: phrase("Starting a new agent", "Started %s", "a new agent"),
   spawn_cloud_build_agent: phrase("Starting a cloud agent", "Started a cloud agent"),
   preview_close: phrase("Checking what closing %s would do", "Checked what closing %s would do", AGENT),
   preview_discard: phrase("Checking what discarding %s would lose", "Checked what discarding %s would lose", AGENT),
@@ -262,6 +309,64 @@ export function conciergeActivitySubject(args: unknown): ConciergeActivitySubjec
 }
 
 /**
+ * The subject a call's REPLY names, for the ops whose subject does not exist until they return.
+ *
+ * ══ WHY THIS EXISTS AT ALL ══════════════════════════════════════════════════════════════════════
+ * `conciergeActivitySubject` reads the ARGUMENTS, which is right for every op that operates ON
+ * something: you cannot close an agent without naming it. A SPAWN is the one shape that inverts
+ * that — it is the call that brings the agent into existence, so its arguments cannot possibly
+ * carry the id, and its reply is the first moment the id exists anywhere.
+ *
+ * Without this the spawn line would take the only subject its args offer, the PROJECT, and the
+ * column would say "Started a new agent" forever — the exact failure that started this work: a line
+ * with no identity attached, which the reader cannot click and cannot follow as it takes on a name.
+ *
+ * ══ WHY IT IS A TABLE OF ONE AND NOT A HEURISTIC ════════════════════════════════════════════════
+ * "Read `data.agentId` off any reply that has one" is a shorter rule and a wrong one: plenty of ops
+ * echo the agent they acted on, and letting a reply RE-point the subject means an op whose args and
+ * reply disagree silently reports the reply's answer. Only an op that had no subject to begin with
+ * may learn one here, so this is keyed on the op that genuinely has that property, and every other
+ * call gets null and keeps the subject its arguments named.
+ *
+ * `data` is UNTRUSTED in shape (it crosses the registry's `unknown`-typed reply), so this validates
+ * rather than casts — a malformed reply resolves to null and the line degrades to the indefinite.
+ */
+export function conciergeActivityResultSubject(
+  domain: string,
+  op: string,
+  data: unknown,
+): ConciergeActivitySubject {
+  if (!learnsSubjectFromReply(domain, op)) return null;
+  if (!data || typeof data !== "object") return null;
+  const agentId = (data as Record<string, unknown>).agentId;
+  return typeof agentId === "string" && agentId ? { kind: "agent", agentId } : null;
+}
+
+/**
+ * Does this op take its subject from its REPLY rather than from its arguments?
+ *
+ * ══ WHY THIS IS SEPARATE FROM `conciergeActivityResultSubject` ══════════════════════════════════
+ * They answer different questions, and collapsing them produced a real bug (roborev 55373). The
+ * function above answers *"who does this reply name"* — and returns null both for an op that never
+ * learns from its reply AND for a spawn whose reply named someone the store cannot resolve. The
+ * recorder needs to tell those apart, because it must DISCARD the arguments' subject in the second
+ * case and KEEP it in the first.
+ *
+ * The concrete failure when it could not: a spawn's arguments are `{ projectId }`, which
+ * `conciergeActivitySubject` happily resolves to the PROJECT. With the past tense now `"Started
+ * %s"`, a successful spawn whose new agent had already been closed fell through to that leftover
+ * subject and rendered **"Started web"** — naming the project as though it were the agent that had
+ * just been created. The intended degradation, "Started a new agent", only held when the project
+ * ALSO failed to resolve, which is why an empty-store test could pass over it.
+ *
+ * So this asks about the OP alone, is answerable without a reply in hand, and is the one place the
+ * spawn's special status is written down.
+ */
+export function learnsSubjectFromReply(domain: string, op: string): boolean {
+  return domain === "lifecycle" && op === "spawn_build_agent";
+}
+
+/**
  * The line for one observed call, or null when there is nothing honest to say — an unknown DOMAIN,
  * which only happens for a malformed call the registry itself would refuse. The indicator falls
  * back to the plain pulse on null; a wrong sentence is worse than three dots.
@@ -296,13 +401,37 @@ export function conciergeActivityLine(
     return { icon: domain.icon, text: `${verb} ${activity.domain} · ${activity.op}` };
   }
   const template = activity.outcome === "done" ? phrase.past : phrase.present;
-  const filled = template.replace("%s", activity.subject ?? phrase.indefinite ?? "");
+  // SPLIT RATHER THAN `replace`, so the subject stays addressable.
+  //
+  // The sentence used to be built with a single `String.replace`, which is fine for words and
+  // useless for a CONTROL: the component has to draw a clickable pill exactly where the name goes,
+  // and a finished string offers no way to find that span again that isn't re-matching the name
+  // against its own output — which breaks the moment an agent is called something that also appears
+  // in the template. Splitting at the slot is the same sentence and keeps the seam.
+  const slot = template.indexOf("%s");
+  const before = slot < 0 ? template : template.slice(0, slot);
+  const after = slot < 0 ? "" : template.slice(slot + 2);
+  const subject = slot < 0 ? "" : (activity.subject ?? phrase.indefinite ?? "");
   // "Reading %s's terminal" → "Tried reading …". Every present phrase is a capitalised participle
   // (they are sentence openers), so lowering the first letter is all the frame needs — no second
   // table, and no op can be added that has a present tense but no attempt phrasing.
-  const text =
+  //
+  // Applied to the HEAD, not to the assembled sentence, which is what it used to be. Identical
+  // output for every template here (they all open with the participle, so only the head's first
+  // character is ever touched) — and strictly better for one that opened WITH the slot, where
+  // lowercasing the whole string would have de-capitalised the agent's own name.
+  const head =
     activity.outcome === "refused"
-      ? `Tried ${filled.charAt(0).toLowerCase()}${filled.slice(1)}`
-      : filled;
-  return { icon: domain.icon, text };
+      ? `Tried ${before.charAt(0).toLowerCase()}${before.slice(1)}`
+      : before;
+  const text = `${head}${subject}${after}`;
+  // A PILL ONLY WHEN ALL THREE ARE TRUE: the sentence has a slot, the subject is an agent, and it
+  // RESOLVED. The third is the one that matters — an unresolved subject has already degraded to the
+  // indefinite noun ("an agent"), and wrapping that in a pill would offer a click that opens
+  // nothing. No ref means the component renders plain words, which is the honest rendering.
+  const agentRef =
+    slot >= 0 && activity.agentId && activity.subject
+      ? { agentId: activity.agentId, name: activity.subject, before: head, after }
+      : undefined;
+  return agentRef ? { icon: domain.icon, text, agentRef } : { icon: domain.icon, text };
 }

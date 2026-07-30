@@ -103,6 +103,7 @@ import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { markProjectVisited, resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { RELEASE_ARM_WINDOW_MS } from "../engine/cable";
 import { openProjectTab } from "../services/openProjectTab";
 import type { AgentTab, Project } from "../types";
 
@@ -354,6 +355,242 @@ describe("unbinding", () => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
     expect(shell().getAttribute("data-wired")).toBe("off");
+  });
+});
+
+// ── 3b. ESCAPE IS A TWO-STEP RELEASE ──────────────────────────────────────────────────────────
+//
+// Founder: *"pressing Escape once detaches the concierge from the build row"* — that half already
+// worked — *"pressing Escape AGAIN detaches the ACTIVE BUILD ROW itself. After the second Escape
+// there is no active build row at all, and the terminal column shows nothing."* A third press does
+// nothing rather than escalating further.
+//
+// These drive REAL key events through the window listener and assert the store writes that follow.
+// The visual consequences of each step (the cable, the flood, the connector) belong to the agent
+// that owns the cockpit chrome; what is pinned here is the state machine underneath them.
+describe("Escape — the progressive release", () => {
+  const selectedAgent = () =>
+    useProjectStore.getState().projects.find((p) => p.id === "p1")?.selectedAgentId;
+  const escape = () => act(() => void fireEvent.keyDown(window, { key: "Escape" }));
+
+  it("first press unwires the concierge and LEAVES the row selected", () => {
+    render(<Workspace />);
+    patch("right");
+    expect(selectedAgent()).toBe("a1");
+    escape();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    // THE INTERMEDIATE STATE IS THE FEATURE. If one press did both, the user would never see the
+    // "detached but still looking at that agent" step they confirmed is exactly right.
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  it("second press clears the active build row, leaving nothing selected", () => {
+    render(<Workspace />);
+    patch("right");
+    escape();
+    escape();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    expect(selectedAgent()).toBeNull();
+  });
+
+  it("a third press does nothing rather than escalating further", () => {
+    render(<Workspace />);
+    patch("right");
+    escape();
+    escape();
+    const before = useProjectStore.getState().projects;
+    escape();
+    expect(selectedAgent()).toBeNull();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    // Not merely "still null": the store was not WRITTEN. `selectAgent` bails on a selection that
+    // already matches, so the third press churns no projects array and re-renders no pane. A
+    // reference-equality check is what makes "does nothing" mean nothing, rather than "does the
+    // same thing again harmlessly".
+    expect(useProjectStore.getState().projects).toBe(before);
+  });
+
+  // ══ THE REGRESSION THAT MADE ESCAPE DESTRUCTIVE EVERYWHERE (roborev 55373) ═══════════════════
+  // This case previously asserted the OPPOSITE — that an Escape with nothing patched clears the row
+  // — which encoded the bug as intended behavior and guaranteed the suite would never catch it.
+  //
+  // `wired === "off"` is the app's DEFAULT, not "you already pressed Escape once". So the old rule
+  // meant every Escape pressed anywhere, at any time, blanked the terminal column. Rung 2 now needs
+  // positive evidence that a release is under way, and cannot be reached without rung 1 firing.
+  it("does NOTHING on an Escape when no release is under way — the app's resting state", () => {
+    render(<Workspace />);
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    escape();
+    escape();
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // THE CASE THAT MADE IT DANGEROUS, asserted concretely. Escape is the most common key in an agent
+  // terminal — vim, `less`, interrupting Claude Code — and `Terminal.tsx`'s custom key handler
+  // claims only the composer chord and ⌘C, so it bubbles to the window listener. Under the old rule
+  // the user deselected the very agent whose terminal they were typing in, and watched it vanish.
+  it("leaves the row alone when Escape is typed into a terminal", () => {
+    render(<Workspace />);
+    act(() => {
+      fireEvent.keyDown(screen.getByTestId("terminal-stage"), { key: "Escape", bubbles: true });
+    });
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // A CLICK-AWAY UNBIND MUST NOT ARM RUNG 2. Clicking away is the other unbind gesture and reaches
+  // the same `wired: "off"`, so under the old rule the very next Escape — for any reason at all —
+  // cleared the row. The latch is set by the KEY path only.
+  it("does not arm the second rung when the cable was unbound by a click", () => {
+    render(<Workspace />);
+    patch("right");
+    act(() => {
+      fireEvent.pointerDown(shell());
+    });
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // A pointer press between the two Escapes means the user moved on, so the second press is a fresh
+  // first press rather than the back half of a gesture.
+  it("disarms when the user does anything else between the two presses", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — armed
+    act(() => {
+      fireEvent.pointerDown(screen.getByTestId("terminal-stage"));
+    });
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // ══ THE LATCH MUST MEAN "THE NEXT PRESS", NOT "ANY LATER ESCAPE" (roborev 55478) ═══════════════
+  //
+  // Cleared only by a POINTER press, the latch survived indefinitely across keyboard-only work — so
+  // an Escape typed into a PTY an hour later still blanked the terminal column. Note this is the case
+  // the earlier "Escape typed into a terminal" test could NOT catch: that one runs UNARMED, where
+  // rung 2 is unreachable for a different reason, so it only re-proved the 55373 revert.
+  it("leaves the row alone when Escape reaches a terminal AFTER a release was armed", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — armed
+    // Keyboard-only work: the user carries on typing. No pointer press ever happens.
+    act(() => {
+      fireEvent.keyDown(screen.getByTestId("terminal-stage"), { key: "j", bubbles: true });
+    });
+    act(() => {
+      fireEvent.keyDown(screen.getByTestId("terminal-stage"), { key: "Escape", bubbles: true });
+    });
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // ══ A HELD ESCAPE IS ONE PRESS, NOT TWO (roborev 55491) ═══════════════════════════════════════
+  // The OS delivers keydown #2 after the repeat delay (~500ms, configurable to ~120ms on macOS). By
+  // then rung 1 has unwired, so `unbindsOnKey` is false and the repeat fell straight through to rung
+  // 2 — and nothing could disarm in between, because the repeat IS an Escape.
+  it("ignores an autorepeat, so holding Escape does not walk both rungs", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — armed
+    act(() => void fireEvent.keyDown(window, { key: "Escape", repeat: true }));
+    expect(selectedAgent()).toBe("a1");
+    // And the latch SURVIVES the repeat it ignored — a repeat is not the user moving on, so the
+    // deliberate second press still completes the release.
+    escape();
+    expect(selectedAgent()).toBeNull();
+  });
+
+  it("disarms when focus leaves the window between the two presses", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — armed
+    act(() => void fireEvent.blur(window));
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // ══ THE STALE-LATCH CASE THE EVENT CLEARS CANNOT REACH (roborev 55491) ════════════════════════
+  // Typing in a focused terminal disarms NOTHING: xterm's handler ends in
+  // `CoreBrowserTerminal.cancel()`, which calls `preventDefault()` and `stopPropagation()` for every
+  // key it turns into a PTY sequence, so those keydowns never reach the `window` listener at all. No
+  // pointer press, no blur, no foreign keydown — the latch simply outlived the gesture, and the first
+  // Escape to arrive once focus fell outside the terminal cleared the row.
+  //
+  // The clock is mocked rather than the keyboard because the point is that NO event is required: the
+  // latch goes stale on its own. (Mocked only AFTER the arming press, so the render itself still runs
+  // on a real clock.)
+  //
+  // THE CLOCK IS FROZEN ACROSS BOTH PRESSES, and the first draft of these two rows was not — it
+  // anchored the mock to the time the mock was installed rather than to the arming press, so a couple
+  // of milliseconds of render overhead pushed the "within the window" case past the window and it
+  // failed only when the whole file ran. Pin `t0` once and step it deliberately.
+  function atFrozenClock(run: (advanceTo: (t: number) => void) => void) {
+    const t0 = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      run((offset) => void clock.mockReturnValue(t0 + offset));
+    } finally {
+      clock.mockRestore();
+    }
+  }
+
+  it("expires a stale latch, so a much later Escape cannot clear the row", () => {
+    render(<Workspace />);
+    patch("right");
+    atFrozenClock((advanceTo) => {
+      escape(); // rung 1 — armed at exactly t0
+      advanceTo(RELEASE_ARM_WINDOW_MS + 1);
+      escape();
+      expect(selectedAgent()).toBe("a1");
+    });
+  });
+
+  // The complement, so the expiry cannot pass by simply never arming: WITHIN the window it still
+  // fires. Without this row, setting RELEASE_ARM_WINDOW_MS to 0 would leave the suite green.
+  it("still completes the release when the second press is within the window", () => {
+    render(<Workspace />);
+    patch("right");
+    atFrozenClock((advanceTo) => {
+      escape();
+      advanceTo(RELEASE_ARM_WINDOW_MS - 1);
+      escape();
+      expect(selectedAgent()).toBeNull();
+    });
+  });
+
+  // ARMING IS GATED ON `defaultPrevented` TOO, not just rung 2. Several Escape-owning surfaces carry
+  // no dialog role for the DOM probe to find and only call `preventDefault`; under the first cut such
+  // a press unbound AND armed, so the user's NEXT Escape at that same surface cleared the row.
+  it("does not arm the second rung on a press another handler has already claimed", () => {
+    render(<Workspace />);
+    patch("right");
+    const claim = (e: KeyboardEvent) => {
+      if (e.key === "Escape") e.preventDefault();
+    };
+    window.addEventListener("keydown", claim, true);
+    escape(); // unbinds — rung 1's reach is confirmed behavior — but must NOT arm
+    window.removeEventListener("keydown", claim, true);
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // The 54697 hazard, one rung along and worse: emptying the terminal column behind a dialog the
+  // user was only dismissing is a change they did not ask for and cannot watch happen.
+  it("leaves the row alone while a dismissible surface owns the press", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — the release is now under way
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    document.body.appendChild(dialog);
+    escape(); // belongs to the dialog, not to the cockpit
+    expect(selectedAgent()).toBe("a1");
+    dialog.remove();
+    // The latch SURVIVES a press it declined — the user has not moved on, a modal merely
+    // intercepted one press. So the release completes on the next real Escape.
+    escape();
+    expect(selectedAgent()).toBeNull();
   });
 });
 

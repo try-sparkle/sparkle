@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   conciergeActivityLine,
+  conciergeActivityResultSubject,
   conciergeActivitySubject,
   type ConciergeToolActivity,
 } from "./conciergeActivityLine";
@@ -176,5 +177,139 @@ describe("conciergeActivitySubject", () => {
     expect(conciergeActivitySubject({ agentId: "" })).toBeNull();
     expect(conciergeActivitySubject({ number: Number.NaN })).toBeNull();
     expect(conciergeActivitySubject({ enabled: true })).toBeNull();
+  });
+});
+
+// ── THE SPAWN LINE — progressive disclosure ─────────────────────────────────────────────────────
+//
+// The founder's ask, and why it needed a new phrase shape: *"once you have the agent ID, it would
+// say starting agent 12345 except that would render as a pill so I would see it as Build 17 or
+// whatever. And then as it renames, I would see it rename."* A spawn is the one call that CREATES
+// its own subject, so the two tenses genuinely know different things.
+describe("the spawn line resolves from nameless to named", () => {
+  const spawning = (over: Partial<ConciergeToolActivity> = {}) =>
+    conciergeActivityLine(
+      activity({ domain: "lifecycle", op: "spawn_build_agent", subject: null, ...over }),
+    );
+
+  it("names nothing while the agent does not exist yet", () => {
+    // Honest, not lazy: the call is what brings the agent into being, so there is no id in the
+    // arguments and nothing truthful to point at. A `%s` in the present tense would have the column
+    // naming an agent that does not exist.
+    const line = spawning();
+    expect(line?.text).toBe("Starting a new agent");
+    expect(line?.agentRef).toBeUndefined();
+  });
+
+  it("names the agent — as a REFERENCE, not just words — once the id exists", () => {
+    const line = spawning({ outcome: "done", subject: "Build 17", agentId: "agent-7" });
+    expect(line?.text).toBe("Started Build 17");
+    // The half that makes it clickable and rename-proof. `before`/`after` bracket the name so the
+    // renderer can put a live control exactly where the words are, and `agentId` is what it binds
+    // to — never the name string.
+    expect(line?.agentRef).toEqual({
+      agentId: "agent-7",
+      name: "Build 17",
+      before: "Started ",
+      after: "",
+    });
+  });
+
+  // The degradation the founder was explicit about: *"NEVER render a dead link, and never fall back
+  // to guessing a different agent."* A spawn whose agent is closed before the reply is rendered
+  // resolves to nothing, and the line must be plain words — an inert sentence, not a pill over the
+  // word "agent" that opens nothing.
+  it("falls back to the indefinite noun, with NO reference, when the agent is gone", () => {
+    const line = spawning({ outcome: "done", subject: null, agentId: null });
+    expect(line?.text).toBe("Started a new agent");
+    expect(line?.agentRef).toBeUndefined();
+  });
+
+  // A refused spawn created nothing, so it stays on the present phrase — which carries no slot and
+  // therefore can carry no pill. The past tense here would claim an agent exists.
+  it("reports a refused spawn as an attempt that names nobody", () => {
+    const line = spawning({ outcome: "refused" });
+    expect(line?.text).toBe("Tried starting a new agent");
+    expect(line?.agentRef).toBeUndefined();
+  });
+
+  // An id with no resolved name is the "closed or discarded" case wearing a different hat, and it
+  // must not produce a pill either — the words beside it would be the indefinite noun.
+  it("refuses to build a reference from an id whose name did not resolve", () => {
+    expect(spawning({ outcome: "done", subject: null, agentId: "agent-7" })?.agentRef).toBeUndefined();
+  });
+});
+
+describe("agent references in every other line", () => {
+  // The mechanism is not spawn-specific: any op whose subject is a live agent becomes clickable.
+  it("brackets the subject so a mid-sentence name can be a pill", () => {
+    const line = conciergeActivityLine(
+      activity({ outcome: "done", subject: "Kraken Auth", agentId: "agent-7" }),
+    );
+    expect(line?.text).toBe("Read Kraken Auth's terminal");
+    expect(line?.agentRef).toEqual({
+      agentId: "agent-7",
+      name: "Kraken Auth",
+      before: "Read ",
+      after: "'s terminal",
+    });
+  });
+
+  // The "Tried …" frame lowercases the head only. Asserted because the frame used to be applied to
+  // the WHOLE assembled sentence — harmless for today's templates, and a name-mangler for any
+  // template that ever opens with its slot.
+  it("keeps the attempt frame on the head and never touches the agent's own name", () => {
+    const line = conciergeActivityLine(
+      activity({ outcome: "refused", subject: "Kraken Auth", agentId: "agent-7" }),
+    );
+    expect(line?.text).toBe("Tried reading Kraken Auth's terminal");
+    expect(line?.agentRef?.before).toBe("Tried reading ");
+  });
+
+  // A PROJECT or a PR fills the same slot and is emphatically NOT an agent. Handing either to the
+  // pill would open an agent whose id is a project id — the "wrong agent" failure the founder
+  // called far worse than no pill.
+  it("never builds an agent reference for a subject that is not an agent", () => {
+    const project = conciergeActivityLine(
+      activity({ domain: "workspace", op: "select_project", subject: "web", agentId: null }),
+    );
+    expect(project?.text).toBe("Switching to web");
+    expect(project?.agentRef).toBeUndefined();
+  });
+});
+
+describe("conciergeActivityResultSubject", () => {
+  it("reads the agent a spawn created out of its reply", () => {
+    expect(conciergeActivityResultSubject("lifecycle", "spawn_build_agent", { agentId: "a9" })).toEqual(
+      { kind: "agent", agentId: "a9" },
+    );
+  });
+
+  // THE RULE THAT KEEPS THIS FROM BECOMING A HEURISTIC. Plenty of replies echo the agent they acted
+  // on; letting any of them re-point the subject means an op whose args and reply disagree silently
+  // reports the reply's answer. Only the op that had no subject to begin with may learn one.
+  it("declines for every op that already knew its subject from its arguments", () => {
+    const others: [string, string][] = [
+      ["lifecycle", "close_agent"],
+      ["lifecycle", "ship_agent"],
+      ["lifecycle", "spawn_cloud_build_agent"],
+      ["terminal", "read_agent_terminal"],
+      ["workflow", "open_agent_pr"],
+    ];
+    for (const [domain, op] of others) {
+      expect(conciergeActivityResultSubject(domain, op, { agentId: "a9" })).toBeNull();
+    }
+  });
+
+  // `data` crosses the registry as `unknown` — it is whatever a handler returned. Nothing may throw.
+  it("returns null for a malformed reply rather than throwing", () => {
+    const spawn = (data: unknown) =>
+      conciergeActivityResultSubject("lifecycle", "spawn_build_agent", data);
+    expect(spawn(undefined)).toBeNull();
+    expect(spawn(null)).toBeNull();
+    expect(spawn("agent-7")).toBeNull();
+    expect(spawn({ agentId: 42 })).toBeNull();
+    expect(spawn({ agentId: "" })).toBeNull();
+    expect(spawn({})).toBeNull();
   });
 });

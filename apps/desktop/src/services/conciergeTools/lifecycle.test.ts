@@ -205,6 +205,33 @@ describe("spawnBuildAgent", () => {
     expect(useRuntimeStore.getState().openAgentIds).toContain(r.data.agentId);
   });
 
+  // ══ THE NAME IS PROVISIONAL, AND THE PAYLOAD SAYS SO ══════════════════════════════════════════
+  // This reply used to carry a plain `name`, and that one word produced a real failure: the
+  // concierge read it and told the founder "Build 17" — a spawn-time placeholder the agent had
+  // already replaced by the time they read it, so the name pointed at nothing on their screen.
+  // *"Build 17 is not the name of the agent right now … that doesn't mean anything to me because I
+  // can't see it."* The value is still useful to the model; what changed is that nothing downstream
+  // can now mistake it for identity.
+  it("returns the placeholder name as PROVISIONAL, never as the agent's identity", () => {
+    const pid = seedProject();
+    const r = spawnBuildAgent({ projectId: pid });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const live = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === pid)!
+      .agents.find((a) => a.id === r.data.agentId)!;
+    expect(r.data.provisionalName).toBe(live.name);
+    // Spelled out in the payload, not merely implied by the field name: the reply is read by a
+    // language model, and a flag it can see beats a convention it has to infer.
+    expect(r.data.nameIsProvisional).toBe(true);
+    // The field a caller would quote as identity is GONE, which is the half that actually prevents
+    // the failure — a rename that left `name` in place would have changed nothing.
+    expect("name" in r.data).toBe(false);
+    // The durable handle is still there, and it is what a reference must be built from.
+    expect(typeof r.data.agentId).toBe("string");
+  });
+
   it("refuses (typed) with no project open — nothing is created", () => {
     const r = spawnBuildAgent();
     expect(r.ok).toBe(false);

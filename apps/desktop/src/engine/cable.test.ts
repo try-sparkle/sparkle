@@ -7,6 +7,9 @@ import {
   BUILD_ROW_SELECTOR,
   CABLE_REST,
   isBuildAgentRow,
+  clearsSelectionOnKey,
+  releaseStillArmed,
+  RELEASE_ARM_WINDOW_MS,
   pairIsLive,
   patchCable,
   setOverlay,
@@ -160,6 +163,127 @@ describe("gestures", () => {
   // every row click.
   it("matches AgentSidebar's published accessibility structure", () => {
     expect(BUILD_ROW_SELECTOR).toBe('[data-agent-tree] [role="treeitem"]');
+  });
+});
+
+// ══ THE LATCH EXPIRES, BECAUSE THE EVENT-BASED CLEARS ARE NOT EXHAUSTIVE (roborev 55491) ═════════
+//
+// The consumer clears the latch on a pointer press, on a non-Escape keydown and on blur — none of
+// which fire while the user types into a focused terminal, because xterm's own handler ends in
+// `CoreBrowserTerminal.cancel()` and that calls `preventDefault()` AND `stopPropagation()` for every
+// key it turns into a PTY sequence. So a latch armed before an hour of keyboard-only work was still
+// armed after it, and the first Escape to arrive once focus fell outside the terminal blanked the
+// column — the same "arbitrarily far away, in a different context" defect, one surface along.
+//
+// A wall clock is the fix precisely BECAUSE it is not another event: no component can cancel it.
+describe("releaseStillArmed", () => {
+  it("is not armed when it was never armed", () => {
+    expect(releaseStillArmed(null, 1_000)).toBe(false);
+  });
+
+  it("stays armed across the deliberate double press", () => {
+    expect(releaseStillArmed(1_000, 1_000)).toBe(true);
+    expect(releaseStillArmed(1_000, 1_000 + RELEASE_ARM_WINDOW_MS)).toBe(true);
+  });
+
+  it("expires one millisecond past the window", () => {
+    expect(releaseStillArmed(1_000, 1_000 + RELEASE_ARM_WINDOW_MS + 1)).toBe(false);
+  });
+
+  // A latch stamped in the FUTURE means the clock moved backwards under us (NTP correction, a laptop
+  // waking with a corrected clock). The fail-closed reading is to decline the destructive rung — an
+  // unbounded `elapsed <= WINDOW` test would treat a far-future stamp as freshly armed forever.
+  it("declines a latch from the future rather than trusting it", () => {
+    expect(releaseStillArmed(10_000, 1_000)).toBe(false);
+  });
+});
+
+// ESCAPE IS A TWO-STEP RELEASE: first press unwires the concierge, second clears the active build
+// row. These are the rungs as pure predicates; Workspace.cockpit.test.tsx drives the real key
+// events through the listener and asserts the store writes that follow.
+describe("Escape — the progressive release", () => {
+  const wired: CableState = { wired: "right", overlay: "off" };
+
+  const armed = { releaseArmed: true };
+
+  it("does NOT clear the selection on the press that is still unwiring", () => {
+    // The whole point of two steps. If this were true while wired, ONE press would both unwire the
+    // concierge AND empty the terminal column — the user would never see the intermediate state
+    // they asked for, and the second press would have nothing left to do.
+    expect(clearsSelectionOnKey(wired, "Escape", armed)).toBe(false);
+  });
+
+  it("clears the selection on an Escape that follows the one which unwired", () => {
+    expect(clearsSelectionOnKey(CABLE_REST, "Escape", armed)).toBe(true);
+  });
+
+  // ══ THE REGRESSION THIS PREDICATE WAS REWRITTEN FOR (roborev 55373) ═══════════════════════════
+  // The first version was the exact complement of `unbindsOnKey` — fire whenever `wired === "off"`.
+  // That reads as elegant and is a serious bug: `wired === "off"` IS `CABLE_REST`, the app's
+  // DEFAULT. It does not mean "you already pressed Escape once", it means "no cable was ever
+  // patched". So every Escape anywhere in the app blanked the terminal column — including the most
+  // common key in an agent terminal (vim, `less`, interrupting Claude Code), which `Terminal.tsx`
+  // lets bubble straight to the window listener.
+  //
+  // Asserted against `CABLE_REST` BY NAME, not against a hand-built `{wired:"off"}`, so the test
+  // says out loud that the unarmed case is the resting state of the whole app.
+  it("is INERT at rest — an unarmed Escape must never clear the row", () => {
+    expect(clearsSelectionOnKey(CABLE_REST, "Escape")).toBe(false);
+    expect(clearsSelectionOnKey(CABLE_REST, "Escape", { releaseArmed: false })).toBe(false);
+  });
+
+  // The two rungs are deliberately NOT exhaustive, which is the opposite of what the first version
+  // claimed. An Escape claimed by NEITHER rung is the common case: it is what every Escape did
+  // before this feature existed, and what an Escape in a terminal must keep doing.
+  it("lets an ordinary Escape through untouched, claimed by neither rung", () => {
+    for (const state of [CABLE_REST, { wired: "off", overlay: "assist" }] as CableState[]) {
+      expect(unbindsOnKey(state, "Escape")).toBe(false);
+      expect(clearsSelectionOnKey(state, "Escape")).toBe(false);
+    }
+  });
+
+  // What DOES still hold: at most one rung per press, so a single Escape can never produce two
+  // releases. Checked armed AND unarmed, across every reachable cable state.
+  it("never lets both rungs claim the same press", () => {
+    for (const state of [
+      CABLE_REST,
+      { wired: "left", overlay: "off" },
+      { wired: "right", overlay: "off" },
+      { wired: "off", overlay: "assist" },
+      { wired: "left", overlay: "build" },
+    ] as CableState[]) {
+      for (const releaseArmed of [true, false]) {
+        const claims = [
+          unbindsOnKey(state, "Escape"),
+          clearsSelectionOnKey(state, "Escape", { releaseArmed }),
+        ].filter(Boolean).length;
+        expect(claims).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  // Arming can never RESURRECT rung 2 while a cable is patched — rung 1 owns that press, and a
+  // stale latch (armed, then re-patched without a pointer press to clear it) must not double-fire.
+  it("stays inert while wired, however it was armed", () => {
+    expect(clearsSelectionOnKey(wired, "Escape", armed)).toBe(false);
+    expect(clearsSelectionOnKey({ wired: "left", overlay: "build" }, "Escape", armed)).toBe(false);
+  });
+
+  // Same hazard as roborev 54697, one rung further along — and worse here. A press aimed at a modal
+  // that ALSO empties the terminal column behind it is a change the user did not ask for and cannot
+  // watch happen, because the dialog is covering the thing that changed.
+  it("leaves the row alone when a dismissible surface owns the press", () => {
+    expect(
+      clearsSelectionOnKey(CABLE_REST, "Escape", { releaseArmed: true, dismissibleOpen: true }),
+    ).toBe(false);
+    // …and then neither rung fires, which is the correct total for a press that belongs to a modal.
+    expect(unbindsOnKey(wired, "Escape", { dismissibleOpen: true })).toBe(false);
+  });
+
+  it("no other key clears the row", () => {
+    for (const k of ["Enter", "Tab", " ", "esc", "Esc", "a", "Backspace", "Delete"]) {
+      expect(clearsSelectionOnKey(CABLE_REST, k, armed)).toBe(false);
+    }
   });
 });
 

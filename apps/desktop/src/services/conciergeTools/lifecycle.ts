@@ -260,7 +260,17 @@ function isUnmerged(stage: WorkflowStageId): boolean {
 export interface SpawnedBuildAgent {
   agentId: string;
   projectId: string;
-  name: string;
+  /** The row's name RIGHT NOW — a spawn-time placeholder ("Build 17"), not the agent's identity.
+   *
+   *  It used to be called `name`, and that word cost a real failure: the concierge read it and told
+   *  the founder "Build 17", which auto-naming had already replaced by the time they read it — so
+   *  the name existed nowhere on their screen and they had to ask which agent was meant. The value
+   *  is still useful (it is what the row says before the first rename), but nothing may quote it as
+   *  identity. `agentId` is the durable handle, and a reference is built from that. */
+  provisionalName: string;
+  /** Always true — spelled out in the payload rather than left to the field name, because the reply
+   *  is read by a language model and a flag it can see beats a convention it must infer. */
+  nameIsProvisional: true;
   /** The capacity reading AFTER the spawn, so the concierge can say "that's 3 of 8". */
   capacity: CapacityReading;
   /** True when a brief was seeded with the spawn. Reported back so the caller can tell a briefed
@@ -416,7 +426,26 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
       "The project closed while I was starting the agent, so nothing was created.",
     );
   }
-  const name =
+  // ══ THE NAME IS PROVISIONAL, AND THE FIELD SAYS SO ════════════════════════════════════════════
+  //
+  // This used to come back as `name`, and that one word caused a real failure the founder had to
+  // stop and correct: the concierge, reading a field called `name`, told them *"Build 17"* — and by
+  // the time they read it the agent had auto-named itself something else, so the name it quoted did
+  // not exist anywhere in the UI and could not be found. Their words: *"Build 17 is not the name of
+  // the agent right now … When you tell me Build 17, that doesn't mean anything to me because I
+  // can't see it."*
+  //
+  // The value is a SPAWN-TIME PLACEHOLDER with a lifespan measured in seconds — auto-naming replaces
+  // it as soon as the agent has done enough to be named. So it is returned under a name that cannot
+  // be mistaken for identity, beside the field that IS identity. `agentId` is the durable handle;
+  // the persona's rule (concierge.rs) is to reference an agent as `[@Name](sparkle-agent:<id>)`,
+  // which the renderer resolves to whatever the agent is called at the moment it is READ.
+  //
+  // Kept rather than dropped because it is genuinely useful to the model — it is what the row says
+  // right now, so a reply written before the first rename is not blind — but nothing downstream
+  // should quote it as the agent's identity, and a field called `provisionalName` does not invite
+  // that the way `name` did.
+  const provisionalName =
     useProjectStore
       .getState()
       .projects.find((p) => p.id === project.id)
@@ -425,7 +454,10 @@ export function spawnBuildAgent(input: SpawnBuildAgentInput = {}): LifecycleResu
   return ok("spawn_build_agent", {
     agentId,
     projectId: project.id,
-    name,
+    provisionalName,
+    /** Spelled out in the payload, not only in this file's comments: the reply is read by a language
+     *  model, and a flag it can see is worth more than a naming convention it has to infer. */
+    nameIsProvisional: true,
     capacity: localAgentCapacity(),
     briefed: Boolean(input.prompt),
     mode: input.mode === "plan" ? "plan" : "build",

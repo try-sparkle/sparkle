@@ -159,6 +159,97 @@ export function unbindsOnKey(
   return key === "Escape" && state.wired !== "off" && !dismissibleOpen;
 }
 
+/** How long an armed release stays armed. See {@link releaseStillArmed}.
+ *
+ *  Sized to a DELIBERATE double press — long enough to press Escape, look at the screen, and press
+ *  again, short enough that it cannot outlive the gesture and surprise someone later. It is a
+ *  ceiling on how wrong a stale latch can be, not a target anyone should aim at. */
+export const RELEASE_ARM_WINDOW_MS = 5_000;
+
+/**
+ * Is a release armed at `armedAt` still live at `now`?
+ *
+ * `null` means never armed. A NEGATIVE delta also reads as not-armed: `Date.now()` can go backwards
+ * (NTP correction, the laptop waking with a corrected clock), and the fail-closed reading of "this
+ * latch is from the future" is to decline the destructive rung rather than to trust it.
+ */
+export function releaseStillArmed(armedAt: number | null, now: number): boolean {
+  if (armedAt === null) return false;
+  const elapsed = now - armedAt;
+  return elapsed >= 0 && elapsed <= RELEASE_ARM_WINDOW_MS;
+}
+
+/**
+ * Should this key clear the ACTIVE BUILD ROW — the second step of the progressive release?
+ *
+ * ESCAPE IS A TWO-STEP RELEASE, and the founder's ask names both steps precisely: *"pressing Escape
+ * once detaches the concierge from the build row"* — that is {@link unbindsOnKey} — and *"pressing
+ * Escape AGAIN detaches the ACTIVE BUILD ROW itself. After the second Escape there is no active
+ * build row at all, and the terminal column shows nothing."*
+ *
+ * ══ `releaseArmed` IS THE WHOLE SAFETY OF THIS, AND IT IS NOT OPTIONAL ══════════════════════════
+ * The first cut was the exact complement of `unbindsOnKey` — fire whenever `wired === "off"` — on
+ * the reasoning that "not attached" means "the next thing to release is the row". That reasoning is
+ * WRONG, and roborev 55373 caught it: `wired === "off"` is `CABLE_REST`, the app's **default**. It
+ * does not mean "you already pressed Escape once", it means "no cable has ever been patched". So
+ * that version made EVERY Escape pressed anywhere in the app, at any time, blank the terminal
+ * column — and Escape is the single most common key in an agent terminal (vim, `less`, interrupting
+ * Claude Code). `Terminal.tsx`'s `attachCustomKeyEventHandler` only claims the composer chord and
+ * ⌘C, so an Escape typed into a PTY bubbles straight to the `window` listener: the user would have
+ * deselected the very agent whose terminal they were typing in, and watched it vanish.
+ *
+ * The fix is to require POSITIVE EVIDENCE that a release sequence is under way, rather than
+ * inferring it from the absence of a cable. `releaseArmed` is that evidence, and the consumer sets
+ * it only when {@link unbindsOnKey} has actually fired — so rung 2 is reachable ONLY by pressing
+ * Escape a second time, and is strictly NARROWER than rung 1. That is the safe direction: rung 1's
+ * exposure is behavior the founder has already confirmed is right, and rung 2 must not exceed it.
+ *
+ * This is also why the two predicates are deliberately NOT exhaustive. An Escape that claims neither
+ * rung is the common case — it is what every Escape did before this feature existed, and it is what
+ * an Escape in a terminal must keep doing.
+ *
+ * A COUNTER IS STILL THE WRONG SHAPE, for the original reason: unbinding by CLICKING away
+ * (`unbindsOnPointerDown`) is not a keypress, so a count would drift from the cable's real state.
+ * `releaseArmed` is not a count — it is a latch, and the consumer clears it on rung 2 firing, on any
+ * pointer press, on any keydown that is not Escape *and that reaches `window`*, and when focus leaves
+ * the window. It does NOT clear on re-patch (this comment used to imply otherwise — roborev 55478);
+ * the `wired === "off"` term below is what makes a latch left standing across a patch harmless, so
+ * that term is load-bearing rather than merely a tidy complement of `unbindsOnKey`.
+ *
+ * ══ THE LATCH ALSO EXPIRES, BECAUSE THE KEYDOWN LIST ABOVE IS NOT ACTUALLY EXHAUSTIVE ════════════
+ * "Any keydown that is not Escape" sounds total and is not: xterm's own handler ends in
+ * `CoreBrowserTerminal.cancel()`, which calls `preventDefault()` AND `stopPropagation()` for every
+ * key it turns into a PTY sequence — all ordinary typing, arrows, Enter. Those presses never reach
+ * the `window` listener, so a latch armed before an hour of keyboard-only work in a focused terminal
+ * was still armed at the end of it, and the first Escape to arrive once focus fell back outside the
+ * terminal fired rung 2 (roborev 55491). That is the same "arbitrarily far away, in a different
+ * context" defect the latch was supposed to close, one surface along.
+ *
+ * {@link releaseStillArmed} is the answer, and the reason it is a WALL-CLOCK expiry rather than
+ * another event to listen for: it holds no matter which surface swallowed the intervening keys, so it
+ * cannot be defeated by the next component that decides to cancel its own keydowns.
+ *
+ * `dismissibleOpen` is honored for the SAME reason it is honored above: fifteen components treat
+ * Escape as "close me" and the consumer listens on `window`, so a press aimed at a modal must not
+ * also empty the terminal column behind it (roborev 54697's failure, one step further along).
+ *
+ * THE THIRD PRESS DOES NOTHING, and that is delivered by the consumer rather than by a third
+ * predicate here: the latch is cleared when rung 2 fires, so a third press finds it disarmed — and
+ * `selectAgent(projectId, null)` on an already-null selection is a documented no-op in projectStore
+ * even if it somehow got through. The founder asked that a third press "do nothing rather than
+ * escalating further"; the safest way to honour that is to have no third rung on the ladder at all.
+ */
+export function clearsSelectionOnKey(
+  state: CableState,
+  key: string,
+  {
+    dismissibleOpen = false,
+    releaseArmed = false,
+  }: { dismissibleOpen?: boolean; releaseArmed?: boolean } = {},
+): boolean {
+  return key === "Escape" && state.wired === "off" && releaseArmed && !dismissibleOpen;
+}
+
 /**
  * Does `pair` hold the live circuit?
  *

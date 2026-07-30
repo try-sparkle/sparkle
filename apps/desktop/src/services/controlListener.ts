@@ -1326,6 +1326,12 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
     message: "The call ended without producing a reply.",
   };
   let ok = false;
+  // The reply's `data`, kept for the indicator's settle. A SPAWN is the one call whose subject does
+  // not exist until it returns — it creates the agent it is about — so its id is here and nowhere
+  // else, and without carrying it the column could only ever say "Started a new agent": a line with
+  // no identity, which the reader cannot click and cannot watch take on a name. Every other op
+  // ignores this (see `conciergeActivityResultSubject`).
+  let okData: unknown;
   try {
     // Total by contract — it resolves to a reply for an unknown domain, bad args, or an internal
     // error, so nothing here needs a catch of its own (dispatch's outer one stays as the backstop).
@@ -1340,12 +1346,13 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       { policy: configuredToolPolicy },
     );
     ok = reply.ok === true;
+    if (reply.ok) okData = reply.data;
     auditReply = reply.ok
       ? { ok: true }
       : { ok: false, code: reply.code, message: reply.message };
     return reply;
   } finally {
-    settleActivity(ok);
+    settleActivity(ok, okData);
     settleAudit(auditReply);
   }
 }
