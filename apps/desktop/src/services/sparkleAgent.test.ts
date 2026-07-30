@@ -30,6 +30,8 @@ import {
   SPARKLE_AGENT_ID,
   type SubmitVerdict,
 } from "./sparkleAgent";
+import { retroEmissionProtocol } from "./buildAgent";
+import { RETRO_MARKER_TEMPLATE } from "./retroMarker";
 
 // A public user is read-only on the upstream repo, so the agent's last step — `gh pr create` —
 // simply cannot work for them. These tests pin the two rules that keeps honest: a blocked machine
@@ -228,6 +230,17 @@ describe("sparklePersona — consent branching", () => {
     expect(p).toContain("explicit go-ahead");
     expect(p).toContain("`gh pr create`");
   });
+
+  it.each(["always", "case_by_case", "never"] as const)(
+    "%s: ends with the structured retro + embeds the PR-body marker",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+      expect(p).toContain(retroEmissionProtocol());
+      expect(p).toContain("**SPARKLE IMPROVEMENTS:**");
+      expect(p).toContain(RETRO_MARKER_TEMPLATE);
+      expect(p).toContain("FINISHING A PASS");
+    },
+  );
 
   it.each(["always", "case_by_case", "never"] as const)(
     "%s: carries the dedupe gate so work already in flight isn't re-filed",

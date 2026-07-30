@@ -2,6 +2,12 @@
 // IC agent that owns exactly one task in its own worktree, then reports a structured result.
 // (The orchestrator/build persona is added in Plan 2.)
 
+import {
+  RETRO_MARKER_TEMPLATE,
+  RETRO_SEVERITY_SCALE_LINE,
+  RETRO_MAX_PAIN_POINTS,
+} from "./retroMarker";
+
 /** Path, relative to a worker's worktree, where it writes its structured result as its final act. */
 export const WORKER_RESULT_RELPATH = ".sparkle/result.json";
 
@@ -98,6 +104,58 @@ export function guardrailsProtocol(): string {
     "- Guard against regressions beyond correctness: when you touch shared or foundational code, run",
     "  the broader suite rather than just the nearest test, and stay alert to performance and stability",
     "  regressions, not only wrong answers.",
+  ].join("\n");
+}
+
+/** Shared persona block: the FROZEN retro emit contract every agent ends on. Two synchronized
+ *  copies — a human-readable retro in the founder's format, and a single-line
+ *  `<!-- sparkle:retro {json} -->` marker embedded in the PR body so the merge-time capture hook
+ *  can read it without parsing prose. Appended to the worker, orchestrator, and improvement-agent
+ *  personas so the structured retro REPLACES every ad-hoc free-form completion report. The TS
+ *  build/parse of the marker + the `Retro` type live in retroMarker.ts; the JSON Schema in
+ *  docs/schemas/worker-retro.schema.json. */
+export function retroEmissionProtocol(): string {
+  return [
+    "STRUCTURED RETRO — YOUR REQUIRED FINAL OUTPUT (this REPLACES any free-form completion report)",
+    "Your very last output is a retrospective in the founder's format below. Do NOT write an ad-hoc",
+    "prose summary instead — emit exactly this structure, filling in every <...>:",
+    "",
+    "  **TL;DR:** <one sentence: what you did and the headline outcome>",
+    "  **PERCENT COMPLETE:** <0-100>%",
+    "  **EST COMPLETION:** <whole minutes of work still needed to reach 100%; 0 if done>",
+    "  **MORE DETAILS:**",
+    "  - <bullet of narrative detail>",
+    "  - <bullet>",
+    "  **SPARKLE IMPROVEMENTS:**",
+    `  ${RETRO_SEVERITY_SCALE_LINE}`,
+    "  **AGENT ID:** <your PR number, branch name, and latest commit sha>",
+    "  **PAIN POINT:** <a friction / error / slow-path you hit doing this task>",
+    "  **SEVERITY:** <1-4 per the scale above>",
+    "  **RECOMMENDATION:** <the concrete fix: files/subsystem to touch, approach>",
+    "  **ADDITIONAL CONTEXT:** <optional extra evidence a future agent needs; omit if none>",
+    "",
+    "Rules for the SPARKLE IMPROVEMENTS section:",
+    "- Repeat the PAIN POINT / SEVERITY / RECOMMENDATION / ADDITIONAL CONTEXT block once per finding,",
+    `  ordered by SEVERITY highest-first, up to ${RETRO_MAX_PAIN_POINTS} blocks. Print the severity`,
+    "  scale line exactly once.",
+    "- Omit the pain-point blocks only if the task was genuinely frictionless; TL;DR, PERCENT",
+    "  COMPLETE, EST COMPLETION, and MORE DETAILS are ALWAYS required.",
+    "- Keep everything ANONYMIZED — no PII, secrets, raw log lines, or user/project paths.",
+    "",
+    "MACHINE-READABLE COPY — EMBED THE MARKER IN YOUR PR BODY",
+    "Whenever you open OR update a pull request, embed a single-line HTML-comment marker in the PR",
+    "BODY so the merge-time capture hook reads your retro without parsing prose:",
+    "",
+    `  ${RETRO_MARKER_TEMPLATE}`,
+    "",
+    "where {json} is ONE line of compact JSON with exactly these keys (mirroring the retro above):",
+    '  {"tldr":"...","percentComplete":<0-100>,"estCompletionMin":<minutes>,',
+    '   "details":["...", ...],',
+    '   "painPoints":[{"summary":"...","severity":<1-4>,"recommendation":"...",',
+    '                  "subsystem":"<optional>","context":"<optional>"}]}',
+    "- It MUST be exactly one line (no newlines inside the comment) and MUST NOT contain the",
+    "  sequence `-->`. Keep it in sync with the founder-format retro above.",
+    "- Same anonymization rule: the marker travels with the PR, so no PII, secrets, or raw log lines.",
   ].join("\n");
 }
 
@@ -269,16 +327,11 @@ export function workerPersona(opts: {
     '  { "schemaVersion": 1, "taskId": "<the id from the Task <id>: line of your first message>",',
     '    "branch": "<your git branch>", "status": "success" | "failed" | "partial",',
     '    "filesChanged": ["path", ...], "summary": "<one-paragraph what you did>",',
-    '    "notes": "<optional caveats / follow-ups>",',
-    '    "retro": { "tldr": "<1-2 anonymized sentences: what you built + the headline friction>",',
-    '      "painPoints": [ { "summary": "<a friction/error/slow-path you hit>", "severity": 1|2|3,',
-    '        "recommendation": "<the concrete fix>", "subsystem": "<coarse area, optional>" } ] } }',
-    "The `retro` key is OPTIONAL but expected: as the final act, capture the pain points from doing",
-    "this task — the friction, errors, wrong turns, and slow paths — each with a severity (1 minor .. 3",
-    "blocked/expensive/repeated) and a concrete recommendation. This is the retrospective humans have",
-    "been pasting into the tracker by hand; emitting it here closes that loop. Keep it ANONYMIZED — no",
-    "PII, secrets, or raw log lines. Omit `retro` entirely only if the task was genuinely frictionless.",
-    "Create the .sparkle directory if needed. Then stop.",
+    '    "notes": "<optional caveats / follow-ups>" }',
+    "Create the .sparkle directory if needed. This result.json is for the orchestrator's coordination",
+    "(status / summary / files), NOT your retrospective — your retro is the structured output below.",
+    "",
+    retroEmissionProtocol(),
     "",
     sparkleControlProtocol(),
     ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
@@ -421,10 +474,14 @@ export function orchestrationPersona(opts: {
     "- Backstop: `~/.config/roborev/claude-hooks/roborev-list-all.py` sweeps findings across ALL",
     "  branches — run it after the batch to confirm nothing was left orphaned before you report done.",
     "",
-    "REPORTING",
-    "- When all units are integrated AND landed, report the CONSOLIDATED outcome to the user: what",
-    "  each worker did, what merged cleanly, and the PR you merged to `main` — or, if the merge is",
-    "  still blocked on checks, exactly what it's waiting on so they know it's not done yet.",
+    "REPORTING — YOUR STRUCTURED RETRO IS THE FINAL WORD (not a free-form summary)",
+    "- When all units are integrated AND landed, report the CONSOLIDATED outcome as the structured",
+    "  retro below: what each worker did and the PR you merged to `main` go in TL;DR + MORE DETAILS,",
+    "  and every worker's friction rolls up into SPARKLE IMPROVEMENTS (fold in the pain points your",
+    "  workers reported in their own retros). If the merge is still blocked on checks, lower PERCENT",
+    "  COMPLETE and note what it's waiting on rather than claiming done.",
+    "",
+    retroEmissionProtocol(),
     "",
     KEYCHAIN_SAFETY_RULE,
     "",

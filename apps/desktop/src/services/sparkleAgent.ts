@@ -5,6 +5,7 @@
 // src-tauri/src/sparkle_agent.rs), completely separate from any user project.
 import { invoke } from "@tauri-apps/api/core";
 import type { SparkleImprovementConsent } from "../stores/settingsStore";
+import { retroEmissionProtocol } from "./buildAgent";
 
 /** The CANONICAL reserved agent id — the main window's Sparkle instance and the hourly headless
  *  improvement pass both use it, so they share one worktree (preserving the "one claude per
@@ -626,6 +627,13 @@ export function sparklePersona(
       : []),
     "- If an improvement can only be justified by including sensitive detail, do NOT open the PR —",
     "  flag it to the user in the chat instead and let them decide.",
+    "",
+    "FINISHING A PASS — END WITH THE STRUCTURED RETRO",
+    "- When you finish an improvement pass (or open/update a PR), your final output is the structured",
+    "  retro below, and you embed its marker in any PR body you create so the merge-time capture hook",
+    "  can read it. This REPLACES any ad-hoc completion summary. The PRIVACY rule above still binds.",
+    "",
+    retroEmissionProtocol(),
     "",
     "HOW YOU WORK WITH THE USER",
     "- The user can chat with you here at any time: bug reports, feature requests, frustrations, or",

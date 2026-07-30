@@ -9,7 +9,9 @@ import {
   sparkleControlProtocol,
   KEYCHAIN_SAFETY_RULE,
   WORKER_RESULT_RELPATH,
+  retroEmissionProtocol,
 } from "./buildAgent";
+import { RETRO_MARKER_TEMPLATE, RETRO_SEVERITY_SCALE_LINE } from "./retroMarker";
 
 describe("sparkleControlProtocol — name yourself early, but never in a turn of your own", () => {
   it("still demands rename_agent in the agent's FIRST tool-calling turn", () => {
@@ -236,17 +238,45 @@ describe("workerPersona", () => {
     expect(p).toContain("ai.sparkle.desktop");
     expect(p).toMatch(/never/i);
   });
-  it("asks the worker to emit an optional structured retro (pain points + severity + recommendation)", () => {
-    // The retro is the worker's own experience of the task, forwarded (via the capture hook) into
-    // the agent-feedback beads inbox that the Improvement Agent drains — the retro humans used to
-    // paste by hand. Optional so a frictionless task can omit it, but named in the FINISHING block.
-    expect(p).toContain('"retro"');
+  it("makes the structured founder-format retro + PR-body marker the required final output", () => {
+    // The retro REPLACES any free-form completion report. The human copy is the founder format;
+    // the machine copy is the single-line PR-body marker the merge-time capture hook reads. Both
+    // come from the shared retroEmissionProtocol(), so assert the block is present verbatim plus
+    // the load-bearing anchors a reader would eyeball.
+    expect(p).toContain(retroEmissionProtocol());
+    expect(p).toContain("**TL;DR:**");
+    expect(p).toContain("**PERCENT COMPLETE:**");
+    expect(p).toContain("**SPARKLE IMPROVEMENTS:**");
+    expect(p).toContain(RETRO_SEVERITY_SCALE_LINE);
+    expect(p).toContain(RETRO_MARKER_TEMPLATE);
     expect(p).toMatch(/painPoints/);
     expect(p).toMatch(/severity/);
-    expect(p).toMatch(/recommendation/);
-    expect(p).toMatch(/OPTIONAL/i);
     // Anonymized — the retro leaves the worktree, so it carries the same no-PII rule as everything else.
     expect(p).toMatch(/ANONYMIZED|no.*PII/i);
+  });
+});
+
+describe("retroEmissionProtocol — the frozen retro emit contract, shared across personas", () => {
+  const r = retroEmissionProtocol();
+  it("prints the founder format, the severity scale once, and the PR-body marker template", () => {
+    for (const anchor of [
+      "**TL;DR:**",
+      "**PERCENT COMPLETE:**",
+      "**EST COMPLETION:**",
+      "**MORE DETAILS:**",
+      "**SPARKLE IMPROVEMENTS:**",
+      "**AGENT ID:**",
+      "**PAIN POINT:**",
+      "**SEVERITY:**",
+      "**RECOMMENDATION:**",
+      "**ADDITIONAL CONTEXT:**",
+    ]) {
+      expect(r).toContain(anchor);
+    }
+    expect(r.split(RETRO_SEVERITY_SCALE_LINE)).toHaveLength(2); // scale line printed exactly once
+    expect(r).toContain(RETRO_MARKER_TEMPLATE);
+    expect(r).toMatch(/REPLACES any free-form completion report/);
+    expect(r).toMatch(/ANONYMIZED|no PII/);
   });
 });
 
@@ -355,6 +385,14 @@ describe("orchestrationPersona", () => {
   it("tells it to spin_down_worker after merging and to report the consolidated outcome", () => {
     expect(p).toContain("spin_down_worker");
     expect(p).toMatch(/report|consolidated/i);
+  });
+
+  it("ends the report as the structured retro + embeds the PR-body marker", () => {
+    // The orchestrator is the agent that opens the landing PR, so the machine-readable marker rides
+    // on its PR body; the human copy is the founder-format retro. Both come from the shared block.
+    expect(p).toContain(retroEmissionProtocol());
+    expect(p).toContain("**SPARKLE IMPROVEMENTS:**");
+    expect(p).toContain(RETRO_MARKER_TEMPLATE);
   });
 
   it("makes it drain roborev findings on each worker branch BEFORE spinning the worker down", () => {
