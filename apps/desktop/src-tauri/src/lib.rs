@@ -85,6 +85,7 @@ mod worktree;
 mod notes;
 mod concierge;
 mod concierge_guidelines;
+mod concierge_lint_log;
 
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
@@ -307,6 +308,27 @@ pub fn run() {
                         ),
                         Ok(_) => tracing::debug!("inbox retention: nothing to reap"),
                         Err(e) => tracing::warn!("inbox retention failed: {e}"),
+                    }
+                    // Size-cap the concierge linter's violation log (concierge_lint_log.rs).
+                    // TRUNCATE-ONLY, never deleted: it is the count that says whether the linter is
+                    // working, and deleting it would read as "nothing left to fix". Rides this
+                    // thread rather than getting its own — same stat-a-file work, and it must stay
+                    // off the launch path for the same reason.
+                    match retention::reap_concierge_lint_log(
+                        // Through the module's own resolver, NOT base.join(LINT_LOG_FILE) (roborev
+                        // 55779): two independent constructions of one path can silently
+                        // diverge, and the failure is invisible — a moved file makes plain_file
+                        // return None, the reap returns default stats, and the "under the cap"
+                        // debug line reports healthy while the cap has stopped existing.
+                        &concierge_lint_log::lint_log_path(&base),
+                        retention::ConciergeLintPolicy::default(),
+                    ) {
+                        Ok(s) if s.truncated > 0 => tracing::info!(
+                            kb_freed = s.bytes_freed / 1024,
+                            "concierge lint log tail-truncated"
+                        ),
+                        Ok(_) => tracing::debug!("concierge lint log: under the cap"),
+                        Err(e) => tracing::warn!("concierge lint log retention failed: {e}"),
                     }
                 });
             }
@@ -725,6 +747,10 @@ pub fn run() {
             concierge_guidelines::write_concierge_guidelines,
             concierge_guidelines::append_concierge_guideline,
             concierge_guidelines::concierge_guidelines_path,
+            // The reply linter's violation log. METADATA ONLY (never reply text, never the matched
+            // span) — the constraint `services/conciergeAudit.ts` established for concierge text on
+            // disk. Returns `()`: logging a violation must never be able to fail the reply path.
+            concierge_lint_log::concierge_lint_log,
             delivery::collect_delivery_evidence,
             delivery::tag_contains_commit,
             roster::publish_window_roster,

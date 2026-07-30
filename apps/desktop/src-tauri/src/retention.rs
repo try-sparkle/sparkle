@@ -1,6 +1,7 @@
 //! Disk retention for the directories Sparkle grows without any upper bound.
 //!
-//! All three were unbounded by construction:
+//! Three of the four were unbounded by construction (the fourth, the concierge lint log, is bounded
+//! here from the start rather than retrofitted):
 //!   - `<app_data>/hook-events/` — one `<agentId>.jsonl` per agent, appended to forever by
 //!     `resources/sparkle-hook.mjs`. Never reaped: 606 files / 107 MB, oldest 3+ weeks old.
 //!   - `<app_log_dir>/` — `tracing_appender::rolling::daily` rotates but never deletes:
@@ -11,6 +12,12 @@
 //!     spun-down worker's queue and claims directory persisted forever with nobody left to drain
 //!     them. The store lives outside the worktree so it SURVIVES spin-down; "survives" was never
 //!     meant to be "unbounded".
+//!   - `<app_data>/concierge-lint.jsonl` — the concierge reply linter's violation log
+//!     (`concierge_lint_log.rs`), appended to once per violation for the life of the install.
+//!     UNLIKE the other three it is TRUNCATE-ONLY and is never deleted: it is the count that says
+//!     whether the linter is working, and deleting it would read as "nothing left to fix". See
+//!     `ConciergeLintPolicy` and section (4) — do not "tidy" it into the log-directory deletion
+//!     path it currently sits next to.
 //!
 //! DELETION SAFETY is the whole design constraint here, because this code removes user files:
 //!   - Every function takes the directory to operate on as an argument and only ever considers
@@ -21,6 +28,10 @@
 //!     `sparkle.log` prefix for logs). Anything else the user put there is left alone.
 //!   - A hook-event log whose agent worktree still EXISTS is never deleted — only size-capped.
 //!   - The newest log files are never deleted, so the file being written right now is safe.
+//!   - The concierge lint log is never DELETED at all, only tail-truncated — and it is addressed as
+//!     a single file path rather than a directory scan, so no shape-matching applies. `plain_file`
+//!     still refuses a symlink there, so a link planted at that name cannot have its target
+//!     rewritten by the truncation.
 //!
 //! Nothing here touches `<app_data>/worktrees/` beyond READING the directory listing to learn
 //! which agent ids are still live. Worktrees are live agent workspaces (~54 GB of in-flight work,
@@ -82,6 +93,31 @@ impl Default for InboxPolicy {
             orphan_max_age: Duration::from_secs(7 * 24 * 60 * 60),
             max_records_per_file: 10 * crate::inbox::MAX_PER_AGENT,
         }
+    }
+}
+
+/// Retention rules for `<app_data>/concierge-lint.jsonl` (see `concierge_lint_log.rs`).
+///
+/// TRUNCATE-ONLY, deliberately: there is no orphan or age arm here the way there is for
+/// `HookEventsPolicy`. That file's records belong to a specific agent, so "the agent is gone and the
+/// log is old" is a real reason to delete. This one is a single install-wide COUNT over time — the
+/// number the human looks at to decide whether the linter is working — and deleting it resets that
+/// number to zero, which reads as "the linter fixed everything." Tail-truncating loses the oldest
+/// history and keeps the recent shape, which is the answer the report is actually asked for.
+#[derive(Clone, Copy, Debug)]
+pub struct ConciergeLintPolicy {
+    /// Above this, the log gets tail-truncated.
+    pub max_file_bytes: u64,
+    /// How much of the tail to keep when truncating. Must be < `max_file_bytes`.
+    pub keep_bytes: u64,
+}
+
+impl Default for ConciergeLintPolicy {
+    fn default() -> Self {
+        // A violation record is ~110 bytes, so 2 MiB is on the order of 19k violations and the
+        // retained tail is ~4.7k — many months of history at any plausible rate, and small enough
+        // that the report script reads the whole file without thinking about it.
+        Self { max_file_bytes: 2 * 1024 * 1024, keep_bytes: 512 * 1024 }
     }
 }
 
@@ -807,6 +843,55 @@ pub fn prune_logs(
         }
     }
 
+    Ok(stats)
+}
+
+/// Size-cap `<app_data>/concierge-lint.jsonl`, the concierge linter's violation log.
+///
+/// NEVER DELETES. A log over `max_file_bytes` is tail-truncated to `keep_bytes` of whole lines; a
+/// log under the cap is left byte-for-byte alone. See `ConciergeLintPolicy` for why deletion is not
+/// on the table here even though it is for `hook-events`.
+///
+/// Same deletion-safety posture as the rest of this module even though nothing is unlinked: the
+/// path is taken as an argument, and `plain_file` refuses symlinks — so a symlink planted at that
+/// name cannot get its target rewritten by the truncation.
+// ---------------------------------------------------------------------------
+// (4) concierge lint log retention
+// ---------------------------------------------------------------------------
+//
+// TRUNCATE-ONLY. This section exists separately from (3) precisely because (3)'s policy — age plus
+// total-size DELETION — is the opposite of this one's contract, and a merge once left this function
+// sitting under that banner with no section of its own (roborev 55779).
+
+pub fn reap_concierge_lint_log(
+    log_path: &Path,
+    policy: ConciergeLintPolicy,
+) -> Result<ReapStats, String> {
+    let mut stats = ReapStats::default();
+    let Some((size, _mtime)) = plain_file(log_path) else {
+        // Absent (no violation ever logged), a directory, a symlink, or unstattable. Not an error —
+        // a fresh install has no such file and the sweep runs on every launch.
+        return Ok(stats);
+    };
+    if size <= policy.max_file_bytes {
+        return Ok(stats);
+    }
+    // Same invariant as HookEventsPolicy: keep_bytes >= max_file_bytes makes `truncate_to_tail`'s
+    // early return always fire, so the cap silently stops existing.
+    debug_assert!(
+        policy.keep_bytes < policy.max_file_bytes,
+        "ConciergeLintPolicy invariant violated: keep_bytes ({}) must be < max_file_bytes ({})",
+        policy.keep_bytes,
+        policy.max_file_bytes
+    );
+    match truncate_to_tail(log_path, policy.keep_bytes) {
+        Ok(freed) if freed > 0 => {
+            stats.truncated += 1;
+            stats.bytes_freed += freed;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(path = %log_path.display(), "rotate concierge lint log failed: {e}"),
+    }
     Ok(stats)
 }
 
@@ -1783,5 +1868,93 @@ mod tests {
         let root = tmpdir("nologdir");
         let stats = prune_logs(&root.join("nope"), "sparkle.log", LogPolicy::default(), SystemTime::now()).unwrap();
         assert_eq!(stats, ReapStats::default());
+    }
+
+    // -- concierge lint log retention -------------------------------------
+
+    /// Write `n` violation records shaped exactly like `concierge_lint_log.rs` emits, numbered so
+    /// the test can prove WHICH end of the file survived.
+    fn write_violations(path: &Path, n: usize) {
+        let mut buf = String::new();
+        for i in 0..n {
+            buf.push_str(&format!(
+                "{{\"ts\":{},\"turn\":\"{i}\",\"check\":\"relay-paste\",\"severity\":\"block\",\"action\":\"revised\",\"count\":1,\"span\":412}}\n",
+                1_769_649_600_000u64 + i as u64
+            ));
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn truncates_an_oversized_lint_log_keeping_the_most_recent_violations() {
+        // THE SIDE EFFECT: the file shrinks under the cap, every retained record is whole, and the
+        // records that survive are the NEWEST — a truncation that kept the head would silently
+        // freeze the number the human is watching.
+        let root = tmpdir("lintlog-rotate");
+        let log = root.join("concierge-lint.jsonl");
+        let policy = ConciergeLintPolicy { max_file_bytes: 4096, keep_bytes: 1024 };
+        write_violations(&log, 400);
+        let before = std::fs::read_to_string(&log).unwrap();
+        let last_line = before.trim_end().lines().last().unwrap().to_string();
+        let first_line = before.lines().next().unwrap().to_string();
+
+        let stats = reap_concierge_lint_log(&log, policy).unwrap();
+
+        assert_eq!(stats.truncated, 1);
+        assert_eq!(stats.deleted, 0, "the violation log is never deleted, only capped");
+        let after = std::fs::read_to_string(&log).unwrap();
+        assert!(after.len() as u64 <= policy.keep_bytes, "capped to keep_bytes");
+        assert!(!after.is_empty(), "recent history survives");
+        for line in after.lines() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("retained a partial record {line:?}: {e}"));
+        }
+        assert_eq!(after.trim_end().lines().last().unwrap(), last_line, "newest kept");
+        assert!(!after.contains(&first_line), "oldest dropped");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lint_log_under_the_cap_is_left_byte_for_byte_intact() {
+        let root = tmpdir("lintlog-undercap");
+        let log = root.join("concierge-lint.jsonl");
+        write_violations(&log, 5);
+        let before = std::fs::read(&log).unwrap();
+
+        let stats = reap_concierge_lint_log(&log, ConciergeLintPolicy::default()).unwrap();
+
+        assert_eq!(stats, ReapStats::default());
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_lint_log_is_not_an_error() {
+        // The common case on a fresh install, and the sweep runs on every launch.
+        let root = tmpdir("lintlog-missing");
+        let stats =
+            reap_concierge_lint_log(&root.join("concierge-lint.jsonl"), ConciergeLintPolicy::default())
+                .unwrap();
+        assert_eq!(stats, ReapStats::default());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_lint_log_reap_skips_a_symlink() {
+        // A symlink at that name must not get its TARGET rewritten by the truncation.
+        let root = tmpdir("lintlog-symlink");
+        let outside = root.join("precious.jsonl");
+        write_violations(&outside, 400);
+        let before = std::fs::read(&outside).unwrap();
+        let planted = root.join("concierge-lint.jsonl");
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+
+        let stats =
+            reap_concierge_lint_log(&planted, ConciergeLintPolicy { max_file_bytes: 1, keep_bytes: 0 })
+                .unwrap();
+
+        assert_eq!(stats, ReapStats::default());
+        assert_eq!(std::fs::read(&outside).unwrap(), before, "the target is untouched");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

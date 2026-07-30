@@ -32,12 +32,30 @@ export interface ConciergeDeltaEvent {
   text: string;
 }
 
+/** One tool call the concierge made during the turn: the tool `name` and its FULL arguments,
+ *  as `serde_json`'s compact serialization of the call's `input` (`"{}"` when it had none).
+ *
+ *  A string, not a parsed object, because the consumer scans it for verbatim overlap with the
+ *  reply rather than navigating it — and because a very large payload is truncated at capture
+ *  (Rust: `MAX_TOOL_USE_INPUT_CHARS`), which leaves it valid text but not necessarily valid JSON.
+ *  Do not `JSON.parse` it without guarding.
+ *
+ *  This is deliberately NOT `conciergeAudit.ts`'s record of the same calls: that store truncates
+ *  every argument value at 220 characters, far below the length of a relayed message, so it cannot
+ *  answer "did the reply paste back the text we sent?". */
+export interface ConciergeToolCall {
+  name: string;
+  input: string;
+}
+
 /** Final reply for the turn `id` (`concierge:done`). `sessionId` is the Claude Code session to
- *  resume next turn — the manager stores it automatically. */
+ *  resume next turn — the manager stores it automatically. `toolCalls` is what the turn actually
+ *  SENT, correlated to this reply by construction (Rust captures both from the one stream parse). */
 export interface ConciergeDoneEvent {
   id: string;
   sessionId: string;
   text: string;
+  toolCalls: ConciergeToolCall[];
 }
 
 /** A failed turn (`concierge:error`). `detail` is the most specific reason available (claude's

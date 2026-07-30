@@ -256,10 +256,279 @@ pub struct ConciergeConfig {
     /// but does not drop them, because the frontend treats an unreadable rule as `ask` and dropping
     /// it here would silently restore a permissive default on a rule the user was trying to tighten.
     pub tools: std::collections::BTreeMap<String, String>,
+    /// The deterministic reply linter's policy (`[concierge.checks]`). Unlike `tools`, this ships
+    /// NON-empty: the checks ARE the policy, so a fresh install lints from the first turn.
+    pub checks: ConciergeChecksConfig,
 }
 
 /// The three values a `[concierge.tools]` entry may take. Mirrors PolicyDecision in policy.ts.
 const CONCIERGE_TOOL_DECISIONS: [&str; 3] = ["allow", "ask", "deny"];
+
+/// The three values a `[concierge.checks.<id>].severity` may take. `"block"` re-prompts the
+/// concierge once for a corrected reply, `"warn"` renders and badges it, `"off"` disables that one
+/// check while leaving its row (and any comment explaining WHY it is off) in the file.
+///
+/// `pub(crate)` so `concierge_lint_log::SEVERITIES` can be pinned against it by direct comparison.
+/// That log restates this vocabulary (it must, to bucket a violation without depending on config),
+/// and the sibling test `the_severity_vocabulary_matches_the_config_one` fails if the two ever
+/// diverge. Comparing the constants beats re-parsing this file's text — the analogous
+/// TypeScript pin has to scrape source because it crosses a language boundary, and it already broke
+/// once on a too-greedy extractor. Same crate, so there is no reason to be that fragile here.
+pub(crate) const CONCIERGE_CHECK_SEVERITIES: [&str; 3] = ["block", "warn", "off"];
+
+/// The severity an unreadable `severity` value resolves to. `"warn"` and never `"off"`: a typo in a
+/// line the user wrote to TIGHTEN a check must not silently switch that check off. Same direction as
+/// `[concierge.tools]`, where an unrecognized decision reads as the stricter `"ask"`.
+const CONCIERGE_CHECK_SEVERITY_FALLBACK: &str = "warn";
+
+/// ONE check's policy in `[concierge.checks.<id>]`.
+///
+/// Every field is a SCALAR on purpose. `json_to_toml_value` accepts only bool / i64 / String and
+/// rejects arrays and tables, so a table-per-check of scalars is writable from the UI through the
+/// existing dotted setter (`concierge.checks.relay-paste.enabled = false`) — an array-of-tables
+/// would need a bespoke writer like `write_stage_definition`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConciergeCheck {
+    /// Run this check at all. `false` and `severity = "off"` both disable it; the pair exists
+    /// because they read differently in a hand-edited file ("switched off" vs "downgraded").
+    pub enabled: bool,
+    /// `"block"` | `"warn"` | `"off"`, KEPT VERBATIM including an unrecognized value: `validate`
+    /// warns about it and [`ConciergeCheck::effective_severity`] resolves it, but nothing rewrites
+    /// what the user typed — the raw string is what makes the warning nameable and fixable.
+    pub severity: String,
+    /// Rewrite the reply into the compliant form instead of just reporting it. Only meaningful for
+    /// the checks whose compliant form is mechanically derivable (a bare name → its pill); a check
+    /// whose fix is a rewrite only the model can produce ships `false`.
+    pub autofix: bool,
+    /// The check's numeric knob, where it has one — contiguous verbatim characters for the overlap
+    /// checks. `None` for a check that takes no threshold, which is not the same as `0`.
+    pub threshold: Option<i64>,
+    /// The check's word list, where it has one, comma-separated so it stays hand-editable as a
+    /// scalar (an array would not survive `json_to_toml_value`). `None` for a check with no list.
+    pub words: Option<String>,
+}
+
+impl Default for ConciergeCheck {
+    /// The policy an UNKNOWN check id resolves to: on, warning, no autofix. A check id this build
+    /// has never heard of does nothing (no linter claims it), so the value only matters when a newer
+    /// Sparkle reads the same file back — and "on and warning" is the honest, non-weakening default.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity: CONCIERGE_CHECK_SEVERITY_FALLBACK.to_string(),
+            autofix: false,
+            threshold: None,
+            words: None,
+        }
+    }
+}
+
+impl ConciergeCheck {
+    /// The severity the linter ACTS on: the configured value when it is one of
+    /// [`CONCIERGE_CHECK_SEVERITIES`], otherwise [`CONCIERGE_CHECK_SEVERITY_FALLBACK`].
+    ///
+    /// Separate from the stored `severity` so a typo is both surfaced (the raw string is still there
+    /// for `validate` to quote back) and harmless (the check keeps running). The TypeScript linter
+    /// mirrors this fallback; if the two ever disagree, THIS is the reference.
+    pub fn effective_severity(&self) -> &str {
+        if CONCIERGE_CHECK_SEVERITIES.contains(&self.severity.as_str()) {
+            &self.severity
+        } else {
+            CONCIERGE_CHECK_SEVERITY_FALLBACK
+        }
+    }
+}
+
+/// One row of the shipped check policy — the DEFAULT for a check id, stated once.
+///
+/// A SEED, not a closed set. `PluginsConfig::unknown_keys` can flag an unrecognized `[plugins]` key
+/// because plugin toggles are authoritative in Rust; check ids are NOT — the authoritative list
+/// lives in the TypeScript linter module, exactly as the tool list does (see [`ConciergeConfig`]).
+/// So an id absent from this table is kept verbatim and never warned about; the table only decides
+/// what a fresh install starts with.
+struct DefaultCheck {
+    id: &'static str,
+    severity: &'static str,
+    autofix: bool,
+    threshold: Option<i64>,
+    words: Option<&'static str>,
+}
+
+/// The shipped policy. Every check ships ENABLED: an off-by-default linter is a linter nobody has,
+/// and the whole point is that the mechanical rules stop depending on the model's attention.
+///
+/// `block` is reserved for the four violations whose compliant form is a rewrite only the model can
+/// produce (so there is nothing to autofix, and rendering them would show the human the thing the
+/// rule exists to prevent). Everything derivable from data the app already holds is `warn` +
+/// `autofix`. Keep this in step with the `[concierge.checks]` block in `DEFAULT_TEMPLATE` —
+/// `concierge_checks_template_matches_the_default` asserts they agree.
+const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
+    // THE MOST-REPEATED FAILURE, and the one the human named four times in a single session:
+    // reporting accurately and then asking permission instead of acting. Blocks, because a logged
+    // violation the human has to read is the same passivity one level up. Its exemption for
+    // genuinely irreversible or spend-bearing actions is keyed off the tool risk classification, not
+    // off phrasing — phrasing is what a model under a linter learns to game.
+    DefaultCheck {
+        id: "ask-without-action",
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
+    // The most recently broken rule: never paste the text you just sent back into the reply.
+    DefaultCheck {
+        id: "relay-paste",
+        severity: "block",
+        autofix: false,
+        threshold: Some(240),
+        words: None,
+    },
+    DefaultCheck {
+        id: "bare-agent-name",
+        severity: "warn",
+        // Autofix ONLY on a unique roster match — an ambiguous name warns instead, because a pill
+        // carrying the wrong id opens the wrong agent and the reader cannot tell it guessed.
+        autofix: true,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "bare-pr-number",
+        severity: "warn",
+        autofix: true,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "unresolved-agent-pill",
+        // Blocks: a pill whose id resolves to nothing is worse than the bare text it replaced.
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "fat-pill-label",
+        severity: "warn",
+        autofix: true,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "actions-first",
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "unreported-refusal",
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
+    DefaultCheck {
+        id: "hedge-words",
+        severity: "warn",
+        autofix: false,
+        threshold: None,
+        // The rule names two; the list is hand-editable so a user can add their own.
+        words: Some("should, deserves to"),
+    },
+    DefaultCheck {
+        id: "restated-state",
+        severity: "warn",
+        autofix: false,
+        threshold: Some(200),
+        words: None,
+    },
+    DefaultCheck {
+        id: "naked-file-ref",
+        severity: "warn",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
+];
+
+/// The deterministic concierge-reply linter's policy (`[concierge.checks]`).
+///
+/// DATA for a linter, deliberately — the rules that can be decided mechanically live here so a
+/// misfiring check is a one-line edit instead of a rebuild, while the rules that are dispositions
+/// stay prose in `concierge-guidelines.md`. Hot reload is free: the existing `config.toml` watcher
+/// emits `config-changed`, so a severity edit takes effect on the next turn.
+///
+/// GLOBAL ONLY, and this is a security boundary rather than tidiness. `build_effective` already
+/// ignores `[concierge]` in a per-project `.sparkle/config.toml` so a cloned repo cannot grant
+/// itself the concierge's authority; the same reasoning binds harder here — a repo must not be able
+/// to disable the linter that governs the replies the human reads ABOUT that repo.
+///
+/// `checks` is a FREE-FORM MAP, schema-agnostic about check NAMES and validating only VALUES, for
+/// the same reason `[concierge.tools]` is (see [`ConciergeConfig`]): the authoritative check list
+/// lives in the TypeScript linter module, and a second copy here would drift with Rust unable to
+/// notice. An unrecognized id is kept verbatim so a config written by a newer Sparkle survives a
+/// round-trip through an older one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConciergeChecksConfig {
+    /// Master switch. `false` disables the whole linter and every rule reverts to prose — the
+    /// widest of the three escape hatches (one check off → the whole linter off → hand-annotate the
+    /// file saying why), because a blocking check that misfires would make the concierge unusable
+    /// and the way out has to be cheaper than the failure.
+    pub enabled: bool,
+    /// Append each violation to `concierge-lint.jsonl` (metadata only — never the reply text).
+    pub log: bool,
+    /// Also log a short HASH of the matched span. Opt-in and off by default: it is enough to tell
+    /// "the same violation 40 times" from "40 different ones" without putting reply text on disk.
+    pub log_matches: bool,
+    /// Check id → its policy. Seeded from [`DEFAULT_CONCIERGE_CHECKS`]; unknown ids are KEPT.
+    ///
+    /// A check RUNS when `enabled` (this struct's) is true, its own `enabled` is true, and its
+    /// resolved severity ([`ConciergeCheck::effective_severity`]) is not `"off"`. That resolution
+    /// lives in the TypeScript linter — deliberately not mirrored as an unused Rust helper, which
+    /// would be a second implementation with nothing to keep it honest.
+    pub checks: std::collections::BTreeMap<String, ConciergeCheck>,
+}
+
+impl ConciergeChecksConfig {
+    /// The shipped policy, built from [`DEFAULT_CONCIERGE_CHECKS`] so the defaults are stated once
+    /// rather than in the table, `SparkleConfig::default()`, and `DEFAULT_TEMPLATE` separately.
+    pub fn defaults() -> Self {
+        Self {
+            enabled: true,
+            log: true,
+            log_matches: false,
+            checks: DEFAULT_CONCIERGE_CHECKS
+                .iter()
+                .map(|d| {
+                    (
+                        d.id.to_string(),
+                        ConciergeCheck {
+                            enabled: true,
+                            severity: d.severity.to_string(),
+                            autofix: d.autofix,
+                            threshold: d.threshold,
+                            words: d.words.map(str::to_string),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+}
+
+impl Default for ConciergeChecksConfig {
+    /// The shipped policy, NOT an empty map. `ConciergeConfig` derives `Default`, so an empty one
+    /// here would make `ConciergeConfig::default()` mean "linter with no rules" and diverge from
+    /// `SparkleConfig::default()` — the exact template-disagrees-with-Default bug class this file
+    /// has been bitten by before.
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
 
 /// 1Password env-backup state that isn't a simple on/off toggle. Machine-wide (like [tools]): a
 /// per-project value is ignored with a warning, because the vault is a property of the user's
@@ -743,11 +1012,18 @@ impl Default for SparkleConfig {
             // Ships auto-approve ON for every category except bash (see ApprovalsConfig::default),
             // so a fresh install isn't blocked by permission prompts. bash stays ask-each-time.
             approvals: ApprovalsConfig::default(),
-            // EMPTY by design, and it is meant to stay mostly empty: every concierge tool sits on
-            // the default derived from its risk class (policy.ts), so the file only ever carries the
-            // rules the human actually changed. An empty table is not "no policy" — it is "the
-            // derived policy", which is total.
-            concierge: ConciergeConfig::default(),
+            concierge: ConciergeConfig {
+                // EMPTY by design, and it is meant to stay mostly empty: every concierge tool sits
+                // on the default derived from its risk class (policy.ts), so the file only ever
+                // carries the rules the human actually changed. An empty table is not "no policy" —
+                // it is "the derived policy", which is total.
+                tools: std::collections::BTreeMap::new(),
+                // The OPPOSITE of `tools`: non-empty, because here the shipped defaults ARE the
+                // policy. A user with no config file gets exactly the [concierge.checks] block
+                // DEFAULT_TEMPLATE describes (asserted by
+                // `concierge_checks_template_matches_the_default`).
+                checks: ConciergeChecksConfig::defaults(),
+            },
             // Opinionated defaults: every tool ships on for a new install — except onepassword,
             // which needs an external account + CLI before it can do anything (see the field doc).
             tools: ToolsConfig {
@@ -938,17 +1214,46 @@ struct PartialApprovals {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialConcierge {
-    /// Deliberately `toml::Value`, NOT `String` (roborev 54240).
+    /// Deliberately `toml::Value`, NOT a typed map (roborev 54240).
     ///
-    /// With `String`, a single hand-edit — `merge_pr = true`, or a nested
+    /// With a typed map, a single hand-edit — `merge_pr = true`, or a nested
     /// `[concierge.tools.x]` table — fails `toml::from_str::<PartialConfig>` for the WHOLE FILE.
     /// That discards the entire global layer and sets `hard_error`, so every unrelated setting in
     /// the file silently reverts to its default. One typo in one concierge rule should not cost
     /// the user their whole configuration.
     ///
-    /// Non-string values are dropped in `apply_concierge` and read as "no rule", which is what the
-    /// TS side already documents and asserts. This makes the two halves agree.
-    tools: Option<std::collections::BTreeMap<String, toml::Value>>,
+    /// The tolerance has to reach the SECTION, not just its values: `tools = false` (reaching for a
+    /// switch that does not exist) is exactly as fatal as `merge_pr = true` was, so this is a bare
+    /// `Value` and `apply_concierge` checks `as_table()` first. Non-string entries inside it are
+    /// dropped and read as "no rule", which is what the TS side already documents and asserts.
+    tools: Option<toml::Value>,
+    /// A bare `Value` for the reason on `tools` above, one level further out than it looks like it
+    /// needs to be: a typed struct here would still make `[concierge]` + `checks = false` fatal to
+    /// the whole global layer. `apply_concierge` requires a table before reading it as
+    /// [`PartialConciergeChecks`], whose own fields cannot then fail.
+    checks: Option<toml::Value>,
+}
+
+/// `[concierge.checks]` as read from TOML.
+///
+/// EVERY value is `toml::Value`, including the three named master switches, for the reason recorded
+/// on `PartialConcierge::tools` (roborev 54240): with strong types, one hand-edit — `enabled = "yes"`
+/// — fails `toml::from_str::<PartialConfig>` for the WHOLE FILE, which discards the entire global
+/// layer and silently reverts every unrelated setting to its default. A wrong-typed value is dropped
+/// with a warning in `apply_concierge_checks` instead, so a typo in one lint knob costs exactly that
+/// knob. Nothing in this struct can fail to deserialize FROM A TABLE, which is what lets
+/// `apply_concierge` treat "not a table" as the only failure it has to report.
+///
+/// `#[serde(flatten)]` puts every remaining key — the per-check tables — into `checks`. That is what
+/// keeps this layer schema-agnostic about check NAMES: an id this build has never heard of parses,
+/// merges, and round-trips instead of being rejected or erased.
+#[derive(Debug, Default, Deserialize)]
+struct PartialConciergeChecks {
+    enabled: Option<toml::Value>,
+    log: Option<toml::Value>,
+    log_matches: Option<toml::Value>,
+    #[serde(flatten)]
+    checks: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1235,10 +1540,49 @@ fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
 /// Overlay a partial `[concierge]` section. Per-KEY, like `apply_approvals` and for the same reason:
 /// a layer that mentions two tools must not erase the rules the lower layer set for the other forty.
 /// Wholesale-replacing the map would make writing one rule by hand a silent reset of every other.
-fn apply_concierge(into: &mut ConciergeConfig, p: Option<PartialConcierge>) {
-    let Some(p) = p else { return };
+///
+/// Returns the user-facing warnings for values that were DROPPED as wrong-typed. They have to be
+/// handed back: a rejected value never enters the config, so nothing downstream (`validate`
+/// included) can rediscover it, and a line the user deliberately wrote that silently does nothing is
+/// the worst of the three outcomes. Same contract as `apply_plugins`.
+#[must_use]
+fn apply_concierge(into: &mut ConciergeConfig, p: Option<PartialConcierge>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+    // Both sections are read as a bare `Value` and required to be a TABLE here, so `checks = false`
+    // / `tools = "allow"` — a plausible reach for a switch that does not exist — costs that one line
+    // instead of failing the whole-file parse and reverting every unrelated setting. That is roborev
+    // 54240's failure one level further out: the tolerance has to reach the section, not just the
+    // values inside it.
+    if let Some(checks) = p.checks {
+        if checks.is_table() {
+            match checks.try_into::<PartialConciergeChecks>() {
+                Ok(p) => apply_concierge_checks(&mut into.checks, p, &mut warnings),
+                // Unreachable today — every field of that struct is an Option<Value> or a Value
+                // map, so a table always reads. Reported rather than swallowed if that ever changes.
+                Err(e) => warnings.push(format!(
+                    "[concierge.checks] could not be read ({e}); the built-in reply checks are \
+                     still running"
+                )),
+            }
+        } else {
+            warnings.push(format!(
+                "[concierge.checks] is a {}, not a section like [concierge.checks], so it has no \
+                 effect; the master switch is `enabled` INSIDE that section",
+                checks.type_str()
+            ));
+        }
+    }
     if let Some(tools) = p.tools {
-        for (name, decision) in tools {
+        let Some(tools) = tools.as_table() else {
+            warnings.push(format!(
+                "[concierge.tools] is a {}, not a section like [concierge.tools], so it has no \
+                 effect; every tool stays on its derived default",
+                tools.type_str()
+            ));
+            return warnings;
+        };
+        for (name, decision) in tools.clone() {
             // Keep the RAW string, unnarrowed — the TS policy layer reads an unrecognized value as
             // `ask`, which is stricter than the derived default, and narrowing here would erase the
             // difference between "the user typo'd a rule" and "the user set no rule", handing back
@@ -1257,6 +1601,94 @@ fn apply_concierge(into: &mut ConciergeConfig, p: Option<PartialConcierge>) {
                         "[concierge.tools] value is not a string; ignoring this rule"
                     );
                 }
+            }
+        }
+    }
+    warnings
+}
+
+/// Overlay a partial `[concierge.checks]` section onto the shipped policy.
+///
+/// PER-FIELD, per check — not per check, and not wholesale. The shipped defaults ARE the policy, so
+/// the one-line edit the whole design rests on (`severity = "off"` under an existing check's header)
+/// has to leave that check's `threshold`/`words` alone. Replacing the whole `ConciergeCheck` would
+/// turn "downgrade one check" into "silently reset its other knobs to nothing".
+///
+/// A wrong-typed value is DROPPED with a warning rather than being coerced or fatal: coercing would
+/// make `enabled = "false"` read as ON, and being fatal would cost the user their whole config layer
+/// over one typo. An UNKNOWN check id is kept verbatim (a newer config must survive an older app),
+/// and is never warned about — check ids are authoritative in TypeScript, not here. An unknown FIELD
+/// inside a check IS warned about, because that set is authoritative here; see the arm that does it.
+fn apply_concierge_checks(
+    into: &mut ConciergeChecksConfig,
+    p: PartialConciergeChecks,
+    warnings: &mut Vec<String>,
+) {
+    /// Read a master switch, or record why it did nothing.
+    fn master(field: &str, v: toml::Value, into: &mut bool, warnings: &mut Vec<String>) {
+        match v.as_bool() {
+            Some(b) => *into = b,
+            None => warnings.push(format!(
+                "[concierge.checks].{field} is a {}, not true or false, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+    if let Some(v) = p.enabled {
+        master("enabled", v, &mut into.enabled, warnings);
+    }
+    if let Some(v) = p.log {
+        master("log", v, &mut into.log, warnings);
+    }
+    if let Some(v) = p.log_matches {
+        master("log_matches", v, &mut into.log_matches, warnings);
+    }
+
+    for (id, value) in p.checks {
+        let Some(table) = value.as_table() else {
+            warnings.push(format!(
+                "[concierge.checks].{id} is a {}, not a table like [concierge.checks.{id}], so it \
+                 has no effect",
+                value.type_str()
+            ));
+            continue;
+        };
+        // `or_default()` on a KNOWN id yields the shipped row, so the fields this table omits keep
+        // the values they shipped with; on an unknown one it yields the neutral on+warn default.
+        let check = into.checks.entry(id.clone()).or_default();
+        for (field, v) in table {
+            let ok = match field.as_str() {
+                "enabled" => v.as_bool().map(|b| check.enabled = b).is_some(),
+                "autofix" => v.as_bool().map(|b| check.autofix = b).is_some(),
+                // Kept VERBATIM, unrecognized values included — see `ConciergeCheck::severity`.
+                "severity" => v.as_str().map(|s| check.severity = s.to_string()).is_some(),
+                "threshold" => v.as_integer().map(|n| check.threshold = Some(n)).is_some(),
+                "words" => v.as_str().map(|s| check.words = Some(s.to_string())).is_some(),
+                // A field NAME this build doesn't know is reported, unlike an unknown check ID. The
+                // asymmetry is the point: the id list is authoritative in TypeScript, so an id we
+                // don't recognize is plausibly from the future — but the FIELD set is authoritative
+                // right here (`ConciergeCheck` is the struct), so `sevrity`/`enable` is a typo, and a
+                // typo on the one-line escape hatch would otherwise parse, apply nothing, and say
+                // nothing while a blocking check kept firing. Same treatment `[plugins]` gives an
+                // unknown toggle.
+                _ => {
+                    warnings.push(format!(
+                        "[concierge.checks.{id}].{field} is not a check setting (enabled, severity, \
+                         autofix, threshold, words), so it has no effect"
+                    ));
+                    true
+                }
+            };
+            if !ok {
+                let expected = match field.as_str() {
+                    "threshold" => "a whole number",
+                    "severity" | "words" => "text",
+                    _ => "true or false",
+                };
+                warnings.push(format!(
+                    "[concierge.checks.{id}].{field} is a {}, not {expected}, so it has no effect",
+                    v.type_str()
+                ));
             }
         }
     }
@@ -1913,6 +2345,37 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
             ));
         }
     }
+    // A `[concierge.checks.<id>].severity` that isn't block/warn/off is surfaced but NOT rewritten,
+    // and it resolves to "warn" (see `ConciergeCheck::effective_severity`). NEVER to "off": the user
+    // was editing that line to change how strict a check is, and failing open on it would hand back
+    // exactly the leniency they were trying to remove. Check IDS are not validated — the
+    // authoritative list lives in the TypeScript linter module (see ConciergeChecksConfig), and an
+    // unknown id is inert here anyway.
+    for (id, check) in &cfg.concierge.checks.checks {
+        // Asked through `effective_severity` rather than by re-testing the list, so the warning and
+        // the behavior can never disagree about what counts as unrecognized.
+        if check.effective_severity() != check.severity {
+            warnings.push(format!(
+                "[concierge.checks.{id}].severity is \"{}\", which is not block, warn, or off; that \
+                 check will {} until it is fixed",
+                check.severity,
+                check.effective_severity()
+            ));
+        }
+        // A non-positive threshold is meaningless for both shipped uses (contiguous characters
+        // shared with a tool argument / with the previous reply) and matches trivially, so on a
+        // `block` check it would re-prompt EVERY reply. Warned, not clamped: the number is the
+        // user's, the linter owns what to do with it, and clamping 0 to 1 would not restore the
+        // behavior they wanted anyway — only saying so does.
+        if let Some(n) = check.threshold {
+            if n <= 0 {
+                warnings.push(format!(
+                    "[concierge.checks.{id}].threshold is {n}, which every reply matches; that \
+                     check will fire on everything until it is a positive number"
+                ));
+            }
+        }
+    }
     // A `[plugins]` key no row claims is almost always a typo for one that exists, and it is
     // otherwise indistinguishable from a working line: it parses, it round-trips, and it does
     // nothing. The VALUE is kept (a config from a newer Sparkle must survive an older one) — this
@@ -1968,7 +2431,9 @@ fn build_effective(
                 apply_capture(&mut cfg.capture, p.capture);
                 apply_voice(&mut cfg.voice, p.voice);
                 apply_approvals(&mut cfg.approvals, p.approvals);
-                apply_concierge(&mut cfg.concierge, p.concierge);
+                // Extended immediately rather than collected like `rejected_plugins`: `[concierge]`
+                // is global-only, so there is no second layer whose warnings could interleave.
+                warnings.extend(apply_concierge(&mut cfg.concierge, p.concierge));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -2055,11 +2520,24 @@ fn build_effective(
                 // standing authority over the whole app — quit_app, remove_project, discard_agent —
                 // so a repo could otherwise hand itself that authority over the user's machine
                 // merely by being cloned with a rule in its checked-in config.
+                //
+                // [concierge.checks] inherits the boundary for a STRONGER reason: those are the
+                // deterministic checks run over every concierge reply, so a repo that could edit
+                // them could disable the linter that governs what the human is told about that very
+                // repo. One `if` covers both because both live under the same `[concierge]` table.
+                //
+                // The remedy names the GLOBAL FILE, not a pane. "⋯ Settings → Concierge tools"
+                // lists tools with their risk and has no check rows at all, so pointing a
+                // [concierge.checks] override there sends the user somewhere the setting is absent —
+                // a remedy string is an instruction they will follow, so it gets scoped to the half
+                // it actually covers.
                 if p.concierge.is_some() {
                     warnings.push(
                         "[concierge] in a per-project .sparkle/config.toml is ignored — how \
-                         autonomous the concierge is over YOUR machine is not something a repo gets \
-                         to set; use the global config.toml (or ⋯ Settings → \"Concierge tools\")"
+                         autonomous the concierge is over YOUR machine, and which checks run over \
+                         its replies, are not something a repo gets to set; set them in the global \
+                         config.toml (the tools half is also editable in ⋯ Settings → \"Concierge \
+                         tools\")"
                             .to_string(),
                     );
                 }
@@ -2458,6 +2936,87 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # merge_pr            = "deny"    # never merge a PR, even if you ask it to in chat
 # push_agent_branch   = "allow"   # let it push branches without stopping to ask
 # discard_agent       = "deny"    # never let it destroy unmerged work
+
+# --- Concierge reply checks (per-machine; ignored in a project file) ---------------------
+# The deterministic linter that runs on every concierge reply BEFORE you see it.
+# These are DATA for a linter; judgment rules live in concierge-guidelines.md.
+# Set enabled = false to switch off a check that is misfiring. Global only:
+# a project's .sparkle/config.toml cannot change these.
+#
+# UNLIKE [concierge.tools] above, this section ships LIVE rather than commented out: an empty
+# [concierge.tools] means "every tool on its derived default", which is a complete policy, whereas
+# an empty check list would mean no linting at all. Here the values below ARE the policy.
+#
+# Each check takes:
+#   enabled   = true|false     run it at all
+#   severity  = "block" | "warn" | "off"
+#                              block = the concierge is asked once for a corrected reply;
+#                              warn  = the reply renders with a badge naming the rule;
+#                              off   = this check is skipped (the row and your comment stay).
+#   autofix   = true|false     rewrite into the compliant form instead of just reporting — only
+#                              where that form is mechanically derivable and cannot change meaning.
+# Plus, where a check has one: threshold (a whole number) or words (comma-separated text).
+# An unrecognized severity WARNS and behaves as "warn" — never as "off", because a typo in a line
+# you wrote to tighten a check must not switch it off.
+[concierge.checks]
+enabled     = true      # master switch — false disables the whole linter
+log         = true      # append violations to concierge-lint.jsonl
+log_matches = false     # opt-in: also log a HASH of the matched span (never the text)
+
+# Offered to act ("want me to…", "should I…") while taking no action that turn. Blocks and
+# re-prompts once: handing you a note about it to read would be the same passivity again.
+# A genuine question about an IRREVERSIBLE or spend-bearing action (publish a release, delete a
+# branch, remove a project, spend money) is exempt — that exemption is keyed off which tool the
+# action belongs to, not off how the sentence is phrased. Merging is NOT exempt.
+[concierge.checks.ask-without-action]
+enabled   = true
+severity  = "block"
+autofix   = false
+
+[concierge.checks.relay-paste]
+enabled   = true
+severity  = "block"     # "block" | "warn" | "off"
+autofix   = false
+# Contiguous verbatim chars shared with a tool argument before it counts.
+threshold = 240
+
+[concierge.checks.bare-agent-name]
+enabled   = true
+severity  = "warn"
+autofix   = true        # ONLY on a unique roster match; ambiguous never autofixes
+[concierge.checks.bare-pr-number]
+enabled   = true
+severity  = "warn"
+autofix   = true        # only when pr_owner resolves an unambiguous owner
+[concierge.checks.unresolved-agent-pill]
+enabled   = true
+severity  = "block"     # a wrong id opens the WRONG agent — worse than a dead link
+autofix   = false
+[concierge.checks.fat-pill-label]
+enabled   = true
+severity  = "warn"
+autofix   = true
+[concierge.checks.actions-first]
+enabled   = true
+severity  = "block"
+autofix   = false
+[concierge.checks.unreported-refusal]
+enabled   = true
+severity  = "block"
+autofix   = false
+[concierge.checks.hedge-words]
+enabled   = true
+severity  = "warn"
+autofix   = false
+# Hand-editable, comma-separated. The rule names two; add your own.
+words     = "should, deserves to"
+[concierge.checks.restated-state]
+enabled   = true
+severity  = "warn"
+threshold = 200
+[concierge.checks.naked-file-ref]
+enabled   = true
+severity  = "warn"
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -5251,6 +5810,381 @@ quit_app = 42
             cfg.concierge.tools.get("quit_app").map(String::as_str),
             Some("ask"),
             "clearing one rule must not disturb its neighbour"
+        );
+    }
+
+    // --- [concierge.checks] — the deterministic reply linter's policy -------------------------
+
+    /// The shipped policy, spelled out LITERALLY rather than read back from
+    /// `DEFAULT_CONCIERGE_CHECKS`. Deriving the expectation from the table under test would make
+    /// every assertion below true by construction — it would still pass after someone deleted a
+    /// check or flipped a severity, which is exactly the drift these tests exist to catch.
+    /// `(id, severity, autofix, threshold, words)`, in BTreeMap (sorted) order.
+    const EXPECTED_CHECKS: &[(&str, &str, bool, Option<i64>, Option<&str>)] = &[
+        ("actions-first", "block", false, None, None),
+        ("ask-without-action", "block", false, None, None),
+        ("bare-agent-name", "warn", true, None, None),
+        ("bare-pr-number", "warn", true, None, None),
+        ("fat-pill-label", "warn", true, None, None),
+        ("hedge-words", "warn", false, None, Some("should, deserves to")),
+        ("naked-file-ref", "warn", false, None, None),
+        ("relay-paste", "block", false, Some(240), None),
+        ("restated-state", "warn", false, Some(200), None),
+        ("unreported-refusal", "block", false, None, None),
+        ("unresolved-agent-pill", "block", false, None, None),
+    ];
+
+    #[test]
+    fn concierge_checks_ship_the_whole_policy_with_no_config_file() {
+        // The OPPOSITE of [concierge.tools], whose empty default is a complete policy. An empty
+        // check list would mean no linting at all, so the shipped values ARE the policy and a user
+        // with no config file has to get them.
+        let (cfg, warns, _) = effective(None, None);
+        let c = &cfg.concierge.checks;
+        assert!(c.enabled, "the linter must be ON for a fresh install");
+        assert!(c.log, "violations are counted from the first turn — drift has to be a number");
+        assert!(!c.log_matches, "hashing the matched span is opt-in");
+
+        let ids: Vec<&str> = c.checks.keys().map(String::as_str).collect();
+        let expected: Vec<&str> = EXPECTED_CHECKS.iter().map(|e| e.0).collect();
+        assert_eq!(ids, expected, "the ten shipped checks, no more and no fewer");
+        for (id, severity, autofix, threshold, words) in EXPECTED_CHECKS {
+            let got = c.checks.get(*id).unwrap_or_else(|| panic!("no shipped policy for {id}"));
+            assert!(got.enabled, "{id} must ship enabled");
+            assert_eq!(got.severity, *severity, "{id} severity");
+            assert_eq!(got.effective_severity(), *severity, "{id} must resolve to its own severity");
+            assert_eq!(got.autofix, *autofix, "{id} autofix");
+            assert_eq!(got.threshold, *threshold, "{id} threshold");
+            assert_eq!(got.words.as_deref(), *words, "{id} words");
+        }
+        assert!(
+            !warns.iter().any(|w| w.contains("[concierge.checks")),
+            "the shipped policy must load clean: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn concierge_checks_template_matches_the_default() {
+        // Modeled on `plugins_default_matches_the_template`, with the same trap avoided explicitly:
+        // overlaying the template onto SparkleConfig::default() would pass even if the block were
+        // MISSING from the template, because the base already holds the policy. So start from a
+        // WIPED policy — then this equality can only hold if the template really writes every field.
+        let mut base = SparkleConfig::default();
+        base.concierge.checks = ConciergeChecksConfig {
+            enabled: false,
+            log: false,
+            log_matches: true,
+            checks: std::collections::BTreeMap::new(),
+        };
+        let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert_eq!(
+            cfg.concierge.checks,
+            SparkleConfig::default().concierge.checks,
+            "DEFAULT_TEMPLATE's [concierge.checks] disagrees with SparkleConfig::default() — the \
+             bug class that already bit [approvals].bash"
+        );
+        // And it ships LIVE, unlike [concierge.tools]: a commented-out block would leave the user
+        // nothing to edit for the one-line escape hatch the design depends on.
+        assert!(
+            DEFAULT_TEMPLATE.contains("\n[concierge.checks]\n"),
+            "the block must ship uncommented"
+        );
+    }
+
+    #[test]
+    fn a_global_check_edit_lands_and_leaves_the_rest_of_the_policy_alone() {
+        // The one-line hatch the whole design rests on: switch off a misfiring check with no
+        // rebuild — without silently resetting that check's other knobs, or its neighbours'.
+        let g = "[concierge.checks.relay-paste]\nseverity = \"off\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let c = &cfg.concierge.checks;
+        let relay = c.checks.get("relay-paste").expect("relay-paste must still exist");
+        assert_eq!(relay.effective_severity(), "off", "the edit must take effect");
+        assert_eq!(
+            relay.threshold,
+            Some(240),
+            "a field the edit didn't mention keeps its shipped value — per-FIELD merge, not \
+             per-check replacement"
+        );
+        assert!(relay.enabled, "severity = \"off\" is a different edit from enabled = false");
+        assert_eq!(
+            c.checks.get("actions-first").map(|k| k.severity.as_str()),
+            Some("block"),
+            "another check must not move"
+        );
+        assert!(c.enabled, "one check off is not the whole linter off");
+        assert!(warns.is_empty(), "a valid edit warns about nothing: {warns:?}");
+    }
+
+    #[test]
+    fn the_master_switch_turns_the_whole_linter_off() {
+        // The widest escape hatch. Asserted on the resolved config rather than on the file text,
+        // because "the line is in the file" is not "the linter is off".
+        let (cfg, _, hard) = effective(Some("[concierge.checks]\nenabled = false\n"), None);
+        assert!(!hard);
+        assert!(!cfg.concierge.checks.enabled);
+        assert_eq!(
+            cfg.concierge.checks.checks.len(),
+            EXPECTED_CHECKS.len(),
+            "the master switch must not erase the per-check rows — turning the linter back on has \
+             to restore the policy the user tuned, not a blank one"
+        );
+    }
+
+    #[test]
+    fn an_unknown_check_id_survives_verbatim() {
+        // Same discipline as [concierge.tools]: the authoritative check list lives in the TypeScript
+        // linter, so a config written by a NEWER Sparkle must round-trip through this one rather
+        // than having its unrecognized rows rejected or erased.
+        let g = "[concierge.checks.rule-from-the-future]\nseverity = \"block\"\nthreshold = 9\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let got = cfg
+            .concierge
+            .checks
+            .checks
+            .get("rule-from-the-future")
+            .expect("an unknown id must be kept");
+        assert_eq!(got.severity, "block");
+        assert_eq!(got.threshold, Some(9));
+        assert!(got.enabled, "an unknown id resolves to on+warn, never to silently-off");
+        assert!(
+            !warns.iter().any(|w| w.contains("rule-from-the-future")),
+            "an unknown NAME is not a warning — Rust does not own the check list: {warns:?}"
+        );
+        // ...and it did not disturb the shipped rows.
+        assert_eq!(cfg.concierge.checks.checks.len(), EXPECTED_CHECKS.len() + 1);
+    }
+
+    #[test]
+    fn a_wrong_typed_check_value_is_dropped_with_a_warning_and_costs_nothing_else() {
+        // roborev 54240's lesson applied to [concierge.checks]: with strongly-typed fields any ONE
+        // of these lines fails the WHOLE-FILE parse, discarding the entire global layer so every
+        // unrelated setting silently reverts. Each bad value must cost exactly itself.
+        let g = r#"
+[workflow]
+require_pr = false
+
+[concierge.checks]
+enabled = "yes"
+hedge-words = true
+
+[concierge.checks.relay-paste]
+threshold = "lots"
+autofix = 1
+severity = "warn"
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a wrong-typed lint knob must never be a hard error");
+        // The unrelated setting in the same file survived — the whole point.
+        assert!(!cfg.workflow.require_pr, "an unrelated section must still apply");
+        let c = &cfg.concierge.checks;
+        assert!(c.enabled, "a non-bool master switch is dropped, so the shipped `true` stands");
+        let relay = c.checks.get("relay-paste").unwrap();
+        assert_eq!(relay.threshold, Some(240), "the bad threshold was dropped, not coerced");
+        assert!(!relay.autofix, "the bad autofix was dropped, not coerced to true");
+        assert_eq!(relay.severity, "warn", "the GOOD field in the same table still applied");
+        // `hedge-words = true` is a scalar where a table belongs; the shipped row is untouched.
+        assert_eq!(
+            c.checks.get("hedge-words").and_then(|k| k.words.as_deref()),
+            Some("should, deserves to")
+        );
+        // Every dropped line is REPORTED. A line the user deliberately wrote that silently does
+        // nothing is worse than either applying it or refusing it.
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("[concierge.checks].enabled"), "master switch: {warns:?}");
+        assert!(said("[concierge.checks.relay-paste].threshold"), "threshold: {warns:?}");
+        assert!(said("[concierge.checks.relay-paste].autofix"), "autofix: {warns:?}");
+        assert!(said("[concierge.checks].hedge-words"), "non-table check: {warns:?}");
+    }
+
+    #[test]
+    fn a_bad_severity_resolves_to_warn_and_never_to_off() {
+        // DIRECTION MATTERS. Failing open on a check the user was editing to TIGHTEN hands back
+        // exactly the leniency they were trying to remove, so an unreadable severity warns.
+        let g = "[concierge.checks.relay-paste]\nseverity = \"blokc\"\n\
+                 [concierge.checks.hedge-words]\nseverity = \"of\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a bad severity is a warning, never a hard error");
+        let relay = cfg.concierge.checks.checks.get("relay-paste").unwrap();
+        assert_eq!(relay.severity, "blokc", "the raw value is KEPT so the warning can name it");
+        assert_eq!(relay.effective_severity(), "warn", "and it resolves to warn");
+        assert_ne!(relay.effective_severity(), "off", "never to off");
+        // A near-miss for "off" is the case that would silently disable a check.
+        let hedge = cfg.concierge.checks.checks.get("hedge-words").unwrap();
+        assert_eq!(hedge.effective_severity(), "warn", "\"of\" must not read as \"off\"");
+        assert!(
+            warns.iter().any(|w| {
+                w.contains("[concierge.checks.relay-paste].severity") && w.contains("blokc")
+            }),
+            "the warning must quote the key and the value: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn concierge_checks_in_a_project_file_cannot_override_the_global_policy() {
+        // The security boundary [concierge.tools] already draws, inherited for a stronger reason: a
+        // cloned repo must not be able to disable the linter that governs what the concierge tells
+        // the human ABOUT that repo.
+        let p = "[concierge.checks]\nenabled = false\n\
+                 [concierge.checks.relay-paste]\nseverity = \"off\"\nenabled = false\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        let c = &cfg.concierge.checks;
+        assert!(c.enabled, "a repo must not be able to switch the linter off");
+        let relay = c.checks.get("relay-paste").unwrap();
+        assert!(relay.enabled, "a repo must not be able to disable one check either");
+        assert_eq!(relay.effective_severity(), "block", "the global severity stands");
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge]")),
+            "the user must be told their project rules were ignored: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_check_field_is_reported_rather_than_silently_doing_nothing() {
+        // The ASYMMETRY with an unknown check id, and it is deliberate. The id list is authoritative
+        // in TypeScript, so an unknown id is plausibly from the future; the FIELD set is
+        // authoritative in this very struct, so `sevrity` is a typo. Left silent it would parse,
+        // apply nothing, and say nothing — while the blocking check the user was trying to switch
+        // off kept firing on every reply. Same treatment [plugins] gives an unknown toggle.
+        let g = "[concierge.checks.relay-paste]\nsevrity = \"off\"\nenable = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let relay = cfg.concierge.checks.checks.get("relay-paste").unwrap();
+        assert_eq!(relay.effective_severity(), "block", "the typo cannot have taken effect");
+        assert!(relay.enabled, "nor can `enable`");
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.checks.relay-paste].sevrity")),
+            "the misspelled field must be named: {warns:?}"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.checks.relay-paste].enable")),
+            "both misspellings, not just the first: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_concierge_section_costs_that_line_and_not_the_whole_config() {
+        // roborev 54240 one level FURTHER OUT than it was originally fixed. Making the values inside
+        // a section tolerant is not enough: `checks = false` / `tools = "allow"` — a plausible reach
+        // for a master switch that lives elsewhere — would fail the WHOLE-FILE parse, discard the
+        // entire global layer, and silently revert every unrelated setting in it.
+        let g = r#"
+[workflow]
+require_pr = false
+
+[concierge]
+checks = false
+tools = "allow"
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a wrong-typed SECTION must not be a hard error");
+        assert!(!cfg.workflow.require_pr, "the unrelated section in the same file must survive");
+        assert!(cfg.concierge.checks.enabled, "the shipped policy stands");
+        assert_eq!(
+            cfg.concierge.checks.checks.len(),
+            EXPECTED_CHECKS.len(),
+            "and no check row was lost"
+        );
+        assert!(cfg.concierge.tools.is_empty(), "a scalar [concierge.tools] sets no rule");
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.checks] is a boolean")),
+            "the dropped section must be reported: {warns:?}"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.tools] is a string")),
+            "both halves report: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_positive_threshold_is_reported_because_every_reply_matches_it() {
+        // `threshold = 0` on a `block` check means every reply is a violation and gets re-prompted.
+        // Warned, not clamped: 1 matches just as trivially, so only saying so helps. Every other
+        // numeric knob in this file is policed the same way.
+        let g = "[concierge.checks.relay-paste]\nthreshold = 0\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(
+            cfg.concierge.checks.checks.get("relay-paste").unwrap().threshold,
+            Some(0),
+            "the value is kept — warned about, not rewritten"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.checks.relay-paste].threshold is 0")),
+            "the warning must quote the key and the value: {warns:?}"
+        );
+        // A positive threshold is silent, so the warning means something.
+        let (_, quiet, _) = effective(Some("[concierge.checks.relay-paste]\nthreshold = 9\n"), None);
+        assert!(quiet.is_empty(), "a usable threshold warns about nothing: {quiet:?}");
+    }
+
+    #[test]
+    fn the_project_refusal_points_at_the_file_that_can_actually_change_checks() {
+        // A remedy string is an instruction the user will follow. "⋯ Settings → Concierge tools"
+        // lists tools with their risk and has no check rows, so sending a [concierge.checks]
+        // override there lands them on a pane where the setting is absent.
+        let p = "[concierge.checks]\nenabled = false\n";
+        let (_, warns, _) = effective(None, Some(p));
+        let msg = warns
+            .iter()
+            .find(|w| w.contains("[concierge]"))
+            .expect("the override must be reported");
+        assert!(msg.contains("global config.toml"), "the remedy must name the file: {msg}");
+        assert!(
+            msg.contains("tools half"),
+            "and must scope the pane pointer to the half it covers: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_check_survives_a_dotted_write_with_the_file_comments_intact() {
+        // The file promises hand-editability AND comment preservation; the settings UI writes
+        // through `set_value`, whose `json_to_toml_value` accepts only bool/i64/String — which is
+        // why every check field is a scalar. Assert the RESOLVED config changed and the human's
+        // annotations survived, not merely that the write returned Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let ad = dir.path();
+        reset(ad).unwrap();
+        // A comment a human might add to record WHY a check is off — the thing that must survive.
+        let annotated = std::fs::read_to_string(global_path(ad))
+            .unwrap()
+            .replace(
+                "[concierge.checks.relay-paste]",
+                "# off since Tuesday: it fired on the quoted diff\n[concierge.checks.relay-paste]",
+            );
+        std::fs::write(global_path(ad), &annotated).unwrap();
+
+        set_value(ad, "concierge.checks.relay-paste.enabled", &serde_json::json!(false)).unwrap();
+        set_value(ad, "concierge.checks.restated-state.threshold", &serde_json::json!(400)).unwrap();
+        set_value(ad, "concierge.checks.hedge-words.words", &serde_json::json!("should, might")).unwrap();
+
+        let text = std::fs::read_to_string(global_path(ad)).unwrap();
+        let (cfg, warns, hard) = effective(Some(&text), None);
+        assert!(!hard, "the written file must parse: {warns:?}");
+        let c = &cfg.concierge.checks;
+        assert!(!c.checks.get("relay-paste").unwrap().enabled, "the bool write took effect");
+        assert_eq!(
+            c.checks.get("relay-paste").unwrap().threshold,
+            Some(240),
+            "writing one field must not disturb its siblings"
+        );
+        assert_eq!(c.checks.get("restated-state").unwrap().threshold, Some(400), "the int write");
+        assert_eq!(
+            c.checks.get("hedge-words").unwrap().words.as_deref(),
+            Some("should, might"),
+            "the string write"
+        );
+        assert!(
+            text.contains("# off since Tuesday: it fired on the quoted diff"),
+            "the human's own comment must survive an in-app write:\n{text}"
+        );
+        assert!(
+            text.contains("# Contiguous verbatim chars shared with a tool argument"),
+            "the shipped explanatory comments must survive too:\n{text}"
         );
     }
 

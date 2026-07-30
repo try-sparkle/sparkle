@@ -39,7 +39,8 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::claude_chat::{
-    cached_login_shell_path, capture_result_status, handle_event, shell_quote,
+    cached_login_shell_path, capture_result_status, capture_tool_uses, handle_event, shell_quote,
+    ToolUseRecord,
 };
 use crate::preflight::cached_claude_path;
 
@@ -482,6 +483,15 @@ struct ConciergeDone {
     id: String,
     session_id: String,
     text: String,
+    /// Every tool call this turn made, with its FULL arguments — serialized as `toolCalls` for the
+    /// frontend (`ConciergeDoneEvent` in services/concierge.ts). Rides the existing `concierge:done`
+    /// event rather than a channel of its own: it is only ever read together with the reply it
+    /// belongs to, and correlating two events by turn id would be a race to re-solve for nothing.
+    ///
+    /// Exists for the deterministic reply linter's `relay-paste` check — "did the concierge paste
+    /// the text it relayed back into its answer?" is decidable only against what was actually sent.
+    /// Bounded at capture time (see `ToolUseRecord`), so this cannot grow without limit.
+    tool_calls: Vec<ToolUseRecord>,
 }
 
 #[derive(Clone, Serialize)]
@@ -819,6 +829,9 @@ struct TurnOutcome {
     result_subtype: Option<String>,
     is_error: bool,
     error_detail: Option<String>,
+    /// What this turn actually SENT — every `tool_use` block's name + full arguments. Empty on the
+    /// un-owned path, mirroring `text`: a turn nobody is waiting on reports nothing.
+    tool_calls: Vec<ToolUseRecord>,
 }
 
 /// Assemble the `Command` for one concierge turn — everything up to (but not including) `.spawn()`.
@@ -1016,6 +1029,10 @@ struct DrainedStream {
     result_subtype: Option<String>,
     is_error: bool,
     error_detail: Option<String>,
+    /// The turn's `tool_use` payloads, in the order the stream carried them (see
+    /// `claude_chat::capture_tool_uses`). Captured from the SAME parse the deltas come from, so it
+    /// is turn-correlated by construction — no id to match up, no second store to keep in step.
+    tool_calls: Vec<ToolUseRecord>,
 }
 
 /// Parse a turn's NDJSON stdout to EOF, emitting each text chunk through `emit` — but ONLY while
@@ -1045,6 +1062,7 @@ fn drain_stream(
     let mut result_subtype: Option<String> = None;
     let mut is_error = false;
     let mut error_detail: Option<String> = None;
+    let mut tool_calls: Vec<ToolUseRecord> = Vec::new();
     let mut line: Vec<u8> = Vec::new();
     let mut live = true;
     loop {
@@ -1074,6 +1092,14 @@ fn drain_stream(
                         emit(txt);
                     });
                     capture_result_status(&ev, &mut result_subtype, &mut is_error, &mut error_detail);
+                    // What this turn SENT, alongside what it said. Captured UNGATED, exactly like
+                    // the parse above and for the same reason: the gate governs EMISSION — what a
+                    // superseded turn is allowed to say to the user — not bookkeeping. Nothing here
+                    // emits, calls back, or touches the manager's mutex, so it cannot change when or
+                    // whether a delta goes out. A turn that loses ownership discards these at the
+                    // reap (the `owned: false` outcome carries an empty vec), so the records only
+                    // ever reach the frontend attached to the reply they belong to.
+                    capture_tool_uses(&ev, &mut tool_calls);
                 } else {
                     tracing::debug!("concierge: skipped non-JSON stdout line");
                 }
@@ -1081,7 +1107,7 @@ fn drain_stream(
             Err(_) => break,
         }
     }
-    DrainedStream { session_id, final_text, acc, result_subtype, is_error, error_detail }
+    DrainedStream { session_id, final_text, acc, result_subtype, is_error, error_detail, tool_calls }
 }
 
 /// The drain loop, with the ownership gate INJECTED so it can be driven in a test — the previous
@@ -1106,8 +1132,15 @@ fn drain_turn(
             );
         },
     );
-    let DrainedStream { session_id, final_text, acc, result_subtype, is_error, error_detail } =
-        drained;
+    let DrainedStream {
+        session_id,
+        final_text,
+        acc,
+        result_subtype,
+        is_error,
+        error_detail,
+        tool_calls,
+    } = drained;
 
     // Reap — but only if the slot still holds OUR turn (token match). A cancel or a newer turn
     // took the slot first (and killed/reaped the child); the frontend initiated that teardown,
@@ -1132,6 +1165,8 @@ fn drain_turn(
             result_subtype,
             is_error,
             error_detail,
+            // Nobody is waiting on this turn: it emits no `done`, so it reports no calls either.
+            tool_calls: Vec::new(),
         };
     };
     let status = child.wait();
@@ -1150,6 +1185,7 @@ fn drain_turn(
         result_subtype,
         is_error,
         error_detail,
+        tool_calls,
     }
 }
 
@@ -1178,7 +1214,12 @@ fn emit_outcome(app: &AppHandle, id: &str, outcome: TurnOutcome, elapsed: std::t
         tracing::info!(id = %id, elapsed_ms, "concierge turn ok");
         let _ = app.emit(
             "concierge:done",
-            ConciergeDone { id: id.to_string(), session_id: outcome.session_id, text: outcome.text },
+            ConciergeDone {
+                id: id.to_string(),
+                session_id: outcome.session_id,
+                text: outcome.text,
+                tool_calls: outcome.tool_calls,
+            },
         );
     } else {
         let detail = failure_detail(
@@ -2337,6 +2378,146 @@ mod tests {
         assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
         assert_eq!(out.session_id, "sess-OLD");
         assert_eq!(out.acc, "the dead turn's buffered output");
+    }
+
+    /// THE FACT THE REPLY LINTER DECIDES ON: what the turn SENT, captured from the same drain that
+    /// produced what it SAID. Driven through the REAL `drain_stream` against literal NDJSON, so a
+    /// capture call deleted from the loop fails here — the point of driving the loop rather than
+    /// calling `capture_tool_uses` directly.
+    ///
+    /// `relay-paste` blocks a reply that pastes back the full text the concierge relayed to a build
+    /// agent, so the argument text has to survive VERBATIM and in full. `conciergeAudit.ts` cannot
+    /// answer this: it truncates argument values at 220 characters, well under any relayed message.
+    #[test]
+    fn the_drain_captures_the_tool_calls_a_turn_actually_made() {
+        // A relayed message longer than conciergeAudit's 220-char argument cap — the exact case
+        // that store cannot answer, and the reason this capture exists.
+        let relayed = "Rebase onto fresh origin/main before you verify: this branch is 95 commits \
+behind and you will spend the round chasing a red that is not yours. Then run the full suite, not \
+just the nearest test, because you are touching shared code.";
+        assert!(relayed.len() > 220, "the fixture must exceed conciergeAudit's arg cap");
+        let ndjson = format!(
+            concat!(
+                r#"{{"type":"system","subtype":"init","session_id":"sess-T"}}"#, "\n",
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"Relayed it. "}}}}}}"#, "\n",
+                r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}},{{"type":"tool_use","id":"toolu_1","name":"mcp__sparkle-control__sparkle_terminal","input":{{"action":"send","agentId":"a1","text":{msg}}}}}]}}}}"#, "\n",
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"Rebase note sent."}}}}}}"#, "\n",
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_2","name":"mcp__sparkle-control__set_agent_goal","input":{{"goal":"land the rebase"}}}}]}}}}"#, "\n",
+                r#"{{"type":"result","subtype":"success","session_id":"sess-T","result":"Relayed it. Rebase note sent."}}"#, "\n",
+            ),
+            msg = serde_json::to_string(relayed).unwrap(),
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()));
+
+        // BOTH survive the same pass: the streamed text is unchanged by the capture…
+        assert_eq!(seen, vec!["Relayed it. ", "Rebase note sent."]);
+        assert_eq!(out.final_text, "Relayed it. Rebase note sent.");
+        // …and the tool calls carry their names in stream order…
+        let names: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["mcp__sparkle-control__sparkle_terminal", "mcp__sparkle-control__set_agent_goal"],
+        );
+        // …with the relayed message intact, which is what the check compares the reply against.
+        assert!(
+            out.tool_calls[0].input.contains(relayed),
+            "the relayed text must survive whole: {}",
+            out.tool_calls[0].input,
+        );
+        assert!(out.tool_calls[1].input.contains("land the rebase"));
+    }
+
+    /// A turn that called nothing yields an EMPTY vec, not an error and not a missing field — the
+    /// common case (the concierge answers a question), and the linter must be able to tell "no
+    /// calls" from "calls we failed to capture".
+    #[test]
+    fn a_turn_with_no_tool_calls_yields_an_empty_list() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sess-N"}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All quiet."}]}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-N","result":"All quiet."}"#, "\n",
+        );
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {});
+        assert!(out.tool_calls.is_empty(), "a text-only turn captures nothing: {:?}", out.tool_calls);
+        assert_eq!(out.final_text, "All quiet.");
+    }
+
+    /// A malformed `tool_use` block must not panic and must not cost the REST of the stream — the
+    /// shapes here are the CLI's to change, and losing a reply over an unexpected block would be a
+    /// far worse failure than losing a lint input.
+    #[test]
+    fn a_malformed_tool_use_block_does_not_stop_the_parse() {
+        let ndjson = concat!(
+            // No name; content isn't even an array on the next one; then a good call and a normal
+            // delta + result AFTER the damage.
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","input":{"a":1}}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":"not-an-array"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/x.rs"}}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"still here"}}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-M","result":"still here"}"#, "\n",
+        );
+        let mut seen: Vec<String> = Vec::new();
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |t| seen.push(t.to_string()));
+
+        let names: Vec<&str> = out.tool_calls.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["Read"], "only the well-formed block is recorded");
+        assert!(out.tool_calls[0].input.contains("/x.rs"));
+        // Everything downstream of the malformed lines still parsed and still emitted.
+        assert_eq!(seen, vec!["still here"]);
+        assert_eq!(out.session_id, "sess-M");
+        assert_eq!(out.final_text, "still here");
+    }
+
+    /// The ownership gate is about EMISSION, not bookkeeping: a retired turn still says nothing,
+    /// and the capture added alongside the parse does not smuggle its output past that gate — the
+    /// records are dropped at the reap, so they never reach a `done` (there isn't one).
+    #[test]
+    fn a_retired_turn_still_emits_nothing_though_the_parse_captures() {
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo dead"}}]}}"#, "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the dead turn's output"}}}"#, "\n",
+        );
+        let mut seen: Vec<String> = Vec::new();
+        let out = drain_stream(ndjson.as_bytes(), &|| false, &|| false, &mut |t| seen.push(t.to_string()));
+        assert!(seen.is_empty(), "a superseded reader must not emit: {seen:?}");
+        // The parse ran (that is the pre-existing contract), so the capture ran with it…
+        assert_eq!(out.acc, "the dead turn's output");
+        assert_eq!(out.tool_calls.len(), 1);
+        // …and what keeps it from ever leaving is `drain_turn`'s un-owned path, which returns
+        // before any emit and hands back an outcome carrying an empty vec. That path needs a live
+        // AppHandle, so it is not driven here; what IS pinned here is that the capture itself adds
+        // no emission — `seen` is still empty with tool_use blocks in the stream.
+    }
+
+    /// The captured records reach the emitted payload as `toolCalls` — the wire contract the
+    /// frontend's `ConciergeDoneEvent` declares. Serializing the REAL struct is the only thing that
+    /// proves the camelCase rename applies to the new field; a field-presence check would not.
+    #[test]
+    fn the_done_payload_carries_the_tool_calls_as_camel_case() {
+        let ndjson = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh pr merge 864 --merge"}}]}}"#, "\n",
+            r#"{"type":"result","subtype":"success","session_id":"sess-D","result":"Merged it."}"#, "\n",
+        );
+        let out = drain_stream(ndjson.as_bytes(), &|| true, &|| false, &mut |_| {});
+        // The exact construction `emit_outcome` performs on the success arm.
+        let done = ConciergeDone {
+            id: "42".into(),
+            session_id: out.session_id,
+            text: out.final_text,
+            tool_calls: out.tool_calls,
+        };
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["sessionId"], "sess-D");
+        let calls = json["toolCalls"].as_array().expect("toolCalls must be an array on the payload");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "Bash");
+        assert!(
+            calls[0]["input"].as_str().unwrap().contains("gh pr merge 864 --merge"),
+            "the argument text must reach the frontend: {:?}",
+            calls[0]["input"],
+        );
     }
 
     /// THE PRECEDENCE RULE OF THE PROACTIVE PUSH CHANNEL: the user's own message always wins.

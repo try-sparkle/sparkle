@@ -304,6 +304,165 @@ pub(crate) fn capture_result_status(
     }
 }
 
+/// One tool call the assistant made during a turn: the tool's `name` and the FULL arguments it
+/// was called with. The turn-correlated, unredacted record the concierge reply linter needs —
+/// `conciergeAudit.ts` cannot supply it, because that store truncates every argument value at 220
+/// characters (`ARG_VALUE_MAX_CHARS`), which is far below the length of the relayed message the
+/// `relay-paste` check exists to detect.
+///
+/// `input` is a STRING, not a `serde_json::Value`, on purpose: the consumer scans it for verbatim
+/// overlap with the reply text, never navigates it, and a `String` keeps the struct `Clone` +
+/// `Serialize` cheap for an event payload that crosses the Tauri bridge on every turn. It holds
+/// `serde_json`'s compact serialization of the block's `input` object (`{}` when the block carried
+/// none). When it exceeds `MAX_TOOL_USE_INPUT_CHARS` it is truncated with a trailing marker, so a
+/// clamped record is deliberately NOT parseable JSON — this field is for text scanning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ToolUseRecord {
+    pub name: String,
+    pub input: String,
+}
+
+/// Most tool calls retained per turn.
+///
+/// THE INVARIANT, and it is the thing to preserve if you touch this number: the cap must stay FAR
+/// ABOVE any real turn, so that eviction is a runaway-only path. That is what makes the eviction
+/// direction a tolerable trade rather than a live defect — `capture_tool_uses` explains why neither
+/// end is safe in general (`relay-paste` needs the late relays, `tookAction` needs the early
+/// action). Lower this toward a plausible turn size and you re-create both bugs at once.
+///
+/// A big fan-out plus its status probes runs a few dozen calls; 128 is comfortably above that.
+///
+/// The ceiling on the other side is the wire: the whole vector rides a `concierge:done` Tauri event.
+/// COUNT THAT IN BYTES, NOT CHARS (roborev 55852) — `clamp_tool_input` cuts at 16_384 *characters*
+/// via `char_indices`, and `serde_json` does not `\u`-escape non-ASCII, so one record encodes as up
+/// to 4 bytes per char: ~64 KiB, not ~16 KB. The true worst case is `128 × 64 KiB ≈ 8 MB` of JSON
+/// on one event — a turn of 128 calls whose inputs are all full-length CJK or emoji. An earlier
+/// version of this paragraph did the multiplication in chars and claimed ~2 MB, i.e. wrong by 4× in
+/// the direction that matters, and then used that number to justify the cap.
+///
+/// Restating it honestly does not change the value, and here is why: that 8 MB requires every one of
+/// 128 calls to carry a maximal non-ASCII payload simultaneously, which is not a turn that occurs —
+/// a real fan-out is a few dozen calls whose inputs are short. Both caps exist to bound a RUNAWAY,
+/// not to price the normal case. What the corrected number does change is the headroom argument: it
+/// is the reason neither cap should be raised again without measuring, and the reason 128 rather
+/// than 256 (which would put the pathological bound at ~16 MB).
+pub(crate) const MAX_TOOL_USE_RECORDS: usize = 128;
+
+/// Most characters retained per `input`. The consuming check looks for a few-hundred-character
+/// verbatim overlap between the reply and a relayed message, so this has to stay comfortably ABOVE
+/// that threshold — clamping below it would silently defeat the feature rather than bound it. 16k
+/// characters is several times the longest message the concierge actually relays, while still
+/// bounding a pathological payload (a pasted file, a base64 blob) that would otherwise cross the
+/// bridge in full.
+pub(crate) const MAX_TOOL_USE_INPUT_CHARS: usize = 16_384;
+
+/// Marker appended to a clamped `input`, so a consumer (or a human reading a log) can tell a short
+/// argument from a truncated one. Short by design: it must not itself be long enough to register as
+/// a verbatim overlap.
+const TOOL_USE_TRUNCATED: &str = "…[truncated]";
+
+/// Clamp to `MAX_TOOL_USE_INPUT_CHARS` on a CHARACTER boundary (never a byte one — the payload is
+/// arbitrary UTF-8 and slicing mid-codepoint would panic).
+fn clamp_tool_input(s: String) -> String {
+    match s.char_indices().nth(MAX_TOOL_USE_INPUT_CHARS) {
+        None => s,
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + TOOL_USE_TRUNCATED.len());
+            out.push_str(&s[..byte_idx]);
+            out.push_str(TOOL_USE_TRUNCATED);
+            out
+        }
+    }
+}
+
+/// Sibling of `handle_event` / `capture_result_status`: capture the `tool_use` blocks carried by an
+/// `assistant` message — the tool NAME plus its full `input` — which `handle_event` drops at its
+/// `_ => {}`. These payloads are already on the wire and were being thrown away; they are the only
+/// authoritative, turn-correlated record of what the assistant actually SENT, which is what a
+/// deterministic reply linter needs to tell "I relayed the message" from "I pasted it back at you".
+///
+/// Kept as a separate function for the same reason `capture_result_status` is: `handle_event`'s
+/// signature is shared with `sparkle_improve.rs`, and this must not perturb it. Appends to `out`;
+/// a caller that wants per-turn records passes a fresh vec.
+///
+/// Defensive throughout — a partial or malformed block is SKIPPED, never fatal. The stream is
+/// third-party output whose shape is the CLI's to change, and losing the rest of a turn's parse
+/// over an unexpected block would trade a missing lint input for a broken reply.
+pub(crate) fn capture_tool_uses(ev: &Value, out: &mut Vec<ToolUseRecord>) {
+    // Counted, then logged ONCE below (roborev 55757, Medium). Warning per evicted record turned a
+    // 500-call runaway into ~436 identical lines per event, burying the warnings around it — the
+    // opposite of a durable trace, and a level escalation over the `debug!` this replaced.
+    let mut evicted = 0usize;
+    if ev.get("type").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(blocks) = ev
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        // A block with no usable name is unattributable — a record naming nothing is worse than no
+        // record, since a consumer cannot tell which call it describes.
+        let Some(name) = block
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        // EVICT THE OLDEST, KEEP THE NEWEST (roborev 55648, Medium).
+        //
+        // This used to `return` on reaching the cap, dropping the TAIL of the turn — and the tail is
+        // the half the consumer cares about. Within a concierge turn the reads and status probes come
+        // first and the `send`/relay calls come after them, so truncating the end removed exactly the
+        // arguments `relay-paste` compares the reply against: the check failed OPEN on the largest
+        // fan-out turns, which are the ones most likely to contain a relay. Keeping the newest N
+        // inverts that: a capped turn loses the early reads, which no check reads.
+        //
+        // THIS IS A TRADE, NOT A FREE WIN (roborev 55757, Medium). An earlier comment here claimed
+        // a capped turn "loses the early reads, which no check reads" — that was wrong.
+        // `ask-without-action` gates on `tookAction`, which scans EVERY record, so evicting the front
+        // can drop the acting call and block a reply that legitimately reported work done: spawn 20
+        // workers, then 60+ status probes, then answer. The old direction had the mirror flaw for
+        // late relays. Neither end is safe in general.
+        //
+        // What makes the trade acceptable is the CAP, not the direction: it is set far above any real
+        // turn (see MAX_TOOL_USE_RECORDS), so eviction is a runaway-only path. Given it does fire,
+        // keeping the newest is still the better half — a relay is the thing `relay-paste` cannot
+        // reconstruct, while `tookAction` needs only one acting record and a runaway turn is
+        // overwhelmingly reads. Classifying records here to evict reads preferentially would restate
+        // the TypeScript risk vocabulary in Rust, which is the drift this codebase repeatedly refuses.
+        //
+        // Also BEST-EFFORT with no in-band marker: a consumer cannot tell a capped list from an exact
+        // one. A sentinel record was considered and rejected — `tookAction` and `relay-paste` both
+        // treat an unrecognized name as a real call, so the marker would read as an action.
+        if out.len() >= MAX_TOOL_USE_RECORDS {
+            evicted += 1;
+            out.remove(0);
+        }
+        let input = block
+            .get("input")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_string());
+        out.push(ToolUseRecord { name: name.to_string(), input: clamp_tool_input(input) });
+    }
+    if evicted > 0 {
+        tracing::warn!(
+            cap = MAX_TOOL_USE_RECORDS,
+            evicted,
+            "tool_use capture: record cap reached; evicted the oldest calls to keep the newest \
+             (the relay-bearing end of the turn)"
+        );
+    }
+}
+
 /// Structured outcome of ONE headless `claude` run (one child, its stdout read to EOF and the
 /// child reaped). Returned by `run_reader` so the caller can decide whether to retry and how to
 /// phrase a failure. `owned` is false when the session map no longer held our token by the time
@@ -928,6 +1087,185 @@ mod tests {
             &mut detail,
         );
         assert_eq!(detail.as_deref(), Some("kept"));
+    }
+
+    /// An `assistant` message's `tool_use` blocks are captured with the tool name AND the full
+    /// argument text — the payload `handle_event` drops. Driven with the exact event shape
+    /// `claude -p --output-format stream-json` emits.
+    #[test]
+    fn capture_tool_uses_keeps_the_name_and_the_whole_argument_text() {
+        let relayed = "Rebase onto origin/main before you verify; the branch is 95 commits behind.";
+        let ev = serde_json::json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": [
+                { "type": "text", "text": "Sending that along." },
+                { "type": "tool_use", "id": "toolu_1", "name": "mcp__sparkle-control__sparkle_terminal",
+                  "input": { "action": "send", "agentId": "a1", "text": relayed } },
+            ]},
+        });
+        let mut out = Vec::new();
+        capture_tool_uses(&ev, &mut out);
+
+        assert_eq!(out.len(), 1, "the text block must not produce a record: {out:?}");
+        assert_eq!(out[0].name, "mcp__sparkle-control__sparkle_terminal");
+        // The whole relayed message survives verbatim — this is the fact the linter decides on.
+        assert!(out[0].input.contains(relayed), "argument text was lost: {}", out[0].input);
+        assert!(out[0].input.contains("\"agentId\""), "other args survive too: {}", out[0].input);
+        assert!(!out[0].input.contains("truncated"), "a short payload is not clamped");
+    }
+
+    #[test]
+    fn capture_tool_uses_records_several_calls_in_order_and_ignores_other_events() {
+        let ev = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": { "file_path": "/a.rs" } },
+                { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "cargo test" } },
+            ]},
+        });
+        let mut out = Vec::new();
+        capture_tool_uses(&ev, &mut out);
+        // A non-assistant event contributes nothing (and must not clear what we already have).
+        capture_tool_uses(&result_event("s", "done"), &mut out);
+        capture_tool_uses(&text_delta_event("hi"), &mut out);
+
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["Read", "Bash"]);
+        assert!(out[1].input.contains("cargo test"), "got: {}", out[1].input);
+    }
+
+    /// Partial / malformed blocks are the stream shapes we do not control. Each must be skipped
+    /// without panicking and without costing the WELL-FORMED block that follows it.
+    #[test]
+    fn capture_tool_uses_skips_malformed_blocks_without_losing_the_good_one() {
+        let ev = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use" },                                   // no name, no input
+                { "type": "tool_use", "name": "" },                       // empty name
+                { "type": "tool_use", "name": 7, "input": { "a": 1 } },   // name isn't a string
+                { "type": "tool_use", "name": "NoArgs" },                 // name, but no input
+                { "type": "tool_use", "name": "Good", "input": { "q": "kept" } },
+            ]},
+        });
+        let mut out = Vec::new();
+        capture_tool_uses(&ev, &mut out);
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["NoArgs", "Good"]);
+        assert_eq!(out[0].input, "{}", "an absent input serializes as an empty object");
+        assert!(out[1].input.contains("kept"), "got: {}", out[1].input);
+
+        // Whole-message shapes that are wrong: no message, content not an array, content missing.
+        let mut out = Vec::new();
+        for ev in [
+            serde_json::json!({ "type": "assistant" }),
+            serde_json::json!({ "type": "assistant", "message": { "content": "oops" } }),
+            serde_json::json!({ "type": "assistant", "message": {} }),
+            serde_json::json!({ "type": "assistant", "message": { "content": [7, "x", null] } }),
+        ] {
+            capture_tool_uses(&ev, &mut out);
+        }
+        assert!(out.is_empty(), "malformed messages yield nothing: {out:?}");
+    }
+
+    #[test]
+    fn capture_tool_uses_clamps_a_huge_payload_and_caps_the_record_count() {
+        // A payload far over the cap is truncated on a CHARACTER boundary (multibyte, so a
+        // byte-slice would panic) and marked.
+        let huge = "é".repeat(MAX_TOOL_USE_INPUT_CHARS * 2);
+        let ev = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "name": "Write", "input": { "content": huge } },
+            ]},
+        });
+        let mut out = Vec::new();
+        capture_tool_uses(&ev, &mut out);
+        assert_eq!(out.len(), 1);
+        let n = out[0].input.chars().count();
+        assert!(
+            n <= MAX_TOOL_USE_INPUT_CHARS + TOOL_USE_TRUNCATED.chars().count(),
+            "clamped to {n} chars, over the cap",
+        );
+        assert!(out[0].input.ends_with(TOOL_USE_TRUNCATED), "a clamped input is marked");
+        // …but it is still generous: a several-thousand-character relayed message survives whole.
+        assert!(n > 4000, "the cap must stay well above the linter's overlap threshold");
+
+        // The record count is capped too, and the cap does not corrupt what was already captured.
+        let blocks: Vec<Value> = (0..MAX_TOOL_USE_RECORDS + 25)
+            .map(|i| serde_json::json!({ "type": "tool_use", "name": format!("T{i}"), "input": {} }))
+            .collect();
+        let mut out = Vec::new();
+        capture_tool_uses(
+            &serde_json::json!({ "type": "assistant", "message": { "content": blocks } }),
+            &mut out,
+        );
+        assert_eq!(out.len(), MAX_TOOL_USE_RECORDS);
+        // THE NEWEST CALLS SURVIVE, NOT THE OLDEST (roborev 55648, Medium).
+        //
+        // This assertion is inverted from what it was, and the inversion IS the fix. A concierge turn
+        // runs its reads and status probes first and its `send`/relay calls last, so keeping the OLDEST
+        // MAX_TOOL_USE_RECORDS dropped precisely the arguments `relay-paste` compares against — the check
+        // failed open on the biggest fan-out turns, the ones most likely to carry a relay. The last
+        // record must be the last call the model actually made.
+        let total = MAX_TOOL_USE_RECORDS + 25;
+        assert_eq!(
+            out[MAX_TOOL_USE_RECORDS - 1].name,
+            format!("T{}", total - 1),
+            "the LAST call of the turn must survive the cap — it is the relay-bearing end"
+        );
+        assert_eq!(
+            out[0].name,
+            format!("T{}", total - MAX_TOOL_USE_RECORDS),
+            "the retained window is the newest MAX_TOOL_USE_RECORDS calls, contiguous"
+        );
+        // Contiguity, so an eviction bug cannot leave a shuffled or gapped window.
+        for (i, rec) in out.iter().enumerate() {
+            assert_eq!(rec.name, format!("T{}", total - MAX_TOOL_USE_RECORDS + i));
+        }
+    }
+
+    /// THE COST OF THE EVICTION DIRECTION, pinned so it is a known trade rather than a surprise
+    /// (roborev 55757, Medium). `ask-without-action` gates on `tookAction`, which scans every record —
+    /// so a turn that ACTS FIRST and then does a runaway of reads loses its acting call and gets a
+    /// legitimate "here is what I did" reply blocked. The cap is set far above any real turn precisely
+    /// so this stays a runaway-only path; this test documents the boundary rather than pretending it
+    /// does not exist.
+    #[test]
+    fn an_early_acting_call_is_lost_once_a_turn_exceeds_the_cap() {
+        let total = MAX_TOOL_USE_RECORDS + 5;
+        let mut blocks = vec![serde_json::json!({
+            "type": "tool_use", "name": "spawn_build_agent", "input": {"task": "x"}
+        })];
+        blocks.extend((0..total - 1).map(|i| {
+            serde_json::json!({ "type": "tool_use", "name": format!("read_{i}"), "input": {} })
+        }));
+        let mut out = Vec::new();
+        capture_tool_uses(
+            &serde_json::json!({ "type": "assistant", "message": { "content": blocks } }),
+            &mut out,
+        );
+        assert_eq!(out.len(), MAX_TOOL_USE_RECORDS);
+        assert!(
+            !out.iter().any(|r| r.name == "spawn_build_agent"),
+            "documents the trade: past the cap the earliest acting call IS evicted"
+        );
+        // ...and one call under the cap keeps it, which is the case that actually occurs.
+        let mut under = vec![serde_json::json!({
+            "type": "tool_use", "name": "spawn_build_agent", "input": {"task": "x"}
+        })];
+        under.extend((0..MAX_TOOL_USE_RECORDS - 1).map(|i| {
+            serde_json::json!({ "type": "tool_use", "name": format!("read_{i}"), "input": {} })
+        }));
+        let mut out2 = Vec::new();
+        capture_tool_uses(
+            &serde_json::json!({ "type": "assistant", "message": { "content": under } }),
+            &mut out2,
+        );
+        assert!(
+            out2.iter().any(|r| r.name == "spawn_build_agent"),
+            "a full-but-uncapped turn must keep its acting call — this is the real-world case"
+        );
     }
 
     #[test]
