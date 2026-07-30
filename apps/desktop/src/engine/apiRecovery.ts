@@ -442,6 +442,19 @@ function describeSpan(ms: number): string {
  *  a test asserts the prompt contains it. */
 export const REVIVE_PROMPT_MARKER = "This is automatic retry ";
 
+/**
+ * Told to the human when a ladder was spent and the agent failed again LATER — late enough that we
+ * cannot tell whether the last retry worked and a new outage arrived, or the same one took a while to
+ * re-print (roborev 55534). Deliberately does NOT claim the outage outlasted the ladder, which is what
+ * the exhaustion reason says and would be a false statement about a failure seconds old.
+ *
+ * Lives here beside the other reasons rather than in the runner so all the copy the human can be shown
+ * is in one file, and the runner keeps no strings of its own.
+ */
+export const SPENT_LADDER_REASON =
+  `Auto-retried ${REVIVE_LADDER_MS.length} times without this settling, and it has failed again. ` +
+  `Retrying from the start, but this one may need you.`;
+
 export function revivePrompt(attempt: number): string {
   return (
     `Your last turn ended on a transient Anthropic API error (e.g. 529 Overloaded / 500), not on ` +

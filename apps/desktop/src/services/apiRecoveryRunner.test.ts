@@ -16,6 +16,7 @@ import {
   REVIVE_LADDER_MS,
   REVIVE_PROMPT_MARKER,
   revivePrompt,
+  SPENT_LADDER_REASON,
 } from "../engine/apiRecovery";
 
 const A = "agent-1";
@@ -291,6 +292,42 @@ describe("sweepApiRecovery", () => {
     expect(apiRecoveryEpisode(A)?.failure).toBe("retryable");
   });
 
+  // ── THE MARKER SLICE MUST SURVIVE ROW WRAPPING (roborev 55534) ─────────────────────────────────
+  // `terminalScrollback` builds its string as one entry per xterm BUFFER ROW
+  // (`translateToString(true)` joined with \r\n), and this feature already documents that a ~62-char
+  // banner arrives split in two because Sparkle runs agents in narrow grid panes. A raw `lastIndexOf`
+  // on a 24-char marker sitting mid-paragraph therefore returned -1 whenever a row boundary fell
+  // inside it, `sinceOurPing` returned "", and the terminal upgrade SILENTLY stopped working — with
+  // every test still green, because they all fed the prompt as one unwrapped line.
+  const wrapAt = (text: string, cols: number): string[] => {
+    const rows: string[] = [];
+    for (let i = 0; i < text.length; i += cols) rows.push(text.slice(i, i + cols));
+    return rows;
+  };
+
+  it("upgrades to terminal even when our marker is SPLIT across wrapped rows", () => {
+    // Prove the premise first: at these widths the marker really is broken mid-word, so a raw
+    // substring search cannot find it. Without this the test could pass on an unwrapped shape.
+    for (const cols of [30, 37, 40, 41, 52]) {
+      const rows = wrapAt(revivePrompt(1), cols);
+      const joined = rows.join("\r\n");
+      const split = !joined.includes(REVIVE_PROMPT_MARKER);
+
+      __resetApiRecovery();
+      noteAgentStatus(A, "errored", T0, () => BANNER_529);
+      const ep = apiRecoveryEpisode(A) as { attempts: number; lastPingAt: number | undefined };
+      Object.assign(ep, { attempts: 1, lastPingAt: T0 + 1_000 });
+      noteAgentStatus(A, "working", T0 + 1_100, () => "");
+      noteAgentStatus(A, "errored", T0 + 2_000, () => [joined, BANNER_SPEND].join("\r\n"));
+      expect(apiRecoveryEpisode(A)?.failure, `cols=${cols} (marker split: ${split})`).toBe("terminal");
+    }
+    // At least one of those widths must actually have split the marker, or this proves nothing.
+    const anySplit = [30, 37, 40, 41, 52].some(
+      (c) => !wrapAt(revivePrompt(1), c).join("\r\n").includes(REVIVE_PROMPT_MARKER),
+    );
+    expect(anySplit).toBe(true);
+  });
+
   it("refuses to upgrade at all when our ping's marker is absent from the scrollback", () => {
     // Fails CLOSED: if we cannot PROVE the text came after our ping, we do not act on it. A terminal
     // verdict stops retries and makes a billing claim, so an unprovable one must not be reached.
@@ -340,7 +377,7 @@ describe("sweepApiRecovery", () => {
     expect(submit2).toHaveBeenCalledOnce();
   });
 
-  it("STILL escalates when the re-fail after ping 11 is SLOW (roborev 55517)", async () => {
+  it("pages once AND starts a fresh ladder when the re-fail after ping 11 is SLOW", async () => {
     // Collapsing the window at exhaustion killed this: a re-fail more than 2 minutes after the last
     // ping was refused, `attempts` AND `escalated` reset, so the ladder restarted at rung 0 and the
     // human was never told — and a long outage could cycle 11 pings → restart → 11 pings forever.
@@ -359,16 +396,63 @@ describe("sweepApiRecovery", () => {
       noteAgentStatus(A, "errored", clock + gap, () => BANNER_529);
       clock += gap;
     }
-    // The ladder is spent AND still un-escalated, so the wide window applies and the rung survived.
+    // AMBIGUOUS (roborev 55534): the ladder is spent and the re-fail was slow, so we cannot tell
+    // "the last retry failed" from "the last retry worked and this is new". Neither pure answer is
+    // right — inheriting rung 11 gives a possibly-new 529 zero retries plus a false "outlasting the
+    // ladder"; starting fresh loses the spent-ladder page entirely, because ping 11 clears `errored`
+    // itself so no sweep ever sees attempts >= length while errored. So: fresh ladder, and one page.
     expect(apiRecoveryEpisode(A)).toMatchObject({
-      attempts: REVIVE_LADDER_MS.length,
+      attempts: 0,
       escalated: false,
+      pendingSpentPage: true,
     });
 
     const onEscalate = vi.fn();
-    await sweepApiRecovery(deps({ now: clock + 60_000, submit, onEscalate }));
+    const submit2 = vi.fn(async () => {});
+    await sweepApiRecovery(deps({ now: clock + REVIVE_LADDER_MS[0]!, submit: submit2, onEscalate }));
+    // The human is told — but with an honest reason, NOT the "outage is outlasting the ladder" claim,
+    // which would be a false statement about a failure seconds old.
     expect(onEscalate).toHaveBeenCalledOnce();
-    expect(onEscalate.mock.calls[0]![1]).toMatch(/outlasting the ladder/);
+    expect(onEscalate.mock.calls[0]![1]).toBe(SPENT_LADDER_REASON);
+    expect(onEscalate.mock.calls[0]![1]).not.toMatch(/outlasting the ladder/);
+    // ...and the possibly-new failure still gets retried, which the inherit-rung-11 version refused.
+    expect(submit2).toHaveBeenCalledOnce();
+    expect(submit2).toHaveBeenCalledWith(A, revivePrompt(1));
+
+    // Paged ONCE, not on every sweep.
+    await sweepApiRecovery(deps({ now: clock + 60 * 60_000, submit: submit2, onEscalate }));
+    expect(onEscalate).toHaveBeenCalledOnce();
+  });
+
+  it("sends the rung-0 ping when ping 11 SUCCEEDED and a new outage arrives much later", async () => {
+    // The production path the previous gate missed entirely (roborev 55534). `escalated` can never
+    // become true on the success path, so the un-escalated hour-wide window carried a 45-minute-later
+    // failure at `attempts: 11` → escalate at once with a false claim, ZERO retries for a plainly
+    // transient 529. The coverage had moved too: the sibling test forces `escalated: true` first, so
+    // nothing exercised this branch.
+    noteAgentStatus(A, "errored", T0, () => BANNER_529);
+    const submit = vi.fn(async () => {});
+    let clock = T0;
+    for (let i = 0; i < REVIVE_LADDER_MS.length; i++) {
+      clock += REVIVE_LADDER_MS[i]!;
+      await sweepApiRecovery(deps({ now: clock, submit }));
+      noteAgentStatus(A, "working", clock + 100, () => "");
+      if (i < REVIVE_LADDER_MS.length - 1) noteAgentStatus(A, "errored", clock + 1_000, () => BANNER_529);
+    }
+    // Ping 11 WORKED — the agent is green and stays green. Nothing ever saw attempts >= length errored.
+    expect(apiRecoveryEpisode(A)).toBeUndefined();
+
+    // 45 minutes of real work later, an unrelated 529. Inside the un-escalated window (tail × 2 = 1h).
+    const newFailure = clock + 45 * 60_000;
+    expect(newFailure - clock).toBeLessThan(REVIVE_LADDER_MS[REVIVE_LADDER_MS.length - 1]! * 2);
+    noteAgentStatus(A, "errored", newFailure, () => BANNER_529);
+
+    const submit2 = vi.fn(async () => {});
+    const onEscalate = vi.fn();
+    await sweepApiRecovery(deps({ now: newFailure + REVIVE_LADDER_MS[0]!, submit: submit2, onEscalate }));
+    expect(submit2).toHaveBeenCalledOnce();
+    expect(submit2).toHaveBeenCalledWith(A, revivePrompt(1));
+    expect(onEscalate.mock.calls[0]?.[1]).not.toMatch(/outlasting the ladder/);
   });
 
   it("STILL carries at exhaustion when the re-fail is immediate, so escalation survives", async () => {

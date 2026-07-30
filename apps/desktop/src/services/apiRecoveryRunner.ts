@@ -29,6 +29,7 @@ import {
   nextRungDueAt,
   REVIVE_LADDER_MS,
   REVIVE_PROMPT_MARKER,
+  SPENT_LADDER_REASON,
   type ApiFailureClass,
   type ReviveDecision,
 } from "../engine/apiRecovery";
@@ -60,6 +61,18 @@ export interface ReviveEpisode {
   failure: ApiFailureClass | null;
   /** Whether we have already escalated (told the human) — so escalation fires once, not every sweep. */
   escalated: boolean;
+  /**
+   * Set when this episode REPLACED a spent ladder whose outcome was AMBIGUOUS (roborev 55534): the
+   * prior episode used every rung, and the re-failure came late enough that we cannot tell whether
+   * that last retry worked and a NEW outage arrived, or the same one simply took a while to re-print.
+   *
+   * The next sweep pages the human once about the spent ladder and then lets THIS episode's own fresh
+   * ladder proceed. That decoupling is the point: inheriting `attempts: 11` handed a brand-new,
+   * plainly transient 529 zero retries plus a false "the outage is outlasting the ladder", while
+   * simply starting fresh lost the spent-ladder page altogether — because ping 11 clears `errored`
+   * itself, so no sweep ever observes `attempts >= length` while errored on that path.
+   */
+  pendingSpentPage: boolean;
 }
 
 // Live episodes, keyed by agent id. Module-level rather than in a zustand store on purpose: nothing
@@ -191,9 +204,16 @@ export function __apiRecoveryCarrySize(): number {
   return recentlyEnded.size;
 }
 
+/** Whitespace removed entirely, so a needle can be found across a HARD WRAP. See {@link sinceOurPing}
+ *  for why nothing gentler works: xterm breaks a row at the column, mid-word and with no separator
+ *  inserted, and the TUI may indent the continuation. Collapsing to a space (what
+ *  `classifyFromScrollback`'s unwrap does) only survives breaks that land on a word boundary. */
+const squashSpace = (s: string): string => s.replace(/\s+/g, "");
+const MARKER_SQUASHED = squashSpace(REVIVE_PROMPT_MARKER);
+
 /**
- * The part of a scrollback that arrived at or after our most recent retry prompt, found by that
- * prompt's own {@link REVIVE_PROMPT_MARKER}. Empty when the marker is absent.
+ * The part of a scrollback that arrived at or after our most recent retry prompt, located by that
+ * prompt's own {@link REVIVE_PROMPT_MARKER}. Empty when the marker cannot be found.
  *
  * FAILS CLOSED, and that is the point: an empty string classifies as null, so a carry that cannot
  * PROVE the text it is judging came after our ping does not upgrade to `terminal`. Slicing at the
@@ -201,10 +221,35 @@ export function __apiRecoveryCarrySize(): number {
  * classify as `terminal` — it says "an account limit" but never the line-initial "You've hit your …
  * limit" opener with a "· resets"/"raise it at" tail. A test guards that property directly, since it
  * is a fact about the prompt's WORDING and would silently break if someone reworded it.
+ *
+ * WRAP-TOLERANT ON PURPOSE (roborev 55534). This was a raw `lastIndexOf`, which is wrong on the input
+ * this module actually receives: `terminalScrollback` builds the string as one entry per xterm BUFFER
+ * ROW (`translateToString(true)` joined with \r\n), and `engine/apiRecovery` already records that a
+ * ~62-char banner arrives split in two because Sparkle runs agents in narrow grid panes. The marker
+ * sits mid-paragraph in a ~110-char prompt, so its offset within a row is arbitrary — whenever a row
+ * boundary fell inside "This is automatic retry ", `lastIndexOf` returned -1 and the terminal upgrade
+ * SILENTLY stopped working, re-opening the 55485 bug with the tests still green (they fed the prompt as
+ * one unwrapped line, the single shape wrapping cannot break). Matching on whitespace-squashed rows
+ * fixes both that and the mirror case, where a split latest marker let `lastIndexOf` anchor on an
+ * OLDER ping and admit text predating the last one.
  */
 function sinceOurPing(scrollback: string): string {
-  const at = scrollback.lastIndexOf(REVIVE_PROMPT_MARKER);
-  return at === -1 ? "" : scrollback.slice(at);
+  const rows = scrollback.split(/[\r\n]/);
+  const squashed = rows.map(squashSpace);
+  for (let i = rows.length - 1; i >= 0; i--) {
+    // Accumulate FORWARD from row i until enough characters exist for the marker to be present, rather
+    // than joining a fixed number of rows. `classifyFromScrollback` looks at exactly two because a
+    // banner's opener and tail are one wrap apart; this needle can be broken across MORE than two — a
+    // blank row (the prompt has a paragraph break) or a very narrow pane both do it, and a two-row join
+    // silently missed those, which is the same invisible-failure shape this fix exists to remove.
+    let acc = "";
+    const enough = squashed[i]!.length + MARKER_SQUASHED.length;
+    for (let j = i; j < rows.length && acc.length < enough; j++) {
+      acc += squashed[j];
+      if (acc.includes(MARKER_SQUASHED)) return rows.slice(i).join("\n");
+    }
+  }
+  return "";
 }
 
 /** What {@link noteAgentStatus} did, so the caller (and tests) can see the transition it observed. */
@@ -268,20 +313,39 @@ export function noteAgentStatus(
         ? "terminal"
         : prior.failure
       : classifyFromScrollback(readScrollback(agentId));
+    // A CARRIED-BUT-SPENT LADDER IS AMBIGUOUS, AND BOTH PURE ANSWERS ARE WRONG (roborev 55534).
+    //
+    // Ping 11 clears `errored` itself, so `escalated` is still false when the episode is filed away and
+    // NO sweep ever observes `attempts >= length` while errored on that path. Consequences of the two
+    // obvious choices, both of which this branch has now shipped and had reviewed:
+    //   • Inherit `attempts: 11` — then if ping 11 actually WORKED and an unrelated 529 arrives 45
+    //     minutes later, the next sweep escalates instantly with "the outage is outlasting the ladder"
+    //     (a false claim about a failure seconds old) and the new, plainly transient error gets ZERO
+    //     retries. Exactly the stall this module exists to end.
+    //   • Start fresh at rung 0 — then the spent-ladder page is never sent at all, and a genuinely
+    //     sustained outage cycles 11 pings → restart → 11 pings with the human never told.
+    // So decouple the two things: page ONCE about the ladder we spent, and give the possibly-new
+    // failure its own full ladder. `escalated` stays false so this episode can still page on its own
+    // exhaustion — two pages 87 minutes apart is correct, not noise.
+    const spentAndAmbiguous =
+      carry && prior.attempts >= REVIVE_LADDER_MS.length && now - prior.lastPingAt! > EPISODE_CARRY_MS;
+    const resumed = carry && !spentAndAmbiguous;
     episodes.set(agentId, {
       erroredSince: now,
-      attempts: carry ? prior.attempts : 0,
-      lastPingAt: carry ? prior.lastPingAt : undefined,
+      attempts: resumed ? prior.attempts : 0,
+      lastPingAt: resumed ? prior.lastPingAt : undefined,
       failure,
       // Carried too, so a resumed episode that already told the human does not tell them again.
-      escalated: carry ? prior.escalated : false,
+      escalated: resumed ? prior.escalated : false,
+      pendingSpentPage: spentAndAmbiguous,
     });
-    log.info("apiRecovery", carry ? "episode resumed" : "episode opened", {
+    log.info("apiRecovery", resumed ? "episode resumed" : "episode opened", {
       agentId,
       failure,
-      attempts: carry ? prior.attempts : 0,
+      attempts: resumed ? prior.attempts : 0,
+      afterSpentLadder: spentAndAmbiguous,
     });
-    return carry ? "resumed" : "started";
+    return resumed ? "resumed" : "started";
   }
   if (!open) return "none";
   episodes.delete(agentId);
@@ -372,6 +436,16 @@ export async function sweepApiRecovery(deps: ReviveDeps): Promise<SweepOutcome[]
       out.push({ agentId, decision: { action: "none", reason: "status-unknown" } });
       continue;
     }
+    // The one-off page for a ladder we spent, owed from a carry that could not tell "the last retry
+    // failed" from "the last retry worked and this is new" (roborev 55534). Sent BEFORE the decision so
+    // it goes out even if the fresh ladder's first rung is not due yet, and cleared first so a throw
+    // below cannot re-page on the next sweep.
+    if (episode.pendingSpentPage) {
+      episode.pendingSpentPage = false;
+      log.warn("apiRecovery", "spent a full ladder, starting over", { agentId });
+      deps.onEscalate(agentId, SPENT_LADDER_REASON, episode);
+    }
+
     const exited = deps.hasExited(agentId);
     const decision = decideRevive({
       status,
