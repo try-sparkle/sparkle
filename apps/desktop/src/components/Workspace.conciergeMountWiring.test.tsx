@@ -29,7 +29,7 @@
 // prompt target would be asserting the agreement, not the rule. It gets its own coverage when the
 // routing work lands.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -166,6 +166,21 @@ function columnEl(): HTMLElement {
       "no <section aria-label='Sparkle concierge'> carrying [data-wired] under the concierge root",
     );
   }
+  // ══ THE UNLOCKED PREMISE, ENFORCED WHERE IT CANNOT BE BYPASSED (roborev 55745) ═════════════════
+  // The premise case below states this, but no other case goes THROUGH it — they all call
+  // `columnWired()`, and the selector above resolves the section identically whether or not the AI
+  // gate is shut (`data-wired` sits on the section above the `aiLock ?` branch). So the exact drift
+  // this file was rewritten to fix could recur in every case but the premise one: any future edit
+  // that nulls `me` for a single case — and `BalanceBadge`'s mount-time `refresh()` is a live
+  // instance the helpers already stub around — would leave the other rows green while once again
+  // pinning the wire through a column with no thread and no composer. Checked here, every caller
+  // inherits it for free.
+  if (el.querySelector('[data-testid="concierge-ai-locked"]')) {
+    throw new Error(
+      "the concierge column is AI-LOCKED — this suite pins the wire through the UNLOCKED column " +
+        "(thread + composer mounted). Something nulled `me` after enableAiEnhancementsForTests().",
+    );
+  }
   return el as HTMLElement;
 }
 const columnWired = () => columnEl().getAttribute("data-wired");
@@ -207,7 +222,13 @@ describe("the mount reaches the concierge column, through the real host", () => 
   it("renders the UNLOCKED column — thread and composer both mounted", () => {
     render(<Workspace />);
     expect(screen.queryByTestId("concierge-ai-locked")).toBeNull();
-    expect(screen.getByRole("textbox")).not.toBeNull();
+    // ANCHORED INSIDE THE COLUMN, not document-wide (roborev 55745). The claim is "the CONCIERGE's
+    // composer mounted", and the shell is not textbox-free by construction — `AgentSidebar`'s rename
+    // input and `CommandPalette`'s both carry role=textbox under the same render. A bare
+    // `screen.getByRole("textbox")` would pass against a composerless column whenever either of
+    // those is present, and throw "found multiple elements" whenever both are, failing the premise
+    // for a reason that has nothing to do with the premise.
+    expect(within(columnEl()).getByRole("textbox")).not.toBeNull();
   });
 
   it("leaves the column unwired at rest", () => {

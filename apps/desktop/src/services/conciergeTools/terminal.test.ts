@@ -235,7 +235,14 @@ beforeEach(() => {
   // is falsified by whichever case ran before them, and they fail with "expected 'idle' to be 'new'"
   // pointing nowhere near the cause. This store is a module singleton; vi.clearAllMocks cannot touch
   // it.
-  useInteractionStore.getState().forget(AGENT);
+  // THE WHOLE MAP, not `forget(AGENT)` (roborev 55737). The leak source writes under whatever id the
+  // case dispatched to, and this file also dispatches to SPARKLE_AGENT_ID and a `-win-never-ran`
+  // variant. Clearing one key happened to be enough only because `getAgentStatus` gates the
+  // interaction read on `agent?.tab` and AGENT is the sole id here with a roster row — a non-local
+  // coincidence that any future case seeding a second row would silently break, reproducing exactly
+  // the failure this reset exists to prevent. The sibling suite already uses the unconditional form
+  // (conciergeDispatch.interaction.test.ts).
+  useInteractionStore.setState({ lastAt: {} } as never);
   seedAgent("local");
 });
 
@@ -841,6 +848,23 @@ describe("getAgentStatus", () => {
     seedFreshAgent("blocked", { lastPrompt: "go build the thing" });
     expect(getAgentStatus(AGENT).needsYou).toBe(true);
     expect(getAgentStatus(AGENT).status).toBe("blocked");
+  });
+
+  // ══ ROUTE 4: A CONCIERGE-DELIVERED PROMPT IS ALSO A BRIEF (roborev 55737) ══════════════════════
+  // The four cases above are briefless via routes 1-3 (no `lastPrompt`, no `promptHistory`) and the
+  // one above is briefed via `lastPrompt`, so NONE of them touches the interaction record — replace
+  // `getAgentStatus`'s `interactionStore.lastAt[agentId]` argument with `undefined` and every one
+  // stays green. The cross-case coupling that used to be the only thing sensitive to it is exactly
+  // what the `beforeEach` reset removed, so without this row the reset's own comment describes a
+  // mechanism nothing checks. This is the route that matters for Improve Sparkle, which has no
+  // AgentTab and is briefed ONLY this way.
+  it("treats a concierge-delivered prompt as a brief, so the agent is no longer `new`", () => {
+    seedFreshAgent("blocked");
+    // The control: identical fixture, no interaction — this is the first case's assertion.
+    expect(getAgentStatus(AGENT).status).toBe("new");
+    useInteractionStore.getState().touch(AGENT);
+    expect(getAgentStatus(AGENT).status).toBe("blocked");
+    expect(getAgentStatus(AGENT).needsYou).toBe(true);
   });
 
   it("holds an unclassifiable red inside the 5-minute backstop, and releases it after", () => {

@@ -509,4 +509,76 @@ describe("ConciergeHost — @Sparkle addresses the concierge", () => {
     expect(wire).not.toContain("@");
     expect(wire).toContain("what is the status of the build?");
   });
+
+  // ══ THE STRIP IS FOR THE PTY, AND ONLY THE PTY (roborev 55765) ══════════════════════════════════
+  //
+  // The first cut of the fix above stripped the message where the REPLAY IS RECORDED, on the stated
+  // grounds that the only other consumer was the display copy. That was wrong about the code: the
+  // Sparkle-bound arm of `redirect` reads the remembered PAYLOAD, not `sentTextRef`. So "Also ask
+  // Sparkle" began asking the brain about a message with the addressed agent's name deleted —
+  // `mentionFreeText` removes the addressing span whole, not just its sigil.
+  //
+  // Which contradicts this file's own invariant, stated where `mentionAim` is built: "`payload` still
+  // has to carry the address everywhere else — Sparkle answering the message should see who it was
+  // aimed at." Two renderings are now remembered, and this row is the one that tells them apart: it
+  // passes only if the brain-bound replay is the UNSTRIPPED one.
+  it("keeps the agent's name when the receipt is redirected to Sparkle", async () => {
+    mount();
+    await send("@Kraken Auth ship the DMG");
+    await elapse();
+    // The relay follow-up has already asked Sparkle once ("still produces a concierge turn after
+    // relaying"). The redirect is the NEXT call, so this row reads the last one rather than [0] —
+    // indexing [0] here would assert against the follow-up and pass no matter what the redirect did.
+    //
+    // SNAPSHOT AFTER THE BUTTON RESOLVES, AND PIN AN EXACT COUNT (roborev 55963). The follow-up is
+    // emitted in the same synchronous block as the `setReceipt` that mounts this button, so taking
+    // the count first left a scheduling window where the follow-up landed AFTER the snapshot. A
+    // `toBeGreaterThan` is then satisfied by the follow-up alone, `.at(-1)` reads it instead of the
+    // redirect — and it quotes the whole `@Kraken Auth ship the DMG`, so BOTH assertions below pass
+    // against a redirect arm that dispatched nothing. Latent rather than broken (the mutation still
+    // died), but this row is the file's only guard on the payload/wire split, so it must not be one
+    // timing shift away from vacuous.
+    const redirect = await waitFor(() =>
+      screen.getByRole("button", { name: "Also ask Sparkle" }),
+    );
+    const beforeRedirect = h.startConciergeTurn.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(redirect);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(h.startConciergeTurn.mock.calls.length).toBe(beforeRedirect + 1),
+    );
+    const asked = h.startConciergeTurn.mock.calls.at(-1)![0] as string;
+    // BOTH halves. The name is the regression; the instruction is the control that stops this
+    // passing against a replay that lost the sentence instead.
+    expect(asked).toContain("Kraken Auth");
+    expect(asked).toContain("ship the DMG");
+  });
+
+  // ══ A BARE ADDRESS HAS NOTHING TO REDIRECT, SO IT MUST NOT OFFER TO ═════════════════════════════
+  //
+  // "@Sparkle" alone strips to "". The addressed path has refused that since roborev 55418, but its
+  // guard needs a mention that resolved to a PROMPTABLE agent, and @Sparkle never does — so this
+  // message reached Sparkle carrying a redirectable receipt whose replay was the empty string.
+  // `redirect` then refused it silently and left the button mounted for a second tap that did
+  // nothing either: a dead affordance, the exact failure the receipt rules here exist against.
+  it("offers no redirect for a BARE address", async () => {
+    mount();
+    await send("@Sparkle");
+    await elapse();
+    // The receipt itself MUST render — otherwise "no button" is true for the uninteresting reason
+    // that nothing rendered at all, and the row would pass against a message that never sent.
+    await waitFor(() => expect(screen.getByTestId("routing-receipt")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /^Also ask / })).toBeNull();
+  });
+
+  // The control for the row above: the SAME address with words after it keeps its button. Without
+  // this, "offers no redirect" would also pass against a change that killed the redirect outright.
+  it("still offers the redirect when the address carries an instruction", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Also ask / })).toBeTruthy());
+  });
 });

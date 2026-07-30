@@ -1182,6 +1182,20 @@ export function ConciergeHost({
   // for the whole session while every entry past the cap was already unreachable, since redirect
   // bails as soon as sentTextRef has evicted the id.
   const sentPayloadRef = useRef<Map<string, string>>(new Map());
+  // ══ THE PTY-BOUND REPLAY, SEPARATE FROM THE BRAIN-BOUND ONE ABOVE ═══════════════════════════
+  // Same message, `@…` addresses stripped, for the ONE redirect arm that writes into a terminal
+  // (`promptAgent`). These have to be two maps because the two consumers want opposite things and a
+  // single value cannot serve both (roborev 55765):
+  //
+  //   • the PTY needs the sigil GONE — a leading `@` opens the Claude Code CLI's file-reference
+  //     autocomplete and strands the instruction behind a picker (bead sparkle-kaz1l);
+  //   • the BRAIN needs the NAMES KEPT — `askSparkle(replay)` is the "Also ask Sparkle" arm, and
+  //     `mentionFreeText` deletes the addressing span wholesale rather than just its sigil. Stripping
+  //     for that consumer asked Sparkle "ship the DMG" about a message the user aimed at a named
+  //     agent, contradicting this file's own invariant that Sparkle should see who it was aimed at.
+  //
+  // Capped through the same helper as the other two so all three evict together.
+  const sentWireRef = useRef<Map<string, string>>(new Map());
   // Redirects currently in flight, so a double-tap can't deliver twice (see redirect).
   const redirectingRef = useRef<Set<string>>(new Set());
   // Approves currently in flight, per agent. Approve is deferred behind the send queue now, so a
@@ -1959,6 +1973,11 @@ export function ConciergeHost({
        *  `forceSparkle` has no legal twin, and for the gate it does NOT skip. Null on every send
        *  that names nobody, which is every send that existed before mentions. */
       mentionAim: ConciergeMentionAim | null,
+      /** Is there anything left to REDIRECT — i.e. does this message strip to a non-empty wire?
+       *  False only for a bare address ("@Sparkle" and nothing else, no files), which has no
+       *  instruction in it to pass anywhere. Decided in `send`, which is where the strip is computed;
+       *  passed rather than recomputed so the flag and the remembered replay cannot disagree. */
+      redirectable: boolean,
     ): Promise<boolean> => {
       // An agent that has since LEFT the feed is gone (closed, deleted, project unloaded), and
       // routing at it would report a delivery that cannot happen. Gone → the safe direction.
@@ -2183,7 +2202,10 @@ export function ConciergeHost({
         target: "sparkle",
         agentName: here?.name,
         agentId: here?.agentId,
-        redirectable: true,
+        // NOT an unconditional `true` any more. A bare `@Sparkle` strips to an empty wire, and
+        // offering to pass "nothing" along to an agent is a button that cannot do its job — see
+        // `redirectable`'s note on the parameter above.
+        redirectable,
       });
       return true;
     },
@@ -2334,6 +2356,27 @@ export function ConciergeHost({
               return { target: submitted, payload: attachedPayload(wire, staged), text: wire };
             })()
           : null;
+      // ══ A FIFTH: THE SAME STRIP, BUT FOR THE REDIRECT REPLAY ════════════════════════════════════
+      // `mentionAim` above only exists when the address RESOLVED to a promptable agent, so it cannot
+      // carry this: `@Sparkle` resolves to no agent at all, and its receipt is the one that ALWAYS
+      // offers "Also ask <agent>" (the message always lands on Sparkle). That arm hands its string
+      // straight to `promptAgent`, so it needs the same sigil-free wire on a path where `mentionAim`
+      // is null. Keyed off `mentions` — the resolved spans — for the same reason `mentionAim` is.
+      const wirePayload = mentions?.length
+        ? attachedPayload(mentionFreeText(text, rosterFromMentions(mentions)), staged)
+        : payload;
+      // ══ AND WHETHER THERE IS ANYTHING LEFT TO REDIRECT ══════════════════════════════════════════
+      // A BARE address strips to nothing: `mentionFreeText` deletes the addressing span whole, so a
+      // dictated "@Sparkle" with no other words leaves `""`. The addressed path has said so since
+      // roborev 55418 ("You've got <agent> in mind — what should I send over?"), but that guard is
+      // reached only when the mention resolved to a promptable agent, and `@Sparkle` never does — so
+      // the message went to Sparkle carrying a redirectable receipt whose replay was the empty
+      // string. `redirect` then refused it at `if (!replay) return`, correctly (an empty prompt is a
+      // bare newline into a live PTY, which at an open picker presses whatever row is selected) —
+      // but SILENTLY, leaving the button mounted for a second tap that would do nothing either. That
+      // is the dead-affordance failure this file's receipt rules exist against (roborev 55765).
+      // Deciding it HERE makes the button absent rather than inert.
+      const redirectable = wirePayload !== "";
       // SNAPSHOT the staged files onto the message itself, in the same tick they are taken. They are
       // gone from the view model a line later (`takeAttachments` above), so a bubble that read the
       // live list would show the picture for one frame and then go blank — which is the state the
@@ -2354,32 +2397,31 @@ export function ConciergeHost({
           mentions: mentions?.length ? mentions : undefined,
         },
       ]);
-      // Remember BOTH: a redirect to the agent must replay the payload (paths included), a redirect
-      // to Sparkle must replay the plain text.
-      //
-      // ══ THE REMEMBERED PAYLOAD IS MENTION-FREE, BECAUSE IT IS A WIRE INTO A PTY ═════════════════
-      // `redirect`'s "Also ask <agent>" hands this exact string to `promptAgent`, and that is the
-      // THIRD way this box reaches a live terminal — the one that does not go through `mentionAim`.
-      // So the `@…`-stripping that the addressed path gets for free never applied to a replay, and
-      // any mentioned message redirected into an agent typed the sigil verbatim into a Claude Code
-      // CLI, where a leading `@` opens its file-reference autocomplete and strands the instruction
-      // behind a picker the user never asked for (bead sparkle-kaz1l).
+      // ══ THREE RENDERINGS REMEMBERED, ONE PER CONSUMER ═══════════════════════════════════════════
+      // `redirect`'s "Also ask <agent>" hands its string to `promptAgent`, and that is the THIRD way
+      // this box reaches a live terminal — the one that does not go through `mentionAim`. So the
+      // `@…`-stripping the addressed path gets for free never applied to a replay, and any mentioned
+      // message redirected into an agent typed the sigil verbatim into a Claude Code CLI, where a
+      // leading `@` opens its file-reference autocomplete and strands the instruction behind a picker
+      // the user never asked for (bead sparkle-kaz1l).
       //
       // `@Sparkle` was the sharp edge — it always falls to Sparkle, so its receipt always offers the
       // redirect — but the hazard was never specific to it: `@Kraken Auth` redirected to a different
-      // agent carried its sigil too. Stripped HERE, once, at the point the replay is recorded, rather
-      // than at the two call sites that consume it, so a fourth consumer cannot reintroduce it.
+      // agent carried its sigil too.
       //
-      // The DISPLAY copy (`sentTextRef`) keeps its names: it feeds the bubble and the Sparkle-bound
-      // replay, neither of which is a terminal, and the names are content the user wrote.
+      // WHICH REF EACH CONSUMER READS, because an earlier cut got this wrong in a way no test
+      // caught: the strip was applied to `sentPayloadRef`, and the Sparkle-bound arm of `redirect`
+      // reads THAT ref — not `sentTextRef` — so "Also ask Sparkle" started asking about a message
+      // with the addressed agent's name deleted (roborev 55765). Stripped and unstripped are now
+      // two separate recordings, each named for the wire it rides:
+      //
+      //   sentTextRef    → the DISPLAY copy. Bubble and `promptAgent`'s `display`/naming basis.
+      //   sentPayloadRef → the BRAIN copy. `askSparkle(replay)`. Keeps names: they are content.
+      //   sentWireRef    → the PTY copy. `promptAgent`'s prompt. Sigils stripped, or a redirect
+      //                    types `@…` verbatim into a live CLI (bead sparkle-kaz1l).
       rememberSentText(sentTextRef.current, id, text);
-      rememberSentText(
-        sentPayloadRef.current,
-        id,
-        mentions?.length
-          ? attachedPayload(mentionFreeText(text, rosterFromMentions(mentions)), staged)
-          : payload,
-      );
+      rememberSentText(sentPayloadRef.current, id, payload);
+      rememberSentText(sentWireRef.current, id, wirePayload);
       return enqueue(
         () =>
           deliver(
@@ -2396,6 +2438,7 @@ export function ConciergeHost({
             // address must not drop the mount — from being handed to `routeMessage` as a candidate.
             forceSparkle || conciergeAddressed,
             mentionAim,
+            redirectable,
           ),
         false,
       );
@@ -2417,10 +2460,15 @@ export function ConciergeHost({
       // this guard also used to cover is handled elsewhere — conciergeThreadStore clears
       // `redirectable` on a restored receipt.
       if (text === undefined) return;
-      // The AGENT-bound form (attachment paths prefixed). The brain reads paths too, so BOTH
-      // directions replay this rather than the bare text; it falls back to `text` for a message
-      // that carried no files, where the two are the same string anyway.
+      // TWO replays, because the two arms below want opposite things (roborev 55765). Both carry
+      // attachment paths — the brain reads files from disk exactly as an agent does — and both fall
+      // back to `text` for a message that carried none, where the renderings coincide anyway.
+      //
+      //   `replay`     → Sparkle. Keeps `@Name`: the names are content the user wrote, and asking
+      //                  the brain about the message means asking about who it was aimed at.
+      //   `wireReplay` → the agent's PTY. Sigils stripped, or the CLI's file picker eats it.
       const replay = sentPayloadRef.current.get(messageId) ?? text;
+      const wireReplay = sentWireRef.current.get(messageId) ?? replay;
       // ══ GUARD ON WHAT ACTUALLY RIDES THE WIRE, NOT ON `text` ═════════════════════════════════
       // Widening the check above to an existence test (so an attachments-only send stops having a
       // dead button) also admitted `text === ""`, and `replay` falls back to it — so a remembered
@@ -2445,7 +2493,14 @@ export function ConciergeHost({
       // vacuous, and one was written and deleted rather than left here looking like cover. The guard
       // stays because what it prevents is a bare return into a live PTY, which no flag downstream
       // can take back: `neverPickerAnswer` suppresses option MATCHING, not the sending of a newline.
-      if (!replay) return;
+      //
+      // BOTH renderings, because the arm that reaches a PTY reads `wireReplay`, and guarding only
+      // `replay` would let a message that is non-empty ONLY because of its address ("@Kraken Auth",
+      // which strips to "") through to `promptAgent` as a bare return. `send` already withholds
+      // `redirectable` for exactly that message, so this is the second of two locks rather than the
+      // only one — but they guard different things (the button's presence vs what it dispatches) and
+      // a rehydrated receipt reaches this line without passing through `send` at all.
+      if (!replay || !wireReplay) return;
       const current = chatRef.current.find((m) => m.id === messageId);
       const receipt = current?.kind === "you" ? current.receipt : undefined;
       if (!receipt || receipt.alsoSentTo) return;
@@ -2491,7 +2546,8 @@ export function ConciergeHost({
             // and named by the message it belongs to.
             promptAgent(
               aim,
-              replay,
+              // THE STRIPPED ONE. This is the write into a live CLI (bead sparkle-kaz1l).
+              wireReplay,
               { display: text, namingBasis: text },
               [],
               false,
