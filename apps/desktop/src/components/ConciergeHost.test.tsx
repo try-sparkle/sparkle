@@ -218,6 +218,8 @@ import {
 // can tell the two apart.
 import { dispatchBuild, dispatchChat } from "../services/captureSends";
 import { useProjectStore } from "../stores/projectStore";
+// The cable's projected side joins three stores; the pair assignment lives here.
+import { useUiStore } from "../stores/uiStore";
 import { useComposeHandoffStore } from "../stores/composeHandoffStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // The LOGGER, not `console`: logger.ts binds its `realConsole` at module load, so a console spy
@@ -2459,8 +2461,32 @@ describe("the resized width reaches the concierge column", () => {
 });
 
 describe("the cable reaches the concierge column", () => {
-  beforeEach(() => resetCable());
-  afterEach(() => resetCable());
+  // The column reads the PROJECTED side (`useEffectiveWired`), not the raw store: a patched cable
+  // whose far end holds no selected agent draws as off. Both pairs therefore need a selection here,
+  // or every row below asserts the empty-far-end case by accident and proves nothing about the side.
+  const wiredProjects = () =>
+    [
+      {
+        id: "p1", name: "sparkle", rootPath: "/tmp/sparkle", defaultBranch: "main",
+        createdAt: "2026-01-01", selectedAgentId: "ag1",
+        agents: [{ id: "ag1", name: "Right Build", kind: "build", runtime: "local" }],
+      },
+      {
+        id: "p2", name: "other", rootPath: "/tmp/other", defaultBranch: "main",
+        createdAt: "2026-01-01", selectedAgentId: "ag2",
+        agents: [{ id: "ag2", name: "Left Build", kind: "build", runtime: "local" }],
+      },
+    ] as unknown as Project[];
+
+  beforeEach(() => {
+    resetCable();
+    useProjectStore.setState({ projects: wiredProjects(), selectedProjectId: "p1" } as never);
+    useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: "p2" } as never);
+  });
+  afterEach(() => {
+    resetCable();
+    useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never);
+  });
 
   it("is off at rest", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -2475,5 +2501,22 @@ describe("the cable reaches the concierge column", () => {
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("left");
     act(() => useCableStore.getState().unbind());
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
+  });
+
+  it("draws OFF when the patched pair has nothing selected — the column, not just the shell root", () => {
+    // roborev 55386: the projection was applied at the shell root ONLY, so the root said "off"
+    // while this column still flooded. That contradiction is what this row makes unrepresentable,
+    // and it is asserted HERE because the root's own suite cannot see the column.
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    act(() => useCableStore.getState().patch("right"));
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("right");
+    act(() =>
+      useProjectStore.setState({
+        projects: [{ ...useProjectStore.getState().projects[0]!, selectedAgentId: null }],
+      } as never),
+    );
+    expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
+    // Read-side only: the patch survives, so re-selecting relights the flood with no second gesture.
+    expect(useCableStore.getState().wired).toBe("right");
   });
 });

@@ -61,6 +61,22 @@ function isAppModalScrim(lines: string[], i: number): boolean {
   return true;
 }
 
+// Remove every span where a `<ModalLayer>` mention is PROSE rather than JSX: block comments — which
+// includes the JSX comment form, since its interior IS a block comment — line comments, and
+// string/template literals. Counting the tag over the remainder is what makes "this file wraps
+// something" mean it, rather than meaning "this file talks about wrapping".
+//
+// (Written as line comments on purpose: spelling the JSX comment form inside a block comment closes
+// it early, which is its own small demonstration of why prefix-testing lines is not enough.)
+function stripProse(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\/[^\n]*/g, " ")
+    .replace(/`(?:\\[\s\S]|[^`\\])*`/g, " ")
+    .replace(/"(?:\\.|[^"\\])*"/g, " ")
+    .replace(/'(?:\\.|[^'\\])*'/g, " ");
+}
+
 /** The file itself is the primitive, so it cannot import itself. */
 const IS_THE_PRIMITIVE = /\/ModalLayer\.tsx$/;
 const ROUTES_THROUGH_LAYER = /from "[^"]*\/ModalLayer"|from "\.\/ModalLayer"/;
@@ -112,7 +128,13 @@ describe("app-modal surfaces join the root modal layer", () => {
       // it was written for: a NEW modal that paints an app-modal scrim and never mentions the layer
       // at all. A file that routes one surface and adds a second unwrapped one is NOT caught; the
       // wiring tests (ModalLayer.wiring.test.tsx) are what cover specific surfaces.
-      const wraps = lines.filter((l) => !isComment(l) && /<ModalLayer[\s>]/.test(l)).length;
+      // COUNTED OVER SOURCE WITH COMMENTS AND STRINGS STRIPPED, not over lines that merely fail a
+      // prefix test. `isComment` only sees `//`, `/*` and `*` line starts — so in a .tsx file a JSX
+      // comment (`{/* wrap the backdrop in <ModalLayer> */}`) is NOT a comment to it, and neither is
+      // the tag inside a string literal on a code line. Both are exactly the spellings this guard's
+      // own failure message tells the reader to write, so both would have bought a free unwrapped
+      // scrim — the hole the prefix test was introduced to close, still open (roborev 55391).
+      const wraps = (stripProse(src).match(/<ModalLayer[\s>]/g) ?? []).length;
       if (ROUTES_THROUGH_LAYER.test(src) && wraps >= 1) {
         covered += scrimLines.length;
       } else {

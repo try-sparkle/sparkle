@@ -50,6 +50,7 @@ import {
 } from "../windowContext";
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
+import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { unbindsOnKey, unbindsOnPointerDown, type PairSide } from "../engine/cable";
 import {
   pairCountFor,
@@ -796,23 +797,12 @@ export function Workspace() {
   // "user-facing remedy that does the unsafe thing" shape AGENTS.md warns about.
   const wiredProject = wired === "left" ? leftProject : project;
   const wiredAgentId = wiredProject?.selectedAgentId ?? null;
-  // A CIRCUIT WITH NOTHING ON THE FAR END IS NOT A CIRCUIT — enforced HERE, where the state is
-  // READ, rather than only where it is written.
-  //
-  // `selectAndWire` refuses to patch when it seats no agent, and that closed one route in. It could
-  // not close the others, because they do not seat anything at all: switch the WIRED pair's project
-  // tab to a project with no agents, or close the last agent in it, and `wired` still names that
-  // side while `wiredAgentId` is null. The consequences were exactly the ones that bug was filed
-  // for — `data-wired` floods the pair and recedes the other one, while `promptTarget` falls back to
-  // Sparkle, so the cable is lit and the user's next message goes somewhere else. Every acquisition
-  // guard in the world cannot fix a state reachable by removing something.
-  //
-  // Deriving the effective side makes that state UNREPRESENTABLE instead: the one enum every visual
-  // consequence follows from (MAPPING.md) can only say "left" or "right" when there is an agent on
-  // the other end of the cable. The store is untouched — this is a read-side projection, so nothing
-  // has to remember to unbind, which is the same reason the row geometry reads its side rather than
-  // mirroring it into local state (roborev 55249).
-  const effectiveWired: typeof wired = wiredAgentId === null ? "off" : wired;
+  // WHAT THE SHELL DRAWS, from the ONE shared derivation (hooks/useEffectiveWired). It was a local
+  // expression here for one commit, and `wired` has three readers — this root, the concierge column
+  // via ConciergeHost, and the sidebar's row joint — so projecting it at one of them left the state
+  // representable AND self-contradictory: the root said "off" while the column flooded and the rows
+  // drew their joints open (roborev 55386).
+  const shownWired = useEffectiveWired();
   // The agent the concierge compose box can prompt directly (CM-U7): the selected tab's selected
   // agent. This is what re-homes the removed AgentPane composer — with a target the box can send a
   // real prompt into a terminal instead of only chatting with the brain. Null → the box is
@@ -1136,7 +1126,7 @@ export function Workspace() {
       className="shell"
       data-testid="workspace-shell"
       data-pairs={String(pairCount)}
-      data-wired={effectiveWired}
+      data-wired={shownWired}
       data-over={overlay}
       style={{
         display: "flex",
@@ -1189,7 +1179,7 @@ export function Workspace() {
         {pairCount === 2 && (
           <Pair
             side="left"
-            wired={effectiveWired === "left"}
+            wired={wired === "left"}
             tabs={
               <MemoProjectTabsBar
                 side="left"
@@ -1253,7 +1243,7 @@ export function Workspace() {
             Children are always [build, terminal]; `Pair` mirrors the flow for a left pair. */}
         <Pair
           side="right"
-          wired={effectiveWired === "right"}
+          wired={wired === "right"}
           tabs={<MemoProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
         >
           {/* ② Builder agents (the sidebar owns the Plan/Build toggle as its header). */}

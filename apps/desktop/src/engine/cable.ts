@@ -170,3 +170,35 @@ export function unbindsOnKey(
 export function pairIsLive(state: CableState, pair: PairSide): boolean {
   return state.wired === pair;
 }
+
+// ── THE EFFECTIVE SIDE: A CIRCUIT WITH NOTHING ON THE FAR END IS NOT A CIRCUIT ─────────────────
+//
+// `wired` is what the user's gesture WROTE. `effectiveWired` is what the shell should DRAW, and they
+// differ in exactly one case: the named pair has no selected agent, so the cable is plugged into
+// nothing.
+//
+// WHY THIS IS A READ-SIDE PROJECTION AND NOT A STORE INVARIANT. `selectAndWire` refuses to patch
+// when it seats no agent, which closes one route in — and cannot close the ones that REMOVE
+// something, because nothing is being acquired: switch the wired pair's project tab to a project
+// with no agents, or close its last agent, and `wired` still names that side. Enforcing it on write
+// would mean every removal path remembering to unbind; deriving it on read means none of them has to,
+// and re-selecting an agent relights the cable with no second gesture (roborev 55249).
+//
+// AND IT MUST BE DERIVED ONCE. The first cut projected it at the shell root only, while `wired` has
+// THREE readers — `ConciergeHost` passes the raw value to the column for its own `data-wired`, the
+// flood and the lift; `AgentSidebar` reads `pairIsLive` for the row joint. So the state stayed fully
+// representable and became self-contradictory on top: the shell root said "off" while the concierge
+// column still flooded and the rows still drew their joints open. The flood is the exact consequence
+// the finding was filed for, and it was driven by the unprojected value (roborev 55386). Hence one
+// helper here, in the module that already owns "one live circuit", rather than a second expression
+// per surface.
+//
+// NOT FOR CIRCUIT MEMBERSHIP. `unbindsOnPointerDown` and `data-wired-pair` must keep keying off the
+// RAW `wired`: they answer "is this press inside the live circuit", and a pair that is momentarily
+// drawing as unwired is still the pair the cable is patched into. Gating membership on the projection
+// makes a press in that pair unbind the store before a re-selection can relight it — so the user has
+// to click a build row again, which is precisely the "no second gesture" property this exists to
+// preserve. Visual treatment takes the projection; membership takes the store.
+export function effectiveWired(wired: WiredSide, farEndHasAgent: boolean): WiredSide {
+  return farEndHasAgent ? wired : "off";
+}

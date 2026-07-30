@@ -39,7 +39,9 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
 
-const WIDTH_KEY = "sparkle-sidebar-width";
+// Per SIDE now: two mounted sidebars must not race on one value. The default fixture is the
+// right pair.
+const WIDTH_KEY = "sparkle-sidebar-width:right";
 const OVERLAY_KEY = "sparkle-sidebar-overlay";
 
 function mkAgent(id = "a1"): AgentTab {
@@ -192,6 +194,35 @@ describe("AgentSidebar — keyboard resize", () => {
     fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
     unmount();
     expect(localStorage.getItem(WIDTH_KEY)).toBe("228");
+  });
+
+  // THE INVARIANT THE DIRTY GATE EXISTS FOR, which had NO assertion: every width test resized
+  // first, so all of them exercised only the dirty path and deleting both `if (!widthDirty.current)
+  // return;` lines left the suite green (roborev 55391). The key is per-side now, so two instances
+  // cannot race at all — but an instance that never resized must still not write, because that is
+  // what makes a flush safe to register on every mount.
+  it("an instance that never resized writes NOTHING, on unmount or on shutdown", () => {
+    localStorage.setItem(WIDTH_KEY, "300");
+    const { unmount } = render(<AgentSidebar project={mkProject()} />);
+    // Hover and focus the seam, but never commit a width — the reveal is not a resize.
+    fireEvent.mouseEnter(rail());
+    window.dispatchEvent(new Event("pagehide"));
+    expect(localStorage.getItem(WIDTH_KEY)).toBe("300");
+    unmount();
+    expect(localStorage.getItem(WIDTH_KEY)).toBe("300");
+  });
+
+  it("a keypress that moves NOTHING does not make the instance dirty", () => {
+    // `ColumnPullTab.commit` fires `onWidth(applied)` unconditionally, so a press pinned at a bound
+    // used to mark the instance dirty while the width never moved — enough for its flush to speak
+    // for a column the user never touched.
+    localStorage.setItem(WIDTH_KEY, "160");
+    const { unmount } = render(<AgentSidebar project={mkProject()} />);
+    expect(column().style.width).toBe("160px");
+    fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" }); // already at MIN_WIDTH
+    localStorage.setItem(WIDTH_KEY, "999");
+    unmount();
+    expect(localStorage.getItem(WIDTH_KEY)).toBe("999");
   });
 
   it("jumps by a larger step with Shift held", () => {

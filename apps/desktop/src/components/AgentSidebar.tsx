@@ -63,7 +63,7 @@ import { otherSide, pairCountFor, projectsOnSide, sideOf } from "../engine/pairs
 import { LIST_PAD_X, rowBox } from "../engine/rowGeometry";
 import type { PairSide } from "../engine/rowGeometry";
 import { useCableStore } from "../stores/cableStore";
-import { pairIsLive } from "../engine/cable";
+import { usePairIsLive } from "../hooks/useEffectiveWired";
 import { openProjectTab } from "../services/openProjectTab";
 import { publishedStatusFor, rollupViewFor } from "../useAttentionNotifications";
 import {
@@ -404,7 +404,9 @@ export function AgentSidebar({
   // "one live circuit" is stated in exactly one place (engine/cable).
   // Selected as a BOOLEAN, so this column re-renders when its own circuit opens or closes and not
   // on every unrelated cable move (patching the other side, floating an overlay).
-  const jointOpen = useCableStore((s) => pairIsLive(s, pairSide));
+  // The PROJECTED side, not the raw store: a joint drawn open onto a pair with nothing selected
+  // is the same lie the flood was (roborev 55386). Visual treatment takes the projection.
+  const jointOpen = usePairIsLive(pairSide);
   // The Improve-Sparkle agent is keyed by window label (sparkleAgentIdFor — see onSelectSparkle /
   // services/sparkleReveal). There is exactly one app window now, and its label is the constant
   // APP_WINDOW_LABEL; the id is spelled through it rather than the literal so the persistence key
@@ -563,8 +565,19 @@ export function AgentSidebar({
   // a sane range so the column can't be dragged to nothing or take over the window.
   const MIN_WIDTH = 160;
   const MAX_WIDTH = 480;
+  // KEYED PER SIDE. `Workspace` mounts this component TWICE once the left pair is open (plus once
+  // more in the satellite window) and each instance owns its own `width` state, so a single shared
+  // key made the two race: whichever flushed last overwrote the other's value, and the plainest form
+  // needed no clamp at all — resize left, resize right, quit, and the last-mounted instance wins
+  // with its own stale number. A key per side removes the race rather than narrowing it, so a flush
+  // can never speak for the other column (roborev 55391).
+  const widthKey = `sparkle-sidebar-width:${pairSide}`;
   const [width, setWidth] = useState<number>(() => {
-    const saved = Number(localStorage.getItem("sparkle-sidebar-width"));
+    // The unsuffixed key is what every build before this wrote, so it is read as the seed for both
+    // sides — a user's existing width survives the split instead of silently resetting to 220.
+    const saved = Number(
+      localStorage.getItem(widthKey) ?? localStorage.getItem("sparkle-sidebar-width"),
+    );
     return saved >= MIN_WIDTH && saved <= MAX_WIDTH ? saved : 220;
   });
 
@@ -585,23 +598,26 @@ export function AgentSidebar({
    *  timer and flushed on teardown, so a drag writes once and the keyboard path — which has no
    *  settle event of its own — is covered by the same timer. */
   const commitWidth = useCallback((next: number) => {
-    // MARK THIS INSTANCE DIRTY. See `widthDirty` — an instance that never resized must never write.
+    // DIRTY ONLY ON AN ACTUAL CHANGE. `ColumnPullTab.commit` calls `onWidth(applied)`
+    // unconditionally, so an arrow press or a drag pinned at a bound used to mark this instance dirty
+    // while the width never moved — enough to make its flush speak for a column the user never
+    // touched (roborev 55391).
+    if (next === widthRef.current) return;
     widthDirty.current = true;
     setWidth(next);
   }, []);
   const widthRef = useRef(width);
   widthRef.current = width;
-  // ONLY AN INSTANCE THAT ACTUALLY RESIZED MAY PERSIST, and this is not tidiness — the key is
-  // SHARED and the state is not. `Workspace` mounts this component TWICE once the left pair is open,
-  // plus once more in the satellite window, and each instance seeds its own `width` from
-  // `sparkle-sidebar-width` at mount with nothing reconciling them afterwards.
+  // ONLY AN INSTANCE THAT ACTUALLY RESIZED MAY PERSIST. `widthKey` above already stops the two
+  // COLUMNS overwriting each other; this closes the remaining case, which is two instances of the
+  // SAME side — the satellite window mounts one too, and each seeds its own `width` at mount with
+  // nothing reconciling them afterwards.
   //
   // So an unconditional flush lets an instance that never moved overwrite the width the user did
-  // set: drag the RIGHT build column to 400, then click MINUS — the left sidebar unmounts, its
-  // cleanup writes its untouched 220, and the next launch comes back at 220 while the right column
-  // is still showing 400. Worse on shutdown, where nothing unmounts at all: every instance
-  // registers the same three teardown listeners, so the last one mounted wins regardless of which
-  // column the user touched, and resizing the LEFT column then quitting loses it deterministically.
+  // set: resize the right column in the main window to 400, and the satellite's untouched 220 is
+  // what the next launch comes back at. Worse on shutdown, where nothing unmounts at all: every
+  // instance registers the same three teardown listeners, so the last one mounted wins regardless of
+  // which one the user actually touched.
   //
   // Before the debounce landed, the write only happened on an explicit commit, so a non-resized
   // column could not write. This restores that property without giving up the debounce. (It also
@@ -609,9 +625,9 @@ export function AgentSidebar({
   const widthDirty = useRef(false);
   useEffect(() => {
     if (!widthDirty.current) return;
-    const id = setTimeout(() => localStorage.setItem("sparkle-sidebar-width", String(width)), 200);
+    const id = setTimeout(() => localStorage.setItem(widthKey, String(width)), 200);
     return () => clearTimeout(id);
-  }, [width]);
+  }, [width, widthKey]);
   useEffect(() => {
     // A debounce that only cancels is a way to LOSE a width. Same trio the concierge seam and
     // projectStore register, for the same reason: a native window close destroys the webview and
@@ -619,7 +635,7 @@ export function AgentSidebar({
     const flush = () => {
       if (!widthDirty.current) return;
       try {
-        localStorage.setItem("sparkle-sidebar-width", String(widthRef.current));
+        localStorage.setItem(widthKey, String(widthRef.current));
       } catch {
         // A width we cannot persist is cosmetic; it must not take the shutdown with it.
       }
@@ -636,7 +652,7 @@ export function AgentSidebar({
       document.removeEventListener("visibilitychange", onVisibility);
       flush();
     };
-  }, []);
+  }, [widthKey]);
 
   // OVERLAY MODE (§10, the second pull tab). Same right edge, second control: instead of RESIZING
   // the column — which reflows the whole shell and forces the terminal to re-measure — this lifts

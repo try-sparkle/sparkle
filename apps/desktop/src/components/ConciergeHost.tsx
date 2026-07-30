@@ -97,7 +97,7 @@ import { routeMessage } from "../services/conciergeRouter";
 import { mentionFreeText, rosterFromMentions, type ConciergeMention } from "./Concierge/mentions";
 import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
-import { useCableStore } from "../stores/cableStore";
+import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useUiStore } from "../stores/uiStore";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
@@ -573,7 +573,12 @@ export function ConciergeHost({
   searchSlot?: ReactNode;
 }) {
   // Which side the cable is patched into, or "off". Drives the column's flood + lift.
-  const wired = useCableStore((s) => s.wired);
+  // THE PROJECTED SIDE, shared with the shell root and the row joints (hooks/useEffectiveWired).
+  // This drove the column's own `data-wired`, its flood and its lift off the RAW store value, so a
+  // patched pair with nothing selected kept flooding while the shell root already said "off" — the
+  // exact consequence roborev 55249 was filed for, surviving in the surface that shows it most
+  // (roborev 55386).
+  const wired = useEffectiveWired();
   // Latest feed for the event handlers (send/nudge actions), which run after render.
   const feedRef = useRef(feed);
   // The thread's arrival ledger: which message ids have been seen, and in what order. A REF, not
