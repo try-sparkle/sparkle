@@ -153,8 +153,31 @@ export const DEFAULT_MIN_EXPLANATION_WORDS = 4;
  * ("src", "a", "ts") count as explanation for the OTHER reference on the line and push it over the
  * bar. Detection and masking are the same regex precisely so they cannot disagree like that.
  */
-export const FILE_REF_RE =
-  /(?:(?:\\?[A-Za-z0-9_.@-])+\\?\/)+(?:\\?[A-Za-z0-9_.@-])+\\?\.[A-Za-z][A-Za-z0-9]*\\?:\d+(?:\\?[:-]\d+)?/g;
+/**
+ * The one character class a path SEGMENT is built from, and the three SEPARATORS between segments.
+ *
+ * COMPOSED FROM NAMED PIECES SO THE SAFETY PROPERTY IS TESTABLE (roborev 55898). What keeps this
+ * pattern linear is that a separator can never match something the segment class also matches: with
+ * the two disjoint there is exactly ONE way to decompose any input, so the engine never backtracks
+ * across alternatives. Widening either side until they overlap is what produced the exponential
+ * `(?:E+E)+` this file reverted — and the first attempt to guard that searched the source for the
+ * literal token from that diff, which any other spelling of the same overlap (`&\w+;`,
+ * `&(?:#\d+|\w+);`) would have slipped past while the test stayed green.
+ *
+ * Exported so `disjointness` can be asserted by MATCHING, not by reading the source.
+ */
+export const SEGMENT_CHAR = String.raw`\\?[A-Za-z0-9_.@-]`;
+
+/** The separators, in order. Each must stay disjoint from {@link SEGMENT_CHAR} — see it. */
+export const SEPARATORS = [String.raw`\\?\/`, String.raw`\\?\.`, String.raw`\\?:`] as const;
+
+export const FILE_REF_RE = new RegExp(
+  `(?:(?:${SEGMENT_CHAR})+${SEPARATORS[0]})+` +
+    `(?:${SEGMENT_CHAR})+${SEPARATORS[1]}` +
+    `[A-Za-z][A-Za-z0-9]*${SEPARATORS[2]}` +
+    String.raw`\d+(?:\\?[:-]\d+)?`,
+  "g",
+);
 
 /** What a reference is replaced by before words are counted: a private-use character, written as an
  *  escape so it is visible in the source. It cannot match {@link WORD_RE}, so a reference's own

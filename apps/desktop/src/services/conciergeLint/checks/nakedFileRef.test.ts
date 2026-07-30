@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CheckPolicy, LintContext } from "../types";
-import { FILE_REF_RE, nakedFileRefCheck } from "./nakedFileRef";
+import { SEGMENT_CHAR, SEPARATORS, nakedFileRefCheck } from "./nakedFileRef";
 
 const ctx = (policy: Partial<CheckPolicy> = {}): LintContext => ({
   roster: [],
@@ -240,16 +240,90 @@ describe("nakedFileRefCheck", () => {
   // no input position could be consumed as either, so there was one decomposition, not 2^k. Adding
   // an alternative that both accept — an HTML entity, in the reverted change — is what created the
   // ambiguity. This runs in microseconds and can never hang.
-  it("keeps the separator alternatives disjoint from the segment class (the anti-ReDoS property)", () => {
-    const src = FILE_REF_RE.source;
-    expect(src, "an entity alternative makes a position consumable as segment OR separator — the \
-exponential form this file reverted; see the header").not.toMatch(/&#\?/);
-    // The separators must stay single literal characters (optionally backslash-escaped), which is
-    // what keeps them un-ambiguous with the segment class.
-    for (const sep of ["\\\\?\\/", "\\\\?\\.", "\\\\?:"]) {
-      expect(src).toContain(sep);
+  // THE REGRESSION GUARD for the ReDoS revert — a PROPERTY test, asserted by matching.
+  //
+  // Two earlier attempts failed in instructive ways. A timing guard cannot work: the scan is
+  // synchronous and Vitest's testTimeout is timer-based, so a re-widened pattern wedges the worker
+  // instead of failing (roborev 55895). Searching the source for the token from the reverted diff
+  // does not work either: it pins one SPELLING, and `&\\w+;` or `&(?:#\\d+|\\w+);` reintroduce the same
+  // ambiguity with the test green (roborev 55898).
+  //
+  // So assert the thing that actually makes the pattern linear: a separator must never accept a
+  // string the segment class also accepts. With the two disjoint there is exactly ONE decomposition
+  // of any input, so the engine never backtracks across alternatives and 2^k cannot arise. Checked by
+  // RUNNING both against a candidate alphabet, so it holds however either side is spelled.
+  // THE REGRESSION GUARD for the ReDoS revert — a PROPERTY test, asserted by matching.
+  //
+  // Two earlier attempts failed instructively. A timing guard cannot work: the scan is synchronous
+  // and Vitest's testTimeout is timer-based, so a re-widened pattern wedges the worker rather than
+  // failing (roborev 55895). Searching the source for the token from the reverted diff pins one
+  // SPELLING, and `&\\w+;` reintroduces the same ambiguity with the test green (roborev 55898).
+  //
+  // WHICH SEPARATOR MATTERS, precisely. The exponential form is `(?:E+E)+` — the overlap has to be
+  // on the separator that CLOSES THE REPEATED GROUP, because only then does each additional entity
+  // double the number of ways to split the repetition. That is `SEPARATORS[0]`, the `/`.
+  //
+  // The extension `.` DOES overlap the segment class (which contains `.`), and that is fine and
+  // pre-existing: it sits OUTSIDE the outer `+`, so it is a single choice point per dot — polynomial
+  // backtracking at worst, not 2^k. Writing this test taught us that; asserting disjointness for all
+  // three would fail on the safe pattern and would have to be weakened until it proved nothing.
+  it("keeps the REPEATED separator disjoint from the segment class (the anti-ReDoS property)", () => {
+    const segment = new RegExp(`^(?:${SEGMENT_CHAR})$`);
+    const candidates: string[] = [];
+    for (let c = 0x20; c < 0x7f; c++) {
+      const ch = String.fromCharCode(c);
+      candidates.push(ch, `\\${ch}`);
     }
+    // Multi-character forms a widening would plausibly introduce — entities were the real case — so
+    // the guard is not limited to single characters however the overlap is spelled.
+    candidates.push("&#46;", "&period;", "&amp;", "&#x2e;", "&nbsp;", "&#47;");
+
+    const repeated = new RegExp(`^(?:${SEPARATORS[0]})$`);
+    const overlap = candidates.filter((c) => repeated.test(c) && segment.test(c));
+    expect(
+      overlap,
+      `the repeated separator /${SEPARATORS[0]}/ also matches ${JSON.stringify(overlap)}, which the \
+segment class accepts — each such position is consumable two ways INSIDE the repetition, which is \
+the exponential form this file reverted. See FILE_REF_RE.`,
+    ).toEqual([]);
   });
+
+  it("that guard fails on the overlap it exists to reject", () => {
+    // The previous version passed against the very pattern that hung for ten minutes, so pin that
+    // this one does not. Spelled with no token in common with the reverted diff.
+    const segment = new RegExp(`^(?:${SEGMENT_CHAR})$`);
+    const widened = new RegExp(`^(?:${String.raw`\\?\/|&\w+;|[.@]`})$`);
+    const candidates = ["&amp;", ".", "@", "/"];
+    const overlap = candidates.filter((c) => widened.test(c) && segment.test(c));
+    expect(overlap.length, "a widened separator must be detected as overlapping").toBeGreaterThan(0);
+  });
+
+  it("does not detect a path whose characters are entity-encoded — the documented miss", () => {
+    expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
+  });
+
+  // THE EXPENSIVE HALF OF THAT MISS, pinned rather than left in prose (roborev 55895). The single
+  // -reference case above only costs its own reference. This one costs a DIFFERENT one: the
+  // unmatched entity path is also unmasked, so "Fixed", "src", "retry", "ts", "and" clear the
+  // four-word bar and silence `src/b.ts:9`, which is bare and genuinely naked. Asserted so a change
+  // to masking or word counting MOVES this test instead of drifting away from the doc.
+  it("lets an entity-encoded reference silence a different naked one — the cost of the miss", () => {
+    expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toEqual([]);
+  });
+
+  // THE REGRESSION GUARD for that revert — STRUCTURAL, because a timing guard cannot work here
+  // (roborev 55895). Running the hostile input would be the obvious test and it is unusable: the
+  // scan is SYNCHRONOUS, and Vitest's testTimeout is timer-based, so it cannot preempt CPU-bound
+  // sync code. A re-widened pattern would never reach the assertion — the worker wedges and CI burns
+  // to the workflow timeout with nothing pointing back at this test. The measurement in the revert
+  // commit (eight repetitions, not finished in ten minutes) is exactly why: any input big enough to
+  // demonstrate the catastrophe is far past the point where a duration can be reported.
+  //
+  // So assert the PROPERTY that made the pattern safe instead of its symptom. The old pattern was
+  // linear only because the separator alternatives were DISJOINT from the segment character class:
+  // no input position could be consumed as either, so there was one decomposition, not 2^k. Adding
+  // an alternative that both accept — an HTML entity, in the reverted change — is what created the
+  // ambiguity. This runs in microseconds and can never hang.
 
   it("resolves repeated identical references to their own occurrences", () => {
     // Both lines carry the same reference text. Line 1 explains itself, line 2 does not — so a
