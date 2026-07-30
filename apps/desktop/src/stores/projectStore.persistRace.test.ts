@@ -153,6 +153,33 @@ describe("mergePreservingLiveWorkers — shared removal tombstones (sparkle-pckz
     expect(dropped).toEqual(["b2"]);
   });
 
+  // A tombstoned PROJECT takes its agents with it, and they never reach the per-agent merge paths —
+  // the project is discarded a line earlier, in the order filter. So the callback's contract ("the
+  // ids of agent rows this merge DROPPED") was false for this whole class, and it is the shape most
+  // likely to happen: `removeProject` tombstones `[projectId, ...agentIds]`, so this is simply its
+  // cross-window half (roborev 55902).
+  it("reports the agents of a tombstoned PROJECT, which never reach the per-agent merge", () => {
+    const b1 = agent({ id: "b1", kind: "build" });
+    const b2 = agent({ id: "b2", kind: "build" });
+    const keep = agent({ id: "keep", kind: "build" });
+    const current = currentState([project("p1", [b1, b2]), project("p2", [keep])]);
+    const persisted = {
+      projects: [project("p2", [keep])],
+      selectedProjectId: "p2",
+      removedIds: { p1: 1_784_000_000_000 },
+    };
+
+    const dropped: string[] = [];
+    const merged = mergePreservingLiveWorkers(persisted, current, undefined, (ids) =>
+      dropped.push(...ids),
+    );
+
+    expect(merged.projects.map((p) => p.id)).toEqual(["p2"]);
+    // Both of the dead project's agents — and NOT the surviving project's, whose brief must live.
+    expect(dropped.sort()).toEqual(["b1", "b2"]);
+    expect(dropped).not.toContain("keep");
+  });
+
   it("stays PURE when no teardown callback is supplied", () => {
     const b1 = agent({ id: "b1", kind: "build" });
     const b2 = agent({ id: "b2", kind: "build" });

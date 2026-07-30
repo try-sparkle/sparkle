@@ -783,7 +783,20 @@ export function mergePreservingLiveWorkers(
     ...currentProjects.map((p) => p.id).filter((id) => !incomingById.has(id)),
   ];
   merged.projects = projectOrder
-    .filter((id) => !isRemoved(id))
+    .filter((id) => {
+      if (!isRemoved(id)) return true;
+      // A whole PROJECT tombstoned in another window is discarded here, and every agent it carried
+      // dies with it WITHOUT ever reaching `withoutRemovedAgents` or `mergeProject` — so without
+      // this, none of their ids reach `dropped` and the callback's contract ("the ids of agent rows
+      // this merge DROPPED") is false for a whole class of drops. That is the cross-window half of
+      // the very path `removeProject` handles locally, so it is the shape most likely to occur
+      // (roborev 55902). Consequence of missing it is a brief that never settles: the concierge's
+      // spawn sits out its whole bound answering `unconfirmed`, and the held entry outlives the row.
+      if (dropped) {
+        for (const a of currentProjects.find((c) => c.id === id)?.agents ?? []) dropped.push(a.id);
+      }
+      return false;
+    })
     .map((id) => {
       const ppMaybe = incomingById.get(id);
       const cur = currentProjects.find((c) => c.id === id);
