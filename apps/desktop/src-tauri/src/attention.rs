@@ -920,4 +920,155 @@ mod tests {
         // A stray negative report must not drag the total below a real positive count.
         assert_eq!(badge_total(&counts(&[("main", 4), ("win-1", -10)])), Some(4));
     }
+
+    // ── THE AUTO-DISMISS POLL MUST STAY OFF THE MAIN RUN LOOP ──────────────────────────────────
+    //
+    // `notify_attention` delivers each banner through `mac-notification-sys`, which watches for
+    // auto-dismiss by calling `wasAutoDismissed()` -> `deliveredNotifications`, a SYNCHRONOUS XPC
+    // round-trip to the usernoted daemon. Upstream (issue #86) scheduled that poll as a repeating
+    // NSTimer on `[NSRunLoop mainRunLoop]`; because an un-interacted banner lingers in Notification
+    // Center indefinitely, the poll never stopped, and every parked banner pinned the UI thread on
+    // that XPC twice a second. A live `sample` taken 2026-07-29 13:29 measured the main thread
+    // parked 2255 of 5904 samples (38.2%) in exactly that stack. Three samples taken after the
+    // vendored fix (20:49, 23:50, 23:53) measured ZERO — while 17-18 `deliveredNotifications`
+    // reads were still in flight on background threads, so the XPC moved rather than stopped.
+    //
+    // The crate is vendored at `=0.6.15`, so the ONLY way this regresses is a future bump that
+    // re-applies upstream's shape. Nothing in the type system can catch that: the hazard is which
+    // run loop an ObjC block is scheduled on. These two scans are the guard. They are the
+    // "per-module source guard" instrument recommended in PRD/sparkle/main-thread-stalls.md,
+    // pointed at the specific file whose upstream default is the bug.
+
+    /// Blank out comments and string literals so a scan sees CODE only.
+    ///
+    /// Load-bearing, not decoration: `notify.m` documents the very hazard being asserted, so its
+    /// prose contains `mainRunLoop` and `NSTimer` verbatim. A scan that skipped this step would
+    /// fail against the correct file — see `the_stripper_is_what_makes_the_scan_meaningful`.
+    fn objc_code_only(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                c => {
+                    out.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// True when `needle` is called anywhere inside a `dispatch_get_main_queue()` block.
+    /// Brace-matched from the block literal that follows the queue argument.
+    fn called_on_the_main_queue(code: &str, needle: &str) -> bool {
+        let mut from = 0;
+        while let Some(hit) = code[from..].find("dispatch_get_main_queue") {
+            let start = from + hit;
+            let Some(open) = code[start..].find('{').map(|o| start + o) else {
+                return false;
+            };
+            let mut depth = 0usize;
+            let mut end = open;
+            for (off, ch) in code[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + off;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if code[open..=end].contains(needle) {
+                return true;
+            }
+            from = end.max(start + 1);
+        }
+        false
+    }
+
+    /// The vendored ObjC, as it will actually be compiled into the binary.
+    const NOTIFY_M: &str = include_str!("../vendor/mac-notification-sys/objc/notify.m");
+
+    #[test]
+    fn the_vendored_notification_poll_schedules_nothing_on_the_main_run_loop() {
+        let code = objc_code_only(NOTIFY_M);
+        for banned in [
+            "mainRunLoop",              // upstream's poll host
+            "NSTimer",                  // upstream's poll mechanism
+            "scheduledTimer",           // ditto, via the convenience constructor
+            "performSelectorOnMainThread", // the other way to hoist work onto main
+        ] {
+            assert!(
+                !code.contains(banned),
+                "notify.m schedules `{banned}` — the auto-dismiss XPC poll is back on the main \
+                 thread. This is the 38.2%-of-main-thread regression from 2026-07-29; keep the \
+                 poll on the caller's background thread (see the SPARKLE PATCH comment)."
+            );
+        }
+    }
+
+    #[test]
+    fn the_sync_xpc_read_is_never_called_from_a_main_queue_block() {
+        let code = objc_code_only(NOTIFY_M);
+        // The remaining main-queue hops are deliberate and must stay zero-XPC: they run
+        // `resolveAutoDismiss` so a race-queued `didActivate:` still wins.
+        assert!(
+            called_on_the_main_queue(&code, "resolveAutoDismiss"),
+            "the deliberate zero-XPC main-queue hop vanished — this scan now proves nothing"
+        );
+        for xpc in ["wasAutoDismissed", "deliveredNotifications"] {
+            assert!(
+                !called_on_the_main_queue(&code, xpc),
+                "`{xpc}` is called inside a dispatch_get_main_queue block — that is a synchronous \
+                 XPC round-trip to usernoted executing on the UI thread."
+            );
+        }
+    }
+
+    #[test]
+    fn the_stripper_is_what_makes_the_scan_meaningful() {
+        // Anti-vacuity, both directions. Without the stripper the real file fails; with it, a real
+        // regression still fails. Neither assertion can pass by accident.
+        assert!(
+            NOTIFY_M.contains("mainRunLoop"),
+            "notify.m stopped documenting the hazard — re-point this guard before trusting it"
+        );
+        assert!(!objc_code_only(NOTIFY_M).contains("mainRunLoop"));
+
+        let regressed = r#"
+            // the poll used to live on [NSRunLoop mainRunLoop]
+            [[NSRunLoop mainRunLoop] addTimer:t forMode:NSDefaultRunLoopMode];
+        "#;
+        assert!(objc_code_only(regressed).contains("mainRunLoop"));
+
+        // And the main-queue scan must see through a nested block, not just the first brace.
+        let nested = "dispatch_sync(dispatch_get_main_queue(), ^{ if (x) { wasAutoDismissed(); } });";
+        assert!(called_on_the_main_queue(nested, "wasAutoDismissed"));
+        let outside = "dispatch_sync(dispatch_get_main_queue(), ^{ resolve(); });\nwasAutoDismissed();";
+        assert!(!called_on_the_main_queue(outside, "wasAutoDismissed"));
+    }
 }
