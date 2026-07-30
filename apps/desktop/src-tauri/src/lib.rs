@@ -154,13 +154,11 @@ pub fn run() {
             // of the process. Enter is provisional (cleared on Leave), Drop is consent. Registering
             // on Enter at all is what removes the race with the JS event, which Tauri emits before
             // it runs this listener. See attachments.rs' tier note.
-            // The per-phase rule lives in `attachments::note_drag_event`, not here: as match arms at
-            // this call site nothing could test it, so re-merging Enter into Drop (the pre-fix
-            // shape, which made a drag crossing the window a permanent grant) would have gone
-            // unnoticed by a green suite.
-            if let tauri::WindowEvent::DragDrop(drag) = event {
-                attachments::note_drag_event(drag);
-            }
+            // EVERY decision — which drag phase grants what, and that a destroyed window drops the
+            // hovers it owned — lives in `attachments::note_window_event`. Nothing is decided here,
+            // deliberately: as match arms at this call site no test could reach them, and both times
+            // a rule lived here it could be silently deleted with the suite still green.
+            attachments::note_window_event(window.label(), event);
             if let tauri::WindowEvent::Focused(focused) = event {
                 let app = window.app_handle();
                 let label = window.label();

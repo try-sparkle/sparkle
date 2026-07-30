@@ -157,12 +157,20 @@ fn is_contained_and_visible(candidate: &Path, roots: &[PathBuf]) -> bool {
 // capture_window.rs); a window destroyed mid-drag never delivers `draggingExited:` for its view. A
 // grant that survives one lost event for the life of the process is the same session-long grant the
 // tiers exist to remove, merely conditioned on a rarer trigger. So each provisional entry carries a
-// stamp and is ignored once stale.
+// stamp and is ignored once stale, and `lib.rs` also clears the set when a window goes away — the
+// condition that PRODUCES the lost `Leave`, handled directly rather than waited out.
 //
-// The stamp is REFRESHED on `Over`, which is why the TTL can be short without ever expiring under a
-// live drag: macOS fires `draggingUpdated:` continuously while the drag is over the window, so a
-// real hover keeps renewing itself no matter how long the user deliberates, and the clock only truly
-// starts when the OS stops talking to us — exactly the condition a missed `Leave` describes.
+// The TTL IS DELIBERATELY LONGER THAN ANY PLAUSIBLE HOVER, and that asymmetry is the point. Getting
+// it wrong in the safe direction costs a few extra seconds of exposure on a path the user is already
+// dragging over us; getting it wrong in the other direction silently refuses a real drop, which is
+// the original bug (bead sparkle-zviq) restored. `Over` renews the stamp when it arrives, but the
+// TTL does NOT rely on that: `Over` comes only from `draggingUpdated:`, and AppKit delivers that on
+// pointer MOVEMENT — periodic delivery requires the destination to opt in via
+// `wantsPeriodicDraggingUpdates`, which wry's webview does not implement. So a user holding a file
+// motionless while deciding where to drop may produce no `Over` at all, and a short TTL would lapse
+// mid-drag exactly when someone is being careful. An earlier draft of this comment asserted that
+// macOS fires `draggingUpdated:` continuously; that is not true from this side of the boundary and
+// nothing here should depend on it.
 //
 // The residual exposure is a compromised webview reading a path during the seconds it is hovered.
 // That is bounded by the drag itself and is the price of closing the ordering race; a durable grant
@@ -176,20 +184,37 @@ const USER_CHOSEN_CAP: usize = 512;
 /// Finder selection, so this only has to survive a large multi-file drag.
 const DRAGGED_CAP: usize = 512;
 
-/// How long after the OS last mentioned a hovered path we keep honouring it. `Over` refreshes the
-/// stamp continuously during a real drag, so this is not a limit on how long a user may hover — it
-/// is the window in which a MISSED `Leave` stays exploitable. Generous enough to cover the gap
-/// between the last `Over` and the frontend's post-`Drop` read (milliseconds), short enough that a
-/// lost event is a blip rather than a session.
-const PROVISIONAL_TTL: Duration = Duration::from_secs(10);
+/// How long a hovered path stays readable without further word from the OS. This is a BACKSTOP for a
+/// lost `Leave`, not a hover budget: the window-gone hook clears the common cause immediately, and
+/// `Over` renews the stamp when it happens to arrive. Sized to comfortably outlast a human holding a
+/// file still while deciding where to drop — a lapse mid-drag silently refuses a real drop (the
+/// original bug), while an over-long grant merely extends exposure on a path already being dragged
+/// over us. Those costs are not symmetric, so this errs long.
+const PROVISIONAL_TTL: Duration = Duration::from_secs(60);
+
+/// One path being hovered, and the two facts that decide when it stops being readable: when the OS
+/// last mentioned it, and WHICH window it is over.
+///
+/// The window matters because the app runs several (`project_window.rs`, `helper.rs`,
+/// `capture_window.rs`) and a teardown is per-window. Clearing the whole set when any one of them
+/// goes away would revoke a hover over a DIFFERENT window — and that is unrecoverable for the rest of
+/// that drag: the pointer is already inside, so no further `Enter` arrives to re-register, and `Over`
+/// only re-stamps entries that still exist. The drop would then fall back to racing the durable
+/// registration, which is the silent refusal this whole change exists to remove.
+#[derive(Debug, Clone)]
+struct Hovered {
+    path: PathBuf,
+    seen: Instant,
+    window: String,
+}
 
 #[derive(Default)]
 struct Chosen {
     /// Handed to us for real — a completed drop, or a native panel.
     durable: VecDeque<PathBuf>,
-    /// Hovering right now, each with the last time the OS told us so. Cleared on Leave, superseded
-    /// on Drop, and ignored once older than `PROVISIONAL_TTL` in case Leave never comes.
-    provisional: VecDeque<(PathBuf, Instant)>,
+    /// Hovering right now. Cleared on Leave and on that window's teardown, superseded on Drop, and
+    /// ignored once older than `PROVISIONAL_TTL` in case Leave never comes.
+    provisional: VecDeque<Hovered>,
 }
 
 // The tier rules as PURE methods over already-canonicalized paths. The public fns below are thin
@@ -200,44 +225,49 @@ impl Chosen {
     /// A drag is over the window. Replaces rather than appends: each Enter is a new drag, and the
     /// previous one either dropped (already durable) or left (already irrelevant). Appending would
     /// keep every file ever hovered readable until the cap evicted it.
-    fn note_dragged(&mut self, real: Vec<PathBuf>, now: Instant) {
-        self.provisional.clear();
+    fn note_dragged(&mut self, real: Vec<PathBuf>, now: Instant, window: &str) {
+        self.forget_dragged(window);
         for p in real {
-            if self.provisional.iter().any(|(q, _)| *q == p) {
+            if self.provisional.iter().any(|h| h.path == p && h.window == window) {
                 continue;
             }
             if self.provisional.len() >= DRAGGED_CAP {
                 self.provisional.pop_front();
             }
-            self.provisional.push_back((p, now));
+            self.provisional.push_back(Hovered {
+                path: p,
+                seen: now,
+                window: window.to_owned(),
+            });
         }
     }
 
     /// The drag is still over us (`Over`). Renew the stamps: the OS is telling us this hover is
     /// live, which is the only evidence that distinguishes a real drag from a lost `Leave`.
-    fn refresh_dragged(&mut self, now: Instant) {
-        for entry in &mut self.provisional {
-            entry.1 = now;
+    fn refresh_dragged(&mut self, now: Instant, window: &str) {
+        for entry in self.provisional.iter_mut().filter(|h| h.window == window) {
+            entry.seen = now;
         }
     }
 
-    /// The drag left without dropping — it was never for us.
-    fn forget_dragged(&mut self) {
-        self.provisional.clear();
+    /// The drag left this window without dropping — it was never for us. Scoped to the window, so a
+    /// `Leave` on one does not revoke a hover on another.
+    fn forget_dragged(&mut self, window: &str) {
+        self.provisional.retain(|h| h.window != window);
     }
 
-    /// A completed drop, or a native panel: consent. Supersedes the provisional set.
-    fn note_chosen(&mut self, real: Vec<PathBuf>) {
+    /// A completed drop, or a native panel: consent. Supersedes that window's provisional set.
+    fn note_chosen(&mut self, real: Vec<PathBuf>, window: &str) {
         for p in real {
             remember_into(&mut self.durable, p, USER_CHOSEN_CAP);
         }
-        self.provisional.clear();
+        self.forget_dragged(window);
     }
 
     fn contains(&self, real: &Path, now: Instant) -> bool {
         self.durable.iter().any(|p| p == real)
-            || self.provisional.iter().any(|(p, seen)| {
-                p == real && now.saturating_duration_since(*seen) <= PROVISIONAL_TTL
+            || self.provisional.iter().any(|h| {
+                h.path == real && now.saturating_duration_since(h.seen) <= PROVISIONAL_TTL
             })
     }
 }
@@ -254,49 +284,119 @@ fn canonical_all<I: IntoIterator<Item = PathBuf>>(paths: I) -> Vec<PathBuf> {
     paths.into_iter().filter_map(|p| p.canonicalize().ok()).collect()
 }
 
-/// A drag is now OVER the window (`DragDropEvent::Enter`). Provisional only — see the tier note.
-fn note_dragged_paths<I: IntoIterator<Item = PathBuf>>(paths: I) {
+/// A drag is now OVER `window` (`DragDropEvent::Enter`). Provisional only — see the tier note.
+fn note_dragged_paths<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
     let real = canonical_all(paths);
     if let Ok(mut c) = chosen().lock() {
-        c.note_dragged(real, Instant::now());
+        c.note_dragged(real, Instant::now(), window);
     }
 }
 
-/// The drag is still over the window (`DragDropEvent::Over`) — renew the provisional stamps.
-fn refresh_dragged_paths() {
+/// The drag is still over `window` (`DragDropEvent::Over`) — renew its provisional stamps.
+fn refresh_dragged_paths(window: &str) {
     if let Ok(mut c) = chosen().lock() {
-        c.refresh_dragged(Instant::now());
+        c.refresh_dragged(Instant::now(), window);
     }
 }
 
-/// The drag left without dropping (`DragDropEvent::Leave`) — it was never for us.
-fn forget_dragged_paths() {
+/// The drag left `window` without dropping (`DragDropEvent::Leave`) — it was never for us.
+fn forget_dragged_paths(window: &str) {
     if let Ok(mut c) = chosen().lock() {
-        c.forget_dragged();
+        c.forget_dragged(window);
     }
 }
 
 /// Record paths the user genuinely chose through the OS: a completed DROP, or a native file panel.
+///
+/// The native panel is not attached to any window's drag state, so it passes a window label that
+/// matches no live hover — it only ADDS durable entries, and must not clear anyone's provisional set.
 pub fn note_user_chosen_paths<I: IntoIterator<Item = PathBuf>>(paths: I) {
+    note_chosen_from(paths, NO_WINDOW);
+}
+
+/// A label no real window has, for consent that did not arrive through a window's drag (the native
+/// file panel). Tauri window labels are non-empty, so this cannot collide with one.
+const NO_WINDOW: &str = "";
+
+fn note_chosen_from<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
     let real = canonical_all(paths);
     if let Ok(mut c) = chosen().lock() {
-        c.note_chosen(real);
+        c.note_chosen(real, window);
     }
 }
 
-/// Which tier each drag phase grants. This lives HERE, not at the `on_window_event` call site,
-/// because it IS the security property: `Enter` → provisional, `Drop` → consent, `Leave` → forget.
-/// Wired up in `lib.rs`, the whole rule was a match arm no test could reach, so re-collapsing it to
-/// the pre-fix `Enter { paths, .. } | Drop { paths, .. } =>` — which made a drag merely crossing the
-/// window a permanent read grant — would have left the suite green. `dispatch_drag` below is the
-/// testable form.
-pub fn note_drag_event(event: &tauri::DragDropEvent) {
+/// The single entry point from `lib.rs`'s `on_window_event`. Everything that decides a grant lives on
+/// this side of the call, and `lib.rs` only forwards.
+///
+/// That split is deliberate and was learned twice on this branch. First the drag-phase mapping was a
+/// match at the call site, where no test could reach it — so re-collapsing `Enter` into `Drop` (a
+/// permanent grant for any drag crossing the window) would have left the suite green. Moving it here
+/// fixed the classification but left the WINDOW arms behind as an untested `matches!`, which is the
+/// same defect one level up: deleting the teardown arm silently returns the posture to "up to
+/// `PROVISIONAL_TTL` of exploitable grant per lost `Leave`, with nothing clearing it early", and the
+/// TTL was lengthened precisely BECAUSE this hook exists. So the window dispatch is here too, over
+/// `WindowGrant`, and tested.
+pub fn note_window_event(window: &str, event: &tauri::WindowEvent) {
+    match dispatch_window(event) {
+        WindowGrant::Drag(drag) => note_drag_event(window, drag),
+        WindowGrant::Teardown => note_window_gone(window),
+        WindowGrant::Ignore => {}
+    }
+}
+
+/// Which tier each drag phase grants: `Enter` → provisional, `Over` → renew, `Drop` → consent,
+/// `Leave` → forget. See `dispatch_drag` for the testable form.
+pub fn note_drag_event(window: &str, event: &tauri::DragDropEvent) {
     match dispatch_drag(event) {
-        DragGrant::Provisional(paths) => note_dragged_paths(paths),
-        DragGrant::Renew => refresh_dragged_paths(),
-        DragGrant::Durable(paths) => note_user_chosen_paths(paths),
-        DragGrant::Forget => forget_dragged_paths(),
+        DragGrant::Provisional(paths) => note_dragged_paths(paths, window),
+        DragGrant::Renew => refresh_dragged_paths(window),
+        DragGrant::Durable(paths) => note_chosen_from(paths, window),
+        DragGrant::Forget => forget_dragged_paths(window),
         DragGrant::Ignore => {}
+    }
+}
+
+/// `window` was destroyed. Drop the hover grants it owned — and ONLY those.
+///
+/// This is the cause of the lost `Leave` the TTL exists to survive: a view torn down mid-drag never
+/// delivers `draggingExited:`. Handling it directly is what lets `PROVISIONAL_TTL` be long enough to
+/// never bite a real hover.
+///
+/// Scoping to the window is not tidiness. Clearing every window's entries would revoke a hover over a
+/// DIFFERENT window, and that is unrecoverable for the rest of the drag: the pointer is already
+/// inside, so no further `Enter` arrives to re-register, and `Over` only re-stamps entries that still
+/// exist. The drop would fall back to racing the durable registration — which IS the silent refusal
+/// (bead sparkle-zviq), since the frontend reads off the JS drop payload that Tauri emits before it
+/// runs this listener. An earlier version of this function cleared globally and called that cost "just
+/// reopening the ordering race", which understated it: that race is the bug.
+pub fn note_window_gone(window: &str) {
+    forget_dragged_paths(window);
+}
+
+/// What a window event means for the drag registry. A value so the arm SET is testable — including
+/// the negative case, since `CloseRequested` cannot be constructed outside Tauri.
+///
+/// No `PartialEq`: `DragDropEvent` implements neither it nor `Eq`, and defining equality that ignored
+/// the payload would be a trap. Tests match on the variant.
+#[derive(Debug)]
+pub enum WindowGrant<'a> {
+    /// A drag phase — delegate to the drag tiers.
+    Drag(&'a tauri::DragDropEvent),
+    /// This window is gone; its hover grants go with it.
+    Teardown,
+    /// Nothing to do with file provenance.
+    Ignore,
+}
+
+fn dispatch_window(event: &tauri::WindowEvent) -> WindowGrant<'_> {
+    match event {
+        tauri::WindowEvent::DragDrop(drag) => WindowGrant::Drag(drag),
+        tauri::WindowEvent::Destroyed => WindowGrant::Teardown,
+        // NOT `CloseRequested`. In this app a close request routinely does not destroy anything:
+        // `capture_window.rs` calls `api.prevent_close()` on ⌘W, and the main window's close path
+        // only hides (see `main_window.rs`). Treating it as teardown would revoke a live hover on a
+        // window that is still right there, and no `Enter` follows to re-register it.
+        _ => WindowGrant::Ignore,
     }
 }
 
@@ -680,6 +780,22 @@ mod tests {
         std::fs::write(path, b"x").unwrap();
     }
 
+    /// Serializes EVERY test that mutates the process-global registry.
+    ///
+    /// It is not enough to lock only the hover tests, which is what the first version did and it
+    /// flaked once in a full run: `note_chosen` clears the provisional set (a drop supersedes the
+    /// hover it completes), so a *durable*-registry test running concurrently revokes a hover test's
+    /// grant and the hover test fails as though the security rule had regressed. `Enter` likewise
+    /// replaces the whole provisional set. Unique temp paths keep the DURABLE entries from colliding,
+    /// but nothing about a unique path protects a shared set that gets cleared — so all of them share
+    /// this one lock.
+    fn global_drag_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn read_accepts_a_visible_file_under_a_root() {
         let root = fresh_root();
@@ -743,6 +859,7 @@ mod tests {
     fn read_accepts_a_user_chosen_path_outside_every_root() {
         // THE REPORTED BUG (sparkle-zviq), as a test: a `.txt` at a location no root covers —
         // `/private/tmp` on the real machine — dragged in by hand.
+        let _serialized = global_drag_lock();
         let outside = fresh_root(); // a real dir that is NOT in the allowed list
         let roots = vec![fresh_root()];
         let f = outside.join("sparkle-hang.txt");
@@ -762,6 +879,7 @@ mod tests {
 
     #[test]
     fn load_blocking_reads_a_dragged_txt_from_slash_tmp() {
+        let _serialized = global_drag_lock();
         // The user's exact case, driven through the REAL command body rather than the validator:
         // `/private/tmp/sparkle-hang.txt`, dragged onto the concierge, refused and discarded.
         // `/tmp` is deliberate — it is NOT `std::env::temp_dir()` on macOS (that is the per-user
@@ -816,11 +934,11 @@ mod tests {
         // arbitrary read for the life of the process. The user never gave us that file.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t);
+        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t, "main");
         // Readable WHILE hovering — that is what closes the race with the JS drop event.
         assert!(c.contains(&p("/home/me/.ssh/id_rsa"), t), "readable during the drag");
 
-        c.forget_dragged();
+        c.forget_dragged("main");
         assert!(
             !c.contains(&p("/home/me/.ssh/id_rsa"), t),
             "a drag that left without dropping must not leave a lasting grant"
@@ -835,7 +953,7 @@ mod tests {
         // arbitrary-read primitive, just via a rarer trigger.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t);
+        c.note_dragged(vec![p("/home/me/.ssh/id_rsa")], t, "main");
 
         // No Leave, no Drop, no Over — the OS simply stopped talking about this drag.
         assert!(
@@ -852,13 +970,13 @@ mod tests {
         // bug — an accepted drop that silently refuses to load.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/tmp/notes.txt")], t);
+        c.note_dragged(vec![p("/tmp/notes.txt")], t, "main");
 
         // Still dragging, well past the TTL, with the OS reporting it the whole time.
         let mut hovering = t;
         for _ in 0..10 {
             hovering += PROVISIONAL_TTL;
-            c.refresh_dragged(hovering);
+            c.refresh_dragged(hovering, "main");
             assert!(
                 c.contains(&p("/tmp/notes.txt"), hovering),
                 "a hover the OS is still reporting stays readable"
@@ -872,9 +990,9 @@ mod tests {
         // thread attachment could not be downloaded or copied to the clipboard afterwards.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/tmp/dropped.txt")], t);
-        c.note_chosen(vec![p("/tmp/dropped.txt")]); // the Drop
-        c.forget_dragged(); // a later, unrelated drag leaves
+        c.note_dragged(vec![p("/tmp/dropped.txt")], t, "main");
+        c.note_chosen(vec![p("/tmp/dropped.txt")], "main"); // the Drop
+        c.forget_dragged("main"); // a later, unrelated drag leaves
 
         // Long after the provisional TTL would have lapsed: consent does not expire, or a thread
         // attachment could not be downloaded an hour later.
@@ -891,8 +1009,8 @@ mod tests {
         // the cap evicted it — the durable-grant bug wearing a different hat.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/tmp/first.txt")], t);
-        c.note_dragged(vec![p("/tmp/second.txt")], t);
+        c.note_dragged(vec![p("/tmp/first.txt")], t, "main");
+        c.note_dragged(vec![p("/tmp/second.txt")], t, "main");
 
         assert!(c.contains(&p("/tmp/second.txt"), t), "the current drag is readable");
         assert!(
@@ -908,8 +1026,8 @@ mod tests {
         // not fire after a successful drop.
         let t = Instant::now();
         let mut c = Chosen::default();
-        c.note_dragged(vec![p("/tmp/a.txt"), p("/tmp/b.txt")], t);
-        c.note_chosen(vec![p("/tmp/a.txt")]); // only a.txt was actually dropped
+        c.note_dragged(vec![p("/tmp/a.txt"), p("/tmp/b.txt")], t, "main");
+        c.note_chosen(vec![p("/tmp/a.txt")], "main"); // only a.txt was actually dropped
 
         assert!(c.contains(&p("/tmp/a.txt"), t), "the dropped file is granted");
         assert!(
@@ -951,6 +1069,218 @@ mod tests {
     }
 
     #[test]
+    fn a_real_drag_event_grants_provisionally_and_a_real_leave_revokes_it() {
+        // END-TO-END through `note_drag_event` and the PROCESS-GLOBAL registry, because the two
+        // tests above only cover `dispatch_drag`. Classifying `Enter` as `Provisional` and then
+        // ACTING on that classification are separate steps, and the second one is where the grant
+        // happens: swapping `DragGrant::Provisional(paths) => note_dragged_paths(paths)` for
+        // `note_user_chosen_paths(paths)` is semantically the pre-fix `Enter | Drop` arm — the hole
+        // this whole change exists to close — and every other test in this file survives it. This one
+        // does not.
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![]; // no containment at all: provenance is the only rule here
+        let f = outside.join("hovered.txt");
+        touch(&f);
+
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "precondition: nothing grants this path yet"
+        );
+
+        note_drag_event("main", &tauri::DragDropEvent::Enter {
+            paths: vec![f.clone()],
+            position: drag_position(),
+        });
+        assert!(
+            validate_read_path(&f, &roots).is_ok(),
+            "a file being dragged over the window must be readable — this is what closes the race \
+             with the JS drop event"
+        );
+
+        note_drag_event("main", &tauri::DragDropEvent::Leave);
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "a drag that left without dropping must leave NO grant behind"
+        );
+    }
+
+    #[test]
+    fn a_window_closing_mid_drag_revokes_the_hover_it_would_have_stranded() {
+        // The lost-`Leave` cause, handled at the cause: a view torn down mid-drag never delivers
+        // `draggingExited:`. Without this the grant would sit until PROVISIONAL_TTL lapsed, and that
+        // TTL is deliberately long (a short one would expire under a motionless hover, since `Over`
+        // only arrives on pointer movement).
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![];
+        let f = outside.join("stranded.txt");
+        touch(&f);
+
+        note_drag_event("main", &tauri::DragDropEvent::Enter {
+            paths: vec![f.clone()],
+            position: drag_position(),
+        });
+        assert!(validate_read_path(&f, &roots).is_ok(), "granted while hovering");
+
+        note_window_gone("main");
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "a window that went away mid-drag must not strand the hover grant"
+        );
+    }
+
+    #[test]
+    fn only_a_destroyed_window_is_teardown() {
+        // The arm SET, as a value. This was a `matches!` at the `on_window_event` call site — the same
+        // untestable shape the drag mapping had — so deleting the teardown arm, or widening it back to
+        // `CloseRequested`, left the suite green. `CloseRequested` cannot be constructed here (its
+        // variant is `#[non_exhaustive]`), which is why the negative case matters: it pins that the
+        // arm set is narrow rather than "anything window-ish".
+        assert!(
+            matches!(
+                dispatch_window(&tauri::WindowEvent::Destroyed),
+                WindowGrant::Teardown
+            ),
+            "a destroyed window's hovers must be dropped"
+        );
+        assert!(
+            matches!(
+                dispatch_window(&tauri::WindowEvent::Focused(true)),
+                WindowGrant::Ignore
+            ),
+            "focus is not teardown — clearing here would revoke a live hover"
+        );
+        assert!(
+            matches!(
+                dispatch_window(&tauri::WindowEvent::Focused(false)),
+                WindowGrant::Ignore
+            ),
+            "losing focus is not teardown either: dragging from another app necessarily blurs us"
+        );
+        assert!(
+            matches!(
+                dispatch_window(&tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Leave)),
+                WindowGrant::Drag(tauri::DragDropEvent::Leave)
+            ),
+            "a drag phase must reach the drag tiers"
+        );
+    }
+
+    #[test]
+    fn one_window_closing_does_not_revoke_a_hover_over_another() {
+        // `Destroyed` is per-window and the app runs several (project_window.rs, helper.rs,
+        // capture_window.rs). Clearing globally would revoke a hover over a DIFFERENT window, and
+        // that is unrecoverable for the rest of the drag: the pointer is already inside, so no further
+        // `Enter` re-registers, and `Over` only re-stamps entries that still exist. The drop would
+        // then race the durable registration — which is the silent refusal this branch exists to fix.
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![];
+        let f = outside.join("hovering-over-main.txt");
+        touch(&f);
+
+        note_drag_event(
+            "main",
+            &tauri::DragDropEvent::Enter {
+                paths: vec![f.clone()],
+                position: drag_position(),
+            },
+        );
+        note_window_event("helper-2", &tauri::WindowEvent::Destroyed);
+
+        assert!(
+            validate_read_path(&f, &roots).is_ok(),
+            "a satellite window closing must not revoke the hover the user has over THIS window"
+        );
+
+        // ...but its own window going away does revoke it.
+        note_window_event("main", &tauri::WindowEvent::Destroyed);
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "the hover's own window going away drops it"
+        );
+    }
+
+    #[test]
+    fn a_leave_on_one_window_leaves_another_windows_hover_alone() {
+        // Same scoping rule on the `Leave` path, which is the one that actually fires per-window
+        // during ordinary use.
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![];
+        let f = outside.join("still-hovering.txt");
+        touch(&f);
+
+        note_drag_event(
+            "main",
+            &tauri::DragDropEvent::Enter {
+                paths: vec![f.clone()],
+                position: drag_position(),
+            },
+        );
+        note_drag_event("helper-2", &tauri::DragDropEvent::Leave);
+
+        assert!(
+            validate_read_path(&f, &roots).is_ok(),
+            "a Leave reported by a different window must not revoke this window's hover"
+        );
+    }
+
+    #[test]
+    fn the_native_panel_does_not_disturb_an_in_flight_hover() {
+        // `note_user_chosen_paths` is also the picker's entry point, and a picker choice is not a
+        // window's drag phase. It must ADD durable consent without clearing anyone's provisional set —
+        // otherwise opening the panel mid-drag would revoke the hover.
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![];
+        let hovered = outside.join("hovered-while-picking.txt");
+        let picked = outside.join("picked.txt");
+        touch(&hovered);
+        touch(&picked);
+
+        note_drag_event(
+            "main",
+            &tauri::DragDropEvent::Enter {
+                paths: vec![hovered.clone()],
+                position: drag_position(),
+            },
+        );
+        note_user_chosen_paths([picked.clone()]);
+
+        assert!(validate_read_path(&picked, &roots).is_ok(), "the picked file is granted");
+        assert!(
+            validate_read_path(&hovered, &roots).is_ok(),
+            "a native panel choice must not revoke an in-flight hover"
+        );
+    }
+
+    #[test]
+    fn a_real_drop_event_is_durable_consent() {
+        // The mirror: `Drop` must survive everything that clears a hover, or an attachment could not
+        // be downloaded or clipboard-copied afterwards. Also guards the inverse mutation —
+        // `Durable(paths) => note_dragged_paths(paths)` would make every attachment expire.
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let roots: Vec<PathBuf> = vec![];
+        let f = outside.join("dropped-for-real.txt");
+        touch(&f);
+
+        note_drag_event("main", &tauri::DragDropEvent::Drop {
+            paths: vec![f.clone()],
+            position: drag_position(),
+        });
+        note_drag_event("main", &tauri::DragDropEvent::Leave); // a later, unrelated drag passes through
+        note_window_gone("main"); // and a window closes
+
+        assert!(
+            validate_read_path(&f, &roots).is_ok(),
+            "a file the user actually dropped stays readable"
+        );
+    }
+
+    #[test]
     fn leaving_forgets_and_hovering_renews() {
         assert_eq!(
             dispatch_drag(&tauri::DragDropEvent::Leave),
@@ -968,6 +1298,7 @@ mod tests {
     fn read_still_rejects_a_neighbour_of_a_user_chosen_path() {
         // Choosing one file must not open its directory: the registry admits exactly the paths the
         // OS named, so a compromised webview can't walk from a dragged file to its siblings.
+        let _serialized = global_drag_lock();
         let outside = fresh_root();
         let roots = vec![fresh_root()];
         let chosen = outside.join("dragged.txt");
@@ -988,6 +1319,7 @@ mod tests {
     fn read_rejects_a_symlink_swapped_after_the_user_chose_it() {
         // The check-vs-use window: we canonicalize at registration AND at read, so repointing the
         // link between the drop and the read resolves to a target that was never chosen.
+        let _serialized = global_drag_lock();
         let outside = fresh_root();
         let roots = vec![fresh_root()];
         let real_target = outside.join("innocent.txt");
