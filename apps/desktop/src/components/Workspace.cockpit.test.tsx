@@ -62,8 +62,22 @@ vi.mock("../services/sparkleAgent", async (orig) => ({
   shouldWarmSparkleAtLaunch: () => false,
 }));
 
+// The pane stub publishes the same TERMINAL structure the real one does — the app-owned
+// `data-terminal-surface` host wrapping xterm's hidden `.xterm-helper-textarea`, which is the node
+// that actually holds the caret in a focused terminal. That structure is what `voice/dictationFocus`
+// recognises a live PTY by, and it is how the window key listener decides an Escape belongs to the
+// process rather than to the cable. A stub without it would make the terminal-Escape cases below
+// vacuously pass — the same trap the sidebar stub note describes. Written as the literal attribute,
+// not the imported constant, for the same reason the sidebar stub hardcodes `data-agent-tree`: the
+// stub is asserting the contract, not inheriting it.
 vi.mock("./AgentPane", () => ({
-  AgentPane: ({ agent }: { agent: { id: string } }) => <div data-testid={`pane-${agent.id}`} />,
+  AgentPane: ({ agent }: { agent: { id: string } }) => (
+    <div data-testid={`pane-${agent.id}`}>
+      <div data-terminal-surface="">
+        <textarea className="xterm-helper-textarea" data-testid={`term-sink-${agent.id}`} />
+      </div>
+    </div>
+  ),
 }));
 // The sidebar stub publishes the SAME accessibility structure the real one does — a
 // `[data-agent-tree]` container of `role="treeitem"` rows. That structure is what the click-away
@@ -110,6 +124,7 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { markProjectVisited, resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
 import { RELEASE_ARM_WINDOW_MS } from "../engine/cable";
+import { resetTerminalFocusIntent } from "../services/terminalFocusIntent";
 import { openProjectTab } from "../services/openProjectTab";
 import type { AgentTab, Project } from "../types";
 
@@ -143,6 +158,9 @@ beforeEach(() => {
   useConnectionStore.setState({ isOnline: true } as never);
   resetVisitedProjects();
   resetCable();
+  // Focus provenance is module-level state, so a deliberate focus in one case would otherwise be
+  // inherited by the next and quietly change which Escape rung it exercises.
+  resetTerminalFocusIntent();
 });
 afterEach(() => {
   cleanup();
@@ -481,11 +499,98 @@ describe("Escape — the progressive release", () => {
   // terminal — vim, `less`, interrupting Claude Code — and `Terminal.tsx`'s custom key handler
   // claims only the composer chord and ⌘C, so it bubbles to the window listener. Under the old rule
   // the user deselected the very agent whose terminal they were typing in, and watched it vanish.
+  //
+  // NOTE WHAT THIS CASE DOES NOT COVER, which is why the two below exist: it never patches the cable,
+  // so rung 1 is inert on `wired === "off"` and rung 2 is unarmed. It passes for two reasons that
+  // have nothing to do with terminals, and it moves no caret. Keep it — it pins the resting state —
+  // but it cannot see the regression the next two describe.
   it("leaves the row alone when Escape is typed into a terminal", () => {
     render(<Workspace />);
     act(() => {
       fireEvent.keyDown(screen.getByTestId("terminal-stage"), { key: "Escape", bubbles: true });
     });
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // ══ THE IN-TERMINAL ESCAPE GESTURE IS NOT TESTED HERE, AND CANNOT BE ═══════════════════════════
+  //
+  // An Escape typed into a focused xterm never reaches this listener: xterm calls `cancel(ev, true)`
+  // for Escape — `preventDefault()` + `stopPropagation()` — so it dies at the helper textarea. An
+  // earlier version of this suite had four cases that appeared to cover the gesture; every one of them
+  // fired `keyDown(window, …)` directly at a stub with no xterm handler, which is precisely the
+  // mechanism that blocks it in the real app. They passed while the feature was unreachable
+  // (roborev 55722), so they were worse than no coverage.
+  //
+  // The gesture now lives in `Terminal.tsx`'s key handler. It is covered by
+  // `services/terminalEscapeRelease.test.ts` (the decision, with the cable as the observable effect)
+  // and `Terminal.keyOwnership.test.tsx` (the wiring, including a case that drives a real Escape
+  // through an xterm double which stops propagation the way the real one does). Do not re-add
+  // window-level terminal-Escape cases here.
+
+  // ══ ⌘⇧U — THE WAY OFF THE CABLE THAT STILL WORKS IN A TERMINAL ═════════════════════════════════
+  // Handing Escape to the process closed the only keyboard route off the cable from inside a
+  // terminal. This chord is its replacement, and the case below is the whole reason it exists: the
+  // caret is in the PTY, where Escape must do nothing to the cable, and this must still unmount.
+  //
+  // Not double-Escape: Claude Code binds that (rewind to edit a previous message), and these
+  // terminals almost always run Claude Code.
+  const unmountChord = () =>
+    act(
+      () =>
+        void fireEvent.keyDown(window, { key: "u", metaKey: true, shiftKey: true, bubbles: true }),
+    );
+
+  // The chord is the one release that survives a focused xterm WITHOUT relying on the key reaching
+  // this listener: `Terminal.tsx` returns `false` for it, so xterm never runs `cancel()` and the event
+  // keeps propagating. (Escape is the opposite case — see the note above; it is handled inside
+  // `Terminal.tsx` because it never gets here at all.)
+  it("unmounts on ⌘⇧U with the caret in a terminal", () => {
+    render(<Workspace />);
+    patch("right");
+    act(() => void (screen.getByTestId("term-sink-a1") as HTMLTextAreaElement).focus());
+    unmountChord();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+  });
+
+  it("unmounts on ⌘⇧U from anywhere else too — the chord is focus-blind", () => {
+    render(<Workspace />);
+    patch("right");
+    unmountChord();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+  });
+
+  // IT IS RUNG 1 ONLY. The chord replaces the unbind Escape can no longer do in a terminal; it is not
+  // a shortcut for the whole two-step ladder, so it must never empty the terminal column.
+  it("leaves the build row selected — it unmounts, it does not clear", () => {
+    render(<Workspace />);
+    patch("right");
+    unmountChord();
+    expect(selectedAgent()).toBe("a1");
+    // …and pressing it again on an unwired cable stays inert rather than escalating.
+    unmountChord();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // IT MUST NOT ARM RUNG 2, following the click-away precedent. Otherwise a chord would silently
+  // change what the user's NEXT Escape does, somewhere else in the app, with nothing on screen
+  // saying so.
+  it("does not arm the second rung — a following Escape must not clear the row", () => {
+    render(<Workspace />);
+    patch("right");
+    unmountChord();
+    expect(shell().getAttribute("data-wired")).toBe("off");
+    escape();
+    expect(selectedAgent()).toBe("a1");
+  });
+
+  // …and it also DISARMS a latch already standing, for the same reason any other key does: the
+  // release sequence is over once a different gesture intervenes.
+  it("disarms a release already under way", () => {
+    render(<Workspace />);
+    patch("right");
+    escape(); // rung 1 — unwires and arms
+    unmountChord(); // a different gesture: ends the sequence
+    escape(); // must find nothing armed
     expect(selectedAgent()).toBe("a1");
   });
 

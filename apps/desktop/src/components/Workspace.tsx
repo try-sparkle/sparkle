@@ -56,8 +56,18 @@ import {
   releaseStillArmed,
   unbindsOnKey,
   unbindsOnPointerDown,
+  dismissibleSurfaceOpen,
   type PairSide,
 } from "../engine/cable";
+import { terminalBlocksSelectionRelease } from "../engine/terminalEscape";
+// ONE classifier for "is the caret in a terminal", and it is not ours: `voice/dictationFocus` owns
+// that question for the whole app (dictation pauses on the same fact). This file adds only the
+// orthogonal one — who put the caret there — via `services/terminalFocusIntent`.
+import { focusOwnerNow } from "../voice/dictationFocus";
+import { installTerminalFocusIntentTracker } from "../services/terminalFocusIntent";
+import { clearTerminalEscapeToll } from "../services/terminalEscapeRelease";
+import { matchesChord } from "../keyboardHints/keybindings";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
 import {
   pairCountFor,
   resolveSideProject,
@@ -703,6 +713,11 @@ export function Workspace() {
       // prevent. Disarmed unconditionally, before the predicate, because a press that does NOT
       // unbind (on the wired row, inside Sparkle) is just as much "the user moved on".
       releaseArmedAtRef.current = null;
+      // The in-terminal toll ends here too, and for the first of those reasons: a click is the user
+      // moving on, so the next Escape inside a terminal is a first press again and belongs to the
+      // process. (A click INTO a terminal is also what makes that terminal deliberate, so this is the
+      // same press that starts the gesture — it must not arrive pre-paid.)
+      clearTerminalEscapeToll();
       if (unbindsOnPointerDown(useCableStore.getState(), e.target)) unbind();
     };
     window.addEventListener("pointerdown", onDown, true);
@@ -850,9 +865,17 @@ export function Workspace() {
   //
   // THE VISUALS ARE NOT MINE. This wires the key handling and writes the state; how the cable, the
   // flood and the connector look at each step belongs to the agent that owns the cockpit chrome.
+  // FOCUS PROVENANCE FOR TERMINALS, installed HERE rather than in `App` because this is its only
+  // consumer — the Escape handler below. Co-located deliberately: with it mounted a level up, a
+  // `<Workspace/>` rendered without `<App/>` had no tracker at all, so `terminalFocusWasDeliberate()`
+  // was permanently false and the in-terminal gesture silently degraded to "Escape always unbinds".
+  // That degradation is the SAFE direction, which is precisely why it would have shipped unnoticed.
+  useEffect(() => installTerminalFocusIntentTracker(), []);
+
   useEffect(() => {
     const disarm = () => {
       releaseArmedAtRef.current = null;
+      clearTerminalEscapeToll();
     };
     const onKey = (e: KeyboardEvent) => {
       // AN AUTOREPEAT IS NOT A SECOND PRESS. Holding Escape a beat too long delivers keydown #2 after
@@ -862,6 +885,28 @@ export function Workspace() {
       // (roborev 55491). Skipped before the branch below so a held non-Escape key does not churn the
       // ref either. This is the one disarm rule that costs the user nothing at all.
       if (e.repeat) return;
+      // ⌘⇧U — THE UNMOUNT THAT WORKS FROM INSIDE A TERMINAL.
+      //
+      // Escape no longer unbinds while the caret is in a terminal, because there it belongs to the
+      // running program (see `voice/dictationFocus` and both cable predicates). That left no keyboard
+      // way off the cable from a terminal, which matters now that clicking one patches it. This chord
+      // is that way, and it is deliberately focus-BLIND: it does the same thing wherever the caret is,
+      // so it cannot become another gesture whose meaning depends on where you happen to be.
+      //
+      // CHECKED BEFORE THE DISARM BRANCH BELOW, which returns early on any non-Escape key — a chord
+      // handled after it would be swallowed by the very line that ends the release sequence.
+      //
+      // IT DOES NOT ARM RUNG 2, following the click-away precedent: the two-step ladder is an
+      // Escape-Escape gesture, and letting ⌘⇧U arm it would mean a chord silently changed what the
+      // NEXT Escape does, in a different part of the app, for reasons the user never sees.
+      if (matchesChord(e, useKeybindingsStore.getState().bindings.unmountCable)) {
+        if (useCableStore.getState().wired !== "off") {
+          e.preventDefault();
+          unbind();
+        }
+        releaseArmedAtRef.current = null;
+        return;
+      }
       // ANY OTHER KEY ENDS THE SEQUENCE — this is what gives the latch a LIFETIME.
       //
       // Without it the latch was cleared only by a pointer press, so "the second Escape" was not the
@@ -876,11 +921,27 @@ export function Workspace() {
       // cost is pressing Escape once more, against emptying a terminal column nobody asked to empty.
       if (e.key !== "Escape") {
         releaseArmedAtRef.current = null;
+        // The in-terminal toll expires on any other key for the same reason: typing between two
+        // Escapes means the second is a fresh press, not the back half of a gesture. Note xterm
+        // cancels propagation on keys it forwards, so most typing in a terminal never reaches here —
+        // which is exactly why the toll is wall-clock bounded rather than event-cleared alone.
+        clearTerminalEscapeToll();
         return;
       }
-      const dismissibleOpen =
-        document.querySelector('[role="dialog"], [role="menu"], [data-dismissible-open="true"]') !=
-        null;
+      // The SHARED probe — see `dismissibleSurfaceOpen`. Both Escape paths must ask the same question
+      // with the same selector, or routing them through one predicate buys nothing.
+      const dismissibleOpen = dismissibleSurfaceOpen(document);
+      // DOES THIS ESCAPE BELONG TO THE TERMINAL ALONE? Three facts, combined by
+      // `engine/terminalEscape` rather than here, so the precedence is unit-tested without a DOM:
+      //
+      //   - IN a terminal, read from the LIVE DOM at the instant of the press. Not a mirrored store
+      //     value: leaving a terminal for a non-focusable target often raises no `focusin`, so a
+      //     mirror goes stale in exactly the direction that hurts.
+      //   - DELIBERATE, i.e. the user put the caret there rather than the pane's auto-focus. Without
+      //     this term the guard was catastrophically over-broad: `AgentPane` parks the caret in the
+      //     terminal whenever a pane is visible and ready, so "in a terminal" is the app's RESTING
+      //     state and Escape-to-unbind became unreachable in the normal case.
+      //   - SECOND PRESS. The founder's gesture: inside a terminal, one Escape is the process's, and
       const cable = useCableStore.getState();
       // RUNG 1 — unwire the concierge from the row it is patched into, and ARM the second rung.
       if (unbindsOnKey(cable, e.key, { dismissibleOpen })) {
@@ -896,7 +957,20 @@ export function Workspace() {
       }
       // RUNG 2 — clear the active build row itself, in every pair on screen.
       const armed = releaseStillArmed(releaseArmedAtRef.current, Date.now()) && !e.defaultPrevented;
-      if (!clearsSelectionOnKey(cable, e.key, { dismissibleOpen, releaseArmed: armed })) return;
+      if (
+        !clearsSelectionOnKey(cable, e.key, {
+          dismissibleOpen,
+          releaseArmed: armed,
+          // NEVER clear the build row while the caret is in a terminal, at any press count — see
+          // `terminalBlocksSelectionRelease`. Gated on PRESENCE, not provenance: rung 1 needs
+          // provenance so "Escape twice unmounts" works while the parked-caret ladder survives, but
+          // nothing needs rung 2 reachable there, and blanking the column of the agent holding the
+          // caret is the destructive outcome (roborev 55373/55722). Mostly belt-and-braces: an Escape
+          // from a focused xterm never reaches this listener at all.
+          terminalOwnsEscape: terminalBlocksSelectionRelease(focusOwnerNow() === "terminal"),
+        })
+      )
+        return;
       // DISARM FIRST. A third press must find nothing to do, and that promise should not rest on
       // `selectAgent` happening to no-op on an unchanged selection — it should rest on this rung
       // being unreachable again until the user re-patches and presses Escape afresh.

@@ -115,6 +115,29 @@ export const CIRCUIT_SELECTOR = [
   "[data-circuit]",
 ].join(", ");
 
+/** Every surface that treats Escape as "close me", as the DOM identifies itself to assistive tech.
+ *
+ *  ONE STRING, because `unbindsOnKey` is only as shared as the selector feeding it. Both Escape paths —
+ *  `Workspace`'s window listener and `Terminal`'s xterm key handler — ask this question, and having the
+ *  probe copy-pasted into each meant adding an Escape-owning surface (or renaming the marker attribute)
+ *  in one place and not the other would silently re-create the divergence that routing both through one
+ *  predicate was meant to end. It lives here beside `BUILD_ROW_SELECTOR`/`CIRCUIT_SELECTOR` for the same
+ *  reason those do. */
+export const DISMISSIBLE_SELECTOR =
+  '[role="dialog"], [role="menu"], [data-dismissible-open="true"]';
+
+/** Is a surface that owns Escape currently open? The `dismissibleOpen` input, read from the live DOM.
+ *
+ *  `doc` IS REQUIRED, with no default and no optional chain. Both call sites pass a live `document`, so a
+ *  document-less host is not a reachable state — and the version that guarded against it came with a test
+ *  named "tolerates a document-less host" that proved nothing: an explicitly passed `undefined` triggers
+ *  the default parameter, so the assertion was reading jsdom's real document and passing only because the
+ *  preceding cleanup had emptied `body`. Deleting the `?.` left it green. An unfalsifiable guard plus the
+ *  test that appears to cover it is worse than neither, so both are gone. */
+export function dismissibleSurfaceOpen(doc: Document): boolean {
+  return doc.querySelector(DISMISSIBLE_SELECTOR) != null;
+}
+
 /** Is this event target inside the live circuit? */
 export function isInsideCircuit(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(CIRCUIT_SELECTOR) != null;
@@ -150,6 +173,18 @@ export function unbindsOnPointerDown(state: CableState, target: EventTarget | nu
  *
  * `dismissibleOpen` is that missing input: whether any surface that treats Escape as "close me" is
  * currently open. When one is, Escape belongs to it and the cable stays patched.
+ *
+ * TERMINALS ARE ARBITRATED BEFORE THIS PREDICATE, NOT INSIDE IT. An Escape typed into a PTY belongs
+ * to the process (leaving insert mode in vim, interrupting Claude Code), and a terminal is not one of
+ * the `[role="dialog"], [role="menu"]` surfaces `dismissibleOpen` can see — so it needs its own
+ * decision. That decision lives in `engine/terminalEscape`, because it takes THREE facts this
+ * predicate has no business knowing: whether the caret is in a terminal, whether the USER put it
+ * there or the pane's auto-focus did, and whether the one-press toll has been paid. The consumer
+ * returns early on a press the terminal owns, so by the time this runs the press is the cable's.
+ *
+ * Do NOT add a bare "is the caret in a terminal" term here. That was tried, and it was wrong in the
+ * worst direction: the caret is in a terminal by DEFAULT (see `terminalEscape`'s header), so it made
+ * Escape-to-unbind unreachable in the normal state rather than in an edge case.
  */
 export function unbindsOnKey(
   state: CableState,
@@ -233,6 +268,21 @@ export function releaseStillArmed(armedAt: number | null, now: number): boolean 
  * Escape as "close me" and the consumer listens on `window`, so a press aimed at a modal must not
  * also empty the terminal column behind it (roborev 54697's failure, one step further along).
  *
+ * ══ `terminalOwnsEscape` — RUNG 2 IS UNREACHABLE FROM A TERMINAL THE USER CHOSE ═══════════════════
+ * Rung 1 is reachable inside a terminal after the one-press toll (`engine/terminalEscape`), so the
+ * founder's "press escape twice and it unmounts" works. Rung 2 is NOT, at any press count, and that
+ * asymmetry is deliberate: three consecutive Escapes inside five seconds is a real gesture for a vim
+ * user, and letting it blank the terminal column of the very agent being typed in is exactly the
+ * destructive outcome roborev 55373 was written about. Unbinding is recoverable by clicking; watching
+ * your agent vanish is not, in the way that matters to someone mid-task.
+ *
+ * The term is true only for a caret the USER put in a terminal. A caret the app's auto-focus parked
+ * there is the resting state, where the founder-confirmed two-step ladder must keep working — which
+ * is also why this cannot be a bare "in a terminal" check. It also covers the latch armed legitimately
+ * from the COMPOSER and carried into a terminal (unbind in the compose box, click into a terminal,
+ * press Escape): roborev 55491's shape arriving by a change of focus rather than by swallowed
+ * keydowns, which no wall-clock expiry could catch.
+ *
  * THE THIRD PRESS DOES NOTHING, and that is delivered by the consumer rather than by a third
  * predicate here: the latch is cleared when rung 2 fires, so a third press finds it disarmed — and
  * `selectAgent(projectId, null)` on an already-null selection is a documented no-op in projectStore
@@ -245,9 +295,16 @@ export function clearsSelectionOnKey(
   {
     dismissibleOpen = false,
     releaseArmed = false,
-  }: { dismissibleOpen?: boolean; releaseArmed?: boolean } = {},
+    terminalOwnsEscape = false,
+  }: { dismissibleOpen?: boolean; releaseArmed?: boolean; terminalOwnsEscape?: boolean } = {},
 ): boolean {
-  return key === "Escape" && state.wired === "off" && releaseArmed && !dismissibleOpen;
+  return (
+    key === "Escape" &&
+    state.wired === "off" &&
+    releaseArmed &&
+    !dismissibleOpen &&
+    !terminalOwnsEscape
+  );
 }
 
 /**

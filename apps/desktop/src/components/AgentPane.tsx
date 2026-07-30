@@ -66,6 +66,7 @@ import { registerPromptMarker } from "../services/terminalMarkers";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
 import { isTypingInProgress } from "../engine/focusGuard";
+import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
 import { TerminalDropOverlay } from "./TerminalDropOverlay";
 import { TerminalDropPill } from "./TerminalDropPill";
 import { useTerminalDrop } from "../hooks/useTerminalDrop";
@@ -252,6 +253,12 @@ function AgentPaneInner({
   // Only the VISIBLE pane listens. The webview drag event is window-global and every visited pane
   // stays mounted and stacked in the same stage, so `visible` is the ONLY thing that can name which
   // agent a drop belongs to — see useTerminalDrop's header.
+  // terminal-focus: user-driven — NOT marked as an app-placed caret, deliberately. Dropping a file onto
+  // a terminal is as much an act of aim as clicking into it, so the caret arriving here is the user's
+  // intent and must be recorded that way (see services/terminalFocusIntent). Marking it would tell the
+  // Escape ladder the app parked them here, and one Escape would drop the cable out from under someone
+  // who just aimed at this agent. `terminalAutoFocusSites.test.ts` enforces that every focus call
+  // declares which of the two it is.
   const focusTerminalForDrop = useCallback(() => termFocusRef.current?.(), []);
   const terminalDrop = useTerminalDrop(visible, agent.id, focusTerminalForDrop);
 
@@ -951,6 +958,12 @@ function AgentPaneInner({
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
       if (isTypingInProgress()) return;
+      // THIS IS THE APP MOVING THE CARET, NOT THE USER — and it is the only place that does it for a
+      // terminal. `engine/terminalEscape` needs that distinction: a caret parked here automatically
+      // must keep Escape's long-standing "release the cable" meaning, while a caret the user put here
+      // means they are working in the process and a single Escape belongs to it. Marked immediately
+      // before the focus call so the focusin it raises is the next one the tracker observes.
+      markTerminalAutoFocus();
       termFocusRef.current?.();
     });
     return () => cancelAnimationFrame(raf);

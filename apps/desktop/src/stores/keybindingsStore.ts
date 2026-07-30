@@ -7,13 +7,29 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import type { KeyBinding } from "../keyboardHints/keybindings";
 
 // The shortcuts a user can rebind. Add an id here + a default below + a row in KeyboardShortcutsMenu.
-export type ShortcutId = "toggleHints" | "toggleComposer";
+// (`KeyboardShortcutsMenu.IDS` is hand-maintained, so a new id with no row would be unreachable in
+// Settings — keybindingsStore.test.ts asserts the two lists agree.)
+export type ShortcutId = "toggleHints" | "toggleComposer" | "unmountCable";
 
 export const SHORTCUT_DEFAULTS: Record<ShortcutId, KeyBinding> = {
   // Tap Control to show/hide the keyboard-hint chiclets.
   toggleHints: { kind: "tap", modifier: "Control" },
   // ⌘J toggles focus between the composer and the terminal.
   toggleComposer: { kind: "chord", meta: true, ctrl: false, alt: false, shift: false, key: "j" },
+  // ⌘⇧U unmounts the concierge from the build row it is patched into.
+  //
+  // WHY THIS EXISTS AT ALL, given Escape already unbinds: Escape does not — and must not — unbind
+  // while the caret is in a terminal, because there it is INPUT (leaving insert mode in vim,
+  // dismissing `less`, interrupting Claude Code). See voice/dictationFocus. That left no keyboard way
+  // to unmount from inside a terminal, which matters now that clicking a terminal patches the cable.
+  //
+  // It is NOT the only way off the cable — Escape twice inside a terminal also unmounts (see
+  // `engine/terminalEscape`). This chord is the focus-BLIND alternative: it does the same thing wherever
+  // the caret is, and it is discoverable in Settings, which a two-press gesture is not.
+  //
+  // ⌘⇧U is free — the app had no other ⌘⇧ chord — and `captureReduce` accepts it as a rebindable
+  // shape, since it carries ⌘.
+  unmountCable: { kind: "chord", meta: true, ctrl: false, alt: false, shift: true, key: "u" },
 };
 
 // `allowsTap`: whether a lone-modifier TAP is a valid gesture for this shortcut. Only the hint
@@ -38,6 +54,9 @@ export const SHORTCUT_LABELS: Record<ShortcutId, { title: string; blurb: string;
   // composer, the blurb simply never mentions one, and `keybindingsStore.labels.test.ts` can then
   // assert the invariant directly: any wording that promises such a surface has to name it.
   toggleComposer: { title: "Hold the terminal's keystrokes", blurb: "Held in the terminal so the chord never reaches the running process. To talk to an agent, click its row to mount Sparkle to it.", allowsTap: false },
+  // NAMES NO TEXT SURFACE EITHER, for the reason above: this blurb is rendered in the same Settings
+  // pane, and `keybindingsStore.labels.test.ts` asserts that no wording promises a prompt box.
+  unmountCable: { title: "Unmount the concierge", blurb: "Detach the concierge from the build row it is wired to. Works from inside a terminal, where Escape belongs to the running program instead.", allowsTap: false },
 };
 
 interface KeybindingsState {

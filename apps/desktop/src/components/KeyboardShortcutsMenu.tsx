@@ -19,7 +19,11 @@ import {
 // a "Press a key…" capture button, and a reset. Capture feeds the pure captureReduce state machine
 // (tap = lone modifier press+release; chord = modifiers+key), so a tap of Control and a press of ⌘J
 // are both recordable through the same field.
-const IDS: ShortcutId[] = ["toggleHints", "toggleComposer"];
+// Hand-maintained so the ORDER is a design decision rather than object-key order. An id missing from
+// here has no Settings row and cannot be rebound, so `keybindingsStore.test.ts` asserts this list
+// covers every `ShortcutId`.
+export const SHORTCUT_ROW_ORDER: ShortcutId[] = ["toggleHints", "toggleComposer", "unmountCable"];
+const IDS = SHORTCUT_ROW_ORDER;
 
 export function KeyboardShortcutsMenu() {
   const bindings = useKeybindingsStore((s) => s.bindings);

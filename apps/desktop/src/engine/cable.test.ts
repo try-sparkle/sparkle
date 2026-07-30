@@ -2,12 +2,14 @@
 //
 // The cable state machine. These pin the four rules the founder stated for the cockpit, at the one
 // place they are decided — so a component can never re-decide them differently.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   BUILD_ROW_SELECTOR,
   CABLE_REST,
   isBuildAgentRow,
   clearsSelectionOnKey,
+  DISMISSIBLE_SELECTOR,
+  dismissibleSurfaceOpen,
   releaseStillArmed,
   RELEASE_ARM_WINDOW_MS,
   pairIsLive,
@@ -284,6 +286,114 @@ describe("Escape — the progressive release", () => {
     for (const k of ["Enter", "Tab", " ", "esc", "Esc", "a", "Backspace", "Delete"]) {
       expect(clearsSelectionOnKey(CABLE_REST, k, armed)).toBe(false);
     }
+  });
+});
+
+// ══ AN ESCAPE TYPED INTO A PTY BELONGS TO THE PROCESS, NOT TO THE CABLE ═════════════════════════
+//
+// The block above already states the requirement in as many words — "what an Escape in a terminal
+// must keep doing" — but only rung 2 was actually guarded, by the `releaseArmed` latch. Rung 1 had
+// no terminal term at all, and `dismissibleOpen` cannot stand in for one: it probes for
+// `[role="dialog"], [role="menu"], [data-dismissible-open]`, and a terminal pane is none of those.
+//
+// So with a cable patched, ONE Escape both signalled the process and unbound the cable — the roborev
+// 54697 defect (two state changes for one press, the unasked-for one invisible until the layout
+// reflowed) still live for terminals. It matters more now that clicking a terminal PATCHES the cable,
+// because then the wired state is the normal state while typing in a terminal, and Escape is the
+// single most common key there: leaving insert mode in vim, dismissing `less`, interrupting Claude
+// Code.
+// ══ RUNG 2 IS UNREACHABLE FROM A TERMINAL THE USER CHOSE ════════════════════════════════════════
+//
+// Rung 1 carries NO terminal term, deliberately. Whether an Escape belongs to the process is decided
+// before these predicates run, by `engine/terminalEscape`, because it needs three facts the cable has
+// no business knowing (in a terminal / did the user put the caret there / has the one-press toll been
+// paid). A bare "is the caret in a terminal" term was tried here and was wrong in the worst
+// direction: the caret is in a terminal by DEFAULT, so it made Escape-to-unbind unreachable in the
+// normal state rather than an edge case.
+//
+// Rung 2 does carry one, and the asymmetry is the point. "Escape twice unmounts" needs rung 1 to be
+// reachable inside a terminal; nothing needs rung 2 to be, and three Escapes inside five seconds is a
+// real gesture for a vim user. Blanking the terminal column of the agent being typed in is roborev
+// 55373's destructive outcome, so no press count reaches it from a terminal the user chose.
+// ONE PROBE, ASKED BY BOTH ESCAPE PATHS. `unbindsOnKey` is only as shared as the selector feeding it, so
+// a copy-pasted probe would let a new Escape-owning surface be registered in one path and not the other —
+// silently re-creating the divergence that routing both through one predicate was meant to end.
+describe("dismissibleSurfaceOpen", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("sees each surface that owns Escape", () => {
+    for (const html of [
+      `<div role="dialog"></div>`,
+      `<div role="menu"></div>`,
+      `<div data-dismissible-open="true"></div>`,
+    ]) {
+      document.body.innerHTML = html;
+      expect(dismissibleSurfaceOpen(document)).toBe(true);
+    }
+  });
+
+  it("is false at rest, and for a surface that merely LOOKS dismissible", () => {
+    document.body.innerHTML = `<div role="tooltip"></div><div data-dismissible-open="false"></div>`;
+    expect(dismissibleSurfaceOpen(document)).toBe(false);
+  });
+
+  // The selector is the contract between the two paths. Pinned literally so a change here is a
+  // deliberate edit to a shared rule rather than a drive-by tweak in one consumer.
+  it("is the single selector both paths share", () => {
+    expect(DISMISSIBLE_SELECTOR).toBe(
+      '[role="dialog"], [role="menu"], [data-dismissible-open="true"]',
+    );
+  });
+});
+
+describe("Escape in a terminal — rung 2 stays out of reach", () => {
+  const wired: CableState = { wired: "right", overlay: "off" };
+
+  it("does not clear the build row when the user deliberately entered the terminal", () => {
+    expect(
+      clearsSelectionOnKey(CABLE_REST, "Escape", { releaseArmed: true, terminalOwnsEscape: true }),
+    ).toBe(false);
+  });
+
+  it("stays out of reach at any press count and in every cable state", () => {
+    for (const state of [
+      CABLE_REST,
+      { wired: "left", overlay: "off" },
+      { wired: "right", overlay: "off" },
+      { wired: "off", overlay: "assist" },
+      { wired: "left", overlay: "build" },
+    ] as CableState[]) {
+      for (const releaseArmed of [true, false]) {
+        expect(
+          clearsSelectionOnKey(state, "Escape", { releaseArmed, terminalOwnsEscape: true }),
+        ).toBe(false);
+      }
+    }
+  });
+
+  // RUNG 1 IS NOT GUARDED HERE, and that is load-bearing rather than an omission: it is what lets the
+  // second Escape inside a terminal unmount, and what keeps the FIRST one unbinding when the app —
+  // not the user — parked the caret there.
+  it("leaves rung 1 alone — the terminal decision happens before it", () => {
+    expect(unbindsOnKey(wired, "Escape")).toBe(true);
+    expect(unbindsOnKey(wired, "Escape", { dismissibleOpen: false })).toBe(true);
+  });
+
+  // …and the guard is NARROW. Outside a chosen terminal, rung 2 works exactly as it did, so this
+  // cannot be mistaken for "Escape stopped clearing the row".
+  it("still clears the row when the terminal does not own the press", () => {
+    expect(
+      clearsSelectionOnKey(CABLE_REST, "Escape", { releaseArmed: true, terminalOwnsEscape: false }),
+    ).toBe(true);
+  });
+
+  // Omitting the option must read as "the terminal does not own it", or every existing caller
+  // silently changes behavior. Pinned so the default cannot be flipped to the safe-sounding-but-wrong
+  // direction.
+  it("defaults to not-owned-by-a-terminal when the option is omitted", () => {
+    expect(clearsSelectionOnKey(CABLE_REST, "Escape", { releaseArmed: true })).toBe(true);
   });
 });
 

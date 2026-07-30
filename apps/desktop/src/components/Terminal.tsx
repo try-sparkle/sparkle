@@ -37,6 +37,10 @@ import { resolveTerminalOverlay } from "./terminalOverlay";
 import { TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
 import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
+import { matchesChord } from "../keyboardHints/keybindings";
+import { dismissibleSurfaceOpen } from "../engine/cable";
+import { noteTerminalInteraction } from "../services/terminalFocusIntent";
+import { noteTerminalEscape } from "../services/terminalEscapeRelease";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
@@ -605,6 +609,11 @@ export function Terminal({
       serializeScrollback(term.buffer.active),
     );
     // Let the parent move focus into the terminal imperatively (⌘J / composer minimize).
+    //
+    // terminal-focus: user-driven — this line PROVIDES the capability, it does not exercise it, so the
+    // provenance decision belongs at each CALLER (AgentPane and SparkleAgentPane both mark their
+    // auto-focus; the drop path declares itself user-driven). Marking here would stamp every caller with
+    // one answer and make the distinction unexpressible.
     if (focusRef) focusRef.current = () => term.focus();
 
     // Engine owns the tab status. It reads the rendered screen on settle (via getScreen)
@@ -641,6 +650,13 @@ export function Terminal({
     const lineScan = makeLineScanState();
     term.onData((d) => {
       useInteractionStore.getState().touch(agentId);
+      // THE USER IS WORKING IN THIS TERMINAL. `onData` is the honest signal for that, and the only
+      // one available: the pane parks the caret here automatically, and once this textarea is already
+      // focused a click inside it raises no `focusin` while every keystroke is swallowed by xterm's
+      // own handler before any window listener sees it. Without this, provenance stayed "the app put
+      // you here" for a whole session of hand-driving an agent, and the wrong Escape ladder applied
+      // (roborev 55722). Idempotent — it costs nothing once the verdict is already deliberate.
+      noteTerminalInteraction();
       // Same signal, second consumer: this is the app's only evidence that a user typing into a
       // terminal — rather than into the compose box — is still at the keyboard. Without it the
       // presence store would call someone Away after five minutes of driving an agent by hand, and
@@ -720,6 +736,54 @@ export function Terminal({
       ) {
         return false;
       }
+      // ESCAPE — THE CABLE'S RELEASE GESTURE, DECIDED HERE BECAUSE NOWHERE ELSE CAN SEE IT.
+      //
+      // xterm's own keydown handler calls `cancel(ev, true)` for Escape — `preventDefault()` AND
+      // `stopPropagation()` (`case 27: … o.cancel = !0`, then `i.cancel && this.cancel(e,!0)` in the
+      // shipped bundle). So an Escape typed into a focused terminal NEVER reaches the `window`
+      // listener in `Workspace`. The first version of this feature lived there and was unreachable;
+      // its tests passed only because they fired `keyDown(window, …)` at a stub with no xterm handler
+      // (roborev 55722).
+      //
+      // RETURNS `true` DELIBERATELY: the byte must still reach the PTY, so vim leaves insert mode,
+      // `less` dismisses and Claude Code interrupts exactly as before. The cable's response happens
+      // ALONGSIDE the keystroke, never instead of it — which is what makes the known Escape-Escape
+      // collision affordable rather than a key we stole.
+      // KEYDOWN ONLY, AND NOT AN AUTOREPEAT. Both guards are load-bearing and both were nearly missed:
+      //
+      //   - `attachCustomKeyEventHandler` is called for KEYUP AND KEYPRESS too, not just keydown —
+      //     xterm's `_keyUp` and `_keyPress` both run `this._customKeyEventHandler(e)`, and `keyup` is
+      //     bound on the textarea in `_bindKeys`. Without the type check, ONE physical press called
+      //     this twice: the keydown paid the toll and the keyup of the SAME press found it paid and
+      //     released the cable, collapsing "Escape twice" into one press. The toggle-chord block below
+      //     already knew this ("incl. the keyup") — the lesson was there to be read.
+      //   - macOS autorepeat delivers keydown #2 after ~120–500ms, far inside the toll's 5s window, so
+      //     HOLDING Escape would pay and then release without the user ever pressing twice. `Workspace`
+      //     carries the same guard for the same reason (roborev 55491); it was left behind when this
+      //     decision changed layers.
+      //
+      // `dismissibleOpen` comes from the SHARED probe in `engine/cable`, not a local copy of the
+      // selector — the predicate is only as shared as its input, and a duplicated selector would let a
+      // new Escape-owning surface be registered in one path and not the other. It matters here because a
+      // focused terminal means a surface's own window-level Escape handler never fires either (xterm
+      // cancels propagation), so without it an Escape aimed at an open menu dropped the cable silently.
+      if (e.key === "Escape" && e.type === "keydown" && !e.repeat) {
+        noteTerminalEscape({ dismissibleOpen: dismissibleSurfaceOpen(document) });
+        return true;
+      }
+      // THE UNMOUNT CHORD IS NOT PTY INPUT. It is handled by the `window` listener in `Workspace`,
+      // which owns the cable — but that listener runs on the BUBBLE, i.e. after xterm has already
+      // decided what to send, so its `preventDefault` cannot un-send a sequence xterm emitted on the
+      // way past. `evaluateKeyboardEvent` folds `metaKey` into its modifier bitmask, so a ⌘⇧-letter
+      // combo is not self-evidently inert, and a stray byte written into a live agent's stdin cannot
+      // be taken back. Claim it here and let the window listener do the unmounting — the same
+      // belt-and-braces the toggle chord above takes, for the same reason.
+      //
+      // Read LIVE from the store (not a captured value) so a rebind in Settings takes effect without
+      // remounting the terminal, matching `toggle` above.
+      if (matchesChord(e, useKeybindingsStore.getState().bindings.unmountCable)) {
+        return false;
+      }
       // ⌘C copies the selection ourselves. ⌘C is never a PTY control (that's Ctrl+C, which carries
       // ctrlKey and still SIGINTs), so we always handle it AND call preventDefault() — otherwise
       // xterm returns from _keyDown without preventing the event, WebKit runs its native Copy, finds
@@ -775,6 +839,9 @@ export function Terminal({
     if (apiRef) {
       apiRef.current = {
         arrowFromComposer: (dir) => {
+          // terminal-focus: user-driven — the user pressed an arrow key to drive a menu in THIS
+          // terminal. They are engaging with the running program, so the caret arriving here is their
+          // intent; recording it as app-placed would let a single Escape drop the cable mid-menu.
           term.focus();
           // Encode against the app's cursor-key mode (DECCKM) so the bytes match a real keypress;
           // see arrowKeySequence. `term.modes` reflects whatever the running TUI last requested.
@@ -782,6 +849,8 @@ export function Terminal({
           transport.write(seq);
         },
         enterFromComposer: () => {
+          // terminal-focus: user-driven — same reasoning as `arrowFromComposer`: an Enter aimed at the
+          // terminal's menu is the user acting on that program, not the app relocating their caret.
           term.focus();
           // \r is the byte a real Enter sends to a PTY (the running TUI translates it per its
           // input mode, exactly as it would a keyboard Enter). This confirms the highlighted menu

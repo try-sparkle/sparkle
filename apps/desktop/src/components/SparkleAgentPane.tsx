@@ -29,6 +29,7 @@ import { useTerminalDrop } from "../hooks/useTerminalDrop";
 import { SPARKLE_TERMINAL_DND_TARGET } from "../services/dndTargets";
 import { paneVisibilityStyle } from "./paneVisibility";
 import { isTypingInProgress } from "../engine/focusGuard";
+import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -96,6 +97,12 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   // surface — there is no longer a sibling compose box to split drops with. The claim on the
   // terminal box stays explicit anyway: it is what scopes the drag-over scrim to the terminal and
   // anchors the "pasted, not sent" pill, both of which outlived the composer.
+  // terminal-focus: user-driven — NOT marked as an app-placed caret, matching `AgentPane`'s identical
+  // drop path. Dropping a file onto a terminal is as much an act of aim as clicking into it, so the
+  // caret arriving here is the user's intent; marking it would tell the Escape ladder the app parked
+  // them, and one Escape would drop the cable out from under someone who just aimed at this agent.
+  // `terminalAutoFocusSites.test.ts` is what required this line to exist — it caught this site the
+  // moment the pane grew it, which is exactly what it was written for.
   const focusTerminalForDrop = useCallback(() => termFocusRef.current?.(), []);
   const terminalDrop = useTerminalDrop(
     visible,
@@ -254,6 +261,12 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     if (!visible || !ptyReady) return;
     const raf = requestAnimationFrame(() => {
       if (isTypingInProgress()) return;
+      // THE APP MOVING THE CARET, NOT THE USER — the second such site, and it was missed the first
+      // time this was wired (roborev 55722). Unmarked, this pane recorded a parked caret as
+      // deliberate, so its Escape ladder was the inverse of a builder pane's: the first press did not
+      // release the cable. See `services/terminalFocusIntent`; `AgentPane` marks the equivalent
+      // effect, and `terminalAutoFocusSites.test.ts` requires every such site to declare itself.
+      markTerminalAutoFocus();
       termFocusRef.current?.();
     });
     return () => cancelAnimationFrame(raf);
