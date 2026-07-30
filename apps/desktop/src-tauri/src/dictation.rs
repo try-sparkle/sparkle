@@ -815,10 +815,25 @@ struct DecodeWorker {
     /// DEADLINE instead of an unbounded `join()`. The worker holds the paired `Sender` and never
     /// sends on it; the disconnect IS the signal, so this costs nothing while the worker runs and
     /// needs no polling to observe. See `DECODE_JOIN_TIMEOUT` for why the deadline is load-bearing.
-    /// Set ONLY at the detach point, and read between the decode and the emit. Distinct from
-    /// `abort` on purpose: `abort` means "stop looping", which is safe to set the moment teardown
-    /// starts, whereas suppressing an emit is only correct once teardown has RETURNED and
-    /// `dictation://final` may already be out. See `run_decode_loop` (roborev 55803).
+    /// Read between the decode and the emit, and set at EXACTLY TWO points:
+    ///   - `abort()` — a caller is discarding the backlog outright (blur, mute, exit, reacquire).
+    ///     Those partials are moot; emitting one arms auto-send over speech the user abandoned.
+    ///   - `Drop`'s DETACH branch — teardown has returned, so `dictation://final` may already be out.
+    ///
+    /// And deliberately NOT set by the second (and last) writer of `abort`, `Drop`'s drain
+    /// escalation, which stores `abort` alone. A decode finishing during that grace is still IN
+    /// ORDER and must emit, ahead of the final.
+    ///
+    /// Note the two flags do NOT have the same store sites, so do not expect them to line up:
+    /// `abort` is written at exactly two points (`abort()` and the drain escalation), while this
+    /// flag is written at the two above. The detach branch is nested INSIDE the escalation, so by
+    /// the time it runs `abort` is already set and it writes only this flag.
+    ///
+    /// That asymmetry is the whole point of having two flags — gating the emit on `abort` conflated
+    /// "teardown began" with "the final is already out" and silently ate the user's last sentence
+    /// (roborev 55803, 56014, 56035). Pinned by two tests:
+    /// `a_drain_escalation_still_lets_the_in_flight_decode_emit` (must emit) and
+    /// `a_real_teardown_that_detaches_silences_the_worker_it_left_running` (must not).
     emits_are_unsafe: Arc<AtomicBool>,
     exited: Receiver<()>,
 }
@@ -875,9 +890,13 @@ fn run_decode_loop<P>(
         // `stop_dictation` stores `abort`, waits, and only afterwards emits `dictation://final`. So
         // a decode that finishes during that wait is still IN ORDER and must emit: this is the
         // ordinary case of a ≤8 s segment whose transcribe outran the drain budget, and gating it on
-        // `abort` threw away speech the pre-teardown code emitted fine. What is unsafe is an emit
-        // from a worker we have DETACHED — teardown has returned, so the final may already be out.
-        // That is the only case this flag is set for, and it is set at the detach itself.
+        // `abort` threw away speech the pre-teardown code emitted fine.
+        //
+        // Unsafe is the other two points at which teardown may leave us: a caller discarding the
+        // backlog via `abort()` (its partials are moot — that one does write `abort` too), and a
+        // worker we have DETACHED (teardown returned, the final may be out — that one does NOT write
+        // `abort`; the escalation already set it on the way in). Both set THIS flag; the drain
+        // escalation deliberately does not. See the field doc for the two flags' store sites.
         if emits_are_unsafe.load(Ordering::Acquire) {
             return;
         }
@@ -940,8 +959,8 @@ impl DecodeWorker {
                 },
                     // The emit half. `run_decode_loop` checks `emits_are_unsafe` between the decode
                     // above and this — NOT `abort`. A decode that merely outran the drain budget
-                    // still emits (it lands before `dictation://final`); only one whose worker was
-                    // DETACHED is suppressed, because by then teardown has returned.
+                    // still emits (it lands before `dictation://final`). Suppressed only when the
+                    // backlog was discarded via `abort()` or the worker was DETACHED.
                     |plan| apply_decode_plan(plan, &mut AppEmitSink(&app)),
                 );
             })
@@ -951,8 +970,9 @@ impl DecodeWorker {
 
     /// Signal the worker to abandon any queued decodes and EXIT — observed within one
     /// `DECODE_ABORT_POLL` tick whether or not the decode channel ever closes.
-    /// Abandon the queued backlog. Every caller of this means "these partials are MOOT" — app-exit
-    /// quiesce, window blur, mute pause, capture reacquire — never "a `dictation://final` is coming".
+    ///
+    /// Every caller means "these partials are MOOT" — app-exit quiesce, window blur, mute pause,
+    /// capture reacquire — never "a `dictation://final` is coming".
     ///
     /// So this suppresses emits too, and that is why the suppression cannot live on the `abort` flag
     /// alone: `Drop` also stores `abort` as its drain escalation, and on THAT path an emit is still
@@ -1002,6 +1022,13 @@ impl Drop for DecodeWorker {
             // able to `emit_partial` a stale fragment AFTER the final that ended the transcript.
             // Aborting here bounds all of that — the drain got its budget, and now the worker exits.
             Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                // `abort` ALONE — deliberately not `emits_are_unsafe`. This is the one writer of
+                // `abort` that must not suppress: teardown has not returned, so a decode finishing
+                // during the grace below still lands ahead of `dictation://final` and must emit.
+                // Adding the suppression here reinstates the eaten-last-sentence bug, which is why
+                // `a_drain_escalation_still_lets_the_in_flight_decode_emit` exists to fail on it.
+                // Its counterpart is `a_real_teardown_that_detaches_silences_the_worker_it_left_
+                // running`, on the detach branch below — together they pin both sides.
                 self.abort.store(true, Ordering::Release);
                 // One more short wait, so the overwhelmingly likely outcome is still an orderly
                 // join rather than a detach: the worker observes the abort within a poll tick.
@@ -3510,6 +3537,80 @@ mod tests {
             emits_after_teardown_flags(false, true).is_empty(),
             "a detached worker emitted past teardown — that fragment lands after dictation://final"
         );
+    }
+
+    // THE MIRROR IMAGE, and the one the whole fix rests on (roborev 56026). `Drop` writes `abort`
+    // twice for different reasons: the drain escalation (teardown has NOT returned — a decode
+    // finishing in the grace still lands ahead of dictation://final, so it MUST emit) and the detach
+    // (teardown HAS returned, so it must not). Only the second sets `emits_are_unsafe`.
+    //
+    // Nothing covered that asymmetry end to end: the grace test sets `abort` by hand and never runs
+    // `Drop`, and the un-aborted-worker test wires the loop to `&never()` with a *different* Arc, so
+    // it cannot observe the store at all. Adding the suppression to the escalation branch would
+    // reinstate the eaten-last-sentence bug with the entire suite green.
+    //
+    // This is `stop_dictation`'s exact shape: never calls `abort()`, the Sender stays alive (the
+    // leaked-Sender case), so the drain budget expires, `Drop` escalates, and the held-open decode
+    // is released during the grace. It must still reach `emit`.
+    #[test]
+    fn a_drain_escalation_still_lets_the_in_flight_decode_emit() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let emits_are_unsafe = Arc::new(AtomicBool::new(false));
+        let (abort_loop, unsafe_loop) = (abort.clone(), emits_are_unsafe.clone());
+        let emitted = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let emitted_worker = emitted.clone();
+        let (in_decode_tx, in_decode_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let (exited_tx, exited) = channel::<()>();
+
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                &unsafe_loop,
+                move |samples: Vec<f32>| {
+                    let _ = in_decode_tx.send(());
+                    let _ = release_rx.recv();
+                    samples[0]
+                },
+                move |v| emitted_worker.lock().unwrap().push(v),
+            );
+        });
+        // Same Arcs as the loop, so the test observes what `Drop` actually stores.
+        let worker =
+            DecodeWorker { handle: Some(handle), abort: abort.clone(), emits_are_unsafe, exited };
+
+        tx.send(vec![42.0]).expect("queue a segment");
+        in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
+
+        // Teardown on another thread: it blocks for the drain budget, then escalates. NO `abort()`.
+        let teardown = std::thread::spawn(move || drop(worker));
+
+        // Wait for the escalation itself rather than a wall-clock guess: `abort` going true IS the
+        // escalation, and it happens exactly once the drain budget expires.
+        let escalated = Instant::now();
+        while !abort.load(Ordering::Acquire) {
+            assert!(
+                escalated.elapsed() < DECODE_JOIN_TIMEOUT * 4,
+                "Drop never escalated to an abort — the drain budget should have expired by now"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // We are now inside DECODE_ABORT_GRACE. Release the decode; it must still emit.
+        let _ = release_tx.send(());
+        within(Duration::from_secs(20), "the escalated teardown", move || {
+            teardown.join().expect("teardown thread");
+        });
+
+        assert_eq!(
+            *emitted.lock().unwrap(),
+            vec![42.0],
+            "the drain escalation suppressed an emit that was still IN ORDER — it lands ahead of \
+             dictation://final, and dropping it silently eats the user's last sentence"
+        );
+        drop(tx);
     }
 
     // THE OTHER HALF OF THE SPLIT (roborev 56014). Separating the two signals fixed
