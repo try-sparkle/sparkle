@@ -815,6 +815,11 @@ struct DecodeWorker {
     /// DEADLINE instead of an unbounded `join()`. The worker holds the paired `Sender` and never
     /// sends on it; the disconnect IS the signal, so this costs nothing while the worker runs and
     /// needs no polling to observe. See `DECODE_JOIN_TIMEOUT` for why the deadline is load-bearing.
+    /// Set ONLY at the detach point, and read between the decode and the emit. Distinct from
+    /// `abort` on purpose: `abort` means "stop looping", which is safe to set the moment teardown
+    /// starts, whereas suppressing an emit is only correct once teardown has RETURNED and
+    /// `dictation://final` may already be out. See `run_decode_loop` (roborev 55803).
+    emits_are_unsafe: Arc<AtomicBool>,
     exited: Receiver<()>,
 }
 
@@ -842,6 +847,7 @@ struct DecodeWorker {
 fn run_decode_loop<P>(
     rx: &Receiver<Vec<f32>>,
     abort: &AtomicBool,
+    emits_are_unsafe: &AtomicBool,
     mut decode: impl FnMut(Vec<f32>) -> P,
     mut emit: impl FnMut(P),
 ) {
@@ -863,11 +869,16 @@ fn run_decode_loop<P>(
             return; // fast teardown: abandon this segment and the rest of the backlog
         }
         let plan = decode(samples);
-        // Teardown may have begun WHILE that decode ran — it is the slow part, and the detach path
-        // is reached precisely when a worker is stuck in it. Drop the result rather than emit past
-        // the final. A lost trailing partial is a missing fragment; an emitted one is a fragment
-        // appended to a finished transcript.
-        if abort.load(Ordering::Acquire) {
+        // Suppress the emit only once it is genuinely UNSAFE — which is not the same as "teardown
+        // began", and conflating the two silently ate the user's last sentence (roborev 55803).
+        //
+        // `stop_dictation` stores `abort`, waits, and only afterwards emits `dictation://final`. So
+        // a decode that finishes during that wait is still IN ORDER and must emit: this is the
+        // ordinary case of a ≤8 s segment whose transcribe outran the drain budget, and gating it on
+        // `abort` threw away speech the pre-teardown code emitted fine. What is unsafe is an emit
+        // from a worker we have DETACHED — teardown has returned, so the final may already be out.
+        // That is the only case this flag is set for, and it is set at the detach itself.
+        if emits_are_unsafe.load(Ordering::Acquire) {
             return;
         }
         emit(plan);
@@ -886,6 +897,8 @@ impl DecodeWorker {
         let abort_worker = abort.clone();
         // Moved into the worker and never sent on: its DROP (when the thread body returns) is what
         // `Drop for DecodeWorker` waits on, so the wait is event-driven and has a deadline.
+        let emits_are_unsafe = Arc::new(AtomicBool::new(false));
+        let emits_are_unsafe_worker = emits_are_unsafe.clone();
         let (exited_tx, exited) = channel::<()>();
         let handle = std::thread::Builder::new()
             .name("parakeet-decode".into())
@@ -894,6 +907,7 @@ impl DecodeWorker {
                 run_decode_loop(
                     &rx,
                     &abort_worker,
+                    &emits_are_unsafe_worker,
                     |samples| {
                     // Panic firewall parity with the audio-thread handler: a panic inside the FFI
                     // decode (a poisoned recognizer mutex, a malformed segment) must not kill the
@@ -915,28 +929,41 @@ impl DecodeWorker {
                     // orders them so that stays true (see plan_decode_emit). Same thread, so the
                     // frontend sees them in the order the segments closed.
                     //
-                    let plan = plan_decode_emit(match decoded {
-                        Ok(text) => DecodeOutcome::Decoded(text),
-                        Err(_) => DecodeOutcome::Panicked,
-                    });
                     // Decided by `plan_decode_emit` and dispatched by `apply_decode_plan`, never
                     // re-derived here. This call and `AppEmitSink`'s three bodies are the part of the
                     // path tests cannot reach (they need a live `AppHandle`) — see DecodeEmitSink for
                     // exactly how far the coverage goes, which is less far than it first appears.
-                    plan
+                    plan_decode_emit(match decoded {
+                        Ok(text) => DecodeOutcome::Decoded(text),
+                        Err(_) => DecodeOutcome::Panicked,
+                    })
                 },
-                    // The emit half. `run_decode_loop` re-checks `abort` between the decode above
-                    // and this, so a segment whose decode outlived teardown never reaches here.
+                    // The emit half. `run_decode_loop` checks `emits_are_unsafe` between the decode
+                    // above and this — NOT `abort`. A decode that merely outran the drain budget
+                    // still emits (it lands before `dictation://final`); only one whose worker was
+                    // DETACHED is suppressed, because by then teardown has returned.
                     |plan| apply_decode_plan(plan, &mut AppEmitSink(&app)),
                 );
             })
             .expect("spawn parakeet-decode worker");
-        (tx, DecodeWorker { handle: Some(handle), abort, exited })
+        (tx, DecodeWorker { handle: Some(handle), abort, emits_are_unsafe, exited })
     }
 
     /// Signal the worker to abandon any queued decodes and EXIT — observed within one
     /// `DECODE_ABORT_POLL` tick whether or not the decode channel ever closes.
+    /// Abandon the queued backlog. Every caller of this means "these partials are MOOT" — app-exit
+    /// quiesce, window blur, mute pause, capture reacquire — never "a `dictation://final` is coming".
+    ///
+    /// So this suppresses emits too, and that is why the suppression cannot live on the `abort` flag
+    /// alone: `Drop` also stores `abort` as its drain escalation, and on THAT path an emit is still
+    /// in order (it lands ahead of the final). `stop_dictation` is the one teardown that never calls
+    /// this — it wants the drain — which is what keeps the last-sentence fix intact.
+    ///
+    /// Without the second store, an in-flight decode returning inside the drain budget emits
+    /// `dictation://partial` + `dictation://speech-end` on all five of those paths, arming the
+    /// auto-send countdown over a mic the user just muted or a window they just left (roborev 56014).
     fn abort(&self) {
+        self.emits_are_unsafe.store(true, Ordering::Release);
         self.abort.store(true, Ordering::Release);
     }
 }
@@ -982,7 +1009,7 @@ impl Drop for DecodeWorker {
                     Err(RecvTimeoutError::Disconnected) => {
                         tracing::warn!(
                             target: "dictation",
-                            timeout_secs = DECODE_JOIN_TIMEOUT.as_secs_f64(),
+                            drain_budget_secs = DECODE_DRAIN_BUDGET.as_secs_f64(),
                             "decode worker outlasted the drain deadline; aborted it and it exited \
                              (its queued segments were abandoned)"
                         );
@@ -993,9 +1020,13 @@ impl Drop for DecodeWorker {
                     // is (or blocks) the main thread. The abort above is already stored, so the
                     // thread will exit if it ever returns from whatever it is stuck in.
                     Ok(()) | Err(RecvTimeoutError::Timeout) => {
+                        // Teardown is about to RETURN with this worker still running, so from here
+                        // an emit could land after `dictation://final`. This is the only place the
+                        // suppression is correct — see `run_decode_loop`.
+                        self.emits_are_unsafe.store(true, Ordering::Release);
                         tracing::warn!(
                             target: "dictation",
-                            timeout_secs = DECODE_JOIN_TIMEOUT.as_secs_f64(),
+                            ceiling_secs = DECODE_JOIN_TIMEOUT.as_secs_f64(),
                             grace_secs = DECODE_ABORT_GRACE.as_secs_f64(),
                             "decode worker did not exit even after being aborted; detaching it \
                              rather than blocking teardown (the app must stay responsive)"
@@ -3107,6 +3138,12 @@ mod tests {
     // as it was, these do not merely fail, they HANG — which is exactly the property under test, and
     // a hanging CI job is a far worse signal than a failing assertion.
 
+    /// A suppression flag that is never set — for the loops under test that are not exercising
+    /// the detach path. Emits stay enabled, which is the production default.
+    fn never() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     /// Run `body` on a scratch thread and fail if it has not finished within `limit`.
     /// Returns nothing on success; panics with `what` on timeout, so a regression is a red test
     /// rather than a wedged test binary.
@@ -3135,7 +3172,7 @@ mod tests {
         // racing the signal in.
         abort.store(true, Ordering::Release);
         within(Duration::from_secs(5), "an aborted decode loop", move || {
-            run_decode_loop(&rx, &abort_loop, |_| panic!("must not decode after abort"), |_: ()| {});
+            run_decode_loop(&rx, &abort_loop, &never(), |_| panic!("must not decode after abort"), |_: ()| {});
         });
         drop(tx); // held across the whole wait above — the point of the test
     }
@@ -3150,7 +3187,7 @@ mod tests {
         let abort_loop = abort.clone();
         let (done_tx, done_rx) = channel::<()>();
         let loop_thread = std::thread::spawn(move || {
-            run_decode_loop(&rx, &abort_loop, |_| panic!("no segments were sent"), |_: ()| {});
+            run_decode_loop(&rx, &abort_loop, &never(), |_| panic!("no segments were sent"), |_: ()| {});
             let _ = done_tx.send(());
         });
         // Let the loop actually reach its wait, so this asserts that a LATE abort is observed —
@@ -3185,7 +3222,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_loop = seen.clone();
         within(Duration::from_secs(5), "a draining decode loop", move || {
-            run_decode_loop(&rx, &abort, |s: Vec<f32>| s[0], |v| seen_loop.lock().unwrap().push(v));
+            run_decode_loop(&rx, &abort, &never(), |s: Vec<f32>| s[0], |v| seen_loop.lock().unwrap().push(v));
         });
         assert_eq!(
             *seen.lock().unwrap(),
@@ -3213,6 +3250,7 @@ mod tests {
         let worker = DecodeWorker {
             handle: Some(handle),
             abort: Arc::new(AtomicBool::new(false)),
+            emits_are_unsafe: Arc::new(AtomicBool::new(false)),
             exited,
         };
         let started = Instant::now();
@@ -3241,9 +3279,9 @@ mod tests {
         let (exited_tx, exited) = channel::<()>();
         let handle = std::thread::spawn(move || {
             let _exited_tx = exited_tx;
-            run_decode_loop(&rx, &abort_worker, |_| {}, |()| {});
+            run_decode_loop(&rx, &abort_worker, &never(), |_| {}, |()| {});
         });
-        let worker = DecodeWorker { handle: Some(handle), abort, exited };
+        let worker = DecodeWorker { handle: Some(handle), abort, emits_are_unsafe: Arc::new(AtomicBool::new(false)), exited };
         worker.abort();
         let started = Instant::now();
         within(Duration::from_secs(10), "dropping an exiting worker", move || drop(worker));
@@ -3283,7 +3321,7 @@ mod tests {
         });
         let state = DictationState::default();
         state.0.lock().unwrap().decode_worker =
-            Some(DecodeWorker { handle: Some(handle), abort: Arc::new(AtomicBool::new(false)), exited });
+            Some(DecodeWorker { handle: Some(handle), abort: Arc::new(AtomicBool::new(false)), emits_are_unsafe: Arc::new(AtomicBool::new(false)), exited });
 
         // A second handle on the SAME session. `Arc<Mutex<DictationSession>>` is not `Send` by
         // itself (the session holds a !Send cpal Stream); `DictationState` is, via its `unsafe impl`
@@ -3339,9 +3377,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _exited_tx = exited_tx;
             let _alive = alive_worker;
-            run_decode_loop(&rx, &abort_worker, |_| {}, |()| {});
+            run_decode_loop(&rx, &abort_worker, &never(), |_: Vec<f32>| {}, |()| {});
         });
-        let worker = DecodeWorker { handle: Some(handle), abort, exited };
+        let worker = DecodeWorker { handle: Some(handle), abort, emits_are_unsafe: Arc::new(AtomicBool::new(false)), exited };
 
         let started = Instant::now();
         // NOTE: no `worker.abort()` — this is the stop_dictation path.
@@ -3352,10 +3390,13 @@ mod tests {
             waited >= DECODE_DRAIN_BUDGET,
             "the drain must get its full budget before we abort it — gave up after {waited:?}"
         );
+        // The bound the CODE actually guarantees: the drain elapses in full, then up to a grace.
+        // Asserting strictly under the ceiling made this fail on a busy runner for a worker that
+        // behaved exactly as designed; the ceiling arithmetic is pinned deterministically by
+        // `the_teardown_budget_is_carved_up_not_added_to` instead (roborev 55803).
         assert!(
-            waited < DECODE_JOIN_TIMEOUT,
-            "an idling worker observes the abort within a poll tick, so the teardown must finish \
-             INSIDE the ceiling rather than spending the whole grace ({waited:?})"
+            waited < DECODE_JOIN_TIMEOUT + DECODE_ABORT_GRACE,
+            "the drop must return within the guaranteed bound, not block on the thread ({waited:?})"
         );
         assert_eq!(
             Arc::strong_count(&alive),
@@ -3387,22 +3428,114 @@ mod tests {
     // detach path is reached precisely when the worker is stuck in `on_segment`. Without the
     // between-decode-and-emit check, the transcript lands after `dictation://final`, re-populating
     // the composer and re-arming auto-send over speech the user already finished (roborev 55788).
-    #[test]
-    fn a_segment_still_decoding_when_teardown_begins_does_not_emit_after_the_final() {
+    /// Drive one segment through `run_decode_loop` with the decode held open, flip whichever flags
+    /// the caller asks for while it is blocked, then release it. Returns what reached `emit`.
+    ///
+    /// Shared by the pair below because the ONLY difference that matters is which flag was set —
+    /// writing it twice invites the two from drifting into testing different things.
+    fn emits_after_teardown_flags(set_abort: bool, set_unsafe: bool) -> Vec<f32> {
         let (tx, rx) = sync_channel::<Vec<f32>>(4);
         let abort = Arc::new(AtomicBool::new(false));
-        let abort_loop = abort.clone();
+        let unsafe_flag = Arc::new(AtomicBool::new(false));
+        let (abort_loop, unsafe_loop) = (abort.clone(), unsafe_flag.clone());
         let emitted = Arc::new(Mutex::new(Vec::<f32>::new()));
         let emitted_worker = emitted.clone();
         let (in_decode_tx, in_decode_rx) = channel::<()>();
         let (release_tx, release_rx) = channel::<()>();
+        // The loop's exit is what we wait on, NOT `join()` — see the bounded wait below.
+        let (exited_tx, exited_rx) = channel::<()>();
 
         let worker = std::thread::spawn(move || {
             run_decode_loop(
                 &rx,
                 &abort_loop,
-                // Stands in for `Decoder::transcribe`: announce that we are inside the decode, then
-                // block until the test releases us — i.e. the decode outlives the teardown.
+                &unsafe_loop,
+                // Stands in for `Decoder::transcribe`: announce we are inside the decode, then
+                // block until released — i.e. this decode outlives the teardown.
+                move |samples: Vec<f32>| {
+                    let _ = in_decode_tx.send(());
+                    let _ = release_rx.recv();
+                    samples[0]
+                },
+                move |v| emitted_worker.lock().unwrap().push(v),
+            );
+            let _ = exited_tx.send(());
+        });
+
+        tx.send(vec![42.0]).expect("queue a segment");
+        in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
+        if set_abort {
+            abort.store(true, Ordering::Release);
+        }
+        if set_unsafe {
+            unsafe_flag.store(true, Ordering::Release);
+        }
+        let _ = release_tx.send(()); // the decode now returns
+        // Wait on the loop's EXIT with a deadline rather than `join()`. Either flag must terminate
+        // the loop, and `tx` is deliberately still alive here (as in production), so a regression
+        // that leaves the loop spinning would block a bare `join()` forever — a hung test, which
+        // CI reports as a six-hour timeout with no failing assertion rather than as this bug.
+        // Verified: reverting the emit guard to `abort` wedged this helper for 50 minutes.
+        exited_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run_decode_loop never exited after teardown flags were set");
+        worker.join().expect("worker thread"); // now known to be done; cannot block
+        drop(tx); // the Sender stayed alive throughout, as in production
+        let out = emitted.lock().unwrap().clone();
+        out
+    }
+
+    // THE REGRESSION THIS PAIR EXISTS FOR (roborev 55803). A previous revision suppressed the emit
+    // whenever `abort` was set, which conflated "teardown began" with "the final is already out".
+    // They are not the same moment: `stop_dictation` stores `abort`, waits up to the grace, and only
+    // then emits `dictation://final`. So a ≤8 s segment whose transcribe merely outran the 1.5 s
+    // drain budget — squarely inside `DECODE_JOIN_TIMEOUT`'s own stated worst case — had its
+    // transcript thrown away, losing the user's last sentence on a path that used to emit it fine.
+    #[test]
+    fn a_decode_finishing_during_the_abort_grace_still_emits_before_the_final() {
+        assert_eq!(
+            emits_after_teardown_flags(true, false),
+            vec![42.0],
+            "a decode that finished after abort but before teardown returned must still emit — it \
+             lands ahead of dictation://final, and dropping it silently eats the last sentence"
+        );
+    }
+
+    // The other side: once we have DETACHED, teardown has returned and the final may already be
+    // out, so this worker's emit would append a stale fragment to a finished transcript and re-arm
+    // auto-send. That is the only moment suppression is correct, and it is set at the detach.
+    #[test]
+    fn a_decode_finishing_after_the_worker_was_detached_does_not_emit() {
+        assert!(
+            emits_after_teardown_flags(false, true).is_empty(),
+            "a detached worker emitted past teardown — that fragment lands after dictation://final"
+        );
+    }
+
+    // THE OTHER HALF OF THE SPLIT (roborev 56014). Separating the two signals fixed
+    // `stop_dictation`, but every OTHER teardown calls `abort()` precisely to throw the backlog
+    // away — app-exit quiesce, window blur, mute pause, capture reacquire. On those paths an
+    // in-flight decode that returns inside the drain budget must stay silent: emitting would send
+    // `dictation://partial` + `dictation://speech-end`, arming the auto-send countdown over a mic
+    // the user just muted. Drives the real `abort()` + real `Drop`, and asserts the side effect.
+    #[test]
+    fn a_worker_aborted_to_abandon_its_backlog_emits_nothing_for_the_in_flight_segment() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let emits_are_unsafe = Arc::new(AtomicBool::new(false));
+        let (abort_loop, unsafe_loop) = (abort.clone(), emits_are_unsafe.clone());
+        let emitted = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let emitted_worker = emitted.clone();
+        let (in_decode_tx, in_decode_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let (exited_tx, exited) = channel::<()>();
+
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx;
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                &unsafe_loop,
                 move |samples: Vec<f32>| {
                     let _ = in_decode_tx.send(());
                     let _ = release_rx.recv();
@@ -3411,18 +3544,75 @@ mod tests {
                 move |v| emitted_worker.lock().unwrap().push(v),
             );
         });
+        let worker = DecodeWorker { handle: Some(handle), abort, emits_are_unsafe, exited };
 
         tx.send(vec![42.0]).expect("queue a segment");
         in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
-        abort.store(true, Ordering::Release); // teardown begins mid-decode
-        let _ = release_tx.send(()); // the decode now returns
-        worker.join().expect("worker thread");
+
+        // Exactly what stop_capture / the Teardown plans do: abandon the backlog, then drop.
+        worker.abort();
+        let _ = release_tx.send(()); // the decode returns well inside the drain budget
+        within(Duration::from_secs(20), "dropping an aborted worker", move || drop(worker));
 
         assert!(
             emitted.lock().unwrap().is_empty(),
-            "a decode that finished after teardown began emitted its result — in production that \
-             is a dictation://partial landing after dictation://final, appending a stale fragment \
-             to a finished transcript and re-arming auto-send"
+            "a worker aborted to ABANDON its backlog emitted its in-flight segment anyway — that \
+             arms the auto-send countdown over speech the user abandoned by muting or tabbing away"
+        );
+        drop(tx);
+    }
+
+    // The pair above sets the flags BY HAND, so together they only prove `run_decode_loop` honours
+    // them. Nothing proved the other half: that teardown actually SETS the suppression when it
+    // detaches. Deleting that one store left every test green while the real detach path stayed
+    // broken — so drive the whole thing end to end, through the real `Drop`, with a real wedged
+    // `run_decode_loop`, and assert the SIDE EFFECT: the released decode emits nothing.
+    #[test]
+    fn a_real_teardown_that_detaches_silences_the_worker_it_left_running() {
+        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let emits_are_unsafe = Arc::new(AtomicBool::new(false));
+        let (abort_loop, unsafe_loop) = (abort.clone(), emits_are_unsafe.clone());
+        let emitted = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let emitted_worker = emitted.clone();
+        let (in_decode_tx, in_decode_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let (exited_tx, exited) = channel::<()>(); // the worker's own signal, owned by DecodeWorker
+        let (done_tx, done_rx) = channel::<()>(); // our separate "the loop returned" signal
+
+        let handle = std::thread::spawn(move || {
+            let _exited_tx = exited_tx; // dropped when the body returns == the exit signal
+            run_decode_loop(
+                &rx,
+                &abort_loop,
+                &unsafe_loop,
+                // Wedged inside the decode: it ignores `abort` entirely, which is exactly the
+                // condition that forces teardown to detach instead of joining.
+                move |samples: Vec<f32>| {
+                    let _ = in_decode_tx.send(());
+                    let _ = release_rx.recv();
+                    samples[0]
+                },
+                move |v| emitted_worker.lock().unwrap().push(v),
+            );
+            let _ = done_tx.send(());
+        });
+        let worker = DecodeWorker { handle: Some(handle), abort, emits_are_unsafe, exited };
+
+        tx.send(vec![42.0]).expect("queue a segment");
+        in_decode_rx.recv_timeout(Duration::from_secs(5)).expect("worker reached the decode");
+
+        // Real teardown. The worker is wedged, so this must run the full budget + grace and detach.
+        within(Duration::from_secs(20), "tearing down a wedged worker", move || drop(worker));
+
+        // Teardown has RETURNED — dictation://final is out. Now let the decode finish.
+        let _ = release_tx.send(());
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("the detached worker exited");
+        assert!(
+            emitted.lock().unwrap().is_empty(),
+            "teardown detached this worker and returned, then the worker emitted anyway — that \
+             fragment lands after dictation://final, re-populating the composer and re-arming \
+             auto-send over speech the user already finished"
         );
         drop(tx);
     }
@@ -3431,6 +3621,13 @@ mod tests {
     // is a deliberate trade (the caller is the main thread), so pin it: what was emitted must be a
     // PREFIX of the queue — in order, truncated — never reordered and never complete-by-accident.
     // The pre-existing drain test uses a no-op `on_segment`, so it cannot tell these apart.
+    // The drain is best-effort within `DECODE_DRAIN_BUDGET`; past it the backlog is DISCARDED. That
+    // is a deliberate trade (the caller is the main thread), so pin it: what was emitted must be a
+    // PREFIX of the queue — in order, truncated — never reordered and never complete-by-accident.
+    //
+    // Handshake-driven, with NO sleeps. An earlier revision slept 150ms and hoped two 60ms decodes
+    // had landed, which is a wall-clock race that fails on a loaded runner and reads like an
+    // inherited flake on an untouched path (roborev 55803).
     #[test]
     fn a_drain_that_outruns_its_budget_is_truncated_to_a_prefix_not_reordered() {
         let (tx, rx) = sync_channel::<Vec<f32>>(8);
@@ -3438,6 +3635,10 @@ mod tests {
         let abort_loop = abort.clone();
         let seen = Arc::new(Mutex::new(Vec::<f32>::new()));
         let seen_worker = seen.clone();
+        // Strict per-segment handshake: the decode announces itself and then waits to be released.
+        // Nothing here is timed, so the point at which the abort lands is exact rather than hoped.
+        let (ready_tx, ready_rx) = channel::<f32>();
+        let (go_tx, go_rx) = channel::<()>();
         for i in 0..6 {
             tx.send(vec![i as f32]).expect("queue a segment");
         }
@@ -3445,26 +3646,44 @@ mod tests {
             run_decode_loop(
                 &rx,
                 &abort_loop,
-                |s: Vec<f32>| {
-                    std::thread::sleep(Duration::from_millis(60)); // a slow decode
+                &never(),
+                move |s: Vec<f32>| {
+                    let _ = ready_tx.send(s[0]);
+                    let _ = go_rx.recv();
                     s[0]
                 },
                 move |v| seen_worker.lock().unwrap().push(v),
             );
         });
-        // Abort partway through the backlog, as the drain budget's expiry does.
-        std::thread::sleep(Duration::from_millis(150));
+
+        // Let two segments through, observed rather than timed.
+        for expected in [0.0, 1.0] {
+            let got = ready_rx.recv_timeout(Duration::from_secs(5)).expect("a decode started");
+            assert_eq!(got, expected, "the drain must decode in queue order");
+            go_tx.send(()).expect("release the decode");
+        }
+        // The third is now in-flight. Abort while it decodes — exactly what the drain budget's
+        // expiry does — then release it. It still emits (it lands before the final; see
+        // `a_decode_finishing_during_the_abort_grace_still_emits_before_the_final`), and the loop
+        // then exits at the top with three segments never decoded at all.
+        let got = ready_rx.recv_timeout(Duration::from_secs(5)).expect("the third decode started");
+        assert_eq!(got, 2.0);
         abort.store(true, Ordering::Release);
+        go_tx.send(()).expect("release the in-flight decode");
         worker.join().expect("worker thread");
 
+        // The handshake makes this EXACT, so assert the exact value rather than a prefix property.
+        // `seen.len() < 6` plus `seen == full[..seen.len()]` reads like a strong pair but both hold
+        // for an empty `seen` (`0 < 6`, `[] == []`) — so a loop that emitted nothing at all would
+        // have passed a test whose whole contract is "a prefix, never complete-by-accident"
+        // (roborev 56014). Segments 0-2 decode and emit; 3-5 are never dequeued.
         let seen = seen.lock().unwrap().clone();
-        let full: Vec<f32> = (0..6).map(|i| i as f32).collect();
-        assert!(!seen.is_empty(), "the drain should have made progress before the abort");
-        assert!(
-            seen.len() < full.len(),
-            "the abort must actually truncate the backlog, or this proves nothing (saw {seen:?})"
+        assert_eq!(
+            seen,
+            vec![0.0, 1.0, 2.0],
+            "the drain must emit an in-order PREFIX and then stop: the two released segments plus \
+             the in-flight one that finished during the grace, with 3-5 abandoned unread"
         );
-        assert_eq!(seen[..], full[..seen.len()], "the drain must be an in-order PREFIX: {seen:?}");
         drop(tx);
     }
 
