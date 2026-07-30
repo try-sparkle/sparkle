@@ -1417,6 +1417,16 @@ const MIN_AGENT_RSS_THRESHOLD_MB: u32 = 1536;
 /// the app wrote it for them, so it is not a choice we would be discarding.
 const LEGACY_DEFAULT_MAX_CONCURRENT: u32 = 20;
 
+/// The `stop_word` the app used to ship as its default, before the displayed phrase became
+/// "Sparkle, pause". Installs carrying exactly this value are migrated back to the default (see
+/// `migrate_global` v2): the template wrote it for them, so it is not a choice we would discard.
+///
+/// This is the RETIRED DISPLAY STRING, not a retired command — the recogniser still accepts
+/// "stop" as an undisplayed alias (see `STOP_VARIANTS` in `voice/wakeWords.ts`), and that alias is
+/// deliberately permanent. Removing this line from a config changes what the UI SAYS, never what
+/// the microphone answers to. Mirrors `LEGACY_STOP_WORD` in `voice/voiceDefaults.ts`.
+const LEGACY_DEFAULT_STOP_WORD: &str = "Sparkle, stop";
+
 /// V8's own default old-space ceiling on a 64-bit machine with plenty of RAM (~4 GiB — the machines
 /// in the incident reported 4.09 GiB). Used as the per-agent budget when the user opts OUT of our
 /// cap, since that is then exactly how big each agent can get.
@@ -2286,7 +2296,7 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 # Which one-time config migrations have already been applied to this file. Sparkle uses it to
 # know it has already upgraded you, so it never re-applies a migration and never overrides a
 # value you set yourself afterwards. Lowering or deleting this can re-run past migrations.
-config_version = 1
+config_version = 2
 
 # --- How agents land their work -------------------------------------------------------
 [workflow]
@@ -2698,7 +2708,7 @@ fn load_document(app_data: &Path) -> toml_edit::DocumentMut {
 }
 
 /// Schema revision of the on-disk global config. Bump when adding a one-time migration below.
-const CONFIG_MIGRATION_VERSION: i64 = 1;
+const CONFIG_MIGRATION_VERSION: i64 = 2;
 
 /// Apply one-time migrations to the global config FILE, recording the revision reached in
 /// `[meta].config_version`.
@@ -2784,6 +2794,50 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
         );
     }
 
+    // v2 — drop the RETIRED STOP WORD for installs still carrying it as a stamped default.
+    //
+    // Same shape as v1, and the same root cause: `[voice]` is uncommented in DEFAULT_TEMPLATE and
+    // `load_document` falls back to that template, so the first `set_value` on an install with no
+    // config file writes the WHOLE template — including whichever `stop_word` line shipped that
+    // day. From PR #375 until the rename it read "Sparkle, stop".
+    //
+    // Renaming the phrase therefore only reached FRESH installs. `hydrateFromConfig` cannot tell a
+    // stamped default from a deliberate choice, so everyone else keeps seeing the retired phrase in
+    // the composer placeholder, the waveform caption and the Voice-controls field — with no
+    // migration and nothing on screen explaining it (roborev 55507). Removing the LINE is what
+    // makes it stick: the next load sees no key and falls back to the current default, and a phrase
+    // the user sets LATER survives, because by then the recorded revision has moved past this.
+    //
+    // Scope check, because this one is easy to over-apply: it changes only what the UI DISPLAYS.
+    // The recogniser still answers to "stop" as a permanent undisplayed alias, so no user loses a
+    // working voice command — see the retained-alias note beside `STOP_VARIANTS`.
+    let is_legacy_stop_word = doc
+        .get("voice")
+        .and_then(|v| v.get("stop_word"))
+        .and_then(|v| v.as_str())
+        == Some(LEGACY_DEFAULT_STOP_WORD);
+    if is_legacy_stop_word {
+        // `as_table_like_mut` for the same reason as `workers`: it covers both the `[voice]` header
+        // and a hand-written inline `voice = { … }`, where `unset_dotted`'s traversal would refuse
+        // and strand that user on the retired phrase forever.
+        let Some(t) = doc.get_mut("voice").and_then(|v| v.as_table_like_mut()) else {
+            return Err(
+                "[voice] is not a table; migration deferred until config.toml is fixed".into()
+            );
+        };
+        t.remove("stop_word");
+        // Don't leave a dangling `[voice]` behind when that was its only key — same reasoning as
+        // `[workers]`: the user opens this file in the Advanced editor and an empty stanza
+        // attributable to nothing is clutter.
+        if doc.get("voice").and_then(|v| v.as_table_like()).is_some_and(|t| t.is_empty()) {
+            doc.remove("voice");
+        }
+        tracing::debug!(
+            "config migration v2: removing the retired \
+             stop_word = {LEGACY_DEFAULT_STOP_WORD:?} (a default, not a choice)"
+        );
+    }
+
     // Written table-shape-agnostically for the same reason as `workers` above: `set_dotted` demands
     // a real `Table`, so a pre-existing inline `meta = { … }` would fail its traversal and defer the
     // migration forever. Creating the table when absent keeps the common path unchanged.
@@ -2825,6 +2879,13 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
         tracing::info!(
             "config migration v1: adopted automatic worker concurrency (removed the legacy \
              max_concurrent = {LEGACY_DEFAULT_MAX_CONCURRENT}, which was a default, not a choice)"
+        );
+    }
+    if is_legacy_stop_word {
+        tracing::info!(
+            "config migration v2: adopted the current spoken stop phrase (removed the retired \
+             stop_word = {LEGACY_DEFAULT_STOP_WORD:?}, which was a default, not a choice). The \
+             recogniser still answers to the old phrase."
         );
     }
     Ok(())
@@ -4413,6 +4474,124 @@ quit_app = 42
             let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
             assert_eq!(cfg.workers.max_concurrent, Some(pinned), "kept {pinned}");
         }
+    }
+
+    // ---- v2: the retired stop word ------------------------------------------------------------
+    //
+    // roborev 55507 (High). The UPGRADE path is the whole point of these: renaming the displayed
+    // stop word to "Sparkle, pause" only reached FRESH installs. `[voice]` is uncommented in
+    // DEFAULT_TEMPLATE and `load_document` falls back to that template, so the first `set_value` on
+    // an install with no config file stamps the WHOLE template — including the `stop_word` line of
+    // the day. From PR #375 until the rename, that line read "Sparkle, stop". `hydrateFromConfig`
+    // cannot tell a stamped default from a deliberate choice, so every one of those installs keeps
+    // displaying the retired phrase forever, in the composer placeholder, the waveform caption and
+    // the Voice-controls field.
+    //
+    // A fresh-install test cannot see any of this — which is exactly how it shipped. Each test here
+    // therefore starts from a config file that ALREADY CARRIES the old value.
+
+    #[test]
+    fn a_config_carrying_the_retired_stop_word_migrates_to_the_new_default() {
+        // The shape a real upgrading install has: the whole [voice] stanza as the template stamped
+        // it, and `config_version = 1` because the v1 migration already ran here.
+        let dir = app_data_with(
+            "[voice]\n\
+             wake_word = \"Hey Sparkle\"\n\
+             stop_word = \"Sparkle, stop\"\n\
+             pause_on_submit = true\n\
+             \n[meta]\nconfig_version = 1\n",
+        );
+        migrate_global(dir.path()).unwrap();
+        let text = global_text(&dir);
+
+        // The LINE goes, not just the value — the next load must see no key at all, so the Rust
+        // default supplies the new phrase.
+        let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
+        let voice = doc.get("voice").and_then(|v| v.as_table_like()).expect("[voice] kept");
+        assert!(voice.get("stop_word").is_none(), "the retired key is removed: {text}");
+        assert!(voice.get("wake_word").is_some(), "its siblings stay: {text}");
+        assert!(voice.get("pause_on_submit").is_some(), "its siblings stay: {text}");
+
+        // THE user-visible outcome this migration exists to produce. Asserting the parsed config —
+        // not the file text — is what makes this the side effect rather than the precondition:
+        // it is the exact value `hydrateFromConfig` reads and every caption renders.
+        let (cfg, _, _) = effective(Some(&text), None);
+        assert_eq!(
+            cfg.voice.stop_word, "Sparkle, pause",
+            "the upgraded install now displays the CURRENT phrase, not the retired one"
+        );
+    }
+
+    #[test]
+    fn a_deliberately_chosen_stop_word_survives_the_migration() {
+        // The counterpart risk: this migration must never eat a phrase someone actually picked.
+        // "Sparkle, pause" is in the list on purpose — a user who typed the new default by hand
+        // keeps a real (if redundant) line, and removing it would still be correct behaviour, so
+        // the assertion below is on the EFFECTIVE value rather than the file text.
+        for chosen in ["Jarvis, halt", "Computer, enough", "Sparkle, pause", "stop"] {
+            let dir = app_data_with(&format!(
+                "[voice]\nstop_word = \"{chosen}\"\n\n[meta]\nconfig_version = 1\n"
+            ));
+            migrate_global(dir.path()).unwrap();
+            let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
+            assert_eq!(cfg.voice.stop_word, chosen, "kept {chosen:?}");
+        }
+    }
+
+    #[test]
+    fn the_stop_word_migration_runs_at_most_once_so_a_later_choice_is_the_users_to_keep() {
+        let dir = app_data_with(
+            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
+        );
+        migrate_global(dir.path()).unwrap();
+
+        // The user now DELIBERATELY types the retired phrase back — they liked it, or they are on
+        // a team that still says it. Every later launch re-runs migrations; this must not fire
+        // again, or the phrase becomes permanently unsettable.
+        set_value(dir.path(), "voice.stop_word", &serde_json::json!("Sparkle, stop")).unwrap();
+        migrate_global(dir.path()).unwrap();
+        migrate_global(dir.path()).unwrap();
+
+        let (cfg, _, _) = effective(Some(&global_text(&dir)), None);
+        assert_eq!(cfg.voice.stop_word, "Sparkle, stop", "a chosen phrase survives forever");
+    }
+
+    #[test]
+    fn an_emptied_voice_stanza_is_removed_and_an_inline_one_migrates_too() {
+        // Mirrors the `workers` handling: a stanza whose only key we removed is clutter in the
+        // Advanced editor, and the inline shape is the one a dotted-key traversal cannot touch —
+        // routing through that would strand an inline-table user on the retired phrase forever.
+        for src in [
+            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
+            "voice = { stop_word = \"Sparkle, stop\" }\n\n[meta]\nconfig_version = 1\n",
+        ] {
+            let dir = app_data_with(src);
+            migrate_global(dir.path()).unwrap();
+            let text = global_text(&dir);
+            let doc = text.parse::<toml_edit::DocumentMut>().expect("still valid TOML");
+            assert!(doc.get("voice").is_none(), "the emptied container goes ({src:?}): {text}");
+            let (cfg, _, _) = effective(Some(&text), None);
+            assert_eq!(cfg.voice.stop_word, "Sparkle, pause", "and the phrase updates ({src:?})");
+        }
+    }
+
+    #[test]
+    fn a_project_level_stop_word_is_never_touched_by_the_migration() {
+        // Same rationale as the `workers` case: "the app wrote this, the user never chose it" is
+        // only ever true of the GLOBAL file. A per-project override is always deliberate.
+        let dir = app_data_with(
+            "[voice]\nstop_word = \"Sparkle, stop\"\n\n[meta]\nconfig_version = 1\n",
+        );
+        let project = dir.path().join("some-repo");
+        std::fs::create_dir_all(project.join(".sparkle")).unwrap();
+        let project_file = project.join(".sparkle").join("config.toml");
+        let original = "[voice]\nstop_word = \"Sparkle, stop\"\n";
+        std::fs::write(&project_file, original).unwrap();
+
+        migrate_global(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&project_file).unwrap(), original, "project untouched");
+        assert!(!global_text(&dir).contains("Sparkle, stop"), "global migrated");
     }
 
     // roborev 53140 (Medium): `validate` sees the MERGED config, so migrating there also erased a
