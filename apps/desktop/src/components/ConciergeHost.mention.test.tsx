@@ -502,7 +502,9 @@ describe("ConciergeHost — what the user is told when the named agent is mid-pr
     const said = thread().textContent ?? "";
     expect(said).toContain("waiting on a choice on screen");
     // The remedy names the agent the user actually meant, so following it cannot land anywhere else.
-    expect(said).toContain("open Kraken Auth and pick");
+    // `@`-prefixed because the name is now a pill: the remedy says "open it and pick", and the thing
+    // it tells you to open is itself the control that opens it.
+    expect(said).toContain("open @Kraken Auth and pick");
     // NOT the line that told them to do what they had already done (roborev 54665)…
     expect(said).not.toContain("answer with just the option.");
     // …and NOT "drop the @Name and send just the option" either (roborev 54673). That advice was

@@ -101,6 +101,19 @@ const thread = () => screen.getByTestId("concierge-thread");
 const announcer = () => screen.getByTestId("concierge-announcer");
 const pills = () => within(thread()).queryAllByTestId("composer-text-pill");
 
+/** Find a receipt SENTENCE that is split across elements.
+ *
+ *  The agent's name is now an agent pill — a `<button>` inside the sentence — so the receipt is no
+ *  longer one text node and `findByText` cannot see it whole. This matches on the tightest element
+ *  whose `textContent` satisfies the pattern (an ancestor that merely CONTAINS it is rejected,
+ *  which is what keeps the `^…$` anchors below meaningful). */
+const findSentence = (re: RegExp) =>
+  within(thread()).findByText((_t, el) => {
+    if (!el) return false;
+    if (!re.test(el.textContent ?? "")) return false;
+    return !Array.from(el.children).some((c) => re.test(c.textContent ?? ""));
+  });
+
 /** Emit one deferred-send outcome, the way `flushPendingSends` does when the pane comes up. */
 function outcome(r: ConciergeDispatchResult) {
   act(() => h.deferred!(r));
@@ -122,8 +135,11 @@ describe("ConciergeHost — a long relayed payload rides as a pill, not as trans
     render(<ConciergeHost feed={feed()} />);
     outcome({ ok: true, path: "free-text", agentId: "ag1", sent: BRIEF });
 
-    // The receipt sentence is there…
-    expect(await within(thread()).findByText(/CI Hardening is up — I sent your message/)).toBeTruthy();
+    // The receipt sentence is there… and the agent is named as a CLICKABLE PILL, not bare text.
+    // Scoped to the sentence: a nudge card for the same red agent draws its own pill, so a
+    // thread-wide query would pass on the card's pill and prove nothing about the receipt.
+    const sentence = await findSentence(/@CI Hardening is up — I sent your message/);
+    expect(within(sentence).getByTestId("concierge-agent-pill").textContent).toBe("@CI Hardening");
     // …and the payload is NOT. This is the row that fails against the old unbounded quote: `oneLine`
     // kept every word of the brief, so the canary landed in the bubble.
     expect(thread().textContent).not.toContain(CANARY);
@@ -219,9 +235,7 @@ describe("ConciergeHost — a SHORT held message is untouched", () => {
     render(<ConciergeHost feed={feed()} />);
     outcome({ ok: true, path: "free-text", agentId: "ag1", sent: "start on the docs" });
     expect(
-      await within(thread()).findByText(
-        /^CI Hardening is up — I sent your message \("start on the docs"\)\.$/,
-      ),
+      await findSentence(/^@CI Hardening is up — I sent your message \("start on the docs"\)\.$/),
     ).toBeTruthy();
     expect(pills()).toHaveLength(0);
   });

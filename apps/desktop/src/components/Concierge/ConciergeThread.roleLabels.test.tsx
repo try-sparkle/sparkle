@@ -61,7 +61,7 @@ const messages: ConciergeMessage[] = [
       },
     ],
     decisions: [
-      { id: "d1", kind: "sent", agentName: "Kraken Auth", summary: "approved a file write", at: 1 },
+      { id: "d1", kind: "sent", agentName: "Kraken Auth", agentId: "ag-recap", summary: "approved a file write", at: 1 },
     ],
   },
   {

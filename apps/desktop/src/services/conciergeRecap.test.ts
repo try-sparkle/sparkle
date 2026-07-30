@@ -300,7 +300,7 @@ describe("buildRecap — the minimum-stretch gate", () => {
     // exactly as it is at eight hours, and it can't fire on an idle ⌘-tab the way a status can.
     const s: StatusMap = { a: "working" };
     const recap = build(s, { a: "waiting" }, [
-      { id: "d", kind: "sent", agentName: "A", summary: "Re-ran the tests", at: T0 + 1_000 },
+      { id: "d", kind: "sent", agentName: "A", agentId: "ag-recap", summary: "Re-ran the tests", at: T0 + 1_000 },
     ], T0 + 8_000);
     expect(recap!.decisions).toHaveLength(1);
     // …but the status half is still suppressed: brevity gates the diff, not the log.
@@ -313,6 +313,7 @@ describe("buildRecap — the gate-decision seam", () => {
     id: "d1",
     kind: "queued",
     agentName: "Kraken Auth",
+    agentId: "ag-recap",
     summary: "Delete the staging database",
     at: T0 + 60_000,
     ...over,
@@ -371,9 +372,9 @@ describe("recapSummary", () => {
   it("names what the concierge did on your behalf", () => {
     const s: StatusMap = { a: "working" };
     const recap = build(s, s, [
-      { id: "1", kind: "sent", agentName: "A", summary: "Re-ran the tests", at: T0 + 1 },
-      { id: "2", kind: "queued", agentName: "B", summary: "Dropped the DB", at: T0 + 2 },
-      { id: "3", kind: "cancelled", agentName: "C", summary: "Force push", at: T0 + 3 },
+      { id: "1", kind: "sent", agentName: "A", agentId: "ag-recap", summary: "Re-ran the tests", at: T0 + 1 },
+      { id: "2", kind: "queued", agentName: "B", agentId: "ag-recap", summary: "Dropped the DB", at: T0 + 2 },
+      { id: "3", kind: "cancelled", agentName: "C", agentId: "ag-recap", summary: "Force push", at: T0 + 3 },
     ])!;
     expect(recapSummary(recap)).toBe(
       "While you were away — 12 minutes: 1 sent for you, 1 waiting on your say-so, 1 cancelled.",

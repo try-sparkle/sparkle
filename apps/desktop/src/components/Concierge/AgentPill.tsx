@@ -81,7 +81,12 @@ export interface AgentPillContextValue {
    *  both `string` — so a swap typechecks cleanly, and its only symptom is `openProjectTab` hitting
    *  its unknown-project early return and the click silently doing nothing. Named fields make the
    *  mistake unrepresentable instead of merely tested-for. */
-  onOpenAgent?: (target: { agentId: string; projectId: string }) => boolean;
+  /** `anchorY` is the CLICK'S OWN viewport Y (`MouseEvent.clientY`) — where the reader was looking
+   *  at the moment they asked. The builder column runs past a screenful, so landing on the right
+   *  agent is not the same as the reader FINDING it; the row is brought to the cursor instead of to
+   *  an arbitrary edge. Optional because a keyboard activation has no meaningful cursor position,
+   *  and inventing one would scroll the column to somewhere nobody was looking. */
+  onOpenAgent?: (target: { agentId: string; projectId: string; anchorY?: number }) => boolean;
   /** Search the prompt history of an agent that can no longer be opened. A closed agent's prompts
    *  outlive it (`services/history`), which is exactly how the discarded BYOK agent ids were
    *  recovered — so this is what turns the dead end into a destination.
@@ -336,6 +341,22 @@ export function AgentPill({
   // Known closed before the click, so there is nothing to attempt. Justified here in a way it is
   // not above: the surface IS wired, so its roster is the live fleet and an absence means absence.
   if (!agent) {
+    // NOTE FOR THE NEXT PERSON TEMPTED TO SPECIAL-CASE `onOpen` HERE. It was tried, to stop a
+    // caller-owned pill mounting a region on a card that is permanently on screen, and it was wrong
+    // twice over (roborev 56062):
+    //
+    //   • `onOpen` does NOT report this outcome. The caller-owned openers resolve the id first
+    //     (`ConciergeHost.onRevealAgent` → `resolveAgent` → null → return), so an unresolvable pill
+    //     became a button that did nothing at all, with no notice and nothing announced — the exact
+    //     dead end `AgentPill.deadEnd.test.tsx` exists to forbid.
+    //   • It also dropped the "See what it did" route, which is the whole point of this branch: a
+    //     closed agent's prompts outlive it, and that history is the destination.
+    //
+    // So an unresolvable pill keeps its own disclosure and its own region on EVERY surface. A card
+    // naming an agent that has since closed therefore does add a second live region — which is
+    // pre-existing behaviour that `NudgeCard` has always had, not something a caller can opt out of,
+    // and fixing it belongs with the announcer, not with a branch here that suppresses the message.
+    //
     // Without a history route there is nothing a click could usefully do, so the pill stays inert
     // prose rather than becoming a button that does nothing — see `onSeeHistory`'s doc.
     if (!onSeeHistory) {
@@ -390,7 +411,12 @@ export function AgentPill({
   // cards up it was several.
   //
   // `onOpen` is the exact signal: a caller that supplies its own reveal has taken responsibility for
-  // saying whether it landed (`ConciergeHost.revealAgent` reports through the column's announcer),
+  // saying whether it landed — `ConciergeHost.revealAgentById` posts a "…isn't open any more" line
+  // when the id does not resolve OR the reveal does not land, which is the ONLY thing that makes
+  // this suppression safe. It was NOT true when the suppression was written: `revealAgent` dropped
+  // `openProjectTab`'s boolean, so a pill whose agent closed between render and click did nothing at
+  // all on exactly the two surfaces that supply `onOpen` (roborev 56068). If you add a third
+  // `onOpen` caller, it owes the reader that sentence too —
   // so there is nothing left here to announce and the miss/retry state is unreachable by
   // construction. The pill degrades to what it is on that path — a button that opens an agent.
   const ownsOutcome = onOpen !== undefined;
@@ -434,7 +460,7 @@ export function AgentPill({
         // hazard for dictated sends (voice/useAutoSend: "updaters here stay out of it entirely"),
         // and a version of this handler shipped with the call inline in the updater (roborev 55618).
         // The updater below is pure: it only folds an already-decided outcome.
-        onClick={() => {
+        onClick={(e) => {
           // The caller-owned path reports its own outcome, so there is nothing to fold here — and
           // nothing that could be folded, since it returns void. The context path keeps the miss
           // ladder it was built for.
@@ -442,7 +468,15 @@ export function AgentPill({
             onOpen(target);
             return;
           }
-          const landed = contextOpen!(target);
+          // WHERE THE READER IS LOOKING, passed to the reveal so the row lands at the cursor rather
+          // than at whatever edge `scrollIntoView` picks.
+          //
+          // `detail` is the activation's click count: ≥1 for a real pointer press, and 0 for the
+          // click Enter/Space synthesise on a focused button — whose `clientY` is 0. Anchoring a
+          // keyboard activation to that would yank the column to the top of the viewport, which is
+          // both wrong and unrequested, so it passes no anchor and gets the old behaviour.
+          const anchorY = e.detail > 0 ? e.clientY : undefined;
+          const landed = contextOpen!({ ...target, anchorY });
           setMisses((n) => (landed ? 0 : n + 1));
         }}
         style={

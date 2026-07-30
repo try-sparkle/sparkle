@@ -365,9 +365,26 @@ async function elapseCountdowns() {
  *  region carrying the last finished line (roborev 53010), so a document-wide getByText would match
  *  the same string twice — and would pass even if the visible thread stopped rendering it. */
 const thread = () => screen.getByTestId("concierge-thread");
-const inThread = (re: RegExp | string) => within(thread()).getByText(re);
-const findInThread = (re: RegExp | string) => within(thread()).findByText(re);
-const queryInThread = (re: RegExp | string) => within(thread()).queryByText(re);
+const inThread = (re: RegExp | string) => within(thread()).getByText(spans(re));
+/** Match a concierge line that is SPLIT ACROSS ELEMENTS.
+ *
+ *  Every app-authored line names its agent as an agent pill — a `<button>` inside the sentence — so
+ *  a receipt is no longer one text node and the default `findByText` cannot see it whole. These
+ *  match on the tightest element whose `textContent` satisfies the pattern; an ancestor that merely
+ *  CONTAINS it is rejected, which is what keeps the `^…$` anchors in these tests meaningful (several
+ *  of them exist specifically to stop one refusal string matching another's prefix). */
+const spans = (re: RegExp | string) => (_t: string, el: Element | null) => {
+  if (!el) return false;
+  const text = el.textContent ?? "";
+  const hit = typeof re === "string" ? text === re : re.test(text);
+  if (!hit) return false;
+  return !Array.from(el.children).some((c) => {
+    const kid = c.textContent ?? "";
+    return typeof re === "string" ? kid === re : re.test(kid);
+  });
+};
+const findInThread = (re: RegExp | string) => within(thread()).findByText(spans(re));
+const queryInThread = (re: RegExp | string) => within(thread()).queryByText(spans(re));
 
 describe("ConciergeHost", () => {
   it("surfaces an in-scope needing agent as a nudge with an Approve action", () => {
@@ -411,7 +428,7 @@ describe("ConciergeHost", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
     // The acknowledgement is synchronous — that is what makes the second click unnecessary.
-    expect(inThread(/Approving CI Hardening…/)).toBeTruthy();
+    expect(inThread(/Approving @CI Hardening…/)).toBeTruthy();
     fireEvent.click(inThread("Approve"));
     await settle();
     await act(async () => { release?.(); await Promise.resolve(); });
@@ -607,7 +624,7 @@ describe("ConciergeHost", () => {
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "free-text" });
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
-    expect(await findInThread(/^Approved — sent to CI Hardening\.$/)).toBeTruthy();
+    expect(await findInThread(/^Approved — sent to @CI Hardening\.$/)).toBeTruthy();
     expect(queryInThread(/still starting up|I couldn't send the approval/)).toBeNull();
   });
 
@@ -621,7 +638,7 @@ describe("ConciergeHost", () => {
     h.dispatchConciergeAnswer.mockRejectedValueOnce(new Error("pty write failed"));
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     fireEvent.click(inThread("Approve"));
-    expect(await findInThread(/^I couldn't reach CI Hardening's terminal to approve\.$/)).toBeTruthy();
+    expect(await findInThread(/^I couldn't reach @CI Hardening's terminal to approve\.$/)).toBeTruthy();
     expect(queryInThread(/^Approved — sent to/)).toBeNull();
     // States WHICH failure voice this row pins: the catch's copy, not refusalCopy's — the same
     // distinction the refusal table's forward-guard comment relies on.
@@ -745,7 +762,7 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     expect(armedIntents()).toHaveLength(0);
     // The banner is gone, the user is told, and no expiry can resurrect the send.
     expect(screen.queryByTestId("countdown-banner")).toBeNull();
-    expect(await findInThread(/I didn't send that to CI Hardening/)).toBeTruthy();
+    expect(await findInThread(/I didn't send that to @CI Hardening/)).toBeTruthy();
     await elapseCountdowns();
     expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
@@ -947,7 +964,7 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
       h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: false, path });
       renderWithTarget();
       await send("must not vanish");
-      expect(await findInThread(/I couldn't send that to CI Hardening\./)).toBeTruthy();
+      expect(await findInThread(/I couldn't send that to @CI Hardening\./)).toBeTruthy();
       // …and no "I'll send it the moment it's ready" promise either — that lie is the same shape.
       expect(queryInThread(/still starting up/)).toBeNull();
       expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("must not vanish");
@@ -961,7 +978,7 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     h.dispatchConciergeAnswer.mockRejectedValueOnce(new Error("pty write failed"));
     renderWithTarget();
     await send("worth not retyping");
-    expect(await findInThread(/^I couldn't reach CI Hardening's terminal\.$/)).toBeTruthy();
+    expect(await findInThread(/^I couldn't reach @CI Hardening's terminal\.$/)).toBeTruthy();
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("worth not retyping");
   });
 
@@ -1192,7 +1209,7 @@ describe("ConciergeHost — presence governs what an expiry may do", () => {
     // HELD, not dropped — the message is still there, whole.
     expect(queuedIntents()).toHaveLength(1);
     expect(queuedIntents()[0]!.text).toBe("run the deploy command");
-    expect(await findInThread(/I'm holding it rather than sending it to CI Hardening/)).toBeTruthy();
+    expect(await findInThread(/I'm holding it rather than sending it to @CI Hardening/)).toBeTruthy();
   });
 
   it("a ROUTINE send expiring while Away still goes — the rule holds back one class, not all", async () => {
@@ -1522,7 +1539,7 @@ describe("ConciergeHost — recommended actions", () => {
       neverPickerAnswer: false,
     });
     // A suggestion click posts no receipt, so this is the one delivery that DOES say so itself.
-    expect(await findInThread(/^Sent to CI Hardening\.$/)).toBeTruthy();
+    expect(await findInThread(/^Sent to @CI Hardening\.$/)).toBeTruthy();
   });
 });
 // A queued prompt is a PROMISE ("I'll send that when it's ready"). Whatever happens to it later
@@ -1540,7 +1557,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     // interpolation passed — and the quote is the only thing telling the user WHICH held message
     // an outcome refers to when several were queued (roborev 53123).
     expect(
-      await findInThread(/CI Hardening is up — I sent your message \("start on the docs"\)\./),
+      await findInThread(/@CI Hardening is up — I sent your message \("start on the docs"\)\./),
     ).toBeTruthy();
   });
 
@@ -1578,7 +1595,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     renderHost();
     act(() => h.deferred?.({ ok: false, path: "agent-failed", agentId: "ag1", sent: "held" }));
     expect(
-      await findInThread(/^CI Hardening didn't take the message I was holding \("held"\)\.$/),
+      await findInThread(/^@CI Hardening didn't take the message I was holding \("held"\)\.$/),
     ).toBeTruthy();
     expect(queryInThread(/terminal closed before I could send/)).toBeNull();
     // Not the `abandoned` arm's wording, and no remedy: `agent-failed` needs a Retry and a cloud
@@ -1603,7 +1620,7 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     // `abandoned` fall through and still pass (roborev 53187).
     expect(
       await findInThread(
-        /^CI Hardening couldn't take the message I was holding \("held"\)\. Send it again once it's running\.$/,
+        /^@CI Hardening couldn't take the message I was holding \("held"\)\. Send it again once it's running\.$/,
       ),
     ).toBeTruthy();
     expect(queryInThread(/terminal closed before I could send|never came up/)).toBeNull();

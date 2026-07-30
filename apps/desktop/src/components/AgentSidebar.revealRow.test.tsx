@@ -210,3 +210,211 @@ describe("AgentRow — a reveal request does not outlive its window", () => {
     expect(scrolled).toHaveLength(0);
   });
 });
+
+// ── THE ANCHORED REVEAL ─────────────────────────────────────────────────────────────────────────
+// A reveal that carries `revealAnchorY` brings the row to the READER'S CURSOR instead of asking
+// `scrollIntoView` to get it on screen somewhere. The founder's report: clicking an agent pill lands
+// on the right agent, but the builder column runs well past a screenful, so the row that answered
+// ends up anywhere in it — or off it — and has to be hunted for. `block: "nearest"` cannot help,
+// because it does nothing at all when the row is already visible, however far from the eye.
+//
+// The ARITHMETIC lives in components/anchoredScroll and is tested against real numbers there (jsdom
+// has no layout, so it is the only place it CAN be tested honestly). What these rows pin is the
+// wiring: that the anchor is read, that the container's offset is actually written, that the
+// `scrollIntoView` fallback is skipped, and that an un-anchored request still takes the old path.
+describe("AgentRow — an anchored reveal lands the row at the cursor", () => {
+  // SAVED AND RESTORED, never deleted. `scrollHeight`, `clientHeight` and `getBoundingClientRect`
+  // are NATIVE jsdom prototype members: `delete`ing them in cleanup removes them from the
+  // environment for the rest of the file rather than putting them back. Two ways that bites — this
+  // block's `afterEach` runs BEFORE the file-level `cleanup()`, so React would unmount against a
+  // prototype with no `getBoundingClientRect`; and any test added below would then run with the
+  // production guard seeing `typeof … !== "function"` and quietly taking the un-anchored branch —
+  // a test passing while exercising the opposite path, which is the vacuous shape this repo's
+  // guidance calls its #1 finding (roborev 56060).
+  const PATCHED = ["scrollTop", "scrollHeight", "clientHeight", "getBoundingClientRect"] as const;
+  const originals = new Map(
+    PATCHED.map((k) => [k, Object.getOwnPropertyDescriptor(Element.prototype, k)] as const),
+  );
+
+  /** Give jsdom the layout it does not have: a scrollable container and a row at a known height. */
+  function withLayout(opts: {
+    rowTop: number;
+    rowHeight?: number;
+    containerTop?: number;
+    /** Seed the container's offset, so a clamp toward the TOP of the range is distinguishable from
+     *  a no-op — at offset 0 both produce no write and the mutation survives. */
+    initialScrollTop?: number;
+  }) {
+    const writes: number[] = [];
+    const tops = new WeakMap<Element, number>();
+    Object.defineProperty(Element.prototype, "scrollTop", {
+      configurable: true,
+      get(this: Element) {
+        return tops.get(this) ?? opts.initialScrollTop ?? 0;
+      },
+      set(this: Element, v: number) {
+        writes.push(v);
+        tops.set(this, v);
+      },
+    });
+    // 2000 of content in a 600 viewport → 1400 of scroll range to work with.
+    Object.defineProperty(Element.prototype, "scrollHeight", { configurable: true, get: () => 2000 });
+    Object.defineProperty(Element.prototype, "clientHeight", { configurable: true, get: () => 600 });
+    // The ROW and the CONTAINER must measure DIFFERENTLY, or the container's visible band collapses
+    // onto the row's own position and the band clamp becomes untestable (it would always be
+    // satisfied). Rows are the `data-hint="agent"` wrappers; everything else answers as the
+    // container, whose band here is viewport y 100–700.
+    Object.defineProperty(Element.prototype, "getBoundingClientRect", {
+      configurable: true,
+      writable: true,
+      value: function (this: Element) {
+        return this.closest?.('[data-hint="agent"]') === this
+          ? ({ top: opts.rowTop, height: opts.rowHeight ?? 40 } as DOMRect)
+          : ({ top: opts.containerTop ?? 100, height: 600 } as DOMRect);
+      },
+    });
+    return writes;
+  }
+
+  afterEach(() => {
+    for (const k of PATCHED) {
+      const original = originals.get(k);
+      if (original) Object.defineProperty(Element.prototype, k, original);
+      else delete (Element.prototype as unknown as Record<string, unknown>)[k];
+    }
+  });
+
+  it("scrolls the container so the row's centre reaches the anchor", () => {
+    // Row centre 920 (top 900 + half of 40), cursor at 300 → the content moves up by 620.
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 300 });
+    const writes = withLayout({ rowTop: 900 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+
+    // [1, 0] is abandonReveal's perturbation-and-restore; 620 is the anchored scroll itself.
+    expect(writes).toEqual([1, 0, 620]);
+    // And the fallback did NOT also run — a double scroll would fight itself.
+    expect(scrolled).toHaveLength(0);
+    expect(useUiStore.getState().revealAgentId).toBeNull();
+  });
+
+  it("clamps at the top of the range instead of overscrolling", () => {
+    // Row already near the top, cursor near the BOTTOM OF THE BAND (690, inside 100–700): the move
+    // it wants is impossible, so it goes as far as the range allows — which here is nowhere, since
+    // the container is already at 0.
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 690 });
+    const writes = withLayout({ rowTop: 20 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+    expect(writes).toEqual([1, 0]); // abandonReveal only — no anchored write
+    // AND the fallback stayed off. Without this the row passes when the anchored branch is deleted
+    // entirely, since "no anchored write" is equally true of code that never anchors: the anchored
+    // path DECIDED not to move, which is a different fact from never having looked.
+    expect(scrolled).toHaveLength(0);
+  });
+
+  it("does not move the column when the row is ALREADY at the cursor", () => {
+    // Centre 320 against a cursor at 318: two pixels. Scrolling would shift every other row to fix
+    // something the reader cannot see.
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 318 });
+    const writes = withLayout({ rowTop: 300 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+    expect(writes).toEqual([1, 0]);
+    expect(scrolled).toHaveLength(0);
+  });
+
+  it("falls back to scrollIntoView when the request carries NO anchor", () => {
+    // A spawn, a concierge tool call, a keyboard activation: no cursor behind it, so the old
+    // get-it-on-screen behaviour is still what these get.
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: null });
+    const writes = withLayout({ rowTop: 900 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+    expect(writes).toEqual([1, 0]);
+    expect(scrolled).toHaveLength(1);
+    expect(scrolled[0]!.opts).toEqual({ block: "nearest" });
+  });
+
+  it("anchors only the REQUESTED row, leaving the others alone", () => {
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 300 });
+    const writes = withLayout({ rowTop: 900 });
+    render(
+      <AgentSidebar
+        project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second"), mkAgent("a3", "Third")])}
+      />,
+    );
+    // One anchored write, not one per row.
+    expect(writes.filter((w) => w === 620)).toHaveLength(1);
+  });
+});
+
+// ── THE COMPONENT FEEDS THE *CONTAINER'S* BAND, NOT THE ROW'S OR THE WINDOW'S ───────────────────
+// The arithmetic is covered in anchoredScroll.test.ts, but that file cannot see WHICH values the
+// component passes. Every other row here uses an anchor inside the band, so `containerTop: box.top`
+// and `containerHeight: sc.clientHeight` both survived mutation — swap either for a plausible
+// neighbour (`0`, `sc.scrollHeight`) and the suite stayed green while production lost a clamp
+// (roborev 56063). These two rows put the anchor OUTSIDE the band in each direction, which is the
+// only place those arguments are observable.
+describe("AgentRow — the anchor is clamped by the container the row lives in", () => {
+  const realScrollTop = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  const PATCHED = ["scrollTop", "scrollHeight", "clientHeight", "getBoundingClientRect"] as const;
+  const originals = new Map(
+    PATCHED.map((k) => [k, Object.getOwnPropertyDescriptor(Element.prototype, k)] as const),
+  );
+  afterEach(() => {
+    for (const k of PATCHED) {
+      const original = originals.get(k);
+      if (original) Object.defineProperty(Element.prototype, k, original);
+      else delete (Element.prototype as unknown as Record<string, unknown>)[k];
+    }
+    if (realScrollTop) Object.defineProperty(Element.prototype, "scrollTop", realScrollTop);
+  });
+
+  /** Same stubs as the describe above; duplicated rather than shared so neither block's cleanup can
+   *  pull the prototype out from under the other. Band is viewport y 100–700 (clientHeight 600). */
+  function withLayout(opts: { rowTop: number; initialScrollTop?: number }) {
+    const writes: number[] = [];
+    const tops = new WeakMap<Element, number>();
+    Object.defineProperty(Element.prototype, "scrollTop", {
+      configurable: true,
+      get(this: Element) {
+        return tops.get(this) ?? opts.initialScrollTop ?? 0;
+      },
+      set(this: Element, v: number) {
+        writes.push(v);
+        tops.set(this, v);
+      },
+    });
+    Object.defineProperty(Element.prototype, "scrollHeight", { configurable: true, get: () => 2000 });
+    Object.defineProperty(Element.prototype, "clientHeight", { configurable: true, get: () => 600 });
+    Object.defineProperty(Element.prototype, "getBoundingClientRect", {
+      configurable: true,
+      writable: true,
+      value: function (this: Element) {
+        return this.closest?.('[data-hint="agent"]') === this
+          ? ({ top: opts.rowTop, height: 40 } as DOMRect)
+          : ({ top: 100, height: 600 } as DOMRect);
+      },
+    });
+    return writes;
+  }
+
+  it("clamps an anchor ABOVE the list's top edge to the band, not to the raw click", () => {
+    // The reported failure: a receipt pill clicked high in the transcript, above the builder
+    // column's first visible pixel. Honoured literally the row parks in the clipped region.
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 20 });
+    const writes = withLayout({ rowTop: 900 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+    // Row centre 920, clamped anchor 120 (band top + half a row) → 800.
+    // `containerTop: 0` would give band [20, 580], anchor 20, and a write of 900.
+    expect(writes).toEqual([1, 0, 800]);
+  });
+
+  it("clamps an anchor BELOW the list's bottom edge to the band, not to the range floor", () => {
+    // Seeded offset, because at 0 the correct answer and the mutant's both round to "no write".
+    useUiStore.setState({ revealAgentId: "a2", revealAnchorY: 1500 });
+    const writes = withLayout({ rowTop: 20, initialScrollTop: 700 });
+    render(<AgentSidebar project={mkProject([mkAgent("a1", "First"), mkAgent("a2", "Second")])} />);
+    // Row centre 40, clamped anchor 680 (band bottom - half a row) → 700 - 640 = 60.
+    // `containerHeight: sc.scrollHeight` would widen the band to [120, 2080], leave the anchor at
+    // 1500, and drive the offset to the range floor of 0 instead.
+    expect(writes).toEqual([699, 700, 60]);
+  });
+});

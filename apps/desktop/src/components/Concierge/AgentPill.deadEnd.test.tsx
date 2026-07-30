@@ -338,3 +338,42 @@ describe("the closed state degrades where no host opted in", () => {
     expect(closed.textContent).toContain("@Build 8");
   });
 });
+
+// ── CASE (c), WITH A CALLER-OWNED REVEAL ────────────────────────────────────────────────────────
+// A surface that supplies `onOpen` (RecapCard, NudgeCard) must NOT lose the closed-agent disclosure.
+//
+// This behaviour has been flipped twice in two commits, both times on the strength of a comment. A
+// version of `AgentPill` special-cased `onOpen` in the unresolvable branch — to keep a permanently
+// visible card from mounting a second live region — and that turned the pill into a button which
+// called an opener that resolves the id FIRST and returns on null: no navigation, no notice, nothing
+// announced, and the "See what it did" route gone. The whole suite stayed green through both the
+// break and the revert, because nothing here had ever passed `onOpen` with an id that does not
+// resolve (roborev 56068). Now something does.
+describe("an unresolvable pill keeps its disclosure even when the caller owns the reveal", () => {
+  const mountOwned = (onOpen: (t: { agentId: string; projectId: string }) => void, over = {}) =>
+    render(
+      <AgentPillProvider value={ctx({ agents: [], ...over })}>
+        <AgentPill agentId="b78f9f8c" fallbackName="@Build 8" onOpen={onOpen} />
+      </AgentPillProvider>,
+    );
+
+  it("shows the closed explanation on click, rather than calling a reveal that cannot land", () => {
+    const onOpen = vi.fn();
+    mountOwned(onOpen);
+    const before = visible();
+    fireEvent.click(screen.getByTestId("concierge-agent-pill-closed"));
+    // Something changed on screen…
+    expect(visible()).not.toBe(before);
+    expect(visible()).toContain("Build 8 is closed.");
+    // …and the opener was NOT consulted: it resolves the id first and would have returned silently.
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("still routes to the prompt history that outlived the agent", () => {
+    const onSeeHistory = vi.fn();
+    mountOwned(vi.fn(), { onSeeHistory });
+    fireEvent.click(screen.getByTestId("concierge-agent-pill-closed"));
+    fireEvent.click(screen.getByTestId("concierge-agent-pill-notice-action"));
+    expect(onSeeHistory).toHaveBeenCalledWith({ agentId: "b78f9f8c", name: "Build 8" });
+  });
+});

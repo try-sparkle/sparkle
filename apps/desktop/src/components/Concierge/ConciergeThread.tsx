@@ -112,6 +112,7 @@ export function ConciergeThread({
   messages,
   typing = false,
   onNudgeClick,
+  onRevealAgent,
   onNudgeAction,
   onRedirect,
   onDigestClick,
@@ -127,6 +128,7 @@ export function ConciergeThread({
    *  presentational; the column decides (see ConciergeColumn's `data-wired`). */
   wired?: boolean;
   onNudgeClick: (nudge: ConciergeNudge) => void;
+  onRevealAgent?: (agentId: string) => void;
   onNudgeAction: (nudge: ConciergeNudge, actionId: string) => void;
   /** Redirect the message with this id the other way (see RoutingReceipt). */
   onRedirect?: (messageId: string) => void;
@@ -350,7 +352,8 @@ export function ConciergeThread({
                 onNudgeAction={onNudgeAction}
               />
             );
-          if (m.kind === "recap") return <RecapCard key={m.id} recap={m} />;
+          if (m.kind === "recap")
+            return <RecapCard key={m.id} recap={m} onRevealAgent={onRevealAgent} />;
           if (m.kind === "you")
             return (
               <div

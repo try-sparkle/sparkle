@@ -75,6 +75,8 @@ import { SuggestionRow, SUGGESTION_PILL_HEIGHT } from "../composer/SuggestionRow
 import { terminalSuggestionAnchorStyle } from "../terminalStageAnchor";
 import { applySuggestion } from "../../services/suggestions/applySuggestion";
 import { PtyGoneError } from "../../pty";
+import { line, ref } from "./conciergeLine";
+import type { Line } from "./conciergeLine";
 import { useSuggestions } from "../../services/suggestions/useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useTerminalOverlayStore } from "../../stores/terminalOverlayStore";
@@ -118,7 +120,9 @@ export function ConciergeSuggestions({
   visible?: boolean;
   onDeliverPrompt: (text: string) => Promise<boolean>;
   onApply: (run: () => Promise<boolean>) => Promise<boolean>;
-  onFailure: (message: string) => void;
+  /** A `Line`, not a string — this surface names an agent, and it has the id to make that name
+   *  clickable. See Concierge/conciergeLine for why the type is the enforcement. */
+  onFailure: (message: Line) => void;
 }) {
   // `composerEmpty` is TRUE unconditionally. The hook's own emptiness gate reads a React composer
   // `value`, and there is no React composer on this surface any more — the input line the pill sits
@@ -162,8 +166,9 @@ export function ConciergeSuggestions({
         // (roborev 53074). Say why instead. A dead PTY is NOT the `disabled` case: that flag comes
         // from runtimeStore, which lags the real exit, so the click that races it looks perfectly
         // live — but it is the same fact for the user, so it gets the same words.
-        if (failed === "error") onFailure(`I couldn't run that on ${agentName}.`);
-        else if (failed || disabled) onFailure(`${agentName} isn't running, so I couldn't do that.`);
+        const who = ref({ id: agentId, name: agentName });
+        if (failed === "error") onFailure(line`I couldn't run that on ${who}.`);
+        else if (failed || disabled) onFailure(line`${who} isn't running, so I couldn't do that.`);
       })();
     },
     [agentId, agentName, disabled, onDeliverPrompt, onApply, onFailure, clear],

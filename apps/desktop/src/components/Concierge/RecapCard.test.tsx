@@ -3,13 +3,21 @@
 // The recap card's contract: it renders the newly-entered delta, it renders the gate decisions the
 // sibling branch will feed it, and it carries NO live region of its own (the column's single
 // role="status" node does the announcing — a second region double-announces).
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RecapCard } from "./RecapCard";
+import { AgentPillProvider } from "./AgentPill";
+import type { MentionAgent } from "./mentions";
 import { ConciergeThread } from "./ConciergeThread";
 import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 
 afterEach(() => cleanup());
+
+/** The two agents the fixture recap names, as the live roster a pill resolves against. */
+const ROSTER = [
+  { id: "a", name: "Kraken Auth", projectId: "p1", projectName: "sparkle", band: "needs_you" },
+  { id: "b", name: "OG Images", projectId: "p2", projectName: "drodio-website", band: "done" },
+] as unknown as readonly MentionAgent[];
 
 const recap = (over: Partial<ConciergeRecapMessage> = {}): ConciergeRecapMessage => ({
   id: "recap-1",
@@ -73,10 +81,11 @@ describe("RecapCard", () => {
               id: "d1",
               kind: "queued",
               agentName: "Kraken Auth",
+              agentId: "ag-recap",
               summary: "Delete the staging database",
               at: 1,
             },
-            { id: "d2", kind: "sent", agentName: "OG Images", summary: "Re-ran the tests", at: 2 },
+            { id: "d2", kind: "sent", agentName: "OG Images", agentId: "ag-recap", summary: "Re-ran the tests", at: 2 },
           ],
         })}
       />,
@@ -104,6 +113,7 @@ describe("RecapCard", () => {
       id: `d${i}`,
       kind: "sent" as const,
       agentName: `Agent ${i}`,
+      agentId: "ag-recap",
       summary: `Did thing ${i}`,
       at: i,
     }));
@@ -209,5 +219,93 @@ describe("ConciergeThread", () => {
       />,
     );
     expect(screen.getByTestId("concierge-recap")).toBeTruthy();
+  });
+});
+
+// ── THE ROWS NAME BUILD AGENTS, SO THE ROWS ARE CLICKABLE ───────────────────────────────────────
+// The founder's rule: any mention of a build agent anywhere in the concierge surface is clickable.
+// A recap that tells you three agents want you and then makes you go find them in the column is
+// only half a recap.
+//
+// The interesting half is HOW. A pill left to the pill context reports its own outcome through a
+// `role="status"` node it mounts itself — and this card is permanently on screen, so that is a
+// SECOND live region in a column that owns exactly one (see this file's header). The card therefore
+// supplies `onOpen`, which suppresses the pill's region and moves the reporting to `revealAgent`,
+// which announces through the column's existing announcer.
+describe("RecapCard — its agents are clickable, without a second live region", () => {
+  /** The card as the app actually mounts it: inside the thread, so inside a real pill context.
+   *
+   *  WIRED ON PURPOSE. A context-less card has no roster, so every id fails to resolve and the pill
+   *  makes a "…is closed" claim about agents that are perfectly live — the false claim the
+   *  `!canOpen` guard exists to prevent (roborev 55590). An earlier version of these rows rendered
+   *  the card bare and asserted that claim, which baked the wrong behaviour into tests
+   *  (roborev 56062). */
+  const wired = (onRevealAgent?: (id: string) => void) =>
+    render(
+      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: () => true }}>
+        <RecapCard recap={recap()} onRevealAgent={onRevealAgent} />
+      </AgentPillProvider>,
+    );
+
+  it("draws each named agent as a control, not as bare text", () => {
+    wired(vi.fn());
+    const pills = screen.getAllByTestId("concierge-agent-pill");
+    // Both rows — "Wants you" and "Finished".
+    expect(pills).toHaveLength(2);
+    expect(pills.map((p) => p.tagName)).toEqual(["BUTTON", "BUTTON"]);
+    expect(pills.map((p) => p.textContent)).toEqual(["@Kraken Auth", "@OG Images"]);
+  });
+
+  it("reveals the agent the row named", () => {
+    const onRevealAgent = vi.fn();
+    wired(onRevealAgent);
+    fireEvent.click(screen.getAllByTestId("concierge-agent-pill")[1]!);
+    // The id from the row, not the first one on the card.
+    expect(onRevealAgent).toHaveBeenCalledWith("b");
+  });
+
+  it("adds NO live region of its own, even with pills that RESOLVE", () => {
+    // The regression this guards is exact: pills without `onOpen` report their own outcome through a
+    // `role="status"` node they mount themselves, and this card is permanently on screen — so two
+    // rows meant two extra regions in a column that owns exactly one, and the failure surfaced two
+    // files away in ConciergeHost's recap test.
+    const { container } = wired(vi.fn());
+    expect(container.querySelectorAll('[data-testid="concierge-agent-pill"]')).toHaveLength(2);
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(0);
+  });
+
+  it("WHY the card needs its own reveal: without one the pills bring regions back", () => {
+    // Not a wish, a characterisation. With no `onRevealAgent` the pills fall back to the pill
+    // CONTEXT, which is a perfectly good way to open an agent — but a context-path pill reports its
+    // own outcome, so it mounts a `role="status"` node each, and this card is permanently on screen.
+    // That is the coupling `onRevealAgent` exists to break, and pinning it here means deleting the
+    // prop fails with an explanation rather than in ConciergeHost's recap test two files away.
+    const { container } = wired(undefined);
+    expect(container.querySelectorAll('[data-testid="concierge-agent-pill"]')).toHaveLength(2);
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(2);
+  });
+});
+
+// ── THE WIRING, END TO END ──────────────────────────────────────────────────────────────────────
+// The rows above prove the CARD calls its own prop. They prove nothing about the prop arriving:
+// `onRevealAgent` crosses ConciergeColumn → ConciergeThread → RecapCard, and dropping it at either
+// hop leaves every one of them green while shipping pills that reveal nothing. That is the
+// "assert the side effect, not the precondition" rule applied to a prop chain (roborev 56062).
+describe("a recap pill's reveal reaches the thread's caller", () => {
+  it("carries the clicked row's agentId out through ConciergeThread", () => {
+    const onRevealAgent = vi.fn();
+    render(
+      <AgentPillProvider value={{ agents: ROSTER, onOpenAgent: () => true }}>
+        <ConciergeThread
+          messages={[recap()]}
+          onNudgeClick={vi.fn()}
+          onNudgeAction={vi.fn()}
+          onRevealAgent={onRevealAgent}
+        />
+      </AgentPillProvider>,
+    );
+    fireEvent.click(screen.getAllByTestId("concierge-agent-pill")[0]!);
+    // The FIRST row is "Wants you" → agent "a". A hop that dropped the prop calls nothing at all.
+    expect(onRevealAgent).toHaveBeenCalledWith("a");
   });
 });

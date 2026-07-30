@@ -147,7 +147,7 @@ describe("ConciergeSuggestions — the dead-PTY gate", () => {
     const { onFailure } = setup();
     fireEvent.click(screen.getByText("Yes"));
     await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1));
-    expect(onFailure.mock.calls[0]![0]).toMatch(/isn't running/i);
+    expect(onFailure.mock.calls[0]![0].spoken).toMatch(/isn't running/i);
     expect(h.clear).not.toHaveBeenCalled();
   });
 });
@@ -175,7 +175,9 @@ describe("ConciergeSuggestions — outcomes", () => {
     const { onFailure } = setup();
     fireEvent.click(screen.getByText("Yes"));
     await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1));
-    expect(onFailure.mock.calls[0]![0]).toContain("Kraken Auth");
+    expect(onFailure.mock.calls[0]![0].spoken).toContain("Kraken Auth");
+    // …and the name carries its id, so the reader can click through to the agent it names.
+    expect(onFailure.mock.calls[0]![0].md).toContain("sparkle-agent:a1");
     expect(h.clear).not.toHaveBeenCalled();
   });
 
@@ -190,8 +192,10 @@ describe("ConciergeSuggestions — outcomes", () => {
     const { onFailure } = setup();
     fireEvent.click(screen.getByText("Yes"));
     await waitFor(() => expect(onFailure).toHaveBeenCalledTimes(1));
-    expect(onFailure.mock.calls[0]![0]).toMatch(/isn't running/i);
-    expect(onFailure.mock.calls[0]![0]).toContain("Kraken Auth");
+    expect(onFailure.mock.calls[0]![0].spoken).toMatch(/isn't running/i);
+    expect(onFailure.mock.calls[0]![0].spoken).toContain("Kraken Auth");
+    // …and the name carries its id, so the reader can click through to the agent it names.
+    expect(onFailure.mock.calls[0]![0].md).toContain("sparkle-agent:a1");
     // The row survives, so the user can retry once the agent is back.
     expect(h.clear).not.toHaveBeenCalled();
   });

@@ -15,6 +15,7 @@
 // like an incident.
 import type { CSSProperties } from "react";
 import { C, CARD_WASH_PCT, FONT_WEIGHT } from "../../theme/colors";
+import { AgentPill } from "./AgentPill";
 import {
   recapSummary,
   type ConciergeRecapMessage,
@@ -150,10 +151,12 @@ function ChangeSection({
   label,
   changes,
   section,
+  onRevealAgent,
 }: {
   label: string;
   changes: RecapChange[];
   section: string;
+  onRevealAgent?: (agentId: string) => void;
 }) {
   if (changes.length === 0) return null; // a section with nothing in it is a heading and a gap
   const shown = changes.slice(0, SECTION_CAP);
@@ -161,7 +164,7 @@ function ChangeSection({
     <>
       <div style={sectionLabel}>{label}</div>
       {shown.map((c) => (
-        <ChangeRow key={c.agentId} change={c} />
+        <ChangeRow key={c.agentId} change={c} onRevealAgent={onRevealAgent} />
       ))}
       {changes.length > shown.length && (
         <MoreLine n={changes.length - shown.length} word="more" section={section} label={label} />
@@ -170,17 +173,42 @@ function ChangeSection({
   );
 }
 
-function ChangeRow({ change }: { change: RecapChange }) {
+function ChangeRow({
+  change,
+  onRevealAgent,
+}: {
+  change: RecapChange;
+  onRevealAgent?: (agentId: string) => void;
+}) {
   return (
     <div style={rowStyle} data-testid="recap-change" data-status={change.status}>
       <span style={projectChip}>{change.projectName}</span>
-      <span style={{ fontWeight: FONT_WEIGHT.semibold }}>{change.agentName}</span>
+      {/* A PILL, not a bold span. This card is app-authored prose naming a build agent, and the rule
+          is that every such mention is clickable — a recap that tells you three agents want you and
+          then makes you go find them in the column is only half a recap. `RecapChange` has carried
+          `agentId` all along, so nothing had to be threaded here.
+
+          The card sits inside the thread, hence inside `AgentPillProvider`; a pill outside that
+          provider degrades to plain prose, which is exactly what this was. */}
+      <span style={{ fontWeight: FONT_WEIGHT.semibold }}>
+        <AgentPill
+          agentId={change.agentId}
+          fallbackName={change.agentName}
+          onOpen={onRevealAgent ? () => onRevealAgent(change.agentId) : undefined}
+        />
+      </span>
       <span style={{ color: C.conciergeMuted }}>{change.statusLabel}</span>
     </div>
   );
 }
 
-export function RecapCard({ recap }: { recap: ConciergeRecapMessage }) {
+export function RecapCard({
+  recap,
+  onRevealAgent,
+}: {
+  recap: ConciergeRecapMessage;
+  onRevealAgent?: (agentId: string) => void;
+}) {
   return (
     <div
       data-testid="concierge-recap"
@@ -197,8 +225,18 @@ export function RecapCard({ recap }: { recap: ConciergeRecapMessage }) {
         {recapSummary(recap)}
       </div>
 
-      <ChangeSection label="Wants you" changes={recap.needsYou} section="needsYou" />
-      <ChangeSection label="Finished" changes={recap.finished} section="finished" />
+      <ChangeSection
+        label="Wants you"
+        changes={recap.needsYou}
+        section="needsYou"
+        onRevealAgent={onRevealAgent}
+      />
+      <ChangeSection
+        label="Finished"
+        changes={recap.finished}
+        section="finished"
+        onRevealAgent={onRevealAgent}
+      />
 
       {recap.decisions.length > 0 && (
         <>
@@ -221,7 +259,11 @@ export function RecapCard({ recap }: { recap: ConciergeRecapMessage }) {
                 {decisionVerb(d.kind)}
               </span>
               <span style={{ color: C.conciergeMuted }}>
-                {d.summary} — {d.agentName}
+                {d.summary} — <AgentPill
+                  agentId={d.agentId}
+                  fallbackName={d.agentName}
+                  onOpen={onRevealAgent ? () => onRevealAgent(d.agentId) : undefined}
+                />
               </span>
             </div>
           ))}

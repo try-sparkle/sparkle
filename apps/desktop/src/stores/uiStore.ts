@@ -51,6 +51,9 @@ const TRANSIENT_UI_KEYS = [
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
+  // Travels with `revealAgentId` — a viewport coordinate from one click is meaningless on the next
+  // launch, and worse than meaningless if it outlived the request that carried it.
+  "revealAnchorY",
   "newAgentRuntime",
   "cloudCreateOpen",
   "zeroCreditBannerDismissed",
@@ -333,7 +336,13 @@ interface UiState {
   // AND IT EXPIRES — see REVEAL_REQUEST_TTL_MS. The row is not guaranteed to mount, and an
   // unbounded request is a scroll that fires at an arbitrary later moment (roborev 53784).
   revealAgentId: string | null;
-  requestRevealAgent: (id: string) => void;
+  /** Where on screen the reader was looking when they asked — `MouseEvent.clientY`, viewport
+   *  coordinates — or null for a reveal with no cursor behind it (a spawn, a tool call).
+   *
+   *  Null and a number mean genuinely different things to the row that consumes this: null asks for
+   *  the old "just get on screen" behaviour, a number asks for the row to come to the cursor. */
+  revealAnchorY: number | null;
+  requestRevealAgent: (id: string, opts?: { anchorY?: number }) => void;
   clearRevealAgent: (id: string) => void;
   // Concierge pin scope (CM-U7): the project tab whose pin is lit. Pinning scopes the concierge to
   // that project ("disregard all other project alerts so you can focus"); null = following all
@@ -586,7 +595,8 @@ export const useUiStore = create<UiState>()(
       // must NOT use this seam; give it one of its own.
       requestComposeFocus: () => set((s) => ({ composeFocusSeq: s.composeFocusSeq + 1 })),
       revealAgentId: null,
-      requestRevealAgent: (id) => {
+      revealAnchorY: null,
+      requestRevealAgent: (id, opts) => {
         // Arm the deadline BEFORE publishing the id, so there is no window in which a pending
         // request exists without an expiry attached to it.
         cancelRevealExpiry();
@@ -594,16 +604,19 @@ export const useUiStore = create<UiState>()(
           revealExpiryTimer = null;
           // Id-guarded like clearRevealAgent: a newer request must not be cancelled by an older
           // timer that somehow outlived its own cancellation.
-          set((s) => (s.revealAgentId === id ? { revealAgentId: null } : s));
+          set((s) => (s.revealAgentId === id ? { revealAgentId: null, revealAnchorY: null } : s));
         }, REVEAL_REQUEST_TTL_MS);
-        set({ revealAgentId: id });
+        // SET TOGETHER, ALWAYS. A caller with no anchor must CLEAR the previous one rather than
+        // leave it standing: a stale Y from an earlier click would otherwise steer an unrelated
+        // reveal (a spawn, a tool call) to wherever the cursor happened to be minutes ago.
+        set({ revealAgentId: id, revealAnchorY: opts?.anchorY ?? null });
       },
       // Id-guarded so a row can only retire ITS OWN request: without the check, a stale effect from
       // a row unmounting mid-spawn would swallow the request that named a different row.
       clearRevealAgent: (id) => {
         if (get().revealAgentId !== id) return;
         cancelRevealExpiry();
-        set({ revealAgentId: null });
+        set({ revealAgentId: null, revealAnchorY: null });
       },
       pinnedProjectId: null,
       togglePinnedProject: (id) =>

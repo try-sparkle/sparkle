@@ -42,6 +42,7 @@ import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { SPARKLE_PANE_SIDE, useUiStore } from "../stores/uiStore";
+import { anchoredScrollTop } from "./anchoredScroll";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -3465,13 +3466,58 @@ const AgentRow = memo(function AgentRow({
   // scroll would race the animation instead of preventing it, which is why the order is asserted
   // in AgentSidebar.revealRow.test. The visual outcome is not testable in jsdom (no layout, no
   // scroll animation) — the CALL ORDER is (roborev 53784, 53907, 53929, 53940).
+  //
+  // ── AND WHEN THE REQUEST CARRIES A CURSOR, LAND AT THE CURSOR ─────────────────────────────────
+  // `block: "nearest"` answers "is it on screen", which is the wrong question for a click. The
+  // reader's eye is at the pointer, and the builder column runs well past a screenful, so a row
+  // that arrives correctly-but-elsewhere still has to be hunted for. When the reveal carries an
+  // anchor (`revealAnchorY` — the click's own viewport Y), the row is brought to it instead, with
+  // the arithmetic in components/anchoredScroll: clamped at both ends of the range, and declining
+  // to move at all when the row already sits at roughly that height.
+  //
+  // Falls back to `scrollIntoView` whenever there is no anchor (a spawn, a concierge tool call, a
+  // keyboard activation) — those have no cursor behind them, and inventing one would scroll the
+  // column to a place nobody was looking.
   const revealAgentId = useUiStore((s) => s.revealAgentId);
+  const revealAnchorY = useUiStore((s) => s.revealAnchorY);
   useEffect(() => {
     if (revealAgentId !== a.id) return;
     sidebarScroll?.abandonReveal(true);
-    rowRef.current?.scrollIntoView?.({ block: "nearest" });
+    const row = rowRef.current;
+    const sc = sidebarScroll?.containerRef.current;
+    // Both elements and a real anchor, or this is the un-anchored path. The `getBoundingClientRect`
+    // check guards only against an ENVIRONMENT that does not implement it at all (a test that has
+    // stubbed the prototype and not restored it) — it is NOT the zero-layout guard, since jsdom
+    // implements the method and returns zeroes. Zero layout is caught inside `anchoredScrollTop`,
+    // by `maxScroll <= 0`.
+    if (
+      revealAnchorY != null &&
+      row &&
+      sc &&
+      typeof row.getBoundingClientRect === "function" &&
+      typeof sc.getBoundingClientRect === "function"
+    ) {
+      const rect = row.getBoundingClientRect();
+      // The CONTAINER's band, not just the row's position: the anchor is a click in the concierge
+      // column and can name a Y outside this container entirely (see anchoredScroll's doc).
+      const box = sc.getBoundingClientRect();
+      const target = anchoredScrollTop({
+        rowTop: rect.top,
+        rowHeight: rect.height,
+        anchorY: revealAnchorY,
+        scrollTop: sc.scrollTop,
+        maxScroll: sc.scrollHeight - sc.clientHeight,
+        containerTop: box.top,
+        containerHeight: sc.clientHeight,
+      });
+      // `null` means "already as close as it can get" — leave the column exactly where it is rather
+      // than writing an identical offset, which would still cancel any in-flight smooth scroll.
+      if (target !== null) sc.scrollTop = target;
+    } else {
+      rowRef.current?.scrollIntoView?.({ block: "nearest" });
+    }
     useUiStore.getState().clearRevealAgent(a.id);
-  }, [revealAgentId, a.id, sidebarScroll]);
+  }, [revealAgentId, revealAnchorY, a.id, sidebarScroll]);
 
   // Hover open/close with a short close delay, so moving the cursor from the in-flow row onto the
   // overlay sitting on top of it (which fires the row's mouseleave) doesn't flicker it shut.

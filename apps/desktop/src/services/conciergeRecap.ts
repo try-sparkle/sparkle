@@ -145,6 +145,15 @@ export interface GateDecision {
   kind: "sent" | "queued" | "cancelled";
   /** Who it was for, in the user's vocabulary ("Kraken Auth"). */
   agentName: string;
+  /** The id behind `agentName`. REQUIRED, and required for the same reason `RecapChange` carries
+   *  one: the recap names build agents, and every mention of a build agent in the concierge surface
+   *  is clickable — which is impossible from a name alone, since several agents routinely share one.
+   *
+   *  Nothing constructs a `GateDecision` yet (`ConciergeHost` passes `decisions: []` — the gate that
+   *  logs them lives on a sibling branch), so making this required costs nothing today and means the
+   *  producer cannot land without carrying the id. Optional would have made it forgettable, which is
+   *  the failure this whole change is about. */
+  agentId: string;
   /** One plain-language line: what the action was. Not a command string — the recap is a summary. */
   summary: string;
   /** Epoch ms, so the host can select only decisions taken during THIS away stretch. */

@@ -352,6 +352,19 @@ export interface ConciergeController {
   onCopied?(what: ConciergeCopyKind): void;
   /** Whole-card click: open the nudge's source project/agent. */
   onNudgeClick(nudge: ConciergeNudge): void;
+  /** Reveal an agent named by a CARD that is not a nudge — today, a recap row's pill.
+   *
+   *  Same destination as `onNudgeClick` (both land in `revealAgent`), but keyed on an id because a
+   *  recap row is not a nudge and building a synthetic one to pass here would be a lie the next
+   *  reader has to unpick.
+   *
+   *  IT MUST ANNOUNCE, and that is why this exists rather than the pill using the pill CONTEXT's
+   *  opener. A pill on the context path mounts its own `role="status"` to report the outcome, and
+   *  the concierge column owns exactly ONE live region — a second one is what
+   *  `ConciergeThread.roleLabels` forbids, and what the recap card's own test caught. Supplying an
+   *  `onOpen` suppresses the pill's region, so whatever is supplied has to take over the reporting;
+   *  `revealAgent` already does, through the column's announcer. */
+  onRevealAgent?(agentId: string): void;
   /** The header's 8-dot grip was used: move the concierge to the OTHER side of the shell. Optional,
    *  and the grip renders only when it is supplied — a grip with nowhere to drag to is an
    *  affordance that lies, the same rule ScopeVitals' segment buttons already follow. */

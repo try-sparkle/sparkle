@@ -411,6 +411,7 @@ export function ConciergeColumn({
             messages={model.messages}
             typing={model.typing}
             onNudgeClick={controller.onNudgeClick}
+            onRevealAgent={controller.onRevealAgent}
             onNudgeAction={controller.onNudgeAction}
             onRedirect={controller.onRedirect}
             onDigestClick={controller.onDigestClick}

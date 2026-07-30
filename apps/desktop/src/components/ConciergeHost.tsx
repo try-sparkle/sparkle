@@ -100,6 +100,8 @@ import {
 } from "../services/dispatchIntent";
 import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
+import { flat, line, plain, ref } from "./Concierge/conciergeLine";
+import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
 import { routeMessage } from "../services/conciergeRouter";
 import {
   isSparkleMention,
@@ -251,29 +253,43 @@ function refusedPath(r: ConciergeDispatchResult): RefusedPath | null {
  *
  *  Only NON-delivery is handled: the callers report the delivered/held paths themselves, because
  *  what they do there differs (approve returns void; promptAgent returns whether to keep the draft). */
-function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice): string {
+/** An addressed target — which spells its id `agentId` — as something `ref` can reference.
+ *
+ *  A shape adapter and nothing more. It exists so the call sites below read as prose rather than as
+ *  object literals, and so the `agentId`→`id` rename happens in ONE place: a call site that built
+ *  the object inline is a call site that can build it wrong, and `ref` cannot tell a mistyped id
+ *  from a real one. */
+function asAgent(t: { agentId: string; name: string }): ReferencableAgent {
+  return { id: t.agentId, name: t.name };
+}
+
+function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: RefusalVoice): Line {
   const approving = voice === "approval";
-  const generic = approving ? `I couldn't send the approval to ${name}.` : `I couldn't send that to ${name}.`;
+  // ONE slot, reused across the ladder — every arm names the same agent, and building the reference
+  // once means no arm can be the one that forgets to.
+  const a = ref(agent);
+  const generic = approving ? line`I couldn't send the approval to ${a}.` : line`I couldn't send that to ${a}.`;
   if (path === null) return generic; // refused on a delivered-looking path — see refusedPath
   switch (path) {
     case "trial-spent":
-      return TRIAL_SPENT_TEXT;
+      // Names no agent — the trial is the user's, not any one agent's.
+      return flat(TRIAL_SPENT_TEXT);
     case "agent-failed":
       return approving
-        ? `${name} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`
-        : `${name} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`;
+        ? line`${a} couldn't start, so I couldn't send the approval — open its pane and hit Retry.`
+        : line`${a} couldn't start, so that didn't send — open its pane and hit Retry (or finish installing Claude Code), then send again.`;
     case "cloud-agent":
       return approving
-        ? `${name} runs in the cloud — I can't relay the approval from here yet; answer it in its own pane.`
-        : `${name} runs in the cloud, and prompting cloud agents from here isn't wired up yet — use its own pane for now.`;
+        ? line`${a} runs in the cloud — I can't relay the approval from here yet; answer it in its own pane.`
+        : line`${a} runs in the cloud, and prompting cloud agents from here isn't wired up yet — use its own pane for now.`;
     case "pty-gone":
       return approving
-        ? `${name}'s terminal has closed — I couldn't send the approval.`
-        : `${name}'s terminal has closed — that didn't send. Start it again and I'll pass it along.`;
+        ? line`${a}'s terminal has closed — I couldn't send the approval.`
+        : line`${a}'s terminal has closed — that didn't send. Start it again and I'll pass it along.`;
     case "ambiguous-picker":
       return approving
-        ? `${name} is asking something I can't answer with a plain "approve" — open it to choose.`
-        : `${name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
+        ? line`${a} is asking something I can't answer with a plain "approve" — open it to choose.`
+        : line`${a} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
     // ITS OWN LINE, not a second use of `ambiguous-picker` above (roborev 54665). That copy says
     // the answer mapped to nothing and offers "answer with just the option", and it is wrong here
     // WHETHER OR NOT the text matched — which is the point, because this path no longer depends on
@@ -298,16 +314,16 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
     // branch and a threaded ref to keep an affordance that saves one click. (roborev 54673.)
     case "addressed-at-picker":
       return approving
-        ? `${name} is waiting on a choice on screen — open it and pick.`
-        : `${name} is waiting on a choice on screen, so I didn't send that to it as a message — open ${name} and pick.`;
+        ? line`${a} is waiting on a choice on screen — open it and pick.`
+        : line`${a} is waiting on a choice on screen, so I didn't send that to it as a message — open ${a} and pick.`;
     case "unauthorized":
       // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
       // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,
       // not a user error. Say the honest thing (it did NOT send) without inventing a remedy the
       // user could act on, and let the log line carry the diagnosis.
       return approving
-        ? `Something went wrong on my side, so I didn't send the approval to ${name}.`
-        : `Something went wrong on my side, so I didn't send that to ${name}. Try again.`;
+        ? line`Something went wrong on my side, so I didn't send the approval to ${a}.`
+        : line`Something went wrong on my side, so I didn't send that to ${a}. Try again.`;
     case "queue-full":
       // A full hold queue is NOT a dead terminal — the agent is starting normally, there are simply
       // already MAX_PER_AGENT prompts waiting on it. Falling through to the generic line (or worse,
@@ -316,8 +332,8 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
       // ladders otherwise only say what did NOT happen, leaving the user unsure whether theirs
       // went through.
       return approving
-        ? `${name} already has a few prompts waiting to start — let those land first, then approve again.`
-        : `${name} already has a few prompts waiting to start — let those land first, then send again.`;
+        ? line`${a} already has a few prompts waiting to start — let those land first, then approve again.`
+        : line`${a} already has a few prompts waiting to start — let those land first, then send again.`;
     // No bespoke line: "empty" is a blank answer the UI already swallows, and "expired"/"abandoned"
     // are DEFERRED outcomes reported by the onDeferredSendOutcome effect below, never returned to a
     // caller synchronously. They are listed rather than folded into `default` on purpose — `default`
@@ -1004,7 +1020,15 @@ export function ConciergeHost({
    *  nothing is written to a PTY. Revealing an agent is reversible in a way a delivery is not, so
    *  it needs no gate. */
   const openAgentFromPill = useCallback(
-    ({ agentId, projectId }: { agentId: string; projectId: string }) => {
+    ({
+      agentId,
+      projectId,
+      anchorY,
+    }: {
+      agentId: string;
+      projectId: string;
+      anchorY?: number;
+    }) => {
       // Destructured by NAME on both sides, so the order flip into `openProjectTab(projectId,
       // agentId)` — two strings, silently swappable — cannot happen here (roborev 54894).
       // ASK FIRST, THEN ACT. `openProjectTab` reports the miss only AFTER it has opened and
@@ -1015,7 +1039,20 @@ export function ConciergeHost({
       if (!agentExists(projectId, agentId)) return false;
       // RETURNED, not discarded: both of that path's early exits are silent, and the pill turns a
       // `false` into "…is closed" rather than leaving the reader looking at an unchanged screen.
-      return openProjectTab(projectId, agentId);
+      const landed = openProjectTab(projectId, agentId);
+      // SELECTING IS NOT FINDING. `openProjectTab` selects the agent — which highlights its row and
+      // opens its pane — but the builder column is longer than a screen, so the row that answered
+      // the click can be anywhere in it, including off screen. The reader who just clicked then has
+      // to hunt for the thing they asked for, which is the half of "the pill works" that was
+      // missing.
+      //
+      // Asked for ONLY on a landed open: a reveal for an agent that did not open would scroll the
+      // column toward a row that is not going to be there.
+      //
+      // The anchor rides along so the row comes to the CURSOR (see components/anchoredScroll). A
+      // keyboard activation sends no anchor and keeps the old get-it-on-screen behaviour.
+      if (landed) useUiStore.getState().requestRevealAgent(agentId, { anchorY });
+      return landed;
     },
     [],
   );
@@ -1534,8 +1571,14 @@ export function ConciergeHost({
       ui.showAllStatusBands();
       ui.expandOrchestrators([a.parentRowId]);
     }
-    openProjectTab(a.projectId, a.id);
+    // RETURNED, not discarded. `openProjectTab` reports a miss (unknown project, or an agent that
+    // closed between the render and the click) by returning false, silently — and every caller that
+    // suppresses the pill's own live notice on the grounds that "the caller reports the outcome" is
+    // relying on this value existing (roborev 56068).
+    return openProjectTab(a.projectId, a.id);
   }, []);
+
+
 
   /** Is this agent still in the feed? Absence IS "closed / deleted / project unloaded". */
   const agentStillExists = useCallback(
@@ -1586,8 +1629,15 @@ export function ConciergeHost({
   // `collapsed` is a long payload the line is ABOUT (a relayed brief), carried as a block so the
   // thread can draw it as a pill instead of inlining it — see ConciergeSparkleMessage.collapsed for
   // why the sentence and the payload are two fields.
-  const postSparkle = useCallback((text: string, collapsed?: TextBlock) => {
-    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text, collapsed }]);
+  // TAKES A `Line`, NOT A STRING — and that is the whole enforcement, so it must not be widened.
+  //
+  // Every line here names an agent, and a name the reader cannot click is a dead end: the same agent
+  // named by the concierge's BRAIN one line above IS a pill, because the persona is instructed to
+  // emit `[@Name](sparkle-agent:<id>)` and the app was instructed nothing. A `string` parameter is
+  // what let twenty-five call sites interpolate `${a.name}`; a `Line` cannot be built without going
+  // through `line`, and `line` will not interpolate anything but a `Slot`. See Concierge/conciergeLine.
+  const postSparkle = useCallback((l: Line, collapsed?: TextBlock) => {
+    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text: l.md, collapsed }]);
     // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
     // sends to the same pinned agent produce the same line twice; both must be announced.
     //
@@ -1595,8 +1645,40 @@ export function ConciergeHost({
     // the pill fixes: a screen reader handed the forty rows of a relayed brief has to sit through all
     // of them to learn that a message went out, and there is no scrolling past a live region. The
     // payload is reachable on demand (the pill's modal); it is never spoken on arrival.
-    announce(text);
+    //
+    // `.spoken`, NOT `.md` — the announcer is the "third consumer" agentRefs.ts warns about, and it
+    // is paid here. A live region handed `[@Kraken Auth](sparkle-agent:9f3c…)` reads the uuid aloud
+    // and cannot be scrolled past. `.spoken` is exactly the sentence this announced before pills, so
+    // nothing a screen-reader user hears changes.
+    announce(l.spoken);
   }, [announce]);
+
+  /**
+   * Reveal an agent BY ID and say so when it cannot be revealed.
+   *
+   * This is what `AgentPill`'s `onOpen` contract actually requires: supplying `onOpen` suppresses
+   * the pill's own `role="status"` notice, so whatever is supplied has to take over the reporting or
+   * the click becomes the silent dead end the pill was built to eliminate. Two ways to miss, and
+   * before this they were both silent — the id no longer resolving in the feed, and the reveal
+   * itself not landing because the agent closed between the render and the click.
+   *
+   * `postSparkle` rather than a bare `announce`: the line lands in the transcript AND is spoken, so
+   * the outcome is visible to a reader who is looking at the column rather than only to one using a
+   * screen reader.
+   */
+  const revealAgentById = useCallback(
+    (agentId: string, fallbackName?: string) => {
+      const a = resolveAgent(agentId);
+      if (a && revealAgent(a)) return;
+      const named = a ?? (fallbackName ? { id: agentId, name: fallbackName } : null);
+      postSparkle(
+        named
+          ? line`${ref(named)} isn't open any more, so there's nothing to show you.`
+          : flat("That agent isn't open any more, so there's nothing to show you."),
+      );
+    },
+    [resolveAgent, revealAgent, postSparkle],
+  );
 
   // ── Return-from-Away recap (design §3 A5) ────────────────────────────────────────────────────
   // Snapshot the fleet's statuses the moment presence goes Away; on the way back, diff and post one
@@ -1696,7 +1778,7 @@ export function ConciergeHost({
       approvingRef.current.add(a.id);
       // Acknowledge the click NOW. The dispatch may sit behind a routing send for seconds, and a
       // button that does nothing visible invites the second click the guard above just swallowed.
-      postSparkle(`Approving ${a.name}…`);
+      postSparkle(line`Approving ${ref(a)}…`);
       try {
         // Through the SAME queue as every other user-initiated PTY write. Approve is one click away
         // at all times, so an un-queued Approve while a compose send was still routing wrote
@@ -1720,11 +1802,11 @@ export function ConciergeHost({
           null,
         );
         if (r === "threw") {
-          postSparkle(`I couldn't reach ${a.name}'s terminal to approve.`);
+          postSparkle(line`I couldn't reach ${ref(a)}'s terminal to approve.`);
           return;
         }
         if (!r) {
-          postSparkle(`I couldn't send the approval to ${a.name}.`);
+          postSparkle(line`I couldn't send the approval to ${ref(a)}.`);
           return;
         }
         // "queued" is ok:true but NOT delivered — say so rather than claiming it was sent. The `ok`
@@ -1735,11 +1817,11 @@ export function ConciergeHost({
           // Carries no files, but DOES emit a deferred outcome — so it takes a slot in the hold
           // queue, or its outcome would pop the batch belonging to a later send (roborev 52969).
           holdAttachments(a.id, []);
-          postSparkle(`${a.name} is still starting up — I'll approve as soon as it's ready.`);
-        } else if (r.ok) postSparkle(`Approved — sent to ${a.name}.`);
-        else postSparkle(refusalCopy(refusedPath(r), a.name, "approval"));
+          postSparkle(line`${ref(a)} is still starting up — I'll approve as soon as it's ready.`);
+        } else if (r.ok) postSparkle(line`Approved — sent to ${ref(a)}.`);
+        else postSparkle(refusalCopy(refusedPath(r), a, "approval"));
       } catch {
-        postSparkle(`I couldn't reach ${a.name}'s terminal to approve.`);
+        postSparkle(line`I couldn't reach ${ref(a)}'s terminal to approve.`);
       } finally {
         approvingRef.current.delete(a.id);
       }
@@ -1804,7 +1886,7 @@ export function ConciergeHost({
           // Held, not delivered: keep the files with the promise, so a hold that never lands can
           // give them back instead of quietly costing the user the picking (roborev 51594).
           holdAttachments(target.agentId, staged);
-          postSparkle(`${target.name} is still starting up — I'll send that the moment it's ready.`);
+          postSparkle(line`${ref(asAgent(target))} is still starting up — I'll send that the moment it's ready.`);
           return true;
         }
         // `matchedLabel` is OPTIONAL on the result, so interpolating it unguarded would render the
@@ -1820,19 +1902,19 @@ export function ConciergeHost({
         if (r.ok && r.path === "picker-option") {
           postSparkle(
             r.matchedLabel
-              ? `${target.name} was asking something — I answered "${r.matchedLabel}".`
-              : `${target.name} was asking something — I answered it.`,
+              ? line`${ref(asAgent(target))} was asking something — I answered "${plain(r.matchedLabel)}".`
+              : line`${ref(asAgent(target))} was asking something — I answered it.`,
           );
           return true;
         }
         if (r.ok) {
-          if (announceSuccess) postSparkle(`Sent to ${target.name}.`);
+          if (announceSuccess) postSparkle(line`Sent to ${ref(asAgent(target))}.`);
           return true;
         }
-        postSparkle(refusalCopy(refusedPath(r), target.name, "prompt"));
+        postSparkle(refusalCopy(refusedPath(r), asAgent(target), "prompt"));
         return false;
       } catch {
-        postSparkle(`I couldn't reach ${target.name}'s terminal.`);
+        postSparkle(line`I couldn't reach ${ref(asAgent(target))}'s terminal.`);
         return false;
       }
     },
@@ -1845,7 +1927,16 @@ export function ConciergeHost({
   useEffect(
     () =>
       onDeferredSendOutcome((r) => {
-        const name = allAgents(feedRef.current).find((a) => a.id === r.agentId)?.name ?? "that agent";
+        // THE RECEIPT NAMES THE AGENT AS A PILL — this is the line the founder caught. It reads
+        // "<Name> is up — I sent your message (…)", and until now that name was bare text while the
+        // very same agent, named by the concierge's brain a line above, was clickable.
+        //
+        // Resolved from the feed, so the id travels with the name. When the agent is NO LONGER in
+        // the feed there is no id to carry and the copy falls back to the words it always used —
+        // "that agent" — rather than inventing a reference. A pill carrying a guessed id opens the
+        // wrong agent and the reader cannot tell, which is strictly worse than no pill.
+        const found = allAgents(feedRef.current).find((a) => a.id === r.agentId);
+        const who = found ? ref(found) : plain("that agent");
         // The files that rode this held send: handed back when it never landed, dropped when it
         // did. Taken either way so the queue can't outlive the promise it belongs to.
         const held = takeHeldAttachments(r.agentId);
@@ -1868,8 +1959,11 @@ export function ConciergeHost({
         // RELAY_QUOTE_CHARS and the countdown banner elides to MAX_QUOTED_CHARS. Short payloads —
         // every one this arm was written for — come through byte-identical, so the wording the tests
         // pin is untouched; what changes is that a long one can no longer run away with the column.
-        const line = shown ? oneLine(shown) : "";
-        const quoted = shown ? ` ("${elideQuote(line)}")` : "";
+        // Named `flattened`, not `line` — `line` is the concierge line-builder imported above, and a
+        // local of that name shadows it for the rest of this closure, which is exactly where the
+        // receipt sentence is composed.
+        const flattened = shown ? oneLine(shown) : "";
+        const quoted = shown ? ` ("${elideQuote(flattened)}")` : "";
         // ONE DECISION, NOT TWO. The elide threshold and the pill threshold are independent numbers, and
         // read as two decisions they leave a band between them where the quote is CUT and nothing rides
         // along: a three-line, 300-character relayed instruction is under `shouldPasteAsPill` but well
@@ -1881,7 +1975,7 @@ export function ConciergeHost({
         // still governs the case the pill was designed for (a paste that would flood the column); this
         // second clause is what makes the invariant hold with no gap.
         const collapsed =
-          shown && (shouldPasteAsPill(shown) || line.length > OUTCOME_QUOTE_CHARS)
+          shown && (shouldPasteAsPill(shown) || flattened.length > OUTCOME_QUOTE_CHARS)
             ? collapseText(nextId("pill"), shown)
             : undefined;
         // Each non-delivery says what actually happened; a wrong reason is its own small lie
@@ -1892,10 +1986,10 @@ export function ConciergeHost({
         // specific claim, and letting any future path fall into it (say abandonPendingSends grows
         // an `agent-failed` emit) is how 46485-M happened the first time. An unknown path gets a
         // reason it can always stand behind (roborev 53162).
-        if (r.ok) postSparkle(`${name} is up — I sent your message${quoted}.`, collapsed);
-        else if (r.path === "expired") postSparkle(`${name} never came up, so I dropped the message I was holding${quoted}. Send it again when it's running.`, collapsed);
-        else if (r.path === "abandoned") postSparkle(`${name} couldn't take the message I was holding${quoted}. Send it again once it's running.`, collapsed);
-        else if (r.path === "pty-gone") postSparkle(`${name}'s terminal closed before I could send the message I was holding${quoted}.`, collapsed);
+        if (r.ok) postSparkle(line`${who} is up — I sent your message${plain(quoted)}.`, collapsed);
+        else if (r.path === "expired") postSparkle(line`${who} never came up, so I dropped the message I was holding${plain(quoted)}. Send it again when it's running.`, collapsed);
+        else if (r.path === "abandoned") postSparkle(line`${who} couldn't take the message I was holding${plain(quoted)}. Send it again once it's running.`, collapsed);
+        else if (r.path === "pty-gone") postSparkle(line`${who}'s terminal closed before I could send the message I was holding${plain(quoted)}.`, collapsed);
         // LEXICALLY distinct from the `abandoned` arm — "didn't", not "couldn't". Identical copy
         // silently un-pinned that arm once (roborev 53187), and merely dropping its remedy clause
         // left this string a strict PREFIX of it, so the two were separable only by a `$` anchor in
@@ -1907,7 +2001,7 @@ export function ConciergeHost({
         // "send it again once it's running" would be an instruction that never comes true. Those
         // two are the known paths still routed here; neither reaches this listener today, and if
         // one starts to, it should get its own arm with its own remedy rather than this bare line.
-        else postSparkle(`${name} didn't take the message I was holding${quoted}.`, collapsed);
+        else postSparkle(line`${who} didn't take the message I was holding${plain(quoted)}.`, collapsed);
       }),
     [postSparkle, takeHeldAttachments, restoreAttachments],
   );
@@ -2056,7 +2150,7 @@ export function ConciergeHost({
       const addressable = addressed && !!aim && canAcceptInput;
       if (addressed && !addressable) {
         postSparkle(
-          `${mentionAim.target.name} can't take a message right now, so I've kept this here instead.`,
+          line`${ref(asAgent(mentionAim.target))} can't take a message right now, so I've kept this here instead.`,
         );
       }
       // An address with NOTHING TO SAY is not a send. "@Kraken Auth" on its own strips to an empty
@@ -2064,7 +2158,7 @@ export function ConciergeHost({
       // agent's prompt. It is also almost certainly not what the user meant, so the concierge asks
       // rather than either guessing or silently doing nothing.
       if (addressable && mentionAim.text.trim() === "" && staged.length === 0) {
-        postSparkle(`You've got ${mentionAim.target.name} in mind — what should I send over?`);
+        postSparkle(line`You've got ${ref(asAgent(mentionAim.target))} in mind — what should I send over?`);
         setReceipt(id, {
           target: "sparkle",
           agentName: aim?.name,
@@ -2155,7 +2249,11 @@ export function ConciergeHost({
               // happen — the same re-check `deliver` does around the route call, for the same
               // reason and over a much wider gap.
               if (!agentStillExists(aim.agentId)) {
-                postSparkle(`${aim.name} isn't open any more, so I didn't send that.`);
+                // STILL A PILL, even though the agent is gone. The id is real — it is the agent
+                // that closed, not the reference — so the pill resolves to its known-closed state,
+                // which names it and offers the route to what it did. That is strictly more than
+                // the bare text said.
+                postSparkle(line`${ref(asAgent(aim))} isn't open any more, so I didn't send that.`);
                 restoreDraft(text);
                 restoreAttachments(staged);
                 return false;
@@ -2220,7 +2318,7 @@ export function ConciergeHost({
           // message and re-stage files the pending send is still holding.
           onQueue: () => {
             postSparkle(
-              `That looked like it could break something and you were away, so I'm holding it rather than sending it to ${aim.name}. I'll bring it back when you return.`,
+              line`That looked like it could break something and you were away, so I'm holding it rather than sending it to ${ref(asAgent(aim))}. I'll bring it back when you return.`,
             );
           },
           // Back from the queue and in front of the user again. Feed the column's ONE live region:
@@ -2234,7 +2332,7 @@ export function ConciergeHost({
             // nothing, or they learn not to use the button.
             restoreDraft(text);
             restoreAttachments(staged);
-            postSparkle(`Okay — I didn't send that to ${aim.name}.`);
+            postSparkle(line`Okay — I didn't send that to ${ref(asAgent(aim))}.`);
           },
         });
         // Feed the column's ONE live region (see setReceipt): a countdown a screen-reader user
@@ -2587,9 +2685,13 @@ export function ConciergeHost({
               ? { projectId: "", agentId: promised, name: receipt.agentName }
               : null;
         if (!aim || !agentStillExists(promised)) {
-          postSparkle(
-            `${receipt.agentName ?? "That agent"} isn't open any more, so I couldn't pass the message along.`,
-          );
+          // The receipt remembers BOTH halves, so the agent it promised stays clickable even now
+          // that it is closed. Only a receipt missing one of them falls back to the bare words.
+          const who =
+            promised && receipt.agentName
+              ? ref({ id: promised, name: receipt.agentName })
+              : plain("That agent");
+          postSparkle(line`${who} isn't open any more, so I couldn't pass the message along.`);
           return;
         }
         // Through the queue: a redirect clicked while a compose send is still routing must land
@@ -2691,12 +2793,18 @@ export function ConciergeHost({
         else ui.isolateStatusBand("needs_you");
       },
       onProjectClick: (projectId: string) => openProjectTab(projectId),
+      // Same destination as onNudgeClick, keyed on an id — the recap card's pills. `revealAgent`
+      // reports through the column's one announcer, which is what lets those pills suppress the
+      // live region they would otherwise each mount.
+      onRevealAgent: (agentId: string) => revealAgentById(agentId),
       onNudgeClick: (n: ConciergeNudge) => {
-        const a = resolveAgent(n.id);
-        // `revealAgent`, not a bare `openProjectTab`: a singleton nested-rowless agent keeps a CARD,
-        // and its card click hits exactly the collapse/filter gates the digest line's click had to
-        // learn about (roborev 53737).
-        if (a) revealAgent(a);
+        // THROUGH THE REPORTING PATH. The nudge card's pill also supplies `onOpen`, so it also
+        // suppresses its own notice — a card whose agent closed under it used to swallow the click
+        // entirely (roborev 56068). The card carries the name, so a vanished id can still be named.
+        // Still `revealAgent` underneath, not a bare `openProjectTab`: a singleton nested-rowless
+        // agent keeps a CARD, and its card click hits exactly the collapse/filter gates the digest
+        // line's click had to learn about (roborev 53737).
+        revealAgentById(n.id, n.agentName);
       },
       // The digest's whole purpose: hand off to column two instead of duplicating it.
       //
@@ -2842,10 +2950,12 @@ export function ConciergeHost({
       },
     }),
     // `play` is absent on purpose: voice OUTPUT (TTS) was removed in §5, so main's `play` dep does
-    // not survive the merge. `revealAgent` is main's, and stays.
+    // not survive the merge. `revealAgentById` is what the card surfaces call now — it wraps
+    // `resolveAgent` + `revealAgent` and adds the reporting they were missing — so it is the
+    // identity this memo has to track.
     [
       resolveAgent,
-      revealAgent,
+      revealAgentById,
       approve,
       sendFromComposer,
       redirect,
