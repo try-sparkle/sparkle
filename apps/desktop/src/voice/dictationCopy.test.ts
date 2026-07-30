@@ -363,6 +363,24 @@ describe("voiceErrorNotice — the rendered copy for each bucket", () => {
     expect(n.detail).not.toContain("System Settings");
   });
 
+  it("the unsupported-format remedy names the picker too — the LAST bucket still sent to System Settings", () => {
+    // roborev 55413. This bucket was left behind by the first audit pass, defended in a comment
+    // saying the picker "has nothing better to offer" because the chosen device cannot be opened at
+    // all. That reasoning does not hold: an unsupported sample format is a property of ONE device
+    // and says nothing about the others, which is exactly when a picker helps.
+    //
+    // Driven by the REAL producer's sentence rather than a fixture — audio.rs's only raiser is
+    // `format!("unsupported sample format: {other}")`, and it fires for the device
+    // `resolve_device(choice)` already bound, i.e. Sparkle's own selection. A pinned UID ignores
+    // kAudioHardwarePropertyDefaultInputDevice outright and auto_select prefers a physical input
+    // over it, so changing the OS default cannot rebind capture off the failing device.
+    const REAL = "unsupported sample format: u8";
+    expect(classifyVoiceError(REAL)).toBe("unsupported-format");
+    const n = voiceErrorNotice(REAL)!;
+    expect(n.detail).toMatch(/mic menu/i);
+    expect(n.detail).not.toContain("System Settings");
+  });
+
   it("falls back to the RAW string when the device name can't be parsed out", () => {
     // If the backend rewords past the quoted-device shape, the parse fails. Show the raw sentence
     // rather than authoring a confident remedy that omits the only detail that mattered — the same

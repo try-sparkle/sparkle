@@ -48,6 +48,19 @@ interface AudioInputState {
    *  grant deliberately does not apply optimistically. Cleared by a success or any revoke. */
   grantFailed: boolean;
 
+  /**
+   * A GRANT round-trip is outstanding. Deduplicates the impatient second click, which would
+   * otherwise fire a second grant against the same {@link intentEpoch} (roborev 55351).
+   *
+   * IN THE STORE, not a module-level `let` in audioInputs.ts, and that is a testing property rather
+   * than a rendering one. As module state it had no reset path reachable from outside the module,
+   * so any test leaving a grant unsettled — the natural shape for testing pending behaviour — made
+   * every later `setAllowVirtualInput(true)` in that file a silent no-op, and the tests after it
+   * passed VACUOUSLY against state a previous test had left behind (roborev 55411). Here the
+   * suite's existing `setState` reset clears it like any other field.
+   */
+  grantPending: boolean;
+
   setDevices: (devices: AudioInput[]) => void;
   /** Apply the BACKEND's persisted view. Does not bump {@link intentEpoch} — it is not an intent,
    *  and bumping here would make every refresh look like a user action to the next refresh. */
@@ -56,6 +69,7 @@ interface AudioInputState {
   setAllowVirtual: (allow: boolean) => void;
   setBound: (bound: BoundDevice | null) => void;
   setGrantFailed: (failed: boolean) => void;
+  setGrantPending: (pending: boolean) => void;
 }
 
 export const useAudioInputStore = create<AudioInputState>()((set) => ({
@@ -68,6 +82,7 @@ export const useAudioInputStore = create<AudioInputState>()((set) => ({
   bound: null,
   intentEpoch: 0,
   grantFailed: false,
+  grantPending: false,
 
   setDevices: (devices) => set({ devices }),
   setSettings: ({ chosenUid, allowVirtual }) => set({ chosenUid, allowVirtual }),
@@ -75,4 +90,5 @@ export const useAudioInputStore = create<AudioInputState>()((set) => ({
   setAllowVirtual: (allowVirtual) => set((s) => ({ allowVirtual, intentEpoch: s.intentEpoch + 1 })),
   setBound: (bound) => set({ bound }),
   setGrantFailed: (grantFailed) => set({ grantFailed }),
+  setGrantPending: (grantPending) => set({ grantPending }),
 }));

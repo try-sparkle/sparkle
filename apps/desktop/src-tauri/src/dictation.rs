@@ -1884,8 +1884,7 @@ fn fault_action(
 }
 
 /// What we tell the user when the re-acquire could not rebuild a capture AT ALL, so there is no
-/// device to name. A constant rather than an inline literal so the test that audits the remedy is
-/// asserting the exact bytes the Report arm emits (roborev 55360).
+/// device to name. Say exactly that rather than inventing one.
 ///
 /// Same remedy rule as [`no_audio_message`]: it must name a control that exists AND works. This arm
 /// was missed on the first audit pass and still said "check System Settings → Sound → Input", which
@@ -1894,6 +1893,54 @@ fn fault_action(
 const NO_CAPTURE_MESSAGE: &str =
     "Sparkle couldn't open a microphone. Connect one, then pick it in Sparkle's mic menu \
      (hover the mic).";
+
+/// The whole of what [`FaultAction::Report`] says, for both device states.
+fn watchdog_report_message(device: Option<&crate::audio::BoundDevice>, muted: bool) -> String {
+    match device {
+        Some(d) => no_audio_message(d, muted),
+        None => NO_CAPTURE_MESSAGE.to_string(),
+    }
+}
+
+/// What one watchdog tick sends to the frontend — as DATA, so the entire mapping is unit-testable.
+///
+/// EXISTS BECAUSE THE PREVIOUS SHAPE COULD NOT BE TESTED AT ITS SIDE EFFECT. `watchdog_tick` needs
+/// an `AppHandle` to emit and an `AppHandle` cannot be built in a unit test, so the emit decisions
+/// lived inside a function no test could call. Hoisting `NO_CAPTURE_MESSAGE` into a constant was
+/// meant to fix that and did not: the test read the CONSTANT, which is a precondition, not the
+/// output — reverting the arm to an inline "check System Settings → Sound → Input" literal left the
+/// constant merely unreferenced and the test still green, so the user-visible regression survived
+/// the mutation it was written to catch (roborev 55413, and AGENTS.md's "assert the side effect").
+///
+/// With the decision returned as a value, a test drives the real mapping: which actions speak at
+/// all, which event each one sends, and the exact bytes of the payload. What is left at the call
+/// site is one `match` that emits the variant it is handed and holds no copy of its own — so the
+/// silent-nag and silent-failure regressions (a `Reacquire` that nags the user, a `Report` that
+/// says nothing and reproduces the nine-minute silence) are now caught here rather than in
+/// production.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogEmission {
+    /// Say nothing. A re-acquire is a SILENT recovery attempt on purpose — the user should never be
+    /// told about a hiccup that fixed itself.
+    Silent,
+    /// `dictation://error`, carrying exactly this body.
+    Error(String),
+    /// `dictation://audio-recovered`, which carries no payload — it retracts a notice rather than
+    /// adding one.
+    Recovered,
+}
+
+fn watchdog_emission(
+    action: FaultAction,
+    device: Option<&crate::audio::BoundDevice>,
+    muted: bool,
+) -> WatchdogEmission {
+    match action {
+        FaultAction::Idle | FaultAction::Reacquire => WatchdogEmission::Silent,
+        FaultAction::Report => WatchdogEmission::Error(watchdog_report_message(device, muted)),
+        FaultAction::Recovered => WatchdogEmission::Recovered,
+    }
+}
 
 /// The user-facing message for a capture that is not hearing anything.
 ///
@@ -2093,19 +2140,6 @@ impl DictationState {
                     "no audio from the bound input device; telling the user"
                 );
                 self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reported = true;
-                let message = match &device {
-                    Some(d) => no_audio_message(d, muted),
-                    // The re-acquire could not rebuild a capture at all, so there is no device to
-                    // name. Say exactly that rather than inventing one.
-                    //
-                    // Same remedy rule as `no_audio_message`, and this arm was missed on the first
-                    // pass (roborev 55360): it said "check System Settings → Sound → Input", which
-                    // provably cannot rebind Sparkle — this branch stopped following the system
-                    // default. Worse, the string matches no frontend bucket in `dictationCopy`, so
-                    // it falls to `unknown` and is rendered to the user VERBATIM.
-                    None => NO_CAPTURE_MESSAGE.to_string(),
-                };
-                let _ = app.emit("dictation://error", message);
             }
             FaultAction::Recovered => {
                 tracing::info!(
@@ -2114,6 +2148,17 @@ impl DictationState {
                     "audio is arriving again"
                 );
                 self.0.lock().unwrap_or_else(|p| p.into_inner()).clear_audio_fault();
+            }
+        }
+        // EVERY user-visible output of this tick, decided in one tested place and dispatched here.
+        // This site holds no copy and makes no choice about who gets told what — see
+        // `WatchdogEmission` for why that separation is the point rather than tidiness.
+        match watchdog_emission(action, device.as_ref(), muted) {
+            WatchdogEmission::Silent => {}
+            WatchdogEmission::Error(message) => {
+                let _ = app.emit("dictation://error", message);
+            }
+            WatchdogEmission::Recovered => {
                 let _ = app.emit("dictation://audio-recovered", ());
             }
         }
@@ -2883,7 +2928,7 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 #[cfg(test)]
 mod tests {
     use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
-        missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, NO_CAPTURE_MESSAGE,
+        missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, watchdog_emission, WatchdogEmission,
         begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
@@ -3680,8 +3725,15 @@ mod tests {
         // dictationCopy (`no-audio` needs "no audio from", `no-device` needs a literal "no
         // microphone"), so it falls through to `unknown` and is shown to the user VERBATIM.
         //
-        // Asserted against the constant the Report arm actually emits, so the two cannot drift.
-        let msg = NO_CAPTURE_MESSAGE;
+        // THROUGH `watchdog_emission`, which IS the tick's user-visible output — not through
+        // `NO_CAPTURE_MESSAGE`, which is what this test used to read (roborev 55413). Asserting the
+        // constant proved nothing: it is a precondition, not an output, so reverting the emitting
+        // arm to an inline "System Settings → Sound → Input" literal left the constant merely
+        // unreferenced and this test still green while the regression shipped.
+        let WatchdogEmission::Error(msg) = watchdog_emission(FaultAction::Report, None, false)
+        else {
+            panic!("a Report with no device bound must still TELL the user something");
+        };
         assert!(
             msg.contains("mic menu"),
             "the no-device report must point at the picker that can actually rebind: {msg}"
@@ -3689,6 +3741,52 @@ mod tests {
         assert!(
             !msg.contains("System Settings"),
             "changing the OS default cannot rebind Sparkle: {msg}"
+        );
+
+        // The other device state, through the same entry point: when a device IS bound the report
+        // must NAME it. Picking the wrong branch is silent — both are plausible English.
+        let bound = crate::audio::BoundDevice {
+            name: "ZoomAudioDevice".into(),
+            uid: None,
+            is_virtual: true,
+            was_default: true,
+        };
+        let WatchdogEmission::Error(named) =
+            watchdog_emission(FaultAction::Report, Some(&bound), false)
+        else {
+            panic!("a Report with a device bound must tell the user something");
+        };
+        assert!(
+            named.contains("ZoomAudioDevice"),
+            "a bound device must be NAMED — that fact is the whole value of the report: {named}"
+        );
+    }
+
+    #[test]
+    fn only_a_REPORT_speaks_to_the_user_and_a_RECOVERY_retracts() {
+        // The half the old constant-reading test could not see at all: WHICH actions produce output.
+        // Both directions here are shipped regressions in miniature — a Report that goes silent is
+        // the nine-minute dead-mic incident, and a Reacquire that speaks nags the user about a
+        // hiccup that fixed itself, training them to ignore the one notice that matters.
+        let quiet = [FaultAction::Idle, FaultAction::Reacquire];
+        for action in quiet {
+            assert_eq!(
+                watchdog_emission(action, None, false),
+                WatchdogEmission::Silent,
+                "{action:?} is a silent internal step; the user must not be told about it"
+            );
+        }
+        assert!(
+            matches!(
+                watchdog_emission(FaultAction::Report, None, false),
+                WatchdogEmission::Error(_)
+            ),
+            "a Report is the ONLY thing that surfaces a fault — going quiet here is the incident"
+        );
+        assert_eq!(
+            watchdog_emission(FaultAction::Recovered, None, false),
+            WatchdogEmission::Recovered,
+            "recovery must RETRACT the notice; sending an error here would leave it up forever"
         );
     }
 

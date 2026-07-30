@@ -265,13 +265,40 @@ describe("AudioInputPicker — binding to system audio is opt-in", () => {
 
     fireEvent.click(screen.getByRole("checkbox", { name: ALLOW_VIRTUAL_LABEL }));
 
+    // The UI reflects what the backend actually believes, so the two cannot disagree about who is
+    // allowed to be captured.
+    await waitFor(() => {
+      expect(screen.getByRole("checkbox", { name: ALLOW_VIRTUAL_LABEL }).getAttribute("aria-checked")).toBe(
+        "true",
+      );
+    });
+    // AND NO FAILURE BANNER. This test used to assert the opposite, which pinned a screen showing
+    // a checked box, the "allowed" banner and "Couldn't confirm this — check the box again" all at
+    // once (roborev 55411). The contradiction is not merely confusing: the checkbox's only handler
+    // is a toggle, so obeying that instruction on a checked box REVOKES the grant the reconcile
+    // just confirmed had landed.
+    expect(screen.queryByText(ALLOW_VIRTUAL_FAILED)).toBeNull();
+  });
+
+  it("but DOES say so when the backend will not confirm either way", async () => {
+    // The other half of the reconcile, and the reason the banner still exists. No evidence the
+    // grant landed → fail closed AND tell the user, because a silently unticked box is
+    // indistinguishable from never having clicked.
+    await renderPicker();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_audio_inputs") return Promise.resolve(devices);
+      return Promise.reject(new Error("backend is gone"));
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: ALLOW_VIRTUAL_LABEL }));
+
     await waitFor(() => {
       expect(screen.getByText(ALLOW_VIRTUAL_FAILED)).toBeTruthy();
     });
-    // The UI reflects what the backend actually believes, so the two cannot disagree about who is
-    // allowed to be captured.
+    // Here "check the box again" is safe advice: the box is UNCHECKED, so following it retries the
+    // grant instead of undoing one.
     expect(screen.getByRole("checkbox", { name: ALLOW_VIRTUAL_LABEL }).getAttribute("aria-checked")).toBe(
-      "true",
+      "false",
     );
   });
 

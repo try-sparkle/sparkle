@@ -246,8 +246,8 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
       // Sending someone to change the OS default can leave capture on the very device this notice
       // just named. The picker is the only control that actually rebinds.
       //
-      // `unsupported-format` still points at System Settings: the chosen device cannot be opened at
-      // all, so the picker has nothing better to offer. `no-device` does NOT — see its own branch.
+      // `no-device` and `unsupported-format` reach the same conclusion in their own branches; the
+      // whole bucket set now names the picker, and only mute still names System Settings.
       const device = noAudioDevice(text);
       return {
         kind,
@@ -282,7 +282,16 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
       return {
         kind,
         headline: "This microphone's audio format isn't supported.",
-        detail: "Pick a different input device in System Settings → Sound, then turn the mic back on.",
+        // The last bucket left on "System Settings → Sound", and the exception was reasoned
+        // wrongly (roborev 55413). The comment defending it said the picker "has nothing better to
+        // offer" because the device cannot be opened at all — but an unsupported sample format is a
+        // property of ONE device and says nothing about the others, so offering another one is
+        // exactly what helps. The producer is `audio.rs`'s "unsupported sample format: {other}",
+        // raised for the device `resolve_device` already bound, i.e. Sparkle's OWN selection: a
+        // pinned UID ignores the system default outright and `auto_select` prefers a physical input
+        // over it, so changing the OS default cannot rebind capture away from the failing device.
+        detail:
+          "Hover the mic and pick a different input in Sparkle's mic menu, then turn the mic back on.",
       };
     case "download":
       return {

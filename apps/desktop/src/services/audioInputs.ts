@@ -249,14 +249,18 @@ export async function setAllowVirtualInput(allow: boolean): Promise<void> {
   // fails and the other succeeds, the failure arm runs first, bumps the epoch via
   // setAllowVirtual(false), and the epoch guard then discards the SUCCESSFUL grant — leaving the
   // backend allowing virtual inputs while the UI says it is off (roborev 55351).
-  if (grantInFlight) {
+  //
+  // The flag lives in the STORE rather than a module-level `let` — see `grantPending` there for
+  // why. Read fresh from `getState()` on purpose: `store` above is a snapshot taken before any
+  // await, so it would report the value as of entry rather than as of now.
+  if (useAudioInputStore.getState().grantPending) {
     console.debug("audioInputs: ignoring a grant — one is already in flight");
     return;
   }
   // Clear the previous failure NOW, not on success: leaving it up for the whole retry window
   // recreates the exact "still going or will never work?" ambiguity this message exists to remove.
   store.setGrantFailed(false);
-  grantInFlight = true;
+  store.setGrantPending(true);
   const epoch = store.intentEpoch;
   try {
     await invoke("set_allow_virtual_input", { allow: true });
@@ -280,16 +284,25 @@ export async function setAllowVirtualInput(allow: boolean): Promise<void> {
     // backend what it actually believes, and fail CLOSED only when it will not say.
     const actual = await getAudioInputSettings();
     if (useAudioInputStore.getState().intentEpoch !== epoch) return;
-    store.setAllowVirtual(actual?.allowVirtual ?? false);
-    store.setGrantFailed(true);
+    // CONFIRMED means the grant LANDED — do not then report it as failed.
+    //
+    // Reporting failure here regardless is how the reconcile ended up contradicting itself on the
+    // one path where we have positive evidence (roborev 55411): the box renders CHECKED from
+    // `setAllowVirtual(true)`, the amber "non-microphone inputs are allowed" banner appears, and
+    // beside them sits a red "Couldn't confirm this — check the box again."
+    //
+    // That last sentence is the part that actually hurts. A remedy string is an instruction the
+    // user will follow (AGENTS.md, bead sparkle-8bvh), and the box's only handler is a TOGGLE — so
+    // someone obeying "check the box again" on an already-checked box REVOKES a grant that
+    // succeeded. The message meant for "we don't know" was being shown for "we do know, and it
+    // worked", where its remedy inverts the user's intent.
+    const confirmed = actual?.allowVirtual === true;
+    store.setAllowVirtual(confirmed);
+    store.setGrantFailed(!confirmed);
   } finally {
-    grantInFlight = false;
+    useAudioInputStore.getState().setGrantPending(false);
   }
 }
-
-/** Whether a GRANT round-trip is outstanding. Module-level because it guards a user gesture, not a
- *  render: two clicks land in two separate calls, and both must see the same flag. */
-let grantInFlight = false;
 
 /**
  * Pull the device list + settings into the store. Called when a picker opens (devices are hot-

@@ -59,7 +59,11 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockResolvedValue(undefined);
   for (const k of Object.keys(listeners)) delete listeners[k];
-  useAudioInputStore.setState({ devices: [], chosenUid: null, allowVirtual: false, bound: null, intentEpoch: 0, grantFailed: false });
+  // `grantPending` is reset here like any other field — which is the entire reason it lives in the
+  // store rather than in a module-level `let` (roborev 55411). As module state no `beforeEach`
+  // could reach it, so one test leaving a grant unsettled turned every later grant in this file
+  // into a silent no-op, and those tests then passed against state they had not produced.
+  useAudioInputStore.setState({ devices: [], chosenUid: null, allowVirtual: false, bound: null, intentEpoch: 0, grantFailed: false, grantPending: false });
 });
 
 describe("setAudioInput — the choice reaches the BACKEND, not just the store", () => {
@@ -227,7 +231,14 @@ describe("setAllowVirtualInput — the advanced opt-in reaches the backend", () 
     await setAllowVirtualInput(true);
 
     expect(useAudioInputStore.getState().allowVirtual).toBe(true);
-    expect(useAudioInputStore.getState().grantFailed).toBe(true);
+    // AND SAYS NOTHING FAILED, because nothing did. This assertion was `true` when the test was
+    // written, which pinned the contradiction rather than the fix (roborev 55411): a CHECKED box,
+    // the amber "non-microphone inputs are allowed" banner, and a red "Couldn't confirm this —
+    // check the box again" all at once. The banner's remedy is the dangerous half. The checkbox's
+    // only handler is a toggle, so a user following "check the box again" on a checked box REVOKES
+    // the grant the reconcile just proved had landed — a remedy that inverts the user's intent, the
+    // sparkle-8bvh failure mode. `grantFailed` may only mean "we could not confirm".
+    expect(useAudioInputStore.getState().grantFailed).toBe(false);
   });
 
   it("and still fails CLOSED when the backend will not say", async () => {
@@ -251,6 +262,31 @@ describe("setAllowVirtualInput — the advanced opt-in reaches the backend", () 
     useAudioInputStore.setState({ grantFailed: true });
     await setAllowVirtualInput(true);
     expect(useAudioInputStore.getState().grantFailed).toBe(false);
+  });
+
+  // THE PAIR BELOW IS ONE TEST IN TWO HALVES, and the order matters — it reproduces the leak the
+  // module-level flag caused. The first half deliberately abandons a grant mid-flight; the second
+  // half is the test that would have been silently disarmed by it.
+  it("marks a grant PENDING in the store — and this one is abandoned in flight, on purpose", async () => {
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "set_allow_virtual_input" ? new Promise(() => {}) : Promise.resolve(undefined),
+    );
+    void setAllowVirtualInput(true);
+    await Promise.resolve();
+    expect(useAudioInputStore.getState().grantPending).toBe(true);
+    // No settle, no await. The next test inherits whatever this one leaves behind.
+  });
+
+  it("...and the NEXT grant still reaches the backend, rather than hitting a stale in-flight flag", async () => {
+    // The assertion is on the outbound COMMAND, not on the store. That is the whole point: if the
+    // pending flag were unreachable module state, the abandoned grant above would still be sitting
+    // in it, this call would return at the dedupe guard having invoked NOTHING, and a store-only
+    // assertion would pass anyway off the value the previous test left. Pinning the invoke is what
+    // makes the vacuity visible (roborev 55411).
+    invoke.mockResolvedValue(undefined);
+    await setAllowVirtualInput(true);
+    expect(callsTo("set_allow_virtual_input")).toEqual([[{ allow: true }]]);
+    expect(useAudioInputStore.getState().allowVirtual).toBe(true);
   });
 
   it("a FAILED revoke still shuts the gate locally (strict is the safe direction)", async () => {
