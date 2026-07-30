@@ -9,6 +9,7 @@
 // The listener is window-level and capture-phase so ⌘K works from anywhere — including the
 // concierge compose box and a focused terminal (xterm swallows bubbling keys, not capture).
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { isRebinding } from "../../stores/keybindingsStore";
 
 export interface CommandPaletteController {
   /** Feed straight into CommandPalette's `open` prop. */
@@ -33,6 +34,10 @@ export function useCommandPalette(): CommandPaletteController {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Stand down while the Shortcuts pane is recording a binding. Same trap as ⌘, had: we are on
+      // `window` in capture and registered at Workspace mount, so the recorder's `stopPropagation()`
+      // cannot reach us and pressing ⌘K to record would open the palette on top of the pane.
+      if (isRebinding()) return;
       if (isPaletteShortcut(e)) {
         e.preventDefault();
         setOpen((v) => !v);

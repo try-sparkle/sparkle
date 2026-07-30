@@ -68,20 +68,32 @@ function mountBoth() {
   );
 }
 
+// QUERIED BY THE SLOT, NOT BY THE ACCESSIBLE NAME.
+//
+// These rows say "the shell mounts this control exactly once", and that claim has to be about THIS
+// control. `"Sparkle menu"` was a name only the kebab had; when it became a Settings button the
+// queries followed the new name — and `"Settings"` is generic. Any sibling that names itself Settings
+// (a gear in the tabs bar, a project-settings control — `onOpenProjectSettings` is right there in
+// these very renders) breaks the count, or worse satisfies `contains` for the wrong element and the
+// uniqueness claim silently becomes a claim about something else (roborev 55477).
+//
+// `data-hint="menu"` is the stable identifier for the shell slot, which is exactly what "mounted
+// once" is a statement about, and it survives the next rename of the button's label.
+const kebabs = () => document.querySelectorAll('[data-hint="menu"]');
+
 describe("the shell mounts the top-right cluster exactly ONCE", () => {
   it("renders one kebab with both the tabs bar and the concierge column up", () => {
     mountBoth();
-    expect(screen.getAllByRole("button", { name: "Sparkle menu" })).toHaveLength(1);
+    expect(kebabs()).toHaveLength(1);
   });
 
   it("…and it is the CONCIERGE's copy, not the tab bar's", () => {
     mountBoth();
-    const kebab = screen.getByRole("button", { name: "Sparkle menu" });
-    expect(screen.getByTestId("concierge-header").contains(kebab)).toBe(true);
+    expect(screen.getByTestId("concierge-header").contains(kebabs()[0]!)).toBe(true);
   });
 
   it("renders no kebab at all when the tabs bar is mounted alone", () => {
     render(<ProjectTabsBar feed={feed} onOpenProjectSettings={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: "Sparkle menu" })).toBeNull();
+    expect(kebabs()).toHaveLength(0);
   });
 });

@@ -11,7 +11,7 @@
 // These pin the RULE and the SUBSCRIPTION. That the three components actually call it is pinned
 // where they render — Workspace.cockpit / Workspace.resize for the root, and the sidebar's own
 // geometry suites for the joint.
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { effectiveWired } from "../engine/cable";
 import { useEffectiveWired, usePairIsLive } from "./useEffectiveWired";
@@ -37,7 +37,9 @@ function mkProject(id: string, selectedAgentId: string | null): Project {
 
 beforeEach(() => {
   resetCable();
-  useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never);
+  // `openProjectIds: null` is the pre-feature state and means "every project is open"
+  // (engine/openProjects) — the seed a fresh install has, so it is what these resolve against.
+  useUiStore.setState({ pairAssignment: {}, leftProjectId: null, openProjectIds: null } as never);
   useProjectStore.setState({ projects: [mkProject("p1", "p1-a1")], selectedProjectId: "p1" } as never);
 });
 
@@ -91,6 +93,55 @@ describe("useEffectiveWired — the subscription", () => {
       projects: [mkProject("p1", "p1-a1"), mkProject("p2", null)],
     } as never);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
+  });
+
+  it("asks about the side's SELECTED project, not the first one assigned to it", () => {
+    // THE FINDING (roborev 55490). The first cut resolved the far end with
+    // `projects.find(p => sideOf(assignment, p.id) === wired)` — the first project on that side, over
+    // ALL projects — while the shell renders from the side's SELECTED, OPEN project. `sideOf`
+    // defaults to "right", so the right pair routinely holds several. Here P1 sits first in the store
+    // with a live selection and P2 is the SELECTED project with its last agent closed: the shell
+    // draws nothing on the far end, and the projection must agree.
+    useProjectStore.setState({
+      projects: [mkProject("p1", "p1-a1"), mkProject("p2", null)],
+      selectedProjectId: "p2",
+    } as never);
+    useCableStore.getState().patch("right");
+    expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
+
+    // And the inverse, which the `find` got wrong in the other direction: P1 emptied, selected P2
+    // live. Everything drew off while the circuit was real.
+    useProjectStore.setState({
+      projects: [mkProject("p1", null), mkProject("p2", "p2-a1")],
+      selectedProjectId: "p2",
+    } as never);
+    expect(renderHook(() => useEffectiveWired()).result.current).toBe("right");
+  });
+
+  it("ignores a project whose tab is CLOSED, the way the shell does", () => {
+    // Closed projects stay in `projects` — closing a tab is a view operation that keeps the panes and
+    // PTYs alive — so a projection that reads the raw list answers about a project with no tab.
+    useProjectStore.setState({
+      projects: [mkProject("p1", "p1-a1"), mkProject("p2", null)],
+      selectedProjectId: "p2",
+    } as never);
+    useUiStore.setState({ openProjectIds: ["p2"] } as never);
+    useCableStore.getState().patch("right");
+    expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
+  });
+
+  it("REACTS to the pair assignment changing, not just to its value at mount", () => {
+    // The assignment was read imperatively through `getState()` inside the projectStore selector, so
+    // the hook joined three stores and woke on two. `ConciergeHost` subscribes to no pair state of
+    // its own, so it kept a stale snapshot and stayed flooded while the root went off — roborev
+    // 55386's contradiction, one store later (roborev 55490).
+    useCableStore.getState().patch("right");
+    const { result } = renderHook(() => useEffectiveWired());
+    expect(result.current).toBe("right");
+
+    // Move the right pair's only project to the LEFT pair. No cable write, no project write.
+    act(() => useUiStore.setState({ pairAssignment: { p1: "left" } } as never));
+    expect(result.current).toBe("off");
   });
 
   it("gives every surface the SAME answer — that is the whole point", () => {

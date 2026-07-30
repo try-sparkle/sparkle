@@ -28,6 +28,17 @@ interface KeybindingsState {
   bindings: Record<ShortcutId, KeyBinding>;
   setBinding: (id: ShortcutId, binding: KeyBinding) => void;
   resetBinding: (id: ShortcutId) => void;
+  /** Which shortcut the "Press a key…" UI is currently recording, or null.
+   *
+   *  Lives in the store rather than as KeyboardShortcutsMenu's local state because GLOBAL chord
+   *  handlers have to be able to stand down while a capture is live, and they cannot see a
+   *  component's `useState`. The capture handler's own `stopPropagation()` is not enough: it is on
+   *  `window` in the capture phase, and so are the global handlers, but `stopPropagation` does not
+   *  stop other listeners on the SAME node — and the globals register at app mount, long before the
+   *  user clicks "Press a key…", so they run FIRST regardless. Without this flag, recording a
+   *  binding also fires whatever global chord the user happens to press. */
+  capturingShortcut: ShortcutId | null;
+  setCapturingShortcut: (id: ShortcutId | null) => void;
 }
 
 export const useKeybindingsStore = create<KeybindingsState>()(
@@ -36,10 +47,18 @@ export const useKeybindingsStore = create<KeybindingsState>()(
       bindings: { ...SHORTCUT_DEFAULTS },
       setBinding: (id, binding) => set((s) => ({ bindings: { ...s.bindings, [id]: binding } })),
       resetBinding: (id) => set((s) => ({ bindings: { ...s.bindings, [id]: SHORTCUT_DEFAULTS[id] } })),
+      capturingShortcut: null,
+      setCapturingShortcut: (id) => set({ capturingShortcut: id }),
     }),
     {
       name: "sparkle-keybindings",
       storage: createJSONStorage(() => localStorage),
+      // Only the bindings persist. `capturingShortcut` is transient UI state — writing it would
+      // mean a relaunch mid-capture came back believing it was still recording, and every global
+      // chord would stay dead with no visible cause. (`merge` below already rebuilds everything but
+      // `bindings` from defaults, so this is belt-and-braces; it keeps the flag out of localStorage
+      // entirely rather than relying on the read side to discard it.)
+      partialize: (s) => ({ bindings: s.bindings }) as unknown as KeybindingsState,
       // Merge persisted bindings over the defaults so a newly-added ShortcutId always has a value
       // even when an older persisted blob predates it.
       merge: (persisted, current) => {
@@ -49,3 +68,18 @@ export const useKeybindingsStore = create<KeybindingsState>()(
     },
   ),
 );
+
+/** "A rebinding capture is live — global chord handlers must stand down."
+ *
+ *  Every window-level chord handler calls this and returns early when it is true. It exists as one
+ *  exported function rather than three inline `getState()` reads because the requirement is a
+ *  CONTRACT the store owns, and a handler that quietly forgets to honor it is invisible: the bug is
+ *  "recording a binding also triggered the thing I was rebinding", which nobody attributes to a
+ *  missing line in an unrelated hook. `keybindingsStore.rebindStandDown.test.ts` enumerates the
+ *  handlers and fails when a new one appears without the guard, which a comment could not do.
+ *
+ *  Read via `getState()`, not a selector, so calling it inside a listener never re-subscribes and
+ *  never re-registers the listener. */
+export function isRebinding(): boolean {
+  return useKeybindingsStore.getState().capturingShortcut !== null;
+}

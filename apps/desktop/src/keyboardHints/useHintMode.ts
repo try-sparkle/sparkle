@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { INITIAL_TRIGGER, reduceTrigger, type TriggerState } from "./hintTrigger";
 import { matchesChord } from "./keybindings";
-import { useKeybindingsStore } from "../stores/keybindingsStore";
+import { isRebinding, useKeybindingsStore } from "../stores/keybindingsStore";
 
 // Drives the on/off state of the keyboard-hint overlay.
 //
@@ -36,12 +36,20 @@ export function useHintMode(onEscape?: () => boolean): { active: boolean; close:
   const escapeRef = useRef(onEscape);
   escapeRef.current = onEscape;
 
+  // STAND DOWN while the Shortcuts pane is recording a binding (`isRebinding`). This hook is the
+  // one that most needed it: `toggleHints` is the FIRST row of that pane and its default is a bare
+  // Control TAP, so recording it drives this very tap machine and pops the chiclet overlay over the
+  // whole UI mid-gesture. The recorder's own `stopPropagation()` cannot prevent that — it is on
+  // `window` in capture and so are we, `stopPropagation` does not stop same-node listeners, and we
+  // register at mount while it registers on click, so we always run first. Applied to keyUP as well
+  // as keydown, or a tap begun before the capture started would still complete through it.
   useEffect(() => {
     // A fresh binding starts the tap machine clean (a half-pressed old modifier can't leak across).
     trigger.current = INITIAL_TRIGGER;
     const modifier = binding.kind === "tap" ? binding.modifier : null;
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isRebinding()) return;
       if (modifier) {
         trigger.current = reduceTrigger(trigger.current, { type: "keydown", key: e.key }, modifier).state;
       } else if (matchesChord(e, binding)) {
@@ -81,6 +89,7 @@ export function useHintMode(onEscape?: () => boolean): { active: boolean; close:
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
+      if (isRebinding()) return;
       if (!modifier) return;
       const out = reduceTrigger(trigger.current, { type: "keyup", key: e.key }, modifier);
       trigger.current = out.state;

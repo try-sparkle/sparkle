@@ -60,12 +60,10 @@ import {
 } from "../engine/cable";
 import {
   pairCountFor,
-  projectsOnSide,
-  resolveSideSelection,
+  resolveSideProject,
   sideOf,
   type PairAssignment,
 } from "../engine/pairs";
-import { openProjectsOf } from "../engine/openProjects";
 import { firstVisibleAgentId } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { resolveStage, rollupStages } from "../engine/workflowStage";
@@ -737,20 +735,10 @@ export function Workspace() {
   // entries naming absent projects, so one commit of lag changes nothing on screen.
   useEffect(() => prunePairAssignment(projects), [projects, prunePairAssignment]);
 
-  // Only OPEN projects can be a pair's selection or fill its tab strip — the same rule the single
-  // strip already applied, now applied per side.
-  const openProjects = useMemo(
-    () => openProjectsOf(projects, openProjectIds),
-    [projects, openProjectIds],
-  );
-  const leftProjects = useMemo(
-    () => projectsOnSide(openProjects, pairAssignment, "left"),
-    [openProjects, pairAssignment],
-  );
-  const rightProjects = useMemo(
-    () => projectsOnSide(openProjects, pairAssignment, "right"),
-    [openProjects, pairAssignment],
-  );
+  // "Only OPEN projects can be a pair's selection" lives inside `resolveSideProject` now, along with
+  // the rest of that chain. The three memos that used to compose it here — open → on this side, twice
+  // — went with it: leaving them would have kept a second, unused copy of the exact derivation this
+  // consolidation exists to have only once, which is the divergence path it set out to close.
   // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees
   // with what the map says is unrepresentable. Counts assignment over ALL projects, not just open
   // ones: closing a tab is a view operation that deliberately keeps the project's panes and PTYs
@@ -761,10 +749,14 @@ export function Workspace() {
   // using `selectedProjectId` — that value means "the current project" to the concierge feed,
   // notifications, capture and satellite ownership, and re-pointing it at a two-sided concept would
   // change all of them. The left pair gets its own slot.
-  const rightProjectId = resolveSideSelection(currentProjectId, rightProjects);
-  const leftProjectId = resolveSideSelection(leftProjectIdRaw, leftProjects);
-  const project = projects.find((p) => p.id === rightProjectId) ?? null;
-  const leftProject = projects.find((p) => p.id === leftProjectId) ?? null;
+  // Through `resolveSideProject` — the shared chain — rather than composing the four steps here. The
+  // cable's projection hook needs the same answer, and when it composed them itself it composed them
+  // WRONG (roborev 55490); one shared function is what stops the two disagreeing about which project
+  // is on a side.
+  const project = resolveSideProject("right", projects, openProjectIds, pairAssignment, currentProjectId);
+  const leftProject = resolveSideProject("left", projects, openProjectIds, pairAssignment, leftProjectIdRaw);
+  const rightProjectId = project?.id ?? null;
+  const leftProjectId = leftProject?.id ?? null;
   // COMMIT THE RIGHT PAIR'S FALLBACK BACK TO THE STORE.
   //
   // `resolveSideSelection` is a local repair, so without this `selectedProjectId` and the project
@@ -1335,7 +1327,9 @@ export function Workspace() {
               />
             }
           >
-            <MemoAgentSidebar project={leftProject} />
+            {/* `slotSide` because `leftProject` is null whenever this pair's tab is closed, and a
+                column with no project cannot ask the assignment map which side it is on. */}
+            <MemoAgentSidebar project={leftProject} slotSide="left" />
             {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
                 this stage contributes the destination (`ref`) and nothing else, which is what keeps
                 a project moving to the other pair from unmounting its terminals. See `PaneHost`. */}

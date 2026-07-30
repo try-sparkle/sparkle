@@ -279,11 +279,24 @@ describe("AgentSidebar — the status filter", () => {
     // fires at all — flex resolves wrapping BEFORE shrinking. A `0` basis would silently restore
     // the squeeze with this file still green.
     expect(screen.getByTestId("status-filter-bar").style.flexBasis).toBe("auto");
-    // GROW 0, and this row used to demand 1 — locking in a layout regression. Only the BASIS makes
-    // the wrap possible; grow decides what happens to the leftover space in the WIDE case, and
-    // grow:1 split it 50/50 with the header's spacer, pushing the chips roughly halfway back off
-    // the pane-side edge. The mock has the spacer take all of it (`.bhd .sp{flex:1}`) so the chips
-    // sit flush there (roborev 54779). Asserted rather than dropped so the wide case has a guard.
+  });
+
+  // THE WIDE CASE, which is the common one and which the wrap fix regressed on its first pass. The
+  // basis above is what makes the narrow-width wrap possible; GROW is a separate knob and must stay
+  // 0. The band is `segment (0 0 auto) · spacer (flex:1) · bar`, and the mock hands the spacer alone
+  // the free space (`.bhd .sp{flex:1}`) so the chips sit flush at the pane-side edge. Giving the bar
+  // grow:1 as well splits that space 50/50, which walks the chip cluster back toward the middle of
+  // the header AND — because `Reset` is permanently mounted at `marginLeft: auto` — dumps the bar's
+  // whole share into the gap in front of it, the one place that margin exists to keep still. Grow
+  // buys the wrap nothing either: once the bar is alone on the wrapped line it fills that line
+  // regardless. Asserted as the RELATIONSHIP (spacer grows, bar does not) because either half on its
+  // own reads as an arbitrary number a later pass would feel free to "tidy".
+  it("gives the header's free space to the spacer alone, so the chips stay flush right", () => {
+    const project = seed([mkAgent("a1", "Alpha")]);
+    setStatuses({ a1: "working" });
+    render(<AgentSidebar project={project} />);
+
+    expect(screen.getByTestId("build-header-spacer").style.flexGrow).toBe("1");
     expect(screen.getByTestId("status-filter-bar").style.flexGrow).toBe("0");
   });
 

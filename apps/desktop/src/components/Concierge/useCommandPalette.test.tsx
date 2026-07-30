@@ -4,8 +4,11 @@
 // palette, the imperative API opens/closes it, and the shortcut predicate is pinned so a
 // re-binding can't silently drift (alt-K glyph input must NOT trigger it).
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { isPaletteShortcut, useCommandPalette } from "./useCommandPalette";
+import { useKeybindingsStore } from "../../stores/keybindingsStore";
+
+afterEach(() => useKeybindingsStore.setState({ capturingShortcut: null }));
 
 const key = (over: Partial<KeyboardEvent> = {}) => ({
   key: "k",
@@ -59,6 +62,39 @@ describe("useCommandPalette", () => {
     act(() => result.current.closePalette());
     expect(result.current.open).toBe(false);
     act(() => result.current.togglePalette());
+    expect(result.current.open).toBe(true);
+  });
+
+  // roborev 55487. This listener is window/capture and registers at Workspace mount, so it runs
+  // BEFORE the Shortcuts pane's "Press a key…" recorder (which registers on click) and the
+  // recorder's stopPropagation() cannot reach it — stopPropagation does not stop other listeners on
+  // the same node. Pressing ⌘K to record it therefore both recorded the chord AND opened the palette
+  // on top of the pane. It stands down by reading keybindingsStore.capturingShortcut.
+  it("stands down while the Shortcuts pane is recording a binding", () => {
+    const { result } = renderHook(() => useCommandPalette());
+    useKeybindingsStore.setState({ capturingShortcut: "toggleComposer" });
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    });
+
+    expect(result.current.open).toBe(false);
+  });
+
+  it("resumes the moment the recording ends", () => {
+    const { result } = renderHook(() => useCommandPalette());
+    useKeybindingsStore.setState({ capturingShortcut: "toggleComposer" });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    });
+    expect(result.current.open).toBe(false);
+
+    // Read live per-press, so ending the capture must re-arm without a remount.
+    useKeybindingsStore.setState({ capturingShortcut: null });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true }));
+    });
+
     expect(result.current.open).toBe(true);
   });
 

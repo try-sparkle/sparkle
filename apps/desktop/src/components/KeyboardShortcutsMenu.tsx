@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, type CSSProperties } from "react";
 import { FiRotateCcw } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { FONT_UI } from "../theme/scale";
@@ -25,14 +25,26 @@ export function KeyboardShortcutsMenu() {
   const bindings = useKeybindingsStore((s) => s.bindings);
   const setBinding = useKeybindingsStore((s) => s.setBinding);
   const resetBinding = useKeybindingsStore((s) => s.resetBinding);
-  const [listening, setListening] = useState<ShortcutId | null>(null);
+  // In the STORE, not local state: global chord handlers (⌘, and friends) live on `window` in the
+  // capture phase and register at app mount, so they fire BEFORE this capture listener and its
+  // `stopPropagation` cannot reach them. They stand down by reading this flag. See
+  // keybindingsStore.capturingShortcut for the full reasoning.
+  const listening = useKeybindingsStore((s) => s.capturingShortcut);
+  const setListening = useKeybindingsStore((s) => s.setCapturingShortcut);
   const capture = useRef<CaptureState>(INITIAL_CAPTURE);
 
   useEffect(() => {
     if (!listening) return;
     capture.current = INITIAL_CAPTURE;
-    // Capture phase + swallow everything: while recording, no keystroke should reach the app
-    // (so e.g. ⌘J doesn't also toggle the composer mid-capture). Escape cancels the capture.
+    // Capture phase + preventDefault/stopPropagation, which stops the DEEPER tree — so a recorded
+    // chord doesn't also type into a field or route to a component handler.
+    //
+    // It does NOT stop the window/capture cohort (⌘, ⌘K, the hint-mode tap machine): those sit on
+    // the same node in the same phase and register at mount, so they run BEFORE this listener and
+    // `stopPropagation` cannot reach backwards. `stopImmediatePropagation` would not help either —
+    // it only stops listeners registered after ours. That is why they stand down by READING
+    // `capturingShortcut` instead (see `isRebinding`); it is the only mechanism that works against
+    // an earlier same-node listener. Escape cancels the capture.
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
@@ -66,7 +78,13 @@ export function KeyboardShortcutsMenu() {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("keyup", onKey, true);
     };
-  }, [listening, setBinding]);
+  }, [listening, setBinding, setListening]);
+
+  // Now that the capture flag is GLOBAL, it must not outlive this pane. Closing Settings — or just
+  // switching to another category — unmounts us with `capturingShortcut` still set, which would
+  // leave every global chord standing down permanently, with no visible cause and no way back
+  // short of a relaunch. Clearing on unmount is the whole guard.
+  useEffect(() => () => setListening(null), [setListening]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>

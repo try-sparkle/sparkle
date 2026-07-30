@@ -165,15 +165,17 @@ export const StatusFilterBar = memo(function StatusFilterBar({
         // pushes Reset, the one control this bar adds, off the edge exactly when a band is hidden
         // and the user needs it. Let the row drop Reset to a second line instead.
         flexWrap: "wrap",
-        // `1 1 auto`, so the bar's hypothetical size is its max-content width and the HEADER's own
-        // wrap can push it to a full-width second line, rather than the flex algorithm squeezing it
-        // into whatever the mini segment left over. Flex wrapping is resolved before shrinking, so
-        // an `auto` basis is what makes that decision happen at all.
-        // GROW 0. Only the `auto` BASIS is load-bearing here — it is what lets the bar wrap to a
-        // full-width second line instead of being squeezed by the flex algorithm. Adding grow:1
-        // split the free space 50/50 with the header's spacer, pushing the chip cluster roughly
-        // halfway back off the pane-side edge; the mock has `.bhd .sp{flex:1}` absorb ALL of it so
-        // the chips sit flush at that end (roborev 54779).
+        // The `auto` BASIS is the load-bearing part: it makes the bar's hypothetical size its
+        // max-content width, so the HEADER's own wrap can push the bar to a full-width second line
+        // rather than the flex algorithm squeezing it into whatever the mini segment left over.
+        // Flex resolves wrapping BEFORE shrinking, which is what makes that decision happen at all.
+        // GROW STAYS 0. The header is `segment (0 0 auto) · spacer (flex:1) · bar`, and the mock
+        // gives the spacer alone the free space (`.bhd .sp{flex:1}`) so the chips sit flush at the
+        // pane-side edge. A grow of 1 here splits it 50/50 with the spacer instead — at any normal
+        // sidebar width that walks the chip cluster back toward the middle of the header, and the
+        // bar's own slack all lands in front of `Reset`, which is permanently mounted at
+        // `marginLeft: auto` precisely so that end holds still. Grow buys the wrap nothing: once
+        // the bar is alone on the wrapped line it fills that line regardless (roborev 54779).
         flex: "0 1 auto",
         gap: 3,
         // NO PADDING OF ITS OWN. The bar lives inside the `.bhd` column header now (it used to be

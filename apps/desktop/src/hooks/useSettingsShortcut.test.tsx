@@ -9,7 +9,8 @@
 // `window` itself or an element inside `document.body`, whose capture path runs through `window` —
 // never `document.dispatchEvent`, which would be the vacuous cross-target form the
 // `no-cross-target-event-dispatch` lint rule exists to catch.
-import { act, renderHook } from "@testing-library/react";
+import { lazy, Suspense } from "react";
+import { act, render, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   isSettingsShortcut,
@@ -17,6 +18,7 @@ import {
   useSettingsShortcut,
 } from "./useSettingsShortcut";
 import { useUiStore } from "../stores/uiStore";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
 
 const key = (over: Partial<KeyboardEvent> = {}) => ({
   key: ",",
@@ -46,6 +48,8 @@ function mountFocused(el: HTMLElement): HTMLElement {
 beforeEach(() => {
   // Start from "no request pending" so a passing assertion can only come from THIS press.
   useUiStore.setState({ settingsRequest: null });
+  // …and not mid-rebind, which legitimately suppresses the shortcut (see the capture tests).
+  useKeybindingsStore.setState({ capturingShortcut: null });
 });
 
 afterEach(() => {
@@ -156,6 +160,33 @@ describe("useSettingsShortcut — the rest of the contract", () => {
     expect(useUiStore.getState().settingsRequest).toBeNull();
   });
 
+  // roborev 55310. The Shortcuts pane's "Press a key…" recorder is ALSO a window/capture listener,
+  // but it registers when the user clicks the button — long after this hook did at mount — so this
+  // one runs first and the recorder's stopPropagation() cannot reach it (stopPropagation does not
+  // stop other listeners already on the same node). Pressing ⌘, to BIND it therefore recorded the
+  // chord and opened Settings on the "ai" pane, unmounting the recorder mid-gesture.
+  it("stands down while the Shortcuts pane is recording a new binding", () => {
+    renderHook(() => useSettingsShortcut());
+    useKeybindingsStore.setState({ capturingShortcut: "toggleComposer" });
+
+    pressCommandComma(document.body);
+
+    expect(useUiStore.getState().settingsRequest).toBeNull();
+  });
+
+  it("resumes the moment the recording ends", () => {
+    renderHook(() => useSettingsShortcut());
+    useKeybindingsStore.setState({ capturingShortcut: "toggleComposer" });
+    pressCommandComma(document.body);
+    expect(useUiStore.getState().settingsRequest).toBeNull();
+
+    // The flag is read live per-press, so ending capture must re-arm without a remount.
+    useKeybindingsStore.setState({ capturingShortcut: null });
+    pressCommandComma(document.body);
+
+    expect(useUiStore.getState().settingsRequest).toBe(SETTINGS_SHORTCUT_CATEGORY);
+  });
+
   it("stops listening once unmounted", () => {
     const { unmount } = renderHook(() => useSettingsShortcut());
     unmount();
@@ -166,6 +197,47 @@ describe("useSettingsShortcut — the rest of the contract", () => {
   });
 });
 
-// The "is it actually mounted?" guard lives in useSettingsShortcut.wiring.test.ts — it reads
-// App.tsx off disk, which needs the node environment (under jsdom `import.meta.url` is an http URL
-// and `fileURLToPath` throws).
+// roborev 55487. The binding must not be LIVE anywhere its consumer isn't mounted: nothing clears a
+// request nobody consumed, and the consumer opens the dialog off a pre-existing `settingsRequest` on
+// its first render — so a press in that window silently latches and the dialog springs open
+// uninvited later. In production the consumer sits under a React.lazy Workspace, so the <Suspense>
+// boundary is that window, and the fix is to mount the binding INSIDE the boundary.
+//
+// This asserts the React semantics the fix depends on rather than assuming them: a suspended
+// boundary commits none of its children, so a sibling of the lazy component does not register its
+// effects until the chunk resolves. Written with a hand-held promise so "still loading" is a real
+// state and not a timing guess.
+describe("useSettingsShortcut — not armed before its consumer can exist", () => {
+  it("stays inert while the lazy chunk is pending, then arms once it resolves", async () => {
+    let resolveChunk!: (m: { default: () => null }) => void;
+    const Lazy = lazy(() => new Promise<{ default: () => null }>((res) => (resolveChunk = res)));
+    const Binding = () => {
+      useSettingsShortcut();
+      return null;
+    };
+
+    // Mounted as a SIBLING inside the boundary — exactly App.tsx's shape.
+    render(
+      <Suspense fallback={null}>
+        <Lazy />
+        <Binding />
+      </Suspense>,
+    );
+
+    // Suspended: the boundary showed its fallback, so `Binding`'s effect never ran.
+    pressCommandComma(document.body);
+    expect(useUiStore.getState().settingsRequest).toBeNull();
+
+    await act(async () => {
+      resolveChunk({ default: () => null });
+    });
+
+    // Resolved: the consumer can exist now, so the binding may.
+    pressCommandComma(document.body);
+    expect(useUiStore.getState().settingsRequest).toBe(SETTINGS_SHORTCUT_CATEGORY);
+  });
+});
+
+// The "is it actually mounted, and WHERE?" guard lives in useSettingsShortcut.wiring.test.ts — it
+// reads App.tsx off disk, which needs the node environment (under jsdom `import.meta.url` is an http
+// URL and `fileURLToPath` throws).

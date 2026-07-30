@@ -88,7 +88,7 @@ describe("the concierge header is ONE row", () => {
       // name or email, so `authIdentity` resolves to null and the signed-in control names itself
       // "Account". It is the other half of the `ConciergeTopRight` cluster and has to be IN the row.
       screen.getByRole("button", { name: "Account" }),
-      screen.getByRole("button", { name: "Sparkle menu" }),
+      screen.getByRole("button", { name: "Settings" }),
     ]) {
       expect(h.contains(el), `${el.tagName} is not in the header row`).toBe(true);
     }

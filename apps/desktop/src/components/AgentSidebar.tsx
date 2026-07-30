@@ -292,9 +292,20 @@ export function NewBuildAgentButton({
 
 export function AgentSidebar({
   project,
+  slotSide = "right",
   showSparkleRow = true,
 }: {
   project: Project | null;
+  /** WHICH STAGE MOUNTED THIS COLUMN — used ONLY when `project` is null.
+   *
+   *  The side normally comes from the project's own assignment, and deliberately so: the map is the
+   *  single answer to "where does this project live", and a prop is a second copy that can disagree
+   *  with the stage the panes mount in. But the left stage renders `project={null}` whenever its tab
+   *  is closed, and there is no early return — so with no project to ask, `sideOf(assignment, "")`
+   *  answered "right" and the EMPTY LEFT column seeded from, and on a drag wrote over, the right
+   *  column's width. Exactly the cross-column clobber the per-side key removed, one case further out
+   *  (roborev 55490). The slot knows its own side; this is the only thing it is asked. */
+  slotSide?: PairSide;
   /** Hide the pinned Improve-Sparkle row. Only a SATELLITE window passes false, and it must: the
    *  Sparkle agent's id is keyed to the window label (`sparkleAgentIdFor`), and a satellite would
    *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
@@ -396,16 +407,21 @@ export function AgentSidebar({
   // The assignment map is already the single answer to "where does this project live" (engine/pairs),
   // and a prop would be a second copy of it that could disagree with the stage its panes mount in.
   const pairAssignment = useUiStore((s) => s.pairAssignment);
-  const pairSide = sideOf(pairAssignment, project?.id ?? "");
+  // With no project there is nothing to ask the map, and `sideOf("")` answers "right" — so the empty
+  // left column has to fall back to the side of the SLOT it was mounted in. See `slotSide`.
+  const pairSide = project ? sideOf(pairAssignment, project.id) : slotSide;
   const patchCable = useCableStore((s) => s.patch);
   // DOES THIS PAIR HOLD THE CABLE? Read from the one enum, never mirrored into local state — the
   // rows use it to open their concierge end (engine/rowGeometry), which is the second half of the
   // circuit the flood and the vanishing seam are the rest of. `pairIsLive` rather than a `===` so
   // "one live circuit" is stated in exactly one place (engine/cable).
-  // Selected as a BOOLEAN, so this column re-renders when its own circuit opens or closes and not
-  // on every unrelated cable move (patching the other side, floating an overlay).
   // The PROJECTED side, not the raw store: a joint drawn open onto a pair with nothing selected
   // is the same lie the flood was (roborev 55386). Visual treatment takes the projection.
+  // The cable is still selected as a BOOLEAN inside the hook, so this column re-renders when its own
+  // circuit opens or closes and not on every unrelated cable move (patching the other side, floating
+  // an overlay). That narrowing lived HERE until the projection moved the read into `usePairIsLive`;
+  // written the short way (`useEffectiveWired() === pair`) it took the enum and dropped the narrowing
+  // while this sentence still promised it (roborev 55490).
   const jointOpen = usePairIsLive(pairSide);
   // The Improve-Sparkle agent is keyed by window label (sparkleAgentIdFor — see onSelectSparkle /
   // services/sparkleReveal). There is exactly one app window now, and its label is the constant
@@ -1949,8 +1965,10 @@ export function AgentSidebar({
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
           />
-          {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. */}
-          <span aria-hidden style={{ flex: 1, minWidth: 0 }} />
+          {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. It is the SOLE
+              consumer of the band's free space, which is why the bar beside it grows 0; if the bar
+              grew too they would split it and the chips would sit mid-header. */}
+          <span aria-hidden data-testid="build-header-spacer" style={{ flex: 1, minWidth: 0 }} />
           {/* Hidden in Plan (no rows to filter) and when the project has no top-level agents at all
               — three dead controls over an empty-state hint is worse than no controls. */}
           {mode !== "plan" && ordered.length + (hiddenByFilter ? 1 : 0) > 0 && (

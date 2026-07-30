@@ -86,6 +86,28 @@ function RosterPublisher() {
   return null;
 }
 
+// ⌘, → Settings, from ANY focus context (window-level, capture-phase; see useSettingsShortcut).
+//
+// Mounted INSIDE THE <Suspense> THAT WRAPS Workspace, deliberately — that boundary, not <AuthGate>,
+// is the one that matters. The hook only *requests* a category via uiStore.settingsRequest, and
+// nothing clears a request nobody consumed; the sole consumer (KebabMenu) derives
+// `settingsVisible = settingsOpen || settingsRequest !== null` on its FIRST render. So anywhere the
+// binding is live without that consumer mounted, a press does nothing visible AND latches — and the
+// dialog then springs open uninvited the moment the consumer appears.
+//
+// That is two boundaries deep, and only fixing the outer one leaves the bug: AuthGate withholds
+// everything on the sign-in / loading / paywall screens, and Workspace is ALSO React.lazy, so the
+// chunk fetch right after sign-in is a second window with the same symptom. Mounting here — inside
+// the boundary, as Workspace's sibling — closes both at once, because a suspended boundary commits
+// none of its children, so this hook cannot register until the consumer can honor it.
+//
+// Pinned by useSettingsShortcut.wiring.test.ts, which asserts the position against <Suspense> and
+// exercises the suspended case for real rather than trusting that reading of React. Paints no UI.
+function SettingsShortcut() {
+  useSettingsShortcut();
+  return null;
+}
+
 // Keeps account exhaustion flags in step with REAL rate-limit events (structured transcript
 // records, not terminal text — see services/limitSync). App-wide and singular: a limit belongs to
 // an ACCOUNT, so one poller serves every open agent. Paints no UI.
@@ -148,10 +170,6 @@ export function App() {
   useConnectionMonitor();
   // App-level always-listening voice controller (mounted once).
   useAmbientVoice();
-  // ⌘, opens Settings from ANY focus context (window-level, capture-phase). Mounted here rather
-  // than beside the dialog's host so the binding survives the host moving, and so it is live for
-  // the whole app window instead of only the subtree that happens to render the menu.
-  useSettingsShortcut();
   // Diagnostics: record first-responder + keyboard-capture transitions while the mic is live so a
   // recurrence of the dictation input-freeze (sparkle-d2ec) is pinnable. Inert when dictation off.
   useEffect(
@@ -370,6 +388,8 @@ export function App() {
             skeleton, and this only ever shows for the brief chunk fetch right after sign-in. */}
         <Suspense fallback={null}>
           <Workspace />
+          {/* Inside the boundary on purpose — see SettingsShortcut. */}
+          <SettingsShortcut />
         </Suspense>
         {/* One-time roborev consent modal — mounted once (not per-agent), self-gated on
             settingsStore.roborevConsentOpen (flipped at the first reviewable commit). */}

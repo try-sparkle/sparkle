@@ -65,7 +65,10 @@ export function attachActionLabel(hintId: string): string | null {
 }
 
 // Fixed mnemonic key for each chrome control, keyed by its data-hint attribute value.
-// (The "." for the ⋯ overflow menu is a deliberate pun: three dots → the period key.)
+// (The "." on the `menu` slot is a deliberate pun: three dots → the period key. It puns on the ⋯
+// GLYPH, not on a dropdown — that control opens Settings in one click now and has no menu behind it,
+// so the key still names what is on screen. The slot keeps the name `menu` because it is the shell
+// POSITION and KebabMenu's `data-hint` binds to it.)
 export const CHROME_HINTS: Record<string, string> = {
   think: "t",
   plan: "p",

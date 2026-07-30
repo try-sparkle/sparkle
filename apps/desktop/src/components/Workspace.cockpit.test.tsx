@@ -69,9 +69,15 @@ vi.mock("./AgentPane", () => ({
 // `[data-agent-tree]` container of `role="treeitem"` rows. That structure is what the click-away
 // gesture recognises a build agent row by (engine/cable's BUILD_ROW_SELECTOR), so a stub without it
 // would make the "clicking a row does not unbind" case vacuously pass.
+// THE STUB PUBLISHES `slotSide`, and that is load-bearing rather than tidy. The real component only
+// consults the prop when `project` is null, which is exactly the state the left stage renders in when
+// its tab is closed — and the prop's default is "right", so deleting `slotSide="left"` from the JSX is
+// SILENT: the component-level row keeps passing (it hands the prop in by hand) while the empty left
+// column goes back to seeding from and clobbering the right column's width (roborev 55539). A stub
+// that dropped the prop could not tell the two apart.
 vi.mock("./AgentSidebar", () => ({
-  AgentSidebar: () => (
-    <div data-testid="sidebar">
+  AgentSidebar: ({ slotSide = "right" }: { slotSide?: string }) => (
+    <div data-testid="sidebar" data-slot-side={slotSide}>
       <div role="tree" aria-label="Build agents" data-agent-tree>
         <div role="treeitem" aria-selected data-testid="fake-row">
           <span data-testid="fake-row-label">Stripe checkout retry</span>
@@ -196,6 +202,38 @@ describe("the shell root carries the whole cockpit state", () => {
     // The STORE still holds the patch — this is a read-side projection, so nothing had to remember
     // to unbind and re-selecting an agent lights it again with no second gesture.
     expect(useCableStore.getState().wired).toBe("right");
+  });
+
+  // THE WIRING for the empty left column's width key, which is the half that regressed.
+  //
+  // `AgentSidebar` falls back to `slotSide` only when `project` is null — and the left stage renders
+  // exactly that whenever the left pair's tab is closed. The prop defaults to "right", so deleting
+  // `slotSide="left"` from the JSX leaves the component-level row green (it passes the prop by hand)
+  // while the empty left column silently goes back to seeding from and overwriting
+  // `sparkle-sidebar-width:right` (roborev 55539). Asserted on BOTH columns, because a stub that
+  // reported "left" for every slot would satisfy a one-sided check.
+  it("tells the LEFT stage's column which side it is on, even with no project in it", () => {
+    act(() => {
+      // p2 EXISTS and is assigned left, so the pair stays open (`pairCountFor` counts the assignment
+      // over ALL projects — closing a tab must not unmount its panes) — but its TAB is closed, so it
+      // is not among the open projects the side resolves against and the left stage's `project` is
+      // null. That is precisely the state the fallback exists for, and it is reachable by one click.
+      useUiStore.setState({
+        pairAssignment: { p2: "left" }, leftProjectId: "p2", openProjectIds: ["p1"],
+      } as never);
+      useProjectStore.setState({
+        projects: [
+          mkProject("p1", "Alpha", [mkAgent("a1")], "a1"),
+          mkProject("p2", "Beta", [mkAgent("b1")], "b1"),
+        ],
+      } as never);
+    });
+    render(<Workspace />);
+    const sides = screen
+      .getAllByTestId("sidebar")
+      .map((el) => el.getAttribute("data-slot-side"));
+    expect(sides).toContain("left");
+    expect(sides).toContain("right");
   });
 
   // The whole point of the attribute: nothing else needs to change for the app to look wired, so a

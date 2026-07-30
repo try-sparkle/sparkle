@@ -22,6 +22,7 @@
 // and is moving again, and a shortcut wired straight into a component would break each time.
 import { useEffect } from "react";
 import { log } from "../logger";
+import { isRebinding } from "../stores/keybindingsStore";
 import { useUiStore, type CategoryId } from "../stores/uiStore";
 
 /** Pane ⌘, lands on. Matches `SettingsDialog`'s own `initialCategory ?? "ai"` default, so the
@@ -46,6 +47,13 @@ export function useSettingsShortcut(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!isSettingsShortcut(e)) return;
+      // STAND DOWN while the Shortcuts pane is recording a new binding. That handler is also on
+      // `window` in capture, but this one registers at app mount — long before the user clicks
+      // "Press a key…" — so it runs FIRST, and the recorder's `stopPropagation()` cannot stop a
+      // listener already invoked on the same node. Without this, pressing ⌘, to record a binding
+      // also opened Settings on the "ai" pane, which unmounted the recorder mid-gesture. Read live
+      // via getState so this never re-subscribes.
+      if (isRebinding()) return;
       // preventDefault even though WebKit has no default action for ⌘, — an unhandled ⌘-chord
       // arriving at a focused text field is what makes macOS beep, which reads as "the app ignored
       // me" and is precisely the complaint this fixes.

@@ -38,6 +38,7 @@
 // by handing `createPortal` a different container (that is itself an unmount).
 
 import type { PairCount, PairSide } from "./cable";
+import { openProjectsOf, type OpenProjectIds } from "./openProjects";
 
 export type { PairCount, PairSide };
 
@@ -154,4 +155,32 @@ export function resolveSideSelection(
 ): string | null {
   if (selectedId !== null && sideProjects.some((p) => p.id === selectedId)) return selectedId;
   return sideProjects[0]?.id ?? null;
+}
+
+/**
+ * THE PROJECT ON A SIDE — the whole chain, in one place, because two callers doing it by hand is
+ * how they came to disagree.
+ *
+ * `open → on this side → resolve the selection → look it up` is four steps and every one of them
+ * matters. `Workspace` composed them correctly; the cable's projection hook re-derived the same
+ * question as `projects.find(p => sideOf(assignment, p.id) === side)` — the FIRST project assigned
+ * to that side, over ALL projects — and `sideOf` defaults to `"right"`, so the right pair routinely
+ * holds several and closed projects are still in the list. It answered about a project that was
+ * neither on screen nor necessarily open: with P1 first in the store, P2 selected and P2's last
+ * agent closed, the shell drew the cable lit off P1's selection while the prompt routed to Sparkle
+ * (roborev 55490). Both callers go through here now, so that divergence has nowhere to live.
+ *
+ * `null` when the side holds nothing selectable — the same real state `resolveSideSelection` returns
+ * it for.
+ */
+export function resolveSideProject<T extends { id: string }>(
+  side: PairSide,
+  projects: readonly T[],
+  openIds: OpenProjectIds,
+  assignment: PairAssignment,
+  selectedForSide: string | null,
+): T | null {
+  const onSide = projectsOnSide(openProjectsOf(projects, openIds), assignment, side);
+  const id = resolveSideSelection(selectedForSide, onSide);
+  return projects.find((p) => p.id === id) ?? null;
 }

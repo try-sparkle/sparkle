@@ -87,8 +87,9 @@ const controller = (): ConciergeController => ({
  *  and the dialog — that chain IS the thing under test. */
 function openSettingsFromTheColumn() {
   render(<ConciergeColumn model={model} controller={controller()} />);
-  fireEvent.click(screen.getByRole("button", { name: "Sparkle menu" }));
-  fireEvent.click(screen.getByRole("menuitem", { name: /settings/i }));
+  // ONE click. The kebab used to open a one-item dropdown that this helper then had to click
+  // through; that menu is gone (see Concierge/KebabMenu) and the trigger opens Settings directly.
+  fireEvent.click(screen.getByRole("button", { name: "Settings" }));
   return screen.getByLabelText("Sparkle concierge");
 }
 

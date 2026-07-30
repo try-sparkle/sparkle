@@ -273,6 +273,29 @@ describe("AgentSidebar — keyboard resize", () => {
     expect(column().style.width).toBe("220px");
     expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
   });
+
+  // THE EMPTY LEFT COLUMN, which the per-side key did not actually cover.
+  //
+  // The side came from the PROJECT's assignment, and the left stage renders `project={null}` whenever
+  // its tab is closed — with no early return, so the pull tab still renders. `sideOf(assignment, "")`
+  // answers "right", so that empty column seeded from the RIGHT column's width and, once dragged,
+  // wrote over it: the cross-column clobber the per-side key was introduced to remove, one case
+  // further out (roborev 55490). Every other width row here renders a project-bearing sidebar, so
+  // nothing reached it.
+  //
+  // Asserted on BOTH halves — the seed it reads and the value it writes — because either alone leaves
+  // the other direction of the clobber open.
+  it("an EMPTY left column neither seeds from nor writes the right column's key", async () => {
+    localStorage.setItem(WIDTH_KEY, "300");
+    render(<AgentSidebar project={null} slotSide="left" />);
+    // Did not seed from the right column's 300: it is at the default.
+    expect(column().style.width).toBe("220px");
+
+    fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" }); // ← GROWS a left-pair column
+    await new Promise((r) => setTimeout(r, 260));
+    expect(localStorage.getItem(WIDTH_KEY)).toBe("300");
+    expect(localStorage.getItem("sparkle-sidebar-width:left")).toBe("228");
+  });
 });
 
 describe("AgentSidebar — overlay mode", () => {
