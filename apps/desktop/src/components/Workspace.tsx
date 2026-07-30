@@ -366,7 +366,9 @@ export function Pair({
 /** The concierge column's persisted width, and the range a drag/arrow-key commit is clamped to.
  *  360 is what the column shipped at as a hardcoded prop; the bounds are wider than the agent
  *  column's because this column holds prose (the thread) rather than a list of short rows. */
-const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
+/** Exported so a test asserts the key this component actually writes instead of re-spelling it, or
+ *  worse, discovering it by taking a census of localStorage — see `Workspace.resize.test.tsx`. */
+export const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
 const CONCIERGE_MIN_WIDTH = 280;
 const CONCIERGE_MAX_WIDTH = 560;
 const CONCIERGE_DEFAULT_WIDTH = 360;

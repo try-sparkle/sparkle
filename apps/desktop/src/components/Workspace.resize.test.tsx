@@ -86,7 +86,7 @@ vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 vi.mock("./StatusStrip", () => ({ StatusStrip: () => null }));
 vi.mock("./NewCloudAgentDialog", () => ({ NewCloudAgentDialog: () => null }));
 
-import { Workspace } from "./Workspace";
+import { CONCIERGE_WIDTH_KEY, Workspace } from "./Workspace";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -247,7 +247,7 @@ describe("the concierge seam actually moves the concierge", () => {
 // per-pixel write it replaced could not lose a committed value; a trailing timer whose cleanup only
 // cancels can. Nothing covered persistence at all before this, which is why the hole was invisible.
 describe("the width the user set actually survives", () => {
-  const stored = () => localStorage.getItem("sparkle-concierge-width");
+  const stored = () => localStorage.getItem(CONCIERGE_WIDTH_KEY);
 
   it("persists the width once the drag settles", async () => {
     const { unmount } = render(<Workspace />);
@@ -375,17 +375,26 @@ function dragSeamBy(dx: number, from = 500) {
 /**
  * ══ NOTHING BELOW HARDCODES A WIDTH, A BOUND, OR THE STORAGE KEY ═══════════════════════════════
  *
- * `Workspace.tsx` keeps those four values module-private, and they are NOT exported for this file's
- * benefit: that file is owned by a concurrent agent reworking the cockpit layout, and a third party
- * editing it — even additively — is the convergence collision AGENTS.md calls the most expensive
- * recurring failure in this repo.
+ * `Workspace.tsx` keeps the WIDTHS and BOUNDS module-private, and this file does not re-spell them.
+ *
+ * THE STORAGE KEY IS THE ONE EXCEPTION, and it is a reversal — this block used to forbid exporting
+ * anything from `Workspace.tsx` on the grounds that the file was owned by a concurrent agent and any
+ * third-party edit, even additive, is the convergence collision AGENTS.md calls this repo's most
+ * expensive recurring failure. That concern is real and still worth weighing. It lost here because
+ * the alternative turned out to be worse: the key was instead DISCOVERED by diffing localStorage and
+ * asserting exactly one key appeared, which asserts a GLOBAL property ("the drag was the only thing
+ * in the app that persisted anything in this window") to test a LOCAL one. Once `projectStore` began
+ * flushing `sparkle-projects` through its own 400ms debounce inside the same window, that assertion
+ * put `main` red across several consecutive commits and blocked every release cut (roborev 55445,
+ * bead `sparkle-rqb9`). A single named export is additive and survives a layout rework; a storage
+ * census couples this file to every other persister in the application, forever.
  *
  * Copying the literals instead would have been worse than either option. This file exists to catch
  * width-DELIVERY bugs, so a changed default must not surface here as unexplained numeric failures
  * reading like "the drag broke" (roborev 55342). So every expectation is OBSERVED:
  *
  *   • the default    — read off the column at mount;
- *   • the storage key — discovered as the key the drag actually writes;
+ *   • the storage key — IMPORTED from the component, never re-spelled and never rediscovered;
  *   • the bounds      — LEARNED, by dragging past each end and reading where the column stops;
  *   • the drag deltas — a FRACTION of the learned headroom, never a fixed number of pixels;
  *   • out-of-clamp    — seeded ONE PAST a learned bound, so the seed pins that bound exactly.
@@ -408,36 +417,32 @@ const mountAndReadDefault = () => {
   return conciergeWidthAttr();
 };
 
-/** Every key currently in storage. Enumerated through the Web Storage API rather than
- *  `Object.keys`, which does not enumerate this environment's localStorage. */
-function storageKeys(): string[] {
-  return Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter(
-    (k): k is string => k !== null,
-  );
-}
-
-/** The key the drag wrote, found by diffing localStorage rather than by knowing its name.
+/** What the drag actually flushed to the width key, read past the 200ms trailing debounce.
  *
- *  ASYNC, and the await is load-bearing. #828 wrote this against a persist that hit localStorage on
- *  EVERY mousemove, so diffing storage the instant the drag returned found the key. #825 — merged
+ *  ASYNC, and the await is load-bearing. #828 asserted against a persist that hit localStorage on
+ *  EVERY mousemove, so reading storage the instant the drag returned saw the write. #825 — merged
  *  with it here — turned that into a 200ms TRAILING DEBOUNCE (`Workspace.tsx`, fixing a synchronous
- *  disk write sitting on the drag's hot path), so at that instant nothing has been written yet and
- *  this found ZERO keys. That is a real interaction between the two PRs, not a merge artifact.
+ *  disk write sitting on the drag's hot path), so at that instant nothing has been written yet.
+ *  That is a real interaction between the two PRs, not a merge artifact.
  *
- *  So it waits past the debounce instead of asserting the old timing. It still DISCOVERS the key by
- *  diffing rather than naming it, which is what #828 built it for; only the moment it looks moved.
- *  `toHaveLength(1)` is kept deliberately — it is what catches a persist that never flushes at all,
- *  the same regression #825's own "a debounce that never flushes is a way to LOSE a width" cases
- *  guard from the other side. */
-async function keyWrittenBy(action: () => void): Promise<string> {
-  const before = new Set(storageKeys());
+ *  Returns the stored string (or `null`) so callers assert the VALUE. `null` is what catches a
+ *  persist that never flushes at all — the same regression #825's own "a debounce that never
+ *  flushes is a way to LOSE a width" cases guard from the other side.
+ *
+ *  It reads `CONCIERGE_WIDTH_KEY` imported from the component rather than DISCOVERING the key by
+ *  diffing localStorage, which is what this used to do and why main went red (bead `sparkle-rqb9`).
+ *  A diff plus `expect(added).toHaveLength(1)` asserts a GLOBAL property — "the drag was the only
+ *  thing in the app that persisted anything in this window" — to test a LOCAL one. It survived only
+ *  while nothing else wrote inside the window; once `projectStore` began flushing `sparkle-projects`
+ *  there, the diff found 2 keys and this file failed on `main` with the resize path working fine.
+ *  Importing the constant cannot desync from the component the way a re-spelled literal would, and
+ *  the round-trip assertions below are what still pin read and write to the SAME key. */
+async function widthFlushedBy(action: () => void): Promise<string | null> {
   action();
   // 260ms — past the 200ms trailing timer, the same margin #825's persistence cases already use.
   // Awaiting a resolved promise would not do: this is a real timer, not a microtask.
   await new Promise((r) => setTimeout(r, 260));
-  const added = storageKeys().filter((k) => !before.has(k));
-  expect(added).toHaveLength(1);
-  return added[0] as string;
+  return localStorage.getItem(CONCIERGE_WIDTH_KEY);
 }
 
 /** Mount, drag far past one end, and read where the column came to rest. A fresh mount + cleared
@@ -526,9 +531,10 @@ describe("dragging the concierge seam moves the column", () => {
     const dx = safeDelta(start, max);
 
     render(<Workspace />);
-    const key = await keyWrittenBy(() => dragSeamBy(dx));
     const dragged = String(start + dx);
-    expect(localStorage.getItem(key)).toBe(dragged);
+    // The flush itself: `null` here is a debounce that never fired, a wrong value is a width that
+    // arrived at the column but not at storage.
+    expect(await widthFlushedBy(() => dragSeamBy(dx))).toBe(dragged);
 
     // THE ROUND TRIP, not just the write. Asserting only the localStorage value leaves the
     // `useState` initializer that reads it back completely uncovered — a wrong key or an inverted
@@ -567,9 +573,12 @@ describe("dragging the concierge seam moves the column", () => {
   ])("ignores a persisted width %s rather than restoring it", async (_label, seedFor) => {
     const geo = learnGeometry();
     render(<Workspace />);
-    const key = await keyWrittenBy(() => dragSeamBy(safeDelta(geo.start, geo.max)));
+    // Prove the persist really happened BEFORE seeding over it. Without this the case could seed a
+    // key nothing ever writes and still pass, asserting nothing about the initializer's guard.
+    const dx = safeDelta(geo.start, geo.max);
+    expect(await widthFlushedBy(() => dragSeamBy(dx))).toBe(String(geo.start + dx));
     cleanup();
-    localStorage.setItem(key, String(seedFor(geo)));
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, String(seedFor(geo)));
 
     render(<Workspace />);
     expect(Number(conciergeWidthAttr())).toBe(geo.start);
