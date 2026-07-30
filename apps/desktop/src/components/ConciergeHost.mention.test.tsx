@@ -213,6 +213,13 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
   // Pinned HERE as well as in mentions.test.ts because this is the layer the corruption was seen at:
   // the unit rule and the bytes that actually reach the dispatcher are different facts, and only
   // this one would have caught a caller that stripped a second time on the way to the wire.
+  //
+  // It does depend on a subject mention being DELIVERED to an agent, which is today's ordinal
+  // routing and an open question (see the row below). That is unavoidable — observing the bytes that
+  // reach a terminal requires a terminal delivery — so it is stated rather than hidden: if routing
+  // later sends a subject mention to Sparkle, this row needs re-aiming at a message with a LEADING
+  // address plus a subject mention, and it is the TEXT assertion that must be preserved, not the
+  // destination.
   it("keeps a subject mention's name in the bytes that reach the terminal", async () => {
     mount();
     await send("Why is @Kraken Auth just sitting there? It looks like it has unmerged work.");
@@ -224,16 +231,37 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
     expect(wire).not.toContain("@");
   });
 
-  // It is still ROUTED at the agent it names, wherever in the sentence that name sits. Routing reads
-  // `mentions[0]` and always did; the bug was that the TEXT rule borrowed that ordinal to decide
-  // what to delete. This row is what stops a future fix from "solving" the hole by dropping the
-  // mid-sentence mention as a destination.
-  it("still delivers to a subject mention's agent, not to the selected one", async () => {
+  // ══ WHAT THIS DOES *NOT* PIN, AND WHY THE WEAKER ASSERTION IS THE HONEST ONE ═══════════════════
+  // The obvious row here is "delivers to ag2" — today's behaviour, since routing reads `mentions[0]`
+  // by ordinal and this commit deliberately left that alone. But writing it that way asserts a
+  // question that is genuinely OPEN as though it were settled (roborev 56011, and it is right):
+  // "Why is @Status Check just sitting there? It looks like it has unmerged work." reads as a
+  // question ABOUT that agent, aimed at the concierge — yet it is dispatched INTO that agent's PTY
+  // as a third-person question about itself, and Sparkle, who it was plainly for, never sees it.
+  // The corruption is fixed; the misdelivery is not. Pinning the destination would make the
+  // remaining half harder to correct, and a test is an endorsement whatever the comment says.
+  //
+  // So this asserts only the part that must hold under EITHER answer: the mention is not silently
+  // ignored and the message never lands on the SELECTED agent, which is the misroute a mention
+  // exists to prevent. It holds today (delivered to the named agent) and it would still hold if a
+  // subject mention were later routed to Sparkle instead (nothing dispatched at all).
+  // Tracked as bead sparkle-3dbp6 rather than frozen here.
+  //
+  // THE ROUTER IS POINTED AT THE AGENT, and that is what keeps this from being vacuous. "Never ag1"
+  // is trivially true whenever nothing dispatches, so with the default (sparkle-saying) router this
+  // row passed even when the mention was ignored outright — a test satisfied by silence. Pointing
+  // the router at the agent gives the ignored-mention case somewhere to go: drop the mention and the
+  // auto-router delivers to the SELECTED agent, which is the misroute, and this fails. Honouring the
+  // mention sends it elsewhere (today: the named agent) and it passes — under either answer to the
+  // open question, neither of which is asserted here.
+  it("never lets a subject mention deliver to the SELECTED agent", async () => {
+    h.routeMessage.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
     mount();
     await send("Why is @Kraken Auth just sitting there?");
     await elapse();
-    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
-    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag2");
+    // No "something was dispatched" precondition, deliberately: that would pin AGENT DELIVERY, which
+    // is the half being left open. The router aim above is what makes the bare loop discriminating.
+    for (const call of h.dispatchConciergeAnswer.mock.calls) expect(call[0]).not.toBe("ag1");
   });
 
   // Explicitness buys a skipped CLASSIFY, never a skipped GATE. This is the line the "no forceAgent

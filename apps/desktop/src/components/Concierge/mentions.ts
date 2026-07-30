@@ -290,9 +290,15 @@ export function mentionsIn(text: string, agents: readonly MentionAgent[]): Conci
  *
  *  which is exactly the re-flow the newline rule two lines below was written to prevent, undone one
  *  line later for indentation. The suite missed it because the only no-collapse test took the
- *  `spans.length === 0` early return. So each removal swallows ONE adjacent space of its own instead
- *  — the space `insertMention` put there — and every other run of whitespace in the message is the
- *  user's and survives untouched. */
+ *  `spans.length === 0` early return.
+ *
+ *  THE CURRENT WHITESPACE CONTRACT, which is simpler than the one that replaced the collapse. This
+ *  used to swallow ONE adjacent space per removal — the space `insertMention` had put there. That is
+ *  gone with the interior deletions it existed for (see the branch below): a SURVIVING span drops
+ *  its sigil and touches no whitespace at all, and a CONSUMED leading address can only ever leave
+ *  whitespace at the START, which the closing `out.trim()` takes. So nothing in the body of the
+ *  message is rewritten — every run of whitespace between the ends, including the newlines and
+ *  indentation of a pasted block, is the user's and survives untouched. */
 export function mentionFreeText(text: string, agents: readonly MentionAgent[]): string {
   const spans = findMentionSpans(text, agents);
   if (spans.length === 0) return text;
