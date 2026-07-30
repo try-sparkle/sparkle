@@ -23,15 +23,16 @@ import {
   MICROPHONE_SETTINGS_URL,
   MIC_HOT_PREFIX,
   MIC_HOT_SUFFIX,
-  PAUSED_COMPOSER_PLACEHOLDER,
   PREPARING_PREFIX,
   PREPARING_SUFFIX,
   WAKE_PREFIX,
   WAKE_SUFFIX,
   modelPercent,
+  pausedComposerPlaceholder,
   type VoiceErrorNotice,
 } from "../../voice/dictationCopy";
 import type { MicPresentation } from "../../voice/micPresentation";
+import type { PauseReason } from "../../voice/dictationFocus";
 
 /** How much room the overlay must leave at the textarea's TRAILING-RIGHT edge.
  *
@@ -256,12 +257,17 @@ export function VoicePlaceholderCopy({
   wakeWord,
   stopWord,
   modelProgress,
+  pauseReason = null,
   fallback = null,
 }: {
   micPresentation: MicPresentation;
   wakeWord: string;
   stopWord: string;
   modelProgress: { done: number; total: number | null } | null;
+  /** WHY the mic is paused, for the `focusPaused` arm alone. A pause with no stated cause is what
+   *  left the terminal case reading as a bug, so the arm names what took the keyboard. Defaults to
+   *  null, which keeps the long-standing window wording — the honest general case. */
+  pauseReason?: PauseReason | null;
   /** Rendered for `off` alone — the one state whose answer is the caller's to give. */
   fallback?: ReactNode;
 }) {
@@ -300,10 +306,12 @@ export function VoicePlaceholderCopy({
         </>
       );
     case "focusPaused":
-      // Armed but NOT capturing (window unfocused/muted, or capture not started yet). The mic can't
-      // hear anything, so — exactly like the sidebar's "Listening paused" caption — say so instead
-      // of inviting the wake word.
-      return <>{PAUSED_COMPOSER_PLACEHOLDER}</>;
+      // Armed but NOT capturing (another window, the caret in a terminal, muted, or capture not
+      // started yet). The mic can't hear anything, so — exactly like the sidebar's "Listening
+      // paused" caption — say so instead of inviting the wake word, and NAME THE CAUSE: "paused"
+      // on its own is what made the terminal case read as a broken mic rather than a deliberate
+      // one. The words come from the same module the sidebar's do, keyed on the same reason.
+      return <>{pausedComposerPlaceholder(pauseReason)}</>;
     default: {
       // Unreachable: every member above has an arm. This is the exhaustiveness guard — adding a
       // MicPresentation member fails to compile here until someone decides what it should say.

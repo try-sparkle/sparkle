@@ -666,16 +666,21 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
   });
 
   // ── THE REPORTED BUG ─────────────────────────────────────────────────────────────────────────
-  // Design §2(b) and §4: an agent has a live prompt on screen, the user types something terse that
-  // was meant for the concierge, `looksLikeAnswer` matches, and the router says "agent". That is
-  // the router working as designed — and it used to put the user's word into a terminal with no
-  // warning and no way back.
+  // Design §2(b) and §4: an agent-bound decision used to be dispatched the instant it resolved,
+  // putting the user's word into a terminal with no warning and no way back.
   //
-  // The fix is not to stop routing. It is that the verdict now ARMS a visible, cancellable intent.
-  // So this row asserts the negative that matters: at the moment routing resolves, NOTHING has been
+  // TWO LAYERS FIXED THAT, and this row owns the second. The FIRST is that the router can no longer
+  // produce an agent verdict from a heuristic at all — the "this text answers the question on
+  // screen" branch was deleted, because it was mis-routing the user's answers to the CONCIERGE into
+  // whichever build agent's pane happened to be showing (services/conciergeRouter, and its own
+  // suite pins it). The SECOND, asserted here, is that even a legitimate agent-bound decision ARMS
+  // a visible, cancellable intent rather than dispatching.
+  //
+  // The router is a MOCK in this file, so the verdict below is a knob — it stands for the decision
+  // ConciergeHost really builds today, the one from an explicit `@Name`. What this row asserts is
+  // the negative that matters either way: at the moment routing resolves, NOTHING has been
   // dispatched, and what exists instead is an intent the user can still stop.
-  it("REGRESSION: a live ask plus terse concierge-aimed text ARMS an intent, it does not dispatch", async () => {
-    // A live permission prompt on the agent's screen — the precondition for `looksLikeAnswer`.
+  it("REGRESSION: an agent-bound decision ARMS an intent, it does not dispatch", async () => {
     h.feed = feedWith("approval");
     routeToAgent();
     renderWithTarget();
@@ -1291,9 +1296,12 @@ describe("ConciergeHost — routing receipts", () => {
       userPrompt: true,
       display: "was that right?",
       namingBasis: "was that right?",
-      // FALSE for every send in this file: none of them is @-addressed, so each keeps the
-      // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
-      neverPickerAnswer: false,
+      // TRUE, and this is the ONE send in this file for which it is (roborev 55418). A redirect is a
+      // replay of a COMPOSED message, and unlike an addressed send it does not arm a cancellable
+      // intent — it dispatches on one tap. So it may never be collapsed into a picker keystroke: a
+      // bare "1" redirected at a waiting agent would otherwise select the first row of a picker the
+      // user never read. The countdown sends below keep `false`; only the redirect path changed.
+      neverPickerAnswer: true,
     });
   });
 

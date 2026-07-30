@@ -77,7 +77,6 @@ import {
 } from "../services/conciergeProactive";
 import {
   agentCanAcceptInput,
-  answersLivePicker,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
   type ConciergeDispatchPath,
@@ -96,7 +95,13 @@ import {
 import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
 import { routeMessage } from "../services/conciergeRouter";
-import { mentionFreeText, rosterFromMentions, type ConciergeMention } from "./Concierge/mentions";
+import {
+  mentionFreeText,
+  mentionRoster,
+  mentionsIn,
+  rosterFromMentions,
+  type ConciergeMention,
+} from "./Concierge/mentions";
 import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
@@ -252,12 +257,18 @@ function refusalCopy(path: RefusedPath | null, name: string, voice: RefusalVoice
       return approving
         ? `${name} is asking something I can't answer with a plain "approve" — open it to choose.`
         : `${name} is waiting on a choice I can't map that to — open it and pick, or answer with just the option.`;
-    // ITS OWN LINE, not a second use of `ambiguous-picker` above (roborev 54665). That copy says the
-    // answer mapped to nothing and to "answer with just the option", and here both are false: the
-    // text mapped perfectly — which is WHY it was refused, since an addressed message is a message,
-    // not a keystroke — and answering with just the option is what the user did. Sharing the line
-    // sent them round a loop whose only exit was guessing that the `@` was the problem. This one
-    // states the real reason and the two real exits.
+    // ITS OWN LINE, not a second use of `ambiguous-picker` above (roborev 54665). That copy says
+    // the answer mapped to nothing and offers "answer with just the option", and it is wrong here
+    // WHETHER OR NOT the text matched — which is the point, because this path no longer depends on
+    // the match at all (roborev 55400: the declared disposition is read before the matcher). The
+    // refusal is about what the message IS, not how well it scored:
+    //   • an ADDRESSED send matches perfectly and is still refused, because a message is not a
+    //     keystroke — and "answer with just the option" is exactly what the user already did;
+    //   • an ATTACHMENT-CARRYING redirect matches nothing, because the quoted paths defeat the
+    //     anchored matcher — and the thing in their way is the file, not the wording.
+    // Sharing `ambiguous-picker` sent the first round a loop whose only exit was guessing the `@`
+    // was the problem, and the second one a loop with no exit at all. This line states the real
+    // reason and the real exits.
     // ONE exit, not two. This line used to offer a second — "drop the @<name> and send just the
     // option" — and that advice is only safe when the named agent also happens to be the column's
     // current target. `send` resolves an UNADDRESSED message against `targetRef.current`, so with
@@ -764,6 +775,46 @@ export function ConciergeHost({
     targetRef.current = routingTarget;
   }, [routingTarget]);
 
+  // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
+  // Who the compose box's "@" picker may offer, and — the same list, which is the point — the roster
+  // a typed mention is RESOLVED against. One list, so an agent that is offerable and an agent that
+  // is addressable can never be two different populations.
+  //
+  // DECLARED ABOVE THE RAIL rather than below it, because the rail's own label is derived from this
+  // list now (see `railTargetName`). Physical order in a component body is a real dependency edge.
+  //
+  // UNORDERED AND UNLABELLED, deliberately: `ComposeBox` runs `mentionRoster` on this once and uses
+  // the result for its picker, its resolve and its Backspace alike. This host briefly did the
+  // ordering instead, on a contract stated in a comment — which is not a contract (roborev 54555),
+  // and it left the consumer free to resolve against a list that had skipped the step. Ordering and
+  // duplicate-name labelling belong at the single place that turns text into an aim.
+  //
+  // EVERY agent in the feed, including the ones that cannot take a message: the picker lists those
+  // disabled with a reason rather than hiding them, because "no such agent" and "that one is a
+  // cloud agent" are different answers. `canAcceptInput` here is a snapshot for the LIST; the
+  // authoritative check is the one `deliver` makes at send time against the live store.
+  const mentionAgents = useMemo(
+    () =>
+      allAgents(feed).map((a) => ({
+        id: a.id,
+        name: a.name,
+        projectId: a.projectId,
+        projectName: a.projectName,
+        band: a.band,
+        since: a.since,
+        canAcceptInput: agentCanAcceptInput(a.id),
+      })),
+    [feed],
+  );
+  // …and the same list for the handlers, which are memoized on stable deps and run after render
+  // (the feedRef/targetRef pattern above). `send` resolves a mention off this rather than closing
+  // over a render-time value, so a message submitted after the fleet changed resolves against the
+  // fleet as it is NOW.
+  const mentionAgentsRef = useRef(mentionAgents);
+  useEffect(() => {
+    mentionAgentsRef.current = mentionAgents;
+  }, [mentionAgents]);
+
   // ══ THE AUTO-SEND RAIL (PRD 1 §4) ════════════════════════════════════════════════════════════
   // Armed state is a persisted PRESENTATION preference, read here rather than in the column for the
   // same reason `copyOnSelection` is: nothing under components/Concierge touches a store.
@@ -792,6 +843,45 @@ export function ConciergeHost({
    */
   const autoFiringRef = useRef(false);
 
+  /**
+   * WHO THE RAIL SAYS THIS MESSAGE IS FOR — derived from the COMPOSE BOX'S OWN TEXT, and from
+   * nothing else.
+   *
+   * ══ THE BUG THIS REPLACES ══════════════════════════════════════════════════════════════════════
+   * This was `routingTarget?.name ?? "Concierge"`: the build agent whose pane happens to be on
+   * screen. That is an INHERITED target — the user never chose it, they just navigated. The user was
+   * answering the concierge's own design questions in this box while a build agent's pane was up,
+   * and their answers went into that agent's terminal; they noticed only because the concierge's
+   * replies stopped making sense. The rail is the surface that was supposed to warn them, and it was
+   * naming the wrong destination confidently, because it read the same inherited target the misroute
+   * came from. With auto-send armed that is worse still: an inherited target plus a countdown means
+   * dictated speech reaches a PTY with no deliberate act at all.
+   *
+   * The router half of the fix is in services/conciergeRouter (it can no longer return `agent` at
+   * all), so the ONLY thing that can aim a send at a terminal is an explicit `@Name` in the text.
+   * This is that same fact, rendered: no mention → "Concierge", always.
+   *
+   * ══ THE CONTRACT ═══════════════════════════════════════════════════════════════════════════════
+   * THE LABEL AND THE DESTINATION MUST BE COMPUTED THE SAME WAY, or the rail goes back to lying —
+   * quietly this time, since a label that is merely stale looks identical to a correct one. So this
+   * resolves mentions exactly as the send does: `mentionRoster(mentionAgents, preferredAgentId)`
+   * over the SAME two inputs `ComposeBox` is handed below (its `mentionAgents` / `preferredAgentId`
+   * props), then `mentionsIn` over the live text. ComposeBox builds that roster from those props and
+   * resolves against it at submit; feeding this the same inputs is what makes drift impossible
+   * rather than merely unlikely. If you change either input here, change it in the JSX below too.
+   *
+   * The mention's `name` is the ADDRESS the user typed, which for two same-named agents is the
+   * disambiguated `@Docs (web)` rather than a bare "Docs" that names neither (Concierge/mentions,
+   * `withMentionLabels`). Naming the destination ambiguously is exactly the failure this rail exists
+   * to catch, so it shows the address.
+   */
+  const railTargetName = useMemo(() => {
+    const roster = mentionRoster(mentionAgents, routingTarget?.agentId ?? null);
+    // The FIRST mention, because that is the one `send` routes at — a message goes to one terminal,
+    // and every other name in it is content (see `send`'s `mentions?.[0]`).
+    return mentionsIn(composedText, roster)[0]?.name ?? "Concierge";
+  }, [composedText, mentionAgents, routingTarget?.agentId]);
+
   const autoSendRail = useAutoSend({
     armed: autoSendArmed,
     // OWNERSHIP GATE, and it is load-bearing rather than defensive. `speechEndSeq` is GLOBAL —
@@ -805,8 +895,10 @@ export function ConciergeHost({
     interim: dictation.interim,
     // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
     // countdown is also the moment you can notice you are about to dictate into the wrong agent.
-    // Same source the send itself routes on, never a second guess.
-    targetName: routingTarget?.name ?? "Concierge",
+    // Derived from the compose box's own text — the agent the user NAMED, never the one they
+    // happen to be looking at. See `railTargetName` for the misroute that made that distinction
+    // load-bearing, and for the resolve-it-the-same-way contract it keeps with the send.
+    targetName: railTargetName,
     // Returns whether a send actually went out (see UseAutoSendArgs.onFire), and BOTH ways of not
     // sending are reported rather than just the first:
     //
@@ -843,43 +935,6 @@ export function ConciergeHost({
     // never spoken. Through `announce`, the column's ONE live region, exactly like onCopied.
     onAnnounce: announce,
   });
-
-  // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
-  // Who the compose box's "@" picker may offer, and — the same list, which is the point — the roster
-  // a typed mention is RESOLVED against. One list, so an agent that is offerable and an agent that
-  // is addressable can never be two different populations.
-  //
-  // UNORDERED AND UNLABELLED, deliberately: `ComposeBox` runs `mentionRoster` on this once and uses
-  // the result for its picker, its resolve and its Backspace alike. This host briefly did the
-  // ordering instead, on a contract stated in a comment — which is not a contract (roborev 54555),
-  // and it left the consumer free to resolve against a list that had skipped the step. Ordering and
-  // duplicate-name labelling belong at the single place that turns text into an aim.
-  //
-  // EVERY agent in the feed, including the ones that cannot take a message: the picker lists those
-  // disabled with a reason rather than hiding them, because "no such agent" and "that one is a
-  // cloud agent" are different answers. `canAcceptInput` here is a snapshot for the LIST; the
-  // authoritative check is the one `deliver` makes at send time against the live store.
-  const mentionAgents = useMemo(
-    () =>
-      allAgents(feed).map((a) => ({
-        id: a.id,
-        name: a.name,
-        projectId: a.projectId,
-        projectName: a.projectName,
-        band: a.band,
-        since: a.since,
-        canAcceptInput: agentCanAcceptInput(a.id),
-      })),
-    [feed],
-  );
-  // …and the same list for the handlers, which are memoized on stable deps and run after render
-  // (the feedRef/targetRef pattern above). `send` resolves a mention off this rather than closing
-  // over a render-time value, so a message submitted after the fleet changed resolves against the
-  // fleet as it is NOW.
-  const mentionAgentsRef = useRef(mentionAgents);
-  useEffect(() => {
-    mentionAgentsRef.current = mentionAgents;
-  }, [mentionAgents]);
 
   /** A pill in one of the concierge's OWN replies was clicked: reveal that agent.
    *
@@ -1600,10 +1655,17 @@ export function ConciergeHost({
        *  the diff against a branch that also edits this file stays as small as possible. */
       authority: DispatchAuthority,
       /** Forbid this text being collapsed into a picker keystroke — see
-       *  conciergeDispatch's `neverPickerAnswer`. TRUE only for a message the user ADDRESSED to
-       *  this agent by name; the mirror check in `send` cannot enforce it, because the gate lives
-       *  inside the dispatcher (roborev 54569). REQUIRED, so a future call site has to decide
-       *  rather than inherit a default that is wrong for it. */
+       *  conciergeDispatch's `neverPickerAnswer`.
+       *
+       *  A DISPOSITION, not a synonym for "addressed". TWO call sites set it (roborev 55400):
+       *    • an @-ADDRESSED send — the user wrote a message to this agent by name;
+       *    • a REDIRECT of a message that CARRIED FILES — the replay is the wire payload with the
+       *      attachments' quoted paths prefixed, and no such string is a keystroke.
+       *  Both are "the user composed a message", which is the thing this flag actually asserts.
+       *
+       *  The mirror check in `send` cannot enforce it, because the gate lives inside the dispatcher
+       *  (roborev 54569). REQUIRED, so a future call site has to decide rather than inherit a
+       *  default that is wrong for it. */
       neverPickerAnswer: boolean,
     ): Promise<boolean> => {
       try {
@@ -1884,17 +1946,22 @@ export function ConciergeHost({
       if (decision.target === "agent" && aim && stillThere) {
         // ══ THE FORWARDING-BUG FIX ══════════════════════════════════════════════════════════════
         // This used to dispatch, right here, on the router's verdict alone — an agent with a live
-        // prompt plus terse concierge-aimed text matched `looksLikeAnswer` and the user's words went
-        // into a terminal with no warning and no way back. The router is RIGHT to be here (see
-        // conciergeRouter's header, and PRs #644/#651 — it and all of its tests stay); what was
-        // wrong was that its verdict went straight to the PTY.
+        // prompt plus terse concierge-aimed text matched the router's own answer-detector, and the
+        // user's words went into a terminal with no warning and no way back.
         //
-        // So it now ARMS an intent instead. The send becomes visible, counts down, and can be
-        // cancelled; only an expiry the user didn't stop dispatches, and it does so carrying
+        // THE ROUTER CAN NO LONGER PRODUCE THAT VERDICT AT ALL. The detector and its branch were
+        // deleted: `routeMessage` never returns `agent`, so the only decision that reaches this
+        // block is the one built a few lines up from an explicit `@Name` in the text (see
+        // conciergeRouter's header for the damage that forced it). What remains here is therefore
+        // the ADDRESSED path — a destination the user stated in words.
+        //
+        // The gate stays anyway, and that is deliberate: even a named agent ARMS an intent rather
+        // than dispatching. The send becomes visible, counts down, and can be cancelled; only an
+        // expiry the user didn't stop dispatches, and it does so carrying
         // `{ kind: "countdown", intentId }`. That is why there is no `router` arm in
         // DispatchAuthority and must never be one — a heuristic verdict is not a user gesture, and
         // the union having no legal variant for it is what makes the old behavior unrepresentable
-        // rather than merely discouraged.
+        // rather than merely discouraged. Explicitness buys a skipped classify, never a skipped gate.
         // What actually goes down the wire. For an ADDRESSED message that is the version with the
         // `@…` stripped: the agent on the far end is a Claude Code CLI, where a leading `@` opens
         // its own file-reference autocomplete, so relaying the address verbatim would pop a picker
@@ -2107,29 +2174,41 @@ export function ConciergeHost({
             name: mentionedAgent.name,
           }
         : targetRef.current;
-      // IS THIS A PICKER ANSWER? Asked BEFORE the payload is built, because the answer changes how
-      // it is built. The prefix `attachedPayload` adds is quoted temp paths, and every arm of
-      // `matchAnswerToOption` is anchored — so with a file staged and a picker on screen, "Yes"
-      // arrives as `"/var/folders/…/shot.png" Yes`, matches nothing, and comes back
-      // `ambiguous-picker`. The box then restores the draft AND the chips, so retyping reproduces
-      // it exactly: a loop whose only exit is guessing that the attachments are the problem, which
-      // the refusal copy never says.
+      // ══ THERE IS NO LONGER A PICKER SHORT-CIRCUIT HERE, AND THERE MUST NOT BE ═══════════════
+      // This used to ask `answersLivePicker` BEFORE building the payload and, on a true, send the
+      // text UNPREFIXED with its attachments left staged. The reason was real at the time: a send
+      // could become a KEYSTROKE, `attachedPayload` prefixes quoted temp paths, and every arm of
+      // `matchAnswerToOption` is anchored — so `"/var/folders/…/shot.png" Yes` matched nothing and
+      // came back `ambiguous-picker`. Holding the files was the honest half of that: a keystroke is
+      // not a message that could carry a file, so spending them would cost the user the picking for
+      // nothing.
       //
-      // So a terse answer to a live picker sends UNPREFIXED and KEEPS its attachments staged for
-      // the next message. Holding them is the honest half: the picker answer is a keystroke, not a
-      // message that could carry a file, so consuming them would silently cost the user the picking
-      // for nothing. The chips stay on screen, which is also the only signal that they weren't sent.
+      // NO SEND FROM THIS BOX CAN BECOME A KEYSTROKE ON THE STRENGTH OF THIS TEXT, on any path:
+      //   • UNADDRESSED — `routeMessage` never returns `agent` (see conciergeRouter's header: the
+      //     "the agent on screen is waiting AND this looks like an answer" branch was deleted for
+      //     typing users' concierge-directed answers into a build agent's terminal). So the message
+      //     goes to Sparkle, which reads attachment paths off disk exactly as an agent does. The
+      //     short-circuit therefore only ever fired on CONCIERGE-bound text, where it silently
+      //     withheld the staged screenshot and had the brain answer a question about a picture it
+      //     was never given — with the chips still on screen as the only clue (roborev 55033).
+      //   • ADDRESSED — `deliver` passes `neverPickerAnswer` for every mention-decided dispatch, and
+      //     the dispatcher REFUSES (`addressed-at-picker`) rather than pressing a button. An
+      //     addressed message is a message; its agent is meant to receive the file paths.
+      //   • REDIRECTED — the receipt's "Also ask <agent>" is the THIRD way this box reaches a live
+      //     PTY, and the only one that may still take the keystroke path: a redirected bare "yes"
+      //     SHOULD press the button. But a redirect of a message that carried files replays the
+      //     prefixed payload, and `redirect` declares `neverPickerAnswer` for exactly that case
+      //     (roborev 55309) — so the files never turn into a keystroke there either.
       //
-      // NEVER for an addressed message. `matchAnswerToOption` matches terse text against whatever
-      // picker is on the agent's screen, and a message that names its recipient is a MESSAGE — the
-      // user wrote a sentence at an agent, not a keystroke at a menu. Letting "@Kraken Auth yes"
-      // collapse into pressing "yes" on some unrelated prompt would answer a question they never
-      // read, which is the least recoverable thing this column can do.
-      const answersPicker =
-        !mentionedAgent && !!submitted && answersLivePicker(submitted.agentId, text);
+      // So the lever protects nothing and costs attachments. Do not restore it on the addressed
+      // path either: `answersLivePicker` reads the screen at SUBMIT and the dispatch re-reads it
+      // after the countdown, so a picker that clears in between would land the addressed message as
+      // an ordinary prompt — stripped of the very files the user attached for it. That is this same
+      // bug, one path over.
+      //
       // Take the staged files in the SAME tick the text leaves, so the next message starts clean
       // and a second Send can't deliver the same attachments twice.
-      const staged = answersPicker ? [] : takeAttachments();
+      const staged = takeAttachments();
       // THREE renderings of one message, exactly as the removed composer built them:
       //   payload — the attachments' real paths prefixed to the text, for the PTY only;
       //   display — the typed text plus compact counts, for the thread AND every prompt-history
@@ -2191,11 +2270,44 @@ export function ConciergeHost({
   const redirect = useCallback(
     async (messageId: string) => {
       const text = sentTextRef.current.get(messageId);
-      if (!text) return;
+      // EXISTENCE, not truthiness. An ATTACHMENTS-ONLY send is a real message — ComposeBox allows it
+      // (`canSend` is text OR attachments) and `send` stores `""` for it — and it gets a redirectable
+      // receipt, so the "Also ask <agent>" button is rendered for it. A falsy test returned before
+      // anything dispatched, so that button did NOTHING: no send, no thread line, no receipt change,
+      // and it stayed mounted so the user tapped it again. A silently dead affordance is exactly what
+      // the receipt rules in this file are written against (roborev 55418). The rehydrated-thread case
+      // this guard also used to cover is handled elsewhere — conciergeThreadStore clears
+      // `redirectable` on a restored receipt.
+      if (text === undefined) return;
       // The AGENT-bound form (attachment paths prefixed). The brain reads paths too, so BOTH
       // directions replay this rather than the bare text; it falls back to `text` for a message
       // that carried no files, where the two are the same string anyway.
       const replay = sentPayloadRef.current.get(messageId) ?? text;
+      // ══ GUARD ON WHAT ACTUALLY RIDES THE WIRE, NOT ON `text` ═════════════════════════════════
+      // Widening the check above to an existence test (so an attachments-only send stops having a
+      // dead button) also admitted `text === ""`, and `replay` falls back to it — so a remembered
+      // empty string with no recorded payload would dispatch an EMPTY prompt, i.e. a bare newline
+      // into the agent's terminal. At a live picker that presses whatever row is selected, which is
+      // exactly the "press a button nobody read" hazard the `neverPickerAnswer` rule below exists to
+      // close, arriving through the other door — and that flag cannot help, because it suppresses
+      // option MATCHING, not the sending of a bare return (roborev 55448).
+      //
+      // The old falsy guard made this unrepresentable by accident. This one says it on purpose, and
+      // about the right value: an attachments-only send has an empty `text` but a non-empty `replay`
+      // (the quoted paths), so it still redirects, while a message with nothing to send at all does
+      // not claim the receipt, write a thread line, or reach the PTY.
+      //
+      // HOW NARROW THIS IS, since the next reader will look for a test and not find one — the same
+      // note `onFire`'s empty-box guard carries, for the same reason. `ComposeBox.canSend` is
+      // `text || attachments`, so a send with neither never happens, and every send WITH attachments
+      // records a payload. Reaching this line therefore needs a state the public surface cannot
+      // produce: a remembered `""` with no payload beside it (attachments cleared or failed to
+      // resolve between `send` and `attachedPayload`, or a future caller of `rememberSentText`).
+      // A black-box row asserting "nothing dispatched" passes against the unguarded code too — it is
+      // vacuous, and one was written and deleted rather than left here looking like cover. The guard
+      // stays because what it prevents is a bare return into a live PTY, which no flag downstream
+      // can take back: `neverPickerAnswer` suppresses option MATCHING, not the sending of a newline.
+      if (!replay) return;
       const current = chatRef.current.find((m) => m.id === messageId);
       const receipt = current?.kind === "you" ? current.receipt : undefined;
       if (!receipt || receipt.alsoSentTo) return;
@@ -2246,9 +2358,29 @@ export function ConciergeHost({
               [],
               false,
               { kind: "redirect", receiptId: messageId },
-              // A redirect replays a message the router already sent elsewhere; it is not an
-              // addressed send, so the picker path stays available to it exactly as before.
-              false,
+              // ══ ALWAYS TRUE. A REDIRECT MAY NEVER PRESS A BUTTON ═══════════════════════════════
+              // This started as "false, because a redirected bare yes should still answer a picker",
+              // then grew a carve-out for attachment-carrying replays (roborev 55309). Both were
+              // wrong in the same direction, and the general rule is simpler AND safer (roborev
+              // 55418): a redirect is a REPLAY OF A COMPOSED MESSAGE, which is exactly the
+              // disposition this flag asserts.
+              //
+              // What the carve-out left exposed: unlike an addressed send, which arms a visible,
+              // cancellable intent, this path calls promptAgent DIRECTLY — one tap dispatches
+              // irreversibly. And `matchAnswerToOption` resolves a bare number by 1-based ON-SCREEN
+              // POSITION. So: Sparkle lists three options in chat, the user types "1", the router
+              // sends it to Sparkle (it can no longer route at an agent), the receipt offers "Also
+              // ask CI Hardening", they tap it to pass their choice along — and "1\r" selects the
+              // FIRST ROW of CI Hardening's picker, a question they never read, whose options have
+              // nothing to do with Sparkle's list. The button's own label promises to ASK, not to
+              // press. That is the least recoverable thing this path can do, decided by the
+              // matcher's opinion rather than by anyone's intent.
+              //
+              // Answering a picker from the concierge is still a feature — it just belongs to the
+              // surface built for it (the suggestion/nudge card, which does not route through here
+              // and carries the agent's actual on-screen options), not to a replay of a message the
+              // user aimed somewhere else.
+              true,
             ),
           false,
         );
@@ -2549,6 +2681,10 @@ export function ConciergeHost({
         copyOnSelection={copyOnSelection}
         // The "@" picker's list, and the roster a typed mention resolves against — relevance-
         // ordered, because that order is what breaks a duplicate-name tie (see the memo).
+        //
+        // THESE TWO PROPS ARE ALSO THE RAIL'S INPUTS. `railTargetName` runs `mentionRoster` over
+        // exactly this pair so the label it draws and the agent this box resolves at submit cannot
+        // be two different answers. Change one, change the other.
         mentionAgents={mentionAgents}
         preferredAgentId={routingTarget?.agentId ?? null}
         // ── THE AUTO-SEND RAIL (PRD §4) ──────────────────────────────────────────────────────

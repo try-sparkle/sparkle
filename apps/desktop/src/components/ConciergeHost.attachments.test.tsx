@@ -271,6 +271,37 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
     });
   });
 
+  // ══ THE SAME CLAIM, ON THE PATH PRODUCTION CAN ACTUALLY REACH (roborev 55309) ═════════════════
+  // `routeToAgent()` above is a KNOB — and it is now a knob for a verdict `routeMessage` cannot
+  // produce, since the answer-detector was deleted (conciergeRouter's header). The only send that
+  // still reaches a terminal is an @-ADDRESSED one, and that path does NOT reuse `payload`: it
+  // builds its own fourth rendering, `mentionAim.payload = attachedPayload(wire, staged)`, from the
+  // address-stripped text. Nothing pinned it. Rebuild that line from the bare `text` and every
+  // suite in the repo stayed green while an addressed message silently dropped the user's
+  // screenshot — the same defect the picker suite exists to prevent, on the one path where the
+  // agent, not the brain, is the thing left guessing.
+  //
+  // No `routeToAgent()` here, deliberately: the address alone must be what sends it.
+  it("prefixes the path on an ADDRESSED send, and strips only the address", async () => {
+    mount();
+    await attachViaUpload();
+    type("@CI Hardening what is wrong here?");
+    await clickSend();
+    expect(h.route).not.toHaveBeenCalled(); // named, so nothing is classified or billed
+    expect(h.dispatch).toHaveBeenCalledWith(
+      "ag1",
+      // The `@…` is gone (a leading `@` opens Claude Code's own file autocomplete) — the PATH is not.
+      "/tmp/shot.png what is wrong here?",
+      expect.objectContaining({
+        userPrompt: true,
+        // The thread's rendering never carries the temp path (roborev 46911/46925), address or no.
+        display: "@CI Hardening what is wrong here? · 1 image",
+        // An addressed message is a message, never a keystroke.
+        neverPickerAnswer: true,
+      }),
+    );
+  });
+
   // roborev 53670. The leak that shipped was in the WIRING, not in the formatters: the host had
   // both renderings in scope at the arm site and put the wire payload on the intent. A test that
   // hand-builds an intent cannot see that — and the realistic recurrence, `display: payload`, is

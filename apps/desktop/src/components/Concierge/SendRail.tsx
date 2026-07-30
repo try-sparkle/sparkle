@@ -20,6 +20,28 @@
 // auto-send are your chance to notice you are about to dictate into the wrong agent. (An agent
 // literally NAMED "Build 4" of course keeps its numeral; the ban is on a readout, not on a name.)
 //
+// THE LABEL IS THE SAME SHAPE IN BOTH ARMED STATES — `→ <target>` whether or not a countdown is
+// running. Only the DISARMED state says the bare "Auto-send". It used to drop the arrow the moment
+// counting began, so the row went "→ Build 4" → "Build 4", and the mis-route safety net changed
+// shape at the exact moment it mattered most. Users read that as the target having VANISHED: two
+// screenshots six seconds apart showed one rail with an arrow and a name and one with, apparently,
+// neither an arrow nor a destination — and could not work out what distinguished them. The thing a
+// state change must never do is subtract information the other state was showing.
+//
+// COUNTING IS SIGNALLED BY STRUCTURE, NOT BY TEXTURE. There are two independent facts on this strip
+// and they get two independent channels:
+//
+//   • counting vs armed-idle → the TRACK. A faint bounded plate behind the fill, present only while
+//     counting. Counting reads as a bar draining inside a track; armed-idle reads as bare chrome.
+//   • the confidence TIER → the fill's texture (hatched at very-low, solid otherwise), unchanged.
+//
+// They used to be smeared onto one channel: the fill's mere PRESENCE meant counting, while its
+// TEXTURE meant tier — so the rail rendered "sometimes solid and sometimes hatched" with nothing
+// on screen explaining which fact had changed. Two states that differ only by texture, where one
+// of them also HIDES information the other shows, are not legible: there is nothing to compare, so
+// the difference reads as a rendering bug rather than as a state. Keep the two channels separate —
+// if a new fact needs showing, give it its own channel rather than another texture.
+//
 // PRESENTATIONAL, like everything else in this directory: it takes a `model` and callbacks and
 // reads no store. The host owns the timer, the routing and the announcements.
 //
@@ -30,6 +52,8 @@
 import { useEffect, useRef, useState } from "react";
 
 import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { BLUEPRINT } from "../../theme/blueprintSpec";
+import { useResolvedTheme } from "../../theme/theme";
 import type { AutoSendPhase } from "../../voice/autoSendTimer";
 import type { Confidence } from "../../voice/confidence";
 
@@ -77,13 +101,32 @@ export interface SendRailProps {
   onSend: () => void;
   /** Whether there is anything to send (text or attachments) — greys the button, as before. */
   canSend: boolean;
+  /**
+   * The composer around this rail is PATCHED to a terminal, so the strip is drawn on the terminal
+   * flood rather than on `inputSurface` — the same flag, from the same source, that already swaps
+   * ComposeBox's own border (see its `wired` prop).
+   *
+   * It exists for ONE reason: the counting track's edge. `C.hairline` is the CHROME seam and is
+   * deliberately not a token the terminal plane accepts — theme/chromeContrast.test.ts pairs edges
+   * to the planes they are drawn on precisely because light `hairline` on `forest` measures 1.195
+   * against a 1.2 floor, and `termHair` is the token the spec draws there instead. Painting the
+   * track with the chrome token on the terminal plane would make the counting cue invisible in
+   * wired + light — i.e. it would put counting and armed-idle back to being indistinguishable,
+   * which is the entire defect this track exists to remove (roborev 55244).
+   */
+  wired?: boolean;
 }
 
 /** The strip's height. Matches the Send button so the row has no slack above or below it. */
 const RAIL_HEIGHT = 42;
 
-export function SendRail({ model, onToggleArmed, onSend, canSend }: SendRailProps) {
+export function SendRail({ model, onToggleArmed, onSend, canSend, wired = false }: SendRailProps) {
   const { phase, targetName, tier, remainingFraction } = model;
+  // The ground this strip is drawn on decides the track's edge token — see `wired`. Read here (not
+  // taken as a second prop) exactly as ComposeBox reads it for its own border, so the two cannot
+  // pick different modes for the same paint.
+  const mode = useResolvedTheme();
+  const trackEdge = wired ? BLUEPRINT[mode].termHair : C.hairline;
   const armed = phase !== "disarmed";
   const counting = phase === "counting";
   const veryLow = counting && tier === "verylow";
@@ -125,7 +168,10 @@ export function SendRail({ model, onToggleArmed, onSend, canSend }: SendRailProp
     return () => clearTimeout(id);
   }, [easing]);
 
-  const label = !armed ? "Auto-send" : counting ? targetName : `→ ${targetName}`;
+  // IDENTICAL IN SHAPE ACROSS BOTH ARMED STATES — see the header. The arrow is not decoration; it
+  // is what makes the word after it read as a DESTINATION rather than as a caption, and dropping it
+  // mid-countdown made the target look like it had gone away.
+  const label = armed ? `→ ${targetName}` : "Auto-send";
 
   return (
     <div
@@ -134,6 +180,10 @@ export function SendRail({ model, onToggleArmed, onSend, canSend }: SendRailProp
       // The tier is exposed only while it is DOING something. A `data-tier` on a disarmed rail
       // would let a test (or a stylesheet) key off a tier the user cannot see.
       data-tier={counting ? tier : undefined}
+      // Counting is assertable WITHOUT reading styles. `data-phase` already carries it, but only by
+      // way of knowing which of the phase names count as counting; this states the fact the visual
+      // treatment keys off, so a test can pin the cue rather than the enum behind it.
+      data-counting={counting ? "true" : undefined}
       style={{
         position: "relative",
         display: "flex",
@@ -143,13 +193,61 @@ export function SendRail({ model, onToggleArmed, onSend, canSend }: SendRailProp
         marginTop: 8,
         borderRadius: 6,
         // No border and no fill of its own when idle: the strip is chrome for the Send button, not
-        // a panel. The countdown wash below is the only thing that ever paints it.
+        // a panel. The track and the wash below are the only things that ever paint it, and both
+        // are drawn only while counting — which is exactly what makes their presence the cue.
         overflow: "hidden",
       }}
     >
+      {/* THE TRACK — the counting cue, and the ONLY thing that distinguishes counting from
+          armed-idle. A faint bounded plate spanning the strip, drawn only while counting, so the
+          fill has visible walls to drain between: counting reads as a bar inside a track, and
+          armed-idle reads as the bare chrome it is.
+
+          STRUCTURAL, NOT TEXTURAL, on purpose. The fill's texture is spoken for — it carries the
+          confidence tier — and a second fact on the same channel is what made this rail unreadable
+          (header). An outline is a different channel entirely, so the two never collide.
+
+          THE EDGE TOKEN IS PICKED BY THE GROUND, not fixed. `C.hairline` is the CHROME seam; on the
+          terminal flood a wired composer sits on, the spec draws `termHair` instead. That is not a
+          preference — theme/chromeContrast.test.ts pairs edges to planes because light `hairline`
+          on `forest` measures 1.195 against a 1.2 floor, so a hardcoded `hairline` here would be
+          BELOW the project's own visibility floor in wired + light and the counting cue would
+          vanish exactly where it is needed (roborev 55244). Same choice, same two tokens, that
+          ComposeBox already makes for its own border one component up.
+
+          Held to a whisper either way (a 1px edge and an ~8% wash) so it reads as a boundary and
+          not as a panel, and so `cream` over it is the same text on the same ground it was before —
+          the label's contrast is set by the fill above it, which is unchanged. */}
+      {counting && (
+        <div
+          data-testid="send-rail-track"
+          aria-hidden
+          style={{
+            position: "absolute",
+            // Spelled out rather than `inset: 0` — same reason the fill spells its anchors out, and
+            // the shorthand does not round-trip through a style declaration as four readable edges.
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+            zIndex: 0,
+            borderRadius: 6,
+            // LONGHAND, not the `border` shorthand: the value is a CSS variable, and a shorthand
+            // carrying a `var()` cannot be decomposed into its longhands — the whole declaration
+            // stays an opaque string, so nothing (a test, a devtools inspector) can read the edge
+            // back off the node. The paint is identical either way.
+            borderWidth: 1,
+            borderStyle: "solid",
+            borderColor: trackEdge,
+            background: `color-mix(in srgb, ${trackEdge} 8%, transparent)`,
+          }}
+        />
+      )}
+
       {/* THE FILL. Absolutely placed and anchored RIGHT (`right: 0`, no `left`), so shrinking its
           width walks its left edge rightward — into the Send button. Behind everything else in the
           row (`zIndex` 0 vs the controls' 1), so it washes the strip rather than covering it.
+          After the track in DOM order and at the same `zIndex`, so it paints INSIDE it.
 
           Rendered only while counting: a full-width wash on an idle rail would read as a countdown
           that is stuck rather than one that has not started. */}

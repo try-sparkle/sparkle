@@ -1,17 +1,40 @@
 // Where does this message go? — the decision the compose box's target toggle used to make for us.
 //
 // See PRD/sparkle/concierge-auto-routing.md §2. The box is now empty and the user never picks a
-// destination, so every send lands here first.
+// destination, so every UNADDRESSED send lands here first.
 //
-// HEURISTICS ONLY — deterministic, zero latency, zero cost. They cover the overwhelming majority of
-// sends: nothing to prompt, an answer to a question the agent is visibly asking, or a question
-// about the fleet that only Sparkle can answer.
+// ══ THE RULE, AND IT IS ABSOLUTE ═════════════════════════════════════════════════════════════════
+// `routeMessage` NEVER returns `target: "agent"`. Not on a fallback, not on a heuristic, not on any
+// future tier. The only thing in this app that may aim a message at a live PTY is the USER NAMING
+// THE AGENT — an explicit `@Kraken Auth` in the text, resolved by Concierge/mentions and turned into
+// a `{ target: "agent" }` decision by ConciergeHost BEFORE it ever calls this module. Everything
+// that reaches here resolves to `sparkle`.
 //
-// …and a FALLBACK that is a design decision, not an accident: anything the heuristics can't place
-// resolves to `sparkle`. The two error directions are not symmetric. A wrong chat answer costs the
-// user one click on the receipt's redirect. A paragraph wrongly typed into a live PTY cannot be
-// pulled back — it may already have set an agent off doing the wrong thing. So when the router
-// doesn't know, it picks the reversible side. NEVER change this fallback to "agent".
+// This used to be weaker: the header said "NEVER change this FALLBACK to agent" while a heuristic
+// one screen down did exactly that. The branch read "the agent on screen is in `waiting`/`approval`
+// AND this text looks like an answer → type it into the terminal", and it caused real damage. The
+// user was answering the CONCIERGE's own design questions in the concierge compose box while a
+// build agent's pane happened to be on screen; their answers were typed into that agent's terminal.
+// They only noticed because the concierge's replies stopped making sense.
+//
+// WHY THE BRANCH WAS WRONG, not merely mis-tuned. It inferred a DESTINATION from the shape of the
+// text plus a status the user never mentioned. But the two facts it read are both about the AGENT
+// ("it is asking something", "there is a picker on screen") and neither is about the USER, so the
+// branch could not distinguish "answering the agent" from "answering the concierge in words that
+// happen to be short". A heuristic verdict is not a user gesture. The founder's model of this
+// column, verbatim: *"I'm just talking to you as the concierge, you're deciding when to send it to
+// the agent."* Deciding to send is Sparkle's job downstream; picking a terminal is not this
+// module's.
+//
+// The asymmetry that has always governed this file is the second reason, unchanged: a wrong chat
+// answer costs the user one click on the receipt's redirect, while a paragraph wrongly typed into a
+// live PTY cannot be pulled back — it may already have set an agent off doing the wrong thing. With
+// AUTO-SEND armed it is worse still, because an inherited target plus a countdown means dictated
+// speech reaches a terminal with no deliberate act at all. So this module only ever picks the
+// reversible side, and now it has no branch that could pick the other one.
+//
+// What survives is the part that was never a guess about a terminal: which SPARKLE-side reason to
+// record, so a surprising route is debuggable.
 //
 // There WAS a tier 2 here: one Haiku classify for the ambiguous middle. It was removed when the AI
 // backend moved onto the user's own Claude Code subscription — a `claude -p` classify measures
@@ -20,11 +43,11 @@
 //
 // PURE BY CONSTRUCTION: this module reads no stores and makes no calls. The caller builds
 // `RouteContext` and passes it in, which is what keeps the whole thing unit-testable without a live
-// app — now with no impure seam left at all.
+// app — and with the terminal read gone there is no impure seam left to inject around, either.
 import type { AgentTabStatus } from "../types";
-import { isTerseAnswer, liveOptionsFor } from "./conciergeDispatch";
-import type { SuggestionButton } from "./suggestions/types";
 
+/** `agent` is still a legal DECISION — ConciergeHost produces one for an @-addressed message — but
+ *  it is no longer a legal verdict of {@link routeMessage}. See the header. */
 export type RouteTarget = "sparkle" | "agent";
 /** `classified` is retained in the union but no longer produced — see the tier-2 note above. It
  *  stays so persisted/telemetry rows written before the removal still typecheck. */
@@ -41,34 +64,29 @@ export interface RouteDecision {
 export interface RouteAgent {
   id: string;
   name: string;
+  /** What the agent is doing right now — and DELIBERATELY READ BY NOTHING IN THE VERDICT.
+   *
+   *  It is carried because it is the field the removed branch keyed on. `waiting`/`approval` used to
+   *  mean "this agent is asking, so a short message must be its answer", which is how the user's
+   *  answers to the CONCIERGE ended up in a build agent's terminal (see the header). Keeping the
+   *  field lets `conciergeRouter.test.ts` hand this module an agent in exactly that state and pin
+   *  that the verdict is STILL `sparkle` — the regression is testable only because the input the old
+   *  branch consumed still exists. Delete the field and the branch becomes reintroducible with fresh
+   *  plumbing and no test standing in its way. */
   status: AgentTabStatus | undefined;
   /** Whether this agent can actually receive a message — `conciergeDispatch.agentCanAcceptInput`.
    *  FALSE for a cloud agent (which `dispatchConciergeAnswer` refuses outright) and for an agent
    *  the store no longer knows about.
    *
-   *  REQUIRED, deliberately. As an optional field it was the one flag in this module whose absence
-   *  recreated the exact bug it was added to fix: a caller that omitted it — or that passed
-   *  `undefined` because its lookup failed — got a cloud agent treated as a legitimate PTY target.
-   *  In a module whose whole design is "when in doubt, take the recoverable direction", a
-   *  safety gate must not fail open. A caller that doesn't know cannot route to a terminal. */
+   *  It no longer gates a terminal write — nothing here can produce one — so what it decides now is
+   *  only WHICH `reason` gets recorded, and it is required so that reason cannot silently become the
+   *  wrong one. The gate it used to be still exists, one layer up and closer to the wire, where
+   *  ConciergeHost re-checks `agentCanAcceptInput` at send time against the live store. */
   canAcceptInput: boolean;
 }
 
-/** Statuses where the agent is asking the user something RIGHT NOW.
- *
- *  Deliberately narrower than `needsAttention`, which also includes `errored`. An errored agent is
- *  STALLED, not asking — so a bare "ok" to it has nothing to answer, and routing it as free text
- *  into the PTY is exactly the irreversible direction this module exists to avoid. */
-const LIVE_ASK: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["waiting", "approval"]);
-
 export interface RouteContext {
   agent: RouteAgent | null;
-}
-
-/** Injectable seam so routing can be tested with no Tauri. */
-export interface RouteDeps {
-  /** The prompt options currently on the agent's screen (defaults to the real terminal read). */
-  liveOptions?: (agentId: string) => SuggestionButton[];
 }
 
 /**
@@ -96,31 +114,19 @@ const FLEET_TALK: readonly RegExp[] = [
   /^(?:hey |ok |hi )?sparkle\b/i,
 ];
 
-/** Bare affirmations/negations that only make sense as an answer to something on screen. */
-const BARE_ANSWER = /^(?:y|n|yes|no|yep|yeah|nope|ok|okay|sure|go ahead|do it|approve|deny)$/i;
-
 export function looksLikeFleetTalk(text: string): boolean {
   const t = text.trim();
   return FLEET_TALK.some((re) => re.test(t));
 }
 
-/**
- * Is this text an ANSWER to the question the agent is visibly asking? Reuses the dispatch layer's
- * own matcher (`isTerseAnswer` against the live on-screen options) rather than reimplementing it,
- * so the router's idea of "this answers the prompt" cannot drift from what delivery actually does
- * — a drift would show up as the router confidently sending a non-answer into a picker.
- */
-export function looksLikeAnswer(text: string, options: SuggestionButton[]): boolean {
-  const t = text.trim().replace(/[.!?]+$/, "").trim();
-  if (BARE_ANSWER.test(t)) return true;
-  return isTerseAnswer(text, options);
-}
+// THERE IS NO `looksLikeAnswer` HERE ANY MORE, and it is not merely unused — it was deleted with the
+// branch that consumed it, along with the `RouteDeps`/`liveOptions` seam that read the agent's
+// screen for it. A predicate that answers "does this text look like a picker answer?" is a fine
+// question for DELIVERY to ask (conciergeDispatch.isTerseAnswer still does, at the moment a message
+// the user aimed at an agent is being written), and a category error for ROUTING: the shape of the
+// words cannot tell you who they were addressed to. Do not reintroduce one here.
 
-export async function routeMessage(
-  text: string,
-  ctx: RouteContext,
-  deps: RouteDeps = {},
-): Promise<RouteDecision> {
+export async function routeMessage(text: string, ctx: RouteContext): Promise<RouteDecision> {
   const agent = ctx.agent;
 
   // ── Tier 1 ──────────────────────────────────────────────────────────────────────────────────
@@ -133,35 +139,18 @@ export async function routeMessage(
     return { target: "sparkle", reason: "the agent in view can't take input", source: "heuristic" };
   }
 
-  const readOptions = deps.liveOptions ?? liveOptionsFor;
-  // A terminal read can throw (unmounted pane, dead PTY); an unreadable screen just means "no
-  // options", never a failed send.
-  let options: SuggestionButton[] = [];
-  try {
-    options = readOptions(agent.id);
-  } catch {
-    options = [];
-  }
-
-  // The agent is visibly ASKING and this reads as an answer → it belongs on the terminal.
+  // ══ WHERE THE "IT ANSWERS THE QUESTION ON SCREEN" BRANCH USED TO BE ═════════════════════════
+  // It read the agent's live terminal for its on-screen options and, if `agent.status` was
+  // `waiting`/`approval` and the text matched, returned `{ target: "agent" }`. That is the branch
+  // that put the user's answers to the CONCIERGE into a build agent's terminal, and it is gone —
+  // with its terminal read, its status set and its predicate. The header says why at length; the
+  // short version is that an agent being mid-question is a fact about the AGENT, and it was being
+  // used to decide something only the USER can say.
   //
-  // ONLY a LIVE_ASK status qualifies. `errored` was briefly re-admitted here on the theory that an
-  // agent which crashed mid-prompt still has a real picker on screen — and it was taken back out,
-  // deliberately, because the evidence doesn't support the write:
-  //  • `errored` is SCREEN-DERIVED (statusRouter.fromScreen), so the process is often still
-  //    running. For waiting/approval the status IS the liveness evidence; for errored nothing
-  //    corroborates that the picker is still being asked.
-  //  • the option detector scans a 50-line window, so an agent that ANSWERED a picker and then
-  //    printed a short error trace still matches — and we would type "2" into whatever now owns
-  //    the terminal, answering a prompt nobody is asking. That is the same staleness argument used
-  //    two lines above to exclude idle/working; errored doesn't get an exemption from it.
-  // The cost of leaving it out is one classify on a rare status, and a chat answer the user can
-  // redirect in a click. The cost of getting it wrong is a keystroke that cannot be taken back.
-  // When the two costs are that asymmetric, the module's own rule applies: take the reversible one.
-  const liveAsk = agent.status !== undefined && LIVE_ASK.has(agent.status);
-  if (liveAsk && looksLikeAnswer(text, options)) {
-    return { target: "agent", reason: "answers the question on screen", source: "heuristic" };
-  }
+  // An agent that really is asking still gets its answer, by the route that always required a
+  // gesture: the user names it (`@Kraken Auth yes`), ConciergeHost builds the `agent` decision from
+  // that mention, the send arms a cancellable intent, and only an expiry the user did not stop
+  // reaches the PTY. Nothing about that path runs through this function.
 
   // Talk about the fleet is Sparkle's job by definition.
   if (looksLikeFleetTalk(text)) {

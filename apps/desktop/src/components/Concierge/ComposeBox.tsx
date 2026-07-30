@@ -500,7 +500,8 @@ export function ComposeBox({
   // store snapshot, and a second path to it through this component's prop contract is exactly how
   // the "sidebar says Actively listening, composer says Mic paused" desync comes back. See
   // voice/useVoicePlaceholder.
-  const { micPresentation, wakeWord, stopWord, modelProgress, errorNotice } = useVoicePlaceholder();
+  const { micPresentation, wakeWord, stopWord, modelProgress, errorNotice, pauseReason } =
+    useVoicePlaceholder();
   // The overlay stands in for a native placeholder, so it shows on exactly the same terms one
   // would: an empty textarea. Staged attachments and a live interim transcript each render in
   // their OWN row above the textarea (see below), so neither competes for this slot.
@@ -1344,6 +1345,9 @@ export function ComposeBox({
                 wakeWord={wakeWord}
                 stopWord={stopWord}
                 modelProgress={modelProgress}
+                // WHY the mic is paused, so the `focusPaused` copy can name the cause rather than
+                // saying "paused" and leaving the user to guess (they guessed "broken").
+                pauseReason={pauseReason}
                 // `off` (master mute) is the ONLY state that reaches this, and it is the default —
                 // see CONCIERGE_PLACEHOLDER. `error` and `outOfCredits` deliberately render NOTHING
                 // here rather than falling through to it: inviting someone to speak is the one
@@ -1369,6 +1373,11 @@ export function ComposeBox({
         onToggleArmed={(next) => onToggleAutoSend?.(next)}
         onSend={submit}
         canSend={canSend}
+        // The rail is drawn on whatever ground THIS box is on, so it needs the same flag the box's
+        // own border does. Without it the counting track paints the chrome hairline on the terminal
+        // flood, which theme/chromeContrast.test.ts measures BELOW the visibility floor in light —
+        // i.e. the one cue that separates counting from armed-idle disappears (roborev 55244).
+        wired={wired}
       />
     </div>
   );

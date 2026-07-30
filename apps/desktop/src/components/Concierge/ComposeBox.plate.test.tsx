@@ -17,6 +17,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ComposeBox } from "./ComposeBox";
+import type { SendRailModel } from "./SendRail";
 import { C, COMPOSE_SCRIM } from "../../theme/colors";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { useUiStore } from "../../stores/uiStore";
@@ -123,5 +124,53 @@ describe("the composer while the cable is patched", () => {
     mount();
     expect(box().style.background).toBe(C.inputSurface);
     expect(box().style.border).toBe(`1px solid ${C.hairline}`);
+  });
+});
+
+// ── THE FLAG HAS TO REACH THE RAIL, not merely be owned by the box ─────────────────────────────
+//
+// THE HOLE THIS FILLS. `SendRail.test.tsx` renders `<SendRail … wired />` directly, which proves
+// the branch INSIDE the rail works and says nothing about anyone passing the flag to it. `wired`
+// defaults to `false` on SendRail, so deleting `wired={wired}` from this box's call site silently
+// restores the original defect — the chrome hairline painted on the terminal flood, counting and
+// armed-idle indistinguishable in wired + light (roborev 55244) — with the whole suite green.
+//
+// The rows ABOVE cannot catch it: they assert the box's own `data-wired` and border, and `mount()`
+// passes no `autoSend`, so the box falls back to DISARMED_RAIL and no track element is ever
+// rendered to be checked. These rows supply a COUNTING model so the track actually exists, and
+// then read its edge.
+describe("the counting track inherits the composer's ground", () => {
+  /** Phase `counting` is what makes the rail draw its track at all — the whole cue is "present only
+   *  while counting", so an armed-or-disarmed model renders nothing to assert against. */
+  const COUNTING: SendRailModel = {
+    phase: "counting",
+    targetName: "Build 4",
+    tier: "normal",
+    remainingFraction: 0.6,
+  };
+  const track = () => screen.getByTestId("send-rail-track");
+
+  it("takes the TERMINAL edge token when the box is wired, never the chrome seam", () => {
+    mount({ wired: true, autoSend: COUNTING });
+    // `C.hairline` is the CHROME seam and theme/chromeContrast.test.ts deliberately does NOT pair it
+    // with the terminal plane (light `hairline` on `forest` measures 1.195 against a 1.2 floor); it
+    // floors `termHairline` there instead. On the flood a wired composer goes transparent over, the
+    // chrome token would put the counting cue BELOW the project's own visibility floor.
+    expect(track().style.borderColor).toBe(rgb(BLUEPRINT.dark.termHair));
+    expect(track().style.borderColor).not.toContain(C.hairline);
+  });
+
+  it("…in LIGHT too, which is the end the contrast floor actually bites at", () => {
+    useUiStore.setState({ themePref: "light" } as never);
+    mount({ wired: true, autoSend: COUNTING });
+    expect(track().style.borderColor).toBe(rgb(BLUEPRINT.light.termHair));
+    expect(track().style.borderColor).not.toBe(rgb(BLUEPRINT.dark.termHair));
+  });
+
+  it("and the chrome seam when it is NOT wired — the box passes a branch, not a constant", () => {
+    // The other half of the same forwarding. Hard-coding the terminal token in the rail would pass
+    // the two rows above and fail here, so the pair pins that `wired` is what selects between them.
+    mount({ autoSend: COUNTING });
+    expect(track().style.borderColor).toBe(C.hairline);
   });
 });

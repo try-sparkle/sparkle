@@ -10,6 +10,13 @@ import { openCloudDictationWindow, nextBalanceCents } from "./services/cloudDict
 import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError } from "./voice/dictationCopy";
+import {
+  armedStatus,
+  dictationPauseReason,
+  focusOwnerNow as readFocusOwnerFromDom,
+  type FocusOwner,
+  type PauseReason,
+} from "./voice/dictationFocus";
 
 /**
  * The cloud-stream command (if any) a wake-machine transition implies. Pure so the
@@ -43,11 +50,22 @@ interface DictationOptions {
    *  exactly the focused one. Injected so the multi-window routing is unit-testable; defaults to a
    *  real `document.hasFocus()` check (and `true` in the document-less test/node env). */
   isWindowActive?: () => boolean;
+  /** WHO holds the DOM caret right now — the sibling of `isWindowActive` for focus WITHIN this
+   *  window. Injected for the same reason: the node/test env has no real caret to move, and the
+   *  listener must not reach into the store to re-derive a decision that lives in one pure place.
+   *  Defaults to classifying the LIVE `document.activeElement`, which is race-free by construction
+   *  (nothing can be stale about reading the DOM at the moment the event arrives). */
+  focusOwner?: () => FocusOwner;
 }
 
 interface DictationController {
   toggle: () => Promise<void>;
   cleanup: () => void;
+  /** Drive the caret-owner transition within this window: "terminal" = the caret moved INTO a
+   *  terminal pane (pause, mirroring a window blur), anything else = it left one (resume, through
+   *  the same guard a window refocus uses). Wired to the focus tracker's store field in a real
+   *  webview; exposed so the terminal handoff is unit-testable without a DOM. */
+  notifyFocusOwner: (owner: FocusOwner) => void;
   /** Drive the per-WINDOW OS-focus transition for THIS window (not the app-level `dictation://focus`,
    *  which never fires on a window-to-window switch — see dictation.rs `set_focused`). Wired to the
    *  DOM `window` focus/blur events in a real webview; exposed so the multi-window ownership handoff is
@@ -72,6 +90,31 @@ export async function createDictationController(
   // phrase doesn't land in every open window at once. Default to a real per-window focus check.
   const isWindowActive =
     options.isWindowActive ?? (() => typeof document === "undefined" || document.hasFocus());
+  // Who holds the caret. Read LIVE from the DOM by default (see the option's doc) — the store's
+  // `focusOwner` mirror exists for the COPY, which needs to be reactive; routing needs to be right.
+  const focusOwnerNow = options.focusOwner ?? readFocusOwnerFromDom;
+
+  // --- THE ONE GATE ------------------------------------------------------------------------------
+  // Every routed `dictation://*` event asks THIS question and no other: "may dictation route here
+  // right now?" It used to ask only `isWindowActive()`, which is why the terminal case half-happened
+  // — transcription kept flowing into a composer the user couldn't see while the auto-send rail,
+  // reading a different signal, never armed. Widening the ONE predicate rather than adding a second
+  // check per listener is what makes "arming and transcription can never disagree about the active
+  // target" STRUCTURALLY true instead of merely tested: `dictation://speech-end` (the rail's clock)
+  // and `dictation://partial` (the text) are gated by the same expression, evaluated at the same
+  // instant, so there is no state in which one passes and the other doesn't.
+  //
+  // `isWindowActive()` stays as its own term: it is the per-WINDOW ownership signal (which of our
+  // webviews consumes the app-wide broadcast), while dictationPauseReason answers the user-facing
+  // "is dictation paused, and why". They coincide on the window axis but are not the same question,
+  // and only the first is meaningful while the mic is disarmed.
+  const focusPauseReason = (): PauseReason | null =>
+    dictationPauseReason({
+      windowFocused: isWindowActive(),
+      focusOwner: focusOwnerNow(),
+      enabled: useDictationStore.getState().enabled,
+    });
+  const isRoutable = () => isWindowActive() && focusPauseReason() === null;
 
   const { setLevel, setSpeaking, setError, setModelProgress } =
     useDictationStore.getState();
@@ -102,6 +145,13 @@ export async function createDictationController(
     store.setInterim("");
     store.setLevel(0);
     store.setSpeaking(false);
+    // CLEARED WITH IT, ALWAYS. `onDeviceSpeech` is a LATCH fed only by edges from a LIVE capture,
+    // and Rust's edge state is per-capture starting false — so a capture torn down while it is true
+    // emits no falling edge, and a rebuilt capture computing false sees no change and emits nothing
+    // either. Left set, `useAutoSend` reads "the user is still talking" forever: startClock
+    // early-returns on every speech-end and auto-send never fires again for the whole session.
+    // Capture is not running in any of these states, so the level is false by definition.
+    store.setOnDeviceSpeech(false);
   };
 
   // Resume THIS window's relay when it (re)gains focus mid-session. Guarded so ONLY the focused
@@ -115,7 +165,10 @@ export async function createDictationController(
     const now = Date.now();
     if (now - lastResumeAt < 300) return;
     const store = useDictationStore.getState();
-    if (!isWindowActive() || !store.enabled || store.status === "error" || store.phase !== "active") {
+    // `isRoutable()`, not a bare `isWindowActive()`: a window that is focused but whose caret sits
+    // in a terminal is NOT somewhere the relay may resume into. Same predicate as the listeners, so
+    // the relay can never be open in a state where the events it produces would be dropped.
+    if (!isRoutable() || !store.enabled || store.status === "error" || store.phase !== "active") {
       return;
     }
     lastResumeAt = now;
@@ -131,13 +184,45 @@ export async function createDictationController(
     else tearDownOwnedStream();
   };
 
+  // The caret moved into (or out of) a terminal pane inside THIS window. Deliberately the SAME
+  // shape as a window blur/refocus, because to the user it is the same event: something else took
+  // the keyboard, so Sparkle stops listening until they come back to the box.
+  //
+  // What it does NOT touch, exactly as the window path doesn't: `enabled` (the mic stays armed —
+  // this is a gate on top of the mute toggle, not the toggle) and `phase` (an ACTIVE "Hey Sparkle"
+  // session must survive clicking into a terminal and back without re-saying the wake word).
+  const notifyFocusOwner = (owner: FocusOwner) => {
+    const store = useDictationStore.getState();
+    if (owner === "terminal") {
+      // Close the BILLABLE relay first (no-op unless this window owns one), then flatten the live
+      // UI. Status → idle is what both mic surfaces read as "focus paused", so the ring and the
+      // composer stop claiming to listen at the same instant the gate stops routing.
+      tearDownOwnedStream();
+      store.setInterim("");
+      store.setLevel(0);
+      store.setSpeaking(false);
+      store.setOnDeviceSpeech(false);
+      if (store.status !== "error") store.setStatus("idle");
+      return;
+    }
+    // Left the terminal. Resume through the SAME guard a window refocus uses (streamTornDown +
+    // maybeResumeOwnedStream) rather than a second resume path, so the two can't drift: only a
+    // window that actually tore a stream down reopens one, and only once.
+    if (store.enabled && store.status !== "error" && isRoutable()) {
+      store.setStatus("listening");
+      maybeResumeOwnedStream();
+    }
+  };
+
   // Register event listeners — each `listen()` returns an unsubscribe fn.
   const unsubscribes = await Promise.all([
     listen<string>("dictation://partial", (e) => {
-      // Multi-window: this event is broadcast to EVERY Sparkle window, but committed text must land
-      // in only the focused one — otherwise the same phrase types into every open window's composer
-      // (and each would run the wake machine / open its own cloud stream). Background windows bail.
-      if (!isWindowActive()) return;
+      // THE ONE GATE (see isRoutable). Committed text must land in exactly one place: the focused
+      // window, and only while dictation is routable there. Background windows bail — otherwise the
+      // same phrase types into every open window's composer — and so does a window whose caret sits
+      // in a terminal, where the composer the text would land in isn't the thing the user is typing
+      // into at all.
+      if (!isRoutable()) return;
       // Capture started — clear any lingering model-download progress.
       useDictationStore.getState().setModelProgress(null);
       // A committed (final) segment supersedes the live preview — clear it so the interim text
@@ -149,9 +234,11 @@ export async function createDictationController(
     // Cloud-only: Deepgram interim results — the live, word-by-word preview. Volatile; replaced in
     // place and never routed through the wake machine (that only acts on committed segments).
     listen<string>("dictation://interim", (e) => {
-      // Same multi-window gate as the partial path: only the focused window paints the live ghost.
-      // A background window clears any stale preview it might still be showing and ignores the rest.
-      if (!isWindowActive()) {
+      // Same ONE GATE as the partial path: only a window dictation may route into paints the live
+      // ghost. Anywhere else clears any stale preview it might still be showing and ignores the
+      // rest — a ghost left up in a terminal-paused composer would advertise a live transcription
+      // that is not happening.
+      if (!isRoutable()) {
         useDictationStore.getState().setInterim("");
         return;
       }
@@ -193,9 +280,10 @@ export async function createDictationController(
     ),
 
     listen<number>("dictation://level", (e) => {
-      // Multi-window: broadcast to EVERY window, but only the focused one drives the waveform — without
-      // this gate a background window animates its meter off another window's capture (sparkle-ozvr).
-      if (!isWindowActive()) return;
+      // THE ONE GATE: broadcast to EVERY window, but only one dictation may route into drives the
+      // waveform — without it a background window animates its meter off another window's capture
+      // (sparkle-ozvr), and a terminal-paused one animates a meter for speech it is discarding.
+      if (!isRoutable()) return;
       // Capture started — clear any lingering model-download progress. This fires ~25×/sec, so
       // only write when there's actually progress to clear; an unconditional set(null) would churn
       // the store (and every subscriber) 25 times a second for a no-op.
@@ -210,9 +298,9 @@ export async function createDictationController(
     // The waveform animates only while this is true, so the meter sits flat in silence instead
     // of wiggling on ambient noise. `level` still drives bar HEIGHT; this gates the MOTION.
     listen<boolean>("dictation://speaking", (e) => {
-      // Same multi-window gate as the level meter: only the focused window animates its waveform, so a
-      // background window doesn't wiggle off another window's voice-activity edges (sparkle-ozvr).
-      if (!isWindowActive()) return;
+      // Same ONE GATE as the level meter: only a window dictation may route into animates its
+      // waveform, so it never wiggles off voice activity it is not consuming (sparkle-ozvr).
+      if (!isRoutable()) return;
       setSpeaking(e.payload);
     }),
 
@@ -220,16 +308,32 @@ export async function createDictationController(
     // `UtteranceEnd` frame), which is what the auto-send rail measures its silence against.
     //
     // Registered next to the partial/interim handlers on purpose: it belongs to the same utterance
-    // they carry, and it must ride the SAME multi-window focus gate. Without that gate a background
-    // window would count down and fire a send off a phrase that was typed into another window's
-    // composer — the same "one phrase, every window" bug the partial gate exists to stop
-    // (sparkle-ozvr), except this one presses Send.
+    // they carry, and it MUST ride the very same gate expression. Without that a background window
+    // would count down and fire a send off a phrase that was typed into another window's composer —
+    // the same "one phrase, every window" bug the partial gate exists to stop (sparkle-ozvr),
+    // except this one presses Send. Sharing `isRoutable()` with the partial listener is also what
+    // closes the terminal half-state: there is no snapshot in which the text is being transcribed
+    // but the rail isn't arming, or vice versa, because it is ONE predicate, not two agreeing ones.
     //
     // No payload: the event asserts only "as of now, speech has ended". The frontend already holds
     // a fresher transcript than any payload could carry.
     listen<null>("dictation://speech-end", () => {
-      if (!isWindowActive()) return;
+      if (!isRoutable()) return;
       useDictationStore.getState().noteSpeechEnd();
+    }),
+
+    // THE COUNTDOWN'S CANCEL on the on-device path (see dictationStore.onDeviceSpeech). Rides the
+    // SAME gate as the speech-end it cancels, which is the point: a window where the arm is
+    // delivered but the cancel is not would be strictly worse than neither, since it can only fire
+    // sends and never stop them.
+    listen<boolean>("dictation://on-device-speech", (e) => {
+      if (!isRoutable()) {
+        // Not routable → nothing here can be counting, and a latched `true` would suspend the next
+        // countdown that legitimately starts. Clear rather than ignore.
+        useDictationStore.getState().setOnDeviceSpeech(false);
+        return;
+      }
+      useDictationStore.getState().setOnDeviceSpeech(e.payload);
     }),
 
     listen<string>("dictation://error", (e) => {
@@ -291,10 +395,17 @@ export async function createDictationController(
       // …and only when NO notice is left standing. Reading the store fresh, because setError above
       // just wrote to it. A surviving unrelated error means some other thing is still broken, and
       // "listening" would paint over it — the same overstatement, one failure across.
+      // …and only if the caret is somewhere dictation may actually route. The sibling
+      // dictation://focus(true) handler below carries this same term; without it here, a watchdog
+      // fault that recovers while the caret sits in a terminal flips the UI back to claiming live
+      // capture while the gate keeps discarding every event — the same contradiction by a second
+      // path (roborev 55497). `focusOwnerNow()` rather than the full `isRoutable()` for the reason
+      // given at that handler: the window term is already checked here.
       if (
         useDictationStore.getState().error === null &&
         store.enabled &&
-        isWindowActive()
+        isWindowActive() &&
+        focusOwnerNow() !== "terminal"
       ) {
         store.setStatus("listening");
       }
@@ -319,8 +430,15 @@ export async function createDictationController(
         // Capture is paused — no more frames, so clear the VAD flag ourselves (the backend
         // emits edges only while capturing) to freeze the waveform flat while unfocused.
         store.setSpeaking(false);
+        store.setOnDeviceSpeech(false);
         if (store.status !== "error") store.setStatus("idle");
-      } else if (store.enabled && store.status !== "error") {
+      } else if (store.enabled && store.status !== "error" && focusOwnerNow() !== "terminal") {
+        // `focusOwnerNow() !== "terminal"`, not the full `isRoutable()`: this event IS the app
+        // telling us focus returned, and `document.hasFocus()` can still be false for a beat when
+        // it arrives — gating on the window term would drop the very signal it is reporting. The
+        // terminal term has no such race (the caret is wherever it is), and without it, returning
+        // to the app with the caret parked in a terminal would flip the UI back to "listening"
+        // while the gate above keeps discarding every event — the exact half-state this fixes.
         store.setStatus("listening");
         // Mid-dictation when focus left → resume the cloud stream now, no wake word needed. Routed
         // through the owner guard so only the FOCUSED window (not a background stale-active one)
@@ -349,12 +467,24 @@ export async function createDictationController(
     window.addEventListener("focus", onWinFocus);
   }
 
+  // Caret-owner transitions arrive through the store, which the app-root focus tracker
+  // (voice/dictationFocusTracker) is the sole writer of. Subscribing HERE rather than wiring it
+  // through useAmbientVoice keeps the terminal handoff working for every controller instance —
+  // including the ones created directly by tests — and means there is exactly one place that turns
+  // "the caret moved" into "tear the relay down". Only real CHANGES act; the store setter already
+  // suppresses no-op writes, and this second guard makes the handler idempotent against any other
+  // store update.
+  const unsubscribeFocusOwner = useDictationStore.subscribe((s, prev) => {
+    if (s.focusOwner !== prev.focusOwner) notifyFocusOwner(s.focusOwner);
+  });
+
   const cleanup = () => {
     // safeUnlisten (not a bare `u()`): a window-close during teardown can tear down Tauri's
     // listeners map first, and a raw unlisten then throws the benign "handlerId" race. Routing
     // each call through it also means a throw can't abort the loop and leak the remaining
     // dictation listeners OR the window blur/focus removals below (sparkle teardown-leak sweep).
     unsubscribes.forEach((u) => void safeUnlisten(u));
+    unsubscribeFocusOwner();
     if (hasWindow) {
       window.removeEventListener("blur", onWinBlur);
       window.removeEventListener("focus", onWinFocus);
@@ -374,10 +504,13 @@ export async function createDictationController(
       state.setStatus("idle");
       state.setLevel(0);
       state.setSpeaking(false);
+      state.setOnDeviceSpeech(false);
       state.setInterim("");
     } else {
       state.setError(null);
-      state.setStatus("listening");
+      // Not a bare "listening": see armedStatus. Arming with the caret already in a terminal must
+      // read as paused-with-a-reason, not as an invitation to talk into a gate that drops everything.
+      state.setStatus(armedStatus(focusOwnerNow()));
       try {
         // The cloud-dictation preference is read LIVE at the wake→active transition (start_cloud_stream),
         // not frozen here, so toggling the menu mid-session takes effect without restarting.
@@ -389,7 +522,7 @@ export async function createDictationController(
     }
   };
 
-  return { toggle, cleanup, notifyWindowFocus };
+  return { toggle, cleanup, notifyWindowFocus, notifyFocusOwner };
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +643,18 @@ export function useAmbientVoice(): void {
       // `dictation://not-armed` broadcast was tried and removed; matching it to per-window intent
       // needs a monotonic start id echoed back from Rust. See
       // PRD/sparkle/mic-multi-window-start-stop-race.md.
-      store.setStatus("listening");
+      //
+      // Optimistic about the DOWNLOAD, never about WHERE the caret is (armedStatus, roborev 55497).
+      // THIS IS THE PRODUCTION ARM PATH — the mic button and the voice menu both arm via
+      // `setEnabled(true)`, which lands here; `toggle` on the controller has no caller in the app
+      // (roborev 55555). It is also the launch path (`enabled` persists across restarts) and the
+      // cross-window path (`enabled` is the synced slice), which are the arms that reach the paused
+      // branch below without any click of ours to have moved the caret — see `armedStatus` for why
+      // the same-document click cases are NOT claimed here (roborev 55589).
+      //
+      // Through the shared `focusOwnerNow` seam, not an inline re-read: that duplication is what left
+      // this path — the one that actually runs — without anything a test could reach.
+      store.setStatus(armedStatus(readFocusOwnerFromDom()));
       // Wait until the dictation listeners are attached before starting capture,
       // so the first VAD segment after launch isn't dropped.
       (controllerPromiseRef.current ?? Promise.resolve(null))
@@ -541,6 +685,7 @@ export function useAmbientVoice(): void {
       store.setStatus("idle");
       store.setLevel(0);
       store.setSpeaking(false);
+      store.setOnDeviceSpeech(false);
       store.setPhase("passive");
       store.setInterim("");
       store.setModelProgress(null);

@@ -14,8 +14,11 @@ import {
   modelPercent,
   preparingCaption,
   voiceErrorNotice,
+  pausedCaption,
   MICROPHONE_SETTINGS_URL,
 } from "../voice/dictationCopy";
+import { useDictationPauseReason } from "../voice/useDictationPauseReason";
+import type { PauseReason } from "../voice/dictationFocus";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
 import { useHasAiCredits } from "../services/aiGate";
@@ -89,10 +92,12 @@ export function nextBars(
  *    copy "Mic paused. Say <wake> to activate". "Paused" here means "not actively dictating yet",
  *    NOT "mic off" — the wake phrase in the same line makes clear the mic is live and listening.
  *  - Armed AND actually capturing, ACTIVE phase → the "Actively listening… <stop> to finish" hint.
- *  - Armed but NOT capturing (focus-paused) → the honest "Listening paused: will auto-resume…" —
- *    deliberately different wording ("Listening paused" vs "Mic paused") so a focus-paused mic is
- *    never confused with the live wake-word state, and we never claim "Say Hey Sparkle…" when the
- *    backend isn't actually hearing anything.
+ *  - Armed but NOT capturing (focus-paused) → the honest "Listening paused…" line for whatever took
+ *    focus — deliberately different wording ("Listening paused" vs "Mic paused") so a focus-paused
+ *    mic is never confused with the live wake-word state, and we never claim "Say Hey Sparkle…"
+ *    when the backend isn't actually hearing anything. WHICH paused line is chosen by the cause
+ *    (`pauseReason`), not by this function: a window and a terminal pause for different reasons and
+ *    resume by different gestures, so one sentence cannot be true of both.
  */
 export function captionFor(
   phase: Phase,
@@ -100,10 +105,10 @@ export function captionFor(
   listening: boolean,
   wakeWord: string = WAKE_PHRASE,
   stopWord: string = STOP_PHRASE,
+  pauseReason: PauseReason | null = null,
 ): string | null {
   if (!enabled) return null;
-  if (!listening)
-    return "Listening paused: Will auto-resume when you re-focus on this project.";
+  if (!listening) return pausedCaption(pauseReason);
   return phase === "passive"
     ? `Mic paused. Say ${wakeWord} to activate`
     : `Actively listening: Just say ${stopWord} to finish`;
@@ -251,7 +256,11 @@ export function LogoWaveform() {
     // paintBar/paintOrb are stable for the component's life; only re-arm on gating change.
   }, [enabled, listening]);
 
-  const caption = captionFor(phase, enabled, listening, wakeWord, stopWord);
+  // WHICH "Listening paused" sentence the caption uses is decided by the CAUSE, not by this
+  // component: a lost window auto-resumes and a terminal does not, so one sentence cannot be true
+  // of both. Same hook, same pure decision, as the routing gate that actually stopped the audio.
+  const pauseReason = useDictationPauseReason();
+  const caption = captionFor(phase, enabled, listening, wakeWord, stopWord, pauseReason);
   // The ONE voice-state decision, shared with the composer (deriveMicPresentation). Both surfaces
   // switch their caption/placeholder on this, so the top-left mic and the composer mic can never
   // disagree about which state we're in. The wording each renders is still surface-local; only the

@@ -15,6 +15,7 @@ import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
 // control on, and a remedy naming a control by a label it no longer carries is exactly the dead end
 // the no-device branch below exists to fix.
 import { ALLOW_VIRTUAL_LABEL } from "../services/audioInputs";
+import type { PauseReason } from "./dictationFocus";
 export const STOP_PHRASE = DEFAULT_STOP_WORD;
 // ACTIVE phase (the wake word was heard; dictation is live). Only show this when the backend is
 // BOTH capturing (status "listening") AND in the active phase — never while merely waiting for
@@ -44,13 +45,44 @@ export function wakePlaceholder(wakeWord: string = WAKE_PHRASE): string {
 }
 export const WAKE_PLACEHOLDER = wakePlaceholder();
 
-// FOCUS-PAUSED (armed, but the backend is NOT capturing — window unfocused/muted, or capture hasn't
-// started yet). The mic can't hear anything here, so BOTH surfaces must say so rather than one of
-// them inviting the wake word. This is the composer's wording for the state the sidebar captions as
-// "Listening paused: Will auto-resume…" (LogoWaveform.captionFor). Both open with "Listening paused"
-// so they read as the same state; the composer's adds the reassurance that the box still works.
-// deriveMicPresentation === "focusPaused" is the shared signal that selects this on both surfaces.
+// FOCUS-PAUSED (armed, but the backend is NOT capturing). ONE state, but it now has a REASON, and
+// the reason is the whole point: "paused" with no cause is what left the terminal case reading as a
+// bug. deriveMicPresentation === "focusPaused" still selects the state on both surfaces — that
+// single-decision property is what stops the sidebar and the composer contradicting each other —
+// and dictationPauseReason (voice/dictationFocus) says WHY, so each surface picks its own words for
+// the same cause rather than each re-deciding the state.
+//
+// Every string below opens with "Listening paused" so the two surfaces read as one state, then
+// names what has focus and what will give it back. The sidebar has no box to point at, so it names
+// the box; the composer IS the box, so it points at itself.
 export const PAUSED_COMPOSER_PLACEHOLDER = "Listening paused — you can type here meanwhile.";
+
+/** WINDOW pause, sidebar. Unchanged wording — this is the case it was always right for, and the
+ *  terminal case is what it was wrongly being reused for. */
+export const PAUSED_WINDOW_CAPTION =
+  "Listening paused: Will auto-resume when you re-focus on this project.";
+/** TERMINAL pause, sidebar. Names the thing that took the keyboard ("a terminal") and the single
+ *  gesture that hands it back ("click the message box") — a terminal does NOT auto-resume the way a
+ *  window does, so promising that it will would be the same lie in the other direction. */
+export const PAUSED_TERMINAL_CAPTION =
+  "Listening paused: Your cursor is in a terminal. Click the message box to resume.";
+/** TERMINAL pause, composer. Same cause, but the remedy is "here" because this copy is painted
+ *  inside the very box the user needs to click. */
+export const PAUSED_TERMINAL_COMPOSER_PLACEHOLDER =
+  "Listening paused — your cursor is in a terminal. Click here to resume.";
+
+/** The sidebar caption for a focus-paused mic, by cause. `null` (paused for a reason we don't have
+ *  a specific story for — e.g. capture simply hasn't started yet) keeps the long-standing window
+ *  wording, which is the honest general case: it will come back on its own. */
+export function pausedCaption(reason: PauseReason | null): string {
+  return reason === "terminal" ? PAUSED_TERMINAL_CAPTION : PAUSED_WINDOW_CAPTION;
+}
+
+/** The composer placeholder for a focus-paused mic, by cause. Same fallback rule as
+ *  {@link pausedCaption}: only the terminal case gets the terminal words. */
+export function pausedComposerPlaceholder(reason: PauseReason | null): string {
+  return reason === "terminal" ? PAUSED_TERMINAL_COMPOSER_PLACEHOLDER : PAUSED_COMPOSER_PLACEHOLDER;
+}
 
 // PREPARING (the mic is armed but the one-time voice-model download is still running). On a first
 // run this takes MINUTES, and we used to spend all of it painting the passive wake-word copy —

@@ -34,6 +34,7 @@ import { isCopySelectionKey } from "./copySelectionKey";
 import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
+import { TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
 import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
@@ -1170,7 +1171,18 @@ export function Terminal({
         // fillets curve into nothing. Do not add one back "for definition".
       }}
     >
-      <div ref={containerRef} style={{ width: "100%", height: "100%", overflow: "hidden" }} />
+      {/* DICTATION FOLLOWS FOCUS. This is the element xterm mounts into, so everything with a
+          terminal caret — including xterm's hidden `.xterm-helper-textarea`, which is what actually
+          holds focus — is a descendant of it. The marker is the APP-OWNED half of the match in
+          voice/dictationFocus: xterm's class names are a vendor detail a major bump can rename,
+          this attribute is ours. It sits on the xterm host rather than the outer pane on purpose —
+          the pane also hosts the failure/loading overlays, and a "Start again" button is not a live
+          PTY, so focusing it must not pause the mic. */}
+      <div
+        ref={containerRef}
+        {...{ [TERMINAL_SURFACE_ATTR]: "" }}
+        style={{ width: "100%", height: "100%", overflow: "hidden" }}
+      />
       {/* Affordance over the still-blank terminal. Loading: from spawn until the first PTY byte
           (a `claude --resume` redraw or a fresh banner leaves the pane empty for a few seconds;
           with the sidebar already showing a named, working agent, that blank reads as broken).

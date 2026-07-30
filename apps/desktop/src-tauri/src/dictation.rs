@@ -67,14 +67,47 @@ pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
 
 /// THE SPEAKER STOPPED — the auto-send rail's silence signal (PRD §4).
 ///
-/// Deliberately NOT `dictation://speaking`. That event is the Silero VAD's edge on the ON-DEVICE
-/// path, and on the cloud path it is hard-coded `true` for the whole stream (see the capture
-/// callback below), so it can never fall — a rail keyed off it would arm and never count.
+/// TWO HONEST SOURCES, one per capture mode, because the signal has to mean the same thing in
+/// both — and for a long time it did not. It was emitted ONLY by the cloud relay, so whenever the
+/// engine fell back to on-device (relay closed, cloud off, no credits) speech was transcribed into
+/// the composer forever and the auto-send clock never started even once. Observed in the wild:
+/// after a `cloud relay stream closed`, six minutes of `emit partial source="accept"` with not a
+/// single auto-send evaluation. Transcription and arming MUST NOT disagree about whether an
+/// utterance ended, so both engines report it now:
+///   - **cloud**: Deepgram's own endpoint decision (`speech_final`, or the standalone
+///     `UtteranceEnd` frame), taken from word timings in the audio (see cloud.rs).
+///   - **on-device**: a CLOSED Silero-VAD segment (see `DecodeWorker::spawn`). The VAD closing a
+///     segment IS the engine asserting the speaker stopped — that is the same claim Deepgram's
+///     endpointing makes, arrived at from the same evidence (a silence gap in the audio), just
+///     locally. It is what produced the transcript we emit alongside it.
+///
+/// EXACTLY ONE ENGINE IS FED AT A TIME, BUT THAT DOES NOT MAKE THE EMITS EXCLUSIVE. The capture
+/// callback routes each frame to the relay OR the on-device VAD/decode queue on `cloud_active`,
+/// never both — so ROUTING is exclusive. EMISSION is not: `decode_tx` is a 32-deep buffer the decode
+/// worker keeps draining after the flag flips, so a segment closed just before it decodes hundreds
+/// of ms later, while Deepgram is already authoring. The wake-word path makes that the common case
+/// rather than an exotic one, since the on-device model IS the always-listening wake gate.
+///
+/// That overlap is NOT suppressed here, and `plan_decode_emit` documents at length why an attempt to
+/// suppress it was withdrawn: the boundary it discarded had no successor, so the flagship hands-free
+/// utterance ended with its command in the composer and nothing ever arming. A late boundary is
+/// bounded and cancellable frontend-side; a missing one is unrecoverable by construction.
+///
+/// Deliberately NOT `dictation://speaking`. That event is the Silero VAD's *real-time* edge, and a
+/// rail keyed off its falling edge would be keyed off the wrong thing on BOTH paths: on the cloud
+/// path the VAD is incidental (Deepgram has the audio and does its own endpointing), and on the
+/// on-device path the boundary that matters is the VAD's *segment close* — the one that has a
+/// transcript attached, which is what the ordering guarantee below depends on. A raw level edge has
+/// neither property.
+///
+/// (This doc previously said `speaking` is hard-coded `true` for the whole cloud stream, so it "can
+/// never fall". That was true when it returned `cloud_active || vad_detected`; the 2026-07-29
+/// dead-mic fix made it the raw VAD on both paths. The conclusion is unchanged, the reason isn't —
+/// see roborev 55503.)
 ///
 /// Nor is it inferable from `dictation://partial` going quiet: that measures how long the
 /// TRANSCRIPT has been idle, which under network or model load starts ticking while the user is
-/// still mid-sentence. This event carries Deepgram's own endpoint decision (`speech_final`, or the
-/// standalone `UtteranceEnd` frame), taken from word timings in the audio.
+/// still mid-sentence.
 ///
 /// Payload-free: the only thing it asserts is "as of now, speech has ended". The frontend already
 /// holds the transcript, and it holds a fresher one than any payload here could carry.
@@ -84,6 +117,21 @@ pub(crate) fn emit_interim(app: &AppHandle, seg: String) {
 /// emitters above deliberately keep only a fingerprint.
 pub(crate) fn emit_speech_end(app: &AppHandle) {
     let _ = app.emit("dictation://speech-end", ());
+}
+
+/// The ON-DEVICE speaker went active / idle — the countdown's cancel signal (see
+/// `frame_on_device_speech`). Edge-triggered, like `dictation://speaking`, so it costs one event per
+/// transition rather than one per frame.
+///
+/// A LEVEL, not a pulse, and that matters: the frontend needs to answer "is the user talking right
+/// now?" at the instant a speech-end lands, not merely "did they resume since". The on-device decode
+/// runs hundreds of ms behind the audio, so a user who resumes during that gap produces
+/// resume-then-arm in that order — a pulse would be consumed before the arm it needs to prevent,
+/// and the clock would start while they were mid-sentence.
+///
+/// Privacy: a boolean about voice ACTIVITY, never content, and nothing is logged.
+pub(crate) fn emit_on_device_speech(app: &AppHandle, active: bool) {
+    let _ = app.emit("dictation://on-device-speech", active);
 }
 
 /// Signal that the cloud (relay) worker has exited — whether a clean close, a mid-stream failure, or
@@ -420,6 +468,39 @@ fn segment_cloud_latch(touched: bool, cloud_now: bool, segment_closed: bool) -> 
     }
 }
 
+/// THE ON-DEVICE "the user is talking RIGHT NOW" signal — the auto-send countdown's cancel.
+///
+/// `dictation://speech-end` ARMS the clock; something has to be able to un-arm it, or "keep talking
+/// and it waits" is a promise only one engine keeps. On the CLOUD path that job belongs to
+/// `dictation://interim`, whose arrival means the user is speaking again. The on-device path has no
+/// interim results at all — it decodes whole closed segments — so when the on-device speech-end was
+/// added, arming gained a path that cancelling did not. A mid-thought pause long enough for Silero
+/// to close a segment on a sentence that merely SOUNDS finished would start a clock that resumed
+/// speech could not stop, because the next VAD segment does not close until the user pauses AGAIN.
+///
+/// This is that missing signal, and it is deliberately NOT `frame_speaking` above — but note WHY,
+/// because the reason changed. `frame_speaking` used to be `cloud_active || vad_detected`, pinned
+/// true for a whole cloud stream, and the original rationale here was that reading it as "still
+/// talking" would suspend every cloud countdown forever. The 2026-07-29 dead-mic fix made it honest
+/// (it is now the raw VAD flag on both paths), so that argument no longer holds and this doc used to
+/// go on asserting it (roborev 55503).
+///
+/// The REAL reason the two must stay separate: on the cloud path the cancel belongs to
+/// `dictation://interim`, which tracks Deepgram's own view of the utterance. A local VAD flag routed
+/// into the same suspend-the-countdown role would fight it, and the VAD is not even trustworthy
+/// there — the relay is consuming the audio, so what Silero sees is incidental. Hence this signal is
+/// the VAD's real-time flag AND ONLY WHILE THE ON-DEVICE ENGINE OWNS THE AUDIO: meaningful on
+/// exactly the path that needs it, inert on the one that has a better answer. Emitting it as its own
+/// edge-triggered event keeps that distinction in the one place that knows which engine is running.
+///
+/// Consequence worth stating plainly, since collapsing the two is the tempting simplification: the
+/// two functions now agree everywhere EXCEPT (cloud_active, vad_detected) = (true, true). That is
+/// not a sign one is redundant — it is the whole point. There, the meter must move while the cancel
+/// stays silent and lets `interim` do the job.
+pub(crate) fn frame_on_device_speech(cloud_active: bool, vad_detected: bool) -> bool {
+    !cloud_active && vad_detected
+}
+
 /// Whether the cpal mic capture should currently be live. Two conditions, both required:
 ///   - `armed`: the frontend wants the mic on (the user hasn't muted it).
 ///   - `focused`: at least one Sparkle window is the focused/active OS window.
@@ -486,11 +567,172 @@ const FOCUS_BLUR_COALESCE_MS: u64 = 120;
 /// the safe tradeoff on the realtime thread. 32 segments is minutes of speech of headroom.
 const DECODE_QUEUE_CAP: usize = 32;
 
+/// How a closed VAD segment's decode finished — the input to the on-device emit rule.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum DecodeOutcome {
+    /// `Decoder::transcribe` returned this text (already trimmed by the worker).
+    Decoded(String),
+    /// The decode panicked inside the FFI and the segment was dropped.
+    Panicked,
+}
+
+/// What the worker should emit for one finished decode.
+///
+/// Mirrors the `plan_capture`/`CapturePlan` and cloud.rs `speech_end_action` convention: the
+/// decision is a pure function so it can be proven without an `AppHandle`, rather than living as
+/// untestable branches inside the worker thread. Each variant maps 1:1 onto exactly one arm of
+/// `apply_decode_plan`, which is itself under test through `DecodeEmitSink` — so pinning the plan
+/// pins the DECISION and pinning the sink pins the EMITS. Note the second half: this doc used to
+/// claim the plan alone pinned the emits, which was a convention rather than a fact (roborev 55496).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum DecodeEmitPlan {
+    /// Emit `dictation://partial` (source `"accept"`) with this text, THEN `dictation://speech-end`.
+    ///
+    /// The two are ONE variant on purpose. They are the same claim about the same closed segment —
+    /// "here is what was said, and the speaker has stopped saying it" — and the bug this fixes was
+    /// exactly their decoupling: the partial shipped and the speech-end did not, on every capture
+    /// that wasn't the cloud relay. It was decoupled a second time, for a different reason, and that
+    /// broke the hands-free path instead (see `plan_decode_emit`). There is deliberately NO variant
+    /// that emits one without the other: separating them again means editing this type, which is the
+    /// point — twice now, doing so has cost a send that should have happened.
+    PartialThenSpeechEnd(String),
+    /// Emit nothing at all.
+    Nothing,
+    /// Log the recovered panic; emit nothing.
+    WarnPanicked,
+}
+
+/// Decide what one finished on-device decode emits.
+///
+/// A segment with words in it emits BOTH the transcript and the speech-end, in that order — the
+/// same ordering the cloud path takes, for the same reason (the rail recomputes its confidence
+/// threshold from the text, so a speech-end evaluated first would score the PREVIOUS sentence).
+///
+/// ══ WHY THIS DOES NOT SUPPRESS THE BOUNDARY ONCE THE CLOUD OWNS THE STREAM ══════════════════════
+/// It briefly did (roborev 55311). `decode_tx` is a 32-deep buffer the worker keeps draining after
+/// `cloud_active` flips, so a segment closed just before the flip decodes hundreds of ms later, and
+/// dropping its boundary looked like the safe direction: `useAutoSend` holds a speech-end briefly
+/// across a mic-ownership claim, so a stale one could be replayed as the concierge takes the mic and
+/// count down over a draft the user typed and never spoke.
+///
+/// That guard had NO SUCCESSOR ARM, and it broke the flagship flow (roborev 55417). "Hey Sparkle,
+/// deploy the staging branch" said in one breath closes as TWO segments. The first decodes with the
+/// flag still false, drives the phase flip and opens the relay; the second was captured pre-flip and
+/// drains after it — the common case, not an exotic one, since the on-device model IS the wake gate.
+/// Its transcript lands in the composer and its boundary was thrown away. The user has stopped
+/// talking, so the relay carries only silence and never sends an `Ended`/`UtteranceEnd` frame, and
+/// `cloud_active` means the on-device engine produces no further segment either. Nothing ever arms:
+/// the dictated command sits in the box and the hands-free path ends at a keyboard.
+///
+/// The two costs are not symmetric. The suppression's failure is silent and unrecoverable BY
+/// CONSTRUCTION — no later event can supply the arm it discarded. The stale arm it prevented is
+/// bounded (`DEFERRED_SPEECH_END_MAX_LAG_MS`, 500ms), visible (a countdown the user can cancel), and
+/// aimed at the CONCIERGE rather than a terminal (`conciergeRouter` can no longer route at an agent).
+///
+/// THAT IS THE WHOLE MITIGATION — the bound and the cancellable countdown. Do not add
+/// `onDeviceSpeech` to that list: it is `!cloud_active && vad_detected`, so it is pinned FALSE for
+/// the entire cloud stream, and the reopened case is BY DEFINITION a segment draining after
+/// `cloud_active` flipped. `startClock`'s guard is therefore inert in exactly this window, and the
+/// cloud path's other cancel (a non-empty `interim`) is empty too, because the hazard IS "the user
+/// typed a draft and stopped talking". An earlier version of this comment claimed that gate, which
+/// would have let a future reader shorten the 500ms bound believing something sat behind it
+/// (roborev 55455). The risk is accepted at its true size, not at a flattering one.
+///
+/// So the boundary stays coupled to the transcript it describes, and WHETHER to arm is decided where
+/// the facts live — the frontend knows mic ownership and wake-word stripping; this thread knows
+/// neither.
+///
+/// The two silent cases below are unchanged, and unlike the withdrawn one they ARE recoverable by
+/// the very next segment: the user keeps talking, the VAD closes a segment with words in it, and
+/// that one arms. Both stay quiet for the same reason: **the speech-end arms a countdown over text
+/// the composer holds, so a segment that put no text there did not end an utterance the composer
+/// knows about.**
+///   - EMPTY decode (the VAD closed a segment on a cough, a door, a keyboard, or clipped breath):
+///     no transcript, so arming would count down over whatever was already sitting in the composer
+///     — including text the user typed and never spoke. Non-speech noise must not press send.
+///   - PANICKED decode: the segment is dropped and no partial is emitted, so the composer is
+///     likewise unchanged. Worse, words the user DID say are lost, so arming here would count down
+///     over a knowingly incomplete sentence.
+pub(crate) fn plan_decode_emit(outcome: DecodeOutcome) -> DecodeEmitPlan {
+    match outcome {
+        // Trimmed defensively: the caller trims, but "whitespace only" is the same non-event as
+        // empty and must not depend on a caller keeping that up.
+        DecodeOutcome::Decoded(text) if !text.trim().is_empty() => {
+            DecodeEmitPlan::PartialThenSpeechEnd(text)
+        }
+        DecodeOutcome::Decoded(_) => DecodeEmitPlan::Nothing,
+        DecodeOutcome::Panicked => DecodeEmitPlan::WarnPanicked,
+    }
+}
+
+/// The three side effects a decode plan can produce, behind a trait so the DISPATCH is exercisable
+/// without an `AppHandle`.
+///
+/// WHY (roborev 55496, Medium). `DecodeEmitPlan`'s own doc claimed each variant "maps 1:1 onto
+/// exactly one arm of the worker's `match`, so pinning the plan pins the emits". That was a
+/// convention, not a fact: the `match` lived inside a spawned thread holding an `AppHandle`, so no
+/// test could reach it, and deleting `emit_speech_end` from the `PartialThenSpeechEnd` arm would
+/// restore the original bug — auto-send never arming off the cloud path — with every test still
+/// green. The plan was pinned; the wiring that consumed it was not, and the wiring is where the bug
+/// was. Routing both through a sink moves that arm under test.
+///
+/// WHAT THIS DOES **NOT** BUY, stated plainly because the first version of this comment overclaimed
+/// it and got caught (roborev 55556). `RecordingSink` pins `plan → sink method`. NOTHING pins
+/// `sink method → bus event`: `AppEmitSink`'s three bodies need a live `AppHandle`, so they are
+/// unpinned, and they do carry policy — the `"accept"` source label and which emit each maps to.
+/// Emptying `AppEmitSink::speech_end` still restores the original bug with the whole suite green
+/// (verified). So the gap is narrowed by one level, not closed. Closing it needs the `app.emit` calls
+/// themselves parameterized, which is a real refactor of `emit_partial`'s logging/seq path and is not
+/// attempted here. Treat this as the same kind of bounded, acknowledged residual as the accepted-risk
+/// note in `plan_decode_emit` — and do not read the tests below as covering more than they do.
+pub(crate) trait DecodeEmitSink {
+    /// `dictation://partial`, source `"accept"`.
+    fn partial(&mut self, text: String);
+    /// `dictation://speech-end` — the on-device half of the auto-send rail's arm.
+    fn speech_end(&mut self);
+    /// A recovered decode panic: log it, emit nothing.
+    fn warn_panicked(&mut self);
+}
+
+/// Apply a plan to a sink. Ordering is the contract, not an accident: the transcript lands BEFORE
+/// the speech-end so the rail recomputes its confidence threshold from THIS sentence rather than the
+/// previous one. Both calls, in this order, or neither.
+pub(crate) fn apply_decode_plan<S: DecodeEmitSink>(plan: DecodeEmitPlan, sink: &mut S) {
+    match plan {
+        DecodeEmitPlan::PartialThenSpeechEnd(text) => {
+            sink.partial(text);
+            sink.speech_end();
+        }
+        DecodeEmitPlan::Nothing => {}
+        DecodeEmitPlan::WarnPanicked => sink.warn_panicked(),
+    }
+}
+
+/// The real sink — the only part of the path that needs a live `AppHandle`.
+struct AppEmitSink<'a>(&'a AppHandle);
+
+impl DecodeEmitSink for AppEmitSink<'_> {
+    fn partial(&mut self, text: String) {
+        emit_partial(self.0, "accept", text);
+    }
+    fn speech_end(&mut self) {
+        emit_speech_end(self.0);
+    }
+    fn warn_panicked(&mut self) {
+        tracing::warn!(
+            target: "dictation",
+            "decode worker recovered from a panic; segment dropped"
+        );
+    }
+}
+
 /// Owns the on-device decode worker thread and the bounded channel it drains. The realtime capture
 /// callback pushes closed-segment samples through the channel (non-blocking, drop-on-full); the
 /// worker runs `Decoder::transcribe` on its OWN thread and emits the SAME `dictation://partial`
 /// events (source `"accept"`) the old inline path emitted — moving the hundreds-of-ms decode OFF
-/// `com.apple.audio.IOThread` so it can't overrun the capture ring buffer.
+/// `com.apple.audio.IOThread` so it can't overrun the capture ring buffer. It now also emits the
+/// on-device half of `dictation://speech-end` for each segment that carried words (see
+/// `plan_decode_emit`), which is what lets auto-send arm off the cloud path at all.
 ///
 /// Lifetime is tied to the `Capture`: both are built together in `build_capture` and stored side by
 /// side in the session. The channel's Sender lives only inside the capture callback, so once the
@@ -506,6 +748,10 @@ struct DecodeWorker {
 
 impl DecodeWorker {
     /// Spawn the worker and return the (bounded) sender the capture callback pushes segments into.
+    ///
+    /// It deliberately does NOT take `cloud_active`. It briefly did, to suppress the speech-end of a
+    /// segment that drained after the cloud took over — see `plan_decode_emit` for why that guard was
+    /// withdrawn (it had no successor arm and silently broke the hands-free path).
     fn spawn(decoder: Arc<Decoder>, app: AppHandle) -> (SyncSender<Vec<f32>>, DecodeWorker) {
         let (tx, rx) = sync_channel::<Vec<f32>>(DECODE_QUEUE_CAP);
         let abort = Arc::new(AtomicBool::new(false));
@@ -530,14 +776,25 @@ impl DecodeWorker {
                     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         decoder.transcribe(&samples).trim().to_string()
                     }));
-                    match decoded {
-                        Ok(text) if !text.is_empty() => emit_partial(&app, "accept", text),
-                        Ok(_) => {}
-                        Err(_) => tracing::warn!(
-                            target: "dictation",
-                            "decode worker recovered from a panic; segment dropped"
-                        ),
-                    }
+                    // A closed VAD segment IS this engine's "the speaker stopped", so a segment
+                    // with words in it emits the transcript AND the on-device half of
+                    // `dictation://speech-end` (see emit_speech_end). Without that second emit the
+                    // auto-send clock — which ONLY `speechEndSeq` starts — never armed on this
+                    // path at all: speech went into the composer forever and nothing ever sent.
+                    //
+                    // Speech-end comes AFTER the transcript, never before; the plan couples and
+                    // orders them so that stays true (see plan_decode_emit). Same thread, so the
+                    // frontend sees them in the order the segments closed.
+                    //
+                    let plan = plan_decode_emit(match decoded {
+                        Ok(text) => DecodeOutcome::Decoded(text),
+                        Err(_) => DecodeOutcome::Panicked,
+                    });
+                    // Decided by `plan_decode_emit` and dispatched by `apply_decode_plan`, never
+                    // re-derived here. This call and `AppEmitSink`'s three bodies are the part of the
+                    // path tests cannot reach (they need a live `AppHandle`) — see DecodeEmitSink for
+                    // exactly how far the coverage goes, which is less far than it first appears.
+                    apply_decode_plan(plan, &mut AppEmitSink(&app));
                 }
             })
             .expect("spawn parakeet-decode worker");
@@ -1147,6 +1404,9 @@ fn build_capture(
     // what makes "Deepgram owns this audio" hold for the whole span, not for one frame
     // (roborev 55300). Fresh per capture, like `last_speaking`.
     let mut segment_touched_cloud = false;
+    // Same edge bookkeeping for the on-device speech level. Fresh per capture (starts false), so a
+    // newly (re)built capture never begins by claiming the user is mid-sentence.
+    let mut last_on_device_speech = false;
     // NOTE: the transcriber is locked on every CoreAudio callback frame, but ONLY for the cheap VAD
     // windowing / segment extraction (`accept_segments`) — the hundreds-of-ms transducer decode runs
     // on the decode worker, never here. finalize() is always called *after* Capture (and the worker)
@@ -1232,6 +1492,14 @@ fn build_capture(
                 }
             }
         };
+        // The on-device cancel signal, on its OWN edge — see frame_on_device_speech for why it is
+        // not `speaking` below. Reported before the waveform edge so a resume can never be observed
+        // by the frontend after the arm it is meant to prevent.
+        let on_device_speech = frame_on_device_speech(cloud, vad_detected);
+        if on_device_speech != last_on_device_speech {
+            last_on_device_speech = on_device_speech;
+            emit_on_device_speech(&app_cb, on_device_speech);
+        }
         let speaking = frame_speaking(cloud, vad_detected);
         if speaking != last_speaking {
             last_speaking = speaking;
@@ -2350,6 +2618,12 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
     if let Some(s) = cloud_session {
         s.finish();
     }
+    // DELIBERATELY no `dictation://speech-end` here, unlike the worker's `accept` segments above.
+    // This is a teardown flush: capture has already stopped, so what it emits is the tail the VAD
+    // never got to close — not the engine observing the speaker fall silent. Arming a send
+    // countdown at this point would count down over a mic the user just muted, and would fire
+    // AFTER they stopped dictating, which is precisely the moment they are least able to catch it.
+    // Stopping dictation is the user taking manual control; the send decision is theirs from here.
     if let Some(t) = transcriber {
         for seg in t.lock().unwrap_or_else(|p| p.into_inner()).finalize() { emit_partial(&app, "finalize", seg); }
     }
@@ -2360,7 +2634,8 @@ pub fn stop_dictation(app: AppHandle, state: State<DictationState>) {
 mod tests {
     use super::{AppHandle, State, AudioHealth, FaultAction, fault_action, no_audio_message,
         missing_tick, build_suppresses_watch, BUILD_STALL_GRACE, DictationSession, MISSING_CAPTURE_TICKS, NO_CAPTURE_MESSAGE,
-        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
+        begin_start_decision, capture_should_be_live, choose_engine, cloud_reuse, frame_on_device_speech, frame_speaking, segment_cloud_latch, park_cloud_for_blur, plan_capture,
+        apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         segment_fingerprint, should_emit_blur, should_install_cloud, should_keep_warm_on_stop,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart, CapturePlan,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
@@ -2368,6 +2643,156 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// THE REGRESSION TEST for "auto-send never arms on the on-device path".
+    ///
+    /// Before this rule existed, a closed VAD segment emitted its transcript and NOTHING else —
+    /// `dictation://speech-end` came only from the Deepgram relay. So the moment the cloud stream
+    /// closed (or was never opened), speech kept flowing into the composer while the auto-send
+    /// clock, which only `speechEndSeq` starts, sat unarmed forever: no countdown bar, no send.
+    /// Observed in a real user's log as six unbroken minutes of `emit partial source="accept"`
+    /// with zero auto-send evaluations, ending the instant `source="deepgram"` came back.
+    ///
+    /// The assertion is the SIDE EFFECT — that a decoded segment plans a speech-end at all — not
+    /// the precondition that a decode happened. Nothing about the old code could satisfy it.
+    #[test]
+    fn a_decoded_segment_emits_its_transcript_and_then_a_speech_end() {
+        // Every capture mode must agree that a closed segment ended an utterance, so the on-device
+        // engine reports it exactly like Deepgram's endpointing does on the cloud path.
+        assert_eq!(
+            plan_decode_emit(DecodeOutcome::Decoded("ship it".into())),
+            DecodeEmitPlan::PartialThenSpeechEnd("ship it".into()),
+            "a closed VAD segment with words in it is the on-device engine saying the speaker \
+             stopped — it must emit the speech-end, or auto-send never arms off the cloud path",
+        );
+        // Ordering is carried by the variant, not by luck: the transcript lands FIRST so the rail
+        // recomputes its confidence threshold from THIS sentence, not the previous one. If the two
+        // emits are ever split apart, this variant is what has to change.
+        match plan_decode_emit(DecodeOutcome::Decoded("ship it".into())) {
+            DecodeEmitPlan::PartialThenSpeechEnd(text) => assert_eq!(text, "ship it"),
+            other => panic!("a decoded segment must plan partial-then-speech-end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_emit_plan_can_carry_a_transcript_without_its_boundary() {
+        // THE COUPLING, asserted over the TYPE rather than over one more input — which is the only
+        // form of this test that can fail (roborev 55455). A second `plan_decode_emit(Decoded(..))`
+        // row would just restate the row above it with a different string, and could not catch the
+        // suppression's likeliest return (re-reading the shared flag inside the worker loop), because
+        // the worker's emit path needs an `AppHandle` and has no test by construction.
+        //
+        // What this pins is the claim `PartialThenSpeechEnd`'s doc actually makes: separating the two
+        // emits requires EDITING THIS TYPE. Adding a `PartialOnly`-shaped variant — one that carries
+        // words but no boundary — fails the sweep below, which is the tripwire that matters, since
+        // that is exactly how the suppression was expressed the first time and what silently broke
+        // the hands-free flow ("Hey Sparkle, deploy the staging branch" closing as two segments, the
+        // second draining after the relay opened, its transcript landing and its arm discarded with
+        // no successor: the relay carries only silence and the on-device engine is no longer fed).
+        for plan in [
+            DecodeEmitPlan::PartialThenSpeechEnd("deploy the staging branch".into()),
+            DecodeEmitPlan::Nothing,
+            DecodeEmitPlan::WarnPanicked,
+        ] {
+            let carries_transcript = matches!(plan, DecodeEmitPlan::PartialThenSpeechEnd(_));
+            // Today the two are the same variant, so this reads as a tautology — that IS the
+            // invariant. It stops being one the moment someone adds a variant with a transcript and
+            // no speech-end, and then this arm is what refuses to compile or match.
+            let carries_boundary = match plan {
+                DecodeEmitPlan::PartialThenSpeechEnd(_) => true,
+                DecodeEmitPlan::Nothing | DecodeEmitPlan::WarnPanicked => false,
+            };
+            assert_eq!(
+                carries_transcript, carries_boundary,
+                "a plan that emits words must emit their utterance boundary too — a dropped \
+                 boundary has no successor once the cloud owns the stream",
+            );
+        }
+    }
+
+    #[test]
+    fn a_wordless_or_panicked_segment_stays_completely_silent() {
+        // The VAD closes segments on coughs, doors and keyboards too. Those put NO text in the
+        // composer, so arming a countdown would start a send over whatever was already there —
+        // including text the user typed and never spoke. Noise must not be able to press send.
+        assert_eq!(
+            plan_decode_emit(DecodeOutcome::Decoded(String::new())),
+            DecodeEmitPlan::Nothing,
+            "an empty decode changed nothing in the composer, so it ended no utterance",
+        );
+        assert_eq!(
+            plan_decode_emit(DecodeOutcome::Decoded("   \n\t ".into())),
+            DecodeEmitPlan::Nothing,
+            "whitespace-only is the same non-event as empty",
+        );
+        // A panicked decode DROPS words the user did say, so arming here would count down over a
+        // knowingly incomplete sentence. Warn, emit nothing, let the next segment arm.
+        assert_eq!(
+            plan_decode_emit(DecodeOutcome::Panicked),
+            DecodeEmitPlan::WarnPanicked,
+            "a dropped segment must not arm a send over the words it just lost",
+        );
+    }
+
+    /// Records the emits in the order they happen, so the WIRING is asserted rather than described.
+    #[derive(Default)]
+    struct RecordingSink(Vec<String>);
+
+    impl DecodeEmitSink for RecordingSink {
+        fn partial(&mut self, text: String) {
+            self.0.push(format!("partial:{text}"));
+        }
+        fn speech_end(&mut self) {
+            self.0.push("speech-end".into());
+        }
+        fn warn_panicked(&mut self) {
+            self.0.push("warn".into());
+        }
+    }
+
+    fn emits_for(outcome: DecodeOutcome) -> Vec<String> {
+        let mut sink = RecordingSink::default();
+        apply_decode_plan(plan_decode_emit(outcome), &mut sink);
+        sink.0
+    }
+
+    /// THE WIRING TEST (roborev 55496). The two tests above pin the DECISION; this pins that the
+    /// decision is actually carried out. Before `DecodeEmitSink` existed, the dispatch lived inside a
+    /// spawned thread holding an `AppHandle`, so deleting the speech-end emit restored the original
+    /// bug — auto-send never arming off the cloud path — with the whole suite still green.
+    #[test]
+    fn a_decoded_segment_actually_emits_the_transcript_and_then_the_speech_end() {
+        // Both emits, in this order. Order is load-bearing, not cosmetic: the rail recomputes its
+        // confidence threshold from the transcript, so a speech-end arriving first would arm the
+        // countdown against the PREVIOUS sentence's duration.
+        assert_eq!(
+            emits_for(DecodeOutcome::Decoded("ship it".into())),
+            vec!["partial:ship it", "speech-end"],
+            "a closed VAD segment must emit its transcript and THEN the speech-end that arms the rail",
+        );
+    }
+
+    #[test]
+    fn a_wordless_or_panicked_segment_emits_nothing_onto_the_bus() {
+        // Noise must not be able to press send, so these paths must reach the bus with NOTHING —
+        // not merely plan to. A stray partial here would re-type text; a stray speech-end would arm
+        // a countdown over whatever the user had typed and never spoken.
+        assert!(
+            emits_for(DecodeOutcome::Decoded(String::new())).is_empty(),
+            "an empty decode must put nothing on the bus",
+        );
+        assert!(
+            emits_for(DecodeOutcome::Decoded("  \n\t ".into())).is_empty(),
+            "whitespace-only is the same non-event as empty",
+        );
+        // A panic logs and does NOT emit — in particular it must not emit a speech-end over the
+        // words it just lost.
+        assert_eq!(
+            emits_for(DecodeOutcome::Panicked),
+            vec!["warn"],
+            "a recovered panic warns and emits nothing else",
+        );
+    }
 
     // ---- audio liveness watchdog ----------------------------------------------------------
     // Guards the 2026-07-29 incident: capture ran for nine minutes receiving nothing while the UI
@@ -2635,6 +3060,45 @@ mod tests {
         assert!(
             !msg.contains("System Settings"),
             "changing the OS default cannot rebind Sparkle: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_on_device_speech_level_is_the_vad_and_is_false_whenever_the_cloud_owns_the_audio() {
+        // THE COUNTDOWN'S CANCEL. `dictation://speech-end` arms the auto-send clock on BOTH paths
+        // now; on the cloud path `dictation://interim` cancels it, and this is the on-device
+        // equivalent — without it, resumed speech could not stop a clock that a mid-thought pause
+        // had started, and auto-send could fire mid-sentence.
+        assert!(
+            frame_on_device_speech(false, true),
+            "on-device + VAD detecting speech → the user is talking; a countdown must not run",
+        );
+        assert!(
+            !frame_on_device_speech(false, false),
+            "on-device + VAD silent → not talking; a speech-end may arm the clock",
+        );
+        // THE HALF THAT MAKES IT SAFE TO SHIP. On the cloud path the cancel belongs to
+        // `dictation://interim`, which is what actually tracks Deepgram's view of the utterance.
+        // A local VAD flag routed into the same suspend-the-countdown role would fight it — and the
+        // VAD is not even reliable there, since the audio is being consumed by the relay. So this
+        // signal is INERT whenever the cloud owns the audio, whatever the VAD happens to say.
+        assert!(
+            !frame_on_device_speech(true, true),
+            "cloud owns the audio → this signal is inert, even with the VAD flag set",
+        );
+        assert!(!frame_on_device_speech(true, false), "cloud owns the audio → inert");
+        // …and it is NOT the same function as the waveform's, which is the whole point: while the
+        // relay has the audio and the user IS speaking, the meter must move (`frame_speaking` true)
+        // while the on-device cancel stays silent and lets `interim` do that job. That divergence is
+        // the reason two functions exist; if they ever coincide everywhere, one of them is dead code.
+        //
+        // NOTE the operand: this used to compare at (cloud=true, vad=false) because `frame_speaking`
+        // then returned `cloud_active || vad_detected` and was true for the whole stream. The
+        // 2026-07-29 dead-mic fix made it honest (a still meter now means the engine hears nothing),
+        // so the two agree there and the ONLY point they still diverge is with the VAD detecting.
+        assert!(
+            frame_speaking(true, true) != frame_on_device_speech(true, true),
+            "with the relay streaming live speech the meter must move while the cancel stays inert",
         );
     }
 

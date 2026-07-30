@@ -81,7 +81,8 @@ export type ConciergeDispatchPath =
   | "queued" // the agent's PTY isn't up yet → held, flushed when the pane reports ready
   | "queue-full" // the agent is starting but its hold queue is full (refused, NOT delivered)
   | "ambiguous-picker" // a prompt is live but the answer didn't map to any option (refused)
-  | "addressed-at-picker" // an @-addressed MESSAGE arrived while a picker owns stdin (refused)
+  | "addressed-at-picker" // a composed MESSAGE (addressed, or an attachment-carrying redirect)
+                         // arrived while a picker owns stdin (refused — see neverPickerAnswer)
   | "empty" // nothing to dispatch (blank/whitespace answer)
   | "trial-spent" // the server says the free trial is spent (refused BEFORE delivery)
   | "expired" // held too long waiting for a PTY that never came up (NOT delivered)
@@ -149,8 +150,14 @@ export interface ConciergeDispatchOptions {
   namingBasis?: string;
   /**
    * This text must NEVER be collapsed into a picker keystroke, however well it matches an option
-   * on the agent's screen. Set for a message the user ADDRESSED to this agent by name
-   * (`@Kraken Auth yes` — see ConciergeHost's mention routing).
+   * on the agent's screen — and BECAUSE that is the claim, it is now read BEFORE the matcher runs
+   * (see the picker block below): whether the text happens to match is irrelevant to a caller that
+   * has already said it is not an answer.
+   *
+   * Set by the two callers that mean "the user composed a MESSAGE" (roborev 55400):
+   *   • an @-ADDRESSED send — `@Kraken Auth yes`, see ConciergeHost's mention routing;
+   *   • a REDIRECT of a message that CARRIED FILES — the replay carries the attachments' quoted
+   *     paths, and a person who attached a picture to their question did not send an option.
    *
    * ══ WHY THE CALLER CANNOT ENFORCE THIS ITSELF (roborev 54569) ═══════════════════════════════
    * `answersLivePicker` is a MIRROR of the gate below, exported for callers that must know the
@@ -292,25 +299,30 @@ export function liveOptionsFor(agentId: string): SuggestionButton[] {
  * Would `text` be taken as an answer to a picker the agent has on screen RIGHT NOW?
  *
  * A mirror of the two conditions `dispatchConciergeAnswer` applies below — a live-option match plus
- * terseness — exported for callers that must know the disposition BEFORE they build a payload.
- * Change the gate there and change it here.
+ * terseness — for a caller that must know the disposition BEFORE it builds a payload. Change the
+ * gate there and change it here.
  *
- * The caller that needs it is the concierge compose box. It prefixes the quoted paths of any staged
- * attachments onto the text it sends (`attachedPayload`), unconditionally — and that prefix defeats
- * the matcher completely: every arm of `matchAnswerToOption` is anchored (`YES_WORDS` is `^…$`), so
- * `"/var/folders/…/shot.png" Yes` matches nothing and comes back `ambiguous-picker`. With a file
- * staged and a picker up, typing "Yes" and typing "2" were BOTH refused, the draft and the chips
- * were restored, and retyping produced the identical refusal — a loop with no way out but noticing
- * the attachments and removing them, which the refusal copy never mentions.
+ * ══ IT HAS NO PRODUCTION CALLER TODAY, AND THE CONCIERGE BOX MUST NOT BECOME ONE AGAIN ═════════
+ * The concierge compose box used to consult it. It prefixes the quoted paths of any staged
+ * attachments onto the text it sends (`attachedPayload`), and that prefix defeats the matcher
+ * completely — every arm of `matchAnswerToOption` is anchored (`YES_WORDS` is `^…$`), so
+ * `"/var/folders/…/shot.png" Yes` matched nothing and came back `ambiguous-picker`. On a true it
+ * therefore sent UNPREFIXED and left the files staged, on the reasoning that a picker answer is a
+ * keystroke rather than a message that could carry a file.
  *
- * So a terse picker answer sends UNPREFIXED and the caller HOLDS its attachments for the next send.
- * (Clicking a terminal-kind suggestion pill is unaffected: `applySuggestion` writes the keystroke
- * straight to the PTY and never reaches this module.)
+ * Both halves of that reasoning are gone. `routeMessage` can no longer return `agent` at all (see
+ * conciergeRouter's header), so an unaddressed send never reaches this module — the lever fired only
+ * on CONCIERGE-bound text and silently withheld the user's screenshot from the brain
+ * (roborev 55033). And an ADDRESSED send arrives here with `neverPickerAnswer`, which refuses rather
+ * than pressing a button, so it cannot become a keystroke either.
  *
- * Reads the CURRENT screen, exactly as the dispatch does. The two reads happen at different moments
- * — this at submit, the dispatch after routing — so they can disagree if the picker clears in
- * between. That degrades to the ordinary prompt path with the attachments still staged, which is
- * recoverable and visible (the chips are still there); the reverse ordering could not be.
+ * Re-wiring it would also be unsafe in a second way. It reads the screen at SUBMIT while the
+ * dispatch re-reads it after the countdown, so the two can disagree when a picker clears in
+ * between — and the send then lands as an ordinary prompt stripped of the files it was meant to
+ * carry. Whatever needs this next has to survive that gap.
+ *
+ * (Clicking a terminal-kind suggestion pill is unaffected either way: `applySuggestion` writes the
+ * keystroke straight to the PTY and never reaches this module.)
  */
 export function answersLivePicker(agentId: string, text: string): boolean {
   const options = liveOptionsFor(agentId);
@@ -353,6 +365,24 @@ export async function dispatchConciergeAnswer(
   const options = liveOptionsFor(agentId);
 
   if (options.length > 0) {
+    // ══ THE DECLARED DISPOSITION IS CHECKED FIRST, BEFORE THE MATCH ═════════════════════════════
+    // `neverPickerAnswer` says this text may never become a keystroke "however well it matches an
+    // option on the agent's screen" — so whether it happens to match is irrelevant to it, and
+    // asking the matcher first made the refusal a caller gets depend on the matcher's opinion of a
+    // message that caller had already declared was not an answer.
+    //
+    // That ordering had a live consequence, not merely a tidiness one (roborev 55309). The
+    // concierge prefixes staged attachments' quoted temp paths onto the wire, and every arm of
+    // `matchAnswerToOption` is anchored — so an attachment-carrying send at a live picker never
+    // matched, fell into `ambiguous-picker` below, and was told "I can't map that to a choice —
+    // answer with just the option". Both halves are wrong for it: nothing was ambiguous, and the
+    // user did not send an option at all, they sent a screenshot. The line they need is the
+    // `addressed-at-picker` one — "it's waiting on a choice, so I didn't send that to it as a
+    // message; open it and pick" — which under the old order they could reach only by matching,
+    // i.e. by removing the file, which the copy never told them.
+    if (opts.neverPickerAnswer) {
+      return { ok: false, path: "addressed-at-picker", agentId, options };
+    }
     const match = matchAnswerToOption(text, options);
     if (!match) {
       // A picker is on screen but the answer doesn't map to an option — do NOT guess a keystroke.
@@ -366,19 +396,13 @@ export async function dispatchConciergeAnswer(
     // Machine callers (the nudge Approve relay) send a bare "approve", so they are unaffected.
     //
     // These two conditions — a live-option match plus terseness — are what `answersLivePicker`
-    // above mirrors for callers that must know the disposition BEFORE they build a payload. Change
-    // the gate here and change it there.
+    // above mirrors. Change the gate here and change it there.
     //
-    // `neverPickerAnswer` gets its OWN path, and reusing `ambiguous-picker` for it was a dead end
-    // (roborev 54665). That path's copy is "waiting on a choice I can't map that to — open it and
-    // pick, or answer with just the option", and BOTH halves are false here: the text mapped
-    // perfectly (that is why it was refused), and answering with just the option is exactly what the
-    // user did. So they retype the same thing, get a byte-identical refusal, and the only exit is
-    // guessing that the `@address` is the problem — which the copy never says. Naming the agent you
-    // mean is most natural precisely when several are asking at once, so this is not a rare corner.
-    if (opts.neverPickerAnswer) {
-      return { ok: false, path: "addressed-at-picker", agentId, options };
-    }
+    // (`addressed-at-picker` gets its OWN path rather than reusing this one — roborev 54665. That
+    // copy claims the answer mapped to nothing and offers "answer with just the option", and for a
+    // DECLARED non-answer both are false: the text may have mapped perfectly, and answering with
+    // just the option is either what the user already did or not what they were trying to do at
+    // all. Sharing the line sent them round a loop with no stated exit.)
     if (opts.userPrompt && !isTerseAnswer(text, options)) {
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }

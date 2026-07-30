@@ -3,6 +3,7 @@ import { AuthGate } from "./components/AuthGate";
 import { ReadinessGate } from "./components/ReadinessGate";
 import { useAmbientVoice } from "./useDictation";
 import { installInputFreezeTrace } from "./diagnostics/inputFreezeTrace";
+import { installDictationFocusTracker } from "./voice/dictationFocusTracker";
 import { useDictationStore } from "./stores/dictationStore";
 import { useApplyTheme } from "./theme/theme";
 import { useConnectionMonitor } from "./connectionMonitor";
@@ -174,6 +175,19 @@ export function App() {
   // recurrence of the dictation input-freeze (sparkle-d2ec) is pinnable. Inert when dictation off.
   useEffect(
     () => installInputFreezeTrace({ isDictationEnabled: () => useDictationStore.getState().enabled }),
+    [],
+  );
+  // DICTATION FOLLOWS FOCUS. Records who holds the caret (and whether this window is active) into
+  // the dictation store; the routing gate in useDictation and the paused copy on both mic surfaces
+  // read the ONE verdict derived from it (voice/dictationFocus). Installed here, beside the trace
+  // above, because it is the same app-wide DOM signal — and the trace is what caught the terminal
+  // case in the field. Decides nothing itself; see voice/dictationFocusTracker.
+  useEffect(
+    () =>
+      installDictationFocusTracker({
+        setFocusOwner: (o) => useDictationStore.getState().setFocusOwner(o),
+        setWindowFocused: (v) => useDictationStore.getState().setWindowFocused(v),
+      }),
     [],
   );
   // NOTE: roster publishing lives in <RosterPublisher/> below, mounted inside AppBoot so it starts

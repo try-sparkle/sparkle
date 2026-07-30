@@ -90,12 +90,13 @@ import {
   preparingPlaceholder,
   PREPARING_PREFIX,
   PREPARING_SUFFIX,
-  PAUSED_COMPOSER_PLACEHOLDER,
+  pausedComposerPlaceholder,
   modelPercent,
   voiceErrorNotice,
   MICROPHONE_SETTINGS_URL,
   type VoiceErrorNotice,
 } from "../voice/dictationCopy";
+import { useDictationPauseReason } from "../voice/useDictationPauseReason";
 import { deriveMicPresentation } from "../voice/micPresentation";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { log } from "../logger";
@@ -365,6 +366,11 @@ export function Composer({
     hasError: errorNotice !== null,
     outOfCreditsNotice,
   });
+  // WHY it is paused, for the `focusPaused` copy below. Read through the shared hook off the shared
+  // pure decision (voice/dictationFocus), like every other surface — this composer sits directly
+  // under the terminal that causes the terminal pause, so it is the surface most likely to be read
+  // at the moment the caret is in one.
+  const pauseReason = useDictationPauseReason();
   // Configured wake/stop words so every dictation hint reflects a user's remap (default words
   // reproduce the original copy exactly).
   const wakeWord = useSettingsStore((s) => s.wakeWord);
@@ -1653,7 +1659,7 @@ export function Composer({
                   : micPresentation === "passiveWaiting"
                   ? wakePlaceholder(wakeWord)
                   : micPresentation === "focusPaused"
-                  ? PAUSED_COMPOSER_PLACEHOLDER // armed but not capturing — honest, mirrors the sidebar
+                  ? pausedComposerPlaceholder(pauseReason) // armed but not capturing — honest, mirrors the sidebar, and names the cause
                   : "" // mic off (master mute) — no voice prompt at all
               }
               spellCheck={false}
@@ -1794,11 +1800,12 @@ export function Composer({
                   {WAKE_SUFFIX}
                 </>
               ) : micPresentation === "focusPaused" ? (
-                // Armed but NOT capturing (window unfocused/muted, or capture not started yet). The
-                // mic can't hear anything, so — exactly like the sidebar's "Listening paused" caption
-                // — say so instead of inviting the wake word. The copy already says "you can type
-                // here", so it also subsumes the old focused-only typing hint.
-                PAUSED_COMPOSER_PLACEHOLDER
+                // Armed but NOT capturing (another window, the caret in a terminal, muted, or
+                // capture not started yet). The mic can't hear anything, so — exactly like the
+                // sidebar's "Listening paused" caption — say so instead of inviting the wake word,
+                // and NAME the cause. The copy already says what to do next, so it also subsumes
+                // the old focused-only typing hint.
+                pausedComposerPlaceholder(pauseReason)
               ) : null /* micPresentation === "off": master mute — no voice promise at all */}
             </div>
           )}

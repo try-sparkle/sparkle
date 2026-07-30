@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { Phase } from "../voice/wakeMachine";
+import type { FocusOwner } from "../voice/dictationFocus";
 
 /** localStorage key for the persisted slice (only `enabled`). Exported so the cross-window
  *  sync service can rehydrate on the browser `storage` event. */
@@ -117,12 +118,56 @@ interface DictationState {
    * Runtime only (see `partialize`): a relaunch must not resurrect a stale utterance boundary.
    */
   speechEndSeq: number;
+  /**
+   * The ON-DEVICE speaker is talking RIGHT NOW (`dictation://on-device-speech`) — the auto-send
+   * countdown's CANCEL, and the on-device counterpart of {@link interim}.
+   *
+   * A speech-end ARMS the clock on both capture paths. On the cloud path an arriving `interim`
+   * un-arms it ("keep talking and it waits"); the on-device path has no interim results at all, so
+   * when on-device arming was added, cancelling had no equivalent — a mid-thought pause long enough
+   * for the VAD to close a segment could start a clock that resumed speech was unable to stop.
+   *
+   * A LEVEL, not a pulse, deliberately: the on-device decode runs hundreds of ms behind the audio,
+   * so a user who resumes during that gap produces resume-then-arm IN THAT ORDER. A pulse would be
+   * consumed before the arm it needs to prevent; a level is still true when the arm lands.
+   *
+   * ALWAYS FALSE while the cloud owns the audio — Rust guarantees that (`frame_on_device_speech`).
+   * The reason is that on the cloud path the cancel belongs to `interim`, which tracks Deepgram's own
+   * view of the utterance; a local VAD flag in the same role would fight it, and the VAD is not
+   * trustworthy while the relay is consuming the audio. (It is NOT, as this comment previously said,
+   * because the waveform's `speaking` flag is pinned true for the whole stream — that stopped being
+   * so in the 2026-07-29 dead-mic fix, which made `speaking` the raw VAD on both paths. See
+   * roborev 55503.) Runtime only.
+   */
+  onDeviceSpeech: boolean;
+  /** WHO holds the DOM caret in this window right now — "terminal" when it sits in an xterm pane,
+   *  "other" for everything else INCLUDING nothing at all (the hands-free wake-word case).
+   *
+   *  Written only by the focus tracker (voice/dictationFocusTracker), and only when the answer
+   *  changes. It is an OBSERVATION, not a decision: `dictationPauseReason` turns it (plus
+   *  {@link windowFocused} and {@link enabled}) into the one verdict that both the routing gate and
+   *  both mic surfaces' copy read, so what we transcribe and what we claim can't disagree.
+   *
+   *  Runtime only (never in `partialize`): where the caret was last session says nothing about
+   *  where it is now, and a persisted "terminal" would come back as a mic paused for no visible
+   *  reason. */
+  focusOwner: FocusOwner;
+  /** Is THIS window the active OS window? Tracked alongside {@link focusOwner} purely so the paused
+   *  COPY is reactive — a component can't subscribe to `document.hasFocus()`. The routing gate in
+   *  useDictation keeps using its own live per-window check (`isWindowActive`), which is the
+   *  authoritative, race-free signal for "should this window consume the broadcast".
+   *
+   *  Defaults TRUE so a window-less/test environment, or the moment before the tracker installs,
+   *  fails OPEN (dictation routes) rather than pausing a mic nothing can un-pause. Runtime only. */
+  windowFocused: boolean;
 
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
   setSpeaking: (v: boolean) => void;
   /** The engine says the speaker stopped — bump {@link speechEndSeq}. */
   noteSpeechEnd: () => void;
+  /** The on-device speaker started/stopped talking — see {@link onDeviceSpeech}. */
+  setOnDeviceSpeech: (v: boolean) => void;
   /** Replace the live interim preview (cloud path). Pass "" to clear it. */
   setInterim: (text: string) => void;
   /** Setting a non-null value also transitions status to "error". Clearing with
@@ -147,6 +192,12 @@ interface DictationState {
    *  the concierge ring (LogoWaveform) and the agent composer's ComposerMic — so the arbiter is
    *  set by the same gesture that arms the mic. */
   setVoiceSurface: (s: VoiceSurface) => void;
+  /** Record who holds the caret (focus tracker only). No-op when unchanged, so a focus move between
+   *  two non-terminal elements never wakes a subscriber. */
+  setFocusOwner: (o: FocusOwner) => void;
+  /** Record whether this window is the active OS window (focus tracker only). No-op when
+   *  unchanged. */
+  setWindowFocused: (v: boolean) => void;
   insert: (text: string) => void;
 }
 
@@ -167,11 +218,16 @@ export const useDictationStore = create<DictationState>()(
       insertTarget: null,
       voiceSurface: "concierge",
       speechEndSeq: 0,
+      onDeviceSpeech: false,
+      focusOwner: "other",
+      windowFocused: true,
 
       setStatus: (status) => set({ status }),
       setLevel: (level) => set({ level }),
       setSpeaking: (speaking) => set({ speaking }),
       noteSpeechEnd: () => set((s) => ({ speechEndSeq: s.speechEndSeq + 1 })),
+      setOnDeviceSpeech: (onDeviceSpeech) =>
+        set((s) => (s.onDeviceSpeech === onDeviceSpeech ? s : { onDeviceSpeech })),
       setInterim: (interim) => set({ interim }),
       setError: (error) =>
         set((s) => ({
@@ -203,6 +259,11 @@ export const useDictationStore = create<DictationState>()(
       },
       registerInsert: (insertTarget) => set({ insertTarget }),
       setVoiceSurface: (voiceSurface) => set({ voiceSurface }),
+      // Returning the SAME state object is how zustand is told "nothing changed" — it skips the
+      // notification entirely, so an unchanged focus observation costs no subscriber wakeups.
+      setFocusOwner: (focusOwner) => set((s) => (s.focusOwner === focusOwner ? s : { focusOwner })),
+      setWindowFocused: (windowFocused) =>
+        set((s) => (s.windowFocused === windowFocused ? s : { windowFocused })),
       insert: (text) => {
         const fn = get().insertTarget;
         if (fn) fn(text);

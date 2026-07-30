@@ -13,6 +13,8 @@ import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { voiceErrorNotice, type VoiceErrorNotice } from "./dictationCopy";
 import { deriveMicPresentation, type MicPresentation } from "./micPresentation";
+import { useDictationPauseReason } from "./useDictationPauseReason";
+import type { PauseReason } from "./dictationFocus";
 
 export interface VoicePlaceholderState {
   /** THE voice state, shared with the sidebar caption. Surfaces switch on this and supply only
@@ -28,6 +30,17 @@ export interface VoicePlaceholderState {
   errorNotice: VoiceErrorNotice | null;
   /** An arm attempt was refused for lack of credits (transient, auto-clears). */
   outOfCreditsNotice: boolean;
+  /**
+   * WHY the mic is paused, when `micPresentation === "focusPaused"` — null otherwise.
+   *
+   * Carried ALONGSIDE the presentation rather than folded into it, deliberately. The single-state
+   * property above is what stops the sidebar and the composer contradicting each other about WHICH
+   * state the mic is in; splitting `focusPaused` into one member per cause would put that property
+   * back at risk for nothing, since every surface renders the same state and only differs in words.
+   * So: one state, one reason, and each surface picks its own sentence for the pair (see
+   * dictationCopy.pausedCaption / pausedComposerPlaceholder).
+   */
+  pauseReason: PauseReason | null;
 }
 
 export function useVoicePlaceholder(): VoicePlaceholderState {
@@ -42,6 +55,10 @@ export function useVoicePlaceholder(): VoicePlaceholderState {
   const wakeWord = useSettingsStore((s) => s.wakeWord);
   const stopWord = useSettingsStore((s) => s.stopWord);
   const errorNotice = useMemo(() => voiceErrorNotice(voiceError), [voiceError]);
+  // Read through the SAME hook the sidebar uses, off the SAME pure decision the routing gate makes
+  // (voice/dictationFocus). That is what keeps "we stopped transcribing because you're in a
+  // terminal" and "we say you're in a terminal" from ever being two different answers.
+  const pauseReason = useDictationPauseReason();
   // `errorNotice != null` is this layer's `hasError`; the (idle vs error) distinction in the raw
   // status is irrelevant once a real error is handled by hasError, so `audioActive` suffices.
   const micPresentation = deriveMicPresentation({
@@ -59,5 +76,6 @@ export function useVoicePlaceholder(): VoicePlaceholderState {
     modelProgress,
     errorNotice,
     outOfCreditsNotice,
+    pauseReason,
   };
 }

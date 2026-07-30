@@ -40,6 +40,7 @@ import { useDictationStore } from "./stores/dictationStore";
 import { useAuthStore } from "./stores/authStore";
 import { useUiStore } from "./stores/uiStore";
 import { createDictationController, cloudStreamCommandFor } from "./useDictation";
+import type { FocusOwner } from "./voice/dictationFocus";
 
 /** A minimal signed-in `me` for the credits-pill tests. */
 const meWith = (balanceCents: number) => ({
@@ -786,10 +787,13 @@ describe("dictation://speech-end (the auto-send rail's silence signal)", () => {
     ctrl.cleanup();
   });
 
-  it("is NOT inferable from dictation://speaking, which the cloud path pins true", async () => {
+  it("is NOT inferable from dictation://speaking, which is a raw level and not an utterance boundary", async () => {
     const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
-    // The whole reason this event exists: on the cloud path dictation.rs holds `speaking` true for
-    // the entire stream, so its edges say nothing about when a sentence ended.
+    // The whole reason this event exists: `speaking` is the VAD's real-time level, so its falling
+    // edge means "quiet for a frame", not "the sentence ended" — it drops on every inter-word gap and
+    // says nothing about the boundary the rail needs. (It formerly ALSO stayed pinned true for a
+    // whole cloud stream; the 2026-07-29 dead-mic fix removed that, but the conclusion is the same
+    // and the assertion below is unchanged — see roborev 55503.)
     emit("dictation://speaking", true);
     emit("dictation://speaking", false);
     expect(useDictationStore.getState().speechEndSeq).toBe(0);
@@ -904,5 +908,394 @@ describe("multiple mounted composers (regression: dictation must not leak across
 
     ctrlA.cleanup();
     ctrlB.cleanup();
+  });
+});
+
+describe("dictation follows focus — the caret in a TERMINAL pauses routing", () => {
+  // THE REGRESSION THIS BLOCK EXISTS FOR. The mic used to keep transcribing while the caret sat in
+  // a terminal: words landed in a composer the user was not looking at, the auto-send rail never
+  // armed, and nothing on screen said why. Two subsystems disagreeing about the active target is
+  // exactly the half-state the one gate (`isRoutable`) was introduced to make unrepresentable.
+  //
+  // Every test below drives the REAL listeners through the injected `focusOwner` seam and asserts
+  // the SIDE EFFECT — a segment not delivered, a seq not bumped — never a precondition.
+  beforeEach(() => {
+    useDictationStore.setState({
+      interim: "",
+      modelProgress: null,
+      speechEndSeq: 0,
+      enabled: true,
+      status: "listening",
+      phase: "active",
+    });
+  });
+
+  // ── ARMING is not a focus transition, which is how the half-state survived ────────────────────
+  // The gate above is driven by focus CHANGES. Clicking the mic changes no focus, so these two paths
+  // asserted "listening" outright and produced the contradiction inverted: nothing routed, while
+  // both surfaces read `status === "listening"` as `passiveWaiting` and printed "Mic paused. Say Hey
+  // Sparkle to activate" — an invitation to speak into a pipeline that discards every word, with the
+  // terminal copy suppressed because it only renders under `focusPaused` (roborev 55497).
+  //
+  // Both assert `status`, which is the INPUT deriveMicPresentation reads to choose the copy, and both
+  // fail against the previous code, which wrote "listening" unconditionally on these paths.
+
+  it("arming the mic while the caret is ALREADY in a terminal reads as paused, not as listening", async () => {
+    // The pre-arm shape: armed by the user (`enabled` true — that is the mic button's own state and
+    // `toggle` deliberately never writes it), status not yet settled. `toggle()` takes the arm branch.
+    // `enabled` must be true here or deriveMicPresentation short-circuits to "off" and the paused copy
+    // is moot — "off" and "paused" are different claims and only the second one needs a cause.
+    useDictationStore.setState({ enabled: true, status: "idle" });
+    // MUTABLE on purpose: the caret has to be able to actually leave. A constant `() => "terminal"`
+    // would keep `isRoutable()` false forever, so the resume half below could never fire and the
+    // "recoverable" claim would be untestable — passing only because nothing ran.
+    let owner: FocusOwner = "terminal";
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => owner,
+    });
+    await ctrl.toggle();
+    // THE ASSERTION. "listening" here is what painted the false invitation; anything else routes the
+    // surfaces through `focusPaused`, the one presentation that states the CAUSE.
+    expect(useDictationStore.getState().status).toBe("idle");
+    // …and the arm genuinely happened — this must be a PAUSE, not a refusal to arm. Capture really
+    // starts, and `enabled` is left exactly as the user set it, so this can never be read as a mute.
+    expect(invoke).toHaveBeenCalledWith("start_dictation");
+    expect(useDictationStore.getState().enabled).toBe(true);
+    // And the mic is not stuck there: the existing focus-owner path restores it on the way out,
+    // proving the pause is recoverable by moving the caret alone — no second click on the mic.
+    owner = "other";
+    ctrl.notifyFocusOwner("other");
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("arming with the caret in the composer still claims listening (the fix must not mute the normal case)", async () => {
+    // The other half of the pin. Without this, `armedStatus` returning "idle" unconditionally would
+    // satisfy the test above while breaking every ordinary arm — the mic would never claim to listen.
+    useDictationStore.setState({ enabled: true, status: "idle" });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    await ctrl.toggle();
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("the watchdog's all-clear does NOT re-claim listening while the caret is in a terminal", async () => {
+    // Second path to the same contradiction. Frames stopped, the user was told, they fixed it — and
+    // recovery arrived while the caret was parked in a terminal. The sibling dictation://focus(true)
+    // handler already carried the terminal term; this one did not, so it flipped the UI back to
+    // claiming live capture over a gate that keeps dropping everything.
+    useDictationStore.setState({ enabled: true, status: "error", error: null, deadMicSilent: true });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().status).not.toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("the watchdog's all-clear DOES restore listening once the caret is back in the composer", async () => {
+    // Guards the fix from over-reaching: the recovery path must still do its job in the normal case,
+    // or a recovered mic stays drawn as paused until the user cycles it by hand.
+    useDictationStore.setState({ enabled: true, status: "error", error: null, deadMicSilent: true });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().status).toBe("listening");
+    ctrl.cleanup();
+  });
+
+  it("a committed partial is DROPPED while the caret is in a terminal", async () => {
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "this belongs to the PTY, not the composer");
+    expect(onSegment).not.toHaveBeenCalled();
+    ctrl.cleanup();
+  });
+
+  it("…and is delivered again the moment the caret leaves the terminal", async () => {
+    const onSegment = vi.fn();
+    // A mutable seam, so ONE controller sees the caret move — the real sequence a user performs.
+    let owner: "terminal" | "other" = "terminal";
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => owner,
+    });
+    emit("dictation://partial", "swallowed");
+    expect(onSegment).not.toHaveBeenCalled();
+    owner = "other";
+    emit("dictation://partial", "delivered");
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    expect(onSegment).toHaveBeenCalledWith("delivered");
+    ctrl.cleanup();
+  });
+
+  it("speech-end does NOT arm the auto-send clock while the caret is in a terminal", async () => {
+    // `speechEndSeq` is the ONLY thing that starts the countdown (voice/useAutoSend). A bump here
+    // would count down over a composer the user is not typing into and then press Send.
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://speech-end", null);
+    expect(useDictationStore.getState().speechEndSeq).toBe(0);
+    ctrl.cleanup();
+  });
+
+  it("speech-end arms normally once the caret is back out of the terminal", async () => {
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://speech-end", null);
+    expect(useDictationStore.getState().speechEndSeq).toBe(1);
+    ctrl.cleanup();
+  });
+
+  it("THE ONE GATE: text and speech-end are never in disagreement", async () => {
+    // The DONE-WHEN criterion, asserted directly. Whatever the caret is doing, the transcript and
+    // the rail's clock must make the SAME decision — one gate, not two that happen to agree. A
+    // regression that re-splits them (a second predicate on either listener) fails here.
+    for (const owner of ["terminal", "other"] as const) {
+      useDictationStore.setState({ speechEndSeq: 0 });
+      const onSegment = vi.fn();
+      const ctrl = await createDictationController({
+        onSegment,
+        isWindowActive: () => true,
+        focusOwner: () => owner,
+      });
+      emit("dictation://partial", "words");
+      emit("dictation://speech-end", null);
+      const textRouted = onSegment.mock.calls.length > 0;
+      const clockArmed = useDictationStore.getState().speechEndSeq > 0;
+      expect(textRouted).toBe(clockArmed);
+      // …and the shared answer is the one the caret implies, so this can't pass by both being off.
+      expect(textRouted).toBe(owner === "other");
+      ctrl.cleanup();
+    }
+  });
+
+  it("a disarmed mic is OFF, not terminal-paused — routing is unaffected by the caret", async () => {
+    // dictationPauseReason returns null when `enabled` is false, so nothing about a muted mic
+    // should start depending on where the caret happens to be. (`isWindowActive` still gates, as
+    // it always did — that term is about which window consumes the broadcast, not about pausing.)
+    useDictationStore.setState({ enabled: false });
+    const onSegment = vi.fn();
+    const ctrl = await createDictationController({
+      onSegment,
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://partial", "still routed — the pause is a dictation concept");
+    expect(onSegment).toHaveBeenCalledTimes(1);
+    ctrl.cleanup();
+  });
+
+  it("moving the caret INTO a terminal flattens the live mic UI (mirrors a window blur)", async () => {
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    // `phase: "active"` so `tearDownOwnedStream` does NOT early-return — this case owns the
+    // active-phase side of the terminal branch, and the relay teardown is the part only it can see.
+    useDictationStore.setState({
+      interim: "half a sentence",
+      level: 0.8,
+      speaking: true,
+      onDeviceSpeech: true,
+      phase: "active",
+    });
+    invoke.mockClear();
+    // The app-root tracker writes this; the controller subscribes to it.
+    useDictationStore.getState().setFocusOwner("terminal");
+    // ══ THE BILLABLE RELAY IS TORN DOWN, and this is the only test that can prove it ═════════════
+    // The terminal branch DELEGATES that to `tearDownOwnedStream()`; everything else it does it does
+    // itself. So without this assertion, deleting the `tearDownOwnedStream()` CALL leaves the whole
+    // suite green while a Deepgram relay keeps streaming — and METERING — after the user clicks into
+    // a terminal. That is the sparkle-ozvr class of bug, in the one place the pause was added to
+    // prevent it. Asserted here rather than in the passive-phase case below, which cannot reach it:
+    // tearDownOwnedStream early-returns on any phase but "active".
+    expect(invoke).toHaveBeenCalledWith("stop_cloud_stream");
+    const s = useDictationStore.getState();
+    // …and the latch is cleared on this path too, not only on the passive one.
+    expect(s.onDeviceSpeech).toBe(false);
+    expect(s.interim).toBe("");
+    expect(s.level).toBe(0);
+    expect(s.speaking).toBe(false);
+    // Status → idle is what both mic surfaces read as "focus paused", so the ring and the composer
+    // stop claiming to listen at the same instant the gate stops routing.
+    expect(s.status).toBe("idle");
+    // NEITHER of these may move: the mic stays armed, and an active "Hey Sparkle" session must
+    // survive clicking into a terminal and back without re-saying the wake word.
+    expect(s.enabled).toBe(true);
+    expect(s.phase).toBe("active");
+    ctrl.cleanup();
+  });
+});
+
+describe("the on-device speech LEVEL — the countdown's cancel, and the latch that must not stick", () => {
+  // `dictation://on-device-speech` is what lets resumed speech stop an auto-send countdown on the
+  // path with no interim results. Everything about it is dangerous in one direction: while it reads
+  // true, `useAutoSend` refuses to start a clock at all — so a value that gets STUCK true does not
+  // merely mis-cancel, it disables auto-send for the rest of the session.
+  beforeEach(() => {
+    // `focusOwner` is reset explicitly: an earlier block leaves it on "terminal", and the caret
+    // test below drives a store CHANGE — setting it to a value it already holds notifies nobody.
+    useDictationStore.setState({
+      onDeviceSpeech: false,
+      focusOwner: "other",
+      windowFocused: true,
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      interim: "",
+      speaking: false,
+      level: 0,
+    });
+  });
+
+  it("the listener carries the payload into the store", async () => {
+    // Driven through the REAL listener rather than the store setter, which is the gap that let the
+    // whole `listen(...)` block be deletable with the suite still green.
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://on-device-speech", true);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
+    emit("dictation://on-device-speech", false);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
+  });
+
+  it("a window dictation may not route into FORCES it false, even on a true payload", async () => {
+    // Not merely "ignores": a latched true would suspend the next countdown that legitimately
+    // starts, so the non-routable branch has to clear rather than skip.
+    useDictationStore.setState({ onDeviceSpeech: true });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    emit("dictation://on-device-speech", true);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
+  });
+
+  it("THE LATCH: losing window focus mid-utterance clears it", async () => {
+    // Rust's edge state is PER-CAPTURE and starts false, so a capture torn down while this is true
+    // emits no falling edge, and a rebuilt capture computing false sees no change and emits nothing
+    // either — nothing would ever resync it. Left set, `useAutoSend` reads "still talking" forever:
+    // startClock early-returns on every speech-end and auto-send never fires again for the session.
+    // That is the "suspend every cloud countdown forever" failure reached through a different door.
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://on-device-speech", true);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
+    emit("dictation://focus", false); // tabbed away mid-utterance
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
+  });
+
+  it("THE LATCH: the caret moving into a terminal clears it too", async () => {
+    // `phase: "passive"` ON PURPOSE, and it is what makes this case pin its OWN line. The terminal
+    // branch calls `tearDownOwnedStream()` first, but that early-returns unless the phase is
+    // "active" — so on a passive phase the branch's own clear is the ONLY one that runs. With
+    // "active" both fire and either alone satisfies the assertion, which is how this line sat
+    // unpinned while the suite looked green. The window-handoff case above covers the "active" side.
+    // Seeded DIRTY on purpose (roborev 55415). With the teardown short-circuited, the branch's own
+    // three writes are the only thing that can flatten these — and a passive window really does
+    // accumulate them, because the partial/level/speaking listeners gate on `isRoutable()`, not on
+    // phase. Seeding them already-flat (as the shared beforeEach does) made the assertions unable to
+    // tell "flattened" from "never dirty", so deleting those three lines left the suite green while a
+    // window the user clicked out of kept rendering stale interim text and an animating waveform.
+    useDictationStore.setState({
+      phase: "passive",
+      interim: "half a sentence",
+      level: 0.8,
+      speaking: true,
+    });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://on-device-speech", true);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
+    useDictationStore.getState().setFocusOwner("terminal");
+    const s = useDictationStore.getState();
+    expect(s.onDeviceSpeech).toBe(false);
+    // The branch's OWN flatten, each one pinned individually.
+    expect(s.interim).toBe("");
+    expect(s.level).toBe(0);
+    expect(s.speaking).toBe(false);
+    ctrl.cleanup();
+  });
+
+  it("THE LATCH: a window-to-window handoff clears it — the one path with no `dictation://focus`", async () => {
+    // PINS `tearDownOwnedStream`'s clear ON ITS OWN. Every other case reaches a SECOND, redundant
+    // clear further down its path (notifyFocusOwner clears again after calling this), so deleting
+    // this one alone left the whole suite green — the latch could be reintroduced by a cleanup that
+    // reads the second write as the redundant one. `notifyWindowFocus(false)` is the per-window OS
+    // blur, which is exactly the handoff `dictation://focus` never fires for (it stays true while
+    // ANY Sparkle window is up), so this is the only clear that runs on it.
+    //
+    // `phase: "active"` matters: tearDownOwnedStream early-returns on any other phase, so without
+    // it this test would pass without executing the line it exists to pin.
+    useDictationStore.setState({ phase: "active" });
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://on-device-speech", true);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
+    ctrl.notifyWindowFocus(false);
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
+  });
+
+  // KNOWN GAP, stated rather than left to be discovered: the SIXTH clear lives in
+  // `useAmbientVoice`'s own `enabled === false` effect, which is a React hook and not reachable from
+  // this file — these cases drive `createDictationController` directly. Deleting that one alone
+  // leaves this suite green. It is needed (muting stops capture, and a re-arm starts a fresh Rust
+  // edge state that emits nothing if it computes false), so if it is ever refactored, re-verify it
+  // by hand or move the mute reset into the controller where it can be pinned.
+  it("THE LATCH: muting the mic clears it", async () => {
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => true,
+      focusOwner: () => "other",
+    });
+    emit("dictation://on-device-speech", true);
+    // Asserted BEFORE the toggle, like the two cases above: without it, a listener gate that stops
+    // delivering would leave the store already false and this test would pass over a clear that
+    // never ran — pinning nothing.
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(true);
+    await ctrl.toggle(); // status was "listening", so this stops dictation
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    ctrl.cleanup();
   });
 });

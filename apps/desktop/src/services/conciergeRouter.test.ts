@@ -1,41 +1,35 @@
-// The router decides where every compose-box send goes now that the user no longer picks. The
-// tests that matter most are the ASYMMETRY ones: anything the heuristics cannot place must resolve
-// to `sparkle`, because that is the direction the user can undo. A wrong chat answer costs one
-// click on the receipt's redirect; a paragraph typed into a live PTY cannot be pulled back. See
-// PRD/sparkle/concierge-auto-routing.md §2.
+// The router decides where every UNADDRESSED compose-box send goes now that the user no longer
+// picks. There is exactly one answer, and this suite's job is to make that unmissable: `routeMessage`
+// returns `sparkle` for every input. See PRD/sparkle/concierge-auto-routing.md §2 and the module
+// header.
 //
-// WHAT CHANGED: the tier-2 suites that used to live here (the classifier, its 4s deadline, its
-// error taxonomy, the invoke seam, and `contextLine`'s token bounding) were deleted along with
-// tier 2 itself, when the AI backend moved onto the user's own Claude Code subscription. A
-// `claude -p` classify measures ~5.8s wall clock against a 4s deadline that exists because this
-// sits on the critical path of pressing Enter, so it could only ever have timed out — becoming
-// "always Sparkle" while still spending the user's quota on an abandoned process.
+// WHAT CHANGED, AND WHY THESE ROWS READ AS INVERTED: this file used to assert that a terse message
+// sent while the on-screen agent was in `waiting`/`approval` routed to the AGENT. That branch caused
+// real damage — the user was answering the CONCIERGE's own design questions in the concierge compose
+// box while a build agent's pane happened to be on screen, and their answers were typed into that
+// agent's terminal. They noticed only because the concierge's replies stopped making sense.
 //
-// Those suites are replaced by one stronger property, asserted at the bottom: the router makes NO
-// call at all. Every "the classifier must not be reached" test collapses into that, and it cannot
-// be satisfied by a classify that merely happens to fail.
+// So the rows were INVERTED rather than deleted, deliberately. Same inputs, opposite expectation:
+// the exact scenarios that used to reach a PTY are now pinned to `sparkle`, which is what makes the
+// regression un-reintroducible. A deleted test would have left the branch free to come back.
+//
+// The other suite that survives is the tier-2 removal's: the router makes NO call at all — no model,
+// and now no terminal read either.
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// The dispatch layer is where the removed branch got the agent's on-screen options from. Mocked so
+// the "reads no terminal" row below can assert the absence of that read as a SIDE EFFECT rather than
+// as a claim about the import list.
+vi.mock("./conciergeDispatch", () => ({
+  liveOptionsFor: vi.fn(() => []),
+  isTerseAnswer: vi.fn(() => true),
+}));
 
 import { invoke } from "@tauri-apps/api/core";
-import {
-  looksLikeAnswer,
-  looksLikeFleetTalk,
-  routeMessage,
-  type RouteContext,
-} from "./conciergeRouter";
-import type { SuggestionButton } from "./suggestions/types";
-
-const opt = (label: string, value: string): SuggestionButton => ({
-  id: label,
-  label,
-  value,
-  kind: "terminal",
-  source: "heuristic",
-});
-
-const YES_NO = [opt("Yes", "y\n"), opt("No", "n\n")];
+import { liveOptionsFor } from "./conciergeDispatch";
+import { looksLikeFleetTalk, routeMessage, type RouteContext } from "./conciergeRouter";
+import type { AgentTabStatus } from "../types";
 
 /** An agent blocked on a question, i.e. in the "answer this now" attention set. */
 const blocked: RouteContext = {
@@ -45,9 +39,6 @@ const blocked: RouteContext = {
 const working: RouteContext = {
   agent: { id: "a1", name: "Kraken Auth", status: "working", canAcceptInput: true },
 };
-
-const noOptions = () => [];
-const yesNoOptions = () => YES_NO;
 
 describe("tier 1 — no agent to prompt", () => {
   it("routes to Sparkle when nothing is in view", async () => {
@@ -63,40 +54,69 @@ describe("tier 1 — no agent to prompt", () => {
     });
     expect(d).toMatchObject({ target: "sparkle", source: "heuristic" });
   });
+
+  // The two tier-1 guards must stay DISTINGUISHABLE. Both answer `sparkle`, so the only thing that
+  // can tell a reader (or a support transcript) which one fired is the reason string — and
+  // `canAcceptInput` exists now solely to pick between them.
+  it("records WHICH tier-1 guard fired, since both answer the same", async () => {
+    const none = await routeMessage("add retry logic", { agent: null });
+    const cloud = await routeMessage("add retry logic", {
+      agent: { id: "a1", name: "Cloud Runner", status: "working", canAcceptInput: false },
+    });
+    expect(none.reason).not.toBe(cloud.reason);
+  });
 });
 
-describe("tier 1 — answering the question on screen", () => {
-  it.each(["y", "yes", "no", "go ahead", "approve", "2", "Yes"])(
-    "routes %j to the agent when it is blocked on a question",
+// ── THE REPORTED BUG ────────────────────────────────────────────────────────────────────────────
+// The user answers the CONCIERGE's question in the concierge compose box. A build agent happens to
+// be the pane on screen, and it happens to be mid-prompt. Nothing in that sentence is a decision to
+// write into a terminal — and with auto-send armed, "happens to be on screen" plus a countdown means
+// dictated speech reaching a PTY with no deliberate act at all.
+describe("REGRESSION: a live ask never captures an unaddressed message", () => {
+  it("sends a terse answer to Sparkle when the on-screen agent is WAITING and nothing is @-named", async () => {
+    const waiting: RouteContext = {
+      agent: { id: "a1", name: "CI Hardening", status: "waiting", canAcceptInput: true },
+    };
+    const d = await routeMessage("yes", waiting);
+    expect(d.target).toBe("sparkle");
+  });
+
+  // Inverted wholesale from the old "routes %j to the agent when it is blocked on a question" row —
+  // every string that used to reach a terminal, pinned to the recoverable side.
+  it.each(["y", "yes", "no", "go ahead", "approve", "2", "Yes", "ok", "do it", "sure"])(
+    "routes %j to Sparkle even though the agent is blocked on a question",
     async (text) => {
-      const d = await routeMessage(text, blocked, { liveOptions: yesNoOptions });
-      expect(d).toMatchObject({ target: "agent", source: "heuristic" });
+      const d = await routeMessage(text, blocked);
+      expect(d.target).toBe("sparkle");
     },
   );
 
-  // An idle agent is not asking anything, so a bare "yes" to it is conversation, not a keystroke.
+  // An idle agent was never a keystroke target; it still isn't.
   it("does NOT treat a bare yes as a keystroke when the agent isn't blocked", async () => {
-    const d = await routeMessage("yes", working, { liveOptions: yesNoOptions });
+    const d = await routeMessage("yes", working);
     expect(d.target).toBe("sparkle");
   });
 
-  // A real instruction that merely opens with a yes-word is not an answer (roborev 46311's lesson,
-  // inherited via isTerseAnswer).
-  it("does not mistake an instruction for a terse answer", async () => {
-    const d = await routeMessage("yes-but-use-the-other-endpoint instead", blocked, {
-      liveOptions: yesNoOptions,
-    });
-    expect(d.target).toBe("sparkle");
-  });
+  // Inverted from "routes the same answer straight to the PTY when the agent is genuinely asking".
+  // That contrast is the one the fix removes: `approval` and `errored` now read the same, because
+  // neither is a statement by the USER about where their words should go.
+  it.each<AgentTabStatus>(["waiting", "approval", "errored", "working", "idle"])(
+    "gives the same verdict whatever the agent's status is (%s)",
+    async (status) => {
+      const d = await routeMessage("2", {
+        agent: { id: "a1", name: "Kraken Auth", status, canAcceptInput: true },
+      });
+      expect(d.target).toBe("sparkle");
+    },
+  );
 
-  it("survives a terminal read that throws (an unreadable screen is not a failed send)", async () => {
-    const d = await routeMessage("yes", blocked, {
-      liveOptions: () => {
-        throw new Error("pty gone");
-      },
-    });
-    // Still routed by the BARE_ANSWER rule, which needs no options.
-    expect(d.target).toBe("agent");
+  // The status field is still CARRIED (see RouteAgent.status) — so this pins that carrying it and
+  // acting on it are different things.
+  it("ignores the status field even when it is the only thing that differs", async () => {
+    const asking = await routeMessage("yes", blocked);
+    const not = await routeMessage("yes", working);
+    expect(asking.target).toBe(not.target);
+    expect(asking.target).toBe("sparkle");
   });
 });
 
@@ -111,7 +131,7 @@ describe("tier 1 — fleet talk", () => {
     "hey sparkle, summarize",
     "anything need me?",
   ])("routes %j to Sparkle as a heuristic match", async (text) => {
-    const d = await routeMessage(text, working, { liveOptions: noOptions });
+    const d = await routeMessage(text, working);
     expect(d).toMatchObject({ target: "sparkle", source: "heuristic" });
   });
 
@@ -119,81 +139,55 @@ describe("tier 1 — fleet talk", () => {
   // classifier; it now takes the reversible fallback, which lands in the same place.
   it("does not claim a merely-fleet-flavoured instruction as fleet talk", async () => {
     expect(looksLikeFleetTalk("add a status endpoint to the API")).toBe(false);
-    const d = await routeMessage("add a status endpoint to the API", working, {
-      liveOptions: noOptions,
-    });
+    const d = await routeMessage("add a status endpoint to the API", working);
     expect(d).toMatchObject({ target: "sparkle", source: "fallback" });
   });
 });
 
-// An errored agent is STALLED, not asking. There is nothing on screen for a bare "ok" to answer,
-// so treating it as a keystroke would be a free-text PTY write in the irreversible direction.
+// An errored agent is STALLED, not asking. Nothing here changed verdict — but the REASON did: these
+// used to pass because `errored` was excluded from the live-ask set, and they now pass because there
+// is no live-ask set to be excluded from.
 describe("an errored agent is not asking a question", () => {
   const errored: RouteContext = {
     agent: { id: "a1", name: "Kraken Auth", status: "errored", canAcceptInput: true },
   };
 
-  it.each(["ok", "yes", "do it"])(
-    "sends %j to Sparkle when NOTHING is on screen to answer",
+  it.each(["ok", "yes", "do it", "2", "Yes", "No"])(
+    "sends %j to Sparkle rather than into a maybe-stale picker",
     async (text) => {
-      const d = await routeMessage(text, errored, { liveOptions: noOptions });
+      const d = await routeMessage(text, errored);
       expect(d.target).toBe("sparkle");
     },
   );
 
-  // Even WITH options detected on screen. `errored` is screen-derived, so the process is often
-  // still running, and the option detector scans a 50-line window — an agent that ANSWERED a
-  // picker and then printed an error trace still matches. Typing "2" there would answer a prompt
-  // nobody is asking, on a live terminal (roborev 53104).
-  it.each(["2", "Yes", "No"])(
-    "still refuses to write %j into a maybe-stale picker",
-    async (text) => {
-      const d = await routeMessage(text, errored, { liveOptions: yesNoOptions });
-      expect(d.target).toBe("sparkle");
-    },
-  );
-
-  // A non-answer is still a non-answer, options or not.
   it("does not route a free-text instruction to an errored agent's picker", async () => {
-    const d = await routeMessage("rewrite the auth middleware", errored, {
-      liveOptions: yesNoOptions,
+    const d = await routeMessage("rewrite the auth middleware", errored);
+    expect(d.target).toBe("sparkle");
+  });
+});
+
+// `canAcceptInput` is no longer the gate that stands between a message and a PTY — nothing here can
+// produce one — but it is still required, and these rows keep the strongest form of the old
+// behaviour: the flag being false can never be overridden by anything about the text.
+describe("canAcceptInput is a required field, and false always means Sparkle", () => {
+  it("refuses to route at an agent whose flag is false", async () => {
+    const d = await routeMessage("add retry logic", {
+      agent: { id: "a1", name: "Cloud", status: "waiting", canAcceptInput: false },
     });
     expect(d.target).toBe("sparkle");
   });
 
-  // The contrast that makes the rule legible: the SAME text on a live ask goes straight through.
-  it("routes the same answer straight to the PTY when the agent is genuinely asking", async () => {
-    const d = await routeMessage("2", blocked, { liveOptions: yesNoOptions });
-    expect(d).toMatchObject({ target: "agent", source: "heuristic" });
-  });
-});
-
-// The gate must fail CLOSED: as an optional field its absence recreated the exact bug it was added
-// to fix (roborev 53060). TypeScript now requires it; this pins the runtime behaviour too.
-describe("canAcceptInput is a required, fail-closed gate", () => {
-  it("refuses to route at an agent whose flag is false", async () => {
-    const d = await routeMessage(
-      "add retry logic",
-      { agent: { id: "a1", name: "Cloud", status: "waiting", canAcceptInput: false } },
-      { liveOptions: yesNoOptions },
-    );
-    expect(d.target).toBe("sparkle");
-  });
-
-  // Even the strongest tier-1 agent signal — a bare answer to a live ask — must not override it.
+  // Even the strongest signal the old tier 1 recognised — a bare answer to a live ask.
   it("refuses even a picker answer when the agent can't take input", async () => {
-    const d = await routeMessage(
-      "yes",
-      { agent: { id: "a1", name: "Cloud", status: "approval", canAcceptInput: false } },
-      { liveOptions: yesNoOptions },
-    );
+    const d = await routeMessage("yes", {
+      agent: { id: "a1", name: "Cloud", status: "approval", canAcceptInput: false },
+    });
     expect(d.target).toBe("sparkle");
   });
 });
 
-describe("no model call — the router is now purely local", () => {
-  // The strongest form of the tier-2 removal, and the property all the deleted "must not be
-  // reached" tests were circling: there is no classify to fail, time out, or return garbage,
+describe("the router is purely local — no model call, and no terminal read", () => {
+  // The tier-2 removal's property: there is no classify to fail, time out, or return garbage,
   // because there is no call. Unlike a stubbed classifier that throws, this cannot pass while the
   // call is still being made.
   it("never invokes Tauri, whatever the message looks like", async () => {
@@ -204,27 +198,50 @@ describe("no model call — the router is now purely local", () => {
       "what's going on",
       "refactor the auth module and then push",
     ]) {
-      await routeMessage(text, blocked, { liveOptions: noOptions });
-      await routeMessage(text, working, { liveOptions: yesNoOptions });
+      await routeMessage(text, blocked);
+      await routeMessage(text, working);
     }
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  // The same property for the branch removed here. The old router read the agent's live screen
+  // (`liveOptionsFor`) to decide whether the text answered a picker; asserting the READ is gone is
+  // stronger than asserting the verdict, because it fails even if some future branch consults the
+  // terminal and then happens to conclude `sparkle` anyway.
+  it("never reads the agent's terminal", async () => {
+    vi.mocked(liveOptionsFor).mockClear();
+    for (const text of ["yes", "2", "no", "approve", "add a test for the redirect case"]) {
+      await routeMessage(text, blocked);
+    }
+    expect(liveOptionsFor).not.toHaveBeenCalled();
+  });
+
   it("sends an unplaceable message to Sparkle, the undoable direction", async () => {
-    // Not a heuristic match on either side: no live ask to answer, no fleet talk. Before, this was
-    // tier 2's whole job; now it takes the reversible fallback rather than typing into a live PTY.
-    const d = await routeMessage("add a test for the redirect case", working, {
-      liveOptions: noOptions,
-    });
+    const d = await routeMessage("add a test for the redirect case", working);
     expect(d).toMatchObject({ target: "sparkle", source: "fallback" });
   });
 
-  // The tripwire, preserved from the deleted asymmetry suite: NOTHING reaches the PTY except an
-  // explicit tier-1 match. There is no longer any code path that could decide otherwise.
-  it("NEVER routes to the agent without a tier-1 heuristic match", async () => {
-    for (const text of ["ambiguous text", "", "42", "maybe agent maybe sparkle", "boom"]) {
-      const d = await routeMessage(text, working, { liveOptions: noOptions });
-      expect(d.target).toBe("sparkle");
+  // THE TRIPWIRE. Every other row in this file is an instance of it: whatever the text, whatever the
+  // status, whatever is on screen, this function does not produce `agent`. The only thing that may
+  // aim a message at a live PTY is the user naming the agent, and that decision is built by
+  // ConciergeHost from `mentionAim` before this module is ever called.
+  it("NEVER returns target: agent, for any combination of text and status", async () => {
+    const statuses: (AgentTabStatus | undefined)[] = [
+      "waiting",
+      "approval",
+      "errored",
+      "working",
+      "idle",
+      undefined,
+    ];
+    const texts = ["yes", "y", "2", "no", "ok", "approve", "", "42", "ambiguous text", "boom"];
+    for (const status of statuses) {
+      for (const text of texts) {
+        const d = await routeMessage(text, {
+          agent: { id: "a1", name: "Kraken Auth", status, canAcceptInput: true },
+        });
+        expect(d.target, `${String(status)} / ${JSON.stringify(text)}`).toBe("sparkle");
+      }
     }
   });
 });
@@ -241,16 +258,5 @@ describe("pure predicates", () => {
     expect(looksLikeFleetTalk("make the error message say how much the retry will cost")).toBe(
       false,
     );
-  });
-
-  it("looksLikeAnswer accepts bare answers with no options on screen", () => {
-    expect(looksLikeAnswer("yes", [])).toBe(true);
-    expect(looksLikeAnswer("ok.", [])).toBe(true);
-    expect(looksLikeAnswer("rewrite the auth middleware", [])).toBe(false);
-  });
-
-  it("looksLikeAnswer defers to the dispatch matcher for on-screen options", () => {
-    expect(looksLikeAnswer("2", YES_NO)).toBe(true);
-    expect(looksLikeAnswer("No", YES_NO)).toBe(true);
   });
 });

@@ -66,7 +66,7 @@ async function tick(ms: number) {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  useDictationStore.setState({ speechEndSeq: 0 });
+  useDictationStore.setState({ speechEndSeq: 0, onDeviceSpeech: false });
   resetAutoSendTelemetry();
 });
 
@@ -337,3 +337,131 @@ describe("a speech-end that beats the mic claim is not lost", () => {
   });
 });
 
+describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
+  // THE HAZARD THIS CLOSES. `dictation://speech-end` arms the clock on BOTH capture paths. The
+  // CANCEL used to exist on only one: it was derived purely from `interim`, and interim results are
+  // cloud-only — the on-device engine decodes whole closed VAD segments and streams nothing. So
+  // on-device, once a mid-thought pause closed a segment on a sentence that merely SOUNDED
+  // finished, the clock could not be stopped by talking: the next VAD segment does not close until
+  // the user pauses AGAIN, and a committed segment landing mid-countdown is specified NOT to touch
+  // the clock. At the `high` tier that is a 1s fuse on a sentence the user has not finished.
+  //
+  // Rust now reports the on-device VAD level on its own channel, false whenever the cloud owns the
+  // audio (`frame_on_device_speech`), and these pin both directions of it.
+  const resumeSpeaking = (v: boolean) =>
+    act(() => {
+      useDictationStore.getState().setOnDeviceSpeech(v);
+    });
+
+  it("resumed on-device speech CANCELS a running countdown instead of sending", async () => {
+    const { onFire, result } = setup();
+    speechEnds();
+    expect(result.current.phase).toBe("counting");
+    resumeSpeaking(true);
+    expect(result.current.phase).not.toBe("counting");
+    // …and it stays uncounted right through the threshold it would otherwise have fired at.
+    await tick(2000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("a speech-end that lands while the user is ALREADY talking does not arm at all", async () => {
+    // The decode runs hundreds of ms behind the audio, so a user who resumes inside that gap
+    // produces resume-then-arm IN THAT ORDER. A pulse-shaped cancel would have been consumed before
+    // the arm it needed to prevent; the level is still true when the arm lands, so nothing starts.
+    const { onFire, result } = setup();
+    resumeSpeaking(true);
+    speechEnds();
+    expect(result.current.phase).not.toBe("counting");
+    await tick(2000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("and once they genuinely stop, the very next speech-end arms and fires as normal", async () => {
+    const { onFire } = setup();
+    resumeSpeaking(true);
+    speechEnds(); // suppressed — still talking
+    resumeSpeaking(false); // the VAD falls: they really did stop
+    speechEnds(); // the next closed segment arms
+    await tick(1200);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  // ── THE GUARD MEETS THE CLAIM-LAG REPLAY (roborev 55498) ──────────────────────────────────────
+  // Effect (3b) consumes the hold (`deferredSpeechEnd.current = null`) BEFORE calling startClock, so
+  // when the guard refuses, that held boundary is gone. The reviewer read that as unrecoverable, by
+  // analogy to the Rust-side suppression this branch reverted for exactly that reason.
+  //
+  // For REAL SPEECH it is recoverable, and that is what these two tests pin. `onDeviceSpeech` is
+  // driven by the same VAD flag whose FALL closes a segment (dictation.rs `frame_on_device_speech`),
+  // and the speech-end is emitted hundreds of ms later, after the decode. So a true level at replay
+  // time means the user RESUMED after that segment closed, and speech that carries words closes a
+  // segment which emits its own boundary. The Rust case had no successor at all: there the audio had
+  // moved to the relay, so the on-device engine was no longer fed and nothing could ever supply one.
+  //
+  // ── BUT THE SUCCESSOR IS NOT UNCONDITIONAL, AND AN EARLIER VERSION OF THIS NOTE SAID IT WAS ──────
+  // Corrected per roborev 55561, which is right and defeats the word "structural" I used here.
+  // `plan_decode_emit` emits NO boundary for two closed segments: an EMPTY decode (the VAD closed on
+  // a cough, a door, a keyboard, clipped breath) and a PANICKED one. `onDeviceSpeech` is the RAW VAD
+  // level, so it goes true on exactly that non-speech noise. Hence the hole:
+  //
+  //   hold deferred → a cough raises the VAD → the claim lands, so (3b) nulls the hold and the guard
+  //   refuses → the cough's segment closes and decodes to nothing → no successor boundary, ever.
+  //
+  // The dictated command then sits in the composer with no countdown — the silent, unrecoverable side
+  // of the very asymmetry this branch invoked twice (and the reason the Rust-side suppression was
+  // withdrawn). It is narrow: it needs a non-speech VAD edge inside the ≤500ms
+  // DEFERRED_SPEECH_END_MAX_LAG_MS claim window AND that segment decoding empty. Narrow is not zero.
+  //
+  // ACCEPTED, NOT FIXED, and deliberately so. The remedy is to keep the hold when the guard refuses
+  // and re-attempt it on the guard's falling edge — which means a new trigger in the auto-send state
+  // machine, and this branch's brief explicitly excludes redesigning the countdown mechanism. Filed
+  // rather than smuggled in (bead sparkle-24pt). Recorded at its true size here in the style of `plan_decode_emit`'s own
+  // accepted-risk note, because an unstated hole is the thing that actually costs the next reader.
+  //
+  // So: do NOT read the first test as licence to add a pending-arm latch without also pinning the
+  // double-arm race against the successor — that race is why the remedy is a mechanism change and not
+  // a one-liner.
+
+  it("a held speech-end replayed while the user is still talking does NOT arm", async () => {
+    const { onFire, update, result } = setup({ micLive: false });
+    speechEnds(); // the wake segment's boundary, deferred: the claim has not landed yet
+    resumeSpeaking(true); // they carry straight on into the command
+    update({ micLive: true }); // the claim lands mid-sentence → (3b) replays into the guard
+    expect(result.current.phase).not.toBe("counting");
+    await tick(2000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("…and the NEXT closed segment still arms, when that segment carries words", async () => {
+    // THE ASSERTION THAT MAKES THE DROP SAFE FOR REAL SPEECH — which is the common case but, per the
+    // note above, not every case: a segment that decodes empty emits no boundary and is the
+    // accepted-risk hole. If even THIS failed, the guard would strand the hands-free path outright.
+    const { onFire, update } = setup({ micLive: false });
+    speechEnds();
+    resumeSpeaking(true);
+    update({ micLive: true }); // hold consumed and refused
+    resumeSpeaking(false); // they finish the command; the VAD falls
+    speechEnds(); // that segment closes and emits its own boundary
+    await tick(1200);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("the CLOUD path is unaffected — its own countdowns still fire", async () => {
+    // WHAT THIS PINS: that the on-device latch is INERT during a cloud session, so cloud countdowns
+    // still fire. Rust keeps `onDeviceSpeech` false while the relay owns the audio
+    // (`frame_on_device_speech`) because the cloud cancel belongs to `interim`, which tracks
+    // Deepgram's view of the utterance rather than a local VAD the relay has taken the audio from.
+    // If this channel ever went true on the cloud path, it would suspend every cloud countdown and
+    // auto-send would never fire there at all — so this asserts the frontend consequence.
+    //
+    // (An earlier version of this note justified the split by claiming the waveform's `speaking` flag
+    // is pinned TRUE for the whole cloud stream. That stopped being true in the 2026-07-29 dead-mic
+    // fix — `speaking` is now the raw VAD on both paths — so the note was arguing from a property
+    // that no longer exists, which invites collapsing the two signals. See roborev 55503.)
+    const { onFire } = setup();
+    expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
+    speechEnds();
+    await tick(1200);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+});

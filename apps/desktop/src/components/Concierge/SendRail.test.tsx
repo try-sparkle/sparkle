@@ -1,14 +1,31 @@
 // @vitest-environment jsdom
 //
-// What this file pins is the rail's two hard promises — the fill drains INTO Send (anchored right,
-// the correction to the source mockup) and NO NUMERAL renders in any state — plus the tier cue, the
-// threshold ease, reduced motion, and the single-live-region contract. The timing rules behind it
-// (when a countdown starts, moves, or fires) are tested in voice/autoSendTimer; this file does not
-// restate them.
+// What this file pins is the rail's hard promises — the fill drains INTO Send (anchored right, the
+// correction to the source mockup), NO NUMERAL renders in any state, the TARGET never disappears
+// while armed, and counting is signalled by STRUCTURE (the track) rather than by texture — plus the
+// tier cue, the threshold ease, reduced motion, and the single-live-region contract. The timing
+// rules behind it (when a countdown starts, moves, or fires) are tested in voice/autoSendTimer;
+// this file does not restate them.
+//
+// The last two are the legibility fix. The rail used to drop the arrow while counting AND encode
+// two independent facts (counting-vs-idle, and the tier) on the fill alone, so a user comparing two
+// screenshots six seconds apart saw one solid rail naming a destination and one hatched rail naming
+// nothing, with no way to tell which fact had changed.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen, fireEvent, cleanup } from "@testing-library/react";
 
 import { SendRail, THRESHOLD_EASE_MS, type SendRailModel } from "./SendRail";
+import { C } from "../../theme/colors";
+import { BLUEPRINT } from "../../theme/blueprintSpec";
+import { useUiStore } from "../../stores/uiStore";
+
+/** jsdom's CSSOM leaves a `var(--…)` string verbatim but normalises a LITERAL hex to
+ *  `rgb(r, g, b)` — including one sitting inside a `color-mix()` it cannot otherwise parse. The
+ *  terminal's edge is the second kind (the spec value has no CSS var of its own), so it has to be
+ *  converted before comparing. Derived from BLUEPRINT rather than hard-coded so a palette retune
+ *  carries these rows along with it — the same trick ComposeBox.plate.test.tsx uses. */
+const rgb = (hex: string) =>
+  `rgb(${[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(", ")})`;
 
 const IDLE: SendRailModel = {
   phase: "disarmed",
@@ -49,6 +66,9 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.useRealTimers();
+  // The wired-track rows below drive an EXPLICIT theme; hand the store back so nothing else in the
+  // suite inherits one.
+  useUiStore.setState({ themePref: "auto" } as never);
 });
 
 describe("SendRail — the three states", () => {
@@ -71,9 +91,12 @@ describe("SendRail — the three states", () => {
     expect(screen.queryByTestId("send-rail-fill")).toBeNull();
   });
 
-  it("counting: the fill appears and the label is the bare target name", () => {
+  it("counting: the fill appears and the label STILL points at the target", () => {
+    // The arrow used to be dropped the moment counting began, so the row went "→ Build 4" →
+    // "Build 4" and the mis-route safety net changed shape at the moment it mattered most. Two
+    // screenshots six seconds apart read as one rail with a destination and one with none.
     draw({ ...COUNTING, targetName: "Build 4" });
-    expect(screen.getByTestId("send-rail-label").textContent).toBe("Build 4");
+    expect(screen.getByTestId("send-rail-label").textContent).toBe("→ Build 4");
     expect(screen.getByTestId("send-rail-fill")).toBeTruthy();
   });
 
@@ -164,7 +187,174 @@ describe("SendRail — NO DIGITS, in any state", () => {
     // The ban is on a countdown readout, not on an agent that happens to be called "Build 4".
     // Stripping it would break the one thing the label is for.
     draw({ ...COUNTING, targetName: "Build 4" });
-    expect(screen.getByTestId("send-rail-label").textContent).toBe("Build 4");
+    expect(screen.getByTestId("send-rail-label").textContent).toBe("→ Build 4");
+  });
+});
+
+describe("SendRail — the target NEVER disappears while armed", () => {
+  it("shows the same `→ target` label in both armed states", () => {
+    // THE DEFECT. `label` was `counting ? targetName : \`→ ${targetName}\``, so the arrow — the
+    // thing that makes the word after it read as a DESTINATION rather than a caption — was dropped
+    // exactly while a send was pending. A state change must not SUBTRACT information the other
+    // state was showing; there is then nothing to compare, and the difference reads as a bug.
+    const { rerender } = draw({ ...ARMED, targetName: "Build 4" });
+    const armedIdle = screen.getByTestId("send-rail-label").textContent;
+
+    rerender(
+      <SendRail
+        model={{ ...COUNTING, targetName: "Build 4" }}
+        onToggleArmed={vi.fn()}
+        onSend={vi.fn()}
+        canSend
+      />,
+    );
+    expect(screen.getByTestId("send-rail-label").textContent).toBe(armedIdle);
+    expect(armedIdle).toBe("→ Build 4");
+  });
+
+  it("keeps the arrow at every tier and every remaining fraction", () => {
+    // The arrow is not a function of how the fill is painted. Pinned across the hatched tier and
+    // the drained end of the bar, where the old rule was most likely to be re-introduced.
+    for (const model of [
+      { ...COUNTING, tier: "verylow" as const, remainingFraction: 1 },
+      { ...COUNTING, tier: "high" as const, remainingFraction: 0.02 },
+      { ...COUNTING, tier: "normal" as const, remainingFraction: 0 },
+    ]) {
+      const { unmount } = draw({ ...model, targetName: "Build 4" });
+      expect(screen.getByTestId("send-rail-label").textContent).toBe("→ Build 4");
+      unmount();
+    }
+  });
+
+  it("only the DISARMED state drops the target, because there is none to name", () => {
+    draw(IDLE);
+    expect(screen.getByTestId("send-rail-label").textContent).toBe("Auto-send");
+  });
+});
+
+describe("SendRail — counting is signalled by STRUCTURE, not by texture", () => {
+  it("draws a bounded track while counting and none when armed-idle", () => {
+    // The cue that separates counting from armed-idle, and the whole point of the fix: the fill's
+    // texture is spoken for (it carries the tier), so counting needs its OWN channel. Without this
+    // the only difference between the two states was that one painted a wash — which the user read
+    // as "sometimes solid, sometimes hatched" with nothing explaining why.
+    const { rerender } = draw(COUNTING);
+    expect(screen.getByTestId("send-rail-track")).toBeTruthy();
+
+    rerender(<SendRail model={ARMED} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend />);
+    expect(screen.queryByTestId("send-rail-track")).toBeNull();
+
+    rerender(<SendRail model={IDLE} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend />);
+    expect(screen.queryByTestId("send-rail-track")).toBeNull();
+  });
+
+  it("the track is a BOUNDED plate — an outline, not another wash", () => {
+    // Structural, not textural. A border is a different visual channel from the fill's texture, so
+    // the two facts can never collide again the way they did.
+    draw(COUNTING);
+    const track = screen.getByTestId("send-rail-track");
+    expect(track.style.borderStyle).toBe("solid");
+    expect(track.style.borderWidth).toBe("1px");
+    // Themed, so it resolves against BOTH light and dark rather than one hard-coded ink. This is
+    // the UNWIRED ground (the composer's own `inputSurface` plate), where the chrome seam is the
+    // right token; see the wired case below for why that cannot be hardcoded.
+    expect(track.style.borderColor).toContain("var(--c-hairline)");
+    // Bounded on all four edges — it is a plate the fill drains inside, not a second wash.
+    for (const edge of ["top", "right", "bottom", "left"] as const) {
+      expect(track.style[edge]).toBe("0px");
+    }
+    // Behind the controls, like the fill — it must wash the strip, not cover it.
+    expect(track.style.zIndex).toBe("0");
+    // It is decoration; the state it depicts is announced by the host, not by this node.
+    expect(track.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("on the TERMINAL ground the track takes the terminal's edge token, not the chrome seam", () => {
+    // roborev 55244. `C.hairline` is the CHROME seam, and theme/chromeContrast.test.ts deliberately
+    // does NOT pair it with the terminal plane: light `hairline` on `forest` measures 1.195 against
+    // a 1.2 floor, which is why the spec draws `termHair` where a rule meets the terminal. A wired
+    // composer goes transparent over that flood (ComposeBox's `wired`), so a hardcoded chrome
+    // hairline here would paint the counting cue BELOW the project's own visibility floor — putting
+    // counting and armed-idle back to indistinguishable in wired + light, which is the whole defect
+    // this track exists to remove.
+    //
+    // ASSERTED AS THE TOKEN, not as "some colour that isn't the chrome seam". That weaker form was
+    // satisfied by ANY substitution — `C.inputEdge`, `C.pillFill`, `C.dialogEdge`, a literal "red"
+    // — which is exactly the wrong shape for a guard whose stated contract is VISIBILITY on the
+    // terminal plane: chromeContrast floors precisely ONE token there (`termHairline`), and
+    // `pillFill`/`inputEdge` are excluded from the `forest` pairing altogether, so a refactor
+    // swapping either in would reintroduce a sub-floor counting cue with this row still green.
+    // Compared against BLUEPRINT rather than a literal hex — the precedent is
+    // AgentPane.blueprint.test.tsx — so the palette can be retuned without editing this file.
+    //
+    // BOTH MODES, because the value is a `BLUEPRINT[mode]` lookup: jsdom hands out dark for free
+    // (no matchMedia ⇒ systemPrefersDark), so a hard-coded `BLUEPRINT.dark` in the component would
+    // pass a dark-only row. Light is also the end the floor actually bites at — 1.195 vs 1.2.
+    for (const mode of ["dark", "light"] as const) {
+      useUiStore.setState({ themePref: mode } as never);
+      render(<SendRail model={COUNTING} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend wired />);
+      const wiredTrack = screen.getByTestId("send-rail-track");
+      expect(wiredTrack.style.borderColor, `${mode}: wired track edge`).toBe(
+        rgb(BLUEPRINT[mode].termHair),
+      );
+      // Said separately, because it is the specific regression: the chrome seam is the token this
+      // plane has no guard for at all.
+      expect(wiredTrack.style.borderColor).not.toContain(C.hairline);
+      // …and the wash is mixed from the SAME token as the edge, so the two can never disagree about
+      // which ground they think they are on. Pinned to the token, not to "whatever the edge is".
+      expect(wiredTrack.style.background).toContain(rgb(BLUEPRINT[mode].termHair));
+      cleanup();
+    }
+    // The two modes really are different colours, so the loop above is two assertions and not one
+    // made twice.
+    expect(rgb(BLUEPRINT.light.termHair)).not.toBe(rgb(BLUEPRINT.dark.termHair));
+
+    // The unwired default is unchanged — the fix is a branch, not a swap.
+    render(<SendRail model={COUNTING} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend />);
+    expect(screen.getByTestId("send-rail-track").style.borderColor).toBe(C.hairline);
+  });
+
+  it("the track sits BEHIND the fill, so the bar drains inside it", () => {
+    // DOM order at equal z-index is what puts the fill on top. Reversed, the plate would paint over
+    // the draining bar and the rail would look full for the whole countdown.
+    draw(COUNTING);
+    const rail = screen.getByTestId("concierge-send-rail");
+    const track = screen.getByTestId("send-rail-track");
+    const fill = screen.getByTestId("send-rail-fill");
+    expect(track.style.zIndex).toBe(fill.style.zIndex);
+    const order = Array.from(rail.children);
+    expect(order.indexOf(track)).toBeLessThan(order.indexOf(fill));
+  });
+
+  it("states counting as an attribute, so the cue is assertable without reading styles", () => {
+    const { rerender } = draw(COUNTING);
+    const rail = () => screen.getByTestId("concierge-send-rail");
+    expect(rail().getAttribute("data-counting")).toBe("true");
+    // …and the existing contract is untouched.
+    expect(rail().getAttribute("data-phase")).toBe("counting");
+    expect(rail().getAttribute("data-tier")).toBe("normal");
+
+    rerender(<SendRail model={ARMED} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend />);
+    expect(rail().hasAttribute("data-counting")).toBe(false);
+    expect(rail().getAttribute("data-phase")).toBe("listening");
+
+    rerender(<SendRail model={IDLE} onToggleArmed={vi.fn()} onSend={vi.fn()} canSend />);
+    expect(rail().hasAttribute("data-counting")).toBe(false);
+    expect(rail().getAttribute("data-phase")).toBe("disarmed");
+  });
+
+  it("the label stays ABOVE the fill in every tier, hatched or solid", () => {
+    // Contrast survives the wash only because the label is painted over it, not under it. Pinned
+    // for both fill treatments so a future tier cue cannot quietly bury the target name.
+    for (const tier of ["verylow", "normal", "high"] as const) {
+      const { unmount } = draw({ ...COUNTING, tier });
+      const label = screen.getByTestId("send-rail-label");
+      const fill = screen.getByTestId("send-rail-fill");
+      // The label's stacking comes from the switch that wraps it.
+      const stacked = label.closest('[role="switch"]') as HTMLElement;
+      expect(Number(stacked.style.zIndex)).toBeGreaterThan(Number(fill.style.zIndex));
+      unmount();
+    }
   });
 });
 

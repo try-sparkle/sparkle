@@ -125,6 +125,36 @@ describe("dispatchConciergeAnswer", () => {
       expect(submitPrompt).not.toHaveBeenCalled();
     });
 
+    // THE FLAG IS A PRECONDITION, NOT A TIE-BREAK (roborev 55309). It used to be read AFTER the
+    // matcher, so a declared non-answer that failed to match fell into `ambiguous-picker` — whose
+    // copy tells the user to "answer with just the option". The realistic text that lands here is a
+    // concierge send carrying a staged file: `attachedPayload` prefixes the quoted temp path, every
+    // arm of the matcher is anchored, so it never matches. Telling someone who attached a
+    // screenshot to answer with just the option describes neither what they did nor what is in
+    // their way. Reading the declaration first gives them the line that is actually true.
+    it("refuses a declared non-answer that does NOT match, with its own path", async () => {
+      setPrompt(YN);
+      const r = await dispatchConciergeAnswer("agent-1", "'/tmp/shot.png' yes", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+        neverPickerAnswer: true,
+      });
+      expect(r).toMatchObject({ ok: false, path: "addressed-at-picker", options: YN });
+      expect(writePtyChainedStrict).not.toHaveBeenCalled();
+      expect(submitPrompt).not.toHaveBeenCalled();
+    });
+
+    // …and the same non-matching text WITHOUT the declaration still reads as ambiguous, so the row
+    // above is pinning the ordering rather than a change to the matcher.
+    it("…while the same text without the flag is still ambiguous-picker", async () => {
+      setPrompt(YN);
+      const r = await dispatchConciergeAnswer("agent-1", "'/tmp/shot.png' yes", {
+        authority: TEST_AUTHORITY,
+        userPrompt: true,
+      });
+      expect(r).toMatchObject({ ok: false, path: "ambiguous-picker", options: YN });
+    });
+
     // The exact text that used to get through: terse, matching, and user-authored.
     it("blocks a bare number that would have selected a menu row", async () => {
       setPrompt(MENU);
@@ -139,6 +169,11 @@ describe("dispatchConciergeAnswer", () => {
 
     // Same call WITHOUT the flag still presses it — so the row above is pinning the flag, not some
     // unrelated change to the matcher.
+    // THE OTHER HALF — this is what makes the flag a BRANCH and not a constant, so hard-coding the
+    // refusal above fails here. No separate `neverPickerAnswer: false` row is needed beside it:
+    // conciergeDispatch reads the flag by TRUTHINESS, so an explicit `false` and an omitted flag are
+    // the same input, and a row passing `false` would only restate this one with weaker assertions.
+    // One was added and removed for exactly that reason (roborev 55462).
     it("…while the same send without the flag still takes the keystroke path", async () => {
       setPrompt(YN);
       const r = await dispatchConciergeAnswer("agent-1", "yes", {

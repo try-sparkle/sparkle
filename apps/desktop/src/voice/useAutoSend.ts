@@ -150,6 +150,11 @@ export function useAutoSend({
   const [, setNow] = useState(0);
 
   const speechEndSeq = useDictationStore((s) => s.speechEndSeq);
+  // THE ON-DEVICE CANCEL. `interim` below is the cloud path's "the user is talking again"; this is
+  // the on-device path's, and without it that path could arm a clock that resumed speech was unable
+  // to stop (see dictationStore.onDeviceSpeech). Always false while the cloud owns the audio, so
+  // the two never both apply.
+  const onDeviceSpeech = useDictationStore((s) => s.onDeviceSpeech);
 
   /**
    * The authoritative copy of the state.
@@ -231,8 +236,21 @@ export function useAutoSend({
    */
   const deferredSpeechEnd = useRef<{ seq: number; at: number } | null>(null);
 
+  // Read by startClock, which must see the CURRENT value without re-arming on every VAD edge.
+  const onDeviceSpeechRef = useRef(onDeviceSpeech);
+  onDeviceSpeechRef.current = onDeviceSpeech;
+
   const startClock = useCallback(
     (at: number) => {
+      // THE USER IS STILL TALKING — do not arm. The on-device decode runs hundreds of ms behind the
+      // audio, so someone who pauses, gets a segment closed, and resumes before the decode lands
+      // produces resume-then-arm IN THAT ORDER. Without this guard the clock would start while they
+      // are mid-sentence, and the only thing that could stop it is another pause — which is exactly
+      // the "fires half a sentence" failure the asymmetric-cost rule in this file exists to avoid.
+      //
+      // Checked HERE rather than at the listener because this is the one place a clock ever starts,
+      // including the deferred replay path below, so no caller can forget it.
+      if (onDeviceSpeechRef.current) return;
       const prev = stateRef.current;
       const next = noteSpeechEnd(prev, at);
       apply(next);
@@ -295,8 +313,13 @@ export function useAutoSend({
     resetSample();
   }, [micLive, speechEndSeq, startClock, apply, resetSample]);
 
-  // ── (4) INTERIM — the user is talking again; stop counting without sending ──────────────────
-  const speaking = interim.trim().length > 0;
+  // ── (4) INTERIM / ON-DEVICE VAD — the user is talking again; stop counting without sending ──
+  // Two sources for ONE fact, because the two capture engines report it differently and neither can
+  // speak for the other: the cloud path streams `interim` results, the on-device path decodes whole
+  // closed segments and has none, so it reports the VAD level instead. Exactly one is ever live —
+  // Rust pins the on-device level false whenever the cloud owns the audio — so OR-ing them cannot
+  // double-count, and "keep talking and it waits" now holds on both paths rather than just one.
+  const speaking = interim.trim().length > 0 || onDeviceSpeech;
   useEffect(() => {
     if (!speaking) return;
     const prev = stateRef.current;
