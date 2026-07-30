@@ -216,16 +216,30 @@ describe("payload vs display", () => {
   ];
   const both = `'${spaced}' /tmp/log.txt`;
 
-  it("prefixes the (quoted) real paths to the typed text for the target", () => {
-    expect(attachedPayload("  look at this  ", atts)).toBe(both + " look at this");
+  it("prefixes the (quoted) real paths to the message body for the target", () => {
+    expect(attachedPayload("look at this", atts)).toBe(both + " look at this");
   });
 
   it("sends the attachments alone when the user typed nothing", () => {
     expect(attachedPayload("", atts)).toBe(both);
   });
 
-  it("is a plain trimmed prompt when nothing is attached", () => {
-    expect(attachedPayload("  ship it  ", [])).toBe("ship it");
+  it("is the plain body when nothing is attached", () => {
+    expect(attachedPayload("ship it", [])).toBe("ship it");
+  });
+
+  // ── THIS FUNCTION DOES NOT TRIM, AND THAT IS THE POINT ────────────────────────────────────────
+  // Its argument is an ALREADY-FINISHED message body from the compose box, not raw typed text, so
+  // the trim it used to apply was a no-op for every caller — the box trims before it reports the
+  // send. It stopped being a no-op once a long paste could collapse into a pill: expanding one puts
+  // its bytes into the body, and this outer trim then dedented a pasted diff and ate its trailing
+  // newline, DOWNSTREAM of everything the compose box does to protect them (roborev 55720/55728).
+  // The two rows above were rewritten from `"  look at this  "` / `"  ship it  "` for that reason:
+  // they were asserting a trim this layer must not perform.
+  it("passes the body through byte for byte, indentation and trailing newline included", () => {
+    const body = "    const x = 1;\n\tindented\nline three\n";
+    expect(attachedPayload(body, [])).toBe(body);
+    expect(attachedPayload(body, atts)).toBe(`${both} ${body}`);
   });
 
   it("never leaks a temp path into what the thread shows", () => {

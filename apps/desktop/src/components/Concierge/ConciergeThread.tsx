@@ -1,7 +1,7 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FiAlertCircle, FiBell, FiCheck } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
@@ -16,6 +16,13 @@ import { ThinkingIndicator } from "./ThinkingIndicator";
 // The read-only strip a SENT message's files draw as, plus the one lightbox they open. It lives in
 // components/composer beside that lightbox rather than here — see its header for why.
 import { MessageAttachments } from "../composer/MessageAttachments";
+// THE collapsed-text pill and its modal — the same components the BUILD-AGENT composer draws (via
+// components/composer/AttachmentRow), reused here rather than copied into a transcript-shaped twin (see
+// TextPill's header for why there is only one). As of this change those are the only two callers: the
+// concierge's own compose box is NOT on this primitive yet, so do not read these imports as evidence
+// that surface is already wired — it still needs doing (roborev 55746).
+import { TextPill } from "../composer/TextPill";
+import { TextPillModal } from "../composer/TextPillModal";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import { splitMentionText, type ConciergeMention } from "./mentions";
 import { MentionPill } from "./MentionPill";
@@ -24,6 +31,7 @@ import type {
   ConciergeDigestMessage,
   ConciergeMessage,
   ConciergeNudge,
+  ConciergeSparkleMessage,
 } from "./types";
 
 /** How close to the bottom still counts as "following", measured when the READER scrolls.
@@ -39,6 +47,8 @@ const FOLLOW_THRESHOLD_PX = 24;
 
 export const FAILURE_BUBBLE_TESTID = "concierge-failure";
 export const FAILURE_EVIDENCE_TESTID = "concierge-failure-evidence";
+/** A collapsed payload the reader chose to see as regular text, expanded IN PLACE in its bubble. */
+export const COLLAPSED_TEXT_TESTID = "concierge-collapsed-text";
 
 /** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
  *
@@ -136,6 +146,62 @@ export function ConciergeThread({
     onCopied: useCallback(() => onCopied?.("selection"), [onCopied]),
   });
   const onAnswerCopied = useCallback(() => onCopied?.("answer"), [onCopied]);
+  // ── A relayed payload, collapsed (see ConciergeSparkleMessage.collapsed) ──────────────────────
+  //
+  // Both bits of state are LOCAL and KEYED BY MESSAGE ID, deliberately. Neither is a fact about the
+  // conversation: which modal is open and which payload the reader has expanded are properties of
+  // this reading session, and the thread is persisted — writing them onto the message would restore
+  // a thread tomorrow with a brief already spilled open, which is the flood coming back by the other
+  // door. Keyed by id rather than held per-bubble because a bubble is not a component here (the map
+  // returns plain JSX), and because the modal is portaled to `document.body` and only ever wants ONE
+  // instance on screen.
+  /** Which message's payload has its full-text modal open, or null. */
+  const [openPayloadId, setOpenPayloadId] = useState<string | null>(null);
+  /** Messages whose payload the reader asked to see as regular text, IN PLACE — the founder's
+   *  literal ask ("show as regular text" puts it back in the bubble, not in a panel). */
+  const [shownAsText, setShownAsText] = useState<ReadonlySet<string>>(() => new Set());
+  const openPayload =
+    openPayloadId === null
+      ? undefined
+      : messages.find(
+          (m): m is ConciergeSparkleMessage =>
+            m.id === openPayloadId && m.kind === "sparkle" && m.collapsed !== undefined,
+        );
+  /**
+   * The pill (or the expanded text) under a sparkle line that carries a payload.
+   *
+   * ONE ROW while collapsed, and `variant="inline"` is what makes that true — the default `tile` is
+   * the composer's 46px dashed box, which reads as an empty drop target sitting in running prose.
+   * NO `onRemove`: a posted line is a record, and offering to delete half of one implies an edit the
+   * app cannot make.
+   */
+  const collapsedPayload = (m: ConciergeSparkleMessage) => {
+    const block = m.collapsed;
+    if (!block) return null;
+    if (shownAsText.has(m.id))
+      return (
+        <div
+          data-testid={COLLAPSED_TEXT_TESTID}
+          style={{
+            marginTop: 4,
+            fontSize: 12,
+            color: C.cream,
+            // VERBATIM, never through <Markdown> — the same call the failure bubble's evidence makes
+            // above, for the same reason: this is the user's own pasted text, where a `_` or a `*` is
+            // a character and not a formatting instruction.
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {block.text}
+        </div>
+      );
+    return (
+      <div style={{ marginTop: 4 }}>
+        <TextPill block={block} variant="inline" onOpen={() => setOpenPayloadId(m.id)} />
+      </div>
+    );
+  };
   // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
   // its newest message) and only changes when the READER scrolls — never as a side effect of new
   // content.
@@ -483,6 +549,7 @@ export function ConciergeThread({
                   <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
                 </div>
                 <Markdown text={m.text} />
+                {collapsedPayload(m)}
                 {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same
                     copy affordance. Copying its markdown source, like the branch below. */}
                 <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
@@ -491,6 +558,9 @@ export function ConciergeThread({
           return (
             <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
               <Markdown text={m.text} />
+              {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
+                  transcript used to echo inline and push the conversation off screen. */}
+              {collapsedPayload(m)}
               {/* ANSWERS ONLY. Not the user's own bubbles (they wrote it), and not the nudge, recap,
                   digest or batch cards above — those are chrome the app generated about state, not
                   prose anyone wants in a doc. Copies `m.text`, the markdown SOURCE, so a table stays
@@ -536,6 +606,23 @@ export function ConciergeThread({
           <FiCheck size={12} />
           Copied
         </div>
+      )}
+      {/* The full text behind a collapsed payload: read it, copy it verbatim, or put it back into the
+          bubble as regular text. ONE instance for the whole thread — the overlay portals to
+          `document.body`, so a per-bubble copy would stack identical dialogs.
+          "Show as regular text" EXPANDS IN PLACE and closes the modal; it does not remove the block
+          the way the composer's does, because there is nothing here to remove it from — the payload is
+          a record of what was sent, and the reader is choosing how to look at it. */}
+      {openPayload?.collapsed && (
+        <TextPillModal
+          block={openPayload.collapsed}
+          onClose={() => setOpenPayloadId(null)}
+          onShowAsText={() => {
+            const id = openPayload.id;
+            setShownAsText((prev) => new Set(prev).add(id));
+            setOpenPayloadId(null);
+          }}
+        />
       )}
     </div>
   );

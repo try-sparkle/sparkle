@@ -109,7 +109,16 @@ import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useUiStore } from "../stores/uiStore";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
-import type { Attachment } from "./composer/attachments";
+// The collapsed-text primitive, used here to keep a relayed payload OUT of the transcript's prose:
+// `shouldPasteAsPill` is the one threshold rule and `collapseText` the one place a block is built, so a
+// transcript pill and the build-agent composer's pill (components/composer/AttachmentRow — the only
+// other caller today) cannot disagree about what collapses or what it carries.
+import {
+  collapseText,
+  shouldPasteAsPill,
+  type Attachment,
+  type TextBlock,
+} from "./composer/attachments";
 import { screenshotAttachment } from "./composer/attachmentsApi";
 import { useComposeHandoffStore } from "../stores/composeHandoffStore";
 import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
@@ -542,6 +551,21 @@ interface ConciergeMentionAim {
  *  unbounded metered input tokens on every mention. */
 const RELAY_QUOTE_CHARS = 240;
 
+/** How much of a held message a deferred-send OUTCOME quotes back into the thread before eliding.
+ *
+ *  Its own number rather than {@link RELAY_QUOTE_CHARS}, because the two are bounded for different
+ *  reasons: that one protects a metered token bill, this one protects a narrow column's geometry — the
+ *  quote is there so the user can tell WHICH held message an outcome refers to (roborev 53123), and a
+ *  recognisable head does that in a line or two. The payload itself is not lost: past
+ *  `shouldPasteAsPill` it rides on the message as a collapsed block. Matches the countdown banner's
+ *  `MAX_QUOTED_CHARS`, which quotes for the same reason on an equally narrow surface. */
+const OUTCOME_QUOTE_CHARS = 120;
+
+/** Bound a one-lined quote for the transcript. See {@link OUTCOME_QUOTE_CHARS}. */
+function elideQuote(text: string): string {
+  return text.length <= OUTCOME_QUOTE_CHARS ? text : `${text.slice(0, OUTCOME_QUOTE_CHARS - 1)}…`;
+}
+
 /**
  * What Sparkle is asked after it has relayed a message — the founder's headline requirement:
  * *"the concierge sends it over to that builder agent, but ALSO still participates in the
@@ -688,7 +712,7 @@ export function ConciergeHost({
 
   // The compose box's own insert fn, kept so a send that dies AFTER the box already cleared can put
   // the user's words back. See `restoreDraft`.
-  const insertRef = useRef<((text: string) => void) | null>(null);
+  const insertRef = useRef<((text: string, opts?: { verbatim?: boolean }) => void) | null>(null);
 
   /**
    * Put a draft back in the compose box.
@@ -704,7 +728,10 @@ export function ConciergeHost({
    */
   const restoreDraft = useCallback((text: string) => {
     if (text.trim() === "") return;
-    insertRef.current?.(text);
+    // VERBATIM: this is the user's own message coming back, and the box's ordinary insert path is
+    // the DICTATION one, which trims. A restored body that contains a collapsed paste would arrive
+    // dedented and short its trailing newline (roborev 55793).
+    insertRef.current?.(text, { verbatim: true });
   }, []);
 
   const registerInsert = useCallback(
@@ -1484,10 +1511,19 @@ export function ConciergeHost({
 
   // Every postSparkle line is BOOKKEEPING — a send outcome, a refusal, a deferred reconciliation —
   // never a brain reply.
-  const postSparkle = useCallback((text: string) => {
-    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text }]);
+  //
+  // `collapsed` is a long payload the line is ABOUT (a relayed brief), carried as a block so the
+  // thread can draw it as a pill instead of inlining it — see ConciergeSparkleMessage.collapsed for
+  // why the sentence and the payload are two fields.
+  const postSparkle = useCallback((text: string, collapsed?: TextBlock) => {
+    setChat((prev) => [...prev, { id: nextId("sparkle"), kind: "sparkle", text, collapsed }]);
     // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
     // sends to the same pinned agent produce the same line twice; both must be announced.
+    //
+    // THE RECEIPT SENTENCE ONLY, never `collapsed`. This is the accessibility half of the same bug
+    // the pill fixes: a screen reader handed the forty rows of a relayed brief has to sit through all
+    // of them to learn that a message went out, and there is no scrolling past a live region. The
+    // payload is reachable on demand (the pill's modal); it is never spoken on arrival.
     announce(text);
   }, [announce]);
 
@@ -1747,7 +1783,36 @@ export function ConciergeHost({
         // attachments' temp paths (roborev 46925). Falls back to `sent` only when the dispatch
         // carried no separate display, i.e. nothing was attached.
         const shown = r.display ?? r.sent;
-        const quoted = shown ? ` ("${oneLine(shown)}")` : "";
+        // THE PAYLOAD RIDES AS A PILL, NOT AS PROSE — the whole point of this arm's rework.
+        //
+        // A relayed brief is routinely forty rows. Interpolated into the sentence it pushed the entire
+        // conversation off screen (the founder's screenshot) and made the standing rule — the
+        // concierge must never paste relayed text back at the user — unenforceable, because the APP
+        // was doing the pasting whatever the concierge did. Past the threshold the block travels on the
+        // message and the thread draws one row for it, full text one click away.
+        //
+        // The sentence keeps a BOUNDED quote either way. `oneLine` collapses newlines and bounds
+        // nothing, which is the defect itself: it turns a paste into one enormous wrapped line rather
+        // than removing it. So the quote is elided here for the same reason `relayFollowUp` slices to
+        // RELAY_QUOTE_CHARS and the countdown banner elides to MAX_QUOTED_CHARS. Short payloads —
+        // every one this arm was written for — come through byte-identical, so the wording the tests
+        // pin is untouched; what changes is that a long one can no longer run away with the column.
+        const line = shown ? oneLine(shown) : "";
+        const quoted = shown ? ` ("${elideQuote(line)}")` : "";
+        // ONE DECISION, NOT TWO. The elide threshold and the pill threshold are independent numbers, and
+        // read as two decisions they leave a band between them where the quote is CUT and nothing rides
+        // along: a three-line, 300-character relayed instruction is under `shouldPasteAsPill` but well
+        // over `OUTCOME_QUOTE_CHARS`, so the user would be left with `("<119 chars>…")` and no way back
+        // to the rest — text that was fully present before this change. That is worst exactly on the
+        // `expired`/`abandoned` arms, whose copy tells them to send it again (roborev 55746).
+        //
+        // So the rule is: A QUOTE THAT WAS ELIDED ALWAYS HAS THE FULL TEXT BEHIND IT. `shouldPasteAsPill`
+        // still governs the case the pill was designed for (a paste that would flood the column); this
+        // second clause is what makes the invariant hold with no gap.
+        const collapsed =
+          shown && (shouldPasteAsPill(shown) || line.length > OUTCOME_QUOTE_CHARS)
+            ? collapseText(nextId("pill"), shown)
+            : undefined;
         // Each non-delivery says what actually happened; a wrong reason is its own small lie
         // (roborev 46485-M — `abandoned` used to be reported as "the terminal closed", which is
         // false when the spawn failed and no terminal ever opened).
@@ -1756,10 +1821,10 @@ export function ConciergeHost({
         // specific claim, and letting any future path fall into it (say abandonPendingSends grows
         // an `agent-failed` emit) is how 46485-M happened the first time. An unknown path gets a
         // reason it can always stand behind (roborev 53162).
-        if (r.ok) postSparkle(`${name} is up — I sent your message${quoted}.`);
-        else if (r.path === "expired") postSparkle(`${name} never came up, so I dropped the message I was holding${quoted}. Send it again when it's running.`);
-        else if (r.path === "abandoned") postSparkle(`${name} couldn't take the message I was holding${quoted}. Send it again once it's running.`);
-        else if (r.path === "pty-gone") postSparkle(`${name}'s terminal closed before I could send the message I was holding${quoted}.`);
+        if (r.ok) postSparkle(`${name} is up — I sent your message${quoted}.`, collapsed);
+        else if (r.path === "expired") postSparkle(`${name} never came up, so I dropped the message I was holding${quoted}. Send it again when it's running.`, collapsed);
+        else if (r.path === "abandoned") postSparkle(`${name} couldn't take the message I was holding${quoted}. Send it again once it's running.`, collapsed);
+        else if (r.path === "pty-gone") postSparkle(`${name}'s terminal closed before I could send the message I was holding${quoted}.`, collapsed);
         // LEXICALLY distinct from the `abandoned` arm — "didn't", not "couldn't". Identical copy
         // silently un-pinned that arm once (roborev 53187), and merely dropping its remedy clause
         // left this string a strict PREFIX of it, so the two were separable only by a `$` anchor in
@@ -1771,7 +1836,7 @@ export function ConciergeHost({
         // "send it again once it's running" would be an instruction that never comes true. Those
         // two are the known paths still routed here; neither reaches this listener today, and if
         // one starts to, it should get its own arm with its own remedy rather than this bare line.
-        else postSparkle(`${name} didn't take the message I was holding${quoted}.`);
+        else postSparkle(`${name} didn't take the message I was holding${quoted}.`, collapsed);
       }),
     [postSparkle, takeHeldAttachments, restoreAttachments],
   );

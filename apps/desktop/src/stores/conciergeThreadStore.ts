@@ -15,7 +15,9 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { ConciergeMessage } from "../components/Concierge/types";
-import type { Attachment } from "../components/composer/attachments";
+// `countLines` is the line-count rule for a collapsed block, imported rather than re-derived so a
+// clipped block's subtitle ("41 lines") counts the same way the pill that made it did.
+import { countLines, type Attachment } from "../components/composer/attachments";
 
 // Keep the thread bounded so localStorage can't grow without limit, exactly as
 // promptHistoryStore.PROMPT_HISTORY_MAX does. 200 messages is far more than anyone scrolls back
@@ -174,10 +176,83 @@ function clip<T extends { text: string }>(m: T): T {
   return { ...m, text: m.text.slice(0, CONCIERGE_MSG_MAX_LEN) + CONCIERGE_TRUNCATION_SUFFIX };
 }
 
+/** The CEILING on one collapsed payload — a backstop, not the working bound. The aggregate budget below
+ *  is what actually holds the quota; this only stops a single pathological paste from eating all of it.
+ *
+ *  Deliberately WELL ABOVE `attachments.PILL_MIN_CHARS` (2000, the size at which a one-line paste
+ *  collapses). A ceiling set AT that threshold truncates essentially every char-triggered pill by
+ *  construction — a block exists because its text is already ≥2000 chars — so the canonical ~40-row
+ *  brief would open onto its first 2000 characters after a restart with 58k of the budget unspent, and
+ *  the `expired`/`abandoned` arms would be telling the user to re-send text the app had just clipped
+ *  (roborev 55760). Matching {@link CONCIERGE_MSG_MAX_LEN} keeps a real brief whole and leaves the
+ *  aggregate worst case below untouched. */
+export const CONCIERGE_COLLAPSED_MAX_LEN = CONCIERGE_MSG_MAX_LEN;
+
+/** …and how much every collapsed payload may add up to, ACROSS messages.
+ *
+ *  THE BOUND THAT MATTERS. The per-block ceiling alone leaves the failure wide open along the other
+ *  axis — 200 receipts each carrying a capped block is ~800k chars (~1.6 MB as UTF-16) of one origin's
+ *  ~5 MB, shared with every other persisted store (roborev 55746, the same shape as
+ *  {@link LIVE_THUMBNAIL_TOTAL_CHARS} closing roborev 53786 for previews). Spent NEWEST-FIRST, like the
+ *  preview budget, because "the newest payloads until the budget runs out" is a rule a reader can
+ *  predict — and because it means a lone brief, the common case, is never clipped at all. */
+export const CONCIERGE_COLLAPSED_TOTAL_CHARS = 60_000;
+
+/** What an out-of-budget payload degrades to rather than vanishing: enough to identify it by.
+ *
+ *  NOT zero, and not the field dropped. A pill with no text behind it is a button that lies, and a
+ *  sentence whose elided quote has lost its "…rest is here" is the gap `onDeferredSendOutcome` closes
+ *  in the first place. A leading stub keeps the pill's face — its first line — which is exactly what
+ *  the face is for, and it wears the truncation suffix so it never claims to be whole. */
+export const CONCIERGE_COLLAPSED_MIN_LEN = 200;
+
+/**
+ * Bound the COLLAPSED-PAYLOAD axis of a persisted thread, which {@link clip} cannot see.
+ *
+ * A `sparkle` message can carry a relayed brief as a `TextBlock` (see
+ * ConciergeSparkleMessage.collapsed) so the transcript draws it as a pill instead of inlining it. That
+ * field SURVIVES persistence for free — every rebuild in this module is a spread, not a field-by-field
+ * copy — and survival is the point: a restored pill with no text behind it would be a button that
+ * lies. But it arrives UNBOUNDED, which is exactly the failure {@link CONCIERGE_MSG_MAX_LEN} exists to
+ * prevent, reaching through a field the text cap cannot see (the same shape as {@link stripDataUrls}):
+ * the persist write throws, zustand silently stops persisting the WHOLE store, and the symptom ("my
+ * thread stopped surviving restarts") shows up long after the message that caused it.
+ *
+ * TWO caps, because each alone leaves that failure reachable — {@link CONCIERGE_COLLAPSED_MAX_LEN} per
+ * block, {@link CONCIERGE_COLLAPSED_TOTAL_CHARS} across them, spent newest-first, with anything past the
+ * budget degraded to {@link CONCIERGE_COLLAPSED_MIN_LEN}. TRUNCATED, never dropped, with the same
+ * admission suffix a clipped bubble gets, and `lineCount` recomputed so the pill's subtitle describes
+ * the text actually behind it rather than the text that used to be. A restored pill therefore says less
+ * than the live one did — never something untrue.
+ *
+ * Returns the INPUT ARRAY UNCHANGED when nothing needed clipping (the common case), for the same reason
+ * {@link boundLiveThumbnails} does: bubbles are memoized on identity.
+ */
+export function boundCollapsedPayloads(chat: ConciergeMessage[]): ConciergeMessage[] {
+  let budget = CONCIERGE_COLLAPSED_TOTAL_CHARS;
+  let out: ConciergeMessage[] | null = null;
+  // Newest first: the budget is spent on the payloads the reader is nearest to.
+  for (let i = chat.length - 1; i >= 0; i--) {
+    const m = chat[i]!;
+    if (m.kind !== "sparkle" || !m.collapsed) continue;
+    const room = Math.max(CONCIERGE_COLLAPSED_MIN_LEN, Math.min(CONCIERGE_COLLAPSED_MAX_LEN, budget));
+    // Spend what this block actually takes, so a short payload does not cost a long one its room. The
+    // floor above can overdraw; clamp rather than going negative, or a later block would get `room`
+    // from a negative `budget` and the Math.max would silently hand it the floor twice over.
+    budget = Math.max(0, budget - Math.min(m.collapsed.text.length, room));
+    if (m.collapsed.text.length <= room) continue;
+    const text = m.collapsed.text.slice(0, room) + CONCIERGE_TRUNCATION_SUFFIX;
+    out ??= chat.slice();
+    out[i] = { ...m, collapsed: { ...m.collapsed, text, lineCount: countLines(text) } };
+  }
+  return out ?? chat;
+}
+
 /**
  * Reduce a live thread to what belongs in localStorage: conversation only, newest
  * {@link CONCIERGE_THREAD_MAX} kept, each clipped to {@link CONCIERGE_MSG_MAX_LEN} and with every
- * attachment's base64 dropped (see {@link stripDataUrls} — the second, larger size axis).
+ * attachment's base64 dropped (see {@link stripDataUrls} — the second, larger size axis) and every
+ * collapsed payload bounded per-block AND in aggregate (see {@link boundCollapsedPayloads} — the third).
  *
  * Exported so the caps are testable without going through zustand's persist middleware, and so the
  * ordering guarantee is pinned in one place: the result stays OLDEST-FIRST, matching
@@ -187,9 +262,13 @@ function clip<T extends { text: string }>(m: T): T {
 export function persistableThread(chat: ConciergeMessage[]): ConciergeMessage[] {
   const conversation = chat.filter(isConversation).map(clip).map(stripDataUrls);
   // Trim from the FRONT: drop the oldest turns, keep the tail the user is actually looking at.
-  return conversation.length > CONCIERGE_THREAD_MAX
-    ? conversation.slice(conversation.length - CONCIERGE_THREAD_MAX)
-    : conversation;
+  const kept =
+    conversation.length > CONCIERGE_THREAD_MAX
+      ? conversation.slice(conversation.length - CONCIERGE_THREAD_MAX)
+      : conversation;
+  // AFTER the trim, never before: the collapsed budget is spent newest-first over what is actually
+  // being written, so payloads on turns about to be dropped must not have taken any of it.
+  return boundCollapsedPayloads(kept);
 }
 
 /** Namespace every restored message id lands in. See {@link rehydrateThread} for why it must exist. */

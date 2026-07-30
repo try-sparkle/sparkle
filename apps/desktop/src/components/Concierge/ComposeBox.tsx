@@ -2,6 +2,12 @@
 // Attach row (ONE paperclip, expanding to Screenshot / Upload) above a textarea + Send row;
 // ⌘/Ctrl+Enter submits. Purely presentational: submit reports trimmed text via onSend and clears.
 //
+// A LONG PASTE COLLAPSES INTO A PILL here too, exactly as it does in the build-agent composer, off
+// the same pure model and the same components (composer/attachments + composer/TextPill). What
+// leaves this box is still the FULL pasted text — the pill is a display decision, expanded inline by
+// `composeBody` at submit — and the one failure worth naming is a surface that sends a pill's LABEL
+// instead, which would look like it worked. See `submit` and ComposeBox.collapsedPaste.test.tsx.
+//
 // THERE IS NO MIC BUTTON HERE, and putting one back would re-create the bug this box was fixed for.
 // It used to carry one immediately left of the textarea, next to Send — which meant the concierge
 // column showed TWO microphones, this one and the waveform ring in the column header a few inches
@@ -71,6 +77,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -93,6 +100,22 @@ import {
   VoicePlaceholderCopy,
 } from "../composer/RichPlaceholder";
 import { ComposerOutOfCreditsNotice } from "../OutOfCreditsNotice";
+// A LONG PASTE COLLAPSES INTO A PILL — the same feature, the same components, the same pure model
+// as the build-agent composer (see composer/TextPill's header for the three surfaces). Nothing here
+// is a concierge-flavoured copy: the threshold, the expand rule and — above all — what a send
+// EXPANDS TO all come from composer/attachments, so this box cannot grow its own idea of what a
+// pill stands for. That matters because the failure would be silent: a surface transmitting a
+// pill's LABEL instead of its text still looks like it worked.
+import {
+  collapseText,
+  composeBody,
+  expandTextBlock,
+  shouldPasteAsPill,
+  type TextBlock,
+} from "../composer/attachments";
+import { nextId } from "../composer/attachmentsApi";
+import { TextPill } from "../composer/TextPill";
+import { TextPillModal } from "../composer/TextPillModal";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
 import { useDictationStore } from "../../stores/dictationStore";
 import { focusQuietly, isProgrammaticFocus } from "../../services/programmaticFocus";
@@ -464,7 +487,9 @@ export function ComposeBox({
   interim?: string;
   /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
    *  changes, and an unstable identity would churn the app-wide dictation target every render. */
-  registerInsert?: (append: ((text: string) => void) | null) => void;
+  registerInsert?: (
+    append: ((text: string, opts?: { verbatim?: boolean }) => void) | null,
+  ) => void;
   /** The user TYPED (or deleted) — reports the new value. Not fired for dictated segments or the
    *  clear-on-send, so the host can see the box being emptied by hand. */
   onTextEdit?: (text: string) => void;
@@ -518,6 +543,17 @@ export function ComposeBox({
   registerSubmit?: (submit: (() => boolean) | null) => void;
 }) {
   const [text, setText] = useState("");
+  // Pastes collapsed into pills, in paste order. Local state, unlike `attachments` (host-owned):
+  // a collapsed paste never leaves this box — it is expanded inline into the string `submit` sends
+  // — so there is nothing for the host to own, and the box already clears it on send.
+  const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
+  /** The pill whose full-text modal is open. */
+  const [openBlock, setOpenBlock] = useState<TextBlock | null>(null);
+  // What is in the textarea RIGHT NOW, readable from an async continuation. `setText`'s own updater
+  // sees the current text, but the pill restore below is a different piece of state and has to make
+  // its decision on both halves at once — see the guard in `submit`'s failure path.
+  const textRef = useRef(text);
+  textRef.current = text;
   // Concrete hex for the two spec tokens that have no CSS var of their own (see
   // theme/blueprintSpec) — the terminal plane the wired composer floats on, and its edge.
   const mode = useResolvedTheme();
@@ -565,8 +601,20 @@ export function ComposeBox({
   const rosterRef = useRef<readonly MentionAgent[]>(EMPTY_MENTION_AGENTS);
   useEffect(() => {
     if (!registerInsert) return;
-    const append = (segment: string) =>
+    const append = (segment: string, opts?: { verbatim?: boolean }) =>
       setText((prev) => {
+        // `verbatim` — a DRAFT COMING BACK, not a dictated segment. `appendDictated` trims what it
+        // inserts, which is right for speech (Deepgram pads its segments) and destructive for a
+        // restored body: the host hands back the composed message, so a collapsed paste's leading
+        // indentation and trailing newline were being stripped on the way IN — before any latch
+        // could protect them, which is why re-arming alone would not have helped (roborev 55793).
+        // The latch is set too, so the retry does not trim what survived.
+        if (opts?.verbatim) {
+          heldExpansionRef.current = true;
+          const restored = prev ? `${prev}${prev.endsWith("\n") ? "" : "\n"}${segment}` : segment;
+          setCaret(restored.length);
+          return restored;
+        }
         // ── SPEAKING AN ADDRESS ──────────────────────────────────────────────────────────────────
         // You cannot say "@" out loud, so without this there is no spoken way to reach the concierge
         // once this column is patched to a terminal. Saying "Sparkle, …" at the head of a message
@@ -743,6 +791,53 @@ export function ComposeBox({
     [pending, applyEdit, text, caret],
   );
 
+  // ── A long paste collapses into a pill instead of flooding the box ───────────────────────────
+  // Threshold and model are the shared ones (composer/attachments). A paste UNDER it is not
+  // intercepted at all — no preventDefault — so the textarea's own insert handles it, caret and
+  // undo stack included.
+  const onPaste = (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = e.clipboardData.getData("text/plain");
+    if (!shouldPasteAsPill(pasted)) return; // native paste
+    e.preventDefault();
+    setTextBlocks((prev) => [...prev, collapseText(nextId("blk"), pasted)]);
+  };
+
+  const removeTextBlock = (id: string) => {
+    setTextBlocks((prev) => prev.filter((b) => b.id !== id));
+    setOpenBlock((cur) => (cur?.id === id ? null : cur));
+  };
+
+  /** "Show as regular text": the block's full text goes back into the textarea and the pill goes.
+   *
+   *  Through `applyEdit`, not a bare `setText`, because this IS a user edit — the host retires its
+   *  routing latches on `onTextEdit` (see that prop's doc), and an expand that bypassed it would
+   *  leave the next send aimed at a destination the user never chose for these words. It also
+   *  carries the caret to the end of the restored text, so typing continues after the paste rather
+   *  than in front of it. */
+  const showBlockAsText = (block: TextBlock) => {
+    // The SHARED expand rule — the round-trip guarantee (expand → send is byte-identical to the
+    // paste) is stated over that one function, not over this call site.
+    const next = expandTextBlock(text, block);
+    // …and the guarantee needs this latch to survive the trip out. See heldExpansionRef.
+    heldExpansionRef.current = true;
+    applyEdit({ text: next, caret: next.length });
+    removeTextBlock(block.id);
+  };
+
+  /**
+   * Has this box held an expanded pill since it was last emptied?
+   *
+   * The same latch the build-agent composer keeps, for the same reason and against the same bug:
+   * expanding a pill moves its bytes out of a block and into `text`, where `composeBody`'s
+   * `typed.trim()` strips a pasted diff's leading indentation and its trailing newline (roborev
+   * 55720/55728). A latch rather than a comparison against the expanded string, because EDITING IS
+   * WHY somebody takes "Show as regular text" — and `trim()` cuts the LEADING end too, where the
+   * bytes belong to the paste and not to the user's stray whitespace.
+   *
+   * Cleared when the box is emptied, by a send or by hand.
+   */
+  const heldExpansionRef = useRef(false);
+
   // ── Height: auto-grow to a ten-line cap, or whatever the user dragged to ────────────────────
   // The box was a fixed 42px with `resize: none`, so a paragraph scrolled invisibly above the
   // caret. Policy (cap, floor, drag arithmetic) lives in engine/composeBoxHeight; this half just
@@ -917,19 +1012,45 @@ export function ComposeBox({
   // the box is still empty, so it can never clobber something the user started typing meanwhile.
   // An attachment alone IS a message — the removed composer allowed attachments-only sends — so the
   // gate is "text or attachments", not "text".
-  const canSend = text.trim().length > 0 || attachments.length > 0;
+  // A COLLAPSED PASTE COUNTS, for the same reason an attachment does: a box holding one pill and no
+  // typing is a message with a long body, and gating on the visible textarea alone would leave Send
+  // dead with the user's whole paste sitting right there on screen.
+  const canSend = text.trim().length > 0 || attachments.length > 0 || textBlocks.length > 0;
   // RETURNS WHETHER A MESSAGE WENT OUT, for the auto-send rail (see `registerSubmit`). The button
   // ignores it; the rail cannot, because "I called submit" and "a message was sent" differ exactly
   // here — an empty box early-returns, and the rail would otherwise announce "Sent to …" and record
   // a tuning sample for a send that never happened.
   const submit = (): boolean => {
     if (!canSend) return false;
-    const v = text.trim();
-    // Resolved HERE, at submit, off the trimmed text that is actually going out — never carried
-    // along in state. That is the whole point of deriving mentions (see ./mentions): what the user
-    // can read in the box at the moment they press Send is what the message is addressed to, with
-    // no second copy that could have drifted from it.
-    const mentions = mentionsIn(v, roster);
+    // WHAT GOES OUT IS EVERY PILL'S FULL TEXT PLUS WHAT WAS TYPED — never a pill's label. Through
+    // the shared `composeBody`, which is where collapsing is proven lossless: a lone block in an
+    // otherwise empty box comes out of it byte-identical to what was pasted in.
+    const held = heldExpansionRef.current;
+    // What goes back in the box if the send fails. The TRIMMED text ordinarily — but the untouched
+    // string when this box is holding an expansion, because there the outer whitespace is the
+    // paste's own and handing back a trimmed copy would quietly dedent the user's draft.
+    const typed = held ? text : text.trim();
+    const blocks = textBlocks;
+    // `verbatimTyped` — this box has held an expanded pill, so its text keeps its own bytes rather
+    // than being trimmed. See heldExpansionRef.
+    const v = composeBody(blocks, text, { verbatimTyped: held });
+    // Resolved HERE, at submit, off what the user can READ IN THE BOX — never carried along in
+    // state. That is the whole point of deriving mentions (see ./mentions): what is visible at the
+    // moment they press Send is what the message is addressed to, with no second copy that could
+    // have drifted from it.
+    //
+    // THE VISIBLE TEXT, NOT THE COMPOSED BODY, and the difference is a collapsed paste (roborev
+    // 55730). Scanning `v` would resolve an aim out of text the user cannot see: paste a Slack
+    // thread or a log that happens to contain "@Docs" while an agent is addressable as Docs, and the
+    // send silently aims at that agent's terminal instead of being routed. It also breaks the
+    // guarantee this feature exists for — the host renders the wire text through `mentionFreeText`,
+    // which DELETES the addressing span and strips the sigil off the rest, so a mention found inside
+    // a pill would have the paste itself rewritten on its way out. A pill's contents are content,
+    // never an envelope. For a box with no pills this is exactly what it always was.
+    //
+    // `text`, not `typed`: the two differ only in edge whitespace (see `typed` above), which cannot
+    // change which spans match — and naming the raw visible string here says what the rule IS.
+    const mentions = mentionsIn(text, roster);
     // ONE argument when nothing is addressed, not a second one holding `undefined`. An unaddressed
     // send has to be indistinguishable from what this box has always sent — the host's `onSend` is
     // the column's oldest contract and every consumer and test of it was written against the
@@ -939,9 +1060,86 @@ export function ComposeBox({
     setText("");
     setCaret(0);
     setDismissedAnchor(null);
+    setTextBlocks([]);
+    setOpenBlock(null);
+    // Emptied, so it no longer holds anybody's paste. Cleared AFTER `v` was built off it; the
+    // restore path below re-arms it, because putting the expansion back means the box is holding it
+    // again.
+    heldExpansionRef.current = false;
     if (outcome && typeof outcome.then === "function") {
       void outcome.then((ok) => {
-        if (!ok && v) setText((cur) => (cur === "" ? v : cur));
+        if (ok) return;
+        // Restored SEPARATELY, as the two halves the user actually sees: the typed words go back
+        // into the textarea and the pills go back to being pills. Putting `v` back into the
+        // textarea instead would "restore" a failed send by flooding the box with the very paste
+        // that was collapsed to keep it out — the draft would come back in a shape the user never
+        // had. Each half is MERGED with whatever arrived meanwhile rather than dropped: the send is
+        // in flight for as long as the host takes to decide, and a user who typed or pasted in that
+        // window must not lose either their new words or the draft coming back (roborev 55758).
+        //
+        // Keeping both is the only option that never destroys text. Bailing out when the box is
+        // non-empty silently discarded the returning draft; overwriting would discard the new words.
+        // RE-ARM WHENEVER THIS SEND WAS VERBATIM, independent of what is in the box (roborev 55776).
+        // An earlier draft restricted this to `cur === ""` on the reasoning that a draft merged with
+        // new keystrokes is "no longer pristine" — which contradicts the latch's own semantics, set
+        // out at `heldExpansionRef`: it is deliberately NOT a pristine test, because editing is
+        // exactly why anyone expands a pill, and `trim()` cuts the LEADING end where the bytes
+        // belong to the paste. The restore PREPENDS, so the string still begins with the paste's own
+        // bytes either way; leaving the latch off re-opened the dedent on the retry.
+        if (held) heldExpansionRef.current = true;
+        // Has the host already put this draft back? `ConciergeHost.restoreDraft` appends the
+        // composed BODY through `registerInsert` on paths this promise cannot see (a cancelled
+        // countdown, a dead agent), so both halves below have to ask that question — but they must
+        // ask it about the same EVIDENCE, not each with its own test.
+        const pasteIsBack = blocks.some((b) => {
+          const needle = b.text.trim();
+          return needle !== "" && textRef.current.includes(needle);
+        });
+        // …and the typed half gets a duplicate guard too (roborev 55776) — but NOT a bare
+        // `includes` of the typed text (roborev 55793). The block half's licence is that its needle
+        // is a multi-line paste over the collapse threshold, so "text the user typed in a few
+        // seconds cannot contain it". A TYPED needle can be two characters: with a pill staged and
+        // "hi" typed, a user who then starts a new thought ("this is urgent") would have `hi`
+        // silently deleted by `includes`, which is the exact loss this design exists to prevent.
+        //
+        // So: evidence of a HOST RESTORE, not bare containment. When there are blocks, the paste
+        // being back is that evidence — the body carries both halves or neither. With no blocks the
+        // restored body IS the typed text, so it can only be back at the END.
+        if (typed) {
+          const needle = typed.trim();
+          const typedAlreadyBack =
+            needle !== "" &&
+            (blocks.length ? pasteIsBack : textRef.current.trim().endsWith(needle));
+          if (!typedAlreadyBack) setText((cur) => (cur === "" ? typed : `${typed}\n\n${cur}`));
+        }
+        // THE PILLS COME BACK UNLESS THE PASTE IS ALREADY IN THE BOX (roborev 55730 / 55748).
+        //
+        // `cur.length === 0` alone guards nothing — we cleared it ourselves a moment ago. The case
+        // to catch is the host putting the draft back FIRST: ConciergeHost.restoreDraft appends
+        // through `registerInsert` on paths this promise cannot see (a cancelled countdown, a dead
+        // agent), and it is handed the composed BODY, paste included. Re-adding the pill on top of
+        // that leaves the paste in the draft twice and sends it twice.
+        //
+        // But the test cannot be "is the textarea empty". A keystroke while the send was in flight
+        // would then destroy the whole collapsed paste — pill gone, block state already cleared,
+        // and the typed half of this restore skipped as well — which is a far worse outcome than
+        // the duplication being avoided. So it discriminates on the actual hazard: does the box
+        // already CONTAIN this paste? Text the user typed in a few seconds cannot; a restored body
+        // must. Compared on the trimmed text because the append path trims what it inserts
+        // (appendDictated), so a block ending in a newline would not match verbatim.
+        // MERGED, NOT BAILED (roborev 55758). A `cur.length === 0` test would discard the sent
+        // paste outright whenever a NEW pill exists — and `onPaste` has no notion of a send being
+        // in flight, so pasting a second chunk while the host is still deciding is exactly how that
+        // happens. Losing the first paste that way is the same silent loss as the keystroke case,
+        // arriving through the paste handler instead. Restored blocks go FIRST, keeping paste order,
+        // and a block already in the list is not duplicated.
+        if (blocks.length) {
+          setTextBlocks((cur) => {
+            if (pasteIsBack) return cur;
+            const fresh = cur.filter((c) => !blocks.some((b) => b.id === c.id));
+            return [...blocks, ...fresh];
+          });
+        }
       });
     }
     // TRUE means the message left this box, not that it arrived. A send that fails asynchronously
@@ -1131,6 +1329,33 @@ export function ComposeBox({
           </button>
         </div>
       )}
+      {/* COLLAPSED PASTES, in their own row directly above the attachment chips — the same register,
+          and the same place in the box, because a pill and a chip are the same statement ("this is
+          riding along with the next message"). Its own row rather than mixed in with the chips so a
+          46px tile never stretches the chip strip it shares a line with. */}
+      {textBlocks.length > 0 && (
+        <div
+          data-testid="concierge-text-pills"
+          style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}
+        >
+          {textBlocks.map((b) => (
+            <TextPill
+              key={b.id}
+              block={b}
+              variant="tile"
+              onOpen={() => setOpenBlock(b)}
+              onRemove={() => removeTextBlock(b.id)}
+            />
+          ))}
+        </div>
+      )}
+      {openBlock && (
+        <TextPillModal
+          block={openBlock}
+          onClose={() => setOpenBlock(null)}
+          onShowAsText={() => showBlockAsText(openBlock)}
+        />
+      )}
       {attachments.length > 0 && (
         <div
           data-testid="concierge-attachment-chips"
@@ -1284,6 +1509,9 @@ export function ComposeBox({
             aria-activedescendant={pickerOpen && active ? mentionOptionId(active.id) : undefined}
             onChange={(e) => {
               setText(e.target.value);
+              // Deleting everything releases the verbatim latch: an empty box holds nobody's paste.
+              // See heldExpansionRef — the other half of "cleared when emptied" is clear-on-send.
+              if (e.target.value === "") heldExpansionRef.current = false;
               // Read from the DOM, not inferred from the new string: an edit can move the caret
               // anywhere (a paste, a middle-of-word deletion, an IME commit), and the query depends
               // on where it actually landed.
@@ -1303,6 +1531,9 @@ export function ComposeBox({
               ownVoice();
               onKeyDown(e);
             }}
+            // A long paste becomes a pill above the box rather than flooding it (see onPaste). A
+            // short one is left entirely to the browser.
+            onPaste={onPaste}
             // EVERY other way the caret moves: arrowing, clicking into the middle of a word,
             // dragging a selection, ⌘A. React's onSelect on a textarea is the DOM `selectionchange`
             // for this element, so one handler covers all of them — without it, typing `@Bl`, then

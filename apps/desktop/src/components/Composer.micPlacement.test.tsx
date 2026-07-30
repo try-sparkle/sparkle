@@ -83,7 +83,7 @@ describe("Composer — mic placement", () => {
     pasteAsPill(textarea);
 
     // The pill is really there (otherwise this test would pass vacuously).
-    const pill = screen.getByTitle("Click to view the full pasted text");
+    const pill = screen.getByTestId("composer-text-pill");
     const row = micRow(container);
     expect(row.contains(textarea)).toBe(true);
     expect(row.contains(pill)).toBe(false);
@@ -93,7 +93,7 @@ describe("Composer — mic placement", () => {
     const { container } = renderComposer();
     pasteAsPill(screen.getByRole("textbox") as HTMLTextAreaElement);
 
-    const pill = screen.getByTitle("Click to view the full pasted text");
+    const pill = screen.getByTestId("composer-text-pill");
     const row = micRow(container);
     const tileRow = pill.closest("div")!.parentElement!;
     // Siblings under the composer body: tiles first, then the mic/input/send row.

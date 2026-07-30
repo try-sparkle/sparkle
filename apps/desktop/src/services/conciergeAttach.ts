@@ -150,9 +150,17 @@ export async function pickAttachments(kind: ConciergeAttachKind): Promise<Attach
 
 /** What the TARGET receives: the attachments' absolute paths (quoted, space-joined) prefixed to the
  *  typed text — the removed composer's exact payload shape, so an agent reads the files from disk.
- *  Identical on the brain path: the concierge's headless `claude -p` reads paths too. */
+ *  Identical on the brain path: the concierge's headless `claude -p` reads paths too.
+ *
+ *  `verbatimTyped: true` — DO NOT TRIM `text` HERE. This function's input is an ALREADY-FINISHED
+ *  message body handed over by the compose box, not raw typed text, so the trim was redundant for
+ *  every existing caller (the box trims what needs trimming before it reports the send). It stopped
+ *  being merely redundant once a long paste could collapse into a pill: expanding one puts its bytes
+ *  into the body, and this outer trim then stripped a pasted diff's leading indentation and its
+ *  trailing newline — downstream of everything the compose box does to protect them, so the box's
+ *  own care was silently undone one layer up (see composer/attachments.composeBody). */
 export function attachedPayload(text: string, attachments: Attachment[]): string {
-  return buildSendPayload({ attachments, textBlocks: [], typed: text });
+  return buildSendPayload({ attachments, textBlocks: [], typed: text, verbatimTyped: true });
 }
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;

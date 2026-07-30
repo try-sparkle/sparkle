@@ -7,7 +7,12 @@ import {
   buildSendPayload,
   buildDisplay,
   rangeSelect,
+  collapseText,
+  composeBody,
+  expandTextBlock,
+  pillPreview,
   PILL_MIN_LINES,
+  PILL_PREVIEW_CHARS,
   type Attachment,
   type TextBlock,
 } from "./attachments";
@@ -61,6 +66,139 @@ describe("shouldPasteAsPill", () => {
   });
   it("is false for an ordinary single line under the char threshold", () => {
     expect(shouldPasteAsPill("x".repeat(1999))).toBe(false);
+  });
+});
+
+describe("pillPreview", () => {
+  it("leads with the paste's own first words, so a pill is identifiable unopened", () => {
+    expect(pillPreview("Concierge Reply Linter is up\nrest of the brief\nand more")).toBe(
+      "Concierge Reply Linter is up",
+    );
+  });
+
+  it("skips leading blank lines rather than showing an empty face", () => {
+    // A brief pasted out of a chat window very often starts blank. Taking `split("\n")[0]`
+    // would put nothing on the pill — the exact failure the preview exists to prevent.
+    expect(pillPreview("\n\n   \nThe actual first line\nmore")).toBe("The actual first line");
+  });
+
+  it("flattens interior whitespace, because the face is one row of UI", () => {
+    expect(pillPreview("a\t\tb   c\nsecond")).toBe("a b c");
+  });
+
+  it("elides past the budget and marks it, so a long line can't blow out the pill", () => {
+    const preview = pillPreview("x".repeat(PILL_PREVIEW_CHARS + 40));
+    expect(preview).toHaveLength(PILL_PREVIEW_CHARS);
+    expect(preview.endsWith("…")).toBe(true);
+  });
+
+  it("is empty only when there is nothing but whitespace to show", () => {
+    expect(pillPreview("\n\n  \n")).toBe("");
+  });
+});
+
+describe("collapsing is lossless", () => {
+  // The one failure that would silently corrupt a message: a surface transmitting the pill's
+  // LABEL instead of its text. These rows are stated over the shared functions — the RULE, not
+  // any one surface's wiring. They do NOT prove a given compose box calls them: each surface
+  // owes its own end-to-end row at its own send boundary (Composer.collapsedPaste.test.tsx is
+  // the build-agent composer's).
+  const original =
+    "Concierge Reply Linter is up\n\n  indented second line\ttabbed\n" +
+    "line three\nline four\nline five\nline six\n\ntrailing blank above this\n";
+
+  it("captures the paste byte for byte", () => {
+    expect(collapseText("b1", original).text).toBe(original);
+  });
+
+  it("sends the FULL text, not the pill's label", () => {
+    const sent = composeBody([collapseText("b1", original)], "");
+    expect(sent).toBe(original);
+    // And explicitly not the face the pill draws.
+    expect(sent).not.toBe(pillPreview(original));
+  });
+
+  it("expand → SEND is byte-identical — the path the product actually has", () => {
+    // THE REAL ROUND TRIP, and the one that was broken (roborev 55720). "Show as regular text"
+    // moves the bytes out of the block and into the typed text; there is no re-collapse gesture
+    // in the app, so this — not the re-collapse below — is what a user does. Trimming here
+    // dedented a pasted diff and ate its trailing newline.
+    const collapsed = collapseText("b1", original);
+    const expanded = expandTextBlock("", collapsed);
+    expect(expanded).toBe(original);
+    expect(composeBody([], expanded, { verbatimTyped: true })).toBe(original);
+  });
+
+  it("…and the trim is what would have corrupted it, so the flag is doing real work", () => {
+    // Pins the mechanism rather than restating the row above: without `verbatimTyped` this same
+    // string comes back dedented and short its trailing newline. If this row ever stops
+    // differing, the flag has become a no-op and the row above is passing vacuously.
+    const expanded = expandTextBlock("", collapseText("b1", original));
+    expect(composeBody([], expanded)).not.toBe(original);
+    expect(composeBody([], expanded, { verbatimTyped: true })).toBe(original);
+  });
+
+  it("expand → collapse → send is byte-identical too", () => {
+    // 1. Pasted: collapsed to a pill.
+    const collapsed = collapseText("b1", original);
+    // 2. "Show as regular text" in the modal: expanded back into an empty box.
+    const expanded = expandTextBlock("", collapsed);
+    // 3. Re-collapsed (the user pastes it again).
+    const recollapsed = collapseText("b2", expanded);
+    // 4. Sent.
+    expect(composeBody([recollapsed], "")).toBe(original);
+  });
+
+  it("still trims text the user actually TYPED around a pill", () => {
+    // The trim is right for a human's stray whitespace — `verbatimTyped` narrows it, it does not
+    // remove it. (buildDisplay/buildSendPayload's existing rows pin the no-pill case.)
+    expect(composeBody([collapseText("b1", original)], "  typed  ")).toBe(`${original}\n\ntyped`);
+  });
+
+  it("survives the same round trip through the build-agent composer's payload", () => {
+    // buildSendPayload prefixes attachment paths, so assert the no-attachment case where the
+    // payload IS the body — the guarantee is about the text, not the prefix.
+    const collapsed = collapseText("b1", original);
+    const once = buildSendPayload({ attachments: [], textBlocks: [collapsed], typed: "" });
+    const again = buildSendPayload({
+      attachments: [],
+      textBlocks: [collapseText("b2", expandTextBlock("", collapsed))],
+      typed: "",
+    });
+    expect(once).toBe(original);
+    expect(again).toBe(original);
+  });
+
+  it("keeps a whitespace-only block, which `filter(Boolean)` must not eat", () => {
+    // Six newlines clears PILL_MIN_LINES, so this really can become a block. Dropping it would
+    // silently delete content the user pasted.
+    const ws = "\n\n\n\n\n\n";
+    expect(shouldPasteAsPill(ws)).toBe(true);
+    expect(composeBody([collapseText("b1", ws)], "")).toBe(ws);
+  });
+
+  it("does not trim a block's own leading indentation", () => {
+    // A pasted diff's indentation is content. Only the TYPED text is trimmed.
+    const indented = "    line1\n    line2\n    line3\n    line4\n    line5\n    line6";
+    expect(composeBody([collapseText("b1", indented)], "  typed  ")).toBe(`${indented}\n\ntyped`);
+  });
+
+  it("orders blocks before the typed text, blank-line separated", () => {
+    expect(composeBody([collapseText("b1", "A"), collapseText("b2", "B")], "C")).toBe("A\n\nB\n\nC");
+  });
+});
+
+describe("expandTextBlock", () => {
+  it("into an empty box is exactly the block's text", () => {
+    expect(expandTextBlock("", block("a\nb"))).toBe("a\nb");
+  });
+
+  it("appends on its own line when the box already has words", () => {
+    expect(expandTextBlock("hi", block("a\nb"))).toBe("hi\na\nb");
+  });
+
+  it("does not double the newline when the box already ends in one", () => {
+    expect(expandTextBlock("hi\n", block("a"))).toBe("hi\na");
   });
 });
 

@@ -13,7 +13,10 @@ import type { DigestVariant } from "../../services/conciergeDigest";
 // The attachment RECORD is the one the removed AgentPane composer used (components/composer/
 // attachments.ts) — a pure, React-free, Tauri-free model, so importing it here does not break this
 // directory's "presentational only" rule, and it keeps the concierge off a parallel model.
-import type { Attachment } from "../composer/attachments";
+// …and the collapsed-text block for the same reason: `TextBlock` is the one declaration of "a long
+// block of text, carried whole, shown as a pill" (see components/composer/attachments), and a second
+// one here is how a transcript pill and a composer pill would drift about what a block is.
+import type { Attachment, TextBlock } from "../composer/attachments";
 // The header line's per-project shape lives with the component that DERIVES it (ScopeVitals owns
 // the pure text rules the founder's strings are pinned against), and is re-exported here so the
 // column's contract still hands consumers one place to import from.
@@ -113,6 +116,28 @@ export interface ConciergeSparkleMessage {
   /** True once {@link digest} no longer matches the live state. The thread renders it visibly
    *  superseded — a push that is no longer true must LOOK no longer true, not silently lie. */
   stale?: boolean;
+  /**
+   * A long payload this line is ABOUT, carried whole and drawn as a collapsed pill under it.
+   *
+   * WHAT IT IS. Today's producer is the deferred-send reconciliation (`ConciergeHost`'s
+   * `onDeferredSendOutcome`): "CI Hardening is up — I sent your message" is the receipt, and the
+   * relayed brief is the payload. The thread draws the payload as a `TextPill` (variant `inline`)
+   * with the full text one click away, so a 40-row brief costs one row of the column.
+   *
+   * WHY IT IS A SEPARATE FIELD AND NOT MORE `text`. Because those are two different things, and
+   * conflating them IS the bug this field exists to fix. `text` is the RECEIPT SENTENCE — one line
+   * of bookkeeping, rendered as markdown, read out by the live region, capped and persisted as
+   * conversation. The payload is a verbatim blob of the user's own words that must be reproducible
+   * byte for byte and must NOT be spoken or laid out as prose. Interpolating it into `text` is what
+   * pushed the whole conversation off screen (the founder's screenshot) and handed a screen reader
+   * forty rows to read; and it made the standing rule — the concierge must never paste relayed text
+   * back at the user — unenforceable, because the APP was doing the pasting regardless of how the
+   * concierge behaved. Kept apart, the sentence stays a sentence and the payload stays a record.
+   *
+   * `undefined` on an ordinary line, matching `ConciergeUserMessage.attachments`: this thread is
+   * persisted, and an empty field per message buys nothing the absent one doesn't.
+   */
+  collapsed?: TextBlock;
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */

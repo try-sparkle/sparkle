@@ -43,7 +43,8 @@ import { AttachmentRow } from "./composer/AttachmentRow";
 import {
   buildSendPayload,
   buildDisplay,
-  countLines,
+  collapseText,
+  expandTextBlock,
   shouldPasteAsPill,
   type Attachment,
   type TextBlock,
@@ -311,6 +312,8 @@ export function Composer({
     atts: Attachment[];
     blocks: TextBlock[];
     text: string;
+    /** The box held an expanded pill, so `typed` keeps its own bytes. See heldExpansionRef. */
+    verbatim: boolean;
   } | null>(null);
   // True while a native file (e.g. a log) is dragged over the window — drives the drop hint.
   const [dropActive, setDropActive] = useState(false);
@@ -920,14 +923,37 @@ export function Composer({
     const text = e.clipboardData.getData("text/plain");
     if (!shouldPasteAsPill(text)) return; // native paste
     e.preventDefault();
-    setTextBlocks((prev) => [
-      ...prev,
-      { id: nextId("blk"), text, lineCount: countLines(text) },
-    ]);
+    setTextBlocks((prev) => [...prev, collapseText(nextId("blk"), text)]);
   };
 
+  /**
+   * Has this box held an expanded pill since it was last emptied?
+   *
+   * Read at send time to decide whether the typed text may be trimmed (see `composeBody`).
+   * Expanding a pill moves its bytes out of a block and into `value`, where `typed.trim()` would
+   * strip a pasted diff's leading indentation and its trailing newline — a silent corruption of
+   * the user's own text on the exact path the reversibility guarantee is about (roborev 55720).
+   *
+   * A LATCH, NOT A STRING COMPARISON. The first version of this compared `value` to the exact
+   * string the expansion produced, which looked stronger and was in fact broken: the exemption
+   * evaporated on the first keystroke, and EDITING IS THE WHOLE REASON somebody takes "Show as
+   * regular text" (roborev 55728). Because `trim()` strips the LEADING end too, and after an
+   * expansion the leading bytes are the paste's own first line, expand → type one character →
+   * send still arrived dedented. The user's stray whitespace is not what is at the front of that
+   * string; the paste's indentation is.
+   *
+   * Cleared when the box is EMPTIED — by a send, or by the user deleting everything. That is the
+   * honest boundary: an empty box holds nobody's paste, so whatever is typed next is theirs and
+   * gets the ordinary trim.
+   */
+  const heldExpansionRef = useRef(false);
+
   const showBlockAsText = (block: TextBlock) => {
-    setValue((v) => (v ? `${v}${v.endsWith("\n") ? "" : "\n"}${block.text}` : block.text));
+    // Through the shared expand rule rather than an inline copy — the round-trip guarantee
+    // (expand → send is byte-identical) is stated over that one function, so the concierge's
+    // compose box inherits it by calling the same thing.
+    heldExpansionRef.current = true;
+    setValue((v) => expandTextBlock(v, block));
     removeTextBlock(block.id);
     focusQuietly(inputRef?.current);
   };
@@ -945,6 +971,7 @@ export function Composer({
     atts: Attachment[];
     blocks: TextBlock[];
     text: string;
+    verbatim: boolean;
   }) => {
     const prev = pendingSendRef.current;
     pendingSendRef.current = prev
@@ -953,13 +980,30 @@ export function Composer({
           atts: [...prev.atts, ...next.atts],
           blocks: [...prev.blocks, ...next.blocks],
           text: `${prev.text}\n${next.text}`.trim(),
+          // EITHER half being verbatim makes the merged body verbatim: the halves are joined with a
+          // newline, so trimming the pair would strip the leading bytes of the FIRST one — which is
+          // exactly the paste whose indentation the flag exists to protect.
+          verbatim: prev.verbatim || next.verbatim,
         }
       : next;
   };
 
   // Put an undelivered draft back in the box. Prepended (not assigned) so anything the user has
   // typed since the failed send survives too.
-  const restoreDraft = (typed: string, atts: Attachment[], blocks: TextBlock[]) => {
+  //
+  // `verbatim` RE-ARMS THE LATCH, and without it the retry corrupts the text this whole feature is
+  // careful about (roborev 55767). `send` clears heldExpansionRef before delivery, so a draft handed
+  // back here — "your text is back in the box", then the user presses Send again — would go out
+  // trimmed: dedented, trailing newline gone. Unconditional when `verbatim`, because this function
+  // PREPENDS, so the restored value still begins with the paste's own bytes even if the user typed
+  // something meanwhile. The concierge box's counterpart does the same thing at its own restore.
+  const restoreDraft = (
+    typed: string,
+    atts: Attachment[],
+    blocks: TextBlock[],
+    verbatim: boolean,
+  ) => {
+    if (verbatim) heldExpansionRef.current = true;
     setValue((cur) => (cur.trim() ? `${typed}\n${cur}` : typed));
     setAttachments((cur) => [...atts, ...cur]);
     setTextBlocks((cur) => [...blocks, ...cur]);
@@ -980,9 +1024,16 @@ export function Composer({
     typed: string,
     atts: Attachment[],
     blocks: TextBlock[],
-    { allowRestart = true }: { allowRestart?: boolean } = {},
+    { allowRestart = true, verbatim = false }: { allowRestart?: boolean; verbatim?: boolean } = {},
   ) => {
-    const payload = buildSendPayload({ attachments: atts, textBlocks: blocks, typed });
+    // `verbatimTyped` — this box has held an expanded pill, so its text keeps its own bytes instead
+    // of being trimmed. See heldExpansionRef.
+    const payload = buildSendPayload({
+      attachments: atts,
+      textBlocks: blocks,
+      typed,
+      verbatimTyped: verbatim,
+    });
     const display = buildDisplay({ attachments: atts, textBlocks: blocks, typed });
     const naming = typed.trim();
     // Deliver FIRST, and only record history once the prompt has actually landed. Recording up
@@ -996,7 +1047,7 @@ export function Composer({
         // ask the parent to respawn: the preparing→ready flush effect delivers it on the new PTY,
         // so "send to a stopped agent" just works instead of vanishing.
         //
-        queuePendingSend({ typed, atts, blocks, text: naming });
+        queuePendingSend({ typed, atts, blocks, text: naming, verbatim });
         log.warn("composer", "send hit a dead PTY — restarting agent and re-queueing", {
           agentId,
           chars: naming.length,
@@ -1006,12 +1057,12 @@ export function Composer({
       } else if (e instanceof PtyGoneError) {
         // The restart didn't take (this is the retry). Stop, and hand the text back — the user is
         // told the truth instead of watching a queue nobody will drain.
-        restoreDraft(typed, atts, blocks);
+        restoreDraft(typed, atts, blocks, verbatim);
         log.error("composer", "send hit a dead PTY again after restart — giving up", { agentId });
         setDeliveryNotice("Couldn't reach that agent, even after restarting it. Your text is back in the box.");
       } else {
         // Unknown failure: hand the text back rather than swallowing it.
-        restoreDraft(typed, atts, blocks);
+        restoreDraft(typed, atts, blocks, verbatim);
         log.error("composer", "send failed — draft restored", {
           agentId,
           error: String((e as { message?: string })?.message ?? e),
@@ -1048,9 +1099,16 @@ export function Composer({
     // users always pass. When blocked, AuthGate's TrialChrome overlay is already visible (it shows
     // on the same `blocked` flag), so this is defense-in-depth, not a silent dead-end.
     if (!trialSendAllowed()) return;
+    // READ BEFORE THE CLEAR, and passed down as a value rather than read again inside
+    // deliverPrompt: the clear below runs first and delivery happens after it (and a queued send is
+    // delivered much later still), so reading the ref at payload-build time would always see false.
+    const verbatim = heldExpansionRef.current;
     setValue("");
     setAttachments([]);
     setTextBlocks([]);
+    // The box is empty again, so it no longer holds anybody's paste — whatever is typed next is the
+    // user's own and gets the ordinary trim.
+    heldExpansionRef.current = false;
     // The draft is gone — snap the box back to its regular rest height so a long message doesn't
     // leave it sitting tall (clears any manual sizing too). Send is unreachable while minimized,
     // so this never fights the keep-minimized exception.
@@ -1059,7 +1117,7 @@ export function Composer({
     // any already queued so nothing is lost) and let the flush effect deliver it the instant the PTY
     // is ready — so the user could compose immediately instead of waiting on the workspace spin-up.
     if (preparing) {
-      queuePendingSend({ typed, atts, blocks, text });
+      queuePendingSend({ typed, atts, blocks, text, verbatim });
       log.info("composer", "queue prompt (agent starting)", {
         agentId,
         chars: text.length,
@@ -1074,7 +1132,7 @@ export function Composer({
       attachments: atts.length,
       textBlocks: blocks.length,
     });
-    await deliverPrompt(typed, atts, blocks);
+    await deliverPrompt(typed, atts, blocks, { verbatim });
     // Learn from a real typed action so the suggestion history reflects what the user actually
     // does in this terminal state. Only log when suggestions were on offer (the agent is waiting
     // on the user) so ordinary mid-turn messages don't pollute the history.
@@ -1105,7 +1163,10 @@ export function Composer({
     });
     // allowRestart:false — this IS the post-restart retry. If the respawned PTY is dead too, give
     // up and hand the text back rather than restarting again (and again).
-    void deliverPrompt(queued.typed, queued.atts, queued.blocks, { allowRestart: false });
+    void deliverPrompt(queued.typed, queued.atts, queued.blocks, {
+      allowRestart: false,
+      verbatim: queued.verbatim,
+    });
     // deliverPrompt is a fresh closure each render but reads only its args + stable refs; re-running
     // this on its identity would risk a double-flush, so key it solely on the preparing transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1606,6 +1667,10 @@ export function Composer({
               value={value}
               onChange={(e) => {
                 setValue(e.target.value);
+                // Deleting everything releases the verbatim latch: an empty box holds nobody's
+                // paste. See heldExpansionRef — this is the other half of "cleared when emptied",
+                // the first being the clear-on-send.
+                if (e.target.value === "") heldExpansionRef.current = false;
                 setGhostDismissed(false); // a fresh edit re-enables suggestions
                 syncCaret();
               }}

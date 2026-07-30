@@ -20,18 +20,30 @@ export interface Attachment {
 }
 
 /** A large pasted block, collapsed into a clickable pill instead of flooding the
- *  textarea. On send its full `text` is expanded inline into the payload. */
+ *  textarea. On send its full `text` is expanded inline into the payload.
+ *
+ *  `text` IS THE ORIGINAL, BYTE FOR BYTE. Nothing in this module trims, normalises or
+ *  re-wraps it, and nothing may start to: collapsing is a display decision, and the one
+ *  guarantee the whole feature rests on is that what leaves a compose surface is what the
+ *  user pasted into it. See {@link composeBody} for where that is cashed in and
+ *  attachments.test.ts's round-trip for the assertion that pins it. */
 export interface TextBlock {
   id: string;
   text: string;
   lineCount: number;
 }
 
-/** "More than five lines" → a paste of six or more lines becomes a pill. */
+/** "More than five lines" → a paste of six or more lines becomes a pill.
+ *
+ *  A NAMED CONSTANT because the founder picked the number loosely ("let's say five rows"),
+ *  so it is a tuning knob rather than a fact — and a literal `6` sprinkled across a paste
+ *  handler, a pill's copy and three tests is how a loose number becomes unchangeable. */
 export const PILL_MIN_LINES = 6;
 /** …and a very large single-/few-line paste pills too, so an enormous one-liner (a
  *  base64 blob, a minified line) doesn't flood the textarea. */
 export const PILL_MIN_CHARS = 2000;
+/** How much of the first line goes on a pill's face. See {@link pillPreview}. */
+export const PILL_PREVIEW_CHARS = 60;
 
 // HEIC is intentionally excluded: Chromium WebViews can't render it in an <img>/data
 // URL, so a HEIC drop falls through to a (downloadable) file tile rather than showing a
@@ -47,6 +59,85 @@ export function countLines(text: string): number {
 
 export function shouldPasteAsPill(text: string): boolean {
   return countLines(text) >= PILL_MIN_LINES || text.length >= PILL_MIN_CHARS;
+}
+
+/**
+ * The identifying line on a collapsed pill's face.
+ *
+ * A PILL MUST BE READABLE WITHOUT BEING OPENED. Two pills both reading "Pasted text · 41
+ * lines" are worse than the three visible rows they replaced, because finding the one you
+ * meant then costs a modal each — so the pill leads with the paste's own first words and
+ * keeps the count as the subtitle, not the headline.
+ *
+ * Takes the first NON-BLANK line: a brief pasted out of a chat window or an editor very often
+ * starts with a blank line or a heading rule, and a pill whose face is empty is the exact
+ * failure this function exists to prevent. Interior whitespace is flattened because the face
+ * is one row of UI, so a tab in the source would otherwise open a gap in the middle of it.
+ */
+export function pillPreview(text: string): string {
+  const line = text.split("\n").find((l) => l.trim() !== "") ?? "";
+  const flat = line.trim().replace(/\s+/g, " ");
+  return flat.length > PILL_PREVIEW_CHARS ? `${flat.slice(0, PILL_PREVIEW_CHARS - 1)}…` : flat;
+}
+
+/** Capture a paste as a collapsed block — the ONE place a `TextBlock` is built, so every
+ *  surface's pill carries the same verbatim text and the same line count. */
+export function collapseText(id: string, text: string): TextBlock {
+  return { id, text, lineCount: countLines(text) };
+}
+
+/**
+ * "Show as regular text": put a collapsed block's full text back into a compose box.
+ *
+ * The ONE expand rule, shared by both compose surfaces. Appended on its own line when there
+ * is already something in the box, and into an EMPTY box it is the block's text and nothing
+ * else — which is the case the round-trip guarantee is stated over (expand → collapse → send
+ * is byte-identical to the paste).
+ */
+export function expandTextBlock(current: string, block: TextBlock): string {
+  if (!current) return block.text;
+  return `${current}${current.endsWith("\n") ? "" : "\n"}${block.text}`;
+}
+
+/**
+ * The message body a compose surface sends: every collapsed block's FULL text, in order,
+ * followed by whatever was typed around them. Blank-line separated.
+ *
+ * THIS IS WHERE COLLAPSING IS PROVEN LOSSLESS, and it is one function on purpose: it exists so
+ * that a second compose surface cannot grow its own idea of what a pill expands to — and the
+ * failure that would be silent is precisely a surface transmitting a pill's
+ * LABEL instead of its text. A block's text is interpolated untouched (never trimmed: a
+ * pasted diff's leading indentation is content), so a lone block in an empty box comes out
+ * of here byte-identical to what was pasted in.
+ *
+ * ── `verbatimTyped`, AND WHY THE TRIM IS NOT UNCONDITIONAL ────────────────────────────────
+ * `typed.trim()` is right for text a human typed: a stray trailing newline should not ride
+ * into an agent's terminal. It is WRONG for text that got into the box by expanding a pill,
+ * and that is not a hypothetical — it is the second half of the round trip the whole feature
+ * promises. "Show as regular text" moves a block's bytes into the box, where they stop being
+ * a block and become `typed`; trimming them there strips exactly what a block is careful to
+ * preserve. A pasted diff indented four spaces, expanded and sent, arrived dedented and with
+ * its trailing newline gone (roborev 55720) — a silent corruption of the user's own text, on
+ * the one path the reversibility guarantee is about.
+ *
+ * So the caller says when the typed text HAS BEEN THROUGH A PILL EXPANSION. It may have been
+ * freely edited since — editing is why anyone expands a pill — and it is still the paste's own
+ * bytes at the front, which is the whole reason the leading trim must not run.
+ *
+ * IT IS A LATCH THE CALLER HOLDS, NOT A BYTE COMPARISON, and that distinction is the finding
+ * this doc exists to stop someone re-deriving. The first version of the rule compared the box's
+ * text to the exact string `expandTextBlock` returned, which reads as stronger and is broken:
+ * the exemption evaporated on the first keystroke, so expand → type one character → send still
+ * arrived dedented (roborev 55728). A fourth surface wired through this function must take the
+ * latch, not the comparison.
+ */
+export function composeBody(
+  textBlocks: TextBlock[],
+  typed: string,
+  { verbatimTyped = false }: { verbatimTyped?: boolean } = {},
+): string {
+  const body = verbatimTyped ? typed : typed.trim();
+  return [...textBlocks.map((b) => b.text), body].filter(Boolean).join("\n\n");
 }
 
 /** True when the path's extension is a known raster image type (case-insensitive).
@@ -70,6 +161,9 @@ interface ComposeInput {
   attachments: Attachment[];
   textBlocks: TextBlock[];
   typed: string;
+  /** This text has been through a pill expansion (possibly edited since) and must not be trimmed —
+   *  a latch the compose box holds, never a byte comparison. See {@link composeBody}. */
+  verbatimTyped?: boolean;
 }
 
 /** What the CLI receives: attachment paths (space-joined, read from disk by the agent)
@@ -83,9 +177,17 @@ interface ComposeInput {
  *  at a live bash/zsh prompt — and `submitPrompt` appends its own carriage return, so it RUNS with
  *  no user Enter. See services/shellQuote for the rule and what the old double-quoting let through
  *  (roborev 54375). */
-export function buildSendPayload({ attachments, textBlocks, typed }: ComposeInput): string {
+export function buildSendPayload({
+  attachments,
+  textBlocks,
+  typed,
+  verbatimTyped,
+}: ComposeInput): string {
   const paths = attachments.map((a) => shellQuotePath(a.path));
-  const body = [...textBlocks.map((b) => b.text), typed.trim()].filter(Boolean).join("\n\n");
+  // Through `composeBody`, not a second copy of its join — the concierge's compose box needs the
+  // same body without the path prefix, and two expansion rules is how one surface ends up
+  // transmitting a pill's label (see composeBody).
+  const body = composeBody(textBlocks, typed, { verbatimTyped });
   return [...paths, body].filter(Boolean).join(" ");
 }
 
