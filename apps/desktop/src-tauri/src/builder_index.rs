@@ -9,9 +9,24 @@
 //! WHAT LEAVES THE MACHINE (and nothing else):
 //!   • one row per (calendar day, model): five token counters + an estimated cost
 //!   • the username the user typed and a per-machine `client_id`
+//!   • aggregate session activity: tool-call counts per CATEGORY, subagent-dispatch and plan-mode
+//!     counts, session counts, and the NAMES of skills invoked — see [`SessionStats`]
 //! There are no file paths, no project or session names, no prompts, no code, no keys — the
 //! rollup below is built from [`crate::spend::UsageRecord`] and structurally cannot carry them
-//! (a record's `project`/`session` fields are dropped by [`rollup`], not merely omitted).
+//! (a record's `project`/`session` fields are dropped by [`rollup`], not merely omitted). The
+//! activity half is counters plus skill names; it never carries a tool's ARGUMENTS, so a Bash
+//! command, an edited path and a prompt cannot ride along inside it either.
+//!
+//! WHY THE ACTIVITY HALF EXISTS. Reporting tokens natively fixed the token undercount but left the
+//! profile's SUBAGENTS/SESSION, PLAN MODE and TOOL MIX panels sourced from the community indexer,
+//! which showed 0.0 subagents/session and 0% plan mode for a machine running a large agent fleet.
+//! Three measured causes, in order of size — the blind spot in this module's header is the SMALLEST
+//! of them, so read `spend.rs`'s "session activity" header before assuming a wider scan is the fix:
+//!   1. the fleet's real fan-out is an MCP tool the community metric does not count as a subagent;
+//!   2. its denominator pools ~87% one-shot automation sessions with interactive ones;
+//!   3. and it never saw the account stores.
+//! [`rollup_activity`] fixes all three off the scan `spend.rs` already does, and OMITS any metric it
+//! cannot compute completely rather than publishing a zero.
 //!
 //! WHY IT'S NATIVE. The community pipeline (tkmx-client + agentsview) UNDERREPORTED this machine
 //! by ~84% (verified 2026-07-24: ~12.6B tokens/7d actual vs 2.03B on the profile), because
@@ -27,7 +42,25 @@
 //!     data: [ { date: "YYYY-MM-DD",
 //!               modelBreakdowns: [ { modelName, inputTokens, outputTokens,
 //!                                    cacheCreationTokens, cacheReadTokens, totalTokens,
-//!                                    cost?, source } ] } ] }
+//!                                    cost?, source } ] } ],
+//!     session_stats?: { schema_version, source, window, adoption?, tool_mix? } }
+//! `session_stats` is an EXISTING field of that protocol (tkmx-client reporter/session-stats.ts
+//! forwards the community indexer's blob in it verbatim), which is why the activity metrics need no
+//! wire-protocol change and no coordination with the server operator. It is optional in both
+//! directions: tkmx-client omits it when it cannot collect one, and so do we.
+//!
+//! COEXISTENCE — TWO WRITERS, LAST ONE WINS, AND WE CANNOT ARBITRATE IT. `session_stats` is replaced
+//! WHOLESALE server-side, and the community launch agent (`com.token-tracking.reporter`,
+//! `StartInterval` 7200) posts its own blob for the same username on this machine. So while both run,
+//! the three panels alternate between two denominators every couple of hours — ours (~1.57
+//! subagents/interactive session) and the community one (~0.03 over every transcript). `source` is a
+//! LABEL, not a lock; nothing here can stop the overwrite. Two consequences we DO control:
+//!   • the blob is a SUPERSET of the community shape, never a lossy replacement — `totals` at the
+//!     top level and RFC-3339 `window.since`/`until`, so whichever writer lands last, no field the
+//!     panel reads goes missing (roborev 55761);
+//!   • the fix for the flapping is environmental, not code: set `REPORT_SESSION_STATS=false` for the
+//!     community reporter while Sparkle reports natively. That is a change to the USER's launch
+//!     agent, so this module does not make it silently — it is called out for the operator instead.
 //! The server's primary key is (username, date, model, client_id, source), so `client_id` must be
 //! STABLE per machine or every re-derivation double-counts the overlapping days on the profile.
 //! We derive it exactly as the reference client does — sha256(machine_id | username), first 32
@@ -426,7 +459,97 @@ pub struct ReportBody {
     pub client_version: String,
     pub report_days: u32,
     pub data: Vec<DailyUsage>,
+    /// The SUBAGENTS/SESSION, PLAN MODE and TOOL MIX panels. OMITTED — never sent as zeroes —
+    /// whenever the scan cannot support them; see [`rollup_activity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_stats: Option<SessionStats>,
 }
+
+/// The window a [`SessionStats`] blob describes, so a reader never has to infer it.
+///
+/// `since`/`until` are RFC-3339, matching the community blob's shape rather than this module's
+/// `YYYY-MM-DD` day labels. The server REPLACES `session_stats` wholesale, so a Sparkle post that
+/// dropped or re-typed a field the community blob carries would be a LOSSY replacement of it — the
+/// panel would lose data every time we won the race. Superset, not substitute. (roborev 55761)
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StatsWindow {
+    pub days: u32,
+    /// Start of the first day in the window, UTC.
+    pub since: String,
+    /// End of the last day in the window, UTC.
+    pub until: String,
+}
+
+/// Session counts, at the blob's TOP LEVEL rather than inside [`Adoption`].
+///
+/// Deliberately not nested under `adoption`: that field is dropped when there is no interactive
+/// session, and tkmx-client reads `ss.totals?.sessions_all` (reporter/report.ts) independently of
+/// any rate. Nesting the counts would make them vanish exactly when someone is asking "did this
+/// machine do anything at all?". (roborev 55761)
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StatsTotals {
+    pub sessions_all: u64,
+    /// Sessions a person drove — the denominator behind [`Adoption`]'s rates.
+    pub sessions_human: u64,
+    /// One-shot programmatic invocations (roborev reviews, hook probes, naming calls).
+    pub sessions_automation: u64,
+}
+
+/// Per-session adoption rates.
+///
+/// The rates come with their own numerators and denominators. That is not redundancy: a bare
+/// `0.031` is precisely the number nobody on this machine could explain, and the counts are what
+/// let a reader (or a future agent) audit it instead of re-deriving it from scratch.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Adoption {
+    pub subagents_per_session: f64,
+    pub plan_mode_rate: f64,
+    pub distinct_skills: u64,
+    /// Which population the two rates are over. Spelled out because it is NOT the community
+    /// indexer's denominator — see [`rollup_activity`].
+    pub denominator: &'static str,
+    pub sessions_interactive: u64,
+    pub sessions_total: u64,
+    pub subagent_dispatches: u64,
+    pub plan_mode_sessions: u64,
+}
+
+/// Tool calls by category. Category names mirror the community indexer's so the panel renders.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolMix {
+    pub by_category: std::collections::BTreeMap<String, u64>,
+    pub total_calls: u64,
+}
+
+/// The `session_stats` blob — the field tkmx-server already reads for these three panels.
+///
+/// Sparkle sends it in the EXISTING protocol slot rather than inventing new top-level keys, so
+/// nothing here needs the server operator to ship a change first.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionStats {
+    /// Matches the community blob's version so the server parses this as the shape it knows.
+    pub schema_version: u32,
+    /// Tells the operator these numbers came from Sparkle's all-accounts scan, not from
+    /// `agentsview`. Without it a corrected rate is indistinguishable from a miscomputed one.
+    ///
+    /// NOTE it does NOT arbitrate the write. See the module header's coexistence warning: `source`
+    /// is a label, not a lock.
+    pub source: &'static str,
+    pub window: StatsWindow,
+    /// Always present — see [`StatsTotals`] for why it is not nested under `adoption`.
+    pub totals: StatsTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<Adoption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_mix: Option<ToolMix>,
+}
+
+/// What [`SessionStats::source`] carries.
+const STATS_SOURCE: &str = "-accounts";
+
+/// The denominator label. `interactive_sessions` = transcripts with ≥2 typed user turns; see
+/// `spend::FileActivity::is_interactive` for why that threshold and what it measured.
+const STATS_DENOMINATOR: &str = "interactive_sessions";
 
 // ── rollup (pure) ───────────────────────────────────────────────────────────────────────────
 
@@ -513,6 +636,97 @@ pub fn rollup<'a>(
     out
 }
 
+/// Build the `session_stats` blob, or `None` when this scan cannot honestly support one.
+///
+/// THE OMISSION RULE, which is the point of this function. An undercount presented confidently is
+/// worse than a gap — a ~84% one sat on this profile looking authoritative for weeks. So every
+/// metric here is either complete or ABSENT; none is ever emitted as a zero:
+///
+///   • `truncated` (the scan hit `MAX_FILES`) ⇒ the WHOLE blob is dropped. A capped scan has an
+///     unknown denominator, and a rate over an unknown denominator is not a smaller number, it is a
+///     meaningless one. This is stricter than the token half, which posts a capped total with a
+///     PARTIAL label — a token count is still a valid lower bound, a rate is not.
+///   • no interactive sessions ⇒ `adoption` is dropped (division by zero has no honest value) while
+///     `tool_mix` survives, because a mix is a proportion of work actually seen, not a per-session
+///     rate.
+///   • no tool calls at all ⇒ `tool_mix` is dropped.
+///   • nothing left to say ⇒ `None`, so the key never appears in the payload.
+///
+/// THE DENOMINATOR IS DELIBERATELY NOT THE COMMUNITY INDEXER'S. It counts every transcript, 87% of
+/// which are one-shot automation on this machine, which is what divided these rates by ~7.5. Ours is
+/// interactive sessions only, labelled as such in [`Adoption::denominator`], with both counts sent
+/// alongside. The consequence to be honest about: these rates are NOT directly comparable to a
+/// profile whose numbers came from the community indexer.
+///
+/// Pure: no clock, no filesystem, no network.
+pub fn rollup_activity(
+    totals: &crate::spend::ActivityTotals,
+    truncated: bool,
+    days: u32,
+    today: i64,
+) -> Option<SessionStats> {
+    if truncated {
+        return None;
+    }
+
+    let adoption = (totals.sessions_interactive > 0).then(|| {
+        let denom = totals.sessions_interactive as f64;
+        Adoption {
+            subagents_per_session: totals.subagent_dispatches as f64 / denom,
+            plan_mode_rate: totals.plan_mode_sessions as f64 / denom,
+            distinct_skills: totals.distinct_skills,
+            denominator: STATS_DENOMINATOR,
+            sessions_interactive: totals.sessions_interactive,
+            sessions_total: totals.sessions_total,
+            subagent_dispatches: totals.subagent_dispatches,
+            plan_mode_sessions: totals.plan_mode_sessions,
+        }
+    });
+
+    let tool_mix = (totals.total_calls > 0).then(|| ToolMix {
+        by_category: totals
+            .by_category
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect(),
+        total_calls: totals.total_calls,
+    });
+
+    // NOTHING LEFT TO SAY ⇒ `None`. This was briefly relaxed to also publish a counts-only blob
+    // (window + totals) whenever any session existed. That was a REGRESSION against the superset
+    // rule this very function documents: `session_stats` is replaced WHOLESALE and the community
+    // reporter writes the same key, so posting a stripped blob DELETES its `adoption` and `tool_mix`
+    // and blanks all three panels until that reporter's next 2h tick. Omitting the key leaves the
+    // existing blob untouched, which is strictly better than overwriting it with less. A light or
+    // chat-only install is exactly the case that hit this. (roborev 55829)
+    if adoption.is_none() && tool_mix.is_none() {
+        return None;
+    }
+
+    let window = days.clamp(1, MAX_REPORT_DAYS);
+    let first_day = today - (window as i64 - 1);
+    Some(SessionStats {
+        schema_version: 1,
+        source: STATS_SOURCE,
+        window: StatsWindow {
+            days: window,
+            // Whole UTC days: the scan's mtime cutoff is the START of `first_day`, and it includes
+            // everything written up to the end of `today`.
+            since: format!("{}T00:00:00Z", crate::spend::epoch_day_label(first_day)),
+            until: format!("{}T23:59:59Z", crate::spend::epoch_day_label(today)),
+        },
+        totals: StatsTotals {
+            sessions_all: totals.sessions_total,
+            sessions_human: totals.sessions_interactive,
+            sessions_automation: totals
+                .sessions_total
+                .saturating_sub(totals.sessions_interactive),
+        },
+        adoption,
+        tool_mix,
+    })
+}
+
 /// The `last_status` line for a successful post. Pure so BOTH branches are testable — the PARTIAL
 /// wording is the whole point of propagating `truncated`, and building it inline inside
 /// `report_once_sync` left it unreachable from a test. (roborev 47904/47899)
@@ -520,9 +734,13 @@ pub fn posted_status(rows: usize, days: usize, truncated: bool) -> String {
     let base = format!("Reported {rows} row(s) across {days} day(s).");
     if truncated {
         // Say so out loud. "Reported N rows" over a capped scan is how a number ends up 84% low
-        // and nobody notices.
+        // and nobody notices. The activity metrics are named too, because "absent" is only honest
+        // if the user can tell absent from zero — a silently missing panel reads as "I have no
+        // subagents", which is the misreading this whole change exists to end.
         format!(
-            "{base} PARTIAL — the transcript scan hit its file cap, so this understates your usage."
+            "{base} PARTIAL — the transcript scan hit its file cap, so this understates your usage. \
+             Subagent, plan-mode and tool-mix stats were omitted rather than published over an \
+             incomplete scan."
         )
     } else {
         base
@@ -703,13 +921,15 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
     let client_id = ensure_client_id(&app_data, &mut state);
     let scan = crate::spend::load_window_records(Some(&app_data), window);
     let data = rollup(scan.records(), scan.today, window);
+    let session_stats = rollup_activity(&scan.activity(), scan.truncated, window, scan.today);
     let rows = row_count(&data);
     let days = data.len();
     if scan.truncated {
         tracing::warn!(
             rows,
             days,
-            "builder index: transcript scan hit its file cap — this report is PARTIAL"
+            "builder index: transcript scan hit its file cap — this report is PARTIAL, and the \
+             session-activity metrics are OMITTED rather than published over an unknown denominator"
         );
     }
 
@@ -722,6 +942,7 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
         client_version: client_version(),
         report_days: window,
         data,
+        session_stats,
     };
     // An empty `data: []` is still POSTed rather than short-circuited. That matches the reference
     // client (which falls through on an inactive day on purpose) and it is the only signal the
@@ -1325,6 +1546,9 @@ mod tests {
             client_version: "sparkle-desktop/0.0.0".into(),
             report_days: 7,
             data: rollup([rec(0, "claude-opus-5", "a", 100, 10)].iter(), today(), 7),
+            // Absent here so the base key set stays the frozen one; the `session_stats` shape has
+            // its own tests, and `an_omitted_session_stats_key_is_absent_not_null` covers this half.
+            session_stats: None,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
 
@@ -1384,6 +1608,23 @@ mod tests {
             client_version: client_version(),
             report_days: 7,
             data: data.clone(),
+            // Carried through the privacy check too: the activity blob is the newest thing that
+            // could leak, and it is built from the SAME records whose session/project labels must
+            // not escape. A skill name is the only string it may contain.
+            session_stats: rollup_activity(
+                &crate::spend::ActivityTotals {
+                    sessions_total: 9,
+                    sessions_interactive: 4,
+                    subagent_dispatches: 6,
+                    plan_mode_sessions: 1,
+                    by_category: [("Bash", 10u64), ("Task", 6)].into_iter().collect(),
+                    total_calls: 16,
+                    distinct_skills: 2,
+                },
+                false,
+                7,
+                today(),
+            ),
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("a-private-project-name"), "{json}");
@@ -1405,6 +1646,7 @@ mod tests {
             client_version: "v".into(),
             report_days: 7,
             data: vec![],
+            session_stats: None,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         for k in ["tools", "projects", "communities", "about", "hn_username", "demo_video_url"] {
@@ -1855,6 +2097,16 @@ mod tests {
         assert!(partial.starts_with("Reported 3 row(s) across 2 day(s)."));
         assert!(partial.contains("PARTIAL"));
         assert!(partial.contains("understates your usage"));
+        // A capped scan drops the activity metrics (see `rollup_activity`), and the status line has
+        // to SAY that — an absent panel the user can't distinguish from a zero teaches the same
+        // wrong thing the zero did.
+        assert!(partial.contains("omitted"), "{partial}");
+        assert!(
+            partial.contains("Subagent") && partial.contains("plan-mode"),
+            "{partial}"
+        );
+        // The clean path stays clean: no scary omission text when nothing was omitted.
+        assert!(!posted_status(3, 2, false).contains("omitted"));
     }
 
     #[test]
@@ -1889,6 +2141,241 @@ mod tests {
         );
         // read_api_key's validation is the same predicate the write path uses.
         assert!(validate_api_key("abc\ndef").is_err());
+    }
+
+    // ── session_stats (the SUBAGENTS / PLAN MODE / TOOL MIX panels) ───────────────────────
+
+    /// A representative rollup: 21 transcripts, 1 of them interactive, which is the shape this
+    /// machine actually has (96% one-shot automation).
+    fn totals() -> crate::spend::ActivityTotals {
+        crate::spend::ActivityTotals {
+            sessions_total: 21,
+            sessions_interactive: 4,
+            subagent_dispatches: 6,
+            plan_mode_sessions: 1,
+            by_category: [("Bash", 40u64), ("Task", 6), ("Read", 4)]
+                .into_iter()
+                .collect(),
+            total_calls: 50,
+            distinct_skills: 3,
+        }
+    }
+
+    /// THE metric fix, asserted as the difference between the two denominators.
+    ///
+    /// Not written as `assert_eq!(rate, 1.5)` alone: that passes for the wrong denominator if the
+    /// fixture happens to divide evenly. It asserts the published rate equals dispatches over
+    /// INTERACTIVE sessions and is strictly greater than dispatches over every transcript — the
+    /// pooling that turned a real 1.5 into a displayed 0.0.
+    #[test]
+    fn the_subagent_rate_is_over_interactive_sessions_not_every_transcript() {
+        let t = totals();
+        let s = rollup_activity(&t, false, 7, today()).expect("stats");
+        let a = s.adoption.expect("adoption");
+
+        assert_eq!(a.subagents_per_session, 6.0 / 4.0);
+        let pooled = t.subagent_dispatches as f64 / t.sessions_total as f64;
+        assert!(
+            a.subagents_per_session > pooled,
+            "the interactive denominator must not be the pooled one ({} vs {pooled})",
+            a.subagents_per_session
+        );
+        // Rounded for display, the pooled rate is the 0.0 on the profile and ours is not.
+        assert_eq!(format!("{pooled:.1}"), "0.3");
+        assert_eq!(format!("{:.1}", a.subagents_per_session), "1.5");
+
+        assert_eq!(a.plan_mode_rate, 1.0 / 4.0);
+        // Both counts ride along so the rate is auditable rather than merely asserted.
+        assert_eq!(a.sessions_interactive, 4);
+        assert_eq!(a.sessions_total, 21);
+        assert_eq!(a.subagent_dispatches, 6);
+        assert_eq!(a.plan_mode_sessions, 1);
+        assert_eq!(a.denominator, "interactive_sessions");
+    }
+
+    /// A capped scan has an unknown denominator, so the blob is dropped WHOLE. Stricter than the
+    /// token half on purpose: a truncated token count is still a valid lower bound, a truncated rate
+    /// is not a smaller number but a meaningless one.
+    #[test]
+    fn a_truncated_scan_omits_session_stats_entirely_rather_than_publishing_a_rate() {
+        assert!(
+            rollup_activity(&totals(), true, 7, today()).is_none(),
+            "a capped scan must publish no activity metric at all"
+        );
+        // And the omission reaches the wire as an ABSENT key, not a null.
+        let body = ReportBody {
+            username: "someone".into(),
+            team: "default".into(),
+            client_id: "abc".into(),
+            client_version: "v".into(),
+            report_days: 7,
+            data: vec![],
+            session_stats: rollup_activity(&totals(), true, 7, today()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("session_stats"), "{json}");
+    }
+
+    /// No interactive session ⇒ no honest denominator ⇒ `adoption` is absent. `tool_mix` survives,
+    /// because a mix is a proportion of work actually observed rather than a per-session rate.
+    #[test]
+    fn without_an_interactive_session_adoption_is_absent_but_tool_mix_survives() {
+        let t = crate::spend::ActivityTotals {
+            sessions_interactive: 0,
+            subagent_dispatches: 0,
+            plan_mode_sessions: 0,
+            ..totals()
+        };
+        let s = rollup_activity(&t, false, 7, today()).expect("tool_mix still worth sending");
+        assert!(
+            s.adoption.is_none(),
+            "a 0/0 rate must be ABSENT, never published as 0.0 — that zero is the whole bug"
+        );
+        let mix = s.tool_mix.as_ref().expect("tool mix");
+        assert_eq!(mix.total_calls, 50);
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("adoption"), "absent, not null: {json}");
+        assert!(json.contains("tool_mix"), "{json}");
+
+        // THE POINT of putting `totals` at the top level: the session counts must survive the very
+        // case that drops `adoption`. Nested under it, they would vanish exactly when a reader is
+        // asking "did this machine do any work at all?" — and tkmx-client reads
+        // `ss.totals?.sessions_all` independently of any rate. (roborev 55761)
+        assert_eq!(s.totals.sessions_all, 21);
+        assert_eq!(s.totals.sessions_human, 0);
+        assert_eq!(s.totals.sessions_automation, 21);
+        assert!(json.contains("sessions_all"), "counts must outlive adoption: {json}");
+    }
+
+    /// Nothing observed at all ⇒ the key never appears, rather than a blob of zeroes that would
+    /// read on the profile as "this machine does no tool work".
+    #[test]
+    fn a_scan_with_nothing_to_report_omits_the_key_instead_of_publishing_zeroes() {
+        let empty = crate::spend::ActivityTotals::default();
+        assert!(rollup_activity(&empty, false, 7, today()).is_none());
+
+        // A window with sessions but no tool calls drops tool_mix specifically.
+        let quiet = crate::spend::ActivityTotals {
+            sessions_total: 5,
+            sessions_interactive: 2,
+            ..Default::default()
+        };
+        let s = rollup_activity(&quiet, false, 7, today()).expect("adoption is still real");
+        assert!(s.tool_mix.is_none(), "no calls ⇒ no mix");
+        assert_eq!(s.adoption.expect("adoption").subagents_per_session, 0.0);
+    }
+
+    /// The keys the three panels read, frozen the way the token rows are. A rename is invisible at
+    /// runtime — the server ignores unknown keys — so this test is what stands between a typo and a
+    /// panel that silently stays wrong.
+    #[test]
+    fn session_stats_serializes_the_keys_the_panels_read() {
+        let s = rollup_activity(&totals(), false, 7, today()).expect("stats");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort();
+        assert_eq!(
+            top,
+            vec!["adoption", "schema_version", "source", "tool_mix", "totals", "window"]
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["source"], "-accounts");
+        assert_eq!(v["window"]["days"], 7);
+        // RFC-3339 both ends, matching the community blob rather than this module's day labels —
+        // the server replaces the blob wholesale, so a re-typed field is a lossy replacement.
+        assert_eq!(v["window"]["until"], "2026-07-24T23:59:59Z");
+        assert_eq!(v["window"]["since"], "2026-07-18T00:00:00Z");
+        // Session counts live at the TOP level, not inside the droppable `adoption`.
+        assert_eq!(v["totals"]["sessions_all"], 21);
+        assert_eq!(v["totals"]["sessions_human"], 4);
+        assert_eq!(v["totals"]["sessions_automation"], 17);
+
+        let mut ad: Vec<&str> = v["adoption"].as_object().unwrap().keys().map(String::as_str).collect();
+        ad.sort();
+        assert_eq!(
+            ad,
+            vec![
+                "denominator",
+                "distinct_skills",
+                "plan_mode_rate",
+                "plan_mode_sessions",
+                "sessions_interactive",
+                "sessions_total",
+                "subagent_dispatches",
+                "subagents_per_session",
+            ]
+        );
+        assert_eq!(v["adoption"]["distinct_skills"], 3);
+
+        let mut tm: Vec<&str> = v["tool_mix"].as_object().unwrap().keys().map(String::as_str).collect();
+        tm.sort();
+        assert_eq!(tm, vec!["by_category", "total_calls"]);
+        assert_eq!(v["tool_mix"]["by_category"]["Bash"], 40);
+        assert_eq!(v["tool_mix"]["by_category"]["Task"], 6);
+    }
+
+    /// `session_stats: None` must vanish from the payload rather than serialize as `null` — a null
+    /// could blank a blob the community reporter posted, the same way sending `tools: ""` would
+    /// blank profile prose (see `profile_prose_fields_are_omitted_not_blanked`).
+    #[test]
+    fn an_omitted_session_stats_key_is_absent_not_null() {
+        let body = ReportBody {
+            username: "someone".into(),
+            team: "default".into(),
+            client_id: "abc".into(),
+            client_version: "v".into(),
+            report_days: 7,
+            data: vec![],
+            session_stats: None,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("session_stats"),
+            "the key must be absent, not null: {v}"
+        );
+    }
+
+    /// The window the blob claims must be the window that was scanned, clamped like the token half.
+    #[test]
+    fn the_reported_window_is_clamped_like_the_token_rollup() {
+        let s = rollup_activity(&totals(), false, 9_999, today()).expect("stats");
+        assert_eq!(s.window.days, MAX_REPORT_DAYS);
+    }
+
+    /// Print what THIS machine's real transcripts produce, with NO network and no state written.
+    ///
+    /// The unit tests above prove the arithmetic against fixtures; this is the check that the
+    /// pipeline yields a sane number on a real 15,000-transcript install rather than a plausible
+    /// zero — which is the failure the whole change exists to end, and one no fixture can catch.
+    /// `#[ignore]`d because it depends on the machine it runs on.
+    ///
+    /// Run: `TKMX_APP_DATA=<app-data-dir> cargo test --lib \
+    ///       builder_index::tests::show_this_machines_activity -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn show_this_machines_activity() {
+        let app_data = std::env::var_os("TKMX_APP_DATA").map(PathBuf::from);
+        if app_data.is_none() {
+            eprintln!(
+                "NOTE: TKMX_APP_DATA unset — scanning ~/.claude ONLY, which is the blind spot \
+                 itself. Set it to compare."
+            );
+        }
+        let window = 28;
+        let scan = crate::spend::load_window_records(app_data.as_deref(), window);
+        let totals = scan.activity();
+        eprintln!("truncated={} totals={totals:#?}", scan.truncated);
+        match rollup_activity(&totals, scan.truncated, window, scan.today) {
+            Some(s) => eprintln!(
+                "session_stats = {}",
+                serde_json::to_string_pretty(&s).unwrap()
+            ),
+            None => eprintln!("session_stats OMITTED (nothing complete enough to publish)"),
+        }
     }
 
     #[test]
@@ -1931,6 +2418,9 @@ mod tests {
     /// `TKMX_APP_DATA` should be the app-data dir whose `accounts/` this machine really uses;
     /// without it the scan covers `~/.claude` ONLY, which is the same undercount in miniature.
     ///
+    /// This posts `session_stats` too, so it can also REPLACE today's activity row — the same
+    /// hazard, which is why the non-production gate below guards both halves and is not relaxed.
+    ///
     /// Everything else is real (that's the point): real transcript scan, real `rollup`, real
     /// `derive_client_id` off the real machine id, 1-day window to keep the upsert surface minimal.
     #[test]
@@ -1964,6 +2454,7 @@ mod tests {
         let app_data = std::env::var_os("TKMX_APP_DATA").map(PathBuf::from);
         let scan = crate::spend::load_window_records(app_data.as_deref(), 1);
         let data = rollup(scan.records(), scan.today, 1);
+        let session_stats = rollup_activity(&scan.activity(), scan.truncated, 1, scan.today);
         let rows = row_count(&data);
         let body = ReportBody {
             username: username.clone(),
@@ -1972,6 +2463,7 @@ mod tests {
             client_version: client_version(),
             report_days: 1,
             data,
+            session_stats,
         };
         let payload = serde_json::to_string(&body).expect("serialize");
 

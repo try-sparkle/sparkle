@@ -26,7 +26,7 @@
 //!   • Costs are ESTIMATES at list API rates (see [`PRICING_NOTE`]). Unknown models contribute
 //!     tokens but no cost, and are reported in `unknownModels` so the table can say so out loud.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -315,11 +315,29 @@ pub fn parse_line(
         return None;
     }
     // Cheap pre-filter: only a minority of lines carry token usage, and json parsing dominates.
-    if !line.contains("\"usage\"") {
+    if !line_may_carry_usage(line) {
         return None;
     }
     let v: Value = serde_json::from_str(line).ok()?;
+    parse_value(&v, session, project_fallback, ordinal)
+}
 
+/// The substring pre-filter guarding the JSON parse. Named so [`parse_file`] can apply the SAME
+/// test before deciding whether one `serde_json::from_str` should feed the token path, the activity
+/// path, or both — parsing a line twice for two consumers doubled the cost of the scan's hot loop.
+fn line_may_carry_usage(line: &str) -> bool {
+    line.contains("\"usage\"")
+}
+
+/// [`parse_line`]'s body, against an already-parsed line. Split out for the single-parse loop in
+/// [`parse_file`]; the pre-filter and `from_str` live in `parse_line`, which is still the entry
+/// point for every other caller.
+fn parse_value(
+    v: &Value,
+    session: &str,
+    project_fallback: &str,
+    ordinal: u64,
+) -> Option<UsageRecord> {
     let usage = v
         .get("message")
         .and_then(|m| m.get("usage"))
@@ -381,6 +399,267 @@ pub fn parse_line(
         cache_1h,
         cache_read,
     })
+}
+
+// ── session activity (tool mix, subagents, plan mode) ───────────────────────────────────────
+//
+// WHY THIS LIVES HERE, next to the token scan. The Builder Index profile's SUBAGENTS/SESSION,
+// PLAN MODE and TOOL MIX panels were computed by the community pipeline's `~/.claude`-only
+// indexer, so they inherited the same blind spot the token half of this module exists to close.
+// Deriving them from THIS scan — the one that already walks every Sparkle account store — is what
+// keeps one trustworthy source instead of two scanners that can disagree.
+//
+// MEASURED CAUSES OF THE ZEROES ON THE PROFILE (verified 2026-07-29 against 15,432 transcripts and
+// this machine's `agentsview stats --since 28d`, whose output the profile reproduces to the digit):
+//
+//   1. NUMERATOR. Sparkle's fleet spawns its workers through the orchestrator MCP tool
+//      `mcp__sparkle-orchestrator__spawn_worker` — 482 calls — which the community indexer buckets
+//      as an uncategorized "Other" tool. Its subagent metric counts only `Task`/`Agent`, so the
+//      fan-out that defines how this machine works was invisible BY CONSTRUCTION, in any directory.
+//      [`SUBAGENT_TOOLS`] counts all three.
+//   2. DENOMINATOR. 13,499 of 15,492 "sessions" were one-shot programmatic invocations (roborev
+//      reviews, hook probes, naming calls). Pooling them with 1,993 interactive ones divided every
+//      per-session adoption rate by ~7.5. Sampling 500 transcripts, 481 (96.2%) held exactly ONE
+//      typed user turn and among them ZERO subagent dispatches and ZERO plan-mode entries; all 24
+//      dispatches fell in the 19 sessions with two or more. So the typed-turn count separates the
+//      two populations cleanly, and [`FileActivity::is_interactive`] is that test.
+//   3. The `~/.claude` blind spot this scan closes is real but SMALL — the account stores hold 696
+//      tool calls against 134,093, with 3 `Agent` calls and 1 `ExitPlanMode`. It is included for
+//      completeness and because a metric sourced from a blind-spot scanner silently re-breaks the
+//      next time an account is added; it is NOT what made the numbers zero. Anyone tempted to
+//      "just point the community scanner at the account stores too" should read that number first.
+//
+// WINDOWING IS PER SESSION, NOT PER DAY, and deliberately so: these are per-session rates, and a
+// session straddling midnight would otherwise be counted in two days' denominators. A transcript
+// whose mtime falls in the window contributes wholly — the same mtime pre-filter `collect_files`
+// already applies. That is why activity is NOT run through `dedupe_window`, which is a per-record,
+// per-day rule for tokens.
+//
+// KNOWN LIMIT: resuming a session copies prior turns into a new transcript, which would double-count
+// its tool calls. Measured at ZERO on this machine (600 files, 5,839 `tool_use` blocks, every one
+// carrying an id, no id appearing twice), so no id-set dedup is carried — that would put ~4 MB of
+// tool ids in the memo permanently to fix a problem the data does not have. If a future transcript
+// format drops `tool_use` ids, revisit this rather than assuming it still holds.
+
+/// Tool names that dispatch a SUBAGENT. `Task` is the historical name, `Agent` the current one, and
+/// `mcp__sparkle-orchestrator__spawn_worker` is how a Sparkle build agent spawns a real isolated
+/// worker — the one that the community metric misses, and the one that matters most on this machine.
+const SUBAGENT_TOOLS: [&str; 3] = ["Task", "Agent", "mcp__sparkle-orchestrator__spawn_worker"];
+
+/// Tool names that mark a plan-mode session.
+const PLAN_MODE_TOOLS: [&str; 2] = ["ExitPlanMode", "EnterPlanMode"];
+
+/// Bucket a raw tool name into the category the Builder Index renders.
+///
+/// The category NAMES mirror the community indexer's (`Bash`, `Edit`, `Read`, `Grep`, `Glob`,
+/// `Write`, `Task`, `Other`) because the profile's TOOL MIX panel keys off them — inventing our own
+/// spelling would render an empty panel rather than a corrected one. `Task` is the subagent bucket,
+/// and unlike the community indexer it receives `spawn_worker` (see [`SUBAGENT_TOOLS`]).
+fn tool_category(name: &str) -> &'static str {
+    if SUBAGENT_TOOLS.contains(&name) {
+        return "Task";
+    }
+    match name {
+        "Bash" | "BashOutput" | "KillShell" | "Shell" => "Bash",
+        "Edit" | "MultiEdit" | "NotebookEdit" | "StrReplace" | "ApplyPatch" => "Edit",
+        "Read" | "NotebookRead" => "Read",
+        "Grep" => "Grep",
+        "Glob" => "Glob",
+        "Write" => "Write",
+        _ => "Other",
+    }
+}
+
+/// One transcript's activity — the session-granularity half of a scan.
+///
+/// `Eq` like [`UsageRecord`], so a memo entry can be compared in tests. Kept small for the same
+/// reason: the memo holds one of these per in-window file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FileActivity {
+    /// Tool calls by [`tool_category`].
+    pub by_category: BTreeMap<&'static str, u64>,
+    /// `Task` + `Agent` + `spawn_worker` calls. Tracked separately from `by_category["Task"]`
+    /// because the category is a display bucket and this is the metric's numerator; keeping one
+    /// derived from the other is how a renamed bucket silently zeroes a published number.
+    pub subagent_dispatches: u64,
+    /// Distinct `Skill` names this session invoked.
+    pub skills: BTreeSet<String>,
+    /// User turns a PERSON typed — a string `content`, or a content list with no `tool_result`
+    /// block. Tool results arrive as user-role turns too, and counting them made every automated
+    /// one-shot look like a conversation.
+    pub typed_user_turns: u64,
+    /// Whether this session entered or left plan mode.
+    pub plan_mode: bool,
+}
+
+impl FileActivity {
+    /// Did a person drive this session? Two or more typed turns.
+    ///
+    /// The threshold is measured, not guessed — see the section header. One typed turn is the
+    /// signature of a programmatic `claude -p` invocation (roborev review, hook, naming call), and
+    /// those are 96% of transcripts on this machine while accounting for none of its subagent
+    /// dispatches. A single-prompt session a human really did start is counted as automation here;
+    /// that is the conservative direction, since it can only UNDERSTATE an adoption rate.
+    pub fn is_interactive(&self) -> bool {
+        self.typed_user_turns >= 2
+    }
+
+    /// Fold one already-parsed transcript line in.
+    fn observe(&mut self, v: &Value) {
+        let role = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let content = v.get("message").and_then(|m| m.get("content"));
+
+        if role == "user" {
+            // A `tool_result` block makes this the harness replying to the model, not a person.
+            let is_tool_result = content
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|b| {
+                        b.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                });
+            // `isMeta` marks content the harness INJECTED as a user turn (hook output, system
+            // reminders). Counting it would let a one-shot automation session cross the interactive
+            // threshold on machinery the user never typed — putting the whole 87% automation
+            // population back into the denominator through the back door.
+            let is_injected = v.get("isMeta").and_then(Value::as_bool).unwrap_or(false);
+            // A user record with no content at all is bookkeeping, not a turn.
+            if !is_tool_result && !is_injected && content.is_some() {
+                self.typed_user_turns = self.typed_user_turns.saturating_add(1);
+            }
+        }
+
+        let Some(blocks) = content.and_then(Value::as_array) else {
+            return;
+        };
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(name) = b.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            *self.by_category.entry(tool_category(name)).or_insert(0) += 1;
+            if SUBAGENT_TOOLS.contains(&name) {
+                self.subagent_dispatches = self.subagent_dispatches.saturating_add(1);
+            }
+            if PLAN_MODE_TOOLS.contains(&name) {
+                self.plan_mode = true;
+            }
+            if name == "Skill" {
+                if let Some(s) = b
+                    .get("input")
+                    .and_then(|i| i.get("skill"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.skills.insert(s.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// The substring pre-filter for the activity path, mirroring [`line_may_carry_usage`]'s role.
+///
+/// A line with neither a `tool_use` block nor a user turn cannot move any counter, and skipping the
+/// JSON parse for it is what keeps the added cost small. NOT free: this path parses lines the token
+/// path never did, measured at ~1.35x the bytes fed to `serde_json`. Say the real number — the first
+/// version of this comment claimed "free" while costing 3.2x.
+///
+/// Two properties, and the SECOND was got wrong once already:
+///
+/// 1. SERIALIZATION-AGNOSTIC. `tool_use"` matches both `"type":"tool_use"` and `"type": "tool_use"`,
+///    so switching to pretty-printed transcripts cannot silently zero every counter here — the
+///    precise failure this feature exists to end. Do not tighten it to include the leading quote.
+/// 2. IT MUST NOT DRAG IN `tool_result` LINES. The bare substring `tool_use` ALSO matches
+///    `tool_use_id`, the field on every `tool_result` block — and tool-result lines (file reads,
+///    command output) are the LARGEST in a transcript. Before this feature none were handed to
+///    `serde_json::from_str`, because the token filter required `"usage"`. Matching them took the
+///    bytes parsed from 14.6 MB to 47.3 MB across 400 sampled transcripts — 3.2x — on a loop whose
+///    own doc says parsing dominates, and re-paid on most passes because `MEMO_CAPACITY` (4,000) is
+///    far below the ~15,000 in-window transcripts here. `tool_use"` excludes `tool_use_id` (no quote
+///    follows `tool_use` there), and a user turn only matters when it is NOT a tool result — which is
+///    what `FileActivity::observe` would conclude anyway, after paying for the parse. Same sample:
+///    1.35x, and zero real `tool_use` lines missed. (roborev 55761)
+///
+/// BOTH exclusions key on the JSON FIELD, never on prose. The `tool_result` clause needs BOTH
+/// quotes — `"tool_result"` — and it took three attempts to get right, so do not "simplify" it:
+///
+///   • bare `tool_result` (attempt 1) dropped any prompt DISCUSSING transcripts;
+///   • `tool_result"` (attempt 2) still dropped a turn whose text ENDS with the token, because the
+///     closing string quote lands right after it (`"content":"explain tool_result"`);
+///   • `"tool_result"` matches a real block in every serialization — compact, spaced (the space
+///     falls before the OPENING quote) and field-reordered — while end-of-text prose (a space
+///     precedes) and an escaped paste (`\"tool_result\"`, backslash before the quote) do not.
+///
+/// Why the churn mattered rather than being cosmetic: a lost typed turn can flip a real session
+/// under the hard `>= 2` threshold into the automation bucket, which removes its subagent dispatches
+/// from the numerator AND its session from the denominator — by DIFFERENT amounts. Every wrong
+/// version silently reintroduced the denominator skew this whole feature exists to remove.
+/// `filter_is_a_superset_of_what_the_parse_finds` now pins all seven shapes as a table.
+/// (roborev 55829, 55834)
+///
+/// `filter_is_a_superset_of_what_the_parse_finds` pins BOTH the superset AND the exclusion, so the
+/// cost cannot silently regress either.
+fn line_may_carry_activity(line: &str) -> bool {
+    // The tool_use check is unconditional: an assistant line carrying tool calls must always be
+    // parsed, even in the (unseen) case that it also mentions a tool result.
+    line.contains("tool_use\"") || (line.contains("\"user\"") && !line.contains("\"tool_result\""))
+}
+
+/// Every in-window session's activity, rolled up into the numbers the reporter publishes.
+///
+/// Counts, not rates. The caller forms the rates so the DENOMINATOR is explicit at the point of
+/// publication — a bare `0.03` on a profile is exactly the number nobody could explain.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActivityTotals {
+    /// Every transcript in the window.
+    pub sessions_total: u64,
+    /// Those with two or more typed user turns — see [`FileActivity::is_interactive`].
+    pub sessions_interactive: u64,
+    /// Subagent dispatches from INTERACTIVE sessions.
+    pub subagent_dispatches: u64,
+    /// Interactive sessions that used plan mode.
+    pub plan_mode_sessions: u64,
+    /// Tool calls by category, across every session (the TOOL MIX panel describes the whole
+    /// machine's work, not just the interactive slice — it is a mix, not a per-session rate).
+    pub by_category: BTreeMap<&'static str, u64>,
+    /// Total tool calls behind `by_category`.
+    pub total_calls: u64,
+    /// Distinct skills invoked anywhere in the window.
+    pub distinct_skills: u64,
+}
+
+/// Fold per-file activity into [`ActivityTotals`].
+///
+/// The adoption numerators are restricted to interactive sessions so numerator and denominator
+/// describe the SAME population. Mixing them — dispatches from every session over interactive
+/// sessions only — would overstate the rate, which is the opposite failure from the one being
+/// fixed but just as wrong.
+pub(crate) fn aggregate_activity<'a>(
+    files: impl Iterator<Item = &'a FileActivity>,
+) -> ActivityTotals {
+    let mut out = ActivityTotals::default();
+    let mut skills: BTreeSet<&str> = BTreeSet::new();
+    for f in files {
+        out.sessions_total = out.sessions_total.saturating_add(1);
+        for (cat, n) in &f.by_category {
+            *out.by_category.entry(cat).or_insert(0) += n;
+            out.total_calls = out.total_calls.saturating_add(*n);
+        }
+        skills.extend(f.skills.iter().map(String::as_str));
+        if f.is_interactive() {
+            out.sessions_interactive = out.sessions_interactive.saturating_add(1);
+            out.subagent_dispatches =
+                out.subagent_dispatches.saturating_add(f.subagent_dispatches);
+            if f.plan_mode {
+                out.plan_mode_sessions = out.plan_mode_sessions.saturating_add(1);
+            }
+        }
+    }
+    out.distinct_skills = skills.len() as u64;
+    out
 }
 
 /// Human label for a working directory: its last path component. Empty/`/` yields `None` so the
@@ -702,6 +981,11 @@ struct CachedFile {
     mtime: SystemTime,
     len: u64,
     records: Arc<Vec<UsageRecord>>,
+    /// The same file's session activity. Cached ALONGSIDE the records, not recomputed: a memo hit
+    /// that returned records but no activity would serve the reporter a silent zero for every warm
+    /// file — which is the failure mode this whole feature exists to remove, reintroduced one layer
+    /// down. `parse_file` produces both together for exactly this reason.
+    activity: Arc<FileActivity>,
     /// The scan generation that last USED this entry. Drives LRU eviction and protects the current
     /// pass's own entries — see [`MEMO_CAPACITY`] and [`evict_to`].
     last_touch: u64,
@@ -805,9 +1089,18 @@ impl Drop for ScanGeneration {
 /// remaining record in the file — one stray byte in a large tool-output line zeroed out the rest of
 /// that session's spend, and the caller had no way to know. A malformed byte now costs at most the
 /// characters it replaces.
-fn parse_file(path: &Path) -> Vec<UsageRecord> {
+/// Returns the file's billed turns AND its session activity, from ONE pass and ONE JSON parse per
+/// line. The two consumers share the parse deliberately: `serde_json::from_str` dominates this loop,
+/// so giving the activity counters their own `parse_line`-style pass would have doubled the cost of
+/// the scan for every heavy install.
+///
+/// Net cost of the activity half is ~1.35x the bytes handed to `serde_json`, because it parses some
+/// lines the token filter skipped (user turns). That is the SMALL side of a mistake already made here
+/// — see property 2 on [`line_may_carry_activity`], which cost 3.2x — so treat that pre-filter as
+/// performance-critical, not cosmetic.
+fn parse_file(path: &Path) -> (Vec<UsageRecord>, FileActivity) {
     let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
+        return (Vec::new(), FileActivity::default());
     };
     let session = path
         .file_stem()
@@ -822,6 +1115,7 @@ fn parse_file(path: &Path) -> Vec<UsageRecord> {
         .to_string();
 
     let mut out = Vec::new();
+    let mut activity = FileActivity::default();
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
     let mut ordinal: u64 = 0;
@@ -833,12 +1127,25 @@ fn parse_file(path: &Path) -> Vec<UsageRecord> {
             Ok(_) => {}
         }
         let line = String::from_utf8_lossy(&raw);
-        if let Some(r) = parse_line(&line, &session, &project_fallback, ordinal) {
+        let trimmed = line.trim();
+        // A line that both consumers want is parsed ONCE and handed to both. A line only the token
+        // path wants goes through `parse_line` as it always did — which is also why that function
+        // stays live in production rather than becoming a test-only entry point.
+        if !trimmed.is_empty() && line_may_carry_activity(trimmed) {
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                if line_may_carry_usage(trimmed) {
+                    if let Some(r) = parse_value(&v, &session, &project_fallback, ordinal) {
+                        out.push(r);
+                    }
+                }
+                activity.observe(&v);
+            }
+        } else if let Some(r) = parse_line(&line, &session, &project_fallback, ordinal) {
             out.push(r);
         }
         ordinal += 1;
     }
-    out
+    (out, activity)
 }
 
 /// Depth-first collect of every `.jsonl` under `root` whose mtime is at or after `cutoff_secs`.
@@ -999,7 +1306,15 @@ fn collect_all(roots: &[PathBuf], cutoff_secs: i64, budget: usize) -> (Vec<PathB
 /// The global memo lock is taken TWICE, briefly, and never across the parsing: holding it for a
 /// whole scan serialized concurrent `spend_report` calls behind hundreds of milliseconds of
 /// blocking IO.
-fn load_records(roots: &[PathBuf], cutoff_secs: i64) -> (Vec<Arc<Vec<UsageRecord>>>, usize, bool) {
+fn load_records(
+    roots: &[PathBuf],
+    cutoff_secs: i64,
+) -> (
+    Vec<Arc<Vec<UsageRecord>>>,
+    Vec<Arc<FileActivity>>,
+    usize,
+    bool,
+) {
     let (files, truncated) = collect_all(roots, cutoff_secs, MAX_FILES);
 
     // Stat once, up front: the mtime is both the sort key and half the memo's validity key.
@@ -1019,6 +1334,7 @@ fn load_records(roots: &[PathBuf], cutoff_secs: i64) -> (Vec<Arc<Vec<UsageRecord
     let generation = pass.id();
     let now = std::time::Instant::now();
     let mut blocks: Vec<Option<Arc<Vec<UsageRecord>>>> = vec![None; stats.len()];
+    let mut acts: Vec<Option<Arc<FileActivity>>> = vec![None; stats.len()];
     let untouched: Vec<PathBuf>;
     {
         // Poison-tolerant: a panic in a prior scan must not permanently disable the memo.
@@ -1029,6 +1345,7 @@ fn load_records(roots: &[PathBuf], cutoff_secs: i64) -> (Vec<Arc<Vec<UsageRecord
                     entry.last_touch = generation;
                     entry.touched_at = now;
                     blocks[i] = Some(Arc::clone(&entry.records));
+                    acts[i] = Some(Arc::clone(&entry.activity));
                 }
             }
         }
@@ -1042,18 +1359,21 @@ fn load_records(roots: &[PathBuf], cutoff_secs: i64) -> (Vec<Arc<Vec<UsageRecord
     // Pass 2 (NO lock): parse the misses — the expensive part, which another scan can run
     // concurrently through — and, in the same unlocked stretch, find the cached files that are gone
     // from disk. That `stat` per entry used to run under the lock inside eviction.
-    let parsed: Vec<(usize, Arc<Vec<UsageRecord>>)> = blocks
+    let parsed: Vec<(usize, Arc<Vec<UsageRecord>>, Arc<FileActivity>)> = blocks
         .iter()
         .enumerate()
         .filter(|(_, b)| b.is_none())
-        .map(|(i, _)| (i, Arc::new(parse_file(&stats[i].0))))
+        .map(|(i, _)| {
+            let (records, activity) = parse_file(&stats[i].0);
+            (i, Arc::new(records), Arc::new(activity))
+        })
         .collect();
     let gone: Vec<PathBuf> = untouched.into_iter().filter(|p| !p.exists()).collect();
 
     // Pass 3 (lock held, no IO): publish what we parsed, then evict.
     {
         let mut cache = memo().lock().unwrap_or_else(|e| e.into_inner());
-        for (i, records) in parsed {
+        for (i, records, activity) in parsed {
             let (path, mtime, len) = &stats[i];
             cache.insert(
                 path.clone(),
@@ -1061,18 +1381,25 @@ fn load_records(roots: &[PathBuf], cutoff_secs: i64) -> (Vec<Arc<Vec<UsageRecord
                     mtime: *mtime,
                     len: *len,
                     records: Arc::clone(&records),
+                    activity: Arc::clone(&activity),
                     last_touch: generation,
                     touched_at: now,
                 },
             );
             blocks[i] = Some(records);
+            acts[i] = Some(activity);
         }
         evict_to_capacity(&mut cache, generation, now, &gone);
     }
 
     drop(pass); // no longer live: its entries become tier-1 evictable from here on
     let count = blocks.len();
-    (blocks.into_iter().flatten().collect(), count, truncated)
+    (
+        blocks.into_iter().flatten().collect(),
+        acts.into_iter().flatten().collect(),
+        count,
+        truncated,
+    )
 }
 
 /// Production eviction, run under the memo lock with NO filesystem access: drop the entries a
@@ -1265,7 +1592,7 @@ fn spend_report_sync(window_days: u32, app_data: Option<PathBuf>) -> SpendReport
     let cutoff_secs = (today - (window as i64 - 1)) * 86_400;
 
     let roots = transcript_roots(app_data.as_deref());
-    let (blocks, files_scanned, truncated) = load_records(&roots, cutoff_secs);
+    let (blocks, _activity, files_scanned, truncated) = load_records(&roots, cutoff_secs);
 
     // Aggregate over the memo's own records — no flattening clone of every record first.
     let mut report = aggregate_records(blocks.iter().flat_map(|b| b.iter()), today, window);
@@ -1320,6 +1647,12 @@ pub(crate) struct WindowScan {
     /// previous doc claimed "deduped, in-window records", and the next caller to believe it would
     /// over-report.)
     blocks: Vec<Arc<Vec<UsageRecord>>>,
+    /// One entry per in-window transcript — the session-granularity counters behind the profile's
+    /// SUBAGENTS/SESSION, PLAN MODE and TOOL MIX panels. Roll them up with [`aggregate_activity`].
+    ///
+    /// Windowed by transcript mtime rather than per record per day, unlike `blocks`. See the
+    /// "session activity" section header for why a per-session rate must not be split across days.
+    activity: Vec<Arc<FileActivity>>,
     /// The epoch day the window ends on (UTC "today").
     pub today: i64,
     /// True when [`MAX_FILES`] cut the scan short. The reporter MUST propagate this: publishing a
@@ -1332,6 +1665,11 @@ impl WindowScan {
     /// Every scanned record, borrowed. Feed it to [`dedupe_window`] before counting anything.
     pub fn records(&self) -> impl Iterator<Item = &UsageRecord> {
         self.blocks.iter().flat_map(|b| b.iter())
+    }
+
+    /// This window's session activity, already rolled up.
+    pub fn activity(&self) -> ActivityTotals {
+        aggregate_activity(self.activity.iter().map(|a| a.as_ref()))
     }
 }
 
@@ -1353,8 +1691,8 @@ fn scan_window(roots: &[PathBuf], window_days: u32) -> WindowScan {
     // flattening them into an owned `Vec<UsageRecord>` would be a second full copy of the scan —
     // held for the whole network POST — and that copy is exactly what taking BORROWED records in
     // `aggregate_records` was introduced to remove.
-    let (blocks, _, truncated) = load_records(roots, cutoff_secs);
-    WindowScan { blocks, today, truncated }
+    let (blocks, activity, _, truncated) = load_records(roots, cutoff_secs);
+    WindowScan { blocks, activity, today, truncated }
 }
 
 /// List-price USD for one turn's token counts, or `None` when the model has no published rate.
@@ -1745,7 +2083,7 @@ mod tests {
         body.push(b'\n');
         std::fs::write(&path, body).unwrap();
 
-        let recs = parse_file(&path);
+        let (recs, _) = parse_file(&path);
         assert_eq!(recs.len(), 2, "the record AFTER the bad bytes must survive: {recs:?}");
         assert_eq!(recs[1].model, "claude-haiku-4-5");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1858,6 +2196,418 @@ mod tests {
         );
     }
 
+    // ── session activity ─────────────────────────────────────────────────────────────────
+
+    /// One assistant line invoking `tool`, with token usage so it also feeds the token path.
+    fn tool_line(tool: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:00Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":1,"output_tokens":1}},"content":[{{"type":"tool_use","id":"toolu_{tool}","name":"{tool}","input":{{}}}}]}}}}"#
+        )
+    }
+
+    /// One user turn a person typed.
+    fn typed_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    /// One user-role turn that is really a tool RESULT coming back.
+    fn tool_result_line() -> String {
+        r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"ok"}]}}"#.to_string()
+    }
+
+    /// Write a transcript of `lines` at `<root>/<project>/<session>.jsonl`.
+    fn write_transcript(root: &Path, project: &str, session: &str, lines: &[String]) -> PathBuf {
+        let dir = root.join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{session}.jsonl"));
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    /// An interactive session (two typed turns) that dispatches `tool` once.
+    fn interactive_session_using(tool: &str) -> Vec<String> {
+        vec![
+            typed_line("do the thing"),
+            tool_line(tool),
+            tool_result_line(),
+            typed_line("now do the other thing"),
+        ]
+    }
+
+    /// THE regression this feature exists for: a dispatch living ONLY in a Sparkle account store
+    /// must reach the published metric.
+    ///
+    /// Asserted as a DIFFERENCE between the two scans rather than as an absolute count, because an
+    /// absolute count passes just as well when the account root is scanned twice or when the
+    /// primary root happens to be empty. Scanning the primary alone — which is all the community
+    /// indexer ever did — must MISS it; scanning both must find it. Restore the `~/.claude`-only
+    /// behaviour and the second half of this test fails.
+    #[test]
+    fn activity_counts_a_subagent_dispatch_that_exists_only_in_an_account_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data = tmp.path();
+        let primary = app_data.join("home-claude/projects");
+        let account = app_data.join("accounts/acct-a/projects");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&account).unwrap();
+
+        // The primary store holds ordinary interactive work and NO dispatch.
+        write_transcript(
+            &primary,
+            "proj",
+            "in-home",
+            &[typed_line("hello"), tool_line("Bash"), typed_line("again")],
+        );
+        // The account store holds the only subagent dispatch on this machine.
+        write_transcript(
+            &account,
+            "proj",
+            "in-account",
+            &interactive_session_using("Agent"),
+        );
+
+        let home_only = scan_window(&[primary.clone()], 7).activity();
+        let both = scan_window(&[primary.clone(), account.clone()], 7).activity();
+
+        assert_eq!(
+            home_only.subagent_dispatches, 0,
+            "a ~/.claude-only scan cannot see the account store — this is the bug being fixed"
+        );
+        assert_eq!(
+            both.subagent_dispatches, 1,
+            "the all-accounts scan must count the dispatch that only exists in the account store"
+        );
+        assert!(
+            both.sessions_interactive > home_only.sessions_interactive,
+            "the account store's session must also reach the denominator: {both:?} vs {home_only:?}"
+        );
+
+        // And the production root resolution really does compose those two roots, so the scan above
+        // is the one `load_window_records` performs rather than a shape only this test builds.
+        assert!(
+            transcript_roots(Some(app_data)).contains(&account),
+            "transcript_roots must enumerate <app_data>/accounts/*/projects"
+        );
+    }
+
+    /// The single largest cause of the zero on the profile: Sparkle's fleet fans out through
+    /// `mcp__sparkle-orchestrator__spawn_worker`, which the community indexer files under "Other".
+    /// It must count as a subagent dispatch AND land in the `Task` display bucket.
+    #[test]
+    fn spawn_worker_counts_as_a_subagent_dispatch_not_an_uncategorized_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        write_transcript(
+            &root,
+            "p",
+            "s",
+            &interactive_session_using("mcp__sparkle-orchestrator__spawn_worker"),
+        );
+
+        let a = scan_window(&[root], 7).activity();
+        assert_eq!(a.subagent_dispatches, 1, "spawn_worker IS a subagent dispatch");
+        assert_eq!(a.by_category.get("Task"), Some(&1), "and renders in the Task bucket");
+        assert_eq!(
+            a.by_category.get("Other"),
+            None,
+            "counting it as Other is exactly what hid this machine's fan-out"
+        );
+    }
+
+    /// The denominator half. A one-shot `claude -p` invocation (roborev review, hook, naming call)
+    /// has ONE typed turn; 96% of this machine's transcripts look like that and none of them
+    /// dispatch a subagent. They must stay out of the interactive denominator, or they divide every
+    /// adoption rate by ~7.5.
+    #[test]
+    fn one_shot_automation_sessions_stay_out_of_the_interactive_denominator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        // One real interactive session that dispatches.
+        write_transcript(&root, "p", "human", &interactive_session_using("Agent"));
+        // Twenty automated one-shots, each with a single typed prompt and real tool work.
+        for i in 0..20 {
+            write_transcript(
+                &root,
+                "p",
+                &format!("auto-{i}"),
+                &[typed_line("review this diff"), tool_line("Bash"), tool_result_line()],
+            );
+        }
+
+        let a = scan_window(&[root], 7).activity();
+        assert_eq!(a.sessions_total, 21, "every transcript is still counted and reported");
+        assert_eq!(
+            a.sessions_interactive, 1,
+            "only the multi-turn session is interactive: {a:?}"
+        );
+        assert_eq!(a.subagent_dispatches, 1);
+        // The whole point: the rate is 1/1, not 1/21.
+        let rate = a.subagent_dispatches as f64 / a.sessions_interactive as f64;
+        assert_eq!(rate, 1.0, "pooling automation sessions is what produced 0.0");
+        // Tool mix, by contrast, is a proportion of ALL work seen — the one-shots belong there.
+        assert_eq!(a.by_category.get("Bash"), Some(&20));
+    }
+
+    /// A `tool_result` arrives as a user-role turn. Counting it as a typed turn made every automated
+    /// one-shot look like a conversation, which would put the whole automation population back into
+    /// the denominator through the back door.
+    #[test]
+    fn tool_results_are_not_typed_user_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        write_transcript(
+            &root,
+            "p",
+            "s",
+            &[
+                typed_line("one prompt only"),
+                tool_line("Bash"),
+                tool_result_line(),
+                tool_line("Read"),
+                tool_result_line(),
+                tool_line("Bash"),
+                tool_result_line(),
+            ],
+        );
+
+        let a = scan_window(&[root], 7).activity();
+        assert_eq!(
+            a.sessions_interactive, 0,
+            "six tool results around one typed prompt is still a one-shot: {a:?}"
+        );
+        assert_eq!(a.total_calls, 3, "but its tool calls are still counted");
+    }
+
+    /// The other two ways a one-shot could be mistaken for a conversation. Both would readmit the
+    /// automation population — 87% of transcripts — into the interactive denominator.
+    #[test]
+    fn injected_and_contentless_user_records_are_not_typed_turns() {
+        let injected = r#"{"type":"user","isMeta":true,"timestamp":"2026-07-24T10:00:00Z","message":{"role":"user","content":"<system-reminder>injected</system-reminder>"}}"#;
+        let contentless = r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"role":"user"}}"#;
+
+        let mut a = FileActivity::default();
+        a.observe(&serde_json::from_str(injected).unwrap());
+        a.observe(&serde_json::from_str(contentless).unwrap());
+        a.observe(&serde_json::from_str(&typed_line("the only real prompt")).unwrap());
+
+        assert_eq!(
+            a.typed_user_turns, 1,
+            "only the human's prompt counts: {a:?}"
+        );
+        assert!(!a.is_interactive(), "one real prompt is a one-shot");
+    }
+
+    /// Plan mode is a property OF A SESSION, so a session that enters and exits counts once — a
+    /// per-call count would let one long planning session read as several.
+    #[test]
+    fn plan_mode_counts_the_session_once_however_many_calls_it_makes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        write_transcript(
+            &root,
+            "p",
+            "planner",
+            &[
+                typed_line("plan it"),
+                tool_line("EnterPlanMode"),
+                tool_line("ExitPlanMode"),
+                tool_line("EnterPlanMode"),
+                typed_line("go"),
+            ],
+        );
+        write_transcript(&root, "p", "no-plan", &interactive_session_using("Bash"));
+
+        let a = scan_window(&[root], 7).activity();
+        assert_eq!(a.sessions_interactive, 2);
+        assert_eq!(a.plan_mode_sessions, 1, "one session used plan mode, not three: {a:?}");
+    }
+
+    /// The memo caches records and activity TOGETHER. A warm hit that returned records but a
+    /// default `FileActivity` would report zero for every file already in the cache — the exact
+    /// silent-undercount failure this feature removes, reintroduced one layer down.
+    #[test]
+    fn a_warm_memo_hit_still_carries_the_files_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        write_transcript(&root, "p", "s", &interactive_session_using("Agent"));
+
+        // First scan populates the memo; the second must be served from it.
+        let cold = scan_window(&[root.clone()], 7).activity();
+        let warm = scan_window(&[root.clone()], 7).activity();
+        assert_eq!(cold.subagent_dispatches, 1, "cold scan sees the dispatch");
+        assert_eq!(warm, cold, "a memo hit must serve the same activity: {warm:?} vs {cold:?}");
+    }
+
+    /// Category names are what the profile's TOOL MIX panel keys off; a spelling of our own renders
+    /// an empty panel rather than a corrected one.
+    #[test]
+    fn tool_categories_use_the_names_the_profile_renders() {
+        assert_eq!(tool_category("Bash"), "Bash");
+        assert_eq!(tool_category("MultiEdit"), "Edit");
+        assert_eq!(tool_category("NotebookRead"), "Read");
+        assert_eq!(tool_category("Write"), "Write");
+        assert_eq!(tool_category("Grep"), "Grep");
+        assert_eq!(tool_category("Glob"), "Glob");
+        // All three subagent spellings share the Task bucket.
+        for t in SUBAGENT_TOOLS {
+            assert_eq!(tool_category(t), "Task", "{t}");
+        }
+        // Anything unrecognized is Other — including plain MCP tools, which is correct for them.
+        assert_eq!(tool_category("mcp__sparkle-control__rename_agent"), "Other");
+        assert_eq!(tool_category("ExitPlanMode"), "Other");
+    }
+
+    /// The pre-filter must never gate out a line the parse would have counted — including a
+    /// pretty-printed one. A filter keyed to compact punctuation passes every fixture in this file
+    /// (they are all compact) while silently zeroing a real install whose transcripts are spaced,
+    /// so the property is asserted against BOTH serializations of the same record.
+    #[test]
+    fn filter_is_a_superset_of_what_the_parse_finds() {
+        let compact = tool_line("Agent");
+        // Same record, pretty-printed — what a format change would look like.
+        let spaced = serde_json::to_string_pretty(
+            &serde_json::from_str::<Value>(&compact).unwrap(),
+        )
+        .unwrap()
+        .replace('\n', " ");
+
+        for (label, line) in [("compact", &compact), ("spaced", &spaced)] {
+            assert!(
+                line_may_carry_activity(line),
+                "{label} tool_use line was filtered out — every activity counter would read zero"
+            );
+            let mut a = FileActivity::default();
+            a.observe(&serde_json::from_str(line).unwrap());
+            assert_eq!(a.subagent_dispatches, 1, "{label}");
+        }
+
+        // Same for a user turn, which is what the denominator is built from.
+        let user = typed_line("hello");
+        let user_spaced = serde_json::to_string_pretty(
+            &serde_json::from_str::<Value>(&user).unwrap(),
+        )
+        .unwrap()
+        .replace('\n', " ");
+        for (label, line) in [("compact", &user), ("spaced", &user_spaced)] {
+            assert!(line_may_carry_activity(line), "{label} user line was filtered out");
+        }
+
+        // And a line with neither is still skipped, so the filter is doing real work.
+        assert!(!line_may_carry_activity(
+            r#"{"type":"summary","summary":"a recap with no tools"}"#
+        ));
+
+        // THE COST PROPERTY, pinned. `tool_result` lines carry `tool_use_id`, so a filter matching
+        // the bare substring `tool_use` drags in the largest lines in every transcript — file reads
+        // and command output the token path never parsed. That regression measured 3.2x the bytes
+        // into serde_json. These lines move no counter, so they must not be parsed at all.
+        let result_line = tool_result_line();
+        assert!(
+            result_line.contains("tool_use_id"),
+            "fixture must carry the field that caused the regression: {result_line}"
+        );
+        assert!(
+            !line_may_carry_activity(&result_line),
+            "a tool_result line must be skipped, not parsed — this is the 3.2x cost regression"
+        );
+        // And it contributes nothing even if parsed, so skipping it loses no data.
+        let mut empty = FileActivity::default();
+        empty.observe(&serde_json::from_str(&result_line).unwrap());
+        assert_eq!(empty, FileActivity::default(), "a tool_result moves no counter");
+
+        // EVERY SHAPE, as a table. This clause was wrong twice (bare `tool_result`, then
+        // `tool_result"`), and both times the suite stayed green because the fixtures happened to
+        // have a word after the token. `skip` means "a real tool_result block, must NOT be parsed";
+        // otherwise it is prose in a typed turn and must be parsed AND counted. (roborev 55829/55834)
+        let shapes: [(&str, &str, bool); 7] = [
+            ("real block, compact", &tool_result_line(), true),
+            (
+                "real block, spaced",
+                r#"{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_x"}]}}"#,
+                true,
+            ),
+            (
+                "real block, field-reordered",
+                r#"{"type":"user","message":{"content":[{"tool_use_id":"toolu_x","type":"tool_result"}]}}"#,
+                true,
+            ),
+            (
+                "prose, word after",
+                r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"role":"user","content":"what is a tool_result block?"}}"#,
+                false,
+            ),
+            (
+                // Attempt 2 filtered this one out: the closing string quote lands on the token.
+                "prose, ENDS with the token",
+                r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"role":"user","content":"explain tool_result"}}"#,
+                false,
+            ),
+            (
+                "prose, text block ending on the token",
+                r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"content":[{"type":"text","text":"explain tool_result"}]}}"#,
+                false,
+            ),
+            (
+                "escaped JSON paste inside a prompt",
+                r#"{"type":"user","timestamp":"2026-07-24T10:00:00Z","message":{"role":"user","content":"review: {\"type\":\"tool_result\"}"}}"#,
+                false,
+            ),
+        ];
+        for (label, line, is_real_block) in shapes {
+            assert_eq!(
+                line_may_carry_activity(line),
+                !is_real_block,
+                "{label}: a real block must be skipped and prose must be parsed"
+            );
+            if !is_real_block {
+                let mut a = FileActivity::default();
+                a.observe(&serde_json::from_str(line).unwrap());
+                assert_eq!(
+                    a.typed_user_turns, 1,
+                    "{label}: prose mentioning the token is still a typed turn"
+                );
+            } else {
+                // Parse the real blocks too, so a row can only pass by ACTUALLY BEING a tool_result
+                // record. Asserting the filter decision alone is satisfied by any string containing
+                // the substring, which is precisely how a mangled fixture stays green — the failure
+                // this table exists to end, and the one that already hid two wrong implementations
+                // and one corrupted fixture. It also pins "skipping loses no data". (roborev 55846)
+                let mut a = FileActivity::default();
+                a.observe(&serde_json::from_str(line).unwrap());
+                assert_eq!(
+                    a,
+                    FileActivity::default(),
+                    "{label}: a real block must move no counter, so skipping it loses nothing"
+                );
+            }
+        }
+    }
+
+    /// Distinct skills are counted by NAME across the window, not per session.
+    #[test]
+    fn distinct_skills_are_deduped_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let skill = |name: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-07-24T10:00:00Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":1,"output_tokens":1}},"content":[{{"type":"tool_use","id":"toolu_s","name":"Skill","input":{{"skill":"{name}"}}}}]}}}}"#
+            )
+        };
+        write_transcript(&root, "p", "a", &[typed_line("x"), skill("roborev"), skill("guardrails")]);
+        write_transcript(&root, "p", "b", &[typed_line("y"), skill("roborev")]);
+
+        let a = scan_window(&[root], 7).activity();
+        assert_eq!(a.distinct_skills, 2, "roborev twice is still one distinct skill: {a:?}");
+    }
+
     /// `evict_two_tier` with one live generation — the shape these policy tests exercise.
     fn evict_here(
         cache: &mut HashMap<PathBuf, CachedFile>,
@@ -1874,6 +2624,7 @@ mod tests {
             mtime,
             len: 0,
             records: Arc::new(Vec::new()),
+            activity: Arc::new(FileActivity::default()),
             last_touch,
             touched_at: std::time::Instant::now(),
         }
@@ -2164,7 +2915,7 @@ mod tests {
         );
         std::fs::write(&path, body).unwrap();
 
-        let recs = parse_file(&path);
+        let (recs, _) = parse_file(&path);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].session, "session-xyz");
         assert_eq!(recs[0].project, "sparkle");
@@ -2185,7 +2936,7 @@ mod tests {
     #[test]
     fn parse_file_on_a_missing_path_is_empty_not_a_panic() {
         let missing = std::env::temp_dir().join("sparkle_spend_missing.jsonl");
-        assert!(parse_file(&missing).is_empty());
+        assert!(parse_file(&missing).0.is_empty());
     }
 
     /// The memo used to be REBUILT from each pass, so the 7d chip and the 28d default evicted each
@@ -2338,7 +3089,7 @@ mod tests {
         let roots = vec![dir.join("projects")];
         let day = days_from_civil(2026, 7, 24);
         let scan = || {
-            let (blocks, files, truncated) = load_records(&roots, 0);
+            let (blocks, _activity, files, truncated) = load_records(&roots, 0);
             assert_eq!(files, 2);
             assert!(!truncated, "two files is not a truncated scan");
             aggregate_records(blocks.iter().flat_map(|b| b.iter()), day, 30)
