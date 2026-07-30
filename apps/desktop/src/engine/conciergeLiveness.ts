@@ -103,6 +103,28 @@ export const UNAVAILABLE_FAILURE_RUN = 3;
  */
 export const FAILURE_RUN_MAX_GAP_MS = 60 * 60 * 1000;
 
+/**
+ * When the app STOPS counting — the bound on the whole feature's running cost.
+ *
+ * The elapsed counter has to keep ticking through a latched UNAVAILABLE (see
+ * {@link showsElapsed} and the hook that drives it): freezing it leaves a dead turn reading
+ * `No answer yet · 1m 30s` forever, which is the one number this feature promises cannot be wrong.
+ * But "keeps ticking" with no ceiling means a user who asks a question, gets nothing, and walks away
+ * leaves a 500ms re-render loop running for the rest of the session — the app burning battery to
+ * animate a number nobody is reading.
+ *
+ * Ten minutes resolves both. Past it the counter is REMOVED rather than frozen, so no stale number
+ * is ever shown, and the timer stops with it — the display and the clock that feeds it end together,
+ * which is the only way to stop counting without lying. By then the sticky strip has been up for
+ * eight and a half minutes saying the concierge isn't answering; "14m 22s" instead of "10m 01s"
+ * changes nothing a human would do about it, and the verdict it qualifies is latched in state, not
+ * computed from the clock, so it survives untouched.
+ *
+ * A re-send restarts the clock ({@link reduceSent} stamps `silentSince`), so the counter and its
+ * timer both come back for the new wait.
+ */
+export const ELAPSED_CEILING_MS = 10 * 60 * 1000;
+
 /** How the concierge came to be UNAVAILABLE — which decides whether there is a REASON to show.
  *
  *  `null` when it is not unavailable at all. See {@link livenessReason} for why the distinction has
@@ -228,10 +250,32 @@ export function livenessReason(
   return s.failureRun >= UNAVAILABLE_FAILURE_RUN ? "failures" : "silence";
 }
 
-/** Should the column be stating the elapsed time yet? */
+/** Should the column be stating the elapsed time yet?
+ *
+ *  Bounded at BOTH ends. Past {@link ELAPSED_CEILING_MS} this goes false again and the number is
+ *  removed from the row — the counter is never frozen, only ever running or absent. {@link ticks}
+ *  goes false at the same instant and from the same comparison, so the clock cannot stop while a
+ *  number computed from it is still on screen. */
 export function showsElapsed(s: ConciergeLivenessState, now: number): boolean {
   const silent = silentForMs(s, now);
-  return silent !== null && silent >= ELAPSED_COUNTER_AFTER_MS;
+  return silent !== null && silent >= ELAPSED_COUNTER_AFTER_MS && silent < ELAPSED_CEILING_MS;
+}
+
+/**
+ * Is there anything left for a clock to change? The gate on the feature's only timer.
+ *
+ * TRUE while a turn is outstanding and under the ceiling — including after UNAVAILABLE has latched,
+ * because the counter is still on screen and a frozen number is the failure mode this replaced.
+ * FALSE once the ceiling passes: the counter is gone by then ({@link showsElapsed}), every
+ * escalation has already fired, and `unavailableLatched` holds the verdict in state, so no later
+ * `now` can produce a different reading. A tick past that point is pure cost.
+ *
+ * Pure and exported so the bound is asserted directly, rather than inferred from a timer count in a
+ * component test.
+ */
+export function ticks(s: ConciergeLivenessState, now: number): boolean {
+  const silent = silentForMs(s, now);
+  return silent !== null && silent < ELAPSED_CEILING_MS;
 }
 
 /** `12s`, `1m 04s`. Seconds are floored, so the counter never claims time that has not passed. */

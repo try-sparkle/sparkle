@@ -89,6 +89,7 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 import { ConciergeHost } from "./ConciergeHost";
 import { SUPERSEDED_DETAILS } from "../services/concierge";
 import { noteConciergeToolCall } from "../services/conciergeActivity";
+import { THINKING_INDICATOR_TESTID } from "./Concierge/ThinkingIndicator";
 import { UNKNOWN_FAILURE_HEADLINE } from "../engine/conciergeFailureNotice";
 import {
   _resetConciergeLivenessForTests,
@@ -318,6 +319,25 @@ describe("the proactive push channel drives none of this", () => {
     expect(useConciergeLivenessStore.getState().failureRun).toBe(0);
   });
 
+  // THE EFFECT THE GUARD IS FOR (roborev 55468-M2). The two rows above only prove the push does not
+  // post a bubble or feed the detector — both of which happen BELOW `setTyping(false)`, so they went
+  // green with the guard sitting in the wrong place. This is the one that pins the placement: the
+  // user has a question genuinely in flight, a push fails underneath it, and the indicator they are
+  // watching must not be the casualty. `offDone` wraps its own `setTyping(false)` in exactly this
+  // condition for exactly this reason.
+  it("leaves the typing indicator alone for the user turn actually in flight", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me?");
+    // Precondition, stated rather than assumed — a row that starts with no indicator would "pass"
+    // by asserting the absence of something that was never there.
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).not.toBeNull();
+
+    h.proactiveIds = ["99"];
+    act(() => h.brain.error?.({ id: "99", detail: "boom" }));
+
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).not.toBeNull();
+  });
+
   // The control: the same detail on a turn the USER started does everything above.
   it("but a user turn's failure still does all of it", async () => {
     render(<ConciergeHost feed={feed()} />);
@@ -325,5 +345,8 @@ describe("the proactive push channel drives none of this", () => {
     act(() => h.brain.error?.({ id: "7", detail: "boom" }));
     expect(screen.getByTestId("concierge-failure")).toBeTruthy();
     expect(useConciergeLivenessStore.getState().failureRun).toBe(1);
+    // ...including standing the indicator down, which is what makes the row above a placement test
+    // and not just "the guard returns early sometimes".
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeNull();
   });
 });

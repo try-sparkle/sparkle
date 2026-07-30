@@ -1292,6 +1292,29 @@ export function ConciergeHost({
         delete brainTextRef.current[e.id];
         return;
       }
+      // NOT FOR A PUSH (roborev 55442-M2, placement corrected in 55468-M2). `offDone` above already
+      // stands down for the proactive channel and this must match it: nobody asked for that turn, so
+      // its failure is not a question that went unanswered, and three failed pushes must not raise a
+      // sticky "your concierge isn't answering" strip over a conversation the user never started.
+      //
+      // ABOVE `setTyping(false)`, not below it — which is where this guard first landed, and that
+      // placement did not buy the parity the paragraph above claims. `offDone` wraps its own
+      // `setTyping(false)` in this same condition precisely because clearing it "would take the
+      // indicator away from the reply the user IS waiting on", and services/concierge names the
+      // identical consequence for the error path. A push failing while a user turn streams would
+      // still have killed that user turn's indicator — the one effect this guard exists to prevent.
+      //
+      // services/concierge filters pushes before the fan-out today, so this is defence in depth
+      // rather than a live bug — but engine/conciergeLiveness's header states the property as an
+      // invariant of THIS call site, and a header that asserts what the code does not enforce is how
+      // the last three rounds of findings happened.
+      //
+      // The partial-text drop stays UNCONDITIONAL: a push's failed turn leaks the same way a user
+      // turn's does, so it is done on both sides of the return.
+      if (isProactiveTurn(e.id)) {
+        delete brainTextRef.current[e.id];
+        return;
+      }
       setTyping(false);
       // A failed turn never reaches the done handler, so drop its partial text here rather than
       // retaining every failed reply for the life of the session.
@@ -1305,15 +1328,6 @@ export function ConciergeHost({
       // `conciergeFailureNotice` is TOTAL and always carries the evidence, including for a failure
       // it cannot classify — a classifier that only spoke for recognised errors would re-create this
       // exact bug one unknown failure at a time.
-      // NOT FOR A PUSH (roborev 55442-M2). `offDone` above already stands down for the proactive
-      // channel and this must match it: nobody asked for that turn, so its failure is not a question
-      // that went unanswered, and three failed pushes must not raise a sticky "your concierge isn't
-      // answering" strip over a conversation the user never started. services/concierge filters
-      // pushes before the fan-out today, so this is defence in depth rather than a live bug — but
-      // engine/conciergeLiveness's header states the property as an invariant of THIS call site, and
-      // a header that asserts what the code does not enforce is how the last three rounds of
-      // findings happened.
-      if (isProactiveTurn(e.id)) return;
       noteConciergeFailed(e.detail);
       // A failure is an ANSWER — the user was told what happened. Not an orphan, so the next send
       // must not stamp this bubble "never answered" on top of the error it already carries.

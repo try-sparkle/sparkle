@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ELAPSED_CEILING_MS,
   FAILURE_RUN_MAX_GAP_MS,
   IDLE_LIVENESS,
   OFFLINE_AFTER_MS,
@@ -19,6 +20,7 @@ import {
   reduceSettled,
   reduceTick,
   showsElapsed,
+  ticks,
   type ConciergeLivenessState,
 } from "./conciergeLiveness";
 
@@ -193,6 +195,57 @@ describe("the elapsed counter", () => {
     expect(elapsedLabel(0)).toBe("0s");
     expect(elapsedLabel(64_000)).toBe("1m 04s");
     expect(elapsedLabel(600_000)).toBe("10m 00s");
+  });
+
+  // THE CEILING (roborev 55468-M3). The counter has to keep running through a latched UNAVAILABLE —
+  // a frozen number is the failure this replaced — but "keeps running" with no upper bound is a
+  // 500ms loop for the rest of the session once a turn dies and the human walks away.
+  it("stops counting at the ceiling", () => {
+    const s = reduceSent(IDLE_LIVENESS, T0);
+    expect(showsElapsed(s, T0 + ELAPSED_CEILING_MS - 1)).toBe(true);
+    expect(showsElapsed(s, T0 + ELAPSED_CEILING_MS)).toBe(false);
+  });
+});
+
+// ── THE TIMER'S BOUND ───────────────────────────────────────────────────────────────────────────
+//
+// `ticks` is the gate on the feature's only interval. It is pure and exported precisely so the bound
+// is asserted here, against the decision, rather than inferred from a timer count in a component.
+describe("ticks — is there anything left for a clock to change", () => {
+  it("does not run for a resting app", () => {
+    expect(ticks(IDLE_LIVENESS, T0)).toBe(false);
+  });
+
+  it("runs while a turn is outstanding", () => {
+    const s = reduceSent(IDLE_LIVENESS, T0);
+    expect(ticks(s, T0)).toBe(true);
+    expect(ticks(s, T0 + OFFLINE_AFTER_MS)).toBe(true);
+  });
+
+  // The distinction the whole finding turns on: NOT gated on the latch. At 90s the verdict is in and
+  // there is no further escalation to reach, but the counter is still on screen and still has to be
+  // right.
+  it("keeps running past the latch, because the counter is still being read", () => {
+    const s = reduceTick(reduceSent(IDLE_LIVENESS, T0), T0 + UNAVAILABLE_AFTER_MS);
+    expect(s.unavailableLatched).toBe(true);
+    expect(ticks(s, T0 + UNAVAILABLE_AFTER_MS)).toBe(true);
+  });
+
+  // Stops at the SAME instant `showsElapsed` does — asserted together, because the two stopping at
+  // different moments is exactly how a stale number gets left on screen.
+  it("stops at the ceiling, in step with the counter it feeds", () => {
+    const s = reduceSent(IDLE_LIVENESS, T0);
+    const at = T0 + ELAPSED_CEILING_MS;
+    expect(ticks(s, at - 1)).toBe(true);
+    expect(ticks(s, at)).toBe(false);
+    expect(showsElapsed(s, at)).toBe(false);
+  });
+
+  it("starts again when the user sends into the silence", () => {
+    const dead = reduceSent(IDLE_LIVENESS, T0);
+    const at = T0 + ELAPSED_CEILING_MS;
+    expect(ticks(dead, at)).toBe(false);
+    expect(ticks(reduceSent(dead, at), at)).toBe(true);
   });
 });
 

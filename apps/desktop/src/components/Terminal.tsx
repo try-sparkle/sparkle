@@ -40,7 +40,20 @@ import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { isMeasuredSize, spawnSize } from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
-import { recoverFromWebglContextLoss, forceFullRepaint, settleRepaintPlan } from "./terminalWebgl";
+import {
+  forceFullRepaint,
+  settleRepaintPlan,
+  releaseGlContext,
+  findWebglCanvas,
+  onWebglContextLostImmediately,
+  type GlCanvasLike,
+} from "./terminalWebgl";
+import {
+  acquireWebglPermit,
+  releaseWebglPermit,
+  liveWebglPermitCount,
+  type WebglPermit,
+} from "./webglContextRegistry";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 import { perfMark, perfSpan } from "../perfTrace";
@@ -250,6 +263,17 @@ export function Terminal({
   // The WebGL renderer (when available) caches colored glyphs in a texture atlas — kept so the
   // live re-theme effect can clear it and force already-painted cells to repaint.
   const webglRef = useRef<WebglAddon | null>(null);
+  // The addon's own canvas, captured at attach time (it exposes no handle, and after dispose the
+  // canvas is detached and unfindable). Needed to release the GPU context deterministically —
+  // xterm's dispose() never does. See teardownWebgl.
+  const webglCanvasRef = useRef<GlCanvasLike | null>(null);
+  // Our slot in the process-wide concurrent-context cap; handed back on every teardown path.
+  const webglPermitRef = useRef<WebglPermit | null>(null);
+  // Unsubscriber for our immediate webglcontextlost listener.
+  const webglLostUnlistenRef = useRef<(() => void) | null>(null);
+  // Lets the context-loss callbacks — registered once at attach and living for the addon's whole
+  // lifetime — call the CURRENT detachWebgl without being re-registered on every render.
+  const detachWebglRef = useRef<(() => void) | null>(null);
   // Set when a PTY chunk is written while this pane can't paint (hidden / 0-sized canvas): those
   // cells get cached as "drawn" by the WebGL renderer but never reach the GPU, so a bare refresh()
   // can't recover them (see forceFullRepaint). The next settle that lands while the pane IS
@@ -325,18 +349,66 @@ export function Terminal({
     }
   }, []);
 
+  // Release EVERY GPU resource this pane holds, in the one order that is safe. Used by all three
+  // release paths — hide, unmount, and context-loss — deliberately as a single function: a second
+  // teardown path that forgot to give the permit back would permanently shrink the cap (after
+  // MAX_WEBGL_CONTEXTS leaks, no pane on this machine would ever get a WebGL renderer again).
+  const teardownWebgl = useCallback(() => {
+    // 1. Stop watching the canvas FIRST. We are about to deliberately lose its context below, which
+    //    dispatches webglcontextlost — our own listener would otherwise re-enter this teardown.
+    webglLostUnlistenRef.current?.();
+    webglLostUnlistenRef.current = null;
+    const webgl = webglRef.current;
+    const canvas = webglCanvasRef.current;
+    webglCanvasRef.current = null;
+    // 2. Null the ref BEFORE dispose so any repaint/re-theme effect that reads webglRef can't touch
+    //    a half-disposed addon if it races in during teardown.
+    webglRef.current = null;
+    if (webgl) {
+      try {
+        webgl.dispose();
+      } catch {
+        /* already torn down — nothing to release */
+      }
+    }
+    // 3. Hand the GPU context back EXPLICITLY, after dispose. xterm's dispose() only does
+    //    removeChild(canvas) — it never calls WEBGL_lose_context.loseContext() (verified: the
+    //    string does not appear in @xterm/addon-webgl 0.19.0), so without this the context survives
+    //    until GC and keeps counting against the engine's measured 16-context budget. That is the
+    //    leak that let 103 attaches in one session exhaust the budget and get the VISIBLE
+    //    terminal's context evicted (the engine evicts the oldest), which is the garbage-glyph bug.
+    releaseGlContext(canvas);
+    // 4. Give the slot back so the next reveal can take it.
+    releaseWebglPermit(webglPermitRef.current);
+    webglPermitRef.current = null;
+  }, []);
+
   // Attach the xterm WebGL renderer to the live terminal. Called ONLY when this pane is
-  // visible/active (see the visibility effect below). WKWebView caps the number of concurrent
-  // WebGL contexts (~8–16), and the app keeps one xterm per open agent — including hidden panes,
-  // which stay laid out (visibility:hidden, not display:none) and so used to keep a live context
-  // each. Past the cap the engine force-loses and restores contexts in a thrash loop that blocks
-  // the main thread (the "spinning beachball" that got worse the more agents were open). Holding a
-  // context only for the visible pane keeps us far under the cap. The xterm core, its scrollback,
-  // and the PTY are untouched — only the renderer addon is added. Idempotent; safe once disposed.
+  // visible/active (see the visibility effect below). The engine caps concurrent WebGL contexts at
+  // a MEASURED 16 (scripts/measure-webgl-context-limit.mjs; WebKit 26.5 and Chromium 149 agree),
+  // and the app keeps one xterm per open agent — including hidden panes, which stay laid out
+  // (visibility:hidden, not display:none) and so used to keep a live context each. Past the cap the
+  // engine evicts the OLDEST context, and an evicted renderer keeps drawing from a dead texture
+  // atlas: right layout, right colors, wrong glyphs. Holding a context only for the visible pane —
+  // and only up to MAX_WEBGL_CONTEXTS of them — keeps us far under the cap. The xterm core, its
+  // scrollback, and the PTY are untouched: only the renderer addon is added. Idempotent.
   const attachWebgl = useCallback(() => {
     if (disposedRef.current) return;
     const term = termRef.current;
     if (!term || webglRef.current) return; // no terminal yet, or already attached
+    // Claim a slot before allocating anything. Refused → stay on xterm's DOM renderer, which has no
+    // GPU context and no texture atlas and therefore CANNOT produce corrupted glyphs. Slightly less
+    // crisp box-drawing is the entire cost; taking a context we don't have budget for would evict
+    // somebody else's and corrupt THEIR pane.
+    const permit = acquireWebglPermit(agentId);
+    if (!permit) {
+      // Logged so a recurrence is self-diagnosing. If this appears, more panes believe they are
+      // visible than MAX_WEBGL_CONTEXTS allows — either raise the cap (still far under the measured
+      // 16) or find out why N panes think they are on screen. Silence here was how the original
+      // exhaustion went unnoticed until it corrupted the screen.
+      console.warn("webgl renderer capped; using DOM renderer", agentId, liveWebglPermitCount());
+      return;
+    }
     // WebGL renderer enables customGlyphs (the default DOM renderer does not), giving crisp,
     // exactly-aligned box-drawing. Fall back silently to the DOM renderer if WebGL is unavailable.
     try {
@@ -346,21 +418,36 @@ export function Terminal({
         "Terminal.attachWebgl",
         () => {
           const w = new WebglAddon();
-          // On a lost GPU context the default renderer must take over and the screen must be
-          // repainted, else it stays blank/stale until the next PTY write.
-          // recoverFromWebglContextLoss disposes the addon, nulls the ref (so the re-theme effect
-          // doesn't touch a disposed addon), and refreshes.
-          w.onContextLoss(() => {
-            recoverFromWebglContextLoss(w, termRef.current, () => {
-              webglRef.current = null;
-            });
-          });
+          // Belt-and-braces: the addon's own onContextLoss fires a full 3 SECONDS after the context
+          // dies (and never at all if the engine restores it first) — far too late to prevent
+          // corruption, which is why the canvas listener below exists. We still wire this so a loss
+          // the listener somehow misses still releases the context and the permit.
+          w.onContextLoss(() => detachWebglRef.current?.());
           term.loadAddon(w);
           return w;
         },
         { agentId },
       );
       webglRef.current = webgl;
+      webglPermitRef.current = permit;
+      // Capture the addon's canvas NOW: it exposes no handle to it, and after dispose the canvas is
+      // detached from the DOM and can no longer be found. Needed to release the context (step 3 of
+      // teardownWebgl) and to watch for loss.
+      webglCanvasRef.current = findWebglCanvas(term.element ?? null);
+      if (!webglCanvasRef.current) {
+        // The probe found no webgl2 canvas even though the addon attached. That means we CANNOT
+        // release this context on teardown and CANNOT watch it for loss — i.e. the original leak is
+        // back, silently. Most likely cause: xterm changed how/where it creates its canvas. Loud on
+        // purpose; a silent no-op here is exactly how this bug survived unnoticed.
+        console.warn("webgl attached but its canvas was not found; context cannot be released", agentId);
+      }
+      // THE FIX THAT MAKES CORRUPTED GLYPHS IMPOSSIBLE RATHER THAN MERELY RARER. Listen for
+      // webglcontextlost ourselves and fall back within the same event dispatch, instead of waiting
+      // out the addon's 3-second restore timer while it renders from a dead atlas. See
+      // onWebglContextLostImmediately for the addon source this works around.
+      webglLostUnlistenRef.current = onWebglContextLostImmediately(webglCanvasRef.current, () =>
+        detachWebglRef.current?.(),
+      );
       // NOTE: we deliberately do NOT force a repaint here. attachWebgl is only ever called when this
       // pane is (becoming) active, and the become-active reveal effect below OWNS the repaint — it
       // waits for the box to lay out, then forceFullRepaints (clearing the fresh atlas so cells
@@ -368,28 +455,26 @@ export function Terminal({
       // single repaint path preserves the tested reveal-repaint contract (Terminal.revealRepaint).
     } catch {
       /* no WebGL — keep the default DOM renderer (TUI borders may be less crisp) */
+      teardownWebgl(); // never hold the permit for a renderer that failed to attach
     }
-  }, []);
+    // agentId is stable for this component's life; it only labels the permit and the perf span.
+  }, [agentId, teardownWebgl]);
 
-  // Detach + dispose the WebGL renderer, releasing its GPU context. xterm falls back to its DOM
-  // renderer when no WebGL addon is loaded (the same fallback recoverFromWebglContextLoss relies
-  // on), so the terminal keeps rendering; the content buffer, scrollback, and PTY all live on the
-  // xterm core and are untouched. Called when this pane becomes hidden. Idempotent.
+  // Drop the WebGL renderer and fall back to xterm's DOM renderer, releasing the GPU context and
+  // the permit. The content buffer, scrollback, and PTY all live on the xterm core and are
+  // untouched, so the terminal keeps rendering. Called when this pane becomes hidden AND when its
+  // context is lost — a lost context must reach a clean fallback, never corrupted output.
+  // Idempotent.
   const detachWebgl = useCallback(() => {
-    const webgl = webglRef.current;
-    if (!webgl) return;
-    // Null the ref BEFORE dispose so any repaint/re-theme effect that reads webglRef can't touch a
-    // half-disposed addon if it races in during teardown.
-    webglRef.current = null;
-    try {
-      webgl.dispose();
-    } catch {
-      /* already torn down — nothing to release */
-    }
-    // Repaint via the now-active DOM renderer so the screen doesn't go stale after the swap
-    // (mirrors recoverFromWebglContextLoss). No-op once disposed.
+    if (!webglRef.current) return;
+    teardownWebgl();
+    // Repaint via the now-active DOM renderer so the screen doesn't go stale after the swap. This is
+    // what turns a lost context into a clean frame instead of leftover garbage. No-op once disposed.
     safeRefresh();
-  }, [safeRefresh]);
+  }, [teardownWebgl, safeRefresh]);
+  // Read by the context-loss callbacks registered at attach time, which must call the LATEST
+  // detachWebgl without being re-registered (they live for the addon's lifetime).
+  detachWebglRef.current = detachWebgl;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -1032,8 +1117,11 @@ export function Terminal({
       // gone — the uncaught "undefined is not an object (this._renderer.value.dimensions)" TypeError
       // seen in the logs. Disposing the addon first stops its loop before the core disappears.
       // (dispose() is idempotent, so term.dispose()'s own addon teardown is a safe no-op after this.)
-      webglRef.current?.dispose();
-      webglRef.current = null;
+      // teardownWebgl (not a bare dispose): it also releases the GPU context — which xterm's
+      // dispose() never does — and hands the concurrency permit back. A bare dispose here leaked
+      // one context per closed pane, so contexts accumulated for the whole session and eventually
+      // got the visible terminal's context evicted.
+      teardownWebgl();
       term.dispose();
       // Null the refs so a late callback that slipped past the sentinel still hits a null guard
       // (safeFit/safeRefresh and the active/zoom/theme effects all bail on a null ref) rather than

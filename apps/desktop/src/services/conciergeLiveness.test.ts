@@ -11,6 +11,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ELAPSED_CEILING_MS,
   ELAPSED_COUNTER_AFTER_MS,
   OFFLINE_AFTER_MS,
   UNAVAILABLE_AFTER_MS,
@@ -107,6 +108,62 @@ describe("the ticker is scheduled only when it has something to do", () => {
     });
     rerender();
     expect(result.current.liveness).toBe("unavailable");
+    expect(result.current.showsElapsed).toBe(true);
+    expect(result.current.silentMs).toBe(ELAPSED_COUNTER_AFTER_MS + 1_000);
+  });
+
+  // THE BOUND ON "KEEPS TICKING" (roborev 55468-M3). The two cases above are the reason the ticker
+  // survives the latch; this is the reason that is not the same as running forever. A turn that dies
+  // silently never gets a delta, a tool call, a done or an error — so `silentSince` stays set, and
+  // with the latch gate removed and nothing in its place the interval re-rendered twice a second for
+  // the rest of the session, animating a number for a human who gave up and closed the laptop.
+  //
+  // Asserted as a TIMER COUNT, because that is the cost being bounded — a reading about the
+  // component's derived state would go green against a version that still had the interval running.
+  it("stops for good once the counter is no longer on screen", () => {
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    act(() => noteConciergeSent());
+    rerender();
+    expect(timers()).toBe(1);
+
+    // Just under: still counting, still ticking. Pinned so the ceiling cannot be quietly lowered to
+    // something that swallows a wait a human is actually watching.
+    act(() => {
+      vi.advanceTimersByTime(ELAPSED_CEILING_MS - 2_000);
+    });
+    rerender();
+    expect(result.current.showsElapsed).toBe(true);
+    expect(timers()).toBe(1);
+
+    act(() => {
+      vi.advanceTimersByTime(4_000);
+    });
+    rerender();
+    expect(timers()).toBe(0);
+    // REMOVED, not frozen — the clock and the number it feeds stop together, so there is no stale
+    // reading left on screen. That pairing is the whole reason stopping is allowed here at all.
+    expect(result.current.showsElapsed).toBe(false);
+    // And the verdict is untouched: it lives in latched state, not in the clock.
+    expect(result.current.liveness).toBe("unavailable");
+  });
+
+  it("comes back when the user sends again after giving up", () => {
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    act(() => noteConciergeSent());
+    rerender();
+    act(() => {
+      vi.advanceTimersByTime(ELAPSED_CEILING_MS + 1_000);
+    });
+    rerender();
+    expect(timers()).toBe(0);
+
+    act(() => noteConciergeSent());
+    rerender();
+    expect(timers()).toBe(1);
+    act(() => {
+      vi.advanceTimersByTime(ELAPSED_COUNTER_AFTER_MS + 1_000);
+    });
+    rerender();
     expect(result.current.showsElapsed).toBe(true);
     expect(result.current.silentMs).toBe(ELAPSED_COUNTER_AFTER_MS + 1_000);
   });

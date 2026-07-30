@@ -11,8 +11,11 @@
 // a turn the user's own next message killed is not evidence the concierge is unwell, and a push
 // nobody asked for is not a question that went unanswered. See the engine's header.
 //
-// THE ONLY TIMER IN THE FEATURE lives in {@link useConciergeLiveness}, and it runs only while a turn
-// is actually being awaited and has not already latched — so a resting app schedules nothing.
+// THE ONLY TIMER IN THE FEATURE lives in {@link useConciergeLiveness}. It runs while a turn is
+// outstanding and the elapsed counter is still on screen — which INCLUDES a latched UNAVAILABLE,
+// because the number is still being read then and a frozen one would be wrong. It stops at
+// `engine.ELAPSED_CEILING_MS`, the same instant the counter is removed. A resting app, and one whose
+// turn died ten minutes ago, both schedule nothing.
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 
@@ -28,6 +31,7 @@ import {
   reduceTick,
   showsElapsed,
   silentForMs,
+  ticks,
   type ConciergeLiveness,
   type ConciergeLivenessState,
   type ConciergeProgressKind,
@@ -39,8 +43,9 @@ import {
  *
  * 500ms so the elapsed counter ticks visibly on whole seconds without the render churn of a
  * requestAnimationFrame loop. It is the ONLY interval this feature schedules, and it is gated on
- * there being something to wait for — an idle app, or one already latched into UNAVAILABLE, runs no
- * timer at all.
+ * `engine.ticks` — there must be a turn outstanding AND a counter still on screen to update. An idle
+ * app runs no timer; neither does one whose turn has been dead past `ELAPSED_CEILING_MS`. A latched
+ * UNAVAILABLE inside that window DOES keep ticking, on purpose — see the hook.
  */
 export const LIVENESS_TICK_MS = 500;
 
@@ -116,41 +121,49 @@ export interface ConciergeLivenessReading {
  * Subscribe to the liveness signal, ticking the clock while a turn is outstanding.
  *
  * The interval both re-renders the caller (so the counter advances) and drives {@link reduceTick},
- * which is what LATCHES the sticky UNAVAILABLE state. Two things follow from that:
+ * which is what LATCHES the sticky UNAVAILABLE state. Three things follow from that:
  *
  *   • It must not run when there is nothing to wait for, or a resting app would schedule a timer
- *     forever — hence the `waiting` gate. That gate is the whole of it.
+ *     forever.
  *   • It deliberately KEEPS running after UNAVAILABLE latches. Gating on the latch looked free —
  *     there is no further escalation to reach — but the elapsed counter is still on screen, and it
  *     is computed from the `now` the last tick captured. Stopping froze it: a dead turn read
  *     `No answer yet · 1m 30s` for as long as it stayed dead. Worse, a re-send then moved
  *     `silentSince` PAST that stale `now`, so the counter computed zero and vanished entirely. The
  *     one number this feature guarantees cannot be wrong must not be the one it stops updating.
+ *   • So the bound is NOT the latch, it is `engine.ELAPSED_CEILING_MS` — the point at which the
+ *     counter is removed from the row. Both facts come from the single `engine.ticks` predicate, so
+ *     the clock and the number it feeds can only stop together. Without that ceiling, "keeps running
+ *     after the latch" meant a permanently dead turn re-rendering twice a second for the rest of the
+ *     session, long after the human gave up and walked away.
  *
  * `reduceTick` returns the same object when nothing changed, so the unconditional `setState` inside
  * the interval does not wake subscribers on every tick — the residual cost of ticking through a
- * latched outage is one `Date.now()` read and one re-render of the two rows that subscribe.
+ * latched outage is one `Date.now()` read and one re-render of the two rows that subscribe, for at
+ * most ten minutes.
  */
 export function useConciergeLiveness(): ConciergeLivenessReading {
   const state = useConciergeLivenessStore();
   const [now, setNow] = useState<number>(() => Date.now());
 
-  const waiting = state.silentSince !== null;
+  // Read the clock during render as well as on the tick. A turn that starts between two intervals
+  // would otherwise be judged against a `now` from before it existed, which reads as an instant
+  // several-second-old wait on the very first frame.
+  const at = state.silentSince !== null ? Math.max(now, state.silentSince) : now;
+  // Derived during render, so the gate re-evaluates on the very tick that carries it past the
+  // ceiling — that render is what tears the interval down.
+  const running = ticks(state, at);
 
   useEffect(() => {
-    if (!waiting) return;
+    if (!running) return;
     const id = setInterval(() => {
       const t = Date.now();
       setNow(t);
       useConciergeLivenessStore.setState(reduceTick(useConciergeLivenessStore.getState(), t));
     }, LIVENESS_TICK_MS);
     return () => clearInterval(id);
-  }, [waiting]);
+  }, [running]);
 
-  // Read the clock during render as well as on the tick. A turn that starts between two intervals
-  // would otherwise be judged against a `now` from before it existed, which reads as an instant
-  // several-second-old wait on the very first frame.
-  const at = waiting ? Math.max(now, state.silentSince ?? now) : now;
   return {
     liveness: livenessAt(state, at),
     reason: livenessReason(state, at),

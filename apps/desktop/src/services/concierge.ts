@@ -210,6 +210,93 @@ let restoring: Promise<void> | null = null;
  *  conversation handed back to them a moment later. */
 let sessionEpoch = 0;
 
+// ---------------------------------------------------------------------------------------------
+// RETIRING A SESSION — the half of "forget this conversation" that outlives the process.
+//
+// `sessionEpoch` protects in-process writes, but the session pointer has a DURABLE source the epoch
+// cannot reach: the on-disk Claude transcript, which {@link restoreConciergeSession} re-probes at
+// every boot. So a reset that only cleared module state was undone by the next launch — and after
+// `resetConciergeIdentityState` wired this to sign-out, that meant user B's first turn resuming user
+// A's conversation with a genuinely empty column in front of it (roborev 55774). That is the
+// invisible variant, and it is worse than the visible one.
+//
+// Retiring is a DENY-LIST rather than a cursor because the probe answers "the newest transcript on
+// disk", which is a fact about the filesystem, not a position we can advance past. The list is
+// bounded and newest-first: it only has to outlive the transcripts a probe could still surface, and
+// an unbounded list of ids in localStorage would be its own slow leak.
+//
+// It backstops the in-flight race too. Retiring at reset time means a `done` that lands afterwards
+// carrying the SAME session id is refused on identity grounds even if its turn was never tracked.
+const RETIRED_SESSIONS_KEY = "sparkle-concierge-retired-sessions";
+const MAX_RETIRED_SESSIONS = 20;
+
+function readRetiredSessions(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(RETIRED_SESSIONS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    // A corrupt or unavailable store must not break a turn: treat it as "nothing retired". The cost
+    // is the pre-existing behaviour, never a throw on the send path.
+    return [];
+  }
+}
+
+/** Record ids as belonging to a conversation that has been deliberately ended, so no later probe
+ *  seeds them back. Silent on a storage failure, for the reason above. */
+function retireSessionIds(...ids: Array<string | null>): void {
+  const fresh = ids.filter((v): v is string => typeof v === "string" && v !== "");
+  if (!fresh.length) return;
+  try {
+    const merged = [...new Set([...fresh, ...readRetiredSessions()])];
+    localStorage.setItem(
+      RETIRED_SESSIONS_KEY,
+      JSON.stringify(merged.slice(0, MAX_RETIRED_SESSIONS)),
+    );
+  } catch {
+    /* storage unavailable — see readRetiredSessions */
+  }
+}
+
+/** Whether `id` names a conversation a reset has ended. Exported for the identity-reset test, which
+ *  asserts the cross-launch half that an in-process assertion cannot see. */
+export function isRetiredConciergeSession(id: string): boolean {
+  return readRetiredSessions().includes(id);
+}
+
+/**
+ * Turn id → the `sessionEpoch` in force when that turn STARTED.
+ *
+ * The `concierge:done` listener has no other way to tell whether the session it is reporting belongs
+ * to the identity that is signed in NOW: it fires for whatever turn was in flight, and a turn started
+ * before a sign-out completes after it. Bounded like everything else here — a `done` is the only
+ * consumer and it deletes its own entry, so this holds at most the genuinely in-flight turns plus the
+ * stragglers of turns that died without one.
+ */
+const turnEpochs = new Map<string, number>();
+const MAX_TRACKED_TURNS = 50;
+
+function rememberTurnEpoch(id: string, epoch: number): void {
+  turnEpochs.set(id, epoch);
+  // Insertion order is start order, so the first key is the oldest.
+  while (turnEpochs.size > MAX_TRACKED_TURNS) {
+    const oldest = turnEpochs.keys().next();
+    if (oldest.done) break;
+    turnEpochs.delete(oldest.value);
+  }
+}
+
+/**
+ * Does this turn still belong to the human who is signed in?
+ *
+ * READ-ONLY, so `delta` (which fires many times per turn) can ask repeatedly. An UNTRACKED turn
+ * answers yes: that is the pre-existing behaviour for anything not started through the two starters,
+ * and silently muting such a turn would be a worse failure than the one being fixed.
+ */
+function turnIsCurrent(id: string): boolean {
+  const startedAt = turnEpochs.get(id);
+  return startedAt === undefined || startedAt === sessionEpoch;
+}
+
 function dispatch<T>(callbacks: Set<Callback<T>>, event: T): void {
   for (const cb of callbacks) {
     try {
@@ -234,17 +321,35 @@ function ensureWired(): Promise<void> {
   if (!wiring) {
     const w = (async () => {
       const results = await Promise.allSettled([
-        listen<ConciergeDeltaEvent>("concierge:delta", (ev) => dispatch(deltaCallbacks, ev.payload)),
+        // THE FAN-OUT IS GATED ON IDENTITY TOO, not just the session pointer (roborev 55794).
+        // `ConciergeHost` is mounted throughout — sign-out is a SettingsDialog action, not an
+        // unmount — and it upserts streamed text straight into `conciergeThreadStore`, which
+        // persists. So a pre-reset turn's deltas would re-populate the column `clearConciergeThread`
+        // had just emptied, with the PREVIOUS human's answer, and it would survive relaunch. Gating
+        // the pointer alone fixes what the model remembers and leaves what the human SEES.
+        listen<ConciergeDeltaEvent>("concierge:delta", (ev) => {
+          if (turnIsCurrent(ev.payload.id)) dispatch(deltaCallbacks, ev.payload);
+        }),
         listen<ConciergeDoneEvent>("concierge:done", (ev) => {
           // A turn that COMPLETED is the strongest evidence a session exists and is resumable, so it
           // refreshes the fallback too — including after Rust's stale-resume self-heal, where the id
           // that comes back is a brand-new session and the old fallback now points at the transcript
           // claude just abandoned.
+          const current = turnIsCurrent(ev.payload.id);
           if (ev.payload.sessionId) {
-            currentSessionId = ev.payload.sessionId;
-            fallbackSessionId = ev.payload.sessionId;
+            if (!current) {
+              // RETIRE WHAT IT LANDED ON. Refusing in-process is only half: a turn that MINTED a
+              // session — a first turn with no resume target, or the stale-resume self-heal — ends on
+              // an id `resetConciergeSession` never saw, so nothing put it on the deny-list. Its
+              // transcript is now the newest on disk, and the next launch would seed it.
+              retireSessionIds(ev.payload.sessionId);
+            } else if (!isRetiredConciergeSession(ev.payload.sessionId)) {
+              currentSessionId = ev.payload.sessionId;
+              fallbackSessionId = ev.payload.sessionId;
+            }
           }
-          dispatch(doneCallbacks, ev.payload);
+          turnEpochs.delete(ev.payload.id);
+          if (current) dispatch(doneCallbacks, ev.payload);
         }),
         listen<ConciergeErrorEvent>("concierge:error", (ev) => {
           // The Rust side already retried a stale --resume once; if the turn still failed, drop the
@@ -276,6 +381,15 @@ function ensureWired(): Promise<void> {
           // after spawning.
           if (isProactiveTurn(ev.payload.id)) {
             console.debug("concierge: proactive turn failed after spawning:", ev.payload.detail);
+            return;
+          }
+          // AND UNLESS IT BELONGS TO A PREVIOUS IDENTITY (roborev 55794), for both halves and for
+          // the same reasons: rolling `currentSessionId` back to a fallback the reset cleared would
+          // undo the reset, and the fan-out would apologise — "I couldn't reach my brain just now" —
+          // to the human who has just signed IN, about a turn the one who signed out had sent.
+          if (!turnIsCurrent(ev.payload.id)) {
+            turnEpochs.delete(ev.payload.id);
+            console.debug("concierge: dropping an error from a previous identity's turn");
             return;
           }
           if (!isSupersededDetail(ev.payload.detail)) currentSessionId = fallbackSessionId;
@@ -360,7 +474,16 @@ export function restoreConciergeSession(): Promise<void> {
         const latestSessionId = info?.latestSessionId;
         // Seed only. A `concierge:done` that landed while the probe was in flight is live process
         // state and wins; a deliberate set/reset in that window (epoch moved) wins too.
-        if (latestSessionId && currentSessionId === null && sessionEpoch === startedAt) {
+        // …and a RETIRED id is refused outright, however fresh the transcript is. This is the only
+        // guard that survives a relaunch: `restoring` and `sessionEpoch` are both process state, so
+        // without it a quit-and-relaunch after sign-out hands the next human the previous one's
+        // conversation (roborev 55774).
+        if (
+          latestSessionId &&
+          !isRetiredConciergeSession(latestSessionId) &&
+          currentSessionId === null &&
+          sessionEpoch === startedAt
+        ) {
           currentSessionId = latestSessionId;
           fallbackSessionId = latestSessionId;
           // The id came out of THIS account's tree, so that is the account it belongs to.
@@ -462,6 +585,9 @@ export async function startConciergeTurn(
     const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
     rebindSessionToAccount(configDir);
     await Promise.all([ensureWired(), restoreConciergeSession()]);
+    // Snapshot BEFORE the await: a sign-out landing while the invoke is in flight must not have its
+    // reset undone by the write below (roborev 55774).
+    const startedAt = sessionEpoch;
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
     // `configDir` binds this turn to an account. Before it existed the concierge always ran as
     // `$HOME/.claude`, so an exhausted default account failed every turn with no way for the human
@@ -472,8 +598,11 @@ export async function startConciergeTurn(
       configDir: configDir ?? null,
     });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
-    // resume target (esp. an explicit override) for a turn that never ran.
-    if (resume) currentSessionId = resume;
+    // resume target (esp. an explicit override) for a turn that never ran — and only while the
+    // identity that started it is still the one signed in.
+    if (resume && sessionEpoch === startedAt) currentSessionId = resume;
+    // Tag the turn either way, so its `done` can be judged on the same basis.
+    if (typeof id === "string") rememberTurnEpoch(id, startedAt);
     // The turn's id — the same one its `concierge:*` events carry. Callers use it to tell this
     // turn's events from a SUPERSEDED turn's stragglers (concierge.rs emits deltas unconditionally;
     // only the reap is token-gated), which they cannot do from the ids they happen to have seen
@@ -521,6 +650,9 @@ export async function startProactiveConciergeTurn(prompt: string): Promise<strin
     const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
     rebindSessionToAccount(configDir);
     await Promise.all([ensureWired(), restoreConciergeSession()]);
+    // Same snapshot as the send path, and it matters MORE here: a proactive push starts on its own
+    // schedule, so the window where a sign-out can land mid-turn is not user-driven at all.
+    const startedAt = sessionEpoch;
     const resume = currentSessionId ?? undefined;
     // Same account as a user send — a push spends the same subscription, so it must not be the one
     // call that keeps burning an account the human has rotated away from.
@@ -529,8 +661,9 @@ export async function startProactiveConciergeTurn(prompt: string): Promise<strin
       resumeSessionId: resume ?? null,
       configDir: configDir ?? null,
     });
-    if (resume) currentSessionId = resume;
+    if (resume && sessionEpoch === startedAt) currentSessionId = resume;
     if (typeof id !== "string") return null;
+    rememberTurnEpoch(id, startedAt);
     // Record it BEFORE returning, so the first event this turn produces already resolves as a push.
     // Rust emits deltas as soon as claude speaks, and the caller has not run a line yet.
     rememberProactiveTurn(id);
@@ -611,8 +744,14 @@ export function setConciergeSessionId(id: string | null): void {
  *
  *  Clears the FALLBACK as well, and that is the point: a user asking to start over must not have the
  *  old conversation resurrected by the next transient error, and the boot restore must not run after
- *  it and undo it either (hence `restoring` is marked done rather than left null). */
+ *  it and undo it either (hence `restoring` is marked done rather than left null).
+ *
+ *  AND THE IDS ARE RETIRED, which is that same intent carried past process exit. Suppressing
+ *  `restoring` only silences the probe for THIS run; the transcript is still the newest one on disk,
+ *  so the next launch re-seeded exactly the conversation the user (or a sign-out) just ended. Both
+ *  callers want the durable meaning — see {@link retireSessionIds}. */
 export function resetConciergeSession(): void {
+  retireSessionIds(currentSessionId, fallbackSessionId);
   sessionEpoch++;
   currentSessionId = null;
   fallbackSessionId = null;
@@ -622,8 +761,15 @@ export function resetConciergeSession(): void {
   restoring ??= Promise.resolve();
 }
 
-/** Test-only: drop all module state (subscribers, wiring, session, restore) between vitest cases. */
-export function _resetConciergeForTests(): void {
+/**
+ * Test-only: drop all module state (subscribers, wiring, session, restore) between vitest cases.
+ *
+ * `keepRetiredSessions` makes this a faithful RELAUNCH rather than a clean slate: module state is
+ * what a fresh webview starts with, while the durable retirement list survives — which is exactly
+ * what distinguishes a relaunch from a first run, and the only way to assert that a retired session
+ * stays retired across one. Default false, so ordinary cases still get full isolation.
+ */
+export function _resetConciergeForTests(opts?: { keepRetiredSessions?: boolean }): void {
   deltaCallbacks.clear();
   doneCallbacks.clear();
   errorCallbacks.clear();
@@ -633,4 +779,15 @@ export function _resetConciergeForTests(): void {
   wiring = null;
   restoring = null;
   proactiveTurnIds.length = 0;
+  turnEpochs.clear();
+  // The retired list is DURABLE by design, so it is the one piece of this module's state that would
+  // otherwise survive into the next case (and, within a worker, the next FILE) and start refusing
+  // session ids that case never retired. Kept only when the caller is simulating a relaunch.
+  if (!opts?.keepRetiredSessions) {
+    try {
+      localStorage.removeItem(RETIRED_SESSIONS_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+  }
 }

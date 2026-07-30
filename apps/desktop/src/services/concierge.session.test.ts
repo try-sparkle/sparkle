@@ -23,6 +23,8 @@ const harness = vi.hoisted(() => ({
   probeFails: false,
   /** Resolved by the probe's caller-visible promise; set to defer the probe mid-flight. */
   gateProbe: undefined as (() => Promise<void>) | undefined,
+  /** Same, for `concierge_turn` — lets a case land a sign-out while a turn's invoke is in flight. */
+  gateTurn: undefined as (() => Promise<void>) | undefined,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -33,7 +35,10 @@ vi.mock("@tauri-apps/api/core", () => ({
       if (harness.probeFails) throw new Error("no app data dir");
       return { hasSession: harness.diskSessionId !== null, latestSessionId: harness.diskSessionId };
     }
-    if (cmd === "concierge_turn") return "turn-1";
+    if (cmd === "concierge_turn" || cmd === "concierge_proactive_turn") {
+      if (harness.gateTurn) await harness.gateTurn();
+      return "turn-1";
+    }
     return undefined;
   }),
 }));
@@ -54,6 +59,7 @@ import {
   restoreConciergeSession,
   setConciergeSessionId,
   startConciergeTurn,
+  startProactiveConciergeTurn,
   SUPERSEDED_DETAILS,
 } from "./concierge";
 
@@ -94,6 +100,31 @@ async function untilProbeInFlight() {
   expect(probeCount()).toBeGreaterThan(0);
 }
 
+/**
+ * Park a TURN inside its invoke and hand back the release.
+ *
+ * The sibling of `untilProbeInFlight` above, for the other gated command, and it exists for the same
+ * reason that one does: the window under test is between "`resume` and the epoch have been captured"
+ * and "the invoke resolved", so a case has to wait until the turn is genuinely in the invoke before
+ * it acts — releasing earlier just tests a turn that never started. The invoke record is pushed
+ * before the gate is awaited, so its presence is the signal. The deferred is built UP FRONT because
+ * the executor only runs when the gate is called, and a `release` captured later is still a no-op —
+ * the identical trap `untilProbeInFlight` documents.
+ *
+ * Polls timers rather than microtasks: the account resolution noted above puts real awaits between
+ * the call and the invoke, so draining the microtask queue alone is not guaranteed to get there.
+ */
+async function parkTurnInFlight(cmd: string): Promise<() => void> {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => (release = r));
+  harness.gateTurn = () => gate;
+  for (let i = 0; i < 100 && !harness.invokes.some((c) => c.cmd === cmd); i++) {
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  if (!harness.invokes.some((c) => c.cmd === cmd)) throw new Error(`${cmd} never reached its invoke`);
+  return release;
+}
+
 /** Deliver a Rust event to the module's internal listener. */
 function emit(name: "concierge:done" | "concierge:error", payload: unknown): void {
   const h = harness.handlers.get(name);
@@ -109,6 +140,7 @@ describe("concierge session restore (C1)", () => {
     harness.diskSessionId = null;
     harness.probeFails = false;
     harness.gateProbe = undefined;
+    harness.gateTurn = undefined;
     _resetConciergeForTests();
   });
 
@@ -333,6 +365,201 @@ describe("concierge session restore (C1)", () => {
       resetConciergeSession();
       emit("concierge:error", { id: "turn-1", detail: "claude exited with status 1" });
       expect(getConciergeSessionId()).toBeNull();
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────────────────────
+  // A RESET IS AN IDENTITY BOUNDARY NOW (roborev 55774).
+  //
+  // `resetConciergeSession` became reachable from sign-out via `resetConciergeIdentityState`, which
+  // promoted two pre-existing write paths from "harmless race" to "the previous human's conversation
+  // comes back". Both are asserted here rather than in the seam's own test, because the seam cannot
+  // see them: one needs a Rust event delivered mid-flight, the other needs a relaunch.
+  describe("a reset is an identity boundary, not just a pointer clear", () => {
+    it("refuses a `done` from a turn that started BEFORE the reset", async () => {
+      harness.diskSessionId = null;
+      // A turn is in flight when the human signs out. Its `done` lands afterwards, carrying the
+      // session id it ran under — and installing that is how user A's conversation survived into
+      // user B's session with nothing on screen to reveal it.
+      await startConciergeTurn("mid-conversation");
+      resetConciergeSession();
+      expect(getConciergeSessionId()).toBeNull();
+
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-user-a", text: "…" });
+
+      expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("still accepts a `done` from a turn started AFTER the reset — the guard is not a blanket mute", async () => {
+      // The refusal above must not degrade into "a reset permanently deafens the listener": the
+      // whole point of `done` is to keep the pointer fresh for whoever is signed in now. (The turn
+      // here also wires the listeners, which `resetConciergeSession` alone does not.)
+      harness.diskSessionId = null;
+      await startConciergeTurn("user A's turn");
+      resetConciergeSession();
+
+      // User B's turn — a different id, started after the boundary.
+      emit("concierge:done", { id: "turn-user-b", sessionId: "sess-user-b", text: "…" });
+
+      expect(getConciergeSessionId()).toBe("sess-user-b");
+    });
+
+    it("a turn whose invoke RESOLVES after the reset does not re-install its resume target", async () => {
+      // The third write path, and the easiest to miss: `resume` is computed BEFORE the await and
+      // written after it, so a sign-out landing in that window was undone by the turn that was
+      // already on its way out.
+      harness.diskSessionId = "sess-user-a";
+      await restoreConciergeSession();
+      expect(getConciergeSessionId()).toBe("sess-user-a");
+
+      // `parkTurnInFlight` is armed before the send, and resolves only once the turn is genuinely
+      // inside its invoke — i.e. `resume` is already "sess-user-a" and cannot be re-read.
+      const parked = parkTurnInFlight("concierge_turn");
+      const inFlight = startConciergeTurn("sent just before signing out");
+      const release = await parked;
+
+      resetConciergeSession();
+      release();
+      await inFlight;
+
+      expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("…and the same for a PROACTIVE turn, which starts on its own schedule", async () => {
+      // Worse than the send path: nobody chose the moment, so the collision window is not bounded by
+      // what the user was doing when they signed out.
+      harness.diskSessionId = "sess-user-a";
+      await restoreConciergeSession();
+
+      const parked = parkTurnInFlight("concierge_proactive_turn");
+      const inFlight = startProactiveConciergeTurn("noticed something");
+      const release = await parked;
+
+      resetConciergeSession();
+      release();
+      await inFlight;
+
+      expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("retires the session a refused `done` MINTED, so a relaunch cannot seed it either", async () => {
+      // THE HOLE THE FIRST FIX LEFT (roborev 55794). `resetConciergeSession` can only retire ids it
+      // can SEE, and a first turn with no resume target has neither pointer set — so a turn that
+      // mints its session mid-flight ends on an id nothing put on the deny-list, whose transcript is
+      // then the newest on disk. Refusing it in-process is only half the fix.
+      harness.diskSessionId = null; // fresh launch, nothing on disk
+      const parked = parkTurnInFlight("concierge_turn");
+      const inFlight = startConciergeTurn("user A's first message");
+      const release = await parked;
+
+      resetConciergeSession(); // sign-out: both pointers are already null, so nothing is retired here
+      release();
+      await inFlight;
+
+      // The turn completes on a session that never existed when the reset ran.
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-minted-mid-flight", text: "…" });
+      expect(getConciergeSessionId()).toBeNull();
+
+      // RELAUNCH: that transcript is now the newest on disk.
+      _resetConciergeForTests({ keepRetiredSessions: true });
+      harness.diskSessionId = "sess-minted-mid-flight";
+      await restoreConciergeSession();
+
+      expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("does not fan a pre-reset turn's DELTAS out to the next human's column", async () => {
+      // The visible companion. `ConciergeHost` stays mounted across sign-out and writes streamed
+      // text into the persisted thread, so an ungated delta re-fills the column
+      // `clearConciergeThread()` just emptied — with the previous human's answer.
+      const seen: string[] = [];
+      const off = onConciergeDelta((d) => seen.push(d.id));
+      harness.diskSessionId = null;
+      await startConciergeTurn("user A's question");
+
+      resetConciergeSession();
+      harness.handlers.get("concierge:delta")?.({
+        payload: { id: "turn-1", text: "…the answer to A's question" },
+      });
+
+      expect(seen).toEqual([]);
+      off();
+    });
+
+    it("does not fan a pre-reset turn's DONE text out to the next human's column", async () => {
+      // The `done` carries the full reply text, so it is the single largest thing that could land in
+      // the freshly cleared column. Asserted separately from the delta case because they are
+      // different listeners: gating one and not the other still delivers the whole answer.
+      const seen: string[] = [];
+      const off = onConciergeDone((d) => seen.push(d.id));
+      harness.diskSessionId = null;
+      await startConciergeTurn("user A's question");
+
+      resetConciergeSession();
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-user-a", text: "A's private answer" });
+
+      expect(seen).toEqual([]);
+      off();
+    });
+
+    it("does not apologise to the next human for the previous one's failed turn", async () => {
+      const seen: string[] = [];
+      const off = onConciergeError((e) => seen.push(e.id));
+      harness.diskSessionId = "sess-user-a";
+      await startConciergeTurn("user A's question");
+
+      resetConciergeSession();
+      emit("concierge:error", { id: "turn-1", detail: "claude exited with status 1" });
+
+      expect(seen).toEqual([]);
+      // …and it must not roll the pointer back to a fallback the reset cleared, either.
+      expect(getConciergeSessionId()).toBeNull();
+      off();
+    });
+
+    it("still fans out for a turn that belongs to the CURRENT human", async () => {
+      // The guard must not degrade into "a reset permanently mutes the column".
+      const deltas: string[] = [];
+      const off = onConciergeDelta((d) => deltas.push(d.id));
+      resetConciergeSession();
+      harness.diskSessionId = null;
+      await startConciergeTurn("user B's question");
+
+      harness.handlers.get("concierge:delta")?.({ payload: { id: "turn-1", text: "hello B" } });
+
+      expect(deltas).toEqual(["turn-1"]);
+      off();
+    });
+
+    it("refuses to restore a RETIRED session across a relaunch", async () => {
+      // The half `sessionEpoch` and `restoring` cannot reach: both are process state, so quitting
+      // after a sign-out cleared them and the boot probe re-seeded the same transcript.
+      harness.diskSessionId = "sess-user-a";
+      await restoreConciergeSession();
+      expect(getConciergeSessionId()).toBe("sess-user-a");
+
+      resetConciergeSession();
+      expect(getConciergeSessionId()).toBeNull();
+
+      // THE RELAUNCH: module state is what a fresh webview starts with; the transcript is still the
+      // newest one on disk; only the durable retirement survives with it.
+      _resetConciergeForTests({ keepRetiredSessions: true });
+      await restoreConciergeSession();
+
+      expect(getConciergeSessionId()).toBeNull();
+    });
+
+    it("still restores a DIFFERENT session after a relaunch — retirement is per-id, not a kill switch", async () => {
+      harness.diskSessionId = "sess-user-a";
+      await restoreConciergeSession();
+      resetConciergeSession();
+
+      // User B has since had a conversation of their own; that transcript is now the newest.
+      _resetConciergeForTests({ keepRetiredSessions: true });
+      harness.diskSessionId = "sess-user-b";
+      await restoreConciergeSession();
+
+      expect(getConciergeSessionId()).toBe("sess-user-b");
     });
   });
 

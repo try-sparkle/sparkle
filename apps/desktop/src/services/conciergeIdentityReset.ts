@@ -45,6 +45,13 @@
 // resuming the previous human's conversation with a blank screen in front of it — the same leak, now
 // invisible.
 //
+// AND BOTH HALVES HAD TO LEARN THE SAME LESSON: clearing module state is not forgetting. The thread's
+// durable copy is its `localStorage` payload; the session's is the on-disk Claude transcript that the
+// boot probe re-reads at every launch. Each is dropped at its own layer — `persist.clearStorage()`
+// there, a retired-session deny-list here — because a reset that only clears memory is undone by the
+// next launch, which is the worst case rather than a lesser one: the column comes back EMPTY while
+// the brain resumes (roborev 55774).
+//
 // So sign-out calls THIS, not a growing list of clears. A per-human concierge store added later is one
 // line here, covered by `conciergeIdentityReset.test.ts` — which exists, because an earlier version of
 // this comment promised a test that did not, and a false claim at the highest-authority location is

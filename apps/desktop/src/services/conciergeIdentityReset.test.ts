@@ -40,6 +40,7 @@ import {
 } from "../stores/conciergeThreadStore";
 import {
   getConciergeSessionId,
+  isRetiredConciergeSession,
   setConciergeSessionId,
   _resetConciergeForTests,
 } from "./concierge";
@@ -181,5 +182,20 @@ describe("resetConciergeIdentityState", () => {
     resetConciergeIdentityState();
 
     expect(getConciergeSessionId()).toBeNull();
+  });
+
+  // …AND THE FORGETTING OUTLIVES THE PROCESS (roborev 55774). Nulling the pointer is in-memory only,
+  // while the session's durable source is the on-disk Claude transcript that the boot probe re-reads
+  // at every launch — so without retirement, quitting after sign-out handed the next human the
+  // previous one's conversation with a genuinely empty column in front of it. The refusal itself is
+  // asserted end-to-end in `concierge.session.test.ts`; what belongs HERE is that the seam records
+  // the durable fact at all, since an in-process assertion cannot distinguish the two.
+  it("retires the session id durably, so a relaunch cannot re-seed it", () => {
+    setConciergeSessionId("session-belonging-to-user-a");
+    expect(isRetiredConciergeSession("session-belonging-to-user-a")).toBe(false);
+
+    resetConciergeIdentityState();
+
+    expect(isRetiredConciergeSession("session-belonging-to-user-a")).toBe(true);
   });
 });

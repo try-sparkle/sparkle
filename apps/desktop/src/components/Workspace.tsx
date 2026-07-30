@@ -180,9 +180,18 @@ function PaneFallback() {
  * WHAT A DOM MOVE COSTS xterm, since it is the obvious worry: nothing that is not already handled.
  * The canvas and the whole xterm subtree move intact. If the stages differ in width the pane's box
  * changes size, which is what `Terminal`'s ResizeObserver already exists to fit; if they don't, there
- * is nothing to re-fit. A WebGL context lost across the move lands in `WebglAddon.onContextLoss` →
- * `recoverFromWebglContextLoss` (components/terminalWebgl.ts), which disposes the addon, falls back
- * to the DOM renderer and forces a repaint — a path that predates this change and has its own tests.
+ * is nothing to re-fit. A WebGL context lost across the move lands in `Terminal`'s `detachWebgl`,
+ * which disposes the addon, releases the GPU context, hands its concurrency permit back, falls back
+ * to the DOM renderer and repaints. That is reached from our own `webglcontextlost` listener in the
+ * SAME event dispatch — not from `WebglAddon.onContextLoss`, which xterm fires a full 3 seconds
+ * later (see terminalWebgl.ts) and which is only kept as a backstop.
+ *
+ * And to close the obvious suspicion, since re-parenting a canvas forces a context re-creation in
+ * some engines: this host does NOT multiply context allocations. The container is never swapped, so
+ * React never deletes and re-creates the portal fiber, and `appendChild` moves the live subtree
+ * rather than rebuilding it. Confirmed against the field log — 103 `Terminal.attachWebgl` spans
+ * across 81 agents, i.e. ~1.3 per agent, which is the hide/show switching rate and not a
+ * per-reparent storm.
  */
 function PaneHost({ target, children }: { target: HTMLElement | null; children: React.ReactNode }) {
   // Created ONCE, per pane, and never replaced — the stable container the note above requires.

@@ -13,7 +13,12 @@ import {
   UNAVAILABLE_SILENT_HEADLINE,
 } from "./ConciergeUnavailable";
 import { QUOTA_FAILURE_HEADLINE } from "../../engine/conciergeFailureNotice";
-import { UNAVAILABLE_AFTER_MS, UNAVAILABLE_FAILURE_RUN } from "../../engine/conciergeLiveness";
+import {
+  OFFLINE_AFTER_MS,
+  UNAVAILABLE_AFTER_MS,
+  UNAVAILABLE_FAILURE_RUN,
+  UNAVAILABLE_SILENT_RUN,
+} from "../../engine/conciergeLiveness";
 import {
   _resetConciergeLivenessForTests,
   noteConciergeFailed,
@@ -75,6 +80,35 @@ describe("ConciergeUnavailable", () => {
     expect(strip()).not.toBeNull();
     expect(strip()?.textContent).toContain(QUOTA_FAILURE_HEADLINE);
     expect(screen.getByTestId(CONCIERGE_UNAVAILABLE_EVIDENCE_TESTID).textContent).toBe(QUOTA);
+  });
+
+  // THE STALE-REASON ROW (roborev 55468-M1). The two cases above cannot see the bug they look like
+  // they cover: the silence case reaches UNAVAILABLE with `failure === null`, and the failure case
+  // reaches it via the failure route — so both render identically whether the component consults
+  // `reason` or just asks "is there a failure lying around?".
+  //
+  // This is the case where those two answers DIVERGE. An old quota rejection is still in state (the
+  // notice deliberately outlives its turn), but what made the concierge unavailable THIS time is
+  // silence — the user re-sent three times into a void. Reading `failure` directly here puts
+  // "resets 8:40am" on screen at 2pm as the stated reason the concierge is quiet, which is the exact
+  // lie the reason-derivation exists to prevent: a real limit, long expired, presented as the
+  // current cause. `livenessReason`'s engine tests prove the derivation; only this proves the strip
+  // consults it.
+  it("blames silence, not a stale earlier failure, when silence is what got us here", () => {
+    failTimes(1);
+    noteConciergeSent();
+    for (let i = 0; i < UNAVAILABLE_SILENT_RUN; i += 1) {
+      vi.advanceTimersByTime(OFFLINE_AFTER_MS);
+      noteConciergeSent();
+    }
+    render(<ConciergeUnavailable />);
+
+    expect(strip()).not.toBeNull();
+    expect(strip()?.textContent).toContain(UNAVAILABLE_SILENT_HEADLINE);
+    // The two halves of the lie, pinned separately: neither the quota headline nor its evidence.
+    expect(strip()?.textContent).not.toContain(QUOTA_FAILURE_HEADLINE);
+    expect(strip()?.textContent).not.toContain("resets 8:40am");
+    expect(screen.queryByTestId(CONCIERGE_UNAVAILABLE_EVIDENCE_TESTID)).toBeNull();
   });
 
   it("does not appear for a single failure", () => {
