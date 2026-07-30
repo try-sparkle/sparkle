@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CheckPolicy, LintContext } from "../types";
-import { SEGMENT_CHAR, SEPARATORS, nakedFileRefCheck } from "./nakedFileRef";
+import { FILE_REF_RE, SEGMENT_CHAR, SEPARATORS, nakedFileRefCheck } from "./nakedFileRef";
 
 const ctx = (policy: Partial<CheckPolicy> = {}): LintContext => ({
   roster: [],
@@ -227,104 +227,151 @@ describe("nakedFileRefCheck", () => {
     expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toEqual([]);
   });
 
-  // THE REGRESSION GUARD for that revert — STRUCTURAL, because a timing guard cannot work here
-  // (roborev 55895). Running the hostile input would be the obvious test and it is unusable: the
-  // scan is SYNCHRONOUS, and Vitest's testTimeout is timer-based, so it cannot preempt CPU-bound
-  // sync code. A re-widened pattern would never reach the assertion — the worker wedges and CI burns
-  // to the workflow timeout with nothing pointing back at this test. The measurement in the revert
-  // commit (eight repetitions, not finished in ten minutes) is exactly why: any input big enough to
-  // demonstrate the catastrophe is far past the point where a duration can be reported.
-  //
-  // So assert the PROPERTY that made the pattern safe instead of its symptom. The old pattern was
-  // linear only because the separator alternatives were DISJOINT from the segment character class:
-  // no input position could be consumed as either, so there was one decomposition, not 2^k. Adding
-  // an alternative that both accept — an HTML entity, in the reverted change — is what created the
-  // ambiguity. This runs in microseconds and can never hang.
   // THE REGRESSION GUARD for the ReDoS revert — a PROPERTY test, asserted by matching.
   //
-  // Two earlier attempts failed in instructive ways. A timing guard cannot work: the scan is
-  // synchronous and Vitest's testTimeout is timer-based, so a re-widened pattern wedges the worker
-  // instead of failing (roborev 55895). Searching the source for the token from the reverted diff
-  // does not work either: it pins one SPELLING, and `&\\w+;` or `&(?:#\\d+|\\w+);` reintroduce the same
-  // ambiguity with the test green (roborev 55898).
+  // Three earlier attempts failed in instructive ways, and each failure narrowed what the guard has
+  // to do:
   //
-  // So assert the thing that actually makes the pattern linear: a separator must never accept a
-  // string the segment class also accepts. With the two disjoint there is exactly ONE decomposition
-  // of any input, so the engine never backtracks across alternatives and 2^k cannot arise. Checked by
-  // RUNNING both against a candidate alphabet, so it holds however either side is spelled.
-  // THE REGRESSION GUARD for the ReDoS revert — a PROPERTY test, asserted by matching.
+  //   1. A TIMING guard cannot work at all. The scan is synchronous and Vitest's `testTimeout` is
+  //      timer-based, so it cannot preempt CPU-bound sync code: a re-widened pattern wedges the
+  //      worker instead of failing, and CI burns to the workflow timeout with nothing pointing back
+  //      here (roborev 55895). The measurement in the revert commit — eight repetitions, not
+  //      finished in ten minutes — is why: any input big enough to demonstrate the catastrophe is
+  //      far past the point where a duration can be reported.
+  //   2. SEARCHING THE SOURCE for the token from the reverted diff pins one SPELLING. `&\w+;` or
+  //      `&(?:#\d+|\w+);` reintroduce the same ambiguity with the test green (roborev 55898).
+  //   3. Comparing candidates against ONE segment character was still too narrow (roborev 55955).
+  //      The ambiguity is between the separator and the repeated run `SEG+`, not a single `SEG`, so
+  //      a multi-character widening like `\.\.` — consumable either as two segment chars or as one
+  //      separator, inside the outer `+` — slipped through. It also made the multi-character
+  //      candidates below dead weight, since a single-char class can never accept them.
   //
-  // Two earlier attempts failed instructively. A timing guard cannot work: the scan is synchronous
-  // and Vitest's testTimeout is timer-based, so a re-widened pattern wedges the worker rather than
-  // failing (roborev 55895). Searching the source for the token from the reverted diff pins one
-  // SPELLING, and `&\\w+;` reintroduces the same ambiguity with the test green (roborev 55898).
+  // So: a separator must never accept a string that a RUN of segment characters also accepts. With
+  // the two disjoint there is exactly one decomposition of any input, the engine never backtracks
+  // across alternatives, and 2^k cannot arise.
   //
   // WHICH SEPARATOR MATTERS, precisely. The exponential form is `(?:E+E)+` — the overlap has to be
-  // on the separator that CLOSES THE REPEATED GROUP, because only then does each additional entity
-  // double the number of ways to split the repetition. That is `SEPARATORS[0]`, the `/`.
+  // on the separator that CLOSES THE REPEATED GROUP, because only then does each extra ambiguous
+  // position double the ways to split the repetition. That is `SEPARATORS[0]`, the `/`.
   //
   // The extension `.` DOES overlap the segment class (which contains `.`), and that is fine and
-  // pre-existing: it sits OUTSIDE the outer `+`, so it is a single choice point per dot — polynomial
-  // backtracking at worst, not 2^k. Writing this test taught us that; asserting disjointness for all
-  // three would fail on the safe pattern and would have to be weakened until it proved nothing.
-  it("keeps the REPEATED separator disjoint from the segment class (the anti-ReDoS property)", () => {
-    const segment = new RegExp(`^(?:${SEGMENT_CHAR})$`);
+  // pre-existing: it sits OUTSIDE the outer `+`, so it is a single choice point per dot —
+  // polynomial at worst, not 2^k. Asserting disjointness for all three separators would fail on the
+  // pattern as shipped and would have to be weakened until it proved nothing.
+
+  /** Strings a separator and a RUN of segment characters both accept — i.e. positions consumable
+   *  two ways. Empty means the two are disjoint and the repetition is unambiguous.
+   *
+   *  Exported as a helper so the guard below and the meta-test that proves the guard can FAIL both
+   *  drive this one implementation. An inlined copy in the meta-test would assert that the regex
+   *  engine works, not that this guard does — it would stay green with the real assertion deleted
+   *  (roborev 55955). */
+  function overlapsSegmentRun(separatorSource: string, segmentSource = SEGMENT_CHAR): string[] {
+    // `+`, not a single character: the ambiguity that produces `(?:E+E)+` is against the whole
+    // repeated run. This is what catches a multi-character widening such as `\.\.`.
+    //
+    // `segmentSource` is a parameter with the real class as its default ONLY so the meta-test can
+    // reproduce the historical revert faithfully. That change widened BOTH sides — an entity was
+    // added to the segment class AND to the separator — and it had to, because `&amp;` is not a run
+    // of `[A-Za-z0-9_.@-]`. Passing a widened separator alone would prove nothing about the entity
+    // case. The guard itself never passes this argument.
+    const segmentRun = new RegExp(`^(?:${segmentSource})+$`);
+    const separator = new RegExp(`^(?:${separatorSource})$`);
+    // A NULLABLE separator is the other canonical route to `(a+)+` and the candidate filter below
+    // structurally cannot see it (roborev 55982): every candidate is non-empty and `segmentRun`
+    // requires at least one character, so nothing it tests can reveal an empty match. If the
+    // separator accepts "" then `(?:SEG+ SEP)+` collapses to `(?:SEG+)+` — fully catastrophic, and
+    // strictly worse than the pattern this file reverted — while the filter returns clean. Checked
+    // first, and reported as a distinct marker so the failure message names the real cause.
+    if (separator.test("")) return ["<matches the empty string>"];
     const candidates: string[] = [];
     for (let c = 0x20; c < 0x7f; c++) {
       const ch = String.fromCharCode(c);
       candidates.push(ch, `\\${ch}`);
     }
-    // Multi-character forms a widening would plausibly introduce — entities were the real case — so
-    // the guard is not limited to single characters however the overlap is spelled.
-    candidates.push("&#46;", "&period;", "&amp;", "&#x2e;", "&nbsp;", "&#47;");
+    // Multi-character forms a widening would plausibly introduce. Entities were the real case; `..`
+    // and `aa` cover the plain repeated-segment shape that finding #3 above was about. These are
+    // only meaningful because `segmentRun` matches runs — under a single-character test they could
+    // never overlap, which is exactly how they became dead weight before.
+    candidates.push("&#46;", "&period;", "&amp;", "&#x2e;", "&nbsp;", "&#47;", "..", "aa", "a.b");
+    return candidates.filter((c) => separator.test(c) && segmentRun.test(c));
+  }
 
-    const repeated = new RegExp(`^(?:${SEPARATORS[0]})$`);
-    const overlap = candidates.filter((c) => repeated.test(c) && segment.test(c));
+  it("is assembled EXACTLY as the disjointness guard below assumes", () => {
+    // The companion to the property guard, and it took two rounds to get right (roborev 55982, then
+    // 55985). The guard below tests `SEPARATORS[0]` and only `SEPARATORS[0]`, because that is the
+    // separator closing the ONE nested repetition — the single position where an overlap goes
+    // exponential. Two ways that assumption can rot, and a `startsWith` prefix check caught neither:
+    //
+    //   • A restructure could close the repetition with `SEPARATORS[1]` — the `.`, which ALREADY
+    //     overlaps the segment class and is safe only because it sits OUTSIDE the `+`.
+    //   • A restructure could ADD a second repetition further along (say `(?:SEG+\.)+` to allow
+    //     `a.b.c.ts`) while leaving the prefix untouched. A prefix assertion stays green, and the
+    //     new repetition is closed by the overlapping `.`. That is the reverted exponential form,
+    //     reachable with every guard passing.
+    //
+    // So pin the WHOLE assembled source. Any structural change fails here and forces the author to
+    // re-derive which separators sit inside a repetition before touching the guard. The property
+    // test below is what explains WHY that matters; this is what makes its single-separator scope
+    // provably sufficient.
+    //
+    // Built through `new RegExp` rather than compared as a raw string: `RegExp.prototype.source`
+    // returns the ESCAPED pattern (`EscapeRegExpPattern` normalizes a bare `/` to `\/`), so a
+    // cosmetic respelling of a separator would otherwise fail with a message blaming a restructure
+    // that never happened (roborev 55985). Both sides go through the same normalization.
+    const expected = new RegExp(
+      `(?:(?:${SEGMENT_CHAR})+${SEPARATORS[0]})+` +
+        `(?:${SEGMENT_CHAR})+${SEPARATORS[1]}` +
+        `[A-Za-z][A-Za-z0-9]*${SEPARATORS[2]}` +
+        String.raw`\d+(?:\\?[:-]\d+)?`,
+    ).source;
+    expect(
+      FILE_REF_RE.source,
+      "FILE_REF_RE was restructured. The guard below assumes there is exactly ONE nested repetition \
+and that SEPARATORS[0] closes it — re-derive which separators now sit inside a repetition, and point \
+the disjointness guard at every one of them, before updating this pin.",
+    ).toBe(expected);
+  });
+
+  it("keeps the REPEATED separator disjoint from the segment RUN (the anti-ReDoS property)", () => {
+    const overlap = overlapsSegmentRun(SEPARATORS[0]);
     expect(
       overlap,
-      `the repeated separator /${SEPARATORS[0]}/ also matches ${JSON.stringify(overlap)}, which the \
-segment class accepts — each such position is consumable two ways INSIDE the repetition, which is \
-the exponential form this file reverted. See FILE_REF_RE.`,
+      `the repeated separator /${SEPARATORS[0]}/ is AMBIGUOUS with the segment run: ${JSON.stringify(
+        overlap,
+      )}. Either it accepts a string a run of segment characters also accepts, or it accepts the \
+EMPTY string (which collapses the repetition to (?:SEG+)+ outright). Either way a position inside \
+the repetition is consumable more than one way, which is the exponential form this file reverted. \
+See FILE_REF_RE.`,
     ).toEqual([]);
   });
 
-  it("that guard fails on the overlap it exists to reject", () => {
-    // The previous version passed against the very pattern that hung for ten minutes, so pin that
-    // this one does not. Spelled with no token in common with the reverted diff.
-    const segment = new RegExp(`^(?:${SEGMENT_CHAR})$`);
-    const widened = new RegExp(`^(?:${String.raw`\\?\/|&\w+;|[.@]`})$`);
-    const candidates = ["&amp;", ".", "@", "/"];
-    const overlap = candidates.filter((c) => widened.test(c) && segment.test(c));
-    expect(overlap.length, "a widened separator must be detected as overlapping").toBeGreaterThan(0);
+  it("that guard DETECTS an overlap, including a multi-character one", () => {
+    // Drives the real helper, so deleting the guard's alphabet, its `SEPARATORS[0]` reference, or
+    // its assertion breaks this too. Both spellings below share no token with the reverted diff.
+    //
+    // `\.\.` is the case the single-character version of this guard missed entirely: two segment
+    // characters, also matchable as one separator, inside the outer `+`.
+    expect(overlapsSegmentRun(String.raw`\\?\/|\.\.`), "a multi-character widening").toContain("..");
+    // The historical case, reproduced as it actually was: the entity went into BOTH the segment
+    // class and the separator. That is what made a single entity consumable two ways.
+    expect(
+      overlapsSegmentRun(String.raw`\\?\/|&\w+;`, String.raw`\\?[A-Za-z0-9_.@-]|&\w+;`),
+      "the entity widening that was reverted",
+    ).toContain("&amp;");
+    // A NULLABLE separator collapses `(?:SEG+ SEP)+` to `(?:SEG+)+` — the textbook `(a+)+`, worse
+    // than what was reverted. No candidate string can expose it, hence the dedicated check.
+    expect(overlapsSegmentRun(String.raw`\\?\/?`), "a nullable separator").toEqual([
+      "<matches the empty string>",
+    ]);
   });
 
-  it("does not detect a path whose characters are entity-encoded — the documented miss", () => {
-    expect(run("See src/retry&#46;ts:88").violations).toEqual([]);
+  it("does not flag the SAFE pattern as overlapping when the segment class is widened alone", () => {
+    // The other half of "the guard can fail": it must not fire on everything. Widening only the
+    // segment class leaves the repeated separator `/` still unmatchable by it, so there is no
+    // ambiguity inside the repetition and no exponential form.
+    expect(overlapsSegmentRun(SEPARATORS[0], String.raw`\\?[A-Za-z0-9_.@-]|&\w+;`)).toEqual([]);
   });
-
-  // THE EXPENSIVE HALF OF THAT MISS, pinned rather than left in prose (roborev 55895). The single
-  // -reference case above only costs its own reference. This one costs a DIFFERENT one: the
-  // unmatched entity path is also unmasked, so "Fixed", "src", "retry", "ts", "and" clear the
-  // four-word bar and silence `src/b.ts:9`, which is bare and genuinely naked. Asserted so a change
-  // to masking or word counting MOVES this test instead of drifting away from the doc.
-  it("lets an entity-encoded reference silence a different naked one — the cost of the miss", () => {
-    expect(run("Fixed src/retry&#46;ts:12 and src/b.ts:9").violations).toEqual([]);
-  });
-
-  // THE REGRESSION GUARD for that revert — STRUCTURAL, because a timing guard cannot work here
-  // (roborev 55895). Running the hostile input would be the obvious test and it is unusable: the
-  // scan is SYNCHRONOUS, and Vitest's testTimeout is timer-based, so it cannot preempt CPU-bound
-  // sync code. A re-widened pattern would never reach the assertion — the worker wedges and CI burns
-  // to the workflow timeout with nothing pointing back at this test. The measurement in the revert
-  // commit (eight repetitions, not finished in ten minutes) is exactly why: any input big enough to
-  // demonstrate the catastrophe is far past the point where a duration can be reported.
-  //
-  // So assert the PROPERTY that made the pattern safe instead of its symptom. The old pattern was
-  // linear only because the separator alternatives were DISJOINT from the segment character class:
-  // no input position could be consumed as either, so there was one decomposition, not 2^k. Adding
-  // an alternative that both accept — an HTML entity, in the reverted change — is what created the
-  // ambiguity. This runs in microseconds and can never hang.
-
   it("resolves repeated identical references to their own occurrences", () => {
     // Both lines carry the same reference text. Line 1 explains itself, line 2 does not — so a
     // search that always found the FIRST occurrence would report zero instead of one.
