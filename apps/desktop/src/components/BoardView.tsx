@@ -199,6 +199,25 @@ export function BoardView({ project }: { project: Project }) {
       useUiStore.getState().setBoardFocusBeadId(null);
     }
   }, [boardFocusBeadId, snapshot]);
+  // Per-agent feedback filter (feedback-pill-and-filter): a build-agent's FEEDBACK pill sets
+  // boardAgentFilter to its agent id before switching here; the board then shows ONLY beads labeled
+  // `agent:<id>` — the beads that agent created or commented on, stamped by the buildAgent shell.
+  // Client-side: we narrow the ALREADY-bucketed columns rather than re-querying, so the poll and the
+  // store's fetch are untouched and the 5-column bucketing stays intact. Unlike boardFocusBeadId this
+  // filter PERSISTS across polls (it is a view mode, not a one-shot) — cleared by the banner's Clear.
+  const boardAgentFilter = useUiStore((s) => s.boardAgentFilter);
+  const displayBoard = useMemo(() => {
+    if (!board || !boardAgentFilter) return board;
+    const label = `agent:${boardAgentFilter}`;
+    const keep = (arr: Bead[]) => arr.filter((b) => b.labels.includes(label));
+    return {
+      backlog: keep(board.backlog),
+      blocked: keep(board.blocked),
+      inProgress: keep(board.inProgress),
+      done: keep(board.done),
+      delivered: keep(board.delivered),
+    };
+  }, [board, boardAgentFilter]);
   // Workers live in the agent store; the Plan view reads them to show who's building each bead.
   const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
 
@@ -234,8 +253,47 @@ export function BoardView({ project }: { project: Project }) {
         )}
       </div>
 
+      {/* Per-agent feedback filter banner: shown only while a FEEDBACK pill has narrowed the board.
+          Clicking Clear drops the filter (boardAgentFilter → null) and the full board returns. */}
+      {boardAgentFilter && (
+        <div
+          data-testid="board-agent-filter-banner"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "8px 16px",
+            borderBottom: `1px solid ${C.hairline}`,
+            background: C.deepForest,
+            color: C.cream,
+            fontSize: 12,
+            flexShrink: 0,
+          }}
+        >
+          <span>
+            Showing feedback from agent <strong>{boardAgentFilter}</strong>
+          </span>
+          <span style={{ color: C.muted }}>·</span>
+          <button
+            type="button"
+            onClick={() => useUiStore.getState().setBoardAgentFilter(null)}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: C.accentInk,
+              cursor: "pointer",
+              font: "inherit",
+              textDecoration: "underline",
+            }}
+          >
+            Clear
+          </button>
+        </div>
+      )}
+
       {/* No snapshot yet → loading. Otherwise the four columns. */}
-      {!board ? (
+      {!displayBoard ? (
         <div style={{ padding: 24, color: C.muted, fontSize: 13 }}>Loading tasks…</div>
       ) : (
         <div
@@ -253,7 +311,7 @@ export function BoardView({ project }: { project: Project }) {
               key={key}
               columnKey={key}
               label={label}
-              beads={board[key]}
+              beads={displayBoard[key]}
               allBeads={allBeads}
               agents={agents}
               project={project}

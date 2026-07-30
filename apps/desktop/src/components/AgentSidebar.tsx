@@ -3305,6 +3305,14 @@ const AgentRow = memo(function AgentRow({
   // Click jumps to the Plan board and opens that epic's DetailOverlay via the boardFocusBeadId handoff.
   const board = useBeadsStore((s) => s.byProject[project.id]?.board ?? null);
   const epicPillData = a.kind === "build" ? epicPillFor(a, board, project.agents) : null;
+  // How many beads carry THIS build-agent's feedback label (`agent:<id>`), stamped on every bead it
+  // created or commented on. Drives the FEEDBACK pill below: shown only when the count is ≥1, and the
+  // count itself is the pill's number. Computed from the raw beads list (not the bucketed board) so it
+  // still counts feedback on auto-labeled/closed beads the board's own bucketing drops.
+  const feedbackCount =
+    a.kind === "build"
+      ? beads.filter((b) => b.labels.includes(`agent:${a.id}`)).length
+      : 0;
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
@@ -3949,6 +3957,42 @@ const AgentRow = memo(function AgentRow({
     </span>
   ) : null;
 
+  // The FEEDBACK pill (feedback-pill-and-filter): a build-agent row's affordance to jump to the Plan
+  // board filtered to JUST that agent's feedback — the beads labeled `agent:<id>` it created or
+  // commented on. Mirrors epicPill's handoff (stopPropagation so it doesn't select the row; flip to
+  // Plan → board), but sets boardAgentFilter instead of boardFocusBeadId. Shown ONLY on build rows
+  // that actually have feedback (feedbackCount ≥ 1), so a row with nothing to show never offers a
+  // dead click. Styled like StageChip (bordered, mono, micro, muted) but with an accent border +
+  // cursor:pointer so it reads as an action rather than a status readout — structure drawn, not filled.
+  const feedbackPill =
+    a.kind === "build" && feedbackCount > 0 ? (
+      <span
+        data-testid="row-feedback-pill"
+        onClick={(e) => {
+          e.stopPropagation();
+          const ui = useUiStore.getState();
+          ui.setWorkMode("plan");
+          ui.setActiveSpecial("board");
+          ui.setBoardAgentFilter(a.id);
+        }}
+        title={`${feedbackCount} feedback ${feedbackCount === 1 ? "bead" : "beads"} from this agent — open in Plan`}
+        style={{
+          flex: "0 0 auto",
+          fontFamily: FONT_MONO,
+          fontSize: TYPE.micro,
+          lineHeight: 1,
+          color: C.accentInk,
+          border: `1px solid ${C.accentInk}`,
+          borderRadius: RADIUS.sm,
+          padding: "1px 5px",
+          whiteSpace: "nowrap",
+          cursor: "pointer",
+        }}
+      >
+        {`FEEDBACK ${feedbackCount}`}
+      </span>
+    ) : null;
+
   // The card's TOP STRIP: glyph/× + timer + name (or rename input) + the progress bar. It's the
   // SAME element collapsed (in the column) and expanded (the unified hover card's top strip, which
   // spans the column into the terminal area) — `expanded` only swaps the glyph for the × close,
@@ -4160,6 +4204,9 @@ const AgentRow = memo(function AgentRow({
                   against it rather than pushing it off the row. Collapsed only: the card already
                   renders the full WorkflowLine for this stage, and two readings of one fact in one
                   view is the thing the row was stripped down to avoid. */}
+              {/* FEEDBACK pill sits to the LEFT of the stage chip (the row's rightmost status pill),
+                  so the row reads dot · el · nm · [feedback] · stg · close. */}
+              {feedbackPill}
               {trackerStage && <StageChip stage={trackerStage} active={isActive} />}
             </div>
           )}

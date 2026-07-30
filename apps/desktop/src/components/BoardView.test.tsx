@@ -114,6 +114,7 @@ import { sendToBuild } from "../services/sendToBuild";
 import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useUiStore } from "../stores/uiStore";
 import { waitFor } from "@testing-library/react";
 
 /** Point the mocked config at a defined "Done" (a single criterion of the given kind). */
@@ -782,5 +783,59 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
     );
     unmount();
     expect(stopDeliveryMonitor).toHaveBeenCalled();
+  });
+});
+
+// The per-agent FEEDBACK filter (feedback-pill-and-filter): a build-agent row's FEEDBACK pill sets
+// uiStore.boardAgentFilter to its agent id, then jumps here. The board must then show ONLY beads
+// carrying that agent's `agent:<id>` label — the beads it created or commented on — and offer a
+// clearable banner. Client-side over the already-bucketed columns; the poll/fetch are untouched.
+describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", () => {
+  afterEach(() => {
+    // The filter lives in the real uiStore singleton (a module-level store), so clear it or it leaks
+    // into every later suite in this file and silently hides their beads.
+    useUiStore.getState().setBoardAgentFilter(null);
+  });
+
+  function labeledSnapshot() {
+    const mine = bead({ id: "p1-mine", title: "My feedback bead", labels: ["agent:agent-x"] });
+    const other = bead({ id: "p1-other", title: "Someone elses bead", labels: ["agent:agent-y"] });
+    snapshot = {
+      beads: [mine, other],
+      board: { backlog: [mine, other], blocked: [], inProgress: [], done: [], delivered: [] },
+      loadedAt: Date.now(),
+    };
+  }
+
+  // THE mutation-check target for the filter: deleting the client-side narrow (so displayBoard ===
+  // board) renders BOTH beads, which fails the `queryByText(...).toBeNull()` below.
+  it("with boardAgentFilter set, renders ONLY beads labeled agent:<id> and hides the rest", () => {
+    labeledSnapshot();
+    useUiStore.getState().setBoardAgentFilter("agent-x");
+    render(<BoardView project={project} />);
+    // The matching bead is shown…
+    expect(screen.getByText("My feedback bead")).toBeTruthy();
+    // …and the non-matching one is HIDDEN. This is the assertion the filter exists to satisfy.
+    expect(screen.queryByText("Someone elses bead")).toBeNull();
+  });
+
+  it("shows a clearable banner naming the agent, and Clear restores the full board", () => {
+    labeledSnapshot();
+    useUiStore.getState().setBoardAgentFilter("agent-x");
+    render(<BoardView project={project} />);
+    const banner = screen.getByTestId("board-agent-filter-banner");
+    expect(banner.textContent).toContain("agent-x");
+    // Clear drops the filter → the store goes null AND the hidden bead comes back.
+    fireEvent.click(within(banner).getByText("Clear"));
+    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+    expect(screen.getByText("Someone elses bead")).toBeTruthy();
+  });
+
+  it("renders the full board (and NO banner) when no filter is set", () => {
+    labeledSnapshot();
+    render(<BoardView project={project} />);
+    expect(screen.queryByTestId("board-agent-filter-banner")).toBeNull();
+    expect(screen.getByText("My feedback bead")).toBeTruthy();
+    expect(screen.getByText("Someone elses bead")).toBeTruthy();
   });
 });

@@ -171,6 +171,27 @@ describe("uiStore boardFocusBeadId (spec §8 pill → board handoff)", () => {
 
 });
 
+// The per-agent feedback filter (feedback-pill-and-filter): a build-agent's FEEDBACK pill sets this
+// to its agent id and jumps to the Plan board; BoardView narrows to `agent:<id>` beads. Same
+// transient handoff shape as boardFocusBeadId above, so it gets the same set/clear guarantee.
+describe("uiStore boardAgentFilter (FEEDBACK pill → board filter handoff)", () => {
+  afterEach(() => {
+    localStorage.clear();
+    useUiStore.setState({ boardAgentFilter: null });
+  });
+
+  it("defaults to null", () => {
+    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+  });
+
+  it("setBoardAgentFilter stores an agent id and clears back to null", () => {
+    useUiStore.getState().setBoardAgentFilter("agent-7");
+    expect(useUiStore.getState().boardAgentFilter).toBe("agent-7");
+    useUiStore.getState().setBoardAgentFilter(null);
+    expect(useUiStore.getState().boardAgentFilter).toBeNull();
+  });
+});
+
 describe("uiStore orchestrator collapse", () => {
   afterEach(() => {
     localStorage.clear();
@@ -430,6 +451,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       workMode: "build",
       buildAgentHover: false,
       boardFocusBeadId: null,
+      boardAgentFilter: null,
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
@@ -449,6 +471,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
       workMode: "plan",
       buildAgentHover: true,
       boardFocusBeadId: "epic-42",
+      boardAgentFilter: "agent-x",
       settingsRequest: "accounts",
       composeFocusSeq: 7,
       revealAgentId: "a-42",
@@ -480,6 +503,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
       workMode: "build",
       buildAgentHover: false,
       boardFocusBeadId: null,
+      boardAgentFilter: null,
       settingsRequest: null,
       composeFocusSeq: 0,
       revealAgentId: null,
@@ -503,6 +527,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
           workMode: "plan",
           buildAgentHover: true,
           boardFocusBeadId: "epic-42",
+          boardAgentFilter: "agent-x",
           settingsRequest: "accounts",
           composeFocusSeq: 7,
           revealAgentId: "a-42",
@@ -523,6 +548,7 @@ describe("uiStore rehydrate — a stale transient key in the blob must not be re
     expect(s.workMode).toBe("build");
     expect(s.buildAgentHover).toBe(false);
     expect(s.boardFocusBeadId).toBeNull();
+    expect(s.boardAgentFilter).toBeNull();
     expect(s.settingsRequest).toBeNull();
     expect(s.composeFocusSeq).toBe(0);
     expect(s.revealAgentId).toBeNull();

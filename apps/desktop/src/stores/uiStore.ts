@@ -39,6 +39,7 @@ const TRANSIENT_UI_KEYS = [
   "workMode",
   "buildAgentHover",
   "boardFocusBeadId",
+  "boardAgentFilter",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -209,6 +210,12 @@ interface UiState {
   // the pill, consumed-then-cleared by BoardView once the bead is present. Transient — NOT persisted.
   boardFocusBeadId: string | null;
   setBoardFocusBeadId: (id: string | null) => void;
+  // One-shot "open the Plan board filtered to just this agent's feedback" handoff, mirroring
+  // boardFocusBeadId above. Set by an agent row's FEEDBACK pill (AgentSidebar), consumed by BoardView
+  // which narrows the displayed beads to those labeled `agent:<id>`. The id is the build-agent's a.id.
+  // Transient — NOT persisted (see partialize): a relaunch must never restore a filtered board.
+  boardAgentFilter: string | null;
+  setBoardAgentFilter: (id: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -413,6 +420,8 @@ export const useUiStore = create<UiState>()(
       setWorkMode: (m) => set({ workMode: m }),
       boardFocusBeadId: null,
       setBoardFocusBeadId: (id) => set({ boardFocusBeadId: id }),
+      boardAgentFilter: null,
+      setBoardAgentFilter: (id) => set({ boardAgentFilter: id }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       newAgentRuntime: "local",
