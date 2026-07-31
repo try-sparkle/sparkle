@@ -146,6 +146,31 @@ export function splitHoursMinutes(ms: number): { h: number; m: number } {
 }
 
 /**
+ * Is this partner holding work that has not landed?
+ *
+ * EXPORTED AND SHARED because `observeFleet` and `evaluateTriggers` must agree, and they did not:
+ * the observer started the unlanded clock on the boolean alone while this module also accepted a
+ * measured count, so a partner whose branch-status poll supplied `unpushedCommits: 4` with no
+ * fleet-wide boolean never got an `oldestUnpushedAt` — and the count-only case became dead code
+ * through the only producer of observations (roborev 56346).
+ *
+ * That is not the fail-closed rule doing its job. The count WAS measured; the two halves simply
+ * disagreed about what the evidence meant. One predicate, one meaning, both call sites.
+ *
+ * Fires on either piece of affirmative evidence. `undefined` on both is "we did not look" and never
+ * fires — that part IS the fail-closed rule.
+ */
+export function isHoldingWork(evidence: {
+  hasUnlandedWork?: boolean;
+  unpushedCommits?: number;
+}): boolean {
+  return (
+    evidence.hasUnlandedWork === true ||
+    (evidence.unpushedCommits !== undefined && evidence.unpushedCommits > 0)
+  );
+}
+
+/**
  * Which conditions hold, with the arithmetic that makes each one true.
  *
  * Order is by how directly the condition blocks SHIPPING — an expired goal and unpushed work are
@@ -170,11 +195,7 @@ export function evaluateTriggers(obs: Observation): Trigger[] {
     });
   }
 
-  // Fires on the fleet-wide boolean, or on a count where one was measured. `undefined` on both is
-  // "we did not look" and must not fire — see `hasUnlandedWork`.
-  const holdingWork =
-    obs.hasUnlandedWork === true || (obs.unpushedCommits !== undefined && obs.unpushedCommits > 0);
-  if (holdingWork && obs.oldestUnpushedAt !== undefined) {
+  if (isHoldingWork(obs) && obs.oldestUnpushedAt !== undefined) {
     const mins = minutesBetween(obs.oldestUnpushedAt, obs.now);
     if (mins >= UNPUSHED_MINUTES) {
       // The count is quoted ONLY when it was really measured. Both sentences are true statements

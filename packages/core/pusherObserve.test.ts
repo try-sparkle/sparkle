@@ -147,9 +147,56 @@ describe("quiet partners are still observed", () => {
 
 describe("state is returned, never mutated", () => {
   // A sweep that throws part-way must not leave a half-advanced clock behind.
-  it("leaves the previous state untouched", () => {
-    const before = emptyObserveState();
-    observeFleet([snap({ hasUnlandedWork: true })], before, T0);
-    expect(before.unlandedSince.size).toBe(0);
+  //
+  // The previous version of this test seeded an EMPTY state and asserted it was still empty, which
+  // was true before `observeFleet` ran — a precondition, not a side effect, and exactly the vacuous
+  // shape this repo warns about (roborev 56346). `prev` has to hold something damageable for the
+  // assertion to mean anything, and both damage shapes have to be checked: an in-place DELETE of a
+  // cleared key, and an in-place RE-STAMP of a surviving one.
+  it("does not delete a cleared key from the PREVIOUS state", () => {
+    const before = observeFleet([snap({ hasUnlandedWork: true })], emptyObserveState(), T0).next;
+    expect(before.unlandedSince.get("a")).toBe(T0);
+
+    const { next } = observeFleet([snap({ hasUnlandedWork: false })], before, T0 + MIN);
+
+    expect(before.unlandedSince.get("a")).toBe(T0); // untouched
+    expect(next.unlandedSince.has("a")).toBe(false); // and correctly cleared in the new state
+  });
+
+  it("does not re-stamp a surviving key in the PREVIOUS state", () => {
+    const before = observeFleet([snap({ hasUnlandedWork: true })], emptyObserveState(), T0).next;
+    const { next } = observeFleet([snap({ hasUnlandedWork: true })], before, T0 + 30 * MIN);
+    expect(before.unlandedSince.get("a")).toBe(T0);
+    expect(next.unlandedSince.get("a")).toBe(T0); // onset preserved, not advanced
+  });
+});
+
+describe("a measured COUNT alone is evidence (roborev 56346)", () => {
+  // The observer and the trigger must agree on what "holding work" means. They did not: the
+  // observer keyed on the boolean alone, so a partner whose branch-status poll supplied a count
+  // with no fleet-wide boolean never started a clock — and the count-only branch of
+  // `evaluateTriggers` was dead code through the only producer of observations.
+  it("starts the clock on a count with no boolean", () => {
+    const { next } = observeFleet([snap({ unpushedCommits: 4 })], emptyObserveState(), T0);
+    expect(next.unlandedSince.get("a")).toBe(T0);
+  });
+
+  it("carries that partner all the way to a challenge", () => {
+    let st = emptyObserveState();
+    st = observeFleet([snap({ unpushedCommits: 4 })], st, T0).next;
+    const { observations } = observeFleet(
+      [snap({ unpushedCommits: 4 })],
+      st,
+      T0 + UNPUSHED_MINUTES * MIN,
+    );
+    const t = evaluateTriggers(observations.get("a")!);
+    expect(t.map((x) => x.id)).toEqual(["unpushed-commits"]);
+    expect(t[0]!.challenge).toBe(`You have 4 commits unpushed for ${UNPUSHED_MINUTES} minutes.`);
+  });
+
+  // Still fail-closed: a count of ZERO is not evidence of work, it is evidence of none.
+  it("does not start a clock on a zero count", () => {
+    const { next } = observeFleet([snap({ unpushedCommits: 0 })], emptyObserveState(), T0);
+    expect(next.unlandedSince.size).toBe(0);
   });
 });

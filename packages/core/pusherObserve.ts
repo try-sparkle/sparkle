@@ -25,7 +25,7 @@
 // pass — it really was "measured", just from nothing.
 
 import { trackSince, elapsedSince, type SinceClock } from "./pusherClocks";
-import type { Observation } from "./pusherTriggers";
+import { isHoldingWork, type Observation } from "./pusherTriggers";
 
 /**
  * What one sweep saw about one partner. Every field is optional except the id, and every optional is
@@ -84,7 +84,10 @@ export function observeFleet(
   // Only agents where the condition is affirmatively TRUE advance a clock. `undefined` is excluded
   // by the `=== true` test rather than by falsiness, so "we did not look" and "we looked and it is
   // false" both correctly fail to start a clock — and both correctly CLEAR one that was running.
-  const unlandedNow = snapshots.filter((s) => s.hasUnlandedWork === true).map((s) => s.agentId);
+  // `isHoldingWork` is SHARED with `evaluateTriggers` so the two cannot drift. They did: this
+  // filter tested the boolean alone while the trigger also accepted a measured count, so a
+  // count-only partner never started a clock and could never be challenged (roborev 56346).
+  const unlandedNow = snapshots.filter(isHoldingWork).map((s) => s.agentId);
   const awaitingNow = snapshots.filter((s) => s.awaitingAnswer === true).map((s) => s.agentId);
 
   const next: ObserveState = {
