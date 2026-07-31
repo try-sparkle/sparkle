@@ -43,6 +43,7 @@ import {
   CONCIERGE_LOCAL_ERROR_ID,
   cancelConciergeTurn,
   getConciergeSessionId,
+  isRetiredConciergeSession,
   isSupersededDetail,
   onConciergeDelta,
   onConciergeDone,
@@ -442,6 +443,150 @@ describe("concierge account binding", () => {
     expect(turnArgs(1).resumeSessionId).toBeNull();
   });
 
+  it("does not DENY-LIST the other account's conversation when a turn spans a switch", async () => {
+    // Where the two mechanisms meet, and the one place they disagree about what an epoch bump MEANS.
+    //
+    // `rebindSessionToAccount` nulls both session pointers and bumps `sessionEpoch`, so an in-flight
+    // turn's `done` lands looking exactly like an abandoned transcript from a previous human: not
+    // current, and with neither pointer holding its id — the precise shape the sign-out retirement
+    // is built to deny-list. It is not one. An account switch is the SAME human, and that id is the
+    // other account's live conversation, sitting in its own tree where it still resumes fine.
+    //
+    // Retiring it is unrecoverable, which is what makes this worth a test rather than a comment: the
+    // deny-list is durable (localStorage), so switching back would refuse the conversation for ever,
+    // silently, with no way for the human to undo it. What separates the two cases is WHY the epoch
+    // moved — a reset, not a rebind — and the two tests below pin that it is the reason rather than
+    // the account binding, which moves back and forth under both.
+    let turnSeq = 0;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      // Distinct ids per turn: the retirement only reaches TRACKED turns, and reusing one id would
+      // re-stamp it at the current epoch and quietly make the turn "current" again.
+      if (cmd === "concierge_turn") return Promise.resolve(`turn-${++turnSeq}`);
+      return undefined;
+    };
+
+    await startConciergeTurn("first"); // spawns under `def`, and does not finish yet
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+    await startConciergeTurn("second");
+
+    // Only NOW does the first turn come back, having written to `def`'s tree all along.
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "turn-1", sessionId: "sess-on-def", text: "ok" },
+    });
+
+    expect(isRetiredConciergeSession("sess-on-def")).toBe(false);
+  });
+
+  it("does not deny-list the conversation when the account switches AWAY and BACK again", async () => {
+    // THE SNAPSHOT TRAP. Judging this by comparing the turn's account against the binding as it
+    // stands when `done` arrives is not the same as asking whether the binding MOVED: the binding is
+    // a live value that comes back. Switch away and back while turn-1 is still running and its
+    // account equals the current one again, so the comparison reads "no switch happened" and retires
+    // the conversation it was added to protect — permanently, and now with no gesture left that
+    // would ever restore it. Phase 2's rotation reaches this with no human involvement at all.
+    //
+    // The reason the epoch moved is the durable fact; the account binding is not.
+    let turnSeq = 0;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      if (cmd === "concierge_turn") return Promise.resolve(`turn-${++turnSeq}`);
+      return undefined;
+    };
+
+    await startConciergeTurn("first"); // spawns under `def`, and does not finish yet
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+    await startConciergeTurn("second");
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "def"); // …and back again, before turn-1 has reported
+    invalidateAccountState();
+    await startConciergeTurn("third");
+
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "turn-1", sessionId: "sess-on-def", text: "ok" },
+    });
+
+    expect(isRetiredConciergeSession("sess-on-def")).toBe(false);
+  });
+
+  it("still retires a signed-out human's session when the next human lands on ANOTHER account", async () => {
+    // THE OTHER DIRECTION OF THE SAME MISTAKE, and the one that leaks rather than loses. Sign-out
+    // clears the binding, but the next human's first turn installs one — and if it resolves to a
+    // different account than the previous human's in-flight turn ran under (a changed pin, a removed
+    // account, rotation), an account comparison reads that as a switch and waves the retirement
+    // through. The id then stays seedable, so the next launch probes that tree, finds the previous
+    // human's transcript as the newest one, and resumes their conversation behind an empty column —
+    // exactly the leak the deny-list exists for (roborev 55774/55794).
+    let turnSeq = 0;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      if (cmd === "concierge_turn") return Promise.resolve(`turn-${++turnSeq}`);
+      return undefined;
+    };
+
+    await startConciergeTurn("user A's question"); // under `def`, still in flight
+
+    resetConciergeSession(); // sign-out: both pointers are already null, so nothing is retired here
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+    await startConciergeTurn("user B's question"); // the binding is now `work`
+
+    // Only now does user A's turn come back, on a session it MINTED — an id the reset never saw.
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "turn-1", sessionId: "sess-user-a", text: "A's private answer" },
+    });
+
+    expect(isRetiredConciergeSession("sess-user-a")).toBe(true);
+  });
+
+  it("does not deny-list a turn that started AFTER the sign-out and was orphaned by a switch", async () => {
+    // THE ORDERING IS THE MECHANISM, so it needs a case that only the ordering passes. Every other
+    // test here runs with no reset at all, or with a reset that happened AFTER the turn under test
+    // started — so all of them stay green if `startedAt <= lastResetEpoch` degrades to "a reset
+    // happened at some point" (`lastResetEpoch !== null`).
+    //
+    // That degenerate form is wrong in exactly the way this guard exists to prevent, and it is the
+    // COMMON case rather than an exotic one: once any sign-out has occurred in the process, every
+    // later turn orphaned by a mere account rebind — a manual switch, or Phase 2's rotation, which
+    // needs no human gesture — would be written to the durable deny-list. The conversation belongs
+    // to the human sitting there now, and losing it is permanent and silent.
+    let turnSeq = 0;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      if (cmd === "concierge_turn") return Promise.resolve(`turn-${++turnSeq}`);
+      return undefined;
+    };
+
+    resetConciergeSession(); // user A signs out FIRST — the reset is already behind us
+
+    await startConciergeTurn("user B's first message"); // …so this turn is B's, not A's
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work"); // B moves accounts while their own turn is still running
+    invalidateAccountState();
+    await startConciergeTurn("user B's second message");
+
+    // B's first turn minted its own session and comes back only now. A rebind orphaned it; no reset
+    // did. It is B's live conversation, sitting in `def`'s tree where it still resumes fine.
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "turn-1", sessionId: "sess-minted-by-b", text: "ok" },
+    });
+
+    expect(isRetiredConciergeSession("sess-minted-by-b")).toBe(false);
+  });
+
   it("keeps resuming while the account stays put", async () => {
     // The guard must be a CHANGE detector, not a blanket "never resume" — otherwise it would quietly
     // end session continuity altogether and this suite's other assertions would not notice.
@@ -479,6 +624,30 @@ describe("concierge account binding", () => {
     invalidateAccountState();
     await startConciergeTurn("hello");
     expect(turnArgs(0).configDir).toBeNull();
+  });
+
+  it("keeps the RESUME and the CONFIG DIR on the same tree when the lookup hiccups", async () => {
+    // The invariant, stated as one assertion: a resume id exists in exactly one account's
+    // transcript tree, so the turn's `configDir` must name that same tree. Retaining the pointer
+    // while spawning under the DEFAULT account is not a half-fix, it is strictly worse than
+    // dropping the pointer — the send path pays a wasted `claude` on its self-heal and loses the
+    // conversation anyway, and the proactive path (no retry, by design) dies silently.
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    await startConciergeTurn("first");
+    expect(turnArgs(0).configDir).toBe("/data/accounts/work");
+    harness.handlers.get("concierge:done")?.({
+      payload: { id: "1", sessionId: "sess-on-work", text: "ok" },
+    });
+
+    const good = harness.invokeImpl;
+    harness.invokeImpl = (cmd, args) =>
+      cmd.startsWith("accounts_") ? Promise.reject(new Error("ipc hiccup")) : good?.(cmd, args);
+    invalidateAccountState();
+
+    await startConciergeTurn("second");
+    expect(turnArgs(1).resumeSessionId).toBe("sess-on-work");
+    // …and under the account that id actually lives in, NOT the default.
+    expect(turnArgs(1).configDir).toBe("/data/accounts/work");
   });
 
   it("does NOT discard the conversation when the account lookup merely hiccups", async () => {
@@ -528,5 +697,105 @@ describe("concierge account binding", () => {
     await startConciergeTurn("second");
     expect(turnArgs(1).configDir).toBe("/data/accounts/work");
     expect(turnArgs(1).resumeSessionId).toBe("sess-on-work");
+  });
+
+  it("does not pair a done from the OLD account with the NEW account's config dir", async () => {
+    // `concierge:done` is an independent writer of the session pointer and carries no account of
+    // its own. A turn spawned under `work` can land its `done` inside the NEXT turn's preamble —
+    // several IPC hops wide — after that turn has already rebound to `def`. The id then belongs to
+    // `work`'s transcript tree while the binding says `def`, the two LOOK consistent, and the turn
+    // spawns `--resume <work-id>` under `$HOME/.claude`.
+    let doneIsPending = false;
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      // Real turn ids: the account stamp is keyed by them, so a harness returning undefined would
+      // make this test vacuous by never recording one.
+      if (cmd === "concierge_turn") return Promise.resolve("t1");
+      if (cmd === "concierge_session_info") {
+        // Fire the stale `done` from INSIDE the second turn's preamble — after its first rebind has
+        // nulled the pointers, before it computes `resume`.
+        if (doneIsPending) {
+          doneIsPending = false;
+          harness.handlers.get("concierge:done")?.({
+            payload: { id: "t1", sessionId: "sess-on-work", text: "ok" },
+          });
+        }
+        return Promise.resolve({ hasSession: false, latestSessionId: null });
+      }
+      return undefined;
+    };
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    await startConciergeTurn("first");
+    expect(turnArgs(0).configDir).toBe("/data/accounts/work");
+
+    setPin(CONCIERGE_ACCOUNT_KEY, "def");
+    invalidateAccountState();
+    doneIsPending = true;
+    await startConciergeTurn("second");
+
+    expect(turnArgs(1).configDir).toBe("/home/.claude");
+    // …and NOT carrying `work`'s id into it.
+    expect(turnArgs(1).resumeSessionId).toBeNull();
+  });
+
+  it("does not let a probe started BEFORE a switch seed the account it lands after", async () => {
+    // The restore is two IPC hops including a transcript-directory scan, so a probe for account B
+    // can still be in flight when the user switches again. It captured `startedAt = sessionEpoch`
+    // before that second switch, and the switch nulls `currentSessionId` — so without the epoch
+    // bump BOTH seed guards would pass when it finally lands, seeding B's session id and stamping
+    // the binding as B while the turn is running on A. The next turn then resumes cross-tree: the
+    // exact failure `rebindSessionToAccount` exists to prevent, reintroduced by the re-probe that
+    // was added to fix it.
+    //
+    // Reaching that state needs TWO switches, because only a switch clears the memo and so only a
+    // switch can start a probe that is still outstanding when the next one arrives.
+    let releaseWork: () => void = () => {};
+    harness.invokeImpl = (cmd, args) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve([]);
+      if (cmd === "accounts_identities") return Promise.resolve([]);
+      if (cmd === "concierge_session_info") {
+        const dir = (args as { configDir?: string | null })?.configDir;
+        // `work`'s probe is held open across the second switch; the default's answers immediately.
+        if (dir === "/data/accounts/work") {
+          return new Promise((r) => {
+            releaseWork = () => r({ hasSession: true, latestSessionId: "sess-on-work" });
+          });
+        }
+        // The DEFAULT tree is deliberately empty. If it seeded a session, `currentSessionId` would
+        // be non-null when the stale probe lands and the OTHER seed guard would block it — the test
+        // would then pass with the epoch bump removed, proving nothing about the guard under test.
+        return Promise.resolve({ hasSession: false, latestSessionId: null });
+      }
+      return undefined;
+    };
+
+    // Turn 1 establishes the binding (def) — a switch is only detectable against a known account.
+    await startConciergeTurn("first");
+    expect(turnArgs(0).configDir).toBe("/home/.claude");
+
+    // Switch 1 → work. NOT awaited: its restore probes `work`, which we are holding open.
+    setPin(CONCIERGE_ACCOUNT_KEY, "work");
+    invalidateAccountState();
+    const stalledTurn = startConciergeTurn("second");
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+    // Switch 2 → back to def, while work's probe is still outstanding.
+    setPin(CONCIERGE_ACCOUNT_KEY, "def");
+    invalidateAccountState();
+    // Index 1, not 2: turn "second" is still parked on its probe and has not invoked yet, so this
+    // is only the SECOND `concierge_turn` to reach Rust.
+    await startConciergeTurn("third");
+    expect(turnArgs(1).configDir).toBe("/home/.claude");
+
+    // The stale probe finally lands, into a state where the OTHER seed guard cannot save us:
+    // `currentSessionId` is null (the default tree is empty). Only the epoch bump retires it.
+    expect(getConciergeSessionId()).toBeNull();
+    releaseWork();
+    await stalledTurn;
+    expect(getConciergeSessionId()).not.toBe("sess-on-work");
   });
 });

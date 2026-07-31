@@ -78,7 +78,7 @@ import {
 } from "./sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { forgetAgentTranscriptPath, readAgentTerminal } from "./conciergeTools/terminal";
-import { invalidateAccountState } from "./accountSelection";
+import { invalidateAccountState, resetStickyAccounts } from "./accountSelection";
 import { setPin, clearAllPins } from "./accountStore";
 
 /** Let the pass's async preamble (preflight → repo → worktree → listeners → invoke) settle
@@ -104,9 +104,12 @@ function resetHarness() {
   harness.invokeImpl = undefined;
   harness.listenImpl = undefined;
   harness.parkImpl = () => Promise.resolve({ parked: true, reason: "parked" });
-  // The account snapshot is module-level and TTL-cached, so an account planted by one test would
-  // otherwise be served to the next.
+  // Three separate pieces of module-level account state outlive a test: the TTL-cached snapshot,
+  // the sticky selection, and the last-resolved config dir. All three must go, or an account
+  // planted by one test is served to the next — which is exactly how the broken-backend case
+  // started reporting the PREVIOUS test's account instead of the default.
   invalidateAccountState();
+  resetStickyAccounts();
   clearAllPins();
   vi.clearAllMocks();
   resetPassRetryForTests();
@@ -972,5 +975,25 @@ describe("improvement pass account binding", () => {
       await completePass();
     });
     expect(runConfigDir()).toBeNull();
+  });
+
+  it("stays on the last known account when the lookup hiccups, rather than relocating", async () => {
+    // A transient IPC failure must not move the pass to the DEFAULT account's tree. The interactive
+    // pane shares this worktree and resolves its own (sticky) account, so a pass that silently
+    // relocated would write its transcript where the pane will not look — the shared-conversation
+    // divergence, caused by a hiccup instead of a real account change.
+    withAccounts();
+    setPin(SPARKLE_AGENT_ID, "work");
+    await completePass();
+    expect(runConfigDir()).toBe("/data/accounts/work");
+
+    harness.invokes.length = 0;
+    harness.invokeImpl = (cmd) =>
+      cmd.startsWith("accounts_") ? Promise.reject(new Error("ipc hiccup")) : undefined;
+    invalidateAccountState();
+    await withWarnSpy(async () => {
+      await completePass();
+    });
+    expect(runConfigDir()).toBe("/data/accounts/work");
   });
 });

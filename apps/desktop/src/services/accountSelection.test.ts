@@ -289,6 +289,54 @@ describe("accountSelection cache", () => {
     expect(chosen?.configDir).toBe("/data/accounts/real");
   });
 
+  it("keeps a sticky key STICKY when its pin is stale", async () => {
+    // A stale pin used to bypass stickiness entirely: the branch was chosen on the pin's mere
+    // presence, but `pickAccount` ignores a `pinnedAccountId` that names no existing account and
+    // falls through to plain lowest-usage auto-pick. So a sticky key silently stopped being sticky
+    // — the divergence `isStickyAccountKey` exists to prevent, on the key it was written for.
+    // Reachable: nothing prunes a pin when its account is removed.
+    setPin(SPARKLE_AGENT_ID, "deleted-account");
+    mockUsage([
+      { id: "def", tokens5h: 0, tokens7d: 10, exhaustedUntil: null },
+      { id: "work", tokens5h: 0, tokens7d: 50, exhaustedUntil: null },
+    ]);
+    expect(await accountConfigDirFor(SPARKLE_AGENT_ID, { now: 9_450_000 })).toBe("/home/.claude");
+
+    // Usage drifts past the point where a non-sticky pick would switch (see the control below).
+    mockUsage([
+      { id: "def", tokens5h: 0, tokens7d: 900, exhaustedUntil: null },
+      { id: "work", tokens5h: 0, tokens7d: 50, exhaustedUntil: null },
+    ]);
+    expect(await accountConfigDirFor(SPARKLE_AGENT_ID, { now: 9_450_001 })).toBe("/home/.claude");
+    expect(await accountConfigDirFor("plain-agent", { now: 9_450_002 })).toBe("/data/accounts/work");
+  });
+
+  it("carries a key through a hiccup, and gives BOTH its callers the same answer", async () => {
+    // The rule lives in the resolver, not in one caller. Improve Sparkle is reached by two callers
+    // on one key — the headless pass (accountConfigDirFor) and its pane (chooseAccountForAgent) —
+    // sharing ONE worktree, so a fallback implemented in only one of them means the other relocates
+    // to the default tree during a hiccup and then cannot find the transcript the first just wrote.
+    setPin(SPARKLE_AGENT_ID, "work");
+    mockUsage([{ id: "work", tokens5h: 0, tokens7d: 1, exhaustedUntil: null }]);
+    expect(await accountConfigDirFor(SPARKLE_AGENT_ID, { now: 9_800_000 })).toBe(
+      "/data/accounts/work",
+    );
+
+    invoke.mockReset();
+    invoke.mockRejectedValue(new Error("ipc down"));
+    invalidateAccountState();
+    // Both paths keep the account, rather than one silently falling to the default.
+    expect(await accountConfigDirFor(SPARKLE_AGENT_ID, { now: 9_800_001 })).toBe(
+      "/data/accounts/work",
+    );
+    const pane = await chooseAccountForAgent(SPARKLE_AGENT_ID, { now: 9_800_002 });
+    expect(pane.chosen?.configDir).toBe("/data/accounts/work");
+
+    // A key that never resolved has nothing to carry, so it still reports "unknown" rather than
+    // inventing an account.
+    expect(await accountConfigDirFor("never-resolved", { now: 9_800_003 })).toBeUndefined();
+  });
+
   it("reports an unresolvable backend as undefined, distinct from the default account's null", async () => {
     // Both spawn identically (neither sets the variable), but a caller that ACTS on a change of
     // account must not read a transient IPC failure as "the user moved to the default account".

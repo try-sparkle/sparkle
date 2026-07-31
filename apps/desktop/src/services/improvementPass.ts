@@ -670,7 +670,12 @@ export async function runImprovementPass(
     // Keyed by SPARKLE_AGENT_ID so the headless pass and the interactive Improve Sparkle pane
     // resolve to the SAME account: they already share one worktree, and pinning the pane would be
     // meaningless if the background pass ignored the pin.
-    const configDir = await accountConfigDirFor(SPARKLE_AGENT_ID);
+    // Riding out a temporarily unreadable accounts backend is the RESOLVER's job, not this
+    // caller's: the interactive Improve Sparkle pane resolves the same key through
+    // `chooseAccountForAgent`, and a rule implemented here would leave that half on a different
+    // one — two spawns into one shared worktree, disagreeing. So `?? null` is the whole of it, and
+    // `undefined` here now means only "no account has ever resolved for this key".
+    const configDir = (await accountConfigDirFor(SPARKLE_AGENT_ID)) ?? null;
 
     setStatus(SPARKLE_AGENT_ID, "working");
     const outcome = await new Promise<PassOutcome>((resolve, reject) => {
@@ -741,7 +746,7 @@ export async function runImprovementPass(
             }),
             prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
             logDir: ws.logDir,
-            configDir: configDir ?? null,
+            configDir,
           }).catch(fail);
         },
         fail,

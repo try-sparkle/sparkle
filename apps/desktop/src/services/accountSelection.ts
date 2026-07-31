@@ -121,16 +121,40 @@ export async function chooseAccountForAgent(
   opts: { force?: boolean; now?: number } = {},
 ): Promise<{ chosen: Account | null; state: AccountState }> {
   const state = await loadAccountState(opts);
+  // RIDE OUT A HICCUP, HERE, so both callers of a key get the same answer.
+  //
+  // When the accounts backend cannot be read, every account looks absent, so a fresh pick would put
+  // the job on the DEFAULT account — a different transcript tree. That is not a neutral degradation:
+  // Improve Sparkle is reached by two callers on one key (the hourly pass and its pane) sharing ONE
+  // worktree, so one of them relocating means the other looks for a transcript that was never
+  // written there. The rule lived in the pass for exactly one commit, which left the pane on a
+  // second rule — the drift this function's header warns about, in the function itself.
+  //
+  // Nothing is remembered until something resolved, so a first-ever call with a broken backend still
+  // reports "unknown" (no accounts → `chosen: null`) rather than inventing one.
+  const remembered = state.failed ? lastResolvedAccount.get(agentId) : undefined;
+  if (remembered) return { chosen: remembered, state };
   // Built ONCE and shared by both branches. Splitting them is how the pinned path silently lost
   // `signedInIds` and re-opened sparkle-gms0: `pickAccount` honours a pin only if it names an
   // EXISTING account, so a pin left behind by a deleted account falls through to auto-pick — and
   // without the signed-in filter a never-logged-in config dir wins on its zero usage and strands
   // the job at a login prompt.
   const base = { signedInIds: signedInAccountIds(state.identities), now: opts.now };
-  const pinnedAccountId = getPin(agentId);
+  // A pin only counts if it still names a REAL account. Branching on the pin's mere presence let a
+  // STALE pin — one left behind by a deleted account — bypass everything below it: `pickAccount`
+  // ignores an unmatched `pinnedAccountId` and falls through to plain lowest-usage auto-pick, so a
+  // sticky key silently stopped being sticky and recorded nothing. Reachable today, because
+  // `setPin` is written for `SPARKLE_AGENT_ID` (its pane is an `AgentPane`) and by `accountSwitch`,
+  // while the only `clearPin` caller is the doomed-agent path — nothing prunes a pin when its
+  // account is removed. The result was the divergence `isStickyAccountKey` exists to prevent, on
+  // the very key it was written for.
+  const pin = getPin(agentId);
+  const pinnedAccountId = pin && state.accounts.some((a) => a.id === pin) ? pin : undefined;
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : autoPick(agentId, state, base);
+  // Remember it so the branch above can carry this key through a later hiccup.
+  if (chosen) lastResolvedAccount.set(agentId, chosen);
   return { chosen, state };
 }
 
@@ -220,9 +244,17 @@ export function isStickyAccountKey(key: string): boolean {
  *  live conversation to keep continuity with. */
 const stickySelections = new Map<string, string>();
 
+/** The last ACCOUNT each key resolved to, so `chooseAccountForAgent` can carry a key through a
+ *  temporarily unreadable accounts backend. The whole record, not just an id: mapping an id back to
+ *  its config dir needs the account list we just failed to load, which is precisely the situation
+ *  this exists for. Distinct from `stickySelections`, which answers "what did we settle on" for a
+ *  HEALTHY load and holds only an id. */
+const lastResolvedAccount = new Map<string, Account>();
+
 /** Forget the sticky selections (tests, and any future "re-evaluate now" trigger). */
 export function resetStickyAccounts(): void {
   stickySelections.clear();
+  lastResolvedAccount.clear();
 }
 
 /** Failure is DISTINCT from "the default account", and conflating them cost the concierge its
@@ -256,7 +288,10 @@ export async function accountConfigDirFor(
     // `failed` is the ONLY way to tell "the backend is broken" from "there are no accounts": both
     // arrive here as an empty list, and `loadAccountState` degrades to empty on purpose so a hiccup
     // never blocks a spawn.
-    if (state.failed) return undefined;
+    // `undefined` only when the backend failed AND this key has nothing to fall back on — with a
+    // remembered account, `chooseAccountForAgent` has already answered coherently and the caller
+    // needs no failure signal.
+    if (state.failed && !chosen) return undefined;
     return chosen?.configDir || null;
   } catch (e) {
     console.warn("accountSelection: could not resolve an account; inheriting the default:", e);

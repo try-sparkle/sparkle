@@ -126,6 +126,26 @@ export const PROACTIVE_TURN_MEMORY = 16;
  *  in the event — it is here, at the only place that knows which invoke opened which id. */
 const proactiveTurnIds: string[] = [];
 
+/** The `CLAUDE_CONFIG_DIR` each recent turn was actually spawned with, newest last.
+ *
+ *  A session id is only meaningful together with the account whose transcript tree holds it, and
+ *  `concierge:done` — the authoritative writer of that id — carries no account of its own. Keyed by
+ *  turn id, so the `done` can stamp the binding with the account ITS turn ran under rather than
+ *  whatever the binding happens to say by the time it arrives.
+ *
+ *  Bounded like {@link PROACTIVE_TURN_MEMORY} and for the same reason: a turn that never reports
+ *  (webview reload, orphaned child) would otherwise leave an entry behind for the life of the page. */
+const turnAccounts = new Map<string, string | null>();
+
+function rememberTurnAccount(id: string, configDir: string | null): void {
+  turnAccounts.set(id, configDir);
+  while (turnAccounts.size > PROACTIVE_TURN_MEMORY) {
+    const oldest = turnAccounts.keys().next().value;
+    if (oldest === undefined) break;
+    turnAccounts.delete(oldest);
+  }
+}
+
 function rememberProactiveTurn(id: string): void {
   if (proactiveTurnIds.includes(id)) return;
   proactiveTurnIds.push(id);
@@ -178,6 +198,25 @@ let fallbackSessionId: string | null = null;
  *  discovered by failing one. */
 let sessionAccountConfigDir: string | null | undefined = undefined;
 
+/** The account a turn (or a probe) will ACTUALLY use, given what resolution returned.
+ *
+ *  THE INVARIANT THIS EXISTS TO KEEP: the `--resume` id and the `CLAUDE_CONFIG_DIR` handed to the
+ *  same `claude` must name the SAME transcript tree. A resume id only exists in one account's tree,
+ *  so a turn that pairs them from different accounts is incoherent by construction.
+ *
+ *  `undefined` (the accounts backend could not be read) must therefore NOT fall to `null`. `null`
+ *  means "the default account" — a real, different tree — so falling to it while keeping a pointer
+ *  into another account's tree produces exactly the doomed `--resume` this module works to avoid:
+ *  the send path pays a wasted `claude` on its self-heal and loses the conversation anyway, and the
+ *  proactive path (no retry, by design) dies silently. Strictly worse than either coherent option.
+ *
+ *  So when the account is unknown, carry on with the one the session already belongs to. "I cannot
+ *  read the account list" is not a reason to change accounts. */
+function effectiveConfigDir(resolved: ResolvedConfigDir): string | null {
+  if (resolved !== undefined) return resolved;
+  return sessionAccountConfigDir ?? null;
+}
+
 /** Drop the session pointers if the account has moved out from under them, so no doomed `--resume`
  *  is ever issued. Returns nothing; the caller reads `currentSessionId` afterwards as usual.
  *
@@ -191,8 +230,8 @@ function rebindSessionToAccount(configDir: ResolvedConfigDir): void {
   // it does NOT mean "moved to the default account", which is `null`. Treating the two alike made
   // a single IPC hiccup discard the live conversation pointer AND the on-disk fallback, the exact
   // loss the error path exists to prevent, and then flip back on the next successful resolve. When
-  // we do not know the account, we change nothing: the turn spawns without an override (the
-  // pre-accounts behaviour) and the session survives to be judged on the next resolvable turn.
+  // we do not know the account, we change nothing — and `effectiveConfigDir` keeps the turn itself
+  // on that same account, so the retained pointer and the spawn still agree.
   if (configDir === undefined) return;
   if (sessionAccountConfigDir !== undefined && sessionAccountConfigDir !== configDir) {
     if (currentSessionId !== null || fallbackSessionId !== null) {
@@ -203,13 +242,20 @@ function rebindSessionToAccount(configDir: ResolvedConfigDir): void {
     }
     currentSessionId = null;
     fallbackSessionId = null;
-    // AND RE-PROBE. The restore is memoized for the life of the page, so without this nothing would
-    // ever look in the new account's transcript tree — the concierge would start a brand-new
-    // conversation even when that account already holds one, which is the amnesia subsystem C
-    // exists to prevent, relocated from the restart path onto the switch path. Clearing the memo is
-    // safe: the restore only SEEDS (`currentSessionId === null && sessionEpoch === startedAt`), so
-    // it cannot overwrite live state, and a user reset leaves `sessionAccountConfigDir` undefined
-    // so it never reaches this branch.
+    // RETIRE ANY IN-FLIGHT PROBE, then re-probe.
+    //
+    // The epoch bump is not bookkeeping: a restore started before the switch captured
+    // `startedAt = sessionEpoch` and resolved its own account back then, so if it lands after this
+    // it would pass BOTH seed guards (`currentSessionId === null` — we just nulled it — and
+    // `sessionEpoch === startedAt`) and seed the OLD account's session id, then stamp the binding
+    // with the old account. The next turn would resume cross-tree, which is the failure this whole
+    // function exists to prevent, reintroduced by the fix for it. Bumping the epoch makes that
+    // stale probe fail its own guard, exactly as a user reset does.
+    sessionEpoch++;
+    // Clearing the memo is what makes the NEW account's own conversation reachable: the restore is
+    // memoized for the life of the page, so without this nothing would ever look in the new tree
+    // and the concierge would open a blank conversation on an account that already holds one — the
+    // amnesia subsystem C exists to prevent, relocated onto the switch path.
     restoring = null;
   }
   sessionAccountConfigDir = configDir;
@@ -227,6 +273,18 @@ let restoring: Promise<void> | null = null;
  *  otherwise a user who hits "start over" during the first second of app launch gets the old
  *  conversation handed back to them a moment later. */
 let sessionEpoch = 0;
+
+/** The epoch value that was IN FORCE when the most recent {@link resetConciergeSession} ran, or null
+ *  if none has (per-process, like the epoch itself — a straggler `done` cannot cross a relaunch).
+ *
+ *  WHY THE EPOCH ALONE IS NOT ENOUGH. Three different things bump `sessionEpoch` and they mean three
+ *  different things: an identity reset ("a different human"), {@link setConciergeSessionId} ("the
+ *  same conversation, learned from outside the event stream") and {@link rebindSessionToAccount}
+ *  ("the same human, a different account"). Only the first is grounds for the durable deny-list, and
+ *  "not current" cannot tell them apart. Recording WHEN the reset happened can: epochs only ever
+ *  increase, so a turn that started at or below this value was in flight when a reset orphaned it,
+ *  and one that started above it was not — whatever the account binding happens to say later. */
+let lastResetEpoch: number | null = null;
 
 // ---------------------------------------------------------------------------------------------
 // RETIRING A SESSION — the half of "forget this conversation" that outlives the process.
@@ -384,12 +442,32 @@ function ensureWired(): Promise<void> {
               // an id `resetConciergeSession` never saw, so nothing put it on the deny-list. Its
               // transcript is now the newest on disk, and the next launch would seed it.
               //
-              // UNLESS THE MODULE STILL HOLDS THAT ID (roborev 55813). `sessionEpoch` also moves on
-              // `setConciergeSessionId`, so "not current" does not always mean "a different human" —
-              // a deliberate set during an in-flight turn moves it too. Retiring there would
-              // deny-list the LIVE conversation: it would keep working this run and then be refused
-              // for ever after the next relaunch, silently and with no way to undo it.
+              // ONLY WHEN A RESET IS WHAT ORPHANED IT, and never on "not current" alone. Three
+              // things bump `sessionEpoch` and only one of them is a sign-out:
+              //
+              //  • `setConciergeSessionId` — a deliberate set during an in-flight turn (roborev
+              //    55813). Retiring there deny-lists the LIVE conversation.
+              //  • `rebindSessionToAccount` — an account switch, which nulls BOTH pointers too, so
+              //    it manufactures this exact shape while meaning the SAME human. That id is their
+              //    live conversation in the other account's tree, still resuming fine where it sits.
+              //  • `resetConciergeSession` — the actual end of a conversation, and the only one
+              //    whose ids belong on a durable deny-list.
+              //
+              // `lastResetEpoch` is what separates them, and it has to be the REASON rather than a
+              // snapshot of the account binding. The binding is a live value that moves back: a
+              // switch away and back again (a human, or Phase 2 rotation, which needs no gesture at
+              // all) leaves the turn's account equal to the current one, so an account comparison
+              // reads "no switch happened" and retires the very conversation it exists to protect —
+              // permanently, since the id is by then the newest transcript in that tree and every
+              // future restore refuses it. It fails the other way too: after a sign-out the next
+              // human's first turn installs a binding, and if that resolves to a different account
+              // than the previous human's turn ran under, the comparison waves the retirement
+              // through and the relaunch hands over their conversation (roborev 55774/55794).
+              const startedAt = turnEpochs.get(ev.payload.id);
+              const orphanedByReset =
+                startedAt !== undefined && lastResetEpoch !== null && startedAt <= lastResetEpoch;
               if (
+                orphanedByReset &&
                 ev.payload.sessionId !== currentSessionId &&
                 ev.payload.sessionId !== fallbackSessionId
               ) {
@@ -398,6 +476,18 @@ function ensureWired(): Promise<void> {
             } else if (!isRetiredConciergeSession(ev.payload.sessionId)) {
               currentSessionId = ev.payload.sessionId;
               fallbackSessionId = ev.payload.sessionId;
+              // AND THE ACCOUNT IT WAS MINTED UNDER. This handler is an independent writer of the
+              // session pointer, so without this the id and the binding could describe different
+              // accounts: a turn spawned under the old account can land its `done` after a switch
+              // has already moved the binding, and because the two then LOOK consistent the change
+              // detector sees nothing to fix and the next turn resumes cross-tree. Recording it
+              // here is what makes the post-preamble `rebindSessionToAccount` able to catch that.
+              //
+              // Only on the branch that INSTALLS the pointer: a retired or superseded id is not
+              // this module's session, so moving the binding to its account would describe a tree
+              // nothing is pointing at.
+              const turnAccount = turnAccounts.get(ev.payload.id);
+              if (turnAccount !== undefined) sessionAccountConfigDir = turnAccount;
             }
           }
           turnEpochs.delete(ev.payload.id);
@@ -496,7 +586,7 @@ function ensureWired(): Promise<void> {
  * capped bubble log has evicted, and vice versa. Rehydrating both from the transcript would fix that
  * but needs an NDJSON reader; the design defers it as a follow-up.
  */
-export function restoreConciergeSession(): Promise<void> {
+export function restoreConciergeSession(probeConfigDir?: string | null): Promise<void> {
   if (restoring) return restoring;
   {
     const startedAt = sessionEpoch;
@@ -518,7 +608,13 @@ export function restoreConciergeSession(): Promise<void> {
         // is called from three mount-time sites as well as the send path, and an argument would be
         // one more thing each of them could get wrong. It is cheap: the account snapshot is
         // TTL-cached and the selection is sticky.
-        const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+        // The CALLER's account when it has one, so the probe and the spawn are provably the same
+        // tree rather than two independent resolutions that "should" agree. They did not: a turn
+        // whose own resolve hiccupped would fall to the default while this probe's succeeded,
+        // seeding an id from the other account's tree — and the turn then paired that id with the
+        // default's config dir. The mount-time subscribers pass nothing and resolve for themselves.
+        const configDir =
+          probeConfigDir ?? effectiveConfigDir(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY));
         const info: ClaudeSessionInfo | undefined = await conciergeSessionInfo(configDir);
         // `hasSession` is deliberately not consulted: the id is the thing we need, and a truthy id
         // already implies a transcript was found. Trusting `hasSession` separately would let the two
@@ -634,11 +730,25 @@ export async function startConciergeTurn(
     // Then wiring + restore together, and the restore resolves the same account internally — same
     // cache, same sticky selection, so the tree it probes cannot disagree with the tree this turn
     // spawns into.
-    const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
-    rebindSessionToAccount(configDir);
-    await Promise.all([ensureWired(), restoreConciergeSession()]);
+    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    // `effectiveConfigDir`, not `resolved`: an unreadable accounts backend must not silently move
+    // the turn to the DEFAULT account while the session pointer still names another one.
+    rebindSessionToAccount(resolved);
+    await Promise.all([ensureWired(), restoreConciergeSession(effectiveConfigDir(resolved))]);
+    // AGAIN, after the preamble. Those two awaits are several IPC hops wide, and `concierge:done`
+    // is an independent writer of the session pointer — a turn spawned under the OLD account can
+    // land its `done` right here, installing an id from that account's tree. The second check is
+    // what keeps the id and the config dir below on one tree; the first exists to drop the restore
+    // memo before the probe runs, so both are load-bearing.
+    rebindSessionToAccount(resolved);
+    const configDir = effectiveConfigDir(resolved);
     // Snapshot BEFORE the await: a sign-out landing while the invoke is in flight must not have its
     // reset undone by the write below (roborev 55774).
+    //
+    // And AFTER the rebind above, not before it: `rebindSessionToAccount` moves `sessionEpoch`
+    // itself, so a snapshot taken earlier would compare unequal for an account change this turn
+    // has already absorbed — and every turn following a switch would decline to record its own
+    // resume target.
     const startedAt = sessionEpoch;
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
     // `configDir` binds this turn to an account. Before it existed the concierge always ran as
@@ -647,14 +757,18 @@ export async function startConciergeTurn(
     const id = await invoke<string>("concierge_turn", {
       prompt,
       resumeSessionId: resume ?? null,
-      configDir: configDir ?? null,
+      configDir,
     });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
     // resume target (esp. an explicit override) for a turn that never ran — and only while the
     // identity that started it is still the one signed in.
     if (resume && sessionEpoch === startedAt) currentSessionId = resume;
-    // Tag the turn either way, so its `done` can be judged on the same basis.
-    if (typeof id === "string") rememberTurnEpoch(id, startedAt);
+    // Tag the turn either way, so its `done` can be judged on the same basis — by epoch, for whether
+    // it is still the current human's, and by account, for which tree its session id lives in.
+    if (typeof id === "string") {
+      rememberTurnEpoch(id, startedAt);
+      rememberTurnAccount(id, configDir);
+    }
     // The turn's id — the same one its `concierge:*` events carry. Callers use it to tell this
     // turn's events from a SUPERSEDED turn's stragglers (concierge.rs emits deltas unconditionally;
     // only the reap is token-gated), which they cannot do from the ids they happen to have seen
@@ -699,11 +813,21 @@ export async function startProactiveConciergeTurn(prompt: string): Promise<strin
     // Same order, same reason, as `startConciergeTurn` — and it matters MORE here, not less: a push
     // has no stale-resume retry by design (see `concierge_proactive_turn`), so a resume aimed at the
     // wrong account's tree is never self-healed; the push just dies silently.
-    const configDir = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
-    rebindSessionToAccount(configDir);
-    await Promise.all([ensureWired(), restoreConciergeSession()]);
-    // Same snapshot as the send path, and it matters MORE here: a proactive push starts on its own
-    // schedule, so the window where a sign-out can land mid-turn is not user-driven at all.
+    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    // `effectiveConfigDir`, not `resolved`: an unreadable accounts backend must not silently move
+    // the turn to the DEFAULT account while the session pointer still names another one.
+    rebindSessionToAccount(resolved);
+    await Promise.all([ensureWired(), restoreConciergeSession(effectiveConfigDir(resolved))]);
+    // AGAIN, after the preamble. Those two awaits are several IPC hops wide, and `concierge:done`
+    // is an independent writer of the session pointer — a turn spawned under the OLD account can
+    // land its `done` right here, installing an id from that account's tree. The second check is
+    // what keeps the id and the config dir below on one tree; the first exists to drop the restore
+    // memo before the probe runs, so both are load-bearing.
+    rebindSessionToAccount(resolved);
+    const configDir = effectiveConfigDir(resolved);
+    // Same snapshot as the send path, taken at the same point and for the same two reasons, and it
+    // matters MORE here: a proactive push starts on its own schedule, so the window where a sign-out
+    // can land mid-turn is not user-driven at all.
     const startedAt = sessionEpoch;
     const resume = currentSessionId ?? undefined;
     // Same account as a user send — a push spends the same subscription, so it must not be the one
@@ -711,11 +835,12 @@ export async function startProactiveConciergeTurn(prompt: string): Promise<strin
     const id = await invoke<string>("concierge_proactive_turn", {
       prompt,
       resumeSessionId: resume ?? null,
-      configDir: configDir ?? null,
+      configDir,
     });
     if (resume && sessionEpoch === startedAt) currentSessionId = resume;
     if (typeof id !== "string") return null;
     rememberTurnEpoch(id, startedAt);
+    rememberTurnAccount(id, configDir);
     // Record it BEFORE returning, so the first event this turn produces already resolves as a push.
     // Rust emits deltas as soon as claude speaks, and the caller has not run a line yet.
     rememberProactiveTurn(id);
@@ -804,6 +929,10 @@ export function setConciergeSessionId(id: string | null): void {
  *  callers want the durable meaning — see {@link retireSessionIds}. */
 export function resetConciergeSession(): void {
   retireSessionIds(currentSessionId, fallbackSessionId);
+  // BEFORE the bump, so this names the epoch the reset ENDED: every turn still in flight started at
+  // or below it, and that is what lets a straggler `done` be judged on the reason its epoch moved
+  // rather than on the account binding it happens to find. See {@link lastResetEpoch}.
+  lastResetEpoch = sessionEpoch;
   sessionEpoch++;
   currentSessionId = null;
   fallbackSessionId = null;
@@ -833,10 +962,14 @@ export function _resetConciergeForTests(opts?: { keepRetiredSessions?: boolean }
   currentSessionId = null;
   fallbackSessionId = null;
   sessionAccountConfigDir = undefined;
+  // Process state, so a "relaunch" (`keepRetiredSessions`) clears it too: a straggler `done` cannot
+  // survive one, and carrying a reset epoch into the next case would retire ids that case never ended.
+  lastResetEpoch = null;
   wiring = null;
   restoring = null;
   proactiveTurnIds.length = 0;
   turnEpochs.clear();
+  turnAccounts.clear();
   // The retired list is DURABLE by design, so it is the one piece of this module's state that would
   // otherwise survive into the next case (and, within a worker, the next FILE) and start refusing
   // session ids that case never retired. Kept only when the caller is simulating a relaunch.
