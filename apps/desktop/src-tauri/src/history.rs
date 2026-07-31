@@ -10,12 +10,12 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager};
 
 /// Managed Tauri state: the single history DB connection behind a mutex (SQLite is fine for a
 /// single guarded connection; our access is low-frequency capture + the occasional search/prune).
 pub struct HistoryDb {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 /// The capture payload from the frontend. camelCase to match the `HistoryEntry` TS interface.
@@ -117,7 +117,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// INSERT the entry; a duplicate `id` (idempotent re-capture) is silently ignored.
-fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result<()> {
+pub(crate) fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO entries
             (id, kind, source, project_id, agent_id, project_name, agent_name, text, created_at)
@@ -139,7 +139,7 @@ fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result<()> {
 
 /// FTS5 search over live (non-tombstoned) rows. Blank query → empty. Punctuation in the query is
 /// neutralized (each whitespace term is quoted) so it can never be parsed as FTS5 syntax.
-fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite::Result<Vec<Hit>> {
+pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite::Result<Vec<Hit>> {
     let Some(match_expr) = fts_query(query) else {
         return Ok(Vec::new());
     };
@@ -170,7 +170,7 @@ fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite::Result<Vec
 
 /// Retention prune. `None` (indefinite) → no-op, 0. `Some(cutoff)` → soft-delete then hard-delete
 /// every row strictly older than `cutoff`; returns the number of rows hard-deleted.
-fn prune_in(conn: &Connection, cutoff: Option<i64>) -> rusqlite::Result<usize> {
+pub(crate) fn prune_in(conn: &Connection, cutoff: Option<i64>) -> rusqlite::Result<usize> {
     let Some(cutoff) = cutoff else {
         return Ok(0);
     };
@@ -205,28 +205,71 @@ fn fts_query(query: &str) -> Option<String> {
     }
 }
 
-#[tauri::command]
-pub fn history_record(db: State<HistoryDb>, entry: EntryInput) -> Result<(), String> {
-    // Poison-tolerant: a panic mid-query poisons the Mutex<Connection>; the recovered guard still
-    // points at a valid SQLite connection, so don't permanently brick history on it.
-    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-    record_into(&conn, &entry).map_err(|e| format!("record: {e}"))
+// ── WHY THESE THREE ARE `async` + `spawn_blocking` ────────────────────────────────────────────
+// Every one of them holds `Mutex<Connection>` across real SQLite work against a WAL database on
+// disk: `record` writes a row AND its FTS5 index entry, `search` runs an FTS5 `MATCH` with
+// `snippet()` over the whole prompt/response corpus, and `prune` mass-UPDATEs then mass-DELETEs
+// every row past the cutoff (de-indexing each from FTS5 as it goes — thousands of rows on a
+// long-lived install's first run). As plain `#[tauri::command]`s all of that executed on the AppKit
+// main thread, and `prune` is additionally driven by a `setInterval` from `main.tsx`.
+//
+// They take `AppHandle` rather than `State<HistoryDb>` because `State<'_, T>` borrows from the
+// invoke and so cannot cross a thread boundary; the handle is owned, `'static`, and resolves the
+// same managed value inside the closure. Both are injected by Tauri, so the JS call signature is
+// UNCHANGED — the frontend still passes only `entry` / `query`+`limit` / `cutoff_ms`.
+//
+// ── WHY `try_state` AND NOT `state` ───────────────────────────────────────────────────────────
+// `HistoryDb` is managed CONDITIONALLY: `lib.rs` only calls `manage` if `HistoryDb::new` succeeded,
+// because "a failure here must not stop the app from booting — capture/search just won't work."
+// Tauri's `State` extractor returned a clean `InvokeError` in that case, but `Manager::state`
+// PANICS ("state() called before manage() for …"). That panic would fire inside `spawn_blocking`
+// — caught by tokio, so the user sees an error string — but on the way out it passes through the
+// chained panic hook in `crash.rs`, which force-captures a backtrace and writes an UPLOADABLE crash
+// record. `history_record` runs on every prompt and every response, so a user whose history DB
+// failed to open would generate a false crash record per capture. `try_state` keeps the original
+// contract: the feature degrades, the app does not report a crash.
+fn history_db(app: &AppHandle) -> Result<tauri::State<'_, HistoryDb>, String> {
+    app.try_state::<HistoryDb>()
+        .ok_or_else(|| "history: DB unavailable (init failed at boot)".to_string())
 }
 
 #[tauri::command]
-pub fn history_search(
-    db: State<HistoryDb>,
+pub async fn history_record(app: AppHandle, entry: EntryInput) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        // Poison-tolerant: a panic mid-query poisons the Mutex<Connection>; the recovered guard
+        // still points at a valid SQLite connection, so don't permanently brick history on it.
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        record_into(&conn, &entry).map_err(|e| format!("record: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_record task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn history_search(
+    app: AppHandle,
     query: String,
     limit: Option<u32>,
 ) -> Result<Vec<Hit>, String> {
-    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-    search_in(&conn, &query, limit.unwrap_or(50)).map_err(|e| format!("search: {e}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        search_in(&conn, &query, limit.unwrap_or(50)).map_err(|e| format!("search: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_search task failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn history_prune(db: State<HistoryDb>, cutoff_ms: Option<i64>) -> Result<usize, String> {
-    let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-    prune_in(&conn, cutoff_ms).map_err(|e| format!("prune: {e}"))
+pub async fn history_prune(app: AppHandle, cutoff_ms: Option<i64>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        prune_in(&conn, cutoff_ms).map_err(|e| format!("prune: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_prune task failed: {e}"))?
 }
 
 #[cfg(test)]

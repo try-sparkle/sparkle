@@ -163,10 +163,34 @@ pub fn probe<R: Runtime>(app: &AppHandle<R>) -> StaleBuildProbe {
 
 /// Tauri command: the frontend polls this on an interval and feeds it to the pure JS `isStaleBuild`
 /// predicate (staleBuildService.ts) to decide whether to show the "Restart to finish updating"
-/// banner. Cheap — a couple of stat/`defaults`/`ps` calls — so an interval poll is fine.
+/// banner.
+///
+/// ── RUNS ON THE BLOCKING POOL ─────────────────────────────────────────────────────────────────
+/// This doc used to say "Cheap — a couple of stat/`defaults`/`ps` calls — so an interval poll is
+/// fine." Two of those three are `Command::output()`: a full fork/exec of `/usr/bin/defaults` and
+/// of `/bin/ps`, each WAITED on. Process creation from a large-RSS app is not cheap, and on a cold
+/// cache Gatekeeper/`amfid` can push `defaults` past 100 ms. As a plain `#[tauri::command]` those
+/// two spawns ran inline on the AppKit main thread, on a timer AND on every window refocus.
+/// "Cheap" was the unexamined word; `sparkle-rfhu5` records that the same word hid three defects.
+///
+/// A join failure degrades to a probe with the compile-time fields populated and the installed-side
+/// fields unknown, preserving this module's stated contract that it "never throws into the UI".
 #[tauri::command]
-pub fn stale_build_probe<R: Runtime>(app: AppHandle<R>) -> StaleBuildProbe {
-    probe(&app)
+pub async fn stale_build_probe<R: Runtime>(app: AppHandle<R>) -> StaleBuildProbe {
+    // `package_info()` is an in-memory read of a struct Tauri built at startup — no syscall — so it
+    // is safe to take here and gives the fallback something truthful to report.
+    let running_version = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || probe(&app)).await.unwrap_or_else(|_| {
+        StaleBuildProbe {
+            running_version,
+            running_sha: running_build_sha().to_string(),
+            installed_version: None,
+            installed_sha: None,
+            installed_mtime_ms: None,
+            running_started_ms: None,
+            installed_path: installed_app_path().to_string_lossy().into_owned(),
+        }
+    })
 }
 
 #[cfg(test)]

@@ -1226,8 +1226,27 @@ fn confine_to_worktrees(worktrees_base: &Path, worktree: &str) -> Result<PathBuf
 /// `project_root` (optional) is the repo the worktree belongs to. It is used only to resolve the
 /// repo-scoped `[plugins]` layer, so a repo's own `.sparkle/config.toml` can decide which agent
 /// plugins its agents get. Absent → the global layer alone, which is the correct fallback.
+/// Runs on the BLOCKING pool. The body is ~8 synchronous filesystem operations — two
+/// `canonicalize()` walks, a bundle→app-data file copy (`stage_resource_script`), two
+/// `create_dir_all`s, a `read_to_string`, an atomic write+rename, and a `config::for_project` stat
+/// (plus a read+parse on a memo miss) — and it fires on EVERY agent prepare. As a plain
+/// `#[tauri::command]` every one of those ran on the AppKit main thread.
+///
+/// Note the pre-existing inner `spawn_blocking` for the marketplace install is unaffected: it was
+/// already off-thread and stays detached.
 #[tauri::command]
-pub fn install_agent_hooks(
+pub async fn install_agent_hooks(
+    app: AppHandle,
+    worktree: String,
+    project_root: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || install_agent_hooks_sync(app, worktree, project_root))
+        .await
+        .map_err(|e| format!("install_agent_hooks task failed: {e}"))?
+}
+
+/// Blocking core of [`install_agent_hooks`].
+pub fn install_agent_hooks_sync(
     app: AppHandle,
     worktree: String,
     project_root: Option<String>,
@@ -1248,17 +1267,26 @@ pub fn install_agent_hooks(
     let dir = worktree_dir.join(".claude");
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
     let file = dir.join("settings.local.json");
-    let existing = std::fs::read_to_string(&file).ok();
-    let merged = merge_event_hooks(existing.as_deref(), &emitter_cmd);
-    // Pre-enable Sparkle's default-on marketplace plugins in the SAME file, after the emitter merge
-    // (both are read-modify-write on this path, so they must compose, not race). Chaining the two
-    // merges means the plugin keys ride the one atomic write below.
-    let cfg = plugins_layer_for(project_root.as_deref());
-    let enabled = cfg.plugins.enabled();
-    let merged = merge_plugin_settings(Some(&merged), &enabled);
-    // Atomic + JSON-validated: a concurrently-running Claude (this file drives its executable hooks)
-    // must never read a truncated/partial write, and we refuse to clobber with invalid JSON.
-    atomic_write_settings(&file, &merged)?;
+    // Held across read→merge→write so a concurrent `heal_agent_hooks` (or a second install for this
+    // same worktree) cannot have its write silently reverted by ours. Scoped to a block so it is
+    // released before the marketplace-install `spawn_blocking` below, which does not touch this
+    // file and must not be serialized behind it. See `settings_write_lock`.
+    let enabled = {
+        let write_lock = settings_write_lock(&file);
+        let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let existing = std::fs::read_to_string(&file).ok();
+        let merged = merge_event_hooks(existing.as_deref(), &emitter_cmd);
+        // Pre-enable Sparkle's default-on marketplace plugins in the SAME file, after the emitter
+        // merge (both are read-modify-write on this path, so they must compose, not race). Chaining
+        // the two merges means the plugin keys ride the one atomic write below.
+        let cfg = plugins_layer_for(project_root.as_deref());
+        let enabled = cfg.plugins.enabled();
+        let merged = merge_plugin_settings(Some(&merged), &enabled);
+        // Atomic + JSON-validated: a concurrently-running Claude (this file drives its executable
+        // hooks) must never read a truncated/partial write, and we refuse to clobber invalid JSON.
+        atomic_write_settings(&file, &merged)?;
+        enabled
+    };
 
     // Install what this PROJECT's layer enables (bead sparkle-s3g2.1 follow-up). The startup pass
     // only ever sees the GLOBAL layer, so a repo that enables a plugin its `.sparkle/config.toml`
@@ -1326,6 +1354,48 @@ fn heal_settings(settings: &str, emitter: &Path, emitter_cmd: &str, guard: &Path
 /// Walk every managed worktree (`<worktrees_base>/<project>/<agent>`) and re-point any stale
 /// emitter/guard hook in its `settings.local.json` at the stable script paths. Returns how many
 /// worktrees were healed. Takes resolved paths (no AppHandle) so it unit-tests with temp dirs.
+/// Serializes the read→merge→write sequence on ONE `settings.local.json`.
+///
+/// ── WHY THIS EXISTS, AND WHY IT DID NOT BEFORE ────────────────────────────────────────────────
+/// `install_agent_hooks_sync` and `scan_and_heal` both read this file, transform it, and write it
+/// back. While they were plain `#[tauri::command]`s their bodies ran on the AppKit main thread, so
+/// they were mutually exclusive BY CONSTRUCTION and no lock was needed. Moving them to the blocking
+/// pool ENABLED concurrency that never existed — the second-order cost of an off-main-thread
+/// conversion, and the one that is invisible in the diff.
+///
+/// `atomic_write_settings` does not cover it: it prevents a TORN read, not a LOST UPDATE. Walk the
+/// failure: heal (app launch) and install (agent prepare) both read the stale file; heal writes the
+/// repaired hook paths; install then writes its merge derived from the stale copy, silently
+/// reverting the heal — so that worktree's hooks keep pointing at a removed bundle, which is the
+/// exact failure `heal_agent_hooks` exists to fix. Two concurrent installs for one worktree lose the
+/// plugin-enablement merge the same way.
+fn settings_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    #[allow(clippy::type_complexity)]
+    static LOCKS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(guard.entry(settings_lock_key(path)).or_default())
+}
+
+/// Canonical key for [`settings_write_lock`].
+///
+/// The two call sites build this path differently — install joins onto a `confine_to_worktrees`
+/// result (already canonicalized), heal joins onto a `read_dir` entry (not). On macOS that alone is
+/// enough to produce `/var/...` and `/private/var/...` for the same file, and two different keys
+/// mean two different mutexes, i.e. no serialization at all while the code reads as if there were.
+/// The PARENT is canonicalized rather than the file: the file may not exist yet on install's first
+/// write, but `.claude/` is created before this is called and always exists for heal.
+fn settings_lock_key(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            parent.canonicalize().map(|p| p.join(name)).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 fn scan_and_heal(
     worktrees_base: &Path,
     hook_events_base: &Path,
@@ -1345,6 +1415,10 @@ fn scan_and_heal(
         for agent in agents.flatten() {
             let worktree = agent.path();
             let settings_path = worktree.join(".claude").join("settings.local.json");
+            // Held across read→heal→write so a concurrent `install_agent_hooks` cannot write a
+            // merge derived from the copy we are about to replace. See `settings_write_lock`.
+            let write_lock = settings_write_lock(&settings_path);
+            let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
             let existing = match std::fs::read_to_string(&settings_path) {
                 Ok(s) => s,
                 Err(_) => continue, // no hooks installed for this worktree
@@ -1366,8 +1440,20 @@ fn scan_and_heal(
 /// re-stages the emitter + write-guard to the stable app-data location, then re-points any
 /// worktree whose baked hook paths reference an old/renamed/removed bundle. Idempotent — a no-op
 /// once everything already points at the stable path. Returns the number of worktrees healed.
+/// Runs on the BLOCKING pool. `scan_and_heal` is an UNBOUNDED nested directory walk — a `read_dir`
+/// of the worktrees base, a `read_dir` per project, and a `read_to_string` (plus a possible
+/// write+rename) per agent inside it — and this repo's own AGENTS.md describes "dozens of
+/// worktrees". It is called at app LAUNCH, which is exactly when the main thread is most contended,
+/// so as a plain `#[tauri::command]` it walked the whole tree inline on the AppKit main thread.
 #[tauri::command]
-pub fn heal_agent_hooks(app: AppHandle) -> Result<u32, String> {
+pub async fn heal_agent_hooks(app: AppHandle) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || heal_agent_hooks_sync(app))
+        .await
+        .map_err(|e| format!("heal_agent_hooks task failed: {e}"))?
+}
+
+/// Blocking core of [`heal_agent_hooks`].
+pub fn heal_agent_hooks_sync(app: AppHandle) -> Result<u32, String> {
     let app_data = crate::dev_identity::app_data_dir(&app)?;
     let emitter = stage_resource_script(&app, "sparkle-hook.mjs")?;
     let guard = stage_resource_script(&app, "worktree-guard.mjs")?;
@@ -1432,8 +1518,20 @@ fn log_path_within(base: &Path, log_path: &str) -> bool {
 /// `skip_existing` (optional, defaults false): jump straight to EOF and return an empty batch.
 /// A pane mounting on an agent with a large accumulated log wants only NEW events; doing that
 /// server-side means we stat the file and return, instead of reading and discarding megabytes.
+/// ── WHY THIS IS `async` + `spawn_blocking`, NOT A PLAIN `fn` ──────────────────────────────────
+/// This is the highest-frequency filesystem command in the app: the frontend polls it every 500 ms
+/// for EVERY open agent pane, so a fleet of 40 agents drives ~80 calls a second. Each one does two
+/// `canonicalize()` walks, a `symlink_metadata`, an `open`, a `seek`, up to `MAX_READ_BYTES` of
+/// reading and a UTF-8 scan. As a plain `#[tauri::command]` all of that ran INLINE on the AppKit
+/// main thread (tauri-macros defaults to `ExecutionContext::Blocking`), so the cost was paid in
+/// dropped frames continuously, not occasionally.
+///
+/// The confinement check moves across with the read deliberately: splitting them would leave a
+/// TOCTOU window between validating the path and opening it. The cheap, non-blocking half — the
+/// app-data path math, which is `dirs::data_dir()` plus a join and touches no filesystem — stays on
+/// the caller thread so a bad handle never occupies a blocking-pool slot.
 #[tauri::command]
-pub fn read_events_since(
+pub async fn read_events_since(
     app: AppHandle,
     log_path: String,
     offset: u64,
@@ -1446,11 +1544,24 @@ pub fn read_events_since(
         Ok(b) => b,
         Err(_) => return Ok(EventsChunk { lines: vec![], offset, truncated: false }),
     };
+    tauri::async_runtime::spawn_blocking(move || read_events_since_confined(&base, &log_path, offset, skip))
+        .await
+        .map_err(|e| format!("read_events_since task failed: {e}"))?
+}
+
+/// Blocking core of [`read_events_since`]: canonicalize the base, confine, read. Separated so the
+/// tests can drive it synchronously — the same shape `support.rs` uses for `read_recent_logs_sync`.
+pub fn read_events_since_confined(
+    base: &Path,
+    log_path: &str,
+    offset: u64,
+    skip: bool,
+) -> Result<EventsChunk, String> {
     match base.canonicalize() {
         // hook-events dir not created yet → no events are possible; report an empty batch.
         Err(_) => Ok(EventsChunk { lines: vec![], offset, truncated: false }),
-        Ok(canon_base) if log_path_within(&canon_base, &log_path) => {
-            read_events_since_impl(Path::new(&log_path), offset, skip)
+        Ok(canon_base) if log_path_within(&canon_base, log_path) => {
+            read_events_since_impl(Path::new(log_path), offset, skip)
         }
         Ok(_) => Err("read_events_since: log_path is outside the managed hook-events dir".into()),
     }
@@ -3111,6 +3222,51 @@ mod tests {
             .any(|e| entry_has_marker(e, GUARD_MARKER)));
         // Re-running on the now-stable file is a no-op (no needless rewrite).
         assert!(heal_settings(&healed, e_new, &e_cmd, g_new, &g_cmd).is_none());
+    }
+
+    // The lock only serializes if both call sites compute the SAME key. They build the path
+    // differently — install joins onto a canonicalized `confine_to_worktrees` result, heal joins
+    // onto a raw `read_dir` entry — so one file can arrive spelled two ways, giving two mutexes and
+    // no serialization while the code reads as if there were one.
+    //
+    // A SYMLINK is the discriminator, and the choice is load-bearing. The first version of this test
+    // used a `./` hop and was VACUOUS: `Path`'s comparison walks `components()`, which already drops
+    // `CurDir`, so `a/./b == a/b` with or without the canonicalize — deleting the normalization left
+    // it green. A symlink is something `Path` equality genuinely cannot resolve, so only a real
+    // `canonicalize` collapses the two spellings. (This is also the actual macOS case: `/var` is a
+    // symlink to `/private/var`, which is where `temp_dir()` lives.)
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_lock_key_collapses_two_spellings_of_one_path() {
+        let tmp = std::env::temp_dir().join(format!("sparkle-lockkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let real = tmp.join("real");
+        std::fs::create_dir_all(real.join(".claude")).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let via_real = real.join(".claude").join("settings.local.json");
+        let via_link = link.join(".claude").join("settings.local.json");
+        assert_ne!(via_real, via_link, "precondition: the two spellings differ as plain paths");
+        assert_eq!(
+            settings_lock_key(&via_real),
+            settings_lock_key(&via_link),
+            "two spellings of one settings file must map to ONE lock, or nothing is serialized"
+        );
+
+        // The file need NOT exist yet — install writes it for the first time under the lock, which
+        // is why the PARENT is what gets canonicalized.
+        assert!(!via_real.exists(), "precondition: this test never creates the file");
+
+        // Distinct worktrees must NOT share a lock, or every install serializes behind every other.
+        let other = tmp.join("other").join(".claude");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_ne!(
+            settings_lock_key(&via_real),
+            settings_lock_key(&other.join("settings.local.json")),
+            "distinct worktrees must take distinct locks"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

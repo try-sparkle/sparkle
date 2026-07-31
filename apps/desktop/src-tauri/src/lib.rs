@@ -32,6 +32,7 @@ mod claude_chat;
 /// `claude` CLI. Replaces the server-side `/ai/anthropic` proxy that `ai.rs` used to own.
 mod claude_oneshot;
 mod cloud;
+mod cmd_timing;
 mod crash;
 mod config;
 mod connectivity;
@@ -51,6 +52,7 @@ mod inbox;
 mod judge;
 mod logging;
 mod mac_panel;
+mod main_thread_bench;
 mod main_window;
 mod memwatch;
 mod mic_permission;
@@ -105,6 +107,13 @@ fn notify_frontend_shown() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Capture the main thread's identity HERE, on the main thread, before the event loop starts.
+    // `cmd_timing` compares against it to report whether a command body actually ran on the main
+    // thread rather than inferring it from the macro's source — see that module's header.
+    cmd_timing::note_main_thread();
+    if cmd_timing::init_from_env() {
+        tracing::info!(target: "perf", "per-command main-thread timing armed (SPARKLE_CMD_TIMING)");
+    }
     tauri::Builder::default()
         // The app menu. `app_menu::build` starts from Tauri's platform default and only INSERTS
         // into it — setting any menu here REPLACES the default outright, and a hand-rolled one that
@@ -487,8 +496,21 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        // Wrapped rather than passed bare so every command's MAIN-THREAD occupancy is measurable.
+        // For a sync command the generated body runs inline here, so the time around `handler` IS
+        // the UI freeze it caused; for an async one the handler only spawns, so the same probe
+        // reads the dispatch hop alone. Inert unless `SPARKLE_CMD_TIMING` is set. See `cmd_timing`.
+        .invoke_handler({
+            // The type is spelled out at the BINDING, not just at the call: `generate_handler!`
+            // expands to a closure whose parameter type is normally inferred from the
+            // `invoke_handler` call it is passed to directly, and binding it to a `let` first
+            // removes that inference site. Boxing costs one dynamic dispatch per invoke, which
+            // Tauri already pays — `invoke_handler` stores it as `Box::new(...)` regardless.
+            #[allow(clippy::type_complexity)]
+            let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
+                Box::new(tauri::generate_handler![
             notify_frontend_shown,
+            cmd_timing::cmd_timing_report,
             fleet::fleet_digest,
             fleet::fleet_read_hook_stream,
             fleet::fleet_read_transcript,
@@ -774,7 +796,9 @@ pub fn run() {
             project_window::open_project_window,
             project_window::set_project_window_bounds,
             project_window::close_project_window
-        ])
+                ]);
+            move |invoke| cmd_timing::measure(invoke, &handler)
+        })
         .build(tauri::generate_context!())
         .expect("error while building Sparkle")
         .run(|app, event| match event {
@@ -811,6 +835,10 @@ pub fn run() {
                 // group kill that stops a detached pass from outliving the app — only actually
                 // happen when driven from here. `Drop` remains an idempotent backstop.
                 app.state::<sparkle_improve::SparkleImproveManager>().end_in_flight_pass();
+                // Leave the per-command main-thread table behind when the probe was armed, so a
+                // measurement run does not depend on someone calling `cmd_timing_report` before
+                // quitting. No-op when disarmed (the default).
+                cmd_timing::log_report_on_exit();
             }
             _ => {}
         });

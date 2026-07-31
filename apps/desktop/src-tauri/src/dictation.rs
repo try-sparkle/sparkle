@@ -2871,9 +2871,20 @@ pub struct AudioInputSettings {
 
 /// Every input device CoreAudio can see, so the user can choose one explicitly rather than living
 /// with whatever the OS calls the default.
+/// Runs on the BLOCKING pool. `list_input_devices` is roughly `2 + 4N` synchronous CoreAudio HAL
+/// property reads (device list, then per device: channel count, transport type, UID, name), each a
+/// round trip that runs through in-process HAL plug-in code and often IPC to `coreaudiod`. This
+/// machine loads EIGHT third-party HAL plug-ins into Sparkle's address space (see the
+/// `audio_devices` module header), so `N` is large and one misbehaving vendor driver stalls the
+/// whole enumeration — which, as a plain `#[tauri::command]`, meant stalling the AppKit main thread.
+///
+/// A join failure degrades to an empty list rather than throwing into the UI, matching how the rest
+/// of this module treats device enumeration as best-effort.
 #[tauri::command]
-pub fn list_audio_inputs() -> Vec<crate::audio_devices::InputDevice> {
-    crate::audio_devices::list_input_devices()
+pub async fn list_audio_inputs() -> Vec<crate::audio_devices::InputDevice> {
+    tauri::async_runtime::spawn_blocking(crate::audio_devices::list_input_devices)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
