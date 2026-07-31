@@ -217,6 +217,34 @@ describe("xtermTheme light-mode ANSI palette", () => {
     }
   });
 
+  it("the FILL contract is PAPER-on-ink — and black-on-hue provably cannot join it", () => {
+    // THE THIRD DIRECTION. `\e[3Xm` over `\e[4Xm` is an ink on an ink, and the two assertions above
+    // (paper-on-ink, ink-on-paper) do not cover it: `\e[42;30m` measures 1.71:1 on this palette.
+    // That is a real idiom (`chalk.bgGreen.black`), so it is recorded rather than left to be found.
+    //
+    // It is the same forced choice the paper pair faces. Rather than assert a hardcoded "this is
+    // 1.71:1" — which pins a symptom and would have to be re-typed on every retune — this
+    // RE-DERIVES the impossibility from the shipped plane. If the terminal plane ever darkens
+    // enough that a hue could both read as text AND carry black, this fails and the decision gets
+    // re-made deliberately instead of silently inherited.
+    const needed = TERM_ANSI_MIN_CONTRAST * (luminance(light.black!) + 0.05) - 0.05;
+    const allowed = (luminance(bg) + 0.05) / TERM_ANSI_MIN_CONTRAST - 0.05;
+    expect(
+      needed,
+      `a hue needs luminance >= ${needed.toFixed(4)} to carry black at AA but <= ${allowed.toFixed(4)} to read on the plane — if this ever inverts, re-decide whether the hues are inks or fills`,
+    ).toBeGreaterThan(allowed);
+
+    // Given that, the contract the palette DOES keep: every ink fill carries a paper foreground.
+    // (Asserted above too; restated here as the positive half of this decision, so a reader of
+    // this test sees what black-on-hue is being traded FOR.)
+    for (const slot of TERM_ANSI_INKS) {
+      const best = Math.max(...paper.map((p) => contrast(p, light[slot]!)));
+      expect(best, `light.${slot} must carry at least one paper tone`).toBeGreaterThanOrEqual(
+        TERM_ANSI_MIN_CONTRAST,
+      );
+    }
+  });
+
   it("PAPER is actually paper — lighter than the plane, so a `\\e[47m` cell reads as a page", () => {
     // Without this, "paper" could satisfy every fill assertion above by being pure white on a pure
     // white plane, i.e. an invisible cell. It also pins the direction: paper is the LIGHT register.

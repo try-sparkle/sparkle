@@ -791,6 +791,26 @@ export const TERM_PAPER_MIN_SPLIT = 1.1;
  * before this change (xterm's default `white` #d3d7cf measured 1.13:1) and no palette can fix it.
  * What this change does fix is every COLOURED token, which is what the report was about.
  *
+ * ── THE FILL CONTRACT IS PAPER-ON-INK, AND BLACK-ON-HUE IS OUTSIDE IT ──────────────────────────
+ * There are three fg/bg directions, not two, and the third is `\e[3Xm` over `\e[4Xm` — an ink on
+ * an ink. `\e[42;30m` (black on a green fill) measures 1.71:1 here, and `chalk.bgGreen.black` is a
+ * real badge/diff-hunk idiom, so this must be stated rather than left for someone to discover.
+ *
+ * IT IS THE SAME FORCED CHOICE THE PAPER PAIR FACES, one hue over. For a fill to carry `black` at
+ * AA it needs luminance ≥ 0.2528; to clear AA as text on this plane it needs ≤ 0.1304. No value
+ * does both, so each hue is either an ink or a black-carrying fill and cannot be both. The hues are
+ * INKS here, deliberately: coloured TEXT washing out is the reported bug, whereas black-on-hue is
+ * a fill idiom whose light foreground (`white`/`brightWhite`) already clears AA on every one of
+ * them. `xtermTheme.test.ts` asserts the contract AND re-derives the impossibility, so if the
+ * terminal plane ever darkens enough to make both satisfiable the test fails and the choice gets
+ * re-made rather than inherited.
+ *
+ * DO NOT read this as "no worse than before": it IS worse for that one idiom, and by how much is
+ * worth knowing. xterm.js's default is the Tango set, where black-on-green measured 3.58:1 and
+ * black-on-blue 2.13:1 — i.e. already under AA. (A ~9:1 figure belongs to the classic `#00cd00`
+ * xterm palette, which is not what this app ever shipped.) So the direction went from failing to
+ * failing worse, while the two directions a TUI relies on most went from failing to passing.
+ *
  * ── WHAT THIS PALETTE DOES NOT REACH, MEASURED RATHER THAN GUESSED ─────────────────────────────
  * `pty.rs` exports `COLORTERM=truecolor`, so the obvious worry is that a chalk/Ink TUI emits
  * 24-bit `\e[38;2;R;G;Bm` and bypasses all of this. For the TUI that prompted the report it does

@@ -3270,6 +3270,10 @@ type WorkerDetail = {
   description: string;
   stage: WorkflowStageId | null;
   status: AgentTabStatus;
+  /** The row's status colour AS PAINTED. It crosses this boundary as a bare `string`, so the row
+   *  re-asserts the text tier with `statusInk` at the point of paint rather than trusting the
+   *  producer — this row's name is an underlined-on-hover LINK, and it previously took the raw
+   *  brand green at 2.22:1. `statusInk` is idempotent on an already-themed value. */
   statusColor: string;
   branchStatus?: BranchStatus;
   shipped: boolean;
@@ -3312,11 +3316,11 @@ function WorkerNameButton({ w }: { w: WorkerDetail }) {
         textDecoration: hover ? "underline" : "none",
       }}
     >
-      <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
+      <span style={{ color: statusInk(w.statusColor), fontSize: 12, fontWeight: FONT_WEIGHT.semibold }}>
         {w.autoTitle || w.name}
       </span>
       {w.description && (
-        <span style={{ color: w.statusColor, fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
+        <span style={{ color: statusInk(w.statusColor), fontSize: 12, fontWeight: FONT_WEIGHT.regular }}>
           {`:  ${w.description}`}
         </span>
       )}
