@@ -165,8 +165,11 @@ export const RAIL_WIDTH = 6;
 
 /** The concierge column's live width. */
 export const CONCIERGE_WIDTH_VAR = "--concierge-w";
-/** Emitted by `AgentSidebar` when a build column COMMITS a width, so the row can re-reserve for it.
- *  Once per drag, not once per move — the gesture paints a variable and commits on release. */
+/** Emitted by `AgentSidebar` so the row can re-reserve for a build column's real width.
+ *  ON MOUNT AND ON EVERY WIDTH CHANGE, not only on commit — the row must reserve for a column the
+ *  user has never dragged, and a sidebar mounting later than `Workspace` at a different window width
+ *  would otherwise leave the two disagreeing for good. `Workspace` ignores an event that does not
+ *  change its mirror, so a re-announcement costs one comparison and no render. */
 export const BUILD_WIDTH_EVENT = "sparkle:build-width";
 /** A build column's live width. Per side, because the two builders are independent. */
 export function buildWidthVar(side: "left" | "right"): string {

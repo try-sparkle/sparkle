@@ -562,20 +562,11 @@ describe("the concierge is the centred anchor in double mode", () => {
     expect(conciergeWidth()).toBe(ceilingAtDefault - 2 * (800 - 220));
   });
 
-  it("ignores an announcement that does not change anything", () => {
-    // The event fires on every sidebar mount and width change, including re-announcements of the
-    // same number. Those must not move the ceiling — or a remount would look like a resize.
-    render(<Workspace />);
-    drag(500, 9000);
-    const before = conciergeWidth();
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent("sparkle:build-width", { detail: { side: "left", width: 220 } }),
-      );
-    });
-    drag(500, 9000);
-    expect(conciergeWidth()).toBe(before);
-  });
+  // The duplicate-announcement guard is asserted in `Workspace.renderCost.test.tsx`, not here. The
+  // version that lived at this spot re-announced the width the mirror already held and checked the
+  // ceiling — which is a pure function of the build widths, so it read the same with or without the
+  // guard and could never fail (roborev 56115). What the guard actually buys is that a re-announcement
+  // writes no state and renders nothing, and only the render-cost harness can see that.
 
   // ── THE STORED WIDTH IS KEYED BY PAIR COUNT ──────────────────────────────────────────────────
   it("writes the PAIRED key and leaves the single-pair preference alone", async () => {

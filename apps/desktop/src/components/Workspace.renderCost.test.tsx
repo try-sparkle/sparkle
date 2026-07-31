@@ -33,7 +33,8 @@
 // pane props the real predicate calls different, which is exactly what makes the real pane re-render.
 // A bare stub (what every other Workspace suite mocks in) would count nothing and pass forever.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { BUILD_WIDTH_EVENT } from "../engine/columnResize";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -314,5 +315,36 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
 
     // …and the release is what finally moves the React-held width.
     expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
+  });
+
+  // The mirror's identity guard, asserted where it can actually redden. `Workspace.resize.test.tsx`
+  // carried a version of this that could not fail: it re-announced the width the mirror already held
+  // and asserted the concierge's CEILING was unchanged — but that ceiling is a pure function of the
+  // build widths, so it is unchanged whether or not the guard exists (roborev 56115). The guard's
+  // real effect is that a duplicate announcement writes no state and therefore renders nothing, and
+  // that needs a render counter, which lives in this file.
+  it("re-announcing the SAME build width costs no render; a NEW one does", async () => {
+    await mount();
+
+    // A real change must re-render the shell. Without this half, the bound below is satisfied by a
+    // listener that is simply broken — the precondition, not the side effect.
+    const before = counts.concierge;
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: "left", width: 640 } }),
+      );
+    });
+    expect(counts.concierge).toBeGreaterThan(before);
+
+    // Now the case every sidebar mount produces: the same width, announced again. `setBuildWidths`
+    // must return the identical object so React bails out. Drop the `prev[side] === width` guard and
+    // this goes above zero — which is the whole point of asserting it here rather than on the ceiling.
+    const settled = counts.concierge;
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: "left", width: 640 } }),
+      );
+    });
+    expect(counts.concierge - settled).toBe(0);
   });
 });

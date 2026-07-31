@@ -586,9 +586,12 @@ export function Workspace() {
   // can reserve the space they actually occupy rather than their minimums. Reserving the minimums
   // would let the concierge be dragged straight over a build column the user deliberately widened.
   //
-  // It stays in step through a custom event the sidebar emits on commit — which is ONCE PER DRAG now
-  // that the gesture paints a CSS variable instead of calling `onWidth` per move. Reading storage on
-  // an event rather than polling it keeps this off the drag's hot path entirely.
+  // It stays in step through a custom event the sidebar emits ON MOUNT AND ON EVERY WIDTH CHANGE —
+  // not only on commit. The row has to reserve for a column the user has never dragged, and a sidebar
+  // that mounts later than this shell at a different window width would otherwise leave the two
+  // disagreeing for good. The listener below ignores an event that does not change the mirror, so a
+  // re-announcement costs one comparison and no render, which is what keeps this off the drag's hot
+  // path — the gesture itself paints a CSS variable and never calls `onWidth` per move.
   const [buildWidths, setBuildWidths] = useState<{ left: number; right: number }>(() => ({
     left: readStoredBuildWidth("left", typeof window === "undefined" ? 1600 : window.innerWidth),
     right: readStoredBuildWidth("right", typeof window === "undefined" ? 1600 : window.innerWidth),
@@ -1720,17 +1723,6 @@ export function Workspace() {
             width: `var(${CONCIERGE_WIDTH_VAR}, ${renderedConciergeWidth}px)`,
           }}
         >
-        {/* THE CONCIERGE'S **LEFT** EDGE — the boundary that had no handle at all, which is the
-            "I cannot resize the concierge" report. The column shipped with a single seam on its right,
-            so from the left pair's side the concierge was a wall.
-
-            IT OWNS THE LEFT PAIR, not the concierge, and that is the rule that makes the two edges
-            independent: each seam resizes the column on ITS OWN LEFT and touches nothing else. So this
-            one moves the left pair's right edge (= the concierge's left edge) while `conciergeWidth` is
-            untouched, and the right seam changes `conciergeWidth` while this width is untouched.
-            `grows="left"` for the same reason the right seam uses it — dragging right grows the column
-            on the left of the boundary. Rendered only with a left pair, since without one this edge is
-            the window frame. */}
         <ConciergeHost
           width={renderedConciergeWidth}
           feed={feed}
