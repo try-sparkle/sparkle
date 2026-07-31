@@ -113,18 +113,22 @@ export function localAgentCapacity(): CapacityReading {
   // every hydrated state. The two expressions differ only in the few hundred ms between
   // `setMaxConcurrentWorkers` and the `config-changed` re-hydrate.
   //
-  // Whether a pin SHOULD throttle the machine is an unresolved semantic question, not a bug to
-  // guess at: the ⋯-menu slider's label (components/WorkerLimitControl.tsx) says "per build agent",
-  // while config.rs's own clamp warning says "this machine can run {auto}. Remove the line from
-  // config.toml" — i.e. machine-wide. The code currently implements the Rust reading.
+  // SETTLED 2026-07-30 (bead `sparkle-axtkw`): a pin IS machine-wide. It was an open semantic
+  // question — the ⋯-menu slider said "per build agent" while config.rs's clamp warning said
+  // machine-wide — and the two gates were written as different expressions that agreed only by the
+  // invariant above (roborev 55068). Both now read `enforcedWorkerCap` compared against a
+  // machine-wide count, so grepping either finds the other.
   //
-  // `orchestrationListener.globalGateBinds` is the SIBLING machine-wide gate and it carries the
-  // OTHER expression — `globalUsedSlots() >= max(1, effectiveMaxConcurrentWorkers)`, under a comment
-  // explicitly rejecting `enforcedWorkerCap` as "the wrong input" for it. The two agree in every
-  // hydrated state only because of the invariant above, NOT because they are written the same way
-  // (roborev 55068). Anyone settling the bead must change BOTH, and must not assume grepping this
-  // file's expression will find the other one: `orchestrationListener` mentions `enforcedWorkerCap`
-  // at its PER-BUILD-AGENT branch, which is a different gate and the wrong place to edit.
+  // `orchestrationListener.globalGateBinds` is the SIBLING gate and the one that admits spawns; this
+  // one is the reading the UI and the concierge quote.
+  //
+  // They share a THRESHOLD but count DIFFERENT POPULATIONS, and that difference is unresolved rather
+  // than designed (roborev 56166, bead `sparkle-dv65b`). This function counts build agents AND workers
+  // — a build agent runs its own Claude Code with its own V8 heap, so it costs what a worker costs.
+  // `globalUsedSlots()` counts `kind === "worker"` only. So with `max_concurrent = 4`, 3 build agents
+  // and 1 worker live, THIS reads at-capacity while the spawn gate sees 1 of 4 and will admit 3 more
+  // workers: 7 model processes against a budget of 4. Do not "simplify" these two into one call
+  // believing they already agree — they agree on the number, not on what it is counting.
   //
   // The genuinely pin-invariant field, if a future gate wants "what the hardware alone can carry",
   // is `machineMaxConcurrentWorkers` — which is what the ⋯-menu slider's track now uses.

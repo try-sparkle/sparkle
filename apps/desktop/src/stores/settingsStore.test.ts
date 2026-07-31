@@ -383,6 +383,40 @@ describe("effectiveMaxConcurrentWorkers — the RAM-aware enforced cap", () => {
     expect(useSettingsStore.getState().effectiveMaxConcurrentWorkers).toBe(1);
   });
 
+  // THE INVARIANT the machine-wide ratification rests on (bead `sparkle-axtkw`, roborev 55068).
+  //
+  // `[workers].max_concurrent` is machine-wide, and the reason there is exactly ONE spawn gate
+  // rather than a per-agent one as well is that `enforcedWorkerCap` — `min(maxConcurrentWorkers,
+  // effectiveMaxConcurrentWorkers)` — is not actually a min in any state hydrate can produce: both
+  // fields come out of the same `pinnedCeiling ?? derived` / `min(pinnedCeiling, derived)` pair, so
+  // they are equal. A per-agent gate written against `enforcedWorkerCap` therefore compared a
+  // SMALLER count against the SAME threshold as the machine-wide gate and could never bind first.
+  //
+  // If a future change makes these two diverge, that reasoning silently stops holding and the
+  // deleted per-agent gate becomes load-bearing again. This test is the tripwire for that, which is
+  // why it sweeps the whole hydrate matrix instead of asserting one pair: pinned-below-derived,
+  // pinned-above-derived, AUTO, a missing backend field, and the floors.
+  it.each([
+    ["pin below what the machine derives", 4, 40],
+    ["pin above what the machine derives", 20, 3],
+    ["pin equal to the derivation", 8, 8],
+    ["AUTO — no pin at all", null, 40],
+    ["AUTO on an unmeasurable machine", null, undefined],
+    ["a backend too old to send the field", 7, undefined],
+    ["a backend reporting zero", 20, 0],
+  ])(
+    "enforcedWorkerCap === effectiveMaxConcurrentWorkers after hydrate (%s)",
+    (_label, pin, derived) => {
+      useSettingsStore.getState().hydrateFromConfig(eff(pin, derived));
+      const s = useSettingsStore.getState();
+      // Not `toBeLessThanOrEqual` — EQUAL. "≤" is what the type of a min() suggests and it would
+      // pass against a divergence, which is exactly the state this exists to catch.
+      expect(enforcedWorkerCap(s)).toBe(s.effectiveMaxConcurrentWorkers);
+      // ...and the min() cannot be clamping, i.e. the pin is never the smaller of the two.
+      expect(s.effectiveMaxConcurrentWorkers).toBeLessThanOrEqual(s.maxConcurrentWorkers);
+    },
+  );
+
   // BUG 2/3 of the agent-ceiling audit. The app told a human "at-capacity: 46 of 32 slots… the
   // ceiling is derived from installed RAM" on an 18-core machine that was CPU-bound at 36 and
   // pinned at 32 — three numbers and the wrong reason. The provenance is computed in Rust next to

@@ -366,6 +366,103 @@ describe("orchestrationPersona", () => {
     expect(p).toContain("4"); // the cap value is interpolated
   });
 
+  it("describes the cap as SHARED machine-wide, never as this agent's own allowance", () => {
+    // roborev 56166, Medium. `[workers].max_concurrent` is machine-wide (bead `sparkle-axtkw`), and
+    // AgentPane hands EVERY orchestrator the same number. While this persona said "workers YOU have
+    // spawned" and "spawn UP TO N per batch", two orchestrators were each told to fan out to N
+    // against a gate that admits N in TOTAL — and the persona's own next paragraph makes that
+    // expensive rather than cosmetic: an over-cap spawn "BLOCKS your REPL … deadlocks until it times
+    // out (~600s)". The second orchestrator stalled ten minutes by following its brief correctly.
+    //
+    // This asserts the SHARED framing, which is the part that changes behavior — not merely that the
+    // number appears (the test above already covers that, and would pass on the old per-agent copy).
+    expect(p).toMatch(/shared/i);
+    expect(p).toMatch(/on this machine/i);
+    // The specific claim that misled: workers counted as the agent's own.
+    expect(p).not.toMatch(/workers you have spawned but not yet spun down/i);
+    // And it must say the ceiling may not all be available, so the agent doesn't plan for all of it.
+    expect(p).toMatch(/may not have all of|fewer are available/i);
+  });
+
+  /** The ONE bullet, sliced to its own text — from `marker` up to the next top-level `- ` bullet.
+   *  A slice that runs to the END of the persona is not a guard: a positive assertion on it can be
+   *  satisfied by any later section that happens to use the same words, which made an earlier
+   *  version of these tests non-vacuous only by luck (roborev 56178). */
+  const bullet = (marker: string): string => {
+    const start = p.indexOf(marker);
+    expect(start, `persona no longer contains "${marker}"`).toBeGreaterThan(-1);
+    const end = p.indexOf("\n- ", start + marker.length);
+    return end === -1 ? p.slice(start) : p.slice(start, end);
+  };
+
+  it("states the capacity rule on the spawn REPLY, the only signal the model receives", () => {
+    // roborev 56170 → 56178, two laps on the same bullet. Attempt 1 said "let a blocked spawn tell
+    // you the real number" — the remedy WAS the ~600s deadlock the same bullet warns about. Attempt
+    // 2 said "keep going while each call RETURNS PROMPTLY", which is (a) the same prohibited probe
+    // reworded and (b) not observable: `SpawnReply` in apps/mcp-orchestrator/src/tools.ts is
+    // `{workerId?, branch?, worktree?, error?}` — no elapsed time, no queued flag — so the model
+    // cannot measure promptness at all. It just LOOKED evaluable, which is worse.
+    //
+    // The rule must therefore hang off `error`, which is the one field that reaches the model.
+    const rule = bullet("- THE RULE");
+    expect(rule).toMatch(/error/i);
+    // The consequence that makes it actionable: the unit did NOT start, so it is still to do.
+    expect(rule).toMatch(/not started|was not started|still unclaimed/i);
+    // And it must NOT reintroduce a latency-based judgement, in any phrasing.
+    expect(rule).not.toMatch(/promptly|straight back|how long|elapsed|quickly|immediately returns/i);
+  });
+
+  it("does not both forbid and prescribe discovering the cap by spawning (roborev 56178)", () => {
+    // Attempt 2 carried a prohibition ("do NOT try to discover it by spawning until one blocks") and
+    // its own violation ("keep going while each call returns promptly") in the SAME bullet. An LLM
+    // reading both literally gets contradictory instructions. Only one prohibition may govern.
+    const shared = bullet("- The concurrency cap is");
+    const rule = bullet("- THE RULE");
+    const both = `${shared}\n${rule}`;
+    expect(both).not.toMatch(/do not try to discover|don't try to discover/i);
+    // The honest framing survives instead: you cannot compute your share up front.
+    expect(both).toMatch(/cannot compute|cannot avoid it by calculation|assume less is available/i);
+  });
+
+  it("its remedy for the shared cap is not the 600s deadlock it warns about (roborev 56170)", () => {
+    // AGENTS.md: "a refusal or remedy message that says 'do X instead' is an INSTRUCTION the user
+    // will follow — so it needs the same safety analysis as the code path it replaces." The first
+    // attempt at the shared-cap copy told the agent to "let a blocked spawn tell you the real
+    // number" — i.e. to discover its allowance by triggering the exact ~600s REPL deadlock the same
+    // bullet exists to prevent. It relocated the stall instead of removing it.
+    //
+    // It also conditioned batch size on "when you are the sole orchestrator", a fact the persona had
+    // just declared UNOBSERVABLE two lines earlier (`list_workers` shows only your own workers, and
+    // no MCP op reports the machine-wide count). A decision rule the agent cannot evaluate is not a
+    // rule. Both are asserted here because both are copy an LLM acts on literally.
+    expect(p).not.toMatch(/let a blocked spawn tell you/i);
+    // A PROPERTY, not a phrase ban (roborev 56178): the earlier `not.toMatch(/sole orchestrator/i)`
+    // was already evaded by this file's own "no other orchestrator is running", so a rewrite saying
+    // "when you are the only orchestrator running, spawn up to 4 per batch" would have passed it.
+    // What must not exist is batch SIZING conditioned on being alone — which the agent cannot check.
+    expect(p).not.toMatch(
+      /(sole|only) orchestrator[^.]*\b(spawn|fan out|batch|up to)\b|\b(spawn|fan out|up to)\b[^.]*\b(sole|only) orchestrator/i,
+    );
+    expect(p).toMatch(/one at a time/i);
+  });
+
+  it("the batch RECIPE step (1) itself carries the shared-cap qualifier", () => {
+    // roborev 56170 found step (1) still reading "spawn up to the cap"; roborev 56178 then found the
+    // GUARD too weak in two ways, both fixed here:
+    //   - the slice ran to the END of the persona, so the positive assertion could be satisfied by
+    //     any later section using the same words (non-vacuous only by luck);
+    //   - the negative banned one exact string, so "(1) spawn 4 workers" / "(1) fill the cap" would
+    //     reintroduce the unqualified imperative and still pass.
+    const recipe = bullet("- Batch workflow:");
+    const step1 = recipe.slice(0, recipe.search(/\(2\)/) === -1 ? undefined : recipe.search(/\(2\)/));
+    // The property: step (1) must carry a qualifier...
+    expect(step1).toMatch(/shared|one worker at a time|do not assume|halting on the first error/i);
+    // ...and must not tell the agent to spawn to the cap, however that is phrased (bare number,
+    // "the cap", "your cap", "fill").
+    expect(step1).not.toMatch(/\b(spawn|fill|start)\b[^.]{0,30}\b(up to )?(the |your )?cap\b(?![^.]*shared)/i);
+    expect(step1).not.toMatch(/\bspawn\s+4\b/i);
+  });
+
   it("uses explicit batching up to the cap — no 'queues automatically' promise", () => {
     // The persona must instruct batching explicitly and warn against exceeding the cap.
     // It must NOT claim that spawn_worker queues transparently (that caused deadlock).

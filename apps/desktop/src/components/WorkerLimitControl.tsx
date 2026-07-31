@@ -19,7 +19,10 @@ import { FONT_UI } from "../theme/scale";
 export const WORKER_LIMIT_SLIDER_FLOOR = 50;
 
 /**
- * ⋯-menu control for the orchestrator's max concurrent workers (per build agent). A range slider
+ * ⋯-menu control for max concurrent workers ON THIS MACHINE — not per build agent. The label said
+ * "per build agent" until 2026-07-30, which was the one place a user could read the opposite of what
+ * the gate enforced (bead `sparkle-axtkw`): `orchestrationListener.globalGateBinds` counts every
+ * worker on the box against this number. A range slider
  * 1..sliderMax (at least WORKER_LIMIT_SLIDER_FLOOR, never below what this machine can run) with a
  * live numeric readout, backed by settingsStore. Raising it lets
  * an orchestrator fan out more workers at once; the persona text the orchestrator receives reads
@@ -105,8 +108,8 @@ export function WorkerLimitControl() {
         </span>
       </div>
       <div style={hint}>
-        How many workers an orchestrator may run at once (per build agent). Higher = more parallel
-        work, more token spend.
+        How many workers may run at once on this machine, across all orchestrators. Higher = more
+        parallel work, more token spend.
       </div>
       {machineCapped && (
         // Say so plainly rather than silently ignoring the setting: something IS the binding

@@ -350,9 +350,13 @@ interface SettingsState {
   /** chiefProjectId -> (doc path -> { content hash, asset id }). The current-state sync ledger:
    *  one entry per path, replaced wholesale each sync. */
   chiefDocStateByProject: Record<string, Record<string, ChiefDocState>>;
-  /** Maximum number of concurrent workers an orchestrator may run at once, per build agent
-   *  (floored at 1, otherwise unbounded). Adjustable via the slider in the ⋯ menu; the
-   *  orchestration persona reads this same value so the cap it's told about always matches. */
+  /** Maximum number of concurrent workers on THIS MACHINE, across every orchestrator (floored at 1,
+   *  otherwise unbounded). Adjustable via the slider in the ⋯ menu; the orchestration persona reads
+   *  this same value so the cap it's told about always matches.
+   *
+   *  Machine-wide, not per build agent — ratified 2026-07-30 (bead `sparkle-axtkw`). The doc said
+   *  "per build agent" while the gate that enforces it counted machine-wide; one key cannot carry
+   *  both dimensions, and a per-agent limit would need its own. */
   maxConcurrentWorkers: number;
   /** The concurrency the app actually ENFORCES: what the MACHINE can carry, computed in Rust as
    *  `min(RAM-derived, cores × AGENTS_PER_CORE)` — see `EffectiveConfig.effective_max_concurrent`.

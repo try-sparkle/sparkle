@@ -505,17 +505,20 @@ describe("orchestrationListener", () => {
     expect(spawnWorkerMock).toHaveBeenCalledTimes(3); // B's queued spawn released by A's spin_down
   });
 
-  it("treats maxConcurrentWorkers as PER AGENT and the RAM cap as MACHINE-WIDE", async () => {
-    // Pinning the two settings' dimensions, because the fix above depends on them differing and
-    // roborev reasonably asked which was intended.
+  it("a PIN is machine-wide: a second agent does NOT get its own allowance (sparkle-axtkw)", async () => {
+    // Replaces a test that asserted the opposite ("treats maxConcurrentWorkers as PER AGENT"), which
+    // the founder settled machine-wide on 2026-07-30. Two things made the old assertion unsafe:
     //
-    //   maxConcurrentWorkers          — the user's ceiling for EACH build agent
-    //   effectiveMaxConcurrentWorkers — RAM-derived, a ceiling for the WHOLE MACHINE
+    // 1. It set `maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 4` — a state `hydrateFromConfig`
+    //    can NEVER produce, since both derive from the same pin/derived pair (`effective <= max` is
+    //    an invariant, swept in settingsStore.test.ts). It pinned a semantic on unreachable input.
+    // 2. The semantic it pinned is the unsafe one. A per-agent allowance is unbounded in N: each
+    //    agent sits under the cap while N agents put N × the cap on one machine — the sparkle-hfhs
+    //    coalition blowup, and how ~68 agents hit the macOS 256-descriptor ceiling on 2026-07-30.
     //
-    // So two agents may each run up to the configured number as long as the machine's RAM budget
-    // covers the total. Reading the per-agent preference as a machine-wide limit would surprise
-    // anyone who set it to 2 meaning "2 each", and would throttle a big machine for no reason.
-    useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 4 });
+    // So: a REACHABLE pinned state (both fields 2, as hydrate would set them), and the second agent
+    // is refused because the MACHINE is full — not waved through on an allowance of its own.
+    useSettingsStore.setState({ maxConcurrentWorkers: 2, effectiveMaxConcurrentWorkers: 2 });
     const store = useProjectStore.getState();
     const buildC = store.addAgent(projectId, { kind: "build" })!;
     store.setAgentWorktree(projectId, buildC, "/wt/buildC", "sparkle/agent-buildC");
@@ -524,12 +527,33 @@ describe("orchestrationListener", () => {
     await flush();
     fire({ reqId: "p2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a2" } });
     await flush();
-    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // agent A held at ITS per-agent cap of 1
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // agent A fills the machine-wide pin of 2
 
+    invokeMock.mockClear();
     fire({ reqId: "p3", op: "spawn_worker", buildAgentId: buildC, projectId, payload: { task: "c" } });
     await flush();
-    // A different agent gets its own slot: 2 machine-wide, still under the RAM budget of 4.
+    // Under a per-agent reading this is 1 worker for a fresh agent — trivially allowed, and the
+    // machine would reach 3 against a budget of 2. Machine-wide, it waits.
     expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).not.toHaveBeenCalled(); // p3 deferred, not answered
+  });
+
+  it("the pin — not just the machine derivation — is what the gate enforces", async () => {
+    // The hazard called out at the `globalGateBinds` call site: `WorkerLimitControl` legitimately
+    // uses `machineMaxConcurrentWorkers` for its slider TRACK (roborev 55027), and a future reader
+    // is likely to "fix" the gate to match. That would make a pin stop capping — pinning 2 on a
+    // 36-capable Mac would admit 36. Here the machine could carry 36 and the user pinned 2; a gate
+    // reading `machineMaxConcurrentWorkers` spawns both, a gate reading `enforcedWorkerCap` spawns one.
+    useSettingsStore.setState({
+      maxConcurrentWorkers: 1,
+      effectiveMaxConcurrentWorkers: 1,
+      machineMaxConcurrentWorkers: 36,
+    });
+    fire({ reqId: "k1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "one" } });
+    await flush();
+    fire({ reqId: "k2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "two" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held at the PIN, not at the hardware's 36
   });
 
   it("queues spawns past the cap, then releases one when a slot frees via spin_down", async () => {
@@ -599,21 +623,41 @@ describe("orchestrationListener", () => {
     expect(reqIds).toContain("f2");
   });
 
-  it("does not starve a second build agent's queued spawn behind a capped head-of-queue", async () => {
-    useSettingsStore.setState({ maxConcurrentWorkers: 1 });
+  it("releases the LONGEST-WAITING queued spawn when a slot frees, across build agents", async () => {
+    // Was "does not starve a second build agent's queued spawn behind a capped head-of-queue": with a
+    // per-agent gate, a head request whose own agent was at cap had to be SKIPPED so another agent
+    // with a free slot could pass it. Machine-wide there is one gate, so every queued request gets
+    // the same answer and skipping is meaningless — the queue is FIFO (sparkle-axtkw).
+    //
+    // The fairness property survives in a stronger form, and this asserts it: the freed slot goes to
+    // whoever waited LONGEST, not to whichever agent the scan happens to reach first. Reintroducing
+    // an agent-keyed scan would hand it to B and fail here.
+    useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
     const buildB = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     useProjectStore.getState().setAgentWorktree(projectId, buildB, "/wt/buildB", "sparkle/agent-buildB");
-    // Build A fills its only slot, then queues a SECOND A spawn (A now at cap → head of queue).
+
+    // A fills the machine's single slot; A's second and then B's first both queue behind it.
     fire({ reqId: "a1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a-live" } });
     await flush();
     fire({ reqId: "a2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "a-queued" } });
     await flush();
-    // Build B has a free slot — its spawn must run even though A's request sits ahead in the queue.
-    fire({ reqId: "b1", op: "spawn_worker", buildAgentId: buildB, projectId, payload: { task: "b-live" } });
+    fire({ reqId: "b1", op: "spawn_worker", buildAgentId: buildB, projectId, payload: { task: "b-queued" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // machine full — BOTH are waiting
+
+    // Free the slot. a2 queued before b1, so a2 goes first.
+    const live = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.kind === "worker")!;
+    invokeMock.mockClear();
+    fire({ reqId: "d1", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: live.id } });
+    await flush();
     await flush();
     const reqIds = invokeMock.mock.calls.map(([, a]) => (a as { reqId: string }).reqId);
-    expect(reqIds).toContain("b1"); // B not blocked behind A's still-capped a2
-    expect(reqIds).not.toContain("a2"); // A's second is still queued (A still at cap)
+    expect(reqIds).toContain("a2"); // the longest-waiting request got the freed slot
+    expect(reqIds).not.toContain("b1"); // ...and exactly one was released; b1 still waits
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2);
   });
 
   it("clears the start guard on init failure so a subsequent call can re-arm the listener", async () => {
@@ -1132,24 +1176,37 @@ describe("orchestrationListener", () => {
       acknowledgeRemovals([orphanId]); // don't leak the tombstone into later tests
     });
 
-    it("does NOT reap when only this agent's OWN cap binds, even long past the grace", async () => {
-      // Own cap = 1, machine gate slack. A spawn over the OWN cap can't be unblocked by reclaiming
-      // machine-wide orphans, so handleSpawn must not kick a reap. Assert the OBSERVABLE outcome (the
-      // orphan survives well past the grace), not that a timer of a particular delay was scheduled.
+    it("reaps for a spawn blocked by a PIN, not only by the hardware derivation", async () => {
+      // Inverted from "does NOT reap when only this agent's OWN cap binds" (sparkle-axtkw). That test
+      // guarded a `if (globalGateBinds())` condition on the reap: with a per-agent gate, a spawn could
+      // be refused while machine-wide orphans were irrelevant, so scanning would be wasted work. It
+      // set `maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 20` — effective ABOVE the pin,
+      // which `hydrateFromConfig` cannot produce (see the invariant sweep in settingsStore.test.ts).
+      //
+      // With one machine-wide gate, reaching the queue IS the gate binding, so the condition became a
+      // tautology and was dropped. The property worth pinning now is that the reap still fires when
+      // the binding limit is the USER'S PIN rather than the hardware — a reader who assumed "reap
+      // only when the machine is physically full" would re-add a `machineMaxConcurrentWorkers` check
+      // here and strand this spawn behind dead records forever.
       vi.useFakeTimers();
       try {
         __setReaperNow(); // production clock == the (now fake) Date.now, advanced in step with timers
         vi.setSystemTime(T0);
-        useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 20 });
+        // Pinned at 1 on hardware that could carry 20 — a reachable hydrated state, unlike the above.
+        useSettingsStore.setState({
+          maxConcurrentWorkers: 1,
+          effectiveMaxConcurrentWorkers: 1,
+          machineMaxConcurrentWorkers: 20,
+        });
         fire({ reqId: "own1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "first" } });
         await vi.advanceTimersByTimeAsync(0);
         const orphanId = addOrphanWorker(projectId, "ghost-build-agent");
         spinDownWorkerMock.mockClear();
 
-        fire({ reqId: "own2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "over own cap" } });
-        await vi.advanceTimersByTimeAsync(GRACE_MS * 3); // no reap was ever triggered by this spawn
+        fire({ reqId: "own2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "over the pin" } });
+        await vi.advanceTimersByTimeAsync(GRACE_MS * 3); // two observations + the grace → reap fires
 
-        expect(spinDownWorkerMock).not.toHaveBeenCalledWith({ projectId, workerId: orphanId });
+        expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId, workerId: orphanId });
       } finally {
         vi.useRealTimers();
       }

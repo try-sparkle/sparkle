@@ -60,9 +60,6 @@ const inFlight = new Map<string, number>();
 function flightKey(projectId: string, buildAgentId: string): string {
   return `${projectId}:${buildAgentId}`;
 }
-function getInFlight(projectId: string, buildAgentId: string): number {
-  return inFlight.get(flightKey(projectId, buildAgentId)) ?? 0;
-}
 function incInFlight(projectId: string, buildAgentId: string): void {
   const k = flightKey(projectId, buildAgentId);
   inFlight.set(k, (inFlight.get(k) ?? 0) + 1);
@@ -156,24 +153,6 @@ function respond(reqId: string, result: unknown): Promise<void> {
   );
 }
 
-function liveWorkerCount(projectId: string, buildAgentId: string): number {
-  const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
-  if (!project) return 0;
-  return project.agents.filter((a) => a.kind === "worker" && a.parentId === buildAgentId).length;
-}
-
-/** Slots already taken: live tabs PLUS spawns mid-flight (reserved synchronously). The single
- *  source of truth for the cap so handleSpawn and drainQueue agree.
- *
-  *  NB: this is THIS build agent's own count. The machine-wide bound is `globalUsedSlots`;
- *  agent may run concurrently (matches the task brief: "count THIS build agent's live workers").
- *  With multiple build agents the machine-wide total can reach N_agents × that cap, which is why
- *  the per-agent V8 heap cap (config.rs `[workers].agent_heap_mb`) is the other half of the
- *  memory bound — this gate alone cannot see other build agents' workers. */
-function usedSlots(projectId: string, buildAgentId: string): number {
-  return liveWorkerCount(projectId, buildAgentId) + getInFlight(projectId, buildAgentId);
-}
-
 /** Every worker on the MACHINE: all projects, all build agents, plus all in-flight reservations.
  *
  *  `effectiveMaxConcurrentWorkers` is derived from the MACHINE's hardware — `min(what its RAM
@@ -194,32 +173,61 @@ function globalUsedSlots(): number {
   return live + flight;
 }
 
-/** True when a spawn must wait: either THIS build agent is at its own ceiling, or the MACHINE is
- *  at the RAM-derived one. Both are real limits and whichever binds first wins — the per-agent
- *  gate keeps one agent from monopolising the machine, the global gate keeps N agents from
- *  collectively overrunning it. Purely additive: this can only ever refuse a spawn the old gate
- *  would have allowed, never admit one it would have refused. */
-function atCapacity(projectId: string, buildAgentId: string): boolean {
-  if (usedSlots(projectId, buildAgentId) >= enforcedWorkerCap(useSettingsStore.getState())) return true;
-  return globalGateBinds(); // the machine-wide branch — shared with the reaper so the two can't drift
+/** True when a spawn must wait. ONE limit, MACHINE-WIDE: every worker on the box counted against
+ *  `enforcedWorkerCap`. `[workers].max_concurrent` is a machine-wide ceiling, ratified 2026-07-30
+ *  (bead `sparkle-axtkw`) — see `globalGateBinds` for why this is one gate and not two. */
+function atCapacity(): boolean {
+  return globalGateBinds();
 }
 
-/** True when the MACHINE-wide gate (not this build agent's own cap) is the binding limit. This is the
- *  global branch of `atCapacity`, factored out so the on-cap reaper trigger tests the SAME condition
- *  `atCapacity` does — if the floor/metric ever changes it changes in one place. */
+/** True when the machine-wide gate binds. The ONLY concurrency gate for worker spawns, and shared
+ *  with the on-cap reaper trigger so the two can't drift.
+ *
+ *  ### Why `enforcedWorkerCap` and NOT `machineMaxConcurrentWorkers`
+ *
+ *  This is the trap. `components/WorkerLimitControl.tsx` uses `machineMaxConcurrentWorkers` for its
+ *  slider TRACK, for a good reason (roborev 55027): `effective` is already clamped by the user's own
+ *  pin, and dragging the slider PERSISTS a pin, so a track derived from it ratchets DOWN and never
+ *  back up. That precedent is easy to find and **must not be applied here**. A track and a gate want
+ *  opposite numbers: the track wants the pin-INDEPENDENT hardware ceiling so the control can always
+ *  reach the machine's real range; the gate wants the pin-DEPENDENT enforced number, because
+ *  honouring the pin is the entire point of the pin. Switching this expression to
+ *  `machineMaxConcurrentWorkers` would make a pin stop capping — pinning 2 on a 36-capable Mac would
+ *  admit 36 — i.e. a cap that silently stops capping. That is not theoretical: on 2026-07-30 ~68
+ *  concurrent agents hit the macOS per-process file-descriptor ceiling of 256.
+ *
+ *  ### Why one gate, not a per-agent one as well
+ *
+ *  There used to be a second, per-build-agent branch here. It could never bind first:
+ *  `hydrateFromConfig` sets `maxConcurrentWorkers = pinned ?? derived` and `effective = pinned ===
+ *  null ? derived : min(pinned, derived)`, so `enforcedWorkerCap(s) === effectiveMaxConcurrentWorkers`
+ *  identically in every hydrated state (pinned by `settingsStore.test.ts`), while
+ *  `usedSlots(oneAgent) <= globalUsedSlots()` always. Same threshold, smaller count — dead code
+ *  wearing the costume of a safeguard, and the two gates' comments contradicted each other about
+ *  what the setting MEANT (roborev 55068).
+ *
+ *  ### It counts WORKERS ONLY — which does not match `localAgentCapacity`
+ *
+ *  `globalUsedSlots()` counts `kind === "worker"`. `services/agentCapacity.localAgentCapacity` — the
+ *  reading the UI and the concierge quote — counts build agents AND workers, because a build agent
+ *  runs its own Claude Code with its own V8 heap and costs what a worker costs. Same threshold,
+ *  different populations, and the difference is UNRESOLVED rather than deliberate (roborev 56166,
+ *  bead `sparkle-dv65b`): with `max_concurrent = 4`, 3 build agents and 1 worker live, this gate sees
+ *  1 of 4 and admits 3 more workers — 7 model processes on a machine budgeted for 4. The RAM
+ *  derivation divides the machine by a per-AGENT budget, so excluding build agents under-counts
+ *  against the very budget the number came from. Left as-is here only because widening it is a
+ *  capacity change beyond this ratification, not because it is right.
+ *
+ *  Taking the min rather than `effectiveMaxConcurrentWorkers` also keeps this strictly TIGHTER than
+ *  the two-gate version it replaces: in the few hundred ms between `setMaxConcurrentWorkers` and the
+ *  `config-changed` re-hydrate the pin can sit below `effective`, and this clamps down to it. This
+ *  change can only ever refuse a spawn the old pair would have allowed, never admit one they refused.
+ *
+ *  If a genuine per-agent limit is ever wanted ("no single orchestrator monopolises the box"), it
+ *  needs its OWN key — e.g. `[workers].max_per_agent` — because one key cannot carry both dimensions.
+ *  That ambiguity is the defect this ratification closes; do not re-overload this one. */
 function globalGateBinds(): boolean {
-  const s = useSettingsStore.getState();
-  // `effectiveMaxConcurrentWorkers` DIRECTLY, and deliberately not `enforcedWorkerCap` — this is the
-  // one gate for which that helper is the wrong input, so the exception is stated rather than left
-  // to look like an oversight (it was audited as one).
-  //
-  // The two settings carry different DIMENSIONS here: `maxConcurrentWorkers` is the user's ceiling
-  // for EACH build agent, `effectiveMaxConcurrentWorkers` is the machine-wide budget. `enforcedWorkerCap`
-  // is their min, which is exactly right for the per-agent branch of `atCapacity` above (a per-agent
-  // cap can never usefully exceed the machine) and exactly wrong here: it would collapse the
-  // machine-wide budget to the per-agent number, so a user who set "2 each" would get 2 on the whole
-  // machine rather than 2 per agent — throttling a big machine for no reason.
-  return globalUsedSlots() >= Math.max(1, s.effectiveMaxConcurrentWorkers);
+  return globalUsedSlots() >= Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
 }
 
 /** Coarse runtime status for list_workers. Authoritative completion is wait_for_workers
@@ -315,18 +323,19 @@ function handleSpawn(req: OrchestrationRequest): void {
     }
     claimedBeads.add(key);
   }
-  if (atCapacity(req.projectId, req.buildAgentId)) {
-    spawnQueue.push(req); // over cap (this agent's, or the machine's) → defer until a slot frees
+  if (atCapacity()) {
+    spawnQueue.push(req); // machine is at its ceiling → defer until a slot frees
     // A spawn blocked by LEAKED machine-wide capacity — orphaned workers from a build agent that
     // departed without spinning them down — would otherwise wait behind dead records forever. Kick a
-    // reap so any reclaimable slot frees and drains this request via the store subscription. Only when
-    // the GLOBAL gate is the binding limit: if this agent is merely at its OWN cap, reclaiming
-    // machine-wide orphans can't unblock it, so a scan+teardown would be wasted work (roborev). The
-    // grace + single-flight inside reapOrphanedWorkers keep a burst of queued spawns cheap. Fire-and-
-    // forget (handleSpawn is sync); it self-throttles, so overlapping triggers are harmless.
-    if (globalGateBinds()) {
-      void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] on-cap reap failed", e));
-    }
+    // reap so any reclaimable slot frees and drains this request via the store subscription.
+    //
+    // This used to be guarded by `if (globalGateBinds())`, to skip the scan when only the per-agent
+    // gate bound (reclaiming machine-wide orphans could not unblock that case). With one machine-wide
+    // gate, reaching here IS `globalGateBinds()` being true, so the guard was a tautology — dropped
+    // rather than left to read as a live condition. The grace + single-flight inside
+    // reapOrphanedWorkers keep a burst of queued spawns cheap. Fire-and-forget (handleSpawn is sync);
+    // it self-throttles, so overlapping triggers are harmless.
+    void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] on-cap reap failed", e));
     return;
   }
   // runSpawn reserves the slot synchronously at its first line, so firing it (not awaiting) is
@@ -699,14 +708,14 @@ async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
  *  are safe: each splice + runSpawn reservation is synchronous, so a second drain sees the updated
  *  queue and inFlight before it can act.
  *
- *  Scans for the first ELIGIBLE request rather than bailing on the head: the queue is shared across
- *  every build agent (global singleton), so a head request whose agent is still at cap must not
- *  starve a later request belonging to a different agent that has a free slot. */
+ *  Releases in FIFO order. It used to scan for the first ELIGIBLE request, because a per-agent gate
+ *  could refuse the head while a different agent had a free slot — with one machine-wide gate the
+ *  answer is the same for every queued request, so a scan would find index 0 or nothing. FIFO is
+ *  what that collapses to, and it is the fairer order anyway: the longest-waiting spawn goes first
+ *  rather than whichever agent happens to be scanned first. */
 async function drainQueue(): Promise<void> {
-  for (;;) {
-    const idx = spawnQueue.findIndex((r) => !atCapacity(r.projectId, r.buildAgentId));
-    if (idx === -1) return; // no queued request has a free slot (per-agent or machine-wide)
-    const [next] = spawnQueue.splice(idx, 1);
+  while (spawnQueue.length > 0 && !atCapacity()) {
+    const [next] = spawnQueue.splice(0, 1);
     await runSpawn(next!);
   }
 }

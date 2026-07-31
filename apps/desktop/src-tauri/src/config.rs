@@ -52,7 +52,15 @@ pub struct WorkflowConfig {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkersConfig {
-    /// The user's requested ceiling on parallel agents, or `None` for AUTO — let the machine decide.
+    /// The user's requested ceiling on parallel agents ON THIS MACHINE, or `None` for AUTO — let the
+    /// machine decide.
+    ///
+    /// MACHINE-WIDE, not per build agent — ratified 2026-07-30 (bead `sparkle-axtkw`). The frontend
+    /// counts every worker on the box against it (`orchestrationListener.globalGateBinds`). It had
+    /// been documented both ways: this file's clamp warning said machine-wide, the ⋯-menu slider
+    /// said "per build agent". Per-agent is the unsafe reading — N agents each under a per-agent cap
+    /// put N × the cap on one machine, which is the `sparkle-hfhs` coalition blowup. A genuine
+    /// per-agent limit would need its own key; do not re-overload this one.
     ///
     /// `None` is the default, and it is the important case: a fixed number cannot be right for both
     /// an 8 GiB Air and a 192 GiB Studio, and the old hardcoded 20 silently throttled every machine
@@ -2852,7 +2860,9 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 
 # --- How many agents run at once (per-machine; ignored in a project file) --------------
 [workers]
-# How many agents/worktrees run in parallel.
+# How many agents/worktrees run in parallel ON THIS MACHINE, counting every orchestrator's workers
+# together — NOT a per-orchestrator allowance. Two orchestrators share this number rather than
+# getting one each.
 #
 # LEFT OUT ON PURPOSE — with no value here, Sparkle sizes itself to YOUR machine, which is almost
 # always what you want. It takes the smaller of two real limits:
@@ -2872,11 +2882,11 @@ changed_lines  = 1000    # ...or once the agent has changed this many lines (whi
 # below is being built for. NOTE that section is not yet wired to anything (see its own comment),
 # so today this prediction is the only limit actually in force.
 #
-# Uncomment to pin your own CEILING. It only ever lowers the automatic value — setting 40 on a 16 GB
-# Mac still gets you ~6, because the point of the clamp is to keep the kernel from killing your
-# machine. A pin is reported AS a pin (the app says "pinned to N in config.toml", not "your RAM is
-# full"), so it never masquerades as a hardware limit. To go back to automatic, delete the line
-# rather than guessing a number.
+# Uncomment to pin your own CEILING for the whole machine. It only ever lowers the automatic value —
+# setting 40 on a 16 GB Mac still gets you ~6, because the point of the clamp is to keep the kernel
+# from killing your machine. A pin is reported AS a pin (the app says "pinned to N in config.toml",
+# not "your RAM is full"), so it never masquerades as a hardware limit. To go back to automatic,
+# delete the line rather than guessing a number.
 # max_concurrent = 8
 # Memory ceiling per agent, in MiB, applied as NODE_OPTIONS=--max-old-space-size. Agents are
 # Node processes, and Node's OWN default ceiling is ~4 GiB — high enough that a handful of
