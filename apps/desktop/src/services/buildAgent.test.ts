@@ -347,7 +347,11 @@ describe("workerMission", () => {
 });
 
 describe("orchestrationPersona", () => {
-  const p = orchestrationPersona({ ownBranch: "sparkle/agent-build1", maxConcurrentWorkers: 4 });
+  /** The fixture's cap, referenced by the guards below instead of a literal. Hardcoding `4` couples
+   *  a guard to this fixture, so changing it here would silently stop the guard from guarding
+   *  (roborev 56186). */
+  const CAP = 4;
+  const p = orchestrationPersona({ ownBranch: "sparkle/agent-build1", maxConcurrentWorkers: CAP });
 
   it("establishes the orchestrator role and decomposition", () => {
     expect(p).toMatch(/ORCHESTRATOR|orchestrator/);
@@ -407,9 +411,32 @@ describe("orchestrationPersona", () => {
     const rule = bullet("- THE RULE");
     expect(rule).toMatch(/error/i);
     // The consequence that makes it actionable: the unit did NOT start, so it is still to do.
-    expect(rule).toMatch(/not started|was not started|still unclaimed/i);
+    expect(rule).toMatch(/not\s+started|still\s+unclaimed/i);
     // And it must NOT reintroduce a latency-based judgement, in any phrasing.
     expect(rule).not.toMatch(/promptly|straight back|how long|elapsed|quickly|immediately returns/i);
+  });
+
+  it("distinguishes a CAPACITY error from every other spawn failure (roborev 56186)", () => {
+    // Two defects in one line, both High/Medium. The copy said "An ERROR or timeout → the machine
+    // was FULL and THAT UNIT WAS NOT STARTED … re-spawn exactly that unit":
+    //
+    //  (a) FALSE for a timeout, and the duplicate-worker hazard. An over-cap request sits in
+    //      `spawnQueue`; the MCP client gave up at its own 660s socket timeout, but nothing dropped
+    //      the entry, so `drainQueue` created the worker minutes later. Re-spawning then produced a
+    //      SECOND worktree + branch on the same unit — un-deduplicated for an ad-hoc (no-bead)
+    //      spawn. Fixed in orchestrationListener by expiring the queued entry UNDER the client
+    //      timeout, so the caller gets a real error and "did not start" is now true.
+    //  (b) It treated EVERY error as capacity. A refused goal, an already-claimed bead or a failed
+    //      worktree cut are not capacity, and "do not spawn anything else until a spin_down of yours
+    //      frees a slot" deadlocks on the first unit — there is nothing live to spin down.
+    const rule = bullet("- THE RULE");
+    // Capacity is named by the signal that actually indicates it, not by "any error".
+    expect(rule).toMatch(/timed\s+out\s+waiting\s+for\s+a\s+free\s+slot/i);
+    // Non-capacity failures get their own branch that says CARRY ON.
+    expect(rule).toMatch(/any\s+other\s+error/i);
+    expect(rule).toMatch(/carry\s+on|continue\s+with\s+the\s+rest|rest\s+of\s+the\s+batch/i);
+    // And the blanket conflation must be gone.
+    expect(rule).not.toMatch(/an error or timeout\s*→\s*the machine was full/i);
   });
 
   it("does not both forbid and prescribe discovering the cap by spawning (roborev 56178)", () => {
@@ -456,11 +483,18 @@ describe("orchestrationPersona", () => {
     const recipe = bullet("- Batch workflow:");
     const step1 = recipe.slice(0, recipe.search(/\(2\)/) === -1 ? undefined : recipe.search(/\(2\)/));
     // The property: step (1) must carry a qualifier...
-    expect(step1).toMatch(/shared|one worker at a time|do not assume|halting on the first error/i);
-    // ...and must not tell the agent to spawn to the cap, however that is phrased (bare number,
-    // "the cap", "your cap", "fill").
-    expect(step1).not.toMatch(/\b(spawn|fill|start)\b[^.]{0,30}\b(up to )?(the |your )?cap\b(?![^.]*shared)/i);
-    expect(step1).not.toMatch(/\bspawn\s+4\b/i);
+    expect(step1).toMatch(/shared|one at a time|do not assume|stopping on a capacity error/i);
+    // ...and must not tell the agent to spawn a QUANTITY, however that is phrased. roborev 56186:
+    // the previous pair of bans was still phrase-shaped — `(1) spawn up to 4 workers, one worker at
+    // a time` passed all three assertions, because "up to " separated `spawn` from the number, the
+    // word "cap" was absent, and the positive was satisfied by the trailing qualifier. So ban a bare
+    // `spawn`/`fill`/`start` followed by EITHER the cap word or a number, with words allowed in
+    // between.
+    expect(step1).not.toMatch(/\b(spawn|fill|start)\b[^.]{0,40}\b(cap|\d+)\b/i);
+    // And use the INTERPOLATED cap, not a literal 4: hardcoding the fixture's number means this
+    // silently stops guarding the moment that fixture changes (roborev 56186).
+    const cap = String(CAP);
+    expect(step1).not.toMatch(new RegExp(String.raw`\bspawn\b[^.]{0,40}\b${cap}\b`, "i"));
   });
 
   it("uses explicit batching up to the cap — no 'queues automatically' promise", () => {

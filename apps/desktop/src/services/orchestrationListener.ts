@@ -47,9 +47,27 @@ let unsubRuntime: (() => void) | undefined;
 // both register a listener (which would double-dispatch every event → doubled spawns). Reset by
 // cleanup so a later start (e.g. after HMR) can re-arm.
 let startPromise: Promise<() => void> | undefined;
-// spawn_worker requests deferred because the build agent is at its concurrency cap. Released by
+// spawn_worker requests deferred because the machine is at its concurrency cap. Released by
 // drainQueue() whenever a worker slot frees (a spin_down, a failed/finished spawn, or a store change).
 const spawnQueue: OrchestrationRequest[] = [];
+// When each queued request was deferred, keyed by reqId. Cleared at every removal site.
+const queuedAt = new Map<string, number>();
+// How long a spawn may sit queued before we stop honouring it.
+//
+// MUST stay BELOW the MCP client's socket timeout (`DEFAULT_TIMEOUT_MS = 660_000` in
+// apps/mcp-orchestrator/src/bridgeClient.ts). Before this existed, an over-cap request outlived its
+// caller: the client gave up at 660s and destroyed the socket, but NOTHING here noticed — the entry
+// stayed queued and `drainQueue` created the worker minutes later, for a caller that had already
+// been told the spawn failed. That worker is absent from the orchestrator's registry, so the
+// orchestrator re-spawns the unit and gets a DUPLICATE worktree + branch doing the same work — the
+// most expensive recurring failure AGENTS.md names, and un-deduplicated for an ad-hoc (no-bead)
+// spawn, which `handleSpawn` deliberately does not claim (roborev 56186, High).
+//
+// Expiring UNDER the client timeout (not over it) is what makes the persona's rule true: the caller
+// receives a real `{ error }` reply instead of a socket timeout, and the unit genuinely did not
+// start — so "an error means it did not start, re-spawn it" is now sound advice. Sixty seconds of
+// margin covers reply latency so the error, not the timeout, is what the caller sees.
+export const SPAWN_QUEUE_MAX_WAIT_MS = 600_000;
 // Synchronous reservation count keyed by `${projectId}:${buildAgentId}`. spawnWorker is async and
 // the store's worker count only rises once it resolves, so a cap check on liveWorkerCount alone
 // would let concurrent spawn_worker events (and concurrent drainQueue passes) ALL read the
@@ -128,6 +146,7 @@ export function purgeBuildAgent(buildAgentId: string): void {
   for (let i = spawnQueue.length - 1; i >= 0; i--) {
     if (spawnQueue[i]!.buildAgentId === buildAgentId) {
       const [dropped] = spawnQueue.splice(i, 1);
+      queuedAt.delete(dropped!.reqId);
       // Release the bead claim with the request. A QUEUED request holds its claim (taken in
       // handleSpawn, released in runSpawn's finally) — but a dropped request never reaches
       // runSpawn, so without this the key leaks permanently in a module-level Set. A build agent
@@ -325,6 +344,7 @@ function handleSpawn(req: OrchestrationRequest): void {
   }
   if (atCapacity()) {
     spawnQueue.push(req); // machine is at its ceiling → defer until a slot frees
+    queuedAt.set(req.reqId, reaperNow()); // so it can EXPIRE rather than outlive its caller
     // A spawn blocked by LEAKED machine-wide capacity — orphaned workers from a build agent that
     // departed without spinning them down — would otherwise wait behind dead records forever. Kick a
     // reap so any reclaimable slot frees and drains this request via the store subscription.
@@ -714,9 +734,39 @@ async function handleSpinDown(req: OrchestrationRequest): Promise<void> {
  *  what that collapses to, and it is the fairer order anyway: the longest-waiting spawn goes first
  *  rather than whichever agent happens to be scanned first. */
 async function drainQueue(): Promise<void> {
+  expireStaleQueuedSpawns();
   while (spawnQueue.length > 0 && !atCapacity()) {
     const [next] = spawnQueue.splice(0, 1);
+    queuedAt.delete(next!.reqId);
     await runSpawn(next!);
+  }
+}
+
+/** Drop queued spawns whose caller has provably given up (see `SPAWN_QUEUE_MAX_WAIT_MS`), replying
+ *  with an error so the caller learns the unit did not start rather than timing out on its socket.
+ *
+ *  Runs at the TOP of drainQueue, before the capacity check and unconditionally — an entry that
+ *  expires while the machine is still full must not be held until a slot happens to free, which is
+ *  exactly when it would materialize an untracked worker. drainQueue is wired to every store change,
+ *  so this sweeps regularly without its own timer. */
+function expireStaleQueuedSpawns(): void {
+  const now = reaperNow();
+  for (let i = spawnQueue.length - 1; i >= 0; i--) {
+    const req = spawnQueue[i]!;
+    const since = queuedAt.get(req.reqId);
+    if (since === undefined || now - since < SPAWN_QUEUE_MAX_WAIT_MS) continue;
+    spawnQueue.splice(i, 1);
+    queuedAt.delete(req.reqId);
+    // Same reasoning as purgeBuildAgent's: a queued request holds its bead claim (taken in
+    // handleSpawn, released in runSpawn's finally), and an expired one never reaches runSpawn — so
+    // without this the key leaks and a legitimate retry of that bead is refused as "already being
+    // spawned" with nothing in flight (roborev 41945).
+    releaseBeadClaim(req);
+    void respond(req.reqId, {
+      error:
+        "spawn timed out waiting for a free slot — the machine stayed at its concurrency cap. " +
+        "This unit was NOT started; retry it once a worker has been spun down.",
+    });
   }
 }
 
@@ -874,6 +924,7 @@ function teardown(): void {
     void respond(req.reqId, { error: "orchestration listener stopped" });
   }
   spawnQueue.length = 0;
+  queuedAt.clear();
   inFlight.clear();
   // Claims die with the listener, for the same reason inFlight does: nothing is in flight after a
   // teardown, so any surviving key is a phantom that would refuse a legitimate spawn once a fresh

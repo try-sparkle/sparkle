@@ -95,6 +95,7 @@ import {
   reapOrphanedWorkers,
   __setReaperNow,
   REAP_GRACE_MS,
+  SPAWN_QUEUE_MAX_WAIT_MS,
   type OrchestrationRequest,
 } from "./orchestrationListener";
 
@@ -554,6 +555,82 @@ describe("orchestrationListener", () => {
     fire({ reqId: "k2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "two" } });
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held at the PIN, not at the hardware's 36
+  });
+
+  it("EXPIRES a queued spawn instead of materializing a worker its caller gave up on (roborev 56186)", async () => {
+    // The High. An over-cap spawn sits in `spawnQueue`; the MCP client abandons it at its own socket
+    // timeout (`DEFAULT_TIMEOUT_MS = 660_000`, apps/mcp-orchestrator/src/bridgeClient.ts) and
+    // destroys the socket — but nothing here removed the entry. When a slot later freed, drainQueue
+    // created the worker anyway: a real worktree + branch the orchestrator was told had FAILED, so
+    // it is absent from `list_workers` and the orchestrator re-spawns the unit. That is a DUPLICATE
+    // worker on the same task, and `handleSpawn` deliberately does not de-duplicate an ad-hoc
+    // (no-bead) spawn, so nothing catches it.
+    //
+    // Asserting the SIDE EFFECT — no worker is created when the slot frees — not merely that a
+    // reply was sent. A test that only checked the error reply would pass while the spawn still
+    // happened, which is the whole defect.
+    let clock = 1_000_000;
+    __setReaperNow(() => clock);
+    try {
+      useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
+      fire({ reqId: "x1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "holds the slot" } });
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+      // Over the cap → queued, no reply.
+      invokeMock.mockClear();
+      fire({ reqId: "x2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "abandoned" } });
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+      expect(invokeMock).not.toHaveBeenCalled();
+
+      // Its caller gives up. Push past the expiry, then free the slot.
+      clock += SPAWN_QUEUE_MAX_WAIT_MS + 1;
+      const live = useProjectStore
+        .getState()
+        .projects.find((pr) => pr.id === projectId)!
+        .agents.find((a) => a.kind === "worker")!;
+      fire({ reqId: "x3", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: live.id } });
+      await flush();
+      await flush();
+
+      // THE ASSERTION: the freed slot must NOT be consumed by the abandoned request.
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+      // ...and the caller is told plainly that the unit did not start, which is what makes the
+      // persona's "re-spawn it" advice sound.
+      const x2 = invokeMock.mock.calls.find(([, a]) => (a as { reqId: string }).reqId === "x2");
+      expect((x2![1] as { result: { error?: string } }).result.error).toMatch(/timed out waiting for a free slot/i);
+      expect((x2![1] as { result: { error?: string } }).result.error).toMatch(/NOT started/i);
+    } finally {
+      __setReaperNow();
+    }
+  });
+
+  it("still honours a queued spawn whose caller is STILL waiting (expiry must not fire early)", async () => {
+    // The other half: expiring too eagerly would break the normal queue-and-drain path, which is the
+    // feature. Just under the deadline, the queued spawn must run exactly as before.
+    let clock = 2_000_000;
+    __setReaperNow(() => clock);
+    try {
+      useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
+      fire({ reqId: "y1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "holds" } });
+      await flush();
+      fire({ reqId: "y2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "still wanted" } });
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+      clock += SPAWN_QUEUE_MAX_WAIT_MS - 1; // one tick INSIDE the window
+      const live = useProjectStore
+        .getState()
+        .projects.find((pr) => pr.id === projectId)!
+        .agents.find((a) => a.kind === "worker")!;
+      fire({ reqId: "y3", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId: live.id } });
+      await flush();
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // y2 ran, as it always did
+    } finally {
+      __setReaperNow();
+    }
   });
 
   it("queues spawns past the cap, then releases one when a slot frees via spin_down", async () => {
