@@ -25,14 +25,12 @@ import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
 import { useAudioInputSync } from "../services/audioInputs";
 import { BoundDeviceCaption } from "./BoundDeviceCaption";
+import { WAVE_HEIGHT } from "./waveGeometry";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
 // it shifts one number per frame and React diffs flat <span>s.
 const BAR_COUNT = 140;
-// Overall height of the waveform strip. Bars are mirrored about the vertical center
-// (they grow up AND down from the middle), so a single bar can reach this full height.
-const WAVE_HEIGHT = 56;
 
 /**
  * Map a raw RMS audio level → bar-height fraction in [0,1].

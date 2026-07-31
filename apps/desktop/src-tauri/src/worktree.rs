@@ -3071,8 +3071,25 @@ pub struct PrRow {
     /// checks at all — distinct from "couldn't tell", which drops the whole probe to `None`.
     pub checks: String,
     /// "mergeable" | "conflicting" | "unknown". GitHub computes mergeability asynchronously, so a
-    /// freshly opened PR often reads "unknown"; the UI treats that as "let gh decide", not a block.
+    /// freshly opened PR often reads "unknown"; the UI treats that as "not yet known", which is a
+    /// reason to WAIT rather than a reason to offer a one-click merge.
     pub mergeable: String,
+    /// GitHub's `mergeStateStatus`, lowercased: "clean" | "dirty" | "unstable" | "blocked" |
+    /// "behind" | "draft" | "has_hooks" | "unknown".
+    ///
+    /// This is the axis `mergeable` alone cannot express, and the reason the dot used to read as
+    /// arbitrary. `mergeable` answers "would git accept this merge"; `merge_state_status` answers
+    /// "is anything else wrong". UNSTABLE is the case that matters: GitHub reports
+    /// `mergeable: MERGEABLE` — you genuinely CAN merge — while a non-required check is failing or
+    /// still running. Collapsing those two axes into one colour is what put an enabled Merge button
+    /// under a yellow dot.
+    pub merge_state_status: String,
+    /// Names of the checks that FAILED, so the UI can say which one rather than "checks failing".
+    /// Deduplicated, in rollup order. Empty when nothing failed.
+    pub failing_checks: Vec<String>,
+    /// Names of the checks still RUNNING, same shape as `failing_checks`. A PR can have both (some
+    /// checks red while others are still going).
+    pub pending_checks: Vec<String>,
     /// The agent that opened this PR, from the DURABLE mapping in `pr_owner` — `None` when nothing
     /// identifies it. Never inferred: a pill carrying the wrong id opens the wrong agent, which is
     /// worse than no pill, so "couldn't tell" stays null. See `pr_owner`'s module header.
@@ -3092,29 +3109,19 @@ pub struct PrRow {
 fn classify_checks(rollup: &[Value]) -> &'static str {
     let mut saw_any = false;
     let mut saw_pending = false;
+    let mut saw_failing = false;
     for c in rollup {
         saw_any = true;
-        // A check run reports status+conclusion; a legacy commit-status context reports one `state`.
-        if let Some(state) = c.get("state").and_then(Value::as_str) {
-            match state {
-                "SUCCESS" => {}
-                "PENDING" | "EXPECTED" => saw_pending = true,
-                _ => return "failing", // FAILURE | ERROR
-            }
-        } else {
-            // Not COMPLETED yet → still running (QUEUED | IN_PROGRESS | WAITING | REQUESTED | ...).
-            if c.get("status").and_then(Value::as_str) != Some("COMPLETED") {
-                saw_pending = true;
-                continue;
-            }
-            match c.get("conclusion").and_then(Value::as_str).unwrap_or("") {
-                // A neutral/skipped/successful check does not block a merge.
-                "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-                _ => return "failing", // FAILURE | CANCELLED | TIMED_OUT | ACTION_REQUIRED | STALE
-            }
+        match check_state(c) {
+            CheckState::Failing => saw_failing = true,
+            CheckState::Pending => saw_pending = true,
+            CheckState::Passing => {}
         }
     }
-    if saw_pending {
+    // Precedence is unchanged: a failure dominates, then anything still running, then success.
+    if saw_failing {
+        "failing"
+    } else if saw_pending {
         "pending"
     } else if saw_any {
         "passing"
@@ -3123,9 +3130,97 @@ fn classify_checks(rollup: &[Value]) -> &'static str {
     }
 }
 
+/// How ONE `statusCheckRollup` entry reads.
+///
+/// Split out of `classify_checks` so that function and `collect_check_names` decide a given check
+/// the same way BY CONSTRUCTION. They must not drift: the rollup word colours the dot and the names
+/// write the label beside it, so two independent readings of the same entry is how you get a green
+/// dot sitting next to the words "1 check failing".
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum CheckState {
+    Passing,
+    Pending,
+    Failing,
+}
+
+fn check_state(c: &Value) -> CheckState {
+    // A check run reports status+conclusion; a legacy commit-status context reports one `state`.
+    if let Some(state) = c.get("state").and_then(Value::as_str) {
+        return match state {
+            "SUCCESS" => CheckState::Passing,
+            "PENDING" | "EXPECTED" => CheckState::Pending,
+            _ => CheckState::Failing, // FAILURE | ERROR
+        };
+    }
+    // Not COMPLETED yet → still running (QUEUED | IN_PROGRESS | WAITING | REQUESTED | ...).
+    if c.get("status").and_then(Value::as_str) != Some("COMPLETED") {
+        return CheckState::Pending;
+    }
+    match c.get("conclusion").and_then(Value::as_str).unwrap_or("") {
+        // A neutral/skipped/successful check does not block a merge.
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckState::Passing,
+        _ => CheckState::Failing, // FAILURE | CANCELLED | TIMED_OUT | ACTION_REQUIRED | STALE
+    }
+}
+
+/// The NAME a check shows under. Check runs carry `name`; legacy commit statuses carry `context`.
+/// An entry with neither is still worth counting — it is a real check that is really failing — so
+/// it gets a placeholder rather than being silently dropped from the count.
+fn check_name(c: &Value) -> String {
+    c.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| c.get("context").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unnamed check")
+        .to_string()
+}
+
+/// `(failing, pending)` check names, in rollup order, deduplicated.
+///
+/// Deduplicated because the same check can appear twice in a rollup (a re-run, or a job reported
+/// under both its own name and a rollup context), and a list that names the same check twice reads
+/// as a bug in the reader rather than a fact about the PR.
+fn collect_check_names(rollup: &[Value]) -> (Vec<String>, Vec<String>) {
+    let mut failing: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for c in rollup {
+        let bucket = match check_state(c) {
+            CheckState::Failing => &mut failing,
+            CheckState::Pending => &mut pending,
+            CheckState::Passing => continue,
+        };
+        let name = check_name(c);
+        if !bucket.contains(&name) {
+            bucket.push(name);
+        }
+    }
+    (failing, pending)
+}
+
+/// GitHub's `mergeStateStatus` enum → the lowercase word the UI reads. An unrecognised or absent
+/// value reads "unknown", which the UI treats as "we cannot promise this is safe" — never as clean.
+fn normalize_merge_state(v: Option<&str>) -> &'static str {
+    match v {
+        Some("CLEAN") => "clean",
+        Some("DIRTY") => "dirty",
+        Some("UNSTABLE") => "unstable",
+        Some("BLOCKED") => "blocked",
+        Some("BEHIND") => "behind",
+        Some("DRAFT") => "draft",
+        Some("HAS_HOOKS") => "has_hooks",
+        _ => "unknown",
+    }
+}
+
 /// GitHub's `mergeable` enum → the lowercase word the UI reads. Anything other than the two known
 /// terminal values (including the very common asynchronously-not-yet-computed `UNKNOWN`) reads as
-/// "unknown", which the UI treats as "attempt the merge and let gh decide" rather than a hard block.
+/// "unknown", which the UI treats as NOT-YET: the dot goes amber and the Merge button is withheld.
+///
+/// That used to say the opposite — "attempt the merge and let gh decide rather than a hard block" —
+/// and it is exactly how an amber dot ended up beside a live one-click Merge. GitHub invalidates
+/// mergeability on every push to the base branch, so UNKNOWN is routine rather than rare, and a
+/// gate must not offer a confident button over an answer it does not have. The panel's Refresh
+/// re-asks on demand, so nothing is stranded behind the poll (see services/openPrs.ts).
 fn normalize_mergeable(v: Option<&str>) -> &'static str {
     match v {
         Some("MERGEABLE") => "mergeable",
@@ -3149,14 +3244,15 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                 let str_field = |k: &str| {
                     r.get(k).and_then(Value::as_str).unwrap_or("").to_string()
                 };
-                let checks = r
-                    .get("statusCheckRollup")
-                    .and_then(Value::as_array)
-                    .map(|a| classify_checks(a))
-                    .unwrap_or("none")
-                    .to_string();
+                let rollup = r.get("statusCheckRollup").and_then(Value::as_array);
+                let checks = rollup.map(|a| classify_checks(a)).unwrap_or("none").to_string();
+                let (failing_checks, pending_checks) =
+                    rollup.map(|a| collect_check_names(a)).unwrap_or_default();
                 let mergeable =
                     normalize_mergeable(r.get("mergeable").and_then(Value::as_str)).to_string();
+                let merge_state_status =
+                    normalize_merge_state(r.get("mergeStateStatus").and_then(Value::as_str))
+                        .to_string();
                 Some(PrRow {
                     number,
                     title: str_field("title"),
@@ -3164,6 +3260,9 @@ fn decode_open_prs(stdout: &str) -> Option<Vec<PrRow>> {
                     url: str_field("url"),
                     checks,
                     mergeable,
+                    merge_state_status,
+                    failing_checks,
+                    pending_checks,
                     // Ownership is resolved by the caller, which has the app-data store; the pure
                     // decoder only carries the raw material (`body`) forward.
                     agent_id: None,
@@ -3196,7 +3295,7 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
             "--limit",
             "100",
             "--json",
-            "number,title,headRefName,url,mergeable,statusCheckRollup,body",
+            "number,title,headRefName,url,mergeable,mergeStateStatus,statusCheckRollup,body",
         ])
         .current_dir(root)
         .env("GH_PROMPT_DISABLED", "1")
@@ -7890,6 +7989,7 @@ mod tests {
                     "headRefName": "sparkle/agent-abc",
                     "url": "https://github.com/o/r/pull/42",
                     "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
                     "statusCheckRollup": [{ "status": "COMPLETED", "conclusion": "SUCCESS" }]
                 },
                 { "number": 7 }
@@ -7905,6 +8005,9 @@ mod tests {
                 url: "https://github.com/o/r/pull/42".into(),
                 checks: "passing".into(),
                 mergeable: "mergeable".into(),
+                merge_state_status: "clean".into(),
+                failing_checks: vec![],
+                pending_checks: vec![],
                 // Ownership is attached by `attach_pr_owners`, not by the pure decoder.
                 agent_id: None,
                 agent_id_source: None,
@@ -7912,7 +8015,8 @@ mod tests {
             }
         );
         // A sparse row keeps its number and defaults the rest — a missing rollup is "none", a missing
-        // mergeable is "unknown".
+        // mergeable is "unknown", and a missing merge state is "unknown" (never "clean": an absent
+        // answer must not read as a safe one).
         assert_eq!(
             rows[1],
             PrRow {
@@ -7922,11 +8026,145 @@ mod tests {
                 url: String::new(),
                 checks: "none".into(),
                 mergeable: "unknown".into(),
+                merge_state_status: "unknown".into(),
+                failing_checks: vec![],
+                pending_checks: vec![],
                 agent_id: None,
                 agent_id_source: None,
                 body: String::new(),
             }
         );
+    }
+
+    /// THE UNSTABLE CASE, decoded end-to-end from the real `gh pr list` shape.
+    ///
+    /// PR #934 as GitHub actually reported it: `mergeable: MERGEABLE` (git would accept the merge)
+    /// with `mergeStateStatus: UNSTABLE` because two non-required checks are red. The decoder has to
+    /// keep those two facts APART — collapsing them is what put a one-click Merge under a
+    /// non-green dot — and it has to carry the failing checks BY NAME so the UI can say which.
+    #[test]
+    fn decode_open_prs_keeps_mergeable_and_merge_state_apart_and_names_the_failing_checks() {
+        let rows = decode_open_prs(
+            r#"[{
+                "number": 934,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    { "name": "Node — static", "status": "COMPLETED", "conclusion": "SUCCESS" },
+                    { "name": "Node — coverage (shard 3/4)", "status": "COMPLETED", "conclusion": "FAILURE" },
+                    { "name": "Node — typecheck · test · build", "status": "COMPLETED", "conclusion": "FAILURE" },
+                    { "name": "Vercel Agent Review", "status": "IN_PROGRESS" }
+                ]
+            }]"#,
+        )
+        .expect("valid array decodes");
+        let r = &rows[0];
+        // Mergeable per git, and NOT clean per GitHub. Both true at once; that is the whole point.
+        assert_eq!(r.mergeable, "mergeable");
+        assert_eq!(r.merge_state_status, "unstable");
+        // A failure dominates the rollup word even with a check still running.
+        assert_eq!(r.checks, "failing");
+        assert_eq!(
+            r.failing_checks,
+            vec!["Node — coverage (shard 3/4)", "Node — typecheck · test · build"]
+        );
+        assert_eq!(r.pending_checks, vec!["Vercel Agent Review"]);
+    }
+
+    /// PR #944 as GitHub reported it: a genuine conflict, with a check still running. The conflict
+    /// is the headline, but the pending check is still carried — the UI names both.
+    #[test]
+    fn decode_open_prs_carries_a_conflict_alongside_a_still_running_check() {
+        let rows = decode_open_prs(
+            r#"[{
+                "number": 944,
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "statusCheckRollup": [
+                    { "name": "Vercel Agent Review", "status": "IN_PROGRESS" },
+                    { "context": "Vercel", "state": "SUCCESS" }
+                ]
+            }]"#,
+        )
+        .expect("valid array decodes");
+        assert_eq!(rows[0].mergeable, "conflicting");
+        assert_eq!(rows[0].merge_state_status, "dirty");
+        assert_eq!(rows[0].checks, "pending");
+        assert!(rows[0].failing_checks.is_empty());
+        assert_eq!(rows[0].pending_checks, vec!["Vercel Agent Review"]);
+    }
+
+    #[test]
+    fn collect_check_names_buckets_by_state_dedupes_and_falls_back_to_context() {
+        let rollup = vec![
+            json!({ "name": "ok", "status": "COMPLETED", "conclusion": "SUCCESS" }),
+            json!({ "name": "red", "status": "COMPLETED", "conclusion": "FAILURE" }),
+            // Same check reported twice (a re-run) must be named once, not counted twice.
+            json!({ "name": "red", "status": "COMPLETED", "conclusion": "FAILURE" }),
+            // A legacy commit status names itself with `context`, not `name`.
+            json!({ "context": "legacy-ci", "state": "ERROR" }),
+            json!({ "context": "legacy-slow", "state": "PENDING" }),
+            json!({ "name": "running", "status": "QUEUED" }),
+            // Neither name nor context: still a real failing check, so still counted.
+            json!({ "status": "COMPLETED", "conclusion": "TIMED_OUT" }),
+        ];
+        let (failing, pending) = collect_check_names(&rollup);
+        assert_eq!(failing, vec!["red", "legacy-ci", "unnamed check"]);
+        assert_eq!(pending, vec!["legacy-slow", "running"]);
+    }
+
+    /// The names and the rollup word are two readings of the same array, and they must agree.
+    /// A green rollup with a name in the failing list (or vice versa) is the drift `check_state`
+    /// exists to make impossible.
+    #[test]
+    fn check_names_and_the_rollup_word_never_disagree() {
+        let cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![json!({ "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" })],
+            vec![json!({ "name": "a", "status": "COMPLETED", "conclusion": "SKIPPED" })],
+            vec![json!({ "name": "a", "status": "IN_PROGRESS" })],
+            vec![json!({ "name": "a", "status": "COMPLETED", "conclusion": "FAILURE" })],
+            vec![
+                json!({ "name": "a", "status": "COMPLETED", "conclusion": "FAILURE" }),
+                json!({ "name": "b", "status": "IN_PROGRESS" }),
+            ],
+            vec![json!({ "context": "c", "state": "EXPECTED" })],
+        ];
+        for rollup in cases {
+            let word = classify_checks(&rollup);
+            let (failing, pending) = collect_check_names(&rollup);
+            match word {
+                // "failing" must name at least one failing check, or the label would read
+                // "0 checks failing" beside a red dot.
+                "failing" => assert!(!failing.is_empty(), "failing word with no named check"),
+                // "pending" means nothing failed, and something is running.
+                "pending" => {
+                    assert!(failing.is_empty(), "pending word but a check is failing");
+                    assert!(!pending.is_empty(), "pending word with no named check");
+                }
+                // "passing"/"none" must have nothing outstanding at all — this is the case that
+                // guards a GREEN dot, so it is the one that matters most.
+                _ => {
+                    assert!(failing.is_empty(), "{word} word but a check is failing");
+                    assert!(pending.is_empty(), "{word} word but a check is running");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_merge_state_maps_the_github_enum_and_defaults_unknown() {
+        assert_eq!(normalize_merge_state(Some("CLEAN")), "clean");
+        assert_eq!(normalize_merge_state(Some("DIRTY")), "dirty");
+        assert_eq!(normalize_merge_state(Some("UNSTABLE")), "unstable");
+        assert_eq!(normalize_merge_state(Some("BLOCKED")), "blocked");
+        assert_eq!(normalize_merge_state(Some("BEHIND")), "behind");
+        assert_eq!(normalize_merge_state(Some("DRAFT")), "draft");
+        assert_eq!(normalize_merge_state(Some("HAS_HOOKS")), "has_hooks");
+        // An unrecognised or absent state must never read as "clean" — an unknown answer is not a
+        // safe answer.
+        assert_eq!(normalize_merge_state(Some("SOMETHING_NEW")), "unknown");
+        assert_eq!(normalize_merge_state(None), "unknown");
     }
 
     #[test]

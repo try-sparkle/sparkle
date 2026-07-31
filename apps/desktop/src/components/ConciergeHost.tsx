@@ -124,6 +124,7 @@ import { buildDigest } from "../services/conciergeDigest";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useUiStore } from "../stores/uiStore";
+import { openProjectsOf } from "../engine/openProjects";
 import { attachedDisplay, attachedPayload } from "../services/conciergeAttach";
 import { useConciergeAttachments } from "../hooks/useConciergeAttachments";
 // The collapsed-text primitive, used here to keep a relayed payload OUT of the transcript's prose:
@@ -144,6 +145,7 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // host renders from the feed, and a project-store subscription would re-render it on every unrelated
 // agent write.
 import { useProjectStore } from "../stores/projectStore";
+import { OpenPrMenu, agentLinkForPr } from "./OpenPrMenu";
 // The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
 // re-renders this host only when the selection actually changes, which is the narrow subscription
 // the note above rules the whole `projects` array out in favour of.
@@ -673,6 +675,82 @@ function LivenessAnnouncer({ announce }: { announce: (text: string) => void }) {
   }, [liveness, announce]);
 
   return null;
+}
+
+/**
+ * WHICH repo the concierge's PR chip lists, given both pairs' selections.
+ *
+ * There used to be an `OpenPrMenu` in EACH project tab strip, and each was scoped to its own side —
+ * so the left pair's PRs were reachable from the left strip and the right pair's from the right.
+ * Collapsing that to one chip means one of those scopes has to win, and reading only the store's
+ * `selectedProjectId` picks the RIGHT pair every time: `ProjectTabsBar` documents that selecting on
+ * the left writes only `uiStore.leftProjectId` and deliberately does not move the global one. Left
+ * pair on `mobile`, right on `sparkle`, and `mobile`'s PRs would be unreachable from anywhere.
+ *
+ * So the precedence is explicit, and every candidate is validated against the OPEN projects — the
+ * strip did that too (`resolveSideSelection`), and without it the chip can list a project that has
+ * no tab anywhere:
+ *   1. the global selection, when it is open — the app-wide "current project", the right answer
+ *      whenever there is only one pair, which is the overwhelmingly common case;
+ *   2. the LEFT pair's slot, when it is open — this is what covers "nothing selected on the right",
+ *      e.g. only a left-pair project is open, where reading the global id alone yields `null` and
+ *      the app ends up with NO pull-request affordance at all;
+ *   3. any open project, so a chip exists whenever there is a repo to ask about.
+ *
+ * KNOWN LIMIT, recorded rather than papered over: with two pairs holding DIFFERENT projects this
+ * still lists only one of them. Listing both means `OpenPrMenu` fetching per repo and keying its
+ * merge state by repo+number instead of number (PR numbers collide across repos), which is a real
+ * change to that component rather than to this resolution — tracked separately. Rule 2 is what
+ * keeps the single-pair and left-only arrangements correct today.
+ *
+ * Pure and exported so the precedence is tested without mounting the host.
+ */
+export function prChipProject<T extends { id: string }>(
+  openProjects: readonly T[],
+  globalSelectedProjectId: string | null,
+  leftProjectId: string | null,
+): T | null {
+  return (
+    openProjects.find((p) => p.id === globalSelectedProjectId) ??
+    openProjects.find((p) => p.id === leftProjectId) ??
+    openProjects[0] ??
+    null
+  );
+}
+
+/**
+ * The concierge header's PR chip — the app's ONE pull-request affordance.
+ *
+ * It used to be a wide bordered "3 PRs waiting" pill over in the project tab strip, and the
+ * concierge header carried a second, DEAD one (a `prsReady` number that nothing ever passed). This
+ * is the single survivor: the same `OpenPrMenu`, mounted `compact` so it reads as an icon and a
+ * count beside the ⋮ rather than a labelled pill competing with the tab row.
+ *
+ * The wiring it needs is repo state — which is why the presentational `Concierge/` directory takes
+ * it as a slot rather than growing a store read (see `ConciergeColumnProps.prSlot`). Scope comes
+ * from {@link prChipProject}; `resolveAgent` still searches EVERY project, so a PR belonging to the
+ * other pair's agent still offers "Open agent" and routes there.
+ */
+function ConciergePrChip() {
+  const projects = useProjectStore((s) => s.projects);
+  const selectedProjectId = useProjectStore((s) => s.selectedProjectId);
+  const openProjectIds = useUiStore((s) => s.openProjectIds);
+  const leftProjectId = useUiStore((s) => s.leftProjectId);
+  const project = prChipProject(
+    openProjectsOf(projects, openProjectIds),
+    selectedProjectId,
+    leftProjectId,
+  );
+  if (!project) return null;
+  return (
+    <OpenPrMenu
+      compact
+      rootPath={project.rootPath ?? null}
+      projectId={project.id}
+      resolveAgent={(pr) => agentLinkForPr(pr, projects, selectedProjectId)}
+      onOpenAgent={(link) => openProjectTab(link.projectId, link.agentId)}
+    />
+  );
 }
 
 export function ConciergeHost({
@@ -3281,6 +3359,7 @@ export function ConciergeHost({
         // holder of the value (MAPPING.md: `data-wired` must not become scattered component state).
         wired={wired}
         searchSlot={searchSlot}
+        prSlot={<ConciergePrChip />}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's
         // own onCancel (which restores the files and posts to the thread), so the controller here
         // has nothing to remember — see services/dispatchIntent.

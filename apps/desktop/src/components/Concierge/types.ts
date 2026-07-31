@@ -285,10 +285,6 @@ export interface ConciergeViewModel {
    *  or a later attempt succeeds. The affordance above promises the drop will land, so the one
    *  case it doesn't has to be stated rather than left for the user to spot (bead sparkle-zviq). */
   attachNotice?: string | null;
-  /** How many open pull requests are ready to merge, across every in-scope project — the header's
-   *  PR pill. Absent or zero renders NO pill: a "0 ready" chip is chrome asserting the absence of
-   *  a thing, and the header consolidated precisely to stop carrying those. */
-  prsReady?: number;
   /** Whether the GLOBAL needs-you filter is currently on. It is state the shell owns (it focuses
    *  every open column at once), reflected here so the header pill can paint it; the column never
    *  filters anything itself. */
@@ -373,8 +369,6 @@ export interface ConciergeController {
    *  focuses every open column at once, which is why it is a shell gesture rather than something
    *  this column can do; `ConciergeViewModel.needsYouFilter` reflects the result back. */
   onNeedsYouFilterToggle?(): void;
-  /** The header's PR pill was pressed: open the pull-request sheet. */
-  onPrClick?(): void;
   /** An action button on the card; never accompanied by onNudgeClick. */
   onNudgeAction(nudge: ConciergeNudge, actionId: string): void;
 }
@@ -394,6 +388,17 @@ export interface ConciergeColumnProps {
   /** Optional affordance rendered under the scope/vitals line — the shell drops the ⌘K palette
    *  trigger here (PRD §4: history search lives in the concierge). */
   searchSlot?: ReactNode;
+  /** The pull-request affordance, rendered in the header immediately left of the ⋮ cluster.
+   *
+   *  A SLOT rather than a `prsReady` number and an `onPrClick` callback, which is what this used to
+   *  be. Those were dead — nothing in the app ever passed either, so the chip could not render in
+   *  production — and a count plus a click is anyway not enough to describe the job: opening the
+   *  list, judging each PR's mergeability, merging from it, and jumping to the owning agent all
+   *  require the fleet and the GitHub probe, neither of which this presentational directory knows
+   *  about. The integration layer hands `<OpenPrMenu compact />` in through here instead.
+   *
+   *  Absent renders nothing at all, which is correct for any surface with no PR probe wired. */
+  prSlot?: ReactNode;
   /** Live, uncommitted dictation transcript for the compose box; "" when nothing is being said. */
   interim?: string;
   /** Handed straight to the compose box so the integration layer can receive committed segments.

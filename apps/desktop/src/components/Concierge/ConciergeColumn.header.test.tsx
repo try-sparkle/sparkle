@@ -60,14 +60,22 @@ function controller(over: Partial<ConciergeController> = {}): ConciergeControlle
   };
 }
 
+/** Stands in for `<OpenPrMenu compact />`, which the shell — not this directory — supplies. */
+const PR_SLOT = (
+  <button type="button" data-testid="pr-slot-stub">
+    <svg />3
+  </button>
+);
+
 /** Every control the founder named, with the handlers that make the optional ones render. */
 function fullHeader(over: Partial<ConciergeViewModel> = {}) {
   const c = controller({
     onMoveSide: vi.fn(),
     onNeedsYouFilterToggle: vi.fn(),
-    onPrClick: vi.fn(),
   });
-  render(<ConciergeColumn model={{ ...model, prsReady: 3, ...over }} controller={c} />);
+  render(
+    <ConciergeColumn model={{ ...model, ...over }} controller={c} prSlot={PR_SLOT} />,
+  );
   return c;
 }
 
@@ -82,7 +90,7 @@ describe("the concierge header is ONE row", () => {
       screen.getByTestId("concierge-grip"),
       screen.getByTestId("concierge-vitals-line"),
       screen.getByTestId("concierge-needs-filter"),
-      screen.getByTestId("concierge-pr-pill"),
+      screen.getByTestId("pr-slot-stub"),
       // THE AVATAR — the seventh, and it was missing from this loop while the test claimed "all
       // seven" and listed six (roborev 54712). `enableAiEnhancementsForTests` seeds a `me` with no
       // name or email, so `authIdentity` resolves to null and the signed-in control names itself
@@ -104,7 +112,7 @@ describe("the concierge header is ONE row", () => {
       screen.getByTestId("concierge-grip"),
       screen.getByTestId("concierge-vitals-line"),
       screen.getByTestId("concierge-needs-filter"),
-      screen.getByTestId("concierge-pr-pill"),
+      screen.getByTestId("pr-slot-stub"),
     ];
     for (let i = 1; i < order.length; i++) {
       expect(
@@ -145,14 +153,12 @@ describe("the concierge header is ONE row", () => {
 });
 
 describe("the header's pills", () => {
-  it("routes the grip, the filter and the PR pill through the controller", () => {
+  it("routes the grip and the filter through the controller", () => {
     const c = fullHeader();
     fireEvent.click(screen.getByTestId("concierge-grip"));
     expect(c.onMoveSide).toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("concierge-needs-filter"));
     expect(c.onNeedsYouFilterToggle).toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("concierge-pr-pill"));
-    expect(c.onPrClick).toHaveBeenCalled();
   });
 
   it("reports the filter's state to assistive tech, not just as paint", () => {
@@ -185,36 +191,65 @@ describe("the header's pills", () => {
     fireEvent.click(pill);
   });
 
-  // A control offering to filter nothing, or to merge nothing, is chrome asserting the absence of a
-  // thing — which is exactly what the header consolidated to stop carrying.
-  it("renders neither pill when there is nothing behind it", () => {
+  // A control offering to filter nothing is chrome asserting the absence of a thing — which is
+  // exactly what the header consolidated to stop carrying.
+  it("renders no filter pill when there is nothing behind it", () => {
     render(
       <ConciergeColumn
-        model={{ ...model, vitals: { needs_you: 0, running: 0, done: 0 }, prsReady: 0 }}
-        controller={controller({ onNeedsYouFilterToggle: vi.fn(), onPrClick: vi.fn() })}
+        model={{ ...model, vitals: { needs_you: 0, running: 0, done: 0 } }}
+        controller={controller({ onNeedsYouFilterToggle: vi.fn() })}
       />,
     );
     expect(screen.queryByTestId("concierge-needs-filter")).toBeNull();
-    expect(screen.queryByTestId("concierge-pr-pill")).toBeNull();
   });
 
   // The same rule ScopeVitals' segment buttons follow: no handler, no affordance. A focusable,
   // cursor-pointer, named control that does nothing is worse than no control.
-  it("renders no grip and no pills when the shell supplies no handlers", () => {
-    render(<ConciergeColumn model={{ ...model, prsReady: 3 }} controller={controller()} />);
+  it("renders no grip and no filter pill when the shell supplies no handlers", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
     expect(screen.queryByTestId("concierge-grip")).toBeNull();
     expect(screen.queryByTestId("concierge-needs-filter")).toBeNull();
-    expect(screen.queryByTestId("concierge-pr-pill")).toBeNull();
+  });
+});
+
+// ── THE PR SLOT ───────────────────────────────────────────────────────────────────────────────
+// This used to be a `prsReady` count and an `onPrClick` callback the column painted itself, and it
+// was DEAD: nothing in the app ever passed either, so the only PR affordance a user could reach was
+// the wide "N PRs waiting" pill over in the project tab strip. It is now a slot the shell fills
+// with the real `<OpenPrMenu compact />`, so this directory stays presentational — which means the
+// column's whole contract here is WHERE it puts what it is handed, and that it invents nothing.
+describe("the header's PR slot", () => {
+  it("renders what the shell hands it, between the filter and the ⋮ cluster", () => {
+    fullHeader();
+    const slot = screen.getByTestId("pr-slot-stub");
+    expect(header().contains(slot)).toBe(true);
+    for (const [before, after] of [
+      [screen.getByTestId("concierge-needs-filter"), slot],
+      [slot, screen.getByRole("button", { name: "Settings" })],
+    ] as const) {
+      expect(
+        before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING,
+        "the PR slot must sit after the filter and before the kebab",
+      ).toBeTruthy();
+    }
   });
 
-  // NO EMOJI AS ICONS — a standing founder rule for this repo, and the PR pill is exactly the kind
-  // of control that attracts one. It draws a Feather git-pull-request glyph.
-  it("draws the PR pill with an SVG icon, never an emoji", () => {
+  // The column must not substitute a pill of its own for an absent slot. A surface with no PR probe
+  // wired (a satellite window, a test harness) shows NOTHING here — the old dead `prsReady` chip is
+  // gone, not merely unwired, so there is no path back to two competing PR affordances.
+  it("renders nothing at all when no slot is supplied", () => {
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.queryByTestId("pr-slot-stub")).toBeNull();
+    expect(screen.queryByTestId("concierge-pr-pill")).toBeNull();
+    expect(screen.queryByTestId("open-pr-badge")).toBeNull();
+  });
+
+  // The panel the compact menu drops hangs off the HEADER, not off the chip: the concierge is a
+  // ~380px column that docks to either side, so a panel anchored near its right edge would leave
+  // the window on one of them. That only works if the header is a positioned ancestor.
+  it("is a positioned ancestor, so a dropped panel can span the column", () => {
     fullHeader();
-    const pill = screen.getByTestId("concierge-pr-pill");
-    expect(pill.querySelector("svg")).not.toBeNull();
-    // The surrogate-pair range every pictographic emoji lives in.
-    expect(pill.textContent ?? "").not.toMatch(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
+    expect(header().style.position).toBe("relative");
   });
 });
 
@@ -238,5 +273,55 @@ describe("the wordmark ramps dark → light", () => {
     fullHeader();
     const bg = screen.getByRole("img", { name: "Sparkle" }).style.background;
     expect(bg.indexOf(BLUEPRINT.dark.wmDark)).toBeLessThan(bg.indexOf(BLUEPRINT.dark.wmLit));
+  });
+});
+
+// ── THE VOICE STRIP: WAVEFORM FULL-WIDTH, CREDIT PILL OVERLAID ────────────────────────────────
+// The pill used to be a FLEX SIBLING of the waveform, so it consumed horizontal space and the bars
+// were squeezed to `strip − padding − gap − pill` — dying visibly short of the right edge and
+// leaving the right of the bar dead. The founder's ask was explicit that the waveform reach the
+// edge and the pill float ON it, "not laid out beside it… do not shrink the waveform to make room".
+//
+// jsdom has no layout engine, so nothing here measures a width — a `getBoundingClientRect` in this
+// environment returns zero and would assert nothing. What IS checkable, and is exactly what
+// regressed, is the LAYOUT MODEL: whether the pill is in the flow at all.
+describe("the voice strip lays the credit pill OVER the waveform", () => {
+  const strip = () => screen.getByTestId("concierge-voice-strip");
+
+  it("takes the pill out of the flow entirely, so it consumes no width", () => {
+    fullHeader();
+    const overlay = screen.getByTestId("concierge-credit-overlay");
+    expect(overlay.style.position).toBe("absolute");
+    // Absolute against the STRIP, which must therefore be the positioned ancestor — otherwise it
+    // escapes to whatever ancestor is positioned and lands somewhere else in the column.
+    expect(strip().style.position).toBe("relative");
+    expect(strip().contains(overlay)).toBe(true);
+    // …and the strip is NOT a flex row any more. That is the mechanism that squeezed the bars: as
+    // long as this is a flex container with the pill inside it, the pill takes a share of the line.
+    expect(strip().style.display).not.toBe("flex");
+  });
+
+  it("cancels LogoWaveform's own side padding on BOTH sides, not just the left", () => {
+    fullHeader();
+    const slot = screen.getByTestId("concierge-waveform-slot");
+    // Only the left inset existed — the other half of why the bars stopped short on the right.
+    expect(slot.style.marginLeft).toBe("-14px");
+    expect(slot.style.marginRight).toBe(slot.style.marginLeft);
+  });
+
+  it("keeps the pill legible over moving bars with a backdrop of its own", () => {
+    fullHeader();
+    const overlay = screen.getByTestId("concierge-credit-overlay");
+    // The column's background is dynamic (it floods on `data-wired`), so a scrim in a fixed colour
+    // would be wrong half the time; a local backdrop blur is background-agnostic. It also has to
+    // sit ABOVE the bars in z-order, or "overlaid" is just "hidden behind".
+    // Read through the index signature: jsdom carries the prefixed property, but the DOM lib's
+    // `CSSStyleDeclaration` does not declare it.
+    const filter =
+      overlay.style.backdropFilter || (overlay.style as unknown as Record<string, string>)["webkitBackdropFilter"];
+    expect(filter).toContain("blur");
+    expect(Number(overlay.style.zIndex)).toBeGreaterThan(0);
+    // Confined to the pill's own box — the waveform underneath is untouched.
+    expect(overlay.contains(screen.getByTestId("logo-waveform"))).toBe(false);
   });
 });

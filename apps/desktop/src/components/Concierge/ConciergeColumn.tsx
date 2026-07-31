@@ -12,7 +12,6 @@
 // exactly as they did there. Routing them through the view-model would have meant teaching the
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
-import { FiGitPullRequest } from "react-icons/fi";
 import { useMemo } from "react";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
@@ -21,6 +20,9 @@ import { useResolvedTheme } from "../../theme/theme";
 import { bandColor } from "../../engine/statusBandLabels";
 import { BalanceBadge } from "../BalanceBadge";
 import { LogoWaveform } from "../LogoWaveform";
+// From its own module, NOT from `../LogoWaveform`: ~40 suites mock that component wholesale, and a
+// module mock is total — a constant re-exported from there is `undefined` in every one of them.
+import { WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
@@ -139,6 +141,7 @@ export function ConciergeColumn({
   controller,
   width = 380,
   searchSlot,
+  prSlot,
   interim = "",
   registerInsert,
   onTextEdit,
@@ -167,7 +170,6 @@ export function ConciergeColumn({
   const mode = useResolvedTheme();
   const isWired = wired !== "off";
   const needsYou = model.vitals.needs_you;
-  const prsReady = model.prsReady ?? 0;
   // The roster every agent pill in a concierge reply resolves against. MEMOIZED because it is a
   // context value: a fresh object each render would re-render every pill in the thread on every
   // keystroke in the compose box, which is the exact cost `<Markdown>`'s memo exists to avoid.
@@ -273,6 +275,11 @@ export function ConciergeColumn({
           gap: 7,
           height: HEADER_H,
           flex: "0 0 auto",
+          // The containing block for anything a header slot drops BELOW the row — today the PR
+          // menu's panel. It anchors to the header rather than to the chip so it can span the
+          // column's full width: the concierge is ~380px and docks to either side, so a panel
+          // anchored to a chip near the right edge would hang off the window on one of them.
+          position: "relative",
           // Asymmetric, per the mock: the right edge keeps clearance so the kebab never sits under
           // the column's pull tab.
           padding: "0 20px 0 10px",
@@ -346,27 +353,14 @@ export function ConciergeColumn({
             {needsYou}
           </button>
         )}
-        {/* THE PR / MERGE PILL. Green and filled once something is actually mergeable — that is the
-            one state in the shell where the next action is a single click, so it is the one pill
-            allowed to shout. Hidden at zero for the same reason as the filter above. */}
-        {prsReady > 0 && controller.onPrClick && (
-          <button
-            type="button"
-            data-testid="concierge-pr-pill"
-            data-ready="yes"
-            aria-label={`${prsReady} pull request${prsReady === 1 ? "" : "s"} ready to merge`}
-            title={`${prsReady} pull request${prsReady === 1 ? "" : "s"} ready to merge`}
-            onClick={controller.onPrClick}
-            style={{
-              ...pillStyle(C.successInk),
-              color: C.onGoldFill,
-              background: C.successInk,
-            }}
-          >
-            <FiGitPullRequest size={11} aria-hidden />
-            {prsReady}
-          </button>
-        )}
+        {/* THE PR / MERGE CHIP, beside the ⋮ — a slot rather than a pill this column paints itself.
+            It used to be a local `prsReady` button here, and it was DEAD: nothing in the app ever
+            passed `prsReady` or `onPrClick`, so the chip could not render in production and the
+            only PR affordance a user could actually reach was the wide "3 PRs waiting" pill over in
+            the project tab strip. A count is not the whole job either — the click has to open the
+            list, merge from it, and jump to the owning agent — so the integration layer hands the
+            real menu in through here instead, and this directory stays presentational. */}
+        {prSlot}
         {/* The signed-in avatar + the kebab, as one cluster. `ConciergeTopRight` is the same export
             the project tabs bar mounts today; the cockpit's tabs belong to a PAIR, and this cluster
             is about the human rather than about a project, so its home is this header. */}
@@ -386,16 +380,60 @@ export function ConciergeColumn({
         data-testid="concierge-voice-strip"
         style={{
           flex: "0 0 auto",
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
+          // The containing block for the floating credit pill below. NOT a flex row any more: the
+          // pill used to be a flex SIBLING, so it consumed horizontal space and the waveform was
+          // squeezed to `strip − padding − gap − pill`, dying well short of the right edge and
+          // leaving the right of the bar dead. The waveform is now the strip's only flow child and
+          // spans the whole width; the pill floats on top of it in z-order.
+          position: "relative",
           padding: "6px 16px 0",
         }}
       >
-        <div style={{ flex: 1, minWidth: 0, marginLeft: WAVEFORM_INSET }}>
+        <div
+          data-testid="concierge-waveform-slot"
+          // BOTH insets, symmetrically. Only the left one existed, which is the other half of why
+          // the bars stopped short on the right: LogoWaveform carries its own 14px side padding, so
+          // cancelling it on one side only left the right edge inset by 14px on top of everything
+          // the pill was already taking.
+          style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}
+        >
           <LogoWaveform />
         </div>
-        <BalanceBadge />
+        <div
+          data-testid="concierge-credit-overlay"
+          style={{
+            // OVERLAID, not laid out beside. Absolute so it takes zero width from the waveform —
+            // the ask was explicitly "do not shrink the waveform to make room".
+            position: "absolute",
+            right: 16,
+            // Centred on the WAVE STAGE — half the stage down from the strip's top padding, then
+            // pulled back by half of its OWN height. Against the stage rather than the strip so it
+            // sits on the bars instead of drifting with the caption block underneath them; and by
+            // transform rather than by `height: WAVE_HEIGHT` because the box below is a BACKDROP.
+            // Given the stage's height it became a 56px blurred slab with a 999px radius — a large
+            // pale ellipse bleeding over the bars, which is worse than the clipping it replaced.
+            // Sized to the badge, the same treatment reads as a pill behind the text.
+            top: 6 + WAVE_HEIGHT / 2,
+            transform: "translateY(-50%)",
+            display: "flex",
+            alignItems: "center",
+            zIndex: 1,
+            // LEGIBILITY OVER MOVING BARS. The column's background is dynamic (it floods on
+            // data-wired), so a scrim painted in a fixed colour would be wrong half the time. A
+            // local backdrop blur is background-agnostic: it turns whatever is behind the pill —
+            // bars mid-animation included — into soft texture, and the pill's own fill does the
+            // rest. The blur is confined to the pill's own box, so the waveform is untouched.
+            borderRadius: 999,
+            backdropFilter: "blur(7px)",
+            WebkitBackdropFilter: "blur(7px)",
+            // A DROP shadow, not a spread halo. `0 0 10px 5px` casts equally in every direction
+            // from a box that is itself invisible, which paints a ring around the pill rather than
+            // lifting it off the bars.
+            boxShadow: "0 1px 6px rgba(0,0,0,0.20)",
+          }}
+        >
+          <BalanceBadge />
+        </div>
       </div>
       {searchSlot && <div style={{ flex: "0 0 auto", padding: "10px 16px 0" }}>{searchSlot}</div>}
       {/* THE LOCKED STATE swaps the paid half — the chat with the `claude -p` brain — for the
