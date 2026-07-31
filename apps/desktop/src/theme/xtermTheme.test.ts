@@ -3,7 +3,30 @@
 // colors, and nothing about the calm state touches the background — the pane's chrome, the
 // onboarding empty states and the fixed overlays inside the stage are no longer collateral.
 import { describe, expect, it } from "vitest";
-import { CALM_MIN_CONTRAST, CALM_MIN_SPLIT, THEME_HEX, xtermTheme } from "./colors";
+import {
+  CALM_MIN_CONTRAST,
+  CALM_MIN_SPLIT,
+  TERM_ANSI_INKS,
+  TERM_ANSI_MIN_CONTRAST,
+  TERM_ANSI_MIN_SPLIT,
+  TERM_ANSI_PAPER,
+  TERM_PAPER_MIN_SPLIT,
+  THEME_HEX,
+  xtermTheme,
+} from "./colors";
+
+/** The sixteen ANSI slots, and the eight normal↔bright pairs they form. */
+const ANSI_PAIRS = [
+  ["black", "brightBlack"],
+  ["red", "brightRed"],
+  ["green", "brightGreen"],
+  ["yellow", "brightYellow"],
+  ["blue", "brightBlue"],
+  ["magenta", "brightMagenta"],
+  ["cyan", "brightCyan"],
+  ["white", "brightWhite"],
+] as const;
+const ANSI_SLOTS = ANSI_PAIRS.flat();
 
 /** WCAG relative luminance of a #rrggbb string. */
 function luminance(hex: string): number {
@@ -100,18 +123,141 @@ describe("xtermTheme calm", () => {
     }
   });
 
-  it("wins over the light-mode blue legibility override", () => {
-    // The override exists so TUI headings stay readable on white; while calm, it is one of the
-    // colors being flattened. Order in the object literal is what enforces this.
+  it("wins over the light-mode ANSI legibility palette", () => {
+    // The palette exists so a TUI's coloured tokens stay readable on the light plane; while calm,
+    // every one of them is flattened. Order in the object literal is what enforces this.
     const t = xtermTheme("light", true);
-    expect(t.blue).not.toBe(xtermTheme("light").blue);
-    expect(t.brightBlue).not.toBe(xtermTheme("light").brightBlue);
+    for (const slot of ANSI_SLOTS) {
+      expect(t[slot], `calm must flatten light.${slot}`).not.toBe(xtermTheme("light")[slot]);
+    }
   });
 
   it("never changes the background — calm recedes the TEXT, it does not gray the pane", () => {
     for (const mode of ["light", "dark"] as const) {
       expect(xtermTheme(mode, true).background).toBe(xtermTheme(mode).background);
       expect(xtermTheme(mode, true).selectionBackground).toBe(xtermTheme(mode).selectionBackground);
+    }
+  });
+});
+
+// ── THE LIGHT-MODE ANSI PALETTE ────────────────────────────────────────────────────────────────
+//
+// The regression this replaces shipped for as long as light mode has existed: the theme handed
+// xterm.js its DEFAULT (Tango, dark-tuned) palette and overrode two of the sixteen slots. Eleven
+// defaults failed AA on the light terminal background and so did the override — brightWhite at
+// 1.11:1, brightYellow 1.04:1, brightCyan 1.24:1, brightGreen 1.25:1, white 1.13:1, brightBlue
+// 2.14:1, and the `blue`/`brightBlue` "fix" itself at 3.48:1. That is a TUI's paths, filenames and
+// table cells rendered near-invisible.
+//
+// These assertions are NUMERIC and computed from the shipped hex, per the note in colors.ts: the
+// previous generation of this guard asserted inequalities ("bright is lighter than dim"), and an
+// inequality is exactly what a washed-out palette satisfies. A test that only checked hex values
+// would also be worthless here — the hex can be correct against the wrong background, and the
+// background is the whole point.
+//
+// AND THE BACKGROUND IS NOT ONLY THE PLANE. The first cut of this palette measured every slot as a
+// foreground on the terminal plane, passed all four of its assertions, and shipped `\e[44;37m`
+// (blue bg / white fg) at 1.00:1 — because `\e[4Xm` makes a slot a CELL FILL and nothing here
+// looked at that direction. Both directions are measured now, and the ink/paper split those
+// measurements forced is described in colors.ts.
+describe("xtermTheme light-mode ANSI palette", () => {
+  const light = xtermTheme("light");
+  const bg = THEME_HEX.light.forest;
+  const paper = TERM_ANSI_PAPER.map((s) => light[s]!);
+
+  it("sets EVERY one of the sixteen slots — not the two the old override patched", () => {
+    for (const slot of ANSI_SLOTS) {
+      expect(light[slot], `light.${slot} must be pinned, not left to xterm's dark-tuned default`)
+        .toMatch(/^#[0-9a-f]{6}$/);
+    }
+    // The two registers together are exactly the sixteen — no slot silently ungoverned.
+    expect([...TERM_ANSI_INKS, ...TERM_ANSI_PAPER].sort()).toEqual([...ANSI_SLOTS].sort());
+  });
+
+  it("INK slots clear AA as text on the terminal plane and on the selection fill", () => {
+    // The selection matters separately: a slot measured only against the plane can still vanish the
+    // moment the user drags a selection over it, because the fill is a different surface.
+    for (const slot of TERM_ANSI_INKS) {
+      const ink = light[slot]!;
+      expect(
+        contrast(ink, bg),
+        `light.${slot} (${ink}) as text on the terminal background ${bg}`,
+      ).toBeGreaterThanOrEqual(TERM_ANSI_MIN_CONTRAST);
+      expect(
+        contrast(ink, light.selectionBackground),
+        `light.${slot} (${ink}) as text on the selection fill ${light.selectionBackground}`,
+      ).toBeGreaterThanOrEqual(TERM_ANSI_MIN_CONTRAST);
+    }
+  });
+
+  it("INK slots work as CELL FILLS — paper stays readable on top (`\\e[44;37m`)", () => {
+    // THE 1.00:1 REGRESSION. A TUI paints a coloured background and puts its light foreground on
+    // top: selected rows, status bars, diff hunks. Every ink slot must therefore carry both paper
+    // tones, not merely read well on the plane.
+    for (const slot of TERM_ANSI_INKS) {
+      for (const p of paper) {
+        expect(
+          contrast(p, light[slot]!),
+          `paper ${p} on a light.${slot} (${light[slot]}) cell fill`,
+        ).toBeGreaterThanOrEqual(TERM_ANSI_MIN_CONTRAST);
+      }
+    }
+  });
+
+  it("PAPER slots work as CELL FILLS — dark ink stays readable on top (`\\e[47;30m`)", () => {
+    // The other half of the same idiom, and the one that caught `white` at 1.71:1. `black` is what
+    // a TUI pairs with a white background; `theme.foreground` is what an unstyled cell uses.
+    for (const slot of TERM_ANSI_PAPER) {
+      for (const ink of [light.black!, light.foreground]) {
+        expect(
+          contrast(ink, light[slot]!),
+          `${ink} on a light.${slot} (${light[slot]}) paper fill`,
+        ).toBeGreaterThanOrEqual(TERM_ANSI_MIN_CONTRAST);
+      }
+    }
+  });
+
+  it("PAPER is actually paper — lighter than the plane, so a `\\e[47m` cell reads as a page", () => {
+    // Without this, "paper" could satisfy every fill assertion above by being pure white on a pure
+    // white plane, i.e. an invisible cell. It also pins the direction: paper is the LIGHT register.
+    for (const slot of TERM_ANSI_PAPER) {
+      expect(
+        luminance(light[slot]!),
+        `light.${slot} (${light[slot]}) must be lighter than the plane ${bg}`,
+      ).toBeGreaterThan(luminance(bg));
+    }
+  });
+
+  it("keeps each slot tellable from its bright counterpart", () => {
+    // Both halves clearing the same floor is what makes this necessary: satisfying AA alone would
+    // be satisfied by sixteen identical inks, which is not a palette. The paper pair gets the
+    // looser floor for the reason stated in colors.ts — both are paper by construction.
+    for (const [normal, bright] of ANSI_PAIRS) {
+      const floor = normal === "white" ? TERM_PAPER_MIN_SPLIT : TERM_ANSI_MIN_SPLIT;
+      expect(
+        contrast(light[normal]!, light[bright]!),
+        `light.${normal} (${light[normal]}) vs light.${bright} (${light[bright]})`,
+      ).toBeGreaterThanOrEqual(floor);
+    }
+  });
+
+  it("makes `bright` the lighter half in every one of the eight pairs", () => {
+    // No exception any more. The first cut inverted `white`/`brightWhite` to keep sixteen readable
+    // INKS; once the paper pair stopped being ink, the inversion it required went away with it.
+    for (const [normal, bright] of ANSI_PAIRS) {
+      expect(
+        luminance(light[bright]!),
+        `light.${bright} should be the lighter of the ${normal} pair`,
+      ).toBeGreaterThan(luminance(light[normal]!));
+    }
+  });
+
+  it("leaves DARK mode on xterm's defaults — this change never reaches it", () => {
+    // The founder's report was light-mode-only, and dark is the ground the Tango defaults were
+    // designed for. An unset slot is xterm's own value; that is the contract being pinned.
+    const dark = xtermTheme("dark");
+    for (const slot of ANSI_SLOTS) {
+      expect(dark[slot], `dark.${slot} must stay xterm's default`).toBeUndefined();
     }
   });
 });

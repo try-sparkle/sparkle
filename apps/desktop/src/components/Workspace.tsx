@@ -17,7 +17,7 @@ import { C, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
-import { ColumnPullTab } from "./ColumnPullTab";
+import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -51,7 +51,15 @@ import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useWindowWidth } from "../hooks/useWindowWidth";
-import { BUILD_COLUMN_MIN_WIDTH, windowAwareMax } from "../engine/columnResize";
+import {
+  BUILD_COLUMN_MIN_WIDTH,
+  BUILD_WIDTH_EVENT,
+  CONCIERGE_PAIRED_HARD_MAX,
+  CONCIERGE_WIDTH_VAR,
+  conciergePairedMax,
+  readStoredBuildWidth,
+  windowAwareMax,
+} from "../engine/columnResize";
 import {
   clearsSelectionOnKey,
   releaseStillArmed,
@@ -346,8 +354,6 @@ export function Pair({
   tabs,
   children,
   wired = false,
-  width = null,
-  rowReserve = 0,
 }: {
   side: PairSide;
   /** Does this pair hold the live circuit? Marks it as part of the circuit for the unbind gesture. */
@@ -356,35 +362,6 @@ export function Pair({
   tabs: React.ReactNode;
   /** `[build, terminal]`, in that order, on both sides. */
   children: React.ReactNode;
-  /** EXPLICIT WIDTH, WHICH IS WHAT MAKES THE CONCIERGE'S TWO EDGES INDEPENDENT — AND IT STILL YIELDS.
-   *
-   *  `null` keeps the historical `flex: 1` — the right pair stays elastic and absorbs whatever the
-   *  boundaries give or take, which is what keeps every seam draggable on a narrow window (see
-   *  engine/columnResize's note on the terminals absorbing the shortfall).
-   *
-   *  A NUMBER pins this pair, and that is the whole mechanism behind "moving one edge must not drag
-   *  the other along". While BOTH pairs were `flex: 1`, the concierge's single width was the only
-   *  adjustable number in the row, so growing it shrank both pairs EQUALLY: the column grew about its
-   *  centre and its left edge slid left every time the user dragged its right edge. Pinning the left
-   *  pair removes it from that negotiation, so the left edge stays exactly where the user put it.
-   *
-   *  `flex: "0 1 auto"` AND NOT `0 0 auto`, which is a shipping bug I wrote and roborev 55847 caught.
-   *  With shrink 0 the pinned pair and the concierge (also `0 0 auto`) made the row's non-shrinkable
-   *  width `640 + 6 + 360 + 6 = 1012px` at the defaults — while `tauri.conf.json` declares
-   *  `minWidth: 900`. Below ~1012 the PRIMARY pair, build column and terminal both, was squeezed to
-   *  zero and clipped away by `body { overflow: hidden }`, with no scroll to reach it. It also
-   *  contradicted `engine/columnResize`'s invariant that terminals absorb the shortfall — the left
-   *  pair's terminal could not, because the pair itself refused to shrink. Shrink 1 restores that:
-   *  at any width where the content fits, nothing shrinks and the edges stay exactly where the user
-   *  put them; under real pressure the pair yields instead of evicting its neighbour. `minWidth` keeps
-   *  the yield from going to nothing. */
-  width?: number | null;
-  /** How much of the row this pair must leave for everything else, in px. Passed in rather than
-   *  computed from a constant because the concierge is `flex: 0 0 auto` at its LIVE width (360 by
-   *  default, up to 560) and cannot shrink — so reserving its MINIMUM reserved space the concierge
-   *  then took anyway, and the "primary pair that is still a pair" guarantee failed by up to 280px
-   *  once the user widened it (roborev 55883). */
-  rowReserve?: number;
 }) {
   return (
     <div
@@ -393,27 +370,29 @@ export function Pair({
       data-side={side}
       data-wired-pair={String(wired)}
       data-testid={`pair-${side}`}
-      data-width-mode={width === null ? "elastic" : "pinned"}
-      // The NUMBER the user set, published separately from the CSS `min()` that bounds the paint —
-      // the style attribute is an expression now, so it is no longer a reading of the setting.
-      data-width={width === null ? undefined : String(width)}
+      // ── EVERY PAIR IS ELASTIC NOW, AND THAT IS THE WHOLE CENTRING MECHANISM ──────────────────
+      //
+      // THIS REVERSES A DELIBERATE ASYMMETRY. The left pair used to be PINNED to its own stored
+      // width while the right pair alone was `flex: 1`, so the right pair absorbed every change in
+      // the row. The comment that stood here defended it: with both pairs elastic, "the column grew
+      // about its centre and its left edge slid left every time the user dragged its right edge",
+      // and pinning the left pair was what stopped one edge dragging the other.
+      //
+      // The founder was shown that exact sentence and chose symmetric anyway, because the premise
+      // changed: the concierge is the row's ANCHOR now, not a column between two neighbours. A
+      // column that stays dead centre is worth an edge that moves when you pull its opposite — and
+      // the old model's own costs were worse, since nothing could grow the concierge leftward at all
+      // and a 3-display span put 2.5 displays into the right pair.
+      //
+      // `flex: 1 1 0` and NOT `flex: 1 1 auto`: the halves must divide the free space EQUALLY
+      // regardless of what is inside them. With an `auto` basis each half's content would seed its
+      // share, so a wider build column on one side would make that half wider too and slide the
+      // concierge off centre — the exact defect, re-introduced through the back door.
       style={{
         display: "flex",
         flexDirection: "column",
         minWidth: 0,
-        ...(width === null
-          ? { flex: 1 }
-          : {
-              flex: "0 1 auto",
-              // CSS-CLAMPED AGAINST THE LIVE ROW, not just against a JS ceiling computed at render
-              // time. The JS bound stops the GESTURE; this stops the PAINT, and it is what keeps an
-              // already-set width honest when the window later shrinks — the browser re-evaluates it
-              // at layout, so nothing has to reconcile state against a moving bound (roborev 55869).
-              // The stored preference is untouched, so widening the window restores the user's width
-              // instead of having silently discarded it.
-              width: `min(${width}px, calc(100% - ${rowReserve}px))`,
-              minWidth: PINNED_PAIR_MIN_WIDTH,
-            }),
+        flex: "1 1 0",
         position: "relative",
       }}
     >
@@ -447,71 +426,64 @@ export function Pair({
 /** Exported so a test asserts the key this component actually writes instead of re-spelling it, or
  *  worse, discovering it by taking a census of localStorage — see `Workspace.resize.test.tsx`. */
 export const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
+/** THE TWO-PAIR WIDTH, STORED SEPARATELY — and it has to be, because the two modes now want very
+ *  different numbers from the same column.
+ *
+ *  In the single-pair shell the concierge is a 280–560px reading column pinned to the row's left. In
+ *  the five-column cockpit it is the ANCHOR, and the founder's target layouts put it at ~1100 and
+ *  ~1920 on a three-display span. One shared value means opening a left pair inherits a width chosen
+ *  for the other layout, and — far worse — dragging it there writes that back over the single-pair
+ *  preference, so closing the pair leaves a concierge three times too wide with no way to know why.
+ *
+ *  SEEDED from the single-pair value on first use, so an existing install's width is where the
+ *  cockpit starts rather than snapping to a default. */
+export const CONCIERGE_WIDTH_KEY_PAIRED = "sparkle-concierge-width:2";
 const CONCIERGE_MIN_WIDTH = 280;
+/** The single-pair ceiling, DELIBERATELY UNCHANGED. That layout "is working fine" and this pass must
+ *  not move it; the paired row gets its own, window-aware ceiling (`conciergePairedMax`). */
 const CONCIERGE_MAX_WIDTH = 560;
 const CONCIERGE_DEFAULT_WIDTH = 360;
 
-/** THE LEFT PAIR'S OWN WIDTH — the second half of "the concierge has two edges".
+/** Which key a given pair count reads and writes. */
+function conciergeWidthKeyFor(pairCount: number): string {
+  return pairCount === 2 ? CONCIERGE_WIDTH_KEY_PAIRED : CONCIERGE_WIDTH_KEY;
+}
+
+/** THE LEFT PAIR NO LONGER HAS A WIDTH OF ITS OWN, and deleting it is the change.
  *
- *  ONE BOUNDARY OWNS ONE COLUMN, which is the rule that makes the two edges independent. The seam to
- *  the concierge's RIGHT owns `conciergeWidth`; the seam to its LEFT owns THIS. Each seam resizes the
- *  column on its own left and nothing else, so moving one edge cannot move the other.
+ *  It used to be pinned (`sparkle-left-pair-width`, 320–1400, default 640) so that "one boundary owns
+ *  one column": the seam to the concierge's LEFT moved the LEFT PAIR, the seam to its right moved the
+ *  concierge, and neither could disturb the other. That made the two edges independent — and it is
+ *  precisely what the founder rejected, for two consequences it could not avoid:
  *
- *  What it replaces: both pairs were `flex: 1` and the concierge's single width was the only
- *  adjustable number in the row, so growing the concierge shrank both neighbours EQUALLY — the column
- *  grew about its centre and its left edge slid left whenever the user dragged its right edge. The
- *  right pair stays elastic (`null`) on purpose: something must absorb the give, and engine/columnResize
- *  documents why that has to be a terminal-bearing pair rather than the concierge. */
-export const LEFT_PAIR_WIDTH_KEY = "sparkle-left-pair-width";
-const LEFT_PAIR_MIN_WIDTH = 320;
-const LEFT_PAIR_MAX_WIDTH = 1400;
-const LEFT_PAIR_DEFAULT_WIDTH = 640;
-/** How narrow a PINNED pair may be squeezed before it stops giving. It still has to hold a build
- *  column (min 160) and a terminal that can show something, so this is a floor on the yield, not a
- *  target — see the `width` prop's note for why the pair yields at all. */
-const PINNED_PAIR_MIN_WIDTH = 280;
-/** What must stay on screen BESIDE the left pair: the concierge AT ITS LIVE WIDTH, both seam rails,
- *  and enough of the primary pair to remain a pair rather than a sliver.
+ *    • NO GESTURE GREW THE CONCIERGE LEFTWARD. The left seam owned the pair, so dragging it slid the
+ *      concierge sideways as a rigid block. "It drags the whole app."
+ *    • THE RIGHT PAIR WAS THE ONLY ELASTIC COLUMN, so it absorbed every change in the row. On a
+ *      5760px span, `640 + 360` left it ~4,700px — "the right side display is spanning like one and
+ *      a half displays."
  *
- *  A FUNCTION OF THE LIVE WIDTH, NOT A CONSTANT, and the same value feeds the GESTURE ceiling and the
- *  PAINT clamp. When only the paint tracked the live concierge the two diverged by up to 280px the
- *  moment the user widened it: at 1600px with the concierge at 560 the paint stopped at 748 while the
- *  drag was still permitted to 948, so the seam moved state, logged `applied` with `clampedBy: null`,
- *  and painted nothing — the "a drag that goes nowhere is indistinguishable from a drag that isn't
- *  applied" failure engine/columnResize was written to eliminate. The over-permissive value persisted
- *  too, so the next launch read a width the layout would never paint (roborev 55897). */
-/** How much of the row the PRIMARY (elastic) pair must be left, and it is NOT `PINNED_PAIR_MIN_WIDTH`.
+ *  Both halves are `flex: 1 1 0` now, so they are equal by construction and the concierge is pinned
+ *  dead centre with no arithmetic anywhere (engine/columnResize's `cockpitGeometry`). A pair has no
+ *  width to store, so the key, its bounds, its state, its debounce and its flush are all gone. What
+ *  the user actually adjusts inside a half is the BUILD column, which has always had its own per-side
+ *  storage and keeps it. */
+
+/** How much of the row the sole pair must be left in a SINGLE-pair shell.
  *
- *  A DISTINCT CONSTANT BECAUSE IT ANSWERS A DIFFERENT QUESTION. `PINNED_PAIR_MIN_WIDTH` is how far the
- *  pinned pair may be SQUEEZED once the row is already over-subscribed; this is how much space the
- *  primary pair is never asked to give up in the first place. Borrowing the former for the latter read
- *  as a no-op — both totals come to 652 at the default concierge width — while silently cutting the
- *  primary pair's guarantee from 360 to 280 the moment the concierge was NARROWED, which is exactly
- *  the kind of change no test at default widths can see (roborev 55910).
+ *  UNCHANGED, and deliberately still expressed for the one-pair row: that layout is the one the
+ *  founder says already works, so its ceiling arithmetic is preserved exactly rather than
+ *  re-derived from the five-column budget (which would move it).
  *
  *  360 = a build column at its floor (160) + 200 of terminal. DELIBERATELY BELOW
  *  `BUILD_COLUMN_MIN_WIDTH + TERMINAL_MIN_WIDTH` (480), which is what `AgentSidebar`'s own CSS clamp
- *  would prefer: at the 900px window `tauri.conf.json` permits, reserving 480 leaves the five-column
- *  cockpit unable to seat anyone above their minimum, so the honest reserve is the one the narrowest
+ *  would prefer: at the 900px window `tauri.conf.json` permits, reserving 480 leaves the cockpit
+ *  unable to seat anyone above their minimum, so the honest reserve is the one the narrowest
  *  supported window can actually honour. A 200px terminal is cramped; it is not a lockout, and the
  *  build column's `max(160px, …)` floor keeps it from being eaten below that. */
 const PRIMARY_PAIR_ROW_RESERVE = BUILD_COLUMN_MIN_WIDTH + 200;
-function leftPairRowReserve(conciergeWidth: number): number {
-  return conciergeWidth + 2 * 6 + PRIMARY_PAIR_ROW_RESERVE;
-}
-/** The mirror of `leftPairRowReserve`, for the concierge's OWN ceiling — the one edge in the row that
- *  had no window-aware bound at all.
- *
- *  THE ROW YIELDED TO THE CONCIERGE FROM BOTH SIDES WHILE THE CONCIERGE ANSWERED TO NOBODY. Once the
- *  left pair's ceiling became a function of `conciergeWidth`, the concierge was the only column whose
- *  own max was a bare constant (560), so at the 900px window `tauri.conf.json` permits, dragging its
- *  right edge to 560 was fully permitted: the left pair yielded to its 280 `minWidth`, and the primary
- *  pair was left `900 - 280 - 12 - 560 = 48px` — its build column painting at its 160px floor, its
- *  pull tab pushed past a viewport with `overflow: hidden` and no scroll to reach it. That is the same
- *  lockout `windowAwareMax` was introduced to close, reached from the one edge it never covered
- *  (roborev 55910). */
-function conciergeRowReserve(leftPairWidth: number, pairCount: number): number {
-  return (pairCount === 2 ? leftPairWidth + 2 * 6 : 6) + PRIMARY_PAIR_ROW_RESERVE;
+/** The single-pair concierge reserve: its one seam rail plus the pair beside it. */
+function conciergeSingleRowReserve(): number {
+  return 6 + PRIMARY_PAIR_ROW_RESERVE;
 }
 
 /**
@@ -547,9 +519,28 @@ export function Workspace() {
   // owns both sides of it. Same storage shape as the agent column's width, and the same
   // read-through validation — a persisted value outside the clamp is ignored rather than restored,
   // so a stale entry from an older clamp cannot wedge the column off-screen.
-  const [conciergeWidth, setConciergeWidthRaw] = useState<number>(() => {
-    const saved = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY));
-    return saved >= CONCIERGE_MIN_WIDTH && saved <= CONCIERGE_MAX_WIDTH ? saved : CONCIERGE_DEFAULT_WIDTH;
+  // ONE VALUE PER PAIR COUNT, both read at mount. See CONCIERGE_WIDTH_KEY_PAIRED for why they cannot
+  // share: the single-pair shell wants a 280–560 reading column, the cockpit wants an anchor that may
+  // be 1920 wide, and one shared number means each mode overwrites the other's preference the first
+  // time it is dragged.
+  //
+  // BOTH KEYS ARE READ HERE rather than lazily when the count changes, because `pairCount` is derived
+  // from the project store further down and a state initialiser that depended on it would have to run
+  // again — re-initialising state on a prop change is the pattern that silently drops whatever the
+  // user did in between.
+  const [conciergeWidths, setConciergeWidthsRaw] = useState<Record<1 | 2, number>>(() => {
+    const rawSingle = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY));
+    const single =
+      rawSingle >= CONCIERGE_MIN_WIDTH && rawSingle <= CONCIERGE_MAX_WIDTH
+        ? rawSingle
+        : CONCIERGE_DEFAULT_WIDTH;
+    // VALIDATED AGAINST THE HARD CEILING, not the window-aware one: the live clamp happens at render
+    // (`renderedConciergeWidth`), so a width chosen on a three-display span is KEPT while docked to a
+    // laptop and restored on the way back — the same preference-survival rule the build columns have.
+    const rawPaired = Number(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED));
+    const paired =
+      rawPaired >= CONCIERGE_MIN_WIDTH && rawPaired <= CONCIERGE_PAIRED_HARD_MAX ? rawPaired : single;
+    return { 1: single, 2: paired };
   });
   // NOT PERSISTED PER PIXEL, and not re-created per render. Both halves are on the drag's hot path.
   //
@@ -575,93 +566,104 @@ export function Workspace() {
   // clamp exists to preserve: a 900px left-pair width set on a big display is seeded down to the local
   // ceiling at mount, and then dragging only the CONCIERGE persists that reduced value over the 900
   // (roborev 55883). The satellite-window clobber is fixed either way; this cross-contamination is not.
-  const conciergeWidthDirty = useRef(false);
-  const leftPairWidthDirty = useRef(false);
-  const setConciergeWidth = useCallback((next: number) => {
-    conciergeWidthDirty.current = true;
-    setConciergeWidthRaw(next);
-  }, []);
-  // THE LEFT PAIR'S WIDTH — same shape as the concierge's above, for the seam on the concierge's
-  // OTHER side. `useCallback` for the same reason: it is `onWidth` on a pull tab whose drag keys its
-  // window listeners on that identity, and this shell re-renders on every projectStore write.
+  // DIRTY ONLY ONCE THIS INSTANCE HAS ACTUALLY MOVED A WIDTH — and PER KEY, not one flag for both.
+  //
+  // `Workspace` mounts in the SATELLITE window too (it branches internally on `useIsMainWindow`), so
+  // its hooks run there and it registers the same pagehide/beforeunload/visibilitychange trio. Without
+  // this guard that untouched instance flushes its own DEFAULT over the width the user set in the main
+  // window, and whichever webview fires last wins (roborev 55869).
+  //
+  // A SET, keyed by pair count, because the two modes now store separately: dragging the concierge in
+  // the cockpit must not mark the single-pair width dirty and write a 1920 over a 360 the next time
+  // anything tears the tree down. A shared flag is exactly how one boundary comes to destroy a
+  // preference it never touched (roborev 55883).
+  const conciergeDirty = useRef<Set<1 | 2>>(new Set());
   const windowWidth = useWindowWidth();
-  const [leftPairWidth, setLeftPairWidthRaw] = useState<number>(() => {
-    const saved = Number(localStorage.getItem(LEFT_PAIR_WIDTH_KEY));
-    // Read-through validation against the WINDOW-aware ceiling, so a width persisted on a large
-    // display is ignored rather than restored onto a small one.
-    const max = windowAwareMax(
-      LEFT_PAIR_MAX_WIDTH,
-      typeof window === "undefined" ? LEFT_PAIR_MAX_WIDTH : window.innerWidth,
-      leftPairRowReserve(conciergeWidth),
-      LEFT_PAIR_MIN_WIDTH,
-    );
-    return saved >= LEFT_PAIR_MIN_WIDTH && saved <= max ? saved : Math.min(LEFT_PAIR_DEFAULT_WIDTH, max);
-  });
-  const setLeftPairWidth = useCallback((next: number) => {
-    leftPairWidthDirty.current = true;
-    setLeftPairWidthRaw(next);
-  }, []);
-  const leftPairWidthRef = useRef(leftPairWidth);
-  leftPairWidthRef.current = leftPairWidth;
-  // Debounced + flushed exactly like the concierge's, and for the same reason: a trailing timer whose
-  // cleanup only CANCELS loses the width the user just set if anything tears the tree down inside the
-  // window. The flush trio below is shared with the concierge width.
+
+  // THE TWO BUILD COLUMNS' WIDTHS, MIRRORED HERE — because the concierge's ceiling depends on them.
+  //
+  // `AgentSidebar` owns these widths and keeps owning them; this is a read-only reflection so the row
+  // can reserve the space they actually occupy rather than their minimums. Reserving the minimums
+  // would let the concierge be dragged straight over a build column the user deliberately widened.
+  //
+  // It stays in step through a custom event the sidebar emits on commit — which is ONCE PER DRAG now
+  // that the gesture paints a CSS variable instead of calling `onWidth` per move. Reading storage on
+  // an event rather than polling it keeps this off the drag's hot path entirely.
+  const [buildWidths, setBuildWidths] = useState<{ left: number; right: number }>(() => ({
+    left: readStoredBuildWidth("left", typeof window === "undefined" ? 1600 : window.innerWidth),
+    right: readStoredBuildWidth("right", typeof window === "undefined" ? 1600 : window.innerWidth),
+  }));
   useEffect(() => {
-    if (!leftPairWidthDirty.current) return;
+    const onBuildWidth = (e: Event) => {
+      const detail = (e as CustomEvent<{ side?: "left" | "right"; width?: number }>).detail;
+      if (!detail?.side || typeof detail.width !== "number") return;
+      setBuildWidths((prev) =>
+        prev[detail.side!] === detail.width ? prev : { ...prev, [detail.side!]: detail.width! },
+      );
+    };
+    window.addEventListener(BUILD_WIDTH_EVENT, onBuildWidth);
+    return () => window.removeEventListener(BUILD_WIDTH_EVENT, onBuildWidth);
+  }, []);
+
+  // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees with
+  // what the map says is unrepresentable. Read HERE, above the width plumbing, because which key the
+  // concierge reads and writes is a function of it.
+  const projects = useProjectStore((s) => s.projects);
+  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  const pairCount = pairCountFor(projects, pairAssignment);
+
+  const conciergeWidth = conciergeWidths[pairCount];
+  // `useCallback` is not decoration: this is `onWidth` on the pull tab, and the tab reads its config
+  // through a ref precisely so a new identity cannot disturb a live drag — but a stable identity still
+  // keeps the shell's own re-renders from churning anything downstream.
+  const setConciergeWidth = useCallback((next: number) => {
+    conciergeDirty.current.add(pairCount);
+    setConciergeWidthsRaw((prev) => (prev[pairCount] === next ? prev : { ...prev, [pairCount]: next }));
+  }, [pairCount]);
+
+  // NOT PERSISTED PER PIXEL. `localStorage.setItem` is SYNCHRONOUS and disk-backed; the trailing write
+  // lands ~200ms after the last change, so a drag writes once and the keyboard path — which has no
+  // release to hang a commit off — is covered by the same timer.
+  //
+  // (Bead sparkle-fxzx claims a per-mousemove localStorage write on this seam. That was already false
+  // when it was filed — this debounce and the flush trio below predate it — and it is doubly false
+  // now that a drag commits once on release. Verified, then closed with that reason rather than
+  // "fixed".)
+  const conciergeWidthsRef = useRef(conciergeWidths);
+  conciergeWidthsRef.current = conciergeWidths;
+  useEffect(() => {
+    if (!conciergeDirty.current.has(pairCount)) return;
     const id = setTimeout(() => {
       try {
-        localStorage.setItem(LEFT_PAIR_WIDTH_KEY, String(leftPairWidth));
+        localStorage.setItem(conciergeWidthKeyFor(pairCount), String(conciergeWidths[pairCount]));
       } catch {
         // A width we cannot persist is a cosmetic loss; it must not take anything else with it.
       }
     }, 200);
     return () => clearTimeout(id);
-  }, [leftPairWidth]);
+  }, [conciergeWidths, pairCount]);
   // THE DEBOUNCE MUST FLUSH, or it is a way to LOSE a width rather than a way to write it less.
   // A trailing timer whose cleanup only cancels drops whatever the user just set if anything tears
-  // the tree down inside the window — resize the seam (or nudge it with ← →) and quit within 200ms
-  // and the next launch restores the old width. The old per-pixel write could not lose a committed
-  // value; this could. The agent column has no such hole because it hangs its write off `mouseup`
-  // and off each keyboard commit, which are edge events that cannot be cancelled.
-  const conciergeWidthRef = useRef(conciergeWidth);
-  conciergeWidthRef.current = conciergeWidth;
-  useEffect(() => {
-    if (!conciergeWidthDirty.current) return;
-    const id = setTimeout(() => {
-      localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidth));
-    }, 200);
-    return () => clearTimeout(id);
-  }, [conciergeWidth]);
+  // the tree down inside the window — resize the seam (or nudge it with the arrows) and quit within
+  // 200ms and the next launch restores the old width.
   useEffect(() => {
     // ALL THREE TEARDOWN SIGNALS, not just `pagehide` — which is the one this codebase never leans
     // on alone. A native window close in a Tauri/WKWebView destroys the webview outright, and React
     // does not unmount on process teardown, so hanging the quit path on a single event that may
     // never fire loses the width exactly as before. `projectStore` solves the identical problem with
     // this same trio, and `main.tsx` calls `beforeunload` "the pragmatic best-effort 'app closing'
-    // hook in the webview". The effect cleanup covers a real React unmount; all four read the ref,
-    // so whichever fires first writes the latest committed width.
-    //
-    // GUARDED, for the same reason `projectStore` guards its own: `localStorage` can throw (quota,
-    // or disabled entirely), and an unguarded throw here escapes an effect cleanup and an event
-    // handler — turning "we couldn't save a column width" into a broken teardown.
+    // hook in the webview". The effect cleanup covers a real React unmount; all read the ref, so
+    // whichever fires first writes the latest committed width.
     const flush = () => {
-      // EACH WIDTH ANSWERS FOR ITSELF — an instance that never moved this one has nothing to say
-      // about it. See the two refs for the preference a shared flag destroys.
-      if (conciergeWidthDirty.current) {
+      // EACH KEY ANSWERS FOR ITSELF, in its OWN `try`. Sharing one means a throw on the first write
+      // (quota, storage disabled) silently skips the second, so a mode that did not fail loses its
+      // width too — one failure taking out an unrelated write (roborev 55847).
+      for (const count of conciergeDirty.current) {
         try {
-          localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidthRef.current));
+          localStorage.setItem(conciergeWidthKeyFor(count), String(conciergeWidthsRef.current[count]));
         } catch {
           // A width we cannot persist is a cosmetic loss; it must not take the shutdown with it.
         }
-      }
-      if (!leftPairWidthDirty.current) return;
-      // ITS OWN GUARD, not a second statement inside the one above. Sharing a `try` means a throw on
-      // the concierge write (quota, storage disabled) silently skips this one, so the boundary that
-      // did not fail loses its width too — one failure taking out an unrelated write (roborev 55847).
-      try {
-        localStorage.setItem(LEFT_PAIR_WIDTH_KEY, String(leftPairWidthRef.current));
-      } catch {
-        // Same trade as above, independently.
       }
     };
     const onVisibility = () => {
@@ -677,7 +679,8 @@ export function Workspace() {
       flush();
     };
   }, []);
-  const projects = useProjectStore((s) => s.projects);
+  // `projects` is read further up — the concierge's storage key depends on `pairCount`, which is
+  // derived from it, so the width plumbing needs it before this point.
   const currentProjectId = useCurrentProjectId();
   const isMainWindow = useIsMainWindow();
   const currentWindowLabel = useCurrentWindowLabel();
@@ -930,7 +933,8 @@ export function Workspace() {
   // engine/pairs; this reads the map and applies them. See PAIR_COUNT's note for why the second
   // pair could not simply be rendered twice.
   const openProjectIds = useUiStore((s) => s.openProjectIds);
-  const pairAssignment = useUiStore((s) => s.pairAssignment);
+  // `pairAssignment` and `pairCount` are read further up — which key the concierge's width uses is a
+  // function of the count, so the plumbing above needs it before this point.
   const leftProjectIdRaw = useUiStore((s) => s.leftProjectId);
   const prunePairAssignment = useUiStore((s) => s.prunePairAssignment);
   // Drop assignments for projects that are gone. Without this a removed project's entry keeps the
@@ -943,51 +947,40 @@ export function Workspace() {
   // the rest of that chain. The three memos that used to compose it here — open → on this side, twice
   // — went with it: leaving them would have kept a second, unused copy of the exact derivation this
   // consolidation exists to have only once, which is the divergence path it set out to close.
-  // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees
-  // with what the map says is unrepresentable. Counts assignment over ALL projects, not just open
-  // ones: closing a tab is a view operation that deliberately keeps the project's panes and PTYs
-  // alive, so collapsing the pair under it would unmount them.
-  const pairCount = pairCountFor(projects, pairAssignment);
+  // `pairCount` — two pairs or one, derived from the assignment map and never stored — is computed
+  // with the width plumbing above, for the reason given there.
 
-  // ── THE ROW'S THREE CEILINGS, ALL DERIVED FROM ONE LIVE MEASUREMENT ────────────────────────────
+  // ── THE ROW'S ONE CEILING ──────────────────────────────────────────────────────────────────────
   //
-  // Ordered here rather than beside their state because two of them need `pairCount`: a concierge
-  // ceiling that ignored whether a left pair exists is the bug this block closes. There is NO cycle —
-  // `leftPairWidth` (state) → `conciergeMax` → `renderedConciergeWidth` → `leftPairMax` is a chain,
-  // and every link reads a value already settled above it.
-  const conciergeMax = windowAwareMax(
-    CONCIERGE_MAX_WIDTH,
-    windowWidth,
-    conciergeRowReserve(leftPairWidth, pairCount),
-    CONCIERGE_MIN_WIDTH,
-  );
-  // THE PAINT, BOUNDED WITHOUT TOUCHING THE PREFERENCE — the concierge's answer to the CSS `min()`
-  // the two pairs use. It is a derived number rather than a CSS expression because this column's
-  // reserve is expressed against the WINDOW, which `useWindowWidth` hands us exactly; the pairs need
-  // CSS because theirs is a percentage of a flex container no JS here measures. Same guarantee either
-  // way: a window that shrinks under an already-set width brings the paint down on its own, `width`
-  // state is never rewritten, and re-widening restores the width the user chose (roborev 55910).
+  // There used to be three, chained: the left pair's, the concierge's (which depended on it), and the
+  // painted mirror of each. There is one column with a stored width in the row now, so there is one.
+  //
+  // TWO MODES, TWO BUDGETS, and the single-pair one is untouched on purpose. The paired row reserves
+  // both build columns AT THE WIDTHS THEY ACTUALLY HAVE plus both terminals and both rails, which is
+  // what makes the founder's ~1100 and ~1920 targets reachable where a bare 560 blocked them by
+  // 2–3.5×. The single-pair row keeps the exact arithmetic it shipped with.
+  const conciergeMax =
+    pairCount === 2
+      ? conciergePairedMax(windowWidth, buildWidths.left, buildWidths.right, CONCIERGE_MIN_WIDTH)
+      : windowAwareMax(
+          CONCIERGE_MAX_WIDTH,
+          windowWidth,
+          conciergeSingleRowReserve(),
+          CONCIERGE_MIN_WIDTH,
+        );
+  // THE PAINT, BOUNDED WITHOUT TOUCHING THE PREFERENCE. A window that shrinks under an already-set
+  // width brings the paint down on its own, the stored width is never rewritten, and re-widening
+  // restores the width the user chose (roborev 55910). It is also what the pull tab drags FROM: a tab
+  // handed the raw state starts its gesture at a width that is not on screen, going dead for the
+  // difference and collapsing the stored preference on the first pointer-down (roborev 55948).
   const renderedConciergeWidth = Math.min(conciergeWidth, conciergeMax);
-  // CLAMPED AGAINST THE LIVE WINDOW, not just against the hard ceiling. A fixed max lets the pair be
-  // dragged — or RESTORED from localStorage — wider than the window it has to share, which is how a
-  // resize becomes unrecoverable without editing storage (roborev 55847). Reserves the concierge's
-  // RENDERED width, not its stored one: reserving a width the concierge is not actually occupying
-  // over-reserves and costs the left pair room it could have had.
-  const leftPairMax = windowAwareMax(
-    LEFT_PAIR_MAX_WIDTH,
-    windowWidth,
-    leftPairRowReserve(renderedConciergeWidth),
-    LEFT_PAIR_MIN_WIDTH,
-  );
-  // THE SAME SPLIT, ON THE SIBLING SEAM — `renderedConciergeWidth`'s mirror, and it exists for exactly
-  // the same reason (roborev 55966). This pair's PAINT is bounded by the CSS `min()` in `Pair`, and its
-  // GESTURE by `leftPairMax`, but a pull tab handed the raw state drags from a width that is not on
-  // screen. `width > max` is the pair's normal steady state after any window shrink — `useWindowWidth`
-  // is reactive and `leftPairWidth` is deliberately never rewritten — so this is not an edge case:
-  // mount at 1600, drag to the 868 ceiling, resize to 1200, and the tab would start from 868 against a
-  // 548 max, going dead for 320px of travel and collapsing the stored preference on the first
-  // pointer-down. `Pair` still receives the RAW `leftPairWidth`, which is what keeps that preference.
-  const renderedLeftPairWidth = Math.min(leftPairWidth, leftPairMax);
+
+  // PUBLISH IT WHERE THE COLUMN READS IT. The drag writes this same custom property at pointer rate
+  // with no React involvement; this is the other writer — the committed value, written after every
+  // render that changes it. One target, so there is nothing to reconcile and no order to get wrong.
+  useEffect(() => {
+    publishColumnWidthVar(CONCIERGE_WIDTH_VAR, renderedConciergeWidth);
+  }, [renderedConciergeWidth]);
 
   // Each side's selection, validated against what that side actually holds. The RIGHT pair keeps
   // using `selectedProjectId` — that value means "the current project" to the concierge feed,
@@ -1616,16 +1609,10 @@ export function Workspace() {
             way the Sparkle pane is. See PlanBoardSlot. */}
         {pairCount === 2 && (
           <Pair
-            // PINNED, so the concierge's LEFT edge stays where the user put it. See LEFT_PAIR_WIDTH_KEY:
-            // while this was `flex: 1` alongside the right pair, the concierge's single width was the
-            // only adjustable number in the row and every drag of its RIGHT edge moved this one too.
-            width={leftPairWidth}
-            // LIVE, not the constant: the concierge cannot shrink, so the reserve has to track the
-            // width it actually has right now (roborev 55883) — and RENDERED, not stored, so a
-            // concierge the window has already clamped does not bill this pair for space it isn't
-            // using. The SAME expression feeds `leftPairMax` above, which is the whole point: the
-            // gesture and the paint stop at one number (roborev 55897).
-            rowReserve={leftPairRowReserve(renderedConciergeWidth)}
+            // ELASTIC, exactly like the right pair — see `Pair`'s own note. This is the half of the
+            // change that makes the concierge centred: two `flex: 1 1 0` halves divide the row's free
+            // space equally, so the column between them is dead centre for free, at every window
+            // width, with no arithmetic anywhere in this file.
             side="left"
             wired={wired === "left"}
             tabs={
@@ -1669,7 +1656,70 @@ export function Workspace() {
             it, the unbind gesture read every press inside Sparkle — the compose box, Send, the
             thread — as "outside", so patching in and then typing to the agent you just patched
             into dropped the cable on the very first click. */}
+        {/* OUTSIDE `data-concierge-root`, deliberately. `<style>` is `display: none` so it is not a
+            flex ITEM, but it is still a CHILD, and the row's structure is read by position — the box
+            must have a rail immediately either side of it. Keeping this out of that group means
+            nothing has to special-case it. */}
+        <style>{`[data-concierge-box] > section{width:100% !important}`}</style>
         <div data-concierge-root style={{ display: "flex", minHeight: 0 }}>
+        {pairCount === 2 && (
+          <ColumnPullTab
+            // IT OWNS THE CONCIERGE NOW, NOT THE LEFT PAIR — this is "I want to drag out from the
+            // middle". The old rule was "one boundary owns the column on its own left", which made
+            // this seam move the LEFT PAIR: the concierge kept its width and slid sideways as a rigid
+            // block, so no gesture in the app could grow it leftward at all.
+            //
+            // `grows="right"` because the column this seam owns is on its RIGHT, so dragging LEFT —
+            // outward — grows it. `widthPerPx={2}` is the symmetry: the edge moves dx, the column
+            // gains 2·dx, and stays centred. Both seams commit the SAME width, which is why pulling
+            // either one grows both sides.
+            width={renderedConciergeWidth}
+            onWidth={setConciergeWidth}
+            min={CONCIERGE_MIN_WIDTH}
+            max={conciergeMax}
+            grows="right"
+            widthPerPx={2}
+            cssVar={CONCIERGE_WIDTH_VAR}
+            label="Sparkle column"
+            testId="left-pair-pull-tab"
+          />
+        )}
+        {/* ── THE CONCIERGE'S BOX IS OWNED BY THE SHELL, NOT BY THE COLUMN ────────────────────────
+            The column's width has to be paintable WITHOUT a React render, or the drag cannot come
+            off React state — that is the whole point of `--concierge-w`. But `ConciergeColumn` takes
+            its width as a NUMBER and writes it as an inline style, and that file belongs to another
+            worker this pass. An inline style also beats any stylesheet rule on specificity, so the
+            variable cannot simply win.
+
+            So the shell owns the BOX — this div, sized by the variable — and the one rule below
+            neutralises the column's own width so it fills whatever box it is given. `!important` is
+            load-bearing here for exactly the specificity reason above; it is not decoration, and it
+            is scoped to a single element inside a single wrapper.
+
+            THE RAILS ARE SIBLINGS OF THIS BOX, NEVER CHILDREN. The box is the width-bearing element
+            (`width: var(--concierge-w)`, and the rule below makes the column fill it), so anything
+            else inside it is width the column does not get. The left rail WAS inside, and the result
+            was the exact defect this whole change exists to remove: 6px of rail plus a column forced
+            to 100%, neither shrinkable, inside a box of C — so the concierge overflowed by a rail and
+            painted 3px right of true centre, with its last 6px under the right rail (roborev 56086).
+            `cockpitGeometry` models both rails OUTSIDE the concierge; the DOM has to agree.
+
+            THE HONEST FIX is one line in `ConciergeColumn`: accept a CSS length instead of a number,
+            and this whole block plus its rule disappears. Left as a note rather than done, because
+            reaching into a concurrently-owned file to save three lines is how two agents produce the
+            same conflict twice. */}
+        <div
+          data-concierge-box
+          data-testid="concierge-box"
+          style={{
+            flex: "0 0 auto",
+            display: "flex",
+            minWidth: 0,
+            // THE FALLBACK IS THE COMMITTED WIDTH, so the very first paint — before any effect has
+            // run and before any drag — is already correct rather than zero-width.
+            width: `var(${CONCIERGE_WIDTH_VAR}, ${renderedConciergeWidth}px)`,
+          }}
+        >
         {/* THE CONCIERGE'S **LEFT** EDGE — the boundary that had no handle at all, which is the
             "I cannot resize the concierge" report. The column shipped with a single seam on its right,
             so from the left pair's side the concierge was a wall.
@@ -1681,18 +1731,6 @@ export function Workspace() {
             `grows="left"` for the same reason the right seam uses it — dragging right grows the column
             on the left of the boundary. Rendered only with a left pair, since without one this edge is
             the window frame. */}
-        {pairCount === 2 && (
-          <ColumnPullTab
-            // RENDERED, not stored — see `renderedLeftPairWidth`. The gesture origin, the ARIA range
-            // and the paint have to be one number; `Pair` keeps the raw state so the preference lives.
-            width={renderedLeftPairWidth}
-            onWidth={setLeftPairWidth}
-            min={LEFT_PAIR_MIN_WIDTH}
-            max={leftPairMax}
-            label="left pair"
-            testId="left-pair-pull-tab"
-          />
-        )}
         <ConciergeHost
           width={renderedConciergeWidth}
           feed={feed}
@@ -1703,6 +1741,7 @@ export function Workspace() {
           // closed agent's pill has to open it — seeding the query alone would paint nothing.
           onOpenHistory={palette.openPalette}
         />
+        </div>
         {/* THE CONCIERGE BOUNDARY IS DRAGGABLE NOW. This column shipped at a hardcoded 360 with no
             way to move it, while the agent column beside it had a full resize strip — so of the
             shell's two vertical seams, one was adjustable and the other was a wall. Same control,
@@ -1721,8 +1760,15 @@ export function Workspace() {
           onWidth={setConciergeWidth}
           min={CONCIERGE_MIN_WIDTH}
           // WINDOW-AWARE, like every other seam in the row. A bare 560 here let this one column be
-          // dragged over the primary pair on a narrow window — see `conciergeRowReserve`.
+          // dragged over the primary pair on a narrow window — see `conciergeSingleRowReserve` and
+          // `conciergePairedMax`.
           max={conciergeMax}
+          // SYMMETRIC ONLY WHEN THERE ARE TWO EDGES TO BE SYMMETRIC ABOUT. With one pair the concierge
+          // is pinned to the row's left and has no left edge to grow from, so doubling the travel
+          // would just make this seam twice as fast for no reason — and that layout is the one that
+          // must not change.
+          widthPerPx={pairCount === 2 ? 2 : 1}
+          cssVar={CONCIERGE_WIDTH_VAR}
           label="Sparkle column"
           testId="concierge-pull-tab"
         />

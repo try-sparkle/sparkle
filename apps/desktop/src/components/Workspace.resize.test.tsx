@@ -15,7 +15,7 @@
 // So these assert the SIDE EFFECT — the width the concierge column is actually rendered at — and
 // never the precondition that `onWidth` fired.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -86,7 +86,13 @@ vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 vi.mock("./StatusStrip", () => ({ StatusStrip: () => null }));
 vi.mock("./NewCloudAgentDialog", () => ({ NewCloudAgentDialog: () => null }));
 
-import { CONCIERGE_WIDTH_KEY, LEFT_PAIR_WIDTH_KEY, Workspace } from "./Workspace";
+import { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED, Workspace } from "./Workspace";
+// ONLY THE VARIABLE NAME. The geometry helpers were imported here to run the app's rendered numbers
+// through `cockpitGeometry`, which turned out to prove nothing: the model's concierge centre reduces
+// to `windowWidth / 2` algebraically for every input, so restating it at the app level was a
+// pass-by-construction check (roborev 56086). The arithmetic lives in `engine/columnResize.test.ts`;
+// what this file pins is the DOM structure that model assumes — see `assertRowStructure`.
+import { CONCIERGE_WIDTH_VAR } from "../engine/columnResize";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -153,8 +159,17 @@ function grabSeam(clientX: number) {
   fireEvent.mouseEnter(screen.getByTestId("concierge-pull-tab"));
   expect(screen.getByTestId("concierge-pull-tab").getAttribute("data-shown")).toBe("true");
   expect(screen.getByTestId("concierge-pull-tab-tab").style.pointerEvents).toBe("auto");
-  fireEvent.mouseDown(dots(), { button: 0, clientX, buttons: 1 });
+  fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX, buttons: 1 });
 }
+
+/** THE WIDTH THE COLUMN IS PAINTED AT *RIGHT NOW*, including mid-drag.
+ *
+ *  The drag no longer calls `onWidth` per move — it writes this custom property on the root element,
+ *  which is what takes the gesture off React state — so the committed prop on the column is stale
+ *  until release. A case about what the user SEES during a drag has to read this; a case about what
+ *  was COMMITTED reads `conciergeWidth()` after the release. */
+const paintedConciergeWidth = () =>
+  Number(document.documentElement.style.getPropertyValue(CONCIERGE_WIDTH_VAR).replace("px", ""));
 
 /** The same width, read back as the RAW ATTRIBUTE STRING.
  *
@@ -173,8 +188,8 @@ const conciergeWidthAttr = () => screen.getByTestId("concierge").getAttribute("d
  *  is no longer held. */
 function drag(from: number, to: number) {
   grabSeam(from);
-  fireEvent.mouseMove(window, { clientX: to, buttons: 1 });
-  fireEvent.mouseUp(window, { clientX: to });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: to, buttons: 1 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: to });
 }
 
 describe("the concierge seam actually moves the concierge", () => {
@@ -195,16 +210,38 @@ describe("the concierge seam actually moves the concierge", () => {
   });
 
   it("tracks the pointer continuously, not only on release", () => {
-    // A drag that only commits on mouseup reads as a dead control for its whole duration, which is
+    // A drag that only commits on release reads as a dead control for its whole duration, which is
     // indistinguishable from the reported "nothing moves".
+    //
+    // WHAT TRACKS IS THE PAINT, NOT THE STATE, and that is the change. The column follows the pointer
+    // through the CSS variable while React does nothing at all — the measured cost of the old
+    // per-move `setState` was 30 shell re-renders and 1,668ms of jank in a single drag. So this reads
+    // the painted width, and the case below asserts the state was NOT written per move.
     render(<Workspace />);
     const before = conciergeWidth();
     grabSeam(500);
-    fireEvent.mouseMove(window, { clientX: 520, buttons: 1 });
-    expect(conciergeWidth()).toBe(before + 20);
-    fireEvent.mouseMove(window, { clientX: 540, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 520, buttons: 1 });
+    expect(paintedConciergeWidth()).toBe(before + 20);
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 540, buttons: 1 });
+    expect(paintedConciergeWidth()).toBe(before + 40);
+    fireEvent.pointerUp(window, { pointerId: 1, clientX: 540 });
+    // …and the release is what finally moves the React-held width.
     expect(conciergeWidth()).toBe(before + 40);
-    fireEvent.mouseUp(window, { clientX: 540 });
+  });
+
+  it("does NOT write React state per pointer move — the drag is off the render path", () => {
+    // The regression this catches is the one that was measured. `data-width` on the column is the
+    // committed prop, so it must not move until the gesture ends, however far the pointer travels.
+    render(<Workspace />);
+    const before = conciergeWidth();
+    grabSeam(500);
+    for (let x = 505; x <= 560; x += 5) {
+      fireEvent.pointerMove(window, { pointerId: 1, clientX: x, buttons: 1 });
+    }
+    expect(conciergeWidth()).toBe(before); // still the pre-drag value…
+    expect(paintedConciergeWidth()).toBe(before + 60); // …while the paint has tracked all of it
+    fireEvent.pointerUp(window, { pointerId: 1 });
+    expect(conciergeWidth()).toBe(before + 60);
   });
 
   it("stops at the clamp rather than following the pointer past it", () => {
@@ -223,11 +260,12 @@ describe("the concierge seam actually moves the concierge", () => {
     // following the bare cursor — otherwise every later mouse move resizes.
     render(<Workspace />);
     grabSeam(500);
-    fireEvent.mouseMove(window, { clientX: 520, buttons: 1 });
-    const parked = conciergeWidth();
-    fireEvent.mouseMove(window, { clientX: 900, buttons: 0 });
-    fireEvent.mouseMove(window, { clientX: 200, buttons: 0 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 520, buttons: 1 });
+    const parked = paintedConciergeWidth();
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 900, buttons: 0 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 200, buttons: 0 });
     expect(conciergeWidth()).toBe(parked);
+    expect(paintedConciergeWidth()).toBe(parked);
   });
 
   it("keeps the width across a re-render of the shell", () => {
@@ -338,31 +376,95 @@ describe("the seam is reachable in the five-column cockpit", () => {
     expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
     const before = conciergeWidth();
     drag(500, 550);
-    expect(conciergeWidth()).toBe(before + 50);
+    // 2·dx: with a left pair open the concierge is the anchor and grows from both edges at once.
+    expect(conciergeWidth()).toBe(before + 100);
   });
 });
 
-// ── THE CONCIERGE HAS TWO EDGES, AND THEY MOVE INDEPENDENTLY ──────────────────────────────────
+// ── THE CONCIERGE IS THE CENTRED ANCHOR OF THE DOUBLE-PAIR ROW ────────────────────────────────
 //
-// THE REPORT: "I'm still not able to change the width of the concierge… When I change the width on the
-// right side, it doesn't move the left side. When I change the width on the left side, it doesn't move
-// the right side." Two defects in one sentence, and neither is a clamp:
+// THIS BLOCK REPLACES THE ONE THAT PINNED THE OPPOSITE CONTRACT, deliberately. What stood here
+// asserted that dragging the left seam moved the LEFT PAIR by +80 and left the concierge's width
+// untouched — "one boundary owns one column", which made the two edges independent. That was a
+// coherent design and it is the one the founder rejected, because it had two consequences it could
+// not avoid: no gesture grew the concierge leftward at all (it slid sideways as a rigid block — "it
+// drags the whole app"), and the right pair, being the only elastic column, swallowed a 3-display
+// span (`640 + 360` of 5760 left it ~4,700px — "spanning like one and a half displays").
 //
-//   1. The concierge's LEFT edge had NO HANDLE AT ALL. One `ColumnPullTab` was mounted, after the
-//      column, so from the left pair's side the concierge was a wall.
-//   2. The edges were not independent. The concierge stored ONE width and both pairs were `flex: 1`,
-//      so that single width was the only adjustable number in the row: growing it shrank both
-//      neighbours EQUALLY and the column grew about its CENTRE. Drag the right edge, and the left edge
-//      slid left by half the delta on its own.
+// The new contract, in the founder's words: "I basically want to be able to drag out from the
+// middle… make it so that the concierge both sides grow when you pull one side." So BOTH seams own
+// the CONCIERGE, both commit the same width, and each pixel of travel buys two of column.
 //
-// The fix is one boundary owning one column — each seam resizes the column on its own left — so these
-// rows assert the OTHER edge held still, which is the property that was missing. They fail against the
-// pre-change code twice over: `left-pair-pull-tab` does not exist, and `pair-left` has no width to hold.
-const leftPairWidth = () => Number(screen.getByTestId("pair-left").dataset.width);
+// WHAT IS ASSERTED WHERE. jsdom has no layout engine — `min()`/`calc()` never resolve and every
+// `getBoundingClientRect` is zero — so the resulting positions cannot be read off the rendered DOM.
+// The split is:
+//   • `engine/columnResize.test.ts` owns the ARITHMETIC: given the row's numbers, where does every
+//     column land, and is the concierge dead centre.
+//   • This file owns the WIRING: that the app actually renders the inputs that model assumes, and
+//     that a gesture moves the number the model reads.
+// `assertRowStructure()` below is the join between them — it pins the DOM structure the model
+// assumes, which is the only thing that can make the model solve a row the app is not rendering.
+
+const half = (side: "left" | "right") => screen.getByTestId(`pair-${side}`);
+
+/**
+ * THE DOM FACTS THAT DECIDE THE GEOMETRY — asserted here because they are the only half of the
+ * question jsdom can answer, and because getting them wrong is invisible everywhere else.
+ *
+ * THIS REPLACES A SET OF CENTRING ASSERTIONS THAT COULD NOT FAIL. They read
+ * `centreOf(cockpitGeometry({...}), "concierge")` and compared it to `windowWidth / 2` — but the
+ * model defines `x_concierge = half + RAIL` with `half = (W − C − 2·RAIL)/2`, so that centre reduces
+ * to `W/2` ALGEBRAICALLY, for every input, whatever the app rendered. Restating the engine's own
+ * theorem at the app level proved nothing about the app, and it is exactly why a real off-centre
+ * defect sailed through this suite: the left seam rail was rendered INSIDE the width-bearing box, so
+ * the shipped concierge was 3px right of centre with 6px of itself under the right rail, and every
+ * centring assertion here stayed green (roborev 56086).
+ *
+ * The arithmetic belongs to `columnResize.test.ts`, which owns it. What this file must pin is that
+ * the app feeds that model the structure it assumes:
+ *
+ *     [ pair-left: flex 1 1 0 ][ rail ][ concierge box: var(--concierge-w) ][ rail ][ pair-right ]
+ *
+ * Both halves elastic and identical, the box holding ONLY the column, and a rail on each SIDE of the
+ * box rather than inside it. Get any of those wrong and the model is solving a row the app is not
+ * rendering — which is the one failure a shared model can have.
+ */
+function assertRowStructure() {
+  // Equal halves are what centre the concierge. `1 1 0px` — jsdom normalises the basis to a length.
+  expect(half("left").style.flex).toBe("1 1 0px");
+  expect(half("right").style.flex).toBe(half("left").style.flex);
+
+  const root = document.querySelector("[data-concierge-root]")!;
+  const box = screen.getByTestId("concierge-box");
+  // The box is a DIRECT child of the row's concierge group, not nested inside a rail or a wrapper.
+  expect(box.parentElement).toBe(root);
+  // …sized by the variable the drag writes, not by a rendered number.
+  expect((box as HTMLElement).style.width).toContain(`var(${CONCIERGE_WIDTH_VAR}`);
+
+  // THE BOX CONTAINS THE COLUMN AND NOTHING ELSE. Anything else in here is width the column does not
+  // get: a 6px rail inside the box is 6px of overflow and 3px of off-centre.
+  expect(box.querySelector("[data-testid$='-pull-tab']")).toBeNull();
+
+  // A RAIL ON EACH SIDE OF THE BOX. Reading the row's element order is what makes "the concierge is
+  // between its two seams" a fact about the DOM rather than about the model.
+  // Elements only, and nothing that paints nothing: a `<style>` or a hidden node between the box and
+  // its rail would make "a rail either side" read as false for a row that is perfectly correct.
+  const kids = Array.from(root.children).filter(
+    (el) => el.tagName !== "STYLE" && (el as HTMLElement).style.display !== "none",
+  );
+  const boxAt = kids.indexOf(box);
+  expect(boxAt).toBeGreaterThan(0);
+  const isRail = (el: Element | undefined) =>
+    !!el && (el.matches("[data-testid$='-pull-tab']") || !!el.querySelector("[data-testid$='-pull-tab']"));
+  expect(isRail(kids[boxAt - 1])).toBe(true);
+  expect(isRail(kids[boxAt + 1])).toBe(true);
+}
+
 function grabLeftSeam(clientX: number) {
   fireEvent.mouseEnter(screen.getByTestId("left-pair-pull-tab"));
   expect(screen.getByTestId("left-pair-pull-tab").getAttribute("data-shown")).toBe("true");
-  fireEvent.mouseDown(screen.getByTestId("left-pair-pull-tab-dots"), {
+  fireEvent.pointerDown(screen.getByTestId("left-pair-pull-tab-dots"), {
+    pointerId: 1,
     button: 0,
     clientX,
     buttons: 1,
@@ -370,302 +472,262 @@ function grabLeftSeam(clientX: number) {
 }
 function dragLeftSeam(from: number, to: number) {
   grabLeftSeam(from);
-  fireEvent.mouseMove(window, { clientX: to, buttons: 1 });
-  fireEvent.mouseUp(window, { clientX: to });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: to, buttons: 1 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: to });
 }
 
-describe("the concierge's two edges are independently draggable", () => {
-  // A REALISTIC WINDOW, stated rather than inherited. jsdom defaults to 1024px, where the left pair's
-  // window-aware ceiling is genuinely 372 — the clamp doing its job — so absolute widths asserted
-  // below would be measuring the clamp instead of the drag. 1600 is a normal laptop; the narrow case
-  // gets its own row, at the 900px minimum `tauri.conf.json` allows.
+describe("the concierge is the centred anchor in double mode", () => {
+  // A REALISTIC WINDOW, stated rather than inherited: jsdom defaults to 1024, which cannot seat five
+  // columns at their minimums, so the concierge's window-aware ceiling correctly pins it at 280 and
+  // every absolute assertion would be measuring the clamp instead of the gesture.
   const realWidth = window.innerWidth;
   beforeEach(() => {
-    Object.defineProperty(window, "innerWidth", { value: 1600, configurable: true });
+    Object.defineProperty(window, "innerWidth", { value: 2560, configurable: true });
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
   });
   afterEach(() => {
     Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    document.documentElement.removeAttribute("style");
   });
 
   it("gives the concierge a handle on BOTH sides once the left pair is open", () => {
     render(<Workspace />);
     expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
-    // The right seam has always been here; the left one is what the report was missing.
     expect(screen.getByTestId("concierge-pull-tab")).toBeTruthy();
     expect(screen.getByTestId("left-pair-pull-tab")).toBeTruthy();
   });
 
-  it("dragging the LEFT edge moves it and leaves the concierge's width alone", () => {
+  it("renders the structure the centring depends on — equal halves, a rail on EACH SIDE of the box", () => {
     render(<Workspace />);
-    const conciergeBefore = conciergeWidth();
-    const leftBefore = leftPairWidth();
-
-    dragLeftSeam(500, 580);
-
-    // The edge the user grabbed moved…
-    expect(leftPairWidth()).toBe(leftBefore + 80);
-    // …and the concierge's own width did NOT, which is the independence claim. Under the single-width
-    // model there was no left handle to grab at all, so this row could not even run.
-    expect(conciergeWidth()).toBe(conciergeBefore);
+    assertRowStructure();
   });
 
-  it("dragging the RIGHT edge changes the width and leaves the LEFT edge where it was", () => {
+  // ── EITHER EDGE, OUT BY dx → +2·dx, STILL CENTRED ────────────────────────────────────────────
+  it("grows the concierge by 2·dx when the RIGHT edge is pulled outward, and keeps it centred", () => {
     render(<Workspace />);
-    const conciergeBefore = conciergeWidth();
-    const leftBefore = leftPairWidth();
-    // THE PRECONDITION, WITHOUT WHICH THIS ROW IS VACUOUS — and it was, in the first version. Against
-    // the pre-change code `pair-left` carries no inline width, so the reader returns 0 both before and
-    // after and "the left edge did not move" is trivially true. Measured: the row passed against
-    // origin/main while the other three reddened. A pinned width is a POSITIVE number, so requiring
-    // that makes the row fail when the mechanism is absent rather than when the bug is.
-    expect(leftBefore).toBeGreaterThan(0);
-
-    drag(500, 570);
-
-    expect(conciergeWidth()).toBe(conciergeBefore + 70);
-    // THE ROW THAT PINS THE FIX. With both pairs `flex: 1` the left pair absorbed half of every such
-    // drag, so the concierge's left edge moved whenever its right edge did. Pinning the left pair is
-    // what takes it out of that negotiation.
-    expect(leftPairWidth()).toBe(leftBefore);
+    const before = conciergeWidth();
+    drag(500, 560); // 60px of travel
+    expect(conciergeWidth()).toBe(before + 120);
+    assertRowStructure();
   });
 
-  // ── THE NARROW WINDOW, which the first version of this change broke outright ────────────────
+  it("grows the SAME width by 2·dx when the LEFT edge is pulled outward", () => {
+    // THE ROW THAT INVERTS THE OLD CONTRACT. This used to assert `pair-left` gained 80 and the
+    // concierge's width was untouched; now the left seam owns the concierge, outward is LEFT, and
+    // there is no left-pair width to move.
+    render(<Workspace />);
+    const before = conciergeWidth();
+    dragLeftSeam(500, 440); // 60px outward, in the other direction
+    expect(conciergeWidth()).toBe(before + 120);
+    assertRowStructure();
+  });
+
+  // ── "TAKES dx FROM EACH TERMINAL" AND "MOVES BOTH SEAMS" LIVE IN THE ENGINE SUITE ──────────
   //
-  // Pinning the left pair with `flex: 0 0 auto` made the row's non-shrinkable width
-  // 640 + 6 + 360 + 6 = 1012px at the defaults, while `tauri.conf.json` allows a 900px window. Below
-  // ~1012 the PRIMARY pair — build column and terminal — was squeezed to zero and clipped away by
-  // `body { overflow: hidden }`, with no scroll to reach it. A resize feature that can evict the pane
-  // the user actually works in is worse than the wall it replaced (roborev 55847).
-  it("YIELDS instead of evicting the primary pair — pinned is not unshrinkable", () => {
+  // They were here, computed through `cockpitGeometry` from the painted width — and both reduce to
+  // `half` shifting by −dx, which is arithmetic the model owns and this file cannot independently
+  // confirm. `columnResize.test.ts` asserts them against the model directly; what remains here is
+  // the part that is genuinely about the app: the width a gesture commits, and the structure the
+  // model is handed.
+
+  it("wires the concierge's box to the live variable, not to a rendered number", () => {
+    // The mechanism behind every "painted" assertion above: the box is sized by the custom property
+    // the drag writes. A box given a plain number would make the drag dead until release.
     render(<Workspace />);
-    const left = screen.getByTestId("pair-left");
-    // Shrink 1, so the pair gives way under real pressure rather than pushing its neighbour off-screen.
-    expect(left.style.flex).toBe("0 1 auto");
-    // …and the paint is clamped against the LIVE row, so an already-set width cannot survive a window
-    // that shrank under it (roborev 55869).
-    expect(left.style.width).toContain("min(");
-    expect(left.style.width).toContain("calc(100% -");
-    // …but not to nothing: it still has to hold a build column and a terminal.
-    expect(left.style.minWidth).toBe("280px");
+    expect(screen.getByTestId("concierge-box").style.width).toContain(`var(${CONCIERGE_WIDTH_VAR}`);
   });
 
-  it("lowers the left pair's CEILING on a window that cannot afford it", () => {
-    // 900 is the narrowest window tauri.conf.json permits. Reserve is concierge-min + both rails + a
-    // primary pair worth having (280 + 12 + 360 = 652), so 900 leaves 248 — below the pair's own 320
-    // minimum, and the ceiling floors there rather than inverting the range.
-    const realWidth = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
-    try {
-      localStorage.setItem(LEFT_PAIR_WIDTH_KEY, "1200");
-      render(<Workspace />);
-      // The persisted 1200 is REJECTED rather than restored onto a window that cannot show it — which
-      // is what would otherwise put the seam's own handle past the viewport edge with no way back.
-      expect(leftPairWidth()).toBeLessThanOrEqual(320);
-    } finally {
-      Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
-    }
-  });
-
-  // ── THE NEW PERSISTED STATE, which shipped with no coverage at all ──────────────────────────
+  // ── THE ROW LISTENS TO THE BUILD COLUMNS ─────────────────────────────────────────────────────
   //
-  // `LEFT_PAIR_WIDTH_KEY` had no round-trip, no restore and no out-of-range rejection, while the
-  // concierge width beside it has a full suite for exactly those paths. A regression in the write, the
-  // teardown flush or the range guard would have been silent (roborev 55847).
-  it("persists the left pair's width once the drag settles, and reads it back", async () => {
-    const { unmount } = render(<Workspace />);
-    dragLeftSeam(500, 560);
-    const dragged = leftPairWidth();
-    expect(dragged).toBe(700);
-    await waitFor(() => expect(localStorage.getItem(LEFT_PAIR_WIDTH_KEY)).toBe(String(dragged)));
-    unmount();
-
+  // The paired ceiling reserves both builders at the widths they ACTUALLY have. That is only as good
+  // as the mirror it reads, and the mirror is fed by `sparkle:build-width`. `AgentSidebar` is stubbed
+  // in this suite, so the EMITTER is pinned in `AgentSidebar.pullTabs.test.tsx` ("announces ON
+  // MOUNT"); this is the other half — that the shell acts on what it hears.
+  it("LOWERS the concierge's ceiling when a build column announces a wider width", () => {
     render(<Workspace />);
-    expect(leftPairWidth()).toBe(dragged);
-  });
-
-  it("ignores a persisted left-pair width outside the range rather than restoring it", () => {
-    localStorage.setItem(LEFT_PAIR_WIDTH_KEY, "12");
-    render(<Workspace />);
-    // The default, not the stored nonsense — a stale entry must not wedge the pair off-screen.
-    expect(leftPairWidth()).toBe(640);
-  });
-
-  it("flushes the left pair's width on teardown, independently of the concierge's", () => {
-    const { unmount } = render(<Workspace />);
-    dragLeftSeam(500, 540);
-    const dragged = leftPairWidth();
-    // Unmount INSIDE the debounce window: a trailing timer whose cleanup only cancels would lose it.
-    unmount();
-    expect(localStorage.getItem(LEFT_PAIR_WIDTH_KEY)).toBe(String(dragged));
-  });
-
-  // ONE DIRTY FLAG PER WIDTH, asserted — collapse the two refs back into one and this is what reddens.
-  // A shared flag makes moving EITHER width persist BOTH, which destroys a stored preference the local
-  // window was too small to seed: 900 comes back as 628, and dragging only the concierge writes the 628
-  // over it (roborev 55883/55897). Nothing covered it, because every other persistence row drags the
-  // width it then reads.
-  it("dragging ONLY the concierge does not persist the left pair's width", () => {
-    // A preference set on a bigger display, which this window cannot seed at full value.
-    localStorage.setItem(LEFT_PAIR_WIDTH_KEY, "1300");
-    const { unmount } = render(<Workspace />);
-    // The seeded state is lower than the stored preference — the precondition that makes the clobber
-    // possible at all.
-    expect(leftPairWidth()).toBeLessThan(1300);
-
-    drag(500, 540); // the CONCIERGE seam only
-    unmount();
-
-    // The preference SURVIVES. With one shared ref this reads the seeded-down value instead.
-    expect(localStorage.getItem(LEFT_PAIR_WIDTH_KEY)).toBe("1300");
-  });
-
-  // THE RESERVE TRACKS THE LIVE CONCIERGE, asserted against a WIDENED concierge — at the default width
-  // the old constant and the live expression are numerically identical (652), so a row taken at
-  // defaults would be vacuous no matter how exact it looked (roborev 55897).
-  it("reserves the concierge's LIVE width, not its minimum", () => {
-    render(<Workspace />);
-    drag(500, 700); // widen the concierge well past its default
-    const concierge = conciergeWidth();
-    expect(concierge).toBeGreaterThan(360);
-
-    // The PAINT bound follows the width the concierge actually has. 360 — not `PINNED_PAIR_MIN_WIDTH`
-    // — is what the primary pair is owed; borrowing the pinned pair's 280 squeezed it by 80px in a way
-    // no default-width row could see, because both compositions total 652 at a 360px concierge
-    // (roborev 55910).
-    const expected = concierge + 12 + 360;
-    expect(screen.getByTestId("pair-left").style.width).toContain(`${expected}px`);
-  });
-
-  // THE GESTURE BOUND, ASSERTED SEPARATELY FROM THE PAINT — and this is the row the previous pass was
-  // missing. The paint reserve had tracked the live concierge since before that commit, so the row
-  // above stayed green while the DRAG ceiling was still on the old constant: revert only `leftPairMax`
-  // and nothing reddened. A bound is only as good as the places that agree on it, and each place needs
-  // its own assertion (roborev 55910).
-  it("stops the left seam at the SAME bound the paint uses, once the concierge is widened", () => {
-    render(<Workspace />);
-    drag(500, 700); // concierge to its ceiling
-    const concierge = conciergeWidth();
-    const bound = 1600 - (concierge + 12 + 360);
-
-    // Shove the left seam far past that bound — the gesture must stop exactly where the paint would.
-    dragLeftSeam(500, 5000);
-
-    expect(leftPairWidth()).toBe(bound);
-    // …and the OLD constant-based ceiling would have permitted 948, so this is not a coincidence of
-    // the pair simply refusing to move.
-    expect(leftPairWidth()).toBeLessThan(948);
-  });
-
-  // THE CONCIERGE'S OWN EDGE IS BOUNDED TOO — the one seam in the row that answered to nobody. With a
-  // bare 560 ceiling, a 900px window let this column be dragged over the primary pair entirely: left
-  // pair yields to 280, and `900 - 280 - 12 - 560 = 48px` is left for a build column that paints at its
-  // 160px floor, putting its pull tab past an `overflow: hidden` viewport (roborev 55910).
-  it("lowers the CONCIERGE's ceiling on a window that cannot afford it", () => {
-    const realWidth = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
-    try {
-      const { unmount } = render(<Workspace />);
-      expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
-      // Drag the right seam as far as it will go. Against the bare 560 constant this reached 560.
-      drag(500, 5000);
-      const pinned = conciergeWidth();
-      const leftPair = leftPairWidth(); // read BEFORE teardown — the DOM is gone after `unmount()`
-
-      // THE GESTURE BOUND, READ WHERE IT IS ACTUALLY DISTINGUISHABLE FROM THE PAINT — and the first
-      // version of this row got that wrong, which is worth recording because it is the same mistake
-      // finding #1 was about. `data-width` carries the RENDERED width, and the render clamp pins that
-      // to 280 whether or not the drag was bounded — so asserting it passed against the bare 560 and
-      // proved nothing. What separates the two is the value that gets PERSISTED: the gesture commits
-      // raw state, so an unbounded drag stores 560 — a width the layout will never paint, restored on
-      // the next launch as a preference that lies (roborev 55897's exact harm).
-      unmount();
-      expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("280");
-      // WHAT THE BOUND ACTUALLY PROMISES, stated exactly. 900 cannot seat five columns at their
-      // minimums — `320 + 6 + 280 + 6 + 360 = 972` — so the promise is NOT "everyone gets their
-      // minimum"; it is that this seam's ceiling collapses to the column's own floor instead of
-      // staying at 560 and eating the difference out of the primary pair. `windowAwareMax` floors at
-      // `min` rather than inverting the range, and that floor is what shows up here.
-      expect(pinned).toBe(280);
-      // The primary pair is left something a build column can paint into. Against the bare 560 this
-      // was 48px — below the column's own 160 floor, so it overflowed an `overflow: hidden` viewport
-      // and took its pull tab off-screen with it. Now it clears that floor.
-      expect(900 - leftPair - 12 - pinned).toBeGreaterThan(160);
-    } finally {
-      Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
-    }
-  });
-
-  // ── THE PAINT CLAMP, AND THE GESTURE THAT HAS TO START FROM IT ──────────────────────────────
-  //
-  // A stored width the local window cannot honour is the only state where `conciergeWidth` (stored)
-  // and `renderedConciergeWidth` (painted) DIVERGE, so it is the only state in which either of these
-  // two fixes is observable. Every other row in this file drives the state to the ceiling with a drag
-  // FIRST and then asserts, which makes the clamp invisible (roborev 55948). 1200px with a left pair
-  // open: reserve is `320 + 12 + 360 = 692`, so the ceiling is 508 while storage still holds 560.
-  function renderWithOversizedStoredConcierge() {
-    localStorage.setItem(CONCIERGE_WIDTH_KEY, "560");
-    Object.defineProperty(window, "innerWidth", { value: 1200, configurable: true });
-    const r = render(<Workspace />);
-    expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
-    return r;
-  }
-
-  it("PAINTS the concierge at the window's ceiling while leaving the stored width alone", () => {
-    renderWithOversizedStoredConcierge();
-
-    // The column is on screen at the ceiling, not at the 560 it was asked for…
-    expect(conciergeWidth()).toBe(508);
-    // …and the preference is UNTOUCHED, which is the half a state-reconciling clamp would have lost.
-    // Re-open on a display that can afford 560 and the user gets 560 back.
-    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("560");
-  });
-
-  it("starts the seam's drag from the PAINTED width, not the stored one", () => {
-    renderWithOversizedStoredConcierge();
-
-    // Drag inward 10px. The seam must track the pointer from 508.
-    drag(500, 490);
-
-    // 498 = 508 - 10. Handed the stored 560 instead, `clampWidth(560 - 10)` pins to the 508 ceiling:
-    // the first 52px of travel move nothing, and the stored preference collapses on the first
-    // pointer-down rather than on a drag the user meant.
-    expect(conciergeWidth()).toBe(498);
-  });
-
-  // THE SAME TWO PROPERTIES ON THE SIBLING SEAM. The left pair's stored/painted split is reached by a
-  // WINDOW RESIZE rather than by a restore — unlike the concierge, its read-through rejects an
-  // out-of-range stored width at mount, so state can only outgrow the ceiling after `useWindowWidth`
-  // reports a smaller window (roborev 55966).
-  it("keeps the LEFT pair's stored width but drags it from the PAINTED one after a shrink", () => {
-    render(<Workspace />);
-    dragLeftSeam(500, 5000); // to the ceiling this window allows
-    const wide = leftPairWidth();
-    expect(wide).toBe(868); // 1600 - (360 concierge + 12 rails + 360 primary pair)
+    // Where the seam stops with the builders at their default 220.
+    drag(500, 9000);
+    const ceilingAtDefault = conciergeWidth();
+    expect(ceilingAtDefault).toBeGreaterThan(360);
 
     act(() => {
-      Object.defineProperty(window, "innerWidth", { value: 1200, configurable: true });
-      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(
+        new CustomEvent("sparkle:build-width", { detail: { side: "left", width: 800 } }),
+      );
     });
 
-    // THE PREFERENCE SURVIVES THE SHRINK. `Pair` still gets the raw state, and the CSS `min()` brings
-    // the paint down without rewriting it — so re-widening the window gives 868 back.
-    expect(leftPairWidth()).toBe(wide);
-
-    // …and the seam now drags from the width that is actually on screen. At 1200 the concierge floors
-    // at 280, so the pair's ceiling is `1200 - (280 + 12 + 360) = 548`.
-    dragLeftSeam(500, 490); // 10px inward
-    // 538 = 548 - 10. Handed the stored 868, `clampWidth(868 - 10)` pins to 548: the seam is dead for
-    // 320px of outward travel and the stored 868 collapses on the first pointer-down.
-    expect(leftPairWidth()).toBe(538);
+    // The same shove now stops lower, by exactly twice the extra width the builder claimed — the
+    // reserve is `2 * max(left, right)`, and both halves are equal so both pay for the wider one.
+    drag(500, 9000);
+    expect(conciergeWidth()).toBe(ceilingAtDefault - 2 * (800 - 220));
   });
 
-  it("the left pair is PINNED rather than elastic, which is the mechanism", () => {
+  it("ignores an announcement that does not change anything", () => {
+    // The event fires on every sidebar mount and width change, including re-announcements of the
+    // same number. Those must not move the ceiling — or a remount would look like a resize.
     render(<Workspace />);
-    // Stated as its own row so the two independence rows above cannot be read as coincidence: the
-    // right pair stays elastic on purpose (something must absorb the give — see engine/columnResize).
-    expect(screen.getByTestId("pair-left").getAttribute("data-width-mode")).toBe("pinned");
-    expect(screen.getByTestId("pair-right").getAttribute("data-width-mode")).toBe("elastic");
+    drag(500, 9000);
+    const before = conciergeWidth();
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent("sparkle:build-width", { detail: { side: "left", width: 220 } }),
+      );
+    });
+    drag(500, 9000);
+    expect(conciergeWidth()).toBe(before);
+  });
+
+  // ── THE STORED WIDTH IS KEYED BY PAIR COUNT ──────────────────────────────────────────────────
+  it("writes the PAIRED key and leaves the single-pair preference alone", async () => {
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "360");
+    const { unmount } = render(<Workspace />);
+    drag(500, 560);
+    const set = conciergeWidth();
+    unmount();
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe(String(set));
+    // The single-pair width is untouched — which is the whole reason the keys were split. Sharing one
+    // means closing the left pair leaves a concierge sized for a 3-display cockpit.
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("360");
+  });
+
+  it("SEEDS the paired width from the single-pair one on first use", () => {
+    // An existing install must not snap to a default the moment it opens a left pair.
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "420");
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(420);
+  });
+
+  it("restores the paired width on the next launch, independently of the single one", () => {
+    const first = render(<Workspace />);
+    drag(500, 600);
+    const set = conciergeWidth();
+    first.unmount();
+    render(<Workspace />);
+    expect(conciergeWidth()).toBe(set);
+  });
+});
+
+// ── THE FOUNDER'S TWO TARGET LAYOUTS, END TO END ──────────────────────────────────────────────
+//
+// (A) concierge + both build columns on the centre monitor of a 3×1920 span;
+// (B) concierge filling the centre monitor, build columns on the outer ones.
+// `CONCIERGE_MAX_WIDTH = 560` blocked both by 2–3.5×. The engine suite proves the geometry delivers
+// them; these prove the APP does — that the ceiling permits the drag and the width round-trips.
+describe("the 5760px target layouts are reachable in the running shell", () => {
+  const realWidth = window.innerWidth;
+  beforeEach(() => {
+    Object.defineProperty(window, "innerWidth", { value: 5760, configurable: true });
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+  });
+  afterEach(() => {
+    Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    document.documentElement.removeAttribute("style");
+  });
+
+  for (const [name, target] of [
+    ["A — concierge + both builders on the centre monitor", 1100],
+    ["B — concierge fills the centre monitor", 1920],
+  ] as const) {
+    it(`reaches ${name}`, () => {
+      render(<Workspace />);
+      const start = conciergeWidth();
+      // Travel is HALF the width wanted, because the column grows from both edges.
+      drag(500, 500 + (target - start) / 2);
+      // NOT CLAMPED AWAY — the assertion the old 560 ceiling fails.
+      expect(conciergeWidth()).toBe(target);
+      expect(paintedConciergeWidth()).toBe(target);
+      assertRowStructure();
+    });
+
+    it(`round-trips ${name} through localStorage`, () => {
+      const first = render(<Workspace />);
+      const start = conciergeWidth();
+      drag(500, 500 + (target - start) / 2);
+      expect(conciergeWidth()).toBe(target);
+      first.unmount();
+      expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe(String(target));
+
+      render(<Workspace />);
+      expect(conciergeWidth()).toBe(target);
+      assertRowStructure();
+    });
+  }
+
+  it("still collapses to the 280 floor on a window too narrow to seat the row", () => {
+    // The small-window behaviour is unchanged: the ceiling floors at the column's own minimum rather
+    // than inverting the range.
+    Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "1920");
+    render(<Workspace />);
+    // The stored 1920 is KEPT (re-docking to the big display restores it) but PAINTED at the floor.
+    expect(paintedConciergeWidth()).toBe(280);
+  });
+
+  it("keeps the width the window cannot show, and restores it when the window can again", () => {
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "1920");
+    const { unmount } = render(<Workspace />);
+    expect(conciergeWidth()).toBe(1920);
+    unmount();
+    // A trip through a laptop-sized window must not destroy the preference.
+    Object.defineProperty(window, "innerWidth", { value: 1280, configurable: true });
+    const small = render(<Workspace />);
+    expect(paintedConciergeWidth()).toBeLessThan(1920);
+    small.unmount();
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("1920");
+  });
+});
+
+// ── SINGLE MODE IS UNCHANGED ──────────────────────────────────────────────────────────────────
+//
+// "Single mode is working fine." Every rule above is gated on `pairCount === 2`, and these are what
+// hold that gate up: one seam, 1:1 travel, its own storage key, its own 560 ceiling.
+describe("the single-pair shell is untouched by the anchor model", () => {
+  const realWidth = window.innerWidth;
+  beforeEach(() => {
+    Object.defineProperty(window, "innerWidth", { value: 2560, configurable: true });
+  });
+  afterEach(() => {
+    Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    document.documentElement.removeAttribute("style");
+  });
+
+  it("mounts ONE seam — there is no left edge to grow from", () => {
+    render(<Workspace />);
+    expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("1");
+    expect(screen.getByTestId("concierge-pull-tab")).toBeTruthy();
+    expect(screen.queryByTestId("left-pair-pull-tab")).toBeNull();
+  });
+
+  it("moves 1:1 with the pointer, NOT 2·dx", () => {
+    // The symmetric factor is the double-mode rule. Applying it here would make the one seam this
+    // layout has twice as fast for no reason.
+    render(<Workspace />);
+    const before = conciergeWidth();
+    drag(500, 560);
+    expect(conciergeWidth()).toBe(before + 60);
+  });
+
+  it("keeps its own 560 ceiling and its own storage key", () => {
+    const { unmount } = render(<Workspace />);
+    drag(500, 5000);
+    expect(conciergeWidth()).toBe(560); // the single-pair hard max, unchanged
+    unmount();
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("560");
+    // …and nothing was written under the paired key by a single-pair drag.
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBeNull();
+  });
+
+  it("leaves the concierge at the row's LEFT — one rail, and it is on the far side", () => {
+    render(<Workspace />);
+    const root = document.querySelector("[data-concierge-root]")!;
+    const box = screen.getByTestId("concierge-box");
+    const kids = Array.from(root.children).filter(
+      (el) => el.tagName !== "STYLE" && (el as HTMLElement).style.display !== "none",
+    );
+    // The box leads its group: nothing is rendered before it, so there is no left seam and the
+    // column cannot be centred by construction.
+    expect(kids.indexOf(box)).toBe(0);
+    expect(root.querySelectorAll("[data-testid$='-pull-tab']")).toHaveLength(1);
   });
 });
 
@@ -707,8 +769,8 @@ describe("the shell reports no circuit when the far end is empty", () => {
 /** Drag from `clientX` to `clientX + dx` and release. */
 function dragSeamBy(dx: number, from = 500) {
   grabSeam(from);
-  fireEvent.mouseMove(window, { clientX: from + dx, buttons: 1 });
-  fireEvent.mouseUp(window);
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: from + dx, buttons: 1 });
+  fireEvent.pointerUp(window, { pointerId: 1 });
 }
 
 /**

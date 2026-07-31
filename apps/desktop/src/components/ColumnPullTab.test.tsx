@@ -38,6 +38,35 @@ function setup(props: Partial<Parameters<typeof ColumnPullTab>[0]> = {}) {
   return { onWidth, onOverlayToggle };
 }
 
+// ── DRIVING A DRAG, NOW THAT IT IS A POINTER GESTURE THAT COMMITS ONCE ─────────────────────────
+//
+// Two things changed and both show up in every case below.
+//
+//  • POINTER events, not mouse. The seam takes `setPointerCapture` so a release outside the window
+//    is still delivered — a column drag reaches the window edge constantly, and a lost release used
+//    to leave the column following the bare cursor.
+//  • The width is committed ONCE, on release. Moves paint a CSS variable instead of calling
+//    `onWidth`, because calling it per move re-rendered the whole shell at pointer rate (30
+//    `Workspace` renders and 1,668ms of jank in a measured drag). So a case that wants to know what
+//    the user SEES mid-drag reads the variable, and one that wants to know what was COMMITTED reads
+//    `onWidth` after the release.
+const VAR = "--test-col-w";
+const painted = () => document.documentElement.style.getPropertyValue(VAR);
+
+function press(el: Element, clientX: number, opts: Record<string, unknown> = {}) {
+  fireEvent.pointerDown(el, { pointerId: 1, button: 0, buttons: 1, clientX, ...opts });
+}
+function moveTo(clientX: number, opts: Record<string, unknown> = {}) {
+  fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX, ...opts });
+}
+function release() {
+  fireEvent.pointerUp(window, { pointerId: 1 });
+}
+
+afterEach(() => {
+  document.documentElement.removeAttribute("style");
+});
+
 describe("ColumnPullTab — one tab, two zones", () => {
   it("is hidden at rest and revealed on hover", () => {
     // The founder's note verbatim: "It should also only show on hover. It's showing all the time
@@ -90,9 +119,10 @@ describe("ColumnPullTab — one tab, two zones", () => {
 
   it("stays visible THROUGH a drag, when the pointer has left the tab", () => {
     setup();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
+    press(dots(), 500);
     fireEvent.mouseLeave(root());
     expect(tab().style.opacity).toBe("1");
+    release();
   });
 
   it("carries BOTH gestures in one tab — a chevron zone and a six-dot zone", () => {
@@ -172,22 +202,49 @@ describe("ColumnPullTab — the anatomy the founder asked for", () => {
 });
 
 describe("ColumnPullTab — the dots resize", () => {
-  it("drags as a DELTA from the mousedown point, not a jump to the cursor", () => {
-    const { onWidth } = setup();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 540, buttons: 1 });
-    expect(onWidth).toHaveBeenLastCalledWith(400);
-    fireEvent.mouseUp(window);
+  it("drags as a DELTA from the press point, not a jump to the cursor", () => {
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    // What the user SEES: the column is already 40px wider, painted with no React work.
+    expect(painted()).toBe("400px");
+    release();
+    // What was COMMITTED: exactly one call, with the width the drag settled on.
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(400);
   });
 
-  it("clamps at both ends", () => {
-    const { onWidth } = setup();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 9000, buttons: 1 });
-    expect(onWidth).toHaveBeenLastCalledWith(560);
-    fireEvent.mouseMove(window, { clientX: -9000, buttons: 1 });
-    expect(onWidth).toHaveBeenLastCalledWith(280);
-    fireEvent.mouseUp(window);
+  it("does NOT touch React state per move — one commit per gesture, however far it travels", () => {
+    // The regression this exists to catch is the one that was measured: `onWidth` on every pointer
+    // event re-rendered the shell at pointer rate. Ten moves must still be one commit.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    for (let x = 505; x <= 550; x += 5) moveTo(x);
+    expect(onWidth).not.toHaveBeenCalled();
+    expect(painted()).toBe("410px");
+    release();
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(410);
+  });
+
+  it("commits NOTHING when the gesture never moved — a press on the dots is a click", () => {
+    // Committing here would mark the width dirty and persist a value the user never chose.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    release();
+    expect(onWidth).not.toHaveBeenCalled();
+  });
+
+  it("clamps at both ends, live, and commits the clamped width", () => {
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(9000);
+    expect(painted()).toBe("560px");
+    moveTo(-9000);
+    expect(painted()).toBe("280px");
+    release();
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(280);
   });
 
   it("nudges with the arrows, larger with Shift, and is a real separator", () => {
@@ -203,19 +260,21 @@ describe("ColumnPullTab — the dots resize", () => {
   it("runs the gesture BACKWARDS for a column on the right of its seam", () => {
     // The second boundary can own the column on either side. `grows:"right"` means dragging LEFT
     // grows it — get this wrong and one of the two tabs resizes the wrong way round.
-    const { onWidth } = setup({ grows: "right" });
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 460, buttons: 1 });
+    const { onWidth } = setup({ grows: "right", cssVar: VAR });
+    press(dots(), 500);
+    moveTo(460);
+    expect(painted()).toBe("400px");
+    release();
     expect(onWidth).toHaveBeenLastCalledWith(400);
-    fireEvent.mouseUp(window);
     fireEvent.keyDown(dots(), { key: "ArrowLeft" });
     expect(onWidth).toHaveBeenLastCalledWith(368);
   });
 
   it("ignores a non-primary button", () => {
     const { onWidth } = setup();
-    fireEvent.mouseDown(dots(), { button: 2, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 600, buttons: 1 });
+    press(dots(), 500, { button: 2 });
+    moveTo(600);
+    release();
     expect(onWidth).not.toHaveBeenCalled();
   });
 });
@@ -261,23 +320,23 @@ describe("ColumnPullTab — two boundaries, two independent tabs", () => {
   it("each drags its OWN column, from its own width and against its own clamps", () => {
     const { onLeft, onRight } = pair();
 
-    fireEvent.mouseDown(screen.getByTestId("left-tab-dots"), { button: 0, clientX: 100 });
-    fireEvent.mouseMove(window, { clientX: 140, buttons: 1 });
-    fireEvent.mouseUp(window);
+    press(screen.getByTestId("left-tab-dots"), 100);
+    moveTo(140);
+    release();
     expect(onLeft).toHaveBeenLastCalledWith(400); // 360 + 40
     expect(onRight).not.toHaveBeenCalled();
 
-    fireEvent.mouseDown(screen.getByTestId("right-tab-dots"), { button: 0, clientX: 800 });
-    fireEvent.mouseMove(window, { clientX: 830, buttons: 1 });
-    fireEvent.mouseUp(window);
+    press(screen.getByTestId("right-tab-dots"), 800);
+    moveTo(830);
+    release();
     expect(onRight).toHaveBeenLastCalledWith(270); // 240 + 30, its own base width
     expect(onLeft).toHaveBeenCalledTimes(1); // and the first tab did not move again
 
     // Its own clamps, not the other's.
-    fireEvent.mouseDown(screen.getByTestId("right-tab-dots"), { button: 0, clientX: 800 });
-    fireEvent.mouseMove(window, { clientX: 9000, buttons: 1 });
+    press(screen.getByTestId("right-tab-dots"), 800);
+    moveTo(9000);
+    release();
     expect(onRight).toHaveBeenLastCalledWith(480);
-    fireEvent.mouseUp(window);
   });
 
   it("keeps their accessible names apart", () => {
@@ -306,8 +365,9 @@ describe("ColumnPullTab — the chevron overlays, and the dots snap back", () =>
     fireEvent.click(dots());
     expect(onOverlayToggle).toHaveBeenCalledTimes(1);
     // …and it must not try to move a boundary that is not on screen.
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 600, buttons: 1 });
+    press(dots(), 500);
+    moveTo(600);
+    release();
     expect(onWidth).not.toHaveBeenCalled();
     fireEvent.keyDown(dots(), { key: "ArrowRight" });
     expect(onWidth).not.toHaveBeenCalled();
@@ -424,17 +484,32 @@ describe("the seam never swallows a click meant for a column — roborev 54691 /
     expect(tab.style.pointerEvents).toBe("auto");
   });
 
-  it("abandons a drag whose release went missing", () => {
-    // If the mouseup is lost, `dragging` stays true and the column follows the bare cursor across
-    // the screen until the next click commits a width. `buttons === 0` ends it.
+  it("abandons a drag whose release went missing, keeping the width the user last saw", () => {
+    // If the release is lost — the pointer leaves the window, a native drag steals it, the button
+    // goes up over a surface that swallows the event — the column must not follow the bare cursor
+    // across the screen. `buttons === 0` is how we find out it is over.
+    //
+    // THIS CASE PRESSED THE WRONG ELEMENT and so proved nothing for as long as it has existed: it
+    // dispatched on `t-tab`, the wrapper, while the handler is on `t-dots`, a CHILD — which does not
+    // bubble upward. It never started a drag, so "no further commits" was true before the guard
+    // existed. It presses the dots now, and asserts the settled width rather than only an absence.
     const onWidth = vi.fn();
-    render(<ColumnPullTab width={360} onWidth={onWidth} min={240} max={640} label="Build column" testId="t" />);
-    fireEvent.mouseEnter(screen.getByTestId("t"));
-    fireEvent.mouseDown(screen.getByTestId("t-tab"), { clientX: 500 });
-    fireEvent.mouseMove(window, { clientX: 900, buttons: 0 });
+    render(
+      <ColumnPullTab width={360} onWidth={onWidth} min={240} max={640} label="Build column" testId="t" cssVar={VAR} />,
+    );
+    press(screen.getByTestId("t-dots"), 500);
+    moveTo(600);
+    expect(painted()).toBe("460px"); // the drag IS live — the precondition the old case lacked
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 900, buttons: 0 });
+    // It settles on what was on screen, rather than discarding the drag or taking the stray point.
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(460);
+
     onWidth.mockClear();
-    fireEvent.mouseMove(window, { clientX: 200, buttons: 0 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 200, buttons: 0 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 250, buttons: 1 });
     expect(onWidth).not.toHaveBeenCalled();
+    expect(painted()).toBe("460px"); // and nothing repainted it
   });
 });
 
@@ -487,5 +562,158 @@ describe("the rail renders the constant the concierge is pinned against — robo
       <ColumnPullTab width={360} onWidth={() => {}} min={240} max={640} label="Build column" testId="t" />,
     );
     expect(Number(screen.getByTestId("t").style.zIndex)).toBe(PULL_TAB_RAIL_Z);
+  });
+});
+
+// ── SYMMETRIC GROWTH — THE CONCIERGE'S TWO EDGES ───────────────────────────────────────────────
+//
+// "I basically want to be able to drag out from the middle… make it so that the concierge both
+// sides grow when you pull one side."
+//
+// This KNOWINGLY REVERSES a fix. Symmetric growth was removed once as a bug — "the column grew
+// about its centre and its left edge slid left every time the user dragged its right edge" — and the
+// founder, shown that exact sentence, chose symmetric anyway, because the column is now the row's
+// anchor. So the old defect is the specified behaviour, and these are the cases that pin it.
+describe("widthPerPx — one pixel of travel, two pixels of column", () => {
+  it("grows the column by 2·dx when the seam is symmetric", () => {
+    const onWidth = vi.fn();
+    render(
+      <ColumnPullTab width={360} onWidth={onWidth} min={280} max={2000} label="Sparkle column" widthPerPx={2} cssVar={VAR} />,
+    );
+    press(dots(), 500);
+    moveTo(540); // the EDGE moved 40px…
+    expect(painted()).toBe("440px"); // …and the column gained 80.
+    release();
+    expect(onWidth).toHaveBeenCalledWith(440);
+  });
+
+  it("does it from EITHER edge — the mirrored seam grows the same column the same way", () => {
+    // The left seam of the concierge owns the concierge, not the column beside it, and pulling it
+    // LEFT (outward) must grow the concierge by the same 2·dx the right seam gives.
+    const onWidth = vi.fn();
+    render(
+      <ColumnPullTab width={360} onWidth={onWidth} min={280} max={2000} label="Sparkle column" grows="right" widthPerPx={2} cssVar={VAR} />,
+    );
+    press(dots(), 500);
+    moveTo(460); // outward is LEFT for this seam
+    expect(painted()).toBe("440px");
+    release();
+    expect(onWidth).toHaveBeenCalledWith(440);
+  });
+
+  it("keeps an ordinary seam at 1:1, so the build columns are unaffected", () => {
+    // The default must not change: a builder's edge moves its column by exactly the travel.
+    const onWidth = vi.fn();
+    render(<ColumnPullTab width={360} onWidth={onWidth} min={280} max={2000} label="agent column" cssVar={VAR} />);
+    press(dots(), 500);
+    moveTo(540);
+    expect(painted()).toBe("400px");
+    release();
+    expect(onWidth).toHaveBeenCalledWith(400);
+  });
+
+  it("applies the same factor to the ARROW KEYS, so the two input paths agree", () => {
+    // Otherwise a keyboard user finds the concierge growing at half the rate the mouse moves it.
+    const onWidth = vi.fn();
+    render(
+      <ColumnPullTab width={360} onWidth={onWidth} min={280} max={2000} label="Sparkle column" widthPerPx={2} />,
+    );
+    fireEvent.keyDown(dots(), { key: "ArrowRight" });
+    expect(onWidth).toHaveBeenLastCalledWith(376); // 360 + 8·2
+    fireEvent.keyDown(dots(), { key: "ArrowRight", shiftKey: true });
+    expect(onWidth).toHaveBeenLastCalledWith(424); // 360 + 32·2
+  });
+});
+
+// ── THE DRAG SHIELD ────────────────────────────────────────────────────────────────────────────
+//
+// A spindump of a real drag put 537 of 1,299 blocking WindowServer samples in WebKit recomputing
+// the cursor — every mouse-move hit-tests the element under the pointer and walks a deep tree of
+// columns, panes and xterm canvases to ask what cursor it wants. One fixed sheet with a constant
+// cursor makes that answer constant.
+describe("the drag shield", () => {
+  const shield = () => document.querySelector('[data-testid="column-drag-shield"]');
+
+  it("is absent at rest, raised for the gesture, and gone on release", () => {
+    setup({ cssVar: VAR });
+    expect(shield()).toBeNull();
+    press(dots(), 500);
+    expect(shield()).not.toBeNull();
+    release();
+    expect(shield()).toBeNull();
+  });
+
+  it("covers the whole window with ONE constant cursor", () => {
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    const el = shield() as HTMLElement;
+    expect(el.style.position).toBe("fixed");
+    expect(el.style.cursor).toBe("col-resize");
+    expect(el.style.inset).toBe("0");
+    release();
+  });
+
+  it("comes down when the release goes MISSING too, so it cannot be left covering the app", () => {
+    // A shield tied to a flag rather than to the effect's lifetime is how an invisible sheet ends up
+    // permanently over the UI, swallowing every click with no way to tell why.
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 900, buttons: 0 });
+    expect(shield()).toBeNull();
+  });
+
+  it("comes down on a CANCELLED pointer", () => {
+    setup({ cssVar: VAR });
+    press(dots(), 500);
+    fireEvent.pointerCancel(window, { pointerId: 1 });
+    expect(shield()).toBeNull();
+  });
+});
+
+// ── THE LISTENERS ARE INSTALLED ONCE PER GESTURE ───────────────────────────────────────────────
+//
+// They used to be keyed on `[dragging, commit, grows, endDrag]`, and `commit` is rebuilt whenever
+// `onWidth`, `min`, `max` or `label` changes — which for the concierge seam is every time the shell
+// re-renders, i.e. on every projectStore write. So a live drag's own listeners were torn down and
+// re-added mid-gesture, repeatedly, on the hot path.
+describe("a live drag survives the shell re-rendering under it", () => {
+  it("does not re-install its window listeners when its props get new identities", () => {
+    const add = vi.spyOn(window, "addEventListener");
+    const { rerender } = render(
+      <ColumnPullTab width={360} onWidth={() => {}} min={280} max={560} label="Sparkle column" cssVar={VAR} />,
+    );
+    press(dots(), 500);
+    const installed = add.mock.calls.filter(([t]) => t === "pointermove").length;
+    expect(installed).toBe(1);
+
+    // Five shell re-renders, each handing the tab a brand-new `onWidth` identity.
+    for (let i = 0; i < 5; i += 1) {
+      rerender(
+        <ColumnPullTab width={360} onWidth={() => {}} min={280} max={560} label="Sparkle column" cssVar={VAR} />,
+      );
+    }
+    expect(add.mock.calls.filter(([t]) => t === "pointermove").length).toBe(installed);
+    release();
+    add.mockRestore();
+  });
+
+  it("still commits through the LATEST onWidth, from the width it was pressed at", () => {
+    // The corollary: reading config through a ref must not mean reading a STALE one. The gesture's
+    // origin is the width at press time, but the handler it calls is the current one.
+    const stale = vi.fn();
+    const fresh = vi.fn();
+    const { rerender } = render(
+      <ColumnPullTab width={360} onWidth={stale} min={280} max={560} label="Sparkle column" cssVar={VAR} />,
+    );
+    press(dots(), 500);
+    moveTo(520);
+    rerender(
+      <ColumnPullTab width={999} onWidth={fresh} min={280} max={560} label="Sparkle column" cssVar={VAR} />,
+    );
+    moveTo(540);
+    release();
+    expect(stale).not.toHaveBeenCalled();
+    expect(fresh).toHaveBeenCalledWith(400); // 360 (press-time width) + 40, NOT 999 + 40
   });
 });

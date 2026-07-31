@@ -79,8 +79,11 @@ describe("StatusFilterBar — what the chip shows", () => {
         onReset={vi.fn()}
       />,
     );
+    // The TOKEN, not a resolved rgb: the red tier now remaps to `dangerInk` (it measured 3.83:1 on
+    // light's white column as link text), so like the green and gray tiers it is a themed var()
+    // that jsdom passes through verbatim.
     expect(screen.getByTestId("band-badge-needs_you").style.color).toBe(
-      asRgb(statusInk(bandColor("needs_you"))),
+      statusInk(bandColor("needs_you")),
     );
     rerender(
       <StatusFilterBar

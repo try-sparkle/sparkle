@@ -136,13 +136,24 @@ describe("xtermTheme (concrete hex only — no CSS var())", () => {
     expect(xtermTheme("dark").background).toBe(THEME_HEX.dark.forest);
   });
 
-  it("pins ANSI blue to the brand blue in light mode only (legible on white)", () => {
+  it("pins ALL SIXTEEN ANSI slots in light mode only, as literal hex", () => {
+    // This used to pin `blue`/`brightBlue` to the brand blue and nothing else, on the theory that
+    // blue was the slot TUIs paint headings in. It was two slots short of the problem: the other
+    // fourteen kept xterm's Tango defaults, which are tuned for a near-black ground, and eleven of
+    // them failed AA on light's terminal plane — the founder's "terminal inks are way too light".
+    // The override that WAS here also failed, at 3.48:1. The floors are measured in
+    // xtermTheme.test.ts; what this pins is the SHAPE — every slot set, and only in light.
     const light = xtermTheme("light") as Record<string, string>;
-    expect(light.blue).toBe("#2f6bff");
-    expect(light.brightBlue).toBe("#2f6bff");
-    // Dark mode keeps xterm's default ANSI palette (legible on navy) — no override.
     const dark = xtermTheme("dark") as Record<string, string>;
-    expect(dark.blue).toBeUndefined();
-    expect(dark.brightBlue).toBeUndefined();
+    for (const slot of [
+      "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+      "brightBlack", "brightRed", "brightGreen", "brightYellow",
+      "brightBlue", "brightMagenta", "brightCyan", "brightWhite",
+    ]) {
+      // Literal hex, never a CSS var(): xterm paints into a canvas and cannot resolve one.
+      expect(light[slot], `light.${slot}`).toMatch(/^#[0-9a-f]{6}$/);
+      // Dark mode keeps xterm's default ANSI palette (legible on near-black) — no override.
+      expect(dark[slot], `dark.${slot}`).toBeUndefined();
+    }
   });
 });

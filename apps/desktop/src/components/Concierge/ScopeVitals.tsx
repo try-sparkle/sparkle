@@ -25,7 +25,7 @@
 // `sparkle-vohh` fixed, not a second switcher.
 import { bandColor, bandCountLabel } from "../../engine/statusBandLabels";
 import type { StatusBand } from "../../engine/buildSections";
-import { C, FONT_WEIGHT } from "../../theme/colors";
+import { C, FONT_WEIGHT, statusInk } from "../../theme/colors";
 
 /** What the line says when nothing needs you. */
 export const CALM_TEXT = "all calm";
@@ -396,7 +396,16 @@ export function ScopeVitals({
   const total = counts[VITAL_BAND];
   const split = splitFor(pinnedProjectName, byProject);
   const segments = needsYouSegments(total, split);
+  // TWO tokens, because the band's colour is used two ways on this line and only one of them is
+  // READ. `tint` paints the 7px DOT — a shape, so it keeps the brand literal. `vitalInk` paints the
+  // sentence and its link-shaped project button, and the brand red reads at 3.83:1 on light's white
+  // concierge column, which is the founder's "links are too light" report at this site.
+  //
+  // It goes through `statusInk` rather than naming `C.dangerInk` directly so the ink stays DERIVED
+  // from the band the same way `tint` is — a taxonomy change moves both together instead of
+  // silently desynchronising the dot from the words next to it.
   const tint = bandColor(VITAL_BAND);
+  const vitalInk = statusInk(tint);
   return (
     <div
       data-testid="concierge-vitals-line"
@@ -509,7 +518,7 @@ export function ScopeVitals({
                     padding: 0,
                     font: "inherit",
                     fontWeight: FONT_WEIGHT.bold,
-                    color: tint,
+                    color: vitalInk,
                     cursor: "pointer",
                     textDecoration: "underline",
                     textUnderlineOffset: 2,
@@ -518,7 +527,7 @@ export function ScopeVitals({
                   {seg.text}
                 </button>
               ) : (
-                <span style={{ fontWeight: FONT_WEIGHT.bold, color: tint }}>{seg.text}</span>
+                <span style={{ fontWeight: FONT_WEIGHT.bold, color: vitalInk }}>{seg.text}</span>
               )}
             </span>
           ))}

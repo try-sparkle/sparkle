@@ -252,9 +252,11 @@ export function OpenPrMenu({
           alignItems: "center",
           gap: 6,
           background: "transparent",
+          // The BORDER keeps the brand literal (violet is a stroke here); the LABEL takes violetInk,
+          // which is the themed text tier — BRAND.violet reads at 3.8:1 on light's white column.
           border: `1px solid ${C.violet}`,
           borderRadius: 6,
-          color: C.violet,
+          color: C.violetInk,
           cursor: "pointer",
           fontSize: 12,
           fontWeight: FONT_WEIGHT.semibold,
@@ -446,7 +448,9 @@ export function OpenPrMenu({
                     style={{
                       flex: "0 0 auto",
                       background: "transparent",
-                      color: pr.url ? C.violet : C.muted,
+                      // Ink vs stroke, as on the chip above: violetInk for the label the user
+                      // READS, the brand literal for the box it sits in.
+                      color: pr.url ? C.violetInk : C.muted,
                       border: `1px solid ${pr.url ? C.violet : C.muted}`,
                       borderRadius: 6,
                       padding: "3px 8px",

@@ -49,9 +49,9 @@ const dots = () => screen.getByTestId("tab-dots");
 describe("the drag says what it did", () => {
   it("brackets the gesture — a start line and an end line", () => {
     mountTab();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 520, buttons: 1 });
-    fireEvent.mouseUp(window, { clientX: 520 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 520, buttons: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1, clientX: 520 });
 
     expect(lines().some((l) => l.includes("drag start at 360px"))).toBe(true);
     expect(lines().some((l) => l.includes("drag end (release)"))).toBe(true);
@@ -60,8 +60,8 @@ describe("the drag says what it did", () => {
   it("names the bound when the drag goes nowhere — the line the report needed", () => {
     // "Registers but does not resize", diagnosable from the log alone.
     mountTab();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 5000, buttons: 1 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 5000, buttons: 1 });
     expect(lines().some((l) => l.includes("clamped by max"))).toBe(true);
     expect(lines().some((l) => l.includes("applied 560"))).toBe(true);
   });
@@ -69,9 +69,9 @@ describe("the drag says what it did", () => {
   it("says so when the release went missing rather than reporting a clean end", () => {
     // A lost mouseup and an ordinary release are different failures; the log must tell them apart.
     mountTab();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 520, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 540, buttons: 0 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 520, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 540, buttons: 0 });
     expect(lines().some((l) => l.includes("drag end (release-lost)"))).toBe(true);
   });
 
@@ -79,9 +79,9 @@ describe("the drag says what it did", () => {
     // Edge-triggered because every forwarded line costs a synchronous IPC → disk write on the main
     // thread. Instrumenting a drag must not become its own source of jank.
     mountTab();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
     for (const x of [5000, 5100, 5200, 5300, 5400]) {
-      fireEvent.mouseMove(window, { clientX: x, buttons: 1 });
+      fireEvent.pointerMove(window, { pointerId: 1, clientX: x, buttons: 1 });
     }
     expect(lines().filter((l) => l.includes("clamped by max"))).toHaveLength(1);
   });
@@ -101,9 +101,9 @@ describe("the keyboard path is not silent", () => {
     // (`onWidth` is a spy, so the tab stays at the width it was given — which is what puts the
     // keyed nudge on the same bound the drag ended on, the exact case `lastClamp` used to swallow.)
     mountTab(560, 280, 560);
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 5000, buttons: 1 });
-    fireEvent.mouseUp(window, { clientX: 5000 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 5000, buttons: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1, clientX: 5000 });
     info.mockClear();
 
     fireEvent.keyDown(dots(), { key: "ArrowRight" });
@@ -135,13 +135,13 @@ describe("the keyboard path is not silent", () => {
     // Tab/Enter/characters must not clear the drag's edge state — that re-arms per-event logging on
     // a keystroke that moves no boundary at all.
     mountTab();
-    fireEvent.mouseDown(dots(), { button: 0, clientX: 500, buttons: 1 });
-    fireEvent.mouseMove(window, { clientX: 5000, buttons: 1 });
+    fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: 500, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 5000, buttons: 1 });
     info.mockClear();
 
     fireEvent.keyDown(dots(), { key: "Tab" });
     fireEvent.keyDown(dots(), { key: "Enter" });
-    fireEvent.mouseMove(window, { clientX: 5100, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: 5100, buttons: 1 });
     expect(lines().filter((l) => l.includes("clamped by max"))).toHaveLength(0);
   });
 });

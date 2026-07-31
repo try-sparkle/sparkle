@@ -33,9 +33,17 @@ import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
-import { ColumnPullTab } from "./ColumnPullTab";
+import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
 import { useWindowWidth } from "../hooks/useWindowWidth";
-import { BUILD_COLUMN_MIN_WIDTH, TERMINAL_MIN_WIDTH, windowAwareMax } from "../engine/columnResize";
+import {
+  BUILD_COLUMN_MIN_WIDTH,
+  BUILD_WIDTH_EVENT,
+  TERMINAL_MIN_WIDTH,
+  buildColumnMax,
+  buildWidthKey,
+  buildWidthVar,
+  readStoredBuildWidth,
+} from "../engine/columnResize";
 import { TERM_HAIRLINE } from "./terminalChrome";
 import { WEB_BASE_URL } from "../services/sparkleApi";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
@@ -716,10 +724,14 @@ export function AgentSidebar({
   // or editing localStorage. The reserve is the concierge at its minimum plus a terminal worth
   // showing; the restore path below reads this same value, so a width saved on a large display is
   // rejected rather than restored onto a small one.
+  //
+  // THE CEILING AND THE RESTORE RULE MOVED TO `engine/columnResize`, unchanged in value. `Workspace`
+  // has to know how wide these columns are to bound the CONCIERGE against them, and a ceiling spelled
+  // once in each file is precisely the drift that module exists to prevent — the row would reserve
+  // for a column whose real limit had moved.
   const MIN_WIDTH = BUILD_COLUMN_MIN_WIDTH;
-  const HARD_MAX_WIDTH = 1200;
   const windowWidth = useWindowWidth();
-  const MAX_WIDTH = windowAwareMax(HARD_MAX_WIDTH, windowWidth, 280 + 320, MIN_WIDTH);
+  const MAX_WIDTH = buildColumnMax(windowWidth);
   // TWO BOUNDS WITH DIFFERENT JOBS, because one of them cannot do the other's (roborev 55869).
   //
   // `MAX_WIDTH` above bounds the GESTURE — where the drag and the arrow keys stop. `RENDERED_WIDTH`
@@ -742,15 +754,10 @@ export function AgentSidebar({
   // needed no clamp at all — resize left, resize right, quit, and the last-mounted instance wins
   // with its own stale number. A key per side removes the race rather than narrowing it, so a flush
   // can never speak for the other column (roborev 55391).
-  const widthKey = `sparkle-sidebar-width:${pairSide}`;
-  const [width, setWidth] = useState<number>(() => {
-    // The unsuffixed key is what every build before this wrote, so it is read as the seed for both
-    // sides — a user's existing width survives the split instead of silently resetting to 220.
-    const saved = Number(
-      localStorage.getItem(widthKey) ?? localStorage.getItem("sparkle-sidebar-width"),
-    );
-    return saved >= MIN_WIDTH && saved <= MAX_WIDTH ? saved : 220;
-  });
+  const widthKey = buildWidthKey(pairSide);
+  // The restore — including the read-through of the pre-split key, so a user's existing width
+  // survives — is `readStoredBuildWidth`, shared with the row that reserves space for this column.
+  const [width, setWidth] = useState<number>(() => readStoredBuildWidth(pairSide, windowWidth));
 
   /** Commit a width the pull tab has ALREADY clamped and logged.
    *
@@ -810,7 +817,36 @@ export function AgentSidebar({
   // inverts engine/columnResize's documented collapse order — terminal collapses to a strip FIRST, then
   // build. `max(MIN_WIDTH, …)` restores both: the column never paints below its own minimum, and the
   // terminal goes on absorbing the shortfall the way that file says it must.
-  const RENDERED_WIDTH = `max(${MIN_WIDTH}px, min(${width}px, calc(100% - ${TERMINAL_MIN_WIDTH}px)))`;
+  // THE VARIABLE IS THE INNER TERM, and the clamps around it are unchanged. During a drag the pull
+  // tab writes `--build-l-w`/`--build-r-w` on the root element at pointer rate and the browser
+  // re-lays-out this column with no React work at all; on release React writes the same property with
+  // the committed value. The floor and the terminal reserve still apply to whatever the variable says,
+  // so a drag cannot paint this column below its minimum or over the terminal's — the live gesture is
+  // bounded by exactly the same expression the resting layout is.
+  const RENDERED_WIDTH = `max(${MIN_WIDTH}px, min(var(${buildWidthVar(pairSide)}, ${width}px), calc(100% - ${TERMINAL_MIN_WIDTH}px)))`;
+  // The committed-value writer for that same property — see `publishColumnWidthVar` — and the place
+  // this column ANNOUNCES its width to the row.
+  //
+  // ON MOUNT AND ON EVERY CHANGE, not only on commit. The concierge's paired ceiling reserves both
+  // build columns at the widths they actually have, so the row's mirror has to know this column's
+  // width even when the user has never dragged it. Announcing only from `commitWidth` left the two
+  // diverging whenever a sidebar mounted LATER than `Workspace` at a different window width: with
+  // `sparkle-sidebar-width:left = 800`, an app started at 1280 records 220 (800 exceeds that
+  // window's 680 ceiling); maximise to 2560 and open the left pair, and the sidebar seeds 800 while
+  // the row still reserves for 220 — permitting a concierge that squeezes the 800px builder to 220
+  // while the drag reports itself unclamped (roborev 56086/56088). That is the same failure the
+  // `2 * max(left, right)` reserve was introduced to remove, reached through the mirror instead of
+  // through the formula.
+  //
+  // Cheap: this effect already runs exactly when the width or the side changes, and `Workspace`
+  // ignores an event that does not change its mirror, so a re-announcement of the same width costs
+  // one comparison and no render.
+  useEffect(() => {
+    publishColumnWidthVar(buildWidthVar(pairSide), width);
+    window.dispatchEvent(
+      new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: pairSide, width } }),
+    );
+  }, [width, pairSide]);
   // THE THIRD SEAM'S COPY OF THE SAME FIX (roborev 55993). The shell mounts `ColumnPullTab` at three
   // boundaries; the concierge's and the left pair's already drag from what is PAINTED rather than what
   // is STORED, and this one did not. `MAX_WIDTH` is reactive through `useWindowWidth` while `width` is
@@ -2307,10 +2343,11 @@ export function AgentSidebar({
             // own ROW is rendered separately below from `childrenByParent`.
             const workerDetails = workers.map((w) => {
               const wst = status[w.id] ?? "stopped";
-              const wcolor =
-                AGENT_STATUS[wst].color === AGENT_STATUS.done.color
-                  ? C.agentIdle
-                  : AGENT_STATUS[wst].color;
+              // `statusInk`, not a hand-rolled done→agentIdle branch. That branch was a copy of
+              // statusInk's FIRST case and stopped there, so a worker row's name — which is an
+              // underlined-on-hover LINK (WorkerRow below) — was painted with the raw brand green
+              // at 2.22:1 and the raw brand red at 3.83:1 on light's white column.
+              const wcolor = statusInk(AGENT_STATUS[wst].color);
               return {
                 id: w.id,
                 name: w.name,
@@ -2508,7 +2545,9 @@ export function AgentSidebar({
                 border: "none",
                 padding: 0,
                 font: "inherit",
-                color: C.accent,
+                // accentInk, not BRAND.accent — a link, not a fill. The constant cyan reads at
+                // 1.6:1 on light mode's white column; see the ink/fill split in colors.ts.
+                color: C.accentInk,
                 cursor: "pointer",
                 textDecoration: "underline",
               }}
@@ -2654,6 +2693,7 @@ export function AgentSidebar({
           // opposite of the side the terminal is on: in the right pair build is left of the seam
           // (drag right to grow it), in the left pair it is right of it (drag left to grow it).
           grows={pairSide === "right" ? "left" : "right"}
+          cssVar={buildWidthVar(pairSide)}
           testId="sidebar-pull-tab"
         />
       </div>

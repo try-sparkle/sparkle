@@ -122,3 +122,274 @@ export function windowAwareMax(
 ): number {
   return Math.max(min, Math.min(hardMax, windowWidth - reserve));
 }
+
+// ── THE CONCIERGE IS THE ANCHOR — THE FIVE-COLUMN GEOMETRY, AS ARITHMETIC ──────────────────────
+//
+// Everything below is new, and it exists because the row's geometry USED to be a set of flex rules
+// that no test could evaluate. jsdom has no layout engine: `min()`/`calc()` never resolve and
+// `getBoundingClientRect` is all zeros, so "is the concierge centred" was literally unaskable of the
+// rendered DOM. The rules were therefore only ever asserted as *strings* — which is how the row came
+// to be asymmetric in a way nobody noticed until a window spanned three monitors.
+//
+// So the layout is stated ONCE, here, as a function of five numbers, and the components are wired to
+// express exactly this and nothing else:
+//
+//     row:        [ left half: flex 1 1 0 ][ rail ][ concierge: var ][ rail ][ right half: flex 1 1 0 ]
+//     left half:  [ terminal: flex 1 1 0 ][ build: var ]        (mirrored — terminal outboard)
+//     right half: [ build: var ][ terminal: flex 1 1 0 ]
+//
+// THE CENTRING IS A THEOREM, NOT A TUNING. Two halves that are `flex: 1 1 0` against the SAME
+// remaining space are equal by the flex algorithm, so the concierge's centre is
+// `half + rail + C/2` and the row's centre is `(2·half + 2·rail + C)/2` — the same expression, for
+// EVERY window width, every concierge width and every pair of build widths. That is what
+// `cockpitGeometry` computes and what the tests assert, rather than a table of numbers that would
+// have to be re-derived every time a constant moved.
+//
+// WHAT THIS DELIBERATELY OVERTURNS: the row was asymmetric on purpose. The left pair carried its own
+// pinned width and the RIGHT pair was the only `flex: 1`, so it absorbed every change — on a 5760px
+// span that left the right pair ~4,700px, two and a half displays, while the concierge sat wherever
+// the left pair's width happened to put it. The founder asked for the concierge to be the anchor
+// instead, and accepted the consequence the old model was built to avoid (see `widthPerPx` in
+// `ColumnPullTab`: one edge now moves the other).
+
+/** The in-flow seam between the concierge and a half. `ColumnPullTab`'s rail is 6px wide. */
+export const RAIL_WIDTH = 6;
+
+// ── THE THREE WIDTHS, AS CSS CUSTOM PROPERTIES ─────────────────────────────────────────────────
+//
+// Named here because three different components write and read them and a variable spelled in three
+// files is the same drift this module exists to prevent. They live on `document.documentElement`:
+// during a drag the pull tab writes one at pointer rate with no React work at all, and on release
+// React writes the same property with the committed value. One target, one source of truth, nothing
+// to reconcile — see `publishColumnWidthVar` in `ColumnPullTab`.
+
+/** The concierge column's live width. */
+export const CONCIERGE_WIDTH_VAR = "--concierge-w";
+/** Emitted by `AgentSidebar` when a build column COMMITS a width, so the row can re-reserve for it.
+ *  Once per drag, not once per move — the gesture paints a variable and commits on release. */
+export const BUILD_WIDTH_EVENT = "sparkle:build-width";
+/** A build column's live width. Per side, because the two builders are independent. */
+export function buildWidthVar(side: "left" | "right"): string {
+  return side === "left" ? "--build-l-w" : "--build-r-w";
+}
+
+/** The build column's width when nothing has been stored — `AgentSidebar`'s historical default. */
+export const BUILD_COLUMN_DEFAULT_WIDTH = 220;
+/** The build column's own hard ceiling, before the window lowers it. */
+export const BUILD_COLUMN_HARD_MAX = 1200;
+/** What must stay beside the build column for the rest of the row: the concierge at its floor plus a
+ *  terminal worth showing. Spelled here so the component and the row's reserve cannot disagree. */
+export const BUILD_COLUMN_ROW_RESERVE = 280 + TERMINAL_MIN_WIDTH;
+
+/** The build column's live ceiling. ONE spelling, read by `AgentSidebar` (which bounds the gesture)
+ *  and by the storage reader below (which rejects a width saved on a bigger display). */
+export function buildColumnMax(windowWidth: number): number {
+  return windowAwareMax(
+    BUILD_COLUMN_HARD_MAX,
+    windowWidth,
+    BUILD_COLUMN_ROW_RESERVE,
+    BUILD_COLUMN_MIN_WIDTH,
+  );
+}
+
+/** Per-side storage for the build column — the two builders are INDEPENDENT, which is the founder's
+ *  "one doesn't change when the other changes". The key is spelled HERE rather than in `AgentSidebar`
+ *  because `Workspace` has to read both sides to know what the concierge may be dragged to, and a
+ *  key spelled in two files is the drift this module already exists to prevent. */
+export function buildWidthKey(side: "left" | "right"): string {
+  return `sparkle-sidebar-width:${side}`;
+}
+
+/** The pre-split key every build before the per-side keys wrote. Read as the SEED for both sides so
+ *  an existing width survives rather than silently resetting to the default. */
+const LEGACY_BUILD_WIDTH_KEY = "sparkle-sidebar-width";
+
+/**
+ * A side's stored build width, validated against the live window.
+ *
+ * Shared by the component that owns the width and by the row that has to reserve space for it — the
+ * alternative was `Workspace` re-implementing `AgentSidebar`'s restore rules, which is precisely how
+ * the concierge's ceiling would come to disagree with the column it was reserving for.
+ */
+export function readStoredBuildWidth(side: "left" | "right", windowWidth: number): number {
+  const max = buildColumnMax(windowWidth);
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(buildWidthKey(side)) ?? localStorage.getItem(LEGACY_BUILD_WIDTH_KEY);
+  } catch {
+    // Storage can be unavailable outright; the default is a fine answer and must not throw a render.
+  }
+  const saved = Number(raw);
+  if (saved >= BUILD_COLUMN_MIN_WIDTH && saved <= max) return saved;
+  // THE DEFAULT IS A WIDTH TOO, so it answers to the same ceiling. On a narrow window
+  // `buildColumnMax` can fall below 220 — at 700px it is 160 — and returning the raw default there
+  // told the ROW to reserve 220 for a column that paints at 160, lowering the concierge's ceiling
+  // below what the window could actually give (roborev 56070).
+  //
+  // AN OUT-OF-RANGE STORED WIDTH IS STILL DISCARDED RATHER THAN CLAMPED, deliberately. Clamping it
+  // would put the reduced number into `AgentSidebar`'s state, and the first drag after that would
+  // persist it — destroying a preference set on a bigger display, which is the exact failure the
+  // rendered-vs-stored split exists to prevent (roborev 55883/55897). Reading never writes.
+  return Math.min(BUILD_COLUMN_DEFAULT_WIDTH, max);
+}
+
+/**
+ * What the concierge must leave for the rest of a TWO-PAIR row.
+ *
+ * TWICE THE WIDER BUILD COLUMN, NOT THE SUM OF THE TWO — and the difference is the whole point of the
+ * function. The halves are EQUAL (`flex: 1 1 0`), so there is only one half-width and it has to
+ * accommodate the LARGER builder; reserving the sum reserves the AVERAGE, which is correct only when
+ * the two happen to be equal. Every asymmetric row — the exact case the founder asked for, "one
+ * doesn't change when the other changes" — got a ceiling that was too permissive.
+ *
+ * Worked example of what that cost: at a 2560px window with builders of 160 and 900, the sum reserved
+ * 1712 and permitted a 848px concierge. At that width each half is 850, so the 900px builder painted
+ * at 530 — squeezed by 370px — while the drag reported itself unclamped. That is the "a drag that goes
+ * nowhere is indistinguishable from a drag that isn't applied" failure this module exists to
+ * eliminate, reached through the ceiling instead of through the clamp (roborev 56070).
+ *
+ * Symmetric rows are unchanged, which is why no target-layout number moves: at 400/400 the reserve is
+ * 1452 either way.
+ *
+ * THE LIVE WIDTHS, not the minimums: reserving the minimums would let the concierge be dragged
+ * straight over a build column the user had deliberately widened.
+ *
+ * Single-pair rows do NOT use this. That path keeps its own reserve untouched, because the one thing
+ * this change must not do is move a layout the founder says is already working.
+ */
+export function conciergePairedReserve(buildLeftWidth: number, buildRightWidth: number): number {
+  return 2 * Math.max(buildLeftWidth, buildRightWidth) + 2 * TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH;
+}
+
+/** A SANITY CEILING, not the operative bound — the reserve above is what actually stops the drag.
+ *
+ *  `CONCIERGE_MAX_WIDTH` was 560, which blocked the founder's two target layouts (~1100 and ~1920 on
+ *  a 3×1920 span) by 2–3.5×. This number exists only so a corrupt or hand-edited stored width cannot
+ *  name something absurd; it is set above the widest single display the app is likely to be centred
+ *  on, and every real limit comes from `conciergePairedReserve` against the live window. */
+export const CONCIERGE_PAIRED_HARD_MAX = 3200;
+
+/** The widest the concierge may be dragged in a TWO-PAIR row: bounded by the window once both build
+ *  columns, both terminals and both rails are accounted for, and never below `min`. */
+export function conciergePairedMax(
+  windowWidth: number,
+  buildLeftWidth: number,
+  buildRightWidth: number,
+  min: number,
+): number {
+  return windowAwareMax(
+    CONCIERGE_PAIRED_HARD_MAX,
+    windowWidth,
+    conciergePairedReserve(buildLeftWidth, buildRightWidth),
+    min,
+  );
+}
+
+/** The columns of the cockpit, outboard-left to outboard-right. */
+export type ColumnKey =
+  | "terminal-left"
+  | "build-left"
+  | "rail-left"
+  | "concierge"
+  | "rail-right"
+  | "build-right"
+  | "terminal-right";
+
+/** Where a column paints and how wide it is, in row coordinates. */
+export interface ColumnRect {
+  key: ColumnKey;
+  x: number;
+  width: number;
+}
+
+export interface CockpitInput {
+  /** The row's width — the window, since the shell is `width: 100vw` with no horizontal chrome. */
+  windowWidth: number;
+  /** 2 is the five-column cockpit; 1 is the historical right-half-only shell. */
+  pairCount: 1 | 2;
+  /** The concierge's width AS PAINTED — the caller has already lowered it to its live ceiling. */
+  conciergeWidth: number;
+  /** The left build column's stored width. Ignored when `pairCount` is 1. */
+  buildLeftWidth: number;
+  /** The right build column's stored width. */
+  buildRightWidth: number;
+}
+
+/**
+ * A build column's PAINTED width inside a half of the given size.
+ *
+ * This is the arithmetic form of the CSS `AgentSidebar` actually sets —
+ * `max(160px, min(<stored>px, calc(100% - 320px)))` — where `100%` is the half. The two must agree,
+ * so the component builds its expression from these same constants and a test asserts the string it
+ * renders matches this rule rather than re-spelling the numbers.
+ *
+ * The terminal absorbing the remainder is what keeps every seam draggable on a narrow window: it is
+ * `flex: 1` against effectively no min-content, so it yields silently. Below a 480px half the build
+ * column pins at its floor and the terminal takes the whole shortfall — the collapse order this
+ * module has always documented (terminal to a strip first, then build).
+ */
+export function paintedBuildWidth(storedWidth: number, halfWidth: number): number {
+  return Math.max(BUILD_COLUMN_MIN_WIDTH, Math.min(storedWidth, halfWidth - TERMINAL_MIN_WIDTH));
+}
+
+/**
+ * THE ROW, SOLVED — every column's position and width, from the five numbers that determine them.
+ *
+ * Widths are left unrounded on purpose. An odd `windowWidth - conciergeWidth - 2·RAIL` splits into
+ * two half-pixel halves, exactly as the browser does with `flex: 1 1 0`, and rounding here would
+ * manufacture an off-by-one asymmetry the real layout does not have.
+ */
+export function cockpitGeometry(input: CockpitInput): ColumnRect[] {
+  const { windowWidth, pairCount, conciergeWidth, buildLeftWidth, buildRightWidth } = input;
+
+  if (pairCount === 1) {
+    // THE SINGLE-PAIR SHELL, UNCHANGED: concierge on the left with ONE rail, and the sole pair
+    // taking the rest. It is not centred and is not meant to be — there is no left half to balance
+    // against, and the founder's report is explicitly that this layout already works.
+    const half = Math.max(0, windowWidth - conciergeWidth - RAIL_WIDTH);
+    const build = paintedBuildWidth(buildRightWidth, half);
+    return [
+      { key: "concierge", x: 0, width: conciergeWidth },
+      { key: "rail-right", x: conciergeWidth, width: RAIL_WIDTH },
+      { key: "build-right", x: conciergeWidth + RAIL_WIDTH, width: build },
+      {
+        key: "terminal-right",
+        x: conciergeWidth + RAIL_WIDTH + build,
+        width: Math.max(0, half - build),
+      },
+    ];
+  }
+
+  // TWO EQUAL HALVES. This single division is the whole centring guarantee — both halves are
+  // `flex: 1 1 0` against the same free space, so neither can absorb a change the other does not.
+  const half = (windowWidth - conciergeWidth - 2 * RAIL_WIDTH) / 2;
+  const buildL = paintedBuildWidth(buildLeftWidth, half);
+  const buildR = paintedBuildWidth(buildRightWidth, half);
+  const termL = Math.max(0, half - buildL);
+  const termR = Math.max(0, half - buildR);
+
+  const rails = RAIL_WIDTH;
+  const xBuildL = termL;
+  const xRailL = xBuildL + buildL;
+  const xConcierge = xRailL + rails;
+  const xRailR = xConcierge + conciergeWidth;
+  const xBuildR = xRailR + rails;
+  const xTermR = xBuildR + buildR;
+
+  return [
+    { key: "terminal-left", x: 0, width: termL },
+    { key: "build-left", x: xBuildL, width: buildL },
+    { key: "rail-left", x: xRailL, width: rails },
+    { key: "concierge", x: xConcierge, width: conciergeWidth },
+    { key: "rail-right", x: xRailR, width: rails },
+    { key: "build-right", x: xBuildR, width: buildR },
+    { key: "terminal-right", x: xTermR, width: termR },
+  ];
+}
+
+/** The centre of a column, in row coordinates — what "the concierge is dead centre" is asserted on. */
+export function centreOf(columns: readonly ColumnRect[], key: ColumnKey): number {
+  const c = columns.find((col) => col.key === key);
+  if (!c) throw new Error(`no such column: ${key}`);
+  return c.x + c.width / 2;
+}

@@ -316,7 +316,9 @@ export const StatusFilterBar = memo(function StatusFilterBar({
           padding: "0 2px",
           fontFamily: FONT_UI,
           fontSize: 12,
-          color: C.accent,
+          // accentInk, not BRAND.accent: this is a LINK, and the constant cyan is a fill/stroke
+          // colour that reads at 1.5:1 on light mode's near-white bar. See colors.ts's ink split.
+          color: C.accentInk,
           cursor: "pointer",
           textDecoration: "underline",
           whiteSpace: "nowrap",

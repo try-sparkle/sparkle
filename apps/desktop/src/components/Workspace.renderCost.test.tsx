@@ -153,12 +153,30 @@ const conciergeWidth = () => Number(screen.getByTestId("concierge").dataset.widt
  *  under-report by construction — the cost being measured is per-pointer-event work, and a pointer
  *  emits dozens of events per second. */
 function dragSteps(from: number, steps: number, pxPerStep = 2) {
-  fireEvent.mouseDown(dots(), { button: 0, clientX: from, buttons: 1 });
+  fireEvent.pointerDown(dots(), { pointerId: 1, button: 0, clientX: from, buttons: 1 });
+  // SAMPLED PER MOVE, BEFORE THE RELEASE — see the "moves the column by PAINT" case for why reading
+  // the variable afterwards proves nothing.
+  const painted: number[] = [];
   for (let i = 1; i <= steps; i++) {
-    fireEvent.mouseMove(window, { clientX: from + i * pxPerStep, buttons: 1 });
+    fireEvent.pointerMove(window, { pointerId: 1, clientX: from + i * pxPerStep, buttons: 1 });
+    painted.push(paintedWidth());
   }
-  fireEvent.mouseUp(window, { clientX: from + steps * pxPerStep });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: from + steps * pxPerStep });
+  return painted;
 }
+
+/** The width the column is PAINTED at right now — the custom property the drag writes per move. */
+const paintedWidth = () =>
+  Number(document.documentElement.style.getPropertyValue("--concierge-w").replace("px", ""));
+
+/** The width the drag ACTUALLY produced, given the seam it was dragged on.
+ *
+ *  Two things moved under this suite when the concierge became the row's centred anchor:
+ *  the seam is a POINTER gesture, and in DOUBLE mode the column grows from both edges, so one pixel
+ *  of travel buys two of width. Single mode is unchanged at 1:1. Deriving it here keeps the cases
+ *  below stating the cost they measure rather than re-spelling the arithmetic three times. */
+const draggedWidth = (steps: number, pxPerStep = 2) =>
+  360 + steps * pxPerStep * (screen.getByTestId("workspace-shell").dataset.pairs === "2" ? 2 : 1);
 
 const DRAG_STEPS = 30;
 
@@ -192,7 +210,7 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
     expect(counts.pane - mounted).toBe(0);
     // …and the drag really happened. Without this the assertion above is satisfied by a drag that
     // did nothing, which is the precondition, not the side effect.
-    expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
+    expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
   });
 
   // THE BOUND THE ONE ABOVE COULD NOT SEE, and the reason "ZERO pane renders" was a half-truth.
@@ -211,7 +229,7 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
 
     expect(counts.compare - settled).toBe(0);
     // The drag really happened, so the zero above is a bail-out and not a no-op.
-    expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
+    expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
   });
 
   it("costs ZERO pane renders with the LEFT pair open too", async () => {
@@ -235,7 +253,7 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
       dragSteps(500, DRAG_STEPS);
 
       expect(counts.pane - mounted).toBe(0);
-      expect(conciergeWidth()).toBe(360 + DRAG_STEPS * 2);
+      expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
     } finally {
       Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
     }
@@ -255,15 +273,46 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
     expect(counts.tabs - tabs).toBe(0);
   });
 
-  it("STILL re-renders the concierge column, which is the one thing that must move", async () => {
-    // The inverse assertion, and the reason the three above are not satisfied by a dead control:
-    // the column whose width changed has to re-render, once per committed width. If this ever goes
-    // to zero the drag has stopped working and the bounds above would still be green.
+  // ── THE INVERSE ASSERTION, REWRITTEN — ITS PREMISE IS THE THING THAT WAS FIXED ────────────────
+  //
+  // This case used to require `>= DRAG_STEPS` concierge renders: "the column whose width changed has
+  // to re-render, once per committed width." That was the correct guard while the drag committed a
+  // React state change per pointer event — it is what stopped the three ZERO bounds above from being
+  // satisfied by a dead control.
+  //
+  // Taking the drag off React state removes its premise. The concierge column now re-renders ZERO
+  // times during a gesture: moves paint `--concierge-w` on the root element and the browser re-lays
+  // out the row with no React work at all, and `onWidth` fires ONCE, on release. Keeping the old
+  // assertion would demand back the 30-renders-per-drag cost this file exists to measure.
+  //
+  // So the guard has to move rather than go away, and it moves to the PAINT: the thing that must
+  // track the pointer is the variable. That is a strictly stronger anti-dead-control check than the
+  // render count was — a drag that did nothing paints nothing.
+  it("moves the column by PAINT, not by re-rendering it — zero renders, but it tracked every step", async () => {
     await mount();
     const before = counts.concierge;
 
-    dragSteps(500, DRAG_STEPS);
+    const painted = dragSteps(500, DRAG_STEPS);
 
-    expect(counts.concierge - before).toBeGreaterThanOrEqual(DRAG_STEPS);
+    // The cost that used to be here: one full concierge render per pointer event.
+    expect(counts.concierge - before).toBeLessThanOrEqual(1);
+
+    // …AND THE DRAG IS EMPHATICALLY NOT DEAD. This has to be sampled DURING the gesture, which the
+    // first version of this guard got wrong: reading `--concierge-w` after `pointerUp` reads a value
+    // the RELEASE wrote, because `endDrag` calls `onWidth` and the resulting React effect republishes
+    // the same property. Deleting the per-move paint entirely — freezing the column for the whole
+    // gesture and jumping on release, the exact "laggy" regression this file exists to catch — left
+    // that assertion green (roborev 56095).
+    //
+    // One sample per pointer event, strictly increasing, and already at the final width BEFORE the
+    // release: none of those can be produced by a commit that happens afterwards.
+    expect(painted).toHaveLength(DRAG_STEPS);
+    for (let i = 1; i < painted.length; i++) {
+      expect(painted[i]!).toBeGreaterThan(painted[i - 1]!);
+    }
+    expect(painted.at(-1)).toBe(draggedWidth(DRAG_STEPS));
+
+    // …and the release is what finally moves the React-held width.
+    expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
   });
 });

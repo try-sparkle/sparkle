@@ -506,3 +506,63 @@ describe("AgentSidebar — overlay mode", () => {
     expect(Number(column().style.zIndex)).toBe(SIDEBAR_OVERLAY_Z);
   });
 });
+
+// ── THE BUILD COLUMN ANNOUNCES ITS WIDTH TO THE ROW ───────────────────────────────────────────
+//
+// The concierge's paired ceiling reserves both build columns AT THE WIDTHS THEY ACTUALLY HAVE, and
+// `Workspace` learns those widths from this event. Emitting it only on COMMIT left the two diverging
+// whenever a sidebar mounted later than the shell at a different window width — the row would then
+// permit a concierge that squeezes a builder the user had deliberately widened, while the drag
+// reported itself unclamped (roborev 56086/56088).
+describe("the build column tells the row how wide it is", () => {
+  function heard(run: () => void) {
+    const seen: { side?: string; width?: number }[] = [];
+    const on = (e: Event) => seen.push((e as CustomEvent).detail);
+    window.addEventListener("sparkle:build-width", on);
+    try {
+      run();
+    } finally {
+      window.removeEventListener("sparkle:build-width", on);
+    }
+    return seen;
+  }
+
+  it("announces ON MOUNT, before any drag has happened", () => {
+    // The case that was missing entirely: a column the user has never touched still occupies width,
+    // so the row has to know about it.
+    //
+    // AT A WINDOW THAT CAN ACTUALLY HOLD 800. jsdom defaults to 1024, where the build column's
+    // ceiling is 424 and a stored 800 is correctly REJECTED — so this would have been measuring the
+    // restore clamp rather than the announcement.
+    const realWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 2560, configurable: true });
+    try {
+      localStorage.setItem(WIDTH_KEY, "800");
+      const seen = heard(() => render(<AgentSidebar project={mkProject()} />));
+      expect(seen).toContainEqual({ side: "right", width: 800 });
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    }
+  });
+
+  it("announces the width it RESTORED, not a default", () => {
+    localStorage.setItem(WIDTH_KEY, "420");
+    const seen = heard(() => render(<AgentSidebar project={mkProject()} />));
+    expect(seen.at(-1)).toEqual({ side: "right", width: 420 });
+  });
+
+  it("announces again when the width changes", () => {
+    render(<AgentSidebar project={mkProject()} />);
+    const seen = heard(() => {
+      fireEvent.pointerDown(screen.getByTestId("sidebar-pull-tab-dots"), {
+        pointerId: 1,
+        button: 0,
+        clientX: 500,
+        buttons: 1,
+      });
+      fireEvent.pointerMove(window, { pointerId: 1, clientX: 560, buttons: 1 });
+      fireEvent.pointerUp(window, { pointerId: 1, clientX: 560 });
+    });
+    expect(seen.at(-1)?.width).toBe(280); // 220 + 60
+  });
+});

@@ -17,16 +17,16 @@ beforeEach(() => useUiStore.setState({ settingsRequest: null }));
 afterEach(cleanup);
 
 describe("RefillLink", () => {
-  it("defaults to the brand blue the existing mic surfaces expect", () => {
-    // jsdom normalizes an inline hex to rgb(), so compare through the same normalization rather
-    // than asserting the literal token — otherwise this fails on formatting, not on the color.
-    const normalize = (hex: string) => {
-      const probe = document.createElement("span");
-      probe.style.color = hex;
-      return probe.style.color;
-    };
+  it("defaults to the THEMED blue-as-text ink, not the constant brand fill", () => {
+    // It used to default to `C.teal` — the constant CTA/fill blue — under a comment calling that
+    // "the brand blue the existing mic surfaces expect". As INK that value is 4.50:1 on light's
+    // white and 4.30:1 on the composer bar, i.e. below AA on one of the two surfaces this word
+    // actually renders on. `tealInk` is the themed counterpart; theme/linkContrast.test.ts holds
+    // the ratio. Asserting the token (a CSS var, which jsdom passes through verbatim) rather than
+    // a resolved rgb() is what keeps this a statement about the SPLIT and not about a hex.
     render(<RefillLink />);
-    expect(screen.getByRole("button", { name: "Refill" }).style.color).toBe(normalize(C.teal));
+    expect(screen.getByRole("button", { name: "Refill" }).style.color).toBe(C.tealInk);
+    expect(C.tealInk).not.toBe(C.teal);
   });
 
   it("honors an explicit color for callers placing it on a colored fill", () => {

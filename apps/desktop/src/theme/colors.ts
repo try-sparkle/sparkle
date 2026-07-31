@@ -576,6 +576,12 @@ export const ROW_ACTIVE_BUBBLE = "var(--c-chat-bubble-active)";
 export function statusInk(color: string): string {
   if (color === AGENT_STATUS.done.color) return C.agentIdle; // brand gray
   if (color === AGENT_STATUS.working.color) return C.successInk; // brand green
+  // Brand RED (waiting / approval / blocked / errored). This used to fall through to `return color`
+  // under a comment — and a test — asserting the red tier was "already legible in both themes". It
+  // is not: BRAND.sienna measures 3.83:1 on light's white sidebar and 3.54:1 on the builder column,
+  // and it paints the NAME of a worker row, which is an underlined-on-hover link. `dangerInk` is
+  // the themed alarm-red-as-text tier that already existed for exactly this (see above).
+  if (color === AGENT_STATUS.waiting.color) return C.dangerInk;
   return color;
 }
 
@@ -716,6 +722,139 @@ function calmAnsi(c: (typeof CALM)["dark" | "light"]) {
   } as const;
 }
 
+/** Floor for LINK TEXT against the surface it is read on. WCAG AA for body-size text, in both
+ *  themes. Measured by theme/linkContrast.test.ts, which also scans the call sites — a link that
+ *  consumes a brand FILL token instead of its `…Ink` counterpart fails there even though the
+ *  token's own hex is fine, which is how all four of the original failures got in. */
+export const LINK_MIN_CONTRAST = 4.5;
+
+/** Floor for a light-mode ANSI slot against whatever it is read against — the terminal plane when
+ *  it is a foreground, the opposing register when it is a cell FILL. WCAG AA, body text. */
+export const TERM_ANSI_MIN_CONTRAST = 4.5;
+/** Floor between a light-mode ANSI slot and its `bright` counterpart, so the two stay tellable.
+ *  The `white`/`brightWhite` pair is the exception and has its own, looser floor below: both are
+ *  paper tones by construction, and every light terminal profile keeps them close (Solarized
+ *  Light's base2/base3 sit at 1.12:1). Holding them to the ink floor would force one of them off
+ *  paper, which is the entire failure this pair exists to prevent. */
+export const TERM_ANSI_MIN_SPLIT = 1.3;
+/** Floor between the two paper tones. Low on purpose — see above. */
+export const TERM_PAPER_MIN_SPLIT = 1.1;
+
+/**
+ * ── THE LIGHT-MODE ANSI PALETTE ────────────────────────────────────────────────────────────────
+ *
+ * WHY THIS EXISTS. Light mode used to ship xterm.js's DEFAULT palette — the Tango set, which is
+ * tuned for a near-black terminal — and overrode exactly two of its sixteen slots (`blue` and
+ * `brightBlue`, pointed at `BRAND.teal`). Measured against light's actual terminal background
+ * (`term` #d9e3f3), ELEVEN of the sixteen defaults failed AA, and so did the override that was
+ * supposed to be the fix: brightWhite 1.11:1, brightYellow 1.04:1, brightCyan 1.24:1, brightGreen
+ * 1.25:1, white 1.13:1, brightBlue 2.14:1, brightMagenta 2.55:1, cyan 2.72:1, green 2.73:1, yellow
+ * 1.94:1, brightRed 3.23:1 — and `blue`/`brightBlue` → #2f6bff at 3.48:1. That is the founder's
+ * report ("terminal inks are way too light in light mode"): a TUI's coloured tokens — a path, a
+ * `.rs` filename, a table cell — washed out to near-invisible on a near-white plane.
+ *
+ * The root cause is not any individual value. It is that a palette designed for a dark ground was
+ * placed on a light one and patched two slots deep, so the fix is a GENUINE light palette rather
+ * than more per-token nudges. Dark mode still takes xterm's defaults untouched — it is the mode
+ * those defaults were built for, and nothing here reaches it.
+ *
+ * ── AN ANSI SLOT IS A FILL AS WELL AS AN INK, AND THAT SPLITS THE SIXTEEN IN TWO ───────────────
+ *
+ * The first cut of this palette got the diagnosis right and the remedy wrong: it made all sixteen
+ * slots dark ink, because it reasoned only about `\e[3Xm` (set foreground). But `\e[4Xm` / `\e[10Xm`
+ * set a cell BACKGROUND, and a TUI paints those constantly — status bars, selected rows, diff
+ * hunks. Sixteen dark slots means every fg/bg pair drawn from the palette collapses:
+ * `\e[47;30m` (white bg, black fg) measured 1.71:1 and `\e[44;37m` (blue bg, white fg) 1.00:1,
+ * i.e. invisible. The CALM block above already knew this — `CALM_MIN_SPLIT` exists to keep "a
+ * painted-background cell" readable — and the new palette had no equivalent.
+ *
+ * So the sixteen are two registers, not one ramp:
+ *
+ *   • FOURTEEN INK SLOTS — the six hues, their brights, `black` and `brightBlack`. Each is read
+ *     as text on the terminal plane (AA) AND used as a cell fill with a paper tone on top (AA).
+ *     Within a hue the normal slot is a deep, nearly-black tint and `bright` is a lighter, more
+ *     SATURATED one; emphasis is vividness. `brightBlack` is the conventional "dim/comment" slate
+ *     — TUIs draw box rules and de-emphasised text in it, so it is READ, and it gets the floor.
+ *   • TWO PAPER SLOTS — `white` and `brightWhite`. These are the light register: the fill a
+ *     `\e[47m` cell paints, and the foreground a TUI puts ON the dark hue fills. They are NOT
+ *     inks and are deliberately not measured as inks.
+ *
+ * THE PAPER PAIR CANNOT BE INK, and this is arithmetic rather than preference. For `white` to
+ * carry `black` (L≈0.017) at AA it needs luminance ≥ 0.2515; to clear AA as text ON the plane
+ * (L≈0.7396) it needs ≤ 0.1254. There is no value satisfying both, so a palette must choose which
+ * job `white` does. Every light terminal profile — Solarized Light, Apple Terminal Basic, GitHub
+ * Light — chooses paper, and so does this one: default body text is carried by `theme.foreground`
+ * (`hex.cream`, ~13:1 on the plane), not by `\e[37m`.
+ *
+ * THE COST, STATED PLAINLY: a TUI that paints body text with an explicit `\e[37m`/`\e[97m` on this
+ * light terminal stays low-contrast, because it asked for paper-on-paper. That was equally true
+ * before this change (xterm's default `white` #d3d7cf measured 1.13:1) and no palette can fix it.
+ * What this change does fix is every COLOURED token, which is what the report was about.
+ *
+ * ── WHAT THIS PALETTE DOES NOT REACH, MEASURED RATHER THAN GUESSED ─────────────────────────────
+ * `pty.rs` exports `COLORTERM=truecolor`, so the obvious worry is that a chalk/Ink TUI emits
+ * 24-bit `\e[38;2;R;G;Bm` and bypasses all of this. For the TUI that prompted the report it does
+ * NOT: its binary contains zero `38;2` foreground sequences. What it emits is `\e[3Xm`/`\e[9Xm`
+ * plus `\e[38;5;N]`, and for N ≤ 15 xterm resolves the 256-colour form through these very slots —
+ * `38;5;12` and `38;5;14` are `brightBlue` and `brightCyan`, which is precisely the pale blue-grey
+ * the report described. Those are governed here.
+ *
+ * THE REAL BOUNDARY IS THE 256-COLOUR CUBE (N ≥ 16), which xterm computes internally. 201 of its
+ * 240 entries fail AA on this plane, and the TUI above does reach into it — `38;5;215` (a light
+ * orange) measures 1.41:1 and `38;5;242` (a mid grey) 4.06:1.
+ *
+ * THAT IS LEFT ALONE DELIBERATELY. xterm exposes `extendedAnsi` and clamping the cube would be a
+ * dozen lines — but the cube is addressed as a BACKGROUND (`\e[48;5;Nm`) as often as a foreground,
+ * and darkening every light entry is the identical mistake the ink/paper note above exists to
+ * record: it would turn a light fill into a dark one under text chosen to sit on a light fill.
+ * With sixteen slots the two roles are separable because the palette assigns them; across 240
+ * indices the emitter's intent is unknowable from here. A cube fix therefore needs the emitter's
+ * own light theme, not a blanket transform in this file.
+ *
+ * So: "sixteen slots pinned" is NOT the same claim as "every terminal is legible in light mode".
+ * If a specific token still washes out, read what it actually emits before retuning anything here.
+ *
+ * NO RATIOS ARE WRITTEN AS PROSE ELSEWHERE IN THIS FILE and none are asserted here beyond the
+ * failing sets above, which are the case for the change existing. `xtermTheme.test.ts` recomputes
+ * every floor from the actual hex and is the only contract — it measures both directions (ink on
+ * plane AND slot as fill), because measuring only the first is what shipped the 1.00:1 pair.
+ */
+const ANSI_LIGHT = {
+  black: "#172438",
+  red: "#921019",
+  green: "#045422",
+  yellow: "#683f03",
+  blue: "#1041a4",
+  magenta: "#782080",
+  cyan: "#034f63",
+  // PAPER, not ink — see the note above. A `\e[47m` cell is a page, and this is the light
+  // foreground a TUI lays over the dark hue fills.
+  white: "#eef3fb",
+  brightBlack: "#4a6288",
+  brightRed: "#bb1520",
+  brightGreen: "#066d2c",
+  brightYellow: "#875203",
+  brightBlue: "#1554d3",
+  brightMagenta: "#9a29a5",
+  brightCyan: "#03667f",
+  brightWhite: "#ffffff",
+} as const;
+
+/** The light ANSI palette, exported for the contrast guard. Not for component use. */
+export const TERM_ANSI_LIGHT = ANSI_LIGHT;
+
+/** The two PAPER slots — the light register. Measured as fills and as the ink that goes ON a
+ *  hue fill, never as text on the terminal plane. See the note above for why that is arithmetic
+ *  and not taste. */
+export const TERM_ANSI_PAPER = ["white", "brightWhite"] as const;
+
+/** The fourteen INK slots — read as text on the plane, and used as cell fills under paper. */
+export const TERM_ANSI_INKS = [
+  "black", "red", "green", "yellow", "blue", "magenta", "cyan",
+  "brightBlack", "brightRed", "brightGreen", "brightYellow",
+  "brightBlue", "brightMagenta", "brightCyan",
+] as const;
+
 /**
  * The xterm theme object. `calm` desaturates the terminal's OWN COLORS — the prototype's treatment
  * — rather than putting a CSS `filter` on an ancestor of the pane (roborev 46254). A filter over
@@ -736,13 +875,11 @@ export function xtermTheme(resolved: "light" | "dark", calm = false) {
     // While calm the text goes gray, so pin a selection foreground that stays readable over
     // the selection fill (roborev 46341).
     ...(calm ? { selectionForeground: calmC.selectionForeground } : {}),
-    // ANSI blue override. xterm's default blue is a light periwinkle that reads fine on the
-    // dark-mode navy background but goes low-contrast on the light-mode white background — and
-    // TUIs like Claude Code paint headings/links/prompts in (bright) blue. In light mode we
-    // pin both to the PRIMARY brand blue (#2f6bff, the right end of the logo's blue→cyan fade),
-    // which is dark enough to stay legible on white. Dark mode keeps xterm's defaults.
-    ...(resolved === "light" ? { blue: BRAND.teal, brightBlue: BRAND.teal } : {}),
-    // LAST, so calm wins: while calm, even the legibility override above is one of the colors
+    // ALL SIXTEEN ANSI slots in light mode, not the two this used to patch — see ANSI_LIGHT above
+    // for why a two-slot override could not work. Dark mode keeps xterm's defaults, which is the
+    // ground they were designed for.
+    ...(resolved === "light" ? ANSI_LIGHT : {}),
+    // LAST, so calm wins: while calm, even the legibility palette above is one of the colors
     // being flattened.
     ...(calm ? calmAnsi(calmC) : {}),
   };

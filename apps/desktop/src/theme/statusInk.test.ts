@@ -22,11 +22,26 @@ describe("statusInk (raw AGENT_STATUS color → themed text ink)", () => {
     }
   });
 
-  it("passes red/amber statuses through unchanged (already legible in both themes)", () => {
-    // Full red-color tier — waiting/approval/errored plus blocked ('went quiet').
+  it("flips the brand RED tier to the themed dangerInk", () => {
+    // THIS TEST USED TO ASSERT THE OPPOSITE, under the title "passes red/amber statuses through
+    // unchanged (already legible in both themes)". The parenthetical was simply false, and nothing
+    // measured it: BRAND.sienna is 3.83:1 on light's white concierge column and 3.54:1 on the
+    // builder column. It paints the NAME of a worker row in the sidebar — an underlined-on-hover
+    // link — and the concierge's needs-you sentence. `dangerInk` is the themed counterpart that
+    // already existed. The ratios themselves are held by theme/linkContrast.test.ts; what this
+    // pins is the MAPPING, so a taxonomy change that collides on a hex fails here.
     for (const st of ["waiting", "approval", "errored", "blocked"] as const) {
-      expect(statusInk(AGENT_STATUS[st].color)).toBe(AGENT_STATUS[st].color);
+      expect(statusInk(AGENT_STATUS[st].color)).toBe(C.dangerInk);
     }
+    // …and it really is a change, not an identity: the tier does not already equal the ink.
+    expect(C.dangerInk).not.toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("leaves a colour outside the taxonomy alone", () => {
+    // The fallthrough still exists and still means "not a status colour I know" — without this,
+    // the three mappings above could be replaced by an unconditional `return C.dangerInk` and the
+    // suite would not notice.
+    expect(statusInk("#123456")).toBe("#123456");
   });
 });
 

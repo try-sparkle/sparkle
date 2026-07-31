@@ -9,14 +9,18 @@
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { useUiStore } from "../stores/uiStore";
 
-/** The clickable, brand-blue, bold "Refill" word. A <button> styled as an inline link so it works
+/** The clickable, bold "Refill" word. A <button> styled as an inline link so it works
  *  inside the composer's `pointerEvents: none` placeholder overlay (it re-enables pointer events on
  *  itself). Clicking deep-opens the ⋯ settings dialog on the Credits pane.
  *
- *  `color` overrides the default brand blue for callers that place this on a COLORED fill, where
- *  blue-on-blue would be unreadable — the ZeroCreditBanner's amber bar wants dark ink. The click
- *  behavior stays in this one component either way, so there is still exactly one refill seam. */
-export function RefillLink({ label = "Refill", color = C.teal }: { label?: string; color?: string }) {
+ *  The default is `tealInk`, the THEMED blue-as-text tier — not `BRAND.teal`, which is the constant
+ *  CTA/fill blue and clears AA in neither theme as an ink (4.50:1 on light's white, worse on the
+ *  bar). This word is a link the user reads, so it takes the ink half of that split.
+ *
+ *  `color` overrides it for callers that place this on a COLORED fill, where blue-on-blue would be
+ *  unreadable — the ZeroCreditBanner's amber bar wants dark ink. The click behavior stays in this
+ *  one component either way, so there is still exactly one refill seam. */
+export function RefillLink({ label = "Refill", color = C.tealInk }: { label?: string; color?: string }) {
   return (
     <button
       type="button"

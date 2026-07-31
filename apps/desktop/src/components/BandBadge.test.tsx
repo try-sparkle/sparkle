@@ -47,12 +47,15 @@ describe("BandBadge — ● N", () => {
     // The override exists for the single state that rule cannot express: a filter chip switched off,
     // which drops to `muted` so the row reads as "not currently applied". Anything else passing an
     // ink is re-opening the drift this file closed.
-    // `needs_you` is the band `statusInk` passes through unchanged (green and gray are the two it
-    // remaps to themed var() tokens), so the default is comparable as a colour here rather than as
-    // a variable reference.
+    // `needs_you` USED TO BE the band `statusInk` passed through unchanged, which let this compare
+    // a resolved colour rather than a variable reference. It no longer is: the brand red measured
+    // 3.83:1 on light's white column while painting a link, so the red tier now remaps to
+    // `dangerInk` like the green and gray tiers before it. All three are themed var() tokens, so
+    // the comparison is against the TOKEN — jsdom passes a var() through verbatim, and asRgb has
+    // nothing to normalise.
     const { rerender } = render(<BandBadge band="needs_you" count={2} />);
     expect(screen.getByTestId("band-badge-needs_you").style.color).toBe(
-      asRgb(statusInk(bandColor("needs_you"))),
+      statusInk(bandColor("needs_you")),
     );
     rerender(<BandBadge band="needs_you" count={2} ink="rgb(1, 2, 3)" />);
     expect(screen.getByTestId("band-badge-needs_you").style.color).toBe("rgb(1, 2, 3)");

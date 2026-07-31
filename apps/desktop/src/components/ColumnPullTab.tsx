@@ -54,7 +54,15 @@
 // The dots are SQUARE (no rounding) per the same conversation — "a little bit more square than
 // those round dots". A round dot field reads as a generic drag handle; squares match a shell
 // whose thesis is that structure is drawn rather than filled.
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { FiChevronLeft, FiChevronRight } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
@@ -109,11 +117,76 @@ export interface ColumnPullTabProps {
   /** Which side the owned column sits on. `left` means dragging right grows it. */
   grows?: "left" | "right";
   /**
+   * HOW MUCH WIDTH ONE PIXEL OF POINTER TRAVEL BUYS. 1 for an ordinary seam; 2 for a column that
+   * grows from BOTH edges at once.
+   *
+   * THIS KNOWINGLY REVERSES A FIX. Symmetric growth was removed once, as a bug: with both pairs
+   * elastic and the concierge's width the only adjustable number in the row, "the column grew about
+   * its centre and its left edge slid left every time the user dragged its right edge." The founder
+   * was shown that exact sentence and chose symmetric anyway — because the column is now the row's
+   * ANCHOR, and an anchor that stays centred is worth an edge that moves with its opposite. So the
+   * behaviour the old comment called a defect is the specified behaviour here, and the seam that
+   * uses it passes 2: pull either edge out by dx and the concierge gains 2·dx, dx on each side.
+   *
+   * The BOUNDS are unaffected — `min`/`max` are widths, and the clamp still reports which one
+   * stopped a drag. Only the mapping from travel to width changes.
+   */
+  widthPerPx?: number;
+  /**
+   * THE CSS CUSTOM PROPERTY THIS TAB PAINTS INTO WHILE DRAGGING — how the gesture stays off React.
+   *
+   * A drag used to call `onWidth` on every pointer event, so every mousemove re-rendered the whole
+   * shell: a measured drag cost 30 `Workspace` renders and 1,668ms of jank, because `Workspace`
+   * re-renders the live pane list under it. With a variable, the drag writes one string onto the root
+   * element and the browser re-lays-out the row on its own — no React work at all — and `onWidth`
+   * fires ONCE, on release.
+   *
+   * Omit it and the column simply does not move until release. That is a coherent degradation rather
+   * than a second code path: the COMMIT is the same either way, and this only decides whether the
+   * user sees it happening. Every seam the shell mounts passes one.
+   */
+  cssVar?: string;
+  /**
    * How far down the seam the hover zone starts. Defaults to the header band, which is what keeps
    * the tab clear of the header's own controls; a boundary whose columns have no header can pass 0.
    */
   topOffset?: number;
   testId?: string;
+}
+
+/**
+ * Paint a width onto the root element, where every column that consumes it can see it.
+ *
+ * ON `document.documentElement`, NOT on the column, and that is the whole reason this works. A
+ * custom property declared on the element itself would WIN over the inherited one, so React's
+ * declaration and the drag's would fight and the drag would lose on the next render. Both writers
+ * target the same place instead: the drag writes here at pointer rate, React writes here on commit,
+ * and the columns only ever READ `var(--…)`. There is one source of truth and no reconciliation.
+ */
+export function publishColumnWidthVar(name: string, px: number): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.style.setProperty(name, `${px}px`);
+}
+
+/**
+ * THE DRAG SHIELD — a full-window sheet under the cursor for the duration of a gesture.
+ *
+ * A spindump of a real drag put 537 of 1,299 blocking WindowServer samples in WebKit recomputing the
+ * cursor: every mouse-move hit-tests the element under the pointer and asks it what cursor to show,
+ * and the shell's row is a deep tree of columns, panes and xterm canvases to walk. A single fixed
+ * sheet with ONE `cursor` makes that answer constant, which removes about half the blocking time.
+ *
+ * It earns its place twice over: it also stops text selection and stops the pointer being stolen by
+ * a canvas or an iframe mid-drag. It is created and destroyed with the gesture, so nothing is left
+ * covering the app if a render happens to land in the middle.
+ */
+function makeDragShield(): HTMLDivElement {
+  const el = document.createElement("div");
+  el.setAttribute("data-testid", "column-drag-shield");
+  el.style.cssText =
+    "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent";
+  document.body.appendChild(el);
+  return el;
 }
 
 export function ColumnPullTab({
@@ -125,13 +198,28 @@ export function ColumnPullTab({
   overlaid = false,
   onOverlayToggle,
   grows = "left",
+  widthPerPx = 1,
+  cssVar,
   topOffset = HEADER_H,
   testId = "column-pull-tab",
 }: ColumnPullTabProps) {
   const [hovered, setHovered] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [focused, setFocused] = useState(false);
-  const origin = useRef({ x: 0, width: 0 });
+  /** The live gesture: where it started, from what width, on which pointer, and the last width it
+   *  painted. `null` between drags. A REF because none of it may re-render anything. */
+  const drag = useRef<{ pointerId: number; x: number; width: number; applied: number } | null>(null);
+
+  // EVERYTHING THE DRAG READS, IN ONE REF THAT IS NEVER A DEPENDENCY.
+  //
+  // The listeners used to be keyed on `[dragging, commit, grows, endDrag]`, and `commit` is rebuilt
+  // whenever `onWidth`, `min`, `max` or `label` changes — which for the concierge seam is every time
+  // `Workspace` re-renders, i.e. on every projectStore write. So the LIVE drag's own listeners were
+  // torn down and re-added mid-gesture, repeatedly, on the exact hot path the instrumentation exists
+  // to keep honest. Reading config through a ref instead lets the effect depend on `dragging` alone,
+  // so the listeners are installed once per gesture and removed once.
+  const cfg = useRef({ min, max, label, grows, widthPerPx, cssVar, onWidth });
+  cfg.current = { min, max, label, grows, widthPerPx, cssVar, onWidth };
 
   // The last clamp state we reported, so a drag that sits pinned against a bound logs ONCE rather
   // than once per pointer event. Edge-triggered on purpose: `onMove` fires at pointer rate, and
@@ -173,29 +261,56 @@ export function ColumnPullTab({
 
   /** One line at the end of a gesture, so a drag is a bracketed span in the log rather than a
    *  scatter of width changes. `reason` distinguishes an ordinary release from a release the app
-   *  never saw (`buttons === 0`), which is a real failure mode this component already guards. */
-  const endDrag = useCallback(
-    (reason: "release" | "release-lost") => {
+   *  never saw (`buttons === 0`), which is a real failure mode this component already guards.
+   *
+   *  AND IT IS WHERE THE WIDTH IS COMMITTED NOW — the one `onWidth` call a drag makes. See `cssVar`:
+   *  the moves paint a CSS variable and do no React work at all, so the state change that used to
+   *  happen hundreds of times per gesture happens exactly once, here. */
+  const endDrag = useCallback((reason: "release" | "release-lost") => {
+    const g = drag.current;
+    const settled = g?.applied ?? lastApplied.current;
+    log.info(
+      "resize",
+      `${cfg.current.label}: drag end (${reason}) at ${settled ?? "unchanged"}${
+        settled == null ? "" : "px"
+      }`,
+    );
+    drag.current = null;
+    lastApplied.current = null;
+    setDragging(false);
+    // ONLY IF IT MOVED. A press-and-release on the dots with no travel is a click, not a resize, and
+    // committing there would mark the width dirty and persist a value the user never chose.
+    if (g && settled != null && settled !== g.width) cfg.current.onWidth(settled);
+  }, []);
+
+  /** Paint an intermediate width WITHOUT touching React. Clamps and logs exactly as a commit does —
+   *  the log is about the gesture, not about the state write — but the only side effect is the CSS
+   *  variable the columns read. */
+  const preview = useCallback((next: number) => {
+    const { min: lo, max: hi, label: name, cssVar: v } = cfg.current;
+    const { requested, applied, clampedBy } = clampWidth(next, lo, hi);
+    if (clampedBy !== lastClamp.current) {
+      lastClamp.current = clampedBy;
       log.info(
         "resize",
-        `${label}: drag end (${reason}) at ${lastApplied.current ?? "unchanged"}${
-          lastApplied.current == null ? "" : "px"
-        }`,
+        clampedBy
+          ? `${name}: requested ${requested} → applied ${applied}, clamped by ${clampedBy} (min ${lo}, max ${hi})`
+          : `${name}: requested ${requested} → applied ${applied}, unclamped`,
       );
-      lastApplied.current = null;
-      setDragging(false);
-    },
-    [label],
-  );
+    }
+    lastApplied.current = applied;
+    if (drag.current) drag.current.applied = applied;
+    if (v) publishColumnWidthVar(v, applied);
+  }, []);
 
   // While OVERLAID there is no boundary to drag: the column floats over its neighbour and its width
   // comes from the viewport, so a drag would silently move an edge the user cannot see. The dots
   // become a plain "dock me" button in that state — which is the founder's round trip.
-  const startResize = (e: { button?: number; clientX: number; preventDefault: () => void }) => {
+  const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== undefined && e.button !== 0) return; // primary button only
     if (overlaid) return;
     e.preventDefault();
-    origin.current = { x: e.clientX, width };
+    drag.current = { pointerId: e.pointerId, x: e.clientX, width, applied: width };
     // A drag is a new gesture too, so it must not inherit a latched keyboard run.
     keyPinned.current = false;
     // The START of the gesture, named. Without it a log shows widths changing with no way to tell
@@ -203,37 +318,69 @@ export function ColumnPullTab({
     // produces no width lines at all is silent about whether it was ever recognised.
     lastClamp.current = "start";
     log.info("resize", `${label}: drag start at ${width}px (min ${min}, max ${max}, grows ${grows})`);
+    // CAPTURE, so the gesture survives leaving the window — which a column drag does constantly,
+    // since the seam can be dragged all the way to either edge. See the note on the listeners below
+    // for why this does not replace them.
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // jsdom and some synthetic pointers have no capture. The window listeners still deliver the
+      // gesture; it just stops tracking once the pointer leaves the window, which is the behaviour
+      // this component had before capture existed.
+    }
     setDragging(true);
   };
 
   useEffect(() => {
     if (!dragging) return;
-    const onMove = (e: MouseEvent) => {
-      // A DROPPED `mouseup` MUST NOT LEAVE THE COLUMN FOLLOWING THE BARE CURSOR. If the release is
-      // lost — the pointer leaves the window, a native drag steals it, the button is let go over a
-      // surface that swallows the event — `dragging` stays true and every subsequent move resizes.
-      // This was documented as degrading to a no-op; it does not, and this is the instance the
-      // shell actually mounts, while the control that HAD the guard was mounted nowhere
-      // (roborev 54730). `buttons === 0` means no button is held: the gesture is over.
+    // THE SHIELD GOES UP WITH THE GESTURE AND COMES DOWN WITH IT — tied to the effect's lifetime so
+    // there is no path where a stuck flag leaves the app covered by an invisible sheet.
+    const shield = makeDragShield();
+
+    // WINDOW LISTENERS, STILL — pointer capture is an ADDITION to them, not a replacement.
+    //
+    // The original comment here explained that a dropped release must not leave the column following
+    // the bare cursor, and window-level listening is what guaranteed the events arrive at all.
+    // Capture makes them keep arriving OUTSIDE the window, which the old `mousemove` on `window`
+    // could not do; but capture is also the part that silently does nothing in jsdom and under some
+    // synthetic pointers. Listening on `window` keeps the gesture working when capture is absent,
+    // and the captured element's events bubble to `window` anyway when it is present. Both, not
+    // either.
+    const onMove = (e: PointerEvent) => {
+      const g = drag.current;
+      if (!g || (e.pointerId !== undefined && g.pointerId !== e.pointerId)) return;
+      // A DROPPED release must not leave the column following the bare cursor: if the button went up
+      // somewhere the app never saw it, `buttons === 0` is how we find out (roborev 54730).
       if (e.buttons === 0) {
         endDrag("release-lost");
         return;
       }
-      const dx = e.clientX - origin.current.x;
-      commit(origin.current.width + (grows === "left" ? dx : -dx));
+      const dx = e.clientX - g.x;
+      preview(g.width + (cfg.current.grows === "left" ? dx : -dx) * cfg.current.widthPerPx);
     };
     const onUp = () => endDrag("release");
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    // A cancelled pointer (the OS taking over, a touch turning into a scroll) ends the gesture too —
+    // without this the drag would hang with no release ever arriving.
+    window.addEventListener("pointercancel", onUp);
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      shield.remove();
     };
-  }, [dragging, commit, grows, endDrag]);
+    // `dragging` ALONE. Everything else the handlers read comes through `cfg`/`drag` refs, which is
+    // what stops a shell re-render from re-installing these mid-gesture.
+  }, [dragging, endDrag, preview]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if (overlaid) return;
-    const step = e.shiftKey ? BIG_STEP : STEP;
+    // THE SAME MAPPING THE POINTER USES. An arrow key moves the EDGE by `step`, so on a symmetric
+    // seam the column gains `step * widthPerPx` — otherwise the two input paths would disagree about
+    // what one nudge means, and a keyboard user would find the concierge growing half as fast as the
+    // mouse moves it.
+    const step = (e.shiftKey ? BIG_STEP : STEP) * widthPerPx;
     const sign = grows === "left" ? 1 : -1;
     // THE RESET LIVES INSIDE THE ARROW BRANCHES, not above them. Arrowing outward after a drag that
     // ended pinned at `max` used to log nothing at all — `clampedBy` never changed — so the reported
@@ -381,7 +528,7 @@ export function ColumnPullTab({
                 : `Drag to resize the ${label} (or focus it and use ← →)`
             }
             data-testid={`${testId}-dots`}
-            onMouseDown={startResize}
+            onPointerDown={startResize}
             onClick={() => {
               // Only meaningful while overlaid — this is the snap-back half of the round trip.
               if (overlaid) onOverlayToggle?.();
