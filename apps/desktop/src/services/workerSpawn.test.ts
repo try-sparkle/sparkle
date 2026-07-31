@@ -391,9 +391,13 @@ describe("spawnWorker", () => {
   it("hands the user the orchestrator if they were ON the worker when the spawn failed", async () => {
     const store = useProjectStore.getState();
     const projectId = store.addProject("Demo", "/tmp/demo");
-    // agents[0] is a DIFFERENT agent, so "fell back to agents[0]" can't masquerade as a pass.
-    const firstId = store.addAgent(projectId, { kind: "build" })!;
-    const buildId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    // agents[0] must be a DIFFERENT agent, or "fell back to agents[0]" masquerades as a pass. The
+    // DECOY IS CREATED SECOND, and that ordering is the assertion's whole discriminator: `addAgent`
+    // INSERTS at the front, so the last row created is the one at index 0. It used to be created
+    // first, back when `addAgent` appended — and when the insertion side flipped, this test went
+    // silently vacuous with its own comment still claiming the guard (roborev 56125).
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    const firstId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
     useProjectStore.getState().setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-b");
 
     invokeMock.mockImplementation((cmd: string) => {

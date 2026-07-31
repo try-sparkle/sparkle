@@ -1044,7 +1044,15 @@ function mergeProject(
     if (dropped) {
       for (const a of cur.agents) if (!present.has(a.id) && isRemoved(a.id)) dropped.push(a.id);
     }
-    const mergedAgents = survivors.length > 0 ? [...baseAgents, ...survivors] : baseAgents;
+    // SURVIVORS GO ON TOP, on the same side `addAgent` inserts. A live-only row is almost always a
+    // JUST-CREATED one — the projects blob is written on a trailing debounce, so every other
+    // window's snapshot predates it — and `crossWindowSync` rehydrates on every event another
+    // window emits. Appending them put the brand-new agent at the top of its rung and then dropped
+    // it to the bottom a moment later, which is the placement this store just set out to fix, and a
+    // symptom that did not exist under append (the merge's side agreed with `addAgent`'s, so the row
+    // never moved). Ordering by `createdAt` would be the more principled union, but the stamp is
+    // OPTIONAL — see its note in `addAgent` — so it cannot carry the invariant on its own.
+    const mergedAgents = survivors.length > 0 ? [...survivors, ...baseAgents] : baseAgents;
     // Nav-bug fix (Unit A): `selectedAgentId` is LIVE per-window navigation state, not something a
     // concurrent writer's snapshot should reset. A cross-window rehydrate that predates a just-added
     // agent carries a stale `pp.selectedAgentId` (the previously-selected row); taking it verbatim
@@ -1862,8 +1870,13 @@ export const useProjectStore = create<ProjectState>()(
               // restart" guarantee the design rests on. Leaving it undefined makes the age UNKNOWN,
               // and unknown is deliberately treated as OLD. (roborev 54696)
             };
-            // Append WITHOUT changing selectedAgentId — the self-heal must be invisible to the user.
-            return { ...p, agents: [...p.agents, agent] };
+            // Same side as `addAgent`, WITHOUT changing selectedAgentId — the self-heal must be
+            // invisible to the user, and "invisible" is about the selection, not about where the row
+            // lands. This is the second row-creation path, so appending here made "newest first"
+            // true of spawned rows and false of re-adopted ones: after a restart a self-healed
+            // worker sank below every sibling spawned since, an order that is neither newest-first
+            // nor seed order.
+            return { ...p, agents: [agent, ...p.agents] };
           }),
         })),
 
