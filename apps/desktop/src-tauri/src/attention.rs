@@ -978,36 +978,55 @@ mod tests {
         out
     }
 
-    /// True when `needle` is called anywhere inside a `dispatch_get_main_queue()` block.
-    /// Brace-matched from the block literal that follows the queue argument.
-    fn called_on_the_main_queue(code: &str, needle: &str) -> bool {
+    /// Byte range of the brace-matched block starting at the first `{` after `start`, but ONLY if
+    /// that brace belongs to the same statement (it must precede the next `;`).
+    ///
+    /// `Err` means "a block literal does not immediately follow here", which is a REFUSAL, not a
+    /// pass: e.g. `dispatch_queue_t q = dispatch_get_main_queue(); dispatch_sync(q, ^{ ... });`
+    /// decouples the token from the block, and scanning forward to whatever brace comes next would
+    /// silently latch onto an unrelated function body. Callers must surface it.
+    fn block_after(code: &str, start: usize) -> Result<std::ops::RangeInclusive<usize>, String> {
+        let open = code[start..].find('{').map(|o| start + o);
+        let semi = code[start..].find(';').map(|s| start + s);
+        let open = match (open, semi) {
+            (Some(o), Some(s)) if o < s => o,
+            (Some(o), None) => o,
+            _ => {
+                return Err(format!(
+                    "no block literal follows the token at byte {start}; this scan cannot prove \
+                     what runs on that queue — rewrite the call site or extend the matcher"
+                ))
+            }
+        };
+        let mut depth = 0usize;
+        for (off, ch) in code[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(open..=open + off);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(format!("unbalanced braces after byte {start}"))
+    }
+
+    /// True when `needle` is called inside a `dispatch_get_main_queue()` block.
+    /// `Err` when any call site could not be parsed — never silently treated as safe.
+    fn called_on_the_main_queue(code: &str, needle: &str) -> Result<bool, String> {
         let mut from = 0;
         while let Some(hit) = code[from..].find("dispatch_get_main_queue") {
             let start = from + hit;
-            let Some(open) = code[start..].find('{').map(|o| start + o) else {
-                return false;
-            };
-            let mut depth = 0usize;
-            let mut end = open;
-            for (off, ch) in code[open..].char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + off;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
+            let span = block_after(code, start)?;
+            if code[span.clone()].contains(needle) {
+                return Ok(true);
             }
-            if code[open..=end].contains(needle) {
-                return true;
-            }
-            from = end.max(start + 1);
+            from = (*span.end()).max(start + 1);
         }
-        false
+        Ok(false)
     }
 
     /// The vendored ObjC, as it will actually be compiled into the binary.
@@ -1024,9 +1043,10 @@ mod tests {
         ] {
             assert!(
                 !code.contains(banned),
-                "notify.m schedules `{banned}` — the auto-dismiss XPC poll is back on the main \
-                 thread. This is the 38.2%-of-main-thread regression from 2026-07-29; keep the \
-                 poll on the caller's background thread (see the SPARKLE PATCH comment)."
+                "notify.m schedules work on the main run loop via `{banned}`. Upstream's poll used \
+                 exactly this to put the deliveredNotifications XPC on the UI thread — measured at \
+                 38.2% of main-thread samples on 2026-07-29. Keep it on the caller's background \
+                 thread (see the SPARKLE PATCH comment in notify.m)."
             );
         }
     }
@@ -1037,16 +1057,85 @@ mod tests {
         // The remaining main-queue hops are deliberate and must stay zero-XPC: they run
         // `resolveAutoDismiss` so a race-queued `didActivate:` still wins.
         assert!(
-            called_on_the_main_queue(&code, "resolveAutoDismiss"),
+            called_on_the_main_queue(&code, "resolveAutoDismiss").unwrap(),
             "the deliberate zero-XPC main-queue hop vanished — this scan now proves nothing"
         );
         for xpc in ["wasAutoDismissed", "deliveredNotifications"] {
             assert!(
-                !called_on_the_main_queue(&code, xpc),
+                !called_on_the_main_queue(&code, xpc).unwrap(),
                 "`{xpc}` is called inside a dispatch_get_main_queue block — that is a synchronous \
                  XPC round-trip to usernoted executing on the UI thread."
             );
         }
+    }
+
+    // ── THE OTHER TWO HALVES OF THE INVARIANT ──────────────────────────────────────────────────
+    //
+    // The two scans above prove a property of a FILE. Neither proves that file is the one compiled,
+    // and neither covers `notify.m`'s *other* main-thread path. Both gaps are closable, and both
+    // were found by review rather than by the scans themselves — recorded here so the next reader
+    // knows the guard's exact perimeter instead of inferring a wider one from its name.
+
+    /// `version = "..."` inside the `[package]` table of a Cargo manifest.
+    fn package_version(manifest: &str) -> Option<&str> {
+        let pkg = manifest.split("[package]").nth(1)?;
+        let pkg = pkg.split("\n[").next()?; // stop at the next table
+        let line = pkg.lines().find(|l| l.trim_start().starts_with("version"))?;
+        line.split('"').nth(1)
+    }
+
+    #[test]
+    fn the_scanned_file_is_the_one_that_actually_gets_compiled() {
+        // Without this, the single regression route the scans exist to cover is the one route they
+        // cannot see: bumping the dependency to =0.6.16 while `vendor/` stays at 0.6.15 makes the
+        // `[patch.crates-io]` entry UNUSED — which cargo reports as a warning, not an error. The
+        // build would then link upstream's mainRunLoop NSTimer while both scans stayed green,
+        // reading a file no longer in the build.
+        const ROOT_MANIFEST: &str = include_str!("../Cargo.toml");
+        const VENDOR_MANIFEST: &str = include_str!("../vendor/mac-notification-sys/Cargo.toml");
+
+        assert!(
+            ROOT_MANIFEST.contains("mac-notification-sys = { path = \"vendor/mac-notification-sys\" }"),
+            "the [patch.crates-io] entry redirecting mac-notification-sys to vendor/ is gone — the \
+             build is using upstream, and the notify.m scans above are reading a dead file"
+        );
+
+        let pinned = ROOT_MANIFEST
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("mac-notification-sys = \"="))
+            .and_then(|r| r.split('"').next())
+            .expect("mac-notification-sys must stay `=`-pinned; force_present.m depends on the exact class layout");
+        let vendored = package_version(VENDOR_MANIFEST).expect("vendored [package] version");
+        assert_eq!(
+            pinned, vendored,
+            "the `=`-pin ({pinned}) and the vendored crate ({vendored}) disagree, so cargo will \
+             silently ignore the patch and link upstream. Re-vendor before bumping the pin."
+        );
+    }
+
+    #[test]
+    fn the_banner_send_is_still_handed_to_a_spawned_thread() {
+        // notify.m has a SECOND main-thread path the scans above do not cover: its
+        // `if ([NSThread isMainThread])` branch calls `wasAutoDismissed()` — the same synchronous
+        // deliveredNotifications XPC — inside a `runUntilDate:0.1` spin. That is every 100ms on the
+        // main run loop, i.e. WORSE than upstream's 0.5s timer. It is dormant only because
+        // `notify_attention` hands `deliver_attention_banner` to a detached thread, so the crate
+        // always takes its `else` branch. Nothing else pins that. Inlining the spawn — a plausible
+        // "simplify the detached thread" refactor — reproduces the 38.2% regression with every
+        // other test in this module green. So the spawn IS part of the invariant; assert it.
+        const SELF: &str = include_str!("attention.rs");
+        let production = objc_code_only(SELF.split("\n#[cfg(test)]").next().unwrap());
+
+        let spawn = production
+            .find("std::thread::spawn")
+            .expect("notify_attention must still deliver the banner off the main thread");
+        let body = block_after(&production, spawn).expect("spawn takes a closure literal");
+        assert!(
+            production[body].contains("deliver_attention_banner"),
+            "deliver_attention_banner is no longer inside notify_attention's std::thread::spawn. \
+             mac-notification-sys will then run its [NSThread isMainThread] branch, which polls \
+             deliveredNotifications every 100ms on the main run loop."
+        );
     }
 
     #[test]
@@ -1067,8 +1156,18 @@ mod tests {
 
         // And the main-queue scan must see through a nested block, not just the first brace.
         let nested = "dispatch_sync(dispatch_get_main_queue(), ^{ if (x) { wasAutoDismissed(); } });";
-        assert!(called_on_the_main_queue(nested, "wasAutoDismissed"));
+        assert!(called_on_the_main_queue(nested, "wasAutoDismissed").unwrap());
         let outside = "dispatch_sync(dispatch_get_main_queue(), ^{ resolve(); });\nwasAutoDismissed();";
-        assert!(!called_on_the_main_queue(outside, "wasAutoDismissed"));
+        assert!(!called_on_the_main_queue(outside, "wasAutoDismissed").unwrap());
+
+        // The queue-in-a-variable form decouples the token from the block. Scanning forward to the
+        // next brace would latch onto an unrelated body — passing a genuine main-thread XPC hop, or
+        // failing a benign one. The matcher must REFUSE, not guess.
+        let decoupled = "dispatch_queue_t q = dispatch_get_main_queue();\n\
+                         dispatch_sync(q, ^{ wasAutoDismissed(); });";
+        assert!(
+            called_on_the_main_queue(decoupled, "wasAutoDismissed").is_err(),
+            "the matcher guessed at a decoupled queue handle instead of refusing"
+        );
     }
 }
