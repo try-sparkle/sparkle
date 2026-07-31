@@ -658,7 +658,9 @@ export function Terminal({
     try {
       fit.fit();
     } catch {
-      /* container not laid out yet; the ResizeObserver will fit shortly */
+      /* container not laid out yet. A VISIBLE pane is re-fit by the next ResizeObserver tick; a
+         hidden one is not (that tick only records the debt now — see the observer below), so the
+         spawn path explicitly aligns xterm with the size the child is given instead. */
     }
     termRef.current = term;
     fitRef.current = fit;
@@ -1168,6 +1170,17 @@ export function Terminal({
       }
       const laidOut = !!term.element && term.element.clientWidth > 0;
       const { cols, rows } = spawnSize(laidOut, term);
+      // KEEP XTERM AGREED WITH WHAT THE CHILD IS ABOUT TO BE TOLD (roborev 56083). When the box is
+      // unmeasured, `fit.fit()` above no-ops (FitAddon proposes nothing for a 0-dimension box, so
+      // xterm stays at its constructed 80×24) while spawnSize DELIBERATELY returns the 120×30
+      // fallback — a 40-column disagreement, created on purpose by terminalSize.ts. That used to be
+      // healed by the first ResizeObserver tick after layout; for a hidden pane it no longer is,
+      // because that tick now just records the debt. Meanwhile output keeps arriving and being
+      // written into the grid, so the mismatch would bake mis-positioned rows into the scrollback of
+      // exactly the highest-volume case: backgrounded agents redrawing a --resume transcript at
+      // launch. Aligning xterm here costs a reflow of an EMPTY buffer, and is a no-op when the box
+      // was measured (fit already sized it to these very dimensions, and xterm early-returns).
+      if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
       // A mount→unmount inside this async window must not spawn an orphan PTY the cleanup's
       // detach (which already ran, on a not-yet-existing PTY) will never reap (roborev 46244).
       if (disposed) return;
@@ -1223,8 +1236,10 @@ export function Terminal({
     // At most two panes (one per pair) are ever on screen, so ~52 of 54 of those were invisible work.
     //
     // Two things cut it, in this order:
-    //   1. a VISIBILITY gate — an off-screen pane does the one part that is observable from off
-    //      screen (keep the PTY's wrap column right) and defers the rest to its reveal;
+    //   1. a VISIBILITY gate — an off-screen pane records the debt and defers ALL of it (the fit,
+    //      the reflow, the repaint AND the PTY resize) to its reveal, where the two widths move
+    //      together. Do not "optimize" by keeping the child's width live off screen: that reads as
+    //      harmless and is not — see the long note in the branch itself (roborev 56073);
     //   2. a per-pane rAF COALESCE — several observer ticks inside one frame do one pass, not one
     //      pass each (a pointer drag emits dozens of events per second).
     let resizeFrame = 0;
@@ -1396,9 +1411,10 @@ export function Terminal({
   // the ResizeObserver remains the long-term backstop for any late layout.
   //
   // That single fit is ALSO where a resize this pane skipped while hidden gets paid (sparkle-atp1).
-  // The observer keeps the PTY's wrap column current off screen but does not reflow xterm's buffer;
-  // the reflow lands here, once, for the one pane the user is actually looking at — instead of N
-  // times, synchronously, for panes nobody can see.
+  // The observer does NOTHING for an off-screen pane but record the debt — not the reflow and not
+  // the PTY resize, because the child's width and xterm's must never diverge for a pane that is
+  // still receiving output. Both land here, together, once, for the one pane the user is actually
+  // looking at — instead of N times, synchronously, for panes nobody can see.
   //
   // The repaint IS still needed: while hidden this pane ran on the DOM renderer (its WebGL context is
   // released when backgrounded — see attach/detachWebgl), so on reveal WebGL re-attaches with an

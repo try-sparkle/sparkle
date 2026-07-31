@@ -37,7 +37,7 @@ import { act, cleanup, render } from "@testing-library/react";
 // actually re-wrapped (fit() → term.resize()), and `proposals` records each cheap measurement-only
 // read. Counting DISTINCT ids is what turns "how many calls" into "how many PANES paid", which is the
 // quantity the log above is denominated in.
-const { fullFits, proposals, ros, widthCtl, propose, termSize, ptyPushes } = vi.hoisted(() => ({
+const { fullFits, proposals, ros, widthCtl, propose, termSize, ptyPushes, spawnPushes } = vi.hoisted(() => ({
   fullFits: [] as number[],
   proposals: [] as number[],
   ros: [] as Array<() => void>,
@@ -50,6 +50,10 @@ const { fullFits, proposals, ros, widthCtl, propose, termSize, ptyPushes } = vi.
   // Single-terminal tests only — with sixty panes mounted this is whichever one resized last.
   termSize: { cols: 80, rows: 24 },
   ptyPushes: [] as Array<{ pty: { cols: number; rows: number }; term: { cols: number; rows: number } }>,
+  // The size the CHILD was spawned with, paired the same way. Kept apart from ptyPushes because it
+  // happens during mount — `settleMount` clears ptyPushes, so a spawn-time disagreement recorded
+  // there would be thrown away before any assertion could see it (roborev 56083).
+  spawnPushes: [] as Array<{ pty: { cols: number; rows: number }; term: { cols: number; rows: number } }>,
 }));
 
 vi.mock("@xterm/xterm", () => {
@@ -120,6 +124,10 @@ vi.mock("@xterm/addon-fit", () => ({
     }
     proposeDimensions(): { cols: number; rows: number } | undefined {
       if (this.term) proposals.push(this.term.id);
+      // The real FitAddon returns undefined for a 0-dimension box — and fit() then no-ops, leaving
+      // xterm at its constructed size. That is precisely the case the spawn fallback diverges in,
+      // so a mock that always proposed a plausible size could never exercise it.
+      if (widthCtl.value <= 0) return undefined;
       return { ...propose };
     }
     fit(): void {
@@ -144,7 +152,10 @@ vi.mock("@xterm/addon-webgl", () => ({
 }));
 
 vi.mock("../pty", () => ({
-  spawnPty: vi.fn(() => Promise.resolve()),
+  spawnPty: vi.fn((opts: { cols: number; rows: number }) => {
+    spawnPushes.push({ pty: { cols: opts.cols, rows: opts.rows }, term: { ...termSize } });
+    return Promise.resolve();
+  }),
   writePty: vi.fn(() => Promise.resolve()),
   killPty: vi.fn(() => Promise.resolve()),
   resizePty: vi.fn((_id: string, cols: number, rows: number) => {
@@ -209,6 +220,7 @@ beforeEach(() => {
   fullFits.length = 0;
   proposals.length = 0;
   ptyPushes.length = 0;
+  spawnPushes.length = 0;
   ros.length = 0;
   spans.length = 0;
   termSize.cols = 80;
@@ -350,6 +362,28 @@ describe("resize fan-out across a 60-pane cockpit", () => {
 
     expect(fullFits).toHaveLength(0); // no buffer reflow off screen
     expect(resizePty).not.toHaveBeenCalled(); // …and the child is not told a width xterm lacks
+  });
+
+  it("does not diverge AT SPAWN either, when the box is unmeasured and the pane stays hidden", async () => {
+    // The hole the drag test above could not see (roborev 56083). With an unmeasured container
+    // fit() no-ops — xterm stays at its constructed 80x24 — while spawnSize DELIBERATELY hands the
+    // child the 120x30 fallback so the CLI never starts life wrapping into a thin column. That is a
+    // 40-column disagreement, and the ResizeObserver tick that used to heal it does nothing for a
+    // hidden pane now. Output keeps arriving the whole time, so the mismatch bakes mis-positioned
+    // rows into scrollback — the same damage the deferral exists to prevent, seeded at spawn.
+    widthCtl.value = 0; // unmeasured box: fit() cannot propose anything
+    render(<Terminal {...baseProps} agentId="a0" active={false} />);
+    await settleMount();
+
+    // The pane never becomes visible; a drag ticks its observer regardless.
+    propose.cols = 140;
+    dragFanOut();
+
+    expect(spawnPushes).toHaveLength(1); // the child really was spawned
+    // …at a size xterm agrees with. Pre-fix this is { cols: 120 } vs { cols: 80 }.
+    expect(spawnPushes[0]!.pty).toEqual(spawnPushes[0]!.term);
+    // And nothing since has moved either side independently.
+    for (const { pty, term } of ptyPushes) expect(pty).toEqual(term);
   });
 
   it("NEVER lets the child's width and xterm's width diverge, across a whole drag", async () => {
