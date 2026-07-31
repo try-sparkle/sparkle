@@ -432,6 +432,34 @@ describe("orchestrationPersona", () => {
     const rule = bullet("- THE RULE");
     // Capacity is named by the signal that actually indicates it, not by "any error".
     expect(rule).toMatch(/timed\s+out\s+waiting\s+for\s+a\s+free\s+slot/i);
+    // BOTH capacity strings. roborev 56200: naming only the desktop-side expiry reply left the MCP
+    // client's own socket timeout (`bridge request timeout: spawn_worker`, bridgeClient.ts) falling
+    // into the "any other error → carry on" branch — so the orchestrator would DROP a unit that never
+    // started and keep firing spawns into a machine still at cap, each stalling ~10 minutes.
+    expect(rule).toMatch(/bridge\s+request\s+timeout/i);
+    // ...and the general instruction, so a third timeout phrasing is covered too.
+    expect(rule).toMatch(/any\s+TIMEOUT\s+as\s+capacity|treat\s+any\s+timeout/i);
+  });
+
+  it("does not claim a SOCKET timeout proves the unit never started (roborev 56222)", () => {
+    // Collapsing both timeout strings into one "was NOT started, re-spawn it" branch was right about
+    // capacity and wrong about certainty. The desktop-side expiry reply proves the entry never
+    // reached `runSpawn`. A bare `bridge request timeout` proves nothing about what the app did: the
+    // expiry fires at SPAWN_QUEUE_MAX_WAIT_MS while the socket dies at the bridge's own bound, so a
+    // request drained near its deadline can still be inside `spawnWorker` (worktree cut + record +
+    // open) when the socket goes. `handleSpawn` de-duplicates only when a `beadId` is present, so for
+    // an ad-hoc spawn "re-spawn exactly that unit" yields a second worktree + branch on the same
+    // work — the duplicate-agent failure this whole area exists to prevent.
+    const rule = bullet("- THE RULE");
+    // The uncertainty must be stated, and tied to the check that resolves it.
+    expect(rule).toMatch(/unknown/i);
+    expect(rule).toMatch(/list_workers/);
+    // Only the PROVABLE case may carry the certainty language.
+    const provable = rule.slice(0, rule.search(/bare `bridge request/i));
+    expect(provable).toMatch(/provably did not start|did not start/i);
+    // ...and the ambiguous case must not be told to re-spawn without checking first.
+    const ambiguous = rule.slice(rule.search(/bare `bridge request/i));
+    expect(ambiguous).toMatch(/only if|do NOT re-spawn it blind|blind/i);
     // Non-capacity failures get their own branch that says CARRY ON.
     expect(rule).toMatch(/any\s+other\s+error/i);
     expect(rule).toMatch(/carry\s+on|continue\s+with\s+the\s+rest|rest\s+of\s+the\s+batch/i);

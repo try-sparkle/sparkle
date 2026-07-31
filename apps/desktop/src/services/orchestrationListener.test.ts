@@ -606,6 +606,48 @@ describe("orchestrationListener", () => {
     }
   });
 
+  it("expires on the REAP TICK too, so a quiet store cannot miss the deadline (roborev 56200)", async () => {
+    // The expiry originally ran ONLY at the top of drainQueue, which is driven by projectStore
+    // changes / runSpawn's finally / handleSpawn. The 60s reap tick did not call it, and a reap pass
+    // that reclaims nothing mutates no store — so on a machine whose capacity is held by leaked
+    // worker records that no longer tick the store (exactly the case this queue exists for), the
+    // 600s deadline could pass unnoticed and the caller would get the MCP client's raw
+    // `bridge request timeout` at 660s instead of the designed capacity error.
+    //
+    // The duplicate-worker hazard was already closed either way (the top-of-drain sweep runs before
+    // any splice). What this pins is the ERROR REPLY, which is the premise the persona's rule rests
+    // on — so it asserts the reply arrives with NO store activity whatsoever.
+    // Drives `reapOrphanedWorkers` — the exported function the 60s interval, the on-cap trigger and
+    // the startup pass all call — rather than the interval itself. Faking the interval is not an
+    // option here: `beforeEach` starts the listener under REAL timers, so a later `vi.useFakeTimers()`
+    // does not control the already-registered `setInterval` (the first draft of this test failed for
+    // exactly that reason, not because the fix was wrong).
+    let clock = 3_000_000;
+    __setReaperNow(() => clock);
+    try {
+      useSettingsStore.setState({ maxConcurrentWorkers: 1, effectiveMaxConcurrentWorkers: 1 });
+      fire({ reqId: "r1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "holds" } });
+      await flush();
+      fire({ reqId: "r2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "abandoned" } });
+      await flush();
+      invokeMock.mockClear();
+      const before = spawnWorkerMock.mock.calls.length;
+
+      // NOTHING touches the store from here on — only the clock moves and a reap pass runs. That is
+      // the whole point: on a quiet store, the reaper must be what delivers the reply.
+      clock += SPAWN_QUEUE_MAX_WAIT_MS + 1;
+      await reapOrphanedWorkers();
+
+      const r2 = invokeMock.mock.calls.find(([, a]) => (a as { reqId: string }).reqId === "r2");
+      expect(r2, "no reply for the expired spawn — the reap pass did not sweep the queue").toBeDefined();
+      expect((r2![1] as { result: { error?: string } }).result.error).toMatch(/timed out waiting for a free slot/i);
+      // ...and it expired rather than being spawned.
+      expect(spawnWorkerMock.mock.calls.length).toBe(before);
+    } finally {
+      __setReaperNow();
+    }
+  });
+
   it("still honours a queued spawn whose caller is STILL waiting (expiry must not fire early)", async () => {
     // The other half: expiring too eagerly would break the normal queue-and-drain path, which is the
     // feature. Just under the deadline, the queued spawn must run exactly as before.

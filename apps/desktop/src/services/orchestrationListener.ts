@@ -65,9 +65,23 @@ const queuedAt = new Map<string, number>();
 //
 // Expiring UNDER the client timeout (not over it) is what makes the persona's rule true: the caller
 // receives a real `{ error }` reply instead of a socket timeout, and the unit genuinely did not
-// start — so "an error means it did not start, re-spawn it" is now sound advice. Sixty seconds of
-// margin covers reply latency so the error, not the timeout, is what the caller sees.
-export const SPAWN_QUEUE_MAX_WAIT_MS = 600_000;
+// start — so "an error means it did not start, re-spawn it" is sound advice for THAT reply.
+//
+// The budget has to clear the SWEEP GRANULARITY, not just the deadline (roborev 56222). Delivery on
+// a quiet store comes from the reap tick, which is anchored to listener start rather than to enqueue
+// — so an entry queued just after a tick expires on time but is not swept for up to another
+// REAP_INTERVAL_MS, and `respond` then adds its own round trip. At 600_000 that was a dead heat with
+// the 660s socket: 600 + 60 = 660 exactly, leaving nothing for the reply itself. The invariant is
+// `SPAWN_QUEUE_MAX_WAIT_MS + REAP_INTERVAL_MS < DEFAULT_TIMEOUT_MS`, with real headroom — pinned by
+// orchestrationListener.bridgeBound.test.ts, which reads the bridge's own constant rather than
+// trusting a copy of it (the agentBrief.bridgeBound.test.ts pattern, and for the same reason: a
+// copied number is exactly what drifts).
+//
+// The cost of the lower value is 60s of legitimate queue time. That is the right trade: a spawn that
+// has waited nine minutes for a slot is not about to get one, and an ambiguous socket timeout is far
+// more expensive than an early honest error — it forces the orchestrator into the "did it start?"
+// branch, which is where duplicate workers come from.
+export const SPAWN_QUEUE_MAX_WAIT_MS = 540_000;
 // Synchronous reservation count keyed by `${projectId}:${buildAgentId}`. spawnWorker is async and
 // the store's worker count only rises once it resolves, so a cap check on liveWorkerCount alone
 // would let concurrent spawn_worker events (and concurrent drainQueue passes) ALL read the
@@ -414,7 +428,7 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
 }
 
 // ── reaper: reclaim orphaned workers (the machine-wide cap leak) ───────────────────────────────────
-const REAP_INTERVAL_MS = 60_000;
+export const REAP_INTERVAL_MS = 60_000;
 // Grace: an orphan must be observed orphaned across at least REAP_MIN_OBSERVATIONS passes of ONE
 // continuous run AND for at least REAP_GRACE_MS before it is torn down. The listener is per-window and
 // `projectStore` syncs across windows through a debounced persist (~400ms) + a 300ms rehydrate
@@ -523,6 +537,20 @@ export async function reapOrphanedWorkers(): Promise<number> {
   // captured-generation compare here would be a no-op tautology — pass 1 is synchronous, so there is
   // no yield for the generation to change across; pass 2 is where the gen guard actually earns its keep.)
   if (!listenerLive) return 0;
+  // Settle the spawn queue on every reap pass, BEFORE the single-flight guard below — this is a
+  // synchronous, idempotent sweep, so it must not be skipped just because another reap is mid-flight.
+  //
+  // Why it lives here and not only in drainQueue (roborev 56200): drainQueue is driven by
+  // projectStore changes / runSpawn's finally / handleSpawn, and a reap pass that reclaims nothing
+  // mutates no store. The case the queue exists for is capacity held by leaked worker records that
+  // no longer tick the store — exactly the quiet-store case — so relying on drainQueue alone could
+  // let the 600s deadline pass and hand the caller the MCP client's raw `bridge request timeout` at
+  // 660s instead of the designed capacity error. Hanging it off the reaper puts it on the 60s
+  // interval, the on-cap trigger, and the startup pass at once.
+  //
+  // The duplicate-worker hazard is closed by the drainQueue sweep regardless; this guarantees the
+  // ERROR REPLY, which is the premise the orchestrator persona's rule rests on.
+  expireStaleQueuedSpawns();
   if (reaping) {
     // A pass is already running and computed its candidates from an OLDER snapshot. Whatever triggered
     // this call (an orphan or a blocked spawn that materialised since) would be missed until the 60s
@@ -970,6 +998,8 @@ async function doStart(): Promise<() => void> {
   // the teardown gap is a no-op.
   reapTimer = setInterval(() => {
     if (!listenerLive) return;
+    // reapOrphanedWorkers sweeps the spawn queue at its top (see the note there), so this 60s tick
+    // is also what bounds how long an expired spawn can wait for its error reply on a quiet store.
     void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] periodic reap failed", e));
   }, REAP_INTERVAL_MS);
   return teardown;
