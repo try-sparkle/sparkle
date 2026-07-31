@@ -30,7 +30,6 @@ const MIN = 60_000;
 /** An observation in which nothing is wrong, so each test can make exactly one thing wrong. */
 function obs(over: Partial<Observation> = {}): Observation {
   return {
-    unpushedCommits: 0,
     goalMet: false,
     roborevRounds: 0,
     now: NOW,
@@ -70,7 +69,7 @@ describe("goal-expired — the design's highest-value trigger", () => {
 describe("unpushed-commits", () => {
   it(`fires at ${UNPUSHED_MINUTES} minutes and cites the count, the age and the threshold`, () => {
     const t = evaluateTriggers(
-      obs({ unpushedCommits: 4, oldestUnpushedAt: NOW - UNPUSHED_MINUTES * MIN }),
+      obs({ hasUnlandedWork: true, unpushedCommits: 4, oldestUnpushedAt: NOW - UNPUSHED_MINUTES * MIN }),
     );
     expect(ids(t)).toEqual(["unpushed-commits"]);
     expect(t[0]!.measured).toEqual(["4", String(UNPUSHED_MINUTES), String(UNPUSHED_MINUTES)]);
@@ -78,12 +77,12 @@ describe("unpushed-commits", () => {
 
   it("stays quiet one minute under the threshold", () => {
     expect(
-      evaluateTriggers(obs({ unpushedCommits: 4, oldestUnpushedAt: NOW - (UNPUSHED_MINUTES - 1) * MIN })),
+      evaluateTriggers(obs({ hasUnlandedWork: true, unpushedCommits: 4, oldestUnpushedAt: NOW - (UNPUSHED_MINUTES - 1) * MIN })),
     ).toEqual([]);
   });
 
   it("stays quiet when the branch is clean however old the checkout", () => {
-    expect(evaluateTriggers(obs({ unpushedCommits: 0, oldestUnpushedAt: NOW - 999 * MIN }))).toEqual(
+    expect(evaluateTriggers(obs({ hasUnlandedWork: false, unpushedCommits: 0, oldestUnpushedAt: NOW - 999 * MIN }))).toEqual(
       [],
     );
   });
@@ -124,6 +123,7 @@ describe("priority order", () => {
     const t = evaluateTriggers(
       obs({
         goalExpiresAt: NOW - 60 * MIN,
+        hasUnlandedWork: true,
         unpushedCommits: 2,
         oldestUnpushedAt: NOW - 60 * MIN,
         roborevRounds: 12,
@@ -159,10 +159,10 @@ describe("the two-observation rule", () => {
   // which inverts the rule this exists to implement.
   it("admits a persisting condition whose numbers have moved, and cites the FRESH numbers", () => {
     const earlier = evaluateTriggers(
-      obs({ unpushedCommits: 4, oldestUnpushedAt: NOW - 38 * MIN, now: NOW }),
+      obs({ hasUnlandedWork: true, unpushedCommits: 4, oldestUnpushedAt: NOW - 38 * MIN, now: NOW }),
     );
     const later = evaluateTriggers(
-      obs({ unpushedCommits: 4, oldestUnpushedAt: NOW - 38 * MIN, now: NOW + 5 * MIN }),
+      obs({ hasUnlandedWork: true, unpushedCommits: 4, oldestUnpushedAt: NOW - 38 * MIN, now: NOW + 5 * MIN }),
     );
     const persisted = persistedTriggers(earlier, later);
     expect(ids(persisted)).toEqual(["unpushed-commits"]);
@@ -184,6 +184,7 @@ describe("every challenge survives its own gate", () => {
   const everyTrigger = evaluateTriggers(
     obs({
       goalExpiresAt: NOW - (3 * 60 + 12) * MIN,
+      hasUnlandedWork: true,
       unpushedCommits: 4,
       oldestUnpushedAt: NOW - 38 * MIN,
       roborevRounds: 12,
@@ -225,5 +226,47 @@ describe("time helpers", () => {
 
   it("never reports a negative span", () => {
     expect(splitHoursMinutes(-5 * MIN)).toEqual({ h: 0, m: 0 });
+  });
+});
+
+describe("unpushed-commits adapts to the evidence it actually has", () => {
+  // The count lives on runtimeStore.branchStatus (displayed project only); the CONDITION lives on
+  // fleetVerdict.contradictions (every open agent, app-wide, but boolean). So the trigger has to
+  // work from either, and must never invent the number it does not have — the citation gate cannot
+  // catch a fabricated count, because a fabricated count IS "measured" as far as it can tell.
+  it("cites the count when one was measured", () => {
+    const t = evaluateTriggers(
+      obs({ hasUnlandedWork: true, unpushedCommits: 4, oldestUnpushedAt: NOW - 38 * MIN }),
+    );
+    expect(t[0]!.challenge).toBe("You have 4 commits unpushed for 38 minutes.");
+    expect(t[0]!.measured).toContain("4");
+  });
+
+  it("still fires fleet-wide with no count, citing only the duration", () => {
+    const t = evaluateTriggers(obs({ hasUnlandedWork: true, oldestUnpushedAt: NOW - 38 * MIN }));
+    expect(ids(t)).toEqual(["unpushed-commits"]);
+    expect(t[0]!.challenge).toBe("Your branch has held unlanded work for 38 minutes.");
+    expect(t[0]!.measured).toEqual(["38", String(UNPUSHED_MINUTES)]);
+  });
+
+  // FAIL CLOSED. `undefined` is "we did not look", never "clean" — agentStall's rule, inherited.
+  it("does NOT fire when nothing was looked up, however old the clock", () => {
+    expect(evaluateTriggers(obs({ oldestUnpushedAt: NOW - 999 * MIN }))).toEqual([]);
+  });
+
+  it("does not fire on an explicit false", () => {
+    expect(
+      evaluateTriggers(obs({ hasUnlandedWork: false, oldestUnpushedAt: NOW - 999 * MIN })),
+    ).toEqual([]);
+  });
+
+  // A count of 0 alongside a true boolean is a squash-landed branch: `ahead` does not return to
+  // zero reliably, so the boolean wins and the sentence simply omits the number.
+  it("omits a zero count rather than saying '0 commits'", () => {
+    const t = evaluateTriggers(
+      obs({ hasUnlandedWork: true, unpushedCommits: 0, oldestUnpushedAt: NOW - 38 * MIN }),
+    );
+    expect(t[0]!.challenge).toBe("Your branch has held unlanded work for 38 minutes.");
+    expect(t[0]!.measured).not.toContain("0");
   });
 });

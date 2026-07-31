@@ -634,9 +634,16 @@ pub struct PushersConfig {
     /// Same ceiling-only rule as `messages_per_hour`: clamped against `INBOX_YIELD_PCT` on the
     /// TypeScript side, so raising it here cannot make a Pusher talk over a backed-up partner.
     pub inbox_yield_pct: i64,
-    /// The model a Pusher composes on. Default `claude-haiku-4-5` — a bounded observation in, one
-    /// cited sentence out, which is what every other cheap-model caller in the app pins.
-    pub model: String,
+    // THERE IS DELIBERATELY NO `model` FIELD. The design budgeted a cheap-model call per
+    // observation to compose each challenge, and that call was removed: the citation rule in
+    // `packages/core/pusherGate.ts` refuses any number the observation did not measure, which
+    // leaves a composer nothing to do but restate arithmetic somebody else did — and a fixed
+    // sentence shape is easier to recognise at a glance than varied prose.
+    //
+    // The key is gone rather than left inert because this struct is mirrored into `DEFAULT_TEMPLATE`,
+    // which the user is invited to hand-edit. A knob nobody reads is worse than no knob: it invites
+    // an edit, accepts it, warns about nothing, and changes not one thing. Phase 2 may reintroduce
+    // one — together with the caller that reads it.
 }
 
 impl Default for PushersConfig {
@@ -648,7 +655,6 @@ impl Default for PushersConfig {
             observe_interval_ms: 300_000,
             messages_per_hour: 4,
             inbox_yield_pct: 80,
-            model: "claude-haiku-4-5".to_string(),
         }
     }
 }
@@ -1406,7 +1412,6 @@ struct PartialPushers {
     observe_interval_ms: Option<toml::Value>,
     messages_per_hour: Option<toml::Value>,
     inbox_yield_pct: Option<toml::Value>,
-    model: Option<toml::Value>,
     #[serde(flatten)]
     rest: std::collections::BTreeMap<String, toml::Value>,
 }
@@ -1924,22 +1929,10 @@ fn apply_pushers(into: &mut PushersConfig, p: Option<PartialPushers>) -> Vec<Str
     int_field("messages_per_hour", p.messages_per_hour, &mut into.messages_per_hour);
     int_field("inbox_yield_pct", p.inbox_yield_pct, &mut into.inbox_yield_pct);
 
-    if let Some(v) = p.model {
-        match v.as_str() {
-            // Kept verbatim, unrecognized ids included: the model list is not authoritative here,
-            // and narrowing it would reject a model released after this build.
-            Some(s) => into.model = s.to_string(),
-            None => warnings.push(format!(
-                "[pushers].model is a {}, not text, so it has no effect",
-                v.type_str()
-            )),
-        }
-    }
-
     for (field, _) in p.rest {
         warnings.push(format!(
             "[pushers].{field} is not a Pusher setting (enabled, observe_interval_ms, \
-             messages_per_hour, inbox_yield_pct, model), so it has no effect"
+             messages_per_hour, inbox_yield_pct), so it has no effect"
         ));
     }
     warnings
@@ -3358,7 +3351,6 @@ enabled             = true    # master switch — false stops every Pusher from 
 observe_interval_ms = 300000  # ms between observation cycles for one partner (5 min). Floor: 60000
 messages_per_hour   = 4       # challenges per partner per rolling hour. Ceiling only — lower it, never raise
 inbox_yield_pct     = 80      # if the partner's inbox is this % full or more, the Pusher stays quiet
-model               = "claude-haiku-4-5"  # a Pusher composes on the cheap model; one cited sentence out
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -6565,7 +6557,6 @@ tools = "allow"
         assert_eq!(p.observe_interval_ms, 300_000, "five minutes, the costed interval");
         assert_eq!(p.messages_per_hour, 4);
         assert_eq!(p.inbox_yield_pct, 80);
-        assert_eq!(p.model, "claude-haiku-4-5");
         assert!(
             !warns.iter().any(|w| w.contains("[pushers]")),
             "the shipped envelope must load clean: {warns:?}"
@@ -6585,7 +6576,6 @@ tools = "allow"
             observe_interval_ms: 1,
             messages_per_hour: 999,
             inbox_yield_pct: 3,
-            model: "wiped".to_string(),
         };
         let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
         assert!(!hard, "the shipped template must parse: {warns:?}");
@@ -6611,7 +6601,6 @@ tools = "allow"
         assert_eq!(p.messages_per_hour, 1, "the edit must take effect");
         assert_eq!(p.observe_interval_ms, 300_000, "an unmentioned sibling keeps its shipped value");
         assert_eq!(p.inbox_yield_pct, 80, "and so does this one");
-        assert_eq!(p.model, "claude-haiku-4-5", "and the model");
         assert!(p.enabled, "lowering the budget is a different edit from switching Pushers off");
         assert!(warns.is_empty(), "a valid edit warns about nothing: {warns:?}");
     }
@@ -6639,14 +6628,13 @@ mesages_per_hour = 9
         let p = &cfg.pushers;
         assert!(p.enabled, "a non-bool master switch is dropped, so the shipped `true` stands");
         assert_eq!(p.messages_per_hour, 4, "the bad budget was dropped, not coerced");
-        assert_eq!(p.model, "claude-haiku-4-5", "the bad model was dropped, not stringified");
         assert_eq!(p.inbox_yield_pct, 25, "the GOOD field in the same table still applied");
         // Every dropped line is REPORTED — including the misspelling, which would otherwise parse,
         // apply nothing, and say nothing while the Pusher kept its shipped rate.
         let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
         assert!(said("[pushers].enabled is a string"), "master switch: {warns:?}");
         assert!(said("[pushers].messages_per_hour is a string"), "budget: {warns:?}");
-        assert!(said("[pushers].model is a integer"), "model: {warns:?}");
+
         assert!(said("[pushers].mesages_per_hour is not a Pusher setting"), "typo: {warns:?}");
     }
 
@@ -6679,12 +6667,12 @@ mesages_per_hour = 9
         // The boundary [concierge] already draws, for a related reason: how often the agents on
         // this machine get interrupted — and how much is spent doing it — is the machine owner's
         // call, not a property of a repo that happens to be cloned onto it.
-        let p = "[pushers]\nenabled = false\nmessages_per_hour = 99\nmodel = \"repo-choice\"\n";
+        let p = "[pushers]\nenabled = false\nmessages_per_hour = 99\ninbox_yield_pct = 5\n";
         let (cfg, warns, hard) = effective(None, Some(p));
         assert!(!hard);
         assert!(cfg.pushers.enabled, "a repo must not be able to switch this machine's Pushers off");
         assert_eq!(cfg.pushers.messages_per_hour, 4, "nor crank the budget up");
-        assert_eq!(cfg.pushers.model, "claude-haiku-4-5", "nor pick what they compose on");
+        assert_eq!(cfg.pushers.inbox_yield_pct, 80, "nor make them yield sooner");
         let msg = warns
             .iter()
             .find(|w| w.contains("[pushers]"))

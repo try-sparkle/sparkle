@@ -74,9 +74,29 @@ export interface Trigger {
  * something is wrong without being told the number is a Pusher that can say so without one.
  */
 export interface Observation {
-  /** Commits on the partner's branch not present on its upstream. */
-  unpushedCommits: number;
-  /** When the oldest unpushed commit was authored, epoch ms; undefined when there are none. */
+  /**
+   * Whether the partner is holding work that has not landed.
+   *
+   * `undefined` means NOT LOOKED UP and never "clean" — the fail-closed rule `agentStall` states:
+   * *"an ABSENT input never manufactures a stall… a stall claim that fires on missing data trains
+   * the human to ignore the signal, which costs more than the stall did."*
+   */
+  hasUnlandedWork?: boolean;
+  /**
+   * How many commits, when that is knowable — `undefined` when it is not, which is the common case.
+   *
+   * THE COUNT AND THE CONDITION COME FROM DIFFERENT PLACES, and this is why they are two fields.
+   * `runtimeStore.branchStatus[id].ahead` has a count but is refreshed by a poll keyed on the
+   * DISPLAYED project, so most agents have none. `fleetVerdict.contradictions` carries
+   * `silent-with-work-outstanding` for every open agent app-wide, artifact-derived, but it is a
+   * boolean — `FleetVerdict` has no `facts` field, whatever its doc comment claims.
+   *
+   * So the trigger fires on the fleet-wide boolean and cites the count only where one was really
+   * measured. That keeps coverage wide without ever inventing a number, which is the one thing the
+   * citation gate cannot catch: a fabricated count would be "measured" as far as it can tell.
+   */
+  unpushedCommits?: number;
+  /** When the Pusher FIRST observed this unlanded-work episode (its own clock — see pusherClocks). */
   oldestUnpushedAt?: number;
   /** Goal expiry, epoch ms (`setAt + ttlMs`); undefined when there is no goal. */
   goalExpiresAt?: number;
@@ -150,13 +170,25 @@ export function evaluateTriggers(obs: Observation): Trigger[] {
     });
   }
 
-  if (obs.unpushedCommits > 0 && obs.oldestUnpushedAt !== undefined) {
+  // Fires on the fleet-wide boolean, or on a count where one was measured. `undefined` on both is
+  // "we did not look" and must not fire — see `hasUnlandedWork`.
+  const holdingWork =
+    obs.hasUnlandedWork === true || (obs.unpushedCommits !== undefined && obs.unpushedCommits > 0);
+  if (holdingWork && obs.oldestUnpushedAt !== undefined) {
     const mins = minutesBetween(obs.oldestUnpushedAt, obs.now);
     if (mins >= UNPUSHED_MINUTES) {
+      // The count is quoted ONLY when it was really measured. Both sentences are true statements
+      // built from `measured`; the shorter one is what most of the fleet gets, and it is still
+      // actionable because the duration is the part the partner can do something about.
+      const counted = obs.unpushedCommits !== undefined && obs.unpushedCommits > 0;
       out.push({
         id: "unpushed-commits",
-        measured: [String(obs.unpushedCommits), String(mins), String(UNPUSHED_MINUTES)],
-        challenge: `You have ${obs.unpushedCommits} commits unpushed for ${mins} minutes.`,
+        measured: counted
+          ? [String(obs.unpushedCommits), String(mins), String(UNPUSHED_MINUTES)]
+          : [String(mins), String(UNPUSHED_MINUTES)],
+        challenge: counted
+          ? `You have ${obs.unpushedCommits} commits unpushed for ${mins} minutes.`
+          : `Your branch has held unlanded work for ${mins} minutes.`,
       });
     }
   }
