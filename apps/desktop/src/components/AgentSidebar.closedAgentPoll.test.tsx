@@ -85,7 +85,7 @@ function polledIds(): string[] {
 
 beforeEach(() => {
   useUiStore.setState({
-    collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null,
+    collapsedOrchestrators: {}, activeSpecial: null,
   } as never);
   projectAgentsStatus.mockClear();
 });

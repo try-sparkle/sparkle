@@ -88,7 +88,7 @@ function rowFor(name: string): HTMLElement {
 }
 
 beforeEach(() => {
-  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
 });
 afterEach(cleanup);
 

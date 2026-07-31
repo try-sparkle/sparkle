@@ -45,6 +45,7 @@ vi.mock("../services/branchStatus", () => ({
 }));
 
 import { AgentSidebar } from "./AgentSidebar";
+import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -548,22 +549,42 @@ describe("Build column — the filter chips agree with the discs", () => {
   });
 });
 
-describe("Build column — a worker going red opens its parent, once", () => {
-  it("expands a folded parent when one of its workers turns red", () => {
+describe("Build column — a worker going red does NOT open its parent", () => {
+  // POSITIVE CONTROL for the `childRowOf` probe this block relies on. Every other use of it here
+  // expects FALSE, and it returns FALSE for a missing group just as readily as for a shut one — so
+  // without a case that expects TRUE, renaming `subtreeDomId` would turn this whole block into an
+  // always-pass instead of failing.
+  it("the childRowOf probe resolves a real expanded subtree", () => {
+    const project = seedExpanded({ a1: "idle", w1: "working" });
+    render(<AgentSidebar project={project} />);
+    expect(subtreeGroupExists("a1")).toBe(true);
+    expect(childRowOf("a1", "Parser Worker")).toBe(true);
+  });
+
+  // The inverse of what this block used to assert. A red worker opening its parent, combined with
+  // the deliberate refusal to close again when the red cleared, is what left subtrees standing open
+  // showing green workers. Disclosure is user state now; the red still reaches the user through the
+  // head's own disc and through the one-line peek a closed parent draws.
+  it("leaves a folded parent folded when one of its workers turns red", () => {
     const project = seed({ a1: "idle", w1: "working", w2: "working" });
     const { rerender } = render(<AgentSidebar project={project} />);
-    expect(screen.queryByText("Parser Worker")).toBeNull();
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
 
     useRuntimeStore.setState({ status: { a1: "idle", w1: "blocked", w2: "working" } } as never);
     rerender(<AgentSidebar project={{ ...project }} />);
 
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-    expect(screen.queryByText("Parser Worker")).toBeTruthy();
+    // Assert the RENDER after the red, not only the store flag. The pre-red absence above proves
+    // nothing about this — the peek cannot render while every worker is green — so without these
+    // two lines the test would stay green if the render path stopped honouring the collapse and
+    // drew the child rows anyway.
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
+    expect(screen.getByTestId("worker-peek")).toBeTruthy();
   });
 
   // Holding it open for as long as the worker stays red turns a helpful reveal into a control that
   // won't take no for an answer. The head's disc keeps carrying the signal after the fold.
-  it("stays folded once the user closes it again", () => {
+  it("stays folded across further renders while the worker is still red", () => {
     // Pre-selected: folding is the SECOND-stage click, so the head has to be the selected row for
     // this gesture to exist at all. What the test measures — that a still-red worker cannot
     // re-open a subtree the user shut — is unchanged.
@@ -572,24 +593,26 @@ describe("Build column — a worker going red opens its parent, once", () => {
     const { rerender } = render(<AgentSidebar project={project} />);
     useRuntimeStore.setState({ status: { a1: "idle", w1: "blocked", w2: "working" } } as never);
     rerender(<AgentSidebar project={{ ...project }} />);
-    expect(screen.queryByText("Parser Worker")).toBeTruthy();
 
-    fireEvent.click(rowFor("Alpha")); // the user folds it back
+    fireEvent.click(rowFor("Alpha")); // the user opens it deliberately
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    fireEvent.click(rowFor("Alpha")); // and folds it back
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     rerender(<AgentSidebar project={{ ...project }} />); // still red, another render
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    expect(screen.queryByText("Parser Worker")).toBeNull();
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
   });
 
-  // On boot the previous snapshot is empty; without the baseline rule every parent with an
-  // already-red worker would blow open on every relaunch.
   it("does not force a fold open on first render", () => {
     useUiStore.setState({ collapsedOrchestrators: { a1: true }, activeSpecial: null } as never);
     const project = seed({ a1: "idle", w1: "blocked" });
     render(<AgentSidebar project={project} />);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    expect(screen.queryByText("Parser Worker")).toBeNull();
+    // The head stays SHUT. `w1` is red, so a one-line peek naming it does render — that is the
+    // designed replacement for the auto-expansion, and it is not the subtree.
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
+    expect(screen.getByTestId("worker-peek")).toBeTruthy();
   });
 });
 

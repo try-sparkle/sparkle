@@ -103,16 +103,11 @@ import {
 import { StageSectionHeader } from "./StageSectionHeader";
 import { StatusFilterBar } from "./StatusFilterBar";
 import {
-  isUnstartedWorker,
   withUnstartedWorkerAttention,
   withRedWorkerAttention,
 } from "../engine/workerAttention";
-import {
-  autoCollapseTargets,
-  expandOnWorkerAttention,
-  workerAttention,
-  type WorkerAttention,
-} from "../engine/workerExpansion";
+import { attentionWorkersOf } from "../engine/workerExpansion";
+import { bandColor } from "../engine/statusBandLabels";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { withUnmergedWork } from "../engine/unmergedAttention";
@@ -364,7 +359,7 @@ export function AgentSidebar({
   const liveStatus = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const lastObserved = useRuntimeStore((s) => s.lastObserved);
-  // The open set, built once: the strand overlay below and `expectsLiveStatus` further down both
+  // The open set, built once: the strand overlay below and the peek both
   // ask it, and two Sets from one array is two allocations per render for the same answer.
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
   // A spawned-but-never-started worker has no live status, so it (and the orchestrator it's
@@ -1706,87 +1701,67 @@ export function AgentSidebar({
   }, [project?.agents, collapsedRecord]);
   const toggleOrchestratorCollapsed = useUiStore((s) => s.toggleOrchestratorCollapsed);
 
-  // AUTO-EXPAND ON ATTENTION. collapsedOrchestrators reads a missing entry as COLLAPSED, and that
-  // stays the default: a subtree opens by itself only when a worker under it enters the `needs_you`
-  // band, and at no other time. It does NOT open on spawn — gaining a worker is not something that
-  // requires the user, and popping every subtree on every spawn is what this replaced.
-  //
-  // Never auto-COLLAPSES when the red clears: yanking a subtree shut while the user is reading it is
-  // worse than leaving it open. Expansion is automatic; collapsing stays the user's gesture.
-  //
-  // Driven off a snapshot COMPARISON rather than a status callback because a worker can turn red via
-  // several paths (the live PTY map, reconcileWorkersFromDisk, cross-window adopt, the synthetic
-  // overlays in engine/workerAttention), and because only a comparison can distinguish "just went
-  // red" from "is still red" — re-asserting on a steady red would re-open a subtree the user just
-  // collapsed. `effectiveStatus` is the status source, so a DISMISSED alarm is already de-escalated
-  // and correctly re-opens nothing.
-  // Starts EMPTY, and that is the whole first-mount story: expandOnWorkerAttention skips any id
-  // absent from the previous snapshot, so the first pass records a baseline and expands nothing —
-  // a relaunch with an already-red worker respects the persisted collapse (the head row shows that
-  // red on its own). There is deliberately no second `first render?` guard here — one rule, in the
-  // tested pure helper, rather than two that can drift. See engine/workerExpansion.
-  //
-  // Remembered PER PROJECT, for the same reason the selection map below is: one AgentSidebar stays
-  // mounted across project switches, and the snapshot only ever covers the CURRENT project's agents.
-  // With a single record, switching away drops every other project's entry, so coming back reads as
-  // first observation — and since red is a level and not an edge, a worker that went red while you
-  // were elsewhere would never open its subtree on any later tick either. That was invisible while
-  // subtrees only ever opened; with auto-collapse below it means the subtree is shut and stays shut
-  // on the one alarm that most needs to be seen. A map keyed by project id makes "did THIS project
-  // just go red" the actual question, and an unvisited project still baselines and expands nothing.
-  // Is a live PTY status still COMING for this worker? The third state of the attention snapshot
-  // hangs off this: a worker with no status entry is `unknown` only while one is expected, and says
-  // nothing at all otherwise. Two ways a reading is pending — the pane is mounted (in `openAgentIds`)
-  // and simply has not reported yet, which is every worker for the first commit after launch; or the
-  // worker is a spawned-but-unstarted STRAND, the open/evict race that drops it out of `openAgentIds`
-  // before its pane mounts (engine/workerAttention.isUnstartedWorker — the same predicate that paints
-  // its synthetic red, so the two can't disagree).
-  //
-  // A worker that is neither is a closed pane under a closed orchestrator — the settled fleet after a
-  // relaunch that restored the rows but opened nothing. `runtimeStore` does not persist `status`, so
-  // that worker is statusless for the WHOLE session; counting it as pending pinned its head open
-  // forever, auto-collapse dead for that head with a mark that never cleared (roborev 54018).
-  //
-  // Note what the strand clause therefore does NOT cover, and deliberately: a materialized worker
-  // whose pane is shut while its orchestrator is LIVE is not a closed pane, it is a strand — the app
-  // paints it red and `ensureWorkersOpen` re-opens it. Its subtree stays open, which is the point:
-  // that red row is the one the user has to click. If the self-heal exhausts its budget the subtree
-  // stays open showing red, rather than filing a broken worker away out of sight (roborev 54031).
-  const expectsLiveStatus = useCallback(
-    (w: AgentTab) => openIds.has(w.id) || isUnstartedWorker(w, liveStatus, openIds, lastObserved),
-    [openIds, liveStatus, lastObserved],
+  // The heads the expand-all / collapse-all control acts on: every top-level build agent in THIS
+  // column that actually has workers. A head with no workers has no subtree and no chevron, so
+  // including it would let "collapse all" write entries for rows that cannot be expanded.
+  const subtreeHeadIds = useMemo(
+    () =>
+      topLevelAgents
+        .filter((a) => a.kind === "build" && (childrenByParent.get(a.id)?.length ?? 0) > 0)
+        .map((a) => a.id),
+    [topLevelAgents, childrenByParent],
   );
+  // Whether the column is ALREADY fully one way — used only to dim the half that would do nothing.
+  // Two separate reads, not one flag and its negation: a MIXED column (some open, some shut) is
+  // neither, and both halves stay live because pressing either genuinely changes something. Deriving
+  // "fully collapsed" as `!allExpanded` painted the collapse half dead in exactly that case while it
+  // still worked, which is worse than no dimming at all.
+  const allSubtreesExpanded =
+    subtreeHeadIds.length > 0 && subtreeHeadIds.every((id) => !collapsed.has(id));
+  const allSubtreesCollapsed =
+    subtreeHeadIds.length > 0 && subtreeHeadIds.every((id) => collapsed.has(id));
 
-  const prevWorkerAttention = useRef(new Map<string, Record<string, WorkerAttention>>());
-  useEffect(() => {
-    if (!project) return;
-    const next = workerAttention(
-      project.agents,
-      (id) => effectiveStatus[id] ?? "stopped",
-      (id) => liveStatus[id] !== undefined,
-      expectsLiveStatus,
-    );
-    const attention = expandOnWorkerAttention(
-      prevWorkerAttention.current.get(project.id) ?? {},
-      next,
-    );
-    prevWorkerAttention.current.set(project.id, next);
-    if (attention.length > 0)
-      useUiStore.getState().expandOrchestrators(attention, { auto: true });
-  }, [project, effectiveStatus, liveStatus, expectsLiveStatus]);
+  // NOTHING HERE OPENS A SUBTREE. A parent's expanded state is USER STATE — written by the head-row
+  // click and by the header's expand-all / collapse-all, and by nothing else. Two effects used to
+  // live at this spot: one opened a subtree when a worker under it went red, the other closed the
+  // ones it had opened once the red cleared. Together they produced a parent sitting open under a
+  // project the user never touched, showing a GREEN worker. Both are gone, along with the
+  // `autoExpandedOrchestrators` mark that told them apart — see uiStore.setOrchestratorsCollapsed
+  // for why one writer makes that state unreachable rather than merely fixed, and why a periodic
+  // "is anything wrongly open?" sweep must NOT be added back.
+  //
+  // What replaced the capability they provided is the PEEK further down: a CLOSED parent with a red
+  // worker under it renders one inset line naming it (or a count, when several are red). It is
+  // derived from the current attention snapshot on every render and writes no state at all, which is
+  // why it needs neither the edge detector nor the first-sighting baseline those effects carried.
+  //
+  // The PEEK is what replaced the capability those effects provided: a CLOSED parent with a red
+  // worker under it renders one inset line naming it (or a count, when several are red). It is
+  // derived from the current statuses on every render and writes no state at all, which is why it
+  // needs neither the edge detector nor the first-sighting baseline those effects carried — and why
+  // it cannot leave a subtree standing open after the red has gone. See WorkerPeek below.
+  //
+  // Note what is NOT here any more: an `expectsLiveStatus` predicate and the three-state attention
+  // snapshot it fed. That third state (`unknown` — "a reading is still coming for some worker under
+  // this head") existed to stop AUTO-COLLAPSE acting on a fact it did not have. With nothing closing
+  // rows on the user's behalf there is no such decision to protect, and the peek needs only the
+  // two-valued question `attentionWorkersOf` asks: is this worker live, and is it red?
 
-  // REVEAL THE SELECTION. Orthogonal to attention above: a SELECTED worker must always have a
+  // REVEAL THE SELECTION. A SELECTED worker must always have a
   // visible row, or the terminal shows an agent that no row is highlighting — the original bug that
   // made workers get rows at all (see the header of AgentSidebar.workerRows.test.tsx). Spawning no
   // longer trips this, because spawnWorker's `select: false` never selects the new worker — under
   // ANY prior selection, including a null one (that flag is absolute; see AddAgentOpts.select, which
   // it briefly wasn't). This is the guard for every other way selection reaches a worker.
   //
-  // Fires on a CHANGE of selection, not on the state of it, for the same reason as the attention
-  // rule: a user who selects a worker and then collapses its subtree must stay collapsed, and
-  // re-asserting every render would undo that gesture immediately. The first observation DOES count
-  // here (unlike the attention baseline) — a relaunch that restores a worker selection must render
-  // its row, and this opens the ONE subtree that holds it rather than all of them.
+  // This is a USER-INTENT write, and the only one in this file: selecting a worker is a human act,
+  // and it names exactly one subtree. That is what distinguishes it from the deleted attention rule,
+  // which opened rows in response to a machine event nobody asked about.
+  //
+  // Fires on a CHANGE of selection, not on the state of it: a user who selects a worker and then
+  // collapses its subtree must stay collapsed, and re-asserting every render would undo that gesture
+  // immediately. The first observation DOES count — a relaunch that restores a worker selection must
+  // render its row, and this opens the ONE subtree that holds it rather than all of them.
   //
   // Remembered PER PROJECT, not as one last-seen id, because exactly one AgentSidebar stays mounted
   // across project switches (Workspace renders it once with `project` as a prop). With a single ref,
@@ -1809,48 +1784,16 @@ export function AgentSidebar({
     if (selectedAgentId !== null && !sel) return;
     seen.set(project.id, selectedAgentId);
     if (sel?.kind === "worker" && sel.parentId) {
-      // `auto`, like the attention rule: the reason this subtree opened is that you are looking at
-      // the worker inside it, so once you look elsewhere the reason is spent. Auto-collapse exempts
-      // the subtree holding the selection, so this can never be undone while it is still true.
-      useUiStore.getState().expandOrchestrators([sel.parentId], { auto: true });
+      useUiStore.getState().expandOrchestrators([sel.parentId]);
     }
   }, [selectedAgentId, project]);
 
-
-  // PUT IT AWAY AGAIN. The counterpart to the two rules above, and the end of the one-way expansion
-  // that let a settled fleet leave a wall of green worker rows with no undo but a chevron click per
-  // orchestrator. A subtree the APP opened closes once nothing under it needs you — never the one you
-  // are reading, and never one you opened yourself. The rule and its exemptions are pure and tested
-  // in engine/workerExpansion.autoCollapseTargets; this is the wiring.
-  //
-  // Its own effect rather than a tail on the attention effect, and the deps are the reason: closing
-  // has to react to the SELECTION moving (navigating away from a subtree is what releases it) and to
-  // the mark changing, neither of which that effect watches — and it must not re-run the expansion's
-  // edge detector, which would consume a rising edge as a side effect of a selection change. The
-  // snapshot is recomputed rather than shared for the same reason; it is one pure pass over `agents`.
-  //
-  // Acts on the CURRENT snapshot with no baseline of its own, which is only safe because that
-  // snapshot distinguishes `calm` from `unknown`: a subtree with any worker the PTY has not reported
-  // on reads `unknown` and is left alone. Without that third state this effect closed every
-  // persisted auto mark on the first commit after launch — the status map is still empty then — and
-  // flapped a subtree shut-and-open on every round of the open/evict race (roborev 53994).
-  const autoExpandedRecord = useUiStore((s) => s.autoExpandedOrchestrators);
-  useEffect(() => {
-    if (!project) return;
-    const attention = workerAttention(
-      project.agents,
-      (id) => effectiveStatus[id] ?? "stopped",
-      (id) => liveStatus[id] !== undefined,
-      expectsLiveStatus,
-    );
-    const stale = autoCollapseTargets(
-      project.agents,
-      attention,
-      (headId) => autoExpandedRecord[headId] === true,
-      project.selectedAgentId,
-    );
-    if (stale.length > 0) useUiStore.getState().collapseAutoExpanded(stale);
-  }, [project, liveStatus, effectiveStatus, autoExpandedRecord, expectsLiveStatus]);
+  // NOTE what is deliberately absent here: the "put it away again" effect that used to close subtrees
+  // the app had opened. It existed only to undo the app's OWN expansions, and with nothing left that
+  // opens a row automatically it has nothing to undo. Re-adding it — or any periodic sweep that
+  // closes rows it judges stale — would make the app a writer of user state again and reintroduce the
+  // flap it cost two roborev findings (53994, 54031) to tune out. If a row is open, a human opened
+  // it, and only a human closes it.
 
   // The stage ladder the list renders: top-level rows bucketed into workflow-stage sections, in
   // `project.agents` order within each section (that order is the user's own drag arrangement), with
@@ -2306,6 +2249,17 @@ export function AgentSidebar({
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
           />
+          {/* Expand-all / collapse-all, where the `«` chevron used to sit. Hidden in Plan (no rows)
+              and when NO head has workers — a control that would act on nothing is worse than none.
+              Distinct from `PairCountControl` at the other end of the band: that one adds/removes a
+              whole PAIR, this one only folds worker subtrees. */}
+          {mode !== "plan" && subtreeHeadIds.length > 0 && (
+            <SubtreeDisclosureControl
+              headIds={subtreeHeadIds}
+              allExpanded={allSubtreesExpanded}
+              allCollapsed={allSubtreesCollapsed}
+            />
+          )}
           {/* `.bhd .sp` — the spacer that pushes the chips to the pane-side end. It is the SOLE
               consumer of the band's free space, which is why the bar beside it grows 0; if the bar
               grew too they would split it and the chips would sit mid-header. */}
@@ -2575,6 +2529,18 @@ export function AgentSidebar({
             // which top-level rows the ladder shows; applying them again per child would leave an
             // expanded parent with an empty subtree, or hide a working worker under a visible head.
             const kids = collapsed.has(top.id) ? [] : workers;
+            // THE PEEK. A CLOSED head with a worker asking for you shows ONE inset line naming it.
+            // Read only when the head is closed: opening it renders the real child rows, and both at
+            // once would say the same thing twice. Empty for a green/gray subtree, so a settled
+            // fleet stays exactly as compact as it is today.
+            const peek = collapsed.has(top.id)
+              ? attentionWorkersOf(
+                  project?.agents ?? [],
+                  top.id,
+                  (id) => effectiveStatus[id] ?? "stopped",
+                  (id) => liveStatus[id] !== undefined,
+                )
+              : [];
             return (
               // A FRAGMENT, not a wrapper div. An anonymous div here would sit between the section's
               // `group` and its `treeitem`s, so the group would own generic content — the same "a
@@ -2582,6 +2548,13 @@ export function AgentSidebar({
               // level down (roborev 53891).
               <Fragment key={top.id}>
                 {renderRow(top, headStage, section.id)}
+                {peek.length > 0 && (
+                  <WorkerPeek
+                    workers={peek}
+                    headName={top.name}
+                    onOpen={() => toggleOrchestratorCollapsed(top.id)}
+                  />
+                )}
                 {/* The subtree is a `group` that the head OWNS BY ID (aria-owns on the row). It is a
                     DOM sibling because nesting it inside the row's div would put the worker rows
                     inside their parent's box and wreck the layout; aria-owns is the standard way to
@@ -2913,6 +2886,218 @@ function PairCountControl({
 }
 
 const subtreeDomId = (headId: string) => `agent-subtree-${headId}`;
+
+/**
+ * EXPAND ALL / COLLAPSE ALL — a filled triangle pointing DOWN and one pointing UP, in the column
+ * header where the `«` chevron used to sit.
+ *
+ * WHY TRIANGLES. They are the same shape the per-row disclosure uses, so the pair reads as "do that,
+ * to everything" without a text label. That similarity is also the one risk: at this size a bare
+ * triangle pair can be misread as ONE row's disclosure control rather than a column-wide one. Three
+ * things separate it, none of them a label:
+ *
+ *   1. It sits inside the header BAND, above the list's own hairline — structurally not in the rows.
+ *   2. The pair is boxed as a single grouped unit (one border, one background, a hairline between
+ *      the two halves), which no row-level chevron ever is.
+ *   3. Both directions are visible at once. A row's disclosure shows ONE triangle whose direction is
+ *      that row's state; two opposed triangles side by side cannot be a single row's state.
+ *
+ * Inline SVG polygons rather than an icon-set glyph: Feather (`react-icons/fi`) is a stroked set
+ * with no FILLED triangle, and the fill is what makes these read as the row affordance rather than
+ * as a chevron. (Emoji are banned outright as icons in this codebase.)
+ *
+ * Both halves stay live regardless of the column's state — a "collapse all" on an already-collapsed
+ * column is a no-op the store absorbs identity-stably, and disabling it would make the control
+ * flicker in and out of reach as workers come and go.
+ */
+function SubtreeDisclosureControl({
+  headIds,
+  allExpanded,
+  allCollapsed,
+}: {
+  headIds: readonly string[];
+  allExpanded: boolean;
+  allCollapsed: boolean;
+}) {
+  const setOrchestratorsCollapsed = useUiStore((s) => s.setOrchestratorsCollapsed);
+  const half = (dir: "expand" | "collapse") => {
+    const isExpand = dir === "expand";
+    return (
+      <button
+        type="button"
+        data-testid={isExpand ? "expand-all-subtrees" : "collapse-all-subtrees"}
+        aria-label={
+          isExpand
+            ? `Expand all worker subtrees (${headIds.length})`
+            : `Collapse all worker subtrees (${headIds.length})`
+        }
+        title={isExpand ? "Expand all workers" : "Collapse all workers"}
+        onClick={() => setOrchestratorsCollapsed(headIds, !isExpand)}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 20,
+          height: 18,
+          padding: 0,
+          background: "transparent",
+          border: "none",
+          // The hairline BETWEEN the two halves, so they read as one segmented control rather than
+          // two loose buttons that happen to be adjacent.
+          borderLeft: isExpand ? "none" : `1px solid ${C.hairline}`,
+          cursor: "pointer",
+          // The direction the column is already fully in is dimmed — still pressable, but it tells
+          // the user at a glance which way there is anything left to do. A MIXED column dims
+          // NEITHER half: both would change something, so `!allExpanded` is the wrong test for
+          // "already fully collapsed" and painted a live control dead.
+          color: (isExpand ? allExpanded : allCollapsed) ? C.hairline : C.muted,
+        }}
+      >
+        <svg width={9} height={9} viewBox="0 0 10 10" aria-hidden focusable="false">
+          {/* Filled, and pointing DOWN for expand / UP for collapse — the same direction sense as a
+              row's own disclosure triangle. */}
+          <polygon points={isExpand ? "1,3 9,3 5,8" : "5,2 9,7 1,7"} fill="currentColor" />
+        </svg>
+      </button>
+    );
+  };
+  return (
+    <div
+      data-testid="subtree-disclosure-control"
+      role="group"
+      aria-label="Worker subtrees"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        flex: "0 0 auto",
+        border: `1px solid ${C.hairline}`,
+        borderRadius: 4,
+        overflow: "hidden",
+      }}
+    >
+      {half("expand")}
+      {half("collapse")}
+    </div>
+  );
+}
+
+/**
+ * THE PEEK: one inset line under a CLOSED head, shown only when a worker beneath it needs you.
+ *
+ * This is not the subtree, and the distinction is the whole feature. It is a single line no matter
+ * how many workers are red — several red workers collapse to a COUNT rather than several lines,
+ * because a peek that grows with the fleet is an expansion wearing a different name. The head stays
+ * `aria-expanded="false"`, the `group` of real child rows is not rendered, and nothing is written to
+ * `collapsedOrchestrators`; when the red clears the line simply stops being rendered, leaving the
+ * user's collapse exactly as they left it.
+ *
+ * It replaces the capability the deleted auto-expander provided — "something under this closed head
+ * needs you" — without the cost that made that machinery wrong: it cannot leave a subtree standing
+ * open after the red has gone, because it never opened one.
+ *
+ * GREEN AND GRAY WORKERS NEVER REACH HERE (see engine/workerExpansion.attentionWorkersOf), so a
+ * settled fleet is exactly as compact as it was before.
+ *
+ * Clicking it opens the parent for real — the peek names a row you cannot otherwise click, so the
+ * obvious gesture has to lead somewhere. That click goes through the same
+ * `toggleOrchestratorCollapsed` as the head row: it is the USER opening the subtree, which is
+ * allowed, rather than the app doing it on their behalf, which is what this feature removed.
+ */
+function WorkerPeek({
+  workers,
+  headName,
+  onOpen,
+}: {
+  workers: readonly AgentTab[];
+  headName: string;
+  onOpen: () => void;
+}) {
+  const n = workers.length;
+  // One line, always. With several red workers the NAMES are dropped rather than joined — a joined
+  // list is how this becomes two lines at the first long agent name.
+  const label = n === 1 ? (workers[0]?.name ?? "") : `${n} workers`;
+  return (
+    <button
+      type="button"
+      // A `treeitem`, not a bare button. This sits as a direct child of the stage section's
+      // `role="group"` inside `role="tree"`, and a tree may own ONLY treeitems and groups —
+      // the same invariant the subtree `group` three lines up exists to satisfy (roborev 53891).
+      // A generic button here is content AT drops or misannounces, which would silently swallow
+      // the one affordance saying "something under this closed head needs you".
+      role="treeitem"
+      // The WORKER's level, not the head's. Row treeitems declare `aria-level={depth + 1}` — heads
+      // are 1, their workers 2 — and this element stands for a worker. Without it AT falls back to
+      // DOM nesting, which is FLAT here (the peek is a sibling of the head row inside the section
+      // group, not a descendant), so the one line saying "something under this head needs you"
+      // would announce at the same level as the head and read as another top-level agent.
+      aria-level={2}
+      // NO aria-expanded. This treeitem owns no group and can never be expanded — activating it
+      // toggles the HEAD's collapse, after which the peek unmounts entirely. Announcing "collapsed"
+      // here would duplicate the head row's own aria-expanded for the same subtree and offer a state
+      // no keyboard path can act on (see tabIndex below).
+      // NOT a Tab stop. The column is roving-tabindex — one stop for the whole list — so a
+      // `tabIndex=0` here would add one per peek. It is deliberately not in the arrow-key ring
+      // either: the peek is a REDUNDANT affordance (the head row carries the same red on its own
+      // dot, and opening that head is what reveals the real worker row), so a keyboard user loses
+      // no reachable path. Pointer users get the shortcut; nobody depends on it.
+      tabIndex={-1}
+      data-testid="worker-peek"
+      data-peek-count={n}
+      onClick={onOpen}
+      aria-label={`${label} under ${headName} ${n === 1 ? "needs" : "need"} you — open this subtree`}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        // Indented like a child row so it reads as belonging to the head above it, but deliberately
+        // NOT the full row chrome — no tracker, no timer, no controls. It is a signpost.
+        marginLeft: DEPTH_INDENT,
+        width: `calc(100% - ${DEPTH_INDENT}px)`,
+        padding: "2px 6px",
+        background: "transparent",
+        border: "none",
+        borderRadius: 3,
+        cursor: "pointer",
+        font: "inherit",
+        // TYPE.small, not a raw 11: the type scale is a ratchet (src/theme/scale.test.ts) and an
+        // off-scale value fails it. One step down from the row body this line sits under.
+        fontSize: TYPE.small,
+        color: C.muted,
+        textAlign: "left",
+        overflow: "hidden",
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          flex: "0 0 auto",
+          width: 6,
+          height: 6,
+          borderRadius: "50%",
+          background: bandColor("needs_you"),
+        }}
+      />
+      <span
+        style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
+      >
+        {label}
+      </span>
+      {/* The marker that says WHY this line is here. Same vocabulary as the filter chips and the
+          band counts, via bandCountLabel, so the column says "needs you" in one voice. */}
+      <span
+        style={{
+          flex: "0 0 auto",
+          marginLeft: "auto",
+          fontSize: TYPE.micro,
+          fontWeight: 600,
+          color: bandColor("needs_you"),
+        }}
+      >
+        {n === 1 ? "needs you" : "need you"}
+      </span>
+    </button>
+  );
+}
 
 // The row box. Named because the hover card has to reproduce them EXACTLY (minus its own border)
 // to stand over a row without anything jumping — see the card strip's padding.

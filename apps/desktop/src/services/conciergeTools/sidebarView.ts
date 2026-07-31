@@ -88,7 +88,6 @@ export const SIDEBAR_VIEW_OPS = [
   "expand_orchestrators",
   "collapse_orchestrators",
   "set_orchestrators_collapsed",
-  "collapse_auto_expanded",
   "set_work_mode",
   "reveal_row",
   "select_row",
@@ -139,7 +138,6 @@ export const SIDEBAR_VIEW_OP_RISK: Record<SidebarViewOp, SidebarViewRiskClass> =
   expand_orchestrators: "view",
   collapse_orchestrators: "view",
   set_orchestrators_collapsed: "view",
-  collapse_auto_expanded: "view",
   set_work_mode: "view",
   reveal_row: "view",
   select_row: "disruptive",
@@ -412,11 +410,13 @@ export interface SidebarViewState {
    *  This is the state the concierge should offer to undo rather than describe as "no agents". */
   hiddenByFilter: boolean;
   selectedAgentId: string | null;
-  /** Heads whose subtree is open right now. */
+  /** Heads whose subtree is open right now.
+   *
+   *  There is no longer an "and these ones the app opened" companion to this. Expansion is user
+   *  state with a single writer (uiStore.setOrchestratorsCollapsed), so an open head means a human
+   *  opened it — there is no second class of expansion that might fold itself away, and nothing for
+   *  a concierge to reason about beyond this list. */
   expandedOrchestrators: string[];
-  /** Of those, the ones the APP opened (and may therefore fold again on its own) rather than the
-   *  user — see uiStore.autoExpandedOrchestrators. */
-  autoExpandedOrchestrators: string[];
   totalRows: number;
   visibleRows: number;
 }
@@ -432,9 +432,6 @@ export function readSidebarView(): SidebarViewResult<SidebarViewState> {
     bands: { ...ui.statusFilter },
     expandedOrchestrators: Object.entries(ui.collapsedOrchestrators)
       .filter(([, collapsed]) => collapsed === false)
-      .map(([id]) => id),
-    autoExpandedOrchestrators: Object.entries(ui.autoExpandedOrchestrators)
-      .filter(([, auto]) => auto === true)
       .map(([id]) => id),
   };
   if (!project) {
@@ -724,50 +721,32 @@ export function expandOrchestrators(ids: readonly string[]): SidebarViewResult<C
 }
 
 /**
- * Fold these subtrees back up — uiStore.toggleOrchestratorCollapsed, applied only to the ones that
- * are currently OPEN.
+ * Fold these subtrees back up — uiStore.setOrchestratorsCollapsed, the store's single writer.
  *
- * The store has no unconditional "collapse", only a toggle (plus `collapseAutoExpanded`, which is
- * vetoed by the auto mark). Toggling blindly would OPEN any subtree that was already closed, which
- * for a tool call is the opposite of what was asked. Guarding on the live collapse state makes this
- * idempotent — a retried "close these" is a no-op, not a flip.
+ * Idempotent by construction now: the setter takes the state it should ARRIVE at rather than
+ * flipping, so a retried "close these" is a no-op instead of re-opening what it just closed. This
+ * used to have to guard each id against the live collapse state by hand, because a toggle was the
+ * only unconditional write the store offered.
  */
 export function collapseOrchestrators(ids: readonly string[]): SidebarViewResult<CollapseChange> {
   return writeSubtrees("collapse_orchestrators", ids, (heads) => {
-    const ui = useUiStore.getState();
-    for (const h of heads) if (!ui.isOrchestratorCollapsed(h.id)) ui.toggleOrchestratorCollapsed(h.id);
+    useUiStore.getState().setOrchestratorsCollapsed(heads.map((h) => h.id), true);
   });
 }
 
 /** Put a `priorCollapsed` snapshot back — the undo for either of the two above, and the reason both
- *  of them return one. Expands and collapses in one call, each through the same guarded actions. */
+ *  of them return one. Expands and collapses in one call, through the same single writer. */
 export function setOrchestratorsCollapsed(
   collapsed: Record<string, boolean>,
 ): SidebarViewResult<CollapseChange> {
   const ids = Object.keys(collapsed);
   return writeSubtrees("set_orchestrators_collapsed", ids, (heads) => {
     const ui = useUiStore.getState();
-    const toExpand = heads.filter((h) => !collapsed[h.id]).map((h) => h.id);
-    if (toExpand.length) ui.expandOrchestrators(toExpand);
-    for (const h of heads) {
-      if (collapsed[h.id] && !useUiStore.getState().isOrchestratorCollapsed(h.id)) {
-        useUiStore.getState().toggleOrchestratorCollapsed(h.id);
-      }
-    }
-  });
-}
-
-/**
- * Close only the subtrees the APP opened — uiStore.collapseAutoExpanded, whose auto mark is its own
- * veto: a subtree the user opened with the chevron is never touched, no matter what is passed.
- *
- * This is the polite "clear the noise" op. Where `collapseOrchestrators` closes what it is told to,
- * this one closes only what nobody chose to have open, so a concierge can tidy the column after a
- * fan-out without taking away anything the human deliberately unfolded.
- */
-export function collapseAutoExpanded(ids: readonly string[]): SidebarViewResult<CollapseChange> {
-  return writeSubtrees("collapse_auto_expanded", ids, (heads) => {
-    useUiStore.getState().collapseAutoExpanded(heads.map((h) => h.id));
+    const wanted = (want: boolean) => heads.filter((h) => !!collapsed[h.id] === want).map((h) => h.id);
+    const toExpand = wanted(false);
+    const toCollapse = wanted(true);
+    if (toExpand.length) ui.setOrchestratorsCollapsed(toExpand, false);
+    if (toCollapse.length) ui.setOrchestratorsCollapsed(toCollapse, true);
   });
 }
 

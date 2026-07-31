@@ -12,6 +12,7 @@ import {
   TERM_ANSI_PAPER,
   TERM_PAPER_MIN_SPLIT,
   THEME_HEX,
+  termMinContrastRatio,
   xtermTheme,
 } from "./colors";
 
@@ -278,6 +279,89 @@ describe("xtermTheme light-mode ANSI palette", () => {
         `light.${bright} should be the lighter of the ${normal} pair`,
       ).toBeGreaterThan(luminance(light[normal]!));
     }
+  });
+
+  it("light mode asks xterm to enforce AA on colours the palette cannot name", () => {
+    // THE SECOND REPORT. Pinning the sixteen slots fixed `\e[3Xm` colours, but a terminal LINK — a
+    // path, a URL, an OSC 8 word — is drawn in whatever colour the emitter picked, and xterm has no
+    // link colour to override. When that colour comes from the 256-colour CUBE this palette never
+    // sees it: `\e[38;5;215m` is 1.41:1 and `\e[38;5;242m` is 4.06:1 on this plane, and the TUI in
+    // this app emits both. `minimumContrastRatio` is xterm's own per-cell fix and covers the cube
+    // AND truecolor while leaving backgrounds alone. It defaults to 1 ("do nothing") — which is
+    // exactly what it was, silently, so this pins the value rather than trusting the default.
+    expect(termMinContrastRatio("light")).toBe(TERM_ANSI_MIN_CONTRAST);
+    // Dark keeps xterm's untouched behaviour: not the report, and its defaults already clear AA.
+    expect(termMinContrastRatio("dark")).toBe(1);
+    expect(termMinContrastRatio("dark", true)).toBe(1);
+  });
+
+  it("never rewrites a calm relationship the palette was TUNED for", () => {
+    // roborev 56210-M1. The first cut indexed on the theme alone, and light mode has a SECOND
+    // palette: CALM is built below AA deliberately (CALM_MIN_CONTRAST 3, CALM_MIN_SPLIT 2) so a
+    // recessive agent's output stays flat. A blanket 4.5 would have dragged calm's `bright` up from
+    // 2.14:1 over a `dim`-painted cell — and `calmAnsi` points black…brightBlack at `dim`, so every
+    // diff hunk and selected row a TUI paints while calm, which is the DEFAULT state for a working
+    // agent. This measures the actual hex: a DESIGNED calm pair under the floor is one xterm
+    // rewrites, i.e. a calm colour silently overridden.
+    //
+    // LIGHT ONLY, on purpose (roborev 56774-M2): dark's calm floor is 1, and `contrast()` is ≥ 1
+    // by construction, so a dark iteration here asserts nothing — it would pass for two identical
+    // hexes. Dark's calm palette is floored by the CALM_MIN_CONTRAST / CALM_MIN_SPLIT tests above,
+    // which are the ones that can actually fail.
+    const floor = termMinContrastRatio("light", true);
+    const t = xtermTheme("light", true);
+    const plane = THEME_HEX.light.forest;
+    // Exactly the two contracts the CALM block states, plus the selection ink's own one.
+    const designed: Array<[string, string, string]> = [
+      ["foreground on the plane", t.foreground, plane],
+      ["dim on the plane", t.red!, plane],
+      ["bright on the plane", t.brightRed!, plane],
+      ["bright over a dim-painted cell", t.brightRed!, t.red!],
+      ["selection ink over the selection fill", t.selectionForeground!, t.selectionBackground],
+    ];
+    for (const [what, fg, bg] of designed) {
+      expect(
+        contrast(fg, bg),
+        `light calm: ${what} (${fg} on ${bg}) must clear the ${floor}:1 handed to xterm, or the adjuster rewrites a tuned colour`,
+      ).toBeGreaterThanOrEqual(floor);
+    }
+  });
+
+  it("DOES lift the calm combinations the palette never designed — that is its job", () => {
+    // roborev 56774-M1: an earlier comment claimed the adjuster never fires while calm. False, and
+    // the claim mattered — two grays across sixteen slots necessarily produce pairs nobody tuned,
+    // and the worst are degenerate. Pinning them from BELOW is what makes the rule above honest:
+    // these are under the floor, so xterm lifts them, and that is the net doing the job it exists
+    // for rather than overriding calm.
+    const floor = termMinContrastRatio("light", true);
+    const t = xtermTheme("light", true);
+    const undesigned: Array<[string, string, string]> = [
+      // A TUI paints a status bar from a BRIGHT slot and leaves the foreground default.
+      ["default ink over a bright-painted cell", t.foreground, t.brightRed!],
+      // `\e[44m\e[37m` — white on blue. Both collapse onto `dim`, so fg IS bg: invisible.
+      ["a dark slot on a dark-slot fill", t.white!, t.blue!],
+      ["a bright slot on a bright-slot fill", t.brightWhite!, t.brightBlue!],
+    ];
+    for (const [what, fg, bg] of undesigned) {
+      expect(
+        contrast(fg, bg),
+        `light calm: ${what} (${fg} on ${bg}) is a pair calm never tuned — it should sit UNDER the ${floor}:1 floor so xterm rescues it`,
+      ).toBeLessThan(floor);
+    }
+    // The degenerate ones really are fg == bg, which is what makes them unreadable rather than dim.
+    expect(t.white).toBe(t.blue);
+    expect(t.brightWhite).toBe(t.brightBlue);
+  });
+
+  it("still nets the cube while CALM — flattening the sixteen does not reach it", () => {
+    // The other half of the same decision: the calm floor is LOWER, not off. `calmAnsi` rewrites
+    // only the sixteen NAMED slots, so a calm terminal still emits `\e[38;5;215m` at its own value
+    // (1.41:1 on this plane) — turning the net off while calm would leave the founder's report
+    // unfixed in the state the app spends most of its time in.
+    expect(termMinContrastRatio("light", true)).toBe(CALM_MIN_SPLIT);
+    expect(termMinContrastRatio("light", true)).toBeGreaterThan(1);
+    // …and it is genuinely gentler than the non-calm net, which is the whole point of splitting it.
+    expect(termMinContrastRatio("light", true)).toBeLessThan(termMinContrastRatio("light"));
   });
 
   it("leaves DARK mode on xterm's defaults — this change never reaches it", () => {

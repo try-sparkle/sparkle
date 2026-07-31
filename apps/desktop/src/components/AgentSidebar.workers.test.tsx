@@ -70,7 +70,7 @@ function openOrchestratorCard() {
   fireEvent.contextMenu(card);
 }
 
-beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} }));
+beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
 afterEach(() => {
   cleanup();
   refreshAgentBranch.mockClear();

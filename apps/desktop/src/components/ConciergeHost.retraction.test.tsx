@@ -136,7 +136,7 @@ const dismissed = (): Array<{ projectId: string; agentId: string; status: string
 
 beforeEach(() => {
   useUiStore.getState().showAllStatusBands();
-  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
+  useUiStore.setState({ collapsedOrchestrators: {} });
   // The REAL store with one action swapped, rather than a module mock: everything else in the host
   // still reads the genuine projectStore, and `dismissAlert` is the one write these cases are about.
   h.dismissAlert.mockClear();

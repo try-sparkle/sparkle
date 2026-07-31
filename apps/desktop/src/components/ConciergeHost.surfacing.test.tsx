@@ -159,7 +159,7 @@ beforeEach(() => {
   // line leaves that head expanded, and the next one asserting "starts collapsed" then reads a
   // state its own fixture never set. Cleared rather than worked around with distinct ids, because
   // "absent → collapsed" is the production default these cases are about.
-  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
+  useUiStore.setState({ collapsedOrchestrators: {} });
   h.openProjectTab.mockClear();
 });
 afterEach(() => {

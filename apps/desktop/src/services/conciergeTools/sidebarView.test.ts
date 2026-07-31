@@ -22,7 +22,6 @@ import {
   SIDEBAR_VIEW_OP_RISK,
   STATUS_BAND_IDS,
   allBands,
-  collapseAutoExpanded,
   collapseOrchestrators,
   expandOrchestrators,
   isolateStatusBand,
@@ -170,7 +169,6 @@ beforeEach(() => {
   useUiStore.setState({
     statusFilter: allBands(),
     collapsedOrchestrators: {},
-    autoExpandedOrchestrators: {},
     workModeBySide: { left: "build", right: "build" },
     activeSpecial: null,
     openProjectIds: null,
@@ -208,7 +206,6 @@ describe("the risk map", () => {
       "expand_orchestrators",
       "collapse_orchestrators",
       "set_orchestrators_collapsed",
-      "collapse_auto_expanded",
       "set_work_mode",
       "reveal_row",
     ] as const) {
@@ -241,7 +238,6 @@ describe("the domain is pure store state", () => {
     expandOrchestrators(["b2"]);
     collapseOrchestrators(["b2"]);
     setOrchestratorsCollapsed({ b2: false });
-    collapseAutoExpanded(["b2"]);
     setWorkMode("plan");
     setWorkMode("build");
     revealRow("b1");
@@ -299,7 +295,6 @@ describe("readSidebarView", () => {
     const v = value(readSidebarView());
     expect(v.bands.done).toBe(false);
     expect(v.expandedOrchestrators).toEqual(["b2"]);
-    expect(v.autoExpandedOrchestrators).toEqual([]);
   });
 });
 
@@ -526,21 +521,13 @@ describe("status-band filtering", () => {
 
 // ── orchestrator subtrees ────────────────────────────────────────────────────────────────────
 describe("orchestrator subtrees", () => {
-  it("expands as USER intent, so auto-collapse cannot take it away again", () => {
+  // A reveal the user asked for is STICKY. There is no longer a "close what the app opened" op that
+  // could take it back — that tool existed to undo auto-expansion, and auto-expansion is gone.
+  it("expands and reports what it changed", () => {
     const v = value(expandOrchestrators(["b2"]));
     expect(v.priorCollapsed).toEqual({ b2: true });
     expect(v.collapsed).toEqual({ b2: false });
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
-    // The app's own fold-up is vetoed by the missing auto mark.
-    collapseAutoExpanded(["b2"]);
     expect(useUiStore.getState().isOrchestratorCollapsed("b2")).toBe(false);
-  });
-
-  it("closes only what the APP opened when asked to tidy up", () => {
-    useUiStore.getState().expandOrchestrators(["b2"], { auto: true });
-    const v = value(collapseAutoExpanded(["b2"]));
-    expect(v.priorCollapsed).toEqual({ b2: false });
-    expect(v.collapsed).toEqual({ b2: true });
   });
 
   it("collapses idempotently — a retried close never re-opens a folded subtree", () => {
@@ -816,7 +803,6 @@ describe("every entry point returns a value", () => {
       () => expandOrchestrators(["x"]),
       () => collapseOrchestrators(["x"]),
       () => setOrchestratorsCollapsed({}),
-      () => collapseAutoExpanded(["x"]),
       () => setWorkMode(""),
       () => revealRow(""),
       () => selectRow(""),

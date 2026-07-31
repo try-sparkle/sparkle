@@ -1909,9 +1909,11 @@ export function ConciergeHost({
    * `openProjectTab` selects and mounts, but two pieces of pre-existing UI state decide whether a
    * row is actually DRAWN — and for an agent with no row of its own, both default to hiding it:
    *
-   *   1. `collapsedOrchestrators` reads a missing entry as COLLAPSED, and `expandOnWorkerAttention`
-   *      skips first sighting — so on a fresh launch the head's subtree is shut and the reveal lands
-   *      on a terminal pane above zero worker rows.
+   *   1. `collapsedOrchestrators` reads a missing entry as COLLAPSED, and nothing but a user gesture
+   *      ever writes it open — so on a fresh launch the head's subtree is shut and the reveal lands
+   *      on a terminal pane above zero worker rows. (This used to read "and `expandOnWorkerAttention`
+   *      skips first sighting"; that function is gone with app-driven expansion, which makes the gate
+   *      STRONGER, not weaker: there is no longer any path that opens a subtree on the app's own.)
    *   2. The sidebar applies `statusFilter` to heads, so a `running` orchestrator is not drawn at
    *      all when `running` is off — which a prior rows-variant digest click turns off by design.
    *
@@ -3201,11 +3203,14 @@ export function ConciergeHost({
         // silently break it, both of them the default rather than an edge case:
         //
         //   1. COLLAPSE. `uiStore.isOrchestratorCollapsed` reads a missing entry as COLLAPSED, and
-        //      `expandOnWorkerAttention` deliberately skips first sighting — so on a fresh launch the
-        //      head's subtree is shut. `openProjectTab` selects and mounts the lead but never
-        //      expands, so the click gave you a terminal pane above ZERO worker rows.
-        //      (These reveals stay NON-auto on purpose — see uiStore.expandOrchestrators: marking
-        //      them would let auto-collapse fold every head but the selected one away again.)
+        //      nothing but a user gesture ever writes it open — so on a fresh launch the head's
+        //      subtree is shut. `openProjectTab` selects and mounts the lead but never expands, so
+        //      the click gave you a terminal pane above ZERO worker rows.
+        //      (This used to also cite `expandOnWorkerAttention` skipping first sighting, and to
+        //      warn that marking these reveals "auto" would let auto-collapse fold them away. Both
+        //      mechanisms are gone: `setOrchestratorsCollapsed` is the single writer, there is no
+        //      auto/manual distinction left to mark, and nothing revokes an expansion. The reveal
+        //      below is now the ONLY thing that opens these heads.)
         //   2. A LEFTOVER BAND FILTER. The sidebar applies `statusFilter` to heads, so a `running`
         //      orchestrator is not drawn at all if `running` is off — which a previous *rows*-
         //      variant digest click turns off, by design.

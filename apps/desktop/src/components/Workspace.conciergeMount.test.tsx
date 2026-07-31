@@ -165,7 +165,7 @@ beforeEach(() => {
   useUiStore.setState({
     activeSpecial: null, workModeBySide: { left: "build", right: "build" }, pinnedProjectId: null, openProjectIds: null,
     pairAssignment: {}, leftProjectId: null,
-    collapsedOrchestrators: {}, autoExpandedOrchestrators: {},
+    collapsedOrchestrators: {},
   } as never);
   useSettingsStore.setState({ beadsEnabled: true } as never);
   useAuthStore.setState({ me: null, tokenPresent: false, loading: false } as never);

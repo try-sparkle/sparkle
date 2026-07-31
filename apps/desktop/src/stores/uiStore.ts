@@ -288,34 +288,37 @@ interface UiState {
   // compact "N workers" roll-up by default; the user expands to see each worker's own tracker.
   // Keyed by the build agent's id; persisted so the choice survives relaunch.
   collapsedOrchestrators: Record<string, boolean>;
-  // Which of the currently-expanded orchestrators were expanded BY THE APP rather than by the user's
-  // chevron — the mark that makes auto-collapse safe. `collapsedOrchestrators` alone cannot answer
-  // "may I close this again?": it records the state, not who chose it, so closing on that record
-  // would also close the subtree the user deliberately opened. Set by `expandOrchestrators` (only
-  // for ids that were actually closed at the time), cleared by `toggleOrchestratorCollapsed` (either
-  // direction — touching the chevron makes the row yours) and by `collapseAutoExpanded`. Persisted
-  // alongside `collapsedOrchestrators`, so a relaunch doesn't silently re-classify every
-  // app-expanded subtree as a user choice and strand it open forever.
-  autoExpandedOrchestrators: Record<string, boolean>;
   isOrchestratorCollapsed: (id: string) => boolean;
-  toggleOrchestratorCollapsed: (id: string) => void;
-  /** Force these orchestrators expanded. Batch, because a fan-out can add workers to several parents
-   *  in one tick and N separate set() calls would be N renders. A no-op when they are all already
-   *  expanded, so it can be called from an effect on every tick without churning the store.
+  /** THE ONE WRITER of `collapsedOrchestrators`. Every other function below is a named wrapper around
+   *  this, and nothing outside this store may write the record directly.
    *
-   *  `auto` says WHO is asking, and it defaults to FALSE — i.e. "the user wants this open" — because
-   *  the callers split two ways and the sticky answer is the safe one. The sidebar's own rules (a
-   *  worker going red, revealing the selection — see engine/workerExpansion) pass `{ auto: true }`
-   *  and accept that the subtree may fold itself away again once that reason is gone. The
-   *  concierge's reveal paths do NOT: a "Show me" and a rowless digest line expand exactly the heads
-   *  the user clicked to see, and folding all but the selected one back up on the next status tick
-   *  is the 53737 bug returning. */
-  expandOrchestrators: (ids: readonly string[], opts?: { auto?: boolean }) => void;
-  /** Close these orchestrators again — but ONLY the ones still carrying the auto-expanded mark, so
-   *  this can never take away a subtree the user opened themselves. The caller decides WHEN (see
-   *  engine/workerExpansion.autoCollapseTargets); the mark is the store's own veto. Identity-stable
-   *  when there is nothing to close, for the same every-tick-effect reason as expandOrchestrators. */
-  collapseAutoExpanded: (ids: readonly string[]) => void;
+   *  That is the whole design, and it is a narrowing rather than a rename. This state used to be
+   *  writable from a second direction — the sidebar's own effects, which opened a subtree when a
+   *  worker went red and closed it again when the red cleared — and the pair composed into a parent
+   *  standing open, showing a green worker, under a project the user never touched. The fix is not a
+   *  better rule for when the app may open a row; it is that the app HAS no such rule. Expansion is
+   *  user state. With one writer whose every caller is a user gesture, "a row opened by itself" stops
+   *  being a bug to detect and becomes a state with nothing to produce it.
+   *
+   *  Note the consequence, because it is easy to re-add by reflex: there is deliberately NO periodic
+   *  "are any rows wrongly open?" sweep, and adding one would be a mistake. A sweep is what you need
+   *  when writes can come from anywhere; with a single writer there is no drift for it to correct,
+   *  and the sweep itself becomes a second automatic writer — the very thing this removed.
+   *
+   *  Batched, because expand-all/collapse-all acts on every head in the column and N separate set()
+   *  calls would be N renders. Identity-stable when nothing actually changes, so a caller that
+   *  re-asserts the current state does not churn every consumer of the record. */
+  setOrchestratorsCollapsed: (ids: readonly string[], collapsed: boolean) => void;
+  /** The user's own gesture on ONE row — the head-row click. */
+  toggleOrchestratorCollapsed: (id: string) => void;
+  /** Open these subtrees because the USER asked to see them: the concierge's "Show me", a rowless
+   *  digest line, revealing the row that holds the selection. Every caller is downstream of a human
+   *  action naming these heads, which is why it is allowed to write at all.
+   *
+   *  It is sticky, and that is the point (roborev 53737): a reveal the user asked for must not fold
+   *  itself back up on the next status tick. There is no longer any counterpart that could — the
+   *  app-owned "put it away again" path is gone along with the mark that made it possible. */
+  expandOrchestrators: (ids: readonly string[]) => void;
   // Deep-open request for the ⋯ settings dialog: a component anywhere (e.g. BalanceBadge) asks
   // for a category; the shell's kebab menu (which owns the dialog) opens it there and clears the
   // request on close. Transient — NOT persisted (see partialize), a relaunch must never restore a dialog.
@@ -530,61 +533,22 @@ export const useUiStore = create<UiState>()(
       cloudCreateOpen: false,
       setCloudCreateOpen: (v) => set({ cloudCreateOpen: v }),
       collapsedOrchestrators: {},
-      autoExpandedOrchestrators: {},
       // Absent → collapsed (workers start hidden behind the roll-up).
       isOrchestratorCollapsed: (id) => get().collapsedOrchestrators[id] ?? true,
+      // THE ONE WRITER. See the interface note above for why this is the only one.
+      setOrchestratorsCollapsed: (ids, collapsed) =>
+        set((s) => {
+          // Identity-stable when this changes nothing, so a caller may re-assert the current state
+          // without re-rendering every consumer of the record. `?? true` is the absent-is-collapsed
+          // default, read here so "collapse a row that was never expanded" correctly does nothing.
+          if (ids.every((id) => (s.collapsedOrchestrators[id] ?? true) === collapsed)) return s;
+          const next = { ...s.collapsedOrchestrators };
+          for (const id of ids) next[id] = collapsed;
+          return { collapsedOrchestrators: next };
+        }),
       toggleOrchestratorCollapsed: (id) =>
-        set((s) => {
-          const cur = s.collapsedOrchestrators[id] ?? true;
-          // Touching the chevron transfers ownership of this row to the user, in BOTH directions: a
-          // hand-expanded subtree must not be auto-collapsed out from under them, and a hand-
-          // collapsed one must not keep a stale mark that a later re-expansion would inherit.
-          const { [id]: _dropped, ...auto } = s.autoExpandedOrchestrators;
-          return {
-            collapsedOrchestrators: { ...s.collapsedOrchestrators, [id]: !cur },
-            autoExpandedOrchestrators: auto,
-          };
-        }),
-      expandOrchestrators: (ids, opts) =>
-        set((s) => {
-          // Identity-stable when there is nothing to do: the caller is an effect that runs on every
-          // agent-set change, and returning a fresh object each time would re-render every consumer
-          // of collapsedOrchestrators for no reason.
-          //
-          // "Nothing to do" includes the MARK, not just the collapse state. An `auto` call only ever
-          // marks what it opens, so opening nothing changes nothing; a user-intent call also has to
-          // strip any stale mark, and bailing on the collapse state alone would leave a subtree the
-          // app had opened still revocable after the user deliberately revealed it.
-          const opensNothing = ids.every((id) => s.collapsedOrchestrators[id] === false);
-          const marksNothing =
-            opts?.auto || ids.every((id) => s.autoExpandedOrchestrators[id] === undefined);
-          if (opensNothing && marksNothing) return s;
-          const next = { ...s.collapsedOrchestrators };
-          const auto = { ...s.autoExpandedOrchestrators };
-          for (const id of ids) {
-            // Mark ONLY the ones this call actually opens, and only when the caller says it is the
-            // app asking. An id already expanded is expanded for someone else's reason — very likely
-            // the user's chevron — and stamping it here would quietly convert their choice into
-            // something auto-collapse may revoke. A non-auto expansion likewise CLEARS any stale
-            // mark: a user-intent reveal of a subtree the app had opened makes it the user's.
-            if (!opts?.auto) delete auto[id];
-            else if (next[id] !== false) auto[id] = true;
-            next[id] = false;
-          }
-          return { collapsedOrchestrators: next, autoExpandedOrchestrators: auto };
-        }),
-      collapseAutoExpanded: (ids) =>
-        set((s) => {
-          const targets = ids.filter((id) => s.autoExpandedOrchestrators[id] === true);
-          if (targets.length === 0) return s;
-          const next = { ...s.collapsedOrchestrators };
-          const auto = { ...s.autoExpandedOrchestrators };
-          for (const id of targets) {
-            next[id] = true;
-            delete auto[id];
-          }
-          return { collapsedOrchestrators: next, autoExpandedOrchestrators: auto };
-        }),
+        get().setOrchestratorsCollapsed([id], !(get().collapsedOrchestrators[id] ?? true)),
+      expandOrchestrators: (ids) => get().setOrchestratorsCollapsed(ids, false),
       settingsRequest: null,
       openSettings: (cat) => set({ settingsRequest: cat }),
       clearSettingsRequest: () => set({ settingsRequest: null }),

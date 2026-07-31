@@ -259,7 +259,7 @@ describe("uiStore boardAgentFilter (FEEDBACK pill → board filter handoff)", ()
 describe("uiStore orchestrator collapse", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
+    useUiStore.setState({ collapsedOrchestrators: {} });
   });
 
   it("workers start collapsed (a missing entry reads as collapsed)", () => {
@@ -280,83 +280,61 @@ describe("uiStore orchestrator collapse", () => {
   });
 });
 
-// The mark that makes auto-collapse safe. `collapsedOrchestrators` records the STATE; this records
-// WHO CHOSE IT, which is the only thing standing between "put the subtree away when it goes quiet"
-// and "close the subtree the user just opened".
-describe("uiStore auto-expanded mark", () => {
+// ONE WRITER. `setOrchestratorsCollapsed` is the only thing in the store that writes
+// `collapsedOrchestrators`; `toggleOrchestratorCollapsed` and `expandOrchestrators` are named
+// wrappers around it. There used to be a second axis here — an `autoExpandedOrchestrators` mark
+// recording whether the APP or the user had opened a row, so the app could revoke its own
+// expansions. It is gone with the auto-expansion it existed to serve: nothing but a user gesture
+// opens a row now, so there is no second class of expansion to track and nothing to revoke.
+describe("uiStore orchestrator disclosure — the single writer", () => {
   afterEach(() => {
     localStorage.clear();
-    useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {} });
+    useUiStore.setState({ collapsedOrchestrators: {} });
   });
 
-  it("marks what an AUTO expandOrchestrators actually opened", () => {
-    useUiStore.getState().expandOrchestrators(["b1", "b2"], { auto: true });
+  it("sets every id it is given to the requested state in one write", () => {
+    useUiStore.getState().setOrchestratorsCollapsed(["b1", "b2"], false);
     expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: false, b2: false });
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({ b1: true, b2: true });
+    useUiStore.getState().setOrchestratorsCollapsed(["b1", "b2"], true);
+    expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: true, b2: true });
   });
 
-  // The default is user-intent, and the concierge's reveal paths rely on it: a "Show me" or a
-  // rowless digest line expands exactly the heads the user clicked to see, and a mark would let the
-  // sidebar fold all but the selected one away on the next status tick (the 53737 bug).
-  it("leaves a plain expandOrchestrators unmarked, so a reveal is not revocable", () => {
+  // It takes the state to ARRIVE at, not a flip, so a caller that re-asserts what is already true is
+  // a no-op. This is what makes the concierge's "close these" idempotent without each call site
+  // hand-guarding every id against the live state, which is what a toggle-only store forced.
+  it("is idempotent — re-asserting the current state changes nothing", () => {
+    useUiStore.getState().setOrchestratorsCollapsed(["b1"], false);
+    const before = useUiStore.getState().collapsedOrchestrators;
+    useUiStore.getState().setOrchestratorsCollapsed(["b1"], false);
+    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
+  });
+
+  // Identity-stable against the ABSENT-IS-COLLAPSED default too, not just against a written `true`.
+  // Collapsing a row nobody has ever expanded must not manufacture an entry and re-render every
+  // consumer of the record.
+  it("collapsing a never-expanded row is identity-stable", () => {
+    const before = useUiStore.getState().collapsedOrchestrators;
+    useUiStore.getState().setOrchestratorsCollapsed(["never-seen"], true);
+    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
+  });
+
+  it("a partial match still writes — the early return needs ALL ids already correct", () => {
+    useUiStore.getState().setOrchestratorsCollapsed(["b1"], false);
+    useUiStore.getState().setOrchestratorsCollapsed(["b1", "b2"], false);
+    expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: false, b2: false });
+  });
+
+  it("expandOrchestrators is the expand-shaped wrapper over the same writer", () => {
     useUiStore.getState().expandOrchestrators(["b1", "b2"]);
-    expect(useUiStore.getState().collapsedOrchestrators).toEqual({ b1: false, b2: false });
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
+    expect(useUiStore.getState().isOrchestratorCollapsed("b2")).toBe(false);
   });
 
-  // A reveal of a subtree the app had already opened makes it the user's — including when the
-  // collapse state is already `false` and there is nothing to open, which is the case an
-  // identity-stable early return is most likely to skip.
-  it("a user-intent expand strips a mark the app had left", () => {
-    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
+  // A reveal the user asked for is STICKY: nothing marks it, so nothing can fold it back up on the
+  // next status tick (roborev 53737, which is why the mark defaulted to user-intent to begin with).
+  it("an expanded row stays expanded across unrelated writes", () => {
     useUiStore.getState().expandOrchestrators(["b1"]);
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
-    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
-  });
-
-  it("is identity-stable when an auto expand opens nothing", () => {
-    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
-    const before = useUiStore.getState().collapsedOrchestrators;
-    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
-    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
-  });
-
-  // Stamping an already-open row would quietly convert someone else's choice — almost always the
-  // user's chevron — into something auto-collapse may revoke.
-  it("does not mark a row that was already expanded", () => {
-    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // the user opens it
-    useUiStore.getState().expandOrchestrators(["b1", "b2"], { auto: true });
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({ b2: true });
-  });
-
-  it("collapseAutoExpanded closes a marked row and clears its mark", () => {
-    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
-    useUiStore.getState().collapseAutoExpanded(["b1"]);
-    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(true);
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
-  });
-
-  // The store's own veto: even if a caller asks, an unmarked row is not the app's to close.
-  it("collapseAutoExpanded refuses a row the user expanded", () => {
-    useUiStore.getState().toggleOrchestratorCollapsed("b1");
-    useUiStore.getState().collapseAutoExpanded(["b1"]);
-    expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
-  });
-
-  it("collapseAutoExpanded is identity-stable when nothing is marked", () => {
-    const before = useUiStore.getState().collapsedOrchestrators;
-    useUiStore.getState().collapseAutoExpanded(["b1", "b2"]);
-    expect(useUiStore.getState().collapsedOrchestrators).toBe(before);
-  });
-
-  // Touching the chevron transfers ownership in BOTH directions — including the case where the user
-  // collapses an auto-expanded row by hand, which must not leave a stale mark behind.
-  it("the chevron clears the mark whichever way it moves the row", () => {
-    useUiStore.getState().expandOrchestrators(["b1"], { auto: true });
-    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // user closes it themselves
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
-    useUiStore.getState().toggleOrchestratorCollapsed("b1"); // and re-opens it — now theirs
-    expect(useUiStore.getState().autoExpandedOrchestrators).toEqual({});
+    useUiStore.getState().setOrchestratorsCollapsed(["b2"], true);
     expect(useUiStore.getState().isOrchestratorCollapsed("b1")).toBe(false);
   });
 });
@@ -460,13 +438,11 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
   const PERSISTED = [
     "activeSpecial",
     "statusFilter",
+    // Persisted because it is the USER'S choice, and the only thing that writes it is a user
+    // gesture. It used to be joined here by an `autoExpandedOrchestrators` mark recording which
+    // expansions the app had made so it could revoke them; with nothing but a gesture able to open
+    // a row, there is no such class of expansion and no mark to persist.
     "collapsedOrchestrators",
-    // Which of those expansions the APP made rather than the user. Persisted deliberately, and it
-    // has to travel with collapsedOrchestrators: if the mark were transient, every app-expanded
-    // subtree would come back from a relaunch looking like a deliberate user choice, and
-    // auto-collapse — which refuses to touch the user's own expansions — would leave it open
-    // forever. That is the very stuck-open state the mark exists to clear.
-    "autoExpandedOrchestrators",
     // The concierge compose box's dragged height. Persisted on purpose — the user asked for the
     // size to stick across relaunches.
     "conciergeComposeH",

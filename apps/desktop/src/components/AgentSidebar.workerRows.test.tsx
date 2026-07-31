@@ -40,6 +40,7 @@ vi.mock("../services/branchStatus", () => ({
 }));
 
 import { AgentSidebar } from "./AgentSidebar";
+import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -147,7 +148,7 @@ function seedExpanded(status: Record<string, AgentTabStatus> = {}): Project {
 }
 
 beforeEach(() => {
-  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
   open.mockClear();
 });
 afterEach(cleanup);
@@ -158,6 +159,12 @@ describe("AgentSidebar — worker child rows", () => {
     render(<AgentSidebar project={project} />);
     expect(queryRow("Parser Worker")).toBeTruthy();
     expect(queryRow("Lexer Worker")).toBeTruthy();
+    // POSITIVE CONTROL for the shared `childRowOf` probe used throughout this file. It is
+    // negative-only — a missing/renamed subtree id reads the same as a shut subtree — so without a
+    // case asserting TRUE, a renamed `subtreeDomId` would silently turn every other assertion here
+    // into an always-pass.
+    expect(subtreeGroupExists("a1")).toBe(true);
+    expect(childRowOf("a1", "Parser Worker")).toBe(true);
   });
 
   it("indents a worker row one level below its parent", () => {
@@ -406,55 +413,56 @@ describe("AgentSidebar — a subtree opens when a worker needs you, not when one
     expect(queryRow("Codegen Worker")).toBeNull();
   });
 
-  // THE case the auto-expand now exists for.
-  it("expands a collapsed parent when one of its workers goes red", () => {
+  // A worker going red does NOT open its parent, and no child rows appear. This used to be the one
+  // case that DID auto-expand; the pair "opens on red, never closes when the red clears" is what
+  // left a subtree standing open showing a green worker. The red is not lost — the head row carries
+  // it, and a closed parent draws a one-line peek (AgentSidebar.disclosure.test.tsx pins both).
+  it("does not expand a collapsed parent when one of its workers goes red", () => {
     const project = seed({ w1: "working", w2: "working" });
     const { rerender } = render(<AgentSidebar project={project} />);
-    expect(queryRow("Parser Worker")).toBeNull();
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
 
     advance(rerender, project, { w1: "waiting", w2: "working" });
 
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-    expect(queryRow("Parser Worker")).toBeTruthy();
+    // The RENDER after the red, not just the store flag — see the parallel case in rowChrome.
+    expect(useUiStore.getState().collapsedOrchestrators.a1).not.toBe(false);
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
+    expect(screen.getByTestId("worker-peek")).toBeTruthy();
   });
 
-  // TRANSITION, NOT STATE. The effect re-runs on every status/agents change, so a worker that merely
-  // STAYS red must not re-assert the expansion — otherwise collapsing a subtree with a red worker in
-  // it would undo itself on the next render and the chevron would read as broken.
-  it("does not re-expand after the user collapses a subtree whose worker is still red", () => {
+  // A subtree the user closed stays closed while a worker under it is still red, across further
+  // status ticks. There is no edge detector left to get this wrong, which is the point.
+  it("stays collapsed after the user closes a subtree whose worker is still red", () => {
     const project = seed({ w1: "working", w2: "working" });
     const { rerender } = render(<AgentSidebar project={project} />);
 
     advance(rerender, project, { w1: "errored", w2: "working" });
+    toggleAlpha(); // the user opens it themselves
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-
-    toggleAlpha(); // the user shuts it again, red and all
+    toggleAlpha(); // and shuts it again, red and all
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
-    // w1 is still errored; an unrelated change ticks the effect.
+    // w1 is still errored; an unrelated change ticks the render.
     advance(rerender, project, { w1: "errored", w2: "idle" });
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    expect(queryRow("Parser Worker")).toBeNull();
   });
 
-  // The counterpart, and the reason the helper skips a parent's first sighting: a mount must not be
-  // read as a transition, or every relaunch would blow open every subtree the user collapsed. The
-  // red is not lost — the head row carries it.
+  // A relaunch with an already-red worker respects the persisted collapse.
   it("does not expand on first render even when a worker is ALREADY red", () => {
     useUiStore.setState({ collapsedOrchestrators: { a1: true } } as never);
     const project = seed({ w1: "errored" });
     render(<AgentSidebar project={project} />);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    expect(queryRow("Parser Worker")).toBeNull();
+    // A red worker under a shut head draws the one-line PEEK, which names it — so the subtree, not
+    // the text, is what says whether this expanded.
+    expect(childRowOf("a1", "Parser Worker")).toBe(false);
   });
 
-  // Expansion is automatic; COLLAPSING stays the user's gesture — never yank a subtree shut while
-  // they are reading it.
-  it("does not collapse the subtree when the red clears", () => {
+  // COLLAPSING is the user's gesture too: a subtree they opened stays open when the red clears.
+  // Nothing folds it away on their behalf.
+  it("does not collapse the subtree the user opened when the red clears", () => {
     const project = seed({ w1: "errored" });
     const { rerender } = render(<AgentSidebar project={project} />);
-    advance(rerender, project, { w1: "idle" });
-    // The red never triggered an expand (first sighting), so open it as the user would.
     toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
 

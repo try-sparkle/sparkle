@@ -668,6 +668,10 @@ export const DANGER = C.dangerInk;
  *  a cell whose background came from a dark ANSI slot). Satisfying that too would push the band so
  *  far apart that calm stops reading as calm, and it is the rarest combination on screen — a TUI
  *  that paints a background almost always paints its foreground too, which is the pair (2) covers.
+ *  That freedom SURVIVES `TERM_MIN_CONTRAST_RATIO` (roborev 56774-M3): the floor handed to xterm
+ *  while calm is a backstop for combinations this palette never designed, and an uncovered pair is
+ *  by definition one of them — if a future tune drops it under the floor, xterm lifts that CELL's
+ *  foreground and the band is left alone. Tune (1) and (2); this does not add a third constraint.
  *  NO RATIOS ARE WRITTEN IN THESE COMMENTS (roborev 46897): the first set of annotations was
  *  measurably wrong (a "4.6:1" that was really 6.7:1, "2.1:1" pairs that were 2.03), and a reader
  *  checks the comment before the test. `xtermTheme.test.ts` computes both floors from the actual
@@ -752,6 +756,75 @@ export const LINK_MIN_CONTRAST = 4.5;
 /** Floor for a light-mode ANSI slot against whatever it is read against — the terminal plane when
  *  it is a foreground, the opposing register when it is a cell FILL. WCAG AA, body text. */
 export const TERM_ANSI_MIN_CONTRAST = 4.5;
+
+/**
+ * xterm's own per-cell foreground adjuster, and the answer to everything `ANSI_LIGHT` cannot reach.
+ *
+ * WHY IT EXISTS HERE. Pinning the sixteen basic slots fixed the colours a TUI names with `\e[3Xm`,
+ * but a terminal LINK — a path, a URL, an OSC 8 word — is drawn in whatever colour the emitter
+ * chose, and xterm has no link colour of its own to override (its `ITheme` has none; a detected
+ * link only gains an underline). When that colour comes from the 256-COLOUR CUBE, the palette never
+ * sees it: 201 of the cube's 240 entries fail AA on this plane, and the TUI in this app reaches
+ * into it — `\e[38;5;215m` measures 1.41:1 and `\e[38;5;242m` 4.06:1. That is a link you cannot
+ * read, which is precisely the report, and no amount of tuning the sixteen fixes it.
+ *
+ * `minimumContrastRatio` is xterm's built-in remedy and it is strictly better than the clamp I
+ * previously declined to write. It adjusts the FOREGROUND against the ACTUAL background of each
+ * cell, so:
+ *   • it covers the cube AND 24-bit truecolor, not just the slots this file names;
+ *   • it leaves BACKGROUNDS alone — which dissolves the objection that made me defer the cube
+ *     (a blanket palette clamp would have turned a light `\e[48;5;Nm` fill dark under text chosen
+ *     to sit on a light fill; this cannot, because it never rewrites a background);
+ *   • it is measured against the real backdrop, so a painted-background cell is handled correctly
+ *     rather than assumed to be the plane.
+ *
+ * It defaults to 1 ("do nothing") and was simply never set. LIGHT ONLY: dark mode was not the
+ * report and its defaults already clear the floor, so it keeps xterm's untouched behaviour.
+ *
+ * This does NOT make `ANSI_LIGHT` redundant. The adjuster preserves hue only as far as it can
+ * before it has to drive a colour toward black or white, so a palette that already clears the floor
+ * keeps its intended hue and the adjuster never fires on it. The sixteen slots stay hand-chosen;
+ * this catches everything outside them.
+ *
+ * ── WHY CALM GETS ITS OWN FLOOR, AND WHY IT IS NOT 1 ─────────────────────────────────────────────
+ * The first version of this indexed on the THEME alone, and that is wrong: light mode has a SECOND
+ * palette. `CALM` is built deliberately BELOW AA — `CALM_MIN_CONTRAST` is 3 and `CALM_MIN_SPLIT` is
+ * 2 — because a calm agent's output is meant to recede. A blanket 4.5 overrides that intent exactly
+ * where calm works hardest: calm's `bright` sits at 2.14:1 over a `dim`-painted cell, and `calmAnsi`
+ * points `black`…`brightBlack` at `dim`, so every painted-background cell a TUI draws (diff hunks,
+ * selected rows — the case `CALM_MIN_SPLIT` exists for) would be dragged to full contrast. Calm is
+ * the default state for a `working` agent, so that is the common path, not an edge case.
+ *
+ * It is NOT 1 either, because calm does not fix the bug above — `calmAnsi` flattens the sixteen
+ * NAMED slots and nothing else, so a calm terminal still emits cube and truecolor at their own
+ * values, and `\e[38;5;215m` is still 1.41:1. Turning the net off while calm would leave the
+ * original report unfixed in the state the app is in most of the time.
+ *
+ * So the calm floor is CALM'S OWN weakest deliberate relationship, `CALM_MIN_SPLIT`. The rule reads:
+ * nothing on screen may sit below the least contrast the calm palette DESIGNS.
+ *
+ * WHICH IS NOT "the adjuster never fires while calm" — an earlier draft of this comment said that
+ * and it was false (roborev 56774-M1). Calm ships two grays across sixteen slots, so the palette
+ * necessarily produces combinations it never designed, and some are degenerate: default ink over a
+ * `bright`-painted fill is ~1.03:1, and a dark slot on a dark-slot fill (`\e[44m\e[37m`) is exactly
+ * 1:1 — fg == bg, invisible. Those are not calm working as intended, they are calm having nothing to
+ * say about a pair; the net lifting them is the whole reason it exists. What the floor guarantees is
+ * narrower and is what xtermTheme.test.ts measures: the pairs calm DOES design — each ink on the
+ * plane, and `bright` over a `dim` fill — clear it, so the adjuster never rewrites a relationship
+ * the palette was tuned for.
+ */
+export const TERM_MIN_CONTRAST_RATIO = {
+  light: { normal: TERM_ANSI_MIN_CONTRAST, calm: CALM_MIN_SPLIT },
+  // Dark keeps xterm's untouched behaviour in both states — it was not the report.
+  dark: { normal: 1, calm: 1 },
+} as const;
+
+/** The floor to hand xterm for a given pane state. Mirrors `xtermTheme(resolved, calm)`, which
+ *  chooses the palette this floor has to leave alone. */
+export function termMinContrastRatio(resolved: "light" | "dark", calm = false): number {
+  return TERM_MIN_CONTRAST_RATIO[resolved][calm ? "calm" : "normal"];
+}
+
 /** Floor between a light-mode ANSI slot and its `bright` counterpart, so the two stay tellable.
  *  The `white`/`brightWhite` pair is the exception and has its own, looser floor below: both are
  *  paper tones by construction, and every light terminal profile keeps them close (Solarized

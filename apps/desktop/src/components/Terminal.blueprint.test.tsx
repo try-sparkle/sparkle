@@ -19,15 +19,23 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 
 // How many xterm cores have been constructed, and every theme object ever pushed onto the live one.
 // Hoisted so the vi.mock factory can close over them.
-const { constructed, themeWrites, detached, themeRef, spawnCtl } = vi.hoisted(() => ({
-  constructed: { count: 0 },
-  themeWrites: [] as Array<Record<string, unknown>>,
-  detached: { count: 0 },
-  themeRef: { value: "dark" as "light" | "dark" },
-  // Flip to make the spawn chain reject, which is how the component reaches its "Couldn't start
-  // the agent — Start again" affordance (resolveTerminalOverlay's `fail` branch).
-  spawnCtl: { fail: false },
-}));
+const { constructed, themeWrites, contrastWrites, ctorContrast, detached, themeRef, spawnCtl } =
+  vi.hoisted(() => ({
+    constructed: { count: 0 },
+    themeWrites: [] as Array<Record<string, unknown>>,
+    // `minimumContrastRatio` rides the same effect as `theme` and has the same staleness risk, so
+    // it is recorded the same way — every live assignment, in order.
+    contrastWrites: [] as number[],
+    // …and the CONSTRUCTOR value separately. It has to be its own channel: the re-theme effect
+    // fires on the same commit as the mount, so a shared list's first entry is satisfied by the
+    // effect and deleting the constructor option stays green (caught by hand-mutation).
+    ctorContrast: [] as Array<number | undefined>,
+    detached: { count: 0 },
+    themeRef: { value: "dark" as "light" | "dark" },
+    // Flip to make the spawn chain reject, which is how the component reaches its "Couldn't start
+    // the agent — Start again" affordance (resolveTerminalOverlay's `fail` branch).
+    spawnCtl: { fail: false },
+  }));
 
 vi.mock("@xterm/xterm", () => {
   class Terminal {
@@ -36,6 +44,7 @@ vi.mock("@xterm/xterm", () => {
     options: Record<string, unknown> = new Proxy({} as Record<string, unknown>, {
       set(target, prop, value) {
         if (prop === "theme") themeWrites.push(value as Record<string, unknown>);
+        if (prop === "minimumContrastRatio") contrastWrites.push(value as number);
         target[prop as string] = value;
         return true;
       },
@@ -49,6 +58,10 @@ vi.mock("@xterm/xterm", () => {
       constructed.count += 1;
       // The constructor-time theme counts as a write: it is the same xtermTheme() call.
       if (opts.theme) themeWrites.push(opts.theme as Record<string, unknown>);
+      ctorContrast.push(opts.minimumContrastRatio as number | undefined);
+      if (typeof opts.minimumContrastRatio === "number") {
+        contrastWrites.push(opts.minimumContrastRatio);
+      }
     }
     loadAddon(): void {}
     open(parent: HTMLElement): void {
@@ -139,7 +152,7 @@ vi.mock("../engine/statusEngine", () => ({
 vi.mock("../theme/theme", () => ({ useResolvedTheme: () => themeRef.value }));
 
 import { Terminal } from "./Terminal";
-import { THEME_HEX, C } from "../theme/colors";
+import { THEME_HEX, C, termMinContrastRatio } from "../theme/colors";
 import { TERM_HAIRLINE, TERM_PLANE, TERM_TYPE, termInk, termMuted } from "./terminalChrome";
 
 const baseProps = {
@@ -156,6 +169,8 @@ const baseProps = {
 beforeEach(() => {
   constructed.count = 0;
   themeWrites.length = 0;
+  contrastWrites.length = 0;
+  ctorContrast.length = 0;
   detached.count = 0;
   themeRef.value = "dark";
   spawnCtl.fail = false;
@@ -260,6 +275,56 @@ describe("Terminal — xterm is themed from THEME_HEX and re-themes on a data-th
 
     expect(themeWrites.at(-1)!.background).toBe(THEME_HEX.light.forest);
     expect(themeWrites.at(-1)!.foreground).toBe(THEME_HEX.light.cream);
+  });
+
+  it("hands xterm the light-mode contrast net at MOUNT, and dark's no-op", () => {
+    // roborev 56210-M2: the palette test could only compare two constants in one module, so both
+    // of these lines could be deleted from Terminal.tsx with the suite still green. This is the
+    // wiring — the option genuinely reaches the xterm constructor.
+    // Asserted on the CONSTRUCTOR's own channel, not on the first write: the re-theme effect fires
+    // on the same commit, so a shared list cannot tell "the constructor carried it" from "the
+    // effect fixed it up a microtask later".
+    render(<Terminal {...baseProps} />); // themeRef is "dark"
+    expect(ctorContrast.at(0), "dark mounts on xterm's no-op").toBe(termMinContrastRatio("dark"));
+
+    cleanup();
+    ctorContrast.length = 0;
+    themeRef.value = "light";
+    render(<Terminal {...baseProps} />);
+    expect(ctorContrast.at(0), "light mounts with the net on").toBe(termMinContrastRatio("light"));
+  });
+
+  it("pushes the contrast net through the LIVE terminal on a theme flip", () => {
+    // Same staleness the theme effect exists to prevent: a mount-time-only value leaves a
+    // dark→light toggle running xterm's no-op, which is the whole bug in a long-lived session.
+    const { rerender } = render(<Terminal {...baseProps} />);
+    themeRef.value = "light";
+    rerender(<Terminal {...baseProps} />);
+    expect(contrastWrites.at(-1)).toBe(termMinContrastRatio("light"));
+    // …and back, so the net is not one-way.
+    themeRef.value = "dark";
+    rerender(<Terminal {...baseProps} />);
+    expect(contrastWrites.at(-1)).toBe(termMinContrastRatio("dark"));
+  });
+
+  it("drops to CALM's own floor while calm, and restores the full net when it lifts", () => {
+    // roborev 56210-M1. Calm is a second palette built BELOW AA on purpose; the full 4.5 net drags
+    // its `bright` up from 2.14:1 over a dim-painted cell (diff hunks, selected rows) and calm
+    // stops reading as calm. Calm is the default state for a `working` agent, so this is the
+    // common path. The floor must follow `calm` the same way the palette does.
+    themeRef.value = "light";
+    const { rerender } = render(<Terminal {...baseProps} calm />);
+    expect(ctorContrast.at(0), "a calm mount must not hand over the full net").toBe(
+      termMinContrastRatio("light", true),
+    );
+    expect(termMinContrastRatio("light", true)).toBeLessThan(termMinContrastRatio("light"));
+
+    // Calm lifts (the agent now has something for you) — the net comes back on the LIVE terminal.
+    rerender(<Terminal {...baseProps} calm={false} />);
+    expect(contrastWrites.at(-1)).toBe(termMinContrastRatio("light"));
+    // …and one xterm throughout: calm must not be costing the agent its PTY.
+    expect(constructed.count).toBe(1);
+    expect(detached.count).toBe(0);
   });
 
   // ── THE SAFETY CONSTRAINT ────────────────────────────────────────────────────────────────────

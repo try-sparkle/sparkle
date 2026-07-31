@@ -115,7 +115,7 @@ function controller(): ConciergeController {
 }
 
 beforeEach(() => {
-  useUiStore.setState({ collapsedOrchestrators: {}, autoExpandedOrchestrators: {}, activeSpecial: null } as never);
+  useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
   // The island's shipped default, restored per test. Nothing in the sidebar reads these prefs any
   // more (see "the builder sidebar's brand row is gone"); this keeps the last describe's deliberate
   // stale-key write from being the ambient state every other test runs under.

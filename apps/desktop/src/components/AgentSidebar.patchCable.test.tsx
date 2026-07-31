@@ -64,7 +64,6 @@ beforeEach(() => {
   useUiStore.setState({
     activeSpecial: null,
     collapsedOrchestrators: {},
-    autoExpandedOrchestrators: {},
     pairAssignment: {},
     leftProjectId: null,
   } as never);

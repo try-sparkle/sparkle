@@ -5,7 +5,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { copyToClipboard } from "../clipboard";
-import { C, xtermTheme } from "../theme/colors";
+import { C, termMinContrastRatio, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import {
   TERM_HAIRLINE,
@@ -625,6 +625,11 @@ export function Terminal({
       // Concrete hex (xterm can't read CSS var()); the effect below keeps it in sync when the
       // resolved theme changes. Initial value captured at mount.
       theme: xtermTheme(resolvedTheme, calm),
+      // Light mode's safety net for every colour the palette cannot name — the 256-colour cube and
+      // truecolor, which is where a TUI's file paths and URLs live. Takes `calm` for the same
+      // reason `theme` does: calm is a different palette, with a lower floor of its own that this
+      // must not override. See TERM_MIN_CONTRAST_RATIO.
+      minimumContrastRatio: termMinContrastRatio(resolvedTheme, calm),
       // OSC 8 hyperlinks (the escape sequence CLIs use to make a WORD clickable, as opposed to a
       // bare URL in the output) are matched by xterm CORE, not by WebLinksAddon — so the addon
       // handler below never sees them. Core's stock handler calls window.confirm() and then
@@ -1540,6 +1545,11 @@ export function Terminal({
     const term = termRef.current;
     if (disposedRef.current || !term) return;
     term.options.theme = xtermTheme(resolvedTheme, calm);
+    // Rides the SAME flip as the theme, and for the same two reasons: light needs the net and dark
+    // does not, and CALM is a second palette with a deliberately lower floor the net must not
+    // override. Leaving either at its mount value strands the live toggle with the wrong one — the
+    // exact staleness this effect exists to prevent for `theme`.
+    term.options.minimumContrastRatio = termMinContrastRatio(resolvedTheme, calm);
     // The WebGL renderer caches colored glyphs in a texture atlas; a bare options.theme set
     // can leave already-painted cells with stale colors until the next reflow. Clear the atlas
     // and force a full repaint so the live toggle is instantaneous like the rest of the app.
