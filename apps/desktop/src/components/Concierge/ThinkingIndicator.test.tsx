@@ -7,25 +7,22 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  NO_ANSWER_YET_LABEL,
   THINKING_ACTIVITY_TESTID,
-  THINKING_ELAPSED_TESTID,
   THINKING_INDICATOR_TESTID,
+  THINKING_STATE_TESTID,
   ThinkingIndicator,
 } from "./ThinkingIndicator";
 import {
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
 } from "../../services/conciergeActivity";
-import {
-  ELAPSED_COUNTER_AFTER_MS,
-  OFFLINE_AFTER_MS,
-} from "../../engine/conciergeLiveness";
+import { SLOW_AFTER_MS, STALLED_AFTER_MS } from "../../engine/conciergeLiveness";
 import {
   _resetConciergeLivenessForTests,
   noteConciergeSent,
   noteConciergeSettled,
 } from "../../services/conciergeLiveness";
+import { C } from "../../theme/colors";
 import { useProjectStore } from "../../stores/projectStore";
 import { AgentPillProvider } from "./AgentPill";
 import type { MentionAgent } from "./mentions";
@@ -171,19 +168,54 @@ describe("ThinkingIndicator", () => {
   });
 });
 
-// ── HOW LONG YOU HAVE BEEN WAITING ──────────────────────────────────────────────────────────────
+// ── HOW LONG YOU HAVE BEEN WAITING, SAID ONLY IN COLOUR ─────────────────────────────────────────
 //
 // The pulse alone could not tell "thinking hard" from "this turn died and nothing will ever arrive",
-// and on 2026-07-29 the second case happened 149 times without the column changing at all. These
-// rows are the timing half; the thresholds themselves are argued and tested in
+// and on 2026-07-29 the second case happened 149 times without the column changing at all. The first
+// answer to that was too loud — a counter from 5s and the words "No answer yet" from 20s — and the
+// founder's verdict was *"don't have it say no answer yet, just have the color change from gray to
+// yellow to then red."*
+//
+// So these rows assert TWO things at every step, and the second matters as much as the first: the
+// ink moved, and NOTHING ELSE DID. The thresholds themselves are argued and tested in
 // engine/conciergeLiveness.
 describe("ThinkingIndicator — the wait", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  function elapsedText(): string | null {
-    return document.querySelector(`[data-testid="${THINKING_ELAPSED_TESTID}"]`)?.textContent ?? null;
+  /** The rendered ink — the entire signal.
+   *
+   *  Put through a scratch node first, because the theme's tokens are not all the same KIND of
+   *  value: the two muted inks are `var(--…)` and survive verbatim, while sienna is a literal hex
+   *  that the CSSOM canonicalises to `rgb(…)`. Comparing raw strings would have made the red cases
+   *  fail for a reason that has nothing to do with the component. */
+  const canon = (v: string) => {
+    const el = document.createElement("div");
+    el.style.color = v;
+    return el.style.color;
+  };
+  function ink(): string | undefined {
+    return (indicator() as HTMLElement | null)?.style.color;
   }
+  const GRAY = canon(C.conciergeMuted);
+  const YELLOW = canon(C.amberInk);
+  const RED = canon(C.sienna);
+
+  /** What a SIGHTED user sees — `textContent` minus the clip-rect announcement node.
+   *
+   *  The distinction is the whole design: the state must be readable by a screen reader (so it is in
+   *  the DOM, and its appearing is what a live region announces) and invisible to everyone else (so
+   *  it occupies no pixels). A raw `textContent` assertion would conflate the two and fail on a
+   *  correct implementation; asserting only the visible half is what the founder's ask is about. */
+  function visibleText(): string {
+    const el = indicator();
+    if (!el) return "";
+    const clone = el.cloneNode(true) as HTMLElement;
+    clone.querySelector(`[data-testid="${THINKING_STATE_TESTID}"]`)?.remove();
+    return clone.textContent ?? "";
+  }
+  const spokenState = () =>
+    document.querySelector(`[data-testid="${THINKING_STATE_TESTID}"]`)?.textContent ?? null;
 
   /** Let the liveness ticker run, which is what advances both the clock and the escalation. */
   function wait(ms: number, rerender: (ui: React.ReactElement) => void) {
@@ -193,41 +225,91 @@ describe("ThinkingIndicator — the wait", () => {
     rerender(<ThinkingIndicator typing />);
   }
 
-  it("says nothing about time for the first few seconds", () => {
+  it("is gray, and completely quiet, for the whole first half-minute", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
-    wait(ELAPSED_COUNTER_AFTER_MS - 1_000, rerender);
-    expect(elapsedText()).toBeNull();
+    // 5s and 20s are where the old version put a counter and the words on screen.
+    for (const at of [5_000, 15_000, 9_999]) {
+      wait(at, rerender);
+      expect(ink()).toBe(GRAY);
+      expect(visibleText()).toBe("…");
+      expect(indicator()?.getAttribute("data-liveness")).toBe("waiting");
+    }
   });
 
-  // FACTUAL, NOT A CLAIM. A counter cannot be wrong, so it may appear early — which is what the
-  // "show me something within a few seconds" instinct actually wants. Asserting a status that early
-  // would be a guess, and the measured median turn is ~54s.
-  it("states the elapsed time once there is some", () => {
+  it("turns yellow at thirty seconds, and says nothing", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
-    wait(ELAPSED_COUNTER_AFTER_MS + 2_000, rerender);
-    expect(elapsedText()).toContain("7s");
-    // Still just waiting — no alarm, no claim about the brain.
-    expect(indicator()?.textContent).not.toContain(NO_ANSWER_YET_LABEL);
-    expect(indicator()?.getAttribute("data-liveness")).toBe("waiting");
+    wait(SLOW_AFTER_MS - 1_000, rerender);
+    expect(ink()).toBe(GRAY);
+
+    wait(1_000, rerender);
+    expect(ink()).toBe(YELLOW);
+    expect(indicator()?.getAttribute("data-liveness")).toBe("slow");
+    // The pulse and nothing else — no label, no counter, no glyph swap. This is the founder's ask
+    // stated as an assertion.
+    expect(visibleText()).toBe("…");
   });
 
-  it("says plainly that nothing has come back once the silence is long enough", () => {
+  // *Going red at 30 seconds is too distracting for something that is usually just a slow turn. Red
+  // should mean something is actually wrong, not that a reply is taking a moment.*
+  it("does NOT go red at thirty seconds — red waits for sixty", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
-    wait(OFFLINE_AFTER_MS, rerender);
-    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
-    expect(indicator()?.getAttribute("data-liveness")).toBe("offline");
-    // Announced: it changes at most twice a turn, and it is the only notice a non-sighted user gets
-    // that their question has gone nowhere. (The bare counter is NOT — it changes every second.)
-    expect(indicator()?.getAttribute("aria-live")).toBe("polite");
-    expect(indicator()?.getAttribute("aria-label")).toContain(NO_ANSWER_YET_LABEL);
+    wait(SLOW_AFTER_MS, rerender);
+    expect(ink()).not.toBe(RED);
+
+    wait(STALLED_AFTER_MS - SLOW_AFTER_MS, rerender);
+    expect(ink()).toBe(RED);
+    expect(indicator()?.getAttribute("data-liveness")).toBe("stalled");
+    expect(visibleText()).toBe("…");
   });
 
-  // A tool call RESETS the silence clock, so a stale activity line beside "No answer yet" would read
-  // as work still in progress — the one thing we have just established we cannot vouch for.
-  it("drops the stale activity line once it goes silent", () => {
+  // THE WORDS ARE GONE FROM THE SCREEN at every step. Asserted by scanning the rendered text rather
+  // than by a testid, so re-introducing the wording under a different name still fails.
+  it("never puts a word or a number on screen, however long the silence runs", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    for (const at of [5_000, 25_000, 30_000, 60_000, 300_000]) {
+      wait(at, rerender);
+      const text = visibleText();
+      expect(text).toBe("…");
+      expect(text).not.toMatch(/\d/); // no seconds counter, in any phrasing
+      expect(text.toLowerCase()).not.toContain("answer");
+    }
+  });
+
+  // …and the one node that DOES carry words occupies no pixels. Clipped, not `display: none` — the
+  // latter would take it out of the accessibility tree, which is the only place it is meant to
+  // exist. Both halves asserted together, because either alone permits the wrong implementation.
+  it("keeps the announcement node in the tree and out of the layout", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(STALLED_AFTER_MS, rerender);
+
+    const node = document.querySelector(
+      `[data-testid="${THINKING_STATE_TESTID}"]`,
+    ) as HTMLElement | null;
+    expect(node?.textContent).toContain("Still waiting");
+    expect(node?.style.position).toBe("absolute");
+    expect(node?.style.width).toBe("1px");
+    expect(node?.style.height).toBe("1px");
+    expect(node?.style.overflow).toBe("hidden");
+    // The `clip: rect(0 0 0 0)` this also carries is NOT asserted: jsdom's cssstyle does not
+    // implement the legacy shorthand and drops it from the serialised style entirely, so any
+    // assertion about it here would be checking jsdom rather than the component. The four
+    // properties above are enough to prove the node is off-layout; the clip rect is the house
+    // idiom, shared verbatim with RecapCard and the column's announcer.
+    // Not removed from the accessibility tree by any of the usual means.
+    expect(node?.getAttribute("aria-hidden")).toBeNull();
+    expect(node?.hidden).toBe(false);
+    expect(node?.style.display).not.toBe("none");
+  });
+
+  // The activity line SURVIVES the escalation now. The old version suppressed it and swapped the
+  // glyph, which is precisely the reflow the founder objected to — and the pulse beside the line
+  // already says "still going" without claiming the tool call is still running.
+  it("keeps the activity line through yellow and red, and only re-inks it", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
     // AFTER the first render: the row snapshots an activity floor when a turn starts, so a call
@@ -237,23 +319,58 @@ describe("ThinkingIndicator — the wait", () => {
     expect(activityText()).toBe("Reading an agent's terminal");
 
     // Measured from the TOOL CALL, which reset the silence clock — that reset is the whole reason a
-    // 20s threshold is safe for turns whose median duration is ~54s.
-    wait(OFFLINE_AFTER_MS, rerender);
-    expect(activityText()).toBeNull();
-    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
+    // 30s threshold is safe for turns whose median duration is ~54s.
+    wait(SLOW_AFTER_MS, rerender);
+    expect(activityText()).toBe("Reading an agent's terminal");
+    expect(ink()).toBe(YELLOW);
+
+    wait(STALLED_AFTER_MS - SLOW_AFTER_MS, rerender);
+    expect(activityText()).toBe("Reading an agent's terminal");
+    expect(ink()).toBe(RED);
   });
 
   // "Recovering must clear the state promptly" — in the same commit, not on the next tick.
-  it("goes back to normal the instant the turn answers", () => {
+  it("goes back to gray the instant the turn answers", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
-    wait(OFFLINE_AFTER_MS, rerender);
-    expect(indicator()?.textContent).toContain(NO_ANSWER_YET_LABEL);
+    wait(STALLED_AFTER_MS, rerender);
+    expect(ink()).toBe(RED);
 
     act(() => noteConciergeSettled());
     rerender(<ThinkingIndicator typing />);
-    expect(indicator()?.textContent).not.toContain(NO_ANSWER_YET_LABEL);
-    expect(elapsedText()).toBeNull();
+    expect(ink()).toBe(GRAY);
+  });
+
+  // A COLOUR CANNOT BE READ ALOUD, so the state exists as text a screen reader can reach and a
+  // sighted user cannot see. BOTH channels are asserted (roborev 56112-M1): a live region is
+  // announced from a subtree MUTATION, so the clip-rect node appearing is what an AT actually
+  // reacts to — an `aria-label` change alone is not reliably announced, which is how the first draft
+  // of this retune silently lost the fallback it claimed to keep.
+  it("announces the state it can only otherwise show as ink, through both channels", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    wait(10_000, rerender);
+    // Nothing worth saying yet: gray is the normal state, so there is no node and no extra label.
+    expect(spokenState()).toBeNull();
+    expect(indicator()?.getAttribute("aria-label")).toBe("Sparkle is typing");
+
+    wait(SLOW_AFTER_MS - 10_000, rerender);
+    expect(spokenState()).toContain("Still waiting"); // the mutation an AT hears
+    expect(indicator()?.getAttribute("aria-label")).toContain("Still waiting"); // the fallback
+    expect(indicator()?.getAttribute("aria-live")).toBe("polite");
+    // …and none of it reaches the screen.
+    expect(visibleText()).toBe("…");
+  });
+
+  it("announces the activity AND the state together, rather than replacing one with the other", () => {
+    noteConciergeSent();
+    const { rerender } = render(<ThinkingIndicator typing />);
+    act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" }));
+    rerender(<ThinkingIndicator typing />);
+    wait(STALLED_AFTER_MS, rerender);
+    const label = indicator()?.getAttribute("aria-label") ?? "";
+    expect(label).toContain("Reading an agent's terminal");
+    expect(label).toContain("Still waiting");
   });
 
   // The name several suites outside this file identify the row by, kept EXACTLY while there is

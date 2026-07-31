@@ -6,90 +6,124 @@
 // ./conciergeFailureNotice) and 149 of 378 were killed mid-flight by the user's own next send and
 // emitted nothing at all.
 //
-// ─── WHY THE THRESHOLDS ARE WHAT THEY ARE ────────────────────────────────────────────────────────
+// ─── THE SIGNAL IS A COLOUR, AND ONLY A COLOUR (2026-07-30) ──────────────────────────────────────
 //
-// The instinct is "no answer in a few seconds → offline". The logs say that would fire on nearly
-// every HEALTHY turn. Turn duration is not directly logged, but it is recoverable: `concierge_turn`
-// logs its supersede line iff the turn slot was occupied (concierge.rs:930-935), so every
-// consecutive spawn pair is a clean interval-censored observation of the earlier turn. Over 380 such
-// observations on 2026-07-29 (152 still alive / 228 already finished):
+// The first version of this answered the complaint too loudly: an elapsed counter from 5s, the word
+// OFFLINE at 20s, and a sticky "your concierge isn't answering" strip at 90s. The founder's verdict
+// on living with it: *"don't have it say no answer yet, just have the color change from gray to
+// yellow to then red."* And on the timing: going red at 30s is too distracting for something that is
+// usually just a slow turn — RED SHOULD MEAN SOMETHING IS ACTUALLY WRONG, not that a reply is taking
+// a moment.
+//
+// So there are three steps and no words:
+//
+//     GRAY    0-30s    a concierge taking a few seconds is NORMAL and must look normal
+//     YELLOW  30s+     long enough to be worth noticing, quiet enough to ignore
+//     RED     60s+     now something is probably wrong
+//
+// This is deliberately a WEAKER claim than the words it replaces, and that is the point. A colour
+// asserts nothing a clock cannot support, so it can never be the confidently-wrong diagnosis the
+// header below warns about — and it costs a glance rather than a sentence to dismiss.
+//
+// ─── WHY 30s AND 60s ─────────────────────────────────────────────────────────────────────────────
+//
+// Turn duration is not directly logged, but it is recoverable: `concierge_turn` logs its supersede
+// line iff the turn slot was occupied (concierge.rs:930-935), so every consecutive spawn pair is a
+// clean interval-censored observation of the earlier turn. Over 380 such observations on 2026-07-29
+// (152 still alive / 228 already finished):
 //
 //     fastest observed round trip (spawn → quota rejection)   3.03s   nothing can return sooner
-//     slowest observed hard failure                          16.67s   below this, OFFLINE beats the real error
+//     slowest observed hard failure                          16.67s   below this, a colour beats the real error
 //     median user re-send                                    20.94s   the measured moment humans give up
 //     median healthy turn                                     ~54s
 //     p90 healthy turn                                       ~120s
 //
-// So a 5s OFFLINE would be permanently on, and a signal that is always on is not a signal.
+// 30s clears the slowest observed hard failure by ~2x, so a turn that is going to report a real
+// error always wins the race and states its own reason (a verbatim failure bubble) before any
+// colour moves. It sits just past the median re-send, i.e. the signal arrives when the human starts
+// doubting rather than before. And it is 10x the physical floor, so it cannot fire on a fast turn.
+//
+// 60s is the old 20s→90s escalation compressed to a single doubling. It is past the ~54s median
+// healthy turn, which matters far less than it looks — see the next section — and it is the point
+// past which only ~26% of turns are still running at all.
 //
 // ─── SILENCE, NOT ELAPSED TIME ───────────────────────────────────────────────────────────────────
 //
 // The clock measures time since the last OBSERVED SIGN OF LIFE — a send starts it, and every delta
-// and every `concierge_tool` call resets it. That is the whole reason a 20s threshold is safe
+// and every `concierge_tool` call resets it. That is the whole reason a 30s threshold is safe
 // against a 54s median: a healthy turn is emitting something the entire time, so it never
-// accumulates 20 quiet seconds. A turn that has gone 20s without a byte is not a slow turn.
+// accumulates 30 quiet seconds. A turn that has gone 30s without a byte is not a slow turn.
 //
 // ─── SUPERSEDING IS NOT A FAILURE ────────────────────────────────────────────────────────────────
 //
 // A turn killed because the user sent again is self-inflicted, and the replacement turn is the one
-// being awaited — so a supersede must never read as OFFLINE. Superseded/cancelled/proactive events
+// being awaited — so a supersede must never colour the row. Superseded/cancelled/proactive events
 // are filtered at the call site and never reach a reducer here. The OTHER half of that bug — the
 // user's earlier message silently going unanswered — is real, and is surfaced where it belongs, on
 // the orphaned bubble itself (Concierge/RoutingReceipt `unanswered`), not as a health claim.
+//
+// ─── WHAT THIS DOES *NOT* TOUCH: ERRORS THE APP ACTUALLY RECEIVED ────────────────────────────────
+//
+// Everything above is about SILENCE. A turn that comes back with a quota message, a billing error or
+// any other hard failure still surfaces verbatim, in its own thread bubble, on the path that has
+// nothing to do with these thresholds (ConciergeHost's `concierge:error` handler →
+// ./conciergeFailureNotice). {@link failureOutage} below is the sticky version of the same fact for
+// a RUN of them, and it is the one surface in this feature that still speaks in words — because it
+// is repeating what the machine said, not guessing at silence.
 import {
   conciergeFailureNotice,
   type ConciergeFailureNotice,
 } from "./conciergeFailureNotice";
 
 /**
- * When the column starts stating the elapsed time.
+ * YELLOW: nothing has come back for long enough to be worth noticing.
  *
- * This is the honest version of the "a few seconds" instinct: at 5s the column says `12s`, which
- * ASSERTS NOTHING. It cannot be wrong, so it can fire early — which is exactly what a human waiting
- * on a slow turn wants and what the bare `…` never gave them.
+ * See the module header for the measurements. The short version: past the 16.67s slowest observed
+ * hard failure (so a real error always states itself first) and past the 20.94s median re-send (so
+ * it arrives when the human starts doubting, not before).
  */
-export const ELAPSED_COUNTER_AFTER_MS = 5_000;
+export const SLOW_AFTER_MS = 30_000;
 
 /**
- * When silence becomes a CLAIM: "no answer yet".
+ * RED: nothing has come back for long enough that something is probably wrong.
  *
- * Three independent anchors land on 20s, all from the table in the module header:
- *   • above the slowest observed hard failure (16.67s), so a turn that is going to report a real
- *     error always wins the race and states its own reason instead of flashing OFFLINE first;
- *   • at the median moment users actually re-send (20.94s) — the signal arrives exactly when the
- *     human starts doubting, which is the whole point;
- *   • ~7× the 3.03s physical floor for any round trip, so it cannot fire on a fast healthy turn.
+ * The founder's reasoning, which is the whole reason this is 60s and not the 30s an earlier draft
+ * used: *going red at 30 seconds is too distracting for something that is usually just a slow turn.
+ * Red should mean something is actually wrong, not that a reply is taking a moment.* A red that
+ * fires on ordinary slowness is a red nobody reads.
+ *
+ * This is also the TERMINAL step — it subsumes the 90s sticky UNAVAILABLE state this replaced.
+ * A fourth escalation would have to distinguish itself from red without words, and there is no
+ * fourth colour that means "worse than red" at a glance; it would only have re-introduced the
+ * loudness that was the complaint.
  */
-export const OFFLINE_AFTER_MS = 20_000;
-
-/** When continuous silence stops being "slow" and becomes "gone". Only ~14% of turns are still
- *  running at all past 90s, and a running turn emits deltas or tool calls long before then. */
-export const UNAVAILABLE_AFTER_MS = 90_000;
+export const STALLED_AFTER_MS = 60_000;
 
 /**
- * How many consecutive unanswered sends escalate to UNAVAILABLE regardless of the clock.
+ * How many consecutive unanswered sends go RED regardless of the clock.
  *
  * ESSENTIAL, not belt-and-braces. Every re-send restarts the silence clock, so a user pinging every
- * 20s never accumulates 90 continuous quiet seconds — which is precisely the shape of the
+ * 30s never accumulates 60 continuous quiet seconds — which is precisely the shape of the
  * 20:18–20:31 burst on 2026-07-29, where 12 of 14 turns died unanswered. The time bound alone would
- * have stayed silent through the exact incident this feature was built for.
+ * have stayed gray through the exact incident this feature was built for.
  */
-export const UNAVAILABLE_SILENT_RUN = 3;
+export const STALLED_SILENT_RUN = 3;
 
 /**
- * How many consecutive HARD FAILURES escalate to UNAVAILABLE.
+ * How many consecutive HARD FAILURES raise the sticky outage strip.
  *
- * Without this, UNAVAILABLE could essentially never fire in the real world: every failure actually
- * observed in a day of logs was a fast, loud error (3–17s), which ends the wait and so never
- * accumulates silence. Six consecutive monthly-spend-limit rejections is the textbook "your
- * concierge is unavailable" condition and it produces zero silent seconds.
+ * Not a colour step — see {@link failureOutage}. This counts errors the app RECEIVED, which end the
+ * wait and so produce no silence at all: every failure actually observed in a day of logs was a
+ * fast, loud error (3–17s). Six consecutive monthly-spend-limit rejections is the textbook "your
+ * concierge is unavailable" condition and the silence clock never moves for it.
  *
  * Three, not one, for the reason `aiServiceHealthStore.AI_SERVICE_DEGRADED_THRESHOLD` is four: a
  * lone failure is the blip the retry path exists for, and a sticky banner on it would be worse than
- * the silence. Lower than that store's four because a concierge turn is a deliberate user action —
- * three in a row is three questions the human asked and did not get answered.
+ * the one bubble it already wrote. Lower than that store's four because a concierge turn is a
+ * deliberate user action — three in a row is three questions the human asked and did not get
+ * answered.
  */
-export const UNAVAILABLE_FAILURE_RUN = 3;
+export const FAILURE_OUTAGE_RUN = 3;
 
 /**
  * The longest gap allowed BETWEEN two failures in the same run.
@@ -97,42 +131,25 @@ export const UNAVAILABLE_FAILURE_RUN = 3;
  * Mirrors `aiServiceHealthStore.RUN_MAX_GAP_MS`, and exists for the same reason: without it,
  * "3 consecutive failures" silently means "3 failures ever, with any amount of working concierge in
  * between" — a morning quota rejection and two unrelated evening ones would raise a sticky outage
- * banner describing a run that never happened. An hour is long enough to survive the real case (a
+ * strip describing a run that never happened. An hour is long enough to survive the real case (a
  * user retrying into an exhausted quota over several minutes) and short enough that isolated blips
  * days apart cannot accumulate.
  */
 export const FAILURE_RUN_MAX_GAP_MS = 60 * 60 * 1000;
 
 /**
- * When the app STOPS counting — the bound on the whole feature's running cost.
+ * What the column is entitled to say about the brain right now — and it says it in COLOUR.
  *
- * The elapsed counter has to keep ticking through a latched UNAVAILABLE (see
- * {@link showsElapsed} and the hook that drives it): freezing it leaves a dead turn reading
- * `No answer yet · 1m 30s` forever, which is the one number this feature promises cannot be wrong.
- * But "keeps ticking" with no ceiling means a user who asks a question, gets nothing, and walks away
- * leaves a 500ms re-render loop running for the rest of the session — the app burning battery to
- * animate a number nobody is reading.
+ *   `idle`     nothing is being awaited; the row is not on screen at all
+ *   `waiting`  gray — the normal state, and the one the first 30 seconds must look like
+ *   `slow`     yellow
+ *   `stalled`  red, and sticky (see {@link ConciergeLivenessState.stalledLatched})
  *
- * Ten minutes resolves both. Past it the counter is REMOVED rather than frozen, so no stale number
- * is ever shown, and the timer stops with it — the display and the clock that feeds it end together,
- * which is the only way to stop counting without lying. By then the sticky strip has been up for
- * eight and a half minutes saying the concierge isn't answering; "14m 22s" instead of "10m 01s"
- * changes nothing a human would do about it, and the verdict it qualifies is latched in state, not
- * computed from the clock, so it survives untouched.
- *
- * A re-send restarts the clock ({@link reduceSent} stamps `silentSince`), so the counter and its
- * timer both come back for the new wait.
+ * `offline` and `unavailable` were the previous two names. They are gone on purpose: both were
+ * CLAIMS about the brain that the app could not support from silence alone, and the words that
+ * carried them are what the founder asked to remove.
  */
-export const ELAPSED_CEILING_MS = 10 * 60 * 1000;
-
-/** How the concierge came to be UNAVAILABLE — which decides whether there is a REASON to show.
- *
- *  `null` when it is not unavailable at all. See {@link livenessReason} for why the distinction has
- *  to be drawn at read time rather than stored. */
-export type ConciergeUnavailableReason = "failures" | "silence";
-
-/** What the column is entitled to say about the brain right now. */
-export type ConciergeLiveness = "idle" | "waiting" | "offline" | "unavailable";
+export type ConciergeLiveness = "idle" | "waiting" | "slow" | "stalled";
 
 /**
  * Everything the detector knows. ONE record, so the counters and the latched flag cannot drift.
@@ -149,7 +166,7 @@ export type ConciergeLiveness = "idle" | "waiting" | "offline" | "unavailable";
  *   a `done`                 | null        | false     | 0         | 0          | false   | null
  *   a hard error             | null        | false     | 0         | +1         | kept    | = notice
  *   the ticker crossing the  | unchanged   | unchanged | unchanged | unchanged  | true    | kept
- *     UNAVAILABLE bound      |             |           |           |            |         |
+ *     STALLED bound          |             |           |           |            |         |
  *
  * A supersede/cancel appears nowhere: it is filtered before it reaches a reducer.
  */
@@ -171,7 +188,7 @@ export interface ConciergeLivenessState {
    * is the lie this feature exists to remove.
    */
   sawText: boolean;
-  /** Consecutive sends that crossed {@link OFFLINE_AFTER_MS} and produced nothing. */
+  /** Consecutive sends that crossed {@link SLOW_AFTER_MS} and produced nothing. */
   silentRun: number;
   /** Consecutive hard failures with no success in between, and no gap longer than
    *  {@link FAILURE_RUN_MAX_GAP_MS}. */
@@ -179,10 +196,10 @@ export interface ConciergeLivenessState {
   /** When the most recent hard failure was observed, so the run above can be bounded in time.
    *  `null` when no failure has been seen. */
   lastFailureAt: number | null;
-  /** Sticky UNAVAILABLE. Set by {@link reduceTick} when the time bound is crossed and cleared ONLY
-   *  by observed output — this is what makes the state "stronger and stickier" than OFFLINE, and
-   *  what stops a fresh send from silently downgrading a brain we have no evidence is back. */
-  unavailableLatched: boolean;
+  /** Sticky RED. Set by {@link reduceTick} when the time bound is crossed and cleared ONLY by
+   *  observed output — this is what stops a fresh send from silently returning the row to gray over
+   *  a brain we have no evidence is back. */
+  stalledLatched: boolean;
   /** The last hard failure, verbatim. Outlives its turn so the sticky strip can state a REASON
    *  rather than a shrug; cleared the moment anything succeeds. */
   failure: ConciergeFailureNotice | null;
@@ -195,7 +212,7 @@ export const IDLE_LIVENESS: ConciergeLivenessState = {
   silentRun: 0,
   failureRun: 0,
   lastFailureAt: null,
-  unavailableLatched: false,
+  stalledLatched: false,
   failure: null,
 };
 
@@ -205,97 +222,77 @@ export function silentForMs(s: ConciergeLivenessState, now: number): number | nu
 }
 
 /**
- * The state the column may assert. Pure, with `now` injected — so the rule is testable without fake
- * timers and the component cannot drift from the store (the posture
+ * The colour step the column may show. Pure, with `now` injected — so the rule is testable without
+ * fake timers and the component cannot drift from the store (the posture
  * `aiServiceHealthStore.isServiceDegraded` takes).
  *
- * Ordered most-severe first: an UNAVAILABLE brain that happens to have a fresh send against it is
- * still unavailable until something proves otherwise.
+ * Ordered most-severe first: a stalled brain that happens to have a fresh send against it is still
+ * stalled until something proves otherwise.
+ *
+ * SILENCE ONLY. A hard failure does not appear here, because a failure ENDS the wait — there is no
+ * row left to colour, and the error is already in the thread in its own words. {@link failureOutage}
+ * is where a run of them surfaces.
  */
 export function livenessAt(s: ConciergeLivenessState, now: number): ConciergeLiveness {
-  if (
-    s.unavailableLatched ||
-    s.silentRun >= UNAVAILABLE_SILENT_RUN ||
-    s.failureRun >= UNAVAILABLE_FAILURE_RUN
-  ) {
-    return "unavailable";
-  }
+  if (s.stalledLatched || s.silentRun >= STALLED_SILENT_RUN) return "stalled";
   const silent = silentForMs(s, now);
   if (silent === null) return "idle";
-  if (silent >= UNAVAILABLE_AFTER_MS) return "unavailable";
-  if (silent >= OFFLINE_AFTER_MS) return "offline";
+  if (silent >= STALLED_AFTER_MS) return "stalled";
+  if (silent >= SLOW_AFTER_MS) return "slow";
   return "waiting";
 }
 
 /**
- * WHY it is unavailable — `"failures"` when a run of hard errors got us here, `"silence"` when
- * nothing came back, `null` when it is not unavailable at all.
+ * THE ONE SURFACE HERE THAT STILL USES WORDS: a run of hard failures, in the machine's own words.
+ *
+ * Returns the last failure notice once {@link FAILURE_OUTAGE_RUN} consecutive errors have been
+ * observed, and null otherwise. This is NOT the silence signal and must not be conflated with it —
+ * it is a verbatim repeat of something the app actually received (a quota message, a billing error,
+ * an unclassifiable stderr dump), which is exactly the class of thing the colour-only retune was
+ * told to leave alone.
  *
  * THIS IS WHAT KEEPS THE STRIP HONEST. `failure` is deliberately kept across a send (it is still the
  * last thing we know, and clearing it on send would break the failure run, since every failure is
- * followed by another send). But an outage reached through SILENCE has no causal connection to a
- * quota rejection from this morning, and rendering `resets 8:40am` hours later as the reason the
- * concierge is quiet now is a diagnosis from stale evidence — exactly what ConciergeUnavailable's
- * own header forbids. So the reason is DERIVED at read time from which route actually tripped, and
- * only the failure route is entitled to show the failure text.
- *
- * The failure route wins a tie: if both counters are over, a concrete error we observed is a better
- * account than "nothing came back".
+ * followed by another send). Gating the strip on the RUN rather than on `failure != null` is what
+ * stops a quota rejection from this morning being rendered at 2pm as an account of a concierge that
+ * has merely gone quiet — a diagnosis from stale evidence, which is precisely what
+ * Concierge/ConciergeUnavailable's own header forbids (roborev 55442-M4).
  */
-export function livenessReason(
-  s: ConciergeLivenessState,
-  now: number,
-): ConciergeUnavailableReason | null {
-  if (livenessAt(s, now) !== "unavailable") return null;
-  return s.failureRun >= UNAVAILABLE_FAILURE_RUN ? "failures" : "silence";
-}
-
-/** Should the column be stating the elapsed time yet?
- *
- *  Bounded at BOTH ends. Past {@link ELAPSED_CEILING_MS} this goes false again and the number is
- *  removed from the row — the counter is never frozen, only ever running or absent. {@link ticks}
- *  goes false at the same instant and from the same comparison, so the clock cannot stop while a
- *  number computed from it is still on screen. */
-export function showsElapsed(s: ConciergeLivenessState, now: number): boolean {
-  const silent = silentForMs(s, now);
-  return silent !== null && silent >= ELAPSED_COUNTER_AFTER_MS && silent < ELAPSED_CEILING_MS;
+export function failureOutage(s: ConciergeLivenessState): ConciergeFailureNotice | null {
+  return s.failureRun >= FAILURE_OUTAGE_RUN ? s.failure : null;
 }
 
 /**
  * Is there anything left for a clock to change? The gate on the feature's only timer.
  *
- * TRUE while a turn is outstanding and under the ceiling — including after UNAVAILABLE has latched,
- * because the counter is still on screen and a frozen number is the failure mode this replaced.
- * FALSE once the ceiling passes: the counter is gone by then ({@link showsElapsed}), every
- * escalation has already fired, and `unavailableLatched` holds the verdict in state, so no later
- * `now` can produce a different reading. A tick past that point is pure cost.
+ * TRUE while a turn is outstanding and the colour can still move. FALSE at RED, which is terminal:
+ * `stalledLatched` holds the verdict in state, there is no fourth step to escalate to, and — since
+ * the elapsed counter was removed — nothing on screen is computed from `now` any more. A tick past
+ * that point could not change a pixel, so a turn that dies and is never retried schedules nothing
+ * for the rest of the session.
+ *
+ * (The previous version had to keep ticking through the terminal state to advance a visible seconds
+ * counter, and needed a 10-minute ceiling to stop it eventually. Removing the counter removed the
+ * reason for both.)
  *
  * Pure and exported so the bound is asserted directly, rather than inferred from a timer count in a
  * component test.
  */
 export function ticks(s: ConciergeLivenessState, now: number): boolean {
-  const silent = silentForMs(s, now);
-  return silent !== null && silent < ELAPSED_CEILING_MS;
-}
-
-/** `12s`, `1m 04s`. Seconds are floored, so the counter never claims time that has not passed. */
-export function elapsedLabel(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  if (total < 60) return `${total}s`;
-  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+  return s.silentSince !== null && livenessAt(s, now) !== "stalled";
 }
 
 /**
  * A user send went out.
  *
  * This is where "repeated pings with still no response" is counted. The wait being REPLACED is
- * judged, not the new one: if it had already crossed OFFLINE and never produced a byte, that is one
+ * judged, not the new one: if it had already gone yellow and never produced a byte, that is one
  * unanswered ping. A wait that streamed something — even a partial answer the user then interrupted
  * — is not silence and does not count.
  */
 export function reduceSent(s: ConciergeLivenessState, now: number): ConciergeLivenessState {
   const wentUnanswered =
-    s.silentSince !== null && !s.sawOutput && now - s.silentSince >= OFFLINE_AFTER_MS;
+    s.silentSince !== null && !s.sawOutput && now - s.silentSince >= SLOW_AFTER_MS;
   return {
     ...s,
     silentSince: now,
@@ -313,16 +310,16 @@ export type ConciergeProgressKind = "text" | "tool";
  * A sign of life: an assistant delta, or a `concierge_tool` call the control listener dispatched.
  *
  * BOTH reset the silence clock, because a turn can legitimately spend a minute on tool calls without
- * emitting a word of text; counting only deltas would call a working concierge offline. Only
- * `"text"` sets {@link ConciergeLivenessState.sawText} — see that field for why the distinction is
+ * emitting a word of text; counting only deltas would paint a working concierge red. Only `"text"`
+ * sets {@link ConciergeLivenessState.sawText} — see that field for why the distinction is
  * load-bearing rather than tidy.
  *
  * Clears every escalation: this is the "recovering clears the state promptly" requirement, and it is
- * the ONLY thing that unlatches UNAVAILABLE.
+ * the ONLY thing that unlatches RED.
  *
  * Progress observed while nothing is being awaited (a proactive push's tool call) still unlatches:
- * showing "unavailable" over a brain that is visibly working is the one thing worse than showing
- * nothing. It does not start a wait, because nobody is waiting.
+ * showing red over a brain that is visibly working is the one thing worse than showing nothing. It
+ * does not start a wait, because nobody is waiting.
  */
 export function reduceProgress(
   s: ConciergeLivenessState,
@@ -338,7 +335,7 @@ export function reduceProgress(
     silentRun: 0,
     failureRun: 0,
     lastFailureAt: null,
-    unavailableLatched: false,
+    stalledLatched: false,
     failure: null,
   };
 }
@@ -354,7 +351,7 @@ export function reduceSettled(s: ConciergeLivenessState): ConciergeLivenessState
     silentRun: 0,
     failureRun: 0,
     lastFailureAt: null,
-    unavailableLatched: false,
+    stalledLatched: false,
     failure: null,
   };
 }
@@ -367,7 +364,7 @@ export function reduceSettled(s: ConciergeLivenessState): ConciergeLivenessState
  * describes. `failureRun` is the counter that belongs to this path.
  *
  * Deliberately does NOT latch on its own. One failure is the blip the Rust retry path exists for,
- * and the verbatim reason is already going into the thread as its own bubble; a sticky banner on a
+ * and the verbatim reason is already going into the thread as its own bubble; a sticky strip on a
  * single error would be the flappiness `aiServiceHealthStore` was built to avoid.
  */
 export function reduceFailed(
@@ -393,7 +390,7 @@ export function reduceFailed(
 /** The clock advanced. Returns the SAME object when nothing changed, so a store can write it
  *  unconditionally without waking every subscriber on every tick. */
 export function reduceTick(s: ConciergeLivenessState, now: number): ConciergeLivenessState {
-  if (s.unavailableLatched) return s;
-  if (livenessAt(s, now) !== "unavailable") return s;
-  return { ...s, unavailableLatched: true };
+  if (s.stalledLatched) return s;
+  if (livenessAt(s, now) !== "stalled") return s;
+  return { ...s, stalledLatched: true };
 }

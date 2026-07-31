@@ -5,16 +5,15 @@
 // at all, and whether the sticky state is actually latched rather than merely derived.
 //
 // THE TIMER GATE MATTERS. This is the only recurring timer the feature adds, in an app that keeps a
-// concierge column mounted for the whole session. Ungated it would tick twice a second forever, for
+// concierge column mounted for the whole session. Ungated it would tick every second forever, for
 // nothing.
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  ELAPSED_CEILING_MS,
-  ELAPSED_COUNTER_AFTER_MS,
-  OFFLINE_AFTER_MS,
-  UNAVAILABLE_AFTER_MS,
+  FAILURE_OUTAGE_RUN,
+  SLOW_AFTER_MS,
+  STALLED_AFTER_MS,
 } from "../engine/conciergeLiveness";
 import {
   _resetConciergeLivenessForTests,
@@ -67,105 +66,73 @@ describe("the ticker is scheduled only when it has something to do", () => {
     expect(timers()).toBe(0);
   });
 
-  // IT KEEPS TICKING PAST THE LATCH, and that is deliberate (roborev 55442-M3). Gating on the latch
-  // looked free — there is no further escalation to reach — but the elapsed counter is still on
-  // screen and is computed from the tick's `now`. Stopping FROZE it: a dead turn read
-  // "No answer yet · 1m 30s" for as long as it stayed dead. The one number this feature guarantees
-  // cannot be wrong must not be the one it stops updating.
-  it("keeps ticking once the sticky state is reached, so the counter cannot freeze", () => {
-    const { result, rerender } = renderHook(() => useConciergeLiveness());
-    act(() => noteConciergeSent());
-    rerender();
-    act(() => {
-      vi.advanceTimersByTime(UNAVAILABLE_AFTER_MS);
-    });
-    rerender();
-    expect(useConciergeLivenessStore.getState().unavailableLatched).toBe(true);
-    const atLatch = result.current.silentMs;
-
-    act(() => {
-      vi.advanceTimersByTime(60_000);
-    });
-    rerender();
-    expect(result.current.silentMs).toBe((atLatch ?? 0) + 60_000);
-  });
-
-  // The second half of the same finding. `reduceSent` moves `silentSince` forward; against a FROZEN
-  // `now`, `max(now, silentSince)` then computed zero and the counter vanished entirely — stopped
-  // AND wrong — until a delta unlatched it.
-  it("a re-send into a latched outage still counts up", () => {
-    const { result, rerender } = renderHook(() => useConciergeLiveness());
-    act(() => noteConciergeSent());
-    rerender();
-    act(() => {
-      vi.advanceTimersByTime(UNAVAILABLE_AFTER_MS);
-    });
-    rerender();
-
-    act(() => noteConciergeSent());
-    act(() => {
-      vi.advanceTimersByTime(ELAPSED_COUNTER_AFTER_MS + 1_000);
-    });
-    rerender();
-    expect(result.current.liveness).toBe("unavailable");
-    expect(result.current.showsElapsed).toBe(true);
-    expect(result.current.silentMs).toBe(ELAPSED_COUNTER_AFTER_MS + 1_000);
-  });
-
-  // THE BOUND ON "KEEPS TICKING" (roborev 55468-M3). The two cases above are the reason the ticker
-  // survives the latch; this is the reason that is not the same as running forever. A turn that dies
-  // silently never gets a delta, a tool call, a done or an error — so `silentSince` stays set, and
-  // with the latch gate removed and nothing in its place the interval re-rendered twice a second for
-  // the rest of the session, animating a number for a human who gave up and closed the laptop.
+  // IT STOPS AT RED, and that is what removing the seconds counter bought (roborev 55442-M3 /
+  // 55468-M3, both now moot). Those findings existed because the counter was computed from the
+  // tick's `now`, so stopping FROZE a number on screen and a ten-minute ceiling had to be invented
+  // to stop it eventually. Nothing on screen is derived from `now` any more — red is a latched fact
+  // — so the interval can simply end, and a turn that dies while the human closes the laptop
+  // schedules nothing for the rest of the session.
   //
-  // Asserted as a TIMER COUNT, because that is the cost being bounded — a reading about the
-  // component's derived state would go green against a version that still had the interval running.
-  it("stops for good once the counter is no longer on screen", () => {
+  // Asserted as a TIMER COUNT, because that is the cost being bounded: a reading of the hook's
+  // derived state would go green against a version that still had the interval running.
+  it("stops for good at red, with no ceiling needed", () => {
     const { result, rerender } = renderHook(() => useConciergeLiveness());
     act(() => noteConciergeSent());
     rerender();
     expect(timers()).toBe(1);
 
-    // Just under: still counting, still ticking. Pinned so the ceiling cannot be quietly lowered to
-    // something that swallows a wait a human is actually watching.
+    // Just under: yellow, still moving, still ticking.
     act(() => {
-      vi.advanceTimersByTime(ELAPSED_CEILING_MS - 2_000);
+      vi.advanceTimersByTime(STALLED_AFTER_MS - 1_000);
     });
     rerender();
-    expect(result.current.showsElapsed).toBe(true);
+    expect(result.current.liveness).toBe("slow");
     expect(timers()).toBe(1);
 
     act(() => {
-      vi.advanceTimersByTime(4_000);
+      vi.advanceTimersByTime(2_000);
     });
     rerender();
     expect(timers()).toBe(0);
-    // REMOVED, not frozen — the clock and the number it feeds stop together, so there is no stale
-    // reading left on screen. That pairing is the whole reason stopping is allowed here at all.
-    expect(result.current.showsElapsed).toBe(false);
-    // And the verdict is untouched: it lives in latched state, not in the clock.
-    expect(result.current.liveness).toBe("unavailable");
+    // And the verdict is not lost with the clock: it lives in latched state.
+    expect(result.current.liveness).toBe("stalled");
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(true);
   });
 
-  it("comes back when the user sends again after giving up", () => {
+  // A re-send into a latched red must NOT restart the interval: the row is already red and stays red
+  // until something is actually observed, so there is still nothing for a clock to change. This is
+  // the case the old version had to keep ticking for (the counter had to keep counting through it).
+  it("a re-send into a latched red schedules nothing", () => {
     const { result, rerender } = renderHook(() => useConciergeLiveness());
     act(() => noteConciergeSent());
     rerender();
     act(() => {
-      vi.advanceTimersByTime(ELAPSED_CEILING_MS + 1_000);
+      vi.advanceTimersByTime(STALLED_AFTER_MS);
     });
     rerender();
     expect(timers()).toBe(0);
 
     act(() => noteConciergeSent());
     rerender();
-    expect(timers()).toBe(1);
+    expect(result.current.liveness).toBe("stalled");
+    expect(timers()).toBe(0);
+  });
+
+  it("comes back once something clears the latch and a new turn goes out", () => {
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    act(() => noteConciergeSent());
+    rerender();
     act(() => {
-      vi.advanceTimersByTime(ELAPSED_COUNTER_AFTER_MS + 1_000);
+      vi.advanceTimersByTime(STALLED_AFTER_MS);
     });
     rerender();
-    expect(result.current.showsElapsed).toBe(true);
-    expect(result.current.silentMs).toBe(ELAPSED_COUNTER_AFTER_MS + 1_000);
+    expect(timers()).toBe(0);
+
+    act(() => noteConciergeProgress("text"));
+    act(() => noteConciergeSent());
+    rerender();
+    expect(result.current.liveness).toBe("waiting");
+    expect(timers()).toBe(1);
   });
 
   it("unmounting clears it", () => {
@@ -176,46 +143,80 @@ describe("the ticker is scheduled only when it has something to do", () => {
   });
 });
 
+// ── THE LATCH DOES NOT DEPEND ON A CONSUMER BEING MOUNTED AT THE RIGHT MOMENT ──────────────────
+//
+// roborev 56112-M2. `reduceTick` is the only writer of `stalledLatched`, and it used to run only
+// from the interval — so a crossing that happened while nothing was mounted (ConciergeColumn swaps
+// the whole thread out when `aiLock` flips) left the row red from the clock with the latch unset,
+// and the next send quietly returned it to gray.
+describe("red latches on what is READ, not only on what is ticked", () => {
+  it("latches when the crossing happened while nothing was subscribed", () => {
+    // No hook mounted for the whole silence — exactly the aiLock window.
+    act(() => noteConciergeSent());
+    act(() => {
+      vi.advanceTimersByTime(STALLED_AFTER_MS + 5_000);
+    });
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(false);
+
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    rerender();
+    expect(result.current.liveness).toBe("stalled");
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(true);
+
+    // THE CONSEQUENCE, which is the part that was actually broken: without the latch this send
+    // moves `silentSince` forward and the row drops back to gray over a brain nothing proved is
+    // back.
+    act(() => noteConciergeSent());
+    rerender();
+    expect(result.current.liveness).toBe("stalled");
+  });
+});
+
 describe("what the hook reports", () => {
-  it("does not judge a brand-new turn against a clock read before it started", () => {
-    // The hook seeds `now` at mount. A turn that starts BETWEEN two ticks would otherwise be
-    // measured from that stale reading and appear seconds old on its very first frame.
-    const { result, rerender } = renderHook(() => useConciergeLiveness());
-    act(() => {
-      vi.advanceTimersByTime(30_000);
-    });
-    act(() => noteConciergeSent());
-    rerender();
-    expect(result.current.liveness).toBe("waiting");
-    expect(result.current.silentMs).toBe(0);
-  });
-
-  it("walks waiting → offline → unavailable as the silence grows", () => {
+  it("walks gray → yellow → red as the silence grows", () => {
     const { result, rerender } = renderHook(() => useConciergeLiveness());
     act(() => noteConciergeSent());
     rerender();
     expect(result.current.liveness).toBe("waiting");
 
     act(() => {
-      vi.advanceTimersByTime(OFFLINE_AFTER_MS);
+      vi.advanceTimersByTime(SLOW_AFTER_MS);
     });
     rerender();
-    expect(result.current.liveness).toBe("offline");
+    expect(result.current.liveness).toBe("slow");
 
     act(() => {
-      vi.advanceTimersByTime(UNAVAILABLE_AFTER_MS - OFFLINE_AFTER_MS);
+      vi.advanceTimersByTime(STALLED_AFTER_MS - SLOW_AFTER_MS);
     });
     rerender();
-    expect(result.current.liveness).toBe("unavailable");
+    expect(result.current.liveness).toBe("stalled");
   });
 
-  it("hands the verbatim failure detail through to whatever renders it", () => {
+  // THE SCOPE OF THE RETUNE, at the boundary between the two halves. Silence lost its words; an
+  // error the app RECEIVED did not.
+  it("hands a RUN of verbatim failure details through to whatever renders it", () => {
+    const detail = "You've hit your session limit · resets 8:40am (America/Bogota)";
     const { result, rerender } = renderHook(() => useConciergeLiveness());
-    act(() => noteConciergeFailed("You've hit your session limit · resets 8:40am (America/Bogota)"));
+
+    act(() => noteConciergeFailed(detail));
     rerender();
-    expect(result.current.failure?.evidence).toBe(
-      "You've hit your session limit · resets 8:40am (America/Bogota)",
-    );
+    expect(result.current.outage).toBeNull();
+
+    for (let i = 1; i < FAILURE_OUTAGE_RUN; i += 1) act(() => noteConciergeFailed(detail));
+    rerender();
+    expect(result.current.outage?.evidence).toBe(detail);
+  });
+
+  it("never reports an outage from silence, however long it lasts", () => {
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    act(() => noteConciergeSent());
+    rerender();
+    act(() => {
+      vi.advanceTimersByTime(STALLED_AFTER_MS * 10);
+    });
+    rerender();
+    expect(result.current.liveness).toBe("stalled");
+    expect(result.current.outage).toBeNull();
   });
 });
 

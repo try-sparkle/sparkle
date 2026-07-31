@@ -1,5 +1,19 @@
-// THE STICKY ONE: "your concierge is not answering", stated above the compose box so it is the last
-// thing read before typing the next message into a void.
+// THE STICKY ONE: a RUN OF REAL ERRORS, in the concierge's own words, stated above the compose box
+// so it is the last thing read before typing the next message into a void.
+//
+// SILENCE NO LONGER REACHES THIS COMPONENT (2026-07-30). It used to render for two different
+// reasons — a run of hard failures, or ninety seconds of nothing — with a hand-written headline for
+// the second. The founder's retune deleted the words from the silence path entirely: silence is now
+// said only as a colour, by the thinking indicator (see engine/conciergeLiveness). What survives
+// here is the case where the app RECEIVED something and can quote it: a quota message, a billing
+// rejection, a hard failure. Those are not suppressed and never were the complaint.
+//
+// That is also, by construction, the end of a lie this header used to spend four paragraphs
+// avoiding (roborev 55442-M4). A recorded failure OUTLIVES the sends that follow it — deliberately,
+// since clearing it on send would break the consecutive-failure run — so the old silence route
+// could present an unrelated 8:40am quota rejection as the reason the concierge is quiet at 2pm.
+// With the silence route gone there is one route, and it is the one that owns its evidence; there
+// is no `reason` discriminator left to get wrong.
 //
 // WHY IT IS NOT THE THINKING INDICATOR. That row lives inside the scroller and disappears the
 // instant the turn is no longer in flight — which is precisely what happens when a turn dies. The
@@ -12,16 +26,8 @@
 // stacking a vaguer bar on top, and it deliberately never says "your connection" — OfflineBanner
 // owns that claim, and this component makes none about the network.
 //
-// IT NEVER DIAGNOSES WHAT IT CANNOT SEE. When a RUN OF FAILURES is what got us here it shows the
-// concierge's own words (engine/conciergeFailureNotice keeps them verbatim); when only silence did,
-// it says only that nothing came back. There is no third arm that guesses.
-//
-// That distinction is `reason`, not `failure != null`, and the difference is a real lie avoided. A
-// recorded failure OUTLIVES the sends that follow it — deliberately, since clearing it on send would
-// break the consecutive-failure run — so an outage reached through silence can be carrying an
-// unrelated quota rejection from hours earlier. Presenting `resets 8:40am` at 2pm as the reason the
-// concierge is quiet now is a causal claim from stale evidence, which is precisely what this header
-// forbids (roborev 55442-M4).
+// IT NEVER DIAGNOSES WHAT IT CANNOT SEE. Every word it prints came off the wire; nothing here is
+// inferred, and there is no arm that guesses.
 //
 // NO aria-live HERE. The column has exactly one live region, mounted with it and fed through
 // `announce` — a second one is forbidden by convention in six file headers, and a region inserted
@@ -35,14 +41,6 @@ import { useConciergeLiveness } from "../../services/conciergeLiveness";
 
 export const CONCIERGE_UNAVAILABLE_TESTID = "concierge-unavailable";
 export const CONCIERGE_UNAVAILABLE_EVIDENCE_TESTID = "concierge-unavailable-evidence";
-
-/** The headline when nothing has come back and there is no error to explain it.
- *
- *  Says what was OBSERVED — no answers — rather than what it might mean. "Your concierge crashed"
- *  and "Claude is down" are both diagnoses this app cannot make from silence, and being confidently
- *  wrong about the cause is how a user ends up debugging their network for half an hour. */
-export const UNAVAILABLE_SILENT_HEADLINE =
-  "Your concierge isn't answering. Your last messages went out and nothing came back.";
 
 const wrap: CSSProperties = {
   flex: "0 0 auto",
@@ -74,26 +72,26 @@ const evidenceStyle: CSSProperties = {
 };
 
 /**
- * Renders only in the sticky UNAVAILABLE state, and nothing otherwise.
+ * Renders only for a RUN of hard failures, and nothing otherwise.
  *
- * OFFLINE is deliberately NOT rendered here: it is transient by design (the turn may still answer),
- * the thinking indicator is already stating it inside the scroller, and a strip that appeared and
- * vanished on every slow-ish turn would train the user to ignore the one that matters.
+ * SLOWNESS is deliberately not rendered here, in any degree. A slow turn may still answer, the
+ * thinking indicator is already tinting for it inside the scroller, and a strip that appeared and
+ * vanished on every slow-ish turn would train the user to ignore the one that matters. The run
+ * requirement (`engine.failureOutage`) does the same job for errors: one transient failure is not
+ * an outage worth pinning above the compose box.
  */
 export function ConciergeUnavailable() {
-  const { liveness, reason, failure } = useConciergeLiveness();
-  if (liveness !== "unavailable") return null;
-  // Only the failure ROUTE may speak for the cause — see the header.
-  const cause = reason === "failures" ? failure : null;
+  const { outage } = useConciergeLiveness();
+  if (!outage) return null;
 
   return (
     <div data-testid={CONCIERGE_UNAVAILABLE_TESTID} role="region" aria-label="Concierge unavailable" style={wrap}>
       <FiAlertTriangle size={14} aria-hidden style={{ flexShrink: 0, marginTop: 2, color: C.sienna }} />
       <div style={{ minWidth: 0 }}>
-        <span>{cause ? cause.headline : UNAVAILABLE_SILENT_HEADLINE}</span>
-        {cause && cause.evidence && (
+        <span>{outage.headline}</span>
+        {outage.evidence && (
           <p data-testid={CONCIERGE_UNAVAILABLE_EVIDENCE_TESTID} style={evidenceStyle}>
-            {cause.evidence}
+            {outage.evidence}
           </p>
         )}
       </div>

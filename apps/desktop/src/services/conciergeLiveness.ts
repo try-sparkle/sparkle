@@ -12,42 +12,42 @@
 // nobody asked for is not a question that went unanswered. See the engine's header.
 //
 // THE ONLY TIMER IN THE FEATURE lives in {@link useConciergeLiveness}. It runs while a turn is
-// outstanding and the elapsed counter is still on screen — which INCLUDES a latched UNAVAILABLE,
-// because the number is still being read then and a frozen one would be wrong. It stops at
-// `engine.ELAPSED_CEILING_MS`, the same instant the counter is removed. A resting app, and one whose
-// turn died ten minutes ago, both schedule nothing.
+// outstanding and the colour can still move, and stops the moment the row goes RED — which is
+// terminal (`engine.ticks`). A resting app, and one whose turn died an hour ago, both schedule
+// nothing.
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 
 import type { ConciergeFailureNotice } from "../engine/conciergeFailureNotice";
 import {
+  failureOutage,
   IDLE_LIVENESS,
   livenessAt,
-  livenessReason,
   reduceFailed,
   reduceProgress,
   reduceSent,
   reduceSettled,
   reduceTick,
-  showsElapsed,
-  silentForMs,
   ticks,
   type ConciergeLiveness,
   type ConciergeLivenessState,
   type ConciergeProgressKind,
-  type ConciergeUnavailableReason,
 } from "../engine/conciergeLiveness";
 
 /**
  * How often the clock is re-read while a turn is outstanding.
  *
- * 500ms so the elapsed counter ticks visibly on whole seconds without the render churn of a
- * requestAnimationFrame loop. It is the ONLY interval this feature schedules, and it is gated on
- * `engine.ticks` — there must be a turn outstanding AND a counter still on screen to update. An idle
- * app runs no timer; neither does one whose turn has been dead past `ELAPSED_CEILING_MS`. A latched
- * UNAVAILABLE inside that window DOES keep ticking, on purpose — see the hook.
+ * ONE SECOND, because the only thing a tick can change now is a colour, and the two colours change
+ * at 30s and 60s. The previous 500ms existed to animate a visible seconds counter on whole seconds;
+ * that counter is gone (see the engine header), so half the wakeups bought nothing. Landing the
+ * colour up to a second late is not observable — nobody is watching a stopwatch, which is the whole
+ * premise of the retune.
+ *
+ * It is the ONLY interval this feature schedules, and it is gated on `engine.ticks` — there must be
+ * a turn outstanding AND a colour still able to move. An idle app runs no timer; neither does one
+ * already showing red.
  */
-export const LIVENESS_TICK_MS = 500;
+export const LIVENESS_TICK_MS = 1_000;
 
 export const useConciergeLivenessStore = create<ConciergeLivenessState>(() => IDLE_LIVENESS);
 
@@ -100,59 +100,45 @@ export function conciergeSawAnswerText(): boolean {
 
 /** What a component needs to render the signal. */
 export interface ConciergeLivenessReading {
+  /** The colour step: `waiting` gray, `slow` yellow, `stalled` red. */
   liveness: ConciergeLiveness;
-  /** Milliseconds since the last observed sign of life, or null when nothing is being awaited. */
-  silentMs: number | null;
-  /** Whether the elapsed time is old enough to be worth stating. */
-  showsElapsed: boolean;
-  /** The last hard failure, verbatim, or null.
+  /**
+   * A RUN of hard failures, in the machine's own words — or null.
    *
-   *  PRESENT IS NOT THE SAME AS RELEVANT: consult {@link ConciergeLivenessReading.reason} before
-   *  showing it as the cause of the current state. A failure survives the sends that follow it (it
-   *  is still the last thing we know), so an outage reached through silence can be carrying an
-   *  unrelated one from hours ago. */
-  failure: ConciergeFailureNotice | null;
-  /** Which route reached UNAVAILABLE, or null when it is not unavailable. `"failures"` is the only
-   *  value that entitles a surface to present {@link failure} as the reason. */
-  reason: ConciergeUnavailableReason | null;
+   * The only worded surface left in this feature, and deliberately separate from `liveness`: it
+   * repeats an error the app RECEIVED rather than interpreting silence. Already gated on the run
+   * (see `engine.failureOutage`), so a caller may render it as-is; a bare `failure` field would
+   * have let a stale morning quota rejection be presented as the account of an afternoon lull.
+   */
+  outage: ConciergeFailureNotice | null;
 }
 
 /**
  * Subscribe to the liveness signal, ticking the clock while a turn is outstanding.
  *
- * The interval both re-renders the caller (so the counter advances) and drives {@link reduceTick},
- * which is what LATCHES the sticky UNAVAILABLE state. Three things follow from that:
+ * The interval both re-renders the caller (so the colour advances) and drives {@link reduceTick},
+ * which is what LATCHES red. Two things follow from that:
  *
  *   • It must not run when there is nothing to wait for, or a resting app would schedule a timer
  *     forever.
- *   • It deliberately KEEPS running after UNAVAILABLE latches. Gating on the latch looked free —
- *     there is no further escalation to reach — but the elapsed counter is still on screen, and it
- *     is computed from the `now` the last tick captured. Stopping froze it: a dead turn read
- *     `No answer yet · 1m 30s` for as long as it stayed dead. Worse, a re-send then moved
- *     `silentSince` PAST that stale `now`, so the counter computed zero and vanished entirely. The
- *     one number this feature guarantees cannot be wrong must not be the one it stops updating.
- *   • So the bound is NOT the latch, it is `engine.ELAPSED_CEILING_MS` — the point at which the
- *     counter is removed from the row. Both facts come from the single `engine.ticks` predicate, so
- *     the clock and the number it feeds can only stop together. Without that ceiling, "keeps running
- *     after the latch" meant a permanently dead turn re-rendering twice a second for the rest of the
- *     session, long after the human gave up and walked away.
+ *   • It stops AT red, because red is terminal: there is no further escalation to reach and — since
+ *     the visible seconds counter was removed — nothing on screen is derived from `now` any more, so
+ *     no later tick could change a pixel. That is a straight simplification of the previous version,
+ *     which had to keep ticking through the terminal state to advance the counter and needed a
+ *     ten-minute ceiling to stop a dead turn re-rendering twice a second for the rest of the
+ *     session.
  *
  * `reduceTick` returns the same object when nothing changed, so the unconditional `setState` inside
- * the interval does not wake subscribers on every tick — the residual cost of ticking through a
- * latched outage is one `Date.now()` read and one re-render of the two rows that subscribe, for at
- * most ten minutes.
+ * the interval does not wake subscribers on every tick.
  */
 export function useConciergeLiveness(): ConciergeLivenessReading {
   const state = useConciergeLivenessStore();
   const [now, setNow] = useState<number>(() => Date.now());
 
-  // Read the clock during render as well as on the tick. A turn that starts between two intervals
-  // would otherwise be judged against a `now` from before it existed, which reads as an instant
-  // several-second-old wait on the very first frame.
-  const at = state.silentSince !== null ? Math.max(now, state.silentSince) : now;
-  // Derived during render, so the gate re-evaluates on the very tick that carries it past the
-  // ceiling — that render is what tears the interval down.
-  const running = ticks(state, at);
+  const liveness = livenessAt(state, now);
+  // Derived during render, so the gate re-evaluates on the very tick that carries it to red — that
+  // render is what tears the interval down.
+  const running = ticks(state, now);
 
   useEffect(() => {
     if (!running) return;
@@ -164,12 +150,26 @@ export function useConciergeLiveness(): ConciergeLivenessReading {
     return () => clearInterval(id);
   }, [running]);
 
+  // LATCH ON WHAT WAS READ, not only on what was ticked (roborev 56112-M2).
+  //
+  // `reduceTick` is the only writer of `stalledLatched`, and it used to run exclusively from the
+  // interval above — which is fine only while a consumer stays mounted across the crossing. It does
+  // not: when `aiLock` flips (an entitlement or credits refresh) ConciergeColumn swaps the thread
+  // for ConciergeAiLocked and drops the strip, unmounting BOTH consumers. If the silence passes 60s
+  // in that window, the row comes back red from the clock alone with the latch never set — and the
+  // next send moves `silentSince` forward, so it drops silently back to gray over a brain nothing
+  // proved is back. That is precisely what `stalledLatched` exists to prevent.
+  //
+  // So red latches the moment it is OBSERVED, from whichever path produced it. Idempotent: the
+  // write flips the flag, the re-render re-runs this with `stalledLatched` true, and it stops.
+  useEffect(() => {
+    if (liveness !== "stalled" || state.stalledLatched) return;
+    useConciergeLivenessStore.setState(reduceTick(useConciergeLivenessStore.getState(), Date.now()));
+  }, [liveness, state.stalledLatched]);
+
   return {
-    liveness: livenessAt(state, at),
-    reason: livenessReason(state, at),
-    silentMs: silentForMs(state, at),
-    showsElapsed: showsElapsed(state, at),
-    failure: state.failure,
+    liveness,
+    outage: failureOutage(state),
   };
 }
 

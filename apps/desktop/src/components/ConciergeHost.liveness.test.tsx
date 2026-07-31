@@ -101,7 +101,7 @@ import {
   _resetConciergeLivenessForTests,
   useConciergeLivenessStore,
 } from "../services/conciergeLiveness";
-import { UNAVAILABLE_FAILURE_RUN } from "../engine/conciergeLiveness";
+import { FAILURE_OUTAGE_RUN } from "../engine/conciergeLiveness";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
@@ -319,7 +319,7 @@ describe("the proactive push channel drives none of this", () => {
   it("a run of failed pushes cannot raise the outage state", async () => {
     render(<ConciergeHost feed={feed()} />);
     h.proactiveIds = ["99"];
-    for (let i = 0; i < UNAVAILABLE_FAILURE_RUN + 1; i += 1) {
+    for (let i = 0; i < FAILURE_OUTAGE_RUN + 1; i += 1) {
       act(() => h.brain.error?.({ id: "99", detail: "boom" }));
     }
     expect(useConciergeLivenessStore.getState().failureRun).toBe(0);
@@ -383,21 +383,21 @@ describe("sign-out mid-turn leaves the next human nothing to inherit", () => {
     expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeNull();
   });
 
-  it("clears a LATCHED unavailable, so B is not told about a turn A sent", async () => {
+  it("clears a LATCHED red, so B is not told about a turn A sent", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     // A real failure, so `failure` and `failureRun` are whatever the production path writes. The
     // latch itself is seeded rather than driven: `reduceTick` is the only thing that sets it and it
-    // needs the 500ms interval to run, which is the timing suite's subject, not this one's. What is
+    // needs the one-second interval to run, which is the timing suite's subject, not this one's. What is
     // under test here is what the RESET does to the state, however it was reached.
     act(() => h.brain.error?.({ id: "f0", detail: "boom" }));
-    act(() => useConciergeLivenessStore.setState({ unavailableLatched: true }));
-    expect(useConciergeLivenessStore.getState().unavailableLatched).toBe(true);
+    act(() => useConciergeLivenessStore.setState({ stalledLatched: true }));
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(true);
     expect(useConciergeLivenessStore.getState().failure).not.toBeNull();
 
     act(() => h.brain.reset?.());
 
-    expect(useConciergeLivenessStore.getState().unavailableLatched).toBe(false);
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(false);
     // The whole detector, not just the latch: `failure` is what the sticky strip QUOTES, so leaving
     // it behind would show B the previous human's verbatim error the next time anything escalates.
     expect(useConciergeLivenessStore.getState().failure).toBeNull();

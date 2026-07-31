@@ -29,7 +29,7 @@ vi.mock("../../services/creditsMenuApi", () => ({
 import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_AI_PITCH } from "./ConciergeAiLocked";
 import { CONCIERGE_UNAVAILABLE_TESTID } from "./ConciergeUnavailable";
-import { UNAVAILABLE_FAILURE_RUN } from "../../engine/conciergeLiveness";
+import { FAILURE_OUTAGE_RUN } from "../../engine/conciergeLiveness";
 import {
   _resetConciergeLivenessForTests,
   noteConciergeFailed,
@@ -72,10 +72,10 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
-/** Drive the liveness detector into its sticky UNAVAILABLE state, the way a run of quota rejections
+/** Drive the liveness detector into its sticky failure-outage state, the way a run of quota rejections
  *  does. No timers needed: every failure observed in a day of logs was a fast, loud error. */
 function makeConciergeUnavailable() {
-  for (let i = 0; i < UNAVAILABLE_FAILURE_RUN; i += 1) {
+  for (let i = 0; i < FAILURE_OUTAGE_RUN; i += 1) {
     noteConciergeFailed("You've hit your session limit · resets 8:40am (America/Bogota)");
   }
 }

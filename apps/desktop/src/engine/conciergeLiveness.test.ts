@@ -1,25 +1,25 @@
-// The liveness state machine. Every case is a claim about when the column may say something about
-// the brain — so the boundary cases matter more than the happy path, and the ones that must NOT
-// fire matter most of all.
+// The liveness state machine. Every case is a claim about when the column may CHANGE COLOUR — so the
+// boundary cases matter more than the happy path, and the ones that must NOT fire matter most of all.
+//
+// The single most important case in this file is the first one in "gray is the normal state": the
+// founder's complaint was that the row got loud on ordinary slowness, so a test that only proved the
+// escalations fire would be guarding half the requirement.
 import { describe, expect, it } from "vitest";
 
 import {
-  ELAPSED_CEILING_MS,
+  FAILURE_OUTAGE_RUN,
   FAILURE_RUN_MAX_GAP_MS,
   IDLE_LIVENESS,
-  OFFLINE_AFTER_MS,
-  UNAVAILABLE_AFTER_MS,
-  UNAVAILABLE_FAILURE_RUN,
-  UNAVAILABLE_SILENT_RUN,
-  elapsedLabel,
+  SLOW_AFTER_MS,
+  STALLED_AFTER_MS,
+  STALLED_SILENT_RUN,
+  failureOutage,
   livenessAt,
-  livenessReason,
   reduceFailed,
   reduceProgress,
   reduceSent,
   reduceSettled,
   reduceTick,
-  showsElapsed,
   ticks,
   type ConciergeLivenessState,
 } from "./conciergeLiveness";
@@ -28,7 +28,7 @@ const T0 = 1_700_000_000_000;
 
 /** Advance the clock by running the ticker, the way the store's interval does. Without this a
  *  time-based escalation would only ever be observed through `livenessAt`, and the LATCH — the
- *  thing that makes UNAVAILABLE sticky — would never be exercised. */
+ *  thing that makes RED sticky — would never be exercised. */
 function tickTo(s: ConciergeLivenessState, now: number): ConciergeLivenessState {
   return reduceTick(s, now);
 }
@@ -38,58 +38,88 @@ describe("livenessAt — the boundaries", () => {
     expect(livenessAt(IDLE_LIVENESS, T0)).toBe("idle");
   });
 
-  it("says waiting right up to the offline threshold, and offline exactly on it", () => {
+  it("says waiting right up to the slow threshold, and slow exactly on it", () => {
     const sent = reduceSent(IDLE_LIVENESS, T0);
     expect(livenessAt(sent, T0)).toBe("waiting");
-    expect(livenessAt(sent, T0 + OFFLINE_AFTER_MS - 1)).toBe("waiting");
-    expect(livenessAt(sent, T0 + OFFLINE_AFTER_MS)).toBe("offline");
+    expect(livenessAt(sent, T0 + SLOW_AFTER_MS - 1)).toBe("waiting");
+    expect(livenessAt(sent, T0 + SLOW_AFTER_MS)).toBe("slow");
   });
 
-  // THE PROPERTY THAT MAKES 20s SAFE AGAINST A ~54s MEDIAN TURN. The clock measures SILENCE, not
+  it("escalates to stalled on continuous silence", () => {
+    const sent = reduceSent(IDLE_LIVENESS, T0);
+    expect(livenessAt(sent, T0 + STALLED_AFTER_MS - 1)).toBe("slow");
+    expect(livenessAt(sent, T0 + STALLED_AFTER_MS)).toBe("stalled");
+  });
+
+  // THE PROPERTY THAT MAKES 30s SAFE AGAINST A ~54s MEDIAN TURN. The clock measures SILENCE, not
   // elapsed time, so a turn that is streaming resets it continuously and never trips. Without this
   // the threshold would have to sit above the p90 turn duration (~120s) to avoid false alarms, by
   // which point the human has long since given up.
-  it("a delta resets the clock, so a long STREAMING turn never reads offline", () => {
+  it("a delta resets the clock, so a long STREAMING turn never leaves gray", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = reduceProgress(s, T0 + 19_000, "text");
-    expect(livenessAt(s, T0 + 25_000)).toBe("waiting");
-    expect(livenessAt(s, T0 + 19_000 + OFFLINE_AFTER_MS)).toBe("offline");
-  });
-
-  it("escalates to unavailable on continuous silence", () => {
-    const sent = reduceSent(IDLE_LIVENESS, T0);
-    expect(livenessAt(sent, T0 + UNAVAILABLE_AFTER_MS - 1)).toBe("offline");
-    expect(livenessAt(sent, T0 + UNAVAILABLE_AFTER_MS)).toBe("unavailable");
+    s = reduceProgress(s, T0 + 29_000, "text");
+    expect(livenessAt(s, T0 + 45_000)).toBe("waiting");
+    expect(livenessAt(s, T0 + 29_000 + SLOW_AFTER_MS)).toBe("slow");
   });
 });
 
-describe("unavailable is STICKY", () => {
-  // The user asked for a "stronger, stickier" state. Without the latch, the next send resets the
-  // silence clock and the column would drop straight back to "waiting" — quietly downgrading a
-  // brain nothing has proved is back, which is the silence this whole feature exists to end.
-  it("a fresh send does not downgrade a latched unavailable", () => {
+// ── GRAY IS THE NORMAL STATE, AND THAT IS THE REQUIREMENT ───────────────────────────────────────
+//
+// *"A concierge taking a few seconds is normal and should look normal."* The previous version put a
+// counter on screen at 5s and the word "No answer yet" at 20s; the retune's whole point is that
+// nothing happens at all for half a minute. These are the cases that would go red again if someone
+// tuned the constants back down, so they assert against the SECONDS, not against the constants.
+describe("gray is the normal state", () => {
+  const sent = reduceSent(IDLE_LIVENESS, T0);
+
+  it("says nothing for the first thirty seconds", () => {
+    for (const at of [0, 1_000, 5_000, 12_000, 20_000, 29_999]) {
+      expect(livenessAt(sent, T0 + at)).toBe("waiting");
+    }
+  });
+
+  // The founder's reasoning, kept as an executable claim: *going red at 30 seconds is too
+  // distracting for something that is usually just a slow turn. Red should mean something is
+  // actually wrong, not that a reply is taking a moment.*
+  it("is not RED at thirty seconds — that was the complaint", () => {
+    expect(livenessAt(sent, T0 + 30_000)).not.toBe("stalled");
+    expect(livenessAt(sent, T0 + 59_999)).not.toBe("stalled");
+  });
+
+  // 30s clears the slowest observed hard failure (16.67s) by ~2x, so a turn that is going to report
+  // a real error always wins the race and states its own reason before any colour moves.
+  it("stays gray past the slowest hard failure ever observed", () => {
+    expect(livenessAt(sent, T0 + 16_670)).toBe("waiting");
+  });
+});
+
+describe("red is STICKY", () => {
+  // Without the latch, the next send resets the silence clock and the column would drop straight
+  // back to gray — quietly downgrading a brain nothing has proved is back, which is the silence this
+  // whole feature exists to end.
+  it("a fresh send does not downgrade a latched red", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = tickTo(s, T0 + UNAVAILABLE_AFTER_MS);
-    expect(livenessAt(s, T0 + UNAVAILABLE_AFTER_MS)).toBe("unavailable");
+    s = tickTo(s, T0 + STALLED_AFTER_MS);
+    expect(livenessAt(s, T0 + STALLED_AFTER_MS)).toBe("stalled");
 
     const resent = reduceSent(s, T0 + 100_000);
-    expect(livenessAt(resent, T0 + 100_000)).toBe("unavailable");
+    expect(livenessAt(resent, T0 + 100_000)).toBe("stalled");
   });
 
   it("only observed output clears it", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = tickTo(s, T0 + UNAVAILABLE_AFTER_MS);
+    s = tickTo(s, T0 + STALLED_AFTER_MS);
     const recovered = reduceProgress(s, T0 + 100_000, "text");
     expect(livenessAt(recovered, T0 + 100_000)).toBe("waiting");
   });
 
   it("a completed turn clears it too", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = tickTo(s, T0 + UNAVAILABLE_AFTER_MS);
+    s = tickTo(s, T0 + STALLED_AFTER_MS);
     expect(livenessAt(reduceSettled(s), T0 + 100_000)).toBe("idle");
   });
 
-  it("the ticker returns the SAME object when nothing changed, so it can run every 500ms", () => {
+  it("the ticker returns the SAME object when nothing changed, so it can run every second", () => {
     const s = reduceSent(IDLE_LIVENESS, T0);
     expect(reduceTick(s, T0 + 1_000)).toBe(s);
   });
@@ -97,43 +127,48 @@ describe("unavailable is STICKY", () => {
 
 describe("repeated pings with no response", () => {
   // THE 20:18-20:31 BURST, 2026-07-29: 12 of 14 turns died unanswered because each new send killed
-  // the last. Every send restarts the silence clock, so continuous silence NEVER reaches 90s — the
-  // time bound alone would have stayed silent through the exact incident this was built for.
-  it("escalates on consecutive unanswered sends even though silence never reaches the time bound", () => {
+  // the last. Every send restarts the silence clock, so continuous silence NEVER reaches 60s — the
+  // time bound alone would have stayed gray through the exact incident this was built for.
+  it("goes red on consecutive unanswered sends even though silence never reaches the time bound", () => {
     let s = IDLE_LIVENESS;
     let now = T0;
-    for (let i = 0; i < UNAVAILABLE_SILENT_RUN; i += 1) {
+    for (let i = 0; i < STALLED_SILENT_RUN; i += 1) {
       s = reduceSent(s, now);
-      now += OFFLINE_AFTER_MS + 1_000; // re-sent at ~21s, the measured median
-      expect(livenessAt(s, now)).not.toBe("unavailable");
+      now += SLOW_AFTER_MS + 1_000; // re-sent at ~31s, just past the measured median
+      expect(livenessAt(s, now)).not.toBe("stalled");
     }
     s = reduceSent(s, now);
-    expect(livenessAt(s, now)).toBe("unavailable");
+    expect(livenessAt(s, now)).toBe("stalled");
   });
 
   it("a send that DID stream something is not an unanswered ping", () => {
     let s = IDLE_LIVENESS;
     let now = T0;
-    for (let i = 0; i < UNAVAILABLE_SILENT_RUN + 2; i += 1) {
+    for (let i = 0; i < STALLED_SILENT_RUN + 2; i += 1) {
       s = reduceSent(s, now);
       s = reduceProgress(s, now + 1_000, "text"); // the turn answered, then the user sent again anyway
-      now += OFFLINE_AFTER_MS + 1_000;
+      now += SLOW_AFTER_MS + 1_000;
     }
     s = reduceSent(s, now);
     expect(livenessAt(s, now)).toBe("waiting");
   });
 
-  it("a send answered INSIDE the offline window is not an unanswered ping either", () => {
+  it("a send answered INSIDE the gray window is not an unanswered ping either", () => {
     let s = IDLE_LIVENESS;
     let now = T0;
-    for (let i = 0; i < UNAVAILABLE_SILENT_RUN + 2; i += 1) {
+    for (let i = 0; i < STALLED_SILENT_RUN + 2; i += 1) {
       s = reduceSent(s, now);
-      now += OFFLINE_AFTER_MS - 1_000; // impatient re-send, but inside the window
+      now += SLOW_AFTER_MS - 1_000; // impatient re-send, but inside the window
     }
     expect(livenessAt(reduceSent(s, now), now)).toBe("waiting");
   });
 });
 
+// ── ERRORS THE APP ACTUALLY RECEIVED ARE NOT PART OF THE SILENCE SIGNAL ─────────────────────────
+//
+// The retune was explicitly scoped to silence: a real quota message, a billing error or a hard
+// failure must still surface verbatim. `failureOutage` is the sticky version of that fact, and it is
+// deliberately reachable ONLY through observed errors — never through a quiet clock.
 describe("hard failures", () => {
   const QUOTA = "You've hit your session limit · resets 8:40am (America/Bogota)";
 
@@ -146,21 +181,37 @@ describe("hard failures", () => {
   // One failure is the blip the Rust retry path exists for, and its verbatim reason is already going
   // into the thread as its own bubble. A sticky banner on a single error is the flappiness
   // aiServiceHealthStore was built to avoid.
-  it("does not escalate on a single failure", () => {
-    expect(livenessAt(reduceFailed(IDLE_LIVENESS, QUOTA, T0), T0)).toBe("idle");
+  it("does not raise the outage strip on a single failure", () => {
+    expect(failureOutage(reduceFailed(IDLE_LIVENESS, QUOTA, T0))).toBeNull();
   });
 
   // Every failure actually observed in a day of logs was a fast, LOUD error (3-17s), which ends the
-  // wait and so accumulates no silence at all. Without this route UNAVAILABLE could essentially
-  // never fire in the real world — and six consecutive spend-limit rejections is the textbook case.
-  it("escalates on consecutive failures, which produce no silence whatsoever", () => {
+  // wait and so accumulates no silence at all. Six consecutive spend-limit rejections is the textbook
+  // "your concierge is unavailable" condition, and the silence clock never moves for it.
+  it("raises the outage strip on consecutive failures, which produce no silence whatsoever", () => {
     let s = IDLE_LIVENESS;
-    for (let i = 0; i < UNAVAILABLE_FAILURE_RUN - 1; i += 1) s = reduceFailed(s, QUOTA, T0);
-    expect(livenessAt(s, T0)).not.toBe("unavailable");
+    for (let i = 0; i < FAILURE_OUTAGE_RUN - 1; i += 1) s = reduceFailed(s, QUOTA, T0);
+    expect(failureOutage(s)).toBeNull();
     s = reduceFailed(s, QUOTA, T0);
-    expect(livenessAt(s, T0)).toBe("unavailable");
-    // The reason survives into the sticky state — the strip states WHY, not just that.
-    expect(s.failure?.evidence).toContain("resets 8:40am");
+    // The machine's own words survive into the sticky state — the strip states WHY, not just that.
+    expect(failureOutage(s)?.evidence).toContain("resets 8:40am");
+  });
+
+  // THE SEPARATION THE RETUNE TURNS ON. Silence may never speak in words: an outage strip reached by
+  // a quiet clock would be presenting a stale morning quota rejection as the account of an afternoon
+  // lull — the exact lie roborev 55442-M4 named, now impossible by construction.
+  it("silence alone NEVER raises the strip, even carrying an old failure and even at red", () => {
+    let s = reduceFailed(IDLE_LIVENESS, QUOTA, T0);
+    let now = T0;
+    for (let i = 0; i <= STALLED_SILENT_RUN; i += 1) {
+      s = reduceSent(s, now);
+      now += SLOW_AFTER_MS + 1_000;
+    }
+    expect(livenessAt(s, now)).toBe("stalled");
+    // The failure is still ON the state — it is the last thing we know — which is precisely why the
+    // strip has to be gated on the RUN rather than on its presence.
+    expect(s.failure).not.toBeNull();
+    expect(failureOutage(s)).toBeNull();
   });
 
   it("a success between failures breaks the run", () => {
@@ -169,41 +220,17 @@ describe("hard failures", () => {
     s = reduceFailed(s, QUOTA, T0);
     s = reduceSettled(s);
     s = reduceFailed(s, QUOTA, T0);
-    expect(livenessAt(s, T0)).toBe("idle");
     expect(s.failureRun).toBe(1);
+    expect(failureOutage(s)).toBeNull();
   });
 
   // A loud failure and a silent one are different facts. Letting them add up would produce a state
   // that describes neither.
   it("an error resets the SILENT run — it is a response, just not an answer", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = reduceSent(s, T0 + OFFLINE_AFTER_MS + 1); // one unanswered ping banked
+    s = reduceSent(s, T0 + SLOW_AFTER_MS + 1); // one unanswered ping banked
     expect(s.silentRun).toBe(1);
     expect(reduceFailed(s, QUOTA, T0).silentRun).toBe(0);
-  });
-});
-
-describe("the elapsed counter", () => {
-  it("stays quiet for the first few seconds, then states the time", () => {
-    const s = reduceSent(IDLE_LIVENESS, T0);
-    expect(showsElapsed(s, T0 + 4_999)).toBe(false);
-    expect(showsElapsed(s, T0 + 5_000)).toBe(true);
-  });
-
-  it("floors the seconds so it never claims time that has not passed", () => {
-    expect(elapsedLabel(12_999)).toBe("12s");
-    expect(elapsedLabel(0)).toBe("0s");
-    expect(elapsedLabel(64_000)).toBe("1m 04s");
-    expect(elapsedLabel(600_000)).toBe("10m 00s");
-  });
-
-  // THE CEILING (roborev 55468-M3). The counter has to keep running through a latched UNAVAILABLE —
-  // a frozen number is the failure this replaced — but "keeps running" with no upper bound is a
-  // 500ms loop for the rest of the session once a turn dies and the human walks away.
-  it("stops counting at the ceiling", () => {
-    const s = reduceSent(IDLE_LIVENESS, T0);
-    expect(showsElapsed(s, T0 + ELAPSED_CEILING_MS - 1)).toBe(true);
-    expect(showsElapsed(s, T0 + ELAPSED_CEILING_MS)).toBe(false);
   });
 });
 
@@ -216,36 +243,34 @@ describe("ticks — is there anything left for a clock to change", () => {
     expect(ticks(IDLE_LIVENESS, T0)).toBe(false);
   });
 
-  it("runs while a turn is outstanding", () => {
+  it("runs while a colour can still move", () => {
     const s = reduceSent(IDLE_LIVENESS, T0);
     expect(ticks(s, T0)).toBe(true);
-    expect(ticks(s, T0 + OFFLINE_AFTER_MS)).toBe(true);
+    expect(ticks(s, T0 + SLOW_AFTER_MS)).toBe(true);
   });
 
-  // The distinction the whole finding turns on: NOT gated on the latch. At 90s the verdict is in and
-  // there is no further escalation to reach, but the counter is still on screen and still has to be
-  // right.
-  it("keeps running past the latch, because the counter is still being read", () => {
-    const s = reduceTick(reduceSent(IDLE_LIVENESS, T0), T0 + UNAVAILABLE_AFTER_MS);
-    expect(s.unavailableLatched).toBe(true);
-    expect(ticks(s, T0 + UNAVAILABLE_AFTER_MS)).toBe(true);
-  });
-
-  // Stops at the SAME instant `showsElapsed` does — asserted together, because the two stopping at
-  // different moments is exactly how a stale number gets left on screen.
-  it("stops at the ceiling, in step with the counter it feeds", () => {
+  // RED IS TERMINAL, so the interval stops there. This is what the removal of the seconds counter
+  // bought: nothing on screen is derived from `now` any more, so a turn that dies and is never
+  // retried schedules nothing for the rest of the session — no ceiling constant required.
+  it("stops at red, because no later tick could change a pixel", () => {
     const s = reduceSent(IDLE_LIVENESS, T0);
-    const at = T0 + ELAPSED_CEILING_MS;
-    expect(ticks(s, at - 1)).toBe(true);
-    expect(ticks(s, at)).toBe(false);
-    expect(showsElapsed(s, at)).toBe(false);
+    expect(ticks(s, T0 + STALLED_AFTER_MS - 1)).toBe(true);
+    expect(ticks(s, T0 + STALLED_AFTER_MS)).toBe(false);
   });
 
-  it("starts again when the user sends into the silence", () => {
-    const dead = reduceSent(IDLE_LIVENESS, T0);
-    const at = T0 + ELAPSED_CEILING_MS;
-    expect(ticks(dead, at)).toBe(false);
-    expect(ticks(reduceSent(dead, at), at)).toBe(true);
+  it("stops for a LATCHED red too, whatever the clock says", () => {
+    const s = reduceTick(reduceSent(IDLE_LIVENESS, T0), T0 + STALLED_AFTER_MS);
+    expect(s.stalledLatched).toBe(true);
+    expect(ticks(s, T0 + STALLED_AFTER_MS + 1_000)).toBe(false);
+  });
+
+  // A send into a dead silence does NOT restart the timer while the latch stands — the row is
+  // already red and staying red, so there is still nothing for a clock to do.
+  it("starts again only once something actually clears the latch", () => {
+    const dead = reduceTick(reduceSent(IDLE_LIVENESS, T0), T0 + STALLED_AFTER_MS);
+    const at = T0 + STALLED_AFTER_MS + 10_000;
+    expect(ticks(reduceSent(dead, at), at)).toBe(false);
+    expect(ticks(reduceSent(reduceProgress(dead, at, "text"), at), at)).toBe(true);
   });
 });
 
@@ -271,11 +296,11 @@ describe("sawOutput vs sawText", () => {
   });
 
   // A tool call still has to reset the SILENCE clock, or a turn that spends a minute reading
-  // terminals without speaking would be reported offline while visibly working.
+  // terminals without speaking would go red while visibly working.
   it("a tool call still resets the silence clock", () => {
     let s = reduceSent(IDLE_LIVENESS, T0);
-    s = reduceProgress(s, T0 + 19_000, "tool");
-    expect(livenessAt(s, T0 + 25_000)).toBe("waiting");
+    s = reduceProgress(s, T0 + 29_000, "tool");
+    expect(livenessAt(s, T0 + 45_000)).toBe("waiting");
   });
 
   it("both flags reset for each new turn", () => {
@@ -283,44 +308,6 @@ describe("sawOutput vs sawText", () => {
     s = reduceSent(s, T0 + 5_000);
     expect(s.sawOutput).toBe(false);
     expect(s.sawText).toBe(false);
-  });
-});
-
-// ── WHY IT IS UNAVAILABLE DECIDES WHETHER THERE IS A REASON TO SHOW ─────────────────────────────
-//
-// roborev 55442-M4. A recorded failure OUTLIVES the sends that follow it — deliberately, because
-// clearing it on send would break the consecutive-failure run (every failure is followed by another
-// send). So an outage reached through SILENCE can be carrying an unrelated failure from hours
-// earlier, and presenting "resets 8:40am" at 2pm as the reason the concierge is quiet now is a
-// causal claim from stale evidence.
-describe("livenessReason", () => {
-  const QUOTA = "You've hit your session limit · resets 8:40am (America/Bogota)";
-
-  it("is null while the concierge is not unavailable", () => {
-    expect(livenessReason(IDLE_LIVENESS, T0)).toBeNull();
-    expect(livenessReason(reduceSent(IDLE_LIVENESS, T0), T0)).toBeNull();
-  });
-
-  it("names the failure route when a run of errors got us here", () => {
-    let s = IDLE_LIVENESS;
-    for (let i = 0; i < UNAVAILABLE_FAILURE_RUN; i += 1) s = reduceFailed(s, QUOTA, T0 + i * 1_000);
-    expect(livenessReason(s, T0)).toBe("failures");
-  });
-
-  // THE ROW THAT MATTERS. One old failure, then three silent sends: the strip must say "nothing came
-  // back", not re-blame this morning's quota.
-  it("names SILENCE when silence got us here, even with an old failure on the books", () => {
-    let s = reduceFailed(IDLE_LIVENESS, QUOTA, T0);
-    let now = T0;
-    for (let i = 0; i <= UNAVAILABLE_SILENT_RUN; i += 1) {
-      s = reduceSent(s, now);
-      now += OFFLINE_AFTER_MS + 1_000;
-    }
-    expect(livenessAt(s, now)).toBe("unavailable");
-    expect(livenessReason(s, now)).toBe("silence");
-    // The failure is still ON the state — it is the last thing we know — which is exactly why the
-    // reason has to be derived rather than inferred from its presence.
-    expect(s.failure).not.toBeNull();
   });
 });
 
@@ -336,13 +323,13 @@ describe("the failure run is time-bounded", () => {
     s = reduceFailed(s, QUOTA, T0 + FAILURE_RUN_MAX_GAP_MS + 1);
     s = reduceFailed(s, QUOTA, T0 + FAILURE_RUN_MAX_GAP_MS + 2);
     expect(s.failureRun).toBe(2);
-    expect(livenessAt(s, T0 + FAILURE_RUN_MAX_GAP_MS + 2)).not.toBe("unavailable");
+    expect(failureOutage(s)).toBeNull();
   });
 
   it("still counts a real burst, where the retries are seconds apart", () => {
     let s = IDLE_LIVENESS;
-    for (let i = 0; i < UNAVAILABLE_FAILURE_RUN; i += 1) s = reduceFailed(s, QUOTA, T0 + i * 30_000);
-    expect(livenessAt(s, T0)).toBe("unavailable");
+    for (let i = 0; i < FAILURE_OUTAGE_RUN; i += 1) s = reduceFailed(s, QUOTA, T0 + i * 30_000);
+    expect(failureOutage(s)).not.toBeNull();
   });
 
   it("the boundary itself starts a new run", () => {
