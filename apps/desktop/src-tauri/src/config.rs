@@ -1859,12 +1859,22 @@ fn apply_concierge_checks(
 ///
 /// PER-FIELD, like `apply_concierge_checks` — the one-line edit this section exists for
 /// (`messages_per_hour = 1` under an existing header) has to leave `observe_interval_ms` and
-/// `model` at what they shipped with. Replacing the struct wholesale would turn "make it quieter"
-/// into "silently reset everything else too".
+/// `inbox_yield_pct` at what they shipped with. Replacing the struct wholesale would turn "make it
+/// quieter" into "silently reset everything else too".
 ///
-/// A wrong-typed value is DROPPED with a warning rather than coerced or fatal: coercing would make
-/// `enabled = "false"` read as ON, and being fatal would cost the user their whole config layer
-/// over one typo (roborev 54240).
+/// A wrong-typed value is DROPPED with a warning rather than coerced or fatal — being fatal would
+/// cost the user their whole config layer over one typo (roborev 54240) — WITH ONE EXCEPTION, and
+/// the exception is the safety-relevant asymmetry of this section:
+///
+///   `enabled` honors an unambiguous OFF-spelling (`"false"`/`"off"`/`"no"`/`0`), never an
+///   on-spelling. It is the only control over a feature that ships ON and attaches at birth, so a
+///   dropped kill switch fails OPEN — the one direction the user cannot recover by noticing later.
+///   Reading a string as truthy would be the dangerous coercion; reading one as false is not.
+///
+/// That distinction used to be stated backwards here — the header still gave "coercing would make
+/// `enabled = "false"` read as ON" as the reason for dropping it, after the code had started
+/// honoring exactly that spelling. In a file where the comments are the recorded contract, a
+/// maintainer reading that would conclude the arm was a bug and revert the fix (roborev 56365).
 ///
 /// Returns the user-facing warnings, which have to be handed back rather than logged: a rejected
 /// value never enters the config, so nothing downstream — `validate` included — can rediscover it,
@@ -2644,13 +2654,34 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
             pu.messages_per_hour
         ));
     }
-    // A percentage, so anything outside 1..=100 is a typo rather than a preference: 0 (or less)
-    // means "yield on an empty inbox", i.e. never send, and above 100 is unreachable, i.e. never
-    // yield. Both read as a working line and do something the user did not ask for.
-    if pu.inbox_yield_pct < 1 || pu.inbox_yield_pct > 100 {
+    // ABOVE THE SHIPPED CEILING IS SILENTLY REDUCED, so it has to be SAID (roborev 56365). Both of
+    // these are ceilings the TypeScript resolver clamps with `min()`, which means the plausible
+    // edit — "let it talk even when my inbox is busy", `inbox_yield_pct = 100` — resolves to 80
+    // with nothing in the file and nothing in the ⋯ pane to say so. A line the user deliberately
+    // wrote that does nothing and reports nothing is the worst of the three outcomes this section
+    // chooses between, and it was the one being produced.
+    let shipped = PushersConfig::default();
+    if pu.inbox_yield_pct > shipped.inbox_yield_pct {
         warnings.push(format!(
-            "[pushers].inbox_yield_pct is {}, which is not a percentage between 1 and 100; \
-             Sparkle will clamp it to the shipped ceiling until it is fixed",
+            "[pushers].inbox_yield_pct is {}, above the shipped ceiling, so Pushers will still \
+             yield at {}%; lower it to make them yield sooner, not later",
+            pu.inbox_yield_pct, shipped.inbox_yield_pct
+        ));
+    }
+    if pu.messages_per_hour > shipped.messages_per_hour {
+        warnings.push(format!(
+            "[pushers].messages_per_hour is {}, above the shipped ceiling, so each partner will \
+             still hear at most {} an hour; the budget can be lowered, never raised",
+            pu.messages_per_hour, shipped.messages_per_hour
+        ));
+    }
+    // A percentage below 1 is the other end: 0 (or less) means "yield on an empty inbox", i.e.
+    // never send. That IS honored (`pctOrQuiet` clamps toward silence), so it is reported as the
+    // muting it performs rather than as a clamp it does not.
+    if pu.inbox_yield_pct < 1 {
+        warnings.push(format!(
+            "[pushers].inbox_yield_pct is {}, so a Pusher yields even on an empty inbox and never \
+             sends; use enabled = false if that is what you meant",
             pu.inbox_yield_pct
         ));
     }
@@ -6727,12 +6758,36 @@ mesages_per_hour = 9
         assert!(said("[pushers].messages_per_hour is 0"), "budget: {warns:?}");
         assert!(said("[pushers].inbox_yield_pct is 0"), "percentage: {warns:?}");
         assert!(said("[pushers].observe_interval_ms is 5000"), "interval: {warns:?}");
-        // In-range values are silent, so the warnings above mean something.
+        // Values the resolver ACTUALLY HONORS are silent, so the warnings above mean something.
+        //
+        // This used to use `inbox_yield_pct = 100` — a value `resolvePusherPolicy` clamps to 80 —
+        // so the suite was asserting the silence of a line that does nothing, pinning the gap as
+        // intended behaviour (roborev 56365). Every number here now survives the resolver unchanged.
         let (_, quiet, _) = effective(
-            Some("[pushers]\nmessages_per_hour = 2\ninbox_yield_pct = 100\nobserve_interval_ms = 60000\n"),
+            Some("[pushers]\nmessages_per_hour = 2\ninbox_yield_pct = 50\nobserve_interval_ms = 60000\n"),
             None,
         );
         assert!(quiet.is_empty(), "a usable envelope warns about nothing: {quiet:?}");
+    }
+
+    #[test]
+    fn a_pushers_value_above_the_shipped_ceiling_is_reported_not_silently_reduced() {
+        // The plausible edit — "let it talk even when my inbox is busy" — is `inbox_yield_pct = 100`,
+        // and the resolver's `min()` turns it into 80. Silently. A line the user deliberately wrote
+        // that does nothing and says nothing is the worst of the three outcomes this section chooses
+        // between (roborev 56365).
+        let g = "[pushers]\ninbox_yield_pct = 100\nmessages_per_hour = 10\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        // Still never rewritten — the number stays the user's, exactly as for the low end.
+        assert_eq!(cfg.pushers.inbox_yield_pct, 100, "kept — warned about, not rewritten");
+        assert_eq!(cfg.pushers.messages_per_hour, 10, "kept");
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("inbox_yield_pct is 100, above the shipped ceiling"), "yield: {warns:?}");
+        assert!(said("messages_per_hour is 10, above the shipped ceiling"), "budget: {warns:?}");
+        // And the warning names the number the user will actually get, not just that it was wrong.
+        assert!(said("yield at 80%"), "must name the effective value: {warns:?}");
+        assert!(said("at most 4 an hour"), "must name the effective value: {warns:?}");
     }
 
     #[test]
