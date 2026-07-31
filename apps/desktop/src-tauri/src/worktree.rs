@@ -1270,7 +1270,25 @@ pub async fn remove_repo_hooks_cmd(path: String) -> Result<(), String> {
 // like `.wt-*/`, so a future name is covered; the trailing slash and the hyphen keep it off the
 // tracked `.sparkle/` config dir. Kept in step with `.gitignore` by
 // `scripts/tests/ignore-agent-worktrees.test.sh`.
-const AGENT_WORKTREE_IGNORES: [&str; 3] = [".claude/worktrees/", ".wt-*/", ".sparkle-*/"];
+//
+// The last three are the beads runtime store (`sparkle-3u61`). `.beads/.gitignore` already excludes
+// `embeddeddolt/`, `dolt/` and `proxieddb/`, but those patterns are DIRECTORY-ONLY (trailing slash)
+// and do NOT match a SYMLINK. On the live machine a beads consolidation left `.beads/embeddeddolt`
+// as a symlink to the canonical store, so `git status` reported `?? .beads/embeddeddolt`
+// permanently and every hourly park declined `dirty` — the wedge this const already exists to
+// prevent, in a new disguise. These entries carry NO trailing slash so they match the store whether
+// it is a symlink, a directory OR a file, and independent of how stale the checked-out
+// `.beads/.gitignore` is (a wedged worktree is pinned to an old branch that predates any fix). The
+// store is runtime data that is never committed, so excluding it in the untracked `info/exclude`
+// only ever suppresses dirt that had no business blocking the park.
+const AGENT_WORKTREE_IGNORES: [&str; 6] = [
+    ".claude/worktrees/",
+    ".wt-*/",
+    ".sparkle-*/",
+    ".beads/embeddeddolt",
+    ".beads/dolt",
+    ".beads/proxieddb",
+];
 
 /// Append any of `patterns` missing from the newline-delimited `existing`, or `None` when all are
 /// already present. Pure so the idempotency rule is unit-testable without a filesystem.
@@ -7950,6 +7968,105 @@ mod tests {
         assert_eq!(once, twice, "second call appended duplicates");
         assert!(once.contains("scratch.txt"), "clobbered the user's excludes: {once:?}");
         assert_eq!(once.lines().filter(|l| l.trim() == ".wt-*/").count(), 1);
+    }
+
+    #[test]
+    fn ensure_worktree_excludes_hides_the_beads_store_from_status() {
+        // sparkle-3u61: a beads store symlinked to a canonical clone reads as
+        // `?? .beads/embeddeddolt` because `.beads/.gitignore`'s `embeddeddolt/` is DIRECTORY-ONLY
+        // (trailing slash) and does not match a symlink. `park_worktree_on_base` declines `dirty` on
+        // any such untracked entry, so the store wedged the hourly pass permanently. The seeded
+        // excludes must cover the store by path so it never counts as blocking dirt — whether it is a
+        // symlink, a dir or a file, and regardless of a stale checked-out `.beads/.gitignore`.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+
+        // `.beads/` must hold a TRACKED file, because the real repo does (`.beads/config.yaml`,
+        // `metadata.json`, `README.md` and `hooks/*` are all in git — `bd` needs `metadata.json` to
+        // resolve the DB). Without one, git COLLAPSES the wholly-untracked directory and reports
+        // `?? .beads/` instead of descending to `?? .beads/embeddeddolt/` — which is what made the
+        // precondition below unsatisfiable in CI. Measured both ways:
+        //     nothing tracked under .beads/  -> "?? .beads/"
+        //     a tracked file under .beads/   -> "?? .beads/embeddeddolt/"
+        // The second is the shape the wedge actually has, so it is the shape this test must build.
+        std::fs::create_dir_all(d.path().join(".beads")).unwrap();
+        std::fs::write(d.path().join(".beads/config.yaml"), b"# tracked, as in the real repo\n").unwrap();
+        git(&root, &["add", ".beads/config.yaml"]).unwrap();
+        git(&root, &["commit", "-m", "beads config (tracked, mirrors the real repo)"]).unwrap();
+
+        // A real untracked entry at the store path. A plain dir stands in for the symlink: both are
+        // untracked, and the scratch repo has no `.beads/.gitignore` at all, so ONLY the seeded
+        // `info/exclude` can hide it. That is exactly the path under test.
+        std::fs::create_dir_all(d.path().join(".beads/embeddeddolt")).unwrap();
+        std::fs::write(d.path().join(".beads/embeddeddolt/store"), b"x").unwrap();
+
+        // Precondition: without the seeded exclude, the store reads as blocking dirt — the wedge.
+        let before = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            before.contains(".beads/embeddeddolt"),
+            "precondition: the store should read as untracked dirt before excludes are seeded: {before:?}"
+        );
+
+        ensure_worktree_excludes(&root).unwrap();
+
+        // Side effect under test: the store no longer appears in status, so the park will not decline
+        // `dirty` on it. Fails if `.beads/embeddeddolt` is absent from AGENT_WORKTREE_IGNORES.
+        let after = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            !after.contains(".beads/embeddeddolt"),
+            "the beads store must be excluded so the hourly park does not decline 'dirty': {after:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_worktree_excludes_hides_a_symlinked_beads_store() {
+        // THE DISCRIMINATING CASE (roborev 56704). The sibling test above builds the store as a plain
+        // DIRECTORY, which both the shipped slash-less `.beads/embeddeddolt` and the buggy
+        // directory-only `.beads/embeddeddolt/` match — so it cannot tell a correct pattern from the
+        // one that caused sparkle-3u61. And `append_missing_ignores` deliberately treats `p` and
+        // `p.trim_end_matches('/')` as equivalent, so someone "normalizing" AGENT_WORKTREE_IGNORES to
+        // a trailing slash would reintroduce the exact wedge with the whole suite still green.
+        //
+        // A SYMLINK is what actually separates them. Measured against real git:
+        //     pattern `.beads/embeddeddolt/` + symlink  ->  "?? .beads/embeddeddolt"   (the wedge)
+        //     pattern `.beads/embeddeddolt`  + symlink  ->  ""                          (hidden)
+        //     pattern `.beads/embeddeddolt/` + dir      ->  ""                          (no signal)
+        // So this test fails against a trailing-slash pattern and passes against the shipped one,
+        // which is the assertion the directory case cannot make.
+        //
+        // This is the shape the live machine was actually in: a beads consolidation left
+        // `.beads/embeddeddolt` as a symlink to the canonical store, and every hourly park declined
+        // `dirty` on it.
+        let d = scratch_repo();
+        let root = d.path().to_string_lossy().to_string();
+
+        // Tracked content under `.beads/`, for the same reason as the sibling test: without it git
+        // collapses the whole untracked directory to `?? .beads/` and never names the store.
+        std::fs::create_dir_all(d.path().join(".beads")).unwrap();
+        std::fs::write(d.path().join(".beads/config.yaml"), b"# tracked, as in the real repo\n").unwrap();
+        git(&root, &["add", ".beads/config.yaml"]).unwrap();
+        git(&root, &["commit", "-m", "beads config (tracked, mirrors the real repo)"]).unwrap();
+
+        // The store as a SYMLINK to a canonical clone living outside the repo.
+        let canonical = d.path().join("canonical-store");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::os::unix::fs::symlink(&canonical, d.path().join(".beads/embeddeddolt")).unwrap();
+
+        let before = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            before.contains(".beads/embeddeddolt"),
+            "precondition: a symlinked store must read as untracked dirt before excludes are seeded: {before:?}"
+        );
+
+        ensure_worktree_excludes(&root).unwrap();
+
+        let after = git(&root, &["status", "--porcelain"]).unwrap();
+        assert!(
+            !after.contains(".beads/embeddeddolt"),
+            "a SYMLINKED beads store must be excluded too — a directory-only pattern (trailing \
+             slash) does not match a symlink, which is the sparkle-3u61 wedge: {after:?}"
+        );
     }
 
     #[test]
