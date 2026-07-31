@@ -3068,7 +3068,7 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 # Which one-time config migrations have already been applied to this file. Sparkle uses it to
 # know it has already upgraded you, so it never re-applies a migration and never overrides a
 # value you set yourself afterwards. Lowering or deleting this can re-run past migrations.
-config_version = 2
+config_version = 3
 
 # --- How agents land their work -------------------------------------------------------
 [workflow]
@@ -3601,7 +3601,7 @@ fn load_document(app_data: &Path) -> toml_edit::DocumentMut {
 }
 
 /// Schema revision of the on-disk global config. Bump when adding a one-time migration below.
-const CONFIG_MIGRATION_VERSION: i64 = 2;
+const CONFIG_MIGRATION_VERSION: i64 = 3;
 
 /// Apply one-time migrations to the global config FILE, recording the revision reached in
 /// `[meta].config_version`.
@@ -3738,6 +3738,38 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
             "config migration v2: removing the retired \
              stop_word = {LEGACY_DEFAULT_STOP_WORD:?} (a default, not a choice)"
         );
+    }
+
+    // v3 — the RETIRED `[pushers].model` key, removed for the same reason v1 and v2 exist: the app
+    // WROTE this line, so removing it discards nothing the user chose.
+    //
+    // `model = "claude-haiku-4-5"` shipped inside DEFAULT_TEMPLATE, and `load_document` falls back
+    // to that template, so the first `set_value` on a fresh install writes the whole thing to disk.
+    // The field is gone from `PartialPushers` now (nothing composes a challenge — see the note on
+    // PushersConfig), so without this the line falls through to the unknown-key catch-all and emits
+    // "[pushers].model is not a Pusher setting … so it has no effect" on EVERY load, permanently,
+    // for a line nobody typed. A warning that is always on is a warning the user learns to dismiss,
+    // which is the failure `MIN_AGENT_RSS_THRESHOLD_MB` describes from the other direction.
+    //
+    // Gated on `applied < 3` specifically, never on the aggregate — see the rule above. Unlike v1
+    // and v2 the VALUE is not checked: any `model` here is retired regardless of what it says,
+    // because the key itself no longer exists rather than merely having a new default.
+    let had_retired_pusher_model = applied < 3
+        && doc.get("pushers").and_then(|p| p.get("model")).is_some();
+    if had_retired_pusher_model {
+        // `as_table_like_mut` covers both `[pushers]` and a hand-written inline `pushers = { … }`,
+        // exactly as the two blocks above do.
+        let Some(t) = doc.get_mut("pushers").and_then(|p| p.as_table_like_mut()) else {
+            return Err(
+                "[pushers] is not a table; migration deferred until config.toml is fixed".into()
+            );
+        };
+        t.remove("model");
+        // Don't strand an empty `[pushers]` stanza the user opens in the Advanced editor.
+        if doc.get("pushers").and_then(|p| p.as_table_like()).is_some_and(|t| t.is_empty()) {
+            doc.remove("pushers");
+        }
+        tracing::debug!("config migration v3: removing the retired [pushers].model key");
     }
 
     // Written table-shape-agnostically for the same reason as `workers` above: `set_dotted` demands
@@ -6606,6 +6638,43 @@ tools = "allow"
     }
 
     #[test]
+    fn migration_v3_removes_the_retired_pushers_model_key() {
+        // The app WROTE this line — it shipped inside DEFAULT_TEMPLATE, and the first `set_value`
+        // on a fresh install writes the whole template to disk. So removing it discards nothing the
+        // user chose, which is the same standard v1 and v2 hold themselves to. Left in place it
+        // warns "not a Pusher setting" on every single load, forever.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[workflow]\nrequire_pr = false\n\n[pushers]\nmessages_per_hour = 2\nmodel = \"claude-haiku-4-5\"\n",
+        )
+        .expect("seed");
+
+        migrate_global(dir.path()).expect("migration must not fail");
+
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(!after.contains("model"), "the retired key must be gone: {after}");
+        // ONLY that key. A migration that also ate a real setting would be far worse than the
+        // warning it exists to silence.
+        assert!(after.contains("messages_per_hour = 2"), "a real choice survives: {after}");
+        assert!(after.contains("require_pr = false"), "an unrelated section survives: {after}");
+        assert!(after.contains("config_version = 3"), "the revision is stamped: {after}");
+    }
+
+    #[test]
+    fn migration_v3_leaves_no_empty_pushers_stanza() {
+        // Same courtesy the v1/v2 blocks extend: the user opens this file in the Advanced editor,
+        // and a `[pushers]` header attributable to nothing is clutter.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[pushers]\nmodel = \"claude-haiku-4-5\"\n").expect("seed");
+        migrate_global(dir.path()).expect("migration must not fail");
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(!after.contains("[pushers]"), "the emptied stanza must go too: {after}");
+    }
+
+    #[test]
     fn a_wrong_typed_pushers_value_is_dropped_with_a_warning_and_costs_nothing_else() {
         // roborev 54240's lesson applied to [pushers]: with strongly-typed fields any ONE of these
         // lines fails the WHOLE-FILE parse, discarding the entire global layer so every unrelated
@@ -6636,6 +6705,10 @@ mesages_per_hour = 9
         assert!(said("[pushers].messages_per_hour is a string"), "budget: {warns:?}");
 
         assert!(said("[pushers].mesages_per_hour is not a Pusher setting"), "typo: {warns:?}");
+        // The RETIRED key still in the fixture. It is no longer a Pusher setting at all, so it must
+        // be reported by the unknown-key path rather than silently accepted — the same sentence a
+        // stale on-disk `model = ...` gets until the v3 migration removes it.
+        assert!(said("[pushers].model is not a Pusher setting"), "retired key: {warns:?}");
     }
 
     #[test]

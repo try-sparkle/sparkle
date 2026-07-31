@@ -15,18 +15,18 @@ const MIN = 60_000;
 
 describe("trackSince", () => {
   it("stamps a newly true condition", () => {
-    expect(trackSince(undefined, ["a"], T0)).toEqual({ a: T0 });
+    expect(trackSince(undefined, ["a"], T0)).toEqual(new Map([["a", T0]]));
   });
 
   // The whole point: the stamp is the ONSET, not the last sighting.
   it("keeps the ORIGINAL stamp while the condition stays true", () => {
     const first = trackSince(undefined, ["a"], T0);
     const later = trackSince(first, ["a"], T0 + 30 * MIN);
-    expect(later.a).toBe(T0);
+    expect(later.get("a")).toBe(T0);
   });
 
   it("drops a condition that is no longer true", () => {
-    expect(trackSince({ a: T0 }, [], T0 + MIN)).toEqual({});
+    expect(trackSince(new Map([["a", T0]]), [], T0 + MIN)).toEqual(new Map());
   });
 
   // Dropping is what makes a second episode time from ITS onset. Without it the partner that
@@ -39,35 +39,56 @@ describe("trackSince", () => {
   });
 
   it("tracks keys independently", () => {
-    const c = trackSince({ a: T0 }, ["a", "b"], T0 + 10 * MIN);
-    expect(c).toEqual({ a: T0, b: T0 + 10 * MIN });
+    const c = trackSince(new Map([["a", T0]]), ["a", "b"], T0 + 10 * MIN);
+    expect(c).toEqual(new Map([["a", T0], ["b", T0 + 10 * MIN]]));
   });
 
   it("garbage-collects a key the caller stopped observing", () => {
-    const c = trackSince({ a: T0, gone: T0 }, ["a"], T0 + MIN);
-    expect(Object.keys(c)).toEqual(["a"]);
+    const c = trackSince(new Map([["a", T0], ["gone", T0]]), ["a"], T0 + MIN);
+    expect([...c.keys()]).toEqual(["a"]);
   });
 });
 
 describe("elapsedSince", () => {
   it("measures from the onset", () => {
-    expect(elapsedSince({ a: T0 }, "a", T0 + 38 * MIN)).toBe(38 * MIN);
+    expect(elapsedSince(new Map([["a", T0]]), "a", T0 + 38 * MIN)).toBe(38 * MIN);
   });
 
   // "never observed" and "just started" are different facts and only the second is evidence.
   // Every trigger is fail-closed on undefined, matching agentStall's absent-input rule.
   it("returns undefined for a key it has never seen — NOT zero", () => {
-    expect(elapsedSince({ a: T0 }, "b", T0)).toBeUndefined();
+    expect(elapsedSince(new Map([["a", T0]]), "b", T0)).toBeUndefined();
     expect(elapsedSince(undefined, "a", T0)).toBeUndefined();
   });
 
   it("reports zero at the instant of onset", () => {
-    expect(elapsedSince({ a: T0 }, "a", T0)).toBe(0);
+    expect(elapsedSince(new Map([["a", T0]]), "a", T0)).toBe(0);
   });
 
   // A negative duration would render as "-3 minutes ago" and the citation gate would PASS it, since
   // the number really was measured. Clamping is the only place that can catch it.
   it("never reports a negative duration", () => {
-    expect(elapsedSince({ a: T0 + 5 * MIN }, "a", T0)).toBe(0);
+    expect(elapsedSince(new Map([["a", T0 + 5 * MIN]]), "a", T0)).toBe(0);
+  });
+});
+
+describe("prototype-named keys are ordinary keys (roborev 56322)", () => {
+  // A plain Record resolves Object.prototype members, so `before["constructor"]` reads back an
+  // inherited FUNCTION rather than undefined, elapsedSince computes `now - fn`, and the answer is
+  // NaN typed as number. NaN is not undefined, so every fail-closed consumer reads it as a real
+  // measurement. `goalContinuationRunner`'s idle clock is a Map for exactly this reason.
+  it.each([["constructor"], ["__proto__"], ["toString"], ["hasOwnProperty"]])(
+    "%s round-trips as data, and never yields NaN",
+    (key) => {
+      const c = trackSince(undefined, [key], T0);
+      expect(c.get(key)).toBe(T0);
+      const elapsed = elapsedSince(c, key, T0 + 5 * MIN);
+      expect(elapsed).toBe(5 * MIN);
+      expect(Number.isNaN(elapsed)).toBe(false);
+    },
+  );
+
+  it("reports undefined for an unseen prototype-named key rather than a function", () => {
+    expect(elapsedSince(trackSince(undefined, ["a"], T0), "constructor", T0)).toBeUndefined();
   });
 });

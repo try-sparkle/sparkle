@@ -32,8 +32,19 @@
 //
 // Pure: no clock of its own, no I/O. The caller passes `now` and the keys it just saw.
 
-/** `key → epoch ms the condition became continuously true`. */
-export type SinceClock = Readonly<Record<string, number>>;
+/**
+ * `key → epoch ms the condition became continuously true`.
+ *
+ * A `Map`, not a `Record`, and that is a correctness choice rather than a style one — it mirrors
+ * `goalContinuationRunner`'s `IdleClock = ReadonlyMap`. A plain object resolves `Object.prototype`
+ * members, so a key like `"constructor"` reads back an inherited FUNCTION instead of `undefined`,
+ * `elapsedSince` computes `now - fn` and returns **NaN typed as number**, and `"__proto__"` fails a
+ * second way (the write is silently discarded while the read still answers non-undefined).
+ *
+ * That defeats this module's whole contract: `undefined` is supposed to be the fail-closed answer,
+ * and NaN is not `undefined`. A `Map` has no prototype chain, so the class of bug does not exist.
+ */
+export type SinceClock = ReadonlyMap<string, number>;
 
 /**
  * Advance a since-clock by one observation.
@@ -45,11 +56,10 @@ export function trackSince(
   prev: SinceClock | undefined,
   activeKeys: readonly string[],
   now: number,
-): Record<string, number> {
-  const before = prev ?? {};
-  const next: Record<string, number> = {};
+): Map<string, number> {
+  const next = new Map<string, number>();
   for (const key of activeKeys) {
-    next[key] = before[key] ?? now;
+    next.set(key, prev?.get(key) ?? now);
   }
   return next;
 }
@@ -63,7 +73,7 @@ export function trackSince(
  * absent input never manufactures a finding.
  */
 export function elapsedSince(clock: SinceClock | undefined, key: string, now: number): number | undefined {
-  const at = clock?.[key];
+  const at = clock?.get(key);
   if (at === undefined) return undefined;
   // A clock stamped in the future (a clock adjustment, a caller passing a stale `now`) reads as 0
   // rather than negative: a negative duration would render as "-3 minutes ago" in a challenge, and
