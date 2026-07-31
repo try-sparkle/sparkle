@@ -13,8 +13,8 @@
 // re-deriving it.
 import type { Phase } from "./wakeMachine";
 import { micIntentForMode, type SendMode } from "./sendMode";
+import { deriveMicState, type MicState } from "../components/MicButton";
 import type { FocusOwner } from "./dictationFocus";
-import type { MicIntent } from "../components/MicButton";
 
 /** The mutually-exclusive voice states a mic surface can be in. Ordered by the precedence
  *  deriveMicPresentation applies (see below). */
@@ -106,12 +106,36 @@ export function deriveMicPresentation(i: MicPresentationInput): MicPresentation 
 // function the tray's setter drives the microphone with, so "what the tray did to the mic" and
 // "what the indicator draws" are one expression evaluated twice, not two tables to keep aligned.
 // It also inherits that function's fail-closed default — an unrecognised persisted mode draws OFF.
+//
+// ── BUT THE POSITION IS NOT ALWAYS A TRUE STATEMENT ABOUT THE MICROPHONE ────────────────────────
+//
+// A first cut derived the indicator from the position and NOTHING else, and that was wrong in three
+// states — each one the indicator affirmatively contradicting the hardware, which is worse than the
+// desync it replaced:
+//
+//  1. ARMED ELSEWHERE. `useSendMode`'s reconcile deliberately stands down when the tray says Send
+//     and the mic is already on ("an unconditional reconcile would have the concierge mounting
+//     quietly switch off a microphone the user had just turned on somewhere else"). That divergence
+//     is guaranteed by design, and it survives a relaunch: `dictationStore` persists
+//     `{enabled, phase}` while `conciergeSendMode` defaults to `send`. The ring drew a slashed grey
+//     mic labelled "Microphone: off" beside a waveform strip sweeping with live audio.
+//  2. PREPARING. During the one-time model download the tray can sit on Speak while nothing can be
+//     heard yet. The ring drew the green live mic under a caption reading "Setting up voice (42%)"
+//     — and lost the download glyph, which MicButton documents as deliberately not a mic shape "so
+//     it cannot be mistaken for a ready mic at a glance".
+//  3. NOT CAPTURING. Focus-paused, or a backend error: same green mic, under "Listening paused…".
+//
+// So the position governs the INTENT and the hardware governs "can it actually hear you". The two
+// are composed in ONE ordered function ({@link micIndicatorFor}) rather than reconciled by the
+// component, and the composition is directional — every hardware input can only DEMOTE the claim,
+// never promote it. That is what preserves the original fix: nothing but the tray reaching `speak`
+// can put the ring on the live green mic, so the wake word still cannot turn Push to talk green.
 
-/** What the sidebar mic indicator shows: the tray position, in the mic's own vocabulary. */
+/** What the sidebar mic indicator shows. */
 export interface MicIndicator {
   /** The mic state to draw. Feed to `micVisual` (components/MicButton) for colour + glyph — the
    *  same table the tray paints its own pills from, which is what makes the two the same colour. */
-  state: MicIntent;
+  state: MicState;
   /** The indicator's accessible name. It is NOT a control, so this names a STATE ("Microphone:
    *  actively listening") rather than an action ("Pause listening") — a name that promises an
    *  action on something that does not respond to one is worse than no name at all. */
@@ -120,40 +144,106 @@ export interface MicIndicator {
 
 /** Keyed by the derived STATE, never by the mode. Both halves of {@link MicIndicator} therefore
  *  come from the same value, so the words and the glyph cannot describe different things — the
- *  failure this module exists to prevent, one layer down. */
-export const MIC_INDICATOR_LABEL: Record<MicIntent, string> = {
+ *  failure this module exists to prevent, one layer down.
+ *
+ *  `paused` is worded for the STATE and not for Push to talk, even though that is its commonest
+ *  cause: focus-paused Speak and an armed-elsewhere mic reach it too, and "push to talk" would be
+ *  false in both. The position's own name is on the tray, and the caption says it in words. */
+export const MIC_INDICATOR_LABEL: Record<MicState, string> = {
   active: "Microphone: actively listening",
-  paused: "Microphone: push to talk",
+  paused: "Microphone: on, not listening",
+  preparing: "Microphone: setting up voice",
   off: "Microphone: off",
 };
 
+/** The hardware facts the tray position cannot know. Field names mirror {@link MicPresentationInput}
+ *  deliberately — they are the same store fields, read for a different question. */
+export interface MicIndicatorInput {
+  /**
+   * WHO HOLDS THE CARET. A terminal is not "quieter capture" — it is NO capture for this box, so the
+   * ring must read exactly as it does in Send.
+   *
+   * The founder's rule, verbatim: "when listening is paused because my caret is in a terminal, the
+   * mic must show the gray off icon — the microphone with a line struck through it — EXACTLY as it
+   * does in Send mode. Same icon, same gray, no separate treatment." His reasoning is that what he
+   * needs from this glyph is BINARY — is the mic taking my voice or not — and a distinct "paused"
+   * treatment invents a third state he has to learn in order to reach the same conclusion.
+   *
+   * This is deliberately NOT folded into the `status`-based demotion below, which lands on "paused"
+   * (amber). Amber is the right answer for a mic that is armed and merely between utterances; it is
+   * the wrong answer for one whose words are going nowhere. The REASON still gets said in the
+   * caption underneath, which is where an explanation belongs.
+   *
+   * Optional, defaulting to "other", so every existing call site keeps its meaning and the default
+   * can only ever UNDER-claim a pause, never invent one.
+   */
+  focusOwner?: FocusOwner;
+  /**
+   * Can a committed phrase actually be TYPED into that focused terminal right now?
+   *
+   * THIS IS WHAT TURNS A TERMINAL FROM A PAUSE INTO A DESTINATION, and without it the rule above
+   * over-applies (roborev 56699). `useDictation` routes committed phrases into the focused terminal
+   * whenever `terminalRoutingArmed()` holds, and every other surface already carries the term so
+   * they cannot disagree: `armedStatus` keeps `status: "listening"`, `dictationPauseReason` returns
+   * null, and `deriveMicPresentation` yields `activeListening`. Demoting unconditionally therefore
+   * painted a grey struck-through ring named "Microphone: off" directly beneath the live caption
+   * "Actively listening — just say <stop> to finish", over a waveform sweeping with real audio —
+   * the mic denying hardware that was at that moment transcribing the user's speech.
+   *
+   * The founder's rule is scoped to "when listening is PAUSED because my caret is in a terminal".
+   * A routing terminal is not paused, and there the binary question the glyph answers — is the mic
+   * taking my voice — answers YES.
+   *
+   * Defaults false so every existing caller keeps the original meaning; the caller that flips it is
+   * the one that also owns the delivery (dictationFocus `terminalRoutingArmed`).
+   */
+  terminalRoutes?: boolean;
+  /** The mic is genuinely armed. Diverges from the position ONLY in the stand-down case above. */
+  enabled: boolean;
+  /** Whether the backend is ACTUALLY capturing. */
+  status: "idle" | "listening" | "error";
+  /** Which phase the wake machine is in. Read ONLY to describe a mic the tray does not govern. */
+  phase: Phase;
+  /** Non-null only while the one-time voice-model download is running. */
+  modelProgress: { done: number; total: number | null } | null;
+}
+
 /**
- * THE indicator's whole presentation: the tray position, GATED ON WHETHER AUDIO IS ACTUALLY BEING
- * CAPTURED.
+ * THE indicator's whole presentation: the tray position, demoted by what the hardware is doing.
  *
- * ── WHY THE FOCUS OWNER IS AN INPUT ─────────────────────────────────────────────────────────────
- * The founder's rule, stated directly: the mic glyph is a function of "is audio being captured right
- * now", NOT of which position the tray is parked at. Those coincide everywhere except one place —
- * the caret sitting in a terminal — and there they diverge hard: Speak keeps its `active` intent
- * while `voice/dictationFocus` has already stopped the composer route, so a position-only reading
- * paints a live green mic over a pipeline sending the user's voice somewhere else entirely.
- *
- * A terminal therefore draws the SAME grey struck-through glyph as Send. That is deliberate and it
- * is not a lost distinction: what the user needs from this glyph is binary — is the mic taking my
- * voice or not — and a third "paused" treatment invents a state they have to learn in order to
- * conclude the same thing. The REASON still gets said, in the caption underneath
- * (`dictationCopy.pausedCaption`), which is where an explanation belongs.
- *
- * `FocusOwner` rather than a boolean so this reads the shipped classifier's own vocabulary
- * (`classifyFocusOwner`), and so a future owner that is neither terminal nor composer has somewhere
- * to land without changing this signature.
+ * Precedence, highest first:
+ *   1. preparing — a model still coming down cannot hear you, whatever the tray says. Draws the
+ *      download glyph, which is deliberately not a mic shape.
+ *   2. the tray released the mic but it is ON anyway — the stand-down case. The tray is not
+ *      governing this microphone, so the ring reports the MIC (via the shipped `deriveMicState`)
+ *      rather than a position that is not describing it. This is the one path that can reach a
+ *      green mic without the tray saying Speak, and only when capture is genuinely live and the
+ *      wake machine is genuinely in the active phase — i.e. only when it is simply true.
+ *   3. the tray is armed (ptt/speak) but capture is NOT live — focus-paused, or an error. Amber,
+ *      never green: green claims we are hearing you and nothing is being heard.
+ *   4. otherwise the position, unmodified.
  */
-export function micIndicatorForMode(mode: SendMode, focusOwner: FocusOwner = "other"): MicIndicator {
-  // Defaulted so every existing call site keeps its current meaning; the sidebar passes the live
-  // value. A default of "other" is the safe direction — it can only ever OVERSTATE the position's
-  // own intent, never invent capture that is not happening.
-  const state: MicIntent = focusOwner === "terminal" ? "off" : micIntentForMode(mode);
+export function micIndicatorFor(mode: SendMode, i: MicIndicatorInput): MicIndicator {
+  const state = indicatorState(mode, i);
   return { state, label: MIC_INDICATOR_LABEL[state] };
+}
+
+function indicatorState(mode: SendMode, i: MicIndicatorInput): MicState {
+  if (i.modelProgress !== null && i.enabled) return "preparing";
+  // A terminal that CANNOT take the phrase outranks every position: nothing is reaching any box, so
+  // the ring says "off" — the same grey struck-through glyph Send draws. Placed AFTER `preparing` on
+  // purpose: an in-flight model download is a truer thing to say about the mic than where the caret
+  // happens to be.
+  //
+  // `!i.terminalRoutes` is load-bearing, not defensive. dictationFocus states the contract outright:
+  // anything deciding whether a terminal is a destination calls `terminalRoutingArmed`. This is the
+  // fourth consumer of that fact, and the three that already carry it are why the surfaces agree.
+  if (i.focusOwner === "terminal" && !i.terminalRoutes) return "off";
+  const intent = micIntentForMode(mode);
+  // `modelProgress` is passed as null: case 1 above already claimed that state, so this call is
+  // only ever asked the paused-vs-active question.
+  if (intent === "off") return i.enabled ? deriveMicState(true, i.status, i.phase, null) : "off";
+  return i.status === "listening" ? intent : "paused";
 }
 
 /** Which caption the sidebar shows under the waveform, once the health ladder above has been

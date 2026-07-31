@@ -311,6 +311,55 @@ describe("LogoWaveform — the mic indicator is a read-out of the send tray", ()
     expect(screen.queryByRole("menu", { name: "Microphone mode" })).toBeNull();
   });
 
+  it("never claims OFF over a live capture — the mic armed from another surface", () => {
+    // The state useSendMode's reconcile deliberately creates (it stands down rather than release a
+    // mic armed elsewhere), and it SURVIVES A RELAUNCH: dictationStore persists {enabled, phase}
+    // while conciergeSendMode defaults to "send". Deriving the ring from the position alone drew a
+    // slashed grey mic labelled "Microphone: off" beside a waveform strip sweeping with real audio.
+    useUiStore.setState({ conciergeSendMode: "send" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).not.toMatch(/off/i);
+    const probe = document.createElement("span");
+    probe.style.color = C.muted;
+    expect(ring().style.color).not.toBe(probe.style.color);
+  });
+
+  it("never draws a READY mic while the voice model is still downloading", () => {
+    // MicButton documents the download glyph as deliberately not a mic shape, "so it cannot be
+    // mistaken for a ready mic at a glance". The position cannot know a download is in flight, so
+    // deriving from it alone painted the green live mic under "Setting up voice (50%)".
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      modelProgress: { done: 241_000_000, total: 482_000_000 },
+    });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).toMatch(/setting up voice/i);
+    // The caption directly beneath says the same thing, rather than arguing with it.
+    expect(document.body.textContent).toContain("Setting up voice (50%)");
+  });
+
+  it("never draws the live GREEN mic while capture is focus-paused", () => {
+    // Speak with `status: "idle"` — armed, not capturing. The caption reads "Listening paused…",
+    // and a green mic above it would be the adjacent-elements contradiction, one state over.
+    const probe = document.createElement("span");
+    probe.style.color = C.successInk;
+    const GREEN = probe.style.color;
+    probe.style.color = C.amber;
+    const ORANGE = probe.style.color;
+    expect(GREEN).not.toBe(ORANGE);
+
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "idle", phase: "active" });
+    render(<LogoWaveform />);
+    expect(ring().style.color).toBe(ORANGE);
+    expect(ring().getAttribute("aria-label")).not.toMatch(/actively listening/i);
+    expect(document.body.textContent).toMatch(/Listening paused/);
+  });
+
   it("names the STATE it is showing, so a screen reader is not promised an action", () => {
     useUiStore.setState({ conciergeSendMode: "speak" });
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
@@ -334,17 +383,25 @@ describe("LogoWaveform — the mic indicator is a read-out of the send tray", ()
 });
 
 describe("LogoWaveform — out of credits", () => {
-  it("this surface cannot arm the mic at all while out of credits — there is nothing to press", () => {
+  it("this surface offers NO arming affordance at all — the refusal moved to the tray with the arm", () => {
     // The refusal itself (`shouldBlockMicArm`) now lives entirely on the tray's path: this sidebar
     // stopped being a mic control, so the arm it used to attempt cannot be attempted from here.
-    // Asserted as the absence of any control that would try, plus the store staying put under a
-    // click on everything this surface still renders.
+    //
+    // Asserted as the ABSENCE OF THE AFFORDANCE, not as "enabled stayed false" — that was already
+    // true before the click and passes against the pre-change component too (the old control
+    // refused the arm and left `enabled` false), which is the canonical vacuous shape AGENTS.md
+    // names. The claim this test's name makes is "there is nothing to press", so it asserts that.
     useAuthStore.setState({ me: null }); // no credits
     useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: false });
-    const { container } = render(<LogoWaveform />);
-    for (const b of Array.from(container.querySelectorAll("button"))) fireEvent.click(b);
-    fireEvent.click(document.querySelector('[data-hint="mic"]') as HTMLElement);
-    expect(useDictationStore.getState().enabled).toBe(false);
+    render(<LogoWaveform />);
+    // No control anywhere on this surface whose name offers to operate the microphone.
+    expect(
+      screen.queryByRole("button", { name: /microphone|listening|dictat|voice|activate/i }),
+    ).toBeNull();
+    // …and the ring specifically is a read-out, not a button that merely renamed itself.
+    const ring = document.querySelector('[data-hint="mic"]') as HTMLElement;
+    expect(ring.getAttribute("role")).toBe("img");
+    expect(ring.tagName).not.toBe("BUTTON");
   });
 
   it("clicking Refill deep-opens the ⋯ settings dialog on the Credits pane", () => {

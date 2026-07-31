@@ -86,6 +86,11 @@ const commits = (box: Box, text: string) =>
   });
 /** The engine's endpoint decision. Always AFTER the transcript it belongs to — see the header. */
 const speechEnds = () => act(() => useDictationStore.getState().noteSpeechEnd());
+/**
+ * The mic meter, ~25×/sec for the whole capturing window (`LEVEL_EMIT_INTERVAL` = 40ms, dictation.rs)
+ * — UNRELATED to the transcript, but a store write like any other, so the watch's subscriber sees it.
+ */
+const levelTicks = () => act(() => useDictationStore.getState().setLevel(Math.random()));
 
 /** Let the queued macrotask (the send) and its render run. */
 async function flush() {
@@ -251,6 +256,102 @@ describe("a release waits for the words he already said", () => {
     expect(box.sent, "the send must not wait for a close that has already happened").toEqual([
       "ship it",
     ]);
+  });
+
+  it("ON-DEVICE: the VAD dropping is not the same as the transcript arriving", async () => {
+    // The on-device path has NO `interim` at all (only cloud.rs emits it) and Silero's VAD drops
+    // `speaking` at 250ms of silence, while the Whisper decode that actually produces the segment's
+    // `dictation://partial` can lag hundreds of ms to seconds behind that drop. A release read at
+    // "the room is quiet right now" lands in exactly that gap: the VAD has dropped, there is nothing
+    // to preview (there never was, on this path), and the transcript has not arrived yet. That is
+    // the case a bare `quiet` fast-path check gets wrong — it has nothing left to distinguish "never
+    // spoke" from "spoke, decode still pending" once the VAD has dropped, which is why the debt has
+    // to be a watch, not a keyup-time read.
+    const { box } = setup();
+    down();
+    vad(true); // he starts talking, mic captures audio
+    vad(false); // 250ms of silence — Silero closes, decode is still running
+    up(); // released right after — nothing has been transcribed yet
+
+    expect(box.sent, "the VAD dropping must not be read as the transcript having landed").toEqual(
+      [],
+    );
+
+    // The decode finally finishes: the segment's own partial-then-speech-end pair.
+    commits(box, "restart the server");
+    speechEnds();
+    await flush();
+
+    expect(box.sent).toEqual(["restart the server"]);
+  });
+
+  it("ON-DEVICE: a SECOND queued segment is not discarded by the FIRST one's close", async () => {
+    // Two closed-but-undecoded segments can coexist when Whisper's decode lags the audio: "restart
+    // the server" <VAD closes, quiet> "now" <VAD closes again, quiet> — both fully captured before
+    // the key ever comes up. A debt that only remembers ONE outstanding run confirms itself the
+    // instant the FIRST segment's close lands in a now-quiet room, and the second segment — "now" —
+    // is discarded outright. Both must land.
+    const { box } = setup();
+    down();
+    vad(true); // segment 1 starts
+    vad(false); // segment 1's VAD closes
+    vad(true); // segment 2 starts
+    vad(false); // segment 2's VAD closes
+    up(); // both captured, neither decoded yet
+
+    expect(box.sent, "nothing to send until at least the first decode lands").toEqual([]);
+
+    // Segment 1 finishes decoding first — the room is quiet, so this confirms IMMEDIATELY, but only
+    // for the one run it belongs to.
+    commits(box, "restart the server");
+    speechEnds();
+    await flush();
+    expect(box.sent, "segment 2 is still owed — its own close hasn't landed").toEqual([]);
+
+    // Segment 2 finishes.
+    commits(box, "now");
+    speechEnds();
+    await flush();
+
+    expect(box.sent).toEqual(["restart the server now"]);
+  });
+
+  it("CLOUD RACE: the final clause's own speech-end can land before the VAD confirms — it still resolves, not stalls", async () => {
+    // Deepgram's `speech_final` rides a Results frame ~200ms after the last word (plus network RTT);
+    // Silero drops `speaking` at 250ms. On a fast connection the bump for the FINAL clause can land
+    // while the local VAD still reads speech — and `speech_end_action` dedupes to one speech-end per
+    // utterance, re-arming only on a fresh interim/non-final partial, so if settling required the
+    // bump and quiet to coincide in the very same event, no SECOND bump would ever arrive: the wait
+    // would silently run the full cap on this perfectly ordinary release. It must resolve the moment
+    // the VAD catches up instead — well inside the cap, with no interim and no second bump.
+    const { box } = setup();
+    down();
+    vad(true);
+    up();
+
+    commits(box, "ship it");
+    speechEnds(); // the bump for the only clause — but the VAD hasn't caught up yet
+    await flush();
+    expect(box.sent, "a bump while still noisy must not settle on its own").toEqual([]);
+
+    // THE METER KEEPS TICKING while he's still (apparently) speaking — ~25×/sec in production, and
+    // each one is a store write the watch's subscriber sees, same as any other. An earlier version
+    // treated any tick where `speaking` READ true as fresh evidence and cleared the deferred close —
+    // which every one of these ticks would do, since `speaking` hasn't dropped yet — destroying the
+    // confirmation within 40ms of it being armed and stranding this release on the cap.
+    levelTicks();
+    levelTicks();
+    levelTicks();
+    await flush();
+    expect(box.sent, "unrelated meter ticks must not disturb the deferred close").toEqual([]);
+
+    vad(false); // no second bump is coming — the VAD confirming quiet is what resolves this
+    await flush();
+
+    expect(box.sent, "confirmed by the VAD catching up, not by the cap").toEqual(["ship it"]);
+    // Prove it wasn't the cap: nothing left to advance into.
+    await advance(PARTIAL_SETTLE_CAP_MS);
+    expect(box.sent).toEqual(["ship it"]);
   });
 });
 

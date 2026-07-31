@@ -5,10 +5,11 @@ import { FiAlertTriangle } from "react-icons/fi";
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
+import { terminalRoutingArmed } from "../voice/dictationFocus";
 import {
   deriveMicPresentation,
   micCaptionKind,
-  micIndicatorForMode,
+  micIndicatorFor,
 } from "../voice/micPresentation";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -30,12 +31,14 @@ import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
 import { useAudioInputSync } from "../services/audioInputs";
 import { BoundDeviceCaption } from "./BoundDeviceCaption";
-import { WAVE_HEIGHT } from "./waveGeometry";
 
 // Many thin slivers (was 28 fat bars) so the meter reads as a dense, lively waveform
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
 // it shifts one number per frame and React diffs flat <span>s.
 const BAR_COUNT = 140;
+// Overall height of the waveform strip. Bars are mirrored about the vertical center
+// (they grow up AND down from the middle), so a single bar can reach this full height.
+const WAVE_HEIGHT = 56;
 
 /**
  * Map a raw RMS audio level → bar-height fraction in [0,1].
@@ -123,8 +126,8 @@ export function captionFor(
  * gradient sweep while ACTIVE.
  *
  * NOTHING HERE IS A MIC CONTROL ANY MORE. The three-position send tray is the only one, and every
- * surface in this component derives from its position (voice/micPresentation `micIndicatorForMode`
- * / `micCaptionKind`). The mic ring, the waveform strip and the caption all used to be click
+ * surface in this component derives from its position (voice/micPresentation `micIndicatorFor` /
+ * `micCaptionKind`). The mic ring, the waveform strip and the caption all used to be click
  * targets that moved `enabled`/`phase` behind the tray's back — three ways to put the tray and the
  * microphone into states that contradicted each other, which is exactly what this change deletes.
  * They are now read-outs: no onClick, no hover pill, no toggle.
@@ -141,19 +144,11 @@ export function LogoWaveform() {
   // its payload thrown away — this is the only consumer of it in the app, so the real cause of
   // every voice failure was unreachable to the user (see the render branch below).
   const errorNotice = useMemo(() => voiceErrorNotice(error), [error]);
-  // THE one state both this indicator and the send tray are read from: the tray's own position.
-  // Not the dictation store — see the header of voice/micPresentation's indicator section for why
-  // reading `enabled`/`phase` here is what let the glyph go green under a tray reading "Push to
-  // talk". The tray writes this same value and drives the microphone from it.
+  // THE state this indicator and the send tray share: the tray's own position. Reading `phase` for
+  // it — as this component used to — is what let the glyph go green under a tray parked on "Push to
+  // talk", because the wake matcher moves `phase` with no gesture anywhere. The tray writes this
+  // value and drives the microphone from it, so there is exactly one thing to read.
   const sendMode = useUiStore((s) => s.conciergeSendMode);
-  // …AND who holds the caret, because the glyph answers "is audio being captured right now", not
-  // "which position is the tray parked at". Those coincide everywhere except a terminal, where the
-  // routing gate has already stopped the composer route while the tray still reads Speak — the one
-  // case where a position-only reading paints a live green mic over a pipeline that is not feeding
-  // this box. The store's MIRROR is the right source here (unlike routing, which re-reads the DOM):
-  // this is paint, and the mirror is what re-renders the indicator when the caret moves.
-  const focusOwner = useDictationStore((s) => s.focusOwner);
-  const indicator = micIndicatorForMode(sendMode, focusOwner);
   // The out-of-credits notice is shared transient state, so it shows here AND in the composer at
   // once. When set, it takes priority over the normal mic caption below.
   const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
@@ -296,14 +291,38 @@ export function LogoWaveform() {
   // above takes, so the two can never argue. See voice/micPresentation `micCaptionKind`.
   const captionKind = micCaptionKind(sendMode);
 
-  // Mic tint + icon come from the shared tri-state mapping (MicButton.micVisual) — the same table
-  // the send tray paints its own pills from, which is what makes "Speak" and the mic the identical
-  // green. `false` for hover is not a placeholder: this is an INDICATOR, so there is no hover cue
-  // to give, because there is nothing a click would do.
-  //   speak → live open mic, successInk GREEN
+  // The tray position, demoted by what the hardware is actually doing (voice/micPresentation
+  // `micIndicatorFor` — its precedence note is the whole story). The position alone was not enough:
+  // it cannot know that a model is still downloading, that capture is focus-paused, or that a mic
+  // armed from another surface is on while the tray reads Send.
+  //   speak → live open mic, successInk GREEN   (only while capture is genuinely live)
   //   ptt   → mic + pause bars, amber ORANGE
-  //   send  → slashed mic, muted GREY
-  // The ring paints both its glyph color AND its border from micVis.color.
+  //   send  → slashed mic, muted GREY           (unless a mic the tray does not govern is on)
+  // …plus WHO HOLDS THE CARET. A terminal is not quieter capture, it is none for this box, so the
+  // ring draws the same grey struck-through glyph Send does. The store's MIRROR is the right source
+  // here (unlike routing, which re-reads the DOM): this is paint, and the mirror is what re-renders
+  // the indicator when the caret moves.
+  const focusOwner = useDictationStore((s) => s.focusOwner);
+  const indicator = micIndicatorFor(sendMode, {
+    enabled,
+    status,
+    phase,
+    modelProgress,
+    focusOwner,
+    // …and whether that terminal is RECEIVING the phrase, through the shipped predicate rather than
+    // a re-spelled `&&`. A terminal being typed into is not a pause, and a ring reading
+    // "Microphone: off" under the live "Actively listening" caption would be the mic denying
+    // hardware that is transcribing (roborev 56699).
+    terminalRoutes: terminalRoutingArmed({
+      enabled,
+      errored: status === "error",
+      woken: phase === "active",
+    }),
+  });
+  // Colour + glyph from the shared mapping (MicButton.micVisual) — the same table the send tray
+  // paints its own pills from, which is what makes "Speak" and the mic the identical green. `false`
+  // for hover is not a placeholder: this is an INDICATOR, so there is no hover cue to give, because
+  // there is nothing a click would do. The ring paints its glyph color AND its border from it.
   const micVis = micVisual(indicator.state, false);
   const micColor = micVis.color;
   const micBorder = micVis.color;

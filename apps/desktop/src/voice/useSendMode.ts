@@ -183,21 +183,45 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   // it off rather than leaving a send armed against a hold that no longer exists.
   const settling = useRef<(() => void) | null>(null);
 
-  // ── THE HOLD'S UTTERANCE WATCH — "did this hold capture any audio at all?" ───────────────────
+  // ── THE HOLD'S UTTERANCE WATCH — "how many captured runs still owe a transcript?" ──────────────
   //
   // Live for the whole gesture, because `endHold` has to answer that in the keyup's own tick and
-  // nothing readable at that instant answers it on its own. `spoke` is the only thing tracked here:
-  // whether ANY audio was captured during this hold. It is what lets a silent hold skip the wait
-  // entirely — everything else `endHold` needs ("is a close final, or just one clause of many") is
-  // read LIVE at the moment it matters, not accumulated here, for the reason in `endHold`'s own doc.
+  // nothing readable at that instant answers it on its own.
   //
-  // THE VAD IS READ AS A LEVEL, NEVER AS AN EDGE. `dictationStore.speaking` is the raw Silero VAD on
-  // both capture paths (dictation.rs `frame_speaking` ignores `cloud_active`). Rust emits it only on
-  // a CHANGE, so speech already in progress when the hold starts produces no event for this watch to
-  // see — hence the level is read at the START too (`seeded` below), not only from the subscription.
+  // A COUNT, NOT A FLAG — a single boolean debt cannot represent more than one outstanding run, and
+  // the on-device path can genuinely owe two: Whisper's decode runs "hundreds of ms behind the audio"
+  // (dictationStore.onDeviceSpeech), so "restart the server" <VAD closes, quiet> "now" <VAD closes
+  // again, quiet> can both be fully CAPTURED, with NEITHER transcript decoded yet, before the key is
+  // released. A single flag confirmed by the first segment's bump-while-quiet would discard the
+  // second — still-queued — segment outright.
+  //
+  // `owed` counts RUNS: incremented on a genuine QUIET→NOISY transition (`wasQuiet && nowNoisy`,
+  // computed from the store's own before/after, not a re-read of an unchanged level), decremented by
+  // exactly one per confirmed close. A close (`speechEndSeq` bump) confirms immediately if the room
+  // is quiet in that same event; if it lands while still noisy — one clause of several within a
+  // single continuous run, or the cloud race below — the confirmation is DEFERRED (`deferred`) until
+  // whatever LATER event first finds the room quiet, which then discharges every deferred close at
+  // once (a run that has gone fully quiet has, by construction, had every one of its clauses commit).
+  //
+  // NEITHER COUNTER MOVES ON A RE-OBSERVATION OF STATE THAT DID NOT CHANGE, and that is what makes
+  // this survive `dictation://level`: it is forwarded to `setLevel` roughly 25×/sec for the whole
+  // capturing window (LEVEL_EMIT_INTERVAL = 40ms, dictation.rs), and this subscriber runs on EVERY
+  // store update, not just the fields it cares about. An earlier version reset a "close is still
+  // awaiting quiet" flag on any tick where `speaking` READ true — which included every level tick
+  // during ordinary ongoing speech, destroying the deferred confirmation within 40ms of it being set
+  // and silently reopening the cloud race the deferral exists to close (roborev, on the commit before
+  // this one). `wasQuiet`/`nowNoisy` are computed from `prev`/`s` directly, so an update that leaves
+  // `speaking`/`interim` unchanged computes the same answer either side of it and moves nothing.
+  //
+  // THE VAD IS READ AS A LEVEL AT THE START, never only from the subscription. `dictationStore.speaking`
+  // is the raw Silero VAD on both capture paths (dictation.rs `frame_speaking` ignores `cloud_active`),
+  // and Rust emits it only on a CHANGE — speech already in progress when the hold starts produces no
+  // event for this watch to see, so the seed below counts it as a run already underway.
   const utterance = useRef<{
-    /** Any audio at all captured during this hold. `false` means there is nothing to drain. */
-    spoke: boolean;
+    /** Captured runs whose transcript is not yet confirmed dispatched. `0` ⇒ safe to send. */
+    owed: number;
+    /** Closes that landed while still noisy, awaiting the room going quiet to discharge them. */
+    deferred: number;
     unsub: () => void;
   } | null>(null);
 
@@ -209,11 +233,20 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   const startUtteranceWatch = useCallback(() => {
     stopUtteranceWatch();
     const st = useDictationStore.getState();
-    // ALREADY MID-WORD WHEN THE KEY WENT DOWN counts from frame one. The mic is armed between holds
-    // (it listens for the wake word), so `speaking` can already be true when the gesture starts.
-    const u = { spoke: st.speaking || st.interim !== "", unsub: () => {} };
-    u.unsub = useDictationStore.subscribe((s) => {
-      if (s.speaking || s.interim) u.spoke = true;
+    // ALREADY MID-WORD WHEN THE KEY WENT DOWN counts as one run from frame one — see the doc above.
+    const u = { owed: st.speaking || st.interim !== "" ? 1 : 0, deferred: 0, unsub: () => {} };
+    u.unsub = useDictationStore.subscribe((s, prev) => {
+      const wasQuiet = !prev.speaking && prev.interim === "";
+      const nowNoisy = s.speaking || s.interim !== "";
+      if (wasQuiet && nowNoisy) u.owed += 1;
+      if (s.speechEndSeq !== prev.speechEndSeq) {
+        if (nowNoisy) u.deferred += 1;
+        else u.owed = Math.max(0, u.owed - 1);
+      }
+      if (!nowNoisy && u.deferred > 0) {
+        u.owed = Math.max(0, u.owed - u.deferred);
+        u.deferred = 0;
+      }
     });
     utterance.current = u;
   }, [stopUtteranceWatch]);
@@ -300,19 +333,19 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    * IT IS PER CLAUSE, NOT PER HOLD, AND THAT IS THE TRAP. `speech_end_action` emits on every
    * `speech_final` frame and re-arms on the next interim, so at `endpointing=200` a mid-sentence
    * breath produces one while the user is still talking. "A speech-end arrived" therefore does NOT
-   * mean the utterance is over — only that SOME clause is. What makes it mean the utterance is a
-   * LIVE quiet check made at the moment each bump is observed: `!speaking && !interim`, read from
-   * that same event, both at the keyup (the fast path, below) and inside the wait's own subscriber.
-   * A bump that lands while either reads true is one clause of several, not the last one, and is not
-   * treated as final — the wait keeps running for a later, quieter bump, bounded by the cap.
-   *
-   * A LIVE READ, NOT A REMEMBERED ONE, is what keeps this correct across repeated bumps: the CURRENT
-   * event's own `speaking`/`interim` are what decide it, so a bump that closed mid-sentence cannot be
-   * mistaken for final just because a later, UNRELATED quiet tick happens to follow it — nothing
-   * settles until a bump and quiet coincide in the SAME event.
+   * mean the utterance is over — only that SOME clause is, and on the on-device path it can even be
+   * one of SEVERAL still-queued segments. What makes it mean everything captured has landed is
+   * `utterance.owed`, the watch's own counted debt: it reaches zero only once every run's close has
+   * been confirmed against a moment the room was quiet — the same event as the close, or, for the
+   * cloud race where a close can outrun the VAD's slower drop, whatever LATER event first finds the
+   * room quiet. See the watch's own doc for why this has to be an accumulated, counted debt and NOT a
+   * live "is it quiet right now" read: that reopens the bug on the on-device path (quiet-but-still-
+   * decoding) exactly as badly as it reopens it on the cloud path (the confirming close deduped away,
+   * so only the cap would ever fire) — and why a single flag isn't enough either, once a hold can
+   * genuinely owe more than one segment at release time.
    *
    * WE ONLY WAIT WHEN SOMETHING IS ACTUALLY OUTSTANDING — a hold that captured no audio at all
-   * (`utterance.spoke`) never enters the wait.
+   * (`utterance.owed` stays `0`) never enters the wait.
    *
    * THE MACROTASK IS STILL LOAD-BEARING. `submit` reads `text` from React state as of the last
    * render, so the insert triggered by the preceding `dictation://partial` needs its RE-RENDER to
@@ -344,12 +377,10 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         applyIntent(micIntentForMode(useUiStore.getState().conciergeSendMode));
       };
       // ── THE FAST PATH: IS THERE ANYTHING LEFT TO DRAIN? ──────────────────────────────────────
-      // Skipped only when the answer is clearly no: nothing was ever captured, or the room is quiet
-      // RIGHT NOW — read live, at the instant of the keyup. While the VAD still hears speech, or an
-      // interim is outstanding, he may be mid-sentence, so neither counts as "done" on its own.
-      const at = useDictationStore.getState();
-      const quiet = !at.speaking && at.interim === "";
-      if (!send || !utterance.current?.spoke || quiet) {
+      // Skipped only when the watch's own debt says there is nothing to drain: nothing was ever
+      // captured, or every captured run's close has already been confirmed. NOT a live "is it quiet
+      // right now" read — see the watch's doc for why that reopens the bug on the on-device path.
+      if (!send || !utterance.current || utterance.current.owed <= 0) {
         finish();
         return;
       }
@@ -365,15 +396,15 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         wait.unsub?.();
         finish();
       };
-      wait.unsub = useDictationStore.subscribe((s, prev) => {
-        // React ONLY to a fresh close (a `speechEndSeq` change on THIS event), not to `speaking` or
-        // `interim` changing on their own — see the doc above for why a bare quiet tick must not be
-        // able to settle a wait that no bump has closed. `s`/`prev` are this exact event's values, so
-        // the quiet check below is a LIVE read at the moment of THIS bump, not a remembered one.
-        if (s.speechEndSeq === prev.speechEndSeq) return;
-        if (s.speaking || s.interim) return;
-        // A close that arrived with nothing heard AT THAT SAME MOMENT — so its committed text has
-        // already been dispatched and no later clause is outstanding. Yield a macrotask so the
+      wait.unsub = useDictationStore.subscribe(() => {
+        // The watch's own subscriber (registered earlier, in `onHoldStart`) has already run for this
+        // exact event by the time this one does — zustand notifies subscribers in registration order
+        // — so `utterance.current.owed` already reflects it: every run confirmed clear (each close
+        // coinciding with quiet, now or deferred from an earlier noisy bump), or something still
+        // outstanding. This proxies the watch rather than re-deriving the decision, so there is
+        // exactly one place that makes it.
+        if ((utterance.current?.owed ?? 0) > 0) return;
+        // Confirmed clear — every committed run has already been dispatched. Yield a macrotask so the
         // insert's render lands first, then send.
         setTimeout(settle, 0);
       });
