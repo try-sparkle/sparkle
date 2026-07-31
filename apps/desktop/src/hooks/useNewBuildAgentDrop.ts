@@ -19,10 +19,12 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 import {
   isOverDndTarget,
   NEW_BUILD_AGENT_DND_TARGET,
+  noteDropArrived,
   reportDropWithNoTarget,
 } from "../services/dndTargets";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { describePaths } from "../services/logSafePaths";
+import { withDropPaths } from "../services/dropPaths";
 import { log } from "../logger";
 import type { Project } from "../types";
 
@@ -45,6 +47,7 @@ export function useNewBuildAgentDrop(project: Project | null): void {
           setBuildAgentHover(false);
         } else if (p.type === "drop") {
           setBuildAgentHover(false);
+          noteDropArrived(p.position, p.paths);
           if (!isOverDndTarget(p.position, NEW_BUILD_AGENT_DND_TARGET)) {
             // Not ours — usually because another target owns it, in which case this is silent.
             // It only speaks up when the drop matched NOTHING, which is the coordinate-space bug
@@ -52,18 +55,21 @@ export function useNewBuildAgentDrop(project: Project | null): void {
             reportDropWithNoTarget(p.position);
             return;
           }
-          const paths = p.paths ?? [];
-          if (paths.length === 0) return;
-          const id = spawnRef.current();
-          if (!id) return; // no project open — no button rendered either; nothing to do
-          // Kinds, never paths — the log ships with support tickets and crash reports
-          // (see services/logSafePaths).
-          log.info("composer", `dropped ${paths.length} file(s) on + New Build Agent`, {
-            agentId: id,
-            ...describePaths(paths),
+          // Recovered rather than silently discarded when the drag carried no paths — see
+          // services/dropPaths. The spawn happens AFTER the paths resolve, deliberately: spawning
+          // first would leave an empty agent behind for a drag that turns out to carry no file.
+          withDropPaths(p.paths, "new-build-agent", (paths) => {
+            const id = spawnRef.current();
+            if (!id) return; // no project open — no button rendered either; nothing to do
+            // Kinds, never paths — the log ships with support tickets and crash reports
+            // (see services/logSafePaths).
+            log.info("composer", `dropped ${paths.length} file(s) on + New Build Agent`, {
+              agentId: id,
+              ...describePaths(paths),
+            });
+            // The new composer hasn't mounted yet — queue the paths for it to drain on mount.
+            usePendingAttachmentsStore.getState().add(id, paths);
           });
-          // The new composer hasn't mounted yet — queue the paths for it to drain on mount.
-          usePendingAttachmentsStore.getState().add(id, paths);
         }
       })
       .catch((e) => {

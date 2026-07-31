@@ -36,9 +36,11 @@ import {
 import {
   CONCIERGE_COLUMN_DND_TARGET,
   isOverDndTarget,
+  noteDropArrived,
   reportDropWithNoTarget,
 } from "../services/dndTargets";
 import { describePaths } from "../services/logSafePaths";
+import { withDropPaths } from "../services/dropPaths";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { log } from "../logger";
 import type { Attachment } from "../components/composer/attachments";
@@ -184,21 +186,25 @@ export function useConciergeAttachments(): ConciergeAttachments {
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
+            noteDropArrived(p.position, p.paths);
             if (!isOverDndTarget(p.position, CONCIERGE_COLUMN_DND_TARGET)) {
               // Silent when another target owns the drop; speaks only for a drop that matched no
               // target at all (services/dndTargets.reportDropWithNoTarget).
               reportDropWithNoTarget(p.position);
               return;
             }
-            const paths = p.paths ?? [];
-            if (paths.length === 0) return;
-            // Kinds and counts, never paths — this line used to write the RAW absolute paths,
-            // which carry the account name and the file's own title into a log that ships with
-            // support tickets and crash reports (see services/logSafePaths).
-            log.info("composer", `dropped ${paths.length} file(s) on the concierge box`, {
-              ...describePaths(paths),
+            // NOT `p.paths ?? []` with a silent early return any more. A drag whose source
+            // publishes only the modern file-URL pasteboard type arrives with NO paths, and the
+            // bare length check discarded it without a log line — see services/dropPaths.
+            withDropPaths(p.paths, "concierge-box", (paths) => {
+              // Kinds and counts, never paths — this line used to write the RAW absolute paths,
+              // which carry the account name and the file's own title into a log that ships with
+              // support tickets and crash reports (see services/logSafePaths).
+              log.info("composer", `dropped ${paths.length} file(s) on the concierge box`, {
+                ...describePaths(paths),
+              });
+              attachPaths(paths);
             });
-            attachPaths(paths);
           }
         })
         .catch((e) => {

@@ -219,6 +219,44 @@ export function registerCatchAllDropTarget(): () => void {
   };
 }
 
+/** Last drop position already noted by {@link noteDropArrived}, so the four listeners that each see
+ *  the same event emit ONE line between them. Same mechanism and caveat as {@link lastDeadDropKey}:
+ *  a second drop on the identical pixel goes unlogged. */
+let lastArrivedDropKey: string | null = null;
+
+/**
+ * Record that a `drop` EVENT REACHED THE FRONTEND AT ALL — before any hit test, before paths are
+ * inspected, before any listener decides the drop is not its own.
+ *
+ * THIS LINE EXISTS BECAUSE ITS ABSENCE COST A WHOLE DEBUGGING SESSION. Every other drop log in the
+ * app is emitted PAST some guard: `reportDropWithNoTarget` self-suppresses when the position is over
+ * a known target, the per-surface `dropped N file(s)` lines sit behind both a hit test and a
+ * `paths.length` check, and each listener's "not mine" path is deliberately silent. So when the
+ * founder reported that drops did nothing, the log could not distinguish the three possibilities
+ * that matter — the event never arrived, it arrived and matched no target, or it arrived carrying no
+ * paths — because all three look identical from outside: an empty log. Hours went into inferring
+ * from that absence, and the first conclusion drawn from it was wrong.
+ *
+ * One line per drop, whatever happens to it afterwards. `paths` is a COUNT, never the paths
+ * themselves — this log ships with support tickets (services/logSafePaths).
+ */
+export function noteDropArrived(
+  position: { x: number; y: number },
+  paths: string[] | undefined,
+): void {
+  const key = `${position.x},${position.y}`;
+  if (key === lastArrivedDropKey) return;
+  lastArrivedDropKey = key;
+  log.info("composer", "drop event reached the frontend", {
+    position,
+    paths: paths?.length ?? 0,
+    scale: dragPositionScale(position),
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio,
+  });
+}
+
 /**
  * Report a drop that resolved to NO drop target — the signature of a coordinate-space bug.
  *

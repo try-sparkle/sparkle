@@ -12,6 +12,9 @@ mod audio_devices;
 mod auth;
 mod auto_send_tuner;
 mod beads_cmd;
+/// Recovering the paths of a drag whose Tauri event carried none — wry reads only the deprecated
+/// `NSFilenamesPboardType`, so a modern-only drag source drops silently. See the module docs.
+mod drag_paths;
 /// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
 mod builder_index;
 // The orchestration bridge is built on a Unix-domain socket (std::os::unix::net), so the real
@@ -581,6 +584,7 @@ pub fn run() {
             screenshot::capture_screen_region,
             window_screenshot::capture_main_window,
             window_screenshot::capture_main_window_region,
+            drag_paths::recover_drag_paths,
             attachments::load_attachment,
             attachments::probe_attachment,
             attachments::copy_image_to_clipboard,

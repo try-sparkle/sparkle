@@ -36,7 +36,12 @@ import { applySuggestion } from "../services/suggestions/applySuggestion";
 import type { SuggestionButton } from "../services/suggestions/types";
 import { trialSendAllowed, recordTrialSend } from "../services/trialMeter";
 import { safeUnlisten } from "../services/safeUnlisten";
-import { isOverFileDropTarget, registerCatchAllDropTarget } from "../services/dndTargets";
+import {
+  isOverFileDropTarget,
+  noteDropArrived,
+  registerCatchAllDropTarget,
+} from "../services/dndTargets";
+import { withDropPaths } from "../services/dropPaths";
 import { useProjectStore } from "../stores/projectStore";
 import { captureScreenRegion } from "../screenshot";
 import { AttachmentRow } from "./composer/AttachmentRow";
@@ -847,15 +852,19 @@ export function Composer({
           setDropActive(false);
         } else if (p.type === "drop") {
           setDropActive(false);
+          noteDropArrived(p.position, p.paths);
           // NO reportDropWithNoTarget here, unlike the other three drop listeners. This composer is
           // the CATCH-ALL: its early return fires only when the position IS over another target, so
           // it can never be looking at a drop that matched nothing. Reporting here would be dead
           // code by construction (the helper self-suppresses on a known target anyway).
           if (overOtherTarget(p.position)) return;
-          const paths = p.paths ?? [];
-          if (paths.length === 0) return;
-          log.info("composer", `dropped ${paths.length} file(s) into chat`, describePaths(paths));
-          attachPaths(paths);
+          // A drop carrying no paths is RECOVERED, not silently dropped (services/dropPaths):
+          // wry reads only the deprecated NSFilenamesPboardType, so a modern-only drag source
+          // arrives empty and used to vanish here without a log line.
+          withDropPaths(p.paths, "composer", (paths) => {
+            log.info("composer", `dropped ${paths.length} file(s) into chat`, describePaths(paths));
+            attachPaths(paths);
+          });
         }
       })
       .catch((e) => {

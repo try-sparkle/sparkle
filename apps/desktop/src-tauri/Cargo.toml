@@ -182,6 +182,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
     "NSSavePanel",
     "NSWindow",
+    # `drag_paths.rs` reads the named drag pasteboard to recover the file paths wry's macOS handler
+    # does not (it reads only the deprecated NSFilenamesPboardType). NSPasteboardItem is separate
+    # from NSPasteboard and is REQUIRED, not optional: a modern multi-file drag is one item per
+    # file, so without it a 5-photo drag would recover only the first.
+    "NSPasteboard",
+    "NSPasteboardItem",
 ] }
 
 # Foundation, for the NSURL the panel hands back and the NSString we set the title from. Same

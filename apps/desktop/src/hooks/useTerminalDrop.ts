@@ -53,11 +53,13 @@ import { shellQuotePath } from "../services/shellQuote";
 import {
   isOverDndTarget,
   NEW_BUILD_AGENT_DND_TARGET,
+  noteDropArrived,
   reportDropWithNoTarget,
   TERMINAL_STAGE_DND_TARGET,
 } from "../services/dndTargets";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { describePaths } from "../services/logSafePaths";
+import { withDropPaths } from "../services/dropPaths";
 import { log } from "../logger";
 
 /** True when this drag position belongs to the terminal: over `target` — the terminal stage for a
@@ -154,40 +156,47 @@ export function useTerminalDrop(
             setDropActive(false);
           } else if (p.type === "drop") {
             setDropActive(false);
+            noteDropArrived(p.position, p.paths);
             if (!isTerminalDropPosition(p.position, target)) {
               // Silent when some other target owns the drop; speaks only for a drop that matched
               // no target at all (services/dndTargets.reportDropWithNoTarget).
               reportDropWithNoTarget(p.position);
               return;
             }
-            const paths = p.paths ?? [];
-            if (paths.length === 0) return;
-            // Kinds and counts, never paths — the log ships with support tickets and crash reports
-            // (see services/logSafePaths).
-            log.info("composer", `pasting ${paths.length} dropped file(s) into the terminal`, {
-              agentId,
-              ...describePaths(paths),
-            });
-            const result = { count: paths.length, images: paths.filter(isImagePath).length };
-            void pasteIntoPty(agentId, buildDroppedPathsPaste(paths))
-              .then(() => {
-                // The pane may have been hidden while the write was in flight; a background pane
-                // owns no confirmation and must not steal the caret from the visible one.
-                if (!live) return;
-                onPastedRef.current?.();
-                setDropped({ ...result, delivered: true });
-              })
-              .catch((e) => {
-                // A dead PTY is the expected failure (the agent exited), and the ONLY one the pill
-                // can explain in the user's terms. Anything else is a real fault worth a log line —
-                // but the pill says the same thing either way, because from the user's side the
-                // fact that matters is identical: the files did not land.
-                if (!(e instanceof PtyGoneError)) {
-                  log.error("composer", "terminal drop paste failed", e);
-                }
-                if (!live) return;
-                setDropped({ ...result, delivered: false });
+            // Recovered rather than silently discarded when the drag carried no paths — see
+            // services/dropPaths. `live` is re-checked after the await: the pane can be hidden
+            // while the recovery IPC is in flight, and a background pane must not paste.
+            withDropPaths(p.paths, "terminal", (paths) => {
+              // `live` re-checked: for a RECOVERED drop this runs a tick later, and the pane may
+              // have been hidden while the recovery IPC was in flight.
+              if (!live) return;
+              // Kinds and counts, never paths — the log ships with support tickets and crash
+              // reports (see services/logSafePaths).
+              log.info("composer", `pasting ${paths.length} dropped file(s) into the terminal`, {
+                agentId,
+                ...describePaths(paths),
               });
+              const result = { count: paths.length, images: paths.filter(isImagePath).length };
+              void pasteIntoPty(agentId, buildDroppedPathsPaste(paths))
+                .then(() => {
+                  // The pane may have been hidden while the write was in flight; a background pane
+                  // owns no confirmation and must not steal the caret from the visible one.
+                  if (!live) return;
+                  onPastedRef.current?.();
+                  setDropped({ ...result, delivered: true });
+                })
+                .catch((e) => {
+                  // A dead PTY is the expected failure (the agent exited), and the ONLY one the
+                  // pill can explain in the user's terms. Anything else is a real fault worth a log
+                  // line — but the pill says the same thing either way, because from the user's
+                  // side the fact that matters is identical: the files did not land.
+                  if (!(e instanceof PtyGoneError)) {
+                    log.error("composer", "terminal drop paste failed", e);
+                  }
+                  if (!live) return;
+                  setDropped({ ...result, delivered: false });
+                });
+            });
           }
         })
         .catch((e) => {

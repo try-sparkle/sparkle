@@ -356,6 +356,29 @@ pub fn note_window_event(window: &str, event: &tauri::WindowEvent) {
 /// Which tier each drag phase grants: `Enter` → provisional, `Over` → renew, `Drop` → consent,
 /// `Leave` → forget. See `dispatch_drag` for the testable form.
 pub fn note_drag_event(window: &str, event: &tauri::DragDropEvent) {
+    // THE RUST HALF OF "did the drop actually happen". Its JS twin is
+    // `services/dndTargets.noteDropArrived`, and the PAIR is the point: between them they say
+    // whether a drop reached Rust, reached the frontend, both, or neither.
+    //
+    // Written after a founder-blocking report — "we can no longer drag photos or files into the
+    // Compose window" — cost hours precisely because neither line existed. The compose box lit up
+    // under the drag (so `Enter`/`Over` were arriving) and then swallowed the release, with an
+    // ENTIRELY EMPTY log: every drop log in the app sat behind a hit test, a paths check, or a
+    // deliberately-silent "not mine" branch. Three very different faults — macOS never delivering
+    // the drop, Tauri delivering it to no listener, and the drop arriving with no paths — were
+    // indistinguishable from outside, and the first root cause inferred from that silence was wrong.
+    //
+    // DROP ONLY, deliberately: `Over` fires continuously for the whole gesture and would bury the
+    // one event worth seeing. Count, never the paths — this log ships with support tickets.
+    if let tauri::DragDropEvent::Drop { paths, position } = event {
+        tracing::info!(
+            window,
+            paths = paths.len(),
+            x = position.x,
+            y = position.y,
+            "drag-drop: Drop reached Rust"
+        );
+    }
     match dispatch_drag(event) {
         DragGrant::Provisional(paths) => note_dragged_paths(paths, window),
         DragGrant::Renew => refresh_dragged_paths(window),
