@@ -11,9 +11,13 @@
 // asymmetry is stated in ./sendMode `modeCountsDown` and this is the other half of it.
 //
 // THREE WAYS A HOLD IS ABANDONED, and they are all about ⌘ being the OS's modifier as well as ours:
-// a second KEY pressed while ⌘ is down (⌘V, ⌘A, ⌘Z), a POINTER gesture while ⌘ is down (⌘-click,
-// ⌘-scroll, a context menu — none of which emit a keydown, and a click inside the app emits no blur
+// a second KEY pressed while ⌘ is down (⌘V, ⌘A, ⌘Z), a deliberate POINTER PRESS while ⌘ is down
+// (⌘-click or a context menu — neither emits a keydown, and a click inside the app emits no blur
 // either), and a window blur. None of them send.
+//
+// A SCROLL IS NOT ONE OF THEM. `wheel` was briefly in that set and had to come out; the note above
+// `abandon` says why. Stated here too because this header is what the next reader plans against,
+// and a header naming a guard that no longer exists is worse than no header (roborev 56100).
 //
 // WHAT IS DELIBERATELY *NOT* A REASON TO ABANDON: a short hold, or a hold during which nothing was
 // dictated. Both were proposed as extra evidence that the gesture "was really speech", and both
@@ -107,8 +111,15 @@ export function usePushToTalk({
     // ⌘-CLICK IS A CHORD TOO, and it reaches none of the branches above: a mouse press delivers no
     // `keydown`, and a click INSIDE the app fires no `blur` either — so ⌘-click (open-in-new-window,
     // multi-select, a context menu) held the gesture open and then dispatched the draft on ⌘-up.
-    // Same failure as ⌘V, reached by mouse. A pointer gesture while ⌘ is down means ⌘ was being used
-    // as a MODIFIER, not as the talk key, so the hold is abandoned exactly as a second keydown does.
+    // Same failure as ⌘V, reached by mouse. A deliberate POINTER PRESS while ⌘ is down means ⌘ was
+    // being used as a MODIFIER, not as the talk key, so the hold is abandoned as a second keydown is.
+    //
+    // A SCROLL IS NOT A PRESS, and `wheel` is deliberately NOT in this set. It was, briefly, and it
+    // contradicted the feature this file sells: scrolling the transcript with a trackpad while
+    // holding ⌘ killed the gesture mid-utterance, with no cue that anything had happened. macOS also
+    // delivers momentum `wheel` events for up to ~1s after the fingers leave the trackpad, so a
+    // scroll performed BEFORE ⌘ went down could abandon a hold with no gesture from the user at all
+    // (roborev 56087).
     const abandon = () => {
       if (!held.current) return;
       held.current = false;
@@ -121,14 +132,12 @@ export function usePushToTalk({
     window.addEventListener("keyup", up);
     window.addEventListener("blur", blur);
     window.addEventListener("mousedown", abandon);
-    window.addEventListener("wheel", abandon, { passive: true });
     window.addEventListener("contextmenu", abandon);
     return () => {
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
       window.removeEventListener("blur", blur);
       window.removeEventListener("mousedown", abandon);
-      window.removeEventListener("wheel", abandon);
       window.removeEventListener("contextmenu", abandon);
     };
   }, [active, inert]);

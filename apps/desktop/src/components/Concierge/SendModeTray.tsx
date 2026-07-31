@@ -295,15 +295,25 @@ export function SendModeTray({
             aria-label={m === "send" ? "Send" : label}
             aria-keyshortcuts={pressSends ? "Meta+Enter Control+Enter" : undefined}
             title={pressSends ? `${label} (${chicletFor(m, chord)})` : label}
-            disabled={pressSends && !canSend}
+            // `aria-disabled`, NOT `disabled`. A disabled button is neither focusable nor a keydown
+            // target, and the roving tabindex below puts the tray's ONLY tab stop on the selected
+            // pill — which in the default launch state (Send selected, empty composer) is exactly
+            // the pill this would disable. The tray then had ZERO tab stops: a keyboard-only user
+            // could not reach the composer's sole send/voice control at all, nor the arrow keys this
+            // component calls "the only way to reach Push to talk without a pointer" (WCAG 2.1.1).
+            // Every pill used to be a natural tab stop, so the roving stop is what turned this into
+            // a regression rather than a pre-existing gap (roborev 56087).
+            aria-disabled={pressSends && !canSend ? true : undefined}
             // Three outcomes, and the third is DOING NOTHING: pressing the already-selected Push
             // to talk is neither a send (the release is what sends) nor a mode change (you are
             // already there). Falling through to `onModeChange` instead would fire a same-value
             // change on every stray click, which the host cannot tell from a real one — and the
             // host's mode setter drives the MICROPHONE.
             onClick={() => {
-              if (pressSends) onSend();
-              else if (!selected) onModeChange(m);
+              if (pressSends) {
+                if (!canSend) return; // nothing to send: the press is inert, the PILL is not
+                onSend();
+              } else if (!selected) onModeChange(m);
             }}
             // ← / → step the tray one position — the standard gesture for a segmented control, and
             // the only way to reach Push to talk without a pointer.

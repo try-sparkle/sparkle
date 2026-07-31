@@ -2157,7 +2157,13 @@ describe("ConciergeHost — capture handoffs land in the compose box", () => {
     await waitFor(() => expect(chips()).toBeTruthy());
     expect(box().value).toBe("");
     // canSend treats an attachment alone as sendable, so the user can just press Send.
-    expect(screen.getByLabelText("Send").hasAttribute("disabled")).toBe(false);
+    //
+    // `aria-disabled`, NOT the `disabled` PROPERTY. The tray declines a press it cannot honour
+    // without ever disabling the pill, so that the pill stays the tray's roving tab stop
+    // (Concierge/SendModeTray). Asserting `disabled` here went VACUOUS the moment that changed:
+    // the attribute is now absent in both states, so the row passed whatever `canSend` said —
+    // including the regression it exists to catch (roborev 56100).
+    expect(screen.getByLabelText("Send").getAttribute("aria-disabled")).toBeNull();
   });
 
   // ── CHAT MODE (replaces Plan) ────────────────────────────────────────────────────────────────

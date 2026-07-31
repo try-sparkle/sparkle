@@ -8,6 +8,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
 import type { Attachment } from "./types";
 
+// `aria-disabled`, not the `disabled` PROPERTY. The Send position is the send tray's roving tab
+// stop, and a `disabled` button is neither focusable nor a keydown target — with Send selected over
+// an empty composer (the default launch state) that left the tray with zero tab stops and no
+// keyboard route to Push to talk at all (WCAG 2.1.1, roborev 56087). The press is still declined;
+// only the mechanism moved. See ./SendModeTray.
+const sendDeclined = (b: HTMLElement) => b.getAttribute("aria-disabled") === "true";
+
 afterEach(() => cleanup());
 
 const shot: Attachment = {
@@ -103,12 +110,12 @@ describe("ComposeBox — attachment chips", () => {
 describe("ComposeBox — sending with attachments", () => {
   it("Send is disabled with neither text nor attachments", () => {
     setup();
-    expect(send().disabled).toBe(true);
+    expect(sendDeclined(send())).toBe(true);
   });
 
   it("Send is enabled by an attachment alone, and submits empty text", () => {
     const { onSend } = setup({ attachments: [shot] });
-    expect(send().disabled).toBe(false);
+    expect(sendDeclined(send())).toBe(false);
     fireEvent.click(send());
     expect(onSend).toHaveBeenCalledWith("");
   });

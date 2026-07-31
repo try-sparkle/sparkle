@@ -91,11 +91,28 @@ describe("the tray is the only press target", () => {
   it("declines the press when there is nothing to send, without disabling the OTHER positions", () => {
     // The old rail could only grey one button. Here a nothing-to-send state must not also take
     // away the user's ability to change mode — that would be a control that traps you.
-    const { onModeChange } = mount({ mode: "send", canSend: false });
-    expect(pill("send").disabled).toBe(true);
-    expect(pill("speak").disabled).toBe(false);
+    const { onModeChange, onSend } = mount({ mode: "send", canSend: false });
+    expect(pill("send").getAttribute("aria-disabled")).toBe("true");
+    expect(pill("speak").getAttribute("aria-disabled")).toBeNull();
+    fireEvent.click(pill("send"));
+    expect(onSend).not.toHaveBeenCalled();
     fireEvent.click(pill("speak"));
     expect(onModeChange).toHaveBeenCalledWith("speak");
+  });
+
+  it("stays REACHABLE by keyboard with nothing to send — the default launch state", () => {
+    // THE REGRESSION THE ROVING TABINDEX INTRODUCED. A `disabled` button is neither focusable nor a
+    // keydown target, and the tray's only tab stop is the selected pill — which on launch is Send,
+    // over an empty composer. The tray had ZERO tab stops: a keyboard-only user could not reach the
+    // composer's sole send/voice control, nor the arrows this component calls the only way to reach
+    // Push to talk without a pointer (WCAG 2.1.1, roborev 56087).
+    const { onModeChange } = mount({ mode: "send", canSend: false });
+    expect(pill("send").hasAttribute("disabled")).toBe(false);
+    expect(pill("send").tabIndex).toBe(0);
+    // …and the arrows still work from it, which is the thing the tab stop exists to enable.
+    act(() => pill("send").focus());
+    fireEvent.keyDown(pill("send"), { key: "ArrowRight" });
+    expect(onModeChange).toHaveBeenCalledWith("ptt");
   });
 });
 

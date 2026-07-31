@@ -106,7 +106,9 @@ afterEach(() => {
 });
 
 function mount() {
-  render(<ConciergeHost feed={FEED} promptTarget={null} />);
+  // Returns the render result so a row can UNMOUNT the host mid-gesture — teardown is one of the
+  // ways a pending settle gets cancelled, and cancelling has to put the mic back (see below).
+  return render(<ConciergeHost feed={FEED} promptTarget={null} />);
 }
 
 const tray = () => screen.getByTestId("send-mode-tray");
@@ -481,6 +483,78 @@ describe("release sends immediately, and sends everything", () => {
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
     // …and Speak's microphone is still live, not muted by a stale finish.
     expect(mic()).toEqual({ enabled: true, phase: "active" });
+  });
+
+  it("a TERMINAL taking focus mid-settle cancels the send AND puts the mic back to armed", async () => {
+    // THE HALF THAT WAS MISSING. Cancelling used to detach the two races without restoring the
+    // microphone, and on this branch nothing else does: `mode` never changes again so the reconcile
+    // effect does not re-run, and usePushToTalk's inert branch only fires while a hold is still
+    // held, which it is not after the keyup. The mic stayed LIVE AND ROUTING in Push to talk's
+    // resting state — capture resumes the moment the user leaves the terminal, and the next thing
+    // they say lands in the box with no key held (roborev 56087).
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("ship the");
+    act(() => useDictationStore.getState().setInterim("staging"));
+    act(() => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.keyUp(window, { key: "Meta" });
+    });
+    expect(mic().phase).toBe("active"); // still hot: the phrase is still arriving
+
+    act(() => useDictationStore.getState().setFocusOwner("terminal"));
+    await act(async () => {
+      useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+  });
+
+  it("UNMOUNTING mid-settle cancels the send AND puts the mic back to armed", () => {
+    // The same half, reached by TEARDOWN rather than by focus. ConciergeHost unmounts whenever no
+    // project is open (App.tsx), so closing the project inside the settle cap detached the two races
+    // and left the mic LIVE AND ROUTING at a concierge box that had just stopped existing — and with
+    // the host gone there is no reconcile effect left to repair it (roborev 56100).
+    const view = mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("ship the");
+    act(() => useDictationStore.getState().setInterim("staging"));
+    act(() => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.keyUp(window, { key: "Meta" });
+    });
+    expect(mic().phase).toBe("active"); // still hot: the phrase is still arriving
+
+    act(() => view.unmount());
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+  });
+
+  it("SCROLLING while holding does not kill the gesture — you can read the thread and speak", () => {
+    // `wheel` was briefly in the abandon set and contradicted the feature: a trackpad scroll killed
+    // the hold mid-utterance with no cue. macOS also delivers momentum wheel events for up to ~1s
+    // after the fingers lift, so a scroll BEFORE ⌘ went down could abandon a hold with no gesture
+    // from the user at all (roborev 56087).
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    act(() => fireEvent.keyDown(window, { key: "Meta" }));
+    act(() => fireEvent.wheel(window, { deltaY: 120 }));
+    expect(mic().phase).toBe("active"); // still talking
+  });
+
+  it("a CONTEXT MENU while holding does abandon — it is a deliberate press", () => {
+    mount();
+    act(() => fireEvent.click(pill("ptt")));
+    type("not a message");
+    act(() => {
+      fireEvent.keyDown(window, { key: "Meta" });
+      fireEvent.contextMenu(window);
+      fireEvent.keyUp(window, { key: "Meta" });
+    });
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(box().value).toBe("not a message");
   });
 
   it("an ABANDONED hold never waits on a partial — it was never going to send", async () => {

@@ -127,16 +127,45 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   // A release that is waiting on an in-flight partial, so a second gesture (or an unmount) can call
   // it off rather than leaving a send armed against a hold that no longer exists.
   const settling = useRef<(() => void) | null>(null);
-  useEffect(() => () => settling.current?.(), []);
+  // UNMOUNTING CANCELS IT TOO — and it has to put the microphone back for the same reason the
+  // mode/inert canceller below does. While the wait is running the mic is at `pttHeldIntent` (live
+  // AND routing), and `finish` is the only thing on this path that drops it; ConciergeHost unmounts
+  // whenever no project is open (see App.tsx), so closing the project inside PARTIAL_SETTLE_CAP_MS
+  // detached the two races and left a hot mic routing at a concierge box that no longer exists —
+  // with nothing to repair it until one mounts again, and nothing at all if the user never reopens.
+  // Same always-hot failure as the terminal-focus case, reached by teardown (roborev 56100).
+  useEffect(
+    () => () => {
+      if (!settling.current) return;
+      settling.current();
+      applyIntent(micIntentForMode(useUiStore.getState().conciergeSendMode));
+    },
+    [applyIntent],
+  );
 
   // LEAVING PUSH TO TALK CANCELS A PENDING RELEASE. The wait can outlive the gesture by up to
   // PARTIAL_SETTLE_CAP_MS, and before this a user who released and then moved the tray got a message
   // dispatched a second and a half after they had left the mode — from a mode they were no longer
   // in. Same for the tray going inert: a live PTY owns the keyboard, and a send nobody is looking at
   // is exactly what the inert state exists to prevent (roborev 56078).
+  //
+  // CANCELLING MUST ALSO RESTORE THE MICROPHONE. `finish` is the only thing that drops the mic back
+  // to the resting intent on this path, so a canceller that merely detached the two races left it
+  // LIVE AND ROUTING: hold ⌘, release with an interim outstanding, click into a terminal inside the
+  // cap, and the mic stayed hot indefinitely — `mode` never changes again, so the reconcile effect
+  // does not re-run, and `usePushToTalk`'s own inert branch only fires while a hold is still held,
+  // which it is not after the keyup. Capture then resumes the moment the user leaves the terminal
+  // and the next thing they say lands in the concierge box with no key held: the always-hot
+  // push-to-talk this module exists to prevent (roborev 56087).
+  //
+  // Restoring only when a settle was actually pending keeps this idempotent on the mode-change path,
+  // where `setMode` has already applied the new position's intent.
   useEffect(() => {
-    if (mode !== "ptt" || inert) settling.current?.();
-  }, [mode, inert]);
+    if (mode === "ptt" && !inert) return;
+    if (!settling.current) return;
+    settling.current();
+    applyIntent(micIntentForMode(useUiStore.getState().conciergeSendMode));
+  }, [mode, inert, applyIntent]);
 
   /**
    * End the hold: send (or not), then drop the mic back to armed-but-not-routing.

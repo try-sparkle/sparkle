@@ -20,6 +20,13 @@ import { PILL_MIN_LINES, pillPreview } from "../composer/attachments";
 import { COMPOSE_MENTION_PILL_TESTID } from "./MentionMirror";
 import type { MentionAgent } from "./mentions";
 
+// `aria-disabled`, not the `disabled` PROPERTY. The Send position is the send tray's roving tab
+// stop, and a `disabled` button is neither focusable nor a keydown target — with Send selected over
+// an empty composer (the default launch state) that left the tray with zero tab stops and no
+// keyboard route to Push to talk at all (WCAG 2.1.1, roborev 56087). The press is still declined;
+// only the mechanism moved. See ./SendModeTray.
+const sendDeclined = (b: HTMLElement) => b.getAttribute("aria-disabled") === "true";
+
 afterEach(() => cleanup());
 
 /** A paste that must collapse, with content worth checking byte-for-byte.
@@ -247,9 +254,9 @@ describe("ComposeBox — a collapsed paste SENDS its full text", () => {
 
   it("can send a box holding ONLY a pill", () => {
     const { onSend } = setup();
-    expect(send().disabled).toBe(true);
+    expect(sendDeclined(send())).toBe(true);
     paste(LONG);
-    expect(send().disabled).toBe(false);
+    expect(sendDeclined(send())).toBe(false);
     fireEvent.click(send());
     expect(onSend).toHaveBeenCalledWith(LONG);
   });
