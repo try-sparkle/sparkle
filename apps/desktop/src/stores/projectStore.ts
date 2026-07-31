@@ -2,6 +2,7 @@
 // last prompts. Persisted to localStorage (durable in the Tauri webview) so quit/relaunch
 // restores everything. Live process/status state is NOT here (see runtimeStore).
 import { create } from "zustand";
+import type { GoalVerify } from "@sparkle/core";
 import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
 import type {
   AgentKind,
@@ -21,6 +22,7 @@ import {
 } from "../engine/alertDismissal";
 import {
   chargeGoalDebt,
+  type GoalDebt,
   clearGoalMet,
   escalateGoal,
   goalDebtOf,
@@ -192,6 +194,16 @@ export interface ProjectState {
     text: string,
     ttlMs?: number,
     actor?: "human" | "agent",
+    /** HOW this goal is checked. Stating it is what makes the goal UN-SELF-MARKABLE — see
+     *  @sparkle/core `canSelfMarkMet`, enforced in controlListener.handleSetGoalMet. Absent leaves the
+     *  goal self-markable, which is the compatibility path for every goal predating the field.
+     *
+     *  THREE VALUES, NOT TWO. `undefined` = "not stated", which KEEPS whatever check the goal or its
+     *  stashed debt already owed. `null` = **drop the check** — the deliberate human take-back, and
+     *  the only route by which a stated check ever leaves an agent. This store does not police who
+     *  may pass `null`; `controlListener.handleSetGoal` restricts it to the concierge, which is where
+     *  caller authority already lives (roborev 55933). */
+    verify?: GoalVerify | null,
   ) => void;
   /** Mark the current goal met (or un-mark it). This is the only thing that makes an idle agent
    *  legitimately finished, so it is the agent's own way to stop being resumed. */
@@ -572,8 +584,15 @@ function releaseGoalDebt(a: AgentTab): AgentTab {
   // actually running. The pre-existing comment there says that must not happen, and my own docstring
   // claimed it did not.
   const g = a.goal;
+  // A STASH THAT HOLDS ONLY A CHECK OWES THIS RELEASE NOTHING (roborev 55933). `verify` is not part
+  // of what typing releases (see below), so a debt consisting solely of it must not defeat the fast
+  // path — otherwise every terminal line rewrites the agent, its goal and the persisted blob again,
+  // which is the exact regression the paragraph above documents.
+  const debtOwesNothing =
+    a.goalDebt === undefined ||
+    (a.goalDebt.totalContinues === 0 && a.goalDebt.escalatedAt === undefined);
   const owesNothing =
-    a.goalDebt === undefined &&
+    debtOwesNothing &&
     (g === undefined ||
       (g.continues === 0 &&
         g.totalContinues === 0 &&
@@ -581,7 +600,28 @@ function releaseGoalDebt(a: AgentTab): AgentTab {
         g.mark === undefined));
   if (owesNothing) return a;
   const { goalDebt: _released, ...rest } = a;
-  return a.goal ? { ...rest, goal: resetGoalRetries(a.goal) } : rest;
+  // THE STASHED CHECK SURVIVES THIS RELEASE. What fires here is ANY human-authored line — a composer
+  // send, a picker answer, a suggestion click — which is a human engaging, not a human taking back a
+  // verification method. Dropping `verify` here left the bypass this debt closes open one ordinary
+  // gesture wide: agent states a check, agent clears its goal (check stashed), a human types
+  // anything, agent sets new text, and the goal is unverified and self-markable again (roborev
+  // 55933). The deliberate take-back is `set_agent_goal {verify: null}` from the concierge.
+  const keptVerify = a.goalDebt?.verify;
+  const withStash =
+    keptVerify !== undefined
+      ? { ...rest, goalDebt: { totalContinues: 0, verify: keptVerify } }
+      : rest;
+  return a.goal ? { ...withStash, goal: resetGoalRetries(a.goal) } : withStash;
+}
+
+/**
+ * Drop the CHECK from a stashed debt, keeping everything else — and return `undefined` when nothing
+ * is left to owe, so a take-back does not persist a `{ totalContinues: 0 }` on every agent it touches
+ * (the same reason `goalDebtOf` returns `undefined` for a clean goal).
+ */
+function stripVerify(debt: GoalDebt): GoalDebt | undefined {
+  const { verify: _dropped, ...rest } = debt;
+  return rest.totalContinues === 0 && rest.escalatedAt === undefined ? undefined : rest;
 }
 
 /** localStorage key the project store persists under. Shared so cross-window sync
@@ -1350,7 +1390,7 @@ export const useProjectStore = create<ProjectState>()(
       // surface read — a second copy of the arithmetic here is exactly how those three fall out of
       // step about whether a goal is still outstanding.
 
-      setAgentGoal: (projectId, agentId, text, ttlMs, actor = "human") =>
+      setAgentGoal: (projectId, agentId, text, ttlMs, actor = "human", verify) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => {
@@ -1368,7 +1408,10 @@ export const useProjectStore = create<ProjectState>()(
               if (trimmed === "") {
                 const { goal: _dropped, goalDebt: _priorDebt, ...rest } = a;
                 if (actor !== "agent") return rest;
-                const debt = goalDebtOf(a.goal) ?? a.goalDebt;
+                const owed = goalDebtOf(a.goal) ?? a.goalDebt;
+                // An explicit `verify: null` drops the check from the stash too, or the take-back
+                // would only reach a live goal and a cleared one would still owe it forever.
+                const debt = verify === null && owed ? stripVerify(owed) : owed;
                 return debt === undefined ? rest : { ...rest, goalDebt: debt };
               }
               // A goal whose TEXT is unchanged keeps its COUNTERS but RE-ARMS its lifecycle.
@@ -1387,10 +1430,24 @@ export const useProjectStore = create<ProjectState>()(
               // something the agent does on its own; taking back a goal a human has been handed is
               // the human's call, via `resetAgentGoalRetries`.
               if (a.goal && a.goal.text === trimmed) {
-                const { metAt: _met, ...rest } = a.goal;
+                // `verify` comes OFF here and is re-added below, or a take-back could never land:
+                // spreading `rest` would put the old check straight back on top of the drop.
+                const { metAt: _met, verify: _priorVerify, ...rest } = a.goal;
+                // An explicitly supplied `verify` APPLIES here. Discarding it replied `{ ok: true }`
+                // while the goal stayed unverified and self-markable — the exact failure handleSetGoal
+                // refuses malformed input to avoid, relocated one layer down where that check cannot
+                // see it. It also meant a check could never be ADDED to a standing goal without
+                // rewording it (roborev 55893). Passing none keeps whatever the goal already had.
+                // `null` DROPS it (the concierge's take-back); `undefined` keeps what was there.
+                const kept = verify === null ? undefined : (verify ?? _priorVerify);
                 return {
                   ...a,
-                  goal: { ...rest, setAt: Date.now(), ttlMs: ttlMs ?? a.goal.ttlMs },
+                  goal: {
+                    ...rest,
+                    setAt: Date.now(),
+                    ttlMs: ttlMs ?? a.goal.ttlMs,
+                    ...(kept !== undefined ? { verify: kept } : {}),
+                  },
                 };
               }
               // GENUINELY NEW TEXT — new work, so a fresh budget… IF a human asked for it.
@@ -1414,9 +1471,16 @@ export const useProjectStore = create<ProjectState>()(
               // overwrote its goal or cleared it first — both routes arrive here owing the same thing
               // (roborev 55451). A HUMAN setting new goal text is a fresh budget by design, and that
               // is also the moment the stashed debt is released.
-              const fresh = newGoal(trimmed, Date.now(), ttlMs);
+              const fresh = newGoal(trimmed, Date.now(), ttlMs, verify ?? undefined);
               if (actor === "agent") {
-                const debt = goalDebtOf(a.goal) ?? a.goalDebt;
+                // `goalDebtOf` now includes the old goal's `verify`, and `chargeGoalDebt` inherits it
+                // when `fresh` states none — so an agent cannot shed its check by rewording, and
+                // cannot shed it by clear-then-set either (the cleared goal's debt survives in
+                // `a.goalDebt`). Supplying a NEW verify still wins; only silent removal is blocked.
+                // What IS inherited is the obligation, not the old proof — `chargeGoalDebt`
+                // downgrades it to `human`, since this branch runs on genuinely new text.
+                const owed = goalDebtOf(a.goal) ?? a.goalDebt;
+                const debt = verify === null && owed ? stripVerify(owed) : owed;
                 const { goalDebt: _spent, ...restOfAgent } = a;
                 const charged = chargeGoalDebt(fresh, debt);
                 return { ...restOfAgent, goal: charged };

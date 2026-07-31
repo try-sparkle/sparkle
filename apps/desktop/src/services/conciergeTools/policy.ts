@@ -348,7 +348,9 @@ const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
   read_picker_options: "Read the menu an agent is showing right now.",
   select_picker_option: "Answer a menu an agent is showing, as if you had picked it.",
   send_control_key: "Press esc, shift+tab, ctrl+b, enter or an arrow key in an agent's terminal.",
-  send_to_agent_terminal: "Type a message into an agent's terminal, as if you had typed it.",
+  send_to_agent_terminal:
+    "Type a message into an agent's terminal, as if you had typed it. State `goal` (a verifiable " +
+    "completion criterion) or `notWork: { reason }`.",
 };
 
 /** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a

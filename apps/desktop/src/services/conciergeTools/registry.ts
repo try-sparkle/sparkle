@@ -942,35 +942,86 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
     // never told to do — a false unmet goal that auto-continue would then try to drive. The residual
     // risk is the mirror image (a crash between send and set leaves delivered work goalless), and that
     // is the better failure: a missing goal is visible, a fabricated one is not.
+    // ── RECORD THE GOAL, AS THE AGENT ──────────────────────────────────────────────────────────
+    // `actor: "agent"` is load-bearing and its absence was a real defect (roborev 55877). The default
+    // is `"human"`, which on CHANGED text builds a fresh `newGoal` (totalContinues 0) AND releases the
+    // stashed `goalDebt`. Two failures followed from that one omission:
+    //
+    //   1. MAX_CONTINUES_TOTAL became refillable by ordinary concierge traffic. An agent auto-
+    //      continued near the ceiling gets one send with reworded goal text, its budget returns to 0,
+    //      it never reaches the ceiling, so it NEVER ESCALATES — and the escalation guard below
+    //      protected a state this very call site prevented from being reached.
+    //   2. The guard was walkable. An agent clears its goal via set_agent_goal (`actor: "agent"`),
+    //      which drops the record but STASHES the escalation in `goalDebt`; the next send then sees
+    //      `existing === undefined`, passes the guard, and a `"human"` write releases the debt —
+    //      cancelling an escalation the human owned. Exactly what the guard was added to stop.
+    //
+    // `"agent"` makes chargeGoalDebt carry totalContinues and escalatedAt forward on its own. Do NOT
+    // key the actor off `a.userPrompt`: that flag is model-supplied, so it would re-open the launder.
+    let goalRecorded = false;
+    let goalNote: string | undefined;
     if (r.ok && goalVerdict.goal) {
       const project = useProjectStore
         .getState()
         .projects.find((p) => p.agents.some((ag) => ag.id === a.agentId));
-      const existing = project?.agents.find((ag) => ag.id === a.agentId)?.goal;
+      const agent = project?.agents.find((ag) => ag.id === a.agentId);
+      // Read the escalation from the STASH as well as the live goal — after a clear the record is
+      // gone and only `goalDebt` remembers (projectStore's clear-then-set route, roborev 55451).
+      const escalatedAt = agent?.goal?.escalatedAt ?? agent?.goalDebt?.escalatedAt;
+      // Read the REASON off the same chain as the timestamp. Narrowing one and not the other made
+      // the diagnostic always `undefined` on exactly the new path, which is the path worth
+      // diagnosing (roborev 55900).
+      const escalationReason = agent?.goal?.escalationReason ?? agent?.goalDebt?.escalationReason;
       if (!project) {
-        // NOT SILENT. `send_to_agent_terminal` deliberately supports the built-in Improve Sparkle
-        // agent (`__sparkle_self__` and its labelled variants), which by design is in no project — so
-        // this branch is reachable in normal use, and a bare no-op would accept a goal, report
-        // success, and record nothing. Say so instead of pretending it landed.
+        // NOT SILENT, and not an edge case: services/sparkleAgent documents that `__sparkle_self__`
+        // is never in any project's `agents` array, so EVERY work send to the built-in Improve
+        // Sparkle agent lands here. A bare no-op would accept a goal, report success, and leave that
+        // agent at goalStateOf === "none" with auto-continue disabled — the exact state the gate
+        // exists to eliminate, now behind an enforcement that reported success.
+        goalNote = "this agent is not part of a project, so no goal could be recorded on it";
         log.warn("concierge-tools", "goal not recorded — agent is not in any project", {
           agentId: a.agentId,
         });
-      } else if (existing?.escalatedAt) {
-        // DO NOT CLOBBER AN ESCALATED GOAL. Recording a goal is now a side effect of every work send,
-        // and `setAgentGoal` with CHANGED text goes through `newGoal`, which zeroes continues/
-        // totalContinues and drops escalatedAt/escalationReason. An escalated goal is one auto-
-        // continue already gave up on and handed to the HUMAN; silently un-escalating it from a
-        // routine send both defeats the retry bound and takes the item off the human's plate without
-        // anyone deciding to. Clearing an escalation stays a deliberate act (resetAgentGoalRetries).
+      } else if (escalatedAt) {
+        // DO NOT CLOBBER AN ESCALATED GOAL. It is one auto-continue already gave up on and handed to
+        // the HUMAN; taking it back off their plate is not a routine send's decision to make.
+        // Clearing an escalation stays deliberate (resetAgentGoalRetries).
+        //
+        // TWO DIFFERENT STATES, TWO DIFFERENT SENTENCES. With a live goal record this is "your text
+        // was delivered, the standing goal stayed" — a normal outcome. With the escalation known only
+        // from `goalDebt` the agent is GOALLESS and stays that way: the debt is released only by a
+        // human-authored send (`releaseGoalDebt` off `appendPrompt`/`noteTerminalBrief`), and
+        // `resetAgentGoalRetries` has no production caller to point anyone at. Telling the concierge
+        // "the goal was not replaced" there names a goal that does not exist, so it reads the state as
+        // fine and never routes to the human — the one thing that clears it (roborev 55900).
+        goalNote = agent?.goal
+          ? "the agent's goal is escalated to the human, so it was not replaced"
+          : "this agent has an escalation outstanding to the human and NO goal recorded — it will " +
+            "stay goalless until a person types to it, so route this to the human rather than re-sending";
         log.warn("concierge-tools", "goal not replaced — the agent's goal is escalated to the human", {
           agentId: a.agentId,
-          escalationReason: existing.escalationReason,
+          escalationReason,
+          fromDebt: agent?.goal === undefined,
         });
       } else {
-        useProjectStore.getState().setAgentGoal(project.id, a.agentId, goalVerdict.goal);
+        useProjectStore.getState().setAgentGoal(project.id, a.agentId, goalVerdict.goal, undefined, "agent");
+        goalRecorded = true;
       }
+    } else if (r.ok && goalVerdict.override) {
+      // "NO GOAL WAS ASKED FOR" ≠ "A GOAL WAS ASKED FOR AND NOT RECORDED". Under an override the gate
+      // returns `goal: null`, so the block above never runs and the reply was a bare
+      // `goalRecorded: false` — shaped exactly like the two real failures minus their explanation.
+      // The field's own contract makes that read as "your goal did not stick", which invites the
+      // concierge to restate the objective and re-send text the PTY already has: a duplicate send on
+      // the one path the override exists to make cheap (roborev 55900).
+      goalNote = "declared not-work, so no goal was asked for or recorded — nothing to re-send";
     }
-    return r.ok ? ok(ctx, r) : err(ctx, r.path, r.detail);
+    // TELL THE CALLER WHAT HAPPENED TO THE GOAL. It was just refused unless it stated one, so a bare
+    // `ok` reads as "the goal is recorded" and it will neither restate it nor route it to a human. A
+    // warn line in the app log is not a channel the caller can read.
+        return r.ok
+      ? ok(ctx, { ...r, goalRecorded, ...(goalNote ? { goalNote } : {}) })
+      : err(ctx, r.path, r.detail);
   }),
 };
 

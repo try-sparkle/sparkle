@@ -18,6 +18,7 @@
 // identity is structural rather than claimed. Everything below that says "the caller" still means
 // an AgentTab id, except where the reserved id is called out explicitly.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { canSelfMarkMet, selfMarkRefusal, parseGoalVerify, type GoalVerify } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
@@ -953,10 +954,41 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   const goal = req.payload.goal;
   if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };
   const ttlMs = typeof req.payload.ttlMs === "number" && req.payload.ttlMs > 0 ? req.payload.ttlMs : undefined;
+  // HOW the goal is checked, when the caller stated it. Optional at this seam on purpose: making it
+  // required would refuse every existing caller, and an unverified goal is still better than none.
+  // But a MALFORMED `verify` is refused rather than dropped — silently discarding it would hand back
+  // `{ ok: true }` for a goal the caller believes is verified and which is in fact self-markable,
+  // which is worse than either accepting or refusing outright.
+  //
+  // `null` IS NOT "not stated" — it is the DELIBERATE TAKE-BACK, and it is the only route by which a
+  // stated check ever leaves an agent. It has to exist and it has to be restricted. Without it the
+  // check was un-droppable for the life of the persisted record, so one voluntarily-verified goal
+  // turned into a permanent regime where the agent could never close any later goal itself; the only
+  // release that did fire was `releaseGoalDebt` on any typed line, which is incidental rather than a
+  // take-back and shed the check by accident instead (roborev 55933). Concierge-only because that is
+  // the human-driven surface whose reserved id the bridge stamps server-side — an agent allowed to
+  // pass `null` would simply drop its own check, which is the bypass this all exists to close.
+  let verify: GoalVerify | null | undefined;
+  if (req.payload.verify === null) {
+    if (req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID) {
+      return {
+        ok: false,
+        code: "verify_not_yours",
+        error:
+          "clearing a goal's check is a human take-back, not something the agent it binds may do. " +
+          "Ask the concierge to drop it, or state a different check instead.",
+      };
+    }
+    verify = null;
+  } else if (req.payload.verify !== undefined) {
+    const parsed = parseGoalVerify(req.payload.verify);
+    if (!parsed.ok) return { ok: false, code: parsed.reason, error: parsed.message };
+    verify = parsed.verify;
+  }
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   // `"agent"`: see the docstring. Everything reaching this handler came off the control socket.
-  useProjectStore.getState().setAgentGoal(found.projectId, targetId, goal, ttlMs, "agent");
+  useProjectStore.getState().setAgentGoal(found.projectId, targetId, goal, ttlMs, "agent", verify);
   // Report the goal AS IT NOW STANDS, read back out of the store rather than echoed from the args.
   // The store may have done something other than what the caller literally asked (a re-asserted goal
   // keeps its counters; an empty text dropped it), and the caller is about to tell a human what
@@ -1047,6 +1079,29 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
       ok: false,
       code: "no_goal",
       error: "no goal to mark — set one with set_agent_goal first.",
+    };
+  }
+  // ── THE SELF-REPORT GATE ────────────────────────────────────────────────────────────────────────
+  // `setAgentGoalMet` LATCHES `metAt`, and `metAt` is the only signal that makes an idle agent count
+  // as done. So an agent allowed to call this on a goal that stated HOW it would be checked has
+  // self-reported "done" — "I ran the command and it passed" is precisely the self-report the check
+  // exists to replace, and nothing downstream re-verifies it. `canSelfMarkMet` refuses EVERY stated
+  // kind; a goal with no `verify` is untouched, which is the compatibility path for every goal that
+  // predates the field (it never claimed to be verifiable).
+  //
+  // THREE THINGS THIS DELIBERATELY DOES NOT REFUSE:
+  //   • the CONCIERGE. It is the human-driven surface that sweeps for stalls and closes out finished
+  //     work; refusing it would leave a verified goal with no one able to close it at all. Its id is
+  //     stamped server-side by the bridge, so this is not a hole an agent can climb through.
+  //   • `met: false`. Reopening a goal is the opposite of a false "done" — it re-arms auto-continue.
+  //     Refusing it would trap an agent that noticed its own premature close.
+  //   • a goal with no stated check. See above.
+  const goal = found.agent.goal;
+  if (!isConcierge && met && !canSelfMarkMet(goal.verify) && goal.verify) {
+    return {
+      ok: false,
+      code: "goal_not_self_markable",
+      error: selfMarkRefusal(goal.verify),
     };
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);

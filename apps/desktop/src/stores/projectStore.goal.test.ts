@@ -319,6 +319,24 @@ describe("the AGENT's own set is weaker than the human's", () => {
     expect(useProjectStore.getState().projects).toBe(before);
   });
 
+  it("a stash holding ONLY a check is also nothing-owed, so it does not churn the blob either", () => {
+    // The verify-only stash is a NEW way into the 55588 regression above, and that test cannot see
+    // it: it seeds a clean goal with no stash at all, so it passes identically whether or not
+    // `debtOwesNothing` accounts for a debt whose entire content is a check. Once a check survives a
+    // human release (which is the point of carrying it), an agent that cleared a verified goal holds
+    // `{ totalContinues: 0, verify }` forever — and every subsequent typed line would rewrite the
+    // agent, the persisted blob, the cross-window broadcast and the fleet render (roborev 55960).
+    store().setAgentGoal("p1", "a1", "the work is on origin main", undefined, "agent", { kind: "landed" });
+    store().setAgentGoal("p1", "a1", "", undefined, "agent"); // the agent clears; the check is stashed
+    expect(agent().goalDebt).toEqual({ totalContinues: 0, verify: { kind: "landed" } });
+    store().noteTerminalBrief("p1", "a1"); // the human types
+    const before = useProjectStore.getState().projects;
+    store().noteTerminalBrief("p1", "a1"); // …and types again
+    expect(useProjectStore.getState().projects).toBe(before);
+    // And the check is still there — the fast path must not be bought by dropping it.
+    expect(agent().goalDebt?.verify).toEqual({ kind: "landed" });
+  });
+
   it("the debt cannot be diluted by repeated clear/set cycles", () => {
     // `chargeGoalDebt` takes the MAX, so the bound can only ever tighten. Without that, a cycle that
     // spends one continue and re-clears could walk the stored total DOWN.

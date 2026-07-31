@@ -96,9 +96,42 @@ describe("canSelfMarkMet — the self-report gate", () => {
     expect(canSelfMarkMet({ kind: "human" })).toBe(false);
   });
 
-  it("admits command and landed claims for CHECKING (not for trusting)", () => {
-    expect(canSelfMarkMet({ kind: "command", cmd: "npm test" })).toBe(true);
-    expect(canSelfMarkMet({ kind: "landed" })).toBe(true);
+  it("REFUSES command and landed to their own claimant too, not just human", () => {
+    // These returned `true` in the first version, on the theory that such a claim was "admissible
+    // pending a check". That does not survive contact with what it gates: set_agent_goal_met LATCHES
+    // metAt and nothing re-verifies it, so an agent allowed to call it has self-reported "done"
+    // whatever the kind said. "I ran the command and it passed" IS the self-report being replaced.
+    expect(canSelfMarkMet({ kind: "command", cmd: "npm test" })).toBe(false);
+    expect(canSelfMarkMet({ kind: "landed" })).toBe(false);
+  });
+
+  it("names the specific check in each refusal, so the agent knows what would satisfy it", () => {
+    // A generic "you cannot mark this met" leaves the agent with no next action — the refusal has to
+    // say what WOULD close the goal.
+    expect(selfMarkRefusal({ kind: "command", cmd: "cargo test goal_gate" })).toContain("cargo test goal_gate");
+    expect(selfMarkRefusal({ kind: "landed" })).toContain("origin/main");
+    expect(selfMarkRefusal({ kind: "human" })).toMatch(/person|human/i);
+  });
+
+  it("names a PERSON as the closer, never an automated proof that does not exist", () => {
+    // THIS IS THE COPY AN AGENT READS WHILE BLOCKED, which makes it the worst place to promise an
+    // automation that is not there (roborev 56154). These arms used to end "let the check … close the
+    // goal" and "the proof closes the goal, not your say-so" — but no executor exists: `verify` is
+    // read only by canSelfMarkMet/selfMarkRefusal, carried by chargeGoalDebt and rendered by
+    // describeGoalVerify. An agent that states `command`, finishes, is refused, and reads "the proof
+    // closes the goal" waits for a proof that never arrives — and since `verify: null` is
+    // concierge-only it stays un-closable and auto-resumed until a person notices.
+    const cmd = selfMarkRefusal({ kind: "command", cmd: "cargo test goal_gate" });
+    const landed = selfMarkRefusal({ kind: "landed" });
+    for (const msg of [cmd, landed]) {
+      expect(msg).toMatch(/a person closes the goal/i);
+    }
+    expect(cmd).toMatch(/nothing runs the check for you today/i);
+    expect(landed).toMatch(/no code computes `landed` today/i);
+    // The promise of an automated closer must be GONE, not merely accompanied by the caveat.
+    expect(landed).not.toMatch(/computed from git/);
+    expect(landed).not.toMatch(/the proof closes the goal/);
+    expect(cmd).not.toMatch(/let the check .* close the goal/);
   });
 
   it("leaves legacy goals with no verify exactly as they were", () => {

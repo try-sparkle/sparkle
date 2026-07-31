@@ -36,6 +36,31 @@ describe("validateWorkerGoal — a stated, checkable goal", () => {
   });
 });
 
+describe("validateWorkerGoal — the DEFAULT surface still names spawn_worker", () => {
+  // The surface strings are the mechanism the whole "followable refusal" fix rests on, and only the
+  // NEW surface was asserted. Editing DEFAULT_SURFACE — or letting a caller's overrideParam leak into
+  // it — would leave every suite green while the spawn refusal pointed callers at a key
+  // spawnWorkerTool does not accept: a straight recurrence of the defect just fixed (roborev 55877).
+  it("names spawn_worker and goalOverride when no surface is given", () => {
+    const missing = rejected(validateWorkerGoal(undefined, TASK));
+    expect(missing.message).toContain("spawn_worker");
+    expect(missing.message).toContain("goalOverride");
+    expect(missing.message).not.toContain("notWork");
+
+    const thinReason = rejected(validateWorkerGoal(undefined, TASK, { reason: "short" }));
+    expect(thinReason.message).toContain("goalOverride");
+  });
+
+  it("names the CALLER's tool and parameter when a surface is given", () => {
+    const v = rejected(
+      validateWorkerGoal(undefined, TASK, undefined, { tool: "some_other_tool", overrideParam: "notWork" }),
+    );
+    expect(v.message).toContain("some_other_tool");
+    expect(v.message).toContain("notWork");
+    expect(v.message).not.toContain("spawn_worker");
+  });
+});
+
 describe("validateWorkerGoal — refusals", () => {
   it("refuses a missing goal, and says so as `goal-missing`", () => {
     for (const absent of [undefined, null, "", "   ", "\n\t "]) {

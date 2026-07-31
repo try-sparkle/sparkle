@@ -21,6 +21,7 @@ import {
   type AgentGoal,
   type GoalState,
 } from "../engine/agentGoal";
+import { describeGoalVerify } from "@sparkle/core";
 import { stallReport, type StallReport } from "../engine/agentStall";
 import { thrashReportFor, type ThrashReport } from "../engine/agentThrash";
 import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
@@ -49,6 +50,15 @@ export interface GoalReading {
   /** Present ONLY when `state === "escalated"`: why auto-continue gave up, for the human who now
    *  owns it. */
   escalationReason?: string;
+  /** HOW this goal gets checked, rendered as one readable clause ("`pnpm test` exits 0", "a person
+   *  decides"), and ABSENT when no check was stated.
+   *
+   *  Absence is the meaningful half: a goal with no check is one its own claimant may close, so a
+   *  reader that cannot see this field cannot tell a goal someone else must sign off from one the
+   *  agent will latch itself. It also makes an INHERITED check visible — a new goal that carries a
+   *  check forward from a previous one reads as "a person decides" here, which is the only way the
+   *  caller learns it did not get the self-markable goal it thought it set (roborev 55933). */
+  verify?: string;
 }
 
 /**
@@ -76,6 +86,10 @@ export function goalReading(goal: AgentGoal | undefined, now: number): GoalReadi
     ...(state === "escalated" && goal.escalationReason !== undefined
       ? { escalationReason: goal.escalationReason }
       : {}),
+    // Only when a check was actually stated — `describeGoalVerify(undefined)` returns the honest
+    // "no check stated", but rendering that on every goal would put a string on the overwhelming
+    // majority of readings to say nothing, and absence already says it.
+    ...(goal.verify !== undefined ? { verify: describeGoalVerify(goal.verify) } : {}),
   };
 }
 

@@ -846,8 +846,9 @@ describe("controlListener", () => {
   // STORE — asserting the reply alone would pass against a handler that replied `ok` and wrote
   // nothing, which is the exact shape of the vacuous test this repo keeps finding.
   describe("set_agent_goal", () => {
-    const goalOf = (id: string) =>
-      useProjectStore.getState().projects[0]!.agents.find((a) => a.id === id)!.goal;
+    const agentOf = (id: string) =>
+      useProjectStore.getState().projects[0]!.agents.find((a) => a.id === id);
+    const goalOf = (id: string) => agentOf(id)!.goal;
 
     it("sets the CALLER's goal by default", async () => {
       fire({ reqId: "sg1", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: "land the retry PR" } });
@@ -869,6 +870,268 @@ describe("controlListener", () => {
       // legitimately done, and it is what stops the next auto-continue sweep.
       expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
       expect(goalStateOf(goalOf(callerId), Date.now())).toBe("met");
+    });
+
+    // ── THE SELF-REPORT GATE ────────────────────────────────────────────────────────────────────
+    // `metAt` is the ONLY signal that makes an idle agent count as done, and `set_agent_goal_met` was
+    // pure self-report: the agent asserted it and the latch closed on its word. A goal that states HOW
+    // it is checked can no longer be latched by its own claimant — for EVERY kind, because "I ran the
+    // command and it passed" is the same self-report the check replaces.
+    //
+    // Each case asserts the STORE FACT (`metAt` absent) as well as the refusal. A test that only read
+    // the reply would pass against an implementation that refused and latched anyway.
+    it("refuses a command-kind goal to its own claimant, and does not latch metAt", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "nested groups parse and parser.test.ts passes", undefined, "agent", {
+          kind: "command",
+          cmd: "pnpm --filter @sparkle/desktop exec vitest run src/parser.test.ts",
+        });
+      fire({ reqId: "sgV1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      // The refusal must name the command, or the agent cannot tell what would satisfy it.
+      expect(String((lastReply() as { error?: string }).error)).toContain("parser.test.ts");
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      expect(goalStateOf(goalOf(callerId), Date.now())).toBe("unmet");
+    });
+
+    it("refuses a landed-kind goal to its own claimant, and does not latch metAt", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the goal-gate work is on origin main", undefined, "agent", {
+          kind: "landed",
+        });
+      fire({ reqId: "sgV2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    // ── THE ESCAPE HATCHES, CLOSED ──────────────────────────────────────────────────────────────
+    // The gate keys off `goal.verify`, so anything that DROPS `verify` re-opens it in one extra call.
+    // Both routes below were agent-reachable and free-tier (roborev 55893). Each asserts the LATCH
+    // (`metAt` absent after a self-mark attempt), not merely the goal's shape — the shape is a
+    // precondition; the latch is the thing that decides whether an idle agent reads as done.
+    it("an agent cannot shed its check by REWORDING the goal", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      // Rewrite with new text and NO verify — the paraphrase escape.
+      fire({
+        reqId: "sgE1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "a slightly different way of saying it" },
+      });
+      await flush();
+      fire({ reqId: "sgE1b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent cannot shed its check by CLEARING and re-setting the goal", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      // Clear drops the record entirely — only the debt remembers.
+      fire({ reqId: "sgE2", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: "" } });
+      await flush();
+      fire({
+        reqId: "sgE2b",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "a fresh unverified objective" },
+      });
+      await flush();
+      fire({ reqId: "sgE2c", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a check can be ADDED to a standing goal without rewording it", async () => {
+      // The same-text re-assert path silently discarded a supplied `verify`, so the caller got `ok`
+      // while the goal stayed self-markable, and a check could never be added to existing work.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "keep the build green", undefined, "agent");
+      fire({
+        reqId: "sgE3",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "keep the build green", verify: { kind: "command", cmd: "pnpm test" } },
+      });
+      await flush();
+      fire({ reqId: "sgE3b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("an agent may still CHANGE its check, just not silently remove it", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({
+        reqId: "sgE4",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the parser handles nesting", verify: { kind: "command", cmd: "pnpm test parser" } },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "command", cmd: "pnpm test parser" });
+    });
+
+    it("a HUMAN typing between the clear and the re-set does not shed the check", async () => {
+      // The bypass survived one ordinary gesture (roborev 55933). `releaseGoalDebt` fires on ANY
+      // human-authored send — a composer line, a picker answer, a suggestion click — and it dropped
+      // the whole stash, check included. So: state a check, clear the goal, wait for the human to
+      // type literally anything, set new text, and the goal was unverified and self-markable again.
+      // A human engaging is not a human taking back a verification method.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({ reqId: "sgH1", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: "" } });
+      await flush();
+      // THE HUMAN TYPES. Not a goal rewrite, not a take-back — an ordinary line.
+      useProjectStore.getState().appendPrompt(projectId, callerId, "any old thing", "composer", true);
+      fire({
+        reqId: "sgH1b",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "a fresh unverified objective" },
+      });
+      await flush();
+      fire({ reqId: "sgH1c", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("a human's release clears the retry budget but NOT the check", async () => {
+      // The other half of the same rule, and the branch the test above cannot reach: when the stash
+      // owes a spent budget as well as a check, `releaseGoalDebt` really does run. It must give back
+      // the retries — that is what a human engaging earns the agent — while leaving the check in
+      // place, since typing a line says nothing about how the work gets verified (roborev 55933).
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", {
+        kind: "landed",
+      });
+      store.noteAgentGoalContinue(projectId, callerId, "mark-1");
+      store.noteAgentGoalContinue(projectId, callerId, "mark-2");
+      fire({ reqId: "sgH2", op: "set_agent_goal", callerAgentId: callerId, payload: { goal: "" } });
+      await flush();
+      const stashed = agentOf(callerId)!.goalDebt!;
+      expect(stashed.totalContinues).toBeGreaterThan(0);
+      expect(stashed.verify).toEqual({ kind: "landed" });
+
+      useProjectStore.getState().appendPrompt(projectId, callerId, "any old thing", "composer", true);
+
+      const afterRelease = agentOf(callerId)!.goalDebt;
+      expect(afterRelease?.totalContinues).toBe(0); // the budget IS released
+      expect(afterRelease?.verify).toEqual({ kind: "landed" }); // the check is NOT
+    });
+
+    it("inherits the OBLIGATION on new text, not the old command", async () => {
+      // Restoring the check verbatim onto genuinely new goal text was actively wrong on the routine
+      // path: `send_to_agent_terminal` records every work goal with no `verify`, so a command stated
+      // for one objective got silently re-attached to an unrelated one — `selfMarkRefusal` then tells
+      // the agent to run a command that has nothing to do with its goal, and once an executor exists
+      // that stale command exiting 0 closes work nobody checked (roborev 55933).
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the parser handles nesting", undefined, "agent", {
+          kind: "command",
+          cmd: "pnpm test parser",
+        });
+      fire({
+        reqId: "sgI1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "write the release notes for this cut" },
+      });
+      await flush();
+      // The obligation survives — the goal is still not the claimant's to close…
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "human" });
+      // …and the REPLY says so. Without this the caller cannot tell it did not get the
+      // self-markable goal it thought it set, which is the only signal an inheritance ever gives.
+      expect(lastReply()).toMatchObject({ ok: true, goal: { verify: "a person decides" } });
+      fire({ reqId: "sgI1b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      // …but the refusal must NOT instruct the agent to run a command about the previous work.
+      const reply = lastReply() as { error?: string };
+      expect(String(reply.error)).not.toContain("pnpm test parser");
+    });
+
+    it("lets the CONCIERGE drop a check with verify:null, and refuses the agent the same lever", async () => {
+      // Without a deliberate take-back the check was un-droppable for the life of the persisted
+      // record: one voluntarily-verified goal turned into a permanent regime in which the agent could
+      // never close any later goal itself. The lever has to exist, and it has to belong to the
+      // human-driven surface rather than to the agent it binds (roborev 55933).
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+
+      // The AGENT may not take its own check back.
+      fire({
+        reqId: "sgN1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the work is on origin main", verify: null },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "verify_not_yours" });
+      expect(goalOf(callerId)!.verify).toEqual({ kind: "landed" });
+
+      // The CONCIERGE may.
+      fire({
+        reqId: "sgN2",
+        op: "set_agent_goal",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: callerId, goal: "the work is on origin main", verify: null },
+      });
+      await flush();
+      expect(goalOf(callerId)!.verify).toBeUndefined();
+      // And the goal is genuinely self-markable again — the side effect, not just the field's shape.
+      fire({ reqId: "sgN3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+    });
+
+    it("still lets the claimant REOPEN a verified goal — met:false is not a false done", async () => {
+      // Refusing this would trap an agent that noticed its own premature close. Reopening re-arms
+      // auto-continue, which is the opposite of the failure the gate exists to prevent.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the work is on origin main", undefined, "agent", { kind: "landed" });
+      fire({ reqId: "sgV3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: false } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: false });
+    });
+
+    it("leaves an UNVERIFIED goal self-markable, so existing goals keep working", async () => {
+      // The compatibility seam. Every goal predating `verify` has none, and it never claimed to be
+      // verifiable — refusing those would break the op for the whole installed base.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      fire({ reqId: "sgV4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+    });
+
+    it("refuses a MALFORMED verify at set time rather than silently dropping it", async () => {
+      // Dropping it would reply ok for a goal the caller believes is verified and which is in fact
+      // self-markable — worse than either accepting or refusing.
+      fire({
+        reqId: "sgV5",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "something checkable happens here", verify: { kind: "vibes" } },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "verify-unknown-kind" });
     });
 
     it("refuses `met` when there is no goal to mark, instead of reporting a phantom clear", async () => {

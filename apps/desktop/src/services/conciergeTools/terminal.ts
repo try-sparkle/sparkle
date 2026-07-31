@@ -997,7 +997,10 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "send_to_agent_terminal",
     description:
-      "Type a message into an agent's terminal, as if the human had typed it. Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer. " +
+      "Type a message into an agent's terminal, as if the human had typed it. " +
+      "State `goal` — an objectively verifiable completion criterion anyone can check — or " +
+      "`notWork: { reason }` when the send assigns no work; a send stating neither is refused. " +
+      "Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer. " +
       SPARKLE_AGENT_TOOL_NOTE,
     write: true,
   },

@@ -138,6 +138,7 @@ import {
 } from "./registry";
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
 import { useProjectStore } from "../../stores/projectStore";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import { takePendingSends, resetPendingSends } from "../pendingSends";
 import {
   BRIEF_DELIVERY_TIMEOUT_MS,
@@ -859,6 +860,55 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     expect(dispatchAnswerMock).not.toHaveBeenCalled();
   });
 
+  it("records the goal as the AGENT, so a reworded goal cannot refill the retry budget", async () => {
+    // The default actor is "human", which builds a fresh goal (totalContinues 0) and releases the
+    // stashed debt. Ordinary concierge traffic would then refill MAX_CONTINUES_TOTAL on every
+    // reworded goal, the ceiling would never be reached, and the agent would NEVER escalate — the
+    // escalation guard would be protecting a state this call site prevented (roborev 55877).
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const store = useProjectStore.getState();
+    store.setAgentGoal(projectId, agentId, "the original criterion holds", undefined, "agent");
+    store.noteAgentGoalContinue(projectId, agentId, "mark-1");
+    store.noteAgentGoalContinue(projectId, agentId, "mark-2");
+    const before = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!.goal!;
+    expect(before.totalContinues).toBeGreaterThan(0);
+
+    await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "more work", goal: "a reworded but different criterion passes" },
+      }),
+    );
+
+    const after = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!.goal!;
+    // The spend is CARRIED, not laundered.
+    expect(after.totalContinues).toBeGreaterThanOrEqual(before.totalContinues);
+  });
+
+  it("reports goalRecorded:false when the agent is in no project, instead of a bare ok", async () => {
+    // services/sparkleAgent documents that __sparkle_self__ is never in any project, so EVERY work
+    // send to the Improve Sparkle agent lands in that branch. A bare ok told the caller the goal was
+    // recorded when it was not, leaving that agent goalless behind an enforcement reporting success.
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId: SPARKLE_AGENT_ID, text: "improve yourself", goal: "the lint budget is at zero" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    expect(r.ok && (r.data as { goalRecorded?: boolean }).goalRecorded).toBe(false);
+    expect(String((r.ok && (r.data as { goalNote?: string }).goalNote) ?? "")).toMatch(/project/i);
+  });
+
   it("does NOT replace an ESCALATED goal, so a routine send cannot un-escalate an agent", async () => {
     // Recording a goal is a side effect of every work send, and setAgentGoal with CHANGED text runs
     // newGoal — which zeroes the retry counters and drops escalatedAt. An escalated goal is one
@@ -891,6 +941,75 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
       .agents.find((x) => x.id === agentId)!.goal!;
     expect(after.escalatedAt).toBe(before.escalatedAt);
     expect(after.text).toBe(before.text);
+  });
+
+  it("does NOT record a goal when the escalation survives only in goalDebt, and says the human must act", async () => {
+    // THE ROUTE THE GUARD WAS WIDENED FOR, and the one the test above cannot reach (roborev 55900).
+    // The test above stamps `escalatedAt` on the LIVE goal, which the original `existing?.escalatedAt`
+    // read already covered — so deleting `?? agent?.goalDebt?.escalatedAt` left the suite green.
+    // Here the agent CLEARS its goal first: the record is dropped and the escalation survives only in
+    // the `goalDebt` stash, so `agent.goal` is undefined at the guard.
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const store = useProjectStore.getState();
+    store.setAgentGoal(projectId, agentId, "the original objective that was escalated");
+    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts");
+    store.setAgentGoal(projectId, agentId, "", undefined, "agent"); // the agent clears it
+    const cleared = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!;
+    expect(cleared.goal).toBeUndefined();
+    expect(cleared.goalDebt?.escalatedAt).toBeTruthy();
+
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId, text: "here is more work", goal: "a completely different criterion passes" },
+      }),
+    );
+
+    // The SIDE EFFECT: no goal was written, so the escalation was not laundered into a fresh budget.
+    expect(r.ok).toBe(true);
+    const after = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((x) => x.id === agentId)!;
+    expect(after.goal).toBeUndefined();
+    expect(after.goalDebt?.escalatedAt).toBe(cleared.goalDebt?.escalatedAt);
+    expect(r.ok && (r.data as { goalRecorded?: boolean }).goalRecorded).toBe(false);
+    // And the COPY must not claim a goal exists — the agent is goalless and stays that way until a
+    // person types to it, so the note has to route the caller to the human rather than to a re-send.
+    const note = String((r.ok && (r.data as { goalNote?: string }).goalNote) ?? "");
+    expect(note).toMatch(/human|person/i);
+    expect(note).not.toMatch(/not replaced/i);
+  });
+
+  it("explains a not-work send rather than reporting a bare goalRecorded:false", async () => {
+    // Under `notWork` the gate returns `goal: null`, so the recording block never runs and the reply
+    // used to be a bare `goalRecorded: false` — shaped exactly like the genuine failures minus their
+    // explanation. Read by the field's own contract that says "it wasn't recorded", which invites the
+    // concierge to restate the objective and re-send text the PTY already has (roborev 55900).
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: {
+          agentId,
+          text: "nice work on that one",
+          notWork: { reason: "acknowledging a finished handoff; there is nothing to do" },
+        },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    const note = String((r.ok && (r.data as { goalNote?: string }).goalNote) ?? "");
+    expect(note).not.toBe("");
+    // Not mistakable for the no-project failure, which is the other reply carrying goalRecorded:false.
+    expect(note).not.toMatch(/project/i);
+    expect(note).toMatch(/not-work/i);
   });
 
   it("refuses an omitted goal, not merely an empty one", async () => {

@@ -12,13 +12,16 @@
 // makes "objectively verifiable" true rather than aspirational.
 //
 // ── THE THREE KINDS, AND WHY EXACTLY THESE ───────────────────────────────────────────────────────
-//   command — a command that must exit 0. The strongest: a machine runs it, so "met" is PROVEN.
-//   landed  — the work is on origin/main. Computed from git by the same squash/rebase-safe proof the
-//             unlanded-work surface uses, so it cannot be asserted at all. Ties a goal to shipping,
-//             which is the outcome that actually matters.
+//   command — a command that must exit 0. The strongest kind of EVIDENCE: a machine can run it, so
+//             "met" is checkable by someone who is not the claimant.
+//   landed  — the work is on origin/main, checkable by the same squash/rebase-safe proof the
+//             unlanded-work surface uses, so it cannot be asserted. Ties a goal to shipping, which is
+//             the outcome that actually matters.
 //   human   — genuinely needs a person (a design call, a judgement). Naming this explicitly is the
-//             honest option, and it is NOT a loophole: it is the one kind an agent may not
-//             self-mark, so declaring it ROUTES THE DECISION TO THE HUMAN rather than dodging it.
+//             honest option, not a dodge: it ROUTES THE DECISION TO THE HUMAN.
+//
+// NO STATED KIND MAY BE SELF-MARKED. See `canSelfMarkMet` — `set_agent_goal_met` latches `metAt`, so
+// an agent allowed to call it has self-reported "done" regardless of which kind it declared.
 //
 // There is deliberately NO "unverifiable" kind. `human` already covers "no machine can check this",
 // and it covers it in the direction that costs the claimant something. An `unverifiable` kind would
@@ -30,6 +33,14 @@
 // the goal met. It never runs anything — executing a `command` and computing `landed` belong to the
 // callers that own those capabilities, and keeping them out of here is what makes every rule below
 // unit-testable.
+//
+// AND NO CALLER DOES EITHER ONE YET. `verify` is read only by `canSelfMarkMet`/`selfMarkRefusal`,
+// carried by `chargeGoalDebt`, and rendered by `describeGoalVerify` — so today a stated check means
+// a PERSON closes the goal, whichever kind it names. That is a real gap, not an implementation
+// detail: every user-facing string here must say so, because an agent told a proof is coming waits
+// for one that never arrives. Whoever adds the executor should delete those caveats in the same
+// change — they are in `selfMarkRefusal` below, the `verify` field describe in mcp-control's
+// `server.ts`, `.claude/commands/goal.md`, and the sparkle-control SKILL.md.
 //
 // SECURITY NOTE for whoever wires `command` to real execution: `cmd` is a string a MODEL wrote. Do
 // not treat validation here as sanitisation — it rejects a BLANK cmd and nothing else (see the note
@@ -149,31 +160,59 @@ export function parseGoalVerify(input: unknown): VerifyVerdict {
 /**
  * May the AGENT ITSELF declare this goal met?
  *
- * `false` for `human` — that is the entire point of the kind, and the only mechanically enforceable
- * thing this module contributes to `set_agent_goal_met`. A `human` goal marked met by its own claimant
- * would be indistinguishable from the self-report the verification exists to replace.
+ * **`false` for EVERY stated verify kind.** An earlier version returned `true` for `command` and
+ * `landed`, reasoning that those claims were "admissible pending a check". That distinction does not
+ * survive contact with the thing being prevented: `set_agent_goal_met` LATCHES `metAt`, and `metAt`
+ * is the only signal that makes an idle agent count as done. So an agent permitted to call it has
+ * self-reported "done" whatever the kind says — "I ran the command and it passed" is exactly the
+ * self-report the whole mechanism exists to replace, and nothing downstream re-checks it.
  *
- * `true` for `command` and `landed` does NOT mean "take its word for it": it means the claim is
- * ADMISSIBLE and must then be CHECKED by whoever owns that capability (run the command / compute the
- * git proof). A caller that treats `true` as "accept the self-report" has reintroduced the bug — see
- * `selfMarkRefusal` for the message to use when the check has not been performed.
+ * What each kind means once this returns `false`:
+ *   command — the CHECK decides. Someone must run it and mark met on the result.
+ *   landed  — GIT decides. The proof is computed, never asserted.
+ *   human   — a PERSON decides.
+ *
+ * `true` only when NO verify was stated. Every goal that predates this module is in that case, and
+ * refusing them would break `set_agent_goal_met` for the whole installed base to enforce a rule they
+ * never opted into. That is the compatibility seam, not a loophole: a goal with no stated check was
+ * never claiming to be verifiable.
+ *
+ * This function does NOT decide who else may mark it — the human, and the concierge acting as the
+ * human-driven surface, are outside its scope. It answers one question: may the CLAIMANT latch it.
  */
 export function canSelfMarkMet(verify: GoalVerify | undefined): boolean {
-  if (!verify) return true; // legacy goals carry no verify; unchanged behaviour, no new refusals
-  return verify.kind !== "human";
+  return !verify;
 }
 
-/** The refusal to hand an agent that tried to mark a `human`-verified goal met itself. */
+/** The refusal to hand an agent that tried to latch its own verified goal. Total over every kind. */
 export function selfMarkRefusal(verify: GoalVerify): string {
-  if (verify.kind === "human") {
-    return (
-      "This goal is verified by a person, so you cannot mark it met. Say what you finished and why " +
-      "you believe it satisfies the goal, and leave it for the human to close."
-    );
+  switch (verify.kind) {
+    // BOTH ARMS NAME A PERSON AS THE CLOSER, because that is who closes it (roborev 56154). They
+    // used to promise an automated closer — "let the check … close the goal", "the proof closes the
+    // goal" — and no executor exists: nothing runs `cmd`, nothing computes `landed`. This is the
+    // copy an agent reads at the moment it is BLOCKED, so a promised proof that never arrives leaves
+    // it waiting, un-closable (`verify: null` is concierge-only) and auto-resumed until a person
+    // notices. Telling it the truth before it acts and a falsehood once it is stuck is the worst of
+    // both.
+    case "command":
+      return (
+        `This goal is verified by running \`${verify.cmd}\`, so you cannot mark it met yourself — ` +
+        "your saying the command passed is the self-report the check replaces. Run it and show the " +
+        "result; a person closes the goal on that evidence, because nothing runs the check for you " +
+        "today."
+      );
+    case "landed":
+      return (
+        "This goal is verified by the work being on origin/main, so you cannot assert it. Get it " +
+        "landed and say so; a person closes the goal on that evidence, because no code computes " +
+        "`landed` today."
+      );
+    case "human":
+      return (
+        "This goal is verified by a person, so you cannot mark it met. Say what you finished and why " +
+        "you believe it satisfies the goal, and leave it for the human to close."
+      );
   }
-  // Not reachable through `canSelfMarkMet`, but total on purpose: a future kind gets a sentence
-  // rather than an empty string.
-  return "This goal cannot be marked met from here.";
 }
 
 /** One-line human-readable rendering, for a row, a prompt, or a scoreboard. */

@@ -28,6 +28,8 @@
  *  never expires would be eligible for auto-continue forever, so a goal someone set and forgot
  *  becomes a permanent token burner. Four hours is long enough to cover a real build session and
  *  short enough that a forgotten goal dies the same working day. */
+import type { GoalVerify } from "@sparkle/core";
+
 export const DEFAULT_GOAL_TTL_MS = 4 * 60 * 60_000;
 
 /** An agent's current goal. Persisted on the AgentTab record (see types.ts), so it survives the
@@ -60,6 +62,11 @@ export interface AgentGoal {
   escalatedAt?: number;
   /** Why it escalated, in one sentence, for the human who now owns it. */
   escalationReason?: string;
+  /** HOW this goal is checked (see @sparkle/core goalVerify). Absent on every goal that predates the
+   *  field, and absence is what keeps `set_agent_goal_met` working for those: a goal that never stated
+   *  a check was never claiming to be verifiable, so it is still self-markable. A goal that DID state
+   *  one cannot be latched by its own claimant — `canSelfMarkMet` refuses every kind. */
+  verify?: GoalVerify;
 }
 
 /** Where a goal is in its life. `none` is the absence of a goal, kept in the union so every
@@ -77,10 +84,19 @@ export type GoalState = "none" | "unmet" | "met" | "expired" | "escalated";
  *  `set_agent_goal`, a UI field submitted empty — would reach it, so the refusal belongs here
  *  rather than in each caller. Callers that want "empty means clear the goal" must check first;
  *  `projectStore.setAgentGoal` does exactly that. */
-export function newGoal(text: string, now: number, ttlMs = DEFAULT_GOAL_TTL_MS): AgentGoal {
+export function newGoal(
+  text: string,
+  now: number,
+  ttlMs = DEFAULT_GOAL_TTL_MS,
+  verify?: GoalVerify,
+): AgentGoal {
   const trimmed = text.trim();
   if (trimmed === "") throw new Error("a goal needs text — an empty goal can never be acted on");
-  return { text: trimmed, setAt: now, ttlMs, continues: 0, totalContinues: 0 };
+  // `verify` is spread conditionally so an unverified goal has NO `verify` key rather than an explicit
+  // `undefined`. The two are equivalent to `canSelfMarkMet`, but only the former survives a JSON
+  // round-trip through the persisted store identically, and the absence is load-bearing (it is what
+  // marks a goal as pre-dating the field).
+  return { text: trimmed, setAt: now, ttlMs, continues: 0, totalContinues: 0, ...(verify ? { verify } : {}) };
 }
 
 /**
@@ -210,6 +226,18 @@ export interface GoalDebt {
    *  latched within a goal: taking it back is the human's call, not the agent's. */
   escalatedAt?: number;
   escalationReason?: string;
+  /** The CHECK the cleared goal stated. Latched for the same reason as the escalation, and against
+   *  the same escape: `verify` is what decides whether the claimant may latch `metAt`, so a goal that
+   *  lost it on a rewrite would become self-markable in one extra call — the paraphrase-escape this
+   *  debt mechanism already closes for the retry budget, left open for the field that gates the latch
+   *  (roborev 55893).
+   *
+   *  THE ONE WAY OUT IS DELIBERATE AND THE CONCIERGE'S: `set_agent_goal {verify: null}`. This used to
+   *  say "a HUMAN rewrite may still drop it", which was false twice over — no production caller passes
+   *  `actor: "human"`, and the release that DID fire (`releaseGoalDebt`, on any typed line) was
+   *  incidental rather than a take-back, so the check was simultaneously un-droppable on purpose and
+   *  droppable by accident (roborev 55933). */
+  verify?: GoalVerify;
 }
 
 /**
@@ -221,9 +249,14 @@ export interface GoalDebt {
  */
 export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
   if (goal === undefined) return undefined;
-  if (goal.totalContinues === 0 && goal.escalatedAt === undefined) return undefined;
+  // `verify` counts as debt on its own: a goal with a clean budget and no escalation still owes its
+  // CHECK across a clear, or clear-then-set launders a verified goal into an unverified one.
+  if (goal.totalContinues === 0 && goal.escalatedAt === undefined && goal.verify === undefined) {
+    return undefined;
+  }
   return {
     totalContinues: goal.totalContinues,
+    ...(goal.verify !== undefined ? { verify: goal.verify } : {}),
     ...(goal.escalatedAt !== undefined
       ? {
           escalatedAt: goal.escalatedAt,
@@ -234,6 +267,9 @@ export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
       : {}),
   };
 }
+
+/** What an inherited check becomes on NEW goal text — the obligation, without the stale proof. */
+const INHERITED_VERIFY: GoalVerify = { kind: "human" };
 
 /**
  * Charge a freshly-created goal with an outstanding {@link GoalDebt}.
@@ -249,9 +285,25 @@ export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): Age
   if (debt === undefined) return goal;
   const escalatedAt = goal.escalatedAt ?? debt.escalatedAt;
   const escalationReason = goal.escalationReason ?? debt.escalationReason;
+  // THE OBLIGATION IS INHERITED; THE PROOF IS NOT (roborev 55933).
+  //
+  // The incoming goal's own `verify` wins when it has one — the caller stated a NEW check. When it
+  // states none, the owed check is inherited, but DOWNGRADED to `human` rather than restored
+  // verbatim, because this branch runs on genuinely NEW goal text and nothing here can know the old
+  // proof still applies to it. Restoring it verbatim was actively wrong on the routine path:
+  // `send_to_agent_terminal` records every work goal with no `verify` at all, so an agent that once
+  // stated `{ kind: "command", cmd: "pnpm test parser" }` had that command silently re-attached to
+  // "write the release notes" — `selfMarkRefusal` then instructs it to run a command unrelated to
+  // its goal, and once an executor exists a stale command exiting 0 closes an unrelated goal, which
+  // is the false "done" this whole mechanism exists to prevent.
+  //
+  // `human` is the honest carry: it keeps the goal non-self-markable (the invariant the debt owes)
+  // while asserting no machine proof about work nobody checked.
+  const verify = goal.verify ?? (debt.verify !== undefined ? INHERITED_VERIFY : undefined);
   return {
     ...goal,
     totalContinues: Math.max(goal.totalContinues, debt.totalContinues),
+    ...(verify !== undefined ? { verify } : {}),
     ...(escalatedAt !== undefined
       ? {
           escalatedAt,
