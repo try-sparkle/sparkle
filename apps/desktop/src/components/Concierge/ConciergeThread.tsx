@@ -1,8 +1,9 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { FiCheck } from "react-icons/fi";
+import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { useCopyOnSelection } from "./useCopyOnSelection";
@@ -31,16 +32,6 @@ export {
   FAILURE_EVIDENCE_TESTID,
 } from "./ConciergeMessageRow";
 
-/** How close to the bottom still counts as "following", measured when the READER scrolls.
- *
- *  Small on purpose. The old 150px slack existed because the measurement happened after layout and
- *  had to cover one just-appended message; nothing is unlaid-out at scroll time, so the only slack
- *  needed is for rounding. At 150px a reader who scrolled up a line to re-read it still counted as
- *  "following" and got yanked back on the next feed tick — the founder's original complaint, at
- *  small amplitude. Not smaller than this, though: macOS rubber-band settling and fractional
- *  clientHeight/scrollHeight under non-integral zoom can leave a genuinely-bottomed container a few
- *  px off, and each such miss silently costs the reader the follow. Both sides are tested. */
-const FOLLOW_THRESHOLD_PX = 24;
 
 /** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
  *
@@ -160,154 +151,33 @@ export function ConciergeThread({
         );
   /** Open the full-text modal for a payload. Stable, so it does not un-memoise every row. */
   const openPayloadFor = useCallback((id: string) => setOpenPayloadId(id), []);
-  // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
-  // its newest message) and only changes when the READER scrolls — never as a side effect of new
-  // content.
-  const followRef = useRef(true);
-  /** Last observed scrollTop, so an event that moved nothing can be told from the reader actually
-   *  scrolling. -1 is a value no scrollTop can hold, so the first event of a session always counts
-   *  as the reader's. */
-  const lastTopRef = useRef(-1);
-  /** The newest user-sent message id this component has already reacted to. `null` until the first
-   *  effect run, so a thread that MOUNTS with the user's last message in it (the persisted thread,
-   *  restored at launch) isn't mistaken for a fresh submit. */
-  const lastUserMessageIdRef = useRef<string | null>(null);
-  /**
-   * Is the reader dragging out a selection RIGHT NOW?
-   *
-   * GUARD 3 on the auto-follow below, and the one that answers the founder's report directly: "when
-   * I copy boxes sometimes the part where I started copying loses its initial anchor location."
-   *
-   * The auto-follow writes `el.scrollTop = el.scrollHeight` on every change of `contentKey`, and
-   * `contentKey` includes the thread's total text length — so a streaming reply fires it once per
-   * token. Guards 1 and 2 both ask "should we be following?", and while a reply streams in the
-   * honest answer is yes. Neither of them asks whether the reader is in the middle of a GESTURE, so
-   * a drag started anywhere in the transcript gets the container yanked to the bottom underneath it,
-   * several times a second. The browser goes on extending the highlight from where the anchor now
-   * sits on screen, which is not where the reader put it — so the selection start visibly moves, and
-   * it moves again on the next token. That is the whole bug, and it needs a streaming reply to
-   * reproduce, which is exactly the case the founder said to test.
-   *
-   * Deferred, never cancelled: the follow stays armed, so the next delta after the release catches
-   * the thread up. A reader who is selecting is reading, and content arriving during those two
-   * seconds is content they did not ask to be scrolled past.
-   */
-  const selectingRef = useRef(false);
-  useEffect(() => {
-    // Primary button only — a right-click opens a context menu over a selection rather than starting
-    // one.
-    //
-    // BOTH ends on the DOCUMENT, and symmetrically so. The release must be, because a drag that
-    // overshoots the thread (which is how you select through to the end of an answer) lets go
-    // somewhere else entirely — container-bound, this flag would latch on and the thread would stop
-    // following for the rest of the session. The PRESS must be for the mirror reason: a selection
-    // that starts in the compose box and comes up into the transcript is still a selection the
-    // auto-follow would scroll out from under. The cost of listening this widely is that an ordinary
-    // click anywhere defers the follow for the few milliseconds until its own mouseup, which is not
-    // observable.
-    const down = (e: MouseEvent) => {
-      if (e.button === 0) selectingRef.current = true;
-    };
-    // CATCH UP ON RELEASE, rather than leaving the deferral to be resolved by the next delta.
-    //
-    // The guard above only early-returns; nothing re-runs the follow effect on `mouseup`, so a
-    // deferred follow waited on a `contentKey` change that may never come. If the LAST delta of a
-    // reply lands during the hold, the answer stays below the fold until some future message
-    // arrives — and `followRef` still reads `true`, so nothing looks wrong. Widening the press to
-    // the document made that reachable from gestures aimed at other surfaces entirely (dragging a
-    // column pull tab, a scrollbar, a selection in the terminal), which is what turned it from a
-    // trade-off the reader was making deliberately into one made on their behalf.
-    //
-    // Idempotent by construction: while the follow is armed the thread is already at the bottom, so
-    // this is a no-op except in exactly the case it is for — content that arrived during the hold.
-    const up = () => {
-      if (!selectingRef.current) return;
-      selectingRef.current = false;
-      const el = scrollRef.current;
-      if (!el || !followRef.current) return;
-      el.scrollTop = el.scrollHeight;
-      // Record the scroll WE caused, for the same reason the effect below does: otherwise the
-      // browser's async scroll event can read as the reader moving and silently cost them the follow.
-      lastTopRef.current = el.scrollTop;
-    };
-    document.addEventListener("mousedown", down);
-    document.addEventListener("mouseup", up);
-    return () => {
-      document.removeEventListener("mousedown", down);
-      document.removeEventListener("mouseup", up);
-    };
-  }, []);
-
-  // Auto-follow, but only when the reader is actually at the bottom (bead sparkle-y4ft). This used to
-  // be an unconditional `scrollTop = scrollHeight` keyed on [messages, typing], which produced the
-  // founder-visible bug: "every time I click on an item, it scrolls me to the bottom of the first
-  // column." Two independent causes, so two guards — removing either one leaves the bug reachable.
+  // Auto-follow lives in `hooks/useAutoFollow`, shared with the mounted-agent transcript thread.
+  // All three guards — the content key, the stick-to-bottom read, and the live-selection deferral —
+  // moved with it, so both threads behave identically and neither can drift from the other. What
+  // stays here is the pair of KEYS, because only this component knows what "the content changed"
+  // and "the reader just sent something" mean for a concierge message array.
   //
-  // Guard 1, the content key. ConciergeHost builds `messages` as [...chat, ...nudges] inside a useMemo
-  // keyed on the concierge feed, so a NEW ARRAY with IDENTICAL CONTENTS arrives on every feed tick —
-  // and clicking an item ticks the feed. Keying on array identity meant a click scrolled the column.
-  // Key on content instead, so an unchanged thread doesn't re-run this at all.
+  // The content key includes TOTAL text length because the brain streams: `onConciergeDelta` upserts
+  // the same `brain-<id>` bubble with more text, so count and last id both stay put while the reply
+  // grows below the fold. Keyed on those alone, the thread stopped following mid-answer. Total, not
+  // the LAST message's length: ConciergeHost builds `messages` as [...chat, ...nudges], so the moment
+  // any agent is surfaced the growing bubble is no longer last and a per-last-message length tracks a
+  // static nudge instead — which is the state the column normally lives in.
   //
-  // The key includes TOTAL text length because the brain streams: `onConciergeDelta` upserts the
-  // same `brain-<id>` bubble with more text, so count and last id both stay put while the reply
-  // grows below the fold. Keyed on those alone, the thread stopped following mid-answer.
-  //
-  // Total, not the LAST message's length: ConciergeHost builds `messages` as [...chat, ...nudges],
-  // so the moment any agent is surfaced the growing bubble is no longer last and a per-last-message
-  // length tracks a static nudge instead — which is the state the column normally lives in.
+  // `typing` is folded into the key rather than passed separately: the hook re-runs its follow on any
+  // change to the key, which is exactly what a third dependency did before the extraction.
   const last = messages.length > 0 ? messages[messages.length - 1]! : undefined;
   const totalLength = messages.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
-  const contentKey = `${messages.length}:${last?.id ?? ""}:${totalLength}`;
-  const userMessageId = newestUserMessageId(messages);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    // THE ONE THING THAT RE-ARMS THE FOLLOW BESIDES REACHING THE BOTTOM: the user's own submit.
-    //
-    // Everything above is about protecting a reader from content they did not ask for. A message
-    // THEY sent is the opposite — it is an unambiguous "show me what happens next" — and until this
-    // existed there was nothing that could re-arm the follow except personally scrolling back to the
-    // bottom. That is a one-way door in practice, which is the founder's report ("when I submit a
-    // chat it doesn't scroll me down to the bottom of the thread"): a trackpad flick that settles
-    // 30px short of the bottom is past FOLLOW_THRESHOLD_PX, so the follow dies silently and every
-    // later send — including the one they are watching for — lands below the fold.
-    //
-    // Keyed on a NEW user message id, never on "a user message exists". A thread the user has ever
-    // typed in contains a `you` bubble forever, and the host hands this component a fresh array
-    // several times a second; a presence test would re-arm on every feed tick and restore bead
-    // sparkle-y4ft's "clicking an item scrolls the column" in full.
-    //
-    // Deliberately NOT a `sending` prop from the host. The bubble IS the send — the host appends it
-    // in the same tick the message leaves (`ConciergeHost.send`) — so reading it here keeps the
-    // signal in this component's own inputs, with nothing to keep in step and no way for a prop to
-    // be left set after a send that failed.
-    const previousUserMessageId = lastUserMessageIdRef.current;
-    lastUserMessageIdRef.current = userMessageId;
-    const userJustSent =
-      previousUserMessageId !== null &&
-      userMessageId !== "" &&
-      userMessageId !== previousUserMessageId;
-    if (userJustSent) followRef.current = true;
-    // Guard 2, the stick-to-bottom check — READ from the reader's own scrolling, not re-measured
-    // here. Measuring after layout got both ends wrong: on mount `scrollTop` is 0 against a full
-    // `scrollHeight`, so a thread that opens with any content is judged "scrolled up" and never
-    // follows again; and a single tall NudgeCard (badge + text + three buttons) can exceed the
-    // slack, so following silently stops the first time one arrives.
-    if (!followRef.current) return;
-    // Guard 3 — see `selectingRef`. Never scroll out from under a live drag.
-    if (selectingRef.current) return;
-    el.scrollTop = el.scrollHeight;
-    // Record the scroll WE caused, before the browser dispatches its (async) scroll event. Without
-    // this, `lastTopRef` still holds the previous bottom, so a reader gesture that happens to land
-    // on exactly that value reads as "didn't move" and the demotion is skipped — and the previous
-    // bottom is the likeliest such value, since streaming moves the bottom one chunk at a time.
-    lastTopRef.current = el.scrollTop;
-    // `userMessageId` is in the deps even though a new bubble always moves `contentKey` too: the
-    // thread is CAPPED (stores/conciergeThreadStore evicts the oldest bubbles), so a send that
-    // evicts one message while adding another can leave the length unchanged, and the re-arm must
-    // not depend on the total-length term happening to differ.
-  }, [contentKey, typing, userMessageId]);
+  const contentKey = `${messages.length}:${last?.id ?? ""}:${totalLength}:${typing ? 1 : 0}`;
+  // The re-arm key is the newest message the USER sent — never "a user message exists". A thread the
+  // user has ever typed in contains a `you` bubble forever, and the host hands this component a fresh
+  // array several times a second; a presence test would re-arm on every feed tick and restore bead
+  // sparkle-y4ft's "clicking an item scrolls the column" in full.
+  const { onScroll } = useAutoFollow({
+    contentKey,
+    rearmKey: newestUserMessageId(messages),
+    scrollRef,
+  });
 
   return (
     // THE POSITIONED ANCESTOR THE TOAST HANGS OFF, and the reason there is a wrapper at all. The
@@ -323,32 +193,12 @@ export function ConciergeThread({
       <div
         ref={scrollRef}
         data-testid={CONCIERGE_THREAD_TESTID}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= FOLLOW_THRESHOLD_PX;
-          // A CLAMP — the browser firing `scroll` because the viewport shrank or content was removed
-          // — leaves scrollTop exactly where it was while the distance from the bottom grows, and it
-          // always comes with a geometry change. Treating that as "the reader scrolled away" would
-          // silently stop the follow for something they never did, the same class of bug as measuring
-          // after layout. Reaching the bottom re-arms, whatever caused it.
-          // ONE test: did this event actually move the scroll position? Every browser re-fit is
-          // already covered without a second term, which is why there isn't one —
-          //   • viewport shrinks (window resize, panel opens): scrollTop is untouched while the
-          //     distance from the bottom grows. `readerMoved` is false, so nothing happens.
-          //   • content removed below the fold: the browser clamps scrollTop to the new maximum,
-          //     which IS the bottom, so `atBottom` re-arms the follow.
-          //   • a scroll event that changed nothing (horizontal scroll on this element, an anchoring
-          //     adjustment that nets zero, a synthetic event): `readerMoved` is false.
-          // Two earlier attempts added a geometry-based "was this a clamp?" term instead. Both were
-          // worse: keyed on any geometry change it swallowed real scroll-aways during streaming
-          // growth, and keyed on a shrinking range it depended on a baseline that a resize with no
-          // scroll event leaves stale. Neither could be given a test that reached it — every shape
-          // they claimed to guard lands on `atBottom` first.
-          const readerMoved = el.scrollTop !== lastTopRef.current;
-          if (atBottom) followRef.current = true;
-          else if (readerMoved) followRef.current = false;
-          lastTopRef.current = el.scrollTop;
-        }}
+        // The marker ComposeBox measures its drag ceiling against. BOTH threads carry it — see
+        // MountedAgentThread — so the composer asks for "the thread" and never has to know which one
+        // is on screen. Dropped once already, by a merge that took the other side's JSX verbatim;
+        // `threadScrollerMarker.test.tsx` now asserts both scrollers have it so that cannot recur.
+        data-concierge-scroller="yes"
+        onScroll={onScroll}
         // NOT a live region (roborev 53010). Putting one here looked right — `role="log"` is the
         // standard for an append-only transcript — but this transcript is not append-only: the host
         // appends each brain delta into the LAST message's text, so a polite region over the thread

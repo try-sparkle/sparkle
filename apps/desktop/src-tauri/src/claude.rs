@@ -25,7 +25,11 @@ use std::path::{Path, PathBuf};
 /// map to `-` so the computed slug matches Claude's actual transcript directory.
 /// A prior version replaced only `/` and `.`, leaving the space intact — so
 /// `claude_has_session` never matched and agents never resumed.
-fn encode_project_slug(path: &str) -> String {
+///
+/// `pub(crate)` so `transcript.rs` (the mounted-agent transcript reader) resolves the session
+/// directory through the SAME encoder session detection uses, instead of re-deriving the rule.
+/// A second copy of this rule is exactly how the space-in-"Application Support" bug came back.
+pub(crate) fn encode_project_slug(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
@@ -87,7 +91,10 @@ pub(crate) fn effective_spawn_config_dir() -> String {
 
 /// The directory Claude Code would use to store sessions for `worktree_path`.
 /// Pure form so it's testable without touching the environment.
-fn claude_session_dir_for(projects_root: &Path, worktree_path: &str) -> PathBuf {
+///
+/// `pub(crate)` for the same reason as [`encode_project_slug`]: `transcript.rs` composes
+/// `claude_projects_root` + this to find an agent's transcripts, rather than rebuilding the layout.
+pub(crate) fn claude_session_dir_for(projects_root: &Path, worktree_path: &str) -> PathBuf {
     projects_root.join(encode_project_slug(worktree_path))
 }
 
@@ -133,7 +140,11 @@ fn claude_has_session_in(
 /// the env guard rather than trusting the caller to pre-filter), so neither a stray `config_dir: ""`
 /// nor an `export CLAUDE_CONFIG_DIR=` yields a relative `projects/<slug>` root that would skip the
 /// `$HOME/.claude` fallback. Pure so the precedence is unit-testable.
-fn resolve_session_config_dir(explicit: Option<&str>, env: Option<PathBuf>) -> Option<PathBuf> {
+///
+/// `pub(crate)` so `transcript.rs` applies the IDENTICAL precedence rather than re-deriving
+/// "explicit wins, empty means unset, else `$HOME/.claude`" — a reader that resolves a different
+/// account than the spawn did would silently show another account's conversation.
+pub(crate) fn resolve_session_config_dir(explicit: Option<&str>, env: Option<PathBuf>) -> Option<PathBuf> {
     match explicit.filter(|s| !s.is_empty()) {
         Some(e) => Some(PathBuf::from(e)),
         None => env.filter(|p| !p.as_os_str().is_empty()),

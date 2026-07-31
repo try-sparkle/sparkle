@@ -70,6 +70,7 @@ import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAut
 import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
+import { agentTranscriptPath, agentTranscriptWorktree } from "../agentTranscriptRegistry";
 import { isRedStatus } from "../windowStatus";
 import { isObserved, type AgentLiveness } from "../agentLiveness";
 import {
@@ -306,7 +307,19 @@ export interface ConciergeSendResult {
 //     anything here; the two are a pair.
 //
 //  2. A WORKTREE — `noteAgentTranscriptWorktree`, for an agent with NO pane, hence no hook events
-//     (today: the app-owned Improve Sparkle agent — see services/sparkleTranscript). Nothing tells us
+//     — and, since the mounted-concierge transcript work, for EVERY BUILD AGENT: `projectStore
+//     .setAgentWorktree` registers one the moment a worktree is cut. (It was the app-owned Improve
+//     Sparkle agent alone; see services/sparkleTranscript.) THE SCOPE OF THE RESIDUAL RACE BELOW
+//     WIDENED WITH IT — it is now fleet-wide rather than one app-owned agent, so read it as a
+//     property of every agent's tier-(d) read, not a footnote about one. Two things bound it, and
+//     neither is new: writer (1) WINS wherever it is registered, so any agent with a pane (i.e. any
+//     agent the founder is actually looking at) resolves through the session-gated exact path and
+//     never reaches this scan; and the failure mode remains mislabelled provenance rather than a
+//     read of an arbitrary file, because the directory is still one the app itself created.
+//     The mounted pane does not rely on this registry at all — it resolves the worktree from the
+//     roster row and calls the transcript reader directly — so widening this writer buys
+//     `readAgentTerminal` a fallback it did not have across relaunches without putting the new
+//     surface behind the weaker resolution. Nothing tells us
 //     which session is live, so the file is resolved AT READ TIME as the newest transcript in that
 //     worktree's project dir. Its safety property is weaker and worth stating exactly:
 //       • The worktree is one the app itself created; no id-to-path guessing, nothing a model said.
@@ -333,35 +346,19 @@ export interface ConciergeSendResult {
 // fires on a project switch, and tier (d) exists to serve UNMOUNTED agents). The cost is one short
 // string per agent id opened this process. Stated plainly here so nobody reads the exports as
 // evidence of a lifecycle that doesn't exist.
-const transcriptPaths = new Map<string, string>();
-const transcriptWorktrees = new Map<string, string>();
-
-/** Remember where this agent's session transcript lives, enabling tier (d) of the read chain.
- *  Called from AgentPane's `noteTranscriptFromStop` — see writer (1) in the block above. */
-export function noteAgentTranscriptPath(agentId: string, path: string): void {
-  if (path.trim() === "") return;
-  transcriptPaths.set(agentId, path);
-}
-
-/**
- * Remember which WORKTREE an agent runs in, so tier (d) can resolve its newest transcript at READ
- * time — the only route for an agent with no pane and therefore no Stop events.
- *
- * See writer (2) in the block above for what this does and does not guarantee. Deliberately stores
- * the directory and not a file: resolving once, at registration, is what made a long-running agent
- * permanently one session behind.
- */
-export function noteAgentTranscriptWorktree(agentId: string, worktreePath: string): void {
-  if (worktreePath.trim() === "") return;
-  transcriptWorktrees.set(agentId, worktreePath);
-}
-
-/** Forget an agent's transcript path AND worktree. No production caller today (see the block above);
- *  used by tests resetting between cases, and available for a real agent-close seam when one exists. */
-export function forgetAgentTranscriptPath(agentId: string): void {
-  transcriptPaths.delete(agentId);
-  transcriptWorktrees.delete(agentId);
-}
+// THE MAPS LIVE IN `services/agentTranscriptRegistry` — a leaf module with no imports of its own.
+//
+// They were here, next to the reader that consumes them, which reads well but made every WRITER
+// import this module: the snapshot machinery, the dispatcher and the suggestion heuristics come with
+// it. `stores/projectStore` registers a worktree the moment one is cut, and that edge dragged
+// `SNAPSHOT_MAX_LINES` into the module graph of every test importing the project store, failing 16
+// of them at COLLECTION with zero test failures. Re-exported here so this module's public surface is
+// unchanged for existing importers.
+export {
+  noteAgentTranscriptPath,
+  noteAgentTranscriptWorktree,
+  forgetAgentTranscriptPath,
+} from "../agentTranscriptRegistry";
 
 // ---------------------------------------------------------------------------------------------
 // Capping
@@ -584,7 +581,7 @@ async function readHistoryTier(
  * `ReadAgentTerminalOptions` for why that is not a knob a tool argument gets to turn.
  */
 async function readTranscriptTier(agentId: string): Promise<TierResult> {
-  const path = transcriptPaths.get(agentId) ?? (await resolveWorktreeTranscript(agentId));
+  const path = agentTranscriptPath(agentId) ?? (await resolveWorktreeTranscript(agentId));
   if (!path) {
     return {
       why: "no transcript path is known for this agent (see noteAgentTranscriptPath / noteAgentTranscriptWorktree)",
@@ -599,7 +596,7 @@ async function readTranscriptTier(agentId: string): Promise<TierResult> {
  *  when it has no worktree registered — or has one Claude has not yet written a session for, which is
  *  the normal state of a brand-new agent rather than a fault. */
 async function resolveWorktreeTranscript(agentId: string): Promise<string | null> {
-  const worktreePath = transcriptWorktrees.get(agentId);
+  const worktreePath = agentTranscriptWorktree(agentId);
   if (!worktreePath) return null;
   return (await invoke<string | null>("claude_latest_session_path", { worktreePath })) ?? null;
 }

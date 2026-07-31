@@ -468,6 +468,7 @@ export function ComposeBox({
   sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
   registerSubmit,
+  draftKey = "concierge",
 }: {
   /** Reports the trimmed text (empty only when something is attached), plus the agents that text
    *  ADDRESSES by name — `undefined` when it addresses none.
@@ -557,6 +558,18 @@ export function ComposeBox({
    * `false`, which is the difference between the rail announcing a send and staying quiet.
    */
   registerSubmit?: (submit: (() => boolean) | null) => void;
+  /**
+   * WHICH CONVERSATION THE CURRENT DRAFT BELONGS TO. Changing it swaps the draft.
+   *
+   * TWO DRAFTS, NOT ONE, and that is an opinion worth stating. A single shared box means a half-typed
+   * message to a build agent is sitting in front of SPARKLE the moment you unmount — aimed at the
+   * wrong reader, and one Enter away from being sent to them. Keyed drafts make the box show what you
+   * were writing to whoever you are now looking at, and nothing else.
+   *
+   * Defaults to a constant, so every caller that does not mount agents keeps exactly one draft and
+   * behaves as it always has.
+   */
+  draftKey?: string;
 }) {
   const [text, setText] = useState("");
   // Pastes collapsed into pills, in paste order. Local state, unlike `attachments` (host-owned):
@@ -570,6 +583,28 @@ export function ComposeBox({
   // its decision on both halves at once — see the guard in `submit`'s failure path.
   const textRef = useRef(text);
   textRef.current = text;
+  // Drafts for the conversations this box is NOT currently showing, keyed by `draftKey`. A ref, not
+  // state: stashing a draft must not re-render the box, and the value is only ever read at the moment
+  // the key changes.
+  const draftsRef = useRef<Map<string, { text: string; blocks: TextBlock[] }>>(new Map());
+  const blocksRef = useRef(textBlocks);
+  blocksRef.current = textBlocks;
+  const draftKeyRef = useRef(draftKey);
+  // A LAYOUT effect, so the swap lands in the same frame the mount does. As a plain effect the box
+  // paints once with the previous conversation's draft still in it — a visible flash of a message
+  // addressed to somebody else, which is the exact confusion keyed drafts exist to prevent.
+  useLayoutEffect(() => {
+    const previous = draftKeyRef.current;
+    if (previous === draftKey) return;
+    // Stash what is in the box under the key it was written for, then restore the incoming key's own
+    // draft (empty when there isn't one). Blocks travel with the text: a collapsed paste is part of
+    // the message being composed, and leaving it behind would send it with the WRONG draft later.
+    draftsRef.current.set(previous, { text: textRef.current, blocks: blocksRef.current });
+    const restored = draftsRef.current.get(draftKey);
+    draftKeyRef.current = draftKey;
+    setText(restored?.text ?? "");
+    setTextBlocks(restored?.blocks ?? []);
+  }, [draftKey]);
   // Concrete hex for the two spec tokens that have no CSS var of their own (see
   // theme/blueprintSpec) — the terminal plane the wired composer floats on, and its edge.
   const mode = useResolvedTheme();
@@ -888,10 +923,17 @@ export function ComposeBox({
   useEffect(() => {
     const root = rootRef.current;
     if (!root || typeof ResizeObserver === "undefined") return;
+    // WHICHEVER THREAD IS ON SCREEN. The column swaps `ConciergeThread` for `MountedAgentThread`
+    // when the concierge is mounted to a build agent, so a query for one component's testid found
+    // nothing for the whole mounted session and `measure()` fell back to `window.innerHeight` —
+    // trap #1 below, which clips the Send row. Both scrollers carry `data-concierge-scroller`, so
+    // this asks for "the thread" and stays agnostic about which one answers.
     const findThread = () =>
       root
         .closest("section")
-        ?.querySelector<HTMLElement>(`[data-testid="${CONCIERGE_THREAD_TESTID}"]`) ?? null;
+        ?.querySelector<HTMLElement>(
+          `[data-concierge-scroller="yes"], [data-testid="${CONCIERGE_THREAD_TESTID}"]`,
+        ) ?? null;
 
     const ro = new ResizeObserver(() => measure());
     const measure = () => {

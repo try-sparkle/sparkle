@@ -43,6 +43,7 @@ import {
   type ConciergeReceipt,
   type ConciergeViewModel,
 } from "./Concierge";
+import type { ConciergeMountedAgent } from "./Concierge/types";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // The two ALARM controls the card draws (Mute, [x]). Imported rather than re-spelled: the card
 // fires them and this file handles them, and a literal on each side is a silent no-op waiting to
@@ -145,6 +146,8 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // host renders from the feed, and a project-store subscription would re-render it on every unrelated
 // agent write.
 import { useProjectStore } from "../stores/projectStore";
+import { useMountedThread } from "../stores/mountedThreadStore";
+import { useAgentTranscript } from "../hooks/useAgentTranscript";
 import { OpenPrMenu, agentLinkForPr } from "./OpenPrMenu";
 // The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
 // re-renders this host only when the selection actually changes, which is the narrow subscription
@@ -983,6 +986,76 @@ export function ConciergeHost({
   useEffect(() => {
     targetRef.current = routingTarget;
   }, [routingTarget]);
+
+  // ══ THE MOUNTED AGENT'S OWN CONVERSATION ══════════════════════════════════════════════════════
+  // When the cable is patched to a build agent, the column stops showing the Sparkle conversation and
+  // shows THAT AGENT'S — read from the session transcript Claude Code already writes.
+  //
+  // THIS DELIBERATELY STAYS OUT OF `send`/`deliver`. Routing (where a message GOES) is owned
+  // elsewhere and actively worked on; this decides only what the pane SHOWS. The two features meet at
+  // exactly one fact — which agent is mounted — and that fact is already computed above, so this
+  // reads it and adds nothing to the routing path.
+  //
+  // Gated on `wired`, not on `target` alone: `target` is non-null whenever the founder has an agent
+  // selected, mounted or not, and swapping the thread for an UNMOUNTED selection would replace the
+  // Sparkle conversation during ordinary use — the same bug as today's, pointing the other way.
+  const mountedAgentId = wired !== "off" ? (target?.agentId ?? null) : null;
+  // The worktree is what keys the transcript (Claude Code stores sessions per encoded worktree path,
+  // not per agent id). Taken from the roster row the app itself wrote when it CUT the worktree — no
+  // id-to-path guessing, and nothing a model said.
+  //
+  // A SUBSCRIPTION, not a `getState()` read. `worktreePath` is written when the worktree is CUT
+  // (projectStore.setAgentWorktree), which for a freshly spawned agent happens after the row already
+  // exists — so a one-shot read memoized on the agent id would capture `null` and never see the path
+  // arrive, and that agent's transcript would stay permanently unreadable until something unrelated
+  // re-rendered this host. The selector returns the AGENT OBJECT, so this wakes when that one agent
+  // changes rather than on every write anywhere in the project store.
+  const mountedRow = useProjectStore((s) =>
+    mountedAgentId
+      ? s.projects.flatMap((p) => p.agents).find((a) => a.id === mountedAgentId)
+      : undefined,
+  );
+  const mountedThread = useMountedThread(mountedAgentId);
+  const { pageBack } = useAgentTranscript(mountedAgentId, mountedRow?.worktreePath ?? null);
+  // STAGED ATTACHMENTS FOLLOW THE DRAFT THEY WERE STAGED FOR.
+  //
+  // `ComposeBox.draftKey` swaps the typed text when the conversation changes, but attachments are
+  // HOST-owned and global, so without this a screenshot staged for Sparkle stayed staged when the
+  // founder mounted an agent — and `canSend` is true on attachments alone, so one Enter delivered
+  // the other conversation's file to the agent. That is precisely the harm keyed drafts exist to
+  // prevent, and it lives here because only the host can move this state.
+  //
+  // STASHED, NOT CLEARED. `take()` already returns-and-clears and `restore()` puts a list back — the
+  // pair the failed-send path uses — so the founder's staged file is waiting for them when they
+  // come back to that conversation rather than silently thrown away.
+  const attachmentStashRef = useRef<Map<string, Attachment[]>>(new Map());
+  const draftKey = mountedAgentId ? `agent:${mountedAgentId}` : "concierge";
+  const prevDraftKeyRef = useRef(draftKey);
+  useEffect(() => {
+    const previous = prevDraftKeyRef.current;
+    if (previous === draftKey) return;
+    prevDraftKeyRef.current = draftKey;
+    const carried = takeAttachments();
+    if (carried.length > 0) attachmentStashRef.current.set(previous, carried);
+    const waiting = attachmentStashRef.current.get(draftKey);
+    if (waiting && waiting.length > 0) {
+      attachmentStashRef.current.delete(draftKey);
+      restoreAttachments(waiting);
+    }
+  }, [draftKey, takeAttachments, restoreAttachments]);
+
+  const mountedAgent = useMemo<ConciergeMountedAgent | null>(
+    () =>
+      mountedAgentId && mountedRow
+        ? {
+            agentId: mountedAgentId,
+            name: mountedRow.name,
+            thread: mountedThread,
+            onReachTop: pageBack,
+          }
+        : null,
+    [mountedAgentId, mountedRow, mountedThread, pageBack],
+  );
 
   // ══ @-MENTIONS ═══════════════════════════════════════════════════════════════════════════════
   // Who the compose box's "@" picker may offer, and — the same list, which is the point — the roster
@@ -3371,6 +3444,7 @@ export function ConciergeHost({
         // where the column's other live state already comes from, and `engine/cable` is the one
         // holder of the value (MAPPING.md: `data-wired` must not become scattered component state).
         wired={wired}
+        mountedAgent={mountedAgent}
         searchSlot={searchSlot}
         prSlot={<ConciergePrChip />}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's

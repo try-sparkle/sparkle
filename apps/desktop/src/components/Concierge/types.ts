@@ -17,6 +17,11 @@ import type { DigestVariant } from "../../services/conciergeDigest";
 // block of text, carried whole, shown as a pill" (see components/composer/attachments), and a second
 // one here is how a transcript pill and a composer pill would drift about what a block is.
 import type { Attachment, TextBlock } from "../composer/attachments";
+// TYPE-ONLY, and that is the whole reason it is allowed. The rule this module's header states is
+// that nothing under components/Concierge may TOUCH a store; a type import is erased at compile time
+// and creates no subscription, no import cycle and no runtime dependency. Naming the store's own
+// shape here is what stops the column and the store drifting into two definitions of one thing.
+import type { MountedThread } from "../../stores/mountedThreadStore";
 // The header line's per-project shape lives with the component that DERIVES it (ScopeVitals owns
 // the pure text rules the founder's strings are pinned against), and is re-exported here so the
 // column's contract still hands consumers one place to import from.
@@ -307,6 +312,26 @@ export type ConciergeCopyKind = "selection" | "answer";
  *  this one be worked on independently. */
 export type ConciergeWired = "off" | "left" | "right";
 
+/** THE MOUNTED AGENT'S OWN CONVERSATION, ready to render.
+ *
+ *  Present ⇒ the column shows THAT AGENT'S transcript instead of the Sparkle conversation. Absent or
+ *  `null` ⇒ the ordinary concierge thread, unchanged.
+ *
+ *  ARRIVES FULLY RESOLVED, as a value, because nothing under `components/Concierge` touches a store
+ *  (see this module's header). Reading the transcript means a store subscription, a Tauri command and
+ *  a poll timer, so all of that lives in the integration layer and only the RESULT crosses this
+ *  boundary — the same division the rest of `ConciergeViewModel` already follows. */
+export interface ConciergeMountedAgent {
+  agentId: string;
+  /** Display name, for the empty state and the thread's accessible label. */
+  name: string;
+  /** The loaded slice of transcript plus its load/paging flags. Typed from the store's own shape so
+   *  the two cannot drift; the column still never imports the store itself. */
+  thread: MountedThread;
+  /** The reader scrolled near the top and wants older turns. */
+  onReachTop: () => void;
+}
+
 /** Every gesture the column can emit. The integration layer supplies all of these. */
 export interface ConciergeController {
   /** The user submitted trimmed non-empty text (Send button or ⌘/Ctrl+Enter). The integration
@@ -496,6 +521,13 @@ export interface ConciergeColumnProps {
    *  which is the LIFTED state: a soft shadow, no colour change, reading as a layer above the
    *  pairs. Patched, the column drops flush and takes the terminal's colour. */
   wired?: ConciergeWired;
+  /** When set, the column renders THIS AGENT'S conversation in place of the Sparkle thread.
+   *
+   *  Separate from `wired` on purpose. `wired` is the SIDE the cable is patched into and drives
+   *  presentation (the flood, the lift, the bubble fill); this is WHICH AGENT, and drives content.
+   *  A mount can be visually live for a moment before the agent's transcript is resolvable, and
+   *  collapsing the two would make the pane flicker between two conversations on that seam. */
+  mountedAgent?: ConciergeMountedAgent | null;
 }
 
 /** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists

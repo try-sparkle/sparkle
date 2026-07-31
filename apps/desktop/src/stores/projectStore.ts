@@ -39,6 +39,7 @@ import { perfSpan, perfStart } from "../perfTrace";
 import { useUiStore } from "./uiStore";
 import { openProjectsOf } from "../engine/openProjects";
 import { normalizeAgentName } from "../engine/decodeEntities";
+import { noteAgentTranscriptWorktree } from "../services/agentTranscriptRegistry";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept — PER SOURCE (see
@@ -1877,12 +1878,25 @@ export const useProjectStore = create<ProjectState>()(
         }));
       },
 
-      setAgentWorktree: (projectId, agentId, path, branch) =>
+      setAgentWorktree: (projectId, agentId, path, branch) => {
+        // REGISTER THE WORKTREE FOR TRANSCRIPT READS, at the one place that learns it.
+        //
+        // This is writer (2) of the transcript registry (services/conciergeTools/terminal), and it
+        // inherits that writer's stated safety property verbatim: the worktree is one the APP itself
+        // created — `worktree_path()` mints `<app_data>/worktrees/<project_id>/<agent_id>` from
+        // validated ids — so there is no id-to-path guessing and nothing a model said.
+        //
+        // Registered for EVERY build agent, where before only the app-owned Improve Sparkle agent did
+        // it. That also repairs `readAgentTerminal`'s transcript fallback, which until now could only
+        // serve agents that had fired a Stop event in THIS app session (the exact-path registry is
+        // in-memory and is never repopulated across a relaunch).
+        noteAgentTranscriptWorktree(agentId, path);
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) => ({ ...a, worktreePath: path, branch })),
           ),
-        })),
+        }));
+      },
 
       adoptWorker: (projectId, worker) =>
         set((s) => ({

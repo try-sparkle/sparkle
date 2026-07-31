@@ -219,6 +219,8 @@ import {
 // can tell the two apart.
 import { dispatchBuild, dispatchChat } from "../services/captureSends";
 import { useProjectStore } from "../stores/projectStore";
+import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
+import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
 // The cable's projected side joins three stores; the pair assignment lives here.
 import { useUiStore } from "../stores/uiStore";
 import { useComposeHandoffStore } from "../stores/composeHandoffStore";
@@ -2568,6 +2570,54 @@ describe("the cable reaches the concierge column", () => {
   it("is off at rest", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
+  });
+
+  // THE SEAM BETWEEN "the cable is patched" AND "the pane shows that agent's transcript".
+  //
+  // ConciergeColumn.mounted.test.tsx proves the column renders a transcript it is HANDED; this
+  // proves the host actually hands it one — the derivation (wired side → prompt target → roster row
+  // → worktree) that nothing else exercises end to end. Without it, `mountedAgent` could be null in
+  // the real app and every other test would still pass.
+  it("swaps the thread for the mounted agent's own transcript when the cable is patched", async () => {
+    h.feed = feedWith("approval");
+    // The roster row needs a worktree: that is what keys the transcript, and a row without one is
+    // deliberately not readable.
+    const withWorktree = wiredProjects().map((p) =>
+      p.id === "p1"
+        ? {
+            ...p,
+            agents: [
+              { id: "ag1", name: "Right Build", kind: "build", runtime: "local", worktreePath: "/tmp/wt/ag1" },
+            ],
+          }
+        : p,
+    ) as unknown as Project[];
+    useProjectStore.setState({ projects: withWorktree, selectedProjectId: "p1" } as never);
+
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "Right Build" }}
+      />,
+    );
+    // Unpatched: the Sparkle conversation, as always.
+    expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
+    expect(screen.getByTestId(CONCIERGE_THREAD_TESTID)).toBeTruthy();
+
+    act(() => useCableStore.getState().patch("right"));
+
+    // Patched: THAT agent's thread, and the concierge thread is gone rather than merely hidden.
+    // Asserted by the accessible name too, because "a thread is present" would be true either way —
+    // the name is what says WHOSE conversation it is.
+    await waitFor(() => expect(screen.getByTestId(MOUNTED_THREAD_TESTID)).toBeTruthy());
+    expect(screen.getByLabelText("Conversation with Right Build")).toBeTruthy();
+    expect(screen.queryByTestId(CONCIERGE_THREAD_TESTID)).toBeNull();
+    expect(screen.queryByLabelText("Conversation with Sparkle")).toBeNull();
+
+    // Unpatching restores it, which is the other half of the founder's requirement.
+    act(() => useCableStore.getState().unbind());
+    await waitFor(() => expect(screen.getByTestId(CONCIERGE_THREAD_TESTID)).toBeTruthy());
+    expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
   });
 
   it("follows the cable into either pair", () => {

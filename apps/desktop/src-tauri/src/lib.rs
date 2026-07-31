@@ -704,6 +704,10 @@ pub fn run() {
             history::history_search,
             history::history_prune,
             transcript::read_transcript_last_assistant,
+            // Mounted-agent conversation: bounded backwards paging + incremental tailing of the
+            // agent's own Claude Code JSONL transcripts.
+            transcript::agent_transcript_page,
+            transcript::agent_transcript_tail,
             spend::spend_report,
             builder_index::builder_index_status,
             builder_index::builder_index_set_identity,

@@ -29,6 +29,7 @@ import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
+import { MountedAgentThread } from "./MountedAgentThread";
 import { ConciergeTopRight } from "./KebabMenu";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { ScopeVitals } from "./ScopeVitals";
@@ -149,6 +150,7 @@ export function ConciergeColumn({
   countdownSlot,
   approvalSlot,
   wired = "off",
+  mountedAgent = null,
   mentionAgents,
   preferredAgentId,
   copyOnSelection = true,
@@ -489,6 +491,24 @@ export function ConciergeColumn({
           while sitting next to live proof it would be useful (Concierge/ConciergeAiLocked). */}
       {aiLock ? (
         <ConciergeAiLocked reason={aiLock} />
+      ) : mountedAgent ? (
+        /* MOUNTED: this agent's own conversation, not Sparkle's.
+         *
+         * THE SWAP IS A SIBLING, NOT A MODE. `ConciergeThread` is not rendered at all here, which is
+         * what makes "unmount restores the concierge conversation, including any draft" true by
+         * construction rather than by a restore path that could be wrong: the concierge thread's
+         * store is never read, never written and never unmounted-with-side-effects — the component
+         * simply is not on screen, and comes back with its state exactly as it was.
+         *
+         * Keyed on the agent id so mounting a DIFFERENT agent remounts the thread. Without the key
+         * React would reuse the instance and carry the previous agent's scroll position — and, for
+         * the moment before the new transcript lands, its entries — into the new agent's view. */
+        <MountedAgentThread
+          key={mountedAgent.agentId}
+          thread={mountedAgent.thread}
+          agentName={mountedAgent.name}
+          onReachTop={mountedAgent.onReachTop}
+        />
       ) : (
         <AgentPillProvider value={agentPills}>
           <ConciergeThread
@@ -629,6 +649,10 @@ export function ConciergeColumn({
           from here at all (the service-level refusal stays the backstop, not the only line). */}
       {!aiLock && (
         <ComposeBox
+          /* One draft per conversation. Mounted, the box is addressed to that agent; unmounted it is
+             addressed to Sparkle — and a half-typed message must not follow you from one to the
+             other. See ComposeBox's `draftKey`. */
+          draftKey={mountedAgent ? `agent:${mountedAgent.agentId}` : "concierge"}
           wired={isWired}
           onSend={controller.onSend}
           onAttach={controller.onAttach}
