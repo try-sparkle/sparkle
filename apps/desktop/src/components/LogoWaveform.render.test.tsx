@@ -443,3 +443,59 @@ describe("LogoWaveform — out of credits", () => {
     expect(screen.queryByText("You are out of credits.")).toBeNull();
   });
 });
+
+describe("the ring reflects the CARET, not just the tray — through the component", () => {
+  // ── WHY THESE LIVE HERE AND NOT IN micPresentation.test.ts (roborev 56706) ────────────────────
+  // The pure table is already tested there. What was NOT tested is the only production line the
+  // terminal work adds: the `terminalRoutes` wiring in this component. Every other new row calls
+  // `micIndicatorFor` with a hand-written literal, so hard-coding the prop true, hard-coding it
+  // false, or deleting it outright left the whole suite green — the assertion held against a
+  // different function than the one that changed. These drive the store, like the rest of this file.
+  const ring = () => screen.getByRole("img", { name: /microphone/i });
+
+  it("draws the grey OFF ring when the caret is in a terminal that cannot receive", () => {
+    // The founder's rule, at the surface where he actually sees it. Wake gate shut (phase passive),
+    // so the terminal is a pause rather than a destination.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "passive",
+      focusOwner: "terminal",
+      windowFocused: true,
+    });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).toMatch(/off/i);
+  });
+
+  it("keeps the ring HONEST when that terminal is receiving the phrase", () => {
+    // The exact regression from the commit before last: an unconditional demotion painted
+    // "Microphone: off" while dictation was typing into this terminal.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      focusOwner: "terminal",
+      windowFocused: true,
+    });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).toMatch(/actively listening/i);
+  });
+
+  it("does NOT claim a routing terminal in a BACKGROUND window", () => {
+    // `terminalRoutingArmed` is only the mic-state half; the shipped `isTerminalRoutable` also
+    // requires the window. Two Sparkle windows, caret in a terminal here, focus moved to the other:
+    // this window types nothing, so the ring must not paint green (roborev 56706).
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      focusOwner: "terminal",
+      windowFocused: false,
+    });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).toMatch(/off/i);
+  });
+});

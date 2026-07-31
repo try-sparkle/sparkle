@@ -303,6 +303,7 @@ export function LogoWaveform() {
   // here (unlike routing, which re-reads the DOM): this is paint, and the mirror is what re-renders
   // the indicator when the caret moves.
   const focusOwner = useDictationStore((s) => s.focusOwner);
+  const windowFocused = useDictationStore((s) => s.windowFocused);
   const indicator = micIndicatorFor(sendMode, {
     enabled,
     status,
@@ -313,11 +314,26 @@ export function LogoWaveform() {
     // a re-spelled `&&`. A terminal being typed into is not a pause, and a ring reading
     // "Microphone: off" under the live "Actively listening" caption would be the mic denying
     // hardware that is transcribing (roborev 56699).
-    terminalRoutes: terminalRoutingArmed({
-      enabled,
-      errored: status === "error",
-      woken: phase === "active",
-    }),
+    // THE WINDOW TERM IS PART OF THIS (roborev 56706). `terminalRoutingArmed` is only the
+    // MIC-STATE half — its own doc says "with the caret half left to the caller" — and the shipped
+    // decision is `isTerminalRoutable()` = window active AND caret in a terminal AND that predicate.
+    // The other two consumers get away without it because `dictationPauseReason` checks
+    // `windowFocused` itself and returns "window" before it ever reaches the terminal branch;
+    // `micIndicatorFor` has no window term anywhere, so nothing would restore it here.
+    //
+    // Without it: two Sparkle windows, caret parked in a terminal in window A, mic enabled and
+    // phase "active" (cross-window synced). Click window B. A's per-window blur only tears down the
+    // owned stream — it does not touch `status` — and the app-level `dictation://focus(false)` that
+    // would never fires, because a Sparkle window is still active. So A computed `terminalRoutes:
+    // true` and painted a green "actively listening" ring for a window where `isTerminalRoutable()`
+    // is false and not one word is being typed into that terminal.
+    terminalRoutes:
+      windowFocused &&
+      terminalRoutingArmed({
+        enabled,
+        errored: status === "error",
+        woken: phase === "active",
+      }),
   });
   // Colour + glyph from the shared mapping (MicButton.micVisual) — the same table the send tray
   // paints its own pills from, which is what makes "Speak" and the mic the identical green. `false`
