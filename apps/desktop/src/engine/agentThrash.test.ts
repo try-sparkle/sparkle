@@ -144,8 +144,37 @@ describe("the auto-resume banner is excluded from repetition ENTIRELY", () => {
     const events = [0, 1, 2, 3, 4].flatMap((i) => turn(RESUME, [], T0 + i * 60_000));
     const r = thrashReport(run(events), T0 + 300_000, { goalOutstanding: true });
     expect(r.repeatedCommand).toBeUndefined();
-    expect(r.verdict).not.toBe("repeating-command");
+    // THE ROW READS CALM — asserted as `thrashing`, not as "the verdict isn't the one I named".
+    // A `not.toBe("repeating-command")` passes while the verdict is `no-progress`, which renders a
+    // "No progress" chip: the SAME false claim about the same agent, one badge over, and just as
+    // relayable to the founder as fact. Absence of observed tool events is not evidence the agent
+    // ran none — see `sawToolEver`.
+    expect(r.thrashing).toBe(false);
+    expect(r.verdict).toBe("healthy");
     expect(r.detail).not.toContain("looping");
+  });
+
+  it("a human's repeats stay healthy across resumes when EVERY turn did real work", () => {
+    // THE REGRESSION MAKING THE RESUME MERELY INERT WOULD HAVE INTRODUCED. The resume arm preserves
+    // `lastTurnRanTool`, but the `Stop` closing the resume's own turn used to overwrite it with
+    // that turn's (empty) `toolInCurrentTurn` — destroying the work evidence one event later. A
+    // human typing the same command three times, working in every single turn, then accumulated to
+    // `repeating-command`: "It is looping, not working", about an agent that ran a tool every turn.
+    // Same false-positive class as roborev 55259/55314, reached through the resume door.
+    //
+    // REPEAT_LIMIT human submissions, deliberately: the earlier two-submission version of this test
+    // could not reach the limit and passed byte-identically whether or not the flag survived, so it
+    // was vacuous with respect to the property it claimed to guard.
+    const events = [
+      ...turn("run it", ["Bash"]),
+      ...turn(RESUME, []),
+      ...turn("run it", ["Bash"]),
+      ...turn(RESUME, []),
+      ...turn("run it", ["Bash"]),
+    ];
+    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    expect(r.verdict).toBe("healthy");
+    expect(r.repeatedCommand).toBeUndefined();
   });
 
   it("does not let a resume LAUNDER a real loop — the human's repeats still count across it", () => {
@@ -165,19 +194,43 @@ describe("the auto-resume banner is excluded from repetition ENTIRELY", () => {
     expect(r.repeatedCommand).toEqual({ text: "/compact", count: REPEAT_LIMIT });
   });
 
-  it("does not erase work evidence — a resume between two human repeats keeps them healthy", () => {
-    // The mirror of the test above. `lastTurnRanTool` survives the resume arm, so a human who types
-    // the same thing twice around a resume, having had real work happen, is still judged on that
-    // work rather than on a flag the resume wiped.
-    const events = [...turn("run it", ["Bash"]), ...turn(RESUME, []), ...turn("run it", ["Bash"])];
-    expect(thrashReport(run(events), T0, { goalOutstanding: true }).verdict).toBe("healthy");
+  it("a resume that lands MID-TURN does not swallow that turn's work", () => {
+    // THE OTHER HALF OF THE EVIDENCE. `repeatOf` reads `lastTurnRanTool || toolInCurrentTurn`
+    // precisely because a turn can be interrupted and never close (roborev 55314) — the human
+    // presses ESC, or the `Stop` is simply dropped. The resume arm protected the first half and
+    // still zeroed the second at submission, so a resume arriving while a turn was open destroyed
+    // the very evidence `resumeTurn` was added to protect, one event EARLIER instead of one later.
+    // This is the same mistake the `SessionStart{compact}` arm was already fixed for.
+    //
+    // Every other resume fixture in this file is `turn(RESUME, [])` — i.e. preceded by a Stop — so
+    // none of them could reach this. The agent here runs a tool in EVERY turn.
+    const events = [0, 1, 2].flatMap((i) => [
+      { event: "UserPromptSubmit", prompt: "pnpm test", ts: T0 + i * 60_000 } as HookEvent,
+      { event: "PreToolUse", tool: "Bash", ts: T0 + i * 60_000 } as HookEvent,
+      // no Stop — the turn is interrupted, exactly the documented production shape
+      { event: "UserPromptSubmit", prompt: RESUME, ts: T0 + i * 60_000 } as HookEvent,
+      { event: "Stop", ts: T0 + i * 60_000 } as HookEvent,
+    ]);
+    const r = thrashReport(run(events), T0 + 180_000, { goalOutstanding: true });
+    // Both verdicts have to stay clear: the repeat run must not build, AND the swallowed work must
+    // still break the no-tool streak (it passes `sawToolEver`, so nothing else would stop it).
+    expect(r.verdict).toBe("healthy");
+    expect(r.repeatedCommand).toBeUndefined();
+    expect(r.turnsWithoutTool).toBeLessThan(NO_TOOL_TURN_LIMIT);
   });
 
-  it("still counts resumed turns toward NO-PROGRESS — a resume is not progress either", () => {
+  it("still counts resumed turns toward NO-PROGRESS once this window has SEEN a tool", () => {
     // The exclusion is scoped to REPETITION, deliberately. An agent resumed repeatedly that runs no
-    // tools at all is going nowhere, and that is a true finding the detector must keep making — the
-    // rule is that the banner is not evidence FOR a loop, not that it is evidence AGAINST one.
-    const events = [0, 1, 2].flatMap((i) => turn(RESUME, [], T0 + i * 60_000));
+    // tools is going nowhere, and that is a true finding the detector must keep making — the rule
+    // is that the banner is not evidence FOR a loop, not that it is evidence AGAINST one.
+    //
+    // But it may only be made once this window has PROVED it receives tool events for this agent,
+    // which the opening turn does. Without that proof, "no tools ran" and "no tools reached us" are
+    // the same picture — see the partial-observation test above.
+    const events = [
+      ...turn("start", ["Bash"]),
+      ...[0, 1, 2].flatMap((i) => turn(RESUME, [], T0 + i * 60_000)),
+    ];
     const r = thrashReport(run(events), T0, { goalOutstanding: true });
     expect(r.turnsWithoutTool).toBe(NO_TOOL_TURN_LIMIT);
     expect(r.verdict).toBe("no-progress");
@@ -250,11 +303,67 @@ describe("turns that do no work", () => {
     expect(run(events).turnsWithoutTool).toBe(1);
   });
 
+  /** A stream that opens with one WORKING turn, then N tool-less ones.
+   *
+   *  The opening turn is not decoration: `no-progress` reads the ABSENCE of `PreToolUse` as its
+   *  evidence, and may only do so once this window has proved it RECEIVES tool events for this
+   *  agent (`sawToolEver`). It is also the more production-shaped fixture — a real agent runs
+   *  something before it stops running anything. */
+  function afterRealWork(prose: number, prompt = (i: number) => `q${i}`): HookEvent[] {
+    return [
+      ...turn("start", ["Bash"]),
+      ...Array.from({ length: prose }, (_, i) => turn(prompt(i), [])).flat(),
+    ];
+  }
+
   it("flags N consecutive tool-less turns WHEN a goal is outstanding", () => {
-    const events = Array.from({ length: NO_TOOL_TURN_LIMIT }, (_, i) => turn(`q${i}`, [])).flat();
-    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    const r = thrashReport(run(afterRealWork(NO_TOOL_TURN_LIMIT)), T0, { goalOutstanding: true });
     expect(r.verdict).toBe("no-progress");
     expect(r.detail).toContain("Output is not progress");
+  });
+
+  it("will NOT alarm when this window has never seen a tool — absence is not evidence", () => {
+    // The registry is fed from AgentPane's watcher, so "the agent ran no tools" and "no tool events
+    // reached us" are the same picture until one arrives. Alarming on the second is how the
+    // `repeating-command` false positive would have simply relabelled itself as "No progress" over
+    // the very agent it was fixed for. The streak is still reported; only the alarm is withheld.
+    const events = Array.from({ length: NO_TOOL_TURN_LIMIT + 2 }, (_, i) => turn(`q${i}`, [])).flat();
+    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    expect(r.turnsWithoutTool).toBe(NO_TOOL_TURN_LIMIT + 2);
+    expect(r.verdict).toBe("healthy");
+    expect(r.thrashing).toBe(false);
+  });
+
+  // ── WHAT THE COVERAGE GATE DOES NOT COVER ───────────────────────────────────────────────────
+  // These two tests exist to make the gate's limits a RECORDED DECISION rather than an implicit
+  // one. Both assert today's actual behaviour, and both are cases the gate gets wrong in the
+  // direction of silence. See `ThrashState.sawToolEver` and bead sparkle-98yth.
+
+  it("KNOWN GAP: mid-stream tool-event loss is NOT covered — the latch is already armed", () => {
+    // `sawToolEver` is a lifetime latch, so it only ever guards an accumulator that has seen NO
+    // tool. Once one has arrived, dropped tool events later look exactly like an idle agent again
+    // and `no-progress` alarms as it did before. If that — rather than a pane unmount — was the
+    // mechanism behind the motivating incident, this gate would not have caught it.
+    const events = [
+      ...turn("start", ["Bash"]), // arms the latch
+      ...[0, 1, 2].flatMap((i) => turn(`q${i}`, [], T0 + i * 60_000)), // work happening, unobserved
+    ];
+    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    expect(r.verdict).toBe("no-progress");
+    expect(r.thrashing).toBe(true);
+  });
+
+  it("KNOWN GAP: a prose-only agent — the rule's PRIMARY target — can no longer be flagged", () => {
+    // An agent talking instead of working runs no tools by definition, so it never satisfies the
+    // latch. This is the capability the gate costs, and it is accepted deliberately: a false "No
+    // progress" on a hard-working agent misinformed the founder twice, and a detector whose false
+    // positives land on working agents gets ignored entirely.
+    const events = Array.from({ length: NO_TOOL_TURN_LIMIT + 5 }, (_, i) =>
+      turn(`thinking out loud ${i}`, []),
+    ).flat();
+    const r = thrashReport(run(events), T0, { goalOutstanding: true });
+    expect(r.turnsWithoutTool).toBe(NO_TOOL_TURN_LIMIT + 5); // the evidence IS collected
+    expect(r.verdict).toBe("healthy"); // ...but never asserted on
   });
 
   it("does NOT flag ordinary conversation — three questions answered in prose", () => {
@@ -262,8 +371,9 @@ describe("turns that do no work", () => {
     // and fired on any three prose turns. The founder asking an agent three questions got back
     // "it is producing output without doing anything" (roborev 55259). A detector whose false
     // positives land on conversation gets ignored.
-    const events = Array.from({ length: NO_TOOL_TURN_LIMIT + 2 }, (_, i) => turn(`q${i}`, [])).flat();
-    const r = thrashReport(run(events), T0, { goalOutstanding: false });
+    // Built on `afterRealWork` so the COVERAGE gate is already satisfied and this test isolates the
+    // gate it names. Without the opening working turn it would pass for the wrong reason.
+    const r = thrashReport(run(afterRealWork(NO_TOOL_TURN_LIMIT + 2)), T0, { goalOutstanding: false });
     expect(r.verdict).toBe("healthy");
     expect(r.thrashing).toBe(false);
     // The streak is still REPORTED — the evidence is not withheld, only the alarm.
@@ -271,8 +381,7 @@ describe("turns that do no work", () => {
   });
 
   it("an unknown goal state reports the streak without raising the alarm", () => {
-    const events = Array.from({ length: NO_TOOL_TURN_LIMIT }, (_, i) => turn(`q${i}`, [])).flat();
-    expect(thrashReport(run(events), T0, {}).thrashing).toBe(false);
+    expect(thrashReport(run(afterRealWork(NO_TOOL_TURN_LIMIT)), T0, {}).thrashing).toBe(false);
   });
 
   it("a subagent's tool call counts as work — delegation is not idleness", () => {
@@ -331,7 +440,10 @@ describe("context pressure", () => {
     // PreCompact and Stop with NO SessionStart between them, which is not the stream Claude Code
     // produces — and the compaction arm used to zero `turnsWithoutTool`, so `no-progress` could never
     // reach its limit for a compacting agent at all. A compaction is not progress.
-    const events: HookEvent[] = [];
+    // Opens with a real working turn so `sawToolEver` is satisfied — `no-progress` may not alarm on
+    // absent tool events until this window has proved it receives them, and a compacting agent that
+    // has done real work is the shape this fixture is claiming to model anyway.
+    const events: HookEvent[] = [...turn("build it", ["Edit"], T0)];
     for (let i = 0; i < NO_TOOL_TURN_LIMIT; i++) {
       const ts = T0 + i * 1_000;
       events.push({ event: "UserPromptSubmit", prompt: `/compact ${i}`, ts });

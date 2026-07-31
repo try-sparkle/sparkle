@@ -85,6 +85,51 @@ export interface ThrashState {
   /** Did the most recently CLOSED turn run any tool? This is what stops a repeated prompt that
    *  sandwiches real work from reading as a loop — see {@link repeatOf}. */
   lastTurnRanTool: boolean;
+  /**
+   * Was the turn currently open opened by a SYSTEM-AUTHORED prompt (an auto-resume)?
+   *
+   * Exists so the `Stop` closing that turn cannot DESTROY the work evidence in `lastTurnRanTool`.
+   * Excluding the resume at submission was not enough on its own: the resume's own turn closes one
+   * event later and used to overwrite the flag with its (empty) `toolInCurrentTurn`, so a human
+   * typing one command three times — WITH real tool work in every turn — accumulated to
+   * `repeating-command` as soon as resumes fell between the submissions. That is the same false
+   * positive this module keeps re-learning (roborev 55259, 55314), reached through the resume door.
+   */
+  resumeTurn: boolean;
+  /**
+   * Has this accumulator observed a tool event at all, since it was created?
+   *
+   * WHY IT GATES `no-progress`. That rule reads *absence* of `PreToolUse` as evidence the agent ran
+   * nothing — but this registry is fed from AgentPane's watcher, so "the agent ran no tools" and "no
+   * tool events reached us" render identically. Without some coverage check, the fix to
+   * `repeating-command` merely RELABELLED the incident: agent 0bf08c64's row would have carried a
+   * "No progress" chip instead ("it is producing output without doing anything") — the identical
+   * unobserved claim one badge over, and just as relayable to the founder as fact.
+   *
+   * WHAT IT DOES *NOT* PROVE, stated precisely because the obvious reading is stronger than the
+   * truth. It is a LIFETIME LATCH over one accumulator, so it means only "a tool event reached this
+   * accumulator at some point". It does NOT mean the stream is delivering them *now*. Two
+   * consequences, both real and both deliberately accepted here rather than papered over:
+   *
+   *   • MID-STREAM LOSS IS NOT COVERED. If tool events start being dropped after some have already
+   *     arrived, the latch is already `true` and `no-progress` alarms exactly as it did before. If
+   *     that — rather than a pane unmount — was the mechanism behind the motivating incident, this
+   *     gate would not have caught it. `sawToolEver` covers exactly one shape: an accumulator that
+   *     has never seen a tool.
+   *   • THE RULE'S PRIMARY TARGET IS DISARMED. An agent that talks instead of working runs no tools
+   *     BY DEFINITION, so it can never satisfy this and can never be flagged. That is not a corner:
+   *     `forgetThrash` wipes the accumulator on pane unmount, a fresh `SessionStart` wipes it, and
+   *     the watcher starts at EOF — so a freshly-mounted pane begins here every time.
+   *
+   * This is a deliberate trade, not an oversight: a false "No progress" on a hard-working agent
+   * misinformed the founder twice, and a detector whose false positives land on working agents gets
+   * ignored entirely. The durable fix is to corroborate from a channel that does not run through
+   * this pane's watcher — `fleet.rs`'s windowed `PostToolUse` count (surfaced as `toolsRecent` in
+   * fleetVerdict) is read from the hook log directly and can distinguish "ran nothing" from "nothing
+   * reached this pane". That is not plumbed to this call site today; tracked as bead sparkle-98yth.
+   * Both uncovered cases have named tests so the loss stays a recorded decision.
+   */
+  sawToolEver: boolean;
   /** Timestamps of recent compactions, pruned to {@link COMPACT_WINDOW_MS}. */
   compactions: number[];
 }
@@ -96,6 +141,8 @@ export function initialThrashState(): ThrashState {
     toolInCurrentTurn: false,
     turnOpen: false,
     lastTurnRanTool: false,
+    resumeTurn: false,
+    sawToolEver: false,
     compactions: [],
   };
 }
@@ -161,8 +208,28 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
         // resume differs from an unobserved prompt. Clearing it would destroy the work evidence
         // `repeatOf` reads, so a resume landing between two genuine human submissions would make a
         // WORKING agent more likely to read as looping — reintroducing the very false positive this
-        // arm exists to remove, through the back door.
-        return { ...state, turnOpen: true, toolInCurrentTurn: false };
+        // arm exists to remove, through the back door. `resumeTurn` carries that protection through
+        // the `Stop` that closes this turn, which would otherwise undo it one event later.
+        //
+        // AND THE OPEN TURN'S WORK IS PROMOTED, NOT DISCARDED. `repeatOf` reads BOTH flags because a
+        // turn can be interrupted and never close (roborev 55314) — the human presses ESC, or the
+        // `Stop` is dropped. Protecting only `lastTurnRanTool` while still zeroing
+        // `toolInCurrentTurn` destroyed the same evidence one event EARLIER instead of one later:
+        // prompt → PreToolUse → (no Stop) → resume → Stop left `lastTurnRanTool` false, and an agent
+        // that ran a tool in every single turn reached `repeating-command` after three such cycles.
+        // That is the identical mistake the `SessionStart{compact}` arm below was already fixed for.
+        //
+        // The streak gets the same treatment for the same reason: observed work breaks it. Note this
+        // is work being counted, never the resume itself — the resume's own turn still adds to the
+        // streak when it closes having run nothing.
+        return {
+          ...state,
+          turnOpen: true,
+          resumeTurn: true,
+          lastTurnRanTool: state.toolInCurrentTurn || state.lastTurnRanTool,
+          turnsWithoutTool: state.toolInCurrentTurn ? 0 : state.turnsWithoutTool,
+          toolInCurrentTurn: false,
+        };
       }
       // A repeat is only a repeat if we can SEE the text. An event with no prompt (older logs,
       // a redacted payload) must not silently extend or reset a run — leaving both alone is the
@@ -174,7 +241,13 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
       // the observed incident is exactly that shape: a built-in slash command like `/compact`
       // produces no assistant turn and therefore no Stop, so three `/compact`s in a row each read
       // the previous WORKING turn's `true`, reset the run, and the loop was never flagged.
-      return { ...repeat, turnOpen: true, toolInCurrentTurn: false, lastTurnRanTool: false };
+      return {
+        ...repeat,
+        turnOpen: true,
+        toolInCurrentTurn: false,
+        lastTurnRanTool: false,
+        resumeTurn: false,
+      };
     }
     // A NEW SESSION WIPES THE SLATE — BUT ONLY A GENUINELY NEW ONE.
     //
@@ -212,7 +285,12 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
     }
     case "PreToolUse":
     case "PostToolUse":
-      return { ...state, toolInCurrentTurn: true };
+      // `sawToolEver` LATCHES here and is never cleared except by a genuinely new session. It is not
+      // a measure of recent activity, and it is deliberately NOT proof that the stream is still
+      // delivering: it records only that AT LEAST ONE event arrived, which is just enough to rule
+      // out an accumulator that has never observed a tool. Once armed it says nothing about a later
+      // absence. See its field docstring for the two shapes that leaves uncovered.
+      return { ...state, toolInCurrentTurn: true, sawToolEver: true };
     case "Stop":
     case "SessionEnd": {
       if (!state.turnOpen) return state;
@@ -220,10 +298,21 @@ export function reduceThrash(state: ThrashState, ev: HookEvent, now?: number): T
         ...state,
         turnOpen: false,
         // A turn that ran a tool RESETS the streak — that is the progress signal. A turn that ran
-        // none extends it.
+        // none extends it. This counts resume-opened turns too, deliberately: a resume is not
+        // progress, and an agent that keeps being restarted and keeps doing nothing IS going
+        // nowhere. What protects the healthy path is that `no-progress` cannot ALARM until
+        // `sawToolEver`, so an unobserved stream produces a streak nobody acts on.
         turnsWithoutTool: state.toolInCurrentTurn ? 0 : state.turnsWithoutTool + 1,
-        lastTurnRanTool: state.toolInCurrentTurn,
+        // A RESUME-OPENED TURN MAY ONLY ADD WORK EVIDENCE, NEVER REMOVE IT. Closing such a turn with
+        // no tool observed leaves the previous verdict standing rather than overwriting it with
+        // `false` — the resume is not an agent action, so it cannot be the thing that proves the
+        // agent stopped working. Without this, excluding the resume at SUBMISSION was undone one
+        // event later and a working agent's repeated human command still reached
+        // `repeating-command` (see `resumeTurn`).
+        lastTurnRanTool:
+          state.toolInCurrentTurn || (state.resumeTurn && state.lastTurnRanTool),
         toolInCurrentTurn: false,
+        resumeTurn: false,
       };
     }
     case "PreCompact":
@@ -348,7 +437,23 @@ export function thrashReport(state: ThrashState, now: number, ctx: ThrashContext
   }
   // Only an alarm when there is goal work outstanding — otherwise three tool-less turns is just a
   // conversation. See ThrashContext.goalOutstanding.
-  if (state.turnsWithoutTool >= NO_TOOL_TURN_LIMIT && ctx.goalOutstanding === true) {
+  //
+  // AND only when this accumulator has observed at least one tool event. The streak is built from
+  // the ABSENCE of `PreToolUse`, and absence has two causes that render identically here: the agent
+  // ran nothing, or nothing reached us. `sawToolEver` separates them in exactly ONE shape — an
+  // accumulator that has never seen a tool — and NOT once it is armed, where dropped events and an
+  // idle agent are indistinguishable again. Read the field docstring before trusting this gate: it
+  // is a partial guard, and bead sparkle-98yth is the durable separation (corroborating from
+  // fleet.rs's hook-log tool count, which does not run through this pane's watcher).
+  //
+  // Even partial, it is what stops this rule inheriting the false positive `repeating-command` was
+  // just fixed for — agent 0bf08c64 relabelled from "Looping" to "No progress", equally wrong and
+  // equally confident. The streak is still REPORTED in `base`; what it may not do is assert.
+  if (
+    state.turnsWithoutTool >= NO_TOOL_TURN_LIMIT &&
+    ctx.goalOutstanding === true &&
+    state.sawToolEver
+  ) {
     return {
       ...base,
       verdict: "no-progress",
