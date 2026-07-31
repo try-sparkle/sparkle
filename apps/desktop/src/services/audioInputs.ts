@@ -70,28 +70,82 @@ export interface BoundDevice {
   isVirtual: boolean;
 }
 
-/** The Automatic row's label. Exported so the picker and its tests can't drift on the wording. */
-export const AUTOMATIC_LABEL = "Automatic (recommended)";
+/** The Automatic row's label. Exported so the picker and its tests can't drift on the wording.
+ *
+ *  "(recommended)" used to be part of this string. It is a HINT now, rendered in the row's hint
+ *  slot like "built-in" and "system default", because the parenthetical was carrying no
+ *  information the muted hint column doesn't carry with less ink. */
+export const AUTOMATIC_LABEL = "Automatic";
 
-/** The marker shown on every non-microphone input, in the list AND next to the live device. Says
- *  what the device IS from the user's point of view ("system audio"), not what it is technically
- *  ("virtual HAL device") — the user is deciding whether their calls and videos get transcribed,
- *  and the technical term does not answer that question. */
+/** The marker for non-microphone inputs. Says what the device IS from the user's point of view
+ *  ("system audio"), not what it is technically ("virtual HAL device") — the user is deciding
+ *  whether their calls and videos get transcribed, and the technical term does not answer that.
+ *
+ *  It is now the HEADING of the group those devices live in rather than a badge repeated on each
+ *  row. Same fact, stated once: four loopback devices under a "System audio" heading are marked
+ *  more clearly than four rows each wearing the same badge in a flat list of microphones. */
 export const VIRTUAL_MARKER = "System audio";
 
-/** The advanced opt-in's label. States the CONSEQUENCE, not the mechanism: a label reading
- *  "Allow virtual audio devices" is one a user can agree to without ever learning that agreeing
- *  lets Sparkle hear their Zoom calls. */
-export const ALLOW_VIRTUAL_LABEL = "Allow non-microphone inputs (advanced)";
+/**
+ * WHERE THE PICKER LIVES, as a user would navigate to it. One constant because more than one
+ * module has to send someone there: `voice/dictationCopy` writes three remedy strings that name it.
+ *
+ * It moved. Every one of those remedies used to say "hover the mic", which was true while the
+ * picker hung off the mic indicator's hover menu and became false the moment it did not — a remedy
+ * string is an instruction the user will follow (AGENTS.md, bead sparkle-8bvh), so one pointing at
+ * a control that is no longer there is a dead end handed to a user who is already stuck. Naming the
+ * destination once means the next move updates every instruction with it.
+ */
+export const INPUT_PICKER_LOCATION = "Settings → Voice controls";
 
-/** The full consequence, shown under the toggle. */
-export const ALLOW_VIRTUAL_CAPTION =
-  "Lets Sparkle bind to a loopback or virtual input. It can then transcribe anything playing on this machine — calls, videos, streams — not just your voice.";
+/**
+ * The advanced opt-in's label. States the CONSEQUENCE, not the mechanism: a label reading
+ * "Allow virtual audio devices" is one a user can agree to without ever learning that agreeing
+ * lets Sparkle hear their Zoom calls.
+ *
+ * "INSTEAD OF A MICROPHONE" IS THE LOAD-BEARING HALF. The previous label — "Allow non-microphone
+ * inputs (advanced)" — was read by a user as "a checkbox I assume lets me use both", i.e. as
+ * mixing system audio INTO the microphone feed. It does not: it unlocks a different device to bind
+ * to, one at a time. A label the user can agree to while believing the opposite of what it does is
+ * worse than a technical one, because they never find out they were wrong.
+ */
+export const ALLOW_VIRTUAL_LABEL = "Capture system audio instead of a microphone";
 
-/** Shown in the menu whenever the opt-in is ON, so an enabled advanced setting is never something
- *  the user has to go looking for. */
-export const ALLOW_VIRTUAL_ACTIVE_WARNING =
-  "Non-microphone inputs are allowed — Sparkle can transcribe what's playing on this machine, not just your voice.";
+/** The consequence, in one line. Was three, and the three said in ~35 words what the label plus
+ *  this says in nine — the wordiness itself was hiding the choice. */
+export const ALLOW_VIRTUAL_CAPTION = "Calls, videos, streams — anything playing on this Mac.";
+
+/** The two values the status block can report for "is system audio included?" — the second
+ *  question every user of this surface actually has. `SYSTEM_AUDIO_OFF` is the safe answer and the
+ *  default; the other two are warnings and render amber.
+ *
+ *  These replace a paragraph-length amber banner. The banner existed because the picker used to
+ *  live in a hover menu, where an enabled advanced setting was genuinely easy to forget; in
+ *  Settings the toggle is on screen with its own state, so restating it in prose was ink without
+ *  information. What was NOT redundant is the distinction below: "allowed" and "being captured
+ *  right now" are different facts, and only the second one means the user's calls are being
+ *  transcribed at this moment. */
+export const SYSTEM_AUDIO_OFF = "Off";
+export const SYSTEM_AUDIO_ALLOWED = "Allowed";
+export const SYSTEM_AUDIO_CAPTURING = "Capturing now";
+/**
+ * Off, but a system-audio device is STILL PINNED as the choice (roborev 56208).
+ *
+ * Reachable because revoking the opt-in only flips the flag — neither `setAllowVirtualInput(false)`
+ * nor its Rust side clears the persisted device uid. Without this value the two rows contradicted
+ * each other on the one surface that exists to state this honestly: row 1 read an amber
+ * "Selected: BlackHole 2ch" while row 2 read a calm "Off".
+ *
+ * It is also exactly the case where HIDING the loopback rows bites. With the opt-in off the device
+ * appears in neither group, so this row is the only remaining mention of the pinned choice — and it
+ * was the one saying "Off". Kept to a short clause because the wordiness was the original bug.
+ */
+export const SYSTEM_AUDIO_OFF_STILL_SELECTED = "Off — a system-audio device is still selected";
+
+/** The chosen device is not in the machine's current device list — it was unplugged, or its HAL
+ *  plug-in was removed. Shown instead of a name, because silently falling back to "Automatic"
+ *  would tell the user their pinned choice is in force when it cannot be. */
+export const CHOSEN_DEVICE_GONE = "Not connected";
 
 /** Shown beside the live device whenever the thing Sparkle is actually bound to is not a mic. */
 export const BOUND_VIRTUAL_WARNING =
@@ -141,6 +195,92 @@ export const ALLOW_VIRTUAL_FAILED =
 export function boundDeviceCaption(bound: BoundDevice | null, live: boolean): string | null {
   if (!bound) return null;
   return `${live ? "Listening" : "Mic"}: ${bound.name}`;
+}
+
+/** The two-row status block at the top of the picker: the answers to the only two questions a
+ *  user of this surface actually has. See {@link inputStatus}. */
+export interface InputStatus {
+  /** Row 1's label — the VERB, phase-aware for the same reason {@link boundDeviceCaption}'s is. */
+  captureLabel: string;
+  /** Row 1's value: the device name, or the standing choice when nothing has bound. */
+  captureValue: string;
+  /** Row 1 is reporting a non-microphone. Drives the amber. */
+  captureIsVirtual: boolean;
+  /** Row 2's value — one of {@link SYSTEM_AUDIO_OFF} / {@link SYSTEM_AUDIO_ALLOWED} /
+   *  {@link SYSTEM_AUDIO_CAPTURING}. */
+  systemAudioValue: string;
+  /** Row 2 is reporting something other than the safe default. Drives the amber. */
+  systemAudioIsWarning: boolean;
+}
+
+/**
+ * Answer, in two rows and about eight words, the two questions this surface exists for:
+ * (a) WHAT IS BEING CAPTURED, and (b) IS SYSTEM AUDIO INCLUDED.
+ *
+ * Pure, so the wording and — more importantly — the LABEL/VALUE PAIRING are pinned by unit tests
+ * rather than by a DOM assertion. The pairing is the part that can silently go wrong: every string
+ * here is honest in isolation and the bug is always which one gets shown when.
+ *
+ * THREE DISTINCTIONS IT REFUSES TO COLLAPSE, each one a lie this feature exists to prevent:
+ *
+ *   1. BOUND vs CHOSEN. `bound` is what Rust reported on an actual bind; `chosenUid` is an intent
+ *      that can silently fail to bind. Reporting an intent in the present tense is the
+ *      nine-minutes-of-silence failure. So a bound device gets an ACTIVITY verb and an unbound one
+ *      gets "Selected" — which claims nothing about capture, only about the setting.
+ *   2. LIVE vs MERELY BOUND. Same reason `boundDeviceCaption` switches verbs: this block sits in a
+ *      pane that is often open with the mic off, and "Listening" there would assert a capture that
+ *      is not happening.
+ *   3. ALLOWED vs CAPTURING. A user who opted in a week ago and is on their built-in mic is in a
+ *      different situation from one whose calls are being transcribed this second. The old UI had
+ *      one amber banner for both.
+ *
+ * The virtual flag is read from `bound` when there is one and from the CHOSEN device otherwise, so
+ * a pinned loopback is marked before capture starts as well as during it — a loopback that is
+ * about to be captured must not be the one thing on screen that looks like a microphone.
+ */
+export function inputStatus(args: {
+  bound: BoundDevice | null;
+  live: boolean;
+  chosenUid: string | null;
+  devices: AudioInput[];
+  allowVirtual: boolean;
+}): InputStatus {
+  const { bound, live, chosenUid, devices, allowVirtual } = args;
+  const chosen = chosenUid === null ? null : devices.find((d) => d.uid === chosenUid);
+
+  const captureLabel = bound ? (live ? "Listening" : "Mic") : "Selected";
+  const captureValue = bound
+    ? bound.name
+    : chosenUid === null
+      ? AUTOMATIC_LABEL
+      : (chosen?.name ?? CHOSEN_DEVICE_GONE);
+  const captureIsVirtual = bound ? bound.isVirtual : chosen?.isVirtual === true;
+
+  // "Capturing now" is claimed ONLY from a real bind. Deriving it from the chosen device would put
+  // the strongest statement this block can make — your calls are being transcribed at this moment —
+  // behind an intent that may never have bound, which is precisely the substitution rule 1 forbids.
+  const capturingSystemAudio = bound !== null && bound.isVirtual;
+  // THE TWO ROWS MUST NOT CONTRADICT EACH OTHER (roborev 56208). `systemAudioValue` used to be
+  // derived from `bound` and `allowVirtual` only, while `captureIsVirtual` above ALSO falls back to
+  // the CHOSEN device — so a loopback pinned as the choice with the opt-in since revoked rendered an
+  // amber "Selected: BlackHole 2ch" beside a calm "System audio: Off". Both statements were honest
+  // in isolation, which is exactly the failure mode this function's own doc warns about; the pairing
+  // is what was wrong. Row 2 now carries the same chosen-device fallback row 1 does.
+  const systemAudioValue = capturingSystemAudio
+    ? SYSTEM_AUDIO_CAPTURING
+    : allowVirtual
+      ? SYSTEM_AUDIO_ALLOWED
+      : captureIsVirtual
+        ? SYSTEM_AUDIO_OFF_STILL_SELECTED
+        : SYSTEM_AUDIO_OFF;
+
+  return {
+    captureLabel,
+    captureValue,
+    captureIsVirtual,
+    systemAudioValue,
+    systemAudioIsWarning: systemAudioValue !== SYSTEM_AUDIO_OFF,
+  };
 }
 
 /**

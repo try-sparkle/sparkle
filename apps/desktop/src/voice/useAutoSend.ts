@@ -91,6 +91,32 @@ export const AUTO_SEND_TICK_MS = 100;
  */
 export const DEFERRED_SPEECH_END_MAX_LAG_MS = 500;
 
+/**
+ * How long a speech-end held for a transcript that has not reached this hook yet stays replayable.
+ *
+ * A SECOND lag, on a different axis from the one above, and it is what made the FIRST utterance
+ * after activation never send while the second one did.
+ *
+ * The backend emits the transcript and THEN the speech-end, deliberately and on both capture paths
+ * (dictation.rs `PartialThenSpeechEnd`), precisely so the rail scores this sentence rather than the
+ * previous one. That ordering does not survive the trip in here. `speechEndSeq` is a store field
+ * this hook subscribes to directly, so it lands in the very next commit; the words take three more
+ * hops — the dictation insert writes ComposeBox's own `text` state, a ComposeBox effect reports it
+ * up through `onComposedText`, the host stores it, and only then does it arrive as `composedText`.
+ * So the boundary is evaluated a commit or two BEFORE the text it belongs to.
+ *
+ * `noteSpeechEnd` then correctly refuses to start a clock on an empty transcript — and nothing ever
+ * bumps `speechEndSeq` again for that utterance, so the first sentence after the tray is switched to
+ * Speak sits in the box forever. The second one worked only by accident: the first sentence's text
+ * was still sitting there, so ITS boundary found a non-empty transcript.
+ *
+ * Bounded for the same reason its sibling is. Unbounded, a boundary whose words never arrived would
+ * stay live until something else put text in the box — and the next thing to do that is the user
+ * TYPING, which would count down over a draft nobody spoke. Past this window the honest reading is
+ * that whatever that speech was, its words are not coming.
+ */
+export const PENDING_TRANSCRIPT_MAX_LAG_MS = 500;
+
 export interface UseAutoSendArgs {
   /** The arming toggle's state, owned by the caller so it can persist it. */
   armed: boolean;
@@ -195,12 +221,27 @@ export function useAutoSend({
     reeval.current = { sawReeval: false, keptTalking: false, graceApplied: false };
   }, []);
 
+  /**
+   * A speech-end whose TRANSCRIPT had not reached this hook yet, held rather than thrown away.
+   *
+   * See {@link PENDING_TRANSCRIPT_MAX_LAG_MS} for the lag this covers and the symptom it caused.
+   * Written only by `startClock`, consumed only by the transcript effect (2) — which nulls it
+   * BEFORE replaying, exactly as effect (3b) does with its own hold, so a replay the still-talking
+   * guard refuses does not leave a latch behind for the next chunk to trip.
+   */
+  const boundaryAwaitingText = useRef<{ at: number } | null>(null);
+
   // ── (1) ARM / DISARM ────────────────────────────────────────────────────────────────────────
   // Skips the very first run so merely mounting disarmed does not announce "Auto-send off."
   const armedBefore = useRef<boolean | null>(null);
   useEffect(() => {
     apply(setArmedState(stateRef.current, armed));
-    if (!armed) resetSample();
+    if (!armed) {
+      // Disarming clears every clock, and a held boundary is a clock that has not started yet — an
+      // armed-later rail starts fresh (see `setArmed`), so it must not inherit one.
+      boundaryAwaitingText.current = null;
+      resetSample();
+    }
     if (armedBefore.current !== null && armedBefore.current !== armed) {
       say(armed ? "armed" : "disarmed");
     }
@@ -240,6 +281,15 @@ export function useAutoSend({
   const onDeviceSpeechRef = useRef(onDeviceSpeech);
   onDeviceSpeechRef.current = onDeviceSpeech;
 
+  /**
+   * The FULL "they are talking right now" fact — BOTH sources — for the replay in (3c) to read.
+   *
+   * Assigned from the same expression effect (4) uses, at its one definition below, so the two can
+   * never drift apart. Written during render AFTER (3c) is declared, which is fine: (3c) reads it
+   * from an effect body, and effects run once the whole render has finished.
+   */
+  const speakingRef = useRef(false);
+
   const startClock = useCallback(
     (at: number) => {
       // THE USER IS STILL TALKING — do not arm. The on-device decode runs hundreds of ms behind the
@@ -252,6 +302,20 @@ export function useAutoSend({
       // including the deferred replay path below, so no caller can forget it.
       if (onDeviceSpeechRef.current) return;
       const prev = stateRef.current;
+      // THE WORDS HAVE NOT ARRIVED YET — hold the boundary rather than dropping it. `noteSpeechEnd`
+      // refuses to start a clock on an empty transcript, which is right (there is nothing to send),
+      // but the transcript reaches this hook a commit or two behind the boundary that belongs to it
+      // — see PENDING_TRANSCRIPT_MAX_LAG_MS. Dropping it here is unrecoverable in exactly the way
+      // dropping an unclaimed one is: only a NEW `speechEndSeq` bump can start a clock, and this
+      // utterance has already had its only one.
+      //
+      // Checked in `startClock` rather than at the listener for the same reason the still-talking
+      // guard above is: this is the one place a clock ever starts, replay paths included.
+      if (prev.phase !== "disarmed" && prev.transcript.trim() === "") {
+        boundaryAwaitingText.current = { at };
+        return;
+      }
+      boundaryAwaitingText.current = null;
       const next = noteSpeechEnd(prev, at);
       apply(next);
       if (prev.phase !== "counting" && next.phase === "counting") say("counting");
@@ -306,12 +370,49 @@ export function useAutoSend({
     // hold cannot survive anyway: the claim branch above clears unconditionally, whether or not it
     // replays, and the age bound decides which of those two it does.
     //
+    // A boundary held for words that had not landed IS cleared here, unlike the hold above, and the
+    // asymmetry is the point: that one exists to survive precisely this transition (the claim has
+    // not arrived yet), this one was recorded while we DID own the mic and has no claim to wait for.
+    // Left alive it would arm off whatever text next reaches the box on speech this column is no
+    // longer receiving — the hazard the ownership gate exists to close, reopened from a third side.
+    boundaryAwaitingText.current = null;
     // Stop counting, without sending: whatever the user is doing now, it is not watching this
     // rail's fill drain.
     if (stateRef.current.phase !== "counting") return;
     apply(noteSpeechResumed(stateRef.current));
     resetSample();
   }, [micLive, speechEndSeq, startClock, apply, resetSample]);
+
+  // ── (3c) THE HELD BOUNDARY'S WORDS ARRIVED ──────────────────────────────────────────────────
+  // The other half of the hold above, and the fix for "the first utterance after activation never
+  // sends". Declared AFTER (3b) so that in a commit where ownership is lost and text lands at once,
+  // the hold is already gone; and after (2), so `stateRef` carries the transcript this replays over.
+  useEffect(() => {
+    const held = boundaryAwaitingText.current;
+    if (held === null) return;
+    if (stateRef.current.transcript.trim() === "") return; // still nothing to send
+    // Consumed BEFORE the replay, exactly as (3b) consumes its own hold: if the replay is refused —
+    // the user is talking again — no latch may survive for the next chunk to trip.
+    boundaryAwaitingText.current = null;
+    if (Date.now() - held.at > PENDING_TRANSCRIPT_MAX_LAG_MS) return;
+    // THEY ARE TALKING RIGHT NOW — the boundary is refuted, drop it. `startClock` makes this check
+    // too, but against the ON-DEVICE source alone, and that is not enough HERE. On the cloud path
+    // `interim` carries the fact instead, and effect (4) cannot clean up afterwards: its dependency
+    // is the `speaking` BOOLEAN, so once it is already true it does not re-run when a clock starts
+    // underneath it. The countdown would then be unstoppable — `noteTranscript` deliberately never
+    // touches the clock, and the next real speech-end hits `noteSpeechEnd`'s idempotence branch —
+    // and three seconds later it dispatches the previous sentence plus a fragment of this one.
+    //
+    // Checked HERE and not inside `startClock` on purpose. This is the one caller replaying a
+    // boundary that is STALE BY CONSTRUCTION, which is what opens the window for a NEW utterance's
+    // interim to appear in. Evidence that the user is speaking now refutes a stale boundary; it does
+    // not refute a live one, where a lagging interim from the just-ended utterance is the likelier
+    // reading (see the module header's residual race) and refusing would lose the send outright.
+    if (speakingRef.current) return;
+    // Anchored at the REAL speech end. Re-anchoring at the moment the words showed up would hand
+    // back the propagation time, so the user waits out a longer silence than their tier promises.
+    startClock(held.at);
+  }, [composedText, startClock]);
 
   // ── (4) INTERIM / ON-DEVICE VAD — the user is talking again; stop counting without sending ──
   // Two sources for ONE fact, because the two capture engines report it differently and neither can
@@ -320,6 +421,7 @@ export function useAutoSend({
   // Rust pins the on-device level false whenever the cloud owns the audio — so OR-ing them cannot
   // double-count, and "keep talking and it waits" now holds on both paths rather than just one.
   const speaking = interim.trim().length > 0 || onDeviceSpeech;
+  speakingRef.current = speaking; // the replay in (3c) needs this fact too — see that ref's doc
   useEffect(() => {
     if (!speaking) return;
     const prev = stateRef.current;

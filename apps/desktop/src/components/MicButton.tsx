@@ -8,7 +8,6 @@ import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
 import type { Phase } from "../voice/wakeMachine";
 import { RADIUS } from "../theme/scale";
-import { AudioInputPicker } from "./AudioInputPicker";
 
 /** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends
  *  credits, so arming (turning the mic on / setting a listening intent) with an empty balance is
@@ -373,12 +372,16 @@ export function MicMenu({
   hoverProps,
 }: {
   placement?: "up" | "down";
-  /** Horizontal anchoring. `center` suits a mic sitting in the middle of its container (the
-   *  concierge ring). `left` is for a mic pinned to a container's LEFT EDGE: this menu carries a
-   *  ~242px device list, and centering that on the 32px composer mic — which sits at the composer's
-   *  left edge — puts its left edge ~105px OUTSIDE the pane, where it either paints over the
-   *  neighbouring column or is clipped by an `overflow: hidden` ancestor, cutting off the device
-   *  names. Centering was safe only while this was a 40px column of glyphs. */
+  /** Horizontal anchoring. `center` suits a mic sitting in the middle of its container; `left` is
+   *  for a mic pinned to a container's LEFT EDGE, like the composer mic.
+   *
+   *  This mattered acutely while the menu carried a ~242px device list: centering that on the 32px
+   *  composer mic put its left edge ~105px OUTSIDE the pane, where it either painted over the
+   *  neighbouring column or was clipped by an `overflow: hidden` ancestor, cutting off the device
+   *  names. The list has moved to Settings and the menu is back to a ~110px row of glyphs, so the
+   *  overhang is now small — but `left` is still the correct anchor for an edge-pinned mic (it
+   *  cannot overhang at all), and this popover still has NO width of its own, so any future content
+   *  makes the overhang grow again. Keep it. */
   align?: "center" | "left";
   surface: VoiceSurface;
   surfaceColor?: string;
@@ -413,10 +416,12 @@ export function MicMenu({
         WebkitBackdropFilter: "blur(6px)",
       }}
     >
-      {/* The three mode glyphs, now a ROW rather than a column: the menu also carries the input-
-          device picker below, which is a text list ~250px wide, and a vertical stack of three 30px
-          circles floating beside it read as an unrelated widget. The option set, click mapping and
-          selected-state contract are unchanged — only the axis they lay out on. */}
+      {/* The three mode glyphs, laid out as a ROW. The row was adopted when this menu also carried
+          the input-device picker (a ~250px text list, beside which a vertical stack of three 30px
+          circles read as an unrelated widget). The picker has since moved to Settings, but the row
+          is kept: three circles side by side is the compact shape for a menu whose only content is
+          those three circles, and the option set, click mapping and selected-state contract have
+          never depended on the axis. */}
       <div style={{ display: "flex", flexDirection: "row", gap: 4, justifyContent: "center" }}>
       {MIC_OPTIONS.map((opt) => {
         const selected = intent === opt.key;
@@ -452,11 +457,16 @@ export function MicMenu({
         );
       })}
       </div>
-      {/* WHAT the mic listens to, directly under HOW it listens. These belong in one menu: "the mic
-          is on" and "the mic is pointed at a loopback device that hears your Zoom call" are the two
-          halves of one question, and separating them is how a user ends up with a live mic bound to
-          something they never chose. See AudioInputPicker / services/audioInputs. */}
-      <AudioInputPicker />
+      {/* NO DEVICE PICKER HERE — and its absence is load-bearing, not an omission.
+          `AudioInputPicker` used to be mounted directly below this row. It has since moved into
+          Settings (`SettingsDialog`, and `INPUT_PICKER_LOCATION` is the shared string every remedy
+          names), where it was RE-LAID-OUT for a wide pane: the `width: 230` root constraint that
+          used to hold it inside a narrow column went with it. This popover has no width of its own
+          — it is `left: 50%; translateX(-50%)` and shrink-to-fits its content — so re-mounting the
+          widened picker here blows the menu past ~242px on `whiteSpace: nowrap` rows whose
+          max-content width is a full device-name string, which is exactly the spill/clip failure
+          the `align` doc above describes (roborev 56208). If a device control is ever wanted back
+          on a mic surface, it needs its own width constraint first. */}
     </div>
   );
 }

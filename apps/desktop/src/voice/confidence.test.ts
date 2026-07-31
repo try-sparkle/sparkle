@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   confidence,
   thresholdMs,
+  CONFIDENCE_PACE,
   CONFIDENCE_THRESHOLD_MS,
   LONG_UTTERANCE_WORDS,
   type Confidence,
@@ -114,13 +115,33 @@ describe("confidence — purity", () => {
 });
 
 describe("thresholds", () => {
-  it("matches the PRD's 1 / 3 / 5 / 10 second table", () => {
+  it("keeps the PRD's 1 : 3 : 5 : 10 SHAPE, paced by CONFIDENCE_PACE", () => {
+    // The founder asked for the countdown to run 20% slower, so the absolute numbers moved
+    // (1200 / 3600 / 6000 / 12000). Asserted as the PRD RATIO times the pace multiplier rather than
+    // as four fresh literals: the ladder's shape is the decision, the pace is a tuning knob, and
+    // re-pinning literals here would just have to be rewritten by the next tuning without ever
+    // catching a real regression.
     expect(CONFIDENCE_THRESHOLD_MS).toEqual({
-      high: 1_000,
-      normal: 3_000,
-      low: 5_000,
-      verylow: 10_000,
+      high: 1_000 * CONFIDENCE_PACE,
+      normal: 3_000 * CONFIDENCE_PACE,
+      low: 5_000 * CONFIDENCE_PACE,
+      verylow: 10_000 * CONFIDENCE_PACE,
     });
+    // …and the shape itself, independent of the pace, so a bad multiplier cannot quietly flatten it.
+    expect(thresholdMs("normal") / thresholdMs("high")).toBeCloseTo(3, 5);
+    expect(thresholdMs("low") / thresholdMs("high")).toBeCloseTo(5, 5);
+    expect(thresholdMs("verylow") / thresholdMs("high")).toBeCloseTo(10, 5);
+  });
+
+  it("keeps every tier above the tray's one-second sweep floor", () => {
+    // SWEEP_FLOOR_MS (voice/sendMode) promises no countdown paints a sweep shorter than a second —
+    // below that it is a flicker between two frames, not a countdown. Worth pinning at the source
+    // of the numbers: after the 1.2x pacing the floor is no longer binding on ANY tier (the fastest
+    // is 1200ms), so a future tuning that lowered the ladder would silently start relying on the
+    // clamp instead of failing here.
+    for (const tier of ["high", "normal", "low", "verylow"] as const) {
+      expect(thresholdMs(tier)).toBeGreaterThanOrEqual(1_000);
+    }
   });
 
   it("is strictly monotonic: less confident always waits longer", () => {
@@ -139,6 +160,6 @@ describe("thresholds", () => {
     // PRD §4: no cap on the TOTAL wait. Each re-evaluation re-imposes verylow's 10s from the
     // accumulated clock, so a sentence that keeps trailing off waits indefinitely by construction
     // rather than by a special case. See autoSendTimer.
-    expect(thresholdMs("verylow")).toBe(10_000);
+    expect(thresholdMs("verylow")).toBe(10_000 * CONFIDENCE_PACE);
   });
 });

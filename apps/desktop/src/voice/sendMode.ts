@@ -39,6 +39,90 @@ export const SEND_MODE_LABEL: Record<SendMode, string> = {
 };
 
 /**
+ * The same three positions, named for a tray too narrow to spell them out.
+ *
+ * ONLY `ptt` differs, and that is the point: "Push to talk" is the one label that cannot fit a
+ * narrow concierge column, and it is the one that dragged the other two down with it. The pills are
+ * `flex: 1`, so they share the width equally and every label ellipsizes together — the founder's
+ * report was a tray reading "S… P… S…", three positions none of which could be told apart. Naming
+ * the narrow state explicitly beats letting the browser truncate, because an ellipsis is a
+ * character the user has to decode; "Push" is a word they can read.
+ */
+export const SEND_MODE_LABEL_SHORT: Record<SendMode, string> = {
+  send: "Send",
+  ptt: "Push",
+  speak: "Speak",
+};
+
+/**
+ * INVARIANT: every short label is a substring of its full label.
+ *
+ * This is what lets the tray shrink the VISIBLE text while holding the accessible name at the full
+ * label — WCAG 2.5.3 (Label in Name) only requires the visible string to be CONTAINED IN the name,
+ * so "Push" inside "Push to talk" satisfies it in both width states. Break this invariant and the
+ * accessible name stops containing what is on screen, which is the actual failure the rule names.
+ *
+ * Exported as a checkable predicate rather than left as a comment because the two tables are edited
+ * independently and nothing else would notice them drifting apart.
+ */
+export function shortLabelsAreContainedInFullLabels(): boolean {
+  return SEND_MODES.every((m) => SEND_MODE_LABEL[m].includes(SEND_MODE_LABEL_SHORT[m]));
+}
+
+/**
+ * Below this tray width (px) the pills use {@link SEND_MODE_LABEL_SHORT}.
+ *
+ * ── THE ARITHMETIC IS NOT HERE ──────────────────────────────────────────────────────────────────
+ * It lives in `fullLabelsFitAtPx` (components/Concierge/trayGeometry), computed from the tray's
+ * actual constants — pill padding, border, gap, keycap slot, inter-pill gaps. This module only
+ * states the CHOSEN value; sendMode.test.ts asserts `TRAY_SHORT_LABEL_MAX_PX >= fullLabelsFitAtPx()`
+ * so the two cannot drift. That separation is deliberate: three earlier revisions of this constant
+ * (360, 390, 430) were each derived by re-spelling the geometry in prose or in a test, and each was
+ * wrong in a different way — a copied literal going stale (roborev 56213), then an estimate that
+ * omitted the keycap slot, then one that omitted the pill BORDER while also adding tray padding the
+ * measured `contentRect` excludes, two errors that partially cancelled and hid each other
+ * (roborev 56223). The derivation belongs next to its inputs.
+ *
+ * ERRING HIGH IS THE CORRECTNESS ARGUMENT, not a nicety. Between this threshold and the true fit
+ * width the component still selects the FULL table and the label span clips — so a value set too low
+ * paints "Push to tal", a silently truncated word, which is strictly worse than the "P…" this whole
+ * change exists to delete. Showing "Push" a notch early costs nothing.
+ *
+ * 440 sits above the derived bound of 431 — but only by 9px, which is NOT much next to the spread
+ * in the one input nobody can measure (two readings of `WIDEST_LABEL_PX` differed by 14px). So the
+ * margin is not what makes this safe. Two other things are: the test asserts
+ * `TRAY_SHORT_LABEL_MAX_PX >= fullLabelsFitAtPx()`, so any geometry change that outgrows the margin
+ * fails loudly rather than silently clipping; and `textOverflow: ellipsis` remains in the component
+ * as a last-resort backstop if the estimate itself is wrong.
+ *
+ * A residual backstop still exists in the component (`textOverflow: ellipsis`) for exactly that
+ * reason: if the estimate is ever wrong, an ellipsis beats a word cut mid-stroke.
+ *
+ * It also sits above `CONCIERGE_DEFAULT_WIDTH` (engine/columnResize) on purpose — at the DEFAULT
+ * column width the full labels genuinely do not fit, which is why the founder saw "S… P… S…"
+ * without having resized anything unusual. That relationship is pinned in sendMode.test.ts too.
+ */
+export const TRAY_SHORT_LABEL_MAX_PX = 440;
+
+/**
+ * The label a pill draws at a given tray width.
+ *
+ * Pure and exported for this codebase's usual reason (cf. `chicletFor`, `micIntentForMode`): the
+ * decision is testable without a DOM, which MATTERS here because jsdom has no layout engine — a
+ * test that tried to prove this by measuring a rendered node would read every width as 0 and pass
+ * vacuously. The component measures; this decides.
+ *
+ * A width of 0 means "not measured yet" (the first paint, before the ResizeObserver fires) and
+ * takes the FULL labels: booting into the abbreviated form and widening a frame later is a visible
+ * flicker, whereas a too-long label for one frame merely truncates the way it always did.
+ */
+export function trayLabelFor(mode: SendMode, trayWidthPx: number): string {
+  const table =
+    trayWidthPx > 0 && trayWidthPx < TRAY_SHORT_LABEL_MAX_PX ? SEND_MODE_LABEL_SHORT : SEND_MODE_LABEL;
+  return table[mode] ?? SEND_MODE_LABEL[mode];
+}
+
+/**
  * Step the tray one position, CLAMPED at both ends — never wrapping.
  *
  * Wrapping would let one extra keypress flip `send` (microphone off, nothing listening) straight to

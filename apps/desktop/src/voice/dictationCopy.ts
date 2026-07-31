@@ -14,7 +14,7 @@ import { DEFAULT_WAKE_WORD, DEFAULT_STOP_WORD } from "./voiceDefaults";
 // The advanced opt-in's own label, single-sourced. This module INSTRUCTS the user to turn that
 // control on, and a remedy naming a control by a label it no longer carries is exactly the dead end
 // the no-device branch below exists to fix.
-import { ALLOW_VIRTUAL_LABEL } from "../services/audioInputs";
+import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInputs";
 import type { PauseReason } from "./dictationFocus";
 export const STOP_PHRASE = DEFAULT_STOP_WORD;
 // ACTIVE phase (the wake word was heard; dictation is live). Only show this when the backend is
@@ -261,12 +261,15 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
       // pill (listening / muted / off) with no device list, so the backend's "pick a different
       // input in the mic menu" was overridden here and pointed at System Settings → Sound instead.
       //
-      // BOTH halves of that reasoning have since flipped, in the same change. The mic menu now
-      // carries `AudioInputPicker`, so the control exists — and System Settings became actively
-      // WRONG, because capture no longer follows the system default: automatic selection prefers a
-      // physical input over it, and a pinned UID ignores it outright (audio_devices::select_device).
-      // Sending someone to change the OS default can leave capture on the very device this notice
-      // just named. The picker is the only control that actually rebinds.
+      // BOTH halves of that reasoning have since flipped. `AudioInputPicker` exists and now lives
+      // in Settings (`INPUT_PICKER_LOCATION`), so the control this names is real and reachable —
+      // and System Settings became actively WRONG, because capture no longer follows the system
+      // default: automatic selection prefers a physical input over it, and a pinned UID ignores it
+      // outright (audio_devices::select_device). Sending someone to change the OS default can leave
+      // capture on the very device this notice just named. The picker is the only control that
+      // actually rebinds. Named through the SHARED constant, never a hard-coded phrase, because the
+      // picker has already moved once (mic hover menu → Settings) and every remedy has to move with
+      // it — a remedy naming a control by a location it no longer has is a dead end.
       //
       // `no-device` and `unsupported-format` reach the same conclusion in their own branches; the
       // whole bucket set now names the picker, and only mute still names System Settings.
@@ -283,7 +286,7 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         // device we can't name: a wordy string the user can read and report beats a confident one
         // that omits the only detail that mattered.
         detail: device
-          ? `Another app may be holding "${device}" — a screen recorder or a virtual audio device. Hover the mic and pick a different input, or turn the mic off and on.`
+          ? `Another app may be holding "${device}" — a screen recorder or a virtual audio device. Pick a different input in ${INPUT_PICKER_LOCATION}, or turn the mic off and on.`
           : text,
       };
     }
@@ -298,7 +301,7 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         // does nothing in that state: only virtual inputs exist, and select_device refuses a virtual
         // device regardless of the OS default (roborev 55360). Both options, or neither is honest.
         detail:
-          `Connect a microphone, then turn the mic back on. To transcribe system audio instead, hover the mic and turn on "${ALLOW_VIRTUAL_LABEL}".`,
+          `Connect a microphone, then turn the mic back on. To transcribe system audio instead, open ${INPUT_PICKER_LOCATION} and turn on "${ALLOW_VIRTUAL_LABEL}".`,
       };
     case "unsupported-format":
       return {
@@ -313,7 +316,7 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         // pinned UID ignores the system default outright and `auto_select` prefers a physical input
         // over it, so changing the OS default cannot rebind capture away from the failing device.
         detail:
-          "Hover the mic and pick a different input in Sparkle's mic menu, then turn the mic back on.",
+          `Pick a different input in ${INPUT_PICKER_LOCATION}, then turn the mic back on.`,
       };
     case "download":
       return {

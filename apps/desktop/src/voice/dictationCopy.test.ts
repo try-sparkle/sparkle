@@ -22,7 +22,7 @@ import {
 } from "./backendVoiceErrors";
 // The advanced opt-in's own label, imported rather than retyped: the no-device remedy tells the user
 // to turn it on, and an instruction naming a control by a stale label is worse than none.
-import { ALLOW_VIRTUAL_LABEL } from "../services/audioInputs";
+import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInputs";
 
 describe("dictationCopy — dynamic placeholders", () => {
   it("called with no arg reproduces the default constants (back-compat)", () => {
@@ -323,7 +323,7 @@ describe("voiceErrorNotice — the rendered copy for each bucket", () => {
     expect(n.headline).not.toMatch(/no microphone found|couldn't start/i);
   });
 
-  it("sends the user to the control that actually REBINDS capture — the mic menu's picker", () => {
+  it("sends the user to the control that actually REBINDS capture — the picker, wherever it lives", () => {
     // A remedy string is an instruction the user will follow, so it gets the same scrutiny as the
     // code path it replaces. This assertion used to demand the opposite, and both halves of that
     // reasoning have since flipped in one change:
@@ -335,8 +335,13 @@ describe("voiceErrorNotice — the rendered copy for each bucket", () => {
     //     automatic selection prefers a physical input over it, and a pinned UID ignores it
     //     (audio_devices::select_device). Changing the OS default can leave capture on the exact
     //     device this notice just named — a remedy that does nothing.
+    //  3. The picker MOVED — out of the mic hover menu and into Settings, where the mic indicator
+    //     is no longer clickable at all. "Hover the mic" was a dead end handed to a stuck user, so
+    //     this asserts the SHARED location constant rather than a hard-coded phrase: the next move
+    //     updates the instruction and this assertion together, instead of orphaning one of them.
     const n = voiceErrorNotice(noAudioError("MacBook Pro Microphone"))!;
-    expect(n.detail).toMatch(/hover the mic and pick a different input/i);
+    expect(n.detail).toContain(INPUT_PICKER_LOCATION);
+    expect(n.detail).not.toMatch(/hover the mic/i);
     expect(n.detail).not.toContain("System Settings");
     // The other half of the advice is still followable (the pill has off/on), so it survives.
     expect(n.detail).toMatch(/off and on/i);
@@ -377,7 +382,8 @@ describe("voiceErrorNotice — the rendered copy for each bucket", () => {
     const REAL = "unsupported sample format: u8";
     expect(classifyVoiceError(REAL)).toBe("unsupported-format");
     const n = voiceErrorNotice(REAL)!;
-    expect(n.detail).toMatch(/mic menu/i);
+    expect(n.detail).toContain(INPUT_PICKER_LOCATION);
+    expect(n.detail).not.toMatch(/hover the mic/i);
     expect(n.detail).not.toContain("System Settings");
   });
 

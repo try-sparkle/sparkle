@@ -11,6 +11,15 @@
 // a manual press cancel it, and does an expired countdown fire the composer's own submit.
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
+import { thresholdMs } from "./confidence";
+
+// Threshold-crossing waits are DERIVED from the ladder, never written as literals. The founder
+// retuned the pace (x1.2) and every hard-coded 1_000/10_000 here silently stopped crossing its
+// threshold — the tests went red without a single behaviour changing. What these rows assert is
+// "advance past THIS tier's threshold and the send fires", which is independent of the tuning.
+const HIGH = thresholdMs("high");
+const NORMAL = thresholdMs("normal");
+const VERYLOW = thresholdMs("verylow");
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(null) }));
 vi.mock("../analytics", () => ({ capture: vi.fn() }));
@@ -23,6 +32,10 @@ import { resetAutoSendTelemetry } from "./autoSendTelemetry";
 const DONE = "Deploy the staging branch.";
 /** A trailing conjunction — `verylow`, so the threshold is 10s. */
 const MID_CLAUSE = "deploy the staging branch and";
+/** Short, unpunctuated, no bad tail — `normal`, so the threshold is 3s. The founder's shape. */
+const PLAIN = "ship it now";
+/** A second `normal` utterance, so the two can be told apart in an ordinal test. */
+const PLAIN_AGAIN = "run the tests";
 
 type Props = Parameters<typeof useAutoSend>[0];
 
@@ -53,6 +66,13 @@ function setup(overrides: Partial<Props> = {}) {
 function speechEnds() {
   act(() => {
     useDictationStore.getState().noteSpeechEnd();
+  });
+}
+
+/** The on-device VAD's view of "they are talking right now" — the cancel the on-device path has. */
+function speakingAgain(v: boolean) {
+  act(() => {
+    useDictationStore.getState().setOnDeviceSpeech(v);
   });
 }
 
@@ -89,7 +109,7 @@ describe("the clock starts on SPEECH END, not on the transcript settling", () =>
     speechEnds();
     expect(result.current.phase).toBe("counting");
 
-    await tick(1_000 + AUTO_SEND_TICK_MS);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
@@ -97,12 +117,200 @@ describe("the clock starts on SPEECH END, not on the transcript settling", () =>
     const { onFire } = setup({ composedText: MID_CLAUSE });
     speechEnds();
 
-    // Well past `high`'s 1s, nowhere near `verylow`'s 10s.
-    await tick(3_000);
+    // Well past `high`, nowhere near `verylow`.
+    await tick(HIGH + 1_000);
     expect(onFire).not.toHaveBeenCalled();
 
-    await tick(7_500);
+    await tick(VERYLOW - HIGH - 1_000 + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ══ THE FIRST UTTERANCE AFTER ACTIVATION ═══════════════════════════════════════════════════════
+// Reproduced live: switch the tray to Speak, say a sentence — nothing sends. Say another — THAT one
+// sends. Ordinal-dependent, not length-dependent (both sentences scored `normal`).
+//
+// WHY. The backend emits the transcript FIRST and the speech-end second, deliberately and on both
+// capture paths (dictation.rs `PartialThenSpeechEnd`), so that the rail scores THIS sentence rather
+// than the previous one. That ordering does not survive the trip into this hook. `speechEndSeq` is
+// a store field the hook subscribes to directly, so it lands in the very next commit. The text
+// takes three more hops — the dictation insert writes ComposeBox's own `text` state, a ComposeBox
+// effect reports it up via `onComposedText`, the host stores it, and only then does it arrive here
+// as `composedText`. So the speech-end is evaluated a commit or two BEFORE the words it belongs to.
+//
+// `noteSpeechEnd` refuses to start a clock on an empty transcript — correctly, there is nothing to
+// send — and nothing ever bumps `speechEndSeq` again for that utterance, so the first sentence
+// after activation sits in the box forever. The SECOND one works only by accident: the first
+// sentence's text is still in the box, so its speech-end finds a non-empty transcript.
+//
+// Every test above this line hands `setup` a full `composedText` at mount, which is why a suite
+// this thorough never saw it. These feed the two facts in the order the app actually delivers them.
+describe("the transcript can arrive AFTER the speech-end it belongs to", () => {
+  it("fires the first utterance, whose text lands a commit behind its speech-end", async () => {
+    // The box is empty because the user has only just switched the tray to Speak.
+    const { onFire, update } = setup({ composedText: "" });
+
+    speechEnds(); // Deepgram's boundary reaches the store first…
+    update({ composedText: PLAIN }); // …and the words it belongs to a commit later.
+
+    await tick(NORMAL + AUTO_SEND_TICK_MS); // the `normal` tier's accumulated silence
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats the FIRST and the SECOND utterance identically", async () => {
+    // The property the founder actually reported. A suite that only ever exercises the second
+    // utterance is what let this ship, so this walks both in one run, through the same box-emptying
+    // that a successful send performs.
+    const { onFire, update } = setup({ composedText: "" });
+
+    speechEnds();
+    update({ composedText: PLAIN });
+    await tick(NORMAL + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+
+    // The send emptied the compose box behind it, so the next utterance starts from "" exactly as
+    // the first did — which is why this is ordinal-dependent and not a one-off mount artefact.
+    update({ composedText: "" });
+
+    speechEnds();
+    update({ composedText: PLAIN_AGAIN });
+    await tick(NORMAL + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not arm on text the user TYPES long after an unrelated speech-end", async () => {
+    // The bound that keeps the hold from becoming a latch. A speech-end whose words never arrived is
+    // the propagation lag it exists for only for as long as that lag plausibly lasts; a minute later
+    // the next thing to reach the box is a different user action, and arming on it would count down
+    // over a draft nobody spoke.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds(); // a boundary whose words never came
+    await tick(60_000); // …and the user does something else entirely for a minute
+
+    update({ composedText: PLAIN }); // now they TYPE into the box
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("drops the held boundary when the mic moves to another surface before the text lands", async () => {
+    // Same hazard the ownership gate closes, from the other side: a boundary held for a transcript
+    // that has not arrived must not survive losing the mic and then arm off whatever text turns up.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds();
+    update({ micLive: false }); // the user clicked an agent composer's mic
+    update({ composedText: PLAIN });
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("does not arm off a held boundary while the user is talking again", async () => {
+    // The on-device decode runs behind the audio, so the words can land after the speaker has
+    // already resumed. The replay must meet the same still-talking guard a live boundary does,
+    // rather than becoming a way around it.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds();
+    speakingAgain(true);
+    update({ composedText: PLAIN });
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("does not leave a refused boundary latched for the NEXT chunk to trip", async () => {
+    // The hold is consumed BEFORE the replay, so a refusal spends it. Latched instead, the boundary
+    // would sit there until any later transcript change — a committed chunk of the sentence the user
+    // is STILL speaking — quietly armed a countdown anchored back at a boundary the guard had
+    // already rejected, which is the double-arm race the on-device notes above warn against.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds();
+    speakingAgain(true); // they carried straight on into the next clause
+    update({ composedText: PLAIN }); // the held boundary's words land — and are refused
+    expect(result.current.phase).not.toBe("counting");
+
+    speakingAgain(false);
+    // A later chunk of the same continuing sentence, with NO new boundary behind it. Only a fresh
+    // `speechEndSeq` may start a clock.
+    update({ composedText: `${PLAIN} and rerun them` });
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("does not arm off a held boundary while the user is talking again — ON THE CLOUD PATH", async () => {
+    // The twin of the test above, and NOT redundant with it: the hook defines "they are talking" as
+    // two sources because neither can speak for the other, and the cloud path reports it through
+    // `interim` rather than the VAD level. Guarding only the on-device half leaves the cloud half
+    // able to start a countdown that nothing can then stop — effect (4)'s dependency is the
+    // `speaking` BOOLEAN, so once interim is already non-empty it does not re-run when a clock
+    // starts underneath it, `noteTranscript` never touches the clock, and the next real speech-end
+    // hits `noteSpeechEnd`'s idempotence branch. Three seconds later it would dispatch the previous
+    // sentence plus a fragment of the one still being spoken.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds(); // the first utterance's boundary — its words have not landed yet
+    update({ interim: "and then also" }); // Deepgram streams the NEXT utterance
+    update({ composedText: PLAIN }); // …and only now do the first one's words arrive
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  // ── THE LAG BOUND'S VALUE, BRACKETED FROM BOTH SIDES ────────────────────────────────────────
+  // Deliberately in ABSOLUTE milliseconds and not in terms of PENDING_TRANSCRIPT_MAX_LAG_MS. A
+  // bracket written as `MAX_LAG - 100` / `MAX_LAG + 100` moves with the constant, so it pins the
+  // comparison and says nothing whatever about the value — retuning to 5s or to 100ms leaves both
+  // rows green. (Confirmed by mutation: that is exactly what the first draft of these two did.)
+  // What actually needs pinning is that the number stays inside the band where it means what its
+  // doc claims, and only fixed times either side can do that.
+  const WITHIN_PROPAGATION_MS = 400;
+  const TYPING_DELAY_MS = 1_000;
+
+  it("is long enough for the propagation delay it exists for", async () => {
+    // The lower edge. Three React hops under load is the case this hold was built for; a bound
+    // retuned below that silently restores the original bug — the first utterance stops sending
+    // again, with no error anywhere.
+    const { onFire, update } = setup({ composedText: "" });
+    speechEnds();
+    await tick(WITHIN_PROPAGATION_MS);
+
+    update({ composedText: PLAIN });
+    await tick(NORMAL + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("is short enough that text arriving a beat later cannot cash it in", async () => {
+    // The upper edge, and the one that guards a send rather than a symptom. Stretch the bound to
+    // seconds and a stray empty-transcript boundary — background noise closing a segment while the
+    // box is empty — followed by the user typing their first character arms a countdown over a
+    // draft they never spoke, and auto-dispatches it. That is irreversible.
+    const { onFire, update, result } = setup({ composedText: "" });
+    speechEnds();
+    await tick(TYPING_DELAY_MS);
+
+    update({ composedText: PLAIN });
+    expect(result.current.phase).not.toBe("counting");
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("holds nothing at all while the tray is in Send mode", async () => {
+    // Speaking with auto-send OFF must not leave a boundary lying around that switching the tray to
+    // Speak then cashes in. The words the user spoke a moment ago under a different tray position
+    // are not a countdown they started.
+    const { onFire, update, result } = setup({ armed: false, composedText: "" });
+    speechEnds(); // spoken while the tray was still in Send mode
+    update({ armed: true }); // the user switches to Speak…
+    update({ composedText: PLAIN }); // …and only now do those words reach the box
+    expect(result.current.phase).not.toBe("counting");
+
+    await tick(30_000);
+    expect(onFire).not.toHaveBeenCalled();
   });
 });
 
@@ -128,7 +336,7 @@ describe("keep talking and it waits", () => {
     update({ interim: "" });
 
     speechEnds();
-    await tick(1_000 + AUTO_SEND_TICK_MS);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 });
@@ -142,10 +350,10 @@ describe("elapsed silence ACCUMULATES across re-evaluations", () => {
     await tick(600);
 
     // A committed chunk lands mid-countdown and completes the sentence. That moves the THRESHOLD
-    // (verylow → high) but must not touch the 600ms already elapsed — so 600ms is now past the new
-    // 1s... not quite. Advance a little and it must fire, rather than starting 1s over.
+    // (verylow -> high) but must not touch the 600ms already elapsed. Advance the remainder of the
+    // HIGH window and it must fire, rather than starting the whole window over.
     update({ composedText: DONE });
-    await tick(500 + AUTO_SEND_TICK_MS);
+    await tick(HIGH - 600 + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
@@ -243,7 +451,7 @@ describe("the countdown is audible, not just visible", () => {
     // draining fill is aria-hidden, so this is a screen reader's only notice.
     expect(onAnnounce.mock.calls.at(-1)?.[0]).toContain("Build 4");
 
-    await tick(1_000 + AUTO_SEND_TICK_MS);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onAnnounce.mock.calls.at(-1)?.[0]).toBe("Sent to Build 4.");
   });
 
@@ -264,7 +472,7 @@ describe("a send that did not happen is not announced or recorded", () => {
     const { onAnnounce } = setup({ onFire });
     onAnnounce.mockClear();
     speechEnds();
-    await tick(1_000 + AUTO_SEND_TICK_MS);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
 
     expect(onFire).toHaveBeenCalledTimes(1);
     expect(onAnnounce.mock.calls.map((c) => c[0]).join(" ")).not.toContain("Sent to");
@@ -285,7 +493,7 @@ describe("a speech-end that beats the mic claim is not lost", () => {
     update({ micLive: true }); // the claim lands a beat later
     expect(result.current.phase).toBe("counting");
 
-    await tick(1_000 + AUTO_SEND_TICK_MS);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
@@ -320,18 +528,18 @@ describe("a speech-end that beats the mic claim is not lost", () => {
 
   it("anchors the replayed clock at the SPEECH END, not at the moment ownership landed", async () => {
     // Re-anchoring at the claim silently hands back the time the claim itself took, so the user
-    // waits out a longer silence than their tier promises. DONE is `high` → a 1s threshold; 300ms of
-    // that is already spent by the time the claim lands.
+    // waits out a longer silence than their tier promises. DONE is `high`; 300ms of that window is
+    // already spent by the time the claim lands.
     const { onFire, update } = setup({ micLive: false });
     speechEnds();
     await tick(300);
 
     update({ micLive: true });
-    // 300ms already elapsed + 600ms more = 900ms of silence. Still short of the threshold.
-    await tick(600);
+    // 300ms already elapsed, plus enough to land just SHORT of the high threshold.
+    await tick(HIGH - 300 - 100);
     expect(onFire).not.toHaveBeenCalled();
 
-    // Past 1s measured from the real speech end.
+    // …and past it, measured from the real speech end rather than from the claim.
     await tick(100 + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });

@@ -22,6 +22,7 @@ import { KeyboardShortcutsMenu } from "./KeyboardShortcutsMenu";
 import { CreditsPanel } from "./CreditsPanel";
 import { SpendPane } from "./SpendPane";
 import { VoiceControlsMenu } from "./VoiceControlsMenu";
+import { AudioInputPicker } from "./AudioInputPicker";
 import { ToolsPane, TOOLS_SEARCH_ENTRIES } from "./ToolsPane";
 import { categoryEntries, matchesAny, paneQueryFor } from "../engine/settingsSearch";
 import { ApprovalsMenu } from "./ApprovalsMenu";
@@ -97,7 +98,7 @@ const CATEGORIES: Category[] = [
   { id: "cloudauth", label: "Claude auth for cloud agents", Icon: FiCloud, blurb: "The Claude credential your cloud agents run with. Stored encrypted; never shown again.", keywords: ["cloud agents anthropic api key byok subscription setup-token credential sandbox"] },
   { id: "onepassword", label: "1Password", Icon: FiLock, blurb: "Back your .env files up to a vault, and restore them into fresh agent worktrees.", keywords: ["1password onepassword op cli env dotenv secrets vault backup restore seed worktree"] },
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: ["phone pair devices"] },
-  { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Wake word, stop word, and what happens when you submit.", keywords: ["wake word stop word dictation microphone"] },
+  { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Which microphone Sparkle listens to, the wake and stop words, and what happens when you submit.", keywords: ["wake word stop word dictation microphone input device audio picker system audio loopback"] },
   { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: ["auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue"] },
   { id: "conciergetools", label: "Concierge tools", Icon: FiShield, blurb: "How much the concierge may do on its own — tool by tool.", keywords: CONCIERGE_TOOLS_SEARCH_TERMS },
   { id: "conciergevoice", label: "How Sparkle talks to you", Icon: FiMessageSquare, blurb: "Rules Sparkle follows when it writes to you. It adds to these itself as you state preferences.", keywords: ["concierge guidelines communication style tone preferences rules markdown how sparkle talks writes voice"] },
@@ -289,7 +290,17 @@ function PaneBody({
     case "mobile":
       return <MobileDevicesPane />;
     case "voice":
-      return <VoiceControlsMenu />;
+      // The input-device picker LEADS this pane. It used to hang off the mic indicator's hover
+      // menu, where the two questions it answers — what is being captured, and whether that
+      // includes system audio — were reachable only by hovering a control that is now inert. A
+      // privacy affordance behind a hover is one nobody finds; here it is the first thing in the
+      // pane whose own name is what the user came looking for.
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+          <AudioInputPicker />
+          <VoiceControlsMenu />
+        </div>
+      );
     case "approvals":
       return <ApprovalsMenu />;
     case "conciergetools":

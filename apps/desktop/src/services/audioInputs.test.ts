@@ -25,8 +25,18 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import {
+  ALLOW_VIRTUAL_CAPTION,
   ALLOW_VIRTUAL_FAILED,
+  ALLOW_VIRTUAL_LABEL,
+  AUTOMATIC_LABEL,
+  CHOSEN_DEVICE_GONE,
+  INPUT_PICKER_LOCATION,
+  SYSTEM_AUDIO_ALLOWED,
+  SYSTEM_AUDIO_CAPTURING,
+  SYSTEM_AUDIO_OFF,
   boundDeviceCaption,
+  inputStatus,
+  SYSTEM_AUDIO_OFF_STILL_SELECTED,
   isDeviceSelectable,
   refreshAudioInputs,
   setAllowVirtualInput,
@@ -497,5 +507,153 @@ describe("isDeviceSelectable — the opt-in is what gates a non-microphone input
   it("a virtual input is refused until the opt-in is on", () => {
     expect(isDeviceSelectable(LOOPBACK, false)).toBe(false);
     expect(isDeviceSelectable(LOOPBACK, true)).toBe(true);
+  });
+});
+
+describe("inputStatus — the two questions, answered without collapsing them into one", () => {
+  const DEVICES = [BUILTIN, LOOPBACK];
+  const base = { bound: null, live: false, chosenUid: null, devices: DEVICES, allowVirtual: false };
+
+  it("reports a live bind with an ACTIVITY verb and the bound device's name", () => {
+    const s = inputStatus({
+      ...base,
+      bound: { name: "Yeti Stereo Microphone", uid: "usb-yeti", isVirtual: false },
+      live: true,
+    });
+    expect(s.captureLabel).toBe("Listening");
+    expect(s.captureValue).toBe("Yeti Stereo Microphone");
+  });
+
+  it("switches to a POINTING verb when a device is bound but capture is not live", () => {
+    const s = inputStatus({
+      ...base,
+      bound: { name: "Yeti Stereo Microphone", uid: "usb-yeti", isVirtual: false },
+      live: false,
+    });
+    expect(s.captureLabel).toBe("Mic");
+  });
+
+  it("never lets the two rows contradict each other about a pinned loopback", () => {
+    // ── roborev 56208 ───────────────────────────────────────────────────────────────────────────
+    // Revoking the opt-in only flips the flag — neither `setAllowVirtualInput(false)` nor its Rust
+    // side clears the persisted uid — so "loopback chosen, opt-in off" is reachable. Row 1 read an
+    // amber "Selected: BlackHole 2ch" while row 2 read a calm "Off". Both strings were honest in
+    // isolation; the PAIRING was the lie, which is exactly the failure `inputStatus` exists to stop.
+    //
+    // It is also the case where hiding the loopback rows bites: with the opt-in off the device is in
+    // neither group, so this row is the ONLY remaining mention of the pinned choice.
+    const s = inputStatus({ ...base, chosenUid: "hal-loopback", allowVirtual: false });
+    expect(s.captureIsVirtual).toBe(true);
+    expect(s.systemAudioValue).toBe(SYSTEM_AUDIO_OFF_STILL_SELECTED);
+    // ASSERTED AS THE RELATIONSHIP, not as two literals: whenever row 1 flags a non-microphone, row
+    // 2 must not be reading the calm default. That is the invariant; the wording can change.
+    expect(s.systemAudioValue).not.toBe(SYSTEM_AUDIO_OFF);
+    expect(s.systemAudioIsWarning).toBe(true);
+
+    // …and the ordinary case is untouched: a real microphone with the opt-in off is a calm "Off".
+    const clean = inputStatus({ ...base, chosenUid: "builtin-mic", allowVirtual: false });
+    expect(clean.captureIsVirtual).toBe(false);
+    expect(clean.systemAudioValue).toBe(SYSTEM_AUDIO_OFF);
+    expect(clean.systemAudioIsWarning).toBe(false);
+  });
+
+  it("reports the CHOICE — never a capture — when nothing has bound", () => {
+    // The substitution this refuses is the nine-minutes-of-silence bug: an intent rendered in the
+    // present tense as though it were a live capture.
+    expect(inputStatus({ ...base, live: true }).captureLabel).toBe("Selected");
+    expect(inputStatus({ ...base, live: true }).captureValue).toBe(AUTOMATIC_LABEL);
+    expect(inputStatus({ ...base, chosenUid: "builtin-mic" }).captureValue).toBe(BUILTIN.name);
+  });
+
+  it("says a pinned device is NOT CONNECTED rather than quietly reading as automatic", () => {
+    // The uid is persisted by the backend and the device has since been unplugged. Falling back to
+    // "Automatic" would tell the user a choice is in force that cannot be.
+    expect(inputStatus({ ...base, chosenUid: "gone-forever" }).captureValue).toBe(CHOSEN_DEVICE_GONE);
+  });
+
+  it("marks a non-microphone whether it is BOUND or merely chosen", () => {
+    expect(
+      inputStatus({ ...base, bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true } })
+        .captureIsVirtual,
+    ).toBe(true);
+    // Marked before capture even starts: a pinned loopback must not be the one thing on the pane
+    // that looks like a microphone.
+    expect(inputStatus({ ...base, chosenUid: "hal-loopback", allowVirtual: true }).captureIsVirtual).toBe(
+      true,
+    );
+    expect(inputStatus({ ...base, chosenUid: "builtin-mic" }).captureIsVirtual).toBe(false);
+  });
+
+  it("system audio is OFF by default, and that is not a warning", () => {
+    const s = inputStatus(base);
+    expect(s.systemAudioValue).toBe(SYSTEM_AUDIO_OFF);
+    expect(s.systemAudioIsWarning).toBe(false);
+  });
+
+  it("distinguishes merely ALLOWED from being captured RIGHT NOW", () => {
+    // The old UI raised one paragraph-long amber banner for both, so a user who opted in last week
+    // and is on their built-in mic read the same warning as one whose call is on the stream.
+    const allowed = inputStatus({ ...base, allowVirtual: true });
+    expect(allowed.systemAudioValue).toBe(SYSTEM_AUDIO_ALLOWED);
+    expect(allowed.systemAudioIsWarning).toBe(true);
+
+    const capturing = inputStatus({
+      ...base,
+      allowVirtual: true,
+      bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true },
+    });
+    expect(capturing.systemAudioValue).toBe(SYSTEM_AUDIO_CAPTURING);
+  });
+
+  it("claims CAPTURING only from a real bind, never from the choice", () => {
+    // The strongest sentence this block can say — your calls are on the stream this second — must
+    // not rest on an intent that may never have bound.
+    const chosenOnly = inputStatus({ ...base, chosenUid: "hal-loopback", allowVirtual: true });
+    expect(chosenOnly.systemAudioValue).toBe(SYSTEM_AUDIO_ALLOWED);
+    expect(chosenOnly.systemAudioValue).not.toBe(SYSTEM_AUDIO_CAPTURING);
+  });
+
+  it("reports a loopback bind even after the opt-in was revoked", () => {
+    // A stale bind from a since-revoked grant. This is the case that makes it safe to hide the
+    // loopback rows while the opt-in is off: the fact survives the device leaving the list.
+    const s = inputStatus({
+      ...base,
+      allowVirtual: false,
+      bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true },
+    });
+    expect(s.systemAudioValue).toBe(SYSTEM_AUDIO_CAPTURING);
+    expect(s.captureIsVirtual).toBe(true);
+  });
+});
+
+describe("the opt-in's copy — a budget, because the wordiness WAS the bug", () => {
+  it("the label names the consequence AND rules out the misreading it produced", () => {
+    // A user read "Allow non-microphone inputs (advanced)" as "a checkbox I assume lets me use
+    // both" — i.e. as MIXING system audio into the microphone feed. It does not; it unlocks a
+    // different device to bind to, one at a time. A label someone can agree to while believing the
+    // opposite of what it does is worse than a technical one, because they never find out.
+    expect(ALLOW_VIRTUAL_LABEL).toMatch(/system audio/i);
+    expect(ALLOW_VIRTUAL_LABEL).toMatch(/instead of a microphone/i);
+  });
+
+  it("the consequence fits on ONE line", () => {
+    // It was three lines and ~35 words. The founder's complaint — "it's really wordy and not super
+    // clear" — is a product constraint, so it gets an assertion rather than a good intention.
+    expect(ALLOW_VIRTUAL_CAPTION.split(/\s+/).length).toBeLessThanOrEqual(12);
+    // And it still names what is actually at stake, which is the half that must survive the cut.
+    expect(ALLOW_VIRTUAL_CAPTION).toMatch(/calls/i);
+  });
+
+  it("the status values are short enough to read at a glance", () => {
+    for (const v of [SYSTEM_AUDIO_OFF, SYSTEM_AUDIO_ALLOWED, SYSTEM_AUDIO_CAPTURING]) {
+      expect(v.split(/\s+/).length).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("names where the picker lives, so remedy strings elsewhere cannot rot", () => {
+    // voice/dictationCopy builds three user-facing remedies from this. They used to say "hover the
+    // mic" and became false the moment the picker moved into Settings.
+    expect(INPUT_PICKER_LOCATION).toMatch(/settings/i);
+    expect(INPUT_PICKER_LOCATION).not.toMatch(/hover/i);
   });
 });

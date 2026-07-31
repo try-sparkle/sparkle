@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
-use crate::audio::{assess_capture_health, rms_level, AudioHealth, Capture};
+use crate::audio::{assess_capture_health, rms_level, AudioHealth, Capture, ZeroSource};
 use crate::audio_devices::DeviceChoice;
 use crate::cloud::{CloudAudioSender, DeepgramSession};
 use crate::model;
@@ -2069,6 +2069,23 @@ impl DictationSession {
     }
 }
 
+/// The raw-vs-converted sample evidence for one watchdog tick.
+///
+/// A `health=Silent` verdict says the frames the pipeline saw were all zero; it has never said WHO
+/// zeroed them. Carrying these four counters (and the [`ZeroSource`] they classify to) into the
+/// fault log is what turns "no audio from the bound input device" — a sentence compatible with a
+/// dead mic, a revoked TCC grant, and a bug in our own downmix — into a single line that names
+/// which one it was. `raw_nonzero > 0` with `out_nonzero == 0` is OUR bug; both zero with
+/// `raw_samples > 0` is the OS handing us digital silence.
+#[derive(Debug, Clone, Copy, Default)]
+struct SampleCounts {
+    raw_samples: u64,
+    raw_nonzero: u64,
+    out_samples: u64,
+    out_nonzero: u64,
+    zero_source: ZeroSource,
+}
+
 impl DictationState {
     /// Tear the capture down and rebuild it, re-enumerating devices on the way.
     ///
@@ -2100,6 +2117,7 @@ impl DictationState {
 
     /// One watchdog tick. Returns the action taken, so the polling loop stays trivial and this is
     /// the only thing with logic in it.
+    #[allow(clippy::type_complexity)]
     fn watchdog_tick(&self, app: &AppHandle) -> FaultAction {
         // Set when this tick should attempt another BUILD, independently of whether it also has
         // something to say to the user. The two must be separate: `fault_action` short-circuits on
@@ -2109,6 +2127,9 @@ impl DictationState {
         // error, a wedged main thread) left the session silent forever. Report once, keep retrying
         // (roborev 55300).
         let mut retry_build = false;
+        // The RAW-vs-converted evidence, sampled alongside the verdict so the fault log can say
+        // WHO zeroed the audio. Defaults are the "no capture to measure" reading.
+        let mut counts = SampleCounts::default();
         // Sample under the lock, then RELEASE before doing anything that emits or touches audio.
         let sampled = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -2122,6 +2143,13 @@ impl DictationState {
                         WATCHDOG_GRACE,
                     );
                     let device = c.device().clone();
+                    counts = SampleCounts {
+                        raw_samples: c.health().raw_samples(),
+                        raw_nonzero: c.health().raw_nonzero(),
+                        out_samples: c.health().out_samples(),
+                        out_nonzero: c.health().out_nonzero(),
+                        zero_source: c.health().zero_source(),
+                    };
                     // Ends the borrow of `sess.capture` before the counter reset below.
                     sess.audio_missing_ticks = 0;
                     Some((health, Some(device), sess.audio_reacquired, sess.audio_reported))
@@ -2184,6 +2212,9 @@ impl DictationState {
                 tracing::warn!(
                     target: "dictation",
                     device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"), ?health,
+                    raw_samples = counts.raw_samples, raw_nonzero = counts.raw_nonzero,
+                    out_samples = counts.out_samples, out_nonzero = counts.out_nonzero,
+                    zero_source = ?counts.zero_source,
                     "dictation is armed but no audio is arriving; re-acquiring the input device"
                 );
                 self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reacquired = true;
@@ -2195,12 +2226,25 @@ impl DictationState {
                 self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reacquired = true;
             }
             FaultAction::Report => {
+                // Ask TCC again, right now. `ensure_access_blocking` ran once on the arm path, and
+                // its answer is a process-local CACHED read — so a grant that lapsed MID-PROCESS
+                // (a policy push, a TCC reset, the bundle being replaced under a running app) is
+                // invisible to it while CoreAudio has already started delivering zeros forever,
+                // which is precisely this module's documented signature for a denied mic. Re-read
+                // it here, at the one moment it is diagnostic, and record BOTH the answer and the
+                // contradiction: `Authorized` alongside `zero_source=Os` is the stale-grant
+                // reading, and it is the difference between "your microphone is broken" (it is
+                // not) and "this process's mic grant is dead; restart Sparkle" (it is).
+                let tcc = crate::mic_permission::status();
                 tracing::error!(
                     target: "dictation",
                     device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
                     uid = device.as_ref().and_then(|d| d.uid.as_deref()).unwrap_or("<none>"),
                     is_virtual = device.as_ref().map(|d| d.is_virtual).unwrap_or(false),
-                    muted, ?health,
+                    muted, ?health, ?tcc,
+                    raw_samples = counts.raw_samples, raw_nonzero = counts.raw_nonzero,
+                    out_samples = counts.out_samples, out_nonzero = counts.out_nonzero,
+                    zero_source = ?counts.zero_source,
                     "no audio from the bound input device; telling the user"
                 );
                 self.0.lock().unwrap_or_else(|p| p.into_inner()).audio_reported = true;

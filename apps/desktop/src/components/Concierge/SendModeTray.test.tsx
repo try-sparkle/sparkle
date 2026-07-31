@@ -9,7 +9,15 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { SendModeTray, type SendModeTrayProps, type SendTrayModel } from "./SendModeTray";
+import {
+  SendModeTray,
+  DEFAULT_SPEAK_LEFT_FRAC,
+  TRAY_GEOMETRY,
+  speakLeftFraction,
+  type SendModeTrayProps,
+  type SendTrayModel,
+} from "./SendModeTray";
+import { TRAY_SHORT_LABEL_MAX_PX } from "../../voice/sendMode";
 import { C } from "../../theme/colors";
 
 afterEach(cleanup);
@@ -212,7 +220,9 @@ describe("the tray sweep", () => {
     // Speak. Draining toward Send would point at a position that never counts.
     expect(sweep.style.right).toBe("0px");
     expect(sweep.style.left).toBe("");
-    expect(sweep.style.width).toBe("60%");
+    // 0.6 remaining, and the sweep now stops at Speak's LEFT EDGE rather than draining to zero:
+    // width = 100 - speakLeftFrac x 100 x (1 - remaining) = 100 - 66.67 x 0.4 ~= 73%.
+    expect(sweep.style.width).toBe("73%");
     expect(tray().getAttribute("data-counting")).toBe("true");
   });
 
@@ -233,28 +243,153 @@ describe("the tray sweep", () => {
     expect(tray().getAttribute("data-counting")).toBeNull();
   });
 
-  it("keeps the destination on Speak whether or not a clock is running", () => {
-    // THE MIS-ROUTE SAFETY NET. The old rail dropped the target the moment counting began, so users
-    // read it as the destination having vanished at exactly the moment it mattered most. And the
-    // visible text stays INSIDE the accessible name (WCAG 2.5.3) so "click Build 4" still hits it.
+  it("shows the position's name and NOTHING else, whether or not a clock is running", () => {
+    // The founder's ask, verbatim: the pill must read exactly "Speak" — no arrow, no destination,
+    // no ellipsis. The composed "Speak → Build 4" label is what truncated the whole `flex: 1` tray
+    // to "S… P… S…" in a narrow concierge column, taking all three position names down with it.
     mount({ mode: "speak", model: { ...COUNTING, phase: "listening" } });
-    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak → Build 4");
-    expect(pill("speak").getAttribute("aria-label")).toBe("Speak → Build 4");
+    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak");
     cleanup();
     mount({ mode: "speak", model: COUNTING });
-    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak → Build 4");
+    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak");
   });
 
-  it("hatches the very-low tier so a STILL frame can show it, and never prints a number", () => {
-    // Ten seconds of sweep is imperceptible frame to frame, so motion alone cannot carry the tier.
-    // A digits readout is refused outright: it invites the user to race the clock, and the number
-    // was never the information.
-    mount({ mode: "speak", model: { ...COUNTING, tier: "verylow", targetName: "Concierge" } });
-    const sweep = screen.getByTestId("send-tray-sweep");
-    expect(sweep.style.background).toContain("repeating-linear-gradient");
-    // The target name is deliberately digit-free here: an agent literally NAMED "Build 4" of course
-    // keeps its numeral, so the ban is on a READOUT, not on a name.
+  it("keeps the destination in the ACCESSIBLE name after taking it out of the visible one", () => {
+    // Unpinned from the visible text, not deleted: the tooltip and a screen reader still name the
+    // target. This is also what keeps WCAG 2.5.3 (Label in Name) satisfied — the accessible name
+    // must CONTAIN the visible string, and "Speak → Build 4" contains "Speak". The failing
+    // direction is the reverse, which is why the visible label may shrink but the name may not.
+    mount({ mode: "speak", model: { ...COUNTING, phase: "listening" } });
+    expect(pill("speak").getAttribute("aria-label")).toBe("Speak → Build 4");
+    expect(pill("speak").getAttribute("title")).toContain("Speak → Build 4");
+    expect(pill("speak").getAttribute("aria-label")).toContain(
+      screen.getByTestId("send-mode-label-speak").textContent!,
+    );
+  });
+
+  it("keeps the ACCESSIBLE NAME at the full label when the tray narrows the visible one", () => {
+    // ── THE REGRESSION THIS PINS (roborev 56198) ────────────────────────────────────────────────
+    // `spokenLabel` was derived from the width-dependent `label`, so a narrow tray silently renamed
+    // the Push-to-talk pill to "Push": the control renamed itself as the surface resized, and
+    // "click Push to talk" hit in a wide column and missed in a narrow one.
+    //
+    // jsdom has no ResizeObserver, so the narrow branch was UNREACHABLE by any earlier test — which
+    // is exactly how the defect shipped. Stubbing it is what makes this row able to fail at all.
+    const realRO = globalThis.ResizeObserver;
+    let fire: ((w: number) => void) | null = null;
+    class StubRO {
+      constructor(private cb: ResizeObserverCallback) {
+        fire = (w: number) =>
+          this.cb([{ contentRect: { width: w } } as ResizeObserverEntry], this as never);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    }
+    globalThis.ResizeObserver = StubRO as unknown as typeof ResizeObserver;
+    try {
+      mount({ mode: "ptt", model: COUNTING });
+      // Wide first: the full word is both visible and spoken.
+      act(() => fire!(TRAY_SHORT_LABEL_MAX_PX + 100));
+      expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push to talk");
+      expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
+
+      // Now narrow it. The VISIBLE label shrinks…
+      act(() => fire!(300));
+      expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push");
+      // …and the ACCESSIBLE NAME does not move. This is the assertion that fails against the
+      // pre-fix code, where it read "Push".
+      expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
+      expect(pill("ptt").getAttribute("title")).toContain("Push to talk");
+      // WCAG 2.5.3 containment still holds in the NARROW state, which is the state that broke it.
+      expect(pill("ptt").getAttribute("aria-label")).toContain(
+        screen.getByTestId("send-mode-label-ptt").textContent!,
+      );
+    } finally {
+      globalThis.ResizeObserver = realRO;
+    }
+  });
+
+  it("draws EVERY tier as the same solid fill — no hatch the user has to decode", () => {
+    // ── THE FOUNDER'S "SHADED CANDY CANE" ──────────────────────────────────────────────────────
+    // `verylow` used to paint a 135° repeating-linear-gradient. He hit it repeatedly and could not
+    // read it: "I don't know why, I don't know when it does that, but I don't want that." The state
+    // it encoded is real ("that sounded unfinished" — 12s instead of 3.6s) and is still carried, by
+    // the SPEED of the sweep, which needs no legend.
+    for (const tier of ["high", "normal", "low", "verylow"] as const) {
+      cleanup();
+      mount({ mode: "speak", model: { ...COUNTING, tier, targetName: "Concierge" } });
+      const sweep = screen.getByTestId("send-tray-sweep");
+      expect(sweep.style.background).not.toContain("repeating-linear-gradient");
+      expect(sweep.style.background).not.toContain("gradient");
+    }
+    // A digits readout is still refused outright: it invites the user to race the clock, and the
+    // number was never the information. The target name is deliberately digit-free here — an agent
+    // literally NAMED "Build 4" of course keeps its numeral, so the ban is on a READOUT, not a name.
     expect(tray().textContent).not.toMatch(/\d/);
+  });
+
+  it("keeps textOverflow: ellipsis as the LAST-RESORT backstop", () => {
+    // ── roborev 56213 ───────────────────────────────────────────────────────────────────────────
+    // This property was DELETED one commit ago on this branch and produced the "Push to tal" defect
+    // — a word clipped mid-stroke with nothing signalling it — which human review caught and the
+    // suite did not. The old row asserted `textOverflow === ""`, so REMOVING the ellipsis was
+    // pinned; restoring it was not, and a reader of sendMode.ts's "an ellipsis is a character the
+    // user has to decode" comment can delete it again with everything green.
+    //
+    // TO BE CLEAR ABOUT WHAT THIS ENDORSES: the ellipsis is NOT the mechanism. Narrow widths are
+    // handled by choosing a shorter WORD (voice/sendMode `trayLabelFor`), and with the threshold at
+    // its pessimistic value this should never paint. It is here because the threshold is an estimate
+    // of text metrics, and if that estimate is ever wrong an ellipsis beats a truncated word.
+    mount({ mode: "speak", model: COUNTING });
+    for (const m of ["send", "ptt", "speak"] as const) {
+      expect(screen.getByTestId(`send-mode-label-${m}`).style.textOverflow).toBe("ellipsis");
+    }
+  });
+
+  it("measures Speak's edge in ONE coordinate system — padding box, not content box", () => {
+    // ── roborev 56219 ───────────────────────────────────────────────────────────────────────────
+    // The fraction used to be `offsetLeft / contentRect.width`. Those are different boxes:
+    // contentRect EXCLUDES the tray's padding, `offsetLeft` is measured FROM the padding edge, and
+    // an absolutely-positioned child's `width: X%` resolves against the padding box. The result was
+    // inflated by (w + 2*pad)/w — a constant ~4px of Speak left unfilled at the moment of send.
+    //
+    // The measuring branch is unreachable in jsdom (offsetLeft is always 0), so the pure helper is
+    // the only thing a test can pin — which is exactly why it was extracted.
+    const pad = TRAY_GEOMETRY.trayPad;
+    const contentW = 600;
+    const paddingBoxW = contentW + 2 * pad;
+    const offsetLeft = 400; // Speak's left edge, measured from the padding edge
+
+    // Correct: both terms against the padding box.
+    expect(speakLeftFraction(offsetLeft, paddingBoxW)).toBeCloseTo(offsetLeft / paddingBoxW, 10);
+    // The OLD (wrong) denominator produces a strictly larger fraction — the inflation itself.
+    expect(offsetLeft / contentW).toBeGreaterThan(speakLeftFraction(offsetLeft, paddingBoxW));
+
+    // Unmeasurable inputs fall back to the geometric default rather than collapsing the sweep.
+    expect(speakLeftFraction(0, paddingBoxW)).toBe(DEFAULT_SPEAK_LEFT_FRAC);
+    expect(speakLeftFraction(offsetLeft, 0)).toBe(DEFAULT_SPEAK_LEFT_FRAC);
+  });
+
+  it("stops the sweep at Speak's LEFT EDGE, not through it", () => {
+    // The founder: "it shouldn't drain all the way through the speak button. Once it hits the left
+    // side of the speak button, then it sends." Anchored right, so the leading edge is `100 - width`
+    // and must land exactly on Speak's left edge when the clock reaches zero — the same instant the
+    // send fires, because both read the one `remaining` value.
+    // From the component's own default, not a hand-spelled 3 (roborev 56219).
+    const speakLeftPct = DEFAULT_SPEAK_LEFT_FRAC * 100;
+
+    cleanup();
+    mount({ mode: "speak", model: { ...COUNTING, remainingFraction: 1 } });
+    // Full: the leading edge starts at the tray's left edge.
+    expect(parseFloat(screen.getByTestId("send-tray-sweep").style.width)).toBeCloseTo(100, 0);
+
+    cleanup();
+    mount({ mode: "speak", model: { ...COUNTING, remainingFraction: 0 } });
+    // Spent: the fill covers exactly the Speak pill and no more — it did NOT drain to 0%.
+    const spent = parseFloat(screen.getByTestId("send-tray-sweep").style.width);
+    expect(spent).toBeCloseTo(100 - speakLeftPct, 0);
+    expect(spent).toBeGreaterThan(0);
   });
 });
 

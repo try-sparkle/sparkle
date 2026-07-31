@@ -22,13 +22,19 @@ import { usePushToTalk } from "./usePushToTalk";
 import type { MicIntent } from "../components/MicButton";
 
 /**
- * The longest a push-to-talk release will wait for an in-flight partial to commit before sending
- * whatever is in the box.
+ * The longest a push-to-talk release will wait for the utterance it captured to finish arriving
+ * before sending whatever is in the box.
  *
- * A BACKSTOP, not a policy — see `endHold`. The wait ends the instant the transcript lands, so this
- * number is only ever reached when the commit never arrives at all (a dropped socket, a capture torn
- * down mid-utterance). 1.5s is long enough to cover a normal commit's tail and short enough that a
- * user who hit the failure case is not left staring at a composer that appears to have ignored them.
+ * A BACKSTOP, not a policy — see `endHold`. The wait ends the instant the engine closes the
+ * utterance, so this number is only ever reached when that close never arrives at all (a dropped
+ * socket, a capture torn down mid-utterance). 1.5s is long enough to cover a normal commit's tail
+ * and short enough that a user who hit the failure case is not left staring at a composer that
+ * appears to have ignored them.
+ *
+ * IT IS ALSO NEVER REACHED BY A HOLD THAT CAPTURED NOTHING. A silent hold has no utterance to wait
+ * for, so it does not enter the wait at all — see `endHold`'s pending test. That matters because a
+ * hold whose only content is TYPED text is a first-class case here, not an edge one, and making it
+ * sit out a cap would make the send feel broken.
  */
 export const PARTIAL_SETTLE_CAP_MS = 1_500;
 
@@ -38,6 +44,11 @@ export interface UseSendModeArgs {
    *
    * Called on a push-to-talk RELEASE — and on nothing else here, because every other way of
    * sending is a press the tray reports directly to its host.
+   *
+   * A RELEASE IS A SEND, FULL STOP — not "a send that happens when there is a transcript". The
+   * gesture means *send this message*, and what the message is made of (spoken, typed, or both) is
+   * the composer's business, not this hook's. So this is called on every clean release, including
+   * one that captured no speech at all.
    */
   onSend: () => boolean;
 }
@@ -115,11 +126,55 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   //
   // Every other combination imposes, which is the intended direction — a position someone (or the
   // v3 migration) deliberately chose should arm the mic it names.
+  // ── A TERMINAL PAUSES SPEAK, EXACTLY AS IT ALREADY PAUSES PUSH TO TALK ────────────────────────
+  //
+  // THE BUG, and it is not the one it looks like. The founder reported: "when I am in push to talk
+  // mode and I go into terminal, that works correctly — it turns the microphone off. But when it's
+  // in speak mode, it doesn't do that." The obvious reading is that the focus gate is wired into one
+  // path and not the other. It is not — both read the same `focusOwner`. What differs is `phase`:
+  //
+  //   Push to talk at rest -> `micIntentForMode` = "paused" -> phase PASSIVE -> the wake gate in
+  //     `terminalRoutingArmed` (voice/dictationFocus) is false -> `dictationPauseReason` returns
+  //     "terminal" -> capture pauses. Correct, and by accident of the resting intent.
+  //   Speak -> "active" -> phase ACTIVE -> the wake gate PASSES -> the terminal stops being a pause
+  //     and becomes a DESTINATION: `isTerminalRoutable()` is true and dictated speech is typed
+  //     straight into the focused agent's PTY (useDictation's `dictation://partial` handler).
+  //
+  // So Speak did not "keep listening" by omission — it was routing the user's voice into an agent's
+  // command line while they typed there. That is strictly worse than a hot mic: with the countdown
+  // armed it can also dispatch text the user never addressed to anyone.
+  //
+  // Dropping to the PAUSED intent while inert closes it at the one term both gates read. It is a
+  // demotion of `phase`, not of `enabled`, which matters: the mic stays ARMED, so leaving the
+  // terminal costs a resume rather than a re-arm, and the tray's position is never rewritten
+  // underneath the user. `armedStatus` then reports `idle`, so every surface draws the honest
+  // not-capturing state instead of an invitation to speak.
+  //
+  // ONLY POSITIONS WHOSE RESTING INTENT IS A LIVE MIC ARE DEMOTED — `resting !== "off"`.
+  //
+  // An earlier version of this wrote `inert ? "paused" : micIntentForMode(mode)` and claimed in a
+  // comment that it no-opped for Send. It did the opposite (roborev 56315, High). `"paused"` is not
+  // a weaker "off": `applyIntent("paused")` calls `setMuted`, and `setMuted` is an ARM —
+  // `setEnabled(true); setPhase("passive")` (components/MicButton). So with the tray at Send and the
+  // microphone released, moving the caret into a terminal TURNED THE MIC ON. It did not repair
+  // itself either: leaving the terminal re-ran with `intent === "off"` and `enabled` now true, so
+  // the stand-down guard below returned and left the mic armed and wake-word listening indefinitely
+  // under a tray reading "Send" — with the indicator painting it grey "Microphone: off" the whole
+  // time, which is the exact two-controls-disagreeing state this hook exists to delete. It also
+  // fired the out-of-credits notice at anyone who merely clicked into a terminal, and stole
+  // `voiceSurface` from a mic armed in the header or another window.
+  //
+  // Keying on the RESTING intent keeps Send on the "off" branch, where the stand-down guard can do
+  // its job, while still demoting the one position that is actually live.
   useEffect(() => {
-    const intent = micIntentForMode(mode);
+    const resting = micIntentForMode(mode);
+    const intent = inert && resting !== "off" ? "paused" : resting;
     if (intent === "off" && useDictationStore.getState().enabled) return;
     applyIntent(intent);
-  }, [mode, applyIntent]);
+    // `inert` IS a dependency now. Without it this effect only re-ran when the tray moved, so the
+    // caret entering or leaving a terminal changed nothing — which is precisely why Speak stayed
+    // routing into the PTY.
+  }, [mode, inert, applyIntent]);
 
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
@@ -127,6 +182,46 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   // A release that is waiting on an in-flight partial, so a second gesture (or an unmount) can call
   // it off rather than leaving a send armed against a hold that no longer exists.
   const settling = useRef<(() => void) | null>(null);
+
+  // ── THE HOLD'S UTTERANCE WATCH — "did this hold capture any audio at all?" ───────────────────
+  //
+  // Live for the whole gesture, because `endHold` has to answer that in the keyup's own tick and
+  // nothing readable at that instant answers it on its own. `spoke` is the only thing tracked here:
+  // whether ANY audio was captured during this hold. It is what lets a silent hold skip the wait
+  // entirely — everything else `endHold` needs ("is a close final, or just one clause of many") is
+  // read LIVE at the moment it matters, not accumulated here, for the reason in `endHold`'s own doc.
+  //
+  // THE VAD IS READ AS A LEVEL, NEVER AS AN EDGE. `dictationStore.speaking` is the raw Silero VAD on
+  // both capture paths (dictation.rs `frame_speaking` ignores `cloud_active`). Rust emits it only on
+  // a CHANGE, so speech already in progress when the hold starts produces no event for this watch to
+  // see — hence the level is read at the START too (`seeded` below), not only from the subscription.
+  const utterance = useRef<{
+    /** Any audio at all captured during this hold. `false` means there is nothing to drain. */
+    spoke: boolean;
+    unsub: () => void;
+  } | null>(null);
+
+  const stopUtteranceWatch = useCallback(() => {
+    utterance.current?.unsub();
+    utterance.current = null;
+  }, []);
+
+  const startUtteranceWatch = useCallback(() => {
+    stopUtteranceWatch();
+    const st = useDictationStore.getState();
+    // ALREADY MID-WORD WHEN THE KEY WENT DOWN counts from frame one. The mic is armed between holds
+    // (it listens for the wake word), so `speaking` can already be true when the gesture starts.
+    const u = { spoke: st.speaking || st.interim !== "", unsub: () => {} };
+    u.unsub = useDictationStore.subscribe((s) => {
+      if (s.speaking || s.interim) u.spoke = true;
+    });
+    utterance.current = u;
+  }, [stopUtteranceWatch]);
+
+  // The watch is a store subscription, so it has to be dropped when this host goes away even on the
+  // paths that never reach `endHold` — usePushToTalk's own cleanup just unbinds its listeners, so an
+  // unmount mid-hold ends the gesture without calling anything here.
+  useEffect(() => stopUtteranceWatch, [stopUtteranceWatch]);
   // UNMOUNTING CANCELS IT TOO — and it has to put the microphone back for the same reason the
   // mode/inert canceller below does. While the wait is running the mic is at `pttHeldIntent` (live
   // AND routing), and `finish` is the only thing on this path that drops it; ConciergeHost unmounts
@@ -170,42 +265,76 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   /**
    * End the hold: send (or not), then drop the mic back to armed-but-not-routing.
    *
-   * ── "IMMEDIATELY" DOES NOT MEAN "IN THIS TICK" ────────────────────────────────────────────────
-   * Release fires the send — no countdown, no grace period, no confirmation. But the transcript is
-   * not always finished arriving when the key comes up: on the cloud path Deepgram publishes a live
-   * `interim` and only later commits it as a segment that reaches the composer. Sending in the
-   * keyup's own tick when an interim is outstanding delivers a TRUNCATED phrase — or, if the user
-   * spoke one short sentence and let go, an empty box and no message at all.
+   * ── A RELEASE IS A SEND, FULL STOP ────────────────────────────────────────────────────────────
+   * Not "a send when there is a transcript". A hold with no speech in it at all is a deliberate way
+   * to dispatch a TYPED draft — in this mode it is the ONLY way, since `chordSends` makes ⌘↩ inert
+   * here on purpose — so it takes the fast path below and sends in the keyup's own tick. Anything
+   * that made a silent hold wait, or made it a no-op, would take that draft's only send path away.
    *
-   * So a release with an interim outstanding waits for that interim to CLEAR, then yields one
-   * macrotask, and sends the whole phrase after that. That is not a delay anyone chose: there is no
-   * timer to expire, nothing to wait out, and the common case (no interim, or the on-device path,
-   * which has no interim results at all) still sends in the keyup's own tick.
+   * ── "IMMEDIATELY" DOES NOT MEAN "IN THIS TICK" WHEN HE ACTUALLY SPOKE ─────────────────────────
+   * The transcript is not always finished arriving when the key comes up: on the cloud path Deepgram
+   * publishes a live `interim` and only later commits it as a segment that reaches the composer.
+   * Sending in the keyup's own tick then delivers a TRUNCATED phrase — or, for one short sentence,
+   * an empty box and no message at all.
    *
-   * THE MACROTASK IS THE WHOLE FIX, not a hedge. `interim` clearing is NOT "the segment reached the
-   * box" — it is emitted immediately BEFORE the insert: `useDictation`'s `dictation://partial`
-   * handler runs `setInterim(""); onSegment(payload);`, and zustand notifies subscribers
-   * SYNCHRONOUSLY inside `set()`. So a subscriber that sends on the clear runs before `onSegment`
-   * appends anything, and `ComposeBox.submit` reads `text` from React state as of the last render —
-   * which is the pre-insert value. The observable result was the exact truncation this wait exists
-   * to prevent, made worse: "ship the" goes out, the box is cleared, and the committed tail lands in
-   * an emptied composer. A microtask is not enough either; `submit` needs the insert's RE-RENDER to
-   * have flushed, so this yields a full macrotask (roborev 56078).
+   * ── WHY THE OLD "IS AN INTERIM OUTSTANDING?" TEST WAS THE BUG ─────────────────────────────────
+   * This used to wait only when `interim` was non-empty at the instant of the keyup, and this doc
+   * used to claim that covered the case. IT DID NOT, and the gap is the ordinary release rather than
+   * an exotic one. The relay runs `endpointing=200`, so a 200ms gap between clauses CLOSES a segment:
+   * the committed text lands, `useDictation` clears the interim, and the words spoken after that gap
+   * have not produced an interim yet — transcription runs behind the audio. Let go there and
+   * `interim` is already `""`, the old test early-returned, and the tail of the sentence was sent
+   * into the void. The founder's report is exactly this: "if I let go and you haven't fully processed
+   * the text that I said, we lose it." An empty interim is not "nothing is coming"; it is "nothing is
+   * being previewed right now", which is a different fact and true in the middle of every utterance.
    *
-   * THE CAP IS A BACKSTOP, NOT A POLICY. If the commit never arrives — a dropped socket, a capture
-   * torn down mid-utterance — the message must not be stranded forever, so after
-   * {@link PARTIAL_SETTLE_CAP_MS} it sends what is in the box. Reaching the cap means we sent a
-   * possibly-truncated phrase, which is still better than swallowing the user's message.
+   * ── THE SIGNAL: `speechEndSeq`, WHICH THE BACKEND ORDERS BEHIND THE TRANSCRIPT ────────────────
+   * `dictation://speech-end` is the engine's own endpoint decision, and Rust emits it AFTER the
+   * committed transcript it belongs to, on the same thread, on BOTH capture paths — the cloud relay
+   * loop emits `partial` then `speech-end` for a `speech_final` frame (and for the trailing
+   * standalone `UtteranceEnd`, whose transcript already went out earlier), and the on-device worker
+   * asserts the same order in its own tests ("a closed VAD segment must emit its transcript and THEN
+   * the speech-end"). That ordering is what makes it usable here: a bump observed after the keyup is
+   * a GUARANTEE that the committed text it closes has already been dispatched to this window.
+   *
+   * IT IS PER CLAUSE, NOT PER HOLD, AND THAT IS THE TRAP. `speech_end_action` emits on every
+   * `speech_final` frame and re-arms on the next interim, so at `endpointing=200` a mid-sentence
+   * breath produces one while the user is still talking. "A speech-end arrived" therefore does NOT
+   * mean the utterance is over — only that SOME clause is. What makes it mean the utterance is a
+   * LIVE quiet check made at the moment each bump is observed: `!speaking && !interim`, read from
+   * that same event, both at the keyup (the fast path, below) and inside the wait's own subscriber.
+   * A bump that lands while either reads true is one clause of several, not the last one, and is not
+   * treated as final — the wait keeps running for a later, quieter bump, bounded by the cap.
+   *
+   * A LIVE READ, NOT A REMEMBERED ONE, is what keeps this correct across repeated bumps: the CURRENT
+   * event's own `speaking`/`interim` are what decide it, so a bump that closed mid-sentence cannot be
+   * mistaken for final just because a later, UNRELATED quiet tick happens to follow it — nothing
+   * settles until a bump and quiet coincide in the SAME event.
+   *
+   * WE ONLY WAIT WHEN SOMETHING IS ACTUALLY OUTSTANDING — a hold that captured no audio at all
+   * (`utterance.spoke`) never enters the wait.
+   *
+   * THE MACROTASK IS STILL LOAD-BEARING. `submit` reads `text` from React state as of the last
+   * render, so the insert triggered by the preceding `dictation://partial` needs its RE-RENDER to
+   * have flushed. A microtask is not enough (roborev 56078), so this yields a full macrotask after
+   * the seq bump before sending.
+   *
+   * THE CAP IS A BACKSTOP, NOT A POLICY, and ON EXPIRY IT SENDS. If the close never arrives — a
+   * dropped socket, a capture torn down mid-utterance — the message must not be stranded, so after
+   * {@link PARTIAL_SETTLE_CAP_MS} it sends what is in the box. Reaching the cap means a possibly
+   * truncated phrase went out, which is still strictly better than swallowing the message; losing
+   * his words is the failure being fixed here and must never be the timeout's behaviour.
    *
    * THE MIC IS DROPPED AFTER THE SEND, not before, and that ordering is load-bearing on this path:
-   * `paused` stops routing, so tearing the mic down first can be what prevents the very partial we
-   * are waiting for from ever landing.
+   * `paused` stops routing, so tearing the mic down first can be what prevents the very transcript
+   * we are waiting for from ever landing.
    */
   const endHold = useCallback(
     (send: boolean) => {
       settling.current?.();
       const finish = () => {
         settling.current = null;
+        stopUtteranceWatch();
         if (send) onSendRef.current();
         // RE-READ the live position rather than hard-coding "ptt". `finish` can now run up to
         // PARTIAL_SETTLE_CAP_MS after the release, and hard-coding it dropped a mic that a mode the
@@ -214,13 +343,19 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         // reconcile effect would not repair because `mode` did not change again (roborev 56078).
         applyIntent(micIntentForMode(useUiStore.getState().conciergeSendMode));
       };
-      if (!send || !useDictationStore.getState().interim) {
+      // ── THE FAST PATH: IS THERE ANYTHING LEFT TO DRAIN? ──────────────────────────────────────
+      // Skipped only when the answer is clearly no: nothing was ever captured, or the room is quiet
+      // RIGHT NOW — read live, at the instant of the keyup. While the VAD still hears speech, or an
+      // interim is outstanding, he may be mid-sentence, so neither counts as "done" on its own.
+      const at = useDictationStore.getState();
+      const quiet = !at.speaking && at.interim === "";
+      if (!send || !utterance.current?.spoke || quiet) {
         finish();
         return;
       }
-      // TWO RACES END THIS WAIT — the commit landing and the cap expiring — and each needs a handle
-      // on the other to tear it down. Held in one object rather than two `let`s so neither can be
-      // read before it is assigned, with `settled` making the teardown idempotent: both paths can
+      // TWO RACES END THIS WAIT — the utterance closing and the cap expiring — and each needs a
+      // handle on the other to tear it down. Held in one object rather than two `let`s so neither can
+      // be read before it is assigned, with `settled` making the teardown idempotent: both paths can
       // fire in the same turn, and finishing twice would send the message twice.
       const wait: { timer?: ReturnType<typeof setTimeout>; unsub?: () => void; settled?: boolean } = {};
       const settle = () => {
@@ -230,10 +365,17 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         wait.unsub?.();
         finish();
       };
-      wait.unsub = useDictationStore.subscribe((s) => {
-        // The interim cleared, so the insert is about to run — see the doc above. Yield a macrotask
-        // so it and its render land first, then send.
-        if (!s.interim) setTimeout(settle, 0);
+      wait.unsub = useDictationStore.subscribe((s, prev) => {
+        // React ONLY to a fresh close (a `speechEndSeq` change on THIS event), not to `speaking` or
+        // `interim` changing on their own — see the doc above for why a bare quiet tick must not be
+        // able to settle a wait that no bump has closed. `s`/`prev` are this exact event's values, so
+        // the quiet check below is a LIVE read at the moment of THIS bump, not a remembered one.
+        if (s.speechEndSeq === prev.speechEndSeq) return;
+        if (s.speaking || s.interim) return;
+        // A close that arrived with nothing heard AT THAT SAME MOMENT — so its committed text has
+        // already been dispatched and no later clause is outstanding. Yield a macrotask so the
+        // insert's render lands first, then send.
+        setTimeout(settle, 0);
       });
       wait.timer = setTimeout(settle, PARTIAL_SETTLE_CAP_MS);
       settling.current = () => {
@@ -241,9 +383,10 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         if (wait.timer) clearTimeout(wait.timer);
         wait.unsub?.();
         settling.current = null;
+        stopUtteranceWatch();
       };
     },
-    [applyIntent],
+    [applyIntent, stopUtteranceWatch],
   );
 
   usePushToTalk({
@@ -253,8 +396,11 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
       // A new hold cancels a release still waiting on a partial: the user carried on talking, so
       // the phrase they were about to send is no longer the whole of what they mean to say.
       settling.current?.();
+      // Fresh gesture, fresh debt — the watch is what lets the release tell "he spoke and the text
+      // is still coming" apart from "he held the key in silence to send a typed draft".
+      startUtteranceWatch();
       applyIntent(pttHeldIntent());
-    }, [applyIntent]),
+    }, [applyIntent, startUtteranceWatch]),
     onHoldEnd: useCallback(() => endHold(true), [endHold]),
     // ABANDON SENDS NOTHING — see usePushToTalk's header on ⌘Tab never delivering its keyup.
     onAbandon: useCallback(() => endHold(false), [endHold]),

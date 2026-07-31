@@ -263,15 +263,37 @@ describe("the rail names the agent the TEXT addresses, not the one on screen", (
     expect(await railTarget()).toBe("Concierge");
   });
 
-  // The visible label, not just the accessible name — this is the thing the user actually glances
-  // at during a countdown.
-  it("draws the destination as visible text too", async () => {
+  // ── THE DESTINATION LIVES IN THE ACCESSIBLE NAME, NOT THE VISIBLE TEXT ──────────────────────
+  // This row used to assert the opposite ("draws the destination as visible text too"). The founder
+  // asked for the pill to read exactly "Speak" — no arrow, no destination — because the composed
+  // `Speak → <target>` label set the width pressure for all three `flex: 1` pills and truncated the
+  // whole tray to "S… P… S…" in a narrow concierge column. The destination was unreadable there
+  // anyway, AND it took the three position names down with it.
+  //
+  // The safety net is not gone, it MOVED: `title` + `aria-label` still track the target, which the
+  // rows above already exercise through `railTarget()`. What is pinned here is the new contract, so
+  // the visible label cannot silently regrow the target — the mistake would otherwise be invisible
+  // at the widths a developer usually looks at.
+  it("keeps the destination OUT of the visible text while the accessible name still tracks it", async () => {
     mount();
     await type("@Kraken Auth ship the DMG");
-    expect(screen.getByTestId("send-mode-tray").textContent).toContain("Kraken Auth");
-    await type("ship the DMG");
-    expect(screen.getByTestId("send-mode-tray").textContent).toContain("Concierge");
+    // Visible: the position's name, and nothing else — at every target.
+    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak");
     expect(screen.getByTestId("send-mode-tray").textContent).not.toContain("Kraken Auth");
+    // Accessible: the target, tracked live off the composed text.
+    expect(await railTarget()).toBe("Kraken Auth");
+
+    await type("ship the DMG");
+    expect(screen.getByTestId("send-mode-label-speak").textContent).toBe("Speak");
+    expect(screen.getByTestId("send-mode-tray").textContent).not.toContain("Concierge");
+    expect(await railTarget()).toBe("Concierge");
+
+    // NO WCAG-containment assertion here, deliberately. One lived at this spot and was VACUOUS
+    // (roborev 56202): `speakPill()` queries `getByRole("button", { name: /^Speak/ })`, so the
+    // accessible name is already required to start with "Speak" before the assertion runs — and the
+    // visible string is pinned to "Speak" two lines up. `expect(name).toContain("Speak")` could not
+    // fail. The containment invariant is tested where it can actually break: across widths in
+    // SendModeTray.test.tsx, and across the two label tables in voice/sendMode.test.ts.
   });
 });
 

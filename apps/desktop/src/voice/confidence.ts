@@ -32,11 +32,25 @@ export type Confidence = "high" | "normal" | "low" | "verylow";
  * has no honest expiry. A cap would convert exactly the least-confident case into an automatic
  * send, which is backwards.
  */
+/**
+ * The 20% the founder asked for, applied to the THRESHOLDS rather than to the animation.
+ *
+ * He described the visible drain as too fast. The honest place to fix that is here, not in the
+ * sweep's CSS: the sweep is a PICTURE OF THE DEADLINE (SendModeTray draws `remaining` straight off
+ * this clock), so slowing the picture while leaving the deadline where it is would make the control
+ * lie — the fill would still be travelling when the message had already gone. Moving the deadline
+ * keeps the two the same fact.
+ *
+ * Kept as a named multiplier over the original values rather than four rewritten literals, so the
+ * tuning stays legible as a tuning and the ladder's shape (1 : 3 : 5 : 10) survives it.
+ */
+export const CONFIDENCE_PACE = 1.2;
+
 export const CONFIDENCE_THRESHOLD_MS: Record<Confidence, number> = {
-  high: 1_000,
-  normal: 3_000,
-  low: 5_000,
-  verylow: 10_000,
+  high: 1_000 * CONFIDENCE_PACE, // 1200
+  normal: 3_000 * CONFIDENCE_PACE, // 3600
+  low: 5_000 * CONFIDENCE_PACE, // 6000
+  verylow: 10_000 * CONFIDENCE_PACE, // 12000
 };
 
 /** The threshold this tier is measured against. */

@@ -1,13 +1,18 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
 // Themed tokens (muted/forest/cream flip on data-theme); brand teal/accent pass through as
 // constants. Import from ../theme/colors — like Composer — so the waveform stays legible in
 // light mode (the @sparkle/ui C.muted is a dark-mode-only literal).
 import { C, FONT_WEIGHT } from "../theme/colors";
 import type { Phase } from "../voice/wakeMachine";
-import { deriveMicPresentation } from "../voice/micPresentation";
+import {
+  deriveMicPresentation,
+  micCaptionKind,
+  micIndicatorForMode,
+} from "../voice/micPresentation";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useUiStore } from "../stores/uiStore";
 import {
   WAKE_PHRASE,
   STOP_PHRASE,
@@ -20,7 +25,7 @@ import {
 import { useDictationPauseReason } from "../voice/useDictationPauseReason";
 import type { PauseReason } from "../voice/dictationFocus";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useMicToggle, micVisual, MicGlyph, MicMenu, useHoverMenu } from "./MicButton";
+import { micVisual, MicGlyph } from "./MicButton";
 import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
 import { useAudioInputSync } from "../services/audioInputs";
@@ -115,7 +120,14 @@ export function captionFor(
 /**
  * Always-listening waveform pinned under the Sparkle logo (column-one width).
  * Gray bars while PASSIVE ("I hear you, not typing"); an animated blue→cyan
- * gradient sweep while ACTIVE. Click toggles phase; the mic icon mutes.
+ * gradient sweep while ACTIVE.
+ *
+ * NOTHING HERE IS A MIC CONTROL ANY MORE. The three-position send tray is the only one, and every
+ * surface in this component derives from its position (voice/micPresentation `micIndicatorForMode`
+ * / `micCaptionKind`). The mic ring, the waveform strip and the caption all used to be click
+ * targets that moved `enabled`/`phase` behind the tray's back — three ways to put the tray and the
+ * microphone into states that contradicted each other, which is exactly what this change deletes.
+ * They are now read-outs: no onClick, no hover pill, no toggle.
  */
 export function LogoWaveform() {
   const phase = useDictationStore((s) => s.phase);
@@ -129,26 +141,31 @@ export function LogoWaveform() {
   // its payload thrown away — this is the only consumer of it in the app, so the real cause of
   // every voice failure was unreachable to the user (see the render branch below).
   const errorNotice = useMemo(() => voiceErrorNotice(error), [error]);
-  const togglePhase = useDictationStore((s) => s.togglePhase);
-  // The mic ring's state, click cycle, and aria come from the SAME shared source as the composer
-  // mic (MicButton), so the two controls behave identically. The ring only adds its own container
-  // chrome (disc, glow, orb, waveform) around the shared glyph.
-  const mic = useMicToggle();
+  // THE one state both this indicator and the send tray are read from: the tray's own position.
+  // Not the dictation store — see the header of voice/micPresentation's indicator section for why
+  // reading `enabled`/`phase` here is what let the glyph go green under a tray reading "Push to
+  // talk". The tray writes this same value and drives the microphone from it.
+  const sendMode = useUiStore((s) => s.conciergeSendMode);
+  // …AND who holds the caret, because the glyph answers "is audio being captured right now", not
+  // "which position is the tray parked at". Those coincide everywhere except a terminal, where the
+  // routing gate has already stopped the composer route while the tray still reads Speak — the one
+  // case where a position-only reading paints a live green mic over a pipeline that is not feeding
+  // this box. The store's MIRROR is the right source here (unlike routing, which re-reads the DOM):
+  // this is paint, and the mirror is what re-renders the indicator when the caret moves.
+  const focusOwner = useDictationStore((s) => s.focusOwner);
+  const indicator = micIndicatorForMode(sendMode, focusOwner);
   // The out-of-credits notice is shared transient state, so it shows here AND in the composer at
   // once. When set, it takes priority over the normal mic caption below.
   const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
   const setEnabled = useDictationStore((s) => s.setEnabled);
   const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
   const hasCredits = useHasAiCredits();
-  // This ring is the CONCIERGE's mic — it lives in that column's header, directly above the box you
-  // talk to Sparkle in, and since the box's own mic button was removed it is the app's primary mic
-  // control. Every gesture on it therefore names the concierge as the surface that owns dictated
-  // speech, which is what routes the transcript into that box (useConciergeDictation) instead of
-  // into whichever agent pane last mounted. It also decides where the WAKE WORD lands afterwards:
-  // the arbiter is sticky, so "Hey Sparkle" with no click keeps talking to the surface you last
-  // operated. An agent composer's own mic sets it the other way — see ComposerMic.
-  const setVoiceSurface = useDictationStore((s) => s.setVoiceSurface);
-  const ownVoice = useCallback(() => setVoiceSurface("concierge"), [setVoiceSurface]);
+  // NO `setVoiceSurface` CALL HERE ANY MORE, and its absence is deliberate. This ring used to claim
+  // the concierge as the surface that owns dictated speech on every gesture, because it WAS a
+  // control — arming from here had to say where the transcript lands or it would follow whichever
+  // agent pane last mounted. It no longer arms anything, and a read-out has no gesture to hang the
+  // claim on. The tray makes it instead, on the same action that drives the microphone
+  // (voice/useSendMode `applyIntent`), which is the only place it can be made in step with the arm.
   // Keep audioInputStore.bound current from `dictation://device`. Mounted HERE because this ring is
   // the app's primary mic control and is always present, so the device line has a live value the
   // moment anything binds — not only after someone opens the menu.
@@ -170,10 +187,6 @@ export function LogoWaveform() {
   // never animate/claim "listening" when nothing is being heard.
   const listening = status === "listening";
 
-  const [micHover, setMicHover] = useState(false);
-  // Hovering the ring reveals the three-option pill (MicMenu). It opens DOWNWARD (over the waveform
-  // strip) since the ring is pinned near the top of the sidebar.
-  const menu = useHoverMenu();
   const raf = useRef(0);
   // Live audio level + the VAD `speaking` flag held in refs, fed by a TRANSIENT store
   // subscription. The `dictation://level` stream emits once per audio frame; subscribing to it
@@ -272,32 +285,26 @@ export function LogoWaveform() {
     outOfCreditsNotice,
   });
   // Visual "active sweep" only when capture is genuinely live; phase alone isn't
-  // enough (we could be in active phase but focus-paused).
+  // enough (we could be in active phase but focus-paused). Still a HARDWARE fact, deliberately not
+  // derived from the tray: a push-to-talk hold routes speech without moving the tray, and a
+  // waveform that went flat mid-sentence because the position had not changed would be lying about
+  // the audio it is a meter for.
   const liveActive = listening && phase === "active";
-  // Toggle/aria semantics still follow phase — toggling phase while paused is fine
-  // and takes effect once capture resumes.
+  // The orb's colour follows the same in-flight dictation as the bars, for the same reason.
   const active = phase === "active";
+  // WHICH sentence the live caption shows — from the tray position, the same single input the glyph
+  // above takes, so the two can never argue. See voice/micPresentation `micCaptionKind`.
+  const captionKind = micCaptionKind(sendMode);
 
-  // Every control on this ring goes through one of these two, never through the bare store action,
-  // so none of them can put the mic live without also naming where the speech should land. Missing
-  // one would leave a control that arms a mic whose transcript goes to an agent pane — the exact
-  // failure the removed compose-box button used to paper over.
-  const onTogglePhase = () => {
-    ownVoice();
-    togglePhase();
-  };
-  const onMicClick = () => {
-    ownVoice();
-    mic.onClick();
-  };
-
-  // Mic tint + icon come from the shared tri-state mapping (MicButton.micVisual), so the ring and
-  // the composer mic look and behave the same:
-  //   off    → gray slash    (hover teal "click to turn on")
-  //   paused → orange mic+pause bars (hover red slash "click to turn off")
-  //   active → live open mic (hover orange mic+pause bars "click to pause")
+  // Mic tint + icon come from the shared tri-state mapping (MicButton.micVisual) — the same table
+  // the send tray paints its own pills from, which is what makes "Speak" and the mic the identical
+  // green. `false` for hover is not a placeholder: this is an INDICATOR, so there is no hover cue
+  // to give, because there is nothing a click would do.
+  //   speak → live open mic, successInk GREEN
+  //   ptt   → mic + pause bars, amber ORANGE
+  //   send  → slashed mic, muted GREY
   // The ring paints both its glyph color AND its border from micVis.color.
-  const micVis = micVisual(mic.state, micHover);
+  const micVis = micVisual(indicator.state, false);
   const micColor = micVis.color;
   const micBorder = micVis.color;
   // The pulsating orb glow is driven directly by the rAF loop (paintOrb), so there's no
@@ -381,12 +388,12 @@ export function LogoWaveform() {
             />
           </div>
         )}
-        {/* Waveform — clicking anywhere on the strip toggles phase (start/stop). */}
-        <button
-          type="button"
-          onClick={onTogglePhase}
-          aria-label={active ? "Stop listening" : "Activate Sparkle voice"}
-          disabled={!enabled}
+        {/* Waveform. A METER, not a control — it used to be a button that toggled phase, i.e. a
+            second way to start/stop dictating that the send tray knew nothing about. `aria-hidden`
+            rather than a labelled region: it carries no information a screen reader can use that
+            the caption directly below it does not already say in words. */}
+        <div
+          aria-hidden
           style={{
             position: "absolute",
             inset: 0,
@@ -397,7 +404,6 @@ export function LogoWaveform() {
             padding: 0,
             background: "transparent",
             border: "none",
-            cursor: enabled ? "pointer" : "default",
             opacity: enabled ? 1 : 0.4,
             // A soft cyan halo makes the live waveform feel vibrant and alive.
             filter: liveActive
@@ -427,26 +433,19 @@ export function LogoWaveform() {
               }}
             />
           ))}
-        </button>
+        </div>
 
-        {/* Mic ring — floats over the center of the waveform. Click cycles off→paused→off, and
-            pauses (never turns off) an actively-dictating mic. See MicButton.useMicToggle. */}
-        <button
-          type="button"
+        {/* Mic ring — floats over the center of the waveform. AN INDICATOR: it reports the send
+            tray's position and does nothing when clicked, because the tray is the only mic control.
+            `role="img"` with a state-naming label (voice/micPresentation MIC_INDICATOR_LABEL) is
+            what a screen reader gets; there is no button to announce because there is no action.
+            `data-hint="mic"` stays — it is still the mic ANCHOR (coach marks point at it, and
+            ConciergeColumn's one-mic guard counts it). */}
+        <span
           data-hint="mic"
-          onClick={onMicClick}
-          // Two hover concerns share this button: the direction-aware glyph recolor (micHover) and
-          // opening the three-option pill (menu.hoverProps). Fire both on each enter/leave.
-          onMouseEnter={() => {
-            setMicHover(true);
-            menu.hoverProps.onMouseEnter();
-          }}
-          onMouseLeave={() => {
-            setMicHover(false);
-            menu.hoverProps.onMouseLeave();
-          }}
-          aria-label={mic.ariaLabel}
-          title={mic.title}
+          role="img"
+          aria-label={indicator.label}
+          title={indicator.label}
           style={{
             position: "absolute",
             left: "50%",
@@ -462,11 +461,13 @@ export function LogoWaveform() {
             backdropFilter: "blur(2px)",
             WebkitBackdropFilter: "blur(2px)",
             // Border tracks the glyph color from the shared tri-state mapping (see micVis above):
-            // orange when paused, live tint when active, gray/teal when off, red on a paused hover.
+            // green in Speak, orange in Push to talk, grey in Send. No hover state — see micVis.
             border: `1.5px solid ${micBorder}`,
             boxShadow:
               enabled && liveActive ? "0 0 12px rgba(52,224,240,0.6)" : "none",
-            cursor: "pointer",
+            // `default`, not `pointer`. A pointer cursor on a thing that does nothing when clicked
+            // is the affordance promising the control this change removed.
+            cursor: "default",
             color: micColor,
             padding: 0,
             transition: "box-shadow 120ms ease, border-color 120ms ease, color 120ms ease",
@@ -475,18 +476,7 @@ export function LogoWaveform() {
           {/* The ring's disc is a forest-tinted translucent surface, so the pause bars separate
               against forest here too. */}
           <MicGlyph variant={micVis.variant} size={20} surfaceColor={C.forest} />
-        </button>
-
-        {/* Three-option hover pill, centered under the ring. Opens downward over the waveform strip
-            (the ring is pinned near the top of the sidebar, so there's no room above). */}
-        {menu.open && (
-          <MicMenu
-            placement="down"
-            surface="concierge"
-            onChoose={menu.close}
-            hoverProps={menu.hoverProps}
-          />
-        )}
+        </span>
       </div>
 
       {presentation === "outOfCredits" ? (
@@ -562,33 +552,35 @@ export function LogoWaveform() {
         <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>
           {preparingCaption(modelPercent(modelProgress))}
         </div>
-      ) : presentation === "activeListening" || presentation === "passiveWaiting" ? (
-        // Live: the caption doubles as a click target — clicking it toggles phase
-        // (start/stop), mirroring the waveform's behavior.
-        <button
-          type="button"
-          onClick={onTogglePhase}
-          aria-label={active ? "Stop listening" : "Activate Sparkle voice"}
+      ) : (presentation === "activeListening" || presentation === "passiveWaiting") &&
+        captionKind !== "none" ? (
+        // Live. Plain text, not a button: it used to toggle phase on click, which is the same
+        // second mic control the waveform strip was. WHICH of the two sentences shows is decided by
+        // the tray position (voice/micPresentation `micCaptionKind`), NOT by `phase` — the wake word
+        // moves `phase` on its own, so keying off it is what let this caption read "Actively
+        // listening" under a tray parked on Push to talk.
+        //
+        // `captionKind === "none"` (the tray is on Send) suppresses it entirely, even though the
+        // presentation says the mic is live: that happens when the mic was armed from a surface
+        // this column does not govern — an agent composer's own mic — and inviting "Say Hey
+        // Sparkle" here would promise this box speech that is routed to that one.
+        <div
           style={{
             display: "block",
             width: "100%",
             textAlign: "center",
             marginTop: 4,
-            padding: 0,
-            background: "transparent",
-            border: "none",
-            cursor: "pointer",
             color: C.muted,
             fontSize: 12,
           }}
         >
-          {/* Line 1 — current status. Same slot/styling in both phases. */}
+          {/* Line 1 — current status. Same slot/styling in both states. */}
           <span style={{ display: "block", fontWeight: 600 }}>
-            {phase === "passive" ? "Mic paused." : "Actively listening"}
+            {captionKind === "wakeInvite" ? "Mic paused." : "Actively listening"}
           </span>
           {/* Line 2 — the spoken command, with the key phrase in the waveform gradient. */}
           <span style={{ display: "block" }}>
-            {phase === "passive" ? "Say" : "Just say"}{" "}
+            {captionKind === "wakeInvite" ? "Say" : "Just say"}{" "}
             <span
               style={{
                 fontWeight: 600,
@@ -597,17 +589,18 @@ export function LogoWaveform() {
                 color: C.tealInk,
               }}
             >
-              {phase === "passive" ? wakeWord : stopWord}
+              {captionKind === "wakeInvite" ? wakeWord : stopWord}
             </span>{" "}
-            {phase === "passive" ? "to activate" : "to finish"}
+            {captionKind === "wakeInvite" ? "to activate" : "to finish"}
           </span>
-        </button>
+        </div>
       ) : presentation === "focusPaused" ? (
         // Armed but paused (focus lost): show the honest caption as plain text — not a
         // wake hint, since saying "Hey Sparkle" right now wouldn't be heard. `caption` here is
         // captionFor's "Listening paused…" string (non-null because focusPaused ⇒ enabled).
         <div style={{ marginTop: 4, color: C.muted, fontSize: 12, textAlign: "center" }}>{caption}</div>
-      ) : null /* presentation === "off": disarmed, no caption */}
+      ) : null /* "off" (disarmed) — or live but the tray is on Send, i.e. a mic this column does
+                  not govern. Either way there is nothing true for this surface to claim. */}
 
       {/* WHAT the mic is pointed at, under WHAT IT IS DOING. Gated on `enabled` only — it shows
           while focus-paused too, on purpose: the device is still the one that will be re-bound when

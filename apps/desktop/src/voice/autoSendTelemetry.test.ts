@@ -24,12 +24,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 import { useUiStore } from "../stores/uiStore";
 import {
   CORRECTION_WINDOW_MS,
+  bucketEdgesMs,
   bucketMs,
   noteUserSend,
   recordAutoSend,
   resetAutoSendTelemetry,
   type AutoSendSample,
 } from "./autoSendTelemetry";
+import { thresholdMs } from "./confidence";
 
 const SAMPLE: AutoSendSample = {
   tier: "normal",
@@ -59,12 +61,32 @@ afterEach(() => {
 });
 
 describe("bucketMs — durations are banded, never raw", () => {
-  it("bands around the four thresholds the tiers actually use", () => {
-    expect(bucketMs(900)).toBe("under_1_5s");
-    expect(bucketMs(3000)).toBe("1_5s_to_3_5s");
-    expect(bucketMs(5000)).toBe("3_5s_to_6s");
-    expect(bucketMs(10_000)).toBe("6s_to_11s");
-    expect(bucketMs(45_000)).toBe("over_11s");
+  it("puts every tier's threshold STRICTLY INSIDE its own band, never on an edge", () => {
+    // ── roborev 56219 ───────────────────────────────────────────────────────────────────────────
+    // The bands used to be four literals (1.5/3.5/6/11s) hand-placed between the rungs of a 1/3/5/10
+    // ladder. `CONFIDENCE_PACE` moved the rungs and nothing here moved with them: `low` landed
+    // EXACTLY on the `< 6_000` edge and three of four tiers silently changed band mid-dataset, which
+    // makes pre- and post-pace analytics incomparable while every number still looks plausible.
+    //
+    // Asserted as the RELATIONSHIP rather than as new literals, because new literals would just go
+    // stale on the next retune exactly as the old ones did. What must hold is: each tier is in a
+    // DISTINCT band, and none sits on a boundary.
+    const tiers = ["high", "normal", "low", "verylow"] as const;
+    const bands = tiers.map((t) => bucketMs(thresholdMs(t)));
+    expect(new Set(bands).size).toBe(tiers.length);
+
+    for (const t of tiers) {
+      const ms = thresholdMs(t);
+      // Strictly inside: a hair either side of the threshold stays in the same band. On an edge,
+      // one of these two lands in a neighbour and this fails.
+      expect(bucketMs(ms - 1), `${t} sits on a lower edge`).toBe(bucketMs(ms));
+      expect(bucketMs(ms + 1), `${t} sits on an upper edge`).toBe(bucketMs(ms));
+      expect(bucketEdgesMs()).not.toContain(ms);
+    }
+
+    // The ends still behave: below everything and far above everything are their own bands.
+    expect(bucketMs(0)).toMatch(/^under_/);
+    expect(bucketMs(45_000)).toMatch(/^over_/);
   });
 });
 

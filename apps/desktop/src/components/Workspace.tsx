@@ -442,7 +442,10 @@ const CONCIERGE_MIN_WIDTH = 280;
 /** The single-pair ceiling, DELIBERATELY UNCHANGED. That layout "is working fine" and this pass must
  *  not move it; the paired row gets its own, window-aware ceiling (`conciergePairedMax`). */
 const CONCIERGE_MAX_WIDTH = 560;
-const CONCIERGE_DEFAULT_WIDTH = 360;
+// Re-exported from engine/columnResize, which owns the sibling column widths and is importable
+// from a node-environment test without pulling this module's store/Tauri graph in (roborev 56223).
+export { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
+import { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
 
 /** Which key a given pair count reads and writes. */
 function conciergeWidthKeyFor(pairCount: number): string {

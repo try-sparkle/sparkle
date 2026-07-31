@@ -36,7 +36,7 @@ import { ANALYTICS_EVENTS } from "@sparkle/core";
 import { capture } from "../analytics";
 import { log } from "../logger";
 import { useUiStore } from "../stores/uiStore";
-import type { Confidence } from "./confidence";
+import { thresholdMs, type Confidence } from "./confidence";
 
 /**
  * How long after an auto-send a further send still counts as a CORRECTION rather than a new
@@ -71,17 +71,48 @@ export interface AutoSendSample {
 }
 
 /**
+ * The band edges, DERIVED from the ladder rather than restated as literals.
+ *
+ * ── WHY THIS IS NOT FOUR CONSTANTS (roborev 56219) ──────────────────────────────────────────────
+ * The old edges were 1.5 / 3.5 / 6 / 11 s, hand-placed to sit BETWEEN the rungs of a 1/3/5/10
+ * ladder so each tier's fires landed mid-band. `CONFIDENCE_PACE` then moved the rungs to
+ * 1.2/3.6/6/12 and nothing here moved with them: `low` (6000) landed EXACTLY on the `< 6_000` edge,
+ * and three of the four tiers silently changed band. The tuner's whole job is comparing elapsed
+ * against threshold to spot premature sends, so a mid-dataset band shift with no version marker
+ * makes pre- and post-pace events incomparable — the numbers stay plausible and stop meaning the
+ * same thing, which is the worst failure an analytics series can have.
+ *
+ * Placing each edge at the MIDPOINT between adjacent rungs restores the original intent as a
+ * relationship instead of a coincidence: every tier's threshold sits strictly inside a band, and any
+ * future retune carries the bands with it.
+ */
+export function bucketEdgesMs(): number[] {
+  const rungs = (["high", "normal", "low", "verylow"] as const).map(thresholdMs);
+  const midpoints = rungs.slice(0, -1).map((r, i) => (r + rungs[i + 1]!) / 2);
+  // A final edge above the top rung, so the slowest tier still lands INSIDE a band rather than in
+  // the open-ended overflow bucket where it cannot be distinguished from a stall.
+  return [...midpoints, rungs[rungs.length - 1]! * 1.1];
+}
+
+/** A stable, human-readable name for the band an edge list produces. */
+function bandLabel(edges: number[], i: number): string {
+  const s = (ms: number) => `${(ms / 1000).toFixed(1).replace(".", "_").replace(/_0$/, "")}s`;
+  if (i === 0) return `under_${s(edges[0]!)}`;
+  if (i === edges.length) return `over_${s(edges[edges.length - 1]!)}`;
+  return `${s(edges[i - 1]!)}_to_${s(edges[i]!)}`;
+}
+
+/**
  * Coarse duration buckets.
  *
  * Raw millisecond timings would be both noisier and more identifying than anything the tuning needs
- * — the question is only ever "which band", because the thresholds themselves are 1s/3s/5s/10s.
+ * — the question is only ever "which band". The bands themselves come from {@link bucketEdgesMs},
+ * so they track the ladder instead of describing a ladder the code can no longer produce.
  */
 export function bucketMs(ms: number): string {
-  if (ms < 1_500) return "under_1_5s";
-  if (ms < 3_500) return "1_5s_to_3_5s";
-  if (ms < 6_000) return "3_5s_to_6s";
-  if (ms < 11_000) return "6s_to_11s";
-  return "over_11s";
+  const edges = bucketEdgesMs();
+  const i = edges.findIndex((e) => ms < e);
+  return bandLabel(edges, i === -1 ? edges.length : i);
 }
 
 /** A fired auto-send awaiting its verdict. */

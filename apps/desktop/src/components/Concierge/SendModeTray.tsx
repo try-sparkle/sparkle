@@ -19,6 +19,12 @@
 // and ./ComposeBox.tsx, and breaking it produced roborev findings 52648/53010/53088.
 import { useEffect, useRef, useState } from "react";
 
+import {
+  DEFAULT_SPEAK_LEFT_FRAC,
+  TRAY_GEOMETRY,
+  speakLeftFraction,
+} from "./trayGeometry";
+
 import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { RADIUS, TYPE } from "../../theme/scale";
@@ -31,6 +37,7 @@ import {
   chicletFor,
   modeCountsDown,
   stepSendMode,
+  trayLabelFor,
   type SendChord,
   type SendMode,
 } from "../../voice/sendMode";
@@ -126,10 +133,20 @@ const MODE_INK: Record<SendMode, string> = {
   speak: C.successInk,
 };
 
-/** The width reserved for a keycap chiclet AT REST, so nothing shifts when one appears on hover or
- *  focus. Reserving the space rather than letting the pill grow is the whole reason the reveal is
- *  usable — a label that jumps sideways under the pointer is a label you cannot read. */
-const CHICLET_SLOT = 30;
+// The keycap slot's width lives in ./trayGeometry (`chicletSlot`) — it is one of the inputs to the
+// short-label threshold's derivation, so it must not have a second definition here.
+
+// The tray's horizontal geometry and the two decisions derived from it live in ./trayGeometry — a
+// leaf module with no React, so a NODE-environment unit test can read the constants without pulling
+// this component (and its store/Tauri graph) in behind them (roborev 56223). Re-exported here
+// because existing call sites and tests import them from this module.
+export {
+  TRAY_GEOMETRY,
+  WIDEST_LABEL_PX,
+  DEFAULT_SPEAK_LEFT_FRAC,
+  fullLabelsFitAtPx,
+  speakLeftFraction,
+} from "./trayGeometry";
 
 export function SendModeTray({
   mode,
@@ -149,7 +166,10 @@ export function SendModeTray({
   // release — a timer in either would make the deliberate mode feel laggier than the automatic
   // one), and `phase` is whether a clock is running right now.
   const counting = modeCountsDown(mode) && model?.phase === "counting";
-  const veryLow = counting && model?.tier === "verylow";
+  // NO `veryLow` DERIVATION ANY MORE. It existed only to switch the sweep to a hatched fill and to
+  // dim the leading edge — the founder's "shaded candy cane", which he could not interpret. The tier
+  // is still communicated, by how FAST the sweep travels (see the fill's comment below), so nothing
+  // downstream needs to know which rung it is on.
   const remaining = Math.min(1, Math.max(0, model?.remainingFraction ?? 1));
 
   // ── The one-shot ease on a threshold change ────────────────────────────────────────────────
@@ -182,8 +202,58 @@ export function SendModeTray({
   // to stay the same fact — see the arrow handler.
   const pills = useRef<Partial<Record<SendMode, HTMLButtonElement | null>>>({});
 
+  // ── HOW WIDE THE TRAY ACTUALLY IS ────────────────────────────────────────────────────────────
+  // Measured, not inferred from the window: this control lives in the concierge COLUMN, which the
+  // user resizes independently of the window (and which can be torn out into its own window), so
+  // window width is not its width. A ResizeObserver on the tray's own box is the only honest
+  // source.
+  //
+  // 0 means "not measured yet" and `trayLabelFor` reads that as the full labels — see its doc. The
+  // observer is created lazily so the (observer-less) jsdom test env simply stays at 0 rather than
+  // throwing; the label RULE is tested directly against `trayLabelFor`, which is the part that
+  // carries the behaviour. jsdom has no layout engine, so a test that rendered this and measured
+  // would read 0 for every width and pass without proving anything.
+  const trayRoot = useRef<HTMLDivElement | null>(null);
+  const [trayWidth, setTrayWidth] = useState(0);
+  /**
+   * Where the Speak pill's LEFT EDGE sits, as a fraction of the tray — the point the sweep stops at.
+   *
+   * Defaults to the geometric answer for evenly-shared pills ((n-1)/n = 2/3 for three), which is
+   * within a few pixels of the measured value and, crucially, is CORRECT IN JSDOM — `offsetLeft` is
+   * always 0 there, so a 0 default would collapse the sweep to a no-op in every test.
+   */
+  const [speakLeftFrac, setSpeakLeftFrac] = useState(DEFAULT_SPEAK_LEFT_FRAC);
+  useEffect(() => {
+    const el = trayRoot.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      // Only real, changed measurements. A 0 from a hidden/unmounted box would flip the labels back
+      // to full width for a frame on the way out, which is a visible flicker for no information.
+      if (typeof w === "number" && w > 0) setTrayWidth((prev) => (prev === w ? prev : w));
+      // WHERE THE SWEEP STOPS. Measured off the Speak pill rather than assumed, because the pills
+      // are `flex: 1` but not exactly equal thirds once padding, gaps and the chiclet slot are in.
+      // `offsetLeft` is relative to the tray (which is `position: relative`), so this is already the
+      // fraction we want. Guarded on both being real numbers so an unmeasurable layout keeps the
+      // geometric default below instead of collapsing the sweep to nothing.
+      // PADDING BOX, not contentRect. `offsetLeft` is measured from the padding edge and the
+      // sweep's percentage resolves against the padding box, so `contentRect.width` (which excludes
+      // padding) is the wrong denominator — see `speakLeftFraction`. `clientWidth` IS the padding
+      // box, which puts both terms in one coordinate system.
+      const speakEl = pills.current.speak;
+      const box = el.clientWidth;
+      if (speakEl && box > 0) {
+        const frac = speakLeftFraction(speakEl.offsetLeft, box);
+        setSpeakLeftFrac((prev) => (Math.abs(prev - frac) < 0.001 ? prev : frac));
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   return (
     <div
+      ref={trayRoot}
       data-testid="send-mode-tray"
       // A GROUP of toggle buttons, not a `radiogroup`. The Send position is BOTH the mode selector
       // and the submit control — pressing it while selected sends — and a `radio` that submits is a
@@ -203,10 +273,10 @@ export function SendModeTray({
         position: "relative",
         display: "flex",
         alignItems: "stretch",
-        gap: 4,
+        gap: TRAY_GEOMETRY.trayGap,
         height: TRAY_HEIGHT,
         marginTop: 8,
-        padding: 3,
+        padding: TRAY_GEOMETRY.trayPad,
         borderRadius: RADIUS.modal,
         // LONGHAND, not the `border` shorthand: the value is a CSS variable, and a shorthand
         // carrying a `var()` cannot be decomposed into its longhands — the whole declaration stays
@@ -243,17 +313,48 @@ export function SendModeTray({
             top: 0,
             bottom: 0,
             right: 0,
-            width: `${Math.round(remaining * 100)}%`,
+            // ── THE SWEEP STOPS AT SPEAK'S LEFT EDGE ────────────────────────────────────────────
+            // It used to be `remaining * 100`, draining to ZERO width — i.e. straight THROUGH the
+            // Speak pill to the tray's right edge. The founder wants the leading edge to travel only
+            // as far as the button's left edge and to fire the send the instant it arrives:
+            // "it shouldn't drain all the way through the speak button. Once it hits the left side
+            // of the speak button, then it sends."
+            //
+            // Anchored RIGHT, so the LEADING (left) edge sits at `100 - width`. Walking that edge
+            // from 0 to `speakLeftFrac` gives width = 100 - speakLeftFrac × (1 - remaining):
+            //   remaining 1 -> 100%                    (leading edge at the tray's left edge)
+            //   remaining 0 -> 100 - speakLeftFrac%    (leading edge exactly at Speak's left edge)
+            //
+            // ONE CLOCK, NOT TWO. `remaining` is the same value the countdown fires on, so the fill
+            // arriving and the message going are the same event by construction — there is no second
+            // timer that could land a beat early or late and read as broken.
+            width: `${Math.round(100 - speakLeftFrac * 100 * (1 - remaining))}%`,
             zIndex: 0,
-            // VERY LOW IS VISUALLY UNMISTAKABLE. In motion it reads on its own — ten seconds of
-            // sweep is imperceptible frame to frame — but a still frame cannot show motion, so the
-            // tier also gets ONE non-numeric cue: a hatched, dimmed fill instead of a solid one.
+            // ── THE HATCH IS GONE (the founder's "shaded candy cane") ───────────────────────────
+            // `verylow` used to paint a 135° repeating-linear-gradient instead of a solid fill. The
+            // founder hit it repeatedly and could not read it: "it also just did the shaded candy
+            // cane again, and I don't know why, I don't know when it does that, but I don't want
+            // that." A cue nobody can decode is not a cue — it is noise that makes the control feel
+            // broken, which is worse than the state going unmarked.
+            //
+            // THE STATE IT ENCODED IS REAL AND IS STILL COMMUNICATED. `verylow` means "that sounded
+            // unfinished" (./confidence — an empty transcript, a trailing conjunction, or an
+            // unclosed question), and it buys 12s of silence instead of 3.6s. That is now carried by
+            // the thing already on screen and already legible: THE SPEED OF THE SWEEP. A fill
+            // crawling over twelve seconds against one that crosses in under four is a difference
+            // you read without a legend.
+            //
+            // The original justification for the hatch was explicitly that "a still frame cannot
+            // show motion" — true of a screenshot, and irrelevant to a person watching a live
+            // countdown, which is the only way this is ever encountered.
+            //
             // Still no numerals anywhere: a countdown that shows "3…2…1" invites the user to race
             // it, and the number is not the information.
-            background: veryLow
-              ? `repeating-linear-gradient(135deg, color-mix(in srgb, ${C.successInk} 14%, transparent) 0 6px, transparent 6px 12px)`
-              : `color-mix(in srgb, ${C.successInk} 18%, transparent)`,
-            borderLeft: `1px solid color-mix(in srgb, ${C.successInk} ${veryLow ? 35 : 70}%, transparent)`,
+            background: `color-mix(in srgb, ${C.successInk} 18%, transparent)`,
+            // Uniform across tiers, for the same reason the hatch went (above): the dimmed leading
+            // edge was the OTHER half of the illegible `verylow` signalling, and two cues nobody can
+            // decode are not better than one. The sweep's speed carries the tier.
+            borderLeft: `1px solid color-mix(in srgb, ${C.successInk} 70%, transparent)`,
             transition: easing ? `width ${THRESHOLD_EASE_MS}ms ease-out` : "none",
           }}
         />
@@ -266,22 +367,42 @@ export function SendModeTray({
         // already sends and a press would be a second, competing way to do the same thing.
         const pressSends = selected && m !== "ptt";
         const showCap = revealed === m;
-        // THE MIS-ROUTE SAFETY NET (see SendTrayModel.targetName). Two rules carried over from
-        // ./SendRail verbatim, both of which it learned the hard way:
+        // THE VISIBLE LABEL IS THE POSITION'S NAME, AND NOTHING ELSE.
         //
-        //  • SHOWN WHENEVER SPEAK IS SELECTED, counting or not — NOT only while a clock runs. The
-        //    rail used to drop the destination the moment counting began, so the label went
-        //    "→ Build 4" → "Build 4" and users read it as the target having VANISHED at exactly the
-        //    moment it mattered most. A state change must never subtract information the other
-        //    state was showing.
-        //  • PREFIXED, not substituted. "Speak → Build 4" keeps the control recognisable across
-        //    state changes AND keeps the visible text inside the accessible name, without which
-        //    this is a WCAG 2.5.3 (Label in Name) failure — a voice-control user saying "click
-        //    Build 4" could not hit it.
+        // It used to be `${SEND_MODE_LABEL[m]} → ${targetName}` whenever Speak was selected — the
+        // mis-route safety net carried over from ./SendRail. The founder asked for it gone: the
+        // pill is to read exactly "Speak", with no arrow, no destination and no ellipsis. Two
+        // things made the composed label actively harmful in the shipped tray:
+        //
+        //  • IT DID NOT FIT. The pills are `flex: 1`, so the longest label sets the pressure for
+        //    all three. "Speak → Concierge" in a narrow concierge column truncated the WHOLE tray
+        //    to "S… P… S…" — the destination was unreadable AND it took the three position names
+        //    down with it. The safety net was costing more legibility than it bought.
+        //  • IT WAS ALREADY REDUNDANT. The countdown announces where the send is going as it fires,
+        //    which is the moment the information is actionable.
+        //
+        // THE DESTINATION IS NOT DELETED, ONLY UNPINNED FROM THE VISIBLE TEXT: it stays in `title`
+        // and in the accessible name below, so the hover tooltip and a screen reader still name the
+        // target. That ordering also keeps WCAG 2.5.3 (Label in Name) satisfied — the accessible
+        // name "Speak → Concierge" CONTAINS the visible string "Speak", which is the direction the
+        // rule requires; it is the reverse (visible text absent from the name) that fails.
         const showTarget = selected && m === "speak" && Boolean(model?.targetName);
-        const label = showTarget
-          ? `${SEND_MODE_LABEL[m]} → ${model?.targetName}`
-          : SEND_MODE_LABEL[m];
+        // Width-driven, decided by the pure `trayLabelFor` (voice/sendMode) rather than by CSS
+        // truncation — see its doc for why this cannot be proven by measuring in jsdom.
+        const label = trayLabelFor(m, trayWidth);
+        // ── THE ACCESSIBLE NAME DOES NOT MOVE WITH THE WIDTH ───────────────────────────────────
+        // Built from the FULL label, never from the rendered one. An earlier revision derived it
+        // from `label`, so a narrow tray silently renamed the Push-to-talk pill to "Push" — the
+        // control renaming itself as the surface resizes, which is the exact thing the `aria-label`
+        // comment on the Send pill below forbids, and which made "click Push to talk" hit in a wide
+        // column and miss in a narrow one (roborev 56198).
+        //
+        // WCAG 2.5.3 never asked for that shrinkage: it requires the visible string to be CONTAINED
+        // IN the accessible name, and "Push to talk" contains "Push". Holding the name at the full
+        // label satisfies the rule in BOTH width states and keeps the control addressable by one
+        // stable name — see `shortLabelsAreContainedInFullLabels`, which pins the containment.
+        const fullLabel = SEND_MODE_LABEL[m];
+        const spokenLabel = showTarget ? `${fullLabel} → ${model?.targetName}` : fullLabel;
         return (
           <button
             key={m}
@@ -292,9 +413,9 @@ export function SendModeTray({
             // selected. It is the name every keybinding, every voice-control user and every test in
             // this repo already reaches for, and a control that renames itself as the surface
             // changes state is a control nobody can address twice the same way.
-            aria-label={m === "send" ? "Send" : label}
+            aria-label={m === "send" ? "Send" : spokenLabel}
             aria-keyshortcuts={pressSends ? "Meta+Enter Control+Enter" : undefined}
-            title={pressSends ? `${label} (${chicletFor(m, chord)})` : label}
+            title={pressSends ? `${spokenLabel} (${chicletFor(m, chord)})` : spokenLabel}
             // `aria-disabled`, NOT `disabled`. A disabled button is neither focusable nor a keydown
             // target, and the roving tabindex below puts the tray's ONLY tab stop on the selected
             // pill — which in the default launch state (Send selected, empty composer) is exactly
@@ -357,9 +478,9 @@ export function SendModeTray({
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
-              gap: 6,
+              gap: TRAY_GEOMETRY.pillGap,
               height: "100%",
-              padding: "0 8px",
+              padding: `0 ${TRAY_GEOMETRY.pillPadX}px`,
               borderRadius: RADIUS.input,
               font: "inherit",
               fontSize: TYPE.small,
@@ -375,16 +496,27 @@ export function SendModeTray({
               // second thing claiming to be the way to send. Mic dead, button hot; mic hot, button
               // quiet.
               ...(selected && m === "send"
-                ? { background: ink, color: ON_GOLD_FILL, border: `1.5px solid ${ink}` }
+                ? { background: ink, color: ON_GOLD_FILL, border: `${TRAY_GEOMETRY.pillBorder}px solid ${ink}` }
                 : selected
                 ? {
                     background: `color-mix(in srgb, ${ink} 22%, transparent)`,
                     color: ink,
-                    border: `1.5px solid ${ink}`,
+                    border: `${TRAY_GEOMETRY.pillBorder}px solid ${ink}`,
                   }
-                : { background: "transparent", color: C.conciergeMuted, border: "1.5px solid transparent" }),
+                : { background: "transparent", color: C.conciergeMuted, border: `${TRAY_GEOMETRY.pillBorder}px solid transparent` }),
             }}
           >
+            {/* The narrow state is handled by CHOOSING a shorter word (voice/sendMode
+                `trayLabelFor`) — a decision the user can read — rather than by clipping one they
+                cannot. `nowrap` stays so a pill never becomes two lines and changes tray height.
+
+                `textOverflow: ellipsis` is kept as a LAST-RESORT BACKSTOP, not as the mechanism.
+                It was briefly removed outright, which left the range between the threshold and the
+                true fit width hard-clipping mid-word — "Push to tal", with nothing signalling the
+                truncation, strictly worse than the "P…" being replaced (roborev 56198). The
+                threshold is an ESTIMATE of text metrics, so a residual error is possible in either
+                direction; with `TRAY_SHORT_LABEL_MAX_PX` at its pessimistic value this should never
+                paint, and if it does an ellipsis beats a word cut mid-stroke. */}
             <span
               data-testid={`send-mode-label-${m}`}
               style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
@@ -401,7 +533,7 @@ export function SendModeTray({
               aria-hidden
               style={{
                 flex: "none",
-                width: CHICLET_SLOT,
+                width: TRAY_GEOMETRY.chicletSlot,
                 textAlign: "right",
                 // TYPE.micro (10), not an off-scale 11: a keycap IS a badge — the rung this scale
                 // names for tracked labels, badges and ticks. theme/scale.test.ts ratchets off-scale

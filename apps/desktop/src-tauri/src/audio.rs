@@ -55,12 +55,17 @@ fn process_typed<T>(
     data: &[T],
     channels: u16,
     in_rate: u32,
+    health: &CaptureHealth,
     on_frame: &mut impl FnMut(Vec<f32>),
 ) where
     T: Sample,
     f32: FromSample<T>,
 {
     let f32_data: Vec<f32> = data.iter().map(|&s| f32::from_sample(s)).collect();
+    // Count the device's samples BEFORE downmix/resample (see `CaptureHealth::note_raw`). The
+    // int→f32 conversion above is value-preserving for zero, so counting here rather than on the
+    // typed slice still answers the question this measurement exists for: did the OS send silence?
+    health.note_raw(&f32_data);
     on_frame(downmix_resample(&f32_data, channels, in_rate));
 }
 
@@ -92,6 +97,55 @@ pub struct CaptureHealth {
     frames: AtomicU64,
     /// Callbacks carrying at least one non-zero sample.
     voiced_frames: AtomicU64,
+    /// Samples handed to us by CoreAudio, counted BEFORE `downmix_resample` — see `note_raw`.
+    raw_samples: AtomicU64,
+    /// How many of those raw samples were non-zero.
+    raw_nonzero: AtomicU64,
+    /// Samples in the 16 kHz mono frames the pipeline actually consumes, counted AFTER conversion.
+    out_samples: AtomicU64,
+    /// How many of those converted samples were non-zero.
+    out_nonzero: AtomicU64,
+}
+
+/// WHERE the zeros came from, when a capture reads `Silent`.
+///
+/// `frames > 0 && voiced_frames == 0` says the frames the pipeline saw were all zero. It does NOT
+/// say who zeroed them, and until this existed the log could not tell a dead device from a bug in
+/// our own conversion: `note_frame` only ever saw the POST-`downmix_resample` frame. Counting the
+/// RAW device buffer as well makes the two distinguishable, which is the difference between
+/// "the microphone is delivering nothing" and "we threw the audio away" — opposite fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZeroSource {
+    /// Real audio is reaching the pipeline; there is nothing to explain.
+    #[default]
+    NotApplicable,
+    /// CoreAudio invoked the callback with buffers whose samples were all exactly zero. The device
+    /// (or the OS's grant for this process) is the problem — nothing downstream can recover it.
+    Os,
+    /// CoreAudio invoked the callback with EMPTY buffers (zero samples). Distinct from `Os`: there
+    /// were no samples to be zero, so this is a stream-format/negotiation failure, not silence.
+    EmptyBuffers,
+    /// The device DID hand us non-zero samples and the converted frame is all zeros. That is our
+    /// bug — `downmix_resample` (or whatever replaced it) destroyed the audio.
+    SelfInflicted,
+}
+
+/// Pure classifier for [`ZeroSource`], so the policy is unit-tested without an audio device.
+pub fn classify_zero_source(
+    raw_samples: u64,
+    raw_nonzero: u64,
+    out_nonzero: u64,
+) -> ZeroSource {
+    if out_nonzero > 0 {
+        return ZeroSource::NotApplicable;
+    }
+    if raw_nonzero > 0 {
+        return ZeroSource::SelfInflicted;
+    }
+    if raw_samples == 0 {
+        return ZeroSource::EmptyBuffers;
+    }
+    ZeroSource::Os
 }
 
 impl CaptureHealth {
@@ -101,15 +155,48 @@ impl CaptureHealth {
     pub fn voiced_frames(&self) -> u64 {
         self.voiced_frames.load(Ordering::Relaxed)
     }
+    pub fn raw_samples(&self) -> u64 {
+        self.raw_samples.load(Ordering::Relaxed)
+    }
+    pub fn raw_nonzero(&self) -> u64 {
+        self.raw_nonzero.load(Ordering::Relaxed)
+    }
+    pub fn out_samples(&self) -> u64 {
+        self.out_samples.load(Ordering::Relaxed)
+    }
+    pub fn out_nonzero(&self) -> u64 {
+        self.out_nonzero.load(Ordering::Relaxed)
+    }
+    /// Where this capture's zeros came from, if it has any to explain.
+    pub fn zero_source(&self) -> ZeroSource {
+        classify_zero_source(self.raw_samples(), self.raw_nonzero(), self.out_nonzero())
+    }
+
+    /// Record the buffer EXACTLY as CoreAudio delivered it, before any downmix/resample.
+    ///
+    /// Called from the cpal data callback (the only place the raw buffer exists). Full scan rather
+    /// than `any`: the count is the evidence — "72192 of 72192 samples non-zero" and "0 of 72192"
+    /// are the two readings that settle the question, and a boolean would not. It is one pass over
+    /// a ~512-sample buffer at tens of Hz, which is nothing next to the VAD that follows.
+    pub fn note_raw(&self, data: &[f32]) {
+        self.raw_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
+        let nz = data.iter().filter(|&&s| s != 0.0).count() as u64;
+        self.raw_nonzero.fetch_add(nz, Ordering::Relaxed);
+    }
     /// Record one delivered frame. `Relaxed` is sufficient: the watchdog only needs eventual
     /// visibility of a monotonically increasing count, never ordering against other state, and this
     /// runs on the realtime CoreAudio thread where a cheaper op is the right default.
     fn note_frame(&self, frame: &[f32]) {
         self.frames.fetch_add(1, Ordering::Relaxed);
+        self.out_samples.fetch_add(frame.len() as u64, Ordering::Relaxed);
         // `any` short-circuits on the FIRST non-zero sample, so the healthy path costs one compare
         // per frame. Only a genuinely all-zero (dead) frame pays the full scan.
         if frame.iter().any(|&s| s != 0.0) {
             self.voiced_frames.fetch_add(1, Ordering::Relaxed);
+            // Counted only on voiced frames: on the healthy path this scan replaces nothing (the
+            // `any` above already touched the buffer) and on the dead path it never runs at all.
+            let nz = frame.iter().filter(|&&s| s != 0.0).count() as u64;
+            self.out_nonzero.fetch_add(nz, Ordering::Relaxed);
         }
     }
 }
@@ -166,6 +253,59 @@ pub struct BoundDevice {
     pub is_virtual: bool,
     /// True when this is the system default rather than a device the user explicitly chose.
     pub was_default: bool,
+}
+
+/// How to ask cpal for the input device we already decided to open.
+///
+/// THIS IS NOT COSMETIC — it decides whether the resulting `cpal::Stream` can ever be freed.
+///
+/// cpal 0.15.3's macOS backend registers a device-disconnect listener for every input stream whose
+/// `Device` is not flagged `is_default`, and that listener owns a CLONE of the stream's own
+/// `Arc<Mutex<StreamInner>>` (`host/coreaudio/macos/mod.rs`, `add_disconnect_listener`). The Arc
+/// therefore points at itself: dropping our `Stream` takes the strong count from 2 to 1 and stops
+/// there, so `StreamInner` — and with it the CoreAudio `AudioUnit`, which is never uninitialized or
+/// disposed, plus the `kAudioDevicePropertyDeviceIsAlive` listener, which is never removed — LEAKS,
+/// permanently, once per capture.
+///
+/// Only `Host::default_input_device()` produces a `Device` with `is_default == true`; every device
+/// from `Host::input_devices()` has it false. Sparkle resolves its device BY NAME (cpal cannot open
+/// by UID, so `resolve_device` looks the chosen name up in `input_devices()`), which means every
+/// capture the app has ever built took the leaking path — including the automatic, unpinned,
+/// system-default case that is the overwhelming majority of them.
+///
+/// Measured on the built-in microphone with a standalone cpal harness that mirrors
+/// `Capture::drop` (pause, then drop) and holds an `Arc` inside the data callback:
+///
+/// | acquisition                            | `Arc::strong_count` after the drop |
+/// |----------------------------------------|------------------------------------|
+/// | `input_devices().find(name)`            | 2 — every cycle, 12/12 leaked      |
+/// | `default_input_device()`                | 1 — every cycle, 6/6 freed         |
+///
+/// So: when the device we chose IS the system default, take cpal's default handle and the stream
+/// becomes free-able. [`plan_device_acquisition`] is that decision, pure and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAcquisition {
+    /// Ask cpal for the default input device. `is_default == true`, so no self-referential
+    /// disconnect listener is registered and the stream is disposed when we drop it.
+    CpalDefault,
+    /// Look the device up by name in `input_devices()`. The ONLY way to open a non-default device,
+    /// and it leaks the stream (see above) — so it is used only when it is genuinely the only
+    /// option, and it says so in the log.
+    ByName,
+}
+
+/// Decide how to acquire `selected` from cpal.
+///
+/// `cpal_default_name` is the name cpal reports for `default_input_device()` — `None` when there is
+/// no default at all. Matching by NAME is sound here because `audio_devices::select_device` has
+/// already proven the chosen name unambiguous (that is the precondition `unique_names` guards);
+/// without that proof two same-named devices could make this open the wrong one, which is why the
+/// caller must not skip it.
+pub fn plan_device_acquisition(selected: &str, cpal_default_name: Option<&str>) -> DeviceAcquisition {
+    match cpal_default_name {
+        Some(d) if d == selected => DeviceAcquisition::CpalDefault,
+        _ => DeviceAcquisition::ByName,
+    }
 }
 
 // wired into the dictation command in a later task
@@ -304,19 +444,44 @@ impl Capture {
         // Translate the selected NAME into a cpal device (cpal cannot open by UID at all). The
         // name was proven unambiguous by `select_device`, so this `find` can only match the device
         // the policy actually chose — which is what makes the BoundDevice metadata below true.
-        if let Ok(mut it) = host.input_devices() {
-            if let Some(d) = it.find(|d| d.name().map(|n| n == name).unwrap_or(false)) {
-                let picked = devices.iter().find(|x| x.name == name);
-                return Ok((
-                    d,
-                    BoundDevice {
-                        uid: picked.map(|x| x.uid.clone()),
-                        is_virtual: picked.map(|x| x.is_virtual).unwrap_or(false),
-                        was_default: picked.map(|x| x.is_default).unwrap_or(false),
-                        name,
-                    },
-                ));
+        //
+        // HOW we ask cpal for it decides whether the stream can ever be freed: see
+        // `DeviceAcquisition`. Take the default handle whenever the chosen device IS the default,
+        // because the by-name handle leaks the CoreAudio AudioUnit on every capture.
+        let cpal_default = host.default_input_device();
+        let cpal_default_name = cpal_default.as_ref().and_then(|d| d.name().ok());
+        let acquisition = plan_device_acquisition(&name, cpal_default_name.as_deref());
+        let opened = match acquisition {
+            DeviceAcquisition::CpalDefault => cpal_default,
+            DeviceAcquisition::ByName => host
+                .input_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.name().map(|n| n == name).unwrap_or(false))),
+        };
+        if let Some(d) = opened {
+            if acquisition == DeviceAcquisition::ByName {
+                // Say it out loud rather than leak silently. cpal gives us no way to open a
+                // NON-default device without the self-referential disconnect listener, so a user
+                // who pinned a specific microphone still accumulates one stopped-but-undisposed
+                // AudioUnit per capture. Naming it here is what makes that diagnosable from a log
+                // instead of being rediscovered from first principles.
+                tracing::warn!(
+                    target: "dictation", device = %name,
+                    "opening a NON-default input device by name; cpal 0.15.3 leaks the CoreAudio \
+                     stream on this path (its disconnect listener owns the stream's own Arc), so \
+                     each capture rebuild leaves one undisposed audio unit behind"
+                );
             }
+            let picked = devices.iter().find(|x| x.name == name);
+            return Ok((
+                d,
+                BoundDevice {
+                    uid: picked.map(|x| x.uid.clone()),
+                    is_virtual: picked.map(|x| x.is_virtual).unwrap_or(false),
+                    was_default: picked.map(|x| x.is_default).unwrap_or(false),
+                    name,
+                },
+            ));
         }
         // CoreAudio lists it but cpal does not. Do NOT reach for the raw system default here — it
         // is the same unchecked fallback that let a loopback become the capture source. Fail with
@@ -395,6 +560,10 @@ impl Capture {
         // firewall also honors the teardown gate so a callback racing teardown becomes a no-op,
         // and records each delivered frame for the liveness watchdog.
         let mut on_frame = firewall_frame_handler(active.clone(), health.clone(), on_frame);
+        // A second handle for the RAW-buffer counters. It must be read inside the cpal callback,
+        // which is the only place the device's own buffer exists — `firewall_frame_handler` runs
+        // one conversion later and can therefore never tell OS silence from a conversion bug.
+        let raw_health = health.clone();
 
         // Build an input stream, dispatching on the device's native sample format
         // so we never ask cpal to reinterpret bytes incorrectly.
@@ -404,6 +573,10 @@ impl Capture {
             SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Raw buffer FIRST, exactly as CoreAudio handed it over. This is the only
+                    // place it exists, and the only measurement that can distinguish "the OS sent
+                    // silence" from "our conversion destroyed the audio".
+                    raw_health.note_raw(data);
                     on_frame(downmix_resample(data, channels, in_rate));
                 },
                 |err| eprintln!("cpal stream error: {err}"),
@@ -412,7 +585,7 @@ impl Capture {
             SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    process_typed(data, channels, in_rate, &mut on_frame);
+                    process_typed(data, channels, in_rate, &raw_health, &mut on_frame);
                 },
                 |err| eprintln!("cpal stream error: {err}"),
                 None,
@@ -420,7 +593,7 @@ impl Capture {
             SampleFormat::I32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    process_typed(data, channels, in_rate, &mut on_frame);
+                    process_typed(data, channels, in_rate, &raw_health, &mut on_frame);
                 },
                 |err| eprintln!("cpal stream error: {err}"),
                 None,
@@ -428,7 +601,7 @@ impl Capture {
             SampleFormat::F64 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f64], _: &cpal::InputCallbackInfo| {
-                    process_typed(data, channels, in_rate, &mut on_frame);
+                    process_typed(data, channels, in_rate, &raw_health, &mut on_frame);
                 },
                 |err| eprintln!("cpal stream error: {err}"),
                 None,
@@ -601,6 +774,202 @@ mod tests {
             (h.frames(), h.voiced_frames()),
             (2, 1),
             "a single non-zero sample anywhere in the frame makes it voiced"
+        );
+    }
+
+    // ---- the capture LEAK: a dropped Capture must actually free its cpal stream ---------------
+
+    /// THE regression guard for the 2026-07-31 silent-capture break.
+    ///
+    /// `Capture::drop` pauses the cpal `Stream` and lets it drop, and everyone assumed that
+    /// disposed the CoreAudio `AudioUnit`. It did not. cpal 0.15.3 registers a device-disconnect
+    /// listener for every input stream built from a `Device` whose `is_default` is false, and that
+    /// listener owns a clone of the stream's OWN `Arc<Mutex<StreamInner>>` — a cycle, so the strong
+    /// count never reaches zero. Sparkle resolves its device by NAME (cpal cannot open by UID), and
+    /// every device from `input_devices()` has `is_default == false`, so EVERY capture the app had
+    /// ever built leaked one initialized-but-undisposed audio unit, one permanently-registered
+    /// CoreAudio property listener, and the entire frame-handler closure — which in this app holds
+    /// an `AppHandle`, the decode-channel `Sender`, and an `Arc<Mutex<ParakeetTdt>>`.
+    ///
+    /// The assertion is the SIDE EFFECT, not the precondition: a sentinel `Arc` is moved into the
+    /// frame handler, so it can only return to a strong count of 1 if the stream — and with it the
+    /// closure holding that clone — was genuinely freed. Against the pre-fix code this reads 2.
+    /// (Measured with a standalone cpal harness: 12/12 cycles leaked via `input_devices()`, 6/6
+    /// were freed via `default_input_device()`.)
+    #[test]
+    fn dropping_a_capture_frees_the_cpal_stream_and_its_frame_handler() {
+        let Some(cap_result) = try_start_probe_capture() else {
+            eprintln!(
+                "SKIPPED dropping_a_capture_frees_the_cpal_stream_and_its_frame_handler: \
+                 no usable input device on this machine (expected on CI runners, which have no \
+                 microphone). This guard is meaningful only where a capture can actually open."
+            );
+            return;
+        };
+        let (capture, sentinel) = cap_result;
+        assert_eq!(
+            Arc::strong_count(&sentinel),
+            2,
+            "precondition: the live capture's frame handler should be holding the sentinel"
+        );
+        drop(capture);
+        assert_eq!(
+            Arc::strong_count(&sentinel),
+            1,
+            "dropping the Capture must FREE the cpal stream. A count of 2 means the CoreAudio \
+             audio unit, its property listener, and the whole frame-handler closure survived the \
+             drop — the cpal disconnect-listener Arc cycle. See `DeviceAcquisition`."
+        );
+
+        // …and the capture REBUILT after that teardown must still work. This is the user-visible
+        // half of the 2026-07-31 break: every rebuild came back `health=Silent` — callbacks on
+        // schedule, every sample exactly 0.0.
+        //
+        // What is asserted here is deliberately narrower than "the rebuild carries audio", because
+        // that is not ours to guarantee. Whether the DEVICE feeds this process was measured, during
+        // this investigation, to be a transient state of the machine: a standalone two-capture
+        // probe read SILENT four consecutive times and LIVE on every run minutes later, with no
+        // code change in between. An assertion on `raw_nonzero > 0` would therefore be a test that
+        // fails for reasons no edit to this file can fix (a muted mic, a busy device, a CI runner
+        // with no audio at all) — the flake that gets a guard deleted rather than read.
+        //
+        // So: assert the rebuild is WIRED — callbacks arrive — and assert the one failure that IS
+        // ours, that a frame carrying real samples must never reach the pipeline zeroed. When the
+        // OS itself is feeding silence, say so and stop, rather than convict the code.
+        let Some((rebuilt, _sentinel2)) = try_start_probe_capture() else {
+            panic!("the first capture opened, so the rebuild must too");
+        };
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let h = rebuilt.health();
+        assert!(
+            h.frames() > 0,
+            "the REBUILT capture received no callbacks at all — the rebuild produced a stream \
+             CoreAudio never drives (raw_samples={})",
+            h.raw_samples(),
+        );
+        assert_ne!(
+            h.zero_source(),
+            ZeroSource::SelfInflicted,
+            "the device delivered {} of {} samples non-zero and the pipeline still saw all zeros \
+             — the conversion destroyed the audio",
+            h.raw_nonzero(),
+            h.raw_samples(),
+        );
+        if h.zero_source() == ZeroSource::Os {
+            eprintln!(
+                "NOTE dropping_a_capture_frees_the_cpal_stream_and_its_frame_handler: the rebuilt \
+                 capture read {} raw samples and every one was exactly zero (zero_source=Os). The \
+                 OS is feeding this process digital silence right now — a muted or busy device, or \
+                 the very fault this guard was written for. The leak assertions above still ran.",
+                h.raw_samples(),
+            );
+            return;
+        }
+        assert!(
+            h.voiced_frames() > 0 && h.out_nonzero() > 0,
+            "raw audio arrived but no converted frame was voiced (zero_source={:?})",
+            h.zero_source(),
+        );
+    }
+
+    /// Build a real `Capture` whose frame handler owns a sentinel `Arc`, or `None` when this
+    /// machine has no input device to open (CI). Kept out of the test body so the skip path is
+    /// obvious and the assertions above read as assertions.
+    fn try_start_probe_capture() -> Option<(Capture, Arc<()>)> {
+        let sentinel = Arc::new(());
+        let held = sentinel.clone();
+        let capture = Capture::start(&DeviceChoice::Auto { allow_virtual: true }, move |_frame| {
+            // Keep the clone alive for as long as the closure is: the whole measurement.
+            let _keepalive = &held;
+        })
+        .ok()?;
+        Some((capture, sentinel))
+    }
+
+    /// The decision that makes the guard above pass, isolated and exhaustive.
+    ///
+    /// Only `default_input_device()` yields a cpal `Device` with `is_default == true`, which is the
+    /// single condition under which cpal skips the self-referential disconnect listener. So the
+    /// chosen device being the system default MUST route through that handle — and a device that is
+    /// not the default has no other way to be opened, which this pins as the deliberate exception
+    /// rather than an oversight.
+    #[test]
+    fn the_default_device_is_acquired_through_cpals_non_leaking_default_handle() {
+        assert_eq!(
+            plan_device_acquisition("MacBook Pro Microphone", Some("MacBook Pro Microphone")),
+            DeviceAcquisition::CpalDefault,
+            "the system default must be opened via default_input_device(), the only cpal handle \
+             that does not leak the stream"
+        );
+        assert_eq!(
+            plan_device_acquisition("Shure MV7", Some("MacBook Pro Microphone")),
+            DeviceAcquisition::ByName,
+            "a pinned NON-default device can only be opened by name (cpal offers nothing else)"
+        );
+        assert_eq!(
+            plan_device_acquisition("MacBook Pro Microphone", None),
+            DeviceAcquisition::ByName,
+            "with no default input at all there is no default handle to take"
+        );
+    }
+
+    // ---- raw vs converted: telling OS silence from a bug of our own --------------------------
+
+    #[test]
+    fn a_capture_that_gets_real_samples_and_emits_zeros_blames_us_not_the_device() {
+        // THE distinction this instrumentation exists for. Before it, `note_frame` saw only the
+        // POST-conversion frame, so a downmix/resample that destroyed the audio logged exactly the
+        // same `health=Silent` as an unfed device — and the two have opposite fixes.
+        assert_eq!(
+            classify_zero_source(143_872, 143_872, 0),
+            ZeroSource::SelfInflicted,
+            "the device sent audio and the pipeline saw zeros: that is our conversion, not the mic"
+        );
+    }
+
+    #[test]
+    fn a_capture_the_os_feeds_digital_silence_blames_the_os() {
+        assert_eq!(classify_zero_source(143_872, 0, 0), ZeroSource::Os);
+    }
+
+    #[test]
+    fn empty_buffers_are_not_reported_as_silence() {
+        // `downmix_resample` returns an empty Vec for an empty input, and an empty frame counts as
+        // delivered-but-not-voiced — so zero-length callbacks read as `Silent` while nothing was
+        // ever zeroed. A format/negotiation failure and a dead microphone are different problems.
+        assert_eq!(classify_zero_source(0, 0, 0), ZeroSource::EmptyBuffers);
+    }
+
+    #[test]
+    fn a_healthy_capture_has_no_zeros_to_explain() {
+        assert_eq!(classify_zero_source(143_872, 143_872, 47_957), ZeroSource::NotApplicable);
+    }
+
+    #[test]
+    fn the_raw_counters_measure_the_device_buffer_not_the_converted_frame() {
+        // Exercises the SHIPPED counters end to end at the two points the capture callback uses
+        // them, with a conversion that DOES destroy the audio — the case the old single-counter
+        // health could not name. 48 kHz mono in, so `downmix_resample` thirds the length.
+        let h = CaptureHealth::default();
+        let raw = vec![0.5f32; 4800];
+        h.note_raw(&raw);
+        // Simulate a broken conversion by recording an all-zero frame of the right length.
+        h.note_frame(&vec![0.0f32; 1600]);
+        assert_eq!((h.raw_samples(), h.raw_nonzero()), (4800, 4800), "the device's own buffer");
+        assert_eq!((h.out_samples(), h.out_nonzero()), (1600, 0), "what the pipeline received");
+        assert_eq!(
+            h.zero_source(),
+            ZeroSource::SelfInflicted,
+            "non-zero in, all-zero out: the counters must convict the conversion, not the device"
+        );
+        // …and the real conversion must NOT be convicted: same input through the shipped function.
+        let h2 = CaptureHealth::default();
+        h2.note_raw(&raw);
+        h2.note_frame(&downmix_resample(&raw, 1, 48_000));
+        assert_eq!(
+            h2.zero_source(),
+            ZeroSource::NotApplicable,
+            "downmix_resample preserves the signal, so it must never be blamed"
         );
     }
 

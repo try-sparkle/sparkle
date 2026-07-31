@@ -76,9 +76,16 @@ function micGlyphs(container: HTMLElement): Element[] {
 
 /** Anything in the column that operates the voice pipeline, matched loosely by accessible name so
  *  a NEW control slips past only by avoiding every word for what it does. Deliberately broader than
- *  {@link micGlyphs}: it also picks up the waveform strip and the caption button, which toggle the
- *  same phase without drawing a mic. Used for the "nothing below the thread" guard, where breadth
- *  is what matters — not for the count, which those extra header controls would make meaningless. */
+ *  {@link micGlyphs}: it used to pick up the waveform strip and the caption button, which toggled
+ *  the same phase without drawing a mic. Used for the "nothing below the thread" guard, where
+ *  breadth is what matters — not for a count.
+ *
+ *  IT LEGITIMATELY RETURNS AN EMPTY LIST NOW. The send tray became the only mic control, so the
+ *  header's ring/strip/caption are read-outs with no handlers and no action-shaped names, and the
+ *  tray itself is excluded by identity below. An empty result is therefore the PASSING state, not a
+ *  broken matcher — which is why the guard that used to assert `length > 0` was replaced with a
+ *  self-test of the matcher against a synthetic control (see below). Without that swap this file
+ *  would have gone quietly vacuous the moment the last named button left the column. */
 function voiceControls(container: HTMLElement): Element[] {
   return Array.from(container.querySelectorAll("button")).filter((b) => {
     // THE SEND TRAY IS NOT A VOICE CONTROL THAT DRIFTED BACK IN — it is the SEND control, and two of
@@ -110,14 +117,24 @@ describe("ConciergeColumn — exactly one mic", () => {
   for (const [label, state] of MIC_STATES) {
     it(`puts no voice control at all below the thread while ${label}`, () => {
       // The REAL guard, and the broad one. The mic the user wanted gone was at the bottom of the
-      // column, beside Send; the one they kept is in the header. So rather than counting (the
-      // header legitimately holds three phase controls — ring, waveform strip, caption), assert
+      // column, beside Send; the one they kept is in the header. So rather than counting, assert
       // POSITION: every voice control in this column precedes the thread. Anything added to the
       // compose row later fails here whatever it calls itself.
       const { container } = renderColumn(state);
       const thread = screen.getByTestId("concierge-thread");
+
+      // THE MATCHER STILL MATCHES. This used to be `found.length > 0`, which worked only while the
+      // header held named voice buttons — it no longer does (see `voiceControls`), so that form
+      // would now fail on a column that is entirely correct. Probing a synthetic control keeps the
+      // guard's actual job: prove the position loop below could ever fail, rather than pass because
+      // the query was silently matching nothing.
+      const probe = document.createElement("button");
+      probe.setAttribute("aria-label", "Turn off microphone");
+      container.appendChild(probe);
+      expect(voiceControls(container)).toContain(probe);
+      probe.remove();
+
       const found = voiceControls(container);
-      expect(found.length).toBeGreaterThan(0); // the matcher still matches something at all
       for (const c of found) {
         expect(c.compareDocumentPosition(thread) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       }

@@ -4,6 +4,11 @@
 // logoWaveform.test.ts; this exercises the regression-prone render branch that the helpers
 // can't reach: the caption must switch on ACTUAL capture (`status === "listening"`), not on
 // the armed `enabled` flag, so an armed-but-focus-paused mic never claims to be hearing you.
+//
+// SINCE THE SEND TRAY BECAME THE ONLY MIC CONTROL, this surface also has to agree with the tray's
+// position — so most cases set `conciergeSendMode` as well as the dictation store. The two are not
+// independent inputs the component reconciles: the position decides what the mic DRAWS and which
+// caption it shows, and the dictation store decides only whether capture is genuinely live.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +22,7 @@ import { BACKEND_MIC_DENIED } from "../voice/backendVoiceErrors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
-import { C, DANGER } from "../theme/colors";
+import { C } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
 // loop can schedule without throwing. We assert on the rendered caption, not animation frames.
@@ -33,6 +38,10 @@ beforeEach(() => {
     modelProgress: null,
     outOfCreditsNotice: false,
   });
+  // Push to talk is the position that matches the dictation defaults above (armed, not routing), so
+  // the health-ladder cases below read exactly as they did before the tray existed. Cases about the
+  // live/off states set their own.
+  useUiStore.setState({ conciergeSendMode: "ptt" });
   // Arming the mic now requires credits (MicButton.shouldBlockMicArm) and the sidebar force-offs an
   // armed mic when the balance is empty. Seed a credited user so the honest-listening cases behave
   // as before; the out-of-credits behavior is exercised in its own describe block below.
@@ -162,22 +171,20 @@ describe("LogoWaveform — the first-run model download caption", () => {
 });
 
 describe("LogoWaveform — honest listening", () => {
-  // The waveform strip button shares the "Activate Sparkle voice" aria-label, and the live
-  // caption now splits across TWO lines / many nodes ("Mic paused." +
-  // "Say" / <span>Hey Sparkle</span> / "to activate"). Match the BUTTON whose text carries
-  // both the status line and the wake phrase — a stable signal that can't be fooled by the bare
-  // word "Sparkle" turning up elsewhere (an aria-label or title).
-  const wakeHintButton = () =>
-    screen.queryByText((_content, el) => {
-      if (el?.tagName !== "BUTTON") return false;
-      const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
-      return /Mic paused\./.test(t) && /Hey Sparkle/.test(t);
-    });
+  // The live caption splits across TWO lines / many nodes ("Mic paused." + "Say" /
+  // <span>Hey Sparkle</span> / "to activate"), so match the element whose text carries both the
+  // status line and the wake phrase — a stable signal that can't be fooled by the bare word
+  // "Sparkle" turning up elsewhere (an aria-label or title). It is a DIV now, not a button: the
+  // caption used to toggle phase on click, which was a second mic control.
+  const wakeHint = () => {
+    const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
+    return /Mic paused\./.test(t) && /Hey Sparkle/.test(t) ? t : null;
+  };
 
   it("armed + actually listening → shows the live wake hint, not 'Listening paused'", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<LogoWaveform />);
-    expect(wakeHintButton()).not.toBeNull();
+    expect(wakeHint()).not.toBeNull();
     expect(screen.queryByText(/Listening paused/)).toBeNull();
   });
 
@@ -190,126 +197,154 @@ describe("LogoWaveform — honest listening", () => {
       ),
     ).toBeTruthy();
     // The wake-hint caption must NOT render when paused.
-    expect(wakeHintButton()).toBeNull();
+    expect(wakeHint()).toBeNull();
   });
 
-  it("active + listening → 'Actively listening' status with the Sparkle, pause command", () => {
+  it("Speak + listening → 'Actively listening' status with the Sparkle, pause command", () => {
+    useUiStore.setState({ conciergeSendMode: "speak" });
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<LogoWaveform />);
-    const activeCaption = screen.queryByText((_c, el) => {
-      if (el?.tagName !== "BUTTON") return false;
-      const t = el.textContent?.replace(/\s+/g, " ").trim() ?? "";
-      return /Actively listening/.test(t) && /Sparkle, pause/.test(t);
-    });
-    expect(activeCaption).not.toBeNull();
+    const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
+    expect(t).toMatch(/Actively listening/);
+    expect(t).toMatch(/Sparkle, pause/);
     // The passive wake hint must NOT show while actively dictating.
-    expect(wakeHintButton()).toBeNull();
+    expect(wakeHint()).toBeNull();
   });
 
-  it("mic hover cue is direction-aware: paused rests ORANGE→RED on hover; off rests gray→TEAL", () => {
-    // Probe jsdom's normalized form of each token so the assertions are format-agnostic. `C.teal`
-    // and `C.amber` are literal hex and come back as `rgb(...)`; `DANGER` is a themed `var()` and
-    // comes back verbatim. Both are fine — what is NOT fine is the two silently colliding.
-    //
-    // THE COLLISION IS A REAL FAILURE MODE (roborev 54231). If cssstyle ever REJECTS the var()
-    // assignment instead of storing it, `probe.style.color` keeps whatever was set before, so RED
-    // would quietly become ORANGE and every assertion below would still pass while testing nothing.
-    // It does not reject it in the jsdom this suite runs on — verified — but the distinctness is
-    // asserted rather than assumed, so the day that changes this test goes red instead of hollow.
-    const probe = document.createElement("span");
-    probe.style.color = C.teal;
-    const TEAL = probe.style.color;
-    probe.style.color = C.amber;
-    const ORANGE = probe.style.color;
-    probe.style.color = DANGER;
-    const RED = probe.style.color;
-    expect(new Set([TEAL, ORANGE, RED]).size, "two cue colours normalized to the same string — the assertions below would be vacuous").toBe(3);
-
-    // Paused (on, waiting for the wake word): rests ORANGE (the pause affordance), turns RED on
-    // hover — telegraphing the destructive "click to turn off".
-    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
-    render(<LogoWaveform />);
-    const micOn = screen.getByRole("button", { name: "Turn off microphone" });
-    expect(micOn.style.color).toBe(ORANGE);
-    fireEvent.mouseEnter(micOn);
-    expect(micOn.style.color).toBe(RED);
-    cleanup();
-
-    // Off: rests gray, turns TEAL (not red) on hover — the constructive "click to turn on" cue.
-    useDictationStore.setState({ enabled: false, status: "idle" });
-    render(<LogoWaveform />);
-    const micOff = screen.getByRole("button", { name: "Turn on microphone" });
-    const offRest = micOff.style.color;
-    expect(offRest).not.toBe(TEAL); // rests gray, proving the teal is hover-driven
-    fireEvent.mouseEnter(micOff);
-    expect(micOff.style.color).toBe(TEAL);
-    expect(micOff.style.color).not.toBe(RED);
-  });
-
-  it("active mic rests on the live tint and turns ORANGE (pause) on hover, never red", () => {
-    // Distinctness asserted for the same reason as the test above: a var() that cssstyle declined
-    // would leave RED holding ORANGE's value, and `not.toBe(RED)` would then be the same assertion
-    // twice rather than the two separate contracts it looks like.
-    const probe = document.createElement("span");
-    probe.style.color = C.amber;
-    const ORANGE = probe.style.color;
-    probe.style.color = DANGER;
-    const RED = probe.style.color;
-    expect(ORANGE, "the pause tint and the destructive red normalized to one string").not.toBe(RED);
-
-    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
-    render(<LogoWaveform />);
-    const micActive = screen.getByRole("button", { name: "Pause listening" });
-    expect(micActive.style.color).not.toBe(ORANGE); // rests on the live tint
-    expect(micActive.style.color).not.toBe(RED); // active never shows the destructive red
-    fireEvent.mouseEnter(micActive);
-    expect(micActive.style.color).toBe(ORANGE); // hover = "click to pause"
-  });
-
-  it("clicking the mic while ACTIVE pauses (phase→passive) instead of turning it off", () => {
-    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
-    render(<LogoWaveform />);
-    fireEvent.click(screen.getByRole("button", { name: "Pause listening" }));
-    // Paused, NOT off: enabled stays true, phase drops to passive.
-    expect(useDictationStore.getState().enabled).toBe(true);
-    expect(useDictationStore.getState().phase).toBe("passive");
-  });
-
-  it("clicking the mic while PAUSED turns it off", () => {
-    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
-    render(<LogoWaveform />);
-    fireEvent.click(screen.getByRole("button", { name: "Turn off microphone" }));
-    expect(useDictationStore.getState().enabled).toBe(false);
-  });
-
-  it("clicking the mic while OFF turns it back on (to paused)", () => {
-    useDictationStore.setState({ enabled: false, status: "idle" });
-    render(<LogoWaveform />);
-    fireEvent.click(screen.getByRole("button", { name: "Turn on microphone" }));
-    expect(useDictationStore.getState().enabled).toBe(true);
-  });
-
-  it("muted → no caption at all, mic offers to turn on", () => {
+  it("muted → no caption at all", () => {
+    useUiStore.setState({ conciergeSendMode: "send" });
     useDictationStore.setState({ enabled: false, status: "idle" });
     render(<LogoWaveform />);
     expect(screen.queryByText(/Listening paused/)).toBeNull();
-    expect(wakeHintButton()).toBeNull();
-    expect(screen.getByRole("button", { name: "Turn on microphone" })).toBeTruthy();
+    expect(wakeHint()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The mic INDICATOR — one state with the send tray, and no longer a control
+// ---------------------------------------------------------------------------
+//
+// The ring, the waveform strip and the caption were three separate click targets that moved
+// `enabled`/`phase` behind the tray's back. Each of them could put the mic into a state the tray
+// contradicted — the wake word alone did it, flipping `phase` and turning the ring green under a
+// tray parked on "Push to talk". These assert the ring now RENDERS the tray's position and does
+// nothing at all when operated.
+describe("LogoWaveform — the mic indicator is a read-out of the send tray", () => {
+  /** The ring, found by the anchor attribute rather than by role — the point of these tests is that
+   *  it no longer HAS an interactive role. */
+  const ring = () => document.querySelector('[data-hint="mic"]') as HTMLElement;
+
+  it("paints the tray's three positions in three distinct colours", () => {
+    // Probe jsdom's normalized form of each token so the assertions are format-agnostic, and assert
+    // the tokens are DISTINCT first: if cssstyle ever declined one of these assignments, `probe`
+    // would keep the previous value and two of the three checks below would silently become the
+    // same check (roborev 54231).
+    const probe = document.createElement("span");
+    probe.style.color = C.successInk;
+    const GREEN = probe.style.color;
+    probe.style.color = C.amber;
+    const ORANGE = probe.style.color;
+    probe.style.color = C.muted;
+    const GREY = probe.style.color;
+    expect(new Set([GREEN, ORANGE, GREY]).size, "two indicator colours normalized to the same string — the assertions below would be vacuous").toBe(3);
+
+    // Speak → GREEN. Live capture is set up too, but it is the POSITION that decides the colour.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(ring().style.color).toBe(GREEN);
+    cleanup();
+
+    // Push to talk → ORANGE.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(ring().style.color).toBe(ORANGE);
+    cleanup();
+
+    // Send → GREY.
+    useUiStore.setState({ conciergeSendMode: "send" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    render(<LogoWaveform />);
+    expect(ring().style.color).toBe(GREY);
+  });
+
+  it("stays ORANGE on Push to talk even after the WAKE WORD moves the phase", () => {
+    // THE desync, reproduced at its actual trigger. `phase` is not the tray's to set — the wake
+    // matcher flips it with no click anywhere — so an indicator reading the dictation store went
+    // green while the tray still said "Push to talk". Nothing about the tray changed here.
+    const probe = document.createElement("span");
+    probe.style.color = C.amber;
+    const ORANGE = probe.style.color;
+    probe.style.color = C.successInk;
+    const GREEN = probe.style.color;
+    expect(ORANGE).not.toBe(GREEN);
+
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(ring().style.color).toBe(ORANGE);
+    expect(ring().style.color).not.toBe(GREEN);
+    // …and the caption agrees with it, rather than announcing a dictation the tray never entered.
+    expect(document.body.textContent).toMatch(/Mic paused\./);
+    expect(document.body.textContent).not.toMatch(/Actively listening/);
+  });
+
+  it("is not a control: no button role, no click handler, no hover pill", () => {
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
+    render(<LogoWaveform />);
+    const el = ring();
+    // Not a button by role, and not a <button> by tag — either would be operable by keyboard.
+    expect(el.tagName).not.toBe("BUTTON");
+    expect(el.getAttribute("role")).toBe("img");
+    // No onClick: React attaches nothing, so clicking cannot move the store. Asserted at the SIDE
+    // EFFECT rather than by inspecting props — a handler that ran and happened to be a no-op would
+    // still be a control waiting to grow a body.
+    const before = { ...useDictationStore.getState() };
+    fireEvent.click(el);
+    fireEvent.mouseEnter(el);
+    fireEvent.mouseDown(el);
+    expect(useDictationStore.getState().enabled).toBe(before.enabled);
+    expect(useDictationStore.getState().phase).toBe(before.phase);
+    // The three-option hover pill is gone with it — hovering must not open a menu.
+    expect(screen.queryByRole("menu", { name: "Microphone mode" })).toBeNull();
+  });
+
+  it("names the STATE it is showing, so a screen reader is not promised an action", () => {
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).toBe("Microphone: actively listening");
+    // The old action labels must not survive anywhere on this surface.
+    expect(screen.queryByRole("button", { name: /microphone|listening|Activate Sparkle voice/i })).toBeNull();
+  });
+
+  it("nothing else on this surface toggles the mic either — the strip and caption are read-outs", () => {
+    // The waveform strip and the caption were both `onClick={togglePhase}`. Removing only the ring's
+    // handler would leave the same defect reachable by two other click targets.
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    const { container } = render(<LogoWaveform />);
+    const before = useDictationStore.getState().phase;
+    for (const b of Array.from(container.querySelectorAll("button"))) fireEvent.click(b);
+    expect(useDictationStore.getState().phase).toBe(before);
+    expect(useDictationStore.getState().enabled).toBe(true);
   });
 });
 
 describe("LogoWaveform — out of credits", () => {
-  it("clicking the OFF mic while out of credits does NOT arm it — shows the credits notice", () => {
+  it("this surface cannot arm the mic at all while out of credits — there is nothing to press", () => {
+    // The refusal itself (`shouldBlockMicArm`) now lives entirely on the tray's path: this sidebar
+    // stopped being a mic control, so the arm it used to attempt cannot be attempted from here.
+    // Asserted as the absence of any control that would try, plus the store staying put under a
+    // click on everything this surface still renders.
     useAuthStore.setState({ me: null }); // no credits
     useDictationStore.setState({ enabled: false, status: "idle", outOfCreditsNotice: false });
-    render(<LogoWaveform />);
-    fireEvent.click(screen.getByRole("button", { name: "Turn on microphone" }));
-    // Refused: the mic never armed, and the shared notice is up in the sidebar.
+    const { container } = render(<LogoWaveform />);
+    for (const b of Array.from(container.querySelectorAll("button"))) fireEvent.click(b);
+    fireEvent.click(document.querySelector('[data-hint="mic"]') as HTMLElement);
     expect(useDictationStore.getState().enabled).toBe(false);
-    expect(useDictationStore.getState().outOfCreditsNotice).toBe(true);
-    expect(screen.getByText("You are out of credits.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Refill" })).toBeTruthy();
-    useDictationStore.getState().clearOutOfCreditsNotice(); // tidy the pending 5s timer
   });
 
   it("clicking Refill deep-opens the ⋯ settings dialog on the Credits pane", () => {

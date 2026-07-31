@@ -1046,6 +1046,19 @@ export function ConciergeHost({
   // THE TRAY. A push-to-talk RELEASE sends through the box's own submit for exactly the reason the
   // countdown does (above): sending from out here would leave the dictated words sitting in the
   // textarea behind the message they were supposed to be.
+  //
+  // A RELEASE IS A SEND, FULL STOP — it is `submit`, the same call the Send button makes, and it is
+  // made on EVERY clean release rather than only on the ones that produced a transcript. Letting go
+  // of the talk key means "send this message"; what the message turns out to be made of is the box's
+  // business. So all three of these are one path, not a case and two edge cases:
+  //   spoke only  → the box holds the transcript dictation inserted, and that goes out;
+  //   typed only  → a silent hold sends the typed draft, exactly as pressing Send would (and in this
+  //                 mode it is the ONLY way to send it — `chordSends` makes ⌘↩ inert here);
+  //   both        → `submit` sends what the box holds, which is the typed text with the transcript
+  //                 appended after it (ComposeBox's `append` adds dictated segments at the caret,
+  //                 which follows the text) — the typed words were there first, so they lead.
+  // useSendMode's `endHold` owns the one thing that is NOT the box's business: not calling this
+  // until the words he just spoke have finished arriving.
   const sendTray = useSendMode({
     onSend: useCallback(() => composerSubmitRef.current?.() ?? false, []),
   });

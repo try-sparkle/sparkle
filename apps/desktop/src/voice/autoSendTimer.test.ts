@@ -18,6 +18,15 @@ import {
 import { thresholdMs } from "./confidence";
 import { SWEEP_FLOOR_MS, sweepThresholdMs } from "./sendMode";
 
+// Derived from the ladder, never re-spelled as literals. The founder retuned the pace (x1.2), and
+// every absolute ms here would have had to be rewritten by hand — churn that catches no regression
+// while quietly inviting a typo. What these rows actually assert is the ACCUMULATION RULE: the
+// clock survives re-evaluation and the deadline is measured from speech end. That rule is
+// independent of the tuning, so it is expressed that way.
+const HIGH = thresholdMs("high");
+const NORMAL = thresholdMs("normal");
+const VERYLOW = thresholdMs("verylow");
+
 /** An armed rail holding `text`, with silence started at `t`. The common setup, spelled once. */
 function counting(text: string, t: number): AutoSendState {
   let s = setArmed(initialState(), true);
@@ -31,58 +40,58 @@ describe("the clock ACCUMULATES — re-evaluation moves the threshold, never the
     // chunk; chunks arrive several times a second, so the deadline is pushed past the horizon
     // forever and the send NEVER fires. Elapsed must survive re-evaluation untouched.
     const t0 = 1_000;
-    let s = counting("fix the header", t0); // normal → 3000ms
+    let s = counting("fix the header", t0); // normal tier
     expect(elapsedMs(s, t0 + 2_000)).toBe(2_000);
 
     // A late committed segment lands 2s in. Same tier, so the deadline must not move at all.
     s = noteTranscript(s, "fix the header bar", t0 + 2_000);
     expect(elapsedMs(s, t0 + 2_000)).toBe(2_000);
-    expect(remainingMs(s, t0 + 2_000)).toBe(1_000);
+    expect(remainingMs(s, t0 + 2_000)).toBe(NORMAL - 2_000);
 
     // …and it still fires on the ORIGINAL schedule.
-    expect(evaluate(s, t0 + 2_999).action).toBe("wait");
-    expect(evaluate(s, t0 + 3_000).action).toBe("fire");
+    expect(evaluate(s, t0 + NORMAL - 1).action).toBe("wait");
+    expect(evaluate(s, t0 + NORMAL).action).toBe("fire");
   });
 
   it("fires exactly at the threshold measured from speech end, not from the last chunk", () => {
     const t0 = 0;
-    let s = counting("ship it", t0); // normal → 3000
+    let s = counting("ship it", t0); // normal tier
     // Ten chunks, one every 200ms. A clock-resetting implementation would be at 3000ms remaining
-    // after the last of them; the correct one is 1000ms from firing.
+    // after the last of them; the correct one is (NORMAL - 2000)ms from firing.
     for (let i = 1; i <= 10; i += 1) s = noteTranscript(s, "ship it", t0 + i * 200);
     expect(elapsedMs(s, t0 + 2_000)).toBe(2_000);
-    expect(evaluate(s, t0 + 3_000).action).toBe("fire");
+    expect(evaluate(s, t0 + NORMAL).action).toBe("fire");
   });
 
   it("a RISING threshold pushes the deadline out and does not fire early", () => {
     const t0 = 0;
-    // Starts clean: "ship it." is high → 1000ms.
+    // Starts clean: "ship it." is the high tier.
     let s = counting("ship it.", t0);
-    expect(remainingMs(s, t0)).toBe(1_000);
+    expect(remainingMs(s, t0)).toBe(HIGH);
 
-    // At 900ms a chunk lands revealing a dangling conjunction → verylow (10 000ms). The clock is
-    // still at 900; the target just moved to 10 000.
+    // At 900ms a chunk lands revealing a dangling conjunction -> verylow. The clock is still at
+    // 900; the target just moved out to the verylow threshold.
     s = noteTranscript(s, "ship it. and", t0 + 900);
     expect(s.tier).toBe("verylow");
     expect(elapsedMs(s, t0 + 900)).toBe(900);
-    expect(remainingMs(s, t0 + 900)).toBe(9_100);
+    expect(remainingMs(s, t0 + 900)).toBe(VERYLOW - 900);
 
     // The moment the OLD threshold would have fired: nothing happens.
-    expect(evaluate(s, t0 + 1_000).action).toBe("wait");
+    expect(evaluate(s, t0 + HIGH).action).toBe("wait");
     expect(evaluate(s, t0 + 5_000).action).toBe("wait");
-    expect(evaluate(s, t0 + 10_000).action).toBe("fire");
+    expect(evaluate(s, t0 + VERYLOW).action).toBe("fire");
   });
 });
 
 describe("the drop guard — a threshold that falls behind the elapsed clock waits ~600ms", () => {
   it("does not fire on the instant of the drop", () => {
     const t0 = 0;
-    // verylow (10 000) while the sentence dangles; 4s of silence accumulate.
+    // verylow while the sentence dangles; 4s of silence accumulate.
     let s = counting("hold the deploy because", t0);
     expect(s.tier).toBe("verylow");
     expect(evaluate(s, t0 + 4_000).action).toBe("wait");
 
-    // A late chunk completes the sentence → high (1000ms), which 4s has already blown past.
+    // A late chunk completes the sentence -> high, which 4s of silence has already blown past.
     // Firing here would jump the rail from a third-full to gone between two frames.
     s = noteTranscript(s, "hold the deploy because the notarization is flaky.", t0 + 4_000);
     expect(s.tier).toBe("high");
@@ -119,13 +128,13 @@ describe("the drop guard — a threshold that falls behind the elapsed clock wai
 
   it("only DELAYS — an expired grace never pulls the deadline in ahead of the threshold", () => {
     const t0 = 0;
-    let s = counting("open the", t0); // verylow → 10 000
+    let s = counting("open the", t0); // verylow tier
     // A chunk at 100ms leaves us far short of any threshold, so no grace is granted…
-    s = noteTranscript(s, "open the settings panel.", t0 + 100); // high → 1000
+    s = noteTranscript(s, "open the settings panel.", t0 + 100); // high tier
     expect(s.fireNoEarlierThan).toBeNull();
     // …and the ordinary threshold still governs.
-    expect(evaluate(s, t0 + 999).action).toBe("wait");
-    expect(evaluate(s, t0 + 1_000).action).toBe("fire");
+    expect(evaluate(s, t0 + HIGH - 1).action).toBe("wait");
+    expect(evaluate(s, t0 + HIGH).action).toBe("fire");
   });
 });
 
@@ -145,7 +154,7 @@ describe("speech end is the only thing that starts the clock", () => {
     let s = counting("ship it", t0);
     s = noteSpeechEnd(s, t0 + 1_000);
     expect(s.silenceStartedAt).toBe(t0);
-    expect(evaluate(s, t0 + 3_000).action).toBe("fire");
+    expect(evaluate(s, t0 + NORMAL).action).toBe("fire");
   });
 
   it("does nothing with an empty transcript — there is no message to send", () => {
@@ -188,14 +197,14 @@ describe("manual Send always overrides, at any confidence", () => {
     expect(evaluate(s, t0 + 60_000).action).toBe("wait");
   });
 
-  it("works from verylow, where the countdown had nine more seconds to run", () => {
+  it("works from verylow, where the countdown had most of its window left to run", () => {
     const t0 = 0;
     let s = counting("send the diff to", t0);
     expect(s.tier).toBe("verylow");
-    expect(remainingMs(s, t0 + 1_000)).toBe(9_000);
+    expect(remainingMs(s, t0 + 1_000)).toBe(VERYLOW - 1_000);
     s = noteManualSend(s);
     expect(s.silenceStartedAt).toBeNull();
-    expect(evaluate(s, t0 + 10_000).action).toBe("wait");
+    expect(evaluate(s, t0 + VERYLOW).action).toBe("wait");
   });
 
   it("leaves a DISARMED rail alone", () => {
@@ -244,30 +253,35 @@ describe("staleness — a countdown nobody was present for does not fire on its 
   });
 
   it("still fires normally just under the staleness bound", () => {
-    // verylow's 10s window is nowhere near it, so ordinary operation is untouched.
+    // verylow's window is nowhere near the staleness bound, so ordinary operation is untouched.
     const t0 = 0;
     const s = counting("send the diff to", t0);
-    expect(evaluate(s, t0 + 10_000).action).toBe("fire");
+    expect(evaluate(s, t0 + VERYLOW).action).toBe("fire");
   });
 });
 
 describe("the fill fraction the rail draws", () => {
   it("drains from 1 to 0 across the current threshold", () => {
     const t0 = 0;
-    const s = counting("fix the header", t0); // normal → 3000
+    const s = counting("fix the header", t0); // normal tier
     expect(remainingFraction(s, t0)).toBe(1);
-    expect(remainingFraction(s, t0 + 1_500)).toBeCloseTo(0.5, 5);
-    expect(remainingFraction(s, t0 + 3_000)).toBe(0);
+    expect(remainingFraction(s, t0 + NORMAL / 2)).toBeCloseTo(0.5, 5);
+    expect(remainingFraction(s, t0 + NORMAL)).toBe(0);
   });
 
   it("JUMPS UP when the threshold rises — that is the 'that just got longer' signal", () => {
     const t0 = 0;
-    let s = counting("ship it.", t0); // high → 1000
-    expect(remainingFraction(s, t0 + 500)).toBeCloseTo(0.5, 5);
-    s = noteTranscript(s, "ship it. and", t0 + 500); // verylow → 10 000
-    // Same instant, same elapsed — 9500 of 10 000 left. The rail eases to this over ~250ms rather
-    // than teleporting (see SendRail); the MODEL just reports the new truth.
-    expect(remainingFraction(s, t0 + 500)).toBeCloseTo(0.95, 5);
+    let s = counting("ship it.", t0); // high tier
+    // Half-way through the HIGH window, whatever that window is tuned to.
+    expect(remainingFraction(s, t0 + HIGH / 2)).toBeCloseTo(0.5, 5);
+    s = noteTranscript(s, "ship it. and", t0 + HIGH / 2); // verylow tier
+    // Same instant, same elapsed — but measured against the much longer verylow window, so the fill
+    // JUMPS UP. The rail eases to this over ~250ms rather than teleporting (see SendRail); the MODEL
+    // just reports the new truth.
+    expect(remainingFraction(s, t0 + HIGH / 2)).toBeCloseTo(
+      (VERYLOW - HIGH / 2) / VERYLOW,
+      5,
+    );
   });
 
   it("clamps to [0,1] when the threshold has already fallen behind the clock", () => {
@@ -289,8 +303,8 @@ describe("the fill fraction the rail draws", () => {
 describe("firing", () => {
   it("hands back the trimmed text and clears the rail", () => {
     const t0 = 0;
-    const s = counting("  fix the header.  ", t0); // high → 1000
-    const d = evaluate(s, t0 + 1_000);
+    const s = counting("  fix the header.  ", t0); // high tier
+    const d = evaluate(s, t0 + HIGH);
     expect(d.action).toBe("fire");
     if (d.action !== "fire") throw new Error("unreachable");
     expect(d.text).toBe("fix the header.");

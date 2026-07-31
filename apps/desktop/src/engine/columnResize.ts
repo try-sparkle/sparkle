@@ -105,6 +105,17 @@ export function clampWidth(requested: number, min: number, max: number): ClampRe
  *  and a constant two files declare separately is precisely the class of bug this branch keeps
  *  re-finding (roborev 55910). This module already owns the row's other invariants. */
 export const BUILD_COLUMN_MIN_WIDTH = 160;
+
+/**
+ * The concierge column's default width.
+ *
+ * Lives HERE rather than in Workspace.tsx because it is read by a pure decision that must not drag a
+ * React component in behind it: voice/sendMode's short-label threshold is pinned against it, and
+ * that test runs under NODE. Importing Workspace — 61 top-level imports, Tauri APIs, seven stores —
+ * to read one integer made a pure logic test hostage to any module-scope `document` added anywhere
+ * in that graph (roborev 56223). This module already owns the sibling column widths.
+ */
+export const CONCIERGE_DEFAULT_WIDTH = 360;
 /** What must stay for the terminal beside the build column — the floor its CSS clamp leaves it.
  *  Matches the thin-column hazard `paneVisibility` already carries a backstop for: a terminal driven
  *  to ~0 spawns its PTY at fallback dimensions. */

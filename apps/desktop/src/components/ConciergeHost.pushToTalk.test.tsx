@@ -340,9 +340,15 @@ describe("release sends immediately, and sends everything", () => {
   it("RELEASE WITH A PENDING PARTIAL sends the COMPLETE phrase, not a truncated one", async () => {
     // THE ROW THAT MATTERS MOST. On the cloud path Deepgram publishes a live `interim` and only
     // later commits it as a segment that reaches the composer. Sending in the keyup's own tick with
-    // an interim outstanding delivers half a sentence — or, for one short utterance, an empty box
-    // and no message at all. So the release waits for the interim to CLEAR (the commit landing) and
-    // sends then: the whole phrase, with no delay anyone chose.
+    // the phrase still arriving delivers half a sentence — or, for one short utterance, an empty box
+    // and no message at all. So the release waits, and sends the whole phrase.
+    //
+    // WHAT IT WAITS FOR IS THE UTTERANCE CLOSING, NOT THE INTERIM CLEARING. This row used to model
+    // the commit as `setInterim("")` + the insert and stop there, which was an INCOMPLETE picture of
+    // the pipeline: with `endpointing=200` a clause commits on any 200ms gap, so an interim clearing
+    // is routine mid-sentence and says nothing about whether more text is coming. The event that
+    // says so is `dictation://speech-end`, which Rust emits after the committed transcript of the
+    // same utterance — so it is emitted here too, in that order (see useSendMode `endHold`).
     mount();
     act(() => fireEvent.click(pill("ptt")));
     type("ship the");
@@ -367,6 +373,8 @@ describe("release sends immediately, and sends everything", () => {
       fireEvent.change(box(), {
         target: { value: "ship the staging branch", selectionStart: 23, selectionEnd: 23 },
       });
+      // …and the engine closes the utterance, AFTER its transcript — the order Rust guarantees.
+      useDictationStore.getState().noteSpeechEnd();
       await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
@@ -377,10 +385,10 @@ describe("release sends immediately, and sends everything", () => {
     expect(box().value).toBe("");
   });
 
-  it("…and the wait is not a fixed delay — it ends when the transcript lands, not on a clock", async () => {
-    // The distinction between "waits for the commit" and "waits 1.5s". With real timers and nothing
-    // advanced, the send happens the instant the interim clears; a fixed-delay implementation could
-    // not pass this row.
+  it("…and the wait is not a fixed delay — it ends when the utterance closes, not on a clock", async () => {
+    // The distinction between "waits for the utterance to finish" and "waits 1.5s". With real timers
+    // and nothing advanced, the send happens the instant the engine closes the utterance; a
+    // fixed-delay implementation could not pass this row.
     mount();
     act(() => fireEvent.click(pill("ptt")));
     type("deploy it");
@@ -390,8 +398,17 @@ describe("release sends immediately, and sends everything", () => {
       fireEvent.keyUp(window, { key: "Meta" });
     });
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    // The interim clearing on its own is NOT the end of the utterance — a clause commits on any
+    // 200ms gap — so it must not release the send by itself.
     await act(async () => {
       useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+
+    await act(async () => {
+      useDictationStore.getState().noteSpeechEnd();
       await new Promise((r) => setTimeout(r, 0));
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
