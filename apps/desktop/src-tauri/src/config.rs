@@ -586,6 +586,73 @@ impl Default for ConciergeChecksConfig {
     }
 }
 
+/// The Pusher's operating envelope (`[pushers]`) — how often one observes, and how loud it may get.
+///
+/// A Pusher is the adversarial half of a pair: it watches a build agent and may send it a few
+/// CITED challenges an hour. This section is what a human turns down when that is too much.
+///
+/// FLAT AND SCALAR ONLY, unlike `[concierge.checks]`: every field is a bool / integer / string
+/// because `json_to_toml_value` accepts exactly those, and that is what makes the whole section
+/// editable through the existing dotted setters (⋯ Settings and `set_value` both write scalars).
+/// A nested table or an array here would parse from the file and then be unsettable from the UI.
+///
+/// GLOBAL ONLY. `build_effective` ignores `[pushers]` in a per-project `.sparkle/config.toml`, for
+/// the same reason it ignores `[concierge]`: how much a machine nags its own agents is a property
+/// of the human sitting at it, not of a repo that happens to be cloned onto it.
+///
+/// TWO OF THESE ARE CEILINGS, NOT SETTINGS. `messages_per_hour` and `inbox_yield_pct` are resolved
+/// on the TypeScript side as `min(configured, <constant>)` (`resolvePusherPolicy` in
+/// `packages/core/pusherPolicy.ts`), so a config file may only ever make a Pusher QUIETER. That is
+/// the same shape `[workers] max_concurrent` already uses, and the reason is stated on each field.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PushersConfig {
+    /// Master switch. Ships TRUE.
+    ///
+    /// A deliberate founder decision, taken OVER the recommended fail-safe default of off. The
+    /// reasoning: at the first rungs of autonomy the worst case of a misfiring trigger is noise,
+    /// not a destroyed worktree — and `messages_per_hour` below is what bounds how much noise
+    /// "noise" can be. Recorded here rather than left to look like an oversight, because the two
+    /// facts are load-bearing together: on-by-default is only defensible while the budget holds.
+    pub enabled: bool,
+    /// Milliseconds between observation cycles for ONE partner. Default 300000 (5 minutes), the
+    /// interval the design's cost model is computed at.
+    ///
+    /// Per-observation cost is already bounded by a hard terminal-snapshot cap, so how OFTEN a
+    /// Pusher looks is the only term that can make a fleet of them expensive. `validate` warns
+    /// below 60000 and the TypeScript resolver floors there.
+    pub observe_interval_ms: i64,
+    /// Challenges per partner per rolling hour. Default 4.
+    ///
+    /// A CEILING the TypeScript side clamps DOWN against its own `MESSAGES_PER_HOUR` constant: a
+    /// config file may LOWER this, never raise it. If a hand-edited TOML could set it to 999 the
+    /// bound would exist in name only, and the safety argument for `enabled = true` would quietly
+    /// stop holding with nothing reporting that it had.
+    pub messages_per_hour: i64,
+    /// Partner-inbox fill percentage at or above which a Pusher declines to send. Default 80.
+    ///
+    /// Same ceiling-only rule as `messages_per_hour`: clamped against `INBOX_YIELD_PCT` on the
+    /// TypeScript side, so raising it here cannot make a Pusher talk over a backed-up partner.
+    pub inbox_yield_pct: i64,
+    /// The model a Pusher composes on. Default `claude-haiku-4-5` — a bounded observation in, one
+    /// cited sentence out, which is what every other cheap-model caller in the app pins.
+    pub model: String,
+}
+
+impl Default for PushersConfig {
+    /// The shipped envelope. Stated here and mirrored by the `[pushers]` block in
+    /// `DEFAULT_TEMPLATE` (asserted by `pushers_template_matches_the_default`).
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            observe_interval_ms: 300_000,
+            messages_per_hour: 4,
+            inbox_yield_pct: 80,
+            model: "claude-haiku-4-5".to_string(),
+        }
+    }
+}
+
 /// 1Password env-backup state that isn't a simple on/off toggle. Machine-wide (like [tools]): a
 /// per-project value is ignored with a warning, because the vault is a property of the user's
 /// 1Password account, not of any one repo.
@@ -1026,6 +1093,9 @@ pub struct SparkleConfig {
     pub approvals: ApprovalsConfig,
     /// The concierge's per-tool autonomy policy. Machine-wide (see ConciergeConfig).
     pub concierge: ConciergeConfig,
+    /// The Pusher's operating envelope. Machine-wide (see PushersConfig) — a repo does not get to
+    /// decide how much this machine's agents are challenged.
+    pub pushers: PushersConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -1080,6 +1150,10 @@ impl Default for SparkleConfig {
                 // `concierge_checks_template_matches_the_default`).
                 checks: ConciergeChecksConfig::defaults(),
             },
+            // Ships ENABLED — the founder's decision over the fail-safe default; see
+            // `PushersConfig::enabled`. Stated once in `PushersConfig::default()` so this line, the
+            // struct, and DEFAULT_TEMPLATE cannot drift apart.
+            pushers: PushersConfig::default(),
             // Opinionated defaults: every tool ships on for a new install — except onepassword,
             // which needs an external account + CLI before it can do anything (see the field doc).
             tools: ToolsConfig {
@@ -1312,6 +1386,31 @@ struct PartialConciergeChecks {
     checks: std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// `[pushers]` as read from TOML.
+///
+/// EVERY value is `toml::Value`, never a typed field, for the reason recorded on
+/// `PartialConcierge::tools` (roborev 54240): with strong types, ONE hand-edit —
+/// `enabled = "yes"`, `messages_per_hour = "two"` — fails `toml::from_str::<PartialConfig>` for the
+/// WHOLE FILE. That discards the entire global layer and sets `hard_error`, so every unrelated
+/// setting the user wrote silently reverts to its default. One typo in one Pusher knob must cost
+/// exactly that knob, and `apply_pushers` drops it with a warning instead.
+///
+/// `#[serde(flatten)]` collects every key this build does not know into `rest`, so `apply_pushers`
+/// can REPORT a misspelling. The field set is authoritative right here (`PushersConfig` is the
+/// struct), unlike `[concierge.checks]`'s check ids — so `mesages_per_hour` is a typo, not a
+/// setting from the future, and left silent it would parse, apply nothing, and say nothing while
+/// the Pusher kept talking at its shipped rate.
+#[derive(Debug, Default, Deserialize)]
+struct PartialPushers {
+    enabled: Option<toml::Value>,
+    observe_interval_ms: Option<toml::Value>,
+    messages_per_hour: Option<toml::Value>,
+    inbox_yield_pct: Option<toml::Value>,
+    model: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialTools {
     analytics: Option<bool>,
@@ -1419,6 +1518,7 @@ struct PartialConfig {
     voice: Option<PartialVoice>,
     approvals: Option<PartialApprovals>,
     concierge: Option<PartialConcierge>,
+    pushers: Option<PartialPushers>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
 }
@@ -1748,6 +1848,101 @@ fn apply_concierge_checks(
             }
         }
     }
+}
+
+/// Overlay a partial `[pushers]` section onto the shipped envelope.
+///
+/// PER-FIELD, like `apply_concierge_checks` — the one-line edit this section exists for
+/// (`messages_per_hour = 1` under an existing header) has to leave `observe_interval_ms` and
+/// `model` at what they shipped with. Replacing the struct wholesale would turn "make it quieter"
+/// into "silently reset everything else too".
+///
+/// A wrong-typed value is DROPPED with a warning rather than coerced or fatal: coercing would make
+/// `enabled = "false"` read as ON, and being fatal would cost the user their whole config layer
+/// over one typo (roborev 54240).
+///
+/// Returns the user-facing warnings, which have to be handed back rather than logged: a rejected
+/// value never enters the config, so nothing downstream — `validate` included — can rediscover it,
+/// and a line the user deliberately wrote that silently does nothing is the worst outcome of the
+/// three. Same contract as `apply_concierge` / `apply_plugins`.
+#[must_use]
+fn apply_pushers(into: &mut PushersConfig, p: Option<PartialPushers>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    // THE KILL SWITCH READS UNAMBIGUOUS OFF-SPELLINGS, and this is the one exception to the
+    // drop-a-wrong-type rule above (roborev 56226).
+    //
+    // `enabled` is the ONLY control a user has over a feature that ships ON and attaches to every
+    // build agent at birth. Dropping `enabled = "false"` with a warning left Pushers RUNNING, and
+    // the sole signal that the edit did nothing is a string in the ⋯ Advanced panel — not somewhere
+    // the person who just hand-edited the TOML is necessarily looking. Failing open on the off
+    // switch is the one direction that cannot be recovered by the user noticing later.
+    //
+    // This is NOT the coercion the header warns against. The hazard there is reading a string as
+    // truthy and turning `"false"` into ON; recognising the spellings that unambiguously mean OFF
+    // moves in the opposite, safe direction. Anything without a defensible off-reading still warns
+    // and still has no effect, so the default is never flipped by a typo — only by an intent.
+    // Mirrors `readsAsOff` in `packages/core/pusherPolicy.ts`; the TS half cannot see these values
+    // unless this layer passes them through, which is why the fix has to live here too.
+    if let Some(v) = p.enabled {
+        let off = match &v {
+            toml::Value::Boolean(false) => true,
+            toml::Value::Integer(0) => true,
+            toml::Value::String(s) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "off" | "no" | "0")
+            }
+            _ => false,
+        };
+        if off {
+            into.enabled = false;
+        } else {
+            match v.as_bool() {
+                Some(b) => into.enabled = b,
+                None => warnings.push(format!(
+                    "[pushers].enabled is a {}, not true or false, so it has no effect — Pushers \
+                     are still running. Use `enabled = false` to stop them.",
+                    v.type_str()
+                )),
+            }
+        }
+    }
+    // The three integers share a reader so a new numeric knob cannot pick up different wrong-type
+    // wording by accident. Kept VERBATIM when it reads — out-of-range values are `validate`'s job to
+    // report, never this function's to rewrite (see the note there).
+    let mut int_field = |field: &str, v: Option<toml::Value>, into: &mut i64| {
+        let Some(v) = v else { return };
+        match v.as_integer() {
+            Some(n) => *into = n,
+            None => warnings.push(format!(
+                "[pushers].{field} is a {}, not a whole number, so it has no effect",
+                v.type_str()
+            )),
+        }
+    };
+    int_field("observe_interval_ms", p.observe_interval_ms, &mut into.observe_interval_ms);
+    int_field("messages_per_hour", p.messages_per_hour, &mut into.messages_per_hour);
+    int_field("inbox_yield_pct", p.inbox_yield_pct, &mut into.inbox_yield_pct);
+
+    if let Some(v) = p.model {
+        match v.as_str() {
+            // Kept verbatim, unrecognized ids included: the model list is not authoritative here,
+            // and narrowing it would reject a model released after this build.
+            Some(s) => into.model = s.to_string(),
+            None => warnings.push(format!(
+                "[pushers].model is a {}, not text, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    for (field, _) in p.rest {
+        warnings.push(format!(
+            "[pushers].{field} is not a Pusher setting (enabled, observe_interval_ms, \
+             messages_per_hour, inbox_yield_pct, model), so it has no effect"
+        ));
+    }
+    warnings
 }
 
 fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
@@ -2442,6 +2637,40 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
              spelling against the [plugins] block in your config file"
         ));
     }
+    // `[pushers]` is WARNED ABOUT AND NEVER REWRITTEN. Deliberate, and the same discipline the
+    // `[concierge.checks].threshold` rule above follows: the number is the user's, and the
+    // TypeScript resolver (`resolvePusherPolicy`) already clamps every one of these into a safe
+    // range before anything acts on it. Rewriting here would additionally make the value the
+    // ⋯-menu shows disagree with the value in the file the user hand-edited — the standing-rewrite
+    // failure that bit `max_concurrent = 20` (roborev 53140).
+    let pu = &cfg.pushers;
+    if pu.messages_per_hour <= 0 {
+        warnings.push(format!(
+            "[pushers].messages_per_hour is {}, so a Pusher can never send anything; set it to a \
+             positive number, or use enabled = false if that is what you meant",
+            pu.messages_per_hour
+        ));
+    }
+    // A percentage, so anything outside 1..=100 is a typo rather than a preference: 0 (or less)
+    // means "yield on an empty inbox", i.e. never send, and above 100 is unreachable, i.e. never
+    // yield. Both read as a working line and do something the user did not ask for.
+    if pu.inbox_yield_pct < 1 || pu.inbox_yield_pct > 100 {
+        warnings.push(format!(
+            "[pushers].inbox_yield_pct is {}, which is not a percentage between 1 and 100; \
+             Sparkle will clamp it to the shipped ceiling until it is fixed",
+            pu.inbox_yield_pct
+        ));
+    }
+    // The only term that can make a fleet of Pushers expensive is how OFTEN they observe — the size
+    // of one observation is already hard-capped. A few-second interval would multiply the whole
+    // fleet's spend by orders of magnitude and nothing about it looks wrong in the file.
+    if pu.observe_interval_ms < 60_000 {
+        warnings.push(format!(
+            "[pushers].observe_interval_ms is {}, which is under the one-minute floor; observing \
+             that often multiplies what every Pusher costs, so Sparkle will use 60000",
+            pu.observe_interval_ms
+        ));
+    }
     // Incoherent if a build would be blocked before staleness is even warned about.
     let f = &cfg.freshness;
     if f.stale_build_block_commits < f.staleness_warn_commits {
@@ -2490,6 +2719,9 @@ fn build_effective(
                 // Extended immediately rather than collected like `rejected_plugins`: `[concierge]`
                 // is global-only, so there is no second layer whose warnings could interleave.
                 warnings.extend(apply_concierge(&mut cfg.concierge, p.concierge));
+                // Extended immediately for the same reason as [concierge]: [pushers] is global-only,
+                // so there is no second layer whose warnings could interleave with these.
+                warnings.extend(apply_pushers(&mut cfg.pushers, p.pushers));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -2594,6 +2826,19 @@ fn build_effective(
                          its replies, are not something a repo gets to set; set them in the global \
                          config.toml (the tools half is also editable in ⋯ Settings → \"Concierge \
                          tools\")"
+                            .to_string(),
+                    );
+                }
+                // The same boundary [concierge] draws, for the same kind of reason: [pushers]
+                // decides how often the agents on THIS machine get interrupted and challenged, and
+                // how much they may be spent on doing it. A repo could otherwise crank its own
+                // Pushers up — or switch them off — merely by being cloned with a block in its
+                // checked-in config, on a machine whose owner never asked for either.
+                if p.pushers.is_some() {
+                    warnings.push(
+                        "[pushers] in a per-project .sparkle/config.toml is ignored — how much \
+                         Sparkle challenges the agents on YOUR machine is a machine-wide setting, \
+                         not something a repo gets to set; set it in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -3094,6 +3339,26 @@ threshold = 200
 [concierge.checks.naked-file-ref]
 enabled   = true
 severity  = "warn"
+
+# --- The Pusher (per-machine; ignored in a project file) --------------------------------
+# A Pusher is the adversarial half of a pair: it watches one of your build agents and may send it
+# a few CITED challenges an hour — "you claimed the suite is green; the last run you posted was
+# red" — rather than doing any work itself. This section is how you turn that down.
+#
+# Ships ON. That is a deliberate choice over the safer default: at this level of autonomy the worst
+# case of a misfiring trigger is noise, not a damaged worktree — and messages_per_hour is what
+# bounds how much noise "noise" can be. Set enabled = false to switch every Pusher off.
+#
+# CEILINGS, NOT DIALS: messages_per_hour and inbox_yield_pct are clamped against Sparkle's own
+# built-in limits, so a number here can only make a Pusher QUIETER. Raising one past the built-in
+# does nothing. (Same rule [workers] max_concurrent follows.)
+# Out-of-range values are reported and never rewritten in your file.
+[pushers]
+enabled             = true    # master switch — false stops every Pusher from observing or sending
+observe_interval_ms = 300000  # ms between observation cycles for one partner (5 min). Floor: 60000
+messages_per_hour   = 4       # challenges per partner per rolling hour. Ceiling only — lower it, never raise
+inbox_yield_pct     = 80      # if the partner's inbox is this % full or more, the Pusher stays quiet
+model               = "claude-haiku-4-5"  # a Pusher composes on the cheap model; one cited sentence out
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -6284,6 +6549,147 @@ tools = "allow"
             msg.contains("tools half"),
             "and must scope the pane pointer to the half it covers: {msg}"
         );
+    }
+
+    // --- [pushers] — the Pusher's operating envelope -----------------------------------------
+
+    #[test]
+    fn pushers_ship_enabled_by_default_with_no_config_file() {
+        // LITERAL expectations, never read back off PushersConfig::default() — an assertion derived
+        // from the table under test passes whatever that table says, including after someone
+        // flips the founder's on-by-default to off.
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!hard);
+        let p = &cfg.pushers;
+        assert!(p.enabled, "the founder's decision: Pushers ship ON, over the fail-safe default");
+        assert_eq!(p.observe_interval_ms, 300_000, "five minutes, the costed interval");
+        assert_eq!(p.messages_per_hour, 4);
+        assert_eq!(p.inbox_yield_pct, 80);
+        assert_eq!(p.model, "claude-haiku-4-5");
+        assert!(
+            !warns.iter().any(|w| w.contains("[pushers]")),
+            "the shipped envelope must load clean: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn pushers_template_matches_the_default() {
+        // Same trap avoided the same way as `concierge_checks_template_matches_the_default`:
+        // overlaying the template onto SparkleConfig::default() would pass even with the [pushers]
+        // block MISSING from the template, because the base already holds the values. So WIPE the
+        // section to something no default could be — then this equality can only hold if the
+        // template really writes every field.
+        let mut base = SparkleConfig::default();
+        base.pushers = PushersConfig {
+            enabled: false,
+            observe_interval_ms: 1,
+            messages_per_hour: 999,
+            inbox_yield_pct: 3,
+            model: "wiped".to_string(),
+        };
+        let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert_eq!(
+            cfg.pushers,
+            SparkleConfig::default().pushers,
+            "DEFAULT_TEMPLATE's [pushers] disagrees with SparkleConfig::default() — the bug class \
+             that already bit [approvals].bash"
+        );
+        // And it ships LIVE, not commented out: this section is the only place a human can turn a
+        // misfiring Pusher down, so there has to be something in the file to edit.
+        assert!(DEFAULT_TEMPLATE.contains("\n[pushers]\n"), "the block must ship uncommented");
+    }
+
+    #[test]
+    fn a_pushers_edit_lands_and_leaves_its_siblings_alone() {
+        // The one-line edit the section exists for — "this is too noisy" — must not silently reset
+        // the interval or the model on its way through. Per-FIELD merge, not section replacement.
+        let g = "[pushers]\nmessages_per_hour = 1\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let p = &cfg.pushers;
+        assert_eq!(p.messages_per_hour, 1, "the edit must take effect");
+        assert_eq!(p.observe_interval_ms, 300_000, "an unmentioned sibling keeps its shipped value");
+        assert_eq!(p.inbox_yield_pct, 80, "and so does this one");
+        assert_eq!(p.model, "claude-haiku-4-5", "and the model");
+        assert!(p.enabled, "lowering the budget is a different edit from switching Pushers off");
+        assert!(warns.is_empty(), "a valid edit warns about nothing: {warns:?}");
+    }
+
+    #[test]
+    fn a_wrong_typed_pushers_value_is_dropped_with_a_warning_and_costs_nothing_else() {
+        // roborev 54240's lesson applied to [pushers]: with strongly-typed fields any ONE of these
+        // lines fails the WHOLE-FILE parse, discarding the entire global layer so every unrelated
+        // setting silently reverts. Each bad value must cost exactly itself.
+        let g = r#"
+[workflow]
+require_pr = false
+
+[pushers]
+enabled = "yes"
+messages_per_hour = "two"
+inbox_yield_pct = 25
+model = 42
+mesages_per_hour = 9
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a wrong-typed Pusher knob must never be a hard error");
+        // The unrelated setting in the same file survived — the whole point.
+        assert!(!cfg.workflow.require_pr, "an unrelated section must still apply");
+        let p = &cfg.pushers;
+        assert!(p.enabled, "a non-bool master switch is dropped, so the shipped `true` stands");
+        assert_eq!(p.messages_per_hour, 4, "the bad budget was dropped, not coerced");
+        assert_eq!(p.model, "claude-haiku-4-5", "the bad model was dropped, not stringified");
+        assert_eq!(p.inbox_yield_pct, 25, "the GOOD field in the same table still applied");
+        // Every dropped line is REPORTED — including the misspelling, which would otherwise parse,
+        // apply nothing, and say nothing while the Pusher kept its shipped rate.
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("[pushers].enabled is a string"), "master switch: {warns:?}");
+        assert!(said("[pushers].messages_per_hour is a string"), "budget: {warns:?}");
+        assert!(said("[pushers].model is a integer"), "model: {warns:?}");
+        assert!(said("[pushers].mesages_per_hour is not a Pusher setting"), "typo: {warns:?}");
+    }
+
+    #[test]
+    fn an_out_of_range_pushers_value_is_reported_and_never_rewritten() {
+        // WARN ONLY. The number stays the user's: the TypeScript resolver already clamps every one
+        // of these before anything acts on it, and rewriting the merged config here would be the
+        // standing rewrite that made `max_concurrent = 20` unsettable (roborev 53140) — the ⋯-menu
+        // would show a value the file does not contain.
+        let g = "[pushers]\nmessages_per_hour = 0\ninbox_yield_pct = 0\nobserve_interval_ms = 5000\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.pushers.messages_per_hour, 0, "kept — warned about, not rewritten");
+        assert_eq!(cfg.pushers.inbox_yield_pct, 0, "kept");
+        assert_eq!(cfg.pushers.observe_interval_ms, 5000, "kept");
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("[pushers].messages_per_hour is 0"), "budget: {warns:?}");
+        assert!(said("[pushers].inbox_yield_pct is 0"), "percentage: {warns:?}");
+        assert!(said("[pushers].observe_interval_ms is 5000"), "interval: {warns:?}");
+        // In-range values are silent, so the warnings above mean something.
+        let (_, quiet, _) = effective(
+            Some("[pushers]\nmessages_per_hour = 2\ninbox_yield_pct = 100\nobserve_interval_ms = 60000\n"),
+            None,
+        );
+        assert!(quiet.is_empty(), "a usable envelope warns about nothing: {quiet:?}");
+    }
+
+    #[test]
+    fn pushers_in_a_project_file_cannot_override_the_global_envelope() {
+        // The boundary [concierge] already draws, for a related reason: how often the agents on
+        // this machine get interrupted — and how much is spent doing it — is the machine owner's
+        // call, not a property of a repo that happens to be cloned onto it.
+        let p = "[pushers]\nenabled = false\nmessages_per_hour = 99\nmodel = \"repo-choice\"\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        assert!(cfg.pushers.enabled, "a repo must not be able to switch this machine's Pushers off");
+        assert_eq!(cfg.pushers.messages_per_hour, 4, "nor crank the budget up");
+        assert_eq!(cfg.pushers.model, "claude-haiku-4-5", "nor pick what they compose on");
+        let msg = warns
+            .iter()
+            .find(|w| w.contains("[pushers]"))
+            .expect("the user must be told their project rules were ignored");
+        assert!(msg.contains("global config.toml"), "the remedy must name the file: {msg}");
     }
 
     #[test]

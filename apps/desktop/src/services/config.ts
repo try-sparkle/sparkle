@@ -4,6 +4,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+// RE-EXPORTED, not re-declared. `packages/core/pusherPolicy.ts` already owns the `[pushers]` wire
+// shape because it owns the thing that resolves it (`resolvePusherPolicy`), and a second copy here
+// would be a type that can silently disagree with the only code that reads it. Its fields are typed
+// `unknown` on purpose — this is what a HAND-EDITED TOML table can hold, and Rust forwards a
+// wrong-typed value's absence rather than a corrected one.
+import type { PushersConfigPayload } from "@sparkle/core";
+export type { PushersConfigPayload };
+
 export interface DriftConfig {
   behind_nudge: number;
   ahead_nudge: number;
@@ -220,6 +228,11 @@ export interface SparkleConfig {
    *  An absent section means "no explicit rules", which is a perfectly good state — every tool
    *  then sits on the default derived from its risk class. */
   concierge?: ConciergeConfig;
+  /** The Pusher's operating envelope. Optional for the same back-compat reason as
+   *  `tools?`/`concierge?` above: a payload from a Rust backend predating [pushers] omits it.
+   *  An absent section is NOT "Pushers are on with the shipped defaults" — `resolvePusherPolicy`
+   *  reads it as DISABLED, because a backend with no [pushers] concept cannot be running one. */
+  pushers?: PushersConfigPayload;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */
