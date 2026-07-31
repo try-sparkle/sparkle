@@ -512,7 +512,7 @@ describe("release sends immediately, and sends everything", () => {
     expect(mic()).toEqual({ enabled: true, phase: "passive" });
   });
 
-  it("UNMOUNTING mid-settle cancels the send AND puts the mic back to armed", () => {
+  it("UNMOUNTING mid-settle cancels the send AND puts the mic back to armed", async () => {
     // The same half, reached by TEARDOWN rather than by focus. ConciergeHost unmounts whenever no
     // project is open (App.tsx), so closing the project inside the settle cap detached the two races
     // and left the mic LIVE AND ROUTING at a concierge box that had just stopped existing — and with
@@ -528,8 +528,65 @@ describe("release sends immediately, and sends everything", () => {
     expect(mic().phase).toBe("active"); // still hot: the phrase is still arriving
 
     act(() => view.unmount());
-    expect(h.startConciergeTurn).not.toHaveBeenCalled();
     expect(mic()).toEqual({ enabled: true, phase: "passive" });
+
+    // AND THE COMMIT RACE IS REALLY DETACHED, not merely unobservable. `startConciergeTurn` is the
+    // wrong witness here — the composer is gone, so the send cannot be seen from this level whether
+    // or not anything was cancelled, and asserting it never ran is vacuous (roborev 56110). The mic
+    // is the witness instead: park the tray at Send, whose intent RELEASES the mic, and then let the
+    // commit land. A subscription still attached runs `finish`, which re-reads the live position and
+    // would drop the mic to off; a cancelled one leaves it armed where the teardown put it.
+    //
+    // It witnesses `finish` RUNNING, which is what dispatches the send — not the send itself. The
+    // row below covers the other race the same way.
+    act(() => useUiStore.setState({ conciergeSendMode: "send" }));
+    await act(async () => {
+      useDictationStore.getState().setInterim("");
+      await new Promise((r) => setTimeout(r, 0));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    expect(mic()).toEqual({ enabled: true, phase: "passive" });
+  });
+
+  it("…and the SETTLE CAP is detached by that unmount too, not just the commit subscription", async () => {
+    // THE OTHER RACE. `settling.current` tears down two things — the interim subscription and the
+    // PARTIAL_SETTLE_CAP_MS backstop — and the row above only ever drives the first, under real
+    // timers that expire long after the test has ended (roborev 56117). So the cap gets its own row,
+    // with the interim left OUTSTANDING so the subscription cannot be what fires.
+    //
+    // IT PINS THE RACE, NOT EITHER LINE. The cap is guarded twice over — `wait.settled` makes
+    // `settle` a no-op and the `clearTimeout` stops it being called at all — so dropping either one
+    // alone leaves this green (measured, both ways). Dropping both turns it red: the mic reads
+    // `enabled: false`, which is `finish` having run and re-read the live position.
+    vi.useFakeTimers();
+    try {
+      const view = mount();
+      act(() => fireEvent.click(pill("ptt")));
+      type("ship the");
+      act(() => useDictationStore.getState().setInterim("staging"));
+      act(() => {
+        fireEvent.keyDown(window, { key: "Meta" });
+        fireEvent.keyUp(window, { key: "Meta" });
+      });
+      // A SETTLE IS ACTUALLY PENDING — the row's precondition, and without it the final assertion is
+      // indistinguishable from "no wait was ever entered": `micIntentForMode("ptt")` is `paused`, so
+      // clicking the pill alone already leaves the mic exactly where the last line looks for it. A
+      // hold that stopped engaging, or an `endHold` that stopped taking the wait branch, would
+      // schedule no cap timer at all and the row would pass proving nothing (roborev 56129).
+      expect(mic().phase).toBe("active");
+
+      act(() => view.unmount());
+      // Same witness as above, and the interim stays OUTSTANDING so the subscription cannot be what
+      // fires: the cap is the only race left that could run `finish`.
+      act(() => useUiStore.setState({ conciergeSendMode: "send" }));
+      await act(async () => {
+        vi.advanceTimersByTime(PARTIAL_SETTLE_CAP_MS + 10);
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+      expect(mic()).toEqual({ enabled: true, phase: "passive" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("SCROLLING while holding does not kill the gesture — you can read the thread and speak", () => {
