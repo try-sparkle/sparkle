@@ -21,6 +21,8 @@
 //      the row's own. ~20 review rounds died on that distinction, so the assertions below pin the
 //      construction (which corner the circle sits at, and which side is transparent) rather than
 //      just "there is a gradient".
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { C } from "../theme/colors";
@@ -76,6 +78,18 @@ function seed(selectedAgentId: string | null = null): Project {
     pollBranchStatus: vi.fn(() => Promise.resolve()),
   } as never);
   return project;
+}
+
+/** `rel` resolved against the nearest ancestor of the cwd that contains it — so the one test below
+ *  that reads a real file works whether the runner was started in `apps/desktop` or at the repo
+ *  root. Throws rather than returning a miss: a silently unread stylesheet would make its
+ *  assertions pass on an empty string. */
+function resolveFromRoot(rel: string): string {
+  for (let dir = process.cwd(); ; dir = dirname(dir)) {
+    const hit = join(dir, rel);
+    if (existsSync(hit)) return hit;
+    if (dirname(dir) === dir) throw new Error(`cannot find ${rel} above ${process.cwd()}`);
+  }
 }
 
 const rowFor = (name: string) =>
@@ -400,5 +414,91 @@ describe("Build column — the wired joint bridges the row into the concierge", 
     expect(box.marginLeft).toBe("-8px");
     expect(box.paddingLeft).toBe("18px");
     expect(boxOf(rowFor("Alpha"))).toEqual(box);
+  });
+});
+
+// ── THE COLUMN'S OWN HAIRLINE MIRRORS TOO ──────────────────────────────────────────────────────
+//
+// The row opening into the concierge is only half of it: the COLUMN draws a 1px `hairline` of its
+// own, one pixel inside the padding box, so the selected row's fill can paint over it and break the
+// rule exactly where the row bleeds through (see `sidebar-terminal-seam`'s note in AgentSidebar).
+// It marks this column's edge against ITS OWN TERMINAL — the boundary that is never erased.
+//
+// Which edge that is flips with the pair, and this element was the one anchor in the column that
+// never learned: `right: 0`, written when the only pair was the right one, where right IS the
+// terminal edge. The overlay anchor beside it and the pull-tab rail below it were both mirrored;
+// this was not. So a LEFT pair (`TERM │ BUILD │ CONCIERGE`) painted it on the CONCIERGE edge — a
+// full-height rule standing exactly where a mounted row runs through into the concierge, on the one
+// boundary `[data-wired]` exists to erase, while the terminal edge it was meant to mark got nothing.
+//
+// SCOPE, stated because jsdom cannot say otherwise: the OTHER half of that boundary is the column's
+// `border-inline` in index.css, whose `[data-wired]` rule turns it transparent. No stylesheet is
+// applied here, so these assertions cover the inline seam — the half that lives in the component and
+// the half that ships wrong.
+describe("Build column — the terminal seam is drawn on the pane side, not always on the right", () => {
+  const seam = () => screen.getByTestId("sidebar-terminal-seam");
+
+  it("keeps the hairline off a wired LEFT pair's concierge edge", () => {
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    useCableStore.getState().patch("left");
+    render(<AgentSidebar project={seed("a1")} />);
+
+    // The joint mouth names the concierge end — right, for a left pair. The seam must be on the
+    // other one, or it crosses the very end the mount just opened.
+    const jointEnd = rowFor("Alpha").querySelector<HTMLElement>('[data-testid="row-joint-top"]')!;
+    expect(jointEnd.style.right).toBe("0px");
+    expect(seam().style.right).toBe("");
+    expect(seam().style.left).toBe("0px");
+  });
+
+  it("still draws it on the right for a right pair, where right IS the terminal edge", () => {
+    useCableStore.getState().patch("right");
+    render(<AgentSidebar project={seed("a1")} />);
+    expect(seam().style.right).toBe("0px");
+    expect(seam().style.left).toBe("");
+  });
+
+  // THE OTHER HALF OF THE SAME BOUNDARY, and the half that cannot be seen from this file alone.
+  // index.css owns the column's border: `border-inline: none`, one border on the CONCIERGE side per
+  // pair, and a `[data-wired]` rule that turns THAT LONGHAND transparent when the cable is patched
+  // in. An inline declaration of the property outranks every selector, so an inline border here is
+  // not a harmless duplicate — it deletes the mechanism. `borderRight: "none"` shipped on this
+  // column and did exactly that to the left pair, whose concierge edge is its right: no seam
+  // unplugged, and nothing left for the wired rule to erase plugged in.
+  //
+  // BOTH SIDES ARE READ FROM DISK, not restated here, so the stylesheet and the component cannot
+  // drift into agreeing only on paper. And the component side has to be read as SOURCE rather than
+  // rendered, which is the one thing worth saying out loud: jsdom's CSS engine DISCARDS
+  // `border-right: none` outright — the style attribute comes back `"display: flex;"` and
+  // `el.style.borderRight` is `""`, identical to never having set it. So the shipped bug is
+  // literally unobservable through the DOM, and a render-based assertion here would pass against
+  // the broken code (it did — that draft was thrown away). Reading the declaration is the only
+  // instrument that can fail for the stated reason.
+  it("declares no border inline, or the wired rule in index.css cannot erase the concierge edge", () => {
+    const css = readFileSync(resolveFromRoot("src/index.css"), "utf8");
+    const wiredRules = [
+      ...css.matchAll(
+        /\.shell\[data-wired="(?:left|right)"\][^{]*agent-sidebar-column"\]\s*\{([^}]*)\}/g,
+      ),
+    ].map(([, body]) => body);
+    // Both pairs, or the assertion below guards a mechanism that isn't there.
+    expect(wiredRules).toHaveLength(2);
+    const erased = wiredRules.join(" ");
+    expect(erased).toContain("border-right-color: transparent");
+    expect(erased).toContain("border-left-color: transparent");
+
+    // The column's own JSX, from its testid down to the seam element that closes the style object.
+    const src = readFileSync(resolveFromRoot("src/components/AgentSidebar.tsx"), "utf8");
+    const from = src.indexOf('data-testid="agent-sidebar-column"');
+    const to = src.indexOf('data-testid="sidebar-terminal-seam"');
+    expect(from, "column testid").toBeGreaterThan(-1);
+    expect(to, "seam testid, after the column's").toBeGreaterThan(from);
+    const declarations = src
+      .slice(from, to)
+      .split("\n")
+      .map((line) => line.trim())
+      // Prose about the bug names the property; only real declarations count.
+      .filter((line) => !line.startsWith("//") && !line.startsWith("*") && !line.startsWith("/*"));
+    expect(declarations.filter((line) => /^border[A-Za-z]*\s*:/.test(line))).toEqual([]);
   });
 });

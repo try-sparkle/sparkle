@@ -589,12 +589,15 @@ describe("previewDiscard", () => {
     const r = previewDiscard(parent);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.data.targets.map((t) => t.agentId)).toEqual([parent, w1, w2]);
-    expect(r.data.childAgentIds).toEqual([w1, w2]);
+    // Parent first, then its children in the order the COLUMN shows them — `project.agents` order,
+    // which `addAgent` builds newest-first (it inserts at the front). So `w2`, seeded after `w1`,
+    // is listed above it: the preview enumerates what the user is looking at, not seed order.
+    expect(r.data.targets.map((t) => t.agentId)).toEqual([parent, w2, w1]);
+    expect(r.data.childAgentIds).toEqual([w2, w1]);
     expect(r.data.branches).toEqual([
       `sparkle/agent-${parent}`,
-      `sparkle/agent-${w1}`,
       `sparkle/agent-${w2}`,
+      `sparkle/agent-${w1}`,
     ]);
     expect(r.data.beadIds).toEqual(["bd-parent", "bd-w1"]); // w2 has none
     expect(r.data.anyUnmerged).toBe(true);

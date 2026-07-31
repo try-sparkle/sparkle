@@ -1161,7 +1161,7 @@ describe("agent_landed_check", () => {
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.data).toMatchObject({ verdict: "landed", where: "origin-default", basis: "ancestry" });
     // Local refs only — no PR/CI probe is needed to answer "did this reach main".
-    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "a1", "", false);
+    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "a1", "", false, "p1");
   });
 
   it("says 'local only' when the work is in the local default but not confirmed on origin", async () => {
@@ -1251,7 +1251,7 @@ describe("read-only passthroughs", () => {
   it("returns workflow state, passing the worker's parent branch through", async () => {
     m.agentWorkflowState.mockResolvedValue({ inLocalMain: false, inOriginMain: false, inParent: false, aheadOfBase: 0, prState: null, prNumber: null, prUrl: null });
     await agentWorkflowStateTool(worker, { probeGitHub: true });
-    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "w1", "sparkle/agent-a1", true);
+    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "w1", "sparkle/agent-a1", true, "p1");
   });
 
   it("returns the project roster status", async () => {
@@ -1489,7 +1489,7 @@ describe("agent_landed_check knows a worker's integration target", () => {
       expect(r.data).toMatchObject({ verdict: "landed", where: "parent-branch", basis: "ancestry" });
       expect(r.data.caveat).toMatch(/default branch/i);
     }
-    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "w1", "sparkle/agent-a1", false);
+    expect(m.agentWorkflowState).toHaveBeenCalledWith("/repo", "w1", "sparkle/agent-a1", false, "p1");
   });
 
   it("prefers the default branch when the work reached BOTH", async () => {

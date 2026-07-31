@@ -848,7 +848,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           // A worker integrates into its orchestrator's branch; everyone else, into project main.
           const parentBranch =
             agent.kind === "worker" && agent.parentId ? `sparkle/agent-${agent.parentId}` : "";
-          const ws = await agentWorkflowState(root, agentId, parentBranch, true);
+          const ws = await agentWorkflowState(root, agentId, parentBranch, true, projectId);
           // Derive stage + drive bead lifecycle + latch shipped ✓ (shared with pollProjectStatus).
           await applyWorkflowState(projectId, project.rootPath, agent, ws);
         } catch (e) {

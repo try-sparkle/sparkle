@@ -760,6 +760,37 @@ describe("controlListener", () => {
     expect(agent.namePinned).toBe(false);
   });
 
+  it("rename_agent decodes an HTML-escaped ampersand out of a model-authored name", async () => {
+    // The reported ladder defect: a worker meaning "Pane Mounting & Resize Perf" emitted the
+    // ESCAPED form in its tool arguments, and the app stored it verbatim, so every surface rendered
+    // the entity as literal text. The app is not the escaper (other agents' names carry a raw `&`
+    // and are fine) — so the fix is to normalize what arrives. Asserting the STORED name, which is
+    // what every reader downstream sees, not the return value.
+    fire({
+      reqId: "amp1",
+      op: "rename_agent",
+      callerAgentId: callerId,
+      payload: { name: "Pane Mounting &amp; Resize Perf" },
+    });
+    await flush();
+    expect(lastReply()).toEqual({ ok: true });
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
+    expect(agent.name).toBe("Pane Mounting & Resize Perf");
+  });
+
+  it("rename_agent leaves a raw ampersand untouched", async () => {
+    // The other half: normalization must not disturb the names that were already correct.
+    fire({
+      reqId: "amp2",
+      op: "rename_agent",
+      callerAgentId: callerId,
+      payload: { name: "Spider Chart & Live Task" },
+    });
+    await flush();
+    const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
+    expect(agent.name).toBe("Spider Chart & Live Task");
+  });
+
   it("rename_agent does NOT re-pin after the human unpins (sparkle-pel7)", async () => {
     // Agent self-names → the human releases any pin → the agent self-names AGAIN. The row must stay
     // unpinned throughout: the second self-name must not resurrect namePinned.

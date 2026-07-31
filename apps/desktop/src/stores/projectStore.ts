@@ -36,6 +36,7 @@ import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 import { useUiStore } from "./uiStore";
 import { openProjectsOf } from "../engine/openProjects";
+import { normalizeAgentName } from "../engine/decodeEntities";
 
 // Cap on how many prompts we keep per agent so the persisted localStorage record stays bounded.
 // The oldest entries fall off; the most recent PROMPT_HISTORY_LIMIT are kept — PER SOURCE (see
@@ -502,11 +503,25 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
   // non-optional type. Normalize all three fields unconditionally (idempotent `??` no-ops on
   // records that already have them) so every agent satisfies its type regardless of which branch's
   // version number it was saved under.
+  //
+  // HEAL NAMES ALREADY WRITTEN ESCAPED. The ingest normalizers (selfNameAgent via the control
+  // listener, autoRenameAgent, applyAiTitle) stop NEW escaped names, but they cannot touch the ones
+  // already sitting in localStorage — and the reported case ("Pane Mounting &amp; Resize Perf") is
+  // exactly one of those. Decoding here is idempotent and a no-op for every name without an entity
+  // in it, which is nearly all of them. Version-independent for the same reason as the fields
+  // above: a blob saved under any prior version can carry one.
   state.projects = state.projects.map((p) => ({
     ...p,
     agents: (p.agents ?? []).map((a) => ({
       ...a,
-      autoNameVariants: a.autoNameVariants ?? null,
+      name: typeof a.name === "string" ? normalizeAgentName(a.name) : a.name,
+      aiTitle: typeof a.aiTitle === "string" ? normalizeAgentName(a.aiTitle) : a.aiTitle,
+      autoNameVariants: a.autoNameVariants
+        ? {
+            title: normalizeAgentName(a.autoNameVariants.title),
+            description: normalizeAgentName(a.autoNameVariants.description),
+          }
+        : (a.autoNameVariants ?? null),
       promptHistory: a.promptHistory ?? [],
       shellCommand: (a as AgentTab).shellCommand ?? null,
       // NOTE: the v8 `pinnedIndex` backfill was dropped — the field no longer exists on AgentTab
@@ -1257,17 +1272,32 @@ export const useProjectStore = create<ProjectState>()(
               // and every consumer must treat "no stamp" as "age unknown" rather than "age zero".
               createdAt: opts?.createdAt ?? Date.now(),
             };
-            // A freshly-opened BUILD agent floats to the top of the non-alerting sidebar rows
-            // until a newer build agent is opened ("until you open a newer one" — the fresh slot
-            // is single-occupancy). Only build agents claim it; opening a worker/think agent must
-            // not steal the top build slot, so leave freshBuildAgentId untouched for those.
+            // ⚠️ `freshBuildAgentId` NO LONGER AFFECTS ROW POSITION. It used to mark the row that
+            // `FRESH_BUILD_RANK` floated to the top of the attention sort, and that whole sort was
+            // deleted on 2026-07-26 (see engine/agentOrdering's history note) — the field is still
+            // written and cross-window merged, but nothing reads it to place a row. "Newest at the
+            // top" is now a property of the ARRAY (see the prepend below), not of this flag. Left in
+            // place because it is persisted state other windows reconcile against; do not reach for
+            // it to order anything.
             const freshBuildAgentId = kind === "build" ? id : p.freshBuildAgentId;
             // opts.select === false leaves the selection EXACTLY as it was — including a null (or
             // absent) one, which is a deliberate deselect and not a hole for a machine-created agent
             // to fill. No condition, so the flag can't invert itself under state the caller can't
             // see. See AddAgentOpts.select.
             const selectedAgentId = opts?.select === false ? p.selectedAgentId : id;
-            return { ...p, agents: [...p.agents, agent], selectedAgentId, freshBuildAgentId };
+            // NEWEST FIRST. The ladder reads top→bottom as least-done→most-done: that is what the
+            // SECTIONS already say (uncommitted → committed → PR → merged → shipped), and this
+            // applies the same rule one level down, WITHIN a section. A brand-new agent is the
+            // least-done thing there is, so it belongs at the top — appending buried it at the
+            // bottom of "Local: Uncommitted", underneath every older agent sharing that rung.
+            //
+            // Done by INSERTING at the front rather than by sorting, and that is the whole design:
+            // `project.agents` order IS the rendered order (groupAgentsByStage buckets in input
+            // order), so the human's drag arrangement stays the override for free — `reorderAgent`
+            // rewrites this array, and nothing re-sorts it afterwards to undo them. A comparator
+            // would have had to carry a "has been manually moved" flag per row to avoid fighting
+            // the drag; position-as-state needs no such flag.
+            return { ...p, agents: [agent, ...p.agents], selectedAgentId, freshBuildAgentId };
           }),
         }));
         // Anonymous funnel telemetry — every agent/worker tab creation flows through here.
@@ -1542,14 +1572,30 @@ export const useProjectStore = create<ProjectState>()(
               // the old strict behavior: any existing title blocks them.
               a.namePinned || a.selfNamed || !name.trim() || (a.aiTitle ?? null) !== (seenAiTitle ?? null)
                 ? a
-                : { ...a, name: name.trim(), autoNameBasis: basis, autoNameVariants: autoName ?? null },
+                : {
+                    ...a,
+                    // Model-authored (the Haiku namer), so decode entities on the way in — see
+                    // engine/decodeEntities for why this is an ingest fix, not a render fix.
+                    name: normalizeAgentName(name.trim()),
+                    autoNameBasis: basis,
+                    // The hover description is model-authored too, and shows the same leak.
+                    autoNameVariants: autoName
+                      ? {
+                          title: normalizeAgentName(autoName.title),
+                          description: normalizeAgentName(autoName.description),
+                        }
+                      : null,
+                  },
             ),
           ),
         })),
 
       applyAiTitle: (projectId, agentId, title) =>
         set((s) => {
-          const t = title.trim();
+          // Claude Code's session title is model-authored, so it carries the same entity leak as a
+          // self-name. Decode BEFORE the `aiTitle === t` comparison below, so the stored title and
+          // the race-anchor stay the same string and the no-op check keeps working.
+          const t = normalizeAgentName(title.trim());
           if (!t) return s; // no title yet — leave the name as-is
           // Bail BEFORE touching state when there's nothing to change — a manual rename owns the
           // name, or this exact title is already applied. Returning `s` keeps the projects/agents
@@ -1898,7 +1944,13 @@ export const useProjectStore = create<ProjectState>()(
       // v11 backfills removedIds: {} — the shared removal tombstones the union merge needs
       // (sparkle-pckz). An older blob simply has no recorded deletions, which is the safe default:
       // the union keeps everything, and the first close in the new build starts the map.
-      version: 12,
+      // v13 decodes HTML entities out of already-persisted agent names / aiTitle / autoNameVariants
+      // ("Pane Mounting &amp; Resize Perf"). THE BUMP IS THE WHOLE FIX: zustand only calls `migrate`
+      // when the stored version differs from this number, so leaving it at 12 would have made the
+      // heal dead code on every existing install — which is exactly the population that has the
+      // escaped names. A test that calls `migratePersisted` directly passes either way, so it
+      // proves the function works, not that it ever runs.
+      version: 13,
       migrate: (persisted, version) =>
         perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
       // sparkle-pckz: a UNION merge, so no rehydrate (startup or cross-window) can evict a record

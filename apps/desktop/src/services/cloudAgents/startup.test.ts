@@ -53,9 +53,12 @@ describe("reattachProjectOnOpen", () => {
 
     await expect(reattachProjectOnOpen(pid)).resolves.toEqual(["sess-a", "sess-b"]);
     const agents = useProjectStore.getState().projects[0]!.agents;
-    expect(agents.map((a) => a.id)).toEqual(["sess-a", "sess-b"]);
+    // REVERSED against the order they were reattached in, and that is `addAgent`, not this module:
+    // it INSERTS at the front so the newest agent is the top row (projectStore.freshAgent.test.ts).
+    // The return value above is the reattach order; this is where those rows landed.
+    expect(agents.map((a) => a.id)).toEqual(["sess-b", "sess-a"]);
     expect(agents.every((a) => a.runtime === "cloud")).toBe(true);
-    expect(agents[0]!.name).toBe("Refactor");
+    expect(agents.find((a) => a.id === "sess-a")!.name).toBe("Refactor");
     expect(listSessions).toHaveBeenCalledWith("srv-1"); // keyed by the SERVER project id
   });
 
@@ -69,7 +72,8 @@ describe("reattachProjectOnOpen", () => {
 
     await expect(reattachProjectOnOpen(pid)).resolves.toEqual(["sess-new"]);
     const ids = useProjectStore.getState().projects[0]!.agents.map((a) => a.id);
-    expect(ids).toEqual(["sess-a", "sess-new"]);
+    // `sess-new` is the newer row, so `addAgent` puts it on top of the one that already existed.
+    expect(ids).toEqual(["sess-new", "sess-a"]);
 
     // Running it twice (a re-open, a second window) must not add anything either.
     await expect(reattachProjectOnOpen(pid)).resolves.toEqual([]);

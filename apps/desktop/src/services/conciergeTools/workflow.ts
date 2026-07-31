@@ -1124,7 +1124,16 @@ export async function agentWorkflowStateTool(
   const op = "agent_workflow_state";
   try {
     const parent = ctx.kind === "worker" && ctx.parentId ? agentBranchName(ctx.parentId) : "";
-    return ok(op, await agentWorkflowState(ctx.root, ctx.agentId, parent, opts.probeGitHub === true));
+    return ok(
+      op,
+      await agentWorkflowState(
+        ctx.root,
+        ctx.agentId,
+        parent,
+        opts.probeGitHub === true,
+        ctx.projectId,
+      ),
+    );
   } catch (e) {
     return failed(op, "unknown-error", errText(e));
   }
@@ -1456,7 +1465,7 @@ export async function agentLandedCheckTool(
     const parent = ctx.kind === "worker" && ctx.parentId ? agentBranchName(ctx.parentId) : "";
     // probePrState=false: this question is answered from local refs. A PR probe would add network
     // latency and a state ("merged") that is NOT the same fact as containment.
-    s = await agentWorkflowState(ctx.root, ctx.agentId, parent, false);
+    s = await agentWorkflowState(ctx.root, ctx.agentId, parent, false, ctx.projectId);
   } catch (e) {
     return ok(op, {
       verdict: "unknown",

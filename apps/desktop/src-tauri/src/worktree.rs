@@ -2368,6 +2368,98 @@ fn worktree_head_branch(wt_str: &str, exists: bool) -> String {
     }
 }
 
+/// Does `refs/heads/<branch>` exist in this repo?
+fn local_branch_exists(root: &str, branch: &str) -> bool {
+    !branch.trim().is_empty()
+        && git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// The branch a status/workflow probe must REPORT ON for an agent, plus whether the agent's
+/// worktree is actually sitting on it.
+///
+/// WHY THIS IS NOT JUST `format!("sparkle/agent-{id}")` (the ladder's false "Unsaved" rung).
+/// Every read path used to mint the branch name from the agent id and stop there. An agent that
+/// RENAMES its working branch — which AGENTS.md now actively encourages, because a descriptive
+/// name resolves better and `pr_owner` no longer needs the id — leaves no `sparkle/agent-<id>` ref
+/// behind. `rev-parse` then misses, the probe returns the zeroed "no branch yet" status
+/// (`ahead: 0`), and `gitDerivedStage` reads `ahead == 0` as `building_unsaved`. So a worktree with
+/// a SPOTLESS tree and ten committed-but-unpushed commits filed itself under "Local: Uncommitted"
+/// with an 'Unsaved' badge — telling the user their work is one close away from being lost when it
+/// was safely committed the whole time. It also dropped such a parent BELOW its own workers on the
+/// ladder, since the workers' own branches still resolved.
+///
+/// The resolution order below is deliberately conservative — it changes the answer ONLY in the case
+/// that was previously unanswerable, and leaves the parked-worktree contract (sparkle-rhgm) exactly
+/// as it was:
+///   1. The tree is on the minted branch — the overwhelmingly common case. Unchanged.
+///   2. The minted ref EXISTS but the tree is elsewhere — the PARKED case. Keep reporting the
+///      minted branch with `worktree_on_branch: false`, so `dirty` stays attributable to whatever
+///      got checked out and every consumer's existing filtering still applies.
+///   3. The minted ref is GONE and the tree is on some other branch — the RENAME. Report on the
+///      branch the work is actually on. `worktree_on_branch` is true because it genuinely is.
+///   4. Anything else (fresh agent, no worktree, detached HEAD, parked on the base branch with its
+///      own ref already deleted) — fall back to the minted name and let the existing
+///      "branch doesn't exist" guards return the zeroed status, as before.
+///
+/// `base` is the integration base (`main`, `origin/main`, `develop`, …); an `origin/` prefix is
+/// stripped before comparing. Case 4's base check is what stops a tree parked on `main` from
+/// reporting `main`'s ahead/behind as the agent's own work.
+/// `head` is the worktree's current HEAD branch (`worktree_head_branch`), passed IN rather than
+/// re-read: every caller already has it, and re-reading would spawn a second `git rev-parse` per
+/// agent per poll — undoing half of the sparkle-zlic batch saving.
+fn resolve_agent_branch(root: &str, head: &str, agent_id: &str, base: &str) -> (String, bool) {
+    let minted = format!("sparkle/agent-{agent_id}");
+    if head == minted {
+        return (minted, true);
+    }
+    if local_branch_exists(root, &minted) {
+        return (minted, false);
+    }
+    let base_name = base.strip_prefix("origin/").unwrap_or(base);
+    // Never adopt ANOTHER agent's minted branch: a worktree parked on `sparkle/agent-<other>` would
+    // otherwise report that agent's commits as this one's. Unknown beats wrong-but-confident.
+    let is_other_agents = head.starts_with("sparkle/agent-") && head != minted;
+    if !head.is_empty() && head != base_name && !is_other_agents {
+        return (head.to_string(), true);
+    }
+    (minted, false)
+}
+
+/// Resolve the PARENT (orchestrator) branch a worker integrates into.
+///
+/// The frontend mints this as `sparkle/agent-<parentId>`, so it has exactly the same blind spot the
+/// agent's own branch had — and a worse consequence. `workflow_state_shared` computes
+/// `in_parent = ref_contains(root, parent_branch, tip)`, and `ref_contains` on a ref that does not
+/// exist is `false`. So the moment an ORCHESTRATOR renames its branch, every one of its workers
+/// reports `inParent: false`, `agent_landed_check` loses its `where: "parent-branch"` verdict, and a
+/// worker whose work demonstrably merged into its parent is told it has not landed. A confidently
+/// wrong "not landed" is worse than an unknown, and renaming is the behaviour this change is
+/// enabling.
+///
+/// Self-contained in Rust (no frontend change): if the passed ref resolves, use it. Otherwise, if it
+/// carries the minted shape, recover the parent's agent id and resolve THAT agent's worktree the
+/// same way `resolve_agent_branch` does. Falls back to the name as given, so a parent whose worktree
+/// is gone behaves exactly as it does today.
+fn resolve_parent_branch(
+    root: &str,
+    app_data: &Path,
+    project_id: &str,
+    parent_branch: &str,
+    base: &str,
+) -> String {
+    if parent_branch.trim().is_empty() || local_branch_exists(root, parent_branch) {
+        return parent_branch.to_string();
+    }
+    let Some(parent_id) = parent_branch.strip_prefix("sparkle/agent-") else {
+        return parent_branch.to_string();
+    };
+    let Ok(wt) = worktree_path(app_data, project_id, parent_id) else {
+        return parent_branch.to_string();
+    };
+    let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
+    resolve_agent_branch(root, &head, parent_id, base).0
+}
+
 /// RECORD which branch an agent is working on, whatever it is called.
 ///
 /// This is what resolves a PR back to its agent when the branch name embeds no id — the case
@@ -2400,7 +2492,6 @@ pub fn agent_branch_status_at(
     base_branch: &str,
     app_data: &Path,
 ) -> Result<BranchStatus, String> {
-    let branch = format!("sparkle/agent-{agent_id}");
     let base = effective_base(root, base_branch, false); // status never hits the network
     let wt = worktree_path(app_data, project_id, agent_id)?;
     let wt_str = wt.to_string_lossy().to_string();
@@ -2410,8 +2501,12 @@ pub fn agent_branch_status_at(
     // does it too). If it has, the tree there belongs to a DIFFERENT branch, so its dirt is not
     // this branch's dirt. A missing tree is not a mismatch — that case is handled below and has
     // its own long-standing meaning.
+    // Resolve the branch we report on from the tree, not from the id alone — a renamed branch has
+    // no `sparkle/agent-<id>` ref and used to read as a zeroed (⇒ "Unsaved") status. See
+    // `resolve_agent_branch` for the full ordering and why the parked case is unaffected.
     let head_branch = worktree_head_branch(&wt_str, wt.exists());
-    let worktree_on_branch = head_branch == branch;
+    let (branch, worktree_on_branch) =
+        resolve_agent_branch(root, &head_branch, agent_id, &base);
     observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
 
     // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
@@ -3642,13 +3737,46 @@ pub async fn prewarm_spawn(root: String) {
 /// Core (AppHandle-free, testable): the agent's land-to-green workflow state. `parent_branch` is
 /// the orchestrator's branch for workers (empty/None for others). `probe_pr_state` gates the gh
 /// network probe so a pure-local project (or a fast poll) can skip it entirely.
+/// Production callers go through `agent_workflow_state_in` (they know the worktree); this
+/// worktree-less form is kept for the test suite, which drives repos directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn agent_workflow_state_at(
     root: &str,
     agent_id: &str,
     parent_branch: &str,
     probe_pr_state: bool,
 ) -> Result<WorkflowState, String> {
-    let branch = format!("sparkle/agent-{agent_id}");
+    agent_workflow_state_in(root, agent_id, parent_branch, probe_pr_state, None)
+}
+
+/// As `agent_workflow_state_at`, but the caller may supply `(app_data, project_id)` so the agent's
+/// worktree — and its PARENT's — can be located, which is what lets a RENAMED branch resolve at all
+/// (see `resolve_agent_branch` / `resolve_parent_branch`). Without it this falls back to the minted
+/// `sparkle/agent-<id>` names, which read as "no branch yet" for a renamed branch — the zeroed state
+/// that put a fully-committed agent on the "Unsaved" rung.
+pub fn agent_workflow_state_in(
+    root: &str,
+    agent_id: &str,
+    parent_branch: &str,
+    probe_pr_state: bool,
+    ctx: Option<(&Path, &str)>,
+) -> Result<WorkflowState, String> {
+    let default_branch_for_resolve = resolve_default_branch(root);
+    let branch = match ctx.and_then(|(app_data, pid)| worktree_path(app_data, pid, agent_id).ok()) {
+        Some(wt) => {
+            let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
+            resolve_agent_branch(root, &head, agent_id, &default_branch_for_resolve).0
+        }
+        None => format!("sparkle/agent-{agent_id}"),
+    };
+    // Same treatment for the integration target: a renamed ORCHESTRATOR otherwise makes every one
+    // of its workers read `inParent: false`. See `resolve_parent_branch`.
+    let parent_branch: String = match ctx {
+        Some((app_data, pid)) => {
+            resolve_parent_branch(root, app_data, pid, parent_branch, &default_branch_for_resolve)
+        }
+        None => parent_branch.to_string(),
+    };
     // The branch tip lives in the shared repo (worktree add -b created the ref), so we can resolve
     // and compare it from `root` without touching the worktree dir.
     let tip = match git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]) {
@@ -3669,7 +3797,7 @@ pub fn agent_workflow_state_at(
     // ONE implementation, shared with the batched project poll — see `workflow_state_shared`. These
     // two used to carry byte-identical copies of the whole derivation, which is how a fix applied to
     // one silently left the other (the path the sidebar actually polls) wrong.
-    Ok(workflow_state_shared(root, agent_id, parent_branch, &default_branch, has_origin, &tip))
+    Ok(workflow_state_shared(root, &branch, &parent_branch, &default_branch, has_origin, &tip))
 }
 
 /// Live workflow stage signals for an agent: local-ref reachability + a best-effort GitHub PR
@@ -3679,13 +3807,20 @@ pub fn agent_workflow_state_at(
 /// plus the (network) `gh` PR probe this runs per poll never stall the UI thread.
 #[tauri::command]
 pub async fn agent_workflow_state(
+    app: AppHandle,
     root: String,
+    // Carries `project_id` for the same reason `agent_branch_status` does: the worktree lives
+    // OUTSIDE the project (in app-data) and is keyed by project id. Optional so a caller that
+    // genuinely has no project context still works — it just loses renamed-branch resolution.
+    project_id: Option<String>,
     agent_id: String,
     parent_branch: String,
     probe_pr_state: bool,
 ) -> Result<WorkflowState, String> {
+    let app_data = app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        agent_workflow_state_at(&root, &agent_id, &parent_branch, probe_pr_state)
+        let ctx = project_id.as_deref().map(|pid| (app_data.as_path(), pid));
+        agent_workflow_state_in(&root, &agent_id, &parent_branch, probe_pr_state, ctx)
     })
     .await
     .map_err(|e| format!("agent_workflow_state task failed: {e}"))?
@@ -3805,7 +3940,6 @@ fn branch_status_with_base(
     wt: &Path,
     app_data: &Path,
 ) -> Result<BranchStatus, String> {
-    let branch = format!("sparkle/agent-{agent_id}");
     let wt_str = wt.to_string_lossy().to_string();
     // `--no-optional-locks`: a plain `git status` refreshes and REWRITES the worktree index (to
     // update its stat cache), which would bump the index mtime our fingerprint keys on and defeat the
@@ -3816,7 +3950,8 @@ fn branch_status_with_base(
     // sees — fixing only the single-agent path would leave the misreport live in the UI.
     // `rev-parse` doesn't touch the index, so it can't defeat the fingerprint skip above.
     let head_branch = worktree_head_branch(&wt_str, wt.exists());
-    let worktree_on_branch = head_branch == branch;
+    let (branch, worktree_on_branch) =
+        resolve_agent_branch(root, &head_branch, agent_id, base_ref);
     // Only agents the fingerprint did NOT skip reach here — which is exactly right for ownership:
     // a skipped agent is unchanged by definition, so its branch mapping cannot have moved either.
     observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
@@ -3865,7 +4000,7 @@ fn branch_status_with_base(
 /// caller asked to probe — so the `gh` lookup runs iff `has_origin`.
 fn workflow_state_shared(
     root: &str,
-    agent_id: &str,
+    branch: &str,
     parent_branch: &str,
     default_branch: &str,
     has_origin: bool,
@@ -3874,7 +4009,6 @@ fn workflow_state_shared(
     if tip.trim().is_empty() {
         return WorkflowState::default();
     }
-    let branch = format!("sparkle/agent-{agent_id}");
     let in_local_main = ref_contains(root, default_branch, tip);
     let origin_ref = format!("origin/{default_branch}");
     let in_origin_main = ref_contains(root, &origin_ref, tip);
@@ -4018,12 +4152,32 @@ pub fn project_agents_status_at(
                 continue;
             }
         };
-        let branch = format!("sparkle/agent-{}", a.agent_id);
-        let tip = rev_parse_tip(root, &branch);
         let base_ref = base_ref_memo
             .entry(a.base_branch.clone())
             .or_insert_with(|| effective_base(root, &a.base_branch, false))
             .clone();
+        // Resolve the branch from the TREE, not the id: a renamed branch has no
+        // `sparkle/agent-<id>` ref, so minting the name here left `tip` empty, which made
+        // `workflow_state_shared` return the all-false default and `branch_status_with_base`
+        // return ahead=0 — the pair that renders a fully-committed agent as "Unsaved".
+        //
+        // COSTS NOTHING IN THE STEADY STATE, which matters because this runs BEFORE the
+        // fingerprint skip (the `tip` below is part of the fingerprint, so it cannot be deferred).
+        // `rev_parse_tip` on the minted name is the same call the batch already made; a non-empty
+        // answer means the minted branch exists, and `resolve_agent_branch` returns the minted name
+        // in that case regardless of the head. So the extra `git rev-parse` for the head is paid
+        // ONLY when the minted ref is missing — the renamed agent and the brand-new one, never the
+        // idle-and-unchanged majority the sparkle-zlic skip exists to keep cheap.
+        let minted = format!("sparkle/agent-{}", a.agent_id);
+        let minted_tip = rev_parse_tip(root, &minted);
+        let (branch, tip) = if minted_tip.is_empty() {
+            let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
+            let resolved = resolve_agent_branch(root, &head, &a.agent_id, &base_ref).0;
+            let resolved_tip = rev_parse_tip(root, &resolved);
+            (resolved, resolved_tip)
+        } else {
+            (minted, minted_tip)
+        };
         let base_tip = base_tip_memo
             .entry(base_ref.clone())
             .or_insert_with(|| rev_parse_tip(root, &base_ref))
@@ -4081,8 +4235,12 @@ pub fn project_agents_status_at(
                 continue;
             }
         };
+        // A renamed ORCHESTRATOR would otherwise make every one of its workers read
+        // `inParent: false` — see `resolve_parent_branch`.
+        let parent_branch =
+            resolve_parent_branch(root, app_data, project_id, &a.parent_branch, &base_ref);
         let workflow =
-            workflow_state_shared(root, &a.agent_id, &a.parent_branch, &default_branch, has_origin, &tip);
+            workflow_state_shared(root, &branch, &parent_branch, &default_branch, has_origin, &tip);
 
         if let Ok(mut cache) = status_cache().lock() {
             cache.insert(wt_key.clone(), fp);
@@ -9009,6 +9167,279 @@ mod tests {
         // The ref-derived fields are unaffected by parking — that is the whole point of only
         // distrusting `dirty`. If this regresses, the fix over-corrected.
         assert_eq!(parked.ahead, 1, "ahead comes from the branch ref, not the worktree");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The founder's ladder bug, end to end: an agent that RENAMED its working branch, with a
+    /// spotless tree and every commit made, rendered under "Local: Uncommitted" with an 'Unsaved'
+    /// badge — telling the user their work was one close away from being lost.
+    ///
+    /// The assertion is on the SIDE EFFECT that decides the rung (`ahead`), not on the rename
+    /// having happened. Before the fix `ahead` was 0 here — the zeroed "no branch yet" status —
+    /// and `gitDerivedStage` maps `ahead == 0` to `building_unsaved`.
+    #[test]
+    fn a_renamed_branch_reports_its_commits_instead_of_reading_as_unsaved() {
+        let root = unique_root("status-renamed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("status-renamed-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+
+        // Two real commits, then rename the branch to a descriptive name — which AGENTS.md now
+        // actively encourages ("Name a branch for what the work IS").
+        for (n, body) in [("a.txt", "a\n"), ("b.txt", "b\n")] {
+            std::fs::write(Path::new(&info.path).join(n), body).unwrap();
+            git(&info.path, &["add", "-A"]).unwrap();
+            git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        }
+        git(&info.path, &["branch", "-m", "sparkle/column-edges"]).unwrap();
+
+        // Preconditions that make this the founder's case exactly: the minted ref is GONE and the
+        // tree is spotless.
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-renamer"])
+                .is_err(),
+            "precondition: the minted branch no longer exists"
+        );
+        assert!(
+            git(&info.path, &["status", "--porcelain"]).unwrap().is_empty(),
+            "precondition: the tree is clean — nothing is actually unsaved"
+        );
+
+        let st = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        assert_eq!(
+            st.ahead, 2,
+            "the renamed branch's commits must be counted — ahead=0 is what renders 'Unsaved'"
+        );
+        assert!(!st.dirty, "a clean tree must not report dirty");
+        assert!(
+            st.worktree_on_branch,
+            "the tree IS on the branch being reported; this is a rename, not a parked checkout"
+        );
+
+        // The workflow probe must follow the same branch, or the row still can't leave the bottom
+        // rung: `aheadOfBase` feeds the frontend's `committedSeen` gate.
+        let ws =
+            agent_workflow_state_in(&root_str, "renamer", "", false, Some((app_data.as_path(), "p")))
+                .unwrap();
+        assert_eq!(ws.ahead_of_base, 2, "workflow state must resolve the renamed branch too");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The batch path is the one the sidebar actually polls, so fixing only the single-agent path
+    /// would leave the misreport live on screen (the exact split this file's own comments warn
+    /// about twice). Same rename, asserted through `project_agents_status_at`.
+    #[test]
+    fn the_batch_poll_also_resolves_a_renamed_branch() {
+        let root = unique_root("batch-renamed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("batch-renamed-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("a.txt"), "a\n").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        git(&info.path, &["branch", "-m", "sparkle/descriptive-name"]).unwrap();
+
+        let results = project_agents_status_at(
+            &root_str,
+            "p",
+            &[AgentStatusInput {
+                agent_id: "renamer".to_string(),
+                kind: "build".to_string(),
+                base_branch: "main".to_string(),
+                parent_branch: String::new(),
+                force: false,
+            }],
+            false,
+            &app_data,
+        );
+        let row = results.first().expect("one result row");
+        let bs = row.branch.as_ref().expect("branch status present");
+        assert_eq!(bs.ahead, 1, "the batch poll must count the renamed branch's commits");
+        assert!(bs.worktree_on_branch);
+
+        // `bs.ahead` alone does NOT guard the batch path's own work: it comes out of
+        // `branch_status_with_base`, which resolves the branch independently. The lazy
+        // `minted_tip.is_empty()` derivation beside it is what feeds `workflow` (and the status
+        // fingerprint), so it could pick the wrong branch or a stale tip with `bs.ahead` still
+        // green. Assert the value that derivation actually produces (roborev 56051).
+        let ws = row.workflow.as_ref().expect("workflow state present");
+        assert_eq!(
+            ws.ahead_of_base, 1,
+            "the batch poll's own (branch, tip) derivation must resolve the renamed branch too"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The parent fix has TWO call sites, and the sidebar polls the one the test above this pair
+    /// does not reach. `workflow_state_shared`'s `parent_branch` feeds `cut_from_ref` → `no_own_work`
+    /// as well as `in_parent`, so an unresolved parent is not a one-field misreport here — the whole
+    /// batch row is derived against a ref that does not exist (roborev 56051).
+    #[test]
+    fn the_batch_poll_also_resolves_a_renamed_parent_branch() {
+        let root = unique_root("batch-parent-renamed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("batch-parent-renamed-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        let boss = create_worktree_at(&root_str, "p", "boss", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&boss.path).join("boss.txt"), "b\n").unwrap();
+        git(&boss.path, &["add", "-A"]).unwrap();
+        git(&boss.path, &["commit", "-m", "orchestrator work"]).unwrap();
+
+        let wk = create_worktree_from_local(&root_str, "p", "wk", &boss.branch, &app_data).unwrap();
+        std::fs::write(Path::new(&wk.path).join("wk.txt"), "w\n").unwrap();
+        git(&wk.path, &["add", "-A"]).unwrap();
+        git(&wk.path, &["commit", "-m", "worker work"]).unwrap();
+        git(&boss.path, &["merge", "--no-ff", "-m", "integrate", "sparkle/agent-wk"]).unwrap();
+        git(&boss.path, &["branch", "-m", "sparkle/cockpit-columns"]).unwrap();
+
+        // The sidebar mints `sparkle/agent-<parentId>` for every worker row it polls
+        // (AgentSidebar's batch input), so this is the exact string the batch path receives.
+        let results = project_agents_status_at(
+            &root_str,
+            "p",
+            &[AgentStatusInput {
+                agent_id: "wk".to_string(),
+                kind: "worker".to_string(),
+                base_branch: "main".to_string(),
+                parent_branch: "sparkle/agent-boss".to_string(),
+                force: false,
+            }],
+            false,
+            &app_data,
+        );
+        let ws = results
+            .first()
+            .expect("one result row")
+            .workflow
+            .as_ref()
+            .expect("workflow state present");
+        assert!(
+            ws.in_parent,
+            "the worker's work IS in the renamed parent — the batch poll must resolve it too"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A renamed ORCHESTRATOR must not strand its workers. `in_parent` is
+    /// `ref_contains(root, parent_branch, tip)`, and a nonexistent ref answers `false` — so before
+    /// `resolve_parent_branch` a worker whose work had demonstrably merged into its parent reported
+    /// `inParent: false`, and `agent_landed_check` answered "not landed" with confidence.
+    #[test]
+    fn a_worker_still_sees_its_parent_after_the_orchestrator_renames_its_branch() {
+        let root = unique_root("parent-renamed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("parent-renamed-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // The orchestrator commits, then renames its branch to something descriptive.
+        let boss = create_worktree_at(&root_str, "p", "boss", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&boss.path).join("boss.txt"), "b\n").unwrap();
+        git(&boss.path, &["add", "-A"]).unwrap();
+        git(&boss.path, &["commit", "-m", "orchestrator work"]).unwrap();
+
+        // A worker cut from the orchestrator's branch, committing its own work...
+        let wk =
+            create_worktree_from_local(&root_str, "p", "wk", &boss.branch, &app_data).unwrap();
+        std::fs::write(Path::new(&wk.path).join("wk.txt"), "w\n").unwrap();
+        git(&wk.path, &["add", "-A"]).unwrap();
+        git(&wk.path, &["commit", "-m", "worker work"]).unwrap();
+        // ...merged back into the orchestrator, which is what `in_parent` should observe.
+        git(&boss.path, &["merge", "--no-ff", "-m", "integrate", "sparkle/agent-wk"]).unwrap();
+        git(&boss.path, &["branch", "-m", "sparkle/cockpit-columns"]).unwrap();
+        assert!(
+            git(&root_str, &["rev-parse", "--verify", "--quiet", "refs/heads/sparkle/agent-boss"])
+                .is_err(),
+            "precondition: the orchestrator's minted branch is gone"
+        );
+
+        // The frontend still mints the parent ref as `sparkle/agent-boss`; Rust must recover it.
+        let ws = agent_workflow_state_in(
+            &root_str,
+            "wk",
+            "sparkle/agent-boss",
+            false,
+            Some((app_data.as_path(), "p")),
+        )
+        .unwrap();
+        assert!(
+            ws.in_parent,
+            "the worker's work IS in the parent — a renamed parent must not read as 'not landed'"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Guard on the resolver's conservatism: it must never adopt ANOTHER agent's minted branch,
+    /// or a worktree parked on one would report that agent's commits as its own.
+    #[test]
+    fn the_branch_resolver_refuses_another_agents_minted_branch() {
+        let root = unique_root("resolve-other");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-other-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        // `mine`'s worktree, but checked out on another agent's branch, and `mine`'s own ref gone.
+        let info = create_worktree_at(&root_str, "p", "mine", "main", &app_data).unwrap();
+        git(&root_str, &["branch", "sparkle/agent-other", "main"]).unwrap();
+        git(&info.path, &["checkout", "sparkle/agent-other"]).unwrap();
+        git(&root_str, &["branch", "-D", "sparkle/agent-mine"]).unwrap();
+
+        let (branch, on_branch) =
+            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "mine", "main");
+        assert_eq!(
+            branch, "sparkle/agent-mine",
+            "must fall back to the minted name, never adopt another agent's branch"
+        );
+        assert!(!on_branch, "the tree is demonstrably not on this agent's branch");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The other half of the conservatism guard: a tree parked on the BASE branch with its own ref
+    /// already deleted must not start reporting `main`'s history as the agent's work.
+    #[test]
+    fn the_branch_resolver_refuses_the_base_branch() {
+        let root = unique_root("resolve-base");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-base-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "--detach"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "parked", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "main"]).unwrap();
+        git(&root_str, &["branch", "-D", "sparkle/agent-parked"]).unwrap();
+
+        let (branch, on_branch) =
+            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "parked", "main");
+        assert_eq!(branch, "sparkle/agent-parked", "must not adopt the base branch");
+        assert!(!on_branch);
+        // Same via the origin-prefixed base, which is what `effective_base` hands back when a
+        // remote-tracking ref exists.
+        let (branch2, _) =
+            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "parked", "origin/main");
+        assert_eq!(branch2, "sparkle/agent-parked", "the origin/ prefix must be stripped");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);

@@ -1987,12 +1987,21 @@ export function AgentSidebar({
         // BELOW this column reproduces the mock's ordering without containing anything new.
         zIndex: BUILD_COLUMN_Z,
         background: C.deepForest,
-        // THE LINE IS GONE BECAUSE SOMETHING HAS TO FLOW THROUGH THIS SEAM. The active agent row
-        // is painted in `forest`, the terminal's own colour, so it reads as an opening INTO the
-        // pane it selects, and the concave fillets below shape that opening. A 1px rule here cuts
-        // straight across it: the row docks against the line instead of bleeding through, and the
-        // fillets curve into nothing. See the seam rule beside the plane tokens in theme/colors —
-        // it is "does anything cross this boundary", not "how big is the step".
+        // NO BORDER IS DECLARED HERE AT ALL, AND THAT IS DELIBERATE — index.css owns both of this
+        // column's edges (`border-inline: none`, then one border on the CONCIERGE side per pair,
+        // turned transparent by `[data-wired]` when the cable is patched in). An inline declaration
+        // outranks every selector, so a single `borderRight: "none"` here — which is what shipped —
+        // silently deleted the whole mechanism for the LEFT pair, whose concierge edge IS its right:
+        // no seam when unplugged, and nothing for the wired rule to erase when plugged in. It was
+        // invisible for as long as the app had one pair, on the right, where the property it named
+        // was the terminal edge and dropping it was correct.
+        //
+        // THE LINE IS GONE ON THE TERMINAL EDGE BECAUSE SOMETHING HAS TO FLOW THROUGH THAT SEAM.
+        // The active agent row is painted in `forest`, the terminal's own colour, so it reads as an
+        // opening INTO the pane it selects, and the concave fillets below shape that opening. A 1px
+        // rule there cuts straight across it: the row docks against the line instead of bleeding
+        // through, and the fillets curve into nothing. See the seam rule beside the plane tokens in
+        // theme/colors — it is "does anything cross this boundary", not "how big is the step".
         //
         // The rule was added in the first place because the black-and-gold repaint had flattened
         // this pair to almost nothing — a boundary with neither a fill step nor a line, so it
@@ -2011,7 +2020,6 @@ export function AgentSidebar({
         // wanted. What holds the pair up instead is fidelity: both values are ported verbatim from
         // the spec (theme/blueprintSpec.ts) and blueprintSpec.test.ts fails on byte drift, so the
         // step cannot go flat without failing a diff against the design itself.
-        borderRight: "none",
         display: "flex",
         flexDirection: "column",
         height: "100%",
@@ -2045,13 +2053,23 @@ export function AgentSidebar({
       }}
     >
       {/* THE SEAM: this column's edge against the terminal stage. It is a 1px `hairline` rule and
-          it is drawn HERE, as the column's first positioned child at `right: 0`, rather than as
-          the column's `border-right`. The position is the whole point.
+          it is drawn HERE, as the column's first positioned child at the PANE-SIDE edge, rather
+          than as a border on the column. The position is the whole point.
 
-          A `border-right` sits OUTSIDE the padding box, so nothing inside the column can paint on
+          ANCHORED TO `pairSide`, like the overlay above it and the pull-tab rail below it, and it
+          was the one anchor in this column that never learned. `right: 0` was written when the app
+          had a single pair, on the right, where right IS the terminal edge. `TERM │ BUILD │
+          CONCIERGE │ BUILD │ TERM` — a LEFT pair's terminal is on the row's LEFT, so an unmirrored
+          `right: 0` painted this rule on the CONCIERGE edge instead: a full-height hairline standing
+          exactly where a mounted row runs THROUGH into the concierge, on the one boundary that is
+          supposed to vanish when the cable is patched (`[data-wired]` in index.css turns the
+          column's `border-inline` transparent there — and cannot touch an element inside it). The
+          terminal edge it was meant to mark got nothing. Both halves of that are the same typo.
+
+          A border sits OUTSIDE the padding box, so nothing inside the column can paint on
           it — the rule ran unbroken down the full height, including across the SELECTED row. That
           row is supposed to read as an opening onto the terminal: it fills with the terminal's own
-          `C.forest`, squares its right corners, extends `marginRight:-8` to eat the list's padding
+          `C.forest`, squares its pane-side corners, bleeds `-LIST_PAD_X` to eat the list's padding
           and reach this edge, and flares into the stage with the concave fillets below. A rule
           across that edge cancels the effect — the row stops bleeding and starts butting against a
           drawn line. The founder reported exactly that, and it is a regression from ea1b7bd93,
@@ -2080,16 +2098,17 @@ export function AgentSidebar({
               border used to occupy. That extra pixel is the one the active row's `-8` now laps, and
               it is why the hover card's measured `colW` is unaffected. Do NOT "compensate" with
               `width + 1`: that WOULD shift the terminal and re-break the geometry.
-            • The pull-tab / overlay button cluster at `right: 0` covers the seam for its own
-              height. It is a chrome shape with its own `hairline` outline sitting on the edge, so
-              the boundary is still drawn there — by the tab instead of by this rule. */}
+            • The pull-tab / overlay button cluster covers the seam for its own height. It is
+              anchored to `[pairSide]: 0` too, so the two stay on the same edge in both pairs: it is
+              a chrome shape with its own `hairline` outline sitting on the boundary, so the
+              boundary is still drawn there — by the tab instead of by this rule. */}
       <div
         aria-hidden
         data-testid="sidebar-terminal-seam"
         style={{
           position: "absolute",
           top: 0,
-          right: 0,
+          [pairSide]: 0,
           width: 1,
           height: "100%",
           background: C.hairline,

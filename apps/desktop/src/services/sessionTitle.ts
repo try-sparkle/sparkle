@@ -10,6 +10,7 @@
 // (manually-renamed) name and de-dupes an unchanged title.
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../stores/projectStore";
+import { normalizeAgentName } from "../engine/decodeEntities";
 import { reportNamingOutcome } from "./selfReportObservability";
 import type { AgentKind } from "../types";
 
@@ -42,7 +43,11 @@ export async function refreshAgentTitle(
           .getState()
           .projects.find((p) => p.id === projectId)
           ?.agents.find((a) => a.id === agentId)?.aiTitle;
-        if (applied === title.trim()) {
+        // Compare against the NORMALIZED form: applyAiTitle decodes HTML entities out of the
+        // model-authored title before storing it (see engine/decodeEntities), so comparing against
+        // the raw text would read a successful apply of "Ship &amp; Verify" as a no-op and
+        // under-count Tier-1 coverage for exactly the names that fix targets.
+        if (applied === normalizeAgentName(title.trim())) {
           reportNamingOutcome("named_from_session_title_backfill", opts.kind);
         }
       }

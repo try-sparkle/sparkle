@@ -80,9 +80,15 @@ export function agentWorkflowState(
   agentId: string,
   parentBranch: string,
   probePrState: boolean,
+  /** The agent's project. Rust needs it to locate the worktree, which is what lets a RENAMED
+   *  branch resolve at all (see Rust `resolve_agent_branch`). Omitting it falls back to the minted
+   *  `sparkle/agent-<id>` name — which reads as "no branch yet" for a renamed branch, i.e. the
+   *  zeroed state that renders committed work as "Unsaved". Pass it whenever you have it. */
+  projectId?: string,
 ): Promise<WorkflowState> {
   return invoke<WorkflowState>("agent_workflow_state", {
     root,
+    projectId: projectId ?? null,
     agentId,
     parentBranch,
     probePrState,

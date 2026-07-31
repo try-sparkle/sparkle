@@ -52,6 +52,7 @@ import { goalReading, stallReadingFor, thrashReadingFor } from "./agentGoalReadi
 // CALM FIRST, THEN ROLL UP — applied to the raw status map before any bucketing, so a row's own
 // status, its rollup dot and its stall verdict cannot disagree about a never-briefed agent.
 import { withNewAgentCalm } from "../engine/newAgentAttention";
+import { normalizeAgentName } from "../engine/decodeEntities";
 import { useInteractionStore } from "../stores/interactionStore";
 import { setPrClaim, releasePrClaim, fetchPrClaims, findClaim } from "./mergeGuard/prClaims";
 import type { ControlOp } from "../stores/selfReportMetrics";
@@ -882,7 +883,10 @@ function handleRename(req: ControlRequest): Record<string, unknown> {
   if (typeof name !== "string" || !name.trim()) return { ok: false, error: "name is required" };
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
-  useProjectStore.getState().selfNameAgent(found.projectId, targetId, name);
+  // Model-authored text: decode HTML entities before storing. An agent that means "A & B" routinely
+  // emits "A &amp; B" in its tool arguments, and the app is not the escaper — storing it verbatim is
+  // what put "Pane Mounting &amp; Resize Perf" on the ladder. See engine/decodeEntities.
+  useProjectStore.getState().selfNameAgent(found.projectId, targetId, normalizeAgentName(name));
   return { ok: true };
 }
 

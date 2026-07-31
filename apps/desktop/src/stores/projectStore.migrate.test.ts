@@ -201,3 +201,76 @@ describe("migratePersisted — v10 promptHistory source backfill (picker-tagging
     ]);
   });
 });
+
+describe("migratePersisted — HTML-entity heal on already-stored agent names", () => {
+  // The ingest normalizers stop NEW escaped names, but the reported one
+  // ("Pane Mounting &amp; Resize Perf") was already sitting in localStorage — so without this heal
+  // the founder's own roster stays wrong until every affected agent is renamed by hand.
+  type Named = {
+    id: string;
+    name: string;
+    aiTitle?: string | null;
+    autoNameVariants?: { title: string; description: string } | null;
+  };
+  const blob = () => ({
+    projects: [
+      {
+        id: "p1",
+        agents: [
+          { id: "escaped", name: "Pane Mounting &amp; Resize Perf" },
+          { id: "double", name: "A &amp;amp; B" },
+          { id: "raw", name: "Spider Chart & Live Task" },
+          { id: "title", name: "x", aiTitle: "Ship &amp; Verify" },
+          {
+            id: "variants",
+            name: "x",
+            autoNameVariants: { title: "Load &amp; Save", description: "Reads &amp; writes state" },
+          },
+        ],
+      },
+    ],
+  });
+  const readBack = (out: unknown) =>
+    (out as { projects: { agents: Named[] }[] }).projects[0]!.agents;
+
+  it("decodes escaped names, titles and auto-name variants", () => {
+    const a = readBack(migratePersisted(blob(), 12));
+    expect(a.find((x) => x.id === "escaped")!.name).toBe("Pane Mounting & Resize Perf");
+    expect(a.find((x) => x.id === "double")!.name).toBe("A & B");
+    expect(a.find((x) => x.id === "title")!.aiTitle).toBe("Ship & Verify");
+    expect(a.find((x) => x.id === "variants")!.autoNameVariants).toEqual({
+      title: "Load & Save",
+      description: "Reads & writes state",
+    });
+  });
+
+  it("leaves an already-correct name exactly as it was", () => {
+    const a = readBack(migratePersisted(blob(), 12));
+    expect(a.find((x) => x.id === "raw")!.name).toBe("Spider Chart & Live Task");
+  });
+
+  it("is idempotent — re-running it does not keep eating ampersands", () => {
+    const once = migratePersisted(blob(), 12);
+    const twice = migratePersisted(JSON.parse(JSON.stringify(once)), 12);
+    expect(readBack(twice).find((x) => x.id === "escaped")!.name).toBe(
+      "Pane Mounting & Resize Perf",
+    );
+    expect(readBack(twice).find((x) => x.id === "raw")!.name).toBe("Spider Chart & Live Task");
+  });
+});
+
+describe("the entity heal is actually WIRED, not just implemented", () => {
+  // roborev 56030 (High): the heal was added to `migratePersisted` with `version` left at 12.
+  // zustand only calls `migrate` when the STORED version differs from `options.version`, so on
+  // every existing install — the entire population that has escaped names — it would never have
+  // run. The migration tests above call `migratePersisted` directly and passed the whole time:
+  // they prove the function works, not that it ever executes.
+  //
+  // This asserts the wiring instead. It is deliberately a `>` and not an `=== 13`, so a LATER
+  // migration can bump past it without a spurious failure, while a revert to 12 (or a new heal
+  // added without a bump, which is the same mistake) fails here.
+  it("carries a persist version past the one that shipped without the heal", async () => {
+    const { useProjectStore } = await import("./projectStore");
+    expect(useProjectStore.persist.getOptions().version).toBeGreaterThan(12);
+  });
+});

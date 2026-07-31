@@ -2,8 +2,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { useProjectStore, mergePreservingLiveWorkers, type ProjectState } from "./projectStore";
 import type { AgentTab, Project } from "../types";
 
-// Store-level lifecycle of Project.freshBuildAgentId — the "just-opened build agent floats to the
-// top of the non-alerting rows" slot (ordering itself is covered in engine/agentOrdering.test.ts).
+// Store-level lifecycle of Project.freshBuildAgentId, plus the thing that actually decides where a
+// just-opened agent lands.
+//
+// THOSE ARE NO LONGER THE SAME MECHANISM. `freshBuildAgentId` used to name the row `FRESH_BUILD_RANK`
+// floated to the top of the attention sort; that sort was deleted on 2026-07-26, so the field is
+// still written and reconciled across windows but nothing reads it to place a row. "Newest at the
+// top" is a property of the ARRAY now — `addAgent` prepends, and `engine/buildSections` buckets in
+// input order — which is why the ordering assertion below lives here beside the field it replaced
+// rather than in engine/agentOrdering.test.ts, where this note used to send readers.
 
 function mkAgent(over: Partial<AgentTab> & { id: string }): AgentTab {
   return {
@@ -74,6 +81,30 @@ describe("projectStore — freshBuildAgentId lifecycle", () => {
     const fresh = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
     useProjectStore.getState().removeAgent("p1", older);
     expect(proj().freshBuildAgentId).toBe(fresh);
+  });
+});
+
+describe("projectStore — a new agent lands at the TOP of the list", () => {
+  beforeEach(seed);
+
+  it("prepends, so the newest agent is not buried under every older one", () => {
+    // The ladder reads top→bottom as least-done→most-done, and the sections already say that
+    // (uncommitted → committed → PR → merged → shipped). This is the same rule one level down,
+    // WITHIN a section: a brand-new agent is the least-done thing there is. Appending put it at the
+    // bottom of "Local: Uncommitted", underneath every older agent sharing that rung.
+    const older = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    const newer = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    expect(proj().agents.map((a) => a.id)).toEqual([newer, older]);
+  });
+
+  it("does it by INSERTING, so a human's drag arrangement is still the last word", () => {
+    // Position-as-state, not a comparator. `project.agents` order IS the rendered order, so
+    // `reorderAgent` rewrites this array and nothing re-sorts it afterwards to undo the drag — a
+    // comparator would have needed a per-row "has been manually moved" flag to avoid fighting it.
+    const older = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    const newer = useProjectStore.getState().addAgent("p1", { kind: "build" })!;
+    useProjectStore.getState().reorderAgent("p1", newer, null);
+    expect(proj().agents.map((a) => a.id)).toEqual([older, newer]);
   });
 });
 
