@@ -464,27 +464,59 @@ describe("the liveness colour is spoken, through the column's one announcer", ()
     expect(announcer()).toContain("nothing has come back");
   });
 
-  // ── A STALE STORE MUST NOT GREET THE NEXT MOUNT ─────────────────────────────────────────────
+  // ── AN INHERITED TURN IS DISCARDED, NOT MERELY SILENCED ─────────────────────────────────────
   //
-  // roborev 56177-M1. The liveness store is module-level and outlives the host, which unmounts
-  // whenever no project is open (App.tsx). A turn in flight at that moment loses its terminal
-  // listeners and leaves `silentSince` set forever — so on the next mount the very first reading is
-  // already `stalled`. Speaking on the effect's FIRST run would then have a reopened project greet
-  // the user with "nothing has come back" about a turn nobody is waiting for, with no indicator row
-  // on screen and `typing` false — and clobber the column's one live region on mount.
-  it("says nothing on mount, however stalled the store it inherits", async () => {
+  // roborev 56177-M1 then 56194. The liveness store is module-level and outlives the host, which
+  // unmounts whenever no project is open (App.tsx). A turn in flight at that moment loses its
+  // terminal listeners and leaves `silentSince` set forever.
+  //
+  // The first fix muted only the WORDS, with a per-mount ref. That was not enough, and these rows
+  // pin all three consequences it missed — each of which passes against a mute-only version:
+  //   1. the row still painted RED on frame one of a brand-new question,
+  //   2. the mount latched `stalledLatched`, making that red survive even a hard failure,
+  //   3. and with the ref seeded `stalled` and nothing but observed output unlatching, the announcer
+  //      could stay mute for the WHOLE mount — going dark in the degraded case it exists for.
+  it("discards a stalled turn it inherits, rather than silently carrying it forward", async () => {
     // The abandoned turn, established with NO host mounted — exactly the closed-project window.
     noteConciergeSent();
     await act(async () => {
       vi.advanceTimersByTime(STALLED_AFTER_MS * 5);
     });
+    expect(useConciergeLivenessStore.getState().silentSince).not.toBeNull();
 
     render(<ConciergeHost feed={feed()} />);
     await flush();
-    expect(announcer()).toBe("");
 
-    // Not vacuous: the store really is stalled, so a first-run announcement had something to say.
-    expect(useConciergeLivenessStore.getState().silentSince).not.toBeNull();
+    expect(announcer()).toBe("");
+    // THE STATE ITSELF, not just the text. Muting the words while keeping the wrong colour is the
+    // worst of both, and is what the first attempt shipped.
+    expect(useConciergeLivenessStore.getState().silentSince).toBeNull();
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(false);
+  });
+
+  it("still announces the next real turn's escalation after inheriting a stale one", async () => {
+    noteConciergeSent();
+    await act(async () => {
+      vi.advanceTimersByTime(STALLED_AFTER_MS * 5);
+    });
+    render(<ConciergeHost feed={feed()} />);
+    await flush();
+
+    // A brand-new question, and the colour must start over from gray. Asserted on the liveness
+    // WORDING rather than on an empty region: the send writes its own routing receipt through the
+    // same announcer, which is the column working as designed.
+    await send("what needs me?");
+    await act(async () => {
+      vi.advanceTimersByTime(SLOW_AFTER_MS - 2_000);
+    });
+    expect(announcer()).not.toContain("Still waiting");
+
+    // …and the escalation is spoken. A mute-only fix seeds the ref with `stalled`, so this step is
+    // never a CHANGE and the announcer stays dark for the rest of the mount.
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(announcer()).toContain("Still waiting");
   });
 
   // NOT ONCE PER RENDER. `announce` bumps a write counter so identical repeats still speak (roborev

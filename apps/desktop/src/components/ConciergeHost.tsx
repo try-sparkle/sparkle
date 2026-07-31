@@ -1659,6 +1659,34 @@ export function ConciergeHost({
     };
   }, [announce]);
 
+  // ══ AN INHERITED TURN IS DISCARDED, NOT MERELY SILENCED ══════════════════════════════════════
+  //
+  // The liveness store is module-level and outlives this host, which unmounts whenever no project is
+  // open (App.tsx). The listeners above are this host's — a turn in flight when the project closes
+  // loses them, so no `done` and no `error` will ever reach the detector again and `silentSince`
+  // stays set for the rest of the session. Whatever that turn's state was, NOBODY IS WAITING FOR IT.
+  //
+  // Muting it is not enough (roborev 56194). An earlier version guarded only the announcement, with
+  // a per-mount ref, and left the state itself in place — so the row still painted RED on frame one
+  // of a brand-new question the app had zero silence evidence about, and, because the ref had been
+  // seeded with `stalled` and nothing but observed output unlatches, the announcer could then stay
+  // mute for the whole mount in exactly the degraded case the feature exists for. Silencing the
+  // words while keeping the wrong colour is the worst of both.
+  //
+  // So the wait is DISCARDED at mount. The first reading is then a genuine `idle`, the latch never
+  // fires for an abandoned turn, and every real escalation afterwards speaks through the ordinary
+  // transition rule.
+  //
+  // MOUNT-ONLY, and safe to be unconditional: a send is user-driven and cannot have happened between
+  // this host's first render and its first effect, so there is never a live turn of its own to
+  // discard. (A remount mid-turn — a key change rather than a project close — would drop the
+  // accumulated silence and read gray until the next delta restores the clock. That is a mild,
+  // self-healing degradation in a rare case, against a permanent wrong state in a case that happens
+  // whenever someone closes a project mid-question.)
+  useEffect(() => {
+    clearConciergeLiveness();
+  }, []);
+
   // ══ THE PROACTIVE PUSH CHANNEL ═══════════════════════════════════════════════════════════════
   //
   // The brain speaking FIRST, with no user message behind it (services/conciergeProactive, PRD
