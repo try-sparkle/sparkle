@@ -1027,8 +1027,8 @@ impl Drop for DecodeWorker {
                 // during the grace below still lands ahead of `dictation://final` and must emit.
                 // Adding the suppression here reinstates the eaten-last-sentence bug, which is why
                 // `a_drain_escalation_still_lets_the_in_flight_decode_emit` exists to fail on it.
-                // Its counterpart is `a_real_teardown_that_detaches_silences_the_worker_it_left_
-                // running`, on the detach branch below — together they pin both sides.
+                // Its counterpart on the detach branch below is named there in full; together they
+                // pin both sides of the asymmetry.
                 self.abort.store(true, Ordering::Release);
                 // One more short wait, so the overwhelmingly likely outcome is still an orderly
                 // join rather than a detach: the worker observes the abort within a poll tick.
@@ -1048,8 +1048,14 @@ impl Drop for DecodeWorker {
                     // thread will exit if it ever returns from whatever it is stuck in.
                     Ok(()) | Err(RecvTimeoutError::Timeout) => {
                         // Teardown is about to RETURN with this worker still running, so from here
-                        // an emit could land after `dictation://final`. This is the only place the
-                        // suppression is correct — see `run_decode_loop`.
+                        // an emit could land after `dictation://final`. This is ONE OF THE TWO
+                        // points where the suppression is correct — the other is `abort()`, whose
+                        // callers are discarding the backlog outright. Do not "simplify" either one
+                        // away on the strength of the other; both are load-bearing.
+                        //
+                        // This branch is nested inside the escalation, so `abort` is already set and
+                        // it writes only `emits_are_unsafe`. See `run_decode_loop` and the field doc.
+                        // Pinned by `a_real_teardown_that_detaches_silences_the_worker_it_left_running`.
                         self.emits_are_unsafe.store(true, Ordering::Release);
                         tracing::warn!(
                             target: "dictation",
@@ -3530,7 +3536,8 @@ mod tests {
 
     // The other side: once we have DETACHED, teardown has returned and the final may already be
     // out, so this worker's emit would append a stale fragment to a finished transcript and re-arm
-    // auto-send. That is the only moment suppression is correct, and it is set at the detach.
+    // auto-send. That is one of the TWO moments suppression is correct (the other being `abort()`,
+    // whose callers are discarding the backlog); both set the flag, the drain escalation does not.
     #[test]
     fn a_decode_finishing_after_the_worker_was_detached_does_not_emit() {
         assert!(
