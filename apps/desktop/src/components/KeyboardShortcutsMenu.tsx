@@ -1,4 +1,4 @@
-import { useEffect, useRef, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { FiRotateCcw } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { FONT_UI } from "../theme/scale";
@@ -14,6 +14,7 @@ import {
   INITIAL_CAPTURE,
   type CaptureState,
 } from "../keyboardHints/keybindings";
+import { bindingConflict } from "../keyboardHints/reservedChords";
 
 // Settings → Shortcuts pane. Lists the rebindable shortcuts; each row shows the current binding,
 // a "Press a key…" capture button, and a reset. Capture feeds the pure captureReduce state machine
@@ -36,6 +37,15 @@ export function KeyboardShortcutsMenu() {
   const listening = useKeybindingsStore((s) => s.capturingShortcut);
   const setListening = useKeybindingsStore((s) => s.setCapturingShortcut);
   const capture = useRef<CaptureState>(INITIAL_CAPTURE);
+  // Why the last attempt was refused, shown in place of the prompt. Local, not in the store: no
+  // global handler reads it, and it is meaningless once this pane is gone.
+  //
+  // KEYED BY ShortcutId, not a bare string. `capturingShortcut` is a public store action, so
+  // `listening` can move without this component's button being clicked — and an unkeyed message
+  // would then be attributed to whichever row happens to be listening, showing row A's "⌘K already
+  // opens the command palette" on row B (roborev 55581). Keying it makes the mis-attribution
+  // unrepresentable rather than something the clear-on-click path has to keep up with.
+  const [rejected, setRejected] = useState<{ id: ShortcutId; reason: string } | null>(null);
 
   useEffect(() => {
     if (!listening) return;
@@ -53,6 +63,9 @@ export function KeyboardShortcutsMenu() {
       e.preventDefault();
       e.stopPropagation();
       if (e.type === "keydown" && e.key === "Escape") {
+        // Clear the refusal too: cancelling is the user withdrawing, so a leftover "⌘K already
+        // opens…" must not survive to be shown against the next capture.
+        setRejected(null);
         setListening(null);
         return;
       }
@@ -72,6 +85,17 @@ export function KeyboardShortcutsMenu() {
           capture.current = INITIAL_CAPTURE;
           return;
         }
+        // Reject a chord another handler already owns, the same way — keep listening and say why.
+        // Now that global handlers stand down during a capture, a collision no longer announces
+        // itself by firing, so accepting one here would persist a permanent double-fire the user
+        // could only discover later and only undo via Reset (roborev 55540).
+        const conflict = bindingConflict(out.binding, bindings, listening);
+        if (conflict) {
+          capture.current = INITIAL_CAPTURE;
+          setRejected({ id: listening, reason: `${formatBinding(out.binding)} ${conflict}` });
+          return;
+        }
+        setRejected(null);
         setBinding(listening, out.binding);
         setListening(null);
       }
@@ -82,7 +106,10 @@ export function KeyboardShortcutsMenu() {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("keyup", onKey, true);
     };
-  }, [listening, setBinding, setListening]);
+    // `bindings` is a dep because the conflict check reads it. Re-registering on a change is
+    // harmless: the only change that happens mid-capture is the successful setBinding above, which
+    // clears `listening` in the same breath and tears the effect down anyway.
+  }, [listening, setBinding, setListening, bindings]);
 
   // Now that the capture flag is GLOBAL, it must not outlive this pane. Closing Settings — or just
   // switching to another category — unmounts us with `capturingShortcut` still set, which would
@@ -94,6 +121,8 @@ export function KeyboardShortcutsMenu() {
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       {IDS.map((id) => {
         const isListening = listening === id;
+        // Keyed, so a refusal recorded for another row can never surface on this one.
+        const rejectedHere = isListening && rejected?.id === id ? rejected.reason : null;
         return (
           <div key={id}>
             <div style={subLabel}>{SHORTCUT_LABELS[id].title}</div>
@@ -101,11 +130,18 @@ export function KeyboardShortcutsMenu() {
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <button
                 type="button"
-                onClick={() => setListening(isListening ? null : id)}
+                onClick={() => {
+                  setRejected(null);
+                  setListening(isListening ? null : id);
+                }}
                 style={{ ...captureBtn, ...(isListening ? listeningStyle : {}) }}
               >
                 {isListening
-                  ? `${SHORTCUT_LABELS[id].allowsTap ? "Tap a modifier or press a combo" : "Press a combo"}…  (Esc to cancel)`
+                  ? // A refused chord replaces the prompt with the reason, so the rejection isn't
+                    // silent — the pane otherwise just keeps waiting and looks broken.
+                    (rejectedHere
+                      ? `${rejectedHere} — try another`
+                      : `${SHORTCUT_LABELS[id].allowsTap ? "Tap a modifier or press a combo" : "Press a combo"}…  (Esc to cancel)`)
                   : formatBinding(bindings[id])}
               </button>
               <button
