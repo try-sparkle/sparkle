@@ -9,7 +9,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   THINKING_ACTIVITY_TESTID,
   THINKING_INDICATOR_TESTID,
-  THINKING_STATE_TESTID,
   ThinkingIndicator,
 } from "./ThinkingIndicator";
 import {
@@ -201,21 +200,12 @@ describe("ThinkingIndicator — the wait", () => {
   const YELLOW = canon(C.amberInk);
   const RED = canon(C.sienna);
 
-  /** What a SIGHTED user sees — `textContent` minus the clip-rect announcement node.
-   *
-   *  The distinction is the whole design: the state must be readable by a screen reader (so it is in
-   *  the DOM, and its appearing is what a live region announces) and invisible to everyone else (so
-   *  it occupies no pixels). A raw `textContent` assertion would conflate the two and fail on a
-   *  correct implementation; asserting only the visible half is what the founder's ask is about. */
+  /** What a SIGHTED user sees — which, since nothing in this component carries the state as text
+   *  any more, is simply everything it renders. Kept as a named helper because that is the actual
+   *  claim these rows make, and it should keep reading as one if a clipped node ever returns. */
   function visibleText(): string {
-    const el = indicator();
-    if (!el) return "";
-    const clone = el.cloneNode(true) as HTMLElement;
-    clone.querySelector(`[data-testid="${THINKING_STATE_TESTID}"]`)?.remove();
-    return clone.textContent ?? "";
+    return indicator()?.textContent ?? "";
   }
-  const spokenState = () =>
-    document.querySelector(`[data-testid="${THINKING_STATE_TESTID}"]`)?.textContent ?? null;
 
   /** Let the liveness ticker run, which is what advances both the clock and the escalation. */
   function wait(ms: number, rerender: (ui: React.ReactElement) => void) {
@@ -279,31 +269,22 @@ describe("ThinkingIndicator — the wait", () => {
     }
   });
 
-  // …and the one node that DOES carry words occupies no pixels. Clipped, not `display: none` — the
-  // latter would take it out of the accessibility tree, which is the only place it is meant to
-  // exist. Both halves asserted together, because either alone permits the wrong implementation.
-  it("keeps the announcement node in the tree and out of the layout", () => {
+  // …AND IT CARRIES NO LIVE REGION OF ITS OWN. The thread deliberately owns no announcer — a second
+  // aria-live node double-announces, which ConciergeThread.roleLabels asserts and which caught two
+  // attempts to put one here. The state is spoken by the host through the column's ONE announcer;
+  // this row's own aria-live belongs to the activity line and to nothing else.
+  it("adds no live region of its own at any colour", () => {
     noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
-    wait(STALLED_AFTER_MS, rerender);
-
-    const node = document.querySelector(
-      `[data-testid="${THINKING_STATE_TESTID}"]`,
-    ) as HTMLElement | null;
-    expect(node?.textContent).toContain("Still waiting");
-    expect(node?.style.position).toBe("absolute");
-    expect(node?.style.width).toBe("1px");
-    expect(node?.style.height).toBe("1px");
-    expect(node?.style.overflow).toBe("hidden");
-    // The `clip: rect(0 0 0 0)` this also carries is NOT asserted: jsdom's cssstyle does not
-    // implement the legacy shorthand and drops it from the serialised style entirely, so any
-    // assertion about it here would be checking jsdom rather than the component. The four
-    // properties above are enough to prove the node is off-layout; the clip rect is the house
-    // idiom, shared verbatim with RecapCard and the column's announcer.
-    // Not removed from the accessibility tree by any of the usual means.
-    expect(node?.getAttribute("aria-hidden")).toBeNull();
-    expect(node?.hidden).toBe(false);
-    expect(node?.style.display).not.toBe("none");
+    const { container, rerender } = render(<ThinkingIndicator typing />);
+    for (const at of [0, SLOW_AFTER_MS, STALLED_AFTER_MS - SLOW_AFTER_MS]) {
+      wait(at, rerender);
+      expect(container.querySelectorAll("[role='status']")).toHaveLength(0);
+      // No line in this fixture, so the row is decoration and must not become a region either.
+      expect(container.querySelectorAll("[aria-live]")).toHaveLength(0);
+      expect(indicator()?.getAttribute("aria-hidden")).toBe("true");
+    }
+    // Not vacuous: the colour really did walk all the way to red while none of that appeared.
+    expect(indicator()?.getAttribute("data-liveness")).toBe("stalled");
   });
 
   // The activity line SURVIVES the escalation now. The old version suppressed it and swapped the
@@ -341,36 +322,21 @@ describe("ThinkingIndicator — the wait", () => {
     expect(ink()).toBe(GRAY);
   });
 
-  // A COLOUR CANNOT BE READ ALOUD, so the state exists as text a screen reader can reach and a
-  // sighted user cannot see. BOTH channels are asserted (roborev 56112-M1): a live region is
-  // announced from a subtree MUTATION, so the clip-rect node appearing is what an AT actually
-  // reacts to — an `aria-label` change alone is not reliably announced, which is how the first draft
-  // of this retune silently lost the fallback it claimed to keep.
-  it("announces the state it can only otherwise show as ink, through both channels", () => {
-    noteConciergeSent();
-    const { rerender } = render(<ThinkingIndicator typing />);
-    wait(10_000, rerender);
-    // Nothing worth saying yet: gray is the normal state, so there is no node and no extra label.
-    expect(spokenState()).toBeNull();
-    expect(indicator()?.getAttribute("aria-label")).toBe("Sparkle is typing");
-
-    wait(SLOW_AFTER_MS - 10_000, rerender);
-    expect(spokenState()).toContain("Still waiting"); // the mutation an AT hears
-    expect(indicator()?.getAttribute("aria-label")).toContain("Still waiting"); // the fallback
-    expect(indicator()?.getAttribute("aria-live")).toBe("polite");
-    // …and none of it reaches the screen.
-    expect(visibleText()).toBe("…");
-  });
-
-  it("announces the activity AND the state together, rather than replacing one with the other", () => {
+  // A COLOUR CANNOT BE READ ALOUD — but this component is not where that is solved. The row's own
+  // accessible name is the LINE, exactly as it was before the retune, and the waiting state is
+  // spoken by ConciergeHost through the column's announcer (asserted in ConciergeHost.liveness).
+  // Saying it here as well produced a duplicated "Sparkle is typing · Still waiting … Still
+  // waiting" on any AT that read both channels (roborev 56122-M2).
+  it("leaves the row's accessible name to the activity line, at every colour", () => {
     noteConciergeSent();
     const { rerender } = render(<ThinkingIndicator typing />);
     act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "gone" }));
     rerender(<ThinkingIndicator typing />);
-    wait(STALLED_AFTER_MS, rerender);
-    const label = indicator()?.getAttribute("aria-label") ?? "";
-    expect(label).toContain("Reading an agent's terminal");
-    expect(label).toContain("Still waiting");
+    for (const at of [0, SLOW_AFTER_MS, STALLED_AFTER_MS - SLOW_AFTER_MS]) {
+      wait(at, rerender);
+      expect(indicator()?.getAttribute("aria-label")).toBe("Reading an agent's terminal");
+    }
+    expect(indicator()?.getAttribute("data-liveness")).toBe("stalled");
   });
 
   // The name several suites outside this file identify the row by, kept EXACTLY while there is

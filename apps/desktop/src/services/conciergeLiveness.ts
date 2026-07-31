@@ -28,6 +28,8 @@ import {
   reduceSent,
   reduceSettled,
   reduceTick,
+  silentForMs,
+  STALLED_AFTER_MS,
   ticks,
   type ConciergeLiveness,
   type ConciergeLivenessState,
@@ -160,12 +162,22 @@ export function useConciergeLiveness(): ConciergeLivenessReading {
   // next send moves `silentSince` forward, so it drops silently back to gray over a brain nothing
   // proved is back. That is precisely what `stalledLatched` exists to prevent.
   //
-  // So red latches the moment it is OBSERVED, from whichever path produced it. Idempotent: the
-  // write flips the flag, the re-render re-runs this with `stalledLatched` true, and it stops.
+  // GATED ON THE CLOCK, NOT ON THE READING (roborev 56122-M2). `livenessAt` also returns "stalled"
+  // for a RUN of unanswered sends, and latching that would make the run sticky in a way nothing can
+  // undo: `reduceFailed` clears `silentRun` on purpose — an error is a response, this turn WAS
+  // answered — but it does not touch the latch. Latching a run-derived red therefore left a user
+  // who had just been shown a verbatim quota bubble looking at a red row on their next, brand-new
+  // question, about which the app has no silence evidence at all. The old interval could not reach
+  // that state (`ticks` is already false once the reading is stalled), so this was a regression
+  // introduced by the fix above, not a pre-existing hole.
+  //
+  // Idempotent: the write flips the flag, the re-render re-runs this with `stalledLatched` true,
+  // and it stops.
+  const crossed = (silentForMs(state, now) ?? 0) >= STALLED_AFTER_MS;
   useEffect(() => {
-    if (liveness !== "stalled" || state.stalledLatched) return;
+    if (!crossed || state.stalledLatched) return;
     useConciergeLivenessStore.setState(reduceTick(useConciergeLivenessStore.getState(), Date.now()));
-  }, [liveness, state.stalledLatched]);
+  }, [crossed, state.stalledLatched]);
 
   return {
     liveness,

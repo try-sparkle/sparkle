@@ -14,6 +14,7 @@ import {
   FAILURE_OUTAGE_RUN,
   SLOW_AFTER_MS,
   STALLED_AFTER_MS,
+  STALLED_SILENT_RUN,
 } from "../engine/conciergeLiveness";
 import {
   _resetConciergeLivenessForTests,
@@ -169,6 +170,35 @@ describe("red latches on what is READ, not only on what is ticked", () => {
     act(() => noteConciergeSent());
     rerender();
     expect(result.current.liveness).toBe("stalled");
+  });
+
+  // …BUT ONLY THE CLOCK LATCHES (roborev 56122-M1). `livenessAt` also reads stalled for a RUN of
+  // unanswered sends, and latching that would make the run sticky in a way nothing can undo:
+  // `reduceFailed` clears `silentRun` deliberately — an error is a response, the turn WAS answered —
+  // but it does not touch the latch. So the user gets told their quota is gone in a verbatim bubble,
+  // and then their next brand-new question paints red on its first frame over no silence evidence at
+  // all.
+  it("does not latch a run-derived red, so a hard failure still returns the next send to gray", () => {
+    const { result, rerender } = renderHook(() => useConciergeLiveness());
+    for (let i = 0; i <= STALLED_SILENT_RUN; i += 1) {
+      act(() => noteConciergeSent());
+      act(() => {
+        vi.advanceTimersByTime(SLOW_AFTER_MS + 1_000);
+      });
+      rerender();
+    }
+    // Red, and correctly so — but from the run, not from the clock.
+    expect(result.current.liveness).toBe("stalled");
+    expect(useConciergeLivenessStore.getState().silentRun).toBeGreaterThanOrEqual(
+      STALLED_SILENT_RUN,
+    );
+    expect(useConciergeLivenessStore.getState().stalledLatched).toBe(false);
+
+    // The turn comes back with a loud error, which resets the run. The next question is new.
+    act(() => noteConciergeFailed("You've hit your session limit"));
+    act(() => noteConciergeSent());
+    rerender();
+    expect(result.current.liveness).toBe("waiting");
   });
 });
 

@@ -243,6 +243,29 @@ export function livenessAt(s: ConciergeLivenessState, now: number): ConciergeLiv
 }
 
 /**
+ * What a screen reader is told when the colour moves, or null when there is nothing worth saying.
+ *
+ * A COLOUR CANNOT BE READ ALOUD, and the founder's "no words" instruction was about visual noise —
+ * dropping the announcement would leave a non-sighted user with the bare "…" this whole feature
+ * exists to improve on. So the step is spoken, and only spoken: ConciergeHost passes this to the
+ * column's ONE announcer, the same stable region every other line in the column goes through. Two
+ * earlier attempts to keep it inside the indicator failed for reasons worth not repeating — see that
+ * component's header.
+ *
+ * `waiting` is deliberately silent. Gray is the NORMAL state; announcing it would be telling the
+ * user their concierge is behaving, every single turn.
+ *
+ * The wording reports what has NOT been received rather than diagnosing the brain. 26% of turns are
+ * still running at 60s, so "your concierge is offline" would be a claim the app cannot support — the
+ * same discipline the failure notice keeps by quoting the machine verbatim.
+ */
+export function livenessAnnouncement(liveness: ConciergeLiveness): string | null {
+  if (liveness === "slow") return "Still waiting";
+  if (liveness === "stalled") return "Still waiting — nothing has come back";
+  return null;
+}
+
+/**
  * THE ONE SURFACE HERE THAT STILL USES WORDS: a run of hard failures, in the machine's own words.
  *
  * Returns the last failure notice once {@link FAILURE_OUTAGE_RUN} consecutive errors have been

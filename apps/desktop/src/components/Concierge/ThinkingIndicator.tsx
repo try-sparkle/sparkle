@@ -24,19 +24,23 @@
 // the colour: same icon, same line, same pulse, same layout, in a different ink. Nothing reflows, so
 // a slow turn costs a glance rather than a sentence. See the engine header for the thresholds.
 //
-// A colour cannot be read by a screen reader, so the state is carried as text that never renders.
-// That is not a loophole in "no text label": the complaint was visual noise, and dropping the
-// announcement would have left a non-sighted user with the bare "…" this feature exists to improve
-// on.
+// A COLOUR CANNOT BE READ ALOUD, and this component does not solve that — ConciergeHost does, by
+// speaking the step through the column's ONE announcer (`announce`). Nothing here carries the state
+// in text, and that is the third answer to the question after two wrong ones:
 //
-// It is carried TWO ways, and the redundancy is the point (roborev 56112-M1). A live region is
-// announced from a CONTENT mutation in its subtree; an attribute-only change to `aria-label` on the
-// region node is not reliably announced by NVDA/JAWS/VoiceOver. The first draft of this retune moved
-// the state into `aria-label` alone and so most likely announced nothing at all at 30s or 60s —
-// silently losing the very fallback it claimed to preserve, with a test that asserted the attribute
-// rather than the announcement and could not catch it. So the state is now a clip-rect `<span>`
-// (a real subtree mutation) AND appended to the label. Whichever an AT reads, it hears the same
-// thing, and neither path can be the only one that works.
+//   1. `aria-label` ALONE announces nothing (roborev 56112-M1). A live region is announced from a
+//      CONTENT mutation in its subtree; an attribute-only change on the region node is not reliably
+//      announced by NVDA/JAWS/VoiceOver. A test asserting the attribute cannot catch that.
+//   2. A clip-rect region of this component's OWN (roborev 56122-M2) fixes the mutation problem and
+//      breaks something else: the thread deliberately owns no announcer, because a second live
+//      region double-announces (ConciergeThread.roleLabels asserts exactly this, and caught it).
+//      Nesting it inside the row is worse still — with no activity line the row is `aria-hidden`,
+//      which removes its entire subtree from the accessibility tree, so it would have been silent in
+//      the very case it existed for: a turn that thinks for a minute and calls nothing.
+//
+// Both dead ends were reaching for a stable live region. The column already HAS one, mounted with it
+// and keyed on a write counter so identical consecutive lines still speak. The state belongs there,
+// like every other thing this column says.
 //
 // THREE RULES IT DEGRADES BY:
 //
@@ -56,7 +60,14 @@
 // PresenceSlider all read stores); the alternative was a prop threaded through ConciergeHost, which
 // buys nothing — the host would only forward what this subscribes to — and would collide with the
 // @-mention work landing in that file.
-import { useState, type CSSProperties } from "react";
+//
+// That reasoning still holds for the COLOUR, which is all this component reads the store for. It is
+// no longer the whole story: the spoken half deliberately does live in the host, via a leaf that
+// renders nothing (`LivenessAnnouncer`). Not because a prop would have been better, but because the
+// announcement has to go through the column's single live region, which only the host can feed —
+// and because subscribing the host itself to this 1 Hz ticker would reconcile the entire column
+// once a second for the length of every turn (roborev 56177-M2).
+import { useState } from "react";
 import { FiFolder, FiGitBranch, FiTerminal, FiUsers } from "react-icons/fi";
 import type { IconType } from "react-icons";
 
@@ -81,20 +92,6 @@ const ICONS: Record<ConciergeActivityIcon, IconType> = {
 
 export const THINKING_INDICATOR_TESTID = "concierge-thinking";
 export const THINKING_ACTIVITY_TESTID = "concierge-thinking-activity";
-/** The clip-rect node carrying the state. Named so tests can subtract it when asking what is
- *  actually VISIBLE — the founder's constraint is about pixels, not about `textContent`. */
-export const THINKING_STATE_TESTID = "concierge-thinking-state";
-
-/** Same clip-rect shape as the column's announcer and RecapCard — this codebase has no sr-only
- *  utility, and inventing a second one would be the thing that drifts. */
-const OFF_SCREEN: CSSProperties = {
-  position: "absolute",
-  width: 1,
-  height: 1,
-  overflow: "hidden",
-  clip: "rect(0 0 0 0)",
-  whiteSpace: "nowrap",
-};
 
 /**
  * The whole signal: one ink per step, and NOTHING else changes.
@@ -112,22 +109,6 @@ const INK: Record<ConciergeLiveness, string> = {
   waiting: C.conciergeMuted,
   slow: C.amberInk,
   stalled: C.sienna,
-};
-
-/**
- * What a screen reader is told, since it cannot be told a colour.
- *
- * Kept out of the DOM as an `aria-label`, never rendered — the founder's objection was to visual
- * noise, and a non-sighted user who lost this would be back to the bare "…" this whole feature
- * exists to improve on. The wording still reports what we have NOT received rather than diagnosing
- * the brain: 26% of turns are still running at 60s, so "your concierge is offline" would be a claim
- * the app cannot support.
- */
-const SPOKEN_STATE: Record<ConciergeLiveness, string | null> = {
-  idle: null,
-  waiting: null,
-  slow: "Still waiting",
-  stalled: "Still waiting — nothing has come back",
 };
 
 export function ThinkingIndicator({ typing }: { typing: boolean }) {
@@ -170,16 +151,14 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
   // beside the line already says "still going" without claiming the call is still running. So the
   // line stays put in every state and only its ink moves.
   const Icon = line ? ICONS[line.icon] : null;
-  // What a screen reader is given, in the same order of preference a sighted user reads it. The
-  // state is APPENDED rather than substituted, so the announcement gains the waiting news without
-  // losing the activity the sighted user can still see.
-  const state = SPOKEN_STATE[liveness];
-  const base =
+  // What a screen reader is given for the ROW, unchanged by this whole feature: the line, or the
+  // name the row has always carried. The waiting state is NOT appended — the host speaks it through
+  // the column's announcer, and saying it here as well produced a duplicated "Sparkle is typing ·
+  // Still waiting … Still waiting" on any AT that read both (roborev 56122-M2).
+  const spoken =
     line?.text ??
-    // The name this row has always carried, kept EXACTLY when there is nothing else to say —
-    // several suites outside this file identify the indicator by it.
+    // Several suites outside this file identify the indicator by this exact string.
     "Sparkle is typing";
-  const spoken = state ? `${base} · ${state}` : base;
 
   return (
     <div
@@ -188,13 +167,14 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
       // sighted user is getting, and it changes at most once per tool call rather than per token —
       // so it can be announced without the flooding that kept the thread itself off a live region.
       //
-      // The WAITING state is announced for the same reason and a stronger one: it changes at most
-      // twice in a turn, and it is the only notice a non-sighted user gets that their question has
-      // gone nowhere. The old per-second counter was NOT announced — it changed every second, which
-      // is exactly the flooding the thread itself is kept off a live region to avoid; it no longer
-      // exists in either channel.
-      aria-hidden={line || state ? undefined : true}
-      aria-live={line || state ? "polite" : undefined}
+      // DRIVEN BY THE LINE ALONE, exactly as before this retune. The waiting state is spoken by the
+      // host through the column's announcer instead — letting it flip these attributes would create
+      // a live region in the same commit as its own first announcement, which is the failure mode a
+      // stable region exists to avoid. (The old per-second counter was never announced either: it
+      // changed every second, which is the flooding the thread is kept off a live region for. It no
+      // longer exists in any channel.)
+      aria-hidden={line ? undefined : true}
+      aria-live={line ? "polite" : undefined}
       // The accessible name is the LINE when there is one, so what gets announced is the same thing
       // the sighted user is reading rather than the generic "typing" underneath it. It falls back to
       // the name this row has always carried, which several suites identify the indicator by.
@@ -218,15 +198,6 @@ export function ThinkingIndicator({ typing }: { typing: boolean }) {
       }}
     >
       {Icon && <Icon size={12} aria-hidden style={{ flexShrink: 0 }} />}
-      {/* THE ANNOUNCEMENT, and zero pixels. Clipped rather than `display: none` or `hidden`, both of
-          which remove a node from the accessibility tree entirely — the point is that it IS read.
-          Appearing and disappearing here is a subtree mutation in a live region, which is the thing
-          an AT actually announces (see the header). */}
-      {state && (
-        <span data-testid={THINKING_STATE_TESTID} style={OFF_SCREEN}>
-          {state}
-        </span>
-      )}
       {line && (
         <span
           data-testid={THINKING_ACTIVITY_TESTID}

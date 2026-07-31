@@ -99,9 +99,14 @@ import { THINKING_INDICATOR_TESTID } from "./Concierge/ThinkingIndicator";
 import { UNKNOWN_FAILURE_HEADLINE } from "../engine/conciergeFailureNotice";
 import {
   _resetConciergeLivenessForTests,
+  noteConciergeSent,
   useConciergeLivenessStore,
 } from "../services/conciergeLiveness";
-import { FAILURE_OUTAGE_RUN } from "../engine/conciergeLiveness";
+import {
+  FAILURE_OUTAGE_RUN,
+  SLOW_AFTER_MS,
+  STALLED_AFTER_MS,
+} from "../engine/conciergeLiveness";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
@@ -416,5 +421,95 @@ describe("sign-out mid-turn leaves the next human nothing to inherit", () => {
     await send("B's question");
 
     expect(threadText()).not.toContain("never answered");
+  });
+});
+
+// ── THE COLOUR, SPOKEN ─────────────────────────────────────────────────────────────────────────
+//
+// The no-answer signal is a colour and nothing else, which a screen reader cannot read. The step is
+// therefore announced — through the column's ONE live region, fed by the host, like every other line
+// the column says.
+//
+// THIS LIVES HERE, not in ThinkingIndicator, and that placement IS the fix (roborev 56122-M2). Two
+// attempts to give the indicator its own region failed: an `aria-label`-only change is not reliably
+// announced at all, and a clip-rect region of its own violates the thread's "no announcer of its
+// own" rule (ConciergeThread.roleLabels asserts it, and caught the second attempt) — besides being
+// muted outright when nested inside the row, which is `aria-hidden` whenever there is no activity
+// line, i.e. exactly the stalled-and-silent case it existed for.
+describe("the liveness colour is spoken, through the column's one announcer", () => {
+  const announcer = () => screen.getByTestId("concierge-announcer").textContent ?? "";
+
+  beforeEach(() => vi.useFakeTimers({ shouldAdvanceTime: true }));
+  afterEach(() => vi.useRealTimers());
+
+  it("says nothing at all while the wait is normal, then speaks each step once", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me?");
+
+    // GRAY IS SILENT. Announcing it would tell the user their concierge is behaving, every turn.
+    await act(async () => {
+      vi.advanceTimersByTime(SLOW_AFTER_MS - 2_000);
+    });
+    expect(announcer()).not.toContain("Still waiting");
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    expect(announcer()).toContain("Still waiting");
+    expect(announcer()).not.toContain("nothing has come back");
+
+    await act(async () => {
+      vi.advanceTimersByTime(STALLED_AFTER_MS - SLOW_AFTER_MS);
+    });
+    expect(announcer()).toContain("nothing has come back");
+  });
+
+  // ── A STALE STORE MUST NOT GREET THE NEXT MOUNT ─────────────────────────────────────────────
+  //
+  // roborev 56177-M1. The liveness store is module-level and outlives the host, which unmounts
+  // whenever no project is open (App.tsx). A turn in flight at that moment loses its terminal
+  // listeners and leaves `silentSince` set forever — so on the next mount the very first reading is
+  // already `stalled`. Speaking on the effect's FIRST run would then have a reopened project greet
+  // the user with "nothing has come back" about a turn nobody is waiting for, with no indicator row
+  // on screen and `typing` false — and clobber the column's one live region on mount.
+  it("says nothing on mount, however stalled the store it inherits", async () => {
+    // The abandoned turn, established with NO host mounted — exactly the closed-project window.
+    noteConciergeSent();
+    await act(async () => {
+      vi.advanceTimersByTime(STALLED_AFTER_MS * 5);
+    });
+
+    render(<ConciergeHost feed={feed()} />);
+    await flush();
+    expect(announcer()).toBe("");
+
+    // Not vacuous: the store really is stalled, so a first-run announcement had something to say.
+    expect(useConciergeLivenessStore.getState().silentSince).not.toBeNull();
+  });
+
+  // NOT ONCE PER RENDER. `announce` bumps a write counter so identical repeats still speak (roborev
+  // 53392) — which is exactly why a per-render call would re-announce "Still waiting" every second
+  // for as long as the turn stayed slow. Asserted on the write counter, because the TEXT would look
+  // identical either way; this is the one reading that can tell the two apart.
+  it("does not re-announce the same step on every tick", async () => {
+    render(<ConciergeHost feed={feed()} />);
+    await send("what needs me?");
+    await act(async () => {
+      vi.advanceTimersByTime(SLOW_AFTER_MS);
+    });
+    const seq = screen
+      .getByTestId("concierge-announcer")
+      .querySelector("[data-announce-seq]")
+      ?.getAttribute("data-announce-seq");
+
+    await act(async () => {
+      vi.advanceTimersByTime(20_000); // still yellow, twenty more ticks
+    });
+    expect(
+      screen
+        .getByTestId("concierge-announcer")
+        .querySelector("[data-announce-seq]")
+        ?.getAttribute("data-announce-seq"),
+    ).toBe(seq);
   });
 });
