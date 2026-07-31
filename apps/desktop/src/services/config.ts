@@ -64,6 +64,34 @@ export interface ApprovalsConfig {
  *  derived from the tool's risk class — so a small file is not a small policy. */
 export interface ConciergeConfig {
   tools: Record<string, string>;
+  /** The reply linter's policy (`[concierge.checks]`). Optional for the same back-compat reason as
+   *  every other block here: a Rust backend predating it omits the key. An absent section is NOT
+   *  "lint with defaults" — services/conciergeLintPolicy.ts resolves it to the disabled policy, so
+   *  an older backend can never have a gate switched on underneath it. */
+  checks?: ConciergeChecksConfigPayload;
+}
+/** One `[concierge.checks.<id>]` row EXACTLY as Rust serializes it (`ConciergeCheck` in config.rs,
+ *  `rename_all = "snake_case"`).
+ *
+ *  Every field is typed at its wire width, not at its intended width: `severity` is `string` and not
+ *  the `Severity` union because config.toml is HAND-EDITED and Rust keeps an unrecognized value
+ *  verbatim on purpose (the raw string is what makes the warning nameable). Narrowing it here would
+ *  be a lie the compiler then propagates. The narrowing happens once, in
+ *  services/conciergeLintPolicy.ts. */
+export interface ConciergeCheckPayload {
+  enabled: boolean;
+  severity: string;
+  autofix: boolean;
+  threshold?: number | null;
+  words?: string | null;
+}
+/** The `[concierge.checks]` table as Rust serializes it. `log_matches` is snake_case on the wire;
+ *  the camelCase `logMatches` the linter reads is produced by the mapper, not by this type. */
+export interface ConciergeChecksConfigPayload {
+  enabled: boolean;
+  log: boolean;
+  log_matches: boolean;
+  checks: Record<string, ConciergeCheckPayload>;
 }
 /** Opinionated non-AI tools (machine-wide; ignored in a per-project file). Each defaults on for a
  *  new install; false means that tool is used nowhere in Sparkle. Surfaced in the "Tools" pane. */

@@ -110,6 +110,11 @@ describe("useConciergeLintMetrics — session-scoped increments", () => {
     }
     expect(Object.keys(s.checks).sort()).toEqual(
       [
+        // The only BLOCKING check, and the one this list omitted while it shipped: with no column
+        // here its violations were silently uncounted, which reads on the drift readout as "the
+        // check never fires". `conciergeLintRegistry.test.ts` now derives this requirement from the
+        // linter's own registry, so a future check cannot go uncounted the same way.
+        "ask-without-action",
         "bare-agent-name",
         "bare-pr-number",
         "fat-pill-label",

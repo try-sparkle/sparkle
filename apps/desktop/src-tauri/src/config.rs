@@ -264,9 +264,18 @@ pub struct ConciergeConfig {
 /// The three values a `[concierge.tools]` entry may take. Mirrors PolicyDecision in policy.ts.
 const CONCIERGE_TOOL_DECISIONS: [&str; 3] = ["allow", "ask", "deny"];
 
-/// The three values a `[concierge.checks.<id>].severity` may take. `"block"` re-prompts the
-/// concierge once for a corrected reply, `"warn"` renders and badges it, `"off"` disables that one
-/// check while leaving its row (and any comment explaining WHY it is off) in the file.
+/// The three values a `[concierge.checks.<id>].severity` may take, described as they BEHAVE in this
+/// build rather than as designed — the two differ, and saying otherwise here is the same unkept
+/// promise a configured-but-unimplemented check is:
+///
+/// * `"warn"` — the violation is counted and appended to `concierge-lint.jsonl`. The reply renders
+///   UNCHANGED; there is no badge yet, because nothing consumes the metrics store outside the
+///   runner.
+/// * `"block"` — NOT YET IMPLEMENTED, and identical to `"warn"` at the mount today. It is designed
+///   to re-prompt the concierge once for a corrected reply; `ConciergeHost` reads `LintResult.text`
+///   and discards `blocked`. No shipped check uses it, and `conciergeLintRegistry.test.ts` refuses
+///   one until the re-prompt exists.
+/// * `"off"` — that one check is skipped, leaving its row (and any comment explaining WHY) in place.
 ///
 /// `pub(crate)` so `concierge_lint_log::SEVERITIES` can be pinned against it by direct comparison.
 /// That log restates this vocabulary (it must, to bucket a violation without depending on config),
@@ -365,28 +374,58 @@ struct DefaultCheck {
 /// `concierge_checks_template_matches_the_default` asserts they agree.
 const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
     // THE MOST-REPEATED FAILURE, and the one the human named four times in a single session:
-    // reporting accurately and then asking permission instead of acting. Blocks, because a logged
-    // violation the human has to read is the same passivity one level up. Its exemption for
-    // genuinely irreversible or spend-bearing actions is keyed off the tool risk classification, not
-    // off phrasing — phrasing is what a model under a linter learns to game.
+    // reporting accurately and then asking permission instead of acting. Its exemption for genuinely
+    // irreversible or spend-bearing actions is keyed off the tool risk classification, not off
+    // phrasing — phrasing is what a model under a linter learns to game.
+    //
+    // SHIPPED `"warn"`, THOUGH IT IS DESIGNED TO BLOCK, and the reason is the same one that put the
+    // seven checks below at `"off"` (roborev 55981). `"block"` is documented as "re-prompts the
+    // concierge once for a corrected reply", and NOTHING re-prompts: `ConciergeHost` consumes
+    // `LintResult.text` and discards `blocked`. Shipping `"block"` would tell the reader a passive
+    // reply cannot reach them, which is exactly the unkept promise the `"off"` rows exist to avoid —
+    // and it would be worse here, because the check DOES run, so the failure is invisible.
+    //
+    // Raise this to `"block"` in the same change that implements the re-prompt, and upgrade
+    // `askWithoutAction`'s emitted action from `"warned"` to `"revised"` there — not before, or the
+    // rollup counts corrections that never happened.
     DefaultCheck {
         id: "ask-without-action",
-        severity: "block",
+        severity: "warn",
         autofix: false,
         threshold: None,
         words: None,
     },
+    // ══ NOT YET IMPLEMENTED — SHIPPED `"off"` ON PURPOSE ═══════════════════════════════════════
+    // The seven rows below describe checks the TypeScript linter does NOT implement yet. They
+    // shipped at their intended severities (`relay-paste` and three others at `"block"`) while
+    // nothing implemented them, which made this table a PROMISE THE APP DOES NOT KEEP: a user
+    // reading `severity = "block"` for `relay-paste` reasonably concludes a relayed paste cannot
+    // reach them, and it can.
+    //
+    // `"off"` is the honest value, and it is strictly better than deleting the rows. Deleting them
+    // would lose the intended policy AND make a later implementation land silently switched ON for
+    // every existing user — the row is where the design decision is recorded. `off` says "designed,
+    // not built"; an absent row says nothing at all.
+    //
+    // WHAT MAKES THIS SELF-CORRECTING: `conciergeLintRegistry.test.ts` asserts that every id here
+    // whose severity is NOT `"off"` has an implementation in the linter's `CHECKS` registry. Turning
+    // one of these on without writing the check is a RED TEST, not a silent no-op. Flip the severity
+    // in the same commit that implements the check — never before.
+    //
+    // Their intended severities, for whoever implements them: relay-paste = block,
+    // unresolved-agent-pill = block, actions-first = block, unreported-refusal = block,
+    // bare-agent-name = warn + autofix, bare-pr-number = warn + autofix, fat-pill-label = warn.
     // The most recently broken rule: never paste the text you just sent back into the reply.
     DefaultCheck {
         id: "relay-paste",
-        severity: "block",
+        severity: "off",
         autofix: false,
         threshold: Some(240),
         words: None,
     },
     DefaultCheck {
         id: "bare-agent-name",
-        severity: "warn",
+        severity: "off",
         // Autofix ONLY on a unique roster match — an ambiguous name warns instead, because a pill
         // carrying the wrong id opens the wrong agent and the reader cannot tell it guessed.
         autofix: true,
@@ -395,40 +434,42 @@ const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
     },
     DefaultCheck {
         id: "bare-pr-number",
-        severity: "warn",
+        severity: "off",
         autofix: true,
         threshold: None,
         words: None,
     },
     DefaultCheck {
         id: "unresolved-agent-pill",
-        // Blocks: a pill whose id resolves to nothing is worse than the bare text it replaced.
-        severity: "block",
+        // Intended to block: a pill whose id resolves to nothing is worse than the bare text it
+        // replaced. Off until something implements it.
+        severity: "off",
         autofix: false,
         threshold: None,
         words: None,
     },
     DefaultCheck {
         id: "fat-pill-label",
-        severity: "warn",
+        severity: "off",
         autofix: true,
         threshold: None,
         words: None,
     },
     DefaultCheck {
         id: "actions-first",
-        severity: "block",
+        severity: "off",
         autofix: false,
         threshold: None,
         words: None,
     },
     DefaultCheck {
         id: "unreported-refusal",
-        severity: "block",
+        severity: "off",
         autofix: false,
         threshold: None,
         words: None,
     },
+    // ══ IMPLEMENTED AND LIVE ═══════════════════════════════════════════════════════════════════
     DefaultCheck {
         id: "hedge-words",
         severity: "warn",
@@ -480,8 +521,15 @@ pub struct ConciergeChecksConfig {
     pub enabled: bool,
     /// Append each violation to `concierge-lint.jsonl` (metadata only — never the reply text).
     pub log: bool,
-    /// Also log a short HASH of the matched span. Opt-in and off by default: it is enough to tell
-    /// "the same violation 40 times" from "40 different ones" without putting reply text on disk.
+    /// Also log a short HASH of the matched span, to tell "the same violation 40 times" from "40
+    /// different ones" without putting reply text on disk. Opt-in and off by default.
+    ///
+    /// NOT YET IMPLEMENTED — setting it `true` currently does nothing (roborev 55981). The Rust sink
+    /// is fully built for it (`concierge_lint_log` accepts, hex-validates and length-caps `hash`),
+    /// but no producer computes one: `Violation` carries `span` as a character COUNT and never the
+    /// matched text, so the runner has nothing to digest. Honoring the flag needs the checks to
+    /// surface a digest themselves. Documented here rather than silently inert, for the same reason
+    /// the unimplemented checks ship `"off"`.
     pub log_matches: bool,
     /// Check id → its policy. Seeded from [`DEFAULT_CONCIERGE_CHECKS`]; unknown ids are KEPT.
     ///
@@ -2950,9 +2998,16 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # Each check takes:
 #   enabled   = true|false     run it at all
 #   severity  = "block" | "warn" | "off"
-#                              block = the concierge is asked once for a corrected reply;
-#                              warn  = the reply renders with a badge naming the rule;
+#                              warn  = the violation is counted and appended to
+#                                      concierge-lint.jsonl; the reply itself renders UNCHANGED.
+#                              block = NOT YET IMPLEMENTED — behaves exactly like "warn" today.
+#                                      It is designed to re-prompt the concierge once for a
+#                                      corrected reply, and nothing does that yet, so writing it
+#                                      buys you nothing over "warn". No shipped check uses it.
 #                              off   = this check is skipped (the row and your comment stay).
+# There is no badge and no other on-screen marker yet either: violations reach the JSONL and the
+# session counters, not the thread. Said plainly here because a legend that describes behaviour the
+# build does not have is the same broken promise as a check with no implementation.
 #   autofix   = true|false     rewrite into the compliant form instead of just reporting — only
 #                              where that form is mechanically derivable and cannot change meaning.
 # Plus, where a check has one: threshold (a whole number) or words (comma-separated text).
@@ -2961,49 +3016,61 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 [concierge.checks]
 enabled     = true      # master switch — false disables the whole linter
 log         = true      # append violations to concierge-lint.jsonl
-log_matches = false     # opt-in: also log a HASH of the matched span (never the text)
+log_matches = false     # NOT YET IMPLEMENTED — nothing computes a hash, so this has no effect
 
-# Offered to act ("want me to…", "should I…") while taking no action that turn. Blocks and
-# re-prompts once: handing you a note about it to read would be the same passivity again.
+# Offered to act ("want me to…", "should I…") while taking no action that turn.
 # A genuine question about an IRREVERSIBLE or spend-bearing action (publish a release, delete a
 # branch, remove a project, spend money) is exempt — that exemption is keyed off which tool the
 # action belongs to, not off how the sentence is phrased. Merging is NOT exempt.
+# DESIGNED to block and re-prompt once, but shipped "warn": nothing re-prompts yet, and
+# "block" would promise you a passive reply cannot reach you. It can. Raise this in the
+# same change that implements the re-prompt.
 [concierge.checks.ask-without-action]
 enabled   = true
-severity  = "block"
+severity  = "warn"
 autofix   = false
 
+# --- Designed but NOT YET IMPLEMENTED — shipped "off" -----------------------------------
+# The seven checks below have a policy but no implementation in the linter. They are "off"
+# because a severity of "block" here would promise you something the app does not do: it
+# would read as "a relayed paste cannot reach me", and it can. The rows are kept rather than
+# deleted so the intended policy survives — and so a later implementation does not land
+# silently switched on for everyone. Turning one on without writing the check fails a test.
+# Intended: relay-paste / unresolved-agent-pill / actions-first / unreported-refusal = block;
+# bare-agent-name / bare-pr-number = warn + autofix; fat-pill-label = warn.
 [concierge.checks.relay-paste]
 enabled   = true
-severity  = "block"     # "block" | "warn" | "off"
+severity  = "off"       # "block" | "warn" | "off"
 autofix   = false
 # Contiguous verbatim chars shared with a tool argument before it counts.
 threshold = 240
 
 [concierge.checks.bare-agent-name]
 enabled   = true
-severity  = "warn"
+severity  = "off"
 autofix   = true        # ONLY on a unique roster match; ambiguous never autofixes
 [concierge.checks.bare-pr-number]
 enabled   = true
-severity  = "warn"
+severity  = "off"
 autofix   = true        # only when pr_owner resolves an unambiguous owner
 [concierge.checks.unresolved-agent-pill]
 enabled   = true
-severity  = "block"     # a wrong id opens the WRONG agent — worse than a dead link
+severity  = "off"       # intended "block": a wrong id opens the WRONG agent
 autofix   = false
 [concierge.checks.fat-pill-label]
 enabled   = true
-severity  = "warn"
+severity  = "off"
 autofix   = true
 [concierge.checks.actions-first]
 enabled   = true
-severity  = "block"
+severity  = "off"
 autofix   = false
 [concierge.checks.unreported-refusal]
 enabled   = true
-severity  = "block"
+severity  = "off"
 autofix   = false
+
+# --- Implemented and live ---------------------------------------------------------------
 [concierge.checks.hedge-words]
 enabled   = true
 severity  = "warn"
@@ -5869,18 +5936,25 @@ quit_app = 42
     /// every assertion below true by construction — it would still pass after someone deleted a
     /// check or flipped a severity, which is exactly the drift these tests exist to catch.
     /// `(id, severity, autofix, threshold, words)`, in BTreeMap (sorted) order.
+    /// The four `"off"` rows are the checks that are DESIGNED BUT NOT IMPLEMENTED — see the
+    /// "NOT YET IMPLEMENTED" banner in `DEFAULT_CONCIERGE_CHECKS`. They previously shipped at
+    /// `"block"`/`"warn"` with nothing implementing them, which made the table a promise the app did
+    /// not keep. The TypeScript side (`conciergeLintRegistry.test.ts`) is what refuses to let one be
+    /// switched back on without an implementation; this table just records what ships.
     const EXPECTED_CHECKS: &[(&str, &str, bool, Option<i64>, Option<&str>)] = &[
-        ("actions-first", "block", false, None, None),
-        ("ask-without-action", "block", false, None, None),
-        ("bare-agent-name", "warn", true, None, None),
-        ("bare-pr-number", "warn", true, None, None),
-        ("fat-pill-label", "warn", true, None, None),
+        ("actions-first", "off", false, None, None),
+        // `"warn"`, not `"block"`: designed to block, but nothing re-prompts yet. See the row's
+        // comment in DEFAULT_CONCIERGE_CHECKS.
+        ("ask-without-action", "warn", false, None, None),
+        ("bare-agent-name", "off", true, None, None),
+        ("bare-pr-number", "off", true, None, None),
+        ("fat-pill-label", "off", true, None, None),
         ("hedge-words", "warn", false, None, Some("should, deserves to")),
         ("naked-file-ref", "warn", false, None, None),
-        ("relay-paste", "block", false, Some(240), None),
+        ("relay-paste", "off", false, Some(240), None),
         ("restated-state", "warn", false, Some(200), None),
-        ("unreported-refusal", "block", false, None, None),
-        ("unresolved-agent-pill", "block", false, None, None),
+        ("unreported-refusal", "off", false, None, None),
+        ("unresolved-agent-pill", "off", false, None, None),
     ];
 
     #[test]
@@ -5945,22 +6019,27 @@ quit_app = 42
     fn a_global_check_edit_lands_and_leaves_the_rest_of_the_policy_alone() {
         // The one-line hatch the whole design rests on: switch off a misfiring check with no
         // rebuild — without silently resetting that check's other knobs, or its neighbours'.
-        let g = "[concierge.checks.relay-paste]\nseverity = \"off\"\n";
+        // Aimed at `restated-state`, NOT `relay-paste`. relay-paste now ships `"off"` (designed, not
+        // implemented), so `severity = "off"` would be a no-op edit and "the edit must take effect"
+        // would pass without anything taking effect. `restated-state` ships `"warn"` WITH a
+        // threshold, which is what this test needs: a severity that actually changes, plus an
+        // unmentioned field whose survival proves the merge is per-FIELD.
+        let g = "[concierge.checks.restated-state]\nseverity = \"off\"\n";
         let (cfg, warns, hard) = effective(Some(g), None);
         assert!(!hard);
         let c = &cfg.concierge.checks;
-        let relay = c.checks.get("relay-paste").expect("relay-paste must still exist");
-        assert_eq!(relay.effective_severity(), "off", "the edit must take effect");
+        let edited = c.checks.get("restated-state").expect("restated-state must still exist");
+        assert_eq!(edited.effective_severity(), "off", "the edit must take effect");
         assert_eq!(
-            relay.threshold,
-            Some(240),
+            edited.threshold,
+            Some(200),
             "a field the edit didn't mention keeps its shipped value — per-FIELD merge, not \
              per-check replacement"
         );
-        assert!(relay.enabled, "severity = \"off\" is a different edit from enabled = false");
+        assert!(edited.enabled, "severity = \"off\" is a different edit from enabled = false");
         assert_eq!(
-            c.checks.get("actions-first").map(|k| k.severity.as_str()),
-            Some("block"),
+            c.checks.get("ask-without-action").map(|k| k.severity.as_str()),
+            Some("warn"),
             "another check must not move"
         );
         assert!(c.enabled, "one check off is not the whole linter off");
@@ -6077,15 +6156,20 @@ severity = "warn"
         // The security boundary [concierge.tools] already draws, inherited for a stronger reason: a
         // cloned repo must not be able to disable the linter that governs what the concierge tells
         // the human ABOUT that repo.
+        // Aimed at `ask-without-action` and NOT at `relay-paste`. relay-paste now ships `"off"`
+        // (designed, not implemented), so a project file setting it to `"off"` would agree with the
+        // global value and this test would pass without the boundary doing anything — a vacuous
+        // assertion of exactly the kind this repo's #1 finding is about. `ask-without-action` ships
+        // `"block"`, so "the global severity stands" is a claim the override could actually break.
         let p = "[concierge.checks]\nenabled = false\n\
-                 [concierge.checks.relay-paste]\nseverity = \"off\"\nenabled = false\n";
+                 [concierge.checks.ask-without-action]\nseverity = \"off\"\nenabled = false\n";
         let (cfg, warns, hard) = effective(None, Some(p));
         assert!(!hard);
         let c = &cfg.concierge.checks;
         assert!(c.enabled, "a repo must not be able to switch the linter off");
-        let relay = c.checks.get("relay-paste").unwrap();
-        assert!(relay.enabled, "a repo must not be able to disable one check either");
-        assert_eq!(relay.effective_severity(), "block", "the global severity stands");
+        let gated = c.checks.get("ask-without-action").unwrap();
+        assert!(gated.enabled, "a repo must not be able to disable one check either");
+        assert_eq!(gated.effective_severity(), "warn", "the global severity stands");
         assert!(
             warns.iter().any(|w| w.contains("[concierge]")),
             "the user must be told their project rules were ignored: {warns:?}"
@@ -6099,18 +6183,21 @@ severity = "warn"
         // authoritative in this very struct, so `sevrity` is a typo. Left silent it would parse,
         // apply nothing, and say nothing — while the blocking check the user was trying to switch
         // off kept firing on every reply. Same treatment [plugins] gives an unknown toggle.
-        let g = "[concierge.checks.relay-paste]\nsevrity = \"off\"\nenable = false\n";
+        // Aimed at `ask-without-action`, which ships `"block"`. Pointed at `relay-paste` — now
+        // shipped `"off"` — the central assertion would read "off" whether the typo took effect or
+        // not, so it would pass while proving nothing.
+        let g = "[concierge.checks.ask-without-action]\nsevrity = \"off\"\nenable = false\n";
         let (cfg, warns, hard) = effective(Some(g), None);
         assert!(!hard);
-        let relay = cfg.concierge.checks.checks.get("relay-paste").unwrap();
-        assert_eq!(relay.effective_severity(), "block", "the typo cannot have taken effect");
-        assert!(relay.enabled, "nor can `enable`");
+        let gated = cfg.concierge.checks.checks.get("ask-without-action").unwrap();
+        assert_eq!(gated.effective_severity(), "warn", "the typo cannot have taken effect");
+        assert!(gated.enabled, "nor can `enable`");
         assert!(
-            warns.iter().any(|w| w.contains("[concierge.checks.relay-paste].sevrity")),
+            warns.iter().any(|w| w.contains("[concierge.checks.ask-without-action].sevrity")),
             "the misspelled field must be named: {warns:?}"
         );
         assert!(
-            warns.iter().any(|w| w.contains("[concierge.checks.relay-paste].enable")),
+            warns.iter().any(|w| w.contains("[concierge.checks.ask-without-action].enable")),
             "both misspellings, not just the first: {warns:?}"
         );
     }

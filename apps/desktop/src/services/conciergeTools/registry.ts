@@ -1703,6 +1703,23 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
   },
 };
 
+/**
+ * Does this op CHANGE THE WORLD? The dispatcher's own answer, exposed for readers outside it.
+ *
+ * This is the question `DomainEntry.write` already answers for the approval path, and exporting it
+ * is what stops a second copy being maintained elsewhere — `conciergeLint/checks/askWithoutAction`
+ * needs exactly this and had begun hand-listing ops, which cannot stay exhaustive (roborev 56103).
+ * `LIFECYCLE_WRITE` and `SCREENSHOT_WRITE` are `Record<Op, boolean>`, so a new op there is a
+ * typecheck failure until someone decides — completeness this cannot get from a string array.
+ *
+ * Returns `undefined` for an unknown domain so the caller can pick its own default rather than
+ * inheriting a `false` that would read as "changes nothing".
+ */
+export function conciergeOpWrites(domain: string, op: string): boolean | undefined {
+  const entry = DOMAINS[domain as ConciergeToolDomain];
+  return entry ? entry.write(op) : undefined;
+}
+
 /** Every domain's op list, for the MCP layer's enums and for tests that assert the two agree. */
 export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> = {
   lifecycle: DOMAINS.lifecycle.ops,

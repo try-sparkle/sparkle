@@ -74,6 +74,10 @@ import {
   noteConciergeSent,
   noteConciergeSettled,
 } from "../services/conciergeLiveness";
+import { runReplyLint } from "../services/conciergeLintRunner";
+import { DISABLED_POLICY, toLintPolicy } from "../services/conciergeLintPolicy";
+import type { LintPolicy } from "../services/conciergeLint";
+import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
 import { conciergeFailureNotice } from "../engine/conciergeFailureNotice";
 import {
   accountedNeedsYou,
@@ -745,6 +749,18 @@ export function ConciergeHost({
   // set it would aim an unrelated typed message.
   const forceSparkleRef = useRef(false);
 
+  // The reply linter's policy, read from `[concierge.checks]` and refreshed on `config-changed`.
+  //
+  // A REF, not state: it is read inside the `concierge:done` handler and never rendered, so holding
+  // it in state would re-run the subscription effect (and tear down the three event listeners) every
+  // time an unrelated config key changed. It starts DISABLED so the window between mount and the
+  // first `getConfig` resolving cannot lint against a policy nobody supplied.
+  const lintPolicyRef = useRef<LintPolicy>(DISABLED_POLICY);
+  // The last reply the concierge produced, for `restated-state` to compare against. Held here rather
+  // than read back out of the thread store because the store holds RENDERED messages — including
+  // receipts and restores — and the check's corpus is specifically the previous BRAIN reply.
+  const prevReplyRef = useRef<string | null>(null);
+
   // The compose box's own insert fn, kept so a send that dies AFTER the box already cleared can put
   // the user's words back. See `restoreDraft`.
   const insertRef = useRef<((text: string, opts?: { verbatim?: boolean }) => void) | null>(null);
@@ -1281,6 +1297,72 @@ export function ConciergeHost({
   // guarantees delivery in SUBMIT order.
   const sendChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
+  // Hydrate the reply linter's policy, and keep it fresh.
+  //
+  // GLOBAL config deliberately — `getConfig()` with no project root. `config.rs` already ignores
+  // `[concierge]` in a per-project file as a security boundary (a cloned repo must not grant itself
+  // authority), and that applies with more force to the checks: a repo must not be able to switch
+  // OFF the linter that governs replies about it.
+  //
+  // Separate from the stream effect below so a config change re-reads the policy without tearing
+  // down the three event listeners — and so a slow or failed `getConfig` cannot delay them.
+  useEffect(() => {
+    let alive = true;
+    const apply = (eff: EffectiveConfig) => {
+      if (!alive) return;
+      lintPolicyRef.current = toLintPolicy(eff?.config?.concierge?.checks);
+    };
+    let unlisten: (() => void) | undefined;
+    // ══ ONE async FUNCTION, NOT TWO PROMISE CHAINS — AND THAT IS NOT A STYLE CHOICE ═════════════
+    // Both calls fail whenever Tauri is absent, which is EVERY jsdom test that does not mock
+    // `services/config` — most of them. Getting the handling wrong here does not fail a test; it
+    // fails the CI COVERAGE SHARDS, with every test green and, under the blob reporter, a single
+    // word of diagnostic ("undefined"). That cost two full CI rounds to find.
+    //
+    // THE PROPERTY THIS SHAPE HOLDS, stated as a property because the exact trigger was never
+    // reproduced locally and a mechanism nobody proved is not worth asserting: NEITHER CALL'S
+    // FAILURE ESCAPES THIS EFFECT — not a rejection, and not a synchronous throw from a call that
+    // returns a non-promise. The second half is the one a promise chain gets wrong and this does
+    // not: `onConfigChanged(apply).then(…)` throws `Cannot read properties of undefined (reading
+    // 'then')` right there when the call returns `undefined` (a mock whose implementation
+    // `vi.resetAllMocks()` stripped is exactly that), which matches the one-word diagnostic far
+    // better than an unhandled rejection does — a `.catch` attached in the same tick is never
+    // unhandled at any timing, so the original explanation for this rewrite was probably wrong.
+    //
+    // `await` inside try/catch covers both: `await undefined` is fine, and a rejection is handled
+    // where it is produced rather than by a handler on a floating promise. `run()` cannot throw, so
+    // `void run()` cannot reject.
+    //
+    // WHAT IS ACTUALLY TESTED, stated precisely because an earlier version of this comment claimed
+    // more than existed: `ConciergeHost.lint.test.tsx` pins the TWO REJECTION arms (and the
+    // `onConfigChanged` one fails against the catch-in-cleanup shape it replaced). The non-promise
+    // arm is covered by CONSTRUCTION — `await undefined` — and by a note in that file, NOT by a
+    // test; it was measured to be unobservable from that harness, so a row for it could not fail.
+    const run = async () => {
+      try {
+        apply(await getConfig());
+      } catch (e) {
+        // Leaves the policy DISABLED. A config we could not read must not be guessed at: the linter
+        // staying off is a visible non-event, whereas a fabricated policy could block replies from
+        // rules the user never configured.
+        console.warn("conciergeLint: getConfig failed; linter stays disabled", e);
+      }
+      try {
+        const fn = await onConfigChanged(apply);
+        // Unmount-before-resolve: without this the listener outlives the component that made it.
+        if (alive) unlisten = fn;
+        else fn();
+      } catch (e) {
+        console.warn("conciergeLint: config-changed subscribe failed", e);
+      }
+    };
+    void run();
+    return () => {
+      alive = false;
+      unlisten?.();
+    };
+  }, []);
+
   // Stream the brain into the thread: deltas append to a bubble keyed by the turn id; done finalizes.
   useEffect(() => {
     const key = (id: string) => `brain-${id}`;
@@ -1378,11 +1460,47 @@ export function ConciergeHost({
         // message would be stamped "never answered" by whatever the user typed after it.
         awaitingBubbleRef.current = null;
       }
-      if (e.text) upsert(e.id, e.text, true);
+      // ══ THE LINTER RUNS HERE ═══════════════════════════════════════════════════════════════════
+      // The reply is COMPLETE at `done`, which is what the checks need: mid-stream, `[@Left Pai` is
+      // not yet a pill and every check would false-positive at per-token cost.
+      //
+      // This lands on the `replace: true` upsert that already existed — the final text overwrites
+      // the streamed bubble wholesale today, so a linted rewrite needs no new render mechanism.
+      //
+      // ONE HONEST LIMITATION, ACCEPTED: deltas paint live, so a violation CAN be briefly visible
+      // before this replaces it. The durable record — thread store, clipboard, persistence, and the
+      // next turn's context — is always linted. Closing the glimpse would mean suppressing live
+      // streaming or reimplementing every check in Rust (which never sees the roster), and neither
+      // is worth it.
+      const linted = e.text
+        ? runReplyLint({
+            text: e.text,
+            turnId: e.id,
+            toolCalls: e.toolCalls,
+            prevReply: prevReplyRef.current,
+            policy: lintPolicyRef.current,
+          })
+        : null;
+      if (e.text) upsert(e.id, linted?.text ?? e.text, true);
+      // Recorded AFTER this turn is linted, so `restated-state` compares against the previous reply
+      // rather than against itself. Stores the text as RENDERED (autofixes included): the check asks
+      // whether the human is being told the same thing twice, and what they were told is the
+      // rendered form.
+      if (e.text) prevReplyRef.current = linted?.text ?? e.text;
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
       // The reply is FINISHED here — announce it once, rather than per delta. Via `announce`, so
       // the SAME reply twice in a row is still announced twice (roborev 53392).
+      //
+      // This carries the LINTED text, and it matters that it does: this is the column's single
+      // aria-live region, so a screen-reader user gets THIS and not the visual thread. For them the
+      // announcement is not the "mid-stream glimpse" the mount above accepts — it is the delivery.
+      //
+      // It works through a two-step coupling rather than by saying so here (roborev 55981 read it
+      // as a bug for that reason, and it is not one): `full` is `brainTextRef.current[e.id]`, and
+      // the replace-upsert immediately above has already overwritten that ref with exactly the text
+      // it rendered. Re-deriving `linted?.text ?? full` here would be the same value by a second
+      // route. Pinned instead by a test on the live region, so the coupling cannot quietly break.
       if (full) announce(full);
     });
     const offError = onConciergeError((e) => {

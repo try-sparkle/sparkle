@@ -26,6 +26,11 @@ import { create } from "zustand";
  * record that only grows keys on demand cannot show it.
  */
 export type LintCheckId =
+  // The only check here that BLOCKS, and the one the human named four times in a session: reporting
+  // accurately and then asking permission instead of acting. It was added to config.rs and to the
+  // linter registry but NOT to this union, so the headline check had nowhere to be counted — a
+  // silent zero that would have read as "it never fires". Pinned by a test against the registry now.
+  | "ask-without-action"
   | "bare-agent-name"
   | "bare-pr-number"
   | "fat-pill-label"
@@ -51,6 +56,7 @@ export type LintAction = "warned" | "autofixed" | "revised" | "rendered_marked";
 /** Every check id, in the order a readout should list them. Exported so callers never hand-maintain
  *  a second copy of the union's members (TS cannot enumerate a union at runtime). */
 export const LINT_CHECK_IDS: readonly LintCheckId[] = [
+  "ask-without-action",
   "bare-agent-name",
   "bare-pr-number",
   "fat-pill-label",
@@ -88,6 +94,7 @@ interface ConciergeLintMetricsState {
 }
 
 const emptyChecks = (): Record<LintCheckId, number> => ({
+  "ask-without-action": 0,
   "bare-agent-name": 0,
   "bare-pr-number": 0,
   "fat-pill-label": 0,

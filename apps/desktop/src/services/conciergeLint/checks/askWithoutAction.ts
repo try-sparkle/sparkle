@@ -44,6 +44,7 @@ import {
   CONCIERGE_TOOL_CATALOG,
   type ConciergeRiskClass,
 } from "../../conciergeTools/policy";
+import { conciergeOpWrites } from "../../conciergeTools/registry";
 
 /** The check id. Must equal the `[concierge.checks.<id>]` table key in `config.toml`. */
 export const ASK_WITHOUT_ACTION_CHECK_ID = "ask-without-action";
@@ -162,10 +163,113 @@ const NON_ACTING_HARNESS_TOOLS = new Set(
   ].map((s) => s.toLowerCase()),
 );
 
+/**
+ * The name a tool call arrives under, reduced to something {@link RISK_BY_TOOL} can answer.
+ *
+ * ══ WITHOUT THIS THE CHECK IS INERT IN PRODUCTION (roborev 56084, High) ═════════════════════════
+ * `ConciergeToolCall.name` is captured verbatim from Claude Code's `tool_use` blocks, so it is the
+ * MCP wire name — `mcp__sparkle-control__sparkle_workflow` — and the Sparkle surface is exposed as a
+ * dozen per-DOMAIN DISPATCHER tools (`sparkle_lifecycle`, `sparkle_workflow`, …) with the operation
+ * passed as an `op` argument. The catalog, meanwhile, is keyed by per-OP ids (`merge_pr`,
+ * `agent_branch_status`) because that is what `[concierge.tools]` policy paths address.
+ *
+ * So a raw lookup missed on EVERY real concierge call and fell through to the acting-by-default
+ * fallback below. The consequence was not a mild loss of precision — it silenced the check on its
+ * headline case: a turn that investigates with reads only (`sparkle_workflow {op:
+ * "agent_branch_status"}`) and then closes with "Want me to merge #864?" scored as having acted, so
+ * the check returned at its `tookAction` guard. "Investigated accurately, then handed the decision
+ * back" is the exact complaint this module's header quotes.
+ *
+ * Two reductions, in order, each a no-op when it does not apply:
+ *   1. Strip a leading `mcp__<server>__`.
+ *   2. If what remains is a dispatcher, take the op out of the call's own `input.op` — already
+ *      parsed by the runner — and classify THAT.
+ * Anything unresolvable falls through unchanged and keeps the acting-by-default behaviour.
+ */
+export function catalogNameFor(call: LintToolCall): string {
+  const raw = (call?.name ?? "").trim().toLowerCase();
+  // `mcp__<server>__<tool>` — take everything after the LAST `__` pair, so a server name containing
+  // an underscore cannot split it wrongly.
+  const bare = raw.startsWith("mcp__") ? (raw.split("__").pop() ?? raw) : raw;
+  // A dispatcher carries its real operation in `input.op`; the dispatcher's own name says only which
+  // domain it belongs to and classifies nothing.
+  if (bare.startsWith("sparkle_")) {
+    const input = call?.input;
+    if (input && typeof input === "object" && !Array.isArray(input)) {
+      const op = (input as Record<string, unknown>).op;
+      if (typeof op === "string" && op.trim().length > 0) return op.trim().toLowerCase();
+    }
+  }
+  return bare;
+}
+
+/**
+ * Ops that do no work toward an offer: they move the viewport, or keep process-local bookkeeping.
+ *
+ * ══ WHY THESE NEED NAMING EVEN THOUGH THE DISPATCHER CLASSIFIES WRITES ══════════════════════════
+ * Most domains derive `write` from `risk !== "read-only"`, and these are `routine`, so the
+ * dispatcher calls them writes. For the APPROVAL question that is right — selecting a project does
+ * change app state and should be allowed unasked. For THIS question it is wrong: moving the human's
+ * viewport is not "took the action it offered."
+ *
+ * It is not hypothetical (roborev 56103). `navigate` is described in the catalog as the constantly
+ * used "put me where the work is", and the screenshot domain ships a refusal instructing the
+ * concierge to call `select_project` BEFORE re-attempting a capture. So `select_project` →
+ * `capture_agent` → "Want me to merge #864?" does no work toward the offer, yet one `.some(isActing)`
+ * hit would silence the whole turn — the same door as `preview_close`, one room over.
+ *
+ * WHAT IS DELIBERATELY ABSENT: `set_theme`, `set_zoom` and `unpin_agent`. A first draft included
+ * them and that was a regression (roborev 56111) — they write durable, human-observable preferences,
+ * so "Switched you to dark mode. Want me to bump the zoom too?" is a reply that DID what was asked
+ * and is asking about scope beyond it, which `run()` documents as fine. Calling them non-acting
+ * turned that into a blocking false positive: the costly error this module's header names.
+ */
+export const VIEW_ONLY_OPS: readonly string[] = [
+  // ── Viewport only: change what is ON SCREEN and nothing else ──────────────────────────────────
+  "navigate",
+  "select_project",
+  "open_project_tab",
+  "jump_to_history_hit",
+  "show_main_window",
+  // ── Process-local bookkeeping: mutate module state, change nothing a human can observe ─────────
+  // `events.ts` says both halves itself — "they DO mutate module state" (why the approval path
+  // calls them writes) and "nothing but a cursor in this process's memory" (why they are not work
+  // toward an offer). The registry has one bit for two questions, so it answers the approval one;
+  // these stay named here until `DomainEntry` can express both (roborev 56111).
+  //
+  // The concierge brain is ONE PROCESS PER TURN, so a turn with no cursor must `subscribe` before it
+  // can `read_events` — making subscribe→read→offer as canonical as preview→offer.
+  "subscribe",
+  "unsubscribe",
+];
+const VIEW_ONLY_OP_SET = new Set(VIEW_ONLY_OPS);
+
+/** The dispatcher domain a call belongs to (`sparkle_lifecycle` → `lifecycle`), or null when the
+ *  call is not a Sparkle dispatcher at all. Derived from the same name {@link catalogNameFor}
+ *  reduces, so the two cannot disagree about which call is a dispatcher. */
+function dispatcherDomain(call: LintToolCall): string | null {
+  const raw = (call?.name ?? "").trim().toLowerCase();
+  const bare = raw.startsWith("mcp__") ? (raw.split("__").pop() ?? raw) : raw;
+  return bare.startsWith("sparkle_") ? bare.slice("sparkle_".length) : null;
+}
+
 /** Does this single call change state? */
 function isActing(call: LintToolCall): boolean {
-  const name = (call?.name ?? "").trim().toLowerCase();
+  const name = catalogNameFor(call);
   if (name.length === 0) return false;
+  // Presentation only — see VIEW_ONLY_OPS. Checked first because the dispatcher classifies these as
+  // writes for the approval question, which is a different question.
+  if (VIEW_ONLY_OP_SET.has(name)) return false;
+  // THE DISPATCHER'S OWN ANSWER, ahead of the risk class. `routine` is the approval vocabulary's
+  // "may proceed unasked" and says nothing about whether the world changed: `close_agent` is
+  // `routine` and removes worktrees, `preview_close` is `routine` and only computes. `write` is the
+  // question we actually mean, and for lifecycle and screenshot it is a `Record<Op, boolean>` — so a
+  // new preview op is a typecheck failure over there rather than a silent hole here (roborev 56103).
+  const domain = dispatcherDomain(call);
+  if (domain) {
+    const writes = conciergeOpWrites(domain, name);
+    if (writes === false) return false;
+  }
   const risk = RISK_BY_TOOL.get(name);
   if (risk) return !NON_ACTING_RISK_CLASSES.includes(risk);
   if (NON_ACTING_HARNESS_TOOLS.has(name)) return false;
@@ -363,13 +467,20 @@ export const askWithoutActionCheck: Check = {
         violations.push({
           check: ASK_WITHOUT_ACTION_CHECK_ID,
           severity: fired,
-          // HONEST AT DETECTION TIME (roborev 55713, Medium). This used to hardcode `"revised"`,
-          // which claims the concierge was re-prompted and corrected — before anything had revised
-          // anything, and even on the `warn` path where the reply renders untouched. The action
-          // rollup is one of the two numbers this log exists to make trustworthy, so it must not
-          // over-count revisions. Whatever performs the re-prompt upgrades this to `revised` (or
-          // `rendered_marked` when the one retry is exhausted).
-          action: fired === "block" ? "revised" : "warned",
+          // HONEST AT DETECTION TIME (roborev 55713, then 55981). Always `"warned"` — never
+          // `"revised"`, not even on the `block` path.
+          //
+          // `"revised"` claims the concierge was re-prompted and produced a correction. NOTHING
+          // re-prompts yet: the mount consumes `LintResult.text` and discards `blocked`. Stamping
+          // `"revised"` on the block path recorded a revision that never happened, in the exact
+          // rollup this log exists to make trustworthy — and it did so on EVERY hit, so the
+          // correction-rate readout would have read 100% while no reply was ever corrected. A
+          // number that is confidently wrong is worse than a missing one.
+          //
+          // Only the component that performs a revision can honestly claim one, so whatever
+          // implements the re-prompt upgrades this to `"revised"` (or `"rendered_marked"` when the
+          // one permitted retry is exhausted) at that point.
+          action: "warned",
           span: hit[0].length,
           detail: `offered to act ("${label}") without taking any action this turn`,
         });

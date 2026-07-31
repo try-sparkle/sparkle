@@ -3,6 +3,7 @@ import {
   ASK_WITHOUT_ACTION_CHECK_ID,
   EXEMPT_RISK_CLASSES,
   EXEMPT_SYNONYMS,
+  VIEW_ONLY_OPS,
   NON_ACTING_RISK_CLASSES,
   askWithoutActionCheck,
   exemptToolNames,
@@ -10,6 +11,7 @@ import {
   tookAction,
 } from "./askWithoutAction";
 import { CONCIERGE_TOOL_CATALOG } from "../../conciergeTools/policy";
+import { conciergeOpWrites } from "../../conciergeTools/registry";
 import { lintReply } from "../index";
 import type { LintContext, LintPolicy, LintToolCall } from "../types";
 
@@ -45,6 +47,108 @@ const run = (text: string, calls: LintToolCall[] = []) =>
   askWithoutActionCheck.run(text, ctx(calls));
 
 describe("askWithoutAction — the reply that investigated and then handed the decision back", () => {
+  it("every VIEW_ONLY_OP is a real catalog op — the list cannot rot silently", () => {
+    // The list names ops by string, so a rename in the catalog would leave a dead entry here and
+    // silently restore the bug it exists to prevent (a viewport move scoring as action).
+    const known = new Set<string>(CONCIERGE_TOOL_CATALOG.map((t) => t.name));
+    expect(VIEW_ONLY_OPS.filter((op) => !known.has(op))).toEqual([]);
+  });
+
+  it("defers to the DISPATCHER's write classification, so a new preview op needs no list edit", () => {
+    // The completeness a hand-list cannot have (roborev 56103). `LIFECYCLE_WRITE` is a
+    // `Record<Op, boolean>`, so a new preview op is a typecheck failure over there and is correct
+    // here for free. Asserted through the exported helper rather than by re-listing the ops.
+    expect(conciergeOpWrites("lifecycle", "preview_close")).toBe(false);
+    expect(conciergeOpWrites("lifecycle", "close_agent")).toBe(true);
+    expect(conciergeOpWrites("nonsense-domain", "whatever")).toBeUndefined();
+  });
+
+  it("does not count a VIEWPORT move as action", () => {
+    // `select_project` → `capture_agent` → offer. The screenshot domain's own refusal instructs the
+    // concierge to select a project before re-attempting a capture, so this sequence is prescribed
+    // by the tools — and neither call does any work toward the offer. Both are classified `routine`
+    // (workspace) and `privacy-sensitive` (screenshot), so only VIEW_ONLY_OPS keeps this firing.
+    const result = lintReply(
+      "Looked at the board. Want me to merge #864?",
+      ctx([
+        {
+          name: "mcp__sparkle-control__sparkle_workspace",
+          input: { op: "select_project", projectId: "p1" },
+        },
+        {
+          name: "mcp__sparkle-control__sparkle_screenshot",
+          input: { op: "capture_agent", agentId: "ag1" },
+        },
+      ]),
+    );
+    expect(result.violations.map((v) => v.check)).toContain(ASK_WITHOUT_ACTION_CHECK_ID);
+  });
+
+  it("does not count subscribing to the event cursor as action", () => {
+    // The concierge brain is one process per turn, so a turn with no cursor MUST subscribe before it
+    // can read. `events.ts` calls these "nothing but a cursor in this process's memory" — the
+    // registry's `write` bit says otherwise because it answers the APPROVAL question (roborev 56111).
+    const result = lintReply(
+      "Agent CI Hardening finished. Want me to merge #864?",
+      ctx([
+        { name: "mcp__sparkle-control__sparkle_events", input: { op: "subscribe", kinds: ["agent"] } },
+        { name: "mcp__sparkle-control__sparkle_events", input: { op: "read_events" } },
+      ]),
+    );
+    expect(result.violations.map((v) => v.check)).toContain(ASK_WITHOUT_ACTION_CHECK_ID);
+  });
+
+  it("keeps ALL THREE preference writes out of VIEW_ONLY_OPS, not just the one with a row", () => {
+    // The doc comment excludes three; the behavioural row below drives only `set_theme`. Since
+    // VIEW_ONLY_OP_SET is consulted before both conciergeOpWrites and RISK_BY_TOOL — and these are
+    // `app`-domain tools that bypass the dispatcher entirely — re-adding `set_zoom` or
+    // `unpin_agent` is a one-line edit that silently restores a BLOCKING false positive with the
+    // suite still green. The rot guard cannot catch it either: they are real catalog ops.
+    // So the exclusion is an assertion, not a comment (roborev 56118).
+    for (const op of ["set_theme", "set_zoom", "unpin_agent"]) {
+      expect(VIEW_ONLY_OPS, `${op} writes durable preferences — it is not a viewport move`).not.toContain(op);
+    }
+  });
+
+  it("treats a PREFERENCE write as acting — it is not a viewport move", () => {
+    // The mirror guard, and it pins a regression rather than a hypothetical: a draft of
+    // VIEW_ONLY_OPS included set_theme/set_zoom/unpin_agent, which write durable human-observable
+    // state. That made "did what you asked, now offering the next step" — explicitly fine per
+    // `run()` — into a BLOCKING false positive, the costly error this module's header names.
+    const result = lintReply(
+      "Switched you to dark mode. Want me to bump the zoom too?",
+      ctx([{ name: "mcp__sparkle-control__set_theme", input: { theme: "dark" } }]),
+    );
+    expect(result.violations.map((v) => v.check)).not.toContain(ASK_WITHOUT_ACTION_CHECK_ID);
+  });
+
+  it("treats a preview op as NOT acting, so preview-then-ask still fires", () => {
+    // The canonical turn: the shipped sparkle_lifecycle description tells the concierge to use
+    // preview_close BEFORE close_agent, so this is the flow the tool prescribes.
+    const result = lintReply(
+      "The worktree is clean and the branch is landed. Want me to close it?",
+      ctx([
+        {
+          name: "mcp__sparkle-control__sparkle_lifecycle",
+          input: { op: "preview_close", agentId: "ag1" },
+        },
+      ]),
+    );
+    expect(result.violations.map((v) => v.check)).toContain(ASK_WITHOUT_ACTION_CHECK_ID);
+  });
+
+  it("still treats close_agent as acting, though it is `routine` too", () => {
+    // The other side of the same word: close_agent removes worktrees. If the non-acting rules were widened
+    // to "everything routine", this would go silent.
+    const result = lintReply(
+      "Closed the agent. Want me to close the other three?",
+      ctx([
+        { name: "mcp__sparkle-control__sparkle_lifecycle", input: { op: "close_agent", agentId: "ag1" } },
+      ]),
+    );
+    expect(result.violations.map((v) => v.check)).not.toContain(ASK_WITHOUT_ACTION_CHECK_ID);
+  });
+
   // ══ THE CASE FROM THE INCIDENT ═══════════════════════════════════════════════════════════════
   // The literal reply ending, twenty minutes after the fourth "default to action", with 45+
   // branches holding unlanded work and no tool call in the turn.
@@ -258,15 +362,22 @@ describe("askWithoutAction — the reply that investigated and then handed the d
     }
   });
 
-  it("records `warned` rather than `revised` when nothing was revised", () => {
-    // roborev 55713 (Medium): `action` was hardcoded to "revised" at detection time, which claims a
-    // re-prompt that had not happened — over-counting the rollup the log exists to make trustworthy.
+  it("records `warned` on BOTH paths, because nothing revises anything yet", () => {
+    // roborev 55713, then 55981. `action` was first hardcoded to "revised" at detection time; the
+    // fix for that made it conditional on the severity — `block` still claimed "revised". That was
+    // still wrong, and more subtly: NOTHING re-prompts. The mount consumes `LintResult.text` and
+    // discards `blocked`, so a "revised" on the block path recorded a correction that never
+    // happened, on every hit — the correction-rate rollup would have read 100% while no reply was
+    // ever corrected.
+    //
+    // Only the component that performs a revision can honestly claim one. When the re-prompt lands
+    // it upgrades this at that point, and this test changes with it.
     const warned = lintReply("Want me to run that?", ctx([], { policy: policy({ severity: "warn" }) }));
-    const v = warned.violations.find((x) => x.check === ASK_WITHOUT_ACTION_CHECK_ID)!;
-    expect(v.action).toBe("warned");
-    // And on the blocking path it is `revised`, because a re-prompt does follow.
+    expect(warned.violations.find((x) => x.check === ASK_WITHOUT_ACTION_CHECK_ID)!.action).toBe("warned");
     const blocked = lintReply("Want me to run that?", ctx());
-    expect(blocked.violations.find((x) => x.check === ASK_WITHOUT_ACTION_CHECK_ID)!.action).toBe("revised");
+    expect(blocked.violations.find((x) => x.check === ASK_WITHOUT_ACTION_CHECK_ID)!.action).toBe("warned");
+    // The SEVERITY still differs — only the claimed action is held back.
+    expect(blocked.violations.find((x) => x.check === ASK_WITHOUT_ACTION_CHECK_ID)!.severity).toBe("block");
   });
 
   // ══ FALSE POSITIVES ══════════════════════════════════════════════════════════════════════════
