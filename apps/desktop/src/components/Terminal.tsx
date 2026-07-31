@@ -42,7 +42,7 @@ import { matchesChord } from "../keyboardHints/keybindings";
 import { dismissibleSurfaceOpen } from "../engine/cable";
 import { noteTerminalInteraction } from "../services/terminalFocusIntent";
 import { noteTerminalEscape } from "../services/terminalEscapeRelease";
-import { isMeasuredSize, spawnSize } from "./terminalSize";
+import { isMeasuredSize, spawnSize, type TermSize } from "./terminalSize";
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import {
@@ -117,14 +117,40 @@ function openLinkFromTerminal(event: MouseEvent, uri: string): void {
 }
 
 // Push the live xterm size to the PTY — but ONLY when it came from a genuinely laid-out
-// container. fit() on a display:none / pre-layout pane collapses to a tiny size (cols≈12), and
-// sending that to the PTY makes the agent CLI hard-wrap its output into a thin column that no
-// later resize can un-wrap. See terminalSize.ts. term.element exists once term.open() has run;
-// its clientWidth is 0 while the pane is hidden.
-function syncPtySize(transport: AgentTransport | null, term: XTerm): void {
+// container, and ONLY when it actually differs from what the child was last told.
+//
+// The measured-container guard: fit() on a display:none / pre-layout pane collapses to a tiny size
+// (cols≈12), and sending that to the PTY makes the agent CLI hard-wrap its output into a thin
+// column that no later resize can un-wrap. See terminalSize.ts. term.element exists once
+// term.open() has run; its clientWidth is 0 while the pane is hidden.
+//
+// The UNCHANGED-SIZE guard (`sent`) is what makes a drag cheap, and the ordering of these three
+// lines is the whole point. A divider drag moves the box by a few pixels per frame, which is far
+// less than one cell: `fit.fit()` proposes the SAME cols/rows and early-returns, so no reflow
+// happens — and this function used to go on to force a layout read and fire a `pty_resize` IPC
+// telling the child a size it already had, every frame, for every on-screen pane. Measured on
+// v0.68.0 that redundant push was 330-536 ms per frame (`terminal-resize.syncPty` was 534 ms of a
+// 536 ms `terminal-resize`, while `.fit` and `.repaint` never once cleared the 16 ms span floor —
+// see PRD/sparkle/resize-lag-measurement.md). Comparing FIRST costs two integer reads of xterm's
+// own buffer dimensions, which is plain state and not a layout query, so the frame that changed
+// nothing now pays nothing.
+//
+// `sent` is per-PTY and MUST be reset when a new one is spawned (the mount effect does this), or a
+// restarted child would inherit the previous one's memo and never be told its real size.
+function syncPtySize(
+  transport: AgentTransport | null,
+  term: XTerm,
+  sent: { current: TermSize | null },
+): void {
+  const cols = term.cols;
+  const rows = term.rows;
+  if (sent.current && sent.current.cols === cols && sent.current.rows === rows) return;
   const laidOut = !!term.element && term.element.clientWidth > 0;
   if (!isMeasuredSize(laidOut, term)) return;
-  transport?.resize(term.cols, term.rows);
+  transport?.resize(cols, rows);
+  // Record only what we actually pushed. An unmeasured box returns above WITHOUT recording, so the
+  // real size still gets sent once the pane is laid out.
+  sent.current = { cols, rows };
 }
 
 /**
@@ -304,6 +330,10 @@ export function Terminal({
   // fit/reflow/repaint (see the observer below). The become-active reveal effect — which already
   // re-fits and force-repaints unconditionally — is what pays that debt, and clears this.
   const resizeDirtyRef = useRef(false);
+  // The size this pane's PTY was LAST TOLD, so a resize that didn't change the cell count costs
+  // nothing (see syncPtySize). Null means "the child has never been told" — reset to null whenever
+  // a new PTY is spawned, so the memo can never outlive the child it describes.
+  const sentPtySizeRef = useRef<TermSize | null>(null);
   // Latest onRequestFocus, read by the (agentId-keyed) effect without re-subscribing.
   const onRequestFocusRef = useRef(onRequestFocus);
   onRequestFocusRef.current = onRequestFocus;
@@ -569,6 +599,10 @@ export function Terminal({
     // verb below (spawn/write/resize/kill/output/exit) goes through this, not pty.ts directly.
     const transport = getTransport({ id: agentId, runtime });
     transportRef.current = transport;
+    // A fresh PTY has been told nothing yet. Clearing the memo here (rather than trusting the size
+    // handed to spawn) keeps the post-spawn re-sync below unconditional, which is what preserves the
+    // spawn-time width invariant: the child is always told its real size once the box is measured.
+    sentPtySizeRef.current = null;
 
     const term = new XTerm({
       // System monospaces (Menlo/SF Mono) carry full box-drawing glyphs as a fallback;
@@ -1194,7 +1228,7 @@ export function Terminal({
         } catch {
           /* still not laid out */
         }
-        syncPtySize(transport, term);
+        syncPtySize(transport, term, sentPtySizeRef);
         onReady?.();
       }
     })().catch((e) => {
@@ -1294,7 +1328,7 @@ export function Terminal({
             perfSpan("terminal-resize.fit", () => fit.fit(), { panes: liveTerminalCount });
             // Guard the push: a hide transition fires the observer with a 0×0 box, which fit()
             // collapses to a tiny size — sending that to the PTY re-creates the thin-column bug.
-            perfSpan("terminal-resize.syncPty", () => syncPtySize(transport, term), {
+            perfSpan("terminal-resize.syncPty", () => syncPtySize(transport, term, sentPtySizeRef), {
               panes: liveTerminalCount,
             });
             // Repaint the viewport. When the container grows (the pane becoming visible after
@@ -1455,7 +1489,7 @@ export function Terminal({
         onUserRequestFocus: onUserRequestFocusRef.current,
       });
       // Push the true size to the PTY so its wrap column matches xterm (no-op while unmeasured).
-      syncPtySize(transportRef.current, term);
+      syncPtySize(transportRef.current, term, sentPtySizeRef);
       // Defer the repaint one frame so the just-resized canvas has valid char dimensions before we
       // clear the WebGL model; otherwise the renderer bails (no valid dims) and wastes the clear.
       // disposedRef guards the deferred frame (#231/#258).
@@ -1491,7 +1525,7 @@ export function Terminal({
       if (disposedRef.current) return;
       try {
         safeFit();
-        syncPtySize(transportRef.current, term);
+        syncPtySize(transportRef.current, term, sentPtySizeRef);
       } catch {
         /* ignore transient fit errors */
       }

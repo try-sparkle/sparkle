@@ -210,20 +210,33 @@ describe("Terminal reveal repaint", () => {
     expect(clearTextureAtlas).not.toHaveBeenCalled();
   });
 
-  it("on reveal, syncs the PTY size once and force-repaints once (single-shot — no convergence loop)", () => {
+  it("on reveal, does NOT re-push a size the child already has — and force-repaints once", () => {
     // Every pane stays laid out at full size even while backgrounded (visibility:hidden, not
     // display:none — paneVisibility.ts), so on reveal the box is ALREADY measured. There is no
-    // 0-width reveal window to race against, so the old multi-frame convergence loop is gone: a
-    // single fit + size-sync + repaint is all that's needed.
+    // 0-width reveal window to race against, so the old multi-frame convergence loop is gone.
+    //
+    // Which means the child was told its size back at MOUNT, and the reveal has nothing new to say.
+    // This test used to require one push here; that push was redundant by construction, and on
+    // v0.68.0 the same redundant push on every drag frame measured 330-536ms apiece
+    // (`terminal-resize.syncPty` was 534ms of a 536ms `terminal-resize` — see
+    // PRD/sparkle/resize-lag-measurement.md). syncPtySize now compares against what the child was
+    // last told before touching layout or IPC, so an unchanged size costs nothing.
     widthCtl.value = 720; // laid out (the visibility:hidden invariant)
     const { rerender } = render(<Terminal {...baseProps} active={false} />);
+
+    // Asserted BEFORE the clear, and it is what keeps the reveal assertion below honest: a
+    // syncPtySize deleted outright would satisfy "not called on reveal" trivially. The child really
+    // is told its size — just once, while the pane is still backgrounded.
+    expect(resizePty).toHaveBeenCalledTimes(1);
     clearTextureAtlas.mockClear();
     vi.mocked(resizePty).mockClear();
 
     rerender(<Terminal {...baseProps} active={true} />);
 
-    // Exactly one size push and one repaint — no per-frame retry loop.
-    expect(resizePty).toHaveBeenCalledTimes(1);
+    // Nothing about the box changed across the reveal, so the child is told nothing…
+    expect(resizePty).not.toHaveBeenCalled();
+    // …but the repaint still happens exactly once, and is NOT conditional on a size change: the
+    // WebGL model is empty after re-attach and only forceFullRepaint rasterizes the buffer into it.
     expect(clearTextureAtlas).toHaveBeenCalledTimes(1);
   });
 

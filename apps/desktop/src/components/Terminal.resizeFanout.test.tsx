@@ -407,6 +407,67 @@ describe("resize fan-out across a 60-pane cockpit", () => {
     for (const { pty, term } of ptyPushes) expect(pty).toEqual(term);
   });
 
+  // ── The residual v0.68.0 cost: syncing a size the child ALREADY HAS ────────────────────────────
+  // The fan-out gate above cut the drag from ~60 panes to ≤2, which is what made resizing usable.
+  // What was left was measured on a real v0.68.0 build and is a different bug: `terminal-resize` was
+  // 536ms of which `terminal-resize.syncPty` was 534ms, while `.fit` and `.repaint` never once
+  // cleared the 16ms span floor across the WHOLE log. That combination pins the cause exactly —
+  // fit() ran and early-returned, so the proposed cols/rows had NOT changed, and syncPtySize then
+  // forced a layout read and fired a `pty_resize` IPC telling the child a size it already had. Every
+  // frame. A divider drag moves the box a few pixels at a time, which is far less than one cell, so
+  // this was the common case rather than an edge one.
+  it("a drag that does NOT change the cell count pushes NOTHING to the child — the v0.68.0 latency", async () => {
+    render(<Terminal {...baseProps} agentId="a0" active={true} />);
+    await settleMount();
+
+    // `propose` is deliberately LEFT ALONE: the box moves, the cell count does not. This is the case
+    // every other test in this file steps around by flipping propose.cols first.
+    dragFanOut();
+
+    // THE ASSERTION — the side effect, not the precondition. Against the pre-fix code this is 30:
+    // one redundant IPC per frame, each of which cost 330-536ms in the field.
+    expect(resizePty).not.toHaveBeenCalled();
+    // …and the drag was real: fit() was asked to measure on every step, it just had nothing to do.
+    // Without this a suite that mounted a dead pane would satisfy the line above forever.
+    expect(proposals.length).toBeGreaterThanOrEqual(DRAG_STEPS);
+    // No reflow either, for the same reason — so the skip above is not hiding a resize that happened.
+    expect(fullFits).toHaveLength(0);
+  });
+
+  it("…but a drag that DOES change the cell count still pushes — the inverse", async () => {
+    // Without this, "we stopped telling the child anything" would pass the test above with flying
+    // colours. The memo must suppress only the redundant push, never a real one.
+    render(<Terminal {...baseProps} agentId="a0" active={true} />);
+    await settleMount();
+
+    propose.cols = 140;
+    fanOut();
+
+    expect(resizePty).toHaveBeenCalled();
+    expect(ptyPushes.at(-1)?.pty).toEqual({ cols: 140, rows: 30 });
+    // And it is pushed exactly ONCE for the one size change, not once per frame.
+    vi.mocked(resizePty).mockClear();
+    dragFanOut();
+    expect(resizePty).not.toHaveBeenCalled();
+  });
+
+  it("still tracks a size that changes on EVERY step — the memo is per-size, not a one-shot latch", async () => {
+    // A latch that fired once and then went quiet would pass both rows above. Drive a drag where the
+    // cell count genuinely moves each step and require the child to be told each time.
+    render(<Terminal {...baseProps} agentId="a0" active={true} />);
+    await settleMount();
+
+    for (let i = 0; i < 5; i++) {
+      propose.cols = 110 + i * 7;
+      fanOut();
+    }
+
+    expect(vi.mocked(resizePty).mock.calls).toHaveLength(5);
+    expect(ptyPushes.at(-1)?.pty).toEqual({ cols: 138, rows: 30 });
+    // The invariant this file exists to protect still holds on every one of them.
+    for (const { pty, term } of ptyPushes) expect(pty).toEqual(term);
+  });
+
   it("pays the deferred reflow ON REVEAL — the work the hidden pane skipped is not lost", async () => {
     // The other half of the gate, and the assertion that keeps it from being "we stopped resizing".
     const { rerender } = render(<Terminal {...baseProps} agentId="a0" active={false} />);
