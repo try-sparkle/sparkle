@@ -35,7 +35,8 @@ const h = vi.hoisted(() => ({
     delta?: (e: { id: string; text: string }) => void;
     done?: (e: { id: string; sessionId: string; text: string }) => void;
     error?: (e: { id: string; detail: string }) => void;
-    /** "A different human is here now" — carries no id and no text, on purpose. */
+    /** "Every turn in flight has been orphaned" — carries no id and no text, on purpose. Raised by a
+     *  sign-out and by a deliberate session set alike; the host's teardown is the same either way. */
     reset?: () => void;
   },
 }));
@@ -66,7 +67,7 @@ vi.mock("../services/concierge", async (importOriginal) => {
       h.brain.error = cb;
       return () => {};
     },
-    onConciergeIdentityReset: (cb: NonNullable<typeof h.brain.reset>) => {
+    onConciergeTurnsAbandoned: (cb: NonNullable<typeof h.brain.reset>) => {
       h.brain.reset = cb;
       return () => {};
     },

@@ -39,7 +39,7 @@ vi.mock("../services/concierge", () => ({
   // Mirror EVERY export the tree touches: Vitest throws on ACCESS to an export a factory omits, so
   // a partial mock breaks the whole file the moment the host reaches for one more symbol — which is
   // exactly what a rebase onto a moved `main` does.
-  onConciergeIdentityReset: () => () => {},
+  onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],
 }));

@@ -61,7 +61,7 @@ vi.mock("../services/concierge", async (importOriginal) => ({
     h.brain.error = cb;
     return () => {};
   },
-  onConciergeIdentityReset: () => () => {},
+  onConciergeTurnsAbandoned: () => () => {},
 }));
 // Mirror EVERY export: Vitest throws on access to a missing mock export, so a partial factory
 // breaks the moment anything else in the tree imports the other symbol.

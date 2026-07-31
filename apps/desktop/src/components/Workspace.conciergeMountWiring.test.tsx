@@ -78,7 +78,7 @@ vi.mock("../services/concierge", () => ({
   onConciergeDelta: () => () => {},
   onConciergeDone: () => () => {},
   onConciergeError: () => () => {},
-  onConciergeIdentityReset: () => () => {},
+  onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],
 }));

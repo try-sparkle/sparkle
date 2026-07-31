@@ -61,7 +61,7 @@ import {
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
-  onConciergeIdentityReset,
+  onConciergeTurnsAbandoned,
   startConciergeTurn,
   startProactiveConciergeTurn,
   isProactiveTurn,
@@ -1805,7 +1805,7 @@ export function ConciergeHost({
     // A lifecycle signal rather than a synthesised `done`, because "your turn finished" and "the turn
     // was abandoned" are different claims — this one carries no id and no text, so there is nothing of
     // the previous human's left to render.
-    const offReset = onConciergeIdentityReset(() => {
+    const offReset = onConciergeTurnsAbandoned(() => {
       setTyping(false);
       // `clearConciergeLiveness`, not `noteConciergeSettled`: the turn did not settle, and an identity
       // boundary must not preserve a field a turn boundary would.

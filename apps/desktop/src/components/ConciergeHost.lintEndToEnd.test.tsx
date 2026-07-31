@@ -82,7 +82,7 @@ vi.mock("../services/concierge", async (importOriginal) => {
       h.brain.error = cb;
       return () => {};
     },
-    onConciergeIdentityReset: (cb: NonNullable<typeof h.brain.reset>) => {
+    onConciergeTurnsAbandoned: (cb: NonNullable<typeof h.brain.reset>) => {
       h.brain.reset = cb;
       return () => {};
     },

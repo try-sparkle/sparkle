@@ -55,7 +55,7 @@ import {
   onConciergeDelta,
   onConciergeDone,
   onConciergeError,
-  onConciergeIdentityReset,
+  onConciergeTurnsAbandoned,
   resetConciergeSession,
   restoreConciergeSession,
   setConciergeSessionId,
@@ -580,7 +580,7 @@ describe("concierge session restore (C1)", () => {
       const doneSeen: string[] = [];
       let abandoned = 0;
       const offDone = onConciergeDone((d) => doneSeen.push(d.id));
-      const offReset = onConciergeIdentityReset(() => {
+      const offReset = onConciergeTurnsAbandoned(() => {
         abandoned += 1;
       });
       harness.diskSessionId = null;
@@ -595,11 +595,51 @@ describe("concierge session restore (C1)", () => {
       offReset();
     });
 
+    it("signals abandonment for a deliberate session SET too, not just a sign-out (roborev 55969)", async () => {
+      // Two writers orphan a turn on purpose, and the first version of this dispatched from only
+      // one of them. A `setConciergeSessionId` during an in-flight turn orphans that turn exactly as
+      // a sign-out does — `turnIsCurrent()` goes false, so `done` and `error` are both swallowed — so
+      // a host told nothing keeps its spinner up for ever over a turn that actually SUCCEEDED, and
+      // the 90s silence bound then latches "your concierge isn't answering" on top of it.
+      const doneSeen: string[] = [];
+      let abandoned = 0;
+      const offDone = onConciergeDone((d) => doneSeen.push(d.id));
+      const offAbandon = onConciergeTurnsAbandoned(() => {
+        abandoned += 1;
+      });
+      harness.diskSessionId = null;
+      await startConciergeTurn("in flight when the session is set from outside");
+
+      setConciergeSessionId("sess-live");
+      emit("concierge:done", { id: "turn-1", sessionId: "sess-live", text: "the answer" });
+
+      expect(doneSeen).toEqual([]); // the gate still swallows it…
+      expect(abandoned).toBe(1); // …so the host must be told, exactly as on sign-out.
+      offDone();
+      offAbandon();
+    });
+
+    it("a null set delegates to the reset and signals exactly ONCE", () => {
+      // `setConciergeSessionId(null)` early-returns into `resetConciergeSession`. Pinned because the
+      // obvious way to wire the second call site — dispatch, then fall through — signals twice, and a
+      // host that tears down twice per boundary is how a double-clear becomes load-bearing by
+      // accident.
+      let abandoned = 0;
+      const off = onConciergeTurnsAbandoned(() => {
+        abandoned += 1;
+      });
+
+      setConciergeSessionId(null);
+
+      expect(abandoned).toBe(1);
+      off();
+    });
+
     it("unsubscribing really stops the abandonment signal", async () => {
       // The host tears this down on unmount alongside the other three. A returned no-op would leak
       // a closure over a stale `setTyping` for the life of the process.
       let abandoned = 0;
-      const offReset = onConciergeIdentityReset(() => {
+      const offReset = onConciergeTurnsAbandoned(() => {
         abandoned += 1;
       });
       offReset();

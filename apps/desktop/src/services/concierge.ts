@@ -374,26 +374,61 @@ function turnIsCurrent(id: string): boolean {
 }
 
 /**
- * "The conversation you were rendering is over, and its terminal event is not coming."
+ * "Every turn you were rendering is over, and its terminal event is not coming."
  *
  * THE FAN-OUT GATE NEEDS THIS TO BE HONEST (roborev 55813). `done` and `error` are the only two
  * signals that tear the host's per-turn state down — the typing indicator, the liveness latch, the
  * awaiting-bubble marker — and none of that is store state `resetConciergeIdentityState` can reach.
- * So dropping a pre-reset turn's terminal event, which is right for its CONTENT, silently strands
- * all three: the spinner keeps running for the next human over an empty column, and if the liveness
- * bound elapses they get a sticky "your concierge isn't answering" about a turn they never sent.
+ * So dropping an orphaned turn's terminal event, which is right for its CONTENT, silently strands
+ * all three: the spinner keeps running over a column that will never be answered, and if the
+ * liveness bound elapses, a sticky "your concierge isn't answering" latches over a turn that may
+ * actually have SUCCEEDED.
  *
  * A lifecycle signal rather than a doctored event, because the two say different things. Delivering
  * a text-free `done` would tell the host "your turn finished"; this says "the turn was abandoned" —
- * carrying no id and no text, so there is nothing of the previous human's to render.
+ * carrying no id and no text, so there is nothing of the previous conversation to render.
+ *
+ * NAMED FOR THE EVENT, NOT FOR ONE OF ITS CAUSES (roborev 55969). This landed as
+ * `onConciergeIdentityReset` and was renamed within the hour, because a sign-out is only one of the
+ * two things that orphans a turn — see {@link orphanInFlightTurns}. A subscriber that tears down
+ * indicator state does so for the same reason either way, and a name that says "identity reset"
+ * would have made the second caller look like a category error instead of the same event.
  */
-const resetCallbacks = new Set<Callback<void>>();
+const abandonCallbacks = new Set<Callback<void>>();
 
-export function onConciergeIdentityReset(cb: () => void): () => void {
-  resetCallbacks.add(cb);
+export function onConciergeTurnsAbandoned(cb: () => void): () => void {
+  abandonCallbacks.add(cb);
   return () => {
-    resetCallbacks.delete(cb);
+    abandonCallbacks.delete(cb);
   };
+}
+
+/**
+ * Move the epoch, and tell subscribers what moving it just did.
+ *
+ * THE BUMP AND THE SIGNAL MUST NOT BE SEPARABLE (roborev 55969). The first version of this
+ * dispatched from only one of the two writers that orphan a turn on purpose — so a
+ * `setConciergeSessionId` during an in-flight turn orphaned it exactly like a sign-out does
+ * (`turnIsCurrent()` false, `done` and `error` both swallowed) while the host was told nothing. The
+ * spinner stayed up for ever over a turn that had *succeeded*, and the 90s bound then latched "your
+ * concierge isn't answering" on top of it. That is the identical one-layer-over leak the gate itself
+ * was written to close. So the two are one call, and the only way back to the bug is to write
+ * `sessionEpoch++` by hand.
+ *
+ * {@link rebindSessionToAccount} IS THE THIRD EPOCH WRITER AND DELIBERATELY DOES NOT CALL THIS. It
+ * runs INSIDE the send path, before the outgoing turn has an id — so signalling there would stand
+ * the indicator down for the turn that is at that moment starting, which is the opposite of the leak
+ * being fixed. An account switch does still swallow a *previous* turn's terminal event, so the host
+ * can be stranded that way; closing that needs the signal to distinguish "the turn you are rendering
+ * is over" from "the turn you just handed me is fine", which this one-bit event cannot. Tracked
+ * rather than papered over — do not "unify" it by adding the call.
+ *
+ * ALWAYS CALLED LAST by its callers, once the pointers are already in their new state — a subscriber
+ * tearing its own state down should observe the change as complete, not half-applied.
+ */
+function orphanInFlightTurns(): void {
+  sessionEpoch++;
+  dispatch(abandonCallbacks, undefined);
 }
 
 function dispatch<T>(callbacks: Set<Callback<T>>, event: T): void {
@@ -912,9 +947,11 @@ export function setConciergeSessionId(id: string | null): void {
     resetConciergeSession();
     return;
   }
-  sessionEpoch++;
   currentSessionId = id;
   fallbackSessionId = id;
+  // A turn already in flight is orphaned by this exactly as a sign-out orphans one — its `done` will
+  // be refused so it cannot overwrite the pointer just installed — so the host has to hear about it.
+  orphanInFlightTurns();
 }
 
 /** Forget the ongoing session so the next turn starts fresh (e.g. a user-requested reset).
@@ -929,11 +966,12 @@ export function setConciergeSessionId(id: string | null): void {
  *  callers want the durable meaning — see {@link retireSessionIds}. */
 export function resetConciergeSession(): void {
   retireSessionIds(currentSessionId, fallbackSessionId);
-  // BEFORE the bump, so this names the epoch the reset ENDED: every turn still in flight started at
-  // or below it, and that is what lets a straggler `done` be judged on the reason its epoch moved
-  // rather than on the account binding it happens to find. See {@link lastResetEpoch}.
+  // BEFORE the bump — which now happens inside `orphanInFlightTurns()` at the end of this function —
+  // so this still names the epoch the reset ENDED: every turn in flight started at or below it, and
+  // that is what lets a straggler `done` be judged on the reason its epoch moved rather than on the
+  // account binding it happens to find. Nothing between here and that call reads or writes
+  // `sessionEpoch`, so the deferral is not observable. See {@link lastResetEpoch}.
   lastResetEpoch = sessionEpoch;
-  sessionEpoch++;
   currentSessionId = null;
   fallbackSessionId = null;
   // No session, so no account owns one. Leaving a stale binding here would make the next turn look
@@ -941,9 +979,9 @@ export function resetConciergeSession(): void {
   sessionAccountConfigDir = undefined;
   restoring ??= Promise.resolve();
   // LAST, so a subscriber tearing its state down observes the reset as already complete. Any turn
-  // still in flight has just been orphaned by the epoch bump, and its terminal event will be
-  // dropped — see {@link onConciergeIdentityReset} for why silence alone would strand the host.
-  dispatch(resetCallbacks, undefined);
+  // still in flight is orphaned by the epoch bump inside this call, and its terminal event will be
+  // dropped — see {@link onConciergeTurnsAbandoned} for why silence alone would strand the host.
+  orphanInFlightTurns();
 }
 
 /**
@@ -958,7 +996,7 @@ export function _resetConciergeForTests(opts?: { keepRetiredSessions?: boolean }
   deltaCallbacks.clear();
   doneCallbacks.clear();
   errorCallbacks.clear();
-  resetCallbacks.clear();
+  abandonCallbacks.clear();
   currentSessionId = null;
   fallbackSessionId = null;
   sessionAccountConfigDir = undefined;

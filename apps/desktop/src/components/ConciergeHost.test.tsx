@@ -118,7 +118,7 @@ vi.mock("../services/concierge", async (importOriginal) => ({
     h.brain.error = cb;
     return () => {};
   },
-  onConciergeIdentityReset: () => () => {},
+  onConciergeTurnsAbandoned: () => () => {},
 }));
 vi.mock("../services/conciergeDispatch", () => ({
   dispatchConciergeAnswer: h.dispatchConciergeAnswer,
