@@ -525,6 +525,20 @@ export function AgentSidebar({
   // about that window. Otherwise the map is the single answer to "where does this project live",
   // falling back to the slot's own side when there is no project to ask (see slotSide).
   const pairSide = forcePairSide ?? (project ? sideOf(pairAssignment, project.id) : slotSide);
+  // IS THE IMPROVE-SPARKLE PANE COVERING **THIS** COLUMN'S STAGE? Asked once, here, because every
+  // consumer below needs the same answer and the raw `activeSpecial` cannot give it: the flag is
+  // window-global but the pane mounts in exactly ONE pair's stage (Workspace renders
+  // `SparkleAgentPane` only in the primary pair, and its left-hand pane id has no `sparkleActive`
+  // term at all). So in the LEFT column the bare global is a lie in both directions — it claims a
+  // pane that is not there while that column's own build terminal is still on screen.
+  //
+  // Reading it unscoped is what made the left sidebar paint "Improve Sparkle is the active row and
+  // no build row is selected" over a live build terminal, and then made the Build chevron disagree
+  // with that painting: `alreadyHere` came out true, so a press meant as "get me back from Sparkle"
+  // spawned a brand-new build agent — worktree and PTY — and another on every further press. Same
+  // class of split as the singleton this file's per-column work removed, one layer further down: a
+  // scoped write beside an unscoped read.
+  const paneCoversMe = pairSide === SPARKLE_PANE_SIDE && activeSpecial !== null;
   const patchCable = useCableStore((s) => s.patch);
   // DOES THIS PAIR HOLD THE CABLE? Read from the one enum, never mirrored into local state — the
   // rows use it to open their concierge end (engine/rowGeometry), which is the second half of the
@@ -1021,15 +1035,9 @@ export function AgentSidebar({
     return id;
   };
   const onPickBuild = () => {
-    // SCOPE THE READ THE SAME WAY THE WRITE IS SCOPED. `activeSpecial` is window-global but the
-    // pane occupies exactly ONE pair's stage, so "is my stage covered" is a per-column question.
-    // Reading the bare global here — while `showBuildStage` only clears it for the pane-owning
-    // pair — made `alreadyHere` permanently false in the LEFT column whenever Improve Sparkle was
-    // up: second-click-spawn went dead, and every press instead re-ran the "switching INTO Build"
-    // branch, re-selecting the first rendered row and yanking the cable off whatever the user had
-    // patched. A scoped write with an unscoped read is the same class of split as the singleton
-    // this branch removed, just one layer down.
-    const paneCoversMe = pairSide === SPARKLE_PANE_SIDE && activeSpecial !== null;
+    // `paneCoversMe` (component scope) rather than the bare global — see its definition. The
+    // chevron and the row highlighting have to answer "is my stage covered" the same way, or the
+    // press does something other than what the column is painting.
     const alreadyHere = mode === "build" && !paneCoversMe;
     // showBuildStage, not setMode + setActiveSpecial: the pairing lives in the store so this
     // chevron and the concierge's `set_work_mode("build")` cannot answer the same request
@@ -1577,9 +1585,14 @@ export function AgentSidebar({
   // handlers move selection in the other direction, so the two converge.
   useEffect(() => {
     const hasSelection = !!project?.agents.find((a) => a.id === project.selectedAgentId);
-    const next = reconcileWorkMode(hasSelection, mode, activeSpecial !== null);
+    // Scoped for the same reason as the reads above, though note this one carries no behavior
+    // today and no test asserts it: `reconcileWorkMode` short-circuits on `mode === "plan"` and
+    // otherwise `mode` is already "build", so it answers `null` in every state where `hasSpecial`
+    // could matter. It is passed scoped so the column has ONE answer to "is my stage covered"
+    // rather than two that could drift if that helper ever grows a third mode.
+    const next = reconcileWorkMode(hasSelection, mode, paneCoversMe);
     if (next) setMode(next);
-  }, [project, mode, activeSpecial, setMode]);
+  }, [project, mode, paneCoversMe, setMode]);
   // If Beads is turned off while the user is parked on the (now-hidden) Plan board, leave it — the
   // board won't render and the Plan chevron is gone, so a stuck empty state would result otherwise.
   // Also covers Plan mode without the board special, so no code path can strand the user in a Plan
@@ -2360,7 +2373,7 @@ export function AgentSidebar({
                 shipped: shippedOf(w.id),
                 worktreePath: w.worktreePath,
                 baseBranch: w.baseBranch,
-                active: !activeSpecial && project.selectedAgentId === w.id,
+                active: !paneCoversMe && project.selectedAgentId === w.id,
                 onLand: () => onLand(w),
                 onOpen: () => onSelect(w.id),
               };
@@ -2395,7 +2408,7 @@ export function AgentSidebar({
           // The alert toggle to show on this row's expanded card: "dismiss" when it's truly red and
           // not yet dismissed, "reenable" when red-underneath but dismissed, null otherwise.
           const alertControl = alertControlKind(a.alert, trueSt);
-          const isActive = !activeSpecial && project.selectedAgentId === a.id;
+          const isActive = !paneCoversMe && project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
           // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
           const rowShipped =
@@ -2578,7 +2591,10 @@ export function AgentSidebar({
           build row (see SparkleAgentRow), including the status derivation feeding it here. */}
       {showSparkleRow && (
         <SparkleAgentRow
-          active={activeSpecial === "sparkle"}
+          // Scoped, like every other read of this flag in the column: the row may only claim to be
+          // active where the pane it stands for actually mounts. `activeSpecial` is `"sparkle" | null`,
+          // so this is the same test, asked per column.
+          active={paneCoversMe}
           status={sparkleStatus}
           dotColor={sparkleRollupOverrides ? ROLLUP_DOT_COLOR[sparkleRollup] : undefined}
           dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : undefined}
@@ -5291,6 +5307,10 @@ const SparkleAgentRow = memo(function SparkleAgentRow({
   return (
     <div
       data-hint="improve"
+      // The selected state is carried entirely by inline paint (see the fill note below), which is
+      // not a thing a test can read without asserting on colors. This mirrors the build rows'
+      // `aria-selected` as a plain data hook so "which column claims the pane" is observable.
+      data-active={active ? "1" : "0"}
       onClick={onSelect}
       title="Improve Sparkle — reviews your usage to propose improvements to the open-source app"
       style={{

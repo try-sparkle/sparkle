@@ -186,6 +186,77 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
     expect(spawnAgent).toHaveBeenCalledTimes(1);
   });
 
+  // THE OTHER CONJUNCT. The left-column case above pins `activeSpecial !== null`; these two pin
+  // `pairSide === SPARKLE_PANE_SIDE`. Without them, collapsing `paneCoversMe` to the bare
+  // `pairSide === SPARKLE_PANE_SIDE` kills second-press-spawn in the RIGHT (primary) column
+  // permanently — every press re-runs the switching-INTO-Build branch and re-selects the first
+  // rendered row — and the suite stays green. `[data-hint="build"]` is clicked nowhere else.
+  it("spawns on the second Build press in the RIGHT column when no pane is up", () => {
+    useUiStore.setState({
+      activeSpecial: null,
+      workModeBySide: { left: "build", right: "build" },
+    } as never);
+    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
+    render(<AgentSidebar project={right} slotSide="right" />);
+
+    fireEvent.click(document.querySelector('[data-hint="build"]')!);
+
+    expect(spawnAgent).toHaveBeenCalledTimes(1);
+  });
+
+  // ...and the negative: in the column the pane DOES cover, the first press is "get me back to the
+  // stage", not "spawn". This is the half that would break if `paneCoversMe` collapsed to a
+  // constant `false`.
+  it("does NOT spawn on the first Build press in the RIGHT column while the Sparkle pane is up", () => {
+    useUiStore.setState({
+      activeSpecial: "sparkle",
+      workModeBySide: { left: "build", right: "build" },
+    } as never);
+    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
+    render(<AgentSidebar project={right} slotSide="right" />);
+
+    fireEvent.click(document.querySelector('[data-hint="build"]')!);
+
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+  });
+
+  // THE PAINT, not just the press. The row highlighting has to answer "is my stage covered" the
+  // same way the chevron does — reading the bare window-global made the LEFT column paint
+  // "Improve Sparkle is the active row" over its own live build terminal, and that mismatch is
+  // what made the chevron's behavior read as unprovoked.
+  it("does not paint the Improve-Sparkle row active in the column the pane does not cover", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
+    const { container } = render(<AgentSidebar project={left} slotSide="left" />);
+
+    const sparkleRow = container.querySelector('[data-hint="improve"]');
+    expect(sparkleRow).toBeTruthy();
+    expect(sparkleRow!.getAttribute("data-active")).toBe("0");
+  });
+
+  it("paints the Improve-Sparkle row active in the column that DOES own the pane", () => {
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
+    const { container } = render(<AgentSidebar project={right} slotSide="right" />);
+
+    expect(container.querySelector('[data-hint="improve"]')!.getAttribute("data-active")).toBe("1");
+  });
+
+  // THE OTHER HALF OF THE SAME LIE. The left column's build rows took `!activeSpecial`, so a pane
+  // mounted in the OTHER column deselected them — the sidebar showed nothing selected while that
+  // column's stage was still running the selected agent's terminal.
+  it("keeps the selected build row painted in the column the pane does not cover", () => {
+    const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
+    const withSelection = { ...left, selectedAgentId: "p2-a1" };
+    useUiStore.setState({ activeSpecial: "sparkle" } as never);
+    const { container } = render(<AgentSidebar project={withSelection} slotSide="left" />);
+
+    const row = container.querySelector('[data-hint="agent"]');
+    expect(row).toBeTruthy();
+    expect(row!.getAttribute("aria-selected")).toBe("true");
+  });
+
   it("keeps the other column's Plan mode when this one switches back to Build", () => {
     // Left already parked on its board; the user now works the right column.
     useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } } as never);
