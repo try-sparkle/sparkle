@@ -124,6 +124,7 @@ import { processAliveFor } from "../services/goalContinuationRunner";
 // and the wording; nothing here re-decides a verdict.
 import { isStalled, stallReport } from "../engine/agentStall";
 import { thrashReportFor } from "../engine/agentThrash";
+import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import {
   goalBadgeFor,
@@ -455,11 +456,20 @@ export function AgentSidebar({
         const agent = project.agents.find((x) => x.id === id);
         if (agent === undefined) return undefined;
         return stallReport(
-          stallInputsFor(calmStatus[id] ?? "stopped", Date.now(), agent.goal, {
-            bs: branchStatus[id],
-            ws: workflowState[id],
-            stageOverride: workflowStage[id],
-          }),
+          stallInputsFor(
+            calmStatus[id] ?? "stopped",
+            Date.now(),
+            agent.goal,
+            {
+              bs: branchStatus[id],
+              ws: workflowState[id],
+              stageOverride: workflowStage[id],
+            },
+            // The account-limit wall. Without it this surface — the one the founder actually watches —
+            // computes its own reading that can never see a quota block, so the row goes red with no
+            // reason attached and the "Rate limited" chip is unreachable.
+            quotaBlockForAgent(id, Date.now()),
+          ),
         );
       },
       (id) => processAliveFor(id, status, openIds),
@@ -3952,7 +3962,13 @@ const AgentRow = memo(function AgentRow({
   const stall = stallReport(
     // `calmSt`, NOT `st` — see the prop's docstring. Asking the stall question about an already-
     // escalated row returns `active` and no causes, so the row would go red with nothing to say.
-    stallInputsFor(calmSt, clockNow, a.goal, { bs, ws: wfState, stageOverride }),
+    stallInputsFor(
+      calmSt,
+      clockNow,
+      a.goal,
+      { bs, ws: wfState, stageOverride },
+      quotaBlockForAgent(a.id, clockNow),
+    ),
   );
   // `isStalled` is the gate, not `verdict !== "finished"`: it is true ONLY for a confident stall, so
   // the `unknown` verdict — idle with git state we never read — raises nothing. A stall claim that
@@ -3963,6 +3979,8 @@ const AgentRow = memo(function AgentRow({
   // so `false` here is evidence, not a fabrication.
   const thrash = thrashReportFor(a.id, clockNow, {
     goalOutstanding: hasUnmetGoal(a.goal, clockNow),
+    // Same wall, same clock as the stall reading above, so one row cannot say two things.
+    quotaBlock: quotaBlockForAgent(a.id, clockNow),
   });
   const thrashLabel = thrashChipLabel(thrash);
   const goalBadge = goalBadgeFor(a.goal, clockNow);

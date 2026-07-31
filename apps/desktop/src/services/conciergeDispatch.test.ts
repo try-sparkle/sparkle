@@ -194,7 +194,9 @@ describe("dispatchConciergeAnswer", () => {
         neverPickerAnswer: true,
       });
       expect(r).toMatchObject({ ok: true, path: "free-text" });
-      expect(submitPrompt).toHaveBeenCalledWith("agent-1", "ship the DMG");
+      // `machine: false` — a `suggestion` authority is HUMAN-authored, so this send carries the
+      // human-presence signal that clears a quota wall. See StatusEngine.noteUserInput.
+      expect(submitPrompt).toHaveBeenCalledWith("agent-1", "ship the DMG", { machine: false });
     });
   });
 
@@ -202,7 +204,9 @@ describe("dispatchConciergeAnswer", () => {
     setPrompt([]);
     const r = await dispatchConciergeAnswer("agent-1", "add a test for the webhook", { authority: TEST_AUTHORITY });
     expect(r).toMatchObject({ ok: true, path: "free-text", sent: "add a test for the webhook" });
-    expect(submitPrompt).toHaveBeenCalledWith("agent-1", "add a test for the webhook");
+    expect(submitPrompt).toHaveBeenCalledWith("agent-1", "add a test for the webhook", {
+      machine: false,
+    });
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 

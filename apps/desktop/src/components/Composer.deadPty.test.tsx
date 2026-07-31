@@ -87,7 +87,7 @@ describe("Composer — delivery to a dead PTY", () => {
   it("records prompt history when delivery succeeds", async () => {
     const { apiRef, onSubmitPrompt } = renderComposer();
     await typeAndSend(apiRef, "land it to main");
-    expect(submitPrompt).toHaveBeenCalledWith("a1", "land it to main");
+    expect(submitPrompt).toHaveBeenCalledWith("a1", "land it to main", { machine: false });
     expect(onSubmitPrompt).toHaveBeenCalledWith("land it to main", "land it to main");
     expect(usePromptHistoryStore.getState().history).toContain(
       "land it to main",

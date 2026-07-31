@@ -25,6 +25,7 @@
 // `isStalled` deliberately renders no alarm for it.
 import { type AgentGoal, goalRemainingMs, goalStateOf, type GoalState } from "../engine/agentGoal";
 import type { StallCause, StallInput, StallReport } from "../engine/agentStall";
+import type { QuotaBlock } from "../engine/quotaBlock";
 import type { ThrashReport, ThrashVerdict } from "../engine/agentThrash";
 import type { AgentTabStatus } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -101,11 +102,16 @@ export function stallInputsFor(
   now: number,
   goal: AgentGoal | undefined,
   ev: RowGitEvidence,
+  // PASSED IN, not looked up here, so this stays pure and the sidebar keeps deciding its own clock.
+  // It is a separate parameter rather than a member of `RowGitEvidence` because it is not git
+  // evidence — it is an observation from the agent's own output stream.
+  quotaBlock?: QuotaBlock,
 ): StallInput {
   return {
     status,
     now,
     goal,
+    ...(quotaBlock ? { quotaBlock } : {}),
     hasOpenPr: openPrEvidence(ev.ws),
     hasUnlandedWork: unlandedEvidence(ev),
     hasUncommittedChanges: uncommittedEvidence(ev.bs),
@@ -165,6 +171,9 @@ export const THRASH_VERDICT_LABEL: Record<Exclude<ThrashVerdict, "healthy">, str
   "context-pressure": "Context exhausted",
   "repeating-command": "Looping",
   "no-progress": "No progress",
+  // "Rate limited", not "Blocked": the row's STATUS already reads Blocked, and a chip that repeats
+  // the band name spends the row's scarcest space saying nothing. This chip's job is to say WHY.
+  "quota-blocked": "Rate limited",
 };
 
 /**

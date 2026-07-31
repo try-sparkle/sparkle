@@ -44,7 +44,8 @@ async function intoAgent(run: () => Promise<void>): Promise<void> {
 /** Paste an error into the terminal's own agent, framed as a fix request, and submit it. */
 export function fixInAgent(agentId: string, text: string): Promise<void> {
   return intoAgent(() =>
-    submitPrompt(agentId, `I hit this error, please fix it:\n\n${text}`),
+    // `machine: false` — the user selected this text and asked for it. A human is present.
+    submitPrompt(agentId, `I hit this error, please fix it:\n\n${text}`, { machine: false }),
   );
 }
 

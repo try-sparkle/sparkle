@@ -23,6 +23,7 @@ import {
 } from "../engine/agentGoal";
 import { describeGoalVerify } from "@sparkle/core";
 import { stallReport, type StallReport } from "../engine/agentStall";
+import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { thrashReportFor, type ThrashReport } from "../engine/agentThrash";
 import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -200,6 +201,11 @@ export function stallReadingFor(
     status: correctedStatusFor(agentId, status, now),
     now,
     goal,
+    // The account-limit wall, read from the same StatusEngine that observed it. Supplied HERE rather
+    // than by each caller for the reason the corrected status is: `get_agent_status` and the roster
+    // both publish this report, and a wall visible to one but not the other is the same
+    // one-object-contradicts-itself bug the correction above exists to prevent.
+    quotaBlock: quotaBlockForAgent(agentId, now),
     ...stallEvidenceFor(agentId),
   });
 }
@@ -254,5 +260,10 @@ export function thrashReadingFor(
   goal: AgentGoal | undefined,
   now: number,
 ): ThrashReport | undefined {
-  return thrashReportFor(agentId, now, { goalOutstanding: hasUnmetGoal(goal, now) });
+  return thrashReportFor(agentId, now, {
+    goalOutstanding: hasUnmetGoal(goal, now),
+    // Same wall, same reader, same clock as `stallReadingFor` — so the two reports published side by
+    // side in one `get_agent_status` response cannot disagree about whether the agent is blocked.
+    quotaBlock: quotaBlockForAgent(agentId, now),
+  });
 }

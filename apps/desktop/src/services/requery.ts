@@ -105,7 +105,11 @@ export async function requeryOpenAgents(): Promise<void> {
       // Isolate each agent: a single dead PTY (a "done"/exited process whose write rejects)
       // must not abort the loop and strand every later agent's re-query.
       try {
-        await submitPrompt(agent.id, REQUERY_PROMPT);
+        // `machine: true` — NOBODY TYPED THIS. A re-query is fired automatically on an offline→online
+        // transition, and SAFE_TO_REQUERY deliberately includes `blocked`, so this lands on exactly
+        // the quota-walled rows. Claiming human presence here cleared the wall and repainted the row
+        // green — the self-concealing loop, re-entered through a different door.
+        await submitPrompt(agent.id, REQUERY_PROMPT, { machine: true });
       } catch (e) {
         if (e instanceof PtyGoneError) {
           // Expected lifecycle race, not a failure: the agent's PTY was reaped between the status

@@ -36,6 +36,7 @@ import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
 import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames, isApiErrorLine } from "./streamFailure";
+import { type QuotaBlock, isQuotaBlocked, quotaBlockIn, quotaBlocksIn } from "./quotaBlock";
 import {
   logStatusTransition,
   monotonicNow,
@@ -51,6 +52,7 @@ const ANSI = new RegExp("\\u001b[\\[\\]()#;?]*[0-9;]*[@-~]|\\u001b", "g");
 function stripAnsi(s: string): string {
   return s.replace(ANSI, "");
 }
+
 
 // Mid-stream input detection flips to red the instant a prompt streams past, ~2s before
 // the settle screen-check would. It runs the SAME classifier as settle (`screenAwaitsInput`
@@ -249,8 +251,22 @@ export class StatusEngine {
   //             pings, so its token counter climbs too; token progress here proves nothing and must
   //             NEVER clear the red. Only real progress (a classified tool event), a real prompt, or
   //             user input clears a churn wedge — the original sparkle-pqxh contract.
-  // "churn" outranks "api": once churn is seen, a later banner must not downgrade it to clearable.
-  private failureKind: "api" | "churn" | null = null;
+  //   "quota" — an ACCOUNT limit (session window or spend cap). Like churn it is NOT token-clearable
+  //             — the never-idle auto-resume types a goal banner, the agent re-hits the wall, and the
+  //             spinner counts the tokens that produced the refusal — but unlike either of the others
+  //             it is not an ERROR: nothing crashed and nothing needs debugging, the agent is barred
+  //             until a stated wall-clock time. So it paints `blocked` ("needs you to unstick it")
+  //             rather than `errored`, which is the honest band and the one the founder asked for.
+  // "quota" outranks BOTH: it is the most specific reading available and the only one carrying an
+  // actionable time, so a later generic banner must never overwrite it with a vaguer verdict.
+  private failureKind: "api" | "churn" | "quota" | null = null;
+  // The account-limit evidence itself (message verbatim + reset instant), so the surfaces that answer
+  // "why" — get_agent_status, the stall report, the auto-resume backoff — read ONE observation rather
+  // than each re-deriving it from text. Outlives the sticky red on purpose: the red clears on real
+  // progress, whereas the WALL is a fact about the clock and expires only when `resetAt` passes.
+  private quotaBlock: QuotaBlock | null = null;
+  // Fires at the wall's stated reset. See armQuotaRelease for why a timer and not a check-on-ingest.
+  private quotaTimer: ReturnType<typeof setTimeout> | null = null;
   // The token count from the most recent spinner frame that carried one, so a strictly-higher count
   // on a later frame proves the model is still GENERATING (forward progress) and clears a sticky
   // mid-stream failure — the healthy-but-transiently-blipped case (see the recovery in ingest). Null
@@ -319,9 +335,51 @@ export class StatusEngine {
 
   // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its
   // recovery can never drift apart. "churn" outranks "api" (see failureKind).
-  private tripStreamFailure(kind: "api" | "churn"): void {
+  /**
+   * Release the wall when the stated reset arrives.
+   *
+   * A TIMER IS REQUIRED, NOT AN OPPORTUNISTIC CHECK ON THE NEXT CHUNK, and that is the whole point:
+   * a walled agent is SILENT. It runs no tools and prints nothing, so there is no next chunk to
+   * re-classify it on. The first cut of this feature had no timer, and the consequence was that
+   * `blocked` was terminal — `clearTimers()` had removed the settle timer, `blocked` is not a resting
+   * status so auto-continue refused it as `not-idle`, and nothing else could clear the sticky red.
+   * The agent sat dead past its own reset time until a human typed "try again", which is verbatim the
+   * failure this whole branch exists to remove.
+   *
+   * Kept OUT of `clearTimers()` deliberately: that runs on every classification (including the
+   * `blocked` arm that trips this), so clearing the release there would cancel it immediately.
+   */
+  private armQuotaRelease(resetAt: number): void {
+    if (this.quotaTimer) clearTimeout(this.quotaTimer);
+    this.quotaTimer = setTimeout(
+      () => {
+        this.quotaTimer = null;
+        if (this.disposed || this.failureKind !== "quota") return;
+        this.clearStreamFailure();
+        this.quotaBlock = null;
+        // Settle rather than forcing a colour: the wall is down, but whether the agent is working or
+        // resting is a question for the ordinary classifier, not for this timer to assert.
+        this.settle("quiet-settle");
+      },
+      Math.max(0, resetAt - Date.now()),
+    );
+  }
+
+  // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its
+  // recovery can never drift apart. "churn" outranks "api" (see failureKind).
+  private tripStreamFailure(kind: "api" | "churn" | "quota"): void {
     this.sawStreamFailure = true;
-    if (kind === "churn" || this.failureKind === null) this.failureKind = kind;
+    // Precedence, strongest first: quota beats everything (it is the most specific reading and the
+    // only one that names a time), then churn, then api.
+    if (kind === "quota" || this.failureKind === null) this.failureKind = kind;
+    else if (kind === "churn" && this.failureKind !== "quota") this.failureKind = kind;
+  }
+
+  /** The account-limit wall this agent last reported, if any. Read by the surfaces that must explain
+   *  WHY it is blocked and how long for. Not cleared by ordinary recovery — see {@link quotaBlock}. */
+  quotaBlockNow(now: number): QuotaBlock | undefined {
+    const b = this.quotaBlock;
+    return b !== null && isQuotaBlocked(b, now) ? b : undefined;
   }
 
   // The ONE way out of it: every recovery path (a classified tool event, a real prompt, user input, a
@@ -331,6 +389,25 @@ export class StatusEngine {
     this.sawStreamFailure = false;
     this.failureKind = null;
     this.failure.reset();
+  }
+
+  /**
+   * The wall is gone EARLY — the account is demonstrably serving requests again.
+   *
+   * Separate from `clearStreamFailure` because the two answer different questions and the observation
+   * must outlive the colour: the red clears on any recovery signal, but the WALL is a claim about the
+   * account, and only positive evidence retires it before its stated time.
+   *
+   * Without this, a wall observed at 3pm kept every consumer wrong until 4pm even after the human
+   * switched accounts and the agent ran tools and committed for twenty minutes: `get_agent_status`
+   * printed `status: "working"` beside "Not working — it is behind an account limit", and
+   * auto-continue stayed suppressed the whole time (by which point the 4h goal TTL could expire).
+   * A stale block is not the safe direction — it strands a working agent.
+   */
+  private releaseQuotaBlock(): void {
+    this.quotaBlock = null;
+    if (this.quotaTimer) clearTimeout(this.quotaTimer);
+    this.quotaTimer = null;
   }
 
   // A turn boundary (the turn settling, or the user submitting the next message — an approval prompt
@@ -354,11 +431,46 @@ export class StatusEngine {
    *      for a self-prompt/churn ping (Fix 2). Bounded to a line window so a LATER genuine wedge is
    *      still caught.
    */
-  noteUserInput(text: string): void {
+  noteUserInput(text: string, opts?: { machine?: boolean }): void {
     // Same latch: the engine registry only guards by identity at UNREGISTER time, so a submit path
     // holding a stale reference could still reach a disposed engine.
     if (this.disposed) return;
-    this.clearStreamFailure();
+    // A MACHINE SEND IS NOT A USER, AND MUST NOT SPEAK FOR ONE.
+    //
+    // Every send reaches here — `pty.deliverSubmit` calls `noteUserInputForAgent` unconditionally —
+    // so the never-idle auto-resume was claiming the recovery signal reserved for "a person is here
+    // and driving". Against a quota wall that made the loop self-concealing: the resume cleared the
+    // red, the next spinner tick repainted the row green, and the agent looked busy while it was
+    // barred from acting. The recovery mechanism was erasing the evidence of the condition it was
+    // failing to recover from, once per settle window.
+    //
+    // NARROWED TO THE QUOTA KIND ON PURPOSE. `apiRecoveryRunner` documents that its own ping clears
+    // `errored` and depends on it — that is how it observes whether a retry worked, and a transient
+    // 5xx really can be gone by the next request. A quota wall cannot: it clears at a stated time and
+    // nothing a machine types moves it. So `api` and `churn` keep today's behaviour exactly, and only
+    // the verdict that a resume cannot possibly change survives a resume.
+    const keepQuota = opts?.machine === true && this.failureKind === "quota";
+    if (!keepQuota) this.clearStreamFailure();
+    else this.failure.reset(); // the churn counters are still stale; the WALL is what persists
+
+    // THE WALL IS RELEASED ON HUMAN PRESENCE ALONE — deliberately NOT gated on `failureKind`.
+    //
+    // A HUMAN is here. They are the ones who switch accounts or raise the cap, so their arrival is
+    // the strongest available evidence that the wall may already be gone, and holding a stale block
+    // against a present human is strictly worse than re-detecting it if it is still up (the banner
+    // simply arrives again).
+    //
+    // COUPLING THIS TO `failureKind` WAS A BUG, and a subtle one, because the wall is designed to
+    // OUTLIVE the sticky red: the red clears on any recovery signal, the wall expires on a clock.
+    // While the release sat inside the `!keepQuota` branch it therefore fired for a MACHINE send as
+    // soon as the red had been dropped for any unrelated reason — and dropping it is routine: a real
+    // interactive prompt calls `clearStreamFailure()`, which is exactly what happens when Claude
+    // prints the limit banner and then asks the human something. From that point requery (whose
+    // SAFE_TO_REQUERY includes `blocked`), fleetWatch, apiRecoveryRunner or a machine dispatch each
+    // nulled a LIVE wall, `decideContinuation` stopped returning `quota-blocked`, and auto-resume
+    // fired into the wall again — the self-concealing loop, re-entered through the door this change
+    // had just claimed to close. Asking only "was a person here?" cannot drift that way.
+    if (opts?.machine !== true) this.releaseQuotaBlock();
     this.sawRecentError = false;
     this.sawRecentRisk = false;
     // A new turn starts here, and its token counter restarts from zero.
@@ -494,8 +606,40 @@ export class StatusEngine {
         // and reset the churn counter so post-recovery output starts fresh. Real progress also ends
         // the user-input echo window (Fix 2): from here a repeated self-ping is a fresh wedge again.
         this.clearStreamFailure();
-        this.notedUserText = "";
-        this.notedUserLinesLeft = 0;
+        // THE WALL IS DELIBERATELY *NOT* RELEASED HERE, and four rounds of review are why.
+        //
+        // The idea was that a classified line proves the account is serving requests again, so an
+        // out-of-band cap raise would not leave every surface insisting "behind an account limit"
+        // until `resetAt`. Each attempt to build that signal from terminal text was wrong, and each
+        // failure was a FALSE RELEASE — the direction that re-opens the self-concealing resume loop:
+        //
+        //   • Any classified event: `classifyLine` is a RISK classifier, so the agent's own recap
+        //     prose ("Done: ran vitest and committed") classifies exactly like a tool line.
+        //   • Excluding `approval_needed`: that only drops CAUTION/DANGEROUS, while the SAFE class
+        //     *is* the prose surface.
+        //   • A leading shell prompt: `SHELL_PROMPT` is `/^\s*[$#>]\s+/`, so a markdown heading
+        //     ("# Summary"), a Makefile comment or a diff hunk scrolling past all qualify. And the
+        //     `$` shape is not evidence of execution at all — `capturedScreens.fixture`'s
+        //     `⎿  $ touch probe_ok.txt` sits INSIDE the permission dialog, above "Do you want to
+        //     proceed?", so it is a PROPOSAL awaiting a human. An earlier version of this comment
+        //     cited that fixture as proof of execution; that citation was simply wrong.
+        //
+        // The conclusion is not "guard it harder" but that the PTY carries no sound execution signal
+        // at this layer: every candidate is confusable with a proposal or with prose. So the wall
+        // falls only to the two signals that ARE sound — its stated reset (armQuotaRelease) and a
+        // HUMAN send (noteUserInput). The cost is bounded and one-directional: if someone raises the
+        // cap out of band and never types to the agent, the wall stands until `resetAt`. Any
+        // interaction clears it, and a wrong hold only delays an auto-resume, where a wrong release
+        // resurrects the bug this whole module exists to kill.
+        // THE ECHO WINDOW MUST NOT BE CONSUMED BY THE ECHO ITSELF. `notedUserText` holds the whole
+        // normalized message and `isUserEchoLine` matches a single line as a FRAGMENT of it —
+        // precisely because a multi-line message echoes line by line. Clearing unconditionally ended
+        // the window on the echo's OWN first line, so line 2 of the same relay was no longer
+        // recognised and fell through to the false-red guards this window exists to feed.
+        if (!this.isUserEchoLine(line.toLowerCase())) {
+          this.notedUserText = "";
+          this.notedUserLinesLeft = 0;
+        }
       }
       if (ev?.event_type === "approval_needed") this.sawRecentRisk = true;
       // Mid-stream failure/stall while the process is alive (sparkle-pqxh). Only observed when this
@@ -514,6 +658,19 @@ export class StatusEngine {
         // healthy agent red — the false-red this whole line of work exists to kill. A retry loop with
         // no generation is still caught, by the frozen-counter rule.
         this.tripStreamFailure(isApiErrorLine(line) ? "api" : "churn");
+        trippedThisChunk = true;
+      }
+      // ACCOUNT LIMIT, checked SEPARATELY from `this.failure.observe` above and not folded into it.
+      // Two reasons it cannot ride that path: `StreamFailureDetector` answers a boolean, so it cannot
+      // carry the message and reset instant this band exists to report; and it is reached only in the
+      // `else if` arm above, so a chunk that also classified as a tool event would skip the wall
+      // entirely. A quota banner is unambiguous on sight — like an API banner, a single occurrence
+      // trips — so it needs no repetition gate.
+      const wall = quotaBlockIn(line, Date.now());
+      if (wall !== undefined && !this.isUserEchoLine(line.toLowerCase())) {
+        this.quotaBlock = wall;
+        this.armQuotaRelease(wall.resetAt);
+        this.tripStreamFailure("quota");
         trippedThisChunk = true;
       }
       if (screenAwaitsInput(line)) prompt = true;
@@ -552,6 +709,27 @@ export class StatusEngine {
       .filter((f) => !this.isUserEchoLine(f.toLowerCase()));
     if (arrived.length > 0) {
       this.tripStreamFailure("api");
+      trippedThisChunk = true;
+    }
+
+    // THE SAME CHECK ON THE UNTERMINATED TAIL, and this is the arm that actually catches a live
+    // agent: the observed banner arrived with NO trailing newline (the founder's screenshot), so the
+    // completed-line loop above never saw it.
+    //
+    // ARRIVAL-DIFFED, exactly like the API banners above, and this is not optional. A banner in the
+    // tail stays in `carry` and is re-read on every subsequent chunk, so a whole-buffer check answers
+    // "blocked" forever — no human, no tool event, nothing could ever clear it, and the row would be
+    // pinned red long after the limit reset. `base` is the already-seen prefix, so slicing past its
+    // count leaves exactly the walls this chunk ADDED. Same user-echo guard, so a human pasting the
+    // banner into the composer does not paint their own agent blocked.
+    const wallsArrived = quotaBlocksIn(base + tail, Date.now())
+      .slice(quotaBlocksIn(base, Date.now()).length)
+      .filter((w) => !this.isUserEchoLine(w.message.toLowerCase()));
+    const wallInTail = wallsArrived[wallsArrived.length - 1];
+    if (wallInTail !== undefined) {
+      this.quotaBlock = wallInTail;
+      this.armQuotaRelease(wallInTail.resetAt);
+      this.tripStreamFailure("quota");
       trippedThisChunk = true;
     }
 
@@ -626,6 +804,16 @@ export class StatusEngine {
     //     even over a hook `working`. Recovery clears it above (a real tool event / a real prompt).
     if (this.sawStreamFailure) {
       this.clearTimers();
+      // An ACCOUNT limit is not an error and must not be reported as one. Nothing crashed, nothing
+      // needs debugging, and there is no retry that helps — the agent is barred until a stated time.
+      // `blocked` is the band whose own definition is "needs you to unstick it": still RED (so
+      // `isRedStatus` makes `get_agent_status` report `needsYou: true`, which is the point), but it
+      // deliberately raises no banner and no dock badge, which is right for a condition that clears
+      // on its own clock rather than one demanding an answer right now.
+      if (this.failureKind === "quota") {
+        this.set("blocked", "quota-limit");
+        return;
+      }
       this.set("errored", "stream-failure");
       return;
     }
@@ -671,6 +859,13 @@ export class StatusEngine {
   dispose(): void {
     this.disposed = true;
     this.clearTimers();
+    // The quota release timer is kept OUT of `clearTimers()` on purpose (that runs on every
+    // classification, including the `blocked` arm that arms it), so it has to be dropped here
+    // explicitly. Its callback already checks `disposed`, but the timer itself can be up to 5h out
+    // and retains the engine and its closure for that whole time — once per open/close cycle of a
+    // walled agent. A torn-down engine "must go completely silent", and a pending multi-hour timer
+    // is neither silent nor free.
+    this.releaseQuotaBlock();
     // This window stops witnessing the agent when its pane goes away, so drop the record rather than
     // leave a stale "no authority" entry that would keep a destructive gate refusing forever.
     forgetAgent(this.opts.agentId, this);

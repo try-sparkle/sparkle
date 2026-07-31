@@ -96,7 +96,7 @@ describe("conciergeDispatch — payload / display / naming basis stay separate",
 
     expect(r.ok).toBe(true);
     // The agent still reads the file from disk — the payload is unchanged on the wire.
-    expect(h.submitPrompt).toHaveBeenCalledWith("a1", PAYLOAD);
+    expect(h.submitPrompt).toHaveBeenCalledWith("a1", PAYLOAD, { machine: false });
     for (const s of surfacedStrings()) expect(s).not.toContain(SHOT);
     expect(surfacedStrings().length).toBeGreaterThan(0);
   });

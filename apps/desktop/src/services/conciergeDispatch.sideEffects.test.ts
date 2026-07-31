@@ -194,7 +194,12 @@ describe("dispatchConciergeAnswer — side-effects are OPT-IN (the nudge Approve
     const r = await dispatchConciergeAnswer("a1", "approve", { authority: TEST_AUTHORITY });
     expect(r.ok).toBe(true);
     expect(r.path).toBe("free-text");
-    expect(submitPrompt).toHaveBeenCalledWith("a1", "approve");
+    // `machine: false` even though this test is about side-effects being OPT-IN. The two questions
+    // are different and are deliberately answered by different fields: `userPrompt` decides whether to
+    // RECORD the send (history, meter, naming), while `machine` decides whether a HUMAN is present —
+    // and a `suggestion` authority is a human gesture, so it clears a quota wall even though it
+    // records nothing.
+    expect(submitPrompt).toHaveBeenCalledWith("a1", "approve", { machine: false });
     expect(promptsOf("a1")).toHaveLength(0);
     expect(mark).not.toHaveBeenCalled();
     expect(recordTrialSend).not.toHaveBeenCalled();
@@ -318,7 +323,7 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     await dispatchConciergeAnswer("a1", "start on the docs", { authority: TEST_AUTHORITY, userPrompt: true });
     const results = await flushPendingSends("a1");
     expect(results.map((r) => r.path)).toEqual(["free-text"]);
-    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "start on the docs");
+    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "start on the docs", { machine: false });
     expect(promptsOf("a1").map((h) => h.text)).toContain("start on the docs");
     expect(recordTrialSend).toHaveBeenCalledTimes(1);
     expect(pendingSendCount("a1")).toBe(0);
@@ -372,7 +377,10 @@ describe("dispatchConciergeAnswer — queueing a prompt for a PTY that isn't up 
     // The COUNT is what separates "delivered uncharged" from "silently dropped": every
     // suppression assertion below is negative and a dropped entry would satisfy them all.
     expect(submitPrompt).toHaveBeenCalledTimes(2); // the rejected attempt, then the flush
-    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "approve");
+    // The QUEUED path reads `entry.humanAuthored` rather than re-deriving authorship, so a send that
+    // had to wait for a starting PTY carries the same `machine` verdict it would have had if the
+    // PTY had been up — the asymmetry that bit the goal-debt gate at roborev 55628.
+    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "approve", { machine: false });
     expect(promptsOf("a1")).toHaveLength(0);
     expect(recordTrialSend).not.toHaveBeenCalled();
     expect(maybeAutoName).not.toHaveBeenCalled();
@@ -522,7 +530,7 @@ describe("dispatchConciergeAnswer / flushPendingSends — the queue is honest", 
     await Promise.resolve();
     await Promise.resolve();
     expect(pendingSendCount("a1")).toBe(0);
-    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "beat the race");
+    expect(submitPrompt).toHaveBeenLastCalledWith("a1", "beat the race", { machine: false });
   });
 
   it("broadcasts a delivered queued prompt so the concierge can reconcile its promise", async () => {

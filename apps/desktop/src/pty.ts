@@ -199,12 +199,15 @@ export function pasteIntoPty(id: string, text: string): Promise<void> {
   );
 }
 
-async function deliverSubmit(id: string, text: string): Promise<void> {
+async function deliverSubmit(id: string, text: string, machine?: boolean): Promise<void> {
   // Bug B: a user-submitted message is the strongest recovery signal — a new turn is starting, so
   // any prior stall/error latched from earlier output is stale. Tell the StatusEngine BEFORE the
   // text lands (and echoes back through pty:output) so a resuming agent goes green and its own echo
   // isn't mistaken for a self-prompt wedge. No-op when no engine is registered for this id.
-  noteUserInputForAgent(id, text);
+  // `machine` says nobody typed this (an auto-resume, a retry ping). The text is still recorded so
+  // its echo isn't read as a self-prompt wedge, but a machine send does not get to claim the
+  // human-presence authority that clears a quota wall — see StatusEngine.noteUserInput.
+  noteUserInputForAgent(id, text, { machine: machine === true });
   // Marker-stripped like every other paste this module frames. A no-op for composer-typed text, and
   // NOT a no-op for submitPrompt's untrusted-text callers — the concierge free-text path and
   // conciergeTools' sendToAgentTerminal carry phone-relayed and model-authored strings, which could
@@ -222,8 +225,27 @@ async function deliverSubmit(id: string, text: string): Promise<void> {
  *  REJECTS with PtyGoneError if the agent's PTY is dead. This is deliberate: the prompt did not
  *  land, and silently resolving here is what let a dead agent swallow user prompts while the
  *  composer recorded them into history as if they'd been delivered. Callers must handle it. */
-export function submitPrompt(id: string, text: string): Promise<void> {
-  return chainPtyOp(id, () => deliverSubmit(id, text));
+/**
+ * Submit a prompt to an agent's terminal.
+ *
+ * `machine` IS REQUIRED, NOT OPTIONAL WITH A DEFAULT, and that is the point (the same
+ * required-but-explicit shape `decideContinuation.processAlive` uses, and for the same reason). It
+ * says whether a PERSON typed this. `StatusEngine.noteUserInput` treats a human send as the
+ * strongest recovery signal there is and releases an account-limit wall on it — so a default would
+ * decide that question by omission, and every sender added later would silently claim human presence.
+ *
+ * That is not hypothetical: the first cut made it optional and defaulted to human, which closed the
+ * hole on the dispatch paths while leaving `requery` — whose `SAFE_TO_REQUERY` set explicitly
+ * contains `"blocked"` — firing at quota-walled rows on every offline→online transition and clearing
+ * the very red it had just painted. Making it required turns "I forgot" into a compile error instead
+ * of a silent regression of the bug this file was changed to fix.
+ */
+export function submitPrompt(
+  id: string,
+  text: string,
+  opts: { machine: boolean },
+): Promise<void> {
+  return chainPtyOp(id, () => deliverSubmit(id, text, opts.machine));
 }
 
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {

@@ -651,7 +651,12 @@ export function liveDeps(now: number): ReviveDeps {
     // submitPrompt pastes + sends, and registers the text as user input for this agent first — which
     // this path NEEDS: without it our own prompt's echo can read as a self-prompt churn wedge to
     // engine/streamFailure and re-trip the very red we are clearing (see pty.submitPrompt).
-    submit: submitPrompt,
+    // `machine: true` — this is a RETRY PING, not a person. It still clears the `api`/`churn` red
+    // this path depends on clearing (that is how the ladder observes whether the retry worked), but
+    // it must not clear an ACCOUNT-limit wall: no amount of pinging moves a session limit, and a
+    // machine send that cleared it would repaint the row green and hide the block. See
+    // StatusEngine.noteUserInput, which draws exactly that line.
+    submit: (id, text) => submitPrompt(id, text, { machine: true }),
     onEscalate: () => {
       // The row is ALREADY red and `errored` is already in engine/attention's set, so the dock badge,
       // the system notification and the concierge's proactive push all fire without anything more

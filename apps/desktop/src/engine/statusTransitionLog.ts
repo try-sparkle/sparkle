@@ -68,6 +68,10 @@ export type StatusTransitionTrigger =
   | "quiet-settle"
   | "prompt-detected-midstream"
   | "stream-failure"
+  // An ACCOUNT limit (session window or spend cap) — distinct from `stream-failure` on purpose, so
+  // "this agent is barred until 4pm" is greppable in the transition log rather than buried among
+  // crashes and transient 5xx it has nothing in common with.
+  | "quota-limit"
   | "output-flowing"
   | "quiet-blocked"
   | "screen-recheck"

@@ -28,6 +28,7 @@
 // THE EXPECTED FAILURE DIRECTION IS MISSING A STALL, NEVER INTERRUPTING LIVE WORK. Every piece of
 // absent evidence here resolves to "don't send".
 import { decideContinuation, progressMark } from "../engine/goalContinuation";
+import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { resolveStage } from "../engine/workflowStage";
@@ -318,6 +319,9 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         canAcceptInput: agentCanAcceptInput(agent.id),
         processAlive: processAliveFor(agent.id, raw, openIds),
         mark,
+        // The wall the agent itself reported. Without this line the whole backoff is dead code: the
+        // gate lives in the pure decision, and the pure decision only knows what this sweep hands it.
+        quotaBlock: quotaBlockForAgent(agent.id, now),
       });
 
       if (decision.action === "none") {

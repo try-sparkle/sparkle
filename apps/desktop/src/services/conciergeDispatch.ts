@@ -460,7 +460,11 @@ export async function dispatchConciergeAnswer(
   // Free text (strict: rejects a dead PTY).
   const display = opts.display ?? text;
   try {
-    await submitPrompt(agentId, text);
+    // `machine` reuses the SAME authorship question the goal-debt release below asks — "did a person
+    // write this prose?" — because that is exactly the question a quota wall needs answered. An
+    // auto-resume (`goal-continue`) and a concierge-composed relay (`concierge-tool`) are both
+    // machine-authored, and neither is evidence that the human is present to be told anything.
+    await submitPrompt(agentId, text, { machine: !isHumanAuthored(opts.authority) });
     // `userPrompt` says "record this as a prompt"; `isHumanAuthored` says "a person wrote it". They
     // are NOT the same question, and `send_to_agent_terminal` is where they part company: it passes
     // `userPrompt: true` for prose the concierge LLM composed. Only the second may release an agent's
@@ -580,7 +584,9 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
     const display = entry.display ?? entry.text;
     let r: ConciergeDispatchResult;
     try {
-      await submitPrompt(agentId, entry.text);
+      // `entry.humanAuthored` for the same reason the debt release below reads it rather than the
+      // parameter default: the queued path must not re-derive an answer the entry already carries.
+      await submitPrompt(agentId, entry.text, { machine: !entry.humanAuthored });
       // `entry.humanAuthored`, NOT the parameter default (roborev 55628). The gate that keeps
       // machine-composed prose from clearing a human's escalation latch went onto the direct path
       // and missed this one, which re-opened the hole for any concierge send that had to wait for a

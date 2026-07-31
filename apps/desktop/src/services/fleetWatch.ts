@@ -422,7 +422,8 @@ export function defaultFleetWatchDeps(): FleetWatchDeps {
     // The app's ONE programmatic PTY write: bracketed paste, marker-stripped, queued on the
     // per-agent write chain, and strict about a dead PTY (`PtyGoneError`) instead of pretending the
     // message landed. `services/requery` reaches for the same function for the same reason.
-    deliver: (agentId, text) => submitPrompt(agentId, text),
+    // `machine: true` — fleetWatch delivers on its own schedule, with no human in the loop.
+    deliver: (agentId, text) => submitPrompt(agentId, text, { machine: true }),
   };
 }
 

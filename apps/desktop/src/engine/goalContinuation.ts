@@ -26,7 +26,13 @@
 // decision lives in services/goalContinuationRunner.
 import type { AgentTabStatus } from "@sparkle/ui";
 import { type AgentGoal, goalStateOf } from "./agentGoal";
+// BOTH, and they are two halves of one rule rather than two rules. `agentOriginated` says text
+// SPARKLE authored carries no information about the agent (so a resume is neither a repeated command
+// nor progress); `quotaBlock` says an agent behind an account limit cannot act at all. Together they
+// are why this module refuses to resume: once because resuming would prove nothing, once because it
+// would achieve nothing. See the gate order in `decideContinuation`.
 import { RESUME_PROMPT_MARKER } from "./agentOriginated";
+import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
 
 /**
  * How long a row must sit CONTINUOUSLY idle before an auto-continue is allowed.
@@ -78,7 +84,8 @@ export type NoContinueReason =
   | "liveness-unknown"
   | "idle-not-settled"
   | "no-turn-end-authority"
-  | "cannot-accept-input";
+  | "cannot-accept-input"
+  | "quota-blocked";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
@@ -133,6 +140,21 @@ export interface ContinuationInput {
   processAlive: boolean | undefined;
   /** The current progress mark (see {@link progressMark}). */
   mark: string;
+  /**
+   * An observed account/quota wall (engine/quotaBlock), or `undefined` for none seen.
+   *
+   * THE BOUND THIS ADDS IS A TIME, NOT A COUNT, and that is what the existing bounds could not
+   * express. `MAX_CONTINUES_WITHOUT_PROGRESS` asks "has restarting stopped working?" — a reasonable
+   * question that needs three wasted restarts to answer. Here the answer is stated IN THE ERROR
+   * before the first attempt: nothing can run until 4pm. Resuming into that is not a retry with poor
+   * odds, it is a retry with zero odds, and the observed loop burned turns against it for hours
+   * while looking busy.
+   *
+   * Worse, the count-based bounds could not even catch it eventually: a refusal that costs an
+   * attempt would have escalated to the human with "something is blocking it that restarting cannot
+   * fix" — true, but arrived having spent the whole retry budget and told them nothing about WHEN.
+   */
+  quotaBlock?: QuotaBlock;
 }
 
 /**
@@ -175,6 +197,20 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // nothing is coming to finish it. Restarting is precisely right, because landing the branch is
   // work the agent can do itself. Leaving it in `not-idle` meant such an agent was never continued
   // AND never escalated, which is the silent-forever state this whole module exists to abolish.
+  // THE QUOTA WALL COMES BEFORE THE STATUS GATE, and the order is the entire fix.
+  //
+  // Tripping the wall forces `status: "blocked"`, which is NOT a resting status — so with this check
+  // placed after the gate below, every quota-walled agent was refused as `not-idle` and the quota
+  // reason was unreachable by construction. That is the same uninformative answer the founder was
+  // given by `get_agent_status`, reproduced in the one field the concierge reads to explain why an
+  // agent was left alone. It is also why the first cut's "resumes once the reset has passed" test
+  // proved nothing: it passed `status: "idle"`, which a live wall can never produce.
+  //
+  // Before the BOUNDS too, so waiting out a wall never spends a retry and never escalates. The reset
+  // instant is the schedule: StatusEngine releases the row at that instant (armQuotaRelease), it
+  // settles back to idle, and the next 15s sweep resumes it — the "then resume ONCE automatically"
+  // half of the requirement, with no second timer here to drift from that one.
+  if (isQuotaBlocked(input.quotaBlock, now)) return { action: "none", reason: "quota-blocked" };
   if (!isRestingStatus(status)) return { action: "none", reason: "not-idle" };
   // ...but `unmerged` must prove the process still EXISTS, because the overlay that writes it also
   // covers `done` and `stopped`. See ContinuationInput.processAlive: `idle` witnesses its own

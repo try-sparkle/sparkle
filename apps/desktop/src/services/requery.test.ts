@@ -79,7 +79,7 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
   it("sends the status prompt to an idle build agent", async () => {
     seed([agent("b1", "build")], ["b1"], { b1: "idle" });
     await requeryOpenAgents();
-    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT, { machine: true });
   });
 
   it("skips a build agent that is actively working (don't interrupt mid-task)", async () => {
@@ -109,7 +109,7 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
   it("re-queries worker agents too, not just build agents", async () => {
     seed([agent("w1", "worker")], ["w1"], { w1: "idle" });
     await requeryOpenAgents();
-    expect(submitPrompt).toHaveBeenCalledWith("w1", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledWith("w1", REQUERY_PROMPT, { machine: true });
   });
 
   it("keeps re-querying the rest when one agent's PTY write fails", async () => {
@@ -121,7 +121,7 @@ describe("requeryOpenAgents — PTY (build/worker) agents", () => {
     // b1's PTY is gone (e.g. exited) and rejects; b2 must still be re-queried.
     submitPrompt.mockRejectedValueOnce(new Error("pty dead"));
     await expect(requeryOpenAgents()).resolves.toBeUndefined();
-    expect(submitPrompt).toHaveBeenCalledWith("b2", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledWith("b2", REQUERY_PROMPT, { machine: true });
   });
 });
 
@@ -177,7 +177,7 @@ describe("requeryOpenAgents — a PtyGoneError is TERMINAL, not a per-reconnect 
 
     await requeryOpenAgents();
 
-    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT, { machine: true });
     expect(submitPrompt).not.toHaveBeenCalledWith("b2", REQUERY_PROMPT);
     expect(submitPrompt).toHaveBeenCalledTimes(1);
   });
@@ -244,7 +244,7 @@ describe("requeryOnReconnect — the claim actually gates the prompting", () => 
   it("prompts the open agents when it wins the claim", async () => {
     seed([agent("b1", "build")], ["b1"], { b1: "idle" });
     await requeryOnReconnect(1_000, sharedStore());
-    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT);
+    expect(submitPrompt).toHaveBeenCalledWith("b1", REQUERY_PROMPT, { machine: true });
   });
 
   it("sends nothing at all when another window already claimed the reconnect", async () => {

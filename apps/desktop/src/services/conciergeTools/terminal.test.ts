@@ -575,7 +575,10 @@ describe("sendToAgentTerminal — delivery", () => {
     const r = await sendToAgentTerminal(AGENT, "run the tests", ALLOWED);
     expect(r.ok).toBe(true);
     expect(r.path).toBe("free-text");
-    expect(submitPrompt).toHaveBeenCalledWith(AGENT, "run the tests");
+    // `machine: true` — a `concierge-tool` authority is MACHINE-authored prose. The policy that made
+    // the write legal may have come from a human, but nobody typed this, so it must not carry the
+    // human-presence signal that clears a quota wall (engine/quotaBlock).
+    expect(submitPrompt).toHaveBeenCalledWith(AGENT, "run the tests", { machine: true });
   });
 
   it("accepts an ask-tier authority once a human approved it", async () => {
@@ -1119,6 +1122,7 @@ describe("the Improve Sparkle agent is addressable", () => {
     expect(submitPrompt).toHaveBeenCalledWith(
       SPARKLE_AGENT_ID,
       "your outage advice is out of date",
+      { machine: true },
     );
   });
 

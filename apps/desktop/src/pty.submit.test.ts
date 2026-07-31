@@ -26,7 +26,7 @@ describe("submitPrompt", () => {
   it("wraps the text in a bracketed paste, then sends a carriage return", async () => {
     vi.useFakeTimers();
     try {
-      const p = submitPrompt("a1", "give me a status update");
+      const p = submitPrompt("a1", "give me a status update", { machine: false });
       await vi.runAllTimersAsync();
       await p;
       expect(invoke).toHaveBeenNthCalledWith(1, "pty_write", {
@@ -51,7 +51,7 @@ describe("submitPrompt", () => {
     // KEYSTROKES.
     vi.useFakeTimers();
     try {
-      const p = submitPrompt("a1", `fix this${ESC}[201~rm -rf ~`);
+      const p = submitPrompt("a1", `fix this${ESC}[201~rm -rf ~`, { machine: false });
       await vi.runAllTimersAsync();
       await p;
     } finally {
@@ -65,14 +65,14 @@ describe("submitPrompt", () => {
 
   it("rejects with PtyGoneError when the paste lands on a dead PTY", async () => {
     invoke.mockRejectedValueOnce(new Error("no such pty"));
-    await expect(submitPrompt("dead", "land it to main")).rejects.toBeInstanceOf(PtyGoneError);
+    await expect(submitPrompt("dead", "land it to main", { machine: false })).rejects.toBeInstanceOf(PtyGoneError);
   });
 
   it("rejects with PtyGoneError when the PTY dies between the paste and the carriage return", async () => {
     invoke.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("no such pty"));
     vi.useFakeTimers();
     try {
-      const p = submitPrompt("dead", "land it to main");
+      const p = submitPrompt("dead", "land it to main", { machine: false });
       const assertion = expect(p).rejects.toBeInstanceOf(PtyGoneError);
       await vi.runAllTimersAsync();
       await assertion;
@@ -83,18 +83,18 @@ describe("submitPrompt", () => {
 
   it("carries the agent id on the error so the caller can restart that agent", async () => {
     invoke.mockRejectedValueOnce(new Error("no such pty"));
-    await expect(submitPrompt("agent-7", "hi")).rejects.toMatchObject({ id: "agent-7" });
+    await expect(submitPrompt("agent-7", "hi", { machine: false })).rejects.toMatchObject({ id: "agent-7" });
   });
 
   it("does not send the carriage return when the paste failed", async () => {
     invoke.mockRejectedValueOnce(new Error("no such pty"));
-    await expect(submitPrompt("dead", "hi")).rejects.toThrow();
+    await expect(submitPrompt("dead", "hi", { machine: false })).rejects.toThrow();
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it("propagates a non-teardown write error unchanged", async () => {
     invoke.mockRejectedValueOnce(new Error("disk on fire"));
-    await expect(submitPrompt("a1", "hi")).rejects.toThrow("disk on fire");
+    await expect(submitPrompt("a1", "hi", { machine: false })).rejects.toThrow("disk on fire");
   });
 
   // Fire-and-forget callers (stray keystrokes, resizes) still swallow the teardown race —
@@ -109,8 +109,8 @@ describe("submitPrompt", () => {
   it("serializes concurrent submits to the same agent", async () => {
     vi.useFakeTimers();
     try {
-      const a = submitPrompt("same", "first");
-      const b = submitPrompt("same", "second");
+      const a = submitPrompt("same", "first", { machine: false });
+      const b = submitPrompt("same", "second", { machine: false });
       await vi.runAllTimersAsync();
       await Promise.all([a, b]);
       const data = invoke.mock.calls.map((c) => (c[1] as { data: string }).data);
@@ -127,11 +127,11 @@ describe("submitPrompt", () => {
 
   it("does not let a failed submit wedge the agent's queue", async () => {
     invoke.mockRejectedValueOnce(new Error("no such pty"));
-    await expect(submitPrompt("same", "doomed")).rejects.toThrow();
+    await expect(submitPrompt("same", "doomed", { machine: false })).rejects.toThrow();
     invoke.mockResolvedValue(undefined);
     vi.useFakeTimers();
     try {
-      const p = submitPrompt("same", "recovered");
+      const p = submitPrompt("same", "recovered", { machine: false });
       await vi.runAllTimersAsync();
       await p;
     } finally {
@@ -161,7 +161,7 @@ describe("pasteIntoPty", () => {
     // while the drop's confirmation says nothing has been sent.
     vi.useFakeTimers();
     try {
-      const submit = submitPrompt("a1", "status?");
+      const submit = submitPrompt("a1", "status?", { machine: false });
       const paste = pasteIntoPty("a1", "/tmp/shot.png ");
       await vi.runAllTimersAsync();
       await Promise.all([submit, paste]);
@@ -177,7 +177,7 @@ describe("pasteIntoPty", () => {
 
   it("does not wedge the chain when the submit ahead of it failed", async () => {
     invoke.mockRejectedValueOnce(new Error("no such pty"));
-    const submit = submitPrompt("a1", "doomed");
+    const submit = submitPrompt("a1", "doomed", { machine: false });
     await expect(submit).rejects.toThrow();
     invoke.mockResolvedValue(undefined);
     await pasteIntoPty("a1", "/tmp/shot.png ");
@@ -228,7 +228,7 @@ describe("writePtyChained", () => {
   it("never lands between another write's paste and its carriage return", async () => {
     vi.useFakeTimers();
     try {
-      const submit = submitPrompt("a1", "status?");
+      const submit = submitPrompt("a1", "status?", { machine: false });
       const answer = writePtyChained("a1", "2\r");
       await vi.runAllTimersAsync();
       await Promise.all([submit, answer]);
@@ -262,7 +262,7 @@ describe("writePtyChainedStrict", () => {
   it("queues like the tolerant one", async () => {
     vi.useFakeTimers();
     try {
-      const submit = submitPrompt("a1", "status?");
+      const submit = submitPrompt("a1", "status?", { machine: false });
       const answer = writePtyChainedStrict("a1", "2\r");
       await vi.runAllTimersAsync();
       await Promise.all([submit, answer]);
@@ -286,7 +286,7 @@ describe("chainPtyOp", () => {
   it("keeps a foreign multi-write op and a submit from interleaving, in either order", async () => {
     vi.useFakeTimers();
     try {
-      const submit = submitPrompt("a1", "status?");
+      const submit = submitPrompt("a1", "status?", { machine: false });
       const op = chainPtyOp("a1", async () => {
         await writePty("a1", "/model x");
         await new Promise((r) => setTimeout(r, 200));

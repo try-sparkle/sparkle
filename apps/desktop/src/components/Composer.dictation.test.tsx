@@ -10,9 +10,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Tauri / native boundaries the Composer touches at mount or on send.
-const submitPrompt = vi.fn((_id: string, _text: string) => Promise.resolve());
+// FORWARD EVERY ARGUMENT, including the options object. A wrapper that drops `opts` makes this
+// whole file structurally blind to authorship: the spy never records `{ machine }`, so the
+// assertion below passes whatever the composer passes — including `machine: true`, which would
+// suppress the account-limit wall release (engine/quotaBlock) that authorship flag exists to drive.
+// A mock that silently narrows the contract it stands in for is a test that cannot fail.
+const submitPrompt = vi.fn((_id: string, _text: string, _opts?: unknown) => Promise.resolve());
 vi.mock("../pty", () => ({
-  submitPrompt: (id: string, text: string) => submitPrompt(id, text),
+  submitPrompt: (id: string, text: string, opts?: unknown) => submitPrompt(id, text, opts),
 }));
 vi.mock("../screenshot", () => ({ captureScreenRegion: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -445,7 +450,8 @@ describe("Composer — send wiring", () => {
 
     // Text-only send: display string and naming basis are both the typed text.
     await waitFor(() => expect(onSubmitPrompt).toHaveBeenCalledWith("do the thing", "do the thing"));
-    expect(submitPrompt).toHaveBeenCalledWith("a1", "do the thing");
+    // `machine: false` — the composer is a person typing, and that is what releases a quota wall.
+    expect(submitPrompt).toHaveBeenCalledWith("a1", "do the thing", { machine: false });
     expect(ta.value).toBe("");
     expect(usePromptHistoryStore.getState().history).toContain("do the thing");
   });

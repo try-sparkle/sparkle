@@ -1040,7 +1040,8 @@ export function Composer({
     // front is what let a dead agent swallow prompts while the breadcrumb bar showed them as sent
     // — the user saw their prompt in the history and the agent never received it.
     try {
-      await submitPrompt(agentId, payload);
+      // `machine: false` — this is the composer: a person typed it and pressed send.
+      await submitPrompt(agentId, payload, { machine: false });
     } catch (e) {
       if (e instanceof PtyGoneError && allowRestart) {
         // The agent's PTY has exited. Hold the prompt in the same queue used for a cold start and

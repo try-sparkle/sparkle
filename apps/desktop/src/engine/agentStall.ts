@@ -24,6 +24,7 @@
 // than the stall did. `unknown` is a real answer here (mirroring `rollupDot`'s null arm).
 import type { AgentTabStatus } from "@sparkle/ui";
 import { type AgentGoal, goalStateOf } from "./agentGoal";
+import { SESSION_LIMIT_FALLBACK_MS, type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
 
 /** What an idle row actually means.
  *
@@ -32,8 +33,15 @@ import { type AgentGoal, goalStateOf } from "./agentGoal";
  *  `unknown`  — idle, nothing outstanding VISIBLE, but we could not see the evidence that would
  *               have shown otherwise. Distinguished from `finished` so a caller never reads
  *               "we didn't look" as "there's nothing there".
- *  `active`   — not idle at all; the question does not arise. */
-export type StallVerdict = "stalled" | "finished" | "unknown" | "active";
+ *  `active`   — not idle at all; the question does not arise.
+ *  `quota-blocked` — the agent hit an ACCOUNT limit (session window or spend cap) and cannot do
+ *               anything at all until a stated wall-clock time. Reported ahead of every other arm
+ *               because it is the only verdict here that is TOTAL: a stalled agent could be
+ *               restarted, an active one is working, but this one is barred until the clock says
+ *               otherwise. It is deliberately NOT folded into `stalled` — a stall says "nothing is
+ *               coming to finish this on its own", which invites a restart, and restarting into a
+ *               quota wall is precisely the waste that made this condition invisible. */
+export type StallVerdict = "stalled" | "finished" | "unknown" | "active" | "quota-blocked";
 
 /** Why a row is stalled, most-actionable first. Reported so the UI and the concierge can say what
  *  is outstanding rather than only that something is. */
@@ -59,6 +67,16 @@ export interface StallInput {
   hasUnlandedWork?: boolean;
   /** Uncommitted changes in the agent's worktree. `undefined` = not looked up. */
   hasUncommittedChanges?: boolean;
+  /**
+   * An observed account/quota wall (engine/quotaBlock). `undefined` = none seen, NEVER "blocked".
+   *
+   * Consulted BEFORE the `isQuiet` gate, which is the whole point of adding it here. A quota-walled
+   * agent keeps its PTY alive and keeps redrawing, so its status reads `working` — and `working` is
+   * not quiet, so this module returned `active` ("not idle") and stopped. That answer is true and
+   * useless: it describes the terminal rather than the agent, and it is what let a totally-blocked
+   * agent read healthy for hours.
+   */
+  quotaBlock?: QuotaBlock;
 }
 
 export interface StallReport {
@@ -113,7 +131,19 @@ function isQuiet(status: AgentTabStatus): boolean {
  * unexamined inputs would have said, so a partial view still produces a confident, useful answer.
  */
 export function stallReport(input: StallInput): StallReport {
-  const { status, now, goal, hasOpenPr, hasUncommittedChanges } = input;
+  const { status, now, goal, hasOpenPr, hasUncommittedChanges, quotaBlock } = input;
+
+  // FIRST, AHEAD OF THE `isQuiet` GATE — because a quota wall is the one condition that is invisible
+  // from status alone. The agent's PTY is alive and redrawing, so it reads `working`; the old first
+  // line returned `active` on that and never looked further. Nothing below can be true in a useful
+  // way while the agent is barred from acting, so this arm short-circuits the rest.
+  if (isQuotaBlocked(quotaBlock, now) && quotaBlock !== undefined) {
+    return {
+      verdict: "quota-blocked",
+      causes: [],
+      detail: quotaBlockedDetail(quotaBlock),
+    };
+  }
 
   if (!isQuiet(status)) {
     return { verdict: "active", causes: [], detail: `Status '${status}' — not idle.` };
@@ -197,6 +227,31 @@ export function stallReport(input: StallInput): StallReport {
       "Resting with no goal outstanding, no open PR, nothing unlanded and a clean worktree — " +
       "genuinely done.",
   };
+}
+
+/**
+ * The human-facing sentence for a quota wall.
+ *
+ * IT QUOTES THE AGENT'S OWN MESSAGE VERBATIM, and that is the requirement rather than a nicety: the
+ * message is the only place the reset time and the remedy path (`/usage-credits`,
+ * `claude.ai/settings/usage`) appear, and both are what let the human decide between waiting,
+ * switching accounts, and raising the cap. A summary that says "it hit a limit" sends them to go and
+ * find the terminal, which is the work this app exists to remove.
+ *
+ * It also says plainly that restarting cannot help. The auto-resume loop that made this block
+ * invisible did so by looking busy, and a reader who has just been told an agent is blocked will
+ * otherwise reach for exactly that lever.
+ */
+function quotaBlockedDetail(block: QuotaBlock): string {
+  const when = block.resetParsed
+    ? `It clears on its own at the stated time`
+    : `The message names no reset time, so this will be re-checked within ${Math.round(
+        SESSION_LIMIT_FALLBACK_MS / 3_600_000,
+      )}h`;
+  return (
+    `Blocked on an account limit — it cannot do anything until it clears. The agent said, ` +
+    `verbatim: "${block.message}". ${when}; restarting it changes nothing before then.`
+  );
 }
 
 /** The human-facing sentence for a stalled row. Names the outstanding work, because "stalled" on

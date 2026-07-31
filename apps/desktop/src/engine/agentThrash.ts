@@ -42,6 +42,7 @@
 // (`ts`) or as a parameter. No timers, no I/O — so a four-compaction spiral is tested as arithmetic.
 import { isSystemAuthoredPrompt } from "./agentOriginated";
 import type { HookEvent } from "./hookEvents";
+import { type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
 
 /** Identical consecutive commands before we call it repetition.
  *
@@ -149,7 +150,12 @@ export function initialThrashState(): ThrashState {
 
 /** What is wrong, if anything. A single headline so a row can render one badge, with the full
  *  evidence alongside it in {@link ThrashReport}. */
-export type ThrashVerdict = "healthy" | "repeating-command" | "no-progress" | "context-pressure";
+export type ThrashVerdict =
+  | "healthy"
+  | "repeating-command"
+  | "no-progress"
+  | "context-pressure"
+  | "quota-blocked";
 
 export interface ThrashReport {
   verdict: ThrashVerdict;
@@ -394,6 +400,24 @@ export interface ThrashContext {
    * alarm — the same evidence-not-inference default the rest of this surface uses.
    */
   goalOutstanding?: boolean;
+  /**
+   * An observed account/quota wall (engine/quotaBlock), or `undefined` for none.
+   *
+   * THIS MODULE READS THE HOOK STREAM, AND THE HOOK STREAM CANNOT SEE A QUOTA WALL — that is why the
+   * input has to be passed in rather than derived. A quota-limited agent submits a prompt, runs no
+   * tools, and its turn ends; the reducer sees ordinary events and the healthy arm reports "Working —
+   * tools are running and commands are not repeating." about an agent that cannot run a tool at all.
+   *
+   * Nor would the existing `repeating-command` rule have caught the observed loop, for a reason worth
+   * recording: the resume prompt is a pure function of the goal text, so every auto-continue submits a
+   * byte-identical string with no tools in between — which is exactly the `repeatOf` shape. It did not
+   * fire because the goal banner is submitted as a MACHINE send, and `REPEAT_LIMIT` is 3 while the
+   * observed resumes were spaced by the 45s settle window; the surface was polled between them. Even
+   * had it fired, "it is looping, not working" names the symptom and sends the reader to debug the
+   * loop instead of the wall — the same cause-versus-symptom argument the `context-pressure` priority
+   * note makes below.
+   */
+  quotaBlock?: QuotaBlock;
 }
 
 /** `ctx` is REQUIRED, not defaulted — the same call `HookEventHandlerDeps` makes about
@@ -414,6 +438,20 @@ export function thrashReport(state: ThrashState, now: number, ctx: ThrashContext
     ...(repeated ? { repeatedCommand: repeated } : {}),
   };
 
+  // AHEAD OF EVERYTHING, on the same cause-not-symptom principle that puts `context-pressure` ahead
+  // of `repeating-command`, only more so: an agent behind a quota wall is not thrashing, not
+  // compacting, and not looping — it is barred. Every other verdict this module can reach would send
+  // the reader to investigate a problem the agent does not have.
+  if (isQuotaBlocked(ctx.quotaBlock, now) && ctx.quotaBlock !== undefined) {
+    return {
+      ...base,
+      verdict: "quota-blocked",
+      thrashing: true,
+      detail:
+        `Not working — it is behind an account limit and cannot run anything. It said, verbatim: ` +
+        `"${ctx.quotaBlock.message}". Any output since then is the auto-resume being refused, not progress.`,
+    };
+  }
   if (recentCompactions >= COMPACT_PRESSURE_LIMIT) {
     return {
       ...base,

@@ -108,9 +108,16 @@ describe("Composer — a long paste collapses to a pill", () => {
     renderComposer();
     paste(PASTE);
     await send();
-    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE);
+    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE, { machine: false });
     // Said outright, because this is the corruption that would be invisible on screen.
-    expect(submitPrompt).not.toHaveBeenCalledWith("a1", pillPreview(PASTE));
+    //
+    // THE THIRD ARG IS `expect.anything()`, NOT `{ machine: false }`, and it is load-bearing. A
+    // negative `toHaveBeenCalledWith` matches on the WHOLE argument list, so when `submitPrompt`
+    // gained a required third parameter this assertion — left at two arguments — could no longer
+    // match any real call and passed no matter what was sent. It was guarding the one corruption
+    // that is invisible on screen, and it had silently stopped guarding anything. Matching any third
+    // argument restores it AND keeps it from rotting the same way the next time the signature moves.
+    expect(submitPrompt).not.toHaveBeenCalledWith("a1", pillPreview(PASTE), expect.anything());
   });
 
   it("survives expand → send byte-identically (the path the trim used to corrupt)", async () => {
@@ -128,7 +135,7 @@ describe("Composer — a long paste collapses to a pill", () => {
 
     await send();
     // The indentation and the trailing newline are still there.
-    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE);
+    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE, { machine: false });
   });
 
   it("survives expand → EDIT → send, which is why anyone expands at all", async () => {
@@ -176,7 +183,7 @@ describe("Composer — a long paste collapses to a pill", () => {
     submitPrompt.mockReset();
     submitPrompt.mockResolvedValue(undefined);
     await send();
-    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE);
+    expect(submitPrompt).toHaveBeenCalledWith("a1", PASTE, { machine: false });
   });
 
   it("keeps the bytes when the restore MERGES with keystrokes typed during the send", async () => {
@@ -233,7 +240,7 @@ describe("Composer — a long paste collapses to a pill", () => {
       apiRef.current!.insertPrompt("  a fresh message  ");
     });
     await send();
-    expect(submitPrompt).toHaveBeenCalledWith("a1", "a fresh message");
+    expect(submitPrompt).toHaveBeenCalledWith("a1", "a fresh message", { machine: false });
   });
 
   it("still trims what the user TYPED, so the exemption is narrow", async () => {
@@ -242,7 +249,7 @@ describe("Composer — a long paste collapses to a pill", () => {
       apiRef.current!.insertPrompt("  land it  ");
     });
     await send();
-    expect(submitPrompt).toHaveBeenCalledWith("a1", "land it");
+    expect(submitPrompt).toHaveBeenCalledWith("a1", "land it", { machine: false });
   });
 
   it("carries a pill alongside typed text, blocks first", async () => {
@@ -252,6 +259,6 @@ describe("Composer — a long paste collapses to a pill", () => {
       apiRef.current!.insertPrompt("please review this");
     });
     await send();
-    expect(submitPrompt).toHaveBeenCalledWith("a1", `${PASTE}\n\nplease review this`);
+    expect(submitPrompt).toHaveBeenCalledWith("a1", `${PASTE}\n\nplease review this`, { machine: false });
   });
 });
