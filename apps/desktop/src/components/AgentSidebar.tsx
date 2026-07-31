@@ -881,6 +881,57 @@ export function AgentSidebar({
   // destroying the very `sparkle-sidebar-width:<side>` preference the block above says survives a trip
   // through a small display. `RENDERED_WIDTH` and `data-width` keep the RAW state, which is what makes
   // that survival true.
+  // ── THE SECOND CEILING, AND THE ONE A RENDER CANNOT SEE (bead sparkle-1kvfy) ──────────────────
+  //
+  // `MAX_WIDTH` closes the WINDOW-derived half of the split above. It does not close the other half,
+  // and the two-bounds block already says why: its reserve describes a ONE-pair cockpit, while this
+  // component mounts twice once the left pair opens. So `RENDERED_WIDTH`'s `calc(100% - 320px)` —
+  // resolved against `.paircols`, which is the PAIR — is the only thing bounding the paint there,
+  // and `Math.min(width, MAX_WIDTH)` stops being "what is painted" the moment a second pair exists.
+  //
+  // The repro needs no window resize at all, which is what makes it ordinary rather than an edge
+  // case: one pair at a 1600px window puts `MAX_WIDTH` at 1000, so a drag to 700 is legal and
+  // persists. Open the left pair — a first-class action — and the row is concierge 360 + two pairs
+  // sharing ~1240, so this column's container is ~614 and it paints at `min(700, 614 - 320) = 294`
+  // while the tab still starts its drag from 700. ~400px of dead inward travel with no `clampedBy`
+  // line to explain it, which is exactly the signature `engine/columnResize` was written to abolish.
+  //
+  // WHY THIS IS A CALLBACK AND NOT A PROP OR AN OBSERVER, both of which were tried on paper first:
+  //  • A `pairWidth` prop from `Workspace` changes on every pointer event of the CONCIERGE's drag,
+  //    and `Workspace.renderCost.test.tsx` holds that drag to ZERO renders of this component — it
+  //    lists every agent and has no business running at pointer rate.
+  //  • A `ResizeObserver` on the pair costs the same renders, and would be invisible to the suite
+  //    that guards them (jsdom never lays out, so it would never fire) — a ratchet that stays green
+  //    while production regresses is worse than no ratchet.
+  //  • And a render-time value could not have caught the headline case anyway: opening the left pair
+  //    does not change THIS column's props, so `memo` bails out and no render happens to read one.
+  //
+  // Measuring the same element the CSS resolves `100%` against is also what keeps the gesture and
+  // the paint from drifting: a bound re-derived from the row's arithmetic would be a second, private
+  // declaration of the layout — the "one constant, two files" shape this row keeps re-finding.
+  // AND IT IS NEVER CACHED IN STATE, which is the third direction this same split can be entered
+  // from and the one that cost a High (roborev 56159). The first version published each reading to
+  // `measuredMax` so the ARIA range could name it, and fed that into the tab's `width` prop. But a
+  // reading is taken by any gesture, INCLUDING ones that commit nothing: `endDrag` deliberately
+  // skips `onWidth` when a press-and-release never travelled. So click the dots once with the left
+  // pair open (container 614, stored width 700) and `width` is still 700 while the tab is handed
+  // 294 — then CLOSE the left pair, and the column paints at 700 again while the tab still starts
+  // its drag from the stale 294, jumping ~416px on the first pointer move and persisting the
+  // result. The cache was the only stale thing in the design; the fix is to not have one.
+  //
+  // So the reading is read and discarded, per gesture, by `ColumnPullTab` alone. The cost is that
+  // `aria-valuemax` names only the window ceiling — which is what it named before this change, so
+  // nothing regressed, and it is recorded as a known limit rather than claimed as fixed.
+  const columnRef = useRef<HTMLDivElement>(null);
+  const measureGestureMax = useCallback((): number | null => {
+    const box = columnRef.current?.parentElement;
+    const w = box?.getBoundingClientRect().width ?? 0;
+    // A container with no layout yet — the first frame of a mount, or a test environment with no
+    // layout engine — is UNKNOWN, not a bound of zero. Reporting zero here would pin the column to
+    // its minimum on the strength of a measurement that never happened.
+    if (!Number.isFinite(w) || w <= 0) return null;
+    return Math.max(MIN_WIDTH, Math.round(w) - TERMINAL_MIN_WIDTH);
+  }, [MIN_WIDTH]);
   const RENDERED_TAB_WIDTH = Math.min(width, MAX_WIDTH);
   useEffect(() => {
     // A debounce that only cancels is a way to LOSE a width. Same trio the concierge seam and
@@ -2015,6 +2066,10 @@ export function AgentSidebar({
       />
     )}
     <div
+      // The handle `measureGestureMax` reaches the CONTAINER through — see GESTURE_MAX. It reads
+      // `parentElement` rather than taking a ref to the pair, because the parent IS the box the CSS
+      // clamp resolves against, and asking the DOM for it cannot disagree with the stylesheet.
+      ref={columnRef}
       data-testid="agent-sidebar-column"
       data-overlay={String(overlay)}
       // The NUMBER, separate from the CSS `min()` in `width` — see RENDERED_WIDTH.
@@ -2711,7 +2766,11 @@ export function AgentSidebar({
           width={RENDERED_TAB_WIDTH}
           onWidth={commitWidth}
           min={MIN_WIDTH}
+          // The WINDOW ceiling only. The container's is `maxAt`'s job and is intersected with this
+          // one per gesture — deliberately not folded in here, because a render-time copy of it can
+          // go stale in the direction that destroys a width (see the note above `measureGestureMax`).
           max={MAX_WIDTH}
+          maxAt={measureGestureMax}
           label="agent column"
           overlaid={overlay}
           onOverlayToggle={toggleOverlay}

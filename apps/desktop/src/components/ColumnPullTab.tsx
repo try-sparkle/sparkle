@@ -105,6 +105,24 @@ export interface ColumnPullTabProps {
   onWidth: (next: number) => void;
   min: number;
   max: number;
+  /**
+   * A SECOND CEILING THAT IS ONLY KNOWABLE AT GESTURE TIME, consulted at the start of each drag and
+   * on each arrow press and INTERSECTED with `max` (never substituted for it — see `readGestureMax`).
+   * Return `null` when it cannot be read; `max` then stands alone, exactly as before.
+   *
+   * WHY A CALLBACK AND NOT A SECOND NUMBER PROP. A column whose real bound is its CONTAINER — the
+   * build column, whose paint is `min(width, calc(100% - 320px))` against the pair it lives in —
+   * cannot learn that bound from a prop without its owner re-rendering whenever the container moves.
+   * For the build column the container moves on every pointer event of the CONCIERGE's drag, and
+   * `Workspace.renderCost.test.tsx` holds that drag to zero sidebar re-renders, because the sidebar
+   * lists every agent and must not run at pointer rate. Worse, the headline case needs no drag at
+   * all: opening the left pair halves the pair, and the right sidebar's props do not change, so
+   * `memo` bails out and no render-time value could have noticed (bead sparkle-1kvfy).
+   *
+   * Reading it lazily costs nothing until the user actually grabs the seam, and at that moment it is
+   * exact rather than as-of-the-last-render.
+   */
+  maxAt?: () => number | null;
   /** Human name of the column, for the accessible names. */
   label: string;
   /**
@@ -194,6 +212,7 @@ export function ColumnPullTab({
   onWidth,
   min,
   max,
+  maxAt,
   label,
   overlaid = false,
   onOverlayToggle,
@@ -218,8 +237,43 @@ export function ColumnPullTab({
   // torn down and re-added mid-gesture, repeatedly, on the exact hot path the instrumentation exists
   // to keep honest. Reading config through a ref instead lets the effect depend on `dragging` alone,
   // so the listeners are installed once per gesture and removed once.
-  const cfg = useRef({ min, max, label, grows, widthPerPx, cssVar, onWidth });
-  cfg.current = { min, max, label, grows, widthPerPx, cssVar, onWidth };
+  const cfg = useRef({ min, max, label, grows, widthPerPx, cssVar, onWidth, maxAt });
+  cfg.current = { min, max, label, grows, widthPerPx, cssVar, onWidth, maxAt };
+
+  /** THE CEILING THIS GESTURE IS RUNNING AGAINST — `maxAt`'s reading, latched for the duration.
+   *
+   *  LATCHED, not re-read per pointer event, for the two reasons `cfg` above exists: measuring the
+   *  container on every move would make the drag pay a forced layout at pointer rate, and a bound
+   *  that moved MID-gesture would make one pointer position mean two different widths.
+   *  `null` = no reading; `cfg.current.max` then stands alone, which is every seam without `maxAt`. */
+  const gestureMax = useRef<number | null>(null);
+  /**
+   * Take a fresh reading and return the bound now in force.
+   *
+   * IT INTERSECTS THE TWO CEILINGS, IT DOES NOT REPLACE ONE WITH THE OTHER — and the difference is a
+   * lockout, not a nicety. `max` carries a HARD cap (the build column's 1200) whose whole job is to
+   * stop a column being dragged over everything else; the container reading only says how much room
+   * the pair has. On any window wide enough for `max` to saturate at that cap — ~1800px and up, i.e.
+   * an ordinary external display — the container is the LARGER of the two, so taking the reading
+   * neat would discard the cap entirely and let the column be dragged to ~1880 on a 2560px screen.
+   * That width then persists, `aria-valuemax` and the tab's own width still report the capped
+   * number, and the next mousedown starts 680px inward and destroys it: the very stored-vs-painted
+   * split this reading exists to close, re-opened from the other side.
+   *
+   * A non-finite or non-positive answer is UNKNOWN, not a bound of zero — a container that has not
+   * been laid out yet (the first frame of a mount, a test environment with no layout engine) must
+   * not silently pin the column to its minimum.
+   */
+  const readGestureMax = useCallback(() => {
+    const hard = cfg.current.max;
+    const m = cfg.current.maxAt?.();
+    const usable = typeof m === "number" && Number.isFinite(m) && m > 0;
+    gestureMax.current = usable ? Math.min(m, hard) : null;
+    return gestureMax.current ?? hard;
+  }, []);
+  /** The bound in force right now: the gesture's latched reading, else the render-time prop. Reads
+   *  only refs, so its identity is stable and it can never be the reason a listener is re-installed. */
+  const ceiling = useCallback(() => gestureMax.current ?? cfg.current.max, []);
 
   // The last clamp state we reported, so a drag that sits pinned against a bound logs ONCE rather
   // than once per pointer event. Edge-triggered on purpose: `onMove` fires at pointer rate, and
@@ -238,7 +292,20 @@ export function ColumnPullTab({
   const keyPinned = useRef(false);
 
   const commit = useCallback(
-    (next: number) => {
+    /**
+     * @param apply `false` logs the clamp but writes NOTHING — the keyboard's answer to `endDrag`'s
+     *        "only if it moved" guard, and it is load-bearing rather than tidy. Once the keyboard
+     *        steps from `base = min(width, bound)` instead of from `width`, a press in the pinned
+     *        direction resolves to `base` — which is NOT `width` — so an unconditional `onWidth`
+     *        hands the owner a number that differs from its state and gets persisted. Stored 700
+     *        with the pair bounding at 294: one ArrowRight moves nothing on screen and silently
+     *        rewrites the preference to 294 (roborev 56171). The two input paths must agree that a
+     *        gesture which moves nothing may not rewrite a stored width.
+     */
+    (next: number, apply = true) => {
+      // The gesture's reading when one was taken — see `readGestureMax`. This is the KEYBOARD path's
+      // commit; the pointer path settles through `preview` + `endDrag`, which read the same latch.
+      const max = ceiling();
       const { requested, applied, clampedBy } = clampWidth(next, min, max);
       // WHY THIS LINE EXISTS: resizing was completely uninstrumented, so "the divider registers but
       // nothing moves" could not be told apart from "the divider moves it and something downstream
@@ -254,9 +321,9 @@ export function ColumnPullTab({
         );
       }
       lastApplied.current = applied;
-      onWidth(applied);
+      if (apply) onWidth(applied);
     },
-    [onWidth, min, max, label],
+    [onWidth, min, ceiling, label],
   );
 
   /** One line at the end of a gesture, so a drag is a bracketed span in the log rather than a
@@ -277,6 +344,9 @@ export function ColumnPullTab({
     );
     drag.current = null;
     lastApplied.current = null;
+    // The reading belonged to THIS gesture. Holding it past the release would let a stale container
+    // width bound the next one — including an arrow press, which takes its own.
+    gestureMax.current = null;
     setDragging(false);
     // ONLY IF IT MOVED. A press-and-release on the dots with no travel is a click, not a resize, and
     // committing there would mark the width dirty and persist a value the user never chose.
@@ -287,7 +357,10 @@ export function ColumnPullTab({
    *  the log is about the gesture, not about the state write — but the only side effect is the CSS
    *  variable the columns read. */
   const preview = useCallback((next: number) => {
-    const { min: lo, max: hi, label: name, cssVar: v } = cfg.current;
+    const { min: lo, label: name, cssVar: v } = cfg.current;
+    // The gesture's latched ceiling, not `cfg.current.max` — for a container-bounded column those
+    // are different numbers, and the preview is what the user is watching.
+    const hi = gestureMax.current ?? cfg.current.max;
     const { requested, applied, clampedBy } = clampWidth(next, lo, hi);
     if (clampedBy !== lastClamp.current) {
       lastClamp.current = clampedBy;
@@ -310,14 +383,26 @@ export function ColumnPullTab({
     if (e.button !== undefined && e.button !== 0) return; // primary button only
     if (overlaid) return;
     e.preventDefault();
-    drag.current = { pointerId: e.pointerId, x: e.clientX, width, applied: width };
+    // THE BOUND FIRST, THEN THE ORIGIN — and the origin is clamped to it. `width` is what the owner
+    // painted as of its last render, which for a container-bounded column can exceed what is on
+    // screen right now (the pair shrank without re-rendering the column). Starting from that number
+    // is the "divider registers but nothing moves" bug: the first `width - bound` px of travel all
+    // clamp to the same value, so the seam is dead for exactly the amount the reading just corrected.
+    // The same rule every seam follows at render time — drag from what is PAINTED — applied at the
+    // one moment the container bound is knowable.
+    const bound = readGestureMax();
+    const start = Math.min(width, bound);
+    drag.current = { pointerId: e.pointerId, x: e.clientX, width: start, applied: start };
     // A drag is a new gesture too, so it must not inherit a latched keyboard run.
     keyPinned.current = false;
     // The START of the gesture, named. Without it a log shows widths changing with no way to tell
     // WHICH seam the user grabbed, and — more importantly for the v0.63.0 report — a drag that
     // produces no width lines at all is silent about whether it was ever recognised.
     lastClamp.current = "start";
-    log.info("resize", `${label}: drag start at ${width}px (min ${min}, max ${max}, grows ${grows})`);
+    // The width the drag ACTUALLY starts from and the bound actually in force — not the props. When
+    // the reading corrected either, that correction is the first thing the log has to show, or the
+    // widths that follow look like they came from nowhere.
+    log.info("resize", `${label}: drag start at ${start}px (min ${min}, max ${bound}, grows ${grows})`);
     // CAPTURE, so the gesture survives leaving the window — which a column drag does constantly,
     // since the seam can be dragged all the way to either edge. See the note on the listeners below
     // for why this does not replace them.
@@ -376,20 +461,39 @@ export function ColumnPullTab({
 
   const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if (overlaid) return;
+    // A KEYPRESS DURING A LIVE DRAG TOUCHES NOTHING (roborev 56159). The dots are `tabIndex={0}` and
+    // `focused` is explicitly a supported state, so a user mid-drag can absolutely press a key — and
+    // before this guard either outcome was wrong. A NON-arrow cleared `gestureMax`, so every
+    // remaining `preview` of that drag clamped against the looser window ceiling and `endDrag`
+    // committed a width the pair cannot paint: the bug being fixed, re-entered mid-gesture. An arrow
+    // re-latched a fresh reading, which breaks `gestureMax`'s own contract that one pointer position
+    // means one width, and fired a measurement on the drag's hot path.
+    if (drag.current) return;
     // THE SAME MAPPING THE POINTER USES. An arrow key moves the EDGE by `step`, so on a symmetric
     // seam the column gains `step * widthPerPx` — otherwise the two input paths would disagree about
     // what one nudge means, and a keyboard user would find the concierge growing half as fast as the
     // mouse moves it.
     const step = (e.shiftKey ? BIG_STEP : STEP) * widthPerPx;
     const sign = grows === "left" ? 1 : -1;
-    // THE RESET LIVES INSIDE THE ARROW BRANCHES, not above them. Arrowing outward after a drag that
-    // ended pinned at `max` used to log nothing at all — `clampedBy` never changed — so the reported
-    // symptom happened in silence. But resetting on EVERY keydown meant Tab, Enter or any character
-    // cleared the drag's edge state too, re-arming per-event logging on a key that moves nothing.
-    // Only a key that actually commits a width gets to clear it.
-    const target =
-      e.key === "ArrowRight" ? width + step * sign : e.key === "ArrowLeft" ? width - step * sign : null;
-    if (target === null) return;
+    // EVERY NON-ARROW LEAVES BEFORE ANYTHING HAPPENS, and this one line now carries two rules that
+    // used to be enforced separately further down.
+    //
+    //  • THE EDGE STATE. Arrowing outward after a drag that ended pinned at `max` must still log —
+    //    `clampedBy` never changes, so the reported symptom would happen in silence — but resetting
+    //    on EVERY keydown meant Tab, Enter or any character cleared the drag's edge state too,
+    //    re-arming per-event logging on a key that moves nothing. That used to be spelled as "the
+    //    reset lives inside the arrow branches"; the branches are gone, so the guard is here.
+    //  • THE READING. `readGestureMax` performs a layout read. Taking it before this check meant any
+    //    keypress on a focused tab measured the container and latched a bound no gesture asked for
+    //    (roborev 56159).
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    // A KEYPRESS IS A GESTURE TOO, so it takes its own reading and steps from the same corrected base
+    // a drag would. Without this the arrows walk down from an off-screen width one step at a time —
+    // not dead, which is worse: it looks alive while every press before the first in-range one
+    // paints nothing.
+    const bound = readGestureMax();
+    const base = Math.min(width, bound);
+    const target = e.key === "ArrowRight" ? base + step * sign : base - step * sign;
     e.preventDefault();
     // TWO RULES PULL OPPOSITE WAYS HERE, and the keyboard needs its own edge state to satisfy both.
     //
@@ -404,7 +508,9 @@ export function ColumnPullTab({
     // `keyPinned` is what separates them: it tracks a RUN of arrows that are no longer moving the
     // boundary, so the first one reports and the repeats are quiet — while a drag's pinned state,
     // which lives in `lastClamp`, cannot silence the first keypress that follows it.
-    const moves = clampWidth(target, min, max).applied !== width;
+    // Against `base` and `bound`, not `width` and `max`: the question is whether this press moves the
+    // boundary the user can SEE, and after a correction those are different numbers.
+    const moves = clampWidth(target, min, bound).applied !== base;
     if (moves) {
       keyPinned.current = false;
       lastClamp.current = "start";
@@ -412,7 +518,9 @@ export function ColumnPullTab({
       keyPinned.current = true;
       lastClamp.current = "start";
     }
-    commit(target);
+    // LOG ALWAYS, WRITE ONLY IF IT MOVED — the same rule `endDrag` applies to the pointer. See
+    // `commit`'s `apply` parameter for why an unconditional write here destroys a stored width.
+    commit(target, moves);
   };
 
   // Visible while hovered, FOCUSED, or mid-drag.

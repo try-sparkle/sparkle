@@ -310,6 +310,203 @@ describe("AgentSidebar — keyboard resize", () => {
     }
   });
 
+  // ── THE OTHER CEILING: THE PAIR (bead sparkle-1kvfy) ────────────────────────────────────────────
+  //
+  // The row above closes the WINDOW-derived half of the stored-vs-painted split. This column has a
+  // SECOND ceiling that the window cannot see: `RENDERED_WIDTH`'s `calc(100% - 320px)` resolves
+  // against `.paircols`, which is the PAIR — and the pair halves the moment a second one opens,
+  // while `MAX_WIDTH`'s reserve still describes a one-pair cockpit.
+  //
+  // WHAT IS MOCKED HERE, AND WHY THAT IS NOT THE ASSERTION. jsdom has no layout engine, so the
+  // container measures 0 and the component reads its bound as UNKNOWN — correct behaviour (the last
+  // row below pins it) but it leaves nothing to bound. The stub supplies the one INPUT the
+  // environment cannot provide, exactly as `withWindow` supplies `innerWidth`. Every number asserted
+  // is still computed by the component from it; the mock is not the answer, and reverting the fix
+  // reddens all three rows.
+  function givePairWidth(px: number) {
+    const box = column().parentElement!;
+    box.getBoundingClientRect = () =>
+      ({ width: px, height: 0, top: 0, left: 0, right: px, bottom: 0, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+  }
+
+  it("bounds the seam by the PAIR it lives in, not by the window, once a second pair opens", () => {
+    withWindow(1600, () => {
+      // A width that is entirely legal in a ONE-pair cockpit: the window ceiling is
+      // `1600 - (280 concierge + 320 terminal) = 1000`, so this restores rather than being rejected.
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      expect(column().dataset.width).toBe("700");
+
+      // Now the left pair opens — no window resize, no drag, an ordinary action. The row is
+      // concierge 360 + two pairs sharing ~1240, so this column's container is ~614 and the CSS
+      // clamp paints it at `min(700, 614 - 320) = 294` while the window ceiling still says 1000.
+      givePairWidth(614);
+
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      // 294 - 8. Against the window bound alone the answer is 692: the seam is dead for the ~400px
+      // between what is stored and what is on screen, with no `clampedBy` line to explain it.
+      expect(column().dataset.width).toBe("286");
+    });
+  });
+
+  // THE READING IS NEVER CACHED, which is the third direction this same split can be entered from
+  // (roborev 56159, High). A gesture that commits NOTHING still takes a reading — `endDrag` skips
+  // `onWidth` when a press-and-release never travelled — so caching one in state let a click with
+  // the left pair open cap the seam permanently once the pair closed again.
+  it("a click with no travel cannot cap the seam after the pair grows back", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      givePairWidth(614);
+
+      // A press and release with no movement is a CLICK, not a resize: the stored width must survive
+      // it untouched. (That is `endDrag`'s own guard, asserted here because the next half depends on
+      // it — a gesture that commits nothing is exactly the one that used to poison the cache.)
+      fireEvent.mouseEnter(rail());
+      fireEvent.pointerDown(resizeTab(), { pointerId: 1, button: 0, buttons: 1, clientX: 1000 });
+      fireEvent.pointerUp(window, { pointerId: 1 });
+      expect(column().dataset.width).toBe("700");
+
+      // The left pair closes and the room comes back. Nothing about that click may still be
+      // bounding this seam.
+      givePairWidth(1400);
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      // One step off the full stored 700. A cached 294 would have made it 286 — and, worse, would
+      // have persisted ~286 in place of the 700 the user chose.
+      expect(column().dataset.width).toBe("692");
+    });
+  });
+
+  // AND AN ARROW CANNOT RUN A COMMIT INSIDE A LIVE DRAG (roborev 56159, Medium). The dots are
+  // focusable and `focused` is a supported state, so a key during a drag is reachable.
+  //
+  // THE KEY HAS TO BE AN ARROW, and this row asserted `Escape` for one round — which was vacuous
+  // against the guard it is named for (roborev 56171). `onKeyDown` checks for an arrow BEFORE it
+  // takes a reading, so a non-arrow returns without touching the latch whether the drag guard
+  // exists or not. Only an arrow reaches the part the guard protects.
+  it("an arrow pressed mid-drag does not commit against the live gesture", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      givePairWidth(614);
+
+      fireEvent.mouseEnter(rail());
+      fireEvent.pointerDown(resizeTab(), { pointerId: 1, button: 0, buttons: 1, clientX: 1000 });
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      // Drag hard OUTWARD — far past the pair's 294 but well within the window's 1000.
+      fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 1400 });
+      fireEvent.pointerUp(window, { pointerId: 1 });
+
+      // The drag is pinned at the pair's 294 the whole way, so every preview equals the width it
+      // started from and `endDrag`'s "only if it moved" guard commits nothing — the stored 700
+      // survives untouched. Without the guard the arrow runs its own commit mid-gesture: it steps
+      // from `min(700, 294) = 294` to 286 and PERSISTS it, replacing the user's 700 with a width
+      // they never chose, while the drag they are still holding is unaware of it.
+      expect(column().dataset.width).toBe("700");
+    });
+  });
+
+  // A PRESS THAT MOVES NOTHING MUST NOT REWRITE THE STORED WIDTH (roborev 56171, Medium) — the
+  // keyboard's half of the rule `endDrag` already enforces for the pointer, and a regression this
+  // branch introduced: once the arrows step from `base = min(width, bound)` rather than from
+  // `width`, a press in the PINNED direction resolves to `base`, which is not `width`, so an
+  // unconditional write hands the owner a different number and it gets persisted.
+  it("an arrow pinned against the pair does not destroy the stored width", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      givePairWidth(614);
+
+      // OUTWARD, the direction the pair has no room for. On screen: nothing happens.
+      fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
+
+      // So nothing is written either. An unconditional commit would apply 294 — visibly a no-op,
+      // silently the end of the user's 700px preference the moment the left pair closes again.
+      expect(column().dataset.width).toBe("700");
+    });
+  });
+
+  // THE MEASUREMENT'S STRUCTURAL PREMISE, asserted (roborev 56171, Medium). `measureGestureMax`
+  // reads `columnRef.current.parentElement` and treats it as the pair's column row. A wrapper
+  // introduced between them would make it measure the COLUMN instead, so `bound` would under-report
+  // on every gesture and each press would ratchet the persisted width down toward MIN_WIDTH —
+  // silently, with no `clampedBy` anomaly and nothing else red. This pins the half that lives in
+  // this component; `Workspace.cockpit.test.tsx` pins the other half (the sidebar is `.paircols`'s
+  // first child).
+  it("puts the column where `parentElement` really is its container — no wrapper of its own", () => {
+    const { container } = render(<AgentSidebar project={mkProject()} />);
+    expect(column().parentElement).toBe(container);
+  });
+
+  it("starts the DRAG from the pair-bounded width too, not only the arrows", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      givePairWidth(614);
+
+      fireEvent.mouseEnter(rail());
+      fireEvent.pointerDown(resizeTab(), { pointerId: 1, button: 0, buttons: 1, clientX: 1000 });
+      fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 990 });
+      fireEvent.pointerUp(window, { pointerId: 1 });
+
+      // `grows: "left"` in the right pair, so 10px of inward travel off the PAINTED 294. Off the
+      // stored 700 it would be 690 — a width the column was already not rendering at.
+      expect(column().dataset.width).toBe("284");
+    });
+  });
+
+  // THE READING TIGHTENS THE WINDOW CEILING, IT DOES NOT REPLACE IT (roborev 56148, High).
+  // Every row above stubs a container TIGHTER than `MAX_WIDTH`, so none of them can see which of the
+  // two ceilings won — and the dangerous branch is the other one. `MAX_WIDTH` saturates at the hard
+  // 1200 cap on any window past ~1800px, while the container keeps growing with the display, so a
+  // reading taken neat would discard the cap on an ordinary external monitor.
+  it("still honours the HARD cap when the pair is roomier than the window ceiling", () => {
+    withWindow(2600, () => {
+      render(<AgentSidebar project={mkProject()} />);
+      // 2600 - 600 = 2000, capped by HARD_MAX_WIDTH to 1200. The pair is roomier still: 2400 - 320
+      // = 2080 of container room. The gesture must stop at 1200, not at 2080.
+      givePairWidth(2400);
+      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(column().dataset.width).toBe("1200");
+    });
+  });
+
+  // AND IT IS RE-TAKEN PER GESTURE, which is the other half of the contract and the half a
+  // "measure once and cache it" refactor would silently break while leaving every row above green.
+  it("re-reads the container each gesture, so a pair that grows back is not permanently capped", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+
+      // Cramped: the reading pins this press to the pair-bounded 294 - 8.
+      givePairWidth(614);
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      expect(column().dataset.width).toBe("286");
+
+      // The left pair closes and the room comes back. A cached bound would hold the column at ~294
+      // forever; a fresh reading lets it grow again.
+      givePairWidth(1400);
+      for (let i = 0; i < 40; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      // The container now offers `1400 - 320 = 1080` while the window still only offers 1000, so the
+      // intersect stops at the WINDOW ceiling — both bounds live, neither one discarded. A cached
+      // reading would have stopped it at 294 instead.
+      expect(column().dataset.width).toBe("1000");
+    });
+  });
+
+  it("treats an UNMEASURABLE container as unknown, not as a ceiling of zero", () => {
+    withWindow(1600, () => {
+      localStorage.setItem(WIDTH_KEY, "700");
+      render(<AgentSidebar project={mkProject()} />);
+      // No stub: the container reports 0, which is what a satellite column, an unmounted pair, or
+      // the first frame of a mount looks like. Reading that as a bound would pin the column to its
+      // 160px minimum on the strength of a measurement that never happened.
+      fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
+      expect(column().dataset.width).toBe("692");
+      expect(resizeTab().getAttribute("aria-valuemax")).toBe("1000");
+    });
+  });
+
   it("lowers that ceiling on a narrow window instead of putting its own handle off-screen", () => {
     withWindow(900, () => {
       render(<AgentSidebar project={mkProject()} />);
