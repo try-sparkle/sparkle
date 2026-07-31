@@ -194,6 +194,58 @@ describe("the auto-resume banner is excluded from repetition ENTIRELY", () => {
     expect(r.repeatedCommand).toEqual({ text: "/compact", count: REPEAT_LIMIT });
   });
 
+  // ── THE OTHER SYSTEM-AUTHORED PROMPTS (sparkle-sknz2) ────────────────────────────────────────
+  //
+  // The resume banner was the only one this detector knew about, and it is not the only one that
+  // arrives. Measured in a real agent's transcripts (61a5332f, 20 newest sessions): the goal-EXPIRY
+  // banner and `<task-notification>` both land as `type:"user"` records — 13 of them — and both were
+  // being tallied as things the agent chose to submit.
+  //
+  // These fixtures are REAL RECORD OPENINGS, not paraphrases, for the reason the RESUME fixture was
+  // switched to `continuePrompt`: a hand-written approximation tests a string nothing sends.
+  const EXPIRY =
+    "Your goal expired unmet and you are resting with work unfinished — nothing is coming to " +
+    "finish this for you.";
+  const NOTIFICATION =
+    '<task-notification> <task-id>b4shdddfs</task-id> <summary>Monitor event: "CI checks on ' +
+    "PR #939 completed</summary></task-notification>";
+
+  it.each([
+    ["the goal-expiry banner", EXPIRY],
+    ["a background-task notification", NOTIFICATION],
+  ])("%s does not read as a loop, even unobserved", (_label, banner) => {
+    // Byte-identical repeats by construction, and NOT ONE TOOL EVENT — the same shape as the
+    // agent 0bf08c64 case above. The verdict must not depend on our having observed the work,
+    // because the banner carries no information about the agent either way.
+    const events = [0, 1, 2, 3, 4].flatMap((i) => turn(banner, [], T0 + i * 60_000));
+    const r = thrashReport(run(events), T0 + 300_000, { goalOutstanding: true });
+    // Asserted as `healthy`, never `not.toBe("repeating-command")` — that weaker form passes while
+    // the row renders "No progress", which is the same false accusation wearing a different label.
+    expect(r.verdict).toBe("healthy");
+    expect(r.repeatedCommand).toBeUndefined();
+    expect(r.detail).not.toContain("looping");
+  });
+
+  it.each([
+    ["the goal-expiry banner", EXPIRY],
+    ["a background-task notification", NOTIFICATION],
+  ])("%s is INERT, not amnesic — a real loop still counts across it", (_label, banner) => {
+    // The exclusion must skip the banner without resetting the run. If it scrubbed the streak, an
+    // agent genuinely looping on /compact that happened to be interrupted by one of these would go
+    // undetected — the detector silenced on exactly the case it exists for. Same contract the
+    // resume arm is held to directly above.
+    const events = [
+      ...turn("/compact", []),
+      ...turn(banner, []),
+      ...turn("/compact", []),
+      ...turn(banner, []),
+      ...turn("/compact", []),
+    ];
+    const r = thrashReport(run(events), T0, {});
+    expect(r.verdict).toBe("repeating-command");
+    expect(r.repeatedCommand).toEqual({ text: "/compact", count: REPEAT_LIMIT });
+  });
+
   it("a resume that lands MID-TURN does not swallow that turn's work", () => {
     // THE OTHER HALF OF THE EVIDENCE. `repeatOf` reads `lastTurnRanTool || toolInCurrentTurn`
     // precisely because a turn can be interrupted and never close (roborev 55314) — the human

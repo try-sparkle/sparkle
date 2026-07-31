@@ -76,7 +76,61 @@ export const RESUME_PROMPT_MARKER =
   "Your turn ended but your goal is not met yet, so you are being resumed";
 
 /**
- * Did SPARKLE write this prompt, rather than a human or an agent?
+ * The opening of the GOAL-EXPIRY banner — the other end of the goal lifecycle from the resume above.
+ *
+ * UNLIKE `RESUME_PROMPT_MARKER`, NOTHING IN THIS REPO BUILDS THIS STRING. `continuePrompt` is the
+ * only resume prose Sparkle authors; this banner is written outside the tree (grep finds it nowhere,
+ * including `origin/main`) and arrives on the hook stream all the same. So there is no round trip to
+ * pin it with, and the literal here IS the contract — which is why its test uses a real measured
+ * record rather than a paraphrase. If the authoring side rewords, this goes blind and the only
+ * symptom is the false positive coming back; that is a known, stated cost of a marker we do not own.
+ *
+ * Prefix only, stopping before the variable tail, for the same reason as the resume marker.
+ */
+export const GOAL_EXPIRY_PROMPT_MARKER =
+  "Your goal expired unmet and you are resting with work unfinished";
+
+/**
+ * A background-task event, injected as a user turn by the harness when a task the agent spawned
+ * finishes. Twelve of these were measured across twenty sessions — the second-largest class of
+ * non-human `type:"user"` record after injected agent prompts.
+ *
+ * The opening tag is the whole marker because the payload is entirely variable (task id, summary,
+ * status). No human opens a prompt with this tag; an agent QUOTING one still does not, because the
+ * match is anchored at the start.
+ */
+export const TASK_NOTIFICATION_MARKER = "<task-notification>";
+
+/**
+ * Every opening that means "Sparkle or the harness wrote this, not a person and not the agent".
+ *
+ * A LIST RATHER THAN A CHAIN OF `||`, so adding a class is a one-line change next to its constant
+ * and its rationale, and so the test that walks every marker for the prefix and whitespace
+ * disciplines cannot be left behind when one is added.
+ *
+ * WHAT IS DELIBERATELY ABSENT MATTERS AS MUCH AS WHAT IS HERE — see `agentOriginated.test.ts`'s
+ * "deliberate exclusions", each measured in the same transcripts:
+ *
+ *   • `<command-name>` / `<command-message>` — a slash command the HUMAN ran. The gesture is the
+ *     origination, exactly as `dispatchAuthority` rules for `nudge-approve`, and the suite already
+ *     asserts a bare `/compact` stays countable. Suppressing the expanded form would blind the loop
+ *     detector to the very case it was built for.
+ *   • injected agent prompts ("You are a code reviewer…") — the largest non-human class, and NOT
+ *     this agent's: they belong to a different `claude` process sharing the worktree (the residual
+ *     race in `services/conciergeTools/terminal.ts`), so they never reach this predicate. Filtering
+ *     belongs in the transcript reader, which can tell them apart by session id. "You are a…" is
+ *     also far too broad an opening to match safely here.
+ *   • `isMeta` / `isSidechain` — record FIELDS, not prompt text. This predicate takes a string and
+ *     structurally cannot see them; they are the transcript reader's to honour.
+ */
+const SYSTEM_AUTHORED_MARKERS: readonly string[] = [
+  RESUME_PROMPT_MARKER,
+  GOAL_EXPIRY_PROMPT_MARKER,
+  TASK_NOTIFICATION_MARKER,
+];
+
+/**
+ * Did SPARKLE (or the harness) write this prompt, rather than a human or an agent?
  *
  * `true` means the text carries NO information about whether the agent is progressing, so callers
  * must exclude it from both thrash tallies and progress tallies. See the module header for why
@@ -84,8 +138,10 @@ export const RESUME_PROMPT_MARKER =
  *
  * Leading whitespace is tolerated because the PTY write path and the hook payload do not agree
  * about it; nothing else is normalised, because a looser match trades away the one property that
- * makes suppression safe.
+ * makes suppression safe. The match stays anchored at the START for every marker: a prompt that
+ * merely CONTAINS one is an agent quoting it, which is an agent action carrying real information.
  */
 export function isSystemAuthoredPrompt(text: string): boolean {
-  return text.trimStart().startsWith(RESUME_PROMPT_MARKER);
+  const start = text.trimStart();
+  return SYSTEM_AUTHORED_MARKERS.some((marker) => start.startsWith(marker));
 }
