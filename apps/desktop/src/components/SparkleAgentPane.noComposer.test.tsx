@@ -69,7 +69,12 @@ vi.mock("./Composer", () => ({
   ),
 }));
 vi.mock("./Onboarding", () => ({ Onboarding: () => null }));
-vi.mock("./PinnedPrompt", () => ({ PinnedPrompt: () => null }));
+// A STAND-IN THAT RENDERS ITS PROMPT, not a null mock — same reasoning as the Composer stand-in
+// above. The pinned header is also gone from this pane (see below), and a `() => null` mock would
+// make that absence assertion vacuous: it would pass just as well with the element still there.
+vi.mock("./PinnedPrompt", () => ({
+  PinnedPrompt: ({ prompt }: { prompt: string }) => <div data-testid="pane-pinned-prompt">{prompt}</div>,
+}));
 // SparkleConsentBanner is deliberately NOT mocked — it is the thing being guarded.
 vi.mock("../services/worktree", () => ({
   createAgentWorktree: vi.fn(() =>
@@ -193,6 +198,31 @@ describe("SparkleAgentPane — the bottom composer is gone", () => {
 
     expect(captured.focusCalls.n).toBe(0);
     box.remove();
+  });
+});
+
+describe("SparkleAgentPane — the pinned header is gone (the founder said so)", () => {
+  // Founder, 2026-07-30: the text goes, not a reword. Two assertions on purpose — the element, so
+  // re-adding `<PinnedPrompt prompt="…">` fails (the stand-in renders), and the literal string, so
+  // hand-inlining the same label as a plain <div> fails too. The pane's OWN identity strings in
+  // services/sparkleAgent.ts (the persona, the self-introduction) are behaviour, not chrome, and are
+  // deliberately untouched — SparkleAgentPane.spawn.test.tsx still guards those.
+  it("renders no pinned prompt header, and no label of any kind naming the agent", async () => {
+    await readyPane();
+
+    expect(screen.queryByTestId("pane-pinned-prompt")).toBeNull();
+    expect(screen.queryByText(/making Sparkle better from your usage/i)).toBeNull();
+  });
+
+  it("leaves the consent row as the pane's top chrome, with nothing above it", async () => {
+    // The removal must close up, not leave a gap. PinnedPrompt carried its own padding and bottom
+    // hairline, so the consent row inherits the top edge — assert it is literally the first child of
+    // the pane rather than trusting that no spacer was left behind.
+    await readyPane();
+
+    const consent = screen.getByRole("region", { name: "Sparkle improvement consent" });
+    const pane = consent.parentElement!;
+    expect(pane.firstElementChild).toBe(consent);
   });
 });
 

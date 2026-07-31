@@ -19,7 +19,6 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
 import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
-import { PinnedPrompt } from "./PinnedPrompt";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
 import { Terminal } from "./Terminal";
 import { Onboarding } from "./Onboarding";
@@ -72,8 +71,10 @@ interface SpawnCmd {
  *  - The ⌘J "focus the composer" chord finds nothing here and is swallowed, same as in AgentPane.
  *    In particular this pane no longer names itself as the dictation surface: revealing it must not
  *    move the mic off the concierge box.
- *  - The pinned prompt is a static label. It used to echo the last composer send; with the concierge
- *    owning the send, this pane holds no prompt of its own to show.
+ *  - There is no pinned prompt header at all. It used to echo the last composer send; with the
+ *    concierge owning the send it degenerated into a static label, and the founder had that label
+ *    removed outright (2026-07-30) rather than reworded. The consent row is now the pane's top
+ *    chrome.
  */
 export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agentId: string }) {
   const [phase, setPhase] = useState<Phase>("preparing");
@@ -284,10 +285,13 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
         background: C.forest,
       }}
     >
-      {/* A static label, not an echo of the last send: the concierge owns the send now, so this pane
-          has no prompt of its own to pin. (No `history` / "Send to Composer" either — there is no
-          composer to send to, which is exactly what AgentPane's PinnedPrompt says of itself.) */}
-      <PinnedPrompt prompt="Sparkle Improvement Agent — making Sparkle better from your usage" />
+      {/* NO PINNED HEADER ON THIS PANE. Founder, 2026-07-30: the static "Sparkle Improvement Agent
+          — making Sparkle better from your usage" label is gone, not reworded. The element is
+          deleted rather than passed an empty prompt because PinnedPrompt renders nothing at all for
+          an empty prompt (see PinnedPrompt.tsx's "no placeholder" contract), so keeping it would be
+          dead markup. It also carried its own padding + bottom hairline rather than spacing a
+          sibling, so the consent row below simply becomes this pane's top chrome — no gap to close.
+          SparkleAgentPane.noComposer.test.tsx pins the absence. */}
       {/* THE CONSENT ROW STAYS. Founder, 2026-07-29, on the screenshot: "I don't want you to strip
           out the top functionality here." It is how the user answers "Can we use your logs & crash
           reports to automatically improve Sparkle?", it gates what leaves the machine (see the Rust
@@ -339,8 +343,8 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
 
               THE EXPLICIT z-index STAYS, for the other half of what it always bought: it makes this
               box a STACKING CONTEXT, which is what traps the `inset: 0` drag-over scrim inside the
-              terminal region instead of letting it paint across the consent banner and pinned prompt
-              above it. The value only has to be a real number for that; it is no longer derived from
+              terminal region instead of letting it paint across the consent banner above it (the
+              pinned prompt that used to sit above that banner is gone too — see the pane doc). The value only has to be a real number for that; it is no longer derived from
               anything. `SparkleAgentPane.drop.test.tsx` asserts the containment, not the number. */}
           <div
             ref={terminalBoxRef}
