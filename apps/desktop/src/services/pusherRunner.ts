@@ -29,12 +29,23 @@
 
 import {
   decidePusherAction,
+  decideFleetReport,
+  emptyFleetMemory,
   emptyPartnerMemory,
   emptyObserveState,
+  evaluateFleetConditions,
+  evaluateTriggers,
+  expireClearedTriggers,
+  fleetObservationMemory,
+  isQuotaWalled,
   observeFleet,
+  type FleetMemory,
+  type FleetSnapshot,
   type ObserveState,
   type PartnerMemory,
   type PartnerSnapshot,
+  recordSend,
+  type BudgetState,
   type PusherPolicy,
   type InboxReading,
 } from "@sparkle/core";
@@ -61,11 +72,21 @@ export interface PusherRunnerDeps {
    * Returns `projectId` alongside so the ownership election can run per project exactly as the goal
    * sweep does, rather than being decided once for the whole fleet.
    */
-  snapshots(): Array<PartnerSnapshot & { projectId: string }>;
+  snapshots(): Array<PartnerSnapshot & FleetSnapshot & { projectId: string }>;
   /** Batched — ONE call for the whole fleet, not one per partner. */
   inboxUsage(agentIds: string[]): Promise<Map<string, number>>;
   /** Deliver a challenge. Returns whether it actually landed. */
   send(agentId: string, text: string): Promise<boolean>;
+  /**
+   * Who receives the batched fleet report — the conditions no PARTNER can act on.
+   *
+   * `undefined` means there is nobody to report to in this window, so nothing is SENT — though the
+   * conditions are still observed, so the report is not late when a recipient appears. That is the
+   * honest default rather than falling back to some agent: the three fleet conditions are, by
+   * construction, the ones whose subjects cannot act on them (`pusherFleet`), so delivering the
+   * report to an arbitrary partner would be worse than not sending it at all.
+   */
+  reportRecipient(projectId: string): string | undefined;
   /** Structured record of every decision, sent or refused. */
   record(entry: PusherLogEntry): void;
 }
@@ -80,16 +101,33 @@ export interface PusherLogEntry {
   reason?: string;
   /** The measured numbers the delivered text cites. Absent on a refusal. */
   cited?: string[];
+  /**
+   * Set on the batched fleet report, so the hit-rate log can tell it apart from a per-partner
+   * challenge. `agentId` on those lines is the RECIPIENT, not a subject of the report.
+   */
+  scope?: "fleet";
 }
 
 /** Everything the sweep remembers between cycles. */
 export interface PusherState {
   observe: ObserveState;
   partners: Map<string, PartnerMemory>;
+  /**
+   * projectId → the report channel's own memory for that project (its own budget, its own
+   * cooldowns).
+   *
+   * PER PROJECT, not fleet-wide (roborev 56908). The per-partner loop is careful that "the ownership
+   * election can run per project exactly as the goal sweep does, rather than being decided once for
+   * the whole fleet"; a single global report would undo that in three ways at once — it would quote
+   * one project's agent labels and escalation reasons to another project's recipient, and its
+   * cooldown would let one project's long-standing quota wall suppress another project's brand-new
+   * one.
+   */
+  fleet: Map<string, FleetMemory>;
 }
 
 export function emptyPusherState(): PusherState {
-  return { observe: emptyObserveState(), partners: new Map() };
+  return { observe: emptyObserveState(), partners: new Map(), fleet: new Map() };
 }
 
 /**
@@ -121,10 +159,27 @@ export async function sweepPushers(
 
   const { observations, next: observe } = observeFleet(owned, state.observe, now);
 
+  // Grouped per project, so each project's report is composed from — and delivered to — its own
+  // people. `byProject` also fixes the iteration order of the report passes below.
+  const byProject = new Map<string, typeof owned>();
+  for (const s of owned) {
+    const list = byProject.get(s.projectId);
+    if (list === undefined) byProject.set(s.projectId, [s]);
+    else list.push(s);
+  }
+
+  const recipients = new Map<string, string>();
+  for (const projectId of byProject.keys()) {
+    const r = deps.reportRecipient(projectId);
+    if (r !== undefined) recipients.set(projectId, r);
+  }
+
   // Batched, once. `inbox_status` takes `agentIds: Vec<String>`, so the whole fleet costs one call.
+  // Every project's recipient rides along in the SAME call rather than costing one each.
   let usage = new Map<string, number>();
   try {
-    usage = await deps.inboxUsage(owned.map((s) => s.agentId));
+    const ids = [...new Set([...owned.map((s) => s.agentId), ...recipients.values()])];
+    usage = await deps.inboxUsage(ids);
   } catch (e) {
     // A failed read is NOT an empty mailbox. Leaving the map empty would make every partner look
     // like it had room; the gate's own `capacity > 0 ? … : 100` then reads an absent entry as full
@@ -137,6 +192,36 @@ export async function sweepPushers(
   for (const s of owned) {
     const observation = observations.get(s.agentId);
     if (!observation) continue;
+
+    // A QUOTA-WALLED PARTNER IS NOT CHALLENGED, and this is a correctness rule rather than a
+    // courtesy. It cannot execute anything until a wall-clock time, so the message is not merely
+    // unread — it is unreadable, and it consumes one of the `MAX_PER_AGENT` slots the concierge may
+    // need to reach the same builder once the wall comes down. The condition is reported to the
+    // recipient instead, by the fleet pass below, where somebody can actually act on it.
+    //
+    // Note which trigger this suppresses in practice: a walled agent is exactly the agent whose goal
+    // quietly expires while it cannot run, so without this the Pusher's highest-value trigger fires
+    // hardest at the one partner guaranteed not to hear it.
+    // THE SIGHTING IS STILL RECORDED. Suppressing the send must not suppress the observation, or a
+    // wall lasting days leaves the partner's `lastTriggers` frozen and the two-observation rule
+    // restarts from stale state the moment it comes down — rule 1 in `pusherDecide`'s header, which
+    // fails silently and looks exactly like a healthy partner.
+    if (isQuotaWalled(s, now)) {
+      const memory = partners.get(s.agentId) ?? emptyPartnerMemory();
+      const seen = evaluateTriggers(observation);
+      partners.set(s.agentId, {
+        ...memory,
+        lastTriggers: seen,
+        // The cooldowns are expired here too, exactly as `decidePusherAction` does unconditionally
+        // (roborev 56908). A wall lasts many sweeps, and a NON-latching trigger — unpushed work, an
+        // unanswered question — can clear and return inside one. Without this its stale stamp
+        // survives the wall, and the partner is `repeat-suppressed` on release for what is a
+        // genuinely new episode.
+        lastChallengedAt: expireClearedTriggers(memory.lastChallengedAt, seen.map((t) => t.id)),
+      });
+      deps.record({ at: now, agentId: s.agentId, outcome: "refused", reason: "quota-blocked" });
+      continue;
+    }
 
     const used = usage.get(s.agentId);
     const inbox: InboxReading =
@@ -195,7 +280,165 @@ export async function sweepPushers(
   const live = new Set(owned.map((s) => s.agentId));
   for (const id of [...partners.keys()]) if (!live.has(id)) partners.delete(id);
 
-  return { observe, partners };
+  // ONE REPORT PER PROJECT, each with its own memory. Sequential rather than concurrent: each send
+  // is one inbox write, and running them in parallel would buy nothing while making the log order
+  // depend on transport latency.
+  const fleet = new Map(state.fleet);
+  for (const [projectId, list] of byProject) {
+    fleet.set(
+      projectId,
+      await reportFleet(
+        deps,
+        list,
+        recipients.get(projectId),
+        usage,
+        fleet.get(projectId) ?? emptyFleetMemory(),
+        now,
+        // The WHOLE roster, not just this project's slice: `reportRecipient(projectId)` is not
+        // required to name an agent inside that project, and the wall check must still find it
+        // (roborev 56973).
+        owned,
+        partners,
+      ),
+    );
+  }
+  // NOT PRUNED, unlike `partners` above — the two keys are not analogous (roborev 56973). An agent
+  // id that leaves the roster never comes back; a projectId does, after any sweep where that project
+  // contributed zero owned snapshots (a partial store read, a transient `ownsProject` flip, all its
+  // agents momentarily filtered). Deleting its memory there would reset the budget and every
+  // cooldown, so a condition reported minutes earlier is re-reported at zero cost on return. The
+  // growth argument for pruning does not apply either: projectIds are bounded by the number of
+  // projects, not by session length.
+
+  return { observe, partners, fleet };
+}
+
+/**
+ * The batched report — the three conditions no partner can act on, delivered once to the recipient.
+ *
+ * Runs AFTER the per-partner loop and shares its already-batched `inbox_status` read, so the whole
+ * feature costs the sweep no additional IPC. The same delivery discipline applies as above: the
+ * report's own budget is spent only against a confirmed send.
+ */
+async function reportFleet(
+  deps: PusherRunnerDeps,
+  owned: readonly (FleetSnapshot & { projectId: string })[],
+  recipient: string | undefined,
+  usage: ReadonlyMap<string, number>,
+  memory: FleetMemory,
+  now: number,
+  everyone: readonly (FleetSnapshot & { projectId: string })[],
+  partners: Map<string, PartnerMemory>,
+): Promise<FleetMemory> {
+  // NO RECIPIENT, NO REPORT — BUT THE SIGHTING STILL ADVANCES. This is rule 1 from `pusherDecide`'s
+  // header applied to the report channel, and it is easy to get backwards: returning `memory`
+  // untouched looks like the conservative choice, and it means a window that later acquires a
+  // recipient needs two MORE sweeps before it can say anything. The two-observation rule is about
+  // whether the CONDITION is real, not about whether anyone was listening while it was measured.
+  //
+  // The budget does not advance, because nothing was sent — but the cooldowns DO expire, which is
+  // why this goes through `fleetObservationMemory` rather than spreading `lastConditions` by hand.
+  if (recipient === undefined) {
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now));
+  }
+
+  // A QUOTA-WALLED RECIPIENT CANNOT READ THE REPORT EITHER, and the argument is verbatim the one the
+  // per-partner loop makes (roborev 56908): the message is not merely unread, it is unreadable, and
+  // it burns a `MAX_PER_AGENT` slot the concierge needs once the wall lifts. Refusing to send a
+  // partner a challenge while happily posting a report to an equally walled recipient would be the
+  // same mistake with the reasoning left behind.
+  const walledRecipient = everyone.find((s) => s.agentId === recipient && isQuotaWalled(s, now));
+  if (walledRecipient !== undefined) {
+    deps.record({
+      at: now,
+      agentId: recipient,
+      outcome: "refused",
+      reason: "recipient-quota-blocked",
+      scope: "fleet",
+    });
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now));
+  }
+
+  const used = usage.get(recipient);
+  const inbox: InboxReading =
+    used === undefined
+      ? { used: INBOX_CAPACITY, capacity: INBOX_CAPACITY }
+      : { used, capacity: INBOX_CAPACITY };
+
+  // ONE CONTAINMENT FOR AN AGENT THAT IS BOTH (roborev 56908, then 56973). `FleetMemory.budget` is
+  // deliberately separate from `PartnerMemory.budget`, so a recipient that is also a partner would
+  // otherwise receive `MESSAGES_PER_HOUR` challenges AND `MESSAGES_PER_HOUR` reports in one hour —
+  // the gate header calls that budget "the containment", and for exactly that agent it doubled.
+  //
+  // The first fix muted its per-partner channel instead, and that was BROADER THAN THE DEFECT: the
+  // report only ever covers the three fleet conditions, so `goal-expired`, `unpushed-commits` and
+  // `unanswered-question` for that agent became unreachable by any channel — "sat stuck and nobody
+  // said anything", guaranteed for one agent per project. Sharing the budget keeps both channels
+  // open and still bounds the total.
+  const partnerMemory = partners.get(recipient);
+  const shared: BudgetState =
+    partnerMemory === undefined
+      ? memory.budget
+      : { sentAt: [...memory.budget.sentAt, ...partnerMemory.budget.sentAt] };
+
+  const decision = decideFleetReport({
+    policy: deps.policy(),
+    snapshots: owned,
+    memory: { ...memory, budget: shared },
+    inbox,
+    now,
+  });
+
+  // The merged view is for the DECISION only; what is stored is this channel's own budget, or the
+  // partner's sends would be double-counted against it forever.
+  const own = (m: FleetMemory): FleetMemory => ({ ...m, budget: memory.budget });
+
+  if (decision.action === "quiet") {
+    deps.record({
+      at: now,
+      agentId: recipient,
+      outcome: "refused",
+      reason: decision.reason,
+      scope: "fleet",
+    });
+    return own(decision.memory);
+  }
+
+  let delivered = false;
+  try {
+    delivered = await deps.send(recipient, decision.text);
+  } catch (e) {
+    log.warn("pusher", "fleet report send threw", { error: String(e) });
+  }
+
+  if (delivered) {
+    deps.record({
+      at: now,
+      agentId: recipient,
+      outcome: "sent",
+      triggerId: decision.conditionIds.join("+"),
+      cited: decision.cited,
+      scope: "fleet",
+    });
+    // Recorded against BOTH ledgers when they coincide, so the shared bound is symmetric: the next
+    // per-partner sweep sees this send too, not just the next report.
+    if (partnerMemory !== undefined) {
+      partners.set(recipient, { ...partnerMemory, budget: recordSend(partnerMemory.budget, now) });
+    }
+    return { ...decision.memoryOnDelivered, budget: recordSend(memory.budget, now) };
+  }
+
+  // Undelivered: keep the pre-send budget and stamps, but DO keep this sweep's sighting and the
+  // expired cooldowns, exactly as the per-partner path does. A transport failure is not a reason to
+  // forget what was observed — nor to strand the stamp of a condition that has since cleared.
+  deps.record({
+    at: now,
+    agentId: recipient,
+    outcome: "refused",
+    reason: "transport-failed",
+    scope: "fleet",
+  });
+  return own(decision.memoryOnFailure);
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;

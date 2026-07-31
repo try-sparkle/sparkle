@@ -45,6 +45,9 @@ function fakeDeps(over: Partial<PusherRunnerDeps> = {}) {
     ownsProject: () => true,
     snapshots: () => [expired()],
     inboxUsage: async (ids) => new Map(ids.map((id) => [id, 0])),
+    // No recipient by default, so the per-partner cases below stay about the per-partner path. The
+    // fleet report has its own block at the bottom of this file, which supplies one.
+    reportRecipient: () => undefined,
     send: async (agentId, text) => {
       sent.push({ agentId, text });
       return true;
@@ -304,5 +307,298 @@ describe("the loop", () => {
     startPusherRunner(deps, 60_000);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(snapshots).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── THE BATCHED FLEET REPORT ────────────────────────────────────────────────────────────────────
+// The wiring half of `pusherFleet` / `pusherFleetReport`. What only exists here: that the report
+// shares the per-partner `inbox_status` call, that a quota-walled partner is not challenged while
+// still being OBSERVED, and that the report's budget survives a dropped send.
+describe("the fleet report", () => {
+  const WEEKLY = "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)";
+
+  const walledSnap = (id: string) => ({
+    agentId: id,
+    projectId: "p",
+    label: `Agent ${id}`,
+    quota: { message: WEEKLY, resetAt: T0 + 4 * 60 * MIN, resetParsed: true },
+  });
+
+  const escalatedSnap = (id: string) => ({
+    agentId: id,
+    projectId: "p",
+    label: `Agent ${id}`,
+    escalation: { reason: "auto-continue gave up" },
+  });
+
+  it("delivers ONE batched report to the recipient, naming every class", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [walledSnap("q1"), walledSnap("q2"), escalatedSnap("e1")],
+      reportRecipient: () => "concierge",
+    });
+    await sweepTimes(deps, 2);
+    const reports = sent.filter((s) => s.agentId === "concierge");
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.text).toContain("2 agents are quota-blocked");
+    expect(reports[0]!.text).toContain(WEEKLY);
+    expect(reports[0]!.text).toContain("1 goal is escalated");
+  });
+
+  it("reads the recipient's inbox in the SAME batched call as the partners'", async () => {
+    const calls: string[][] = [];
+    const { deps } = fakeDeps({
+      snapshots: () => [escalatedSnap("e1")],
+      reportRecipient: () => "concierge",
+      inboxUsage: async (ids) => {
+        calls.push(ids);
+        return new Map(ids.map((id) => [id, 0]));
+      },
+    });
+    await sweepTimes(deps, 1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual(["e1", "concierge"]);
+  });
+
+  it("never challenges a quota-walled partner — the message would be unreadable", async () => {
+    const { deps, sent, recorded } = fakeDeps({
+      // An expired goal AND a quota wall: the highest-value trigger aimed at the one partner that
+      // provably cannot hear it.
+      snapshots: () => [{ ...expired(), ...walledSnap("a") }],
+      reportRecipient: () => undefined,
+    });
+    await sweepTimes(deps, 3);
+    expect(sent.filter((s) => s.agentId === "a")).toEqual([]);
+    expect(recorded.some((r) => r.reason === "quota-blocked")).toBe(true);
+  });
+
+  it("still records the sighting for a walled partner, so the rule is not restarted on release", async () => {
+    const walledThenFree = vi
+      .fn()
+      .mockReturnValueOnce([{ ...expired(), ...walledSnap("a") }])
+      .mockReturnValueOnce([{ ...expired(), ...walledSnap("a") }])
+      .mockReturnValue([expired()]);
+    const { deps, sent } = fakeDeps({ snapshots: walledThenFree, reportRecipient: () => undefined });
+    await sweepTimes(deps, 3);
+    // Sweep 3 is the first unwalled one. Its challenge lands immediately because sweep 2 recorded
+    // the sighting; had the suppression dropped it, this would need a fourth sweep.
+    expect(sent.map((s) => s.agentId)).toEqual(["a"]);
+  });
+
+  it("sends no report at all when there is no recipient", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [walledSnap("q1")],
+      reportRecipient: () => undefined,
+    });
+    await sweepTimes(deps, 3);
+    expect(sent).toEqual([]);
+  });
+
+  it("does not burn the first observation when there is no recipient yet", async () => {
+    // Two sweeps with nobody to tell, then a recipient appears. The report must arrive on the FIRST
+    // sweep that has one — the two-observation rule is about the fleet, not about the mailbox.
+    let recipient: string | undefined = undefined;
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [walledSnap("q1")],
+      reportRecipient: () => recipient,
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st);
+    recipient = "concierge";
+    await sweepPushers(deps, st);
+    expect(sent.map((s) => s.agentId)).toEqual(["concierge"]);
+  });
+
+  it("a dropped report costs no budget, so the next sweep retries it", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [escalatedSnap("e1")],
+      reportRecipient: () => "concierge",
+      send: async (agentId, text) => {
+        sent.push({ agentId, text });
+        return false; // transport refused
+      },
+    });
+    await sweepTimes(deps, 3);
+    // Two attempts (sweeps 2 and 3), neither of which spent a slot or set a cooldown.
+    expect(sent).toHaveLength(2);
+  });
+
+  it("labels the report in the hit-rate log so it is not counted as a partner challenge", async () => {
+    const { deps, recorded } = fakeDeps({
+      // A walled agent, so the log line can be checked to carry a number that exists ONLY because
+      // the banner was quoted verbatim — the citation path end-to-end, not just the label.
+      snapshots: () => [walledSnap("q1")],
+      reportRecipient: () => "concierge",
+    });
+    await sweepTimes(deps, 2);
+    const fleet = recorded.filter((r) => r.scope === "fleet" && r.outcome === "sent");
+    expect(fleet).toHaveLength(1);
+    expect(fleet[0]!.agentId).toBe("concierge");
+    expect(fleet[0]!.cited).toContain("11");
+  });
+});
+
+// ── SCOPING AND OVERLAP (roborev 56908) ─────────────────────────────────────────────────────────
+// Three ways the report could reach the wrong person, or reach the right person twice.
+describe("the report is scoped and does not double up", () => {
+  const WEEKLY2 = "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)";
+  const escIn = (id: string, projectId: string) => ({
+    agentId: id,
+    projectId,
+    label: `Agent ${id}`,
+    escalation: { reason: "auto-continue gave up" },
+  });
+
+  it("sends ONE report per project, each to its own recipient", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [escIn("a", "p1"), escIn("b", "p2")],
+      reportRecipient: (projectId) => (projectId === "p1" ? "boss1" : "boss2"),
+    });
+    await sweepTimes(deps, 2);
+    expect(sent.map((s) => s.agentId).sort()).toEqual(["boss1", "boss2"]);
+  });
+
+  it("never names one project's agents to another project's recipient", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [escIn("alpha", "p1"), escIn("beta", "p2")],
+      reportRecipient: (projectId) => (projectId === "p1" ? "boss1" : "boss2"),
+    });
+    await sweepTimes(deps, 2);
+    const toBoss1 = sent.find((s) => s.agentId === "boss1")!;
+    expect(toBoss1.text).toContain("Agent alpha");
+    expect(toBoss1.text).not.toContain("Agent beta");
+  });
+
+  // One project's long-standing wall must not suppress another project's brand-new one.
+  it("keeps a separate cooldown per project", async () => {
+    let snaps = [escIn("a", "p1")];
+    const { deps, sent } = fakeDeps({
+      snapshots: () => snaps,
+      reportRecipient: (projectId) => `boss-${projectId}`,
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st); // p1 reported
+    snaps = [escIn("a", "p1"), escIn("b", "p2")];
+    st = await sweepPushers(deps, st);
+    await sweepPushers(deps, st); // p2 becomes eligible
+    expect(sent.map((s) => s.agentId)).toEqual(["boss-p1", "boss-p2"]);
+  });
+
+  // FleetMemory.budget is separate from PartnerMemory.budget, so an agent that is both would get
+  // MESSAGES_PER_HOUR of each — the containment silently doubled for exactly one agent. The fix is
+  // a SHARED budget, not muting the partner channel: the report covers only the three fleet
+  // conditions, so muting would leave goal-expired/unpushed/unanswered unreachable for that agent.
+  it("still challenges an agent that is also the report recipient", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ ...expired(), agentId: "boss", projectId: "p" }, escIn("a", "p")],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    const texts = sent.filter((s) => s.agentId === "boss").map((s) => s.text);
+    // Its own expired goal AND the fleet report — neither channel is muted by the other.
+    expect(texts.some((t) => t.includes("Your goal expired"))).toBe(true);
+    expect(texts.some((t) => t.includes("escalated"))).toBe(true);
+  });
+
+  // TWO DIRECTIONS, TWO TESTS. A `<= MESSAGES_PER_HOUR` assertion looks like it covers this and does
+  // not: both triggers here LATCH, so each channel sends once and stops well short of the cap — the
+  // "not shared" mutation passes it untouched. These assert the mechanism instead.
+  it("a partner's spent budget is visible to the fleet report", async () => {
+    const { deps, recorded } = fakeDeps({
+      snapshots: () => [{ ...expired(), agentId: "boss", projectId: "p" }, escIn("a", "p")],
+      reportRecipient: () => "boss",
+    });
+    const st = await sweepPushers(deps, emptyPusherState()); // first sighting
+    // The recipient has already spent its whole hour on the per-partner channel.
+    st.partners.set("boss", {
+      ...st.partners.get("boss")!,
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+    await sweepPushers(deps, st);
+    const fleet = recorded.filter((r) => r.scope === "fleet");
+    expect(fleet.some((r) => r.reason === "budget-exhausted")).toBe(true);
+  });
+
+  it("a delivered report is charged to the recipient's partner budget too", async () => {
+    const { deps } = fakeDeps({
+      snapshots: () => [{ ...expired(), agentId: "boss", projectId: "p" }, escIn("a", "p")],
+      reportRecipient: () => "boss",
+    });
+    let st = await sweepPushers(deps, emptyPusherState());
+    st = await sweepPushers(deps, st); // report delivered on this sweep
+    // Two sends to boss this sweep — its own challenge and the report — and BOTH are on its ledger.
+    expect(st.partners.get("boss")!.budget.sentAt).toHaveLength(2);
+  });
+
+  // `reportRecipient(projectId)` is not required to name an agent inside that project.
+  it("checks the wall for a recipient that lives in a DIFFERENT project", async () => {
+    const { deps, sent, recorded } = fakeDeps({
+      snapshots: () => [
+        {
+          agentId: "boss",
+          projectId: "p1",
+          label: "Boss",
+          quota: { message: WEEKLY2, resetAt: T0 + 4 * 60 * MIN, resetParsed: true },
+        },
+        escIn("a", "p2"),
+      ],
+      // p2's recipient lives in p1 — the per-project slice would never have seen its wall.
+      reportRecipient: (projectId) => (projectId === "p2" ? "boss" : undefined),
+    });
+    await sweepTimes(deps, 3);
+    expect(sent).toEqual([]);
+    expect(recorded.some((r) => r.reason === "recipient-quota-blocked")).toBe(true);
+  });
+
+  it("does not post a report to a quota-walled recipient either", async () => {
+    const { deps, sent, recorded } = fakeDeps({
+      snapshots: () => [
+        {
+          agentId: "boss",
+          projectId: "p",
+          label: "Boss",
+          quota: { message: WEEKLY2, resetAt: T0 + 4 * 60 * MIN, resetParsed: true },
+        },
+        escIn("a", "p"),
+      ],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 3);
+    expect(sent).toEqual([]);
+    expect(recorded.some((r) => r.reason === "recipient-quota-blocked")).toBe(true);
+  });
+});
+
+// A wall lasts hours to days — many sweeps. A NON-latching trigger can clear and return inside one,
+// and its stale cooldown stamp would then `repeat-suppress` a genuinely new episode the moment the
+// wall lifts. `decidePusherAction` expires cooldowns unconditionally for exactly this reason; the
+// walled short-circuit skips that call, so it has to do it itself (roborev 56908).
+describe("a wall does not strand cooldown stamps", () => {
+  const WEEKLY3 = "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)";
+
+  it("expires the stamp of a trigger that stopped firing while the partner was walled", async () => {
+    const { deps } = fakeDeps({
+      // Walled, and holding only an expired goal — `unpushed-commits` is NOT firing this sweep.
+      snapshots: () => [
+        {
+          ...expired(),
+          label: "Walled One",
+          quota: { message: WEEKLY3, resetAt: T0 + 4 * 60 * MIN, resetParsed: true },
+        },
+      ],
+    });
+    const state = emptyPusherState();
+    state.partners.set("a", {
+      lastTriggers: [],
+      budget: { sentAt: [] },
+      lastChallengedAt: { "unpushed-commits": T0 - 60_000, "goal-expired": T0 - 60_000 },
+    });
+
+    const next = await sweepPushers(deps, state);
+
+    // `goal-expired` is still firing, so its stamp survives; `unpushed-commits` is not, so its
+    // stamp must be dropped rather than left to suppress the next real episode.
+    expect(next.partners.get("a")!.lastChallengedAt).toEqual({ "goal-expired": T0 - 60_000 });
   });
 });
