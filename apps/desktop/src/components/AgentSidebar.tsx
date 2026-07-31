@@ -3388,15 +3388,31 @@ function workerDetailsEqual(a: WorkerDetail[], b: WorkerDetail[]): boolean {
  * Memo comparator for AgentRow (sparkle-alrm.3). A row re-renders ONLY when its OWN display data
  * changes — so one agent's frequent status flip re-paints just that agent's row instead of the whole
  * sidebar subtree. Every data prop is compared here; the callback props (onSelect/onLand/onClose/
- * drag handlers/setEditing) are deliberately EXCLUDED: `project` is compared (any project mutation
- * re-renders the row with fresh closures), and the close/reselect paths read live store state via
- * getState(), so a slightly-stale callback closure can never act on stale data. This list MUST stay
- * exhaustive: omitting a DATA prop that changed makes this return `true`, which SKIPS the re-render
- * and leaves the row painting stale data (a visual/correctness bug, not merely an extra render).
+ * drag handlers/setEditing) are deliberately EXCLUDED, and the close/reselect paths read live store
+ * state via getState(), so a slightly-stale callback closure can never act on stale data. This list
+ * MUST stay exhaustive: omitting a DATA prop that changed makes this return `true`, which SKIPS the
+ * re-render and leaves the row painting stale data (a visual/correctness bug, not merely an extra
+ * render).
+ *
+ * `project` is compared BY THE FIELDS THE ROW READS — `id`, `rootPath`, and the `agents` array —
+ * NOT by object identity (). This is the same shape `arePanePropsEqual` uses for the pane:
+ * a bare `prev.project === next.project` defeated the memo for EVERY project-level write, and the
+ * hottest such write is a pure SELECTION change — `selectAgent` mints a fresh project object that
+ * differs only in `selectedAgentId`, a field this row never reads (the selection highlight arrives as
+ * the separately-compared `isActive` prop). Comparing identity therefore re-rendered all 60 rows on
+ * every click and every hover step (the "latency moving between build-agent rows" report); comparing
+ * the three read fields drops that to the two rows whose `isActive` actually flipped. It is SAFE for
+ * the excluded closures precisely because a pure selection change touches none of what they capture
+ * (`a`, `a.id`, `project.id`, `trueSt`): the skipped row's stale closure is byte-identical to a fresh
+ * one. Any write that changes an agent still mints a new `agents` array (via mapAgent), so the row —
+ * and its closures — refresh exactly as before. The row reads no other project field and forwards no
+ * whole-`project` to a child, so these three are the complete set (audited against the row body).
  */
 function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
   return (
-    prev.project === next.project &&
+    prev.project.id === next.project.id &&
+    prev.project.rootPath === next.project.rootPath &&
+    prev.project.agents === next.project.agents &&
     prev.a === next.a &&
     prev.depth === next.depth &&
     prev.isActive === next.isActive &&

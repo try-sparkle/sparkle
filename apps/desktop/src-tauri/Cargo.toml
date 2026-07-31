@@ -26,7 +26,21 @@ cc = "1"
 [dependencies]
 # macos-private-api: required for the transparent capture-window takeover (capture_window.rs);
 # paired with "macOSPrivateApi": true in tauri.conf.json. Other windows stay opaque.
-tauri = { version = "2", features = ["macos-private-api"] }
+#
+# `default-features = false` + the explicit list below is Tauri's default feature set with ONE
+# member removed: `compression`. That default embeds the frontend brotli-compressed and
+# DECOMPRESSES it on EVERY asset fetch, with no cache — `tauri_utils::assets::EmbeddedAssets::get`
+# runs `brotli::BrotliDecompress` into a fresh `Vec` per call (see the `#[cfg(feature =
+# "compression")]` branch). Tauri's custom URL-scheme handler serves those fetches synchronously on
+# the MAIN thread (`WebURLSchemeHandlerCocoa::platformStartTask`), so a re-render storm that refetches
+# assets turns into per-request main-thread decompression stalls. With the feature off, `get()`
+# returns a zero-copy `Cow::Borrowed` slice and the compile-time codegen embeds the bytes raw — both
+# gated by this same feature, so embed and serve stay consistent. The only documented cost is a
+# larger binary (the frontend is JS/CSS only — sherpa-onnx is native, `public/` is ~12K of SVG). The
+# rest of the list is verbatim Tauri defaults (`wry`, `common-controls-v6`, `dynamic-acl`, `x11`,
+# `dbus`); `x11`/`dbus` gate Linux-only optional deps and are inert on macOS/Windows, kept for parity.
+# `asset_serving.rs` guards this against a dependency bump silently restoring the default.
+tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl", "x11", "dbus", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"

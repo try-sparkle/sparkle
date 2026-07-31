@@ -124,23 +124,34 @@ function project(): Project {
   return useProjectStore.getState().projects[0]!;
 }
 
-/** THE MEASURED COST, as a RATCHET. This is not the number anyone wants — it is 60, i.e. every row
- *  in the sidebar re-renders on every selection — and it is recorded here so it cannot get worse
- *  silently and cannot get BETTER silently either. If you fix the cause (below), this test fails;
- *  lower the constant in the same PR.
+/** THE MEASURED COST OF A PURE SELECTION CHANGE, as a RATCHET. Only the two rows whose selection
+ *  highlight actually flips may re-render on a click — so this is 2, and it is recorded here so it
+ *  cannot silently regress to "every row" again.
  *
- *  WHY IT IS 60. `agentRowPropsEqual` (AgentSidebar.tsx) compares `prev.project === next.project`,
- *  and `selectAgent` routes through `mapProject`, which replaces the project OBJECT. Every one of
- *  the 60 `<AgentRow project={project}>` elements therefore receives a fresh reference, the
- *  comparator returns false for all of them, and the memo — which exists precisely so "one agent's
- *  frequent status flip re-paints just that agent's row instead of the whole sidebar subtree" — is
- *  defeated for every project-level write. The comparator is not wrong to compare `project`: rows
- *  read it (beads, epic lookups, worker names) and its own comment warns that dropping a compared
- *  DATA prop leaves rows painting stale data. The cost is structural, not a typo.
+ *  WHY IT IS 2, AND WHY IT WAS 60. `agentRowPropsEqual` (AgentSidebar.tsx) used to compare
+ *  `prev.project === next.project`, and `selectAgent` routes through `mapProject`, which replaces the
+ *  project OBJECT (changing only `selectedAgentId`). Every one of the 60 `<AgentRow project={project}>`
+ *  elements therefore received a fresh reference, the comparator returned false for all of them, and
+ *  the memo — which exists precisely so "one agent's frequent status flip re-paints just that agent's
+ *  row instead of the whole sidebar subtree" — was defeated for every project-level write (the
+ *  "latency moving between build-agent rows" report, ). The comparator now compares the
+ *  three project FIELDS a row actually reads — `id`, `rootPath`, `agents` — so a selection change,
+ *  which touches none of them, no longer re-renders any row except the two whose `isActive` prop
+ *  flipped (a0 loses the highlight, a7 gains it). An agent-DATA write still costs the whole sidebar
+ *  (see the last case below) because it mints a fresh `agents` array — that larger cost is separate.
  *
- *  WHY IT MATTERS HERE. This is the per-row cost hover-to-preview multiplies: a pointer crossing N
- *  rows costs N × 60 row renders. See PRD/sparkle/terminal-switch-latency.md. */
-const ROWS_RERENDERED_PER_SWITCH = 60;
+ *  WHY IT MATTERS HERE. Selection is what hover-to-preview fires per row crossed: at the old 60 a
+ *  pointer sweeping N rows cost N × 60 row renders; at 2 it is N × 2. See
+ *  PRD/sparkle/terminal-switch-latency.md. */
+const ROWS_RERENDERED_PER_SELECTION = 2;
+
+/** THE MEASURED COST OF AN AGENT-DATA WRITE, still a RATCHET at 60. Renaming (or any single-agent
+ *  mutation) routes through `mapAgent`, which rebuilds the `agents` array, so every row's compared
+ *  `project.agents` reference changes and the whole sidebar re-renders. This is the cost the
+ *  selection fix deliberately does NOT touch — rows read `project.agents` for sibling-derived data
+ *  (epic pills, worker rollups), so narrowing it further is a distinct, riskier change. Recorded so
+ *  it stays visible and can't silently get worse. See PRD/sparkle/terminal-switch-latency.md. */
+const ROWS_RERENDERED_PER_AGENT_WRITE = 60;
 
 describe("what a switch costs the agent sidebar, per row", () => {
   it(`renders all ${ROWS} rows to begin with`, () => {
@@ -151,39 +162,39 @@ describe("what a switch costs the agent sidebar, per row", () => {
     expect(rowRenders.size).toBe(ROWS);
   });
 
-  it(`re-renders ${ROWS_RERENDERED_PER_SWITCH} of ${ROWS} rows on ONE selection change`, () => {
+  it(`re-renders only ${ROWS_RERENDERED_PER_SELECTION} of ${ROWS} rows on ONE selection change`, () => {
     render(<Harness />);
     const base = snapshot();
 
     selectAgent("a7");
 
-    // THE MEASUREMENT. Only two rows changed anything a reader can see — a0 lost the selection
-    // highlight, a7 gained it — so two is the number this SHOULD be. It is 60.
+    // THE MEASUREMENT. Only two rows change anything a reader can see — a0 lost the selection
+    // highlight, a7 gained it — so two is the number this SHOULD be, and now is (was 60 before the
+    // field-wise `agentRowPropsEqual` fix, ).
     const moved = rowsRenderedSince(base);
-    expect(moved).toHaveLength(ROWS_RERENDERED_PER_SWITCH);
-    // …and the two rows that genuinely changed are among them, so this is a real switch and not a
-    // store write that happened to touch everything while changing nothing.
+    expect(moved).toHaveLength(ROWS_RERENDERED_PER_SELECTION);
+    // …and the two rows that genuinely changed are exactly those two — so this is a real switch that
+    // moved only the selection, not a write that happened to touch everything while changing nothing.
     expect(moved).toContain("a0");
     expect(moved).toContain("a7");
     expect(project().selectedAgentId).toBe("a7");
   });
 
-  it("costs that much AGAIN for every step of a hover-style sweep", () => {
+  it("costs only that much AGAIN for every step of a hover-style sweep", () => {
     // What a hover sweep is: the pointer crosses a run of rows and each becomes the selection in
-    // turn. The cost is N x 60, which is the number that makes hover-to-preview unaffordable on the
-    // React side alone, independently of the xterm reveal cost measured in the PRD doc.
+    // turn. The cost is now N x 2, not N x 60 — which is what makes hover-to-preview affordable on
+    // the React side, independently of the xterm reveal cost measured in the PRD doc.
     //
-    // This asserts RAW INVOCATION TOTAL, not the count of distinct rows that moved. The distinct
-    // count is bounded above by ROWS by construction, so summing it could never exceed 5 x 60 no
-    // matter how much real work happened — and given the single-switch case above, it would be
-    // arithmetically implied rather than independently measured. The invocation total is the
-    // quantity that actually grows if a step re-renders some row more than once.
+    // This asserts RAW INVOCATION TOTAL, not the count of distinct rows that moved — the total is the
+    // quantity that actually grows if a step re-renders some row more than once. Each of the 5 steps
+    // re-renders the row it deselects plus the row it selects: 2 per step, 10 in all. (The very first
+    // step deselects a0, seeded selected by the harness; subsequent steps deselect the prior target.)
     render(<Harness />);
     const before = totalRenders();
 
     for (const id of ["a1", "a2", "a3", "a4", "a5"]) selectAgent(id);
 
-    expect(totalRenders() - before).toBe(5 * ROWS_RERENDERED_PER_SWITCH); // 300 row renders
+    expect(totalRenders() - before).toBe(5 * ROWS_RERENDERED_PER_SELECTION); // 10 row renders
   });
 
   it("costs ZERO row re-renders when re-selecting the row already selected", () => {
@@ -201,11 +212,13 @@ describe("what a switch costs the agent sidebar, per row", () => {
     expect(project().selectedAgentId).toBe("a0");
   });
 
-  it("re-renders every row for a write that touches ONE agent, too", () => {
-    // The generalisation, and why this is not only a hover problem: any projectStore write mints a
-    // new project object, so renaming a single agent — or a single status flip, of which a busy
-    // fleet produces many per second — costs the whole sidebar. Recorded because it makes the
-    // background cost measured in the PRD doc plausible from this direction as well.
+  it("STILL re-renders every row for a write that touches ONE agent — the cost the fix does not claim", () => {
+    // The generalisation, and the boundary of the selection fix: renaming a single agent routes
+    // through `mapAgent`, which rebuilds the `agents` array, so every row's compared `project.agents`
+    // reference changes and the whole sidebar re-renders. This is DELIBERATELY still 60 (rows read
+    // `project.agents` for sibling-derived data, so narrowing it further is a separate change), and
+    // pinning it is what proves the selection fix above narrowed the SELECTION path specifically
+    // rather than dropping a compared DATA prop and going blind to real changes.
     render(<Harness />);
     const base = snapshot();
 
@@ -214,7 +227,7 @@ describe("what a switch costs the agent sidebar, per row", () => {
     });
 
     const moved = rowsRenderedSince(base);
-    expect(moved).toHaveLength(ROWS_RERENDERED_PER_SWITCH);
+    expect(moved).toHaveLength(ROWS_RERENDERED_PER_AGENT_WRITE);
     // The renamed row really did re-render with its new name — without this the bound above could be
     // satisfied by a write that re-rendered everything and changed nothing.
     expect(moved).toContain("renamed-42");
