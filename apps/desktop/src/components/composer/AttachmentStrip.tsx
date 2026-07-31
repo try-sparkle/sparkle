@@ -112,6 +112,12 @@ export function AttachmentStrip({
                 <img
                   src={att.dataUrl}
                   alt={att.name}
+                  // An image is natively `-webkit-user-drag: element`, so a press that lands on this
+                  // thumbnail starts a NATIVE IMAGE DRAG instead of a text selection — and a sent
+                  // bubble sits in the middle of the transcript, where a reader drags across
+                  // messages to copy them. Same reasoning as helper/SparkleMark; the fix was never
+                  // applied to the thumbnails.
+                  draggable={false}
                   style={{
                     height: THUMB_H,
                     maxWidth: 158,

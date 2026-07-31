@@ -420,3 +420,150 @@ describe("ConciergeThread — auto-follow", () => {
     expect(el.scrollTop).toBe(1400);
   });
 });
+
+describe("ConciergeThread — auto-follow yields to a live selection", () => {
+  // THE FOUNDER'S ANCHOR BUG. Selecting across several messages while a reply streams in used to be
+  // impossible: `contentKey` includes the thread's total text length, so every token re-ran the
+  // follow effect and wrote `scrollTop = scrollHeight` under the reader's held mouse button. The
+  // browser kept extending the highlight from wherever the anchor had been shoved to, so the start
+  // point visibly walked away — once per token.
+  function streamingRerender(rerender: (ui: React.ReactElement) => void, text: string): void {
+    rerender(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+  }
+
+  it("does NOT scroll while the reader is dragging out a selection", () => {
+    const { rerender } = render(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "a" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 800); // pinned to the bottom: the follow is armed
+    el.scrollTop = 300; // the reader has dragged up to an earlier message
+    el.scrollTop = 300;
+
+    fireEvent.mouseDown(el, { button: 0 });
+    // The reply streams three more tokens while the button is still down.
+    streamingRerender(rerender, "ab");
+    streamingRerender(rerender, "abc");
+    streamingRerender(rerender, "abcd");
+
+    expect(el.scrollTop).toBe(300);
+  });
+
+  it("catches up on the next delta once the reader lets go", () => {
+    // The follow is DEFERRED, not cancelled — a selection must not silently cost the reader the
+    // follow the way a scroll-away does.
+    const { rerender } = render(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "a" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 800);
+    el.scrollTop = 300;
+
+    fireEvent.mouseDown(el, { button: 0 });
+    streamingRerender(rerender, "ab");
+    expect(el.scrollTop).toBe(300);
+
+    fireEvent.mouseUp(document);
+    streamingRerender(rerender, "abc");
+
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+
+  it("a RIGHT-click over a selection does not latch the follow off", () => {
+    // Only a primary press starts a drag. If a context-menu press set the flag, the thread would
+    // stop following until the next left-click anywhere.
+    const { rerender } = render(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "a" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 800);
+
+    fireEvent.mouseDown(el, { button: 2 });
+    streamingRerender(rerender, "ab");
+
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+});
+
+describe("ConciergeThread — a deferred follow resolves on release", () => {
+  // The deferral only early-returns; nothing re-runs the effect on mouseup. So a press-and-hold that
+  // spans the LAST delta of a reply left the answer below the fold indefinitely, with `followRef`
+  // still reading true — nothing looked wrong. Widening the press to the document (so a drag begun
+  // in the compose box also defers) made that reachable from gestures aimed at other surfaces.
+  it("scrolls to the bottom when the gesture ends, with no further content", () => {
+    const { rerender } = render(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "a" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 800); // follow armed
+    el.scrollTop = 300;
+
+    fireEvent.mouseDown(document, { button: 0 });
+    // The final delta of the reply lands during the hold.
+    rerender(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "ab" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    expect(el.scrollTop).toBe(300);
+
+    // Nothing more arrives — the release itself has to resolve it.
+    fireEvent.mouseUp(document);
+
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+
+  it("does not resurrect the follow for a reader who had scrolled away", () => {
+    const { rerender } = render(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "a" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+    const el = thread();
+    makeScrollable(el);
+    readerScrollsTo(el, 600);
+    readerScrollsTo(el, 300); // a real scroll-away: the follow is off
+    rerender(
+      <ConciergeThread
+        messages={[{ id: "m0", kind: "sparkle", text: "ab" }]}
+        onNudgeClick={noop}
+        onNudgeAction={noop}
+      />,
+    );
+
+    fireEvent.mouseDown(document, { button: 0 });
+    fireEvent.mouseUp(document);
+
+    expect(el.scrollTop).toBe(300);
+  });
+});

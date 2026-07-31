@@ -2,32 +2,19 @@
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FiAlertCircle, FiBell, FiCheck } from "react-icons/fi";
-import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
+import { FiCheck } from "react-icons/fi";
+import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
-import { Markdown } from "../Markdown";
-import { bandColor } from "../../engine/statusBandLabels";
-import { CopyAnswerButton } from "./CopyAnswerButton";
 import { useCopyOnSelection } from "./useCopyOnSelection";
-import { NudgeCard } from "./NudgeCard";
-import { RecapCard } from "./RecapCard";
-import { RoutingReceipt } from "./RoutingReceipt";
 import { ThinkingIndicator } from "./ThinkingIndicator";
-// The strip a SENT message's files draw as, plus the one lightbox they open. It lives in
-// components/composer beside that lightbox rather than here — see its header for why.
-// SHARED WITH THE DRAFT: the concierge compose box renders this same component, passing `onRemove`.
-// Omitting it here is what makes this copy read-only — a sent message has nothing to take back.
-import { AttachmentStrip } from "../composer/AttachmentStrip";
-// THE collapsed-text pill and its modal — the same components the BUILD-AGENT composer draws (via
+import { ConciergeMessageRow } from "./ConciergeMessageRow";
+// THE collapsed-text modal — the same component the BUILD-AGENT composer draws (via
 // components/composer/AttachmentRow), reused here rather than copied into a transcript-shaped twin (see
-// TextPill's header for why there is only one). As of this change those are the only two callers: the
-// concierge's own compose box is NOT on this primitive yet, so do not read these imports as evidence
-// that surface is already wired — it still needs doing (roborev 55746).
-import { TextPill } from "../composer/TextPill";
+// TextPill's header for why there is only one). The concierge's own compose box is NOT on this
+// primitive yet, so do not read this import as evidence that surface is already wired — it still
+// needs doing (roborev 55746).
 import { TextPillModal } from "../composer/TextPillModal";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
-import { splitMentionText, type ConciergeMention } from "./mentions";
-import { MentionPill } from "./MentionPill";
 import type {
   ConciergeCopyKind,
   ConciergeDigestMessage,
@@ -35,6 +22,14 @@ import type {
   ConciergeNudge,
   ConciergeSparkleMessage,
 } from "./types";
+
+// Re-exported: these ids named this module before the per-message rendering moved into its own
+// component, and the thread is still where a reader looks for them.
+export {
+  COLLAPSED_TEXT_TESTID,
+  FAILURE_BUBBLE_TESTID,
+  FAILURE_EVIDENCE_TESTID,
+} from "./ConciergeMessageRow";
 
 /** How close to the bottom still counts as "following", measured when the READER scrolls.
  *
@@ -46,11 +41,6 @@ import type {
  *  clientHeight/scrollHeight under non-integral zoom can leave a genuinely-bottomed container a few
  *  px off, and each such miss silently costs the reader the follow. Both sides are tested. */
 const FOLLOW_THRESHOLD_PX = 24;
-
-export const FAILURE_BUBBLE_TESTID = "concierge-failure";
-export const FAILURE_EVIDENCE_TESTID = "concierge-failure-evidence";
-/** A collapsed payload the reader chose to see as regular text, expanded IN PLACE in its bubble. */
-export const COLLAPSED_TEXT_TESTID = "concierge-collapsed-text";
 
 /** The id of the NEWEST message the user themselves sent, or "" when the thread has none.
  *
@@ -64,50 +54,6 @@ function newestUserMessageId(messages: ConciergeMessage[]): string {
     if (m.kind === "you") return m.id;
   }
   return "";
-}
-
-/**
- * A user bubble's words, with any agent it ADDRESSED drawn as a pill rather than as raw `@text`.
- *
- * THIS IS NO LONGER THE FIRST PLACE THE PILL APPEARS, and the correction matters because the old
- * note here was load-bearing prose. It read: "the composer cannot draw one — it is a plain
- * `<textarea>`, and it stays one … so the SENT message is where the pill becomes visible." The
- * premise was right and the conclusion was wrong, and the founder reported the gap: a completed
- * `@Kraken Auth` sat in the compose box as plain text and only became a pill after Send.
- *
- * The textarea IS still a plain textarea (the rich placeholder overlay and the measured height
- * engine both depend on that, and neither moved). What changed is that the composer paints its
- * pills BEHIND it — see ./MentionMirror. So the pill is now visible from the moment the mention is
- * completed, and this bubble is where it becomes a RECORD rather than where it is first seen.
- *
- * Split against the mentions RECORDED ON THE MESSAGE (see ConciergeUserMessage.mentions), never
- * against the live roster, so a message keeps its pills after its agent is closed. That is the one
- * place this surface deliberately differs from the composer's: there, the roster is live, because a
- * draft's aim must track the fleet it will actually be delivered to.
- *
- * Plain text renders exactly as it did before — one string, no wrapper — so a thread of ordinary
- * messages is untouched by this and its whitespace behaviour cannot drift.
- */
-function MentionedText({ text, mentions }: { text: string; mentions?: ConciergeMention[] }) {
-  if (!mentions?.length) return <>{text}</>;
-  return (
-    <>
-      {splitMentionText(text, mentions).map((part, i) =>
-        part.kind === "text" ? (
-          // The index IS the identity here: these parts are positional slices of one immutable
-          // string on a message that never re-renders with different content.
-          <span key={i}>{part.text}</span>
-        ) : (
-          // The SHARED pill (./MentionPill) — the same component the composer paints behind its
-          // textarea. It used to be six style properties inlined here, which is how the sent pill
-          // and the composer pill would have drifted a shade apart with nothing failing.
-          <MentionPill key={i} agentId={part.agentId}>
-            {part.text}
-          </MentionPill>
-        ),
-      )}
-    </>
-  );
 }
 
 export function ConciergeThread({
@@ -149,7 +95,48 @@ export function ConciergeThread({
     enabled: copyOnSelection,
     onCopied: useCallback(() => onCopied?.("selection"), [onCopied]),
   });
-  const onAnswerCopied = useCallback(() => onCopied?.("answer"), [onCopied]);
+  // ── Handlers, STABILISED ───────────────────────────────────────────────────────────────────────
+  //
+  // Every callback below is handed to a memoised row (./ConciergeMessageRow), and a memo is only
+  // worth having if its props actually hold still. These arrive as props from the column, which gets
+  // them from the host — several of them inline — so the identity of what we are given changes on
+  // every tick and cannot be relied on. Kept in refs and re-exposed as `useCallback`s with empty
+  // deps, so a row's props are identical across a tick that changed nothing about that row, and the
+  // memo bites regardless of how a caller upstream chooses to build its handlers.
+  //
+  // `onCopied` IS ONE OF THEM. It was left as `useCallback(…, [onCopied])` at first, which happens to
+  // be stable today only because the host builds its `onCopied` over a `useCallback(…, [])`
+  // `announce`. That is a property of one caller, not of this component's contract: any future
+  // caller passing an inline `onCopied` would silently re-render every row on every feed tick and
+  // undo the whole of this change, with nothing failing.
+  const handlers = useRef({
+    onNudgeClick,
+    onNudgeAction,
+    onRevealAgent,
+    onRedirect,
+    onDigestClick,
+    onCopied,
+  });
+  handlers.current = {
+    onNudgeClick,
+    onNudgeAction,
+    onRevealAgent,
+    onRedirect,
+    onDigestClick,
+    onCopied,
+  };
+  const onAnswerCopied = useCallback(() => handlers.current.onCopied?.("answer"), []);
+  const nudgeClick = useCallback((n: ConciergeNudge) => handlers.current.onNudgeClick(n), []);
+  const nudgeAction = useCallback(
+    (n: ConciergeNudge, a: string) => handlers.current.onNudgeAction(n, a),
+    [],
+  );
+  const revealAgent = useCallback((id: string) => handlers.current.onRevealAgent?.(id), []);
+  const redirect = useCallback((id: string) => handlers.current.onRedirect?.(id), []);
+  const digestClick = useCallback(
+    (d: ConciergeDigestMessage) => handlers.current.onDigestClick?.(d),
+    [],
+  );
   // ── A relayed payload, collapsed (see ConciergeSparkleMessage.collapsed) ──────────────────────
   //
   // Both bits of state are LOCAL and KEYED BY MESSAGE ID, deliberately. Neither is a fact about the
@@ -171,41 +158,8 @@ export function ConciergeThread({
           (m): m is ConciergeSparkleMessage =>
             m.id === openPayloadId && m.kind === "sparkle" && m.collapsed !== undefined,
         );
-  /**
-   * The pill (or the expanded text) under a sparkle line that carries a payload.
-   *
-   * ONE ROW while collapsed, and `variant="inline"` is what makes that true — the default `tile` is
-   * the composer's 46px dashed box, which reads as an empty drop target sitting in running prose.
-   * NO `onRemove`: a posted line is a record, and offering to delete half of one implies an edit the
-   * app cannot make.
-   */
-  const collapsedPayload = (m: ConciergeSparkleMessage) => {
-    const block = m.collapsed;
-    if (!block) return null;
-    if (shownAsText.has(m.id))
-      return (
-        <div
-          data-testid={COLLAPSED_TEXT_TESTID}
-          style={{
-            marginTop: 4,
-            fontSize: 12,
-            color: C.cream,
-            // VERBATIM, never through <Markdown> — the same call the failure bubble's evidence makes
-            // above, for the same reason: this is the user's own pasted text, where a `_` or a `*` is
-            // a character and not a formatting instruction.
-            whiteSpace: "pre-wrap",
-            overflowWrap: "anywhere",
-          }}
-        >
-          {block.text}
-        </div>
-      );
-    return (
-      <div style={{ marginTop: 4 }}>
-        <TextPill block={block} variant="inline" onOpen={() => setOpenPayloadId(m.id)} />
-      </div>
-    );
-  };
+  /** Open the full-text modal for a payload. Stable, so it does not un-memoise every row. */
+  const openPayloadFor = useCallback((id: string) => setOpenPayloadId(id), []);
   // Whether the reader is following the bottom. Starts TRUE (a freshly opened thread should be at
   // its newest message) and only changes when the READER scrolls — never as a side effect of new
   // content.
@@ -218,6 +172,71 @@ export function ConciergeThread({
    *  effect run, so a thread that MOUNTS with the user's last message in it (the persisted thread,
    *  restored at launch) isn't mistaken for a fresh submit. */
   const lastUserMessageIdRef = useRef<string | null>(null);
+  /**
+   * Is the reader dragging out a selection RIGHT NOW?
+   *
+   * GUARD 3 on the auto-follow below, and the one that answers the founder's report directly: "when
+   * I copy boxes sometimes the part where I started copying loses its initial anchor location."
+   *
+   * The auto-follow writes `el.scrollTop = el.scrollHeight` on every change of `contentKey`, and
+   * `contentKey` includes the thread's total text length — so a streaming reply fires it once per
+   * token. Guards 1 and 2 both ask "should we be following?", and while a reply streams in the
+   * honest answer is yes. Neither of them asks whether the reader is in the middle of a GESTURE, so
+   * a drag started anywhere in the transcript gets the container yanked to the bottom underneath it,
+   * several times a second. The browser goes on extending the highlight from where the anchor now
+   * sits on screen, which is not where the reader put it — so the selection start visibly moves, and
+   * it moves again on the next token. That is the whole bug, and it needs a streaming reply to
+   * reproduce, which is exactly the case the founder said to test.
+   *
+   * Deferred, never cancelled: the follow stays armed, so the next delta after the release catches
+   * the thread up. A reader who is selecting is reading, and content arriving during those two
+   * seconds is content they did not ask to be scrolled past.
+   */
+  const selectingRef = useRef(false);
+  useEffect(() => {
+    // Primary button only — a right-click opens a context menu over a selection rather than starting
+    // one.
+    //
+    // BOTH ends on the DOCUMENT, and symmetrically so. The release must be, because a drag that
+    // overshoots the thread (which is how you select through to the end of an answer) lets go
+    // somewhere else entirely — container-bound, this flag would latch on and the thread would stop
+    // following for the rest of the session. The PRESS must be for the mirror reason: a selection
+    // that starts in the compose box and comes up into the transcript is still a selection the
+    // auto-follow would scroll out from under. The cost of listening this widely is that an ordinary
+    // click anywhere defers the follow for the few milliseconds until its own mouseup, which is not
+    // observable.
+    const down = (e: MouseEvent) => {
+      if (e.button === 0) selectingRef.current = true;
+    };
+    // CATCH UP ON RELEASE, rather than leaving the deferral to be resolved by the next delta.
+    //
+    // The guard above only early-returns; nothing re-runs the follow effect on `mouseup`, so a
+    // deferred follow waited on a `contentKey` change that may never come. If the LAST delta of a
+    // reply lands during the hold, the answer stays below the fold until some future message
+    // arrives — and `followRef` still reads `true`, so nothing looks wrong. Widening the press to
+    // the document made that reachable from gestures aimed at other surfaces entirely (dragging a
+    // column pull tab, a scrollbar, a selection in the terminal), which is what turned it from a
+    // trade-off the reader was making deliberately into one made on their behalf.
+    //
+    // Idempotent by construction: while the follow is armed the thread is already at the bottom, so
+    // this is a no-op except in exactly the case it is for — content that arrived during the hold.
+    const up = () => {
+      if (!selectingRef.current) return;
+      selectingRef.current = false;
+      const el = scrollRef.current;
+      if (!el || !followRef.current) return;
+      el.scrollTop = el.scrollHeight;
+      // Record the scroll WE caused, for the same reason the effect below does: otherwise the
+      // browser's async scroll event can read as the reader moving and silently cost them the follow.
+      lastTopRef.current = el.scrollTop;
+    };
+    document.addEventListener("mousedown", down);
+    document.addEventListener("mouseup", up);
+    return () => {
+      document.removeEventListener("mousedown", down);
+      document.removeEventListener("mouseup", up);
+    };
+  }, []);
 
   // Auto-follow, but only when the reader is actually at the bottom (bead sparkle-y4ft). This used to
   // be an unconditional `scrollTop = scrollHeight` keyed on [messages, typing], which produced the
@@ -276,6 +295,8 @@ export function ConciergeThread({
     // follows again; and a single tall NudgeCard (badge + text + three buttons) can exceed the
     // slack, so following silently stops the first time one arrives.
     if (!followRef.current) return;
+    // Guard 3 — see `selectingRef`. Never scroll out from under a live drag.
+    if (selectingRef.current) return;
     el.scrollTop = el.scrollHeight;
     // Record the scroll WE caused, before the browser dispatches its (async) scroll event. Without
     // this, `lastTopRef` still holds the previous bottom, so a reader gesture that happens to land
@@ -344,236 +365,26 @@ export function ConciergeThread({
           gap: 12,
         }}
       >
-        {messages.map((m) => {
-          if (m.kind === "nudge")
-            return (
-              <NudgeCard
-                key={m.id}
-                nudge={m}
-                onNudgeClick={onNudgeClick}
-                onNudgeAction={onNudgeAction}
-              />
-            );
-          if (m.kind === "recap")
-            return <RecapCard key={m.id} recap={m} onRevealAgent={onRevealAgent} />;
-          if (m.kind === "you")
-            return (
-              <div
-                key={m.id}
-                style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}
-              >
-                <div
-                  data-testid="you-bubble"
-                  data-wired={wired ? "yes" : "no"}
-                  style={{
-                    display: "inline-block",
-                    textAlign: "left",
-                    fontSize: 13,
-                    // WIRED: a wash of the terminal's OWN ink over the flood, not `--k-bubble`.
-                    //
-                    // The mock writes this as `rgba(255,255,255,.08)`, which is a dark-mode idiom —
-                    // on light's terminal plane (#d9e3f3) a white wash is very nearly invisible, so
-                    // copying the literal would give the bubble a fill in one theme and none in the
-                    // other. A wash of `termInk` is the themed equivalent: it moves AWAY from the
-                    // plane in both directions, so the bubble reads as a bubble at both ends, and it
-                    // stays inside the terminal's own register rather than reaching back into the
-                    // shell's for a colour the flood just replaced.
-                    background: wired
-                      ? `color-mix(in srgb, currentColor 10%, transparent)`
-                      : CHAT_USER_BUBBLE,
-                    // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it
-                    // says the same thing twice and, at a 25% wash of `muted`, said it faintly. The
-                    // founder called this out directly: the bubble should read as one solid object,
-                    // not a tinted box inside a hairline.
-                    //
-                    // The tail corner is what identifies it as YOURS (14/14/4/14 — square-ish into
-                    // the bottom-right, where the column's own edge is), which is the same
-                    // shape-not-hue reasoning the status dots and the palette badges use.
-                    // 4px corners with a HARD tail (0), per the spec's `--r-bubble: 4px`. This was 14/14/4/14 — a
-                    // pill. The direction draws boxes rather than filling lozenges, so the bubble is a
-                    // tight rectangle whose square bottom-right corner points at the column edge.
-                    borderRadius: "4px 4px 0 4px",
-                    padding: "9px 12px",
-                  }}
-                >
-                  {/* ABOVE the words, the way every chat client shows what was sent with them. The
-                      text still carries the compact count ("look · 1 image"), which is what a
-                      restored bubble falls back to once its base64 has been stripped. */}
-                  <AttachmentStrip attachments={m.attachments ?? []} />
-                  <MentionedText text={m.text} mentions={m.mentions} />
-                </div>
-                {m.receipt && (
-                  <RoutingReceipt
-                    receipt={m.receipt}
-                    onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
-                  />
-                )}
-              </div>
-            );
-          if (m.kind === "digest") {
-            // The digest LINE, not a card. Deliberately quiet chrome — a coloured edge and a count,
-            // the width of a sentence — because the whole point is that N items stop occupying N
-            // cards' worth of the column (bead sparkle-4562.4). The click hands off to column two.
-            //
-            // Paint and label BOTH come from the shared band helpers, the same source NudgeCard reads,
-            // so a digest line and the cards it stands in for can never speak two vocabularies. It is
-            // `bandColor(m.band)` rather than NudgeCard's `nudgeAccent()` because a digest is not
-            // necessarily a nudge: the grouping is keyed by band, and a future surfaced band would
-            // otherwise be painted in the nudge's sienna regardless of what it means.
-            //
-            // THE TWO VARIANTS GET TWO TEST IDS, deliberately. A "rows" line's number is a promise
-            // that its click leaves exactly that many rows standing in column two, and the guards for
-            // that invariant read the DOM by this id (ConciergeHost.digestFilter.test.tsx). A
-            // "rowless" line stands for agents that have no row at all, so folding it under the same
-            // id would hand those guards a number they would then check against rows — and the
-            // honest answer would look like a regression. Same chrome, same band vocabulary,
-            // different promise.
-            const tint = bandColor(m.band);
-            return (
-              <button
-                key={m.id}
-                type="button"
-                data-testid={m.variant === "rowless" ? "concierge-rowless-digest" : "concierge-digest"}
-                data-band={m.band}
-                onClick={() => onDigestClick?.(m)}
-                style={{
-                  alignSelf: "stretch",
-                  textAlign: "left",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  fontSize: 12,
-                  fontFamily: "inherit",
-                  color: C.cream,
-                  background: `color-mix(in srgb, ${tint} 8%, transparent)`,
-                  border: `1px solid color-mix(in srgb, ${tint} 30%, transparent)`,
-                  borderLeft: `3px solid ${tint}`,
-                  borderRadius: 6,
-                  padding: "7px 10px",
-                  cursor: "pointer",
-                }}
-              >
-                {m.text}
-              </button>
-            );
-          }
-          if (m.kind === "batch")
-            return (
-              <div
-                key={m.id}
-                style={{
-                  alignSelf: "stretch",
-                  fontSize: 12,
-                  color: C.conciergeMuted,
-                  textAlign: "center",
-                  padding: "6px 0",
-                  borderTop: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
-                  borderBottom: `1px dashed color-mix(in srgb, ${C.muted} 30%, transparent)`,
-                }}
-              >
-                {m.text}
-              </div>
-            );
-          // A TURN THAT FAILED, with the concierge's own words attached (engine/conciergeFailureNotice).
-          //
-          // The evidence is rendered as PLAIN TEXT, never through <Markdown>. It is a verbatim
-          // machine string — a stderr dump full of `_` and `*` is not a formatting instruction, and
-          // running it through a renderer would silently eat the characters that make it readable.
-          // That is the whole contract: whatever the concierge said, the user sees.
-          if (m.kind === "failure")
-            return (
-              <div
-                key={m.id}
-                data-testid={FAILURE_BUBBLE_TESTID}
-                style={{ maxWidth: "92%", alignSelf: "flex-start" }}
-              >
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
-                  <FiAlertCircle
-                    size={12}
-                    aria-hidden
-                    style={{ flexShrink: 0, marginTop: 4, color: C.sienna }}
-                  />
-                  <div style={{ minWidth: 0 }}>
-                    <div>{m.headline}</div>
-                    {m.evidence && (
-                      <p
-                        data-testid={FAILURE_EVIDENCE_TESTID}
-                        style={{
-                          margin: "4px 0 0",
-                          color: C.conciergeMuted,
-                          fontSize: 12,
-                          whiteSpace: "pre-wrap",
-                          overflowWrap: "anywhere",
-                        }}
-                      >
-                        {m.evidence}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          // kind === "sparkle" — no bubble, RENDERED MARKDOWN.
-          //
-          // The brain's persona tells it to answer in GitHub-flavored markdown, and this used to
-          // print the raw string — so every reply arrived as a wall of "**bold**" and "- " bullets
-          // run together on one line. Reuses the app's shared renderer (components/Markdown), which
-          // already owns the GFM styling and the link/image scheme allow-lists, rather than growing
-          // a second one here.
-          //
-          // A PUSH IS NOT A REPLY, and it has to look like it isn't (services/conciergeProactive,
-          // PRD §2a). Two things a plain sparkle bubble cannot say:
-          //
-          //   • WHO STARTED THIS. Every other left-aligned line in the thread answers something the
-          //     user said. A push doesn't, and a paragraph that appears with no question above it
-          //     reads as the app having lost track of the conversation unless it is labelled.
-          //   • WHETHER IT IS STILL TRUE. A thread entry is append-only, so "3 need you" keeps
-          //     asserting a resolved count forever. `markStaleProactive` decides that from the digest
-          //     the push was authored against; this is where the decision becomes visible. Dimmed and
-          //     relabelled rather than struck through or removed: the founder may well be reading it
-          //     as it goes stale, and a line that vanishes mid-read is its own bug.
-          if (m.proactive)
-            return (
-              <div
-                key={m.id}
-                data-testid="concierge-push"
-                data-stale={m.stale ? "true" : "false"}
-                style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1 }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 5,
-                    fontSize: 12,
-                    color: C.conciergeMuted,
-                    marginBottom: 3,
-                  }}
-                >
-                  <FiBell size={11} aria-hidden />
-                  <span>{m.stale ? "Sparkle noticed — no longer current" : "Sparkle noticed"}</span>
-                </div>
-                <Markdown text={m.text} />
-                {collapsedPayload(m)}
-                {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same
-                    copy affordance. Copying its markdown source, like the branch below. */}
-                <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
-              </div>
-            );
-          return (
-            <div key={m.id} style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
-              <Markdown text={m.text} />
-              {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
-                  transcript used to echo inline and push the conversation off screen. */}
-              {collapsedPayload(m)}
-              {/* ANSWERS ONLY. Not the user's own bubbles (they wrote it), and not the nudge, recap,
-                  digest or batch cards above — those are chrome the app generated about state, not
-                  prose anyone wants in a doc. Copies `m.text`, the markdown SOURCE, so a table stays
-                  a table on paste (see CopyAnswerButton). */}
-              <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
-            </div>
-          );
-        })}
+        {messages.map((m) => (
+          // KEYED BY MESSAGE ID, and memoised (./ConciergeMessageRow). Every prop below either is
+          // the message itself — stable identity for anything that is not the bubble currently
+          // being streamed into — or a callback stabilised above, so a settled entry re-renders
+          // exactly never. That inertness is the point: see the row's header for why a transcript
+          // that re-diffs itself on every token makes a click-drag selection stutter.
+          <ConciergeMessageRow
+            key={m.id}
+            message={m}
+            wired={wired}
+            shownAsText={shownAsText.has(m.id)}
+            onOpenPayload={openPayloadFor}
+            onNudgeClick={nudgeClick}
+            onNudgeAction={nudgeAction}
+            onRevealAgent={revealAgent}
+            onRedirect={redirect}
+            onDigestClick={digestClick}
+            onAnswerCopied={onAnswerCopied}
+          />
+        ))}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app
             observed — see ThinkingIndicator. It falls back to exactly the bare "…" this used to be. */}
         <ThinkingIndicator typing={typing} />
