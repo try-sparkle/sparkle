@@ -380,6 +380,30 @@ export async function setAllowVirtualInput(allow: boolean): Promise<void> {
     } catch (e) {
       console.warn("audioInputs: set_allow_virtual_input(false) failed", e);
     }
+    // AND RELEASE A LOOPBACK THAT IS STILL PINNED. Revoking only flipped the permission, so
+    // `chosenUid` went on naming the loopback: a choice that cannot take effect (the backend refuses
+    // to bind it, and its row is not rendered while the opt-in is off) yet stays ARMED — re-ticking
+    // the box binds system audio again instantly, with no second pick and no fresh look at which
+    // device. Re-arming a capture the user never re-affirmed is the fail-open direction on the one
+    // control protecting the "we listen to your microphone" promise.
+    //
+    // This does NOT replace {@link SYSTEM_AUDIO_OFF_STILL_SELECTED} (roborev 56208), which reports
+    // the state honestly wherever it exists — a pin persisted by an older build, or one the backend
+    // holds and a refresh has not yet contradicted. That says so; this stops a revoke from creating
+    // one. The revoke goes to Rust FIRST, so the permission is shut whether or not this succeeds.
+    const after = useAudioInputStore.getState();
+    // "Is the pinned device a loopback?" is asked of the device LIST first and of the live BIND
+    // second, because the list is best-effort: `listAudioInputs` returns [] when the backend is
+    // unavailable, and Rust degrades a join failure to an empty vec — while this checkbox stays
+    // clickable throughout. Keying only on the list would skip the release in exactly the state it
+    // matters (a HAL enumeration stall with a loopback pinned AND bound), leaving the armed pin
+    // this exists to prevent. `inputStatus` already falls back this way for row 2; the release must
+    // not disagree with what the pane is telling the user (roborev 56366).
+    const chosen = after.devices.find((d) => d.uid === after.chosenUid);
+    const boundIsThePin =
+      after.bound !== null && after.bound.uid === after.chosenUid && after.bound.isVirtual;
+    const pinnedIsVirtual = chosen ? chosen.isVirtual : boundIsThePin;
+    if (after.chosenUid !== null && pinnedIsVirtual) await setAudioInput(null);
     return;
   }
 

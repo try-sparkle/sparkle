@@ -116,6 +116,19 @@ describe("SettingsDialog", () => {
     expect(heading("AI features")).toBeNull();
   });
 
+  it("the Voice controls pane LEADS with the microphone-input picker", () => {
+    // The other end of the move that took the picker out of the mic hover menu (roborev 56208).
+    // MicButton.test.tsx proves it is no longer mounted THERE; without this, both halves are
+    // satisfied by the picker being mounted nowhere at all — it renders beautifully in its own test
+    // file either way, because that file mounts it directly.
+    render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} initialCategory="voice" />);
+    const picker = screen.getByRole("group", { name: "Microphone input device" });
+    // LEADS is the load-bearing word: "which microphone am I on, and can it hear my calls" is the
+    // question people open this pane with, so it precedes the wake/stop-word controls.
+    const onSubmit = screen.getByRole("group", { name: "On submit" });
+    expect(picker.compareDocumentPosition(onSubmit) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("marks the selected rail item with aria-current", () => {
     render(<SettingsDialog onClose={vi.fn()} onManageAccounts={vi.fn()} />);
     expect(screen.getByRole("button", { name: "AI features" }).getAttribute("aria-current")).toBe(

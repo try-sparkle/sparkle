@@ -150,6 +150,82 @@ describe("setAllowVirtualInput — the advanced opt-in reaches the backend", () 
     expect(useAudioInputStore.getState().allowVirtual).toBe(false);
   });
 
+  it("a revoke also RELEASES a loopback that was still pinned", async () => {
+    // Revoking flipped the permission and left the device pinned, which leaves the choice ARMED:
+    // re-ticking the box re-binds system audio instantly, with no second pick and no fresh look at
+    // which device. `SYSTEM_AUDIO_OFF_STILL_SELECTED` (roborev 56208) reports that state honestly;
+    // this stops a revoke from creating it in the first place.
+    //
+    // Asserted at the COMMAND, not at the store: a local `setChosenUid(null)` would satisfy a
+    // store-only assertion while the backend went on holding the loopback as the pinned device.
+    useAudioInputStore.setState({
+      allowVirtual: true,
+      chosenUid: "hal-loopback",
+      devices: [BUILTIN, LOOPBACK],
+    });
+    await setAllowVirtualInput(false);
+    expect(callsTo("set_audio_input")).toEqual([[{ uid: null }]]);
+    expect(useAudioInputStore.getState().chosenUid).toBeNull();
+  });
+
+  it("releases it from the live BIND when the device list is empty or stale", async () => {
+    // The list is best-effort — `listAudioInputs` returns [] when the backend is unavailable, and
+    // Rust degrades a join failure to an empty vec — while this checkbox stays clickable. Keying
+    // the release only on the list skipped it in exactly the state that matters: a HAL enumeration
+    // stall with the loopback pinned AND on the wire, which is the armed pin this exists to
+    // prevent (roborev 56366). No device row, no list entry — the bind is the only witness.
+    useAudioInputStore.setState({
+      allowVirtual: true,
+      chosenUid: "hal-loopback",
+      devices: [],
+      bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: false },
+    });
+    // Control first: a bind that is NOT virtual must not trigger a release, or the fallback is just
+    // "release whatever is pinned whenever the list is empty".
+    await setAllowVirtualInput(false);
+    expect(callsTo("set_audio_input")).toEqual([]);
+
+    // Second control: a virtual bind on a DIFFERENT device says nothing about the pin. Capture can
+    // sit on a loopback while a microphone is pinned (the pinned bind failed, or has not happened
+    // yet), and releasing then would throw away that microphone and hand capture to automatic —
+    // which is free to pick the loopback it is already on. The bind only stands in for the pin when
+    // it IS the pin.
+    invoke.mockClear();
+    useAudioInputStore.setState({
+      allowVirtual: true,
+      chosenUid: "usb-yeti",
+      devices: [],
+      bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true },
+    });
+    await setAllowVirtualInput(false);
+    expect(callsTo("set_audio_input")).toEqual([]);
+    expect(useAudioInputStore.getState().chosenUid).toBe("usb-yeti");
+
+    invoke.mockClear();
+    useAudioInputStore.setState({
+      allowVirtual: true,
+      chosenUid: "hal-loopback",
+      devices: [],
+      bound: { name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true },
+    });
+    await setAllowVirtualInput(false);
+    expect(callsTo("set_audio_input")).toEqual([[{ uid: null }]]);
+    expect(useAudioInputStore.getState().chosenUid).toBeNull();
+  });
+
+  it("a revoke leaves a pinned MICROPHONE alone", async () => {
+    // The half that makes the release specific rather than "any revoke clears your choice", which
+    // would silently throw away a Yeti the user pinned weeks ago.
+    useAudioInputStore.setState({
+      allowVirtual: true,
+      chosenUid: "builtin-mic",
+      devices: [BUILTIN, LOOPBACK],
+    });
+    await setAllowVirtualInput(false);
+    expect(callsTo("set_audio_input")).toEqual([]);
+    expect(useAudioInputStore.getState().chosenUid).toBe("builtin-mic");
+  });
+
   it("a CONFIRMED grant opens the gate", async () => {
     await setAllowVirtualInput(true);
     expect(useAudioInputStore.getState().allowVirtual).toBe(true);
