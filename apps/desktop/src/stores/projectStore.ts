@@ -272,7 +272,6 @@ export interface ProjectState {
   reorderProject: (projectId: string, beforeProjectId: string | null) => void;
   /** Release a manual name freeze so the agent auto-names again. (Formerly also cleared a row
    *  anchor; row anchoring no longer exists — see reorderAgent.) */
-  unpinAgent: (projectId: string, agentId: string) => void;
   /** Advance every agent's alert-episode record for the current (pre-dismissal) status map
    *  (engine/alertDismissal.ts). Called from the sidebar whenever the overlaid status map changes;
    *  writes ONLY when some record actually changed — which is only on a red-tier transition, not on
@@ -1813,15 +1812,6 @@ export const useProjectStore = create<ProjectState>()(
           if (before.every((p, i) => p.id === after[i]?.id)) return {};
           return { projects: next };
         }),
-
-      unpinAgent: (projectId, agentId) =>
-        set((s) => ({
-          projects: mapProject(s.projects, projectId, (p) =>
-            // Release the NAME freeze only — auto-naming resumes. There is no row anchor to clear
-            // any more; row order is the array order (see reorderAgent).
-            mapAgent(p, agentId, (a) => ({ ...a, namePinned: false })),
-          ),
-        })),
 
       advanceAlerts: (projectId, statusMap) => {
         // Compute FIRST and bail without set() when nothing changed. Called on every overlaid-status

@@ -170,20 +170,40 @@ const TERM_PLANE = "forest" as const;
     }
   });
 
-  // The seam between the assistant and builder columns is the app's most prominent boundary, and in
-  // this design it is the ONLY thing separating them — the fills are within 1.09 of each other. A
-  // previous pass deleted this rule on the theory that the plane step carried it. It does not.
-  it("the assistant↔builder seam is a drawn rule, because the fills do not separate them", () => {
+  // ── THE ASSISTANT↔BUILDER SEAM IS NO LONGER A DRAWN RULE. FOUNDER CALL, 2026-07-31. ─────────
+  // This case used to assert the opposite — that the fills do NOT separate the two columns and a
+  // visible `hairline` therefore must. That was true and load-bearing for a long time (a previous
+  // pass deleted the rule on the theory that the plane step carried it; it did not). The founder
+  // then asked, three times, for the vertical line at this boundary to go, and on the third asked
+  // for it removed outright rather than only while mounted.
+  //
+  // WHY THIS CASE HAD TO BE REWRITTEN RATHER THAN LEFT GREEN: it only ever compared TOKENS, never
+  // asserted that anything painted, so deleting the rule from both sides of the seam left it
+  // passing while describing a mechanism the app no longer has. A guard that cannot notice the
+  // change it is named for reads to the next contributor as the live invariant.
+  //
+  // BE HONEST ABOUT WHAT REPLACED IT. The unwired column measures 1.107:1 against `deepForest` —
+  // still under `EDGE_MIN_CONTRAST`, so "separation by fill" is NOT what carries this boundary
+  // now, whatever the CSS comment says. What carries it is `lift`, the elevation shadow. The fill
+  // step only has to be big enough that the column does not read as the SAME plane, which is the
+  // direction's own claim about these two columns; the shadow does the separating.
+  it("the assistant↔builder boundary is carried by elevation, not by a rule or a fill step", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
+      // Unchanged and still true: these two columns are near-identical planes by design.
       expect(
         contrast(hex.conciergeSurface, hex.deepForest),
         `${mode}: the columns are separated by FILL — that is the superseded design`,
       ).toBeLessThan(1.2);
+      // The lifted (unwired) plane does not close that gap either. Pinned so nobody "fixes" the
+      // boundary by quietly pushing `assistLift` up until it separates on its own — the founder
+      // asked for a lighter column, not a re-drawn seam.
       expect(
-        contrast(hex.hairline, hex.conciergeSurface),
-        `${mode}: the seam cannot be seen on the assistant column`,
-      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
+        contrast(hex.conciergeSurfaceLifted, hex.deepForest),
+        `${mode}: assistLift has grown into a fill-step boundary`,
+      ).toBeLessThan(1.2);
+      // …and the elevation that actually carries it is present in both themes.
+      expect(BLUEPRINT[mode].lift, `${mode}: no lift to carry the boundary`).toMatch(/rgba?\(/);
     }
   });
 
@@ -266,14 +286,26 @@ describe("the concierge column's themed INKS clear AA where they are read", () =
   // test that fails for something you are not fixing gets weakened, and then it guards nothing.
   const INKS = ["conciergeMuted", "dangerInk", "goldInk", "goldHotInk"] as const;
 
-  it("every concierge ink on the concierge column, both themes", () => {
+  // BOTH concierge planes, because there are two now. `conciergeSurface` is the token these inks
+  // were specified against; `conciergeSurfaceLifted` is what the column ACTUALLY paints while
+  // unwired, and in dark it is the lighter of the two.
+  //
+  // LIGHTENING A DARK PLANE REDUCES CONTRAST for the light ink on it — dark `conciergeMuted` goes
+  // 6.71 → 6.48, `faint` 4.07 → 3.93 — so the lifted plane is the STRICTER of the two in the only
+  // theme where they differ, and a sweep that measured only `conciergeSurface` would license an ink
+  // (or an `assistLift`) edit that passes here and fails on the surface actually rendered.
+  const CONCIERGE_PLANES = ["conciergeSurface", "conciergeSurfaceLifted"] as const;
+
+  it("every concierge ink on both concierge planes, both themes", () => {
     for (const mode of MODES) {
       const hex = THEME_HEX[mode];
-      for (const ink of INKS) {
-        expect(
-          contrast(hex[ink], hex.conciergeSurface),
-          `${mode}: ${ink} (${hex[ink]}) on conciergeSurface (${hex.conciergeSurface})`,
-        ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+      for (const plane of CONCIERGE_PLANES) {
+        for (const ink of INKS) {
+          expect(
+            contrast(hex[ink], hex[plane]),
+            `${mode}: ${ink} (${hex[ink]}) on ${plane} (${hex[plane]})`,
+          ).toBeGreaterThanOrEqual(INK_MIN_CONTRAST);
+        }
       }
     }
   });

@@ -309,19 +309,23 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
 
     it("still lets it do the routine UI things without nagging", () => {
       // A concierge that must ask before it can put you where the work is would be switched off.
-      for (const op of ["navigate", "set_theme", "set_zoom", "unpin_agent", "set_agent_model"]) {
+      for (const op of ["navigate", "set_theme", "set_zoom", "set_agent_model"]) {
         expect(appOpPolicy(op), op).toEqual({ tier: "allow" });
       }
       expect(appOpPolicy("get_state")).toEqual({ tier: "allow" });
     });
 
     it("has no row for a RETIRED op", () => {
-      // `pin_agent` and `set_agent_ordering` refuse unconditionally and are not registered in the
-      // MCP server. Classifying them would put dead rows in the settings pane for tools that can
-      // never run (roborev 54255, finding 4). They are exempt from the gate in controlListener, so
-      // they keep returning their own "was removed" explanation.
+      // `pin_agent`, `set_agent_ordering` and `unpin_agent` refuse unconditionally and none is
+      // registered in the MCP server. Classifying them would put dead rows in the settings pane for
+      // tools that can never run (roborev 54255, finding 4). They are exempt from the gate in
+      // controlListener, so they keep returning their own "was removed" explanation.
       expect(appOpPolicy("pin_agent").tier).toBe("deny");
       expect(appOpPolicy("set_agent_ordering").tier).toBe("deny");
+      // Joined them 2026-07-31 with the removal of agent pinning. It was briefly left classified
+      // `routine` with a summary that described its own removal — a togglable Settings row for a
+      // tool that can only decline, which is the exact thing this case exists to prevent.
+      expect(appOpPolicy("unpin_agent").tier).toBe("deny");
     });
 
     it("lets the human deny a control op outright", () => {

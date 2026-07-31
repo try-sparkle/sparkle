@@ -220,7 +220,14 @@ export function ConciergeColumn({
         // what says "this column is now one end of that cable". The two are alternatives: a
         // shadow AND a colour change would read as two unrelated effects rather than as one
         // control being plugged in.
-        background: isWired ? BLUEPRINT[mode].term : C.conciergeSurface,
+        // UNWIRED takes `conciergeSurfaceLifted`, not `conciergeSurface`. The comment above says
+        // "no colour change" and that was the design's own wording — but it was written for LIGHT,
+        // where the column is #ffffff and a shadow is the only move available. In DARK the column
+        // sat on exactly the ground colour, so the lift shadow had nothing to lift OFF and the
+        // unplugged concierge read as one more dark column beside the build columns. The lifted
+        // token is +16.3% L* in dark and IDENTICAL to `conciergeSurface` in light, so light is
+        // untouched and the "shadow, not colour" reading still holds wherever it was ever true.
+        background: isWired ? BLUEPRINT[mode].term : C.conciergeSurfaceLifted,
         boxShadow: isWired ? "none" : BLUEPRINT[mode].lift,
         // Above the pairs while it is lifted, so the shadow falls ON them rather than under them —
         // but BELOW the pull tab's rail. See CONCIERGE_LIFT_Z.
@@ -243,7 +250,46 @@ export function ConciergeColumn({
         //
         // `hairline` is the token whose whole job is a 1px rule that must be SEEN, and it is held
         // to the chrome floor on every plane in both themes.
-        borderRight: `1px solid ${C.hairline}`,
+        //
+        // ── …EXCEPT IT DOESN'T ANY MORE. THE RULE IS GONE IN EVERY STATE. FOUNDER CALL. ──────
+        // EVERYTHING ABOVE IS THE ARGUMENT FOR A RULE THIS BOUNDARY NO LONGER GETS. It is kept
+        // because the reasoning is sound and worth reading — "nothing crosses this seam, so a line
+        // costs nothing" was true when the concierge was a closed surface on the same plane as the
+        // ground. It is superseded, not wrong.
+        //
+        // THIS BORDER WAS THE VERTICAL LINE THE FOUNDER REPORTED THREE TIMES. It was written
+        // unconditionally, so it painted in every state. Several rounds of seam work moved the
+        // SIDEBAR's border (index.css, `[data-wired]`) and reported the seam fixed; none of them
+        // touched this one, because it lives in a different file and reads as the concierge's own
+        // edge rather than as half of a shared boundary. That is precisely why it survived every
+        // previous fix — the line on screen was never the border being moved.
+        //
+        // Removed OUTRIGHT rather than suppressed while wired: the third instruction was to take
+        // the concierge-side rule off the build columns "in both light and dark mode", mounted or
+        // not. index.css does the same to the sidebar's facing edge; the two together are the
+        // whole boundary.
+        //
+        // MEASURED, not eyeballed — and the measurement does NOT say "separation by fill".
+        //
+        // MOUNTED: the flooded column is `term` and the build column is `bridge`, 1.083:1 apart in
+        // dark. Already continuous, so this 1px rule WAS the entire visible line, and continuity is
+        // the point — the columns are meant to read as one circuit.
+        //
+        // UNMOUNTED: the column carries its own plane (`conciergeSurfaceLifted`, +16.3% L* in dark)
+        // AND the `lift` shadow. It is the SHADOW that separates it. The fill step alone measures
+        // 1.107:1 against `deepForest` — UNDER `EDGE_MIN_CONTRAST` (1.2) — so do not read the
+        // lighter plane as having taken over the boundary, and do NOT drop `boxShadow` below on
+        // that theory: it is the only thing left holding this edge apart.
+        //
+        // Said explicitly because the opposite claim was written here first. `chromeContrast.test.ts`
+        // pins both halves (the fill step stays under the floor; the lift exists in both themes),
+        // and its own header records that every previous version of this mistake shipped under a
+        // comment asserting the separation held.
+        //
+        // `transparent` rather than dropping the declaration: `box-sizing: border-box` is global
+        // and this column has an explicit `width`, so the border sits INSIDE that box. Removing it
+        // would widen the content box by 1px and shift the thread. Keep the 1px, paint nothing.
+        borderRight: "1px solid transparent",
         // The flood takes the TERMINAL's ink register with its plane — the two are a pair in the
         // spec (`--k-term` / `--k-term-ink`) and separating them would put shell ink on a terminal
         // surface. Set on the section so everything that inherits follows it in one place.

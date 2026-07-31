@@ -474,20 +474,40 @@ describe("Build column — the terminal seam is drawn on the pane side, not alwa
   // literally unobservable through the DOM, and a render-based assertion here would pass against
   // the broken code (it did — that draft was thrown away). Reading the declaration is the only
   // instrument that can fail for the stated reason.
-  it("declares no border inline, or the wired rule in index.css cannot erase the concierge edge", () => {
+  // ── WHAT THIS GUARDS CHANGED: THERE IS NO "WIRED ERASES IT" MECHANISM ANY MORE. ────────────
+  // This used to assert that two `.shell[data-wired=…]` rules set `border-*-color: transparent`,
+  // i.e. that the concierge-side rule was hidden WHILE MOUTNED. The founder asked (third time) for
+  // that rule to be gone in every state, mounted or not, so those overrides were deleted — an
+  // override of a value that is already transparent is dead CSS that reads as if it carried the
+  // feature. The invariant now is simpler and stronger: the concierge-facing edge is declared
+  // transparent unconditionally.
+  //
+  // STILL `transparent`, NOT `none`, and still 1px. `box-sizing: border-box` is global and this
+  // column has an explicit width, so the border sits inside that box; dropping the declaration
+  // would widen the content box by 1px, shift the terminal and re-break the active row's bleed.
+  it("declares the concierge-facing edge transparent in CSS, and no border inline", () => {
     const css = readFileSync(resolveFromRoot("src/index.css"), "utf8");
-    const wiredRules = [
-      ...css.matchAll(
-        /\.shell\[data-wired="(?:left|right)"\][^{]*agent-sidebar-column"\]\s*\{([^}]*)\}/g,
-      ),
-    ].map(([, body]) => body);
-    // Both pairs, or the assertion below guards a mechanism that isn't there.
-    expect(wiredRules).toHaveLength(2);
-    const erased = wiredRules.join(" ");
-    expect(erased).toContain("border-right-color: transparent");
-    expect(erased).toContain("border-left-color: transparent");
+    const sideRules = Object.fromEntries(
+      [
+        ...css.matchAll(
+          /\.pair\[data-side="(left|right)"\][^{]*agent-sidebar-column"\]\s*\{([^}]*)\}/g,
+        ),
+      ].map(([, side, body]) => [side, body]),
+    );
+    // Both pairs, or the assertions below guard a mechanism that isn't there.
+    expect(Object.keys(sideRules).sort()).toEqual(["left", "right"]);
+    // A left pair's build column faces the concierge with its RIGHT edge; a right pair's with its
+    // LEFT. Asserted per side rather than on the joined text, so a rule that transparently painted
+    // the wrong edge — the exact mirroring bug this file exists for — still fails.
+    expect(sideRules.left).toMatch(/border-right:\s*1px solid transparent/);
+    expect(sideRules.right).toMatch(/border-left:\s*1px solid transparent/);
+
+    // And nothing survives that would re-introduce the rule on the mounted side.
+    expect(css).not.toMatch(/border-right-color:\s*transparent/);
+    expect(css).not.toMatch(/border-left-color:\s*transparent/);
 
     // The column's own JSX, from its testid down to the seam element that closes the style object.
+    // An inline border here would beat the stylesheet and put the line straight back.
     const src = readFileSync(resolveFromRoot("src/components/AgentSidebar.tsx"), "utf8");
     const from = src.indexOf('data-testid="agent-sidebar-column"');
     const to = src.indexOf('data-testid="sidebar-terminal-seam"');

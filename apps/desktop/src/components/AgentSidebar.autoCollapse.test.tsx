@@ -103,8 +103,17 @@ const queryRow = (name: string) => screen.queryByText(name);
 const collapsed = (id: string) => useUiStore.getState().collapsedOrchestrators[id];
 const rowFor = (name: string) =>
   screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
-/** The user's own fold gesture. The chevron button is gone — a head row's own left click toggles its
- *  subtree (and selects it), so this is what "expanded it by hand" means now. */
+/** The user's own fold gesture: ONE left click on the row.
+ *
+ *  THE FIXTURES BELOW PRE-SELECT THE HEAD (`selectedAgentId`), and that is load-bearing now rather
+ *  than incidental. Selection is click-only and the fold is its SECOND stage — a click on the row
+ *  you are ALREADY on. These suites are about what folding DOES, so the precondition "the user has
+ *  already selected this agent" belongs in the fixture; without it the first click here would only
+ *  select and every fold assertion would be testing the wrong gesture.
+ *
+ *  It has to be the fixture and not two clicks: the component reads selection from its `project`
+ *  PROP, which these tests pass as a static object, so a click that updates the store never reaches
+ *  the row. Pre-selecting is the only way to express the precondition here. */
 const toggleByHand = (name: string) => fireEvent.click(rowFor(name));
 /** Move the selection, the way clicking another row does, and re-render with the new project. */
 function selectAgent(project: Project, id: string | null, rerender: (ui: React.ReactElement) => void) {
@@ -247,7 +256,10 @@ describe("AgentSidebar — the subtree you are reading never closes under you", 
 
 describe("AgentSidebar — the user's own chevron outranks the automation", () => {
   it("never auto-closes a subtree the user opened by hand", () => {
-    const project = seed();
+    // `seed("a1")`, not `seed()` — folding is the SECOND click on an already-selected row, so the
+    // gesture under test only exists once Alpha is selected. The default stays null because a
+    // selected head SUPPRESSES auto-collapse, which is what the rest of this file measures.
+    const project = seed("a1");
     const { rerender } = render(<AgentSidebar project={project} />);
 
     toggleByHand("Alpha"); // deliberate open, with nothing red
@@ -266,7 +278,7 @@ describe("AgentSidebar — the user's own chevron outranks the automation", () =
   // Expansion is a rising edge, so a subtree collapsed by hand while its worker is STILL red stays
   // collapsed. Auto-collapse must not quietly re-arm that: the head is no longer marked.
   it("does not re-open a subtree the user collapsed while the worker is still red", () => {
-    const project = seed();
+    const project = seed("a1");
     render(<AgentSidebar project={project} />);
 
     setStatus({ ...ALL_WORKING, w1: "waiting" });
@@ -283,7 +295,7 @@ describe("AgentSidebar — the user's own chevron outranks the automation", () =
 
   // Once it goes quiet and asks again, that IS new information and gets to open the subtree.
   it("re-opens when the worker goes quiet and then red a second time", () => {
-    const project = seed();
+    const project = seed("a1");
     render(<AgentSidebar project={project} />);
 
     setStatus({ ...ALL_WORKING, w1: "waiting" });

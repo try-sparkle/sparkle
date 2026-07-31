@@ -307,16 +307,72 @@ describe("Build column — left-click selects and folds, right-click opens the c
     expect(open).toHaveBeenCalledWith("a1");
   });
 
-  it("toggles the subtree on a left click", () => {
+  // ── THE GESTURE, IN TWO STAGES. This is the test that documents it. ────────────────────────
+  // It used to read "toggles the subtree on a left click" and every click both selected AND
+  // folded. The founder's rule splits them: a build agent is selected ONLY on click, and clicking
+  // the row you are ALREADY on is what opens its sub-agents. So the first click on an unselected
+  // head commits to the agent and leaves the subtree exactly as it was — you can look at an agent
+  // without restructuring the column — and the second folds it.
+  //
+  // The rerender between the clicks is not ceremony: the component reads selection from its
+  // `project` PROP, and in the running app that prop is re-supplied from the store after a
+  // selection. These tests own the prop, so the rerender IS that step.
+  it("first click SELECTS only; the second click folds the subtree", () => {
     const project = seed();
-    render(<AgentSidebar project={project} />);
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    // `seed()` starts COLLAPSED, so "the subtree did not change" means the workers stay hidden.
     fireEvent.click(rowFor("Alpha"));
+    expect(liveProject().selectedAgentId).toBe("a1");
+    // UNTOUCHED — not merely "still collapsed". `undefined` is the never-written state, so this
+    // also fails if the first click wrote a fold that something else then undid.
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBeUndefined();
+    expect(screen.queryByText("Parser Worker")).toBeNull();
+
+    const onAlpha = { ...project, selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [onAlpha] } as never);
+    rerender(<AgentSidebar project={onAlpha} />);
+
+    fireEvent.click(rowFor("Alpha")); // now on the row we are already on — this one opens it
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
     expect(screen.queryByText("Parser Worker")).toBeTruthy();
 
-    fireEvent.click(rowFor("Alpha"));
+    fireEvent.click(rowFor("Alpha")); // and folds it again
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
     expect(screen.queryByText("Parser Worker")).toBeNull();
+  });
+
+  // ── THE KEYBOARD MUST AGREE WITH THE MOUSE. ────────────────────────────────────────────────
+  // Enter/Space is the keyboard's copy of a left click (the row is focusable precisely so it is
+  // "operable by Enter/Space like the button it replaced"). When the two-stage rule was first
+  // applied it was applied to `onRowClick` ONLY, which left keyboard users with the single-stage
+  // behaviour the founder had just removed — the divergence roborev 53837 is cited for elsewhere
+  // in this same handler.
+  it("Enter selects on the first press and folds only on the second, like a click", () => {
+    const project = seed();
+    const { rerender } = render(<AgentSidebar project={project} />);
+
+    fireEvent.keyDown(rowFor("Alpha"), { key: "Enter" });
+    expect(liveProject().selectedAgentId).toBe("a1");
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBeUndefined();
+
+    const onAlpha = { ...project, selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [onAlpha] } as never);
+    rerender(<AgentSidebar project={onAlpha} />);
+
+    fireEvent.keyDown(rowFor("Alpha"), { key: "Enter" });
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+  });
+
+  // ArrowRight/ArrowLeft keep owning explicit expand/collapse, so a keyboard user is not forced
+  // through two activations to read a subtree. Unchanged by the two-stage rule, asserted here so
+  // the escape hatch cannot quietly disappear with it.
+  it("ArrowRight still opens a closed subtree in one press, without selecting", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    fireEvent.keyDown(rowFor("Alpha"), { key: "ArrowRight" });
+    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    expect(liveProject().selectedAgentId).toBeNull();
   });
 
   it("does NOT open the detail card on a left click", () => {
@@ -508,7 +564,11 @@ describe("Build column — a worker going red opens its parent, once", () => {
   // Holding it open for as long as the worker stays red turns a helpful reveal into a control that
   // won't take no for an answer. The head's disc keeps carrying the signal after the fold.
   it("stays folded once the user closes it again", () => {
-    const project = seed({ a1: "idle", w1: "working", w2: "working" });
+    // Pre-selected: folding is the SECOND-stage click, so the head has to be the selected row for
+    // this gesture to exist at all. What the test measures — that a still-red worker cannot
+    // re-open a subtree the user shut — is unchanged.
+    const project = { ...seed({ a1: "idle", w1: "working", w2: "working" }), selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [project] } as never);
     const { rerender } = render(<AgentSidebar project={project} />);
     useRuntimeStore.setState({ status: { a1: "idle", w1: "blocked", w2: "working" } } as never);
     rerender(<AgentSidebar project={{ ...project }} />);
@@ -587,15 +647,23 @@ describe("Build column — the row is a real control, not a div that happens to 
     expect(liveProject().selectedAgentId).toBeNull();
   });
 
-  it("folds on Enter", () => {
-    const project = seedExpanded();
+  it("folds on Enter once the row is the selected one", () => {
+    // Pre-selected: activation is two-stage now (see "Enter selects on the first press…" above),
+    // so the fold is what a SECOND activation does. This case is about the key reaching the
+    // handler at all, which is only observable on an activation that is supposed to fold.
+    const project = { ...seedExpanded(), selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [project] } as never);
     render(<AgentSidebar project={project} />);
     fireEvent.keyDown(rowFor("Alpha"), { key: "Enter" });
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
   });
 
-  it("folds on Space", () => {
-    const project = seedExpanded();
+  it("folds on Space once the row is the selected one", () => {
+    // Pre-selected: activation is two-stage now (see "Enter selects on the first press…" above),
+    // so the fold is what a SECOND activation does. This case is about the key reaching the
+    // handler at all, which is only observable on an activation that is supposed to fold.
+    const project = { ...seedExpanded(), selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [project] } as never);
     render(<AgentSidebar project={project} />);
     fireEvent.keyDown(rowFor("Alpha"), { key: " " });
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
@@ -629,7 +697,11 @@ describe("Build column — a HINT JUMP selects without folding", () => {
   // AXPress on a non-native control) also arrive with detail 0. Under the sniff they were
   // indistinguishable from a hint jump and silently lost the fold.
   it("DOES toggle on an unmarked programmatic click, the way an AT activation arrives", () => {
-    const project = seed();
+    // Pre-selected, so the click under test is the FOLDING one. The point of this case is that an
+    // AT activation is not mistaken for a hint jump and does not lose the fold — which can only be
+    // observed on a click that is supposed to fold in the first place.
+    const project = { ...seed(), selectedAgentId: "a1" };
+    useProjectStore.setState({ projects: [project] } as never);
     render(<AgentSidebar project={project} />);
     rowFor("Alpha").click(); // detail === 0, but no hint marker
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);

@@ -14,7 +14,6 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
-import { TbPinFilled } from "react-icons/tb";
 // FiPlus/FiMinus are the collapse/expand pull tabs; FiTool is the "+ New Build Agent" icon.
 // FiAlertTriangle/FiRepeat/FiTarget carry the never-idle overlay (stall / thrash / goal) — see
 // ./rowAttention and the chips in AgentRow. Icons, never emoji: this repo uses react-icons.
@@ -1021,16 +1020,10 @@ export function AgentSidebar({
     open(id);
     patchCable(pairSide);
   };
-  const onSelect = (id: string, via?: "hover") => {
+  const onSelect = (id: string) => {
     if (!project) return;
     // Switching to a normal project agent leaves the special (Sparkle) view.
     setActiveSpecial(null);
-    if (via === "hover") {
-      // Selection may follow the mouse; the cable may not — see below.
-      selectAgent(project.id, id);
-      open(id);
-      return;
-    }
     selectAndWire(id);
     // ── PATCH THE CABLE ──────────────────────────────────────────────────────────────────────
     // THE GESTURE THAT MAKES THE WHOLE CONNECTION FEATURE REACHABLE. Everything downstream of
@@ -1044,18 +1037,22 @@ export function AgentSidebar({
     // live cable", and the side is this sidebar's own pair. ONE LIVE CIRCUIT falls out of
     // `patchCable` — patching the other side moves the cable rather than lighting both.
     //
-    // A DELIBERATE ACTIVATION ONLY — never the hover-intent auto-select. `onSelect` is BOTH paths:
-    // `armSelect` fires it from a 90ms `setTimeout` on plain mouseenter, with no click anywhere. So
-    // hanging the patch on it meant a cursor merely resting over any row re-wired the cable, which
-    // broke two documented behaviours (roborev 55234):
+    // A DELIBERATE ACTIVATION ONLY — and now that is the only kind there is. This function used to
+    // take a `via?: "hover"` flag and serve two callers: a click, and a 90ms dwell timer on plain
+    // mouseenter. The hover half selected and mounted but deliberately SKIPPED the patch below,
+    // because hanging the patch on it broke two documented behaviours (roborev 55234):
     //
     //  1. It defeated the unbind gestures. engine/cable states Escape and click-away are the one way
     //     back to floating middle; after either, moving the pointer back across the column re-patched
-    //     with no intent at all — from exactly the transit the hover-intent gate exists to make inert.
+    //     with no intent at all.
     //  2. WORSE, it re-routed prompts ACROSS PAIRS. `promptTarget` derives from `wired`, so with two
     //     pairs and the cable patched left, a cursor crossing the RIGHT sidebar and pausing 90ms
-    //     moved the cable — and Send delivered the user's message to a different pair's terminal
-    //     than the one they plugged into. Selection may follow the mouse; the cable may not.
+    //     moved the cable — and Send delivered the user's message to a different pair's terminal.
+    //
+    // "Selection may follow the mouse; the cable may not" was the resolution then. The founder's
+    // rule supersedes it: selection may not follow the mouse EITHER. With the hover caller gone the
+    // split has no reason to exist, so the flag went with it — every caller of `onSelect` is now a
+    // deliberate act and every one of them patches. See HOVER_INTENT_MS's headstone.
   };
   // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Build
   // is two-stage: the FIRST click (when Build isn't already the active section) just switches into
@@ -2474,6 +2471,11 @@ export function AgentSidebar({
           // not yet dismissed, "reenable" when red-underneath but dismissed, null otherwise.
           const alertControl = alertControlKind(a.alert, trueSt);
           const isActive = !paneCoversMe && project.selectedAgentId === a.id;
+          // SELECTION, PLAIN — distinct from `isActive`, which ANDs in `paneCoversMe` (a floating
+          // pane laid over this column makes a still-selected row read inactive). The click-again
+          // fold has to key off "is this the row I am already on", and that is the selection alone:
+          // gating it on `isActive` made the fold dead whenever a pane covered the column.
+          const isSelected = project.selectedAgentId === a.id;
           const bs = branchStatus[a.id];
           // The ✓ on the head row reflects the whole build: itself OR any worker that has shipped.
           const rowShipped =
@@ -2512,6 +2514,7 @@ export function AgentSidebar({
               a={a}
               depth={depth}
               isActive={isActive}
+              isSelected={isSelected}
               st={st}
               calmSt={calmStatus[a.id] ?? "stopped"}
               statusColor={color}
@@ -2542,7 +2545,7 @@ export function AgentSidebar({
               onDropAgent={onAgentDrop}
               editing={editing === a.id}
               setEditing={setEditing}
-              onSelect={(via) => onSelect(a.id, via)}
+              onSelect={() => onSelect(a.id)}
               onLand={() => onLand(a)}
               onClose={() => requestClose(a.id)}
             />
@@ -3360,16 +3363,34 @@ function representativeWorker(workers: WorkerDetail[]): WorkerDetail | null {
 // fresh reference every render and loops the store. Reuse one array.
 const NO_BEADS: Bead[] = [];
 
-// How long the pointer must dwell on a row before hovering it activates that terminal. Short enough
-// to feel instant when you mean it; long enough that a cursor merely crossing the column on its way
-// elsewhere never activates the rows it transits. A click never waits on this (see openCard).
-const HOVER_INTENT_MS = 90;
+// ── SELECTION IS CLICK-ONLY. HOVER NEVER SELECTS AND NEVER MOUNTS. ────────────────────────────
+// There used to be a `HOVER_INTENT_MS = 90` dwell gate here, and an `armSelect` on the row's
+// `onMouseEnter` that called `onSelect("hover")` from a timeout: resting the pointer on a row for
+// 90ms selected that agent and MOUNTED its pane, with no click anywhere.
+//
+// The dwell gate was a mitigation, not the rule. It made a fast transit inert, which is why this
+// kept reading as "fixed" — but any pause at all still activated, so reading the column was
+// impossible without taking over the terminal you were reading. The founder's rule is that a
+// build agent is selected ONLY on click; hover may preview, never select or mount.
+//
+// SO THE GATE IS GONE RATHER THAN RETUNED. A longer dwell is the same bug with a bigger number,
+// and it is the shape this regressed into once already. `onSelect` no longer takes a `via`
+// argument at all, so there is no hover path left to re-enable by accident — reintroducing one
+// means adding a parameter back, which is a visible change rather than a one-line default.
+//
+// What hover still does: the row's own paint, and the auto-scroll that keeps a bottom row's card
+// on screen. What opens the detail card is a RIGHT click (`openCard`). See `onRowClick` for the
+// click-again-opens-workers rule.
 
 type AgentRowProps = {
   project: Project;
   a: AgentTab;
   depth: number;
   isActive: boolean;
+  /** True when this row IS the project's selected agent, regardless of whether a floating pane is
+   *  covering the column. `isActive` is that AND-ed with `!paneCoversMe`, which is right for PAINT
+   *  but wrong for the click-again fold — see the computation site. */
+  isSelected: boolean;
   st: AgentTabStatus;
   /**
    * The row's status BEFORE `withStallAttention` escalated it — the one the stall question is asked
@@ -3437,9 +3458,9 @@ type AgentRowProps = {
   onDropAgent: (targetId: string, targetSection?: BuildSectionId) => void;
   editing: boolean;
   setEditing: (id: string | null) => void;
-  /** Called on activation. `"hover"` marks the hover-intent auto-select — see the parent's
-   *  `onSelect`, where it is what keeps a mere transit from re-wiring the cable. */
-  onSelect: (via?: "hover") => void;
+  /** Called on activation — a CLICK, a keyboard Enter/Space, or a right-click opening the card.
+   *  There is no hover caller: selection is click-only (see HOVER_INTENT_MS's headstone). */
+  onSelect: () => void;
   onLand: () => void;
   onClose: () => void;
 };
@@ -3505,6 +3526,7 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
     prev.a === next.a &&
     prev.depth === next.depth &&
     prev.isActive === next.isActive &&
+    prev.isSelected === next.isSelected &&
     prev.st === next.st &&
     prev.calmSt === next.calmSt &&
     prev.subtreeCollapsed === next.subtreeCollapsed &&
@@ -3534,6 +3556,7 @@ const AgentRow = memo(function AgentRow({
   a,
   depth,
   isActive,
+  isSelected,
   st,
   calmSt,
   subtreeCollapsed,
@@ -3565,7 +3588,6 @@ const AgentRow = memo(function AgentRow({
   onClose,
 }: AgentRowProps) {
   const renameAgent = useProjectStore((s) => s.renameAgent);
-  const unpinAgent = useProjectStore((s) => s.unpinAgent);
   const setAgentModel = useProjectStore((s) => s.setAgentModel);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
   // Beads for this project (stable fallback to avoid a re-render loop). Drives the Build-tab
@@ -3589,11 +3611,6 @@ const AgentRow = memo(function AgentRow({
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
-  // Hover-intent gate: activating the terminal on the very first mouseenter means a cursor merely
-  // transiting the column (on its way somewhere else) activates every row it crosses, landing on
-  // whichever it happened to leave last. A short dwell requirement fixes that — the pointer must
-  // linger HOVER_INTENT_MS on one row before it commits. A click bypasses it entirely (openCard).
-  const hoverTimer = useRef<number | null>(null);
   // Set true the instant Escape is pressed so the input's trailing blur (which fires when the field
   // unmounts in this Chromium webview) discards instead of committing — Escape must always cancel.
   const cancelNextBlur = useRef(false);
@@ -3724,36 +3741,25 @@ const AgentRow = memo(function AgentRow({
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => setHover(false), 60);
   };
-  // Arm the hover-intent gate: only after the pointer has dwelled HOVER_INTENT_MS on THIS row does
-  // it commit to activating the terminal. A cursor sweeping through the column re-arms per row and
-  // never dwells long enough on any one, so a mere transit no longer activates anything.
-  const armSelect = () => {
-    if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    hoverTimer.current = window.setTimeout(() => {
-      hoverTimer.current = null;
-      // MARKED as hover: this is the only caller that is not a deliberate act.
-      onSelect("hover");
-    }, HOVER_INTENT_MS);
-  };
-  const disarmSelect = () => {
-    if (hoverTimer.current) {
-      clearTimeout(hoverTimer.current);
-      hoverTimer.current = null;
-    }
-  };
-  // Leaving the row cancels any pending hover-commit (so a transit never lands) and starts the
-  // card's close delay.
+  // Leaving the row starts the card's close delay. It used to also cancel a pending hover-commit;
+  // there is no such thing any more (see HOVER_INTENT_MS's headstone above), so this is just the
+  // card now.
   const onRowLeave = () => {
-    disarmSelect();
     hide();
   };
-  // LEFT click = select this agent, and fold/unfold its workers. Both bypass the hover-intent
-  // dwell: a deliberate click should act NOW, so cancel any armed hover-commit and select
-  // immediately. The subtree toggle rides along on the same click because the chevron that used to
-  // own it is gone (see CardHeader) — `subtreeCollapsed` is null on anything without workers, so a
-  // childless row and a worker row just select.
+  // LEFT click = select this agent. CLICK IT AGAIN = fold/unfold its workers.
+  //
+  // TWO STAGES, NOT ONE. The toggle used to ride along on EVERY click, so the first click on an
+  // unselected head both took the terminal and threw its subtree open — you could not look at an
+  // agent without also restructuring the column, and you could not open a subtree without also
+  // stealing the pane. Gating the toggle on `isActive` separates them: the first click commits to
+  // the agent, and only a click on the row you are ALREADY on expands it.
+  //
+  // `subtreeCollapsed` is null on anything without workers, so a childless row and a worker row
+  // just select on every click — the second stage simply does not exist for them, which is right:
+  // there is nothing to open.
   const onRowClick = (e: React.MouseEvent) => {
-    disarmSelect();
+    const wasAlreadySelected = isSelected;
     onSelect();
     // HintOverlay marks the element while it fires its synthetic click for a keyboard jump. A jump
     // means "take me to this agent"; folding its subtree as well — and PERSISTING that — made
@@ -3764,7 +3770,9 @@ const AgentRow = memo(function AgentRow({
     // misread as jumps, quietly losing the fold for the users least able to work around it
     // (roborev 53837). See keyboardHints/hintTargets.HINT_JUMP_ATTR.
     const isHintJump = (e.currentTarget as HTMLElement).hasAttribute(HINT_JUMP_ATTR);
-    if (subtreeCollapsed !== null && !isHintJump) onToggleSubtree();
+    // `wasActive` — the SECOND click is the one that folds. A jump still never folds (above), and
+    // a jump onto an already-selected row is still a jump, so the check stays ahead of this.
+    if (subtreeCollapsed !== null && !isHintJump && wasAlreadySelected) onToggleSubtree();
   };
   // The row is the disclosure control now, so it has to be a real one: focusable, and operable by
   // Enter/Space like the button it replaced. Without this the `aria-expanded` below is invalid ARIA
@@ -3784,8 +3792,17 @@ const AgentRow = memo(function AgentRow({
       case "Enter":
       case " ":
         e.preventDefault(); // Space would scroll the list
+        // TWO STAGES HERE TOO, gated identically to `onRowClick`. Enter/Space is the keyboard's
+        // copy of a left click, and this line originally selected AND folded in one activation —
+        // so applying the click-again rule to the mouse alone would have left the two gestures
+        // doing different things, with the keyboard keeping the behaviour the founder removed.
+        //
+        // That divergence is the failure mode roborev 53837 is cited for a few lines down: fold
+        // behaviour differing silently for the users least able to work around it. ArrowRight and
+        // ArrowLeft still own explicit expand/collapse, so a keyboard user who wants the subtree
+        // without a second activation has a direct key for it.
+        if (subtreeCollapsed !== null && isSelected) onToggleSubtree();
         onSelect();
-        if (subtreeCollapsed !== null) onToggleSubtree();
         return;
       // Standard tree keys: Right opens a closed node, Left closes an open one. Separating them
       // from Enter is the point — a keyboard user can read a subtree without stealing the terminal.
@@ -3829,14 +3846,12 @@ const AgentRow = memo(function AgentRow({
     // spring open the instant the rename committed (roborev 53814).
     if (editing) return;
     e.preventDefault();
-    disarmSelect();
     onSelect();
     show();
   };
   useEffect(
     () => () => {
       if (hideTimer.current) clearTimeout(hideTimer.current);
-      if (hoverTimer.current) clearTimeout(hoverTimer.current);
     },
     [],
   );
@@ -4059,22 +4074,22 @@ const AgentRow = memo(function AgentRow({
     void applyModelToRunningAgent(a.id, modelId);
   };
 
-  // The name-freeze chip. `namePinned` used to mean two things — "don't auto-rename" AND "hold this
-  // row's position" — but row anchoring is gone (rows only move when their workflow stage changes,
-  // so there is nothing to anchor against). The flag now means exactly one thing, and the tooltip
-  // says so. Click to release and let the agent name itself from its work again.
-  const pinChip = a.namePinned ? (
-    <span
-      onClick={(e) => {
-        e.stopPropagation();
-        unpinAgent(project.id, a.id);
-      }}
-      title="Renamed by you — won't auto-rename. Click to release."
-      style={{ display: "inline-flex", flex: "0 0 auto", cursor: "pointer", lineHeight: 1, color: C.muted }}
-    >
-      <TbPinFilled size={11} />
-    </span>
-  ) : null;
+  // ── NO PIN CHIP. AGENT PINNING IS GONE. ────────────────────────────────────────────────────
+  // A pin glyph used to render here whenever `namePinned` was set, and clicking it released the
+  // freeze. It had already lost most of its meaning: `namePinned` once meant BOTH "don't
+  // auto-rename" AND "hold this row's position", and row anchoring was removed when rows started
+  // moving only on a workflow-stage change. What was left was a pin that pinned nothing — it
+  // reported that the user had renamed the agent, which the name itself already says.
+  //
+  // So the affordance is gone, and `unpin_agent` with it (see services/conciergeTools/policy).
+  //
+  // `namePinned` THE FLAG STAYS, and is still set by a manual rename. It is the reason an explicit
+  // rename is not overwritten by the auto-namer moments later — see projectStore's precedence note
+  // (human rename > self-name > auto-name). Removing the flag as well would have made every
+  // rename temporary, which is a different and much worse bug than a redundant glyph.
+  //
+  // NOT TO BE CONFUSED WITH PROJECT-TAB PINNING (components/ProjectTabs), which is a live feature
+  // and untouched: pinning a PROJECT scopes the concierge to it. Same word, different thing.
 
   // "+3" — how many workers are folded away under this row. It stands in for the disclosure
   // chevron that used to sit ahead of the disc, and it is strictly more informative: the chevron
@@ -4498,7 +4513,6 @@ const AgentRow = memo(function AgentRow({
                 {thrashChipEl}
                 {epicPill}
                 {cloudChip}
-                {pinChip}
               </div>
               {/* The model pill anchors the card's top-right corner, above the progress bar's
                   status text — clickable any time (idle or running) to change this agent's
@@ -4538,7 +4552,6 @@ const AgentRow = memo(function AgentRow({
                 {thrashChipEl}
                 {epicPill}
                 {cloudChip}
-                {pinChip}
               </div>
               {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
                   (dot · el · nm · stg · close). Outside the name container so the title ellipsizes
@@ -4856,7 +4869,6 @@ const AgentRow = memo(function AgentRow({
         // nothing structurally. Only when the group is actually on screen — aria-owns pointing at a
         // missing id is worse than none.
         aria-owns={subtreeCollapsed === false ? subtreeDomId(a.id) : undefined}
-        onMouseEnter={armSelect}
         onMouseLeave={onRowLeave}
         style={{
           // LOAD-BEARING FOR THE BLEED, not just for the fillets and the drop target that anchor

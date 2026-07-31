@@ -796,7 +796,16 @@ describe("controlListener", () => {
     // unpinned throughout: the second self-name must not resurrect namePinned.
     fire({ reqId: "rp1", op: "rename_agent", callerAgentId: callerId, payload: { name: "First Name" } });
     await flush();
-    useProjectStore.getState().unpinAgent(projectId, callerId);
+    // Was `unpinAgent(...)`; agent pinning and that action are gone, so the unpinned state is set
+    // directly. The regression under test is about the SECOND self-name, not about how the row got
+    // unpinned — driving it through the store keeps the coverage without the removed op.
+    useProjectStore.setState((st) => ({
+      projects: st.projects.map((pr) =>
+        pr.id === projectId
+          ? { ...pr, agents: pr.agents.map((ag) => (ag.id === callerId ? { ...ag, namePinned: false } : ag)) }
+          : pr,
+      ),
+    }));
     fire({ reqId: "rp2", op: "rename_agent", callerAgentId: callerId, payload: { name: "Second Name" } });
     await flush();
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!;
@@ -1477,13 +1486,18 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
-  it("unpin_agent still releases the target's NAME freeze (build caller allowed)", async () => {
+  // Agent pinning was removed, so this op is now a refusal — and CRUCIALLY the freeze it used to
+  // release must still be ON afterwards. A handler that quietly returned `ok` while leaving
+  // `namePinned` set would be worse than the refusal: the caller would believe it had unfrozen a
+  // name that is still frozen. That is the half of this the assertion exists for.
+  it("unpin_agent is REFUSED, and leaves the name freeze in place", async () => {
     useProjectStore.getState().renameAgent(projectId, otherId, "Human Choice");
     expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.namePinned).toBe(true);
     fire({ reqId: "unpin1", op: "unpin_agent", callerAgentId: callerId, payload: { targetAgentId: otherId } });
     await flush();
-    expect(lastReply()).toEqual({ ok: true });
-    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.namePinned).toBe(false);
+    expect(lastReply()).toMatchObject({ ok: false });
+    expect(String((lastReply() as { error?: string }).error)).toMatch(/removed/i);
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.namePinned).toBe(true);
   });
 
   it("set_agent_model sets a catalog model and rejects an unknown one", async () => {
@@ -2256,7 +2270,8 @@ describe("controlListener", () => {
         ["rename_agent", { name: "Nobody" }],
         ["set_agent_activity", { activity: "narrating nothing" }],
         ["set_agent_goal", { goal: "a goal for nobody" }],
-        ["unpin_agent", {}],
+        // `unpin_agent` is deliberately NOT here any more: it is a removed op that refuses every
+        // call outright, so it never reaches the target check this case is about.
         ["set_agent_model", { model: "claude-opus-4-8" }],
       ];
       for (const [op, payload] of cases) {

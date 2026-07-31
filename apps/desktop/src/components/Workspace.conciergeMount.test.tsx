@@ -360,25 +360,37 @@ describe("clicking an agent row mounts the concierge to it", () => {
   //
   // `mouseOver`, NOT `mouseEnter`. React synthesizes `onMouseEnter` from DELEGATED mouseover/mouseout
   // listeners on the root container and never binds a native `mouseenter`, so `fireEvent.mouseEnter`
-  // invokes nothing at all: `armSelect` never runs, no 90ms timer is armed, and advancing the clock
-  // advances nothing. The assertion was then just the at-rest precondition — the case could not fail,
-  // and hover-patching could have been reintroduced under a green test (roborev 55529). This repo
-  // already documents the correct form at AgentSidebar.agentRow.test.tsx:113.
-  it("hovering does NOT mount, however long the cursor rests", () => {
+  // invokes nothing at all — the gesture would not be delivered and the case could not fail
+  // (roborev 55529). This repo documents the correct form at AgentSidebar.agentRow.test.tsx:113.
+  //
+  // ── THE POSITIVE CONTROL HAD TO CHANGE. ─────────────────────────────────────────────────────
+  // It used to be "hover-intent SELECTED the row, and the cable stayed off" — proving the dwell
+  // timer really fired. Selection is click-only now, so hover selects nothing and that control is
+  // gone; asserting only "nothing happened" would be exactly the vacuous shape the note above
+  // warns about, since an undelivered gesture looks identical.
+  //
+  // So the control moved to the END: after resting on the row we CLICK it, and that must mount.
+  // A green result therefore means "this harness can observe a mount on this row, and hovering it
+  // did not produce one" — not "nothing in this test does anything".
+  it("hovering does NOT mount or select, however long the cursor rests", () => {
     vi.useFakeTimers();
     try {
       render(<Workspace />);
+      const before = useProjectStore.getState().projects[0]?.selectedAgentId;
       fireEvent.mouseOver(rowFor(SLIDER));
       act(() => {
         vi.advanceTimersByTime(1000);
       });
-      // THE POSITIVE CONTROL, and the whole reason this case now proves anything: the dwell really
-      // did fire — hover-intent SELECTED the row (`onSelect(id, "hover")` calls `selectAgent`) — so
-      // a green result means "the timer ran and the cable stayed off", not "nothing happened".
-      // Without this, a silently-inert gesture is indistinguishable from a correctly ignored one.
-      expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe("a2");
+      // Well past the 90ms dwell the removed hover-intent gate used, and past any longer one a
+      // future edit might reinstate.
+      expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe(before);
       expect(shell().getAttribute("data-wired")).toBe("off");
       expect(useCableStore.getState().wired).toBe("off");
+
+      // THE POSITIVE CONTROL: the same row, clicked, DOES mount.
+      fireEvent.click(rowFor(SLIDER));
+      expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe("a2");
+      expect(useCableStore.getState().wired).not.toBe("off");
     } finally {
       vi.useRealTimers();
     }

@@ -108,14 +108,18 @@ describe("projectStore auto-naming", () => {
     expect(agent.autoNameVariants).toBeNull();
   });
 
-  it("unpinning re-enables auto-rename", () => {
+  // Was "unpinning re-enables auto-rename". Agent pinning is gone and so is `unpinAgent`, which
+  // inverts the interesting claim: a human rename now freezes the name for good, and the guarantee
+  // worth testing is that the auto-namer CANNOT take it back. This is the reason `namePinned`
+  // survived the removal of the pin chip — delete the flag too and this goes red.
+  it("a human rename is permanent — the auto-namer cannot overwrite it", () => {
     const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
     const aid = useProjectStore.getState().addAgent(pid)!;
     useProjectStore.getState().renameAgent(pid, aid, "My Agent");
-    useProjectStore.getState().unpinAgent(pid, aid);
     useProjectStore.getState().autoRenameAgent(pid, aid, "Auto Name", "some prompt");
     const agent = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === aid)!;
-    expect(agent.name).toBe("Auto Name");
+    expect(agent.name).toBe("My Agent");
+    expect(agent.namePinned).toBe(true);
   });
 });
 

@@ -182,6 +182,7 @@ export const THEME_HEX = {
     termHairline: BLUEPRINT.dark.termHair,
     forest: BLUEPRINT.dark.term, deepForest: BLUEPRINT.dark.bridge,
     conciergeSurface: BLUEPRINT.dark.assist, barSurface: BLUEPRINT.dark.bar,
+    conciergeSurfaceLifted: BLUEPRINT.dark.assistLift,
     conciergeMuted: BLUEPRINT.dark.muted, muted: BLUEPRINT.dark.muted,
     // agentIdle is READ AS TEXT, not just painted as a dot: statusInk() maps idle/done/stopped to
     // it and BandBadge colours its count with it. The spec's `faint` tier is a hairline/label
@@ -205,6 +206,7 @@ export const THEME_HEX = {
     termHairline: BLUEPRINT.light.termHair,
     forest: BLUEPRINT.light.term, deepForest: BLUEPRINT.light.bridge,
     conciergeSurface: BLUEPRINT.light.assist, barSurface: BLUEPRINT.light.bar,
+    conciergeSurfaceLifted: BLUEPRINT.light.assistLift,
     conciergeMuted: BLUEPRINT.light.muted, muted: BLUEPRINT.light.muted,
     agentIdle: BLUEPRINT.light.muted, cream: BLUEPRINT.light.ink,
     hairline: BLUEPRINT.light.seam, pillFill: BLUEPRINT.light.hairSolid,
@@ -227,6 +229,25 @@ export const C = {
   deepForest: "var(--c-deep-forest)",
   // The concierge column — the lightest of the shell's three depth layers. See THEME_HEX above.
   conciergeSurface: "var(--c-concierge-surface)",
+  // …AND THE SURFACE IT ACTUALLY PAINTS WHILE UNMOUNTED. `conciergeSurface` is the column's
+  // surface in the abstract and is still what the ink tokens above are measured against; this is
+  // the UNWIRED state's fill. Wired, the column floods to `forest` and neither applies.
+  //
+  // In LIGHT the two are the same #ffffff — there is nothing above white, and the lift shadow
+  // does the separating. In DARK this is a real step (+16.3% L*), which is what stops the
+  // unplugged concierge reading as one more dark column. See blueprintSpec's `assistLift`.
+  //
+  // THE LIFTED PLANE IS THE STRICTER ONE FOR INK — measure against BOTH, and if you only have the
+  // budget for one, measure this. Dark is the only theme where the two differ, and dark reads LIGHT
+  // ink on a DARK plane, so lightening the plane REDUCES contrast: `conciergeMuted` falls 6.71 →
+  // 6.48, `faint` 4.07 → 3.93, `hairline` 1.66 → 1.60. Nothing breaks at these values, but the
+  // implication runs the opposite way to the intuition — clearing the floor on `conciergeSurface`
+  // does NOT imply clearing it here.
+  //
+  // `theme/chromeContrast.test.ts` sweeps the concierge inks over both planes for exactly this
+  // reason. Keep it that way: a guard pinned only to `conciergeSurface` stops measuring the surface
+  // the unwired column actually paints.
+  conciergeSurfaceLifted: "var(--c-concierge-surface-lifted)",
   // Secondary text INSIDE the concierge column — the scope line, the vitals, every secondary
   // label (roborev 46254-L). The contract is unchanged (clear the ink floor on conciergeSurface),
   // but the black-and-gold repaint is what satisfies it in DARK: this token existed because the

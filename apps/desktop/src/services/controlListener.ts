@@ -224,6 +224,10 @@ const CONCIERGE_EXEMPT_OPS = new Set<ControlOp>([
   "concierge_tool",
   "pin_agent",
   "set_agent_ordering",
+  // Retired 2026-07-31 with agent pinning, joining the two above. Exempt rather than classified so
+  // the refusing handler is UNREACHABLE from the concierge instead of being advertised as a
+  // togglable Settings row for a tool that can only decline.
+  "unpin_agent",
 ]);
 
 /**
@@ -241,7 +245,11 @@ type _ConciergeGateCoversEveryControlOp = {
     ? true
     : ["control op is missing from APP_TOOL_NAMES in conciergeTools/policy.ts", K];
 };
-type ControlOpExemptFromConciergePolicy = "concierge_tool" | "pin_agent" | "set_agent_ordering";
+type ControlOpExemptFromConciergePolicy =
+  | "concierge_tool"
+  | "pin_agent"
+  | "set_agent_ordering"
+  | "unpin_agent";
 // Instantiating it is what makes the mapped type actually check.
 const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   get_state: true,
@@ -251,7 +259,6 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   append_communication_guideline: true,
   set_theme: true,
   set_config: true,
-  unpin_agent: true,
   set_agent_model: true,
   set_zoom: true,
   navigate: true,
@@ -357,7 +364,7 @@ export const CONCIERGE_SELF_NAME = "Sparkle";
  * question the caller was actually asking, in a field the roster cannot hold.
  *
  * `isAgent` is the load-bearing field, not decoration: it is exactly the precondition the per-agent
- * ops (`rename_agent`, `set_agent_activity`, `unpin_agent`, `set_agent_model`) default on. `false`
+ * ops (`rename_agent`, `set_agent_activity`, `set_agent_model`) default on. `false`
  * means `targetRequired` will refuse a targetless call, so a caller can learn that from one read
  * instead of from a refusal.
  *
@@ -1433,16 +1440,22 @@ function handlePinAgent(_req: ControlRequest): Record<string, unknown> {
   };
 }
 
-/** unpin_agent → release THAT agent's NAME freeze so it auto-names again (defaults to caller).
- *  This used to release a row anchor as well; row anchoring no longer exists (see handlePinAgent),
- *  so the name freeze is all that remains — which is still worth exposing. */
-function handleUnpinAgent(req: ControlRequest): Record<string, unknown> {
-  const targetId = resolveTargetId(req);
-  if (!targetId) return targetRequired("unpin_agent", req);
-  const found = findAgent(targetId);
-  if (!found) return { ok: false, error: `unknown agent ${targetId}` };
-  useProjectStore.getState().unpinAgent(found.projectId, targetId);
-  return { ok: true };
+/** unpin_agent → REMOVED, exactly as `pin_agent` above was, and for the same reason carried one
+ *  step further. Agent pinning is gone: rows are grouped by workflow stage, so there was never an
+ *  anchor for `pin_agent` to set, and this op's remaining job — releasing the NAME freeze — went
+ *  with the pin chip it was the undo for.
+ *
+ *  THE FREEZE ITSELF IS NOT GONE, and that is why this is a removal rather than a no-op that
+ *  reports success. `namePinned` is still set by a manual rename and is still what stops the
+ *  auto-namer overwriting it seconds later. There is simply no longer a control that clears it —
+ *  renaming the agent again is how you change its name. An op that silently returned `ok` here
+ *  would tell a caller it had released a freeze that is still very much on. */
+function handleUnpinAgent(): Record<string, unknown> {
+  return {
+    ok: false,
+    error:
+      "unpin_agent was removed along with agent pinning: a manual rename still freezes the name, and renaming the agent again is how to change it",
+  };
 }
 
 /** set_agent_model → set THAT agent's Claude model (defaults to caller). Validates `model` against
@@ -1767,7 +1780,7 @@ async function dispatch(req: ControlRequest): Promise<void> {
         result = handlePinAgent(req);
         break;
       case "unpin_agent":
-        result = handleUnpinAgent(req);
+        result = handleUnpinAgent();
         break;
       case "set_agent_model":
         result = handleSetAgentModel(req);

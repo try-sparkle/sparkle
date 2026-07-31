@@ -215,11 +215,16 @@ export const CONCIERGE_TOOL_DOMAINS = [
  * complete and the human can deny them if they want; they default to `allow`, which is exactly the
  * behaviour they have today.
  *
- * DELIBERATELY ABSENT: `pin_agent` and `set_agent_ordering`. Both are RETIRED — their handlers
- * refuse unconditionally and neither is registered in `apps/mcp-control/src/server.ts`. Listing
- * them would put dead rows in the settings pane for tools that can never run, and invite a summary
- * describing behaviour they no longer have. `controlListener`'s `CONCIERGE_EXEMPT_OPS` names them
- * as the exempt set, and a test keeps the two lists in step.
+ * DELIBERATELY ABSENT: `pin_agent`, `set_agent_ordering` and `unpin_agent`. All three are RETIRED —
+ * their handlers refuse unconditionally and none is registered in `apps/mcp-control/src/server.ts`.
+ * Listing them would put dead rows in the settings pane for tools that can never run, and invite a
+ * summary describing behaviour they no longer have. `controlListener`'s `CONCIERGE_EXEMPT_OPS`
+ * names them as the exempt set, and a test keeps the two lists in step.
+ *
+ * `unpin_agent` joined them on 2026-07-31 with the removal of agent pinning. It was briefly left
+ * here with a summary reading "Removed — agent pinning no longer exists", which is exactly the
+ * "summary describing behaviour they no longer have" this note forbids: a togglable Settings row,
+ * risk-classed `routine`, for a tool that can only refuse.
  */
 export const APP_TOOL_NAMES = [
   "get_state",
@@ -229,7 +234,6 @@ export const APP_TOOL_NAMES = [
   "set_theme",
   "set_zoom",
   "navigate",
-  "unpin_agent",
   "set_agent_model",
   "set_config",
   "append_communication_guideline",
@@ -262,7 +266,6 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   set_theme: "routine",
   set_zoom: "routine",
   navigate: "routine",
-  unpin_agent: "routine",
   set_agent_model: "routine",
   // ROUTINE, and that is the founder's explicit call rather than an oversight. Asked whether the
   // concierge should propose a communication rule for approval or just save it and say so, they
@@ -290,7 +293,6 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   set_theme: "Switch the app between light and dark.",
   set_zoom: "Change the terminal text size.",
   navigate: "Move you to a view or open a specific agent.",
-  unpin_agent: "Let an agent's name be auto-generated again.",
   set_agent_model: "Change which Claude model an agent runs on.",
   append_communication_guideline: "Save a rule about how Sparkle should talk to you.",
   set_config: "Write Sparkle's machine-wide configuration.",

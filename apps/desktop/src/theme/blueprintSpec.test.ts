@@ -81,6 +81,7 @@ const REV4_MAP: [keyof BlueprintTheme, string][] = [
   ["wmDark", "--wm-dark"],
   ["wmLit", "--wm-lit"],
   ["lift", "--z-lift"],
+  ["assistLift", "--k-assist-lift"],
 ];
 
 describe("the app's Blueprint tokens ARE the approved spec", () => {
@@ -274,6 +275,19 @@ describe("every rev-4 field IS its token in PRD/sparkle/ui-directions/rev4.html"
   for (const mode of ["light", "dark"] as const) {
     for (const [field, token] of REV4_MAP) {
       it(`${mode}.${field} matches ${token}`, () => {
+        // PRESENCE FIRST, and separately — because "absent" and "different" fail for opposite
+        // reasons and the value compare below reports the absent case as the baffling
+        // `expected '#ffffff' to be undefined`.
+        //
+        // Absent is not hypothetical. `anyTokens` reads a value as "everything up to the next
+        // semicolon", so a COMMENT in rev4.html that writes a custom-property name immediately
+        // followed by a colon captures the rest of the comment AND the declaration under it — the
+        // real token then vanishes from the parse with the page looking perfectly correct. That
+        // ate this exact token twice while it was being added. This assertion names the cause.
+        expect(
+          rev4Token(rev4, mode, token),
+          `${token} is not present in rev4.html's ${mode} block. If it looks present, check the comments just above it: a custom-property name followed by a colon inside a comment swallows the declaration beneath it.`,
+        ).toBeDefined();
         expect(
           BLUEPRINT[mode][field],
           `${mode}.${field} disagrees with ${token} in rev4.html`,
@@ -356,5 +370,57 @@ describe("the LIFT — rev-4's `--z-lift`, the unplugged concierge's elevation",
   it("stores no `flush` counterpart — flush is the absence of this value", () => {
     expect(Object.keys(BLUEPRINT.light)).not.toContain("flush");
     expect(Object.keys(BLUEPRINT.dark)).not.toContain("flush");
+  });
+});
+
+// ── `--k-assist-lift` — THE UNMOUNTED CONCIERGE'S SURFACE ──────────────────────────────────────
+// The REV4_MAP loop above already proves this field transcribes the spec page. What it CANNOT
+// prove is the thing the founder actually asked for: that in dark the unmounted column is
+// meaningfully lighter than the ground, by a stated amount, and that lightening it did not eat a
+// neighbouring register. Those are claims about the RELATIONSHIP between tokens, so they are
+// asserted here — and they are what makes a future edit to the hex a red test rather than a
+// silent regression.
+//
+// THIS BLOCK FAILS AGAINST THE CODE AS IT WAS. Before this change there was no `assistLift` at
+// all; the column painted `assist`, i.e. 0% lighter, which is outside the band asserted below.
+describe("the UNMOUNTED CONCIERGE's surface — rev-4's `--k-assist-lift`", () => {
+  /** CIE L* — PERCEIVED lightness, which is what "10–20% lighter" means to an eye. Raw relative
+   *  luminance is the wrong scale here: the same step reads as +63% in Y and +16% in L*, and only
+   *  the second matches what you see on a near-black navy. */
+  const lStar = (hex: string) => {
+    const Y = lumOf(hex);
+    return Y <= 0.008856 ? 903.3 * Y : 116 * Math.cbrt(Y) - 16;
+  };
+
+  it("dark: the unmounted column is 10–20% lighter than the ground it used to match", () => {
+    const t = BLUEPRINT.dark;
+    const pct = (lStar(t.assistLift) / lStar(t.assist) - 1) * 100;
+    expect(
+      pct,
+      `dark assistLift (${t.assistLift}) is ${pct.toFixed(1)}% lighter than assist (${t.assist}) in L*; the founder asked for roughly 10–20%`,
+    ).toBeGreaterThanOrEqual(10);
+    expect(pct).toBeLessThanOrEqual(20);
+  });
+
+  // The POINT of the step: the unmounted column must not read as one more build column. It was
+  // already lighter than `bridge` before this change — this pins that the gap WIDENED rather than
+  // some later edit closing it.
+  it("dark: it reads as distinctly lighter than the build column", () => {
+    const t = BLUEPRINT.dark;
+    expect(lStar(t.assistLift)).toBeGreaterThan(lStar(t.bridge) * 1.5);
+  });
+
+  // The regression this value was chosen to avoid. `bar` is the top strip and the composer's
+  // frame; if the column behind them lightens past them, those registers stop being visible as
+  // separate things. Ordering, not a magic number.
+  it("dark: it stays UNDER `bar`, so bars and the composer frame keep their separation", () => {
+    const t = BLUEPRINT.dark;
+    expect(lStar(t.assistLift)).toBeLessThan(lStar(t.bar));
+  });
+
+  // Light is deliberately a no-op: #ffffff has nowhere to go, and the `lift` shadow already does
+  // the separating. Asserted so nobody "fixes the asymmetry" by inventing an off-white.
+  it("light: identical to `assist` — there is nothing above white", () => {
+    expect(BLUEPRINT.light.assistLift).toBe(BLUEPRINT.light.assist);
   });
 });

@@ -61,7 +61,7 @@ const open = vi.fn();
 function seed(status: Record<string, AgentTabStatus> = {}): Project {
   const project: Project = {
     id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
-    createdAt: new Date(0).toISOString(), selectedAgentId: null,
+    createdAt: new Date(0).toISOString(), selectedAgentId: "a1",
     agents: [
       mkAgent("a1", "Alpha"),
       mkAgent("w1", "Parser Worker", { kind: "worker", parentId: "a1", baseBranch: "main" }),
@@ -83,7 +83,43 @@ const rowFor = (name: string) =>
 const queryRow = (name: string) => screen.queryByText(name);
 /** Fold/unfold Alpha's subtree. This is a plain left click on the head row — the same gesture that
  *  selects it — since the chevron that used to own the toggle is gone. */
+/** The user's own fold gesture: ONE left click on the row.
+ *
+ *  THE FIXTURES BELOW PRE-SELECT THE HEAD (`selectedAgentId`), and that is load-bearing now rather
+ *  than incidental. Selection is click-only and the fold is its SECOND stage — a click on the row
+ *  you are ALREADY on. These suites are about what folding DOES, so the precondition "the user has
+ *  already selected this agent" belongs in the fixture; without it the first click here would only
+ *  select and every fold assertion would be testing the wrong gesture.
+ *
+ *  It has to be the fixture and not two clicks: the component reads selection from its `project`
+ *  PROP, which these tests pass as a static object, so a click that updates the store never reaches
+ *  the row. Pre-selecting is the only way to express the precondition here. */
 const toggleAlpha = () => fireEvent.click(rowFor("Alpha"));
+
+/** Fold Alpha when the selection currently sits SOMEWHERE ELSE — the honest two-click gesture.
+ *
+ *  Click one lands on an unselected row, so it only selects. In the running app that selection
+ *  flows back down as a new `project` prop; these tests own the prop, so the rerender here IS that
+ *  step. Click two, now on the row the user is already on, is the fold.
+ *
+ *  Written out rather than folded into `toggleAlpha` because the difference matters: `toggleAlpha`
+ *  is for fixtures that already have Alpha selected, and quietly doing two clicks there would fold
+ *  and immediately unfold. */
+const foldAlphaFromElsewhere = (
+  rerender: (ui: React.ReactElement) => void,
+  project: Project,
+): Project => {
+  fireEvent.click(rowFor("Alpha")); // stage 1 — commits to Alpha, folds nothing
+  const nowOnAlpha: Project = { ...project, selectedAgentId: "a1" };
+  useProjectStore.setState({ projects: [nowOnAlpha] } as never);
+  rerender(<AgentSidebar project={nowOnAlpha} />);
+  fireEvent.click(rowFor("Alpha")); // stage 2 — the fold
+  // RETURNED, and callers must keep using it. Folding a head SELECTS that head — under click-only
+  // selection there is no gesture that folds Alpha while leaving a worker selected. Re-rendering
+  // the old (worker-selected) project afterwards would be re-selecting the worker, which correctly
+  // re-reveals its row and re-opens the subtree: a real behaviour, not the regression under test.
+  return nowOnAlpha;
+};
 /** The seeded project, read back fresh from the store. Throws rather than returning undefined so a
  *  vanished project fails as itself instead of as a confusing assertion on `undefined`. */
 function liveProject() {
@@ -515,12 +551,12 @@ describe("AgentSidebar — a selected worker always has a row", () => {
     useProjectStore.setState({ projects: [selected] } as never);
     const { rerender } = render(<AgentSidebar project={selected} />);
 
-    toggleAlpha();
+    const folded = foldAlphaFromElsewhere(rerender, selected);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     // An unrelated tick, selection unchanged.
     useRuntimeStore.setState({ status: { w1: "working", w2: "idle" } } as never);
-    rerender(<AgentSidebar project={selected} />);
+    rerender(<AgentSidebar project={folded} />);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
   });
 
@@ -549,11 +585,11 @@ describe("AgentSidebar — a selected worker always has a row", () => {
     useProjectStore.setState({ projects: [a, b] } as never);
     const { rerender } = render(<AgentSidebar project={a} />);
 
-    toggleAlpha();
+    const folded = foldAlphaFromElsewhere(rerender, a);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     rerender(<AgentSidebar project={b} />); // switch away…
-    rerender(<AgentSidebar project={a} />); // …and back
+    rerender(<AgentSidebar project={folded} />); // …and back
 
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
   });

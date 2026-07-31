@@ -175,47 +175,56 @@ describe("AgentSidebar — workers live in the click-opened detail card", () => 
   });
 });
 
-describe("AgentSidebar — hover vs. click", () => {
-  // The hover-intent gate defers activation behind a short dwell so a cursor transiting the column
-  // doesn't activate every row it crosses. These tests drive that timer with fake timers.
+describe("AgentSidebar — hover vs. click: SELECTION IS CLICK-ONLY", () => {
+  // ── THE CONTRACT INVERTED, ON THE FOUNDER'S RULE. ────────────────────────────────────────────
+  // This block used to assert that hovering a row activated its terminal after a 90ms dwell. That
+  // dwell was a MITIGATION — it made a fast transit inert while any pause still selected and
+  // mounted — which is why the behaviour kept reading as "already fixed" while the founder kept
+  // reporting it. The rule is now: a build agent is selected ONLY on click. Hover may preview; it
+  // may never select or mount.
+  //
+  // Fake timers stay, and they are the whole instrument here: the old bug was a `setTimeout`, so
+  // "nothing happened" is only meaningful if we ADVANCE PAST when it would have fired. A test that
+  // just checked immediately after mouseEnter would have passed against the broken code too.
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("hovering a row activates its terminal only AFTER the dwell, and never opens the card", () => {
+  it("hovering a row NEVER selects it or mounts its terminal, however long you rest there", () => {
     const { project, open } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
     const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
+
     fireEvent.mouseEnter(head);
-    // Immediately on enter the dwell gate is armed but hasn't fired — nothing selected yet.
     expect(open).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBeNull();
-    // After the dwell elapses it commits: selects + opens the terminal…
-    act(() => vi.advanceTimersByTime(100));
-    expect(open).toHaveBeenCalledWith("a1");
-    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a1");
-    // …but STILL does NOT pop the detail card (only a click does).
+
+    // WELL past the old 90ms gate, and past any longer one someone might "fix" it back to.
+    act(() => vi.advanceTimersByTime(5000));
+    expect(open).not.toHaveBeenCalled();
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBeNull();
+    // And hover still does not pop the detail card — that is right-click's job.
     expect(screen.queryByTestId("agent-hover-card")).toBeNull();
   });
 
-  it("a cursor that leaves before the dwell (a transit) never activates the row", () => {
+  it("a cursor that crosses the column leaves nothing selected behind it", () => {
     const { project, open } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
     const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
     fireEvent.mouseEnter(head);
-    act(() => vi.advanceTimersByTime(40)); // still mid-dwell…
-    fireEvent.mouseLeave(head); // …cursor moves on before committing
-    act(() => vi.advanceTimersByTime(200)); // let any stale timer fire
+    act(() => vi.advanceTimersByTime(40));
+    fireEvent.mouseLeave(head);
+    act(() => vi.advanceTimersByTime(5000)); // let any stale timer fire
     expect(open).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBeNull();
   });
 
-  it("clicking a row opens the detail card immediately, bypassing the dwell", () => {
+  it("clicking a row is what selects it — and a right click opens the detail card", () => {
     const { project, open } = seed({ workerStatus: "working" });
     render(<AgentSidebar project={project} />);
     expect(screen.queryByTestId("agent-hover-card")).toBeNull();
     openHeadCard();
-    // Click selects NOW (no dwell wait) and opens the card.
     expect(open).toHaveBeenCalledWith("a1");
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a1");
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy();
   });
 });

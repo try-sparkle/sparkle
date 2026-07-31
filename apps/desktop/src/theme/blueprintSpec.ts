@@ -28,6 +28,21 @@ export interface BlueprintTheme {
   /** The app ground, and the assistant column — the same surface in this design. */
   ground: string;
   assist: string;
+  /** ── THE UNMOUNTED CONCIERGE'S SURFACE (`--k-assist-lift` in rev4.html) ───────────────────────
+   *  `assist` is the column's surface in the abstract; THIS is the one it actually paints when it
+   *  is NOT wired. Mounted, the column floods to `term` and neither of these applies.
+   *
+   *  WHY IT IS A SEPARATE TOKEN AND NOT A TWEAK TO `assist`. `assist` is "the assistant column IS
+   *  the ground" — a structural claim this design makes deliberately, and one that
+   *  `blueprintSpec.test.ts` asserts against the spec page. Moving `assist` to lighten the
+   *  unmounted state would have silently redefined the ground of the whole shell.
+   *
+   *  LIGHT IS INTENTIONALLY EQUAL TO `assist` (#ffffff). There is nothing above white; in light the
+   *  `lift` shadow alone separates the column, exactly as it always did. DARK takes a real step:
+   *  #0f1e37 is +16.3% in CIE L* over `assist` (9.729 → 11.317), which is the middle of the
+   *  10–20% the founder asked for, and it stays UNDER `bar` (11.861) so the bars and the composer
+   *  frame keep their own separation instead of dissolving into the column behind them. */
+  assistLift: string;
   /** The builder column. A hair off the ground, not a plane step. */
   bridge: string;
   /** Bars: the top strip and the composer's frame. */
@@ -95,6 +110,7 @@ export interface BlueprintTheme {
 export const BLUEPRINT_LIGHT: BlueprintTheme = {
   ground: "#ffffff",
   assist: "#ffffff",
+  assistLift: "#ffffff",
   bridge: "#f2f6fd",
   bar: "#f7fafe",
   term: "#d9e3f3",
@@ -128,6 +144,7 @@ export const BLUEPRINT_LIGHT: BlueprintTheme = {
 export const BLUEPRINT_DARK: BlueprintTheme = {
   ground: "#0d1b31",
   assist: "#0d1b31",
+  assistLift: "#0f1e37",
   bridge: "#091426",
   bar: "#101f39",
   term: "#030913",

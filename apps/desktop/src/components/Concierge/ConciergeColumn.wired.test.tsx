@@ -62,20 +62,48 @@ function mount(wired?: ConciergeWired) {
 }
 
 describe("unwired — the concierge LIFTS", () => {
-  it("carries the spec's lift and does NOT change colour", () => {
+  it("carries the spec's lift, on its OWN plane", () => {
     const col = mount();
     expect(col.dataset.wired).toBe("off");
     expect(col.style.boxShadow).toBe(BLUEPRINT.dark.lift);
-    // The lift's whole claim is "I am a layer above the columns" — said with elevation ALONE. A
-    // colour change here would be the flood arriving early, and the two states would stop being
-    // distinguishable.
-    expect(col.style.background).toBe(C.conciergeSurface);
+    // ── THIS ASSERTION WAS INVERTED, DELIBERATELY. ────────────────────────────────────────────
+    // It used to read `toBe(C.conciergeSurface)` under the heading "does NOT change colour",
+    // because the design said the lift speaks with elevation ALONE. That was written for LIGHT,
+    // where the column is #ffffff and elevation is the only move available. In DARK it left the
+    // unmounted column sitting on exactly the ground colour, so the shadow had nothing to lift
+    // OFF and the founder read it as one more dark column beside the build columns.
+    //
+    // The resting state now has its own plane. `conciergeSurfaceLifted` is IDENTICAL to
+    // `conciergeSurface` in light (nothing is above white), so the original "elevation alone"
+    // reading still holds everywhere it was ever true; dark takes a +16.3% L* step. The
+    // relationship between the two tokens is pinned in theme/blueprintSpec.test.ts.
+    expect(col.style.background).toBe(C.conciergeSurfaceLifted);
     expect(col.style.color).toBe(C.cream);
   });
 
   it("is the default, so a shell that knows nothing about wiring gets the resting state", () => {
     expect(mount().dataset.wired).toBe("off");
   });
+});
+
+// ── THE VERTICAL LINE. Reported three times; this is the regression test for it. ───────────────
+// The column used to paint `border-right: 1px solid <hairline>` unconditionally. That single
+// declaration was the line the founder saw at the concierge↔build boundary, and it survived two
+// rounds of "seam" fixes because those moved the SIDEBAR's border in index.css while this one —
+// in a different file, reading as the concierge's own edge — was never touched.
+//
+// ASSERTS THE PAINT, NOT THE ABSENCE OF A DECLARATION. The border must stay 1px (box-sizing is
+// border-box and this column has an explicit width, so dropping it would widen the content box and
+// shift the thread) — so "fixed" means transparent, and a test that merely checked for no border
+// would pass on the layout-shifting version too.
+describe("the concierge↔build boundary paints NO rule, in either state", () => {
+  for (const wired of [undefined, "left", "right"] as const) {
+    it(`draws a transparent 1px right border (wired=${wired ?? "off"})`, () => {
+      const col = mount(wired);
+      expect(col.style.borderRightWidth).toBe("1px");
+      expect(col.style.borderRightColor).toBe("transparent");
+    });
+  }
 });
 
 describe("wired — the concierge FLOODS", () => {

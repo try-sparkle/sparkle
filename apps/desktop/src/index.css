@@ -54,6 +54,7 @@
   --c-forest: #030913;
   --c-deep-forest: #091426;
   --c-concierge-surface: #0d1b31;
+  --c-concierge-surface-lifted: #0f1e37;
   --c-bar-surface: #101f39;
   --c-concierge-muted: #8ba3c8;
   --c-muted: #8ba3c8;
@@ -87,6 +88,7 @@
   --c-forest: #d9e3f3;
   --c-deep-forest: #f2f6fd;
   --c-concierge-surface: #ffffff;
+  --c-concierge-surface-lifted: #ffffff;
   --c-bar-surface: #f7fafe;
   --c-concierge-muted: #4f6284;
   --c-muted: #4f6284;
@@ -327,11 +329,38 @@ body {
 .paircols > [data-testid="agent-sidebar-column"] {
   border-inline: none;
 }
+
+/* ── AND THE CONCIERGE-SIDE RULE IS GONE TOO. FOUNDER CALL, THIRD ASK. ────────────────────────
+   These two selectors used to paint `1px solid var(--c-hairline)` — the build column's edge
+   NEAREST the concierge (a left pair's build column sits to the concierge's left, so its RIGHT
+   edge faces it; a right pair's build column faces it with its LEFT edge). That rule, together
+   with the concierge's own `border-right` in Concierge/ConciergeColumn.tsx, was the vertical line
+   the founder reported three times.
+
+   IT IS REMOVED OUTRIGHT — in both themes, mounted or not — not merely suppressed while wired.
+   The earlier fix hid it only under `[data-wired]`, which left it standing in every unmounted
+   state; the founder's instruction the third time was explicitly to "remove those vertical lines
+   in both light and dark mode from the build columns where they are closest to the concierge".
+
+   WHY THIS DOESN'T LOSE THE BOUNDARY — AND WHAT ACTUALLY HOLDS IT. Mounted, the column floods to
+   the terminal plane and the boundary is MEANT to be continuous; that is the whole point of the
+   seam vanishing. Unmounted, it paints its own plane (`--c-concierge-surface-lifted`, +16.3% L* in
+   dark) and carries the lift shadow — and it is the SHADOW that separates it, not the plane. The
+   fill step measures 1.107:1 against the builder column, under the repo's own `EDGE_MIN_CONTRAST`
+   of 1.2, so this is NOT the "separate by fill" alternative from blueprintSpec's thesis however
+   much it may look like it. Do not delete the lift on the theory that the fill carries this now.
+   `theme/chromeContrast.test.ts` pins both halves.
+
+   `transparent`, NOT `none`, and not deleting the declaration: `* { box-sizing: border-box }` is
+   global and this column has an explicit width, so the border lives INSIDE that box. Dropping it
+   would widen the content box by 1px, shift the terminal, and re-break the active row's bleed
+   geometry — the exact "do NOT compensate with width + 1" trap documented on the seam element in
+   AgentSidebar.tsx. Keeping a transparent 1px border keeps every measurement identical. */
 .pair[data-side="right"] .paircols > [data-testid="agent-sidebar-column"] {
-  border-left: 1px solid var(--c-hairline);
+  border-left: 1px solid transparent;
 }
 .pair[data-side="left"] .paircols > [data-testid="agent-sidebar-column"] {
-  border-right: 1px solid var(--c-hairline);
+  border-right: 1px solid transparent;
 }
 
 /* WIRED: the seam between build and the concierge goes — one continuous circuit. Only on the pair
@@ -350,13 +379,17 @@ body {
    mode is on and the aria-hidden spacer comes FIRST, so for anyone carrying that persisted
    preference the seam was removed from the spacer while the build column kept its border. Patching
    in then looked like nothing happened. It was already wrong for the right pair; landing the left
-   one would have doubled it. */
-.shell[data-wired="left"] .pair[data-side="left"] .paircols > [data-testid="agent-sidebar-column"] {
-  border-right-color: transparent;
-}
-.shell[data-wired="right"] .pair[data-side="right"] .paircols > [data-testid="agent-sidebar-column"] {
-  border-left-color: transparent;
-}
+   one would have doubled it.
+
+   ── THE TWO `border-*-color: transparent` RULES THAT LIVED HERE ARE GONE, AND SO IS THEIR JOB ──
+   They existed to hide the concierge-side rule WHILE WIRED. That rule is now transparent in every
+   state (see the block above), so these had nothing left to suppress — a `[data-wired]` override
+   of a value that is already `transparent` is dead CSS that reads as though it were carrying the
+   feature. Deleting them is what makes the block above the single place this boundary is decided.
+
+   THE REST OF THE FLOOD IS UNAFFECTED. `data-wired` still drives the concierge's own plane and ink
+   (ConciergeColumn), the shell root's attribute, and `promptTarget` routing. This deletion is
+   ONLY about the 1px rule, which no longer depends on the cable at all. */
 
 /* Settings → Concierge tools: the per-row "Reset" and the pane's "Reset all to defaults" are text
    LINKS, not buttons — no border, no fill, muted until hover. They are the undo for a decision, not

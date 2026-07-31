@@ -118,14 +118,22 @@ describe("projectStore reorderAgent", () => {
   });
 });
 
-describe("projectStore unpinAgent — now a NAME-freeze release only", () => {
+// AGENT PINNING IS REMOVED. `unpinAgent` was the last surviving piece of it — by the end it only
+// released the name freeze, which is the undo for the pin chip that no longer renders.
+//
+// Asserted as an ABSENCE from the store's public surface, not merely "we deleted some code": the
+// store is one object, so a re-added action shows up here immediately. Project-tab pinning
+// (components/ProjectTabs) is a separate, live feature and is deliberately not in scope.
+describe("projectStore — agent pinning is gone", () => {
   beforeEach(() => seed());
 
-  it("clears namePinned so the agent auto-names again", () => {
+  it("exposes no unpinAgent action", () => {
+    expect(useProjectStore.getState()).not.toHaveProperty("unpinAgent");
+  });
+
+  it("still freezes a human rename — the flag outlived the affordance", () => {
     useProjectStore.getState().renameAgent("p1", "a1", "Human Choice");
     expect(agent().namePinned).toBe(true);
-    useProjectStore.getState().unpinAgent("p1", "a1");
-    expect(agent().namePinned).toBe(false);
   });
 });
 
