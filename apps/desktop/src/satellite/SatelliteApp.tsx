@@ -35,6 +35,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { planBoardUp } from "../engine/planBoard";
+import type { ZoomColumn } from "../engine/columnZoom";
+import { ZoomColumnOverride } from "../hooks/useZoomColumn";
 import type { PairSide } from "../engine/cable";
 import { useSettingsStore } from "../stores/settingsStore";
 import { AgentSidebar } from "../components/AgentSidebar";
@@ -52,6 +54,11 @@ import {
   releaseSatellite,
   settleSatellite,
 } from "../services/satelliteWindows";
+
+/** THIS WINDOW IS ONE REGION. A torn-off terminal has no cockpit around it — no pairs, no
+ *  concierge — so "which column has focus" has a constant answer here, and its zoom level is its
+ *  own rather than shared with a column in another window. */
+export const SATELLITE_ZOOM_COLUMN: ZoomColumn = "satellite";
 
 /** A satellite hosts one project in one column — the primary side. Named rather than inlined so
  *  the four reads below are visibly the SAME side, not four independent guesses. */
@@ -112,9 +119,8 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   const openPlanBoard = useUiStore((s) => s.openPlanBoard);
   const showBuildStage = useUiStore((s) => s.showBuildStage);
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
-  const zoomIn = useUiStore((s) => s.zoomIn);
-  const zoomOut = useUiStore((s) => s.zoomOut);
-  const resetZoom = useUiStore((s) => s.resetZoom);
+  const stepColumnZoom = useUiStore((s) => s.stepColumnZoom);
+  const resetColumnZoom = useUiStore((s) => s.resetColumnZoom);
 
   // Once true the panes are gone and we are counting down to `destroy` — see CLOSE_SETTLE_MS.
   const [closing, setClosing] = useState(false);
@@ -165,23 +171,30 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   }, [project?.name]);
 
   // ⌘+ / ⌘- / ⌘0 terminal zoom, same bindings the main window carries.
+  //
+  // NO FOCUS LOOKUP HERE, and that is the point of giving this window its own `ZoomColumn`. The main
+  // window has to ask which of five columns a press belongs to; this one holds exactly ONE region, so
+  // the answer is a constant and the gesture can never be ambiguous. It also keeps the satellite's
+  // text size independent of the cockpit's terminals rather than silently sharing a level with
+  // whichever column the pane was torn off from — see `ZoomColumnOverride`, which is what makes the
+  // pane inside actually READ this key.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
       if (e.key === "=" || e.key === "+") {
         e.preventDefault();
-        zoomIn();
+        stepColumnZoom(SATELLITE_ZOOM_COLUMN, 1);
       } else if (e.key === "-" || e.key === "_") {
         e.preventDefault();
-        zoomOut();
+        stepColumnZoom(SATELLITE_ZOOM_COLUMN, -1);
       } else if (e.key === "0") {
         e.preventDefault();
-        resetZoom();
+        resetColumnZoom(SATELLITE_ZOOM_COLUMN);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [zoomIn, zoomOut, resetZoom]);
+  }, [stepColumnZoom, resetColumnZoom]);
 
   // The red traffic light re-docks: intercept it, take the panes down, and let the effect below
   // finish the job. NOT a plain close — the project has to get back to main, and the PTYs have to
@@ -266,6 +279,11 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   };
 
   return (
+    // EVERY PANE BELOW READS THIS WINDOW'S OWN ZOOM KEY. Without the provider `useZoomColumn` would
+    // derive a column from the project's side in the SHARED assignment map and return
+    // `terminal-right` — silently tying this window's text size to a column in the main window,
+    // which is the exact cross-column coupling this whole change exists to remove.
+    <ZoomColumnOverride.Provider value={SATELLITE_ZOOM_COLUMN}>
     <div
       style={{
         display: "flex",
@@ -377,6 +395,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
         )}
       </div>
     </div>
+    </ZoomColumnOverride.Provider>
   );
 }
 

@@ -433,3 +433,34 @@ body {
 .nudge-card-quiet:focus-visible {
   opacity: 1;
 }
+
+/* ── CLIP WITHOUT BECOMING A SCROLL CONTAINER ──────────────────────────────────────────────────
+   The build column's header band and its mini-toggle wrapper must CONTAIN their unshrinkable
+   chrome once the column is dragged toward its 50px floor: the ~80px Build/Plan segment and the
+   `nowrap` Reset button otherwise paint outside the column, and this band sits at BUILD_COLUMN_Z
+   above the terminal pane — so the spill does not merely look wrong, it swallows clicks aimed at
+   the PTY (measured in WebKit: without containment `Reset` takes clicks 5px past the column edge).
+
+   WHY NOT `overflow: hidden` ALONE. It clips, but it also makes the box a SCROLL CONTAINER: the
+   content stays programmatically scrollable and the UA scrolls it to reveal a sequentially-focused
+   descendant. Both boxes hold focusable content that is clipped in exactly the state this targets —
+   `PairCountControl` is deliberately kept in the tab order and sits past the spacer at the far end,
+   so it is the FIRST thing to overflow. Tab onto it in a narrow column and WebKit sets `scrollLeft`
+   to bring it into view, sliding the Build/Plan segment out of the header — with no scrollbar to
+   show it and nothing to reset it, leaving the header displaced until an unrelated relayout.
+   `overflow: clip` cannot do that; not being a scroll container is the entire reason it exists.
+
+   WHY NOT `clip` ALONE. It is WebKit 16+, and `tauri.conf.json` declares
+   `minimumSystemVersion: "11.0"` — on a Big Sur WKWebView below Safari 16 the declaration is
+   dropped and the pointer lockout returns silently.
+
+   So: `hidden` as the floor everyone honours, upgraded to `clip` wherever it is understood. This
+   lives in CSS rather than inline because `@supports` has no inline form. */
+.clip-no-scroll {
+  overflow: hidden;
+}
+@supports (overflow: clip) {
+  .clip-no-scroll {
+    overflow: clip;
+  }
+}

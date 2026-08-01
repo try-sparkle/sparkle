@@ -25,7 +25,7 @@
 // screen-reader-reachable) and a double-click anywhere on the slider (the gesture the founder asked
 // for).
 import { useRef, type MouseEvent } from "react";
-import { FiMapPin } from "react-icons/fi";
+import { FiMapPin, FiMoon, FiUser } from "react-icons/fi";
 import { C, FONT_WEIGHT, PRESENCE_SEGMENT_TINT_PCT } from "../../theme/colors";
 import { usePresenceStore, type PresenceMode } from "../../stores/presenceStore";
 import { HINT_JUMP_ATTR } from "../../keyboardHints/hintTargets";
@@ -51,12 +51,17 @@ export function presenceTitle(mode: PresenceMode, pinnedHere: boolean): string {
   return "Away. Sparkle may act on its own; risky actions wait for you.";
 }
 
-const SEGMENTS: { mode: PresenceMode; label: string }[] = [
-  { mode: "here", label: "Here" },
-  { mode: "away", label: "Away" },
+/** The glyph each segment draws when the toolbar is too narrow for the words — `react-icons/fi`,
+ *  the project's icon set (emoji-as-icons are banned repo-wide).
+ *    • here — a person, i.e. you are at the keyboard and Sparkle checks with you.
+ *    • away — a moon, i.e. you are not, and Sparkle may act on its own.
+ *  Distinguishable at 12px, which is the point: two words truncated to "H…"/"A…" are not. */
+const SEGMENTS: { mode: PresenceMode; label: string; Icon: typeof FiUser }[] = [
+  { mode: "here", label: "Here", Icon: FiUser },
+  { mode: "away", label: "Away", Icon: FiMoon },
 ];
 
-export function PresenceSlider() {
+export function PresenceSlider({ showLabels = true }: { showLabels?: boolean }) {
   const mode = usePresenceStore((s) => s.mode);
   const pinnedHere = usePresenceStore((s) => s.pinnedHere);
   const setHere = usePresenceStore((s) => s.setHere);
@@ -95,7 +100,16 @@ export function PresenceSlider() {
         padding: 2,
         // Sized to its two words rather than stretching, and pushed to the right end of the attach
         // row so it sits directly above Send — the button whose behaviour it governs.
-        flex: "none",
+        //
+        // `0 1 auto` IN THE ICON STATE, not `none`. `flex: none` refuses to shrink, which is how
+        // this control came to hang past the column's right edge in the founder's screenshot: the
+        // row had nowhere to put it and no permission to compress it. Allowing it to shrink (and to
+        // wrap its two segments) is what keeps it inside a 50px column. Unchanged at every width
+        // that fits, where there is no shrinking to do.
+        flex: showLabels ? "none" : "0 1 auto",
+        minWidth: 0,
+        flexWrap: showLabels ? "nowrap" : "wrap",
+        justifyContent: "center",
         marginLeft: "auto",
       }}
     >
@@ -138,7 +152,7 @@ export function PresenceSlider() {
       >
         <FiMapPin size={11} aria-hidden />
       </button>
-      {SEGMENTS.map(({ mode: seg, label }) => {
+      {SEGMENTS.map(({ mode: seg, label, Icon }) => {
         const active = mode === seg;
         // Away is the state with consequences, so it is the one that gets brand color when active;
         // Here is the safe resting state and stays quiet. An always-lit control would be noise.
@@ -206,11 +220,19 @@ export function PresenceSlider() {
                 : "transparent",
               border: "none",
               borderRadius: 999,
-              padding: "4px 9px",
+              // Tighter in the icon state: at that point the padding is competing with the glyph
+              // for a column that may be 50px wide.
+              padding: showLabels ? "4px 9px" : "4px 5px",
               cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
             }}
           >
-            {label}
+            {/* ICONS WHEN THE ROW CANNOT AFFORD WORDS. The founder's narrow-column screenshot had
+                this control running past the column's right edge, clipped mid-word. The accessible
+                name is untouched in both states — it is already the full sentence on `aria-label`
+                above — so this is a purely visual reduction and "click Away" keeps working. */}
+            {showLabels ? label : <Icon size={12} aria-hidden />}
           </button>
         );
       })}

@@ -3,6 +3,9 @@ import { FiChevronDown, FiInfo } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore, type SparkleImprovementConsent } from "../stores/settingsStore";
 import { setImprovementConsent } from "../services/configActions";
+import { useColumnZoom } from "../hooks/useZoomColumn";
+import { zoomColumnFor } from "../engine/columnZoom";
+import { SPARKLE_PANE_SIDE } from "../stores/uiStore";
 
 /**
  * Consent banner for the Sparkle self-improvement agent. Sits at the top of the Sparkle pane
@@ -81,6 +84,23 @@ export function consentCopy(mode: SparkleImprovementConsent): ConsentCopy {
 }
 
 export function SparkleConsentBanner() {
+  // ── IT SCALES WITH THE COLUMN IT LIVES IN ────────────────────────────────────────────────────
+  //
+  // THE LOCKOUT THIS FIXES. The founder: "I can't zoom the right terminal … zoomed out enough to be
+  // able to log back in because it's the always / case by case / never row that's keeping it from
+  // zooming." He was locked out of an agent by a consent banner.
+  //
+  // The cause is that `Cmd -` on a terminal column only ever shrank xterm's FONT (Terminal.tsx
+  // multiplies BASE_FONT_SIZE by the level). This banner is React chrome, not xterm, so it kept its
+  // full size while the terminal beneath it got smaller — meaning zooming out bought fewer usable
+  // rows than it should have, and past a point bought none at all: the banner's fixed height was
+  // simply subtracted from the pane, and the login prompt further down the terminal stayed off
+  // screen.
+  //
+  // Reading the same per-column level the terminal reads makes "zoom this column out" mean the whole
+  // column, which is what the founder asked for in the first place. `SPARKLE_PANE_SIDE` because
+  // there is exactly one Improve-Sparkle pane and it lives in the primary pair.
+  const columnZoom = useColumnZoom(zoomColumnFor("terminal", SPARKLE_PANE_SIDE));
   const mode = useSettingsStore((s) => s.sparkleImprovementConsent);
   // Route through the configAction (not the raw store setter) so the choice is MIRRORED to
   // [improvement].consent in config.toml — that file is the only path headless agents have to it.
@@ -109,6 +129,23 @@ export function SparkleConsentBanner() {
       style={{
         position: "relative",
         flex: "0 0 auto",
+        // ── NO CHILD MAY SET ITS COLUMN'S FLOOR ──────────────────────────────────────────────
+        //
+        // This banner was doing exactly that, and it locked the founder out of an agent. The
+        // Always / Case by case / Never row is an `inline-flex` of three unbreakable buttons, so
+        // its min-content width — ~230px — became a floor the whole PANE could not shrink below.
+        // Zooming the right terminal out therefore stopped early, and the login prompt further down
+        // that terminal stayed off screen: a consent banner denying access to the thing behind it.
+        //
+        // Every box from here down now carries `minWidth: 0`. A flex item's default
+        // `min-width: auto` is what refuses to shrink below its content; without overriding it, no
+        // amount of wrapping downstream helps, because the ancestor never gets smaller in the first
+        // place. The only floor in the cockpit is `COLUMN_MIN_WIDTH` (engine/columnResize).
+        minWidth: 0,
+        // Shrinks the whole banner — text, buttons and padding together — so zooming the column out
+        // hands the terminal the vertical space back. It also reduces this row's min-content width
+        // by the same factor, which is the second half of "stop propping the column open".
+        zoom: columnZoom,
         padding: "10px 14px",
         background: C.deepForest,
         borderBottom: `1px solid ${CHAT_USER_BUBBLE}`,
@@ -123,10 +160,11 @@ export function SparkleConsentBanner() {
           justifyContent: "space-between",
           gap: 12,
           flexWrap: "wrap",
+          minWidth: 0,
         }}
       >
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, flex: "1 1 auto" }}>
+          <span style={{ fontStyle: "italic", fontWeight: FONT_WEIGHT.semibold, fontSize: 13, minWidth: 0 }}>
             Can we use your logs &amp; crash reports to automatically improve Sparkle?
           </span>
           {/* Disclosure toggle: a real button so the detail is reachable by click/tap (not just
@@ -163,6 +201,12 @@ export function SparkleConsentBanner() {
             border: `1px solid ${C.teal}`,
             borderRadius: 6,
             overflow: "hidden",
+            // WRAPS INSTEAD OF PROPPING THE COLUMN OPEN. Three side-by-side buttons are ~230px of
+            // unbreakable row; allowing the group to wrap lets them stack, and `minWidth: 0` is what
+            // permits the group to be asked to. The segmented look survives at every width that can
+            // afford it, which is every width the user is likely to sit at.
+            flexWrap: "wrap",
+            minWidth: 0,
           }}
         >
           {MODES.map((m) => {
@@ -181,6 +225,11 @@ export function SparkleConsentBanner() {
                   fontSize: 12,
                   padding: "5px 12px",
                   cursor: "pointer",
+                  // DELIBERATELY NOT `whiteSpace: nowrap`. "Case by case" wrapping to two or three
+                  // lines is ugly at 60px and READABLE; the alternative is a 85px floor per button
+                  // that the column can never go below. Legible-but-cramped beats locked-out.
+                  minWidth: 0,
+                  flex: "1 1 auto",
                 }}
               >
                 {m.label}

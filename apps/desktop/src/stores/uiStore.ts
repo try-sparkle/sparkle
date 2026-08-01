@@ -7,7 +7,18 @@ import {
   repairActiveSpecial,
   repairSendMode,
   repairStatusFilter,
+  repairZoomByColumn,
 } from "./composerPersist";
+// A VALUE import, unlike StatusBand/SendMode below: engine/columnZoom imports only a TYPE from
+// engine/columnResize and nothing else, so it reaches neither theme/colors nor a component and
+// cannot close the theme → uiStore cycle those two comments describe.
+import {
+  ZOOM_DEFAULT,
+  ZOOM_COLUMNS,
+  clampZoom,
+  steppedZoom,
+  type ZoomColumn,
+} from "../engine/columnZoom";
 import type { Runtime } from "../types";
 // TYPE-ONLY import, deliberately: engine/buildSections → engine/workflowStage → theme/colors, and
 // theme/theme.ts imports THIS store. A value import would close that loop into a runtime cycle; a
@@ -100,16 +111,23 @@ export const COMPOSER_RESTORE_THRESHOLD = 24;
  */
 export const COMPOSER_Z = 5;
 
-// Terminal text-size factor (Cmd +/- and the ⋯ menu "Text size"). Applied as a multiplier
-// on the terminal font size only (see Terminal.tsx), so the text scales while the UI chrome
-// — sidebar, top bar, buttons — stays fixed. Stepped + clamped to sane bounds.
-export const ZOOM_MIN = 0.7;
-export const ZOOM_MAX = 1.8;
-export const ZOOM_STEP = 0.1;
-export const ZOOM_DEFAULT = 1.0;
-// Round to 2dp so repeated +/- steps don't drift into float noise (0.7000000001).
-const clampZoom = (z: number) =>
-  Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(z * 100) / 100));
+// Text-size factor for ONE COLUMN (Cmd +/- and the ⋯ menu "Text size"). It used to be a single
+// global number read only by Terminal.tsx, which is why the shortcut worked in a terminal and
+// nowhere else; it is now one level per cockpit region. The bounds, the step and the clamp moved to
+// engine/columnZoom with the rest of the rule — re-exported here because several call sites already
+// import them from this module and a second spelling of a constant is the drift those files keep
+// re-finding.
+export { ZOOM_MIN, ZOOM_MAX, ZOOM_STEP, ZOOM_DEFAULT } from "../engine/columnZoom";
+export type { ZoomColumn } from "../engine/columnZoom";
+
+/** Every region at 1.0 — the store's initial state and what "Reset all" restores.
+ *  BUILT FROM `ZOOM_COLUMNS` rather than written out, so a region added later cannot be born
+ *  `undefined` in the default object while every rehydrate path repairs it. */
+function defaultZoomByColumn(): Record<ZoomColumn, number> {
+  const out = {} as Record<ZoomColumn, number>;
+  for (const key of ZOOM_COLUMNS) out[key] = ZOOM_DEFAULT;
+  return out;
+}
 
 /**
  * How long a "scroll this agent's row into view" request stays live before it expires.
@@ -195,11 +213,32 @@ interface UiState {
   // user brings it back. composerHeight remembers the open size to restore to.
   composerMinimized: boolean;
   setComposerMinimized: (v: boolean) => void;
-  zoom: number;
-  setZoom: (z: number) => void;
-  zoomIn: () => void;
-  zoomOut: () => void;
-  resetZoom: () => void;
+  // ── ONE ZOOM LEVEL PER COLUMN ────────────────────────────────────────────────────────────────
+  //
+  // A COMPLETE record, never a sparse one. Every action below writes through `repairZoomByColumn`'s
+  // shape, and the rehydrate path repairs it unconditionally, because a missing key here does not
+  // read as "default" — it reads as `undefined`, reaches `BASE_FONT_SIZE * undefined` as `NaN`, and
+  // blanks a terminal for good (the value is persisted). See stores/composerPersist.
+  //
+  // The KEY is `ZoomColumn` — the five cockpit regions plus the satellite window — so "each column
+  // remembers its own level" is a property of the type rather than a convention. There is no global
+  // zoom any more; a caller that wants to move everything calls `resetAllZoom` or iterates.
+  zoomByColumn: Record<ZoomColumn, number>;
+  setColumnZoom: (column: ZoomColumn, z: number) => void;
+  /** Step ONE column. `direction` is +1/-1 so both keys share a single stepping rule. */
+  stepColumnZoom: (column: ZoomColumn, direction: 1 | -1) => void;
+  /** Cmd+0 — the focused column only. */
+  resetColumnZoom: (column: ZoomColumn) => void;
+  /** Step EVERY region at once — what the Settings "Text size" stepper drives.
+   *
+   *  That control lives in a modal, so there is no focused column for it to address: the honest
+   *  reading of a global widget is "all of them". It is also the only surface from which a user who
+   *  cannot remember which column they zoomed can walk everything back together. */
+  stepAllZoom: (direction: 1 | -1) => void;
+  /** "Reset all" — every region back to 1.0 at once. Deliberately a SEPARATE action from
+   *  `resetColumnZoom`, which is what Cmd+0 calls: with five independent levels, a user who has
+   *  zoomed several columns and wants out needs one gesture that does not require visiting each. */
+  resetAllZoom: () => void;
   // Which special (non-project) view is in focus, if any. "sparkle" = the self-improvement agent
   // pinned bottom-left. null = a normal project agent (or nothing) is active. Persisted so the
   // active view survives relaunch. Selecting a normal agent clears this back to null.
@@ -477,11 +516,33 @@ export const useUiStore = create<UiState>()(
       setComposerUserSized: (v) => set({ composerUserSized: v }),
       composerMinimized: false,
       setComposerMinimized: (v) => set({ composerMinimized: v }),
-      zoom: ZOOM_DEFAULT,
-      setZoom: (z) => set({ zoom: clampZoom(z) }),
-      zoomIn: () => set((s) => ({ zoom: clampZoom(s.zoom + ZOOM_STEP) })),
-      zoomOut: () => set((s) => ({ zoom: clampZoom(s.zoom - ZOOM_STEP) })),
-      resetZoom: () => set({ zoom: ZOOM_DEFAULT }),
+      zoomByColumn: defaultZoomByColumn(),
+      setColumnZoom: (column, z) =>
+        set((s) => ({ zoomByColumn: { ...s.zoomByColumn, [column]: clampZoom(z) } })),
+      stepColumnZoom: (column, direction) =>
+        set((s) => ({
+          zoomByColumn: {
+            ...s.zoomByColumn,
+            // Stepped from the column's OWN level, read inside the updater rather than passed in.
+            // A caller that read the level, added a step and called `setColumnZoom` would lose a
+            // press to any interleaving write — and auto-repeat on a held Cmd+= makes that ordinary
+            // rather than theoretical.
+            [column]: steppedZoom(s.zoomByColumn[column] ?? ZOOM_DEFAULT, direction),
+          },
+        })),
+      resetColumnZoom: (column) =>
+        set((s) => ({ zoomByColumn: { ...s.zoomByColumn, [column]: ZOOM_DEFAULT } })),
+      stepAllZoom: (direction) =>
+        set((s) => {
+          const next = {} as Record<ZoomColumn, number>;
+          // Each column steps from ITS OWN level, so a row of differently-zoomed columns keeps its
+          // relative sizes instead of being flattened onto one value by a global press.
+          for (const key of ZOOM_COLUMNS) {
+            next[key] = steppedZoom(s.zoomByColumn[key] ?? ZOOM_DEFAULT, direction);
+          }
+          return { zoomByColumn: next };
+        }),
+      resetAllZoom: () => set({ zoomByColumn: defaultZoomByColumn() }),
       activeSpecial: null,
       setActiveSpecial: (v) => set({ activeSpecial: v }),
       themePref: "auto",
@@ -673,7 +734,9 @@ export const useUiStore = create<UiState>()(
       // complete record, so a partial blob can't hide a band with no visible cause.
       // v3: the boolean `conciergeAutoSend` became the three-position `conciergeSendMode`. An
       // armed blob lands on "speak" rather than silently resetting to microphone-off.
-      version: 3,
+      // v4: the global `zoom` became `zoomByColumn`. Every region is seeded from the old number, so
+      // an upgrading user's terminals keep the text size they set rather than snapping back to 1.0.
+      version: 4,
       migrate: (persisted, version) =>
         migratePersistedUi(persisted as Record<string, unknown>, version, COMPOSER_SNAP) as unknown as UiState,
       // Strip the transient keys on the way IN as well. `partialize` only stops us WRITING them;
@@ -706,6 +769,13 @@ export const useUiStore = create<UiState>()(
         // selected and dead arrow keys (roborev 56071).
         if ("conciergeSendMode" in stored)
           stored.conciergeSendMode = repairSendMode(stored.conciergeSendMode);
+        // The per-column zoom map, repaired on EVERY rehydrate and for the sharpest version of the
+        // reason above: this merge is SHALLOW, so a stored map REPLACES the complete default rather
+        // than filling in around it. A blob carrying four of the six keys therefore hydrates
+        // `undefined` for the rest, and `undefined` is not "unzoomed" — it multiplies into `NaN`,
+        // reaches `term.options.fontSize`, and blanks that column's terminal on every launch until
+        // localStorage is edited by hand.
+        if ("zoomByColumn" in stored) stored.zoomByColumn = repairZoomByColumn(stored.zoomByColumn);
         return { ...current, ...(stored as Partial<UiState>) };
       },
     },

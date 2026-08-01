@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, fireEvent, within } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SparkleConsentBanner, consentCopy } from "./SparkleConsentBanner";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useUiStore } from "../stores/uiStore";
 
 // The banner now routes mode changes through setImprovementConsent, which mirrors the choice to
 // config.toml via setConfigValue → a Tauri invoke that is absent under jsdom. Stub just that write
@@ -194,5 +195,59 @@ describe("SparkleConsentBanner", () => {
     expect(screen.getByText(/Here's how it works/)).toBeTruthy();
     fireEvent.click(toggle); // un-pin
     expect(screen.queryByText(/Here's how it works/)).toBeNull();
+  });
+});
+
+// ── THE BANNER MUST NOT SET ITS COLUMN'S FLOOR ────────────────────────────────────────────────
+//
+// THE LOCKOUT THIS PINS. The founder: "I can't zoom the right terminal … zoomed out enough to be
+// able to log back in because it's the always / case by case / never row that's keeping it from
+// zooming." A consent banner denied him access to the agent behind it.
+//
+// Two causes, and both are asserted here:
+//   1. The Always / Case by case / Never row was an unbreakable `inline-flex` with no `minWidth: 0`,
+//      so its min-content width was a floor the pane could not shrink below.
+//   2. `Cmd -` on a terminal column only ever shrank xterm's FONT, so this React chrome kept its
+//      full height while the terminal got smaller — zooming out bought fewer rows than it should.
+//
+// WHAT jsdom CAN AND CANNOT ANSWER. It has no layout engine, so "does this impose a floor" is not
+// askable of the rendered DOM — every rect is 0. So these assert the STRUCTURAL properties that make
+// shrinking possible at all, which is the same split `ComposeBox.narrow.test.tsx` documents. The
+// measured result was verified in real WebKit: the banner's min-content width drops from 250px to
+// 80px, and zooming to 0.7 returns 35px of height to the terminal.
+describe("the banner does not prop its column open", () => {
+  it("lets every box in its chain shrink below its content", () => {
+    // `min-width: auto` — a flex item's default — is what refuses to shrink. Without overriding it
+    // no amount of wrapping downstream helps, because the ancestor never gets smaller in the first
+    // place. Asserted on every level, because ONE missing link restores the floor.
+    render(<SparkleConsentBanner />);
+    const region = screen.getByRole("region", { name: "Sparkle improvement consent" });
+    expect(region.style.minWidth).toBe("0");
+    const group = screen.getByRole("group", { name: "Consent mode" });
+    expect(group.style.minWidth).toBe("0");
+    // …and the three buttons may stack rather than demanding one unbreakable row.
+    expect(group.style.flexWrap).toBe("wrap");
+  });
+
+  it("SCALES with its column's zoom, so zooming out returns height to the terminal", () => {
+    // The half that actually unlocked the founder. The banner is not xterm, so the terminal's font
+    // scaling never touched it; reading the same per-column level makes "zoom this column out" mean
+    // the whole column. Asserted as the rendered `zoom`, which is the thing that gives the height
+    // back — not as "the hook was called", which would be a precondition.
+    useUiStore.getState().resetAllZoom();
+    const { rerender } = render(<SparkleConsentBanner />);
+    const at = () =>
+      screen.getByRole("region", { name: "Sparkle improvement consent" }).style.zoom;
+    expect(at()).toBe("1");
+
+    act(() => useUiStore.getState().setColumnZoom("terminal-right", 0.7));
+    rerender(<SparkleConsentBanner />);
+    expect(at()).toBe("0.7");
+
+    // …and it is THIS column's level, not any other. Zooming a different column must not move it —
+    // that independence is the whole point of the per-column work this rides on.
+    act(() => useUiStore.getState().setColumnZoom("concierge", 1.8));
+    rerender(<SparkleConsentBanner />);
+    expect(at()).toBe("0.7");
   });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { STATUS_BANDS } from "../engine/buildSections";
+import { ZOOM_COLUMNS } from "../engine/columnZoom";
 import {
   useUiStore,
   ZOOM_MIN,
@@ -18,7 +19,6 @@ describe("uiStore theme", () => {
     useUiStore.setState({
       themePref: "auto",
       composerHeight: COMPOSER_DEFAULT,
-      zoom: ZOOM_DEFAULT,
       activeSpecial: null,
     });
   });
@@ -339,44 +339,98 @@ describe("uiStore orchestrator disclosure — the single writer", () => {
   });
 });
 
-describe("uiStore zoom", () => {
-  beforeEach(() => useUiStore.getState().resetZoom());
+// ── ZOOM IS PER COLUMN NOW ───────────────────────────────────────────────────────────────────
+//
+// These used to drive one global number. What they assert now is the property the founder asked
+// for — INDEPENDENCE — which no assertion about a single value could have expressed: zooming one
+// column must leave the other four exactly where they were.
+describe("uiStore zoom — one level per column", () => {
+  beforeEach(() => useUiStore.getState().resetAllZoom());
 
-  it("starts at and resets to the default", () => {
-    expect(useUiStore.getState().zoom).toBe(ZOOM_DEFAULT);
+  it("starts every column at the default", () => {
+    for (const key of ZOOM_COLUMNS) {
+      expect(useUiStore.getState().zoomByColumn[key]).toBe(ZOOM_DEFAULT);
+    }
   });
 
-  it("clamps setZoom above max and below min", () => {
-    useUiStore.getState().setZoom(999);
-    expect(useUiStore.getState().zoom).toBe(ZOOM_MAX);
-    useUiStore.getState().setZoom(-5);
-    expect(useUiStore.getState().zoom).toBe(ZOOM_MIN);
+  it("ZOOMS ONE COLUMN AND LEAVES THE OTHERS ALONE — the whole point", () => {
+    // The headline requirement: "If I'm in a build agent column, I can change the size of that one
+    // column... that way I can change the size of each of them separately." A global-zoom
+    // implementation passes every other case in this block and fails this one.
+    useUiStore.getState().stepColumnZoom("build-left", 1);
+    expect(useUiStore.getState().zoomByColumn["build-left"]).toBe(
+      Math.round((ZOOM_DEFAULT + ZOOM_STEP) * 100) / 100,
+    );
+    for (const key of ZOOM_COLUMNS) {
+      if (key === "build-left") continue;
+      expect(useUiStore.getState().zoomByColumn[key]).toBe(ZOOM_DEFAULT);
+    }
+  });
+
+  it("keeps the two build columns independent of each other", () => {
+    useUiStore.getState().stepColumnZoom("build-left", 1);
+    useUiStore.getState().stepColumnZoom("build-right", -1);
+    const z = useUiStore.getState().zoomByColumn;
+    expect(z["build-left"]).toBeGreaterThan(ZOOM_DEFAULT);
+    expect(z["build-right"]).toBeLessThan(ZOOM_DEFAULT);
+  });
+
+  it("keeps the two terminals independent of each other", () => {
+    useUiStore.getState().stepColumnZoom("terminal-left", 1);
+    const z = useUiStore.getState().zoomByColumn;
+    expect(z["terminal-left"]).toBeGreaterThan(ZOOM_DEFAULT);
+    expect(z["terminal-right"]).toBe(ZOOM_DEFAULT);
+  });
+
+  it("clamps setColumnZoom above max and below min", () => {
+    useUiStore.getState().setColumnZoom("concierge", 999);
+    expect(useUiStore.getState().zoomByColumn.concierge).toBe(ZOOM_MAX);
+    useUiStore.getState().setColumnZoom("concierge", -5);
+    expect(useUiStore.getState().zoomByColumn.concierge).toBe(ZOOM_MIN);
   });
 
   // The clamp keeps each value at a clean 2dp step, so re-rounding is a no-op (idempotent).
   // (Note: zoom * 100 is NOT a safe integer check — 1.1 * 100 === 110.00000000000001.)
   const isClean = (z: number) => z === Math.round(z * 100) / 100;
 
-  it("steps in by one increment, staying at a clean 2dp value", () => {
-    useUiStore.getState().zoomIn();
-    expect(useUiStore.getState().zoom).toBe(Math.round((ZOOM_DEFAULT + ZOOM_STEP) * 100) / 100);
-    expect(isClean(useUiStore.getState().zoom)).toBe(true);
-  });
-
-  it("never exceeds max on repeated zoomIn", () => {
-    for (let i = 0; i < 50; i++) useUiStore.getState().zoomIn();
-    expect(useUiStore.getState().zoom).toBe(ZOOM_MAX);
-  });
-
-  it("never drops below min on repeated zoomOut", () => {
-    for (let i = 0; i < 50; i++) useUiStore.getState().zoomOut();
-    expect(useUiStore.getState().zoom).toBe(ZOOM_MIN);
+  it("never exceeds max on repeated steps in, or drops below min on repeated steps out", () => {
+    for (let i = 0; i < 50; i++) useUiStore.getState().stepColumnZoom("concierge", 1);
+    expect(useUiStore.getState().zoomByColumn.concierge).toBe(ZOOM_MAX);
+    for (let i = 0; i < 50; i++) useUiStore.getState().stepColumnZoom("concierge", -1);
+    expect(useUiStore.getState().zoomByColumn.concierge).toBe(ZOOM_MIN);
   });
 
   it("stays drift-free across many mixed steps", () => {
-    for (let i = 0; i < 20; i++) useUiStore.getState().zoomIn();
-    for (let i = 0; i < 20; i++) useUiStore.getState().zoomOut();
-    expect(isClean(useUiStore.getState().zoom)).toBe(true);
+    for (let i = 0; i < 20; i++) useUiStore.getState().stepColumnZoom("concierge", 1);
+    for (let i = 0; i < 20; i++) useUiStore.getState().stepColumnZoom("concierge", -1);
+    expect(isClean(useUiStore.getState().zoomByColumn.concierge)).toBe(true);
+  });
+
+  it("resetColumnZoom (Cmd+0) resets ONLY the column named", () => {
+    useUiStore.getState().setColumnZoom("build-left", 1.5);
+    useUiStore.getState().setColumnZoom("build-right", 1.5);
+    useUiStore.getState().resetColumnZoom("build-left");
+    expect(useUiStore.getState().zoomByColumn["build-left"]).toBe(ZOOM_DEFAULT);
+    // The other column is untouched — a Cmd+0 that reset everything would be a different feature.
+    expect(useUiStore.getState().zoomByColumn["build-right"]).toBe(1.5);
+  });
+
+  it("resetAllZoom resets every column", () => {
+    for (const key of ZOOM_COLUMNS) useUiStore.getState().setColumnZoom(key, 1.5);
+    useUiStore.getState().resetAllZoom();
+    for (const key of ZOOM_COLUMNS) {
+      expect(useUiStore.getState().zoomByColumn[key]).toBe(ZOOM_DEFAULT);
+    }
+  });
+
+  it("stepAllZoom steps each column from ITS OWN level, preserving relative sizes", () => {
+    // A global stepper must not flatten a row the user has deliberately made uneven.
+    useUiStore.getState().setColumnZoom("build-left", 1.4);
+    useUiStore.getState().setColumnZoom("build-right", 1.0);
+    useUiStore.getState().stepAllZoom(1);
+    const z = useUiStore.getState().zoomByColumn;
+    expect(z["build-left"]).toBe(1.5);
+    expect(z["build-right"]).toBe(1.1);
   });
 });
 
@@ -481,7 +535,7 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // selection would reopen it on an arbitrary project.
     "leftProjectId",
     "themePref",
-    "zoom",
+    "zoomByColumn",
   ];
 
   // Restore everything this block touches, not just themePref: it writes every transient key as a

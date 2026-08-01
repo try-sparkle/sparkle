@@ -82,7 +82,8 @@ beforeEach(() => {
     unsetGlobalConfigValue: unsetGlobal,
   };
   useKeybindingsStore.setState({ bindings: { ...SHORTCUT_DEFAULTS } });
-  useUiStore.setState({ settingsRequest: null, themePref: "auto", zoom: 1 });
+  useUiStore.setState({ settingsRequest: null, themePref: "auto" });
+  useUiStore.getState().resetAllZoom();
 });
 
 // ── contract 2: the risk map ────────────────────────────────────────────────────────────────────
@@ -606,10 +607,22 @@ describe("the unmapped-settings audit", () => {
 
 describe("appearance", () => {
   it("reads the two store-backed controls get_config cannot see", () => {
-    useUiStore.setState({ themePref: "dark", zoom: 1.2 });
+    // Through the ACTION, not a hand-built partial object. `setState` merges shallowly, so writing
+    // `{ concierge: 1.2 }` would replace the whole map and leave every other column `undefined` —
+    // which is the exact `NaN` hazard `repairZoomByColumn` exists to prevent, smuggled in by the
+    // test's own fixture. Setting one column through the store keeps the record complete.
+    useUiStore.setState({ themePref: "dark" });
+    useUiStore.getState().resetAllZoom();
+    useUiStore.getState().setColumnZoom("concierge", 1.2);
     const res = readAppearance();
     expect(res.ok).toBe(true);
-    if (res.ok) expect(res.value).toEqual({ themePref: "dark", zoom: 1.2 });
+    if (res.ok) {
+      // PER COLUMN — reporting one column's level as "the" zoom would be a confident wrong answer
+      // four times out of five, and this reader exists precisely to say what a preference IS.
+      expect(res.value.themePref).toBe("dark");
+      expect(res.value.zoomByColumn.concierge).toBe(1.2);
+      expect(res.value.zoomByColumn["build-left"]).toBe(1);
+    }
   });
 });
 

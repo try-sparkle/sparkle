@@ -52,6 +52,9 @@ import {
 import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
+import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { focusedZoomColumn, installColumnFocusTracker } from "../services/columnFocusTracker";
+import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
   COLUMN_HARD_MAX,
@@ -704,9 +707,12 @@ export function Workspace() {
   const sparkleAgentId = sparkleAgentIdFor(currentWindowLabel);
   const [settingsProject, setSettingsProject] = useState<Project | null>(null);
   const [closing, setClosing] = useState(false);
-  const zoomIn = useUiStore((s) => s.zoomIn);
-  const zoomOut = useUiStore((s) => s.zoomOut);
-  const resetZoom = useUiStore((s) => s.resetZoom);
+  // The concierge's own level, applied to its box below. Read here rather than inside
+  // `ConciergeColumn` because the SHELL owns that column's box, and the zoom has to be cancelled out
+  // of the same `width` the shell writes.
+  const conciergeZoom = useColumnZoom("concierge");
+  const stepColumnZoom = useUiStore((s) => s.stepColumnZoom);
+  const resetColumnZoom = useUiStore((s) => s.resetColumnZoom);
 
   // The cross-project status-band feed (CM-U3) drives BOTH the per-tab Needs-you glow and the concierge
   // column. Built ONCE here and passed down: two `useConciergeFeed`s meant two tray-roster fetches,
@@ -906,26 +912,48 @@ export function Workspace() {
     return () => window.removeEventListener("pointerdown", onDown, true);
   }, [unbind]);
 
-  // Cmd +/- to resize the terminal text, Cmd 0 to reset (matches browser/editor
-  // conventions). The size factor is applied to the terminal font only — see Terminal.tsx —
-  // so the surrounding UI chrome (sidebar, tabs, buttons) stays fixed.
+  // THE WATCHER THAT FEEDS THE HANDLER BELOW — installed HERE, not in App, because this component
+  // owns the key handler AND renders the five `data-zoom-column` markers the tracker reads. An
+  // install two files away is a feature that can be silently taken apart, and a test that renders
+  // the shell should get the whole behaviour rather than three quarters of it. Cheap by
+  // construction: one `closest()` per press, written to a module-scoped holder, so it re-renders
+  // nothing.
+  useEffect(() => installColumnFocusTracker(), []);
+
+  // ── Cmd +/- ZOOMS THE COLUMN YOU ARE IN, Cmd 0 RESETS IT ─────────────────────────────────────
+  //
+  // It used to drive ONE global number that only `Terminal.tsx` read, so the shortcut worked in a
+  // terminal and, from the user's seat, did nothing anywhere else — pressing it while reading the
+  // concierge silently resized every terminal in the window instead. The founder's ask is that it
+  // apply to whatever column has focus, and that each column keep its own level. In the two-pair
+  // cockpit that is five independent regions: both terminals, both build columns, the concierge.
+  //
+  // A REFUSAL IS A FIRST-CLASS OUTCOME, and it is why `focusedZoomColumn()` may return null: "if
+  // focus is ambiguous or in no column, do nothing rather than guessing — a zoom that lands in the
+  // wrong column is worse than one that does not fire." So a press with no column resolved falls
+  // through UNHANDLED — no `preventDefault`, no store write. Not calling `preventDefault` there is
+  // deliberate: swallowing the key while doing nothing would make the shortcut feel broken rather
+  // than inapplicable, and would block any other handler that legitimately wants it.
+  //
+  // WHERE THE COLUMN COMES FROM: `services/columnFocusTracker`, which watches pointer presses as
+  // well as focus. DOM focus alone cannot answer this — in this webview a `<button>` click blurs to
+  // `<body>` without focusing anything, and three of the five columns are made of buttons.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey) return;
-      if (e.key === "=" || e.key === "+") {
-        e.preventDefault();
-        zoomIn();
-      } else if (e.key === "-" || e.key === "_") {
-        e.preventDefault();
-        zoomOut();
-      } else if (e.key === "0") {
-        e.preventDefault();
-        resetZoom();
-      }
+      const isIn = e.key === "=" || e.key === "+";
+      const isOut = e.key === "-" || e.key === "_";
+      const isReset = e.key === "0";
+      if (!isIn && !isOut && !isReset) return;
+      const column = focusedZoomColumn();
+      if (!column) return; // no column owns the caret — do nothing, and let the key through
+      e.preventDefault();
+      if (isReset) resetColumnZoom(column);
+      else stepColumnZoom(column, isIn ? 1 : -1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [zoomIn, zoomOut, resetZoom]);
+  }, [stepColumnZoom, resetColumnZoom]);
 
   // ── THE TWO PAIRS ────────────────────────────────────────────────────────────────────────────
   // Which side each project lives on, and therefore which stage mounts its panes. Every rule is in
@@ -1652,6 +1680,11 @@ export function Workspace() {
             <div
               ref={setLeftStage}
               data-testid="terminal-stage-left"
+              // THE LEFT TERMINAL, as far as Cmd +/- is concerned. On the STAGE rather than on the
+              // xterm surface because `PaneHost` appends every pane into this element, so one marker
+              // covers both the panes and the empty stage around them — and it cannot accidentally
+              // claim a terminal rendered outside the cockpit (see Terminal.tsx).
+              {...{ [ZOOM_COLUMN_ATTR]: "terminal-left" }}
               data-calm="false"
               style={{ flex: 1, position: "relative", minHeight: 0, background: C.forest }}
             >
@@ -1736,6 +1769,11 @@ export function Workspace() {
             same conflict twice. */}
         <div
           data-concierge-box
+          // THE CONCIERGE, for Cmd +/-. On the shell-owned BOX because this element is the column as
+          // the row sees it, and it is the outermost thing every concierge press lands inside —
+          // including presses on the compose box, which holds the dictation target without holding
+          // DOM focus and so would never be found by a focus-only lookup.
+          {...{ [ZOOM_COLUMN_ATTR]: "concierge" }}
           data-testid="concierge-box"
           style={{
             flex: "0 0 auto",
@@ -1743,7 +1781,16 @@ export function Workspace() {
             minWidth: 0,
             // THE FALLBACK IS THE COMMITTED WIDTH, so the very first paint — before any effect has
             // run and before any drag — is already correct rather than zero-width.
-            width: `var(${CONCIERGE_WIDTH_VAR}, ${renderedConciergeWidth}px)`,
+            // DIVIDED BY THE COLUMN'S ZOOM. CSS `zoom: Z` scales this element's used width by Z, so
+            // without the division a concierge stored at 400 would PAINT at 480 the moment it was
+            // zoomed to 1.2 — the width preference would drift every time the text size changed, and
+            // the pull tab would start its drag from a number that is not on screen. Dividing cancels
+            // it: the box keeps the width the user dragged to, and only the CONTENTS scale.
+            width: `calc(var(${CONCIERGE_WIDTH_VAR}, ${renderedConciergeWidth}px) / ${conciergeZoom})`,
+            // THIS COLUMN'S TEXT SIZE. `zoom`, not `transform: scale()` — a transform paints at the
+            // new size but lays out at the old one, so the column would overlap its neighbours and
+            // every hit-test inside would be offset from what the user sees.
+            zoom: conciergeZoom,
           }}
         >
         <ConciergeHost
@@ -1827,6 +1874,9 @@ export function Workspace() {
           <div
             ref={setRightStage}
             data-testid="terminal-stage"
+            // THE RIGHT TERMINAL for Cmd +/- — see the left stage for why the marker lives on the
+            // stage rather than on the xterm surface.
+            {...{ [ZOOM_COLUMN_ATTR]: "terminal-right" }}
             // Files dropped anywhere on the stage attach to the VISIBLE agent's next message
             // (hooks/useTerminalDrop). Tauri's drag events are window-global and carry no target
             // element, so this marker is what the hit-test resolves against (services/dndTargets).

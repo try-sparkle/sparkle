@@ -338,6 +338,51 @@ const ATTACH_ACTIONS: {
 ];
 
 /**
+ * The composer's fixed horizontal insets, in px — what separates the COLUMN's width from the width
+ * the toolbar row actually gets.
+ *
+ * `margin: 0 10px` (20) + `padding: "10px 12px 12px"` (24) + `border: 1px` (2) = 46.
+ *
+ * THE LABELLED VALUES, deliberately, even though the narrow state uses 2px margins. This number
+ * feeds the threshold that DECIDES the narrow state, so reading the live margins here would rebuild
+ * the feedback loop that was just removed (see the observer below). A fixed inset keeps the input
+ * stable; being 16px pessimistic in the narrow state only means the labels stay collapsed slightly
+ * longer than strictly necessary, which is the safe direction.
+ */
+export const COMPOSER_INSETS_PX = 46;
+
+/**
+ * Below this COLUMN width (px) the expanded attach actions drop their words and draw icons only.
+ *
+ * ── THE UNIT MATTERS, AND IT CHANGED (roborev 57270) ────────────────────────────────────────────
+ * This was derived as the TOOLBAR ROW's own min-content width — the two labels (~76 + ~48px), their
+ * icons and padding (~30px each), the row gap, and the Here/Away slider (~96px) — and it was
+ * compared against a measurement of that row. When the observer moved to the composer's PARENT (to
+ * kill an oscillation), the comparison silently started using a number 46px larger while the
+ * constant kept its old value, so the collapse fired 46px too late: every column in [300, 346) hands
+ * the labelled row less than the ~300px it needs, which is exactly the degradation this tier exists
+ * to prevent.
+ *
+ * So the constant is now expressed in COLUMN terms — the toolbar requirement plus the insets — and
+ * named for it. `attachShowsLabels` takes a column width, and the parameter says so.
+ */
+export const ATTACH_ICON_ONLY_MAX_COLUMN_PX = 300 + COMPOSER_INSETS_PX;
+
+/**
+ * Does the attach group draw words at this COLUMN width?
+ *
+ * Pure and exported for this file's usual reason (cf. `appendDictated`): jsdom has no layout engine,
+ * so a test that rendered the row and measured would read 0 for every width and pass vacuously. The
+ * component measures; this decides.
+ *
+ * 0 means "not measured yet" and takes the LABELLED form, matching `trayDensityFor`: booting into
+ * the collapsed state and widening a frame later is a visible flicker.
+ */
+export function attachShowsLabels(columnWidthPx: number): boolean {
+  return !(columnWidthPx > 0) || columnWidthPx >= ATTACH_ICON_ONLY_MAX_COLUMN_PX;
+}
+
+/**
  * ONE resting paperclip that expands into its two real actions on hover — the founder's ask, and
  * the reason it is a hover EXPANSION rather than a click-then-menu: a menu makes you commit a click
  * before it will tell you what is behind the icon, and there are only two things back there.
@@ -363,7 +408,18 @@ const ATTACH_ACTIONS: {
  * announced state and the reachable state can't drift apart. Choosing one collapses the group back
  * to the single icon — the picker it opened is the surface now.
  */
-function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => void }) {
+/** Exported for a RENDER test of its collapsed form. The pure `attachShowsLabels` decides WHEN to
+ *  collapse; only a render can prove WHAT the collapsed button is — specifically that it keeps an
+ *  accessible name once its visible word is gone (roborev 57049). */
+export function AttachControl({
+  onAttach,
+  showLabels = true,
+}: {
+  onAttach: (kind: ConciergeAttachKind) => void;
+  /** False collapses the two actions to icons — see `attachShowsLabels`. Defaults TRUE so every
+   *  existing caller and test keeps the labelled form it already asserts. */
+  showLabels?: boolean;
+}) {
   const [hovered, setHovered] = useState(false);
   const [pinned, setPinned] = useState(false);
   const groupRef = useRef<HTMLDivElement>(null);
@@ -443,7 +499,11 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
         // inside the group, so its guard is always satisfied on this path.
         close();
       }}
-      style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+      // THE GROUP WRAPPER SHRINKS AND WRAPS TOO. It is a flex item of the toolbar, so its own
+      // default `min-width: auto` refuses to go below its min-content — and the toolbar's
+      // `flex-wrap` cannot break INSIDE it. Expanded, that runs past the column's right edge below
+      // roughly a 97px column: the founder's exact reported failure.
+      style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}
     >
       <button
         ref={clipRef}
@@ -470,7 +530,7 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
       <div
         id={ATTACH_ACTIONS_ID}
         hidden={!open}
-        style={{ display: open ? "inline-flex" : "none", gap: 6, alignItems: "center" }}
+        style={{ display: open ? "inline-flex" : "none", gap: 6, alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
       >
         {ATTACH_ACTIONS.map(({ kind, label, Icon, title, hint }) => (
           <button
@@ -480,6 +540,10 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
             // Only badged while the overlay's attach chain is open — the group expands on hover too,
             // and "s" is also the agent-pane composer's screenshot mnemonic. See HintLayer.
             data-hint={hint}
+            // THE NAME SURVIVES THE COLLAPSE. With the word gone the button would otherwise have no
+            // accessible name at all — the icon is `aria-hidden` — so "click Upload" would stop
+            // working in a narrow column while continuing to work in a wide one.
+            aria-label={showLabels ? undefined : label}
             onClick={() => {
               onAttach(kind);
               close();
@@ -487,7 +551,7 @@ function AttachControl({ onAttach }: { onAttach: (kind: ConciergeAttachKind) => 
             style={attachStyle}
           >
             <Icon size={12} aria-hidden />
-            {label}
+            {showLabels ? label : null}
           </button>
         ))}
       </div>
@@ -1038,6 +1102,36 @@ export function ComposeBox({
   //
   // And because the dragged height is persisted, either mistake survives a relaunch.
   const rootRef = useRef<HTMLDivElement>(null);
+  // ── HOW WIDE THE COLUMN IS — MEASURED OUTSIDE THE COMPOSER, NOT INSIDE IT ────────────────────
+  //
+  // Measured at all because this box lives in the concierge COLUMN, which the user resizes down to
+  // 50px and which can be torn out into its own window — window width is not its width.
+  //
+  // THE PARENT, NOT THE TOOLBAR, and that is a correctness point rather than a preference. An
+  // earlier version observed the toolbar row and derived BOTH the label density AND the composer's
+  // own inset collapse from it — but the toolbar sits INSIDE those insets, so the measurement that
+  // chose the margin was changed BY the margin. It does not settle: with a 300px threshold and
+  // 10px/2px insets, any column width in [304, 320) satisfies both "collapse" and "expand", so the
+  // observer re-fires forever on a band the user can land on by dragging. Observing the parent
+  // removes the loop by construction; hysteresis was rejected because it makes the threshold depend
+  // on which direction you dragged from, so one width renders two ways.
+  //
+  // 0 means "not measured yet" and the rules read that as the roomy form; the observer is created
+  // lazily so an observer-less test env stays at 0 rather than throwing.
+  const [columnWidth, setColumnWidth] = useState(0);
+  useEffect(() => {
+    const el = rootRef.current?.parentElement;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (typeof w === "number" && w > 0) setColumnWidth((prev) => (prev === w ? prev : w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  /** Below the attach threshold the whole composer tightens, not just the labels — see `margin`. */
+  const narrowColumn = !attachShowsLabels(columnWidth);
+
   // The thread node currently under observation. Tracked so `measure` re-observes only when the
   // node IDENTITY changes (ConciergeThread remounting), never on every callback.
   const observedThread = useRef<HTMLElement | null>(null);
@@ -1576,7 +1670,10 @@ export function ComposeBox({
         //
         // Inset rather than full-bleed (`margin`, `borderRadius`), because a box is what makes the
         // surface change read as "this is the field" rather than as a second plane in the column.
-        margin: "0 10px 10px",
+        // TIGHTER IN A NARROW COLUMN. 10px per side is a comfortable inset at 360px and 40% of the
+        // whole column at 50px — the composer's own margins become the thing squeezing its contents
+        // out. Collapsed on the same signal the toolbar collapses its labels on.
+        margin: narrowColumn ? "0 2px 4px" : "0 10px 10px",
         borderRadius: 4,
         // The positioning context for the MENTION PICKER, which hangs off this box's TOP edge.
         //
@@ -1700,13 +1797,28 @@ export function ComposeBox({
         onRemove={onRemoveAttachment}
         testId="concierge-attachment-chips"
       />
-      <div style={{ display: "flex", gap: 6, marginBottom: 8, alignItems: "center" }}>
-        <AttachControl onAttach={onAttach} />
+      {/* THE TOOLBAR ROW MUST FIT THE COLUMN. Icons first, then wrap — an overflow menu was
+          rejected: it hides controls behind a click for a row with four controls total, while
+          wrapping keeps every one visible and directly pressable. `minWidth: 0` is what lets any of
+          it shrink; a flex item's default `min-width: auto` refuses to go below its content, which
+          is exactly how a row overflows its parent instead of compressing inside it. */}
+      <div
+        data-testid="concierge-compose-toolbar"
+        style={{
+          display: "flex",
+          gap: 6,
+          marginBottom: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          minWidth: 0,
+        }}
+      >
+        <AttachControl onAttach={onAttach} showLabels={attachShowsLabels(columnWidth)} />
         {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the
             action whose autonomy it governs. It reads and writes presenceStore itself rather than
             taking props; see PresenceSlider's header for why, and note this box already reads
             useUiStore for the same class of reason. */}
-        <PresenceSlider />
+        <PresenceSlider showLabels={attachShowsLabels(columnWidth)} />
       </div>
       {/* NO INTERIM STRIP HERE. The live dictation preview used to be its own row at exactly this
           point — above the drag handle, above the textarea — and the founder's report was that the

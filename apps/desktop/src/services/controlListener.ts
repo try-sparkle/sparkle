@@ -23,6 +23,7 @@ import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
 import { sideOf } from "../engine/pairs";
+import { ZOOM_COLUMNS, isZoomColumn, type ZoomColumn } from "../engine/columnZoom";
 import {
   useRuntimeStore,
   mergeOpenAgentIds,
@@ -674,7 +675,8 @@ function handleGetState(req: ControlRequest): {
   theme: ThemePref;
   models: string[];
   statusFilter: Record<StatusBand, boolean>;
-  zoom: number;
+  /** Text size PER COLUMN — see handleSetZoom for why this is a map and not a number. */
+  zoomByColumn: Record<ZoomColumn, number>;
 } {
   const { projects } = useProjectStore.getState();
   const status = useRuntimeStore.getState().status;
@@ -875,7 +877,8 @@ function handleGetState(req: ControlRequest): {
     theme: ui.themePref,
     models: getModelCatalog().map((m) => m.id),
     statusFilter: ui.statusFilter,
-    zoom: ui.zoom,
+    // PER COLUMN — there is no single zoom any more. See handleSetZoom.
+    zoomByColumn: ui.zoomByColumn,
   };
 }
 
@@ -1485,15 +1488,35 @@ function handleSetAgentOrdering(_req: ControlRequest): Record<string, unknown> {
   };
 }
 
-/** set_zoom → the terminal text zoom. Global. The store clamps to [ZOOM_MIN, ZOOM_MAX]; we only
- *  validate it is a finite number here. Privileged. */
+/** set_zoom → a column's text zoom. Privileged.
+ *
+ *  THE WIRE CONTRACT IS UNCHANGED AND STAYS BACKWARD COMPATIBLE. `{ zoom }` alone used to set the
+ *  one global number; text size is per-column now, so a payload with no `column` sets EVERY column.
+ *  That is the honest translation of what the old op meant — "make the text this big" — and it keeps
+ *  existing callers (apps/mcp-control, bridge.rs CONTROL_OPS) working exactly as they read.
+ *
+ *  An OPTIONAL `column` addresses one region. It is validated against the known set rather than
+ *  trusted: an unrecognised name is refused outright, because silently falling back to "all columns"
+ *  would make a typo resize the user's whole cockpit. */
 function handleSetZoom(req: ControlRequest): Record<string, unknown> {
   const zoom = req.payload.zoom;
   if (typeof zoom !== "number" || !Number.isFinite(zoom)) {
     return { ok: false, error: "zoom must be a number" };
   }
-  useUiStore.getState().setZoom(zoom); // clamped to [ZOOM_MIN=0.7, ZOOM_MAX=1.8] in the store
-  return { ok: true };
+  const column = req.payload.column;
+  const ui = useUiStore.getState();
+  if (column === undefined || column === null) {
+    for (const key of ZOOM_COLUMNS) ui.setColumnZoom(key, zoom); // each clamped in the store
+    return { ok: true, columns: ZOOM_COLUMNS.length };
+  }
+  if (!isZoomColumn(column)) {
+    return {
+      ok: false,
+      error: `column must be one of: ${ZOOM_COLUMNS.join(", ")}`,
+    };
+  }
+  ui.setColumnZoom(column, zoom); // clamped to [ZOOM_MIN=0.7, ZOOM_MAX=1.8] in the store
+  return { ok: true, column };
 }
 
 /** navigate → move the UI to a view. "sparkle"/"board" set the special view; "agent" opens the

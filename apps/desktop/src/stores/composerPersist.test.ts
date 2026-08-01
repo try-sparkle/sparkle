@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { migratePersistedUi, repairSendMode, OLD_COMPOSER_DEFAULT } from "./composerPersist";
+import {
+  migratePersistedUi,
+  repairSendMode,
+  repairZoomByColumn,
+  OLD_COMPOSER_DEFAULT,
+} from "./composerPersist";
+import { ZOOM_COLUMNS, ZOOM_DEFAULT, ZOOM_MAX, ZOOM_MIN } from "../engine/columnZoom";
 import { STATUS_BANDS } from "../engine/buildSections";
 import { SEND_MODES } from "../voice/sendMode";
 
@@ -27,12 +33,15 @@ describe("migratePersistedUi", () => {
   });
 
   it("preserves other fields while migrating", () => {
+    // `themePref` rather than `zoom` as the passthrough witness: `zoom` is no longer an inert field,
+    // it is what the v4 migration CONSUMES (see below), so using it here would conflate "unknown
+    // keys survive" with "the zoom migration ran".
     const out = migratePersistedUi(
-      { composerHeight: OLD_COMPOSER_DEFAULT, zoom: 1.2, composerMinimized: true },
+      { composerHeight: OLD_COMPOSER_DEFAULT, themePref: "dark", composerMinimized: true },
       0,
       SNAP,
     );
-    expect(out).toMatchObject({ composerHeight: SNAP, zoom: 1.2, composerMinimized: true });
+    expect(out).toMatchObject({ composerHeight: SNAP, themePref: "dark", composerMinimized: true });
   });
 });
 
@@ -65,9 +74,9 @@ describe("v3 — the armed boolean becomes a tray position", () => {
   });
 
   it("leaves the mode UNSET when the blob never had the old key — the store's default applies", () => {
-    const out = migratePersistedUi({ zoom: 1.2 }, 2, SNAP);
+    const out = migratePersistedUi({ themePref: "dark" }, 2, SNAP);
     expect(out && "conciergeSendMode" in out).toBe(false);
-    expect(out?.zoom).toBe(1.2);
+    expect(out?.themePref).toBe("dark");
   });
 
   it("COERCES an unrecognised position to Send", () => {
@@ -221,5 +230,83 @@ describe("migratePersistedUi — the retired activeSpecial: \"board\"", () => {
   it("does not add the key to a blob that never had it", () => {
     const out = migratePersistedUi({ composerHeight: 90 }, 2, 72) as Record<string, unknown>;
     expect("activeSpecial" in out).toBe(false);
+  });
+});
+
+// ── v4: THE GLOBAL ZOOM BECAME ONE LEVEL PER COLUMN ─────────────────────────────────────────────
+//
+// The upgrade path, which is the half a migration test usually skips. A fresh install is covered by
+// the store's default; what needs proving is that a blob written by the PREVIOUS build lands
+// somewhere sensible. The old `zoom` was a real preference — the text size someone had set for their
+// terminals — so a migration that reset it to 1.0 would silently undo a setting with nothing on
+// screen to explain it.
+describe("v4 — the global zoom becomes one level per column", () => {
+  it("SEEDS every column from the old global number", () => {
+    const out = migratePersistedUi({ zoom: 1.4 }, 3, SNAP);
+    const map = out?.zoomByColumn as Record<string, number>;
+    for (const key of ZOOM_COLUMNS) expect(map[key]).toBe(1.4);
+  });
+
+  it("DELETES the retired key so `merge` cannot carry a dead global forward forever", () => {
+    // The same treatment `conciergeAutoSend` got. A key left behind is one a later build can read
+    // back by accident, silently overwriting the per-column levels the user has since chosen.
+    const out = migratePersistedUi({ zoom: 1.4 }, 3, SNAP);
+    expect(out && "zoom" in out).toBe(false);
+  });
+
+  it("falls back to the default when the old blob carried no zoom at all", () => {
+    const out = migratePersistedUi({ themePref: "dark" }, 3, SNAP);
+    const map = out?.zoomByColumn as Record<string, number>;
+    for (const key of ZOOM_COLUMNS) expect(map[key]).toBe(ZOOM_DEFAULT);
+  });
+
+  it("clamps a corrupt or out-of-range global rather than seeding it everywhere", () => {
+    expect((migratePersistedUi({ zoom: 99 }, 3, SNAP)?.zoomByColumn as Record<string, number>)["concierge"]).toBe(ZOOM_MAX);
+    expect((migratePersistedUi({ zoom: -5 }, 3, SNAP)?.zoomByColumn as Record<string, number>)["concierge"]).toBe(ZOOM_MIN);
+    expect((migratePersistedUi({ zoom: NaN }, 3, SNAP)?.zoomByColumn as Record<string, number>)["concierge"]).toBe(ZOOM_DEFAULT);
+  });
+
+  it("does NOT re-seed a blob already at v4 — its per-column levels are the truth", () => {
+    // The mirror image of the seeding rule. `migrate` is skipped for a blob at the current version
+    // anyway, but a stray `zoom` key must not resurrect itself through this path either.
+    const out = migratePersistedUi({ zoom: 1.4, zoomByColumn: { concierge: 1.1 } }, 4, SNAP);
+    const map = out?.zoomByColumn as Record<string, number>;
+    expect(map["concierge"]).toBe(1.1);
+    expect(map["build-left"]).toBe(ZOOM_DEFAULT); // filled from the default, NOT from the stale 1.4
+  });
+});
+
+// ── THE COMPLETENESS REPAIR — WHY A PARTIAL MAP IS A BLANK TERMINAL ────────────────────────────
+//
+// uiStore's merge is SHALLOW, so a persisted map REPLACES the complete default rather than filling
+// in around it. A blob carrying four of six keys hydrates `undefined` for the rest, and `undefined`
+// is not "unzoomed" — it multiplies into `NaN`, reaches `term.options.fontSize`, and blanks that
+// column on every launch until localStorage is edited by hand. Same hazard `repairStatusFilter`
+// documents for the band filter, answered the same way.
+describe("repairZoomByColumn", () => {
+  it("fills EVERY missing column, so a partial blob cannot hydrate undefined", () => {
+    const out = repairZoomByColumn({ concierge: 1.3 });
+    expect(out.concierge).toBe(1.3);
+    for (const key of ZOOM_COLUMNS) expect(typeof out[key]).toBe("number");
+    expect(Object.keys(out).sort()).toEqual([...ZOOM_COLUMNS].sort());
+  });
+
+  it("clamps a stored value and replaces a non-numeric one", () => {
+    const out = repairZoomByColumn({ concierge: 99, "build-left": "big", "terminal-left": null });
+    expect(out.concierge).toBe(ZOOM_MAX);
+    expect(out["build-left"]).toBe(ZOOM_DEFAULT);
+    expect(out["terminal-left"]).toBe(ZOOM_DEFAULT);
+  });
+
+  it("survives a non-object, which is what a hand-edited blob looks like", () => {
+    for (const junk of [null, undefined, 3, "1.2", []]) {
+      const out = repairZoomByColumn(junk);
+      for (const key of ZOOM_COLUMNS) expect(out[key]).toBe(ZOOM_DEFAULT);
+    }
+  });
+
+  it("DROPS a key that is not a known column rather than carrying it forward", () => {
+    const out = repairZoomByColumn({ concierge: 1.2, "build-middle": 1.5 }) as Record<string, number>;
+    expect("build-middle" in out).toBe(false);
   });
 });

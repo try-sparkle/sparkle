@@ -90,7 +90,7 @@ import {
 } from "../config";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useKeybindingsStore, SHORTCUT_DEFAULTS, SHORTCUT_LABELS, type ShortcutId } from "../../stores/keybindingsStore";
-import { useUiStore, type CategoryId, type ThemePref } from "../../stores/uiStore";
+import { useUiStore, type CategoryId, type ThemePref, type ZoomColumn } from "../../stores/uiStore";
 import { formatBinding, type KeyBinding, type ModifierName } from "../../keyboardHints/keybindings";
 import { APPROVAL_CATEGORIES, type ApprovalCategory } from "../suggestions/approvalCategories";
 import type { AgentTabStatus } from "../../types";
@@ -869,8 +869,13 @@ export function listUnmappedSettings(pane?: CategoryId): SettingsResult<Unmapped
 export interface AppearanceState {
   /** "auto" follows the OS appearance; "light"/"dark" force it. */
   themePref: ThemePref;
-  /** Text-size multiplier, clamped by the store to [0.7, 1.8]. */
-  zoom: number;
+  /** Text-size multiplier PER COLUMN, each clamped by the store to [0.7, 1.8].
+   *
+   *  A MAP, NOT A NUMBER, because there is no single "the zoom" any more: Cmd +/- sizes whichever
+   *  cockpit column has focus and each keeps its own level. Reporting one column's level as the
+   *  app's would be a confident wrong answer four times out of five — and this reader exists
+   *  precisely so a concierge can say what a preference currently IS. */
+  zoomByColumn: Record<ZoomColumn, number>;
 }
 
 /**
@@ -884,7 +889,7 @@ export interface AppearanceState {
  */
 export function readAppearance(): SettingsResult<AppearanceState> {
   const ui = useUiStore.getState();
-  return ok("read_appearance", { themePref: ui.themePref, zoom: ui.zoom });
+  return ok("read_appearance", { themePref: ui.themePref, zoomByColumn: ui.zoomByColumn });
 }
 
 export interface NotificationRule {

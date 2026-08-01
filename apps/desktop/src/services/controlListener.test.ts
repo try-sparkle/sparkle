@@ -4,6 +4,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { ZOOM_COLUMNS } from "../engine/columnZoom";
 
 // --- mock the Tauri event layer: capture the registered handler so tests can fire events. ---
 let firedHandler: ((e: { payload: unknown }) => void) | undefined;
@@ -1439,20 +1440,22 @@ describe("controlListener", () => {
   it("get_state additively reports models, statusFilter, and zoom", async () => {
     useUiStore.getState().showAllStatusBands();
     useUiStore.getState().toggleStatusBand("running");
-    useUiStore.getState().setZoom(1.3);
+    useUiStore.getState().setColumnZoom("concierge", 1.3);
     fire({ reqId: "gs2", op: "get_state", callerAgentId: callerId, payload: {} });
     await flush();
     const res = lastReply() as {
       models: string[];
       statusFilter: Record<string, boolean>;
-      zoom: number;
+      zoomByColumn: Record<string, number>;
     };
     expect(Array.isArray(res.models)).toBe(true);
     expect(res.models).toContain("claude-opus-4-8"); // curated catalog fallback id
     // agentOrdering was dropped with the attention sort; statusFilter took its slot.
     expect((res as Record<string, unknown>).agentOrdering).toBeUndefined();
     expect(res.statusFilter).toEqual({ needs_you: true, running: false, done: true });
-    expect(res.zoom).toBe(1.3);
+    // PER COLUMN — get_state reports the map, because there is no single "the zoom" to report.
+    expect(res.zoomByColumn.concierge).toBe(1.3);
+    expect(res.zoomByColumn["build-left"]).toBe(1);
   });
 
   it("set_config accepts an OBJECT value and flattens it to dotted keys via set_config_values", async () => {
@@ -1531,15 +1534,51 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
-  it("set_zoom sets and clamps the zoom (build caller)", async () => {
+  it("set_zoom with NO column sets every column — the back-compatible wire contract", async () => {
+    // The op used to drive one global number. Text size is per-column now, so a payload without a
+    // `column` keeps meaning what it always meant ("make the text this big") rather than failing or
+    // silently picking one region. apps/mcp-control and bridge.rs CONTROL_OPS both send this shape.
     fire({ reqId: "z1", op: "set_zoom", callerAgentId: callerId, payload: { zoom: 5 } });
     await flush();
-    expect(lastReply()).toEqual({ ok: true });
-    expect(useUiStore.getState().zoom).toBe(1.8); // clamped to ZOOM_MAX
+    expect(lastReply()).toMatchObject({ ok: true });
+    const all = useUiStore.getState().zoomByColumn;
+    for (const key of ZOOM_COLUMNS) expect(all[key]).toBe(1.8); // clamped to ZOOM_MAX
 
     fire({ reqId: "z2", op: "set_zoom", callerAgentId: callerId, payload: { zoom: "big" } });
     await flush();
     expect(lastReply()).toMatchObject({ ok: false });
+  });
+
+  it("set_zoom with a COLUMN sets only that one", async () => {
+    useUiStore.getState().resetAllZoom();
+    fire({
+      reqId: "z3",
+      op: "set_zoom",
+      callerAgentId: callerId,
+      payload: { zoom: 1.4, column: "build-left" },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true, column: "build-left" });
+    expect(useUiStore.getState().zoomByColumn["build-left"]).toBe(1.4);
+    expect(useUiStore.getState().zoomByColumn["build-right"]).toBe(1);
+  });
+
+  it("REFUSES an unrecognised column rather than falling back to every column", () => {
+    // Falling back would make a typo resize the user's whole cockpit — the same "a wrong target is
+    // worse than no action" rule the keyboard path follows.
+    useUiStore.getState().resetAllZoom();
+    fire({
+      reqId: "z4",
+      op: "set_zoom",
+      callerAgentId: callerId,
+      payload: { zoom: 1.4, column: "build-middle" },
+    });
+    return flush().then(() => {
+      expect(lastReply()).toMatchObject({ ok: false });
+      for (const key of ZOOM_COLUMNS) {
+        expect(useUiStore.getState().zoomByColumn[key]).toBe(1);
+      }
+    });
   });
 
   it("navigate sets a special view and denies a worker caller", async () => {

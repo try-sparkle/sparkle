@@ -17,8 +17,15 @@
 // old preference across is not a courtesy, it is the difference between an upgrade and a silent
 // reset: someone who deliberately armed auto-send would otherwise relaunch into `send`, dictate,
 // and watch nothing happen, with no message anywhere saying their setting had been dropped.
+//
+// v4: the single global `zoom` became one level PER COLUMN (`zoomByColumn`, see engine/columnZoom).
+// Same reasoning as v3, and the same cost if skipped: the old number was a real preference — the
+// text size someone had set for their terminals — so every column is SEEDED from it rather than
+// reset to 1.0. An upgrading user therefore sees exactly the sizes they had, and only diverges once
+// they zoom a column deliberately.
 
 import { STATUS_BANDS } from "../engine/buildSections";
+import { ZOOM_COLUMNS, ZOOM_DEFAULT, clampZoom, type ZoomColumn } from "../engine/columnZoom";
 
 // The composer rest height before v1 (the value to reset off of).
 export const OLD_COMPOSER_DEFAULT = 128;
@@ -92,6 +99,38 @@ export function repairSendMode(raw: unknown): string {
   return typeof raw === "string" && ["send", "ptt", "speak"].includes(raw) ? raw : "send";
 }
 
+/**
+ * Coerce a persisted per-column zoom map into a COMPLETE, in-range record.
+ *
+ * WHY COMPLETENESS IS THE POINT, and why this is not version-gated: uiStore's merge is SHALLOW, so a
+ * persisted `zoomByColumn` REPLACES the store's default object wholesale rather than merging into
+ * it. A blob missing a key — written before a column existed, hand-edited, or produced by a partial
+ * rollout — therefore hydrates `undefined` for that column, which reaches `Math.round(BASE_FONT_SIZE
+ * * undefined)` as `NaN` and blanks a terminal. This is the identical hazard `repairStatusFilter`
+ * documents for the band filter, and it is answered the same way: rebuild the record from the
+ * canonical key list on every rehydrate, unconditionally. Add a sixth region tomorrow and existing
+ * users get its default rather than a `NaN`.
+ *
+ * `legacy` is the pre-v4 GLOBAL zoom, and it is the seed for any key the blob does not carry — which
+ * is what makes the v4 migration an upgrade rather than a silent reset (see the header). It is
+ * passed only from the migrator; `merge` calls this with no legacy value, so a column missing at the
+ * current version falls to `ZOOM_DEFAULT` instead of resurrecting a number that was already
+ * translated once.
+ */
+export function repairZoomByColumn(raw: unknown, legacy?: unknown): Record<ZoomColumn, number> {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  // A legacy value is only a seed when it is a usable number; a corrupt one must not become every
+  // column's size. `clampZoom` already answers NaN/Infinity with the default, so the guard here is
+  // only about "was there a number at all".
+  const seed = typeof legacy === "number" && Number.isFinite(legacy) ? clampZoom(legacy) : ZOOM_DEFAULT;
+  const out = {} as Record<ZoomColumn, number>;
+  for (const key of ZOOM_COLUMNS) {
+    const v = src[key];
+    out[key] = typeof v === "number" && Number.isFinite(v) ? clampZoom(v) : seed;
+  }
+  return out;
+}
+
 export function migratePersistedUi(
   persisted: PersistedUi | undefined,
   version: number,
@@ -122,6 +161,19 @@ export function migratePersistedUi(
       ? rest
       : { ...rest, conciergeSendMode: conciergeAutoSend ? "speak" : "send" };
   }
+  if (version < 4) {
+    // THE GLOBAL ZOOM BECOMES FIVE (see the header). Seeded from the old number so an upgrading
+    // user's terminals stay the size they set them to, and the retired key is DELETED so `merge`
+    // cannot carry a dead global forward forever — the same treatment `conciergeAutoSend` got.
+    //
+    // THIS SEEDING BELONGS IN THE MIGRATOR AND NOWHERE ELSE. Every other repair in this file is
+    // deliberately un-gated because zustand skips `migrate` for blobs already at the current
+    // version; this one is the opposite case. A blob at v4 has no `zoom` key to seed from, and
+    // re-running the seed on every rehydrate would let a stale global — if one were ever written
+    // back — silently overwrite the per-column levels the user had since chosen.
+    const { zoom, ...rest } = next;
+    next = { ...rest, zoomByColumn: repairZoomByColumn(next.zoomByColumn, zoom) };
+  }
   // Version-mismatched blobs get the repair here; blobs ALREADY at the current version get it from
   // uiStore's `merge`, which is the path that actually runs on an ordinary launch. See
   // `repairSendMode` for why both call sites are needed.
@@ -136,6 +188,13 @@ export function migratePersistedUi(
   // column with no visible cause and nothing failing — precisely what this repair exists to stop.
   // Running it unconditionally costs one object rebuild per launch and closes that hole for good.
   next = { ...next, statusFilter: repairStatusFilter(next.statusFilter) };
+  // Same unconditional treatment and the same shallow-merge reason — a persisted map REPLACES the
+  // default, so an incomplete one hydrates `undefined` for a column and reaches xterm as `NaN`.
+  // Applied only when the key is present so a pre-v4 blob that skipped the branch above (there is
+  // none today, but a future migration could reorder these) is not handed a map it never had.
+  if ("zoomByColumn" in next) {
+    next = { ...next, zoomByColumn: repairZoomByColumn(next.zoomByColumn) };
+  }
   // Same unconditional treatment, same reason — see repairActiveSpecial. Only applied when the key
   // is actually present, so a blob that never carried one is passed through untouched (the store
   // default already answers null) rather than gaining a key it did not have.

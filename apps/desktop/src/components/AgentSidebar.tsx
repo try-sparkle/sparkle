@@ -38,6 +38,8 @@ import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStat
 import { shouldPollTickets, ticketsSignature } from "./supportTicketPoll";
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
+import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
   BUILD_COLUMN_MIN_WIDTH,
@@ -876,7 +878,22 @@ export function AgentSidebar({
   // the committed value. The floor and the terminal reserve still apply to whatever the variable says,
   // so a drag cannot paint this column below its minimum or over the terminal's — the live gesture is
   // bounded by exactly the same expression the resting layout is.
-  const RENDERED_WIDTH = `max(${MIN_WIDTH}px, min(var(${buildWidthVar(pairSide)}, ${width}px), calc(100% - ${TERMINAL_MIN_WIDTH}px)))`;
+  // ONE value for both the level and the DOM marker, and routed through `ZoomColumnOverride`.
+  const zoomColumn = useZoomColumnForSide("build", pairSide);
+  const columnZoom = useColumnZoom(zoomColumn);
+  // MAIN'S WIDTH RULE, UNCHANGED, DIVIDED BY THIS COLUMN'S ZOOM. The clamp itself is left exactly as
+  // it is — floor, stored variable, container ceiling — because that is the landed width design and
+  // this change has no business moving it. The division is only about keeping the two features
+  // independent: CSS `zoom: Z` scales this element's used width by Z, so a column stored at 300
+  // would PAINT at 360 when zoomed to 1.2, silently changing the user's width preference every time
+  // they changed the text size and leaving the seam starting its drag from a number that is not on
+  // screen. Dividing cancels that exactly — the box keeps its dragged width, only the CONTENTS scale.
+  const RENDERED_WIDTH = `calc(max(${MIN_WIDTH}px, min(var(${buildWidthVar(pairSide)}, ${width}px), calc(100% - ${TERMINAL_MIN_WIDTH}px))) / ${columnZoom})`;
+  /** The same width WITHOUT the zoom division — for boxes that do not carry `zoom` themselves.
+   *  The overlay spacer is one: it is plain layout, so reusing the divided expression would size it
+   *  at `stored / Z` and the terminal beside it would reflow (and re-measure its PTY) on every
+   *  overlay toggle, which is the precise thing that spacer exists to prevent. */
+  const SPACER_WIDTH = `max(${MIN_WIDTH}px, min(var(${buildWidthVar(pairSide)}, ${width}px), calc(100% - ${TERMINAL_MIN_WIDTH}px)))`;
   // The committed-value writer for that same property — see `publishColumnWidthVar` — and the place
   // this column ANNOUNCES its width to the row.
   //
@@ -2073,7 +2090,7 @@ export function AgentSidebar({
       <div
         data-testid="agent-sidebar-slot"
         aria-hidden
-        style={{ width: RENDERED_WIDTH, flex: "0 0 auto", height: "100%" }}
+        style={{ width: SPACER_WIDTH, flex: "0 0 auto", height: "100%" }}
       />
     )}
     <div
@@ -2083,6 +2100,12 @@ export function AgentSidebar({
       ref={columnRef}
       data-testid="agent-sidebar-column"
       data-overlay={String(overlay)}
+      // THIS BUILD COLUMN, for Cmd +/- — and PER SIDE, which is the whole point: the two builders
+      // are independent, so zooming the left one must leave the right one alone. Routed through
+      // `ZoomColumnOverride` so a torn-off satellite does not read (or advertise itself as) the
+      // cockpit's right builder. Every row here is a `<button>`, which is exactly the case DOM focus
+      // cannot answer in this webview — see services/columnFocusTracker.
+      {...{ [ZOOM_COLUMN_ATTR]: zoomColumn }}
       data-covered={String(covered)}
       // THE HALF A DESCENDANT CANNOT UNDO — see the `covered` prop. React 19 renders this as the
       // real `inert` attribute; `false` omits it entirely.
@@ -2090,8 +2113,14 @@ export function AgentSidebar({
       // The NUMBER, separate from the CSS `min()` in `width` — see RENDERED_WIDTH.
       data-width={String(width)}
       style={{
-        // CSS-clamped against this column's own container — see RENDERED_WIDTH.
+        // CSS-clamped against this column's own container, then divided by the zoom — see
+        // RENDERED_WIDTH.
         width: RENDERED_WIDTH,
+        // THIS COLUMN'S TEXT SIZE. `zoom` rather than `transform: scale()`: a transform paints at
+        // the new size but lays out at the old one, so the column would visually overlap its
+        // neighbours while the row still reserved the unscaled width, and every hit-test inside
+        // would be offset from what the user sees. `zoom` participates in layout.
+        zoom: columnZoom,
         flex: "0 0 auto",
         position: "relative",
         // COVERED BY THE PAIR'S PLAN BOARD — see the `covered` prop. Layout box kept, everything

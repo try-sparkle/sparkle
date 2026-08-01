@@ -497,10 +497,18 @@ function InstallIdRow() {
 
 /** Theme + Text size + Agent order, each under its own sub-label. */
 function AppearancePane() {
-  const zoom = useUiStore((s) => s.zoom);
-  const zoomIn = useUiStore((s) => s.zoomIn);
-  const zoomOut = useUiStore((s) => s.zoomOut);
-  const resetZoom = useUiStore((s) => s.resetZoom);
+  // EVERY COLUMN'S LEVEL, because this control has no column to address. Text size is per-column
+  // now (Cmd +/- applies to whichever column has focus), but this stepper lives inside a modal
+  // where the focused column is the dialog — i.e. none. So it drives all of them together, which
+  // is also the one place a user who has forgotten which column they zoomed can walk it all back.
+  const zoomByColumn = useUiStore((s) => s.zoomByColumn);
+  const stepAllZoom = useUiStore((s) => s.stepAllZoom);
+  const resetAllZoom = useUiStore((s) => s.resetAllZoom);
+  // "Mixed" when the columns disagree, rather than a number that would be a lie about four of
+  // them. Reading one column's level and calling it "the" text size is exactly how a global
+  // control misreports per-column state.
+  const levels = Object.values(zoomByColumn);
+  const uniform = levels.every((z) => z === levels[0]);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <div>
@@ -511,19 +519,23 @@ function AppearancePane() {
         <div style={subLabel}>Text size</div>
         {/* Right-sized stepper — no longer stretched across the whole panel. */}
         <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <button style={stepBtn} onClick={zoomOut} title="Zoom out (⌘−)">
+          <button style={stepBtn} onClick={() => stepAllZoom(-1)} title="Zoom every column out">
             −
           </button>
           <button
             style={{ ...stepBtn, minWidth: 60, fontVariantNumeric: "tabular-nums" }}
-            onClick={resetZoom}
-            title="Reset to 100% (⌘0)"
+            onClick={resetAllZoom}
+            title="Reset every column to 100%"
+            data-testid="zoom-reset-all"
           >
-            {Math.round(zoom * 100)}%
+            {uniform ? `${Math.round((levels[0] ?? 1) * 100)}%` : "Mixed"}
           </button>
-          <button style={stepBtn} onClick={zoomIn} title="Zoom in (⌘+)">
+          <button style={stepBtn} onClick={() => stepAllZoom(1)} title="Zoom every column in">
             +
           </button>
+        </div>
+        <div style={{ ...subLabel, marginTop: 6, opacity: 0.7 }}>
+          ⌘+ / ⌘− / ⌘0 size the column you are working in, each independently.
         </div>
       </div>
       <div>

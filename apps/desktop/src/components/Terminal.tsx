@@ -38,6 +38,12 @@ import { arrowKeySequence } from "./composerArrowOverflow";
 import { wheelToScrollLines } from "./terminalScroll";
 import { resolveTerminalOverlay } from "./terminalOverlay";
 import { TERMINAL_AGENT_ATTR, TERMINAL_SURFACE_ATTR } from "../voice/dictationFocus";
+// No `ZOOM_COLUMN_ATTR` here on purpose: the marker goes on the STAGE (components/Workspace), and
+// `PaneHost` appends this pane's host node into that stage, so the terminal surface is already a DOM
+// descendant of its column and `closest` finds it. Marking the surface as well would ALSO mark the
+// terminals that are not cockpit columns at all — the setup checklist's and the login modal's —
+// which would let a press in a modal address the right-hand terminal's zoom level.
+import { useColumnZoom, useZoomColumn } from "../hooks/useZoomColumn";
 import { makeLineScanState, scanSubmittedLines, hasPendingInput } from "./terminalSubmit";
 import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { matchesChord } from "../keyboardHints/keybindings";
@@ -354,7 +360,13 @@ export function Terminal({
   // Latest composerOverlay, read by the (agentId-keyed) selection patch without re-subscribing.
   const composerOverlayRef = useRef(composerOverlay);
   composerOverlayRef.current = composerOverlay;
-  const zoom = useUiStore((s) => s.zoom);
+  // THIS TERMINAL'S OWN zoom level, not the window's. The pane's column is derived from its
+  // project's live pair side (see useZoomColumn — a pane has no static side, because it is portalled
+  // into whichever stage owns it). Two consequences worth stating: zooming the LEFT terminal leaves
+  // the right one alone, which is the whole ask; and a terminal now re-fits only when ITS OWN level
+  // moves, where the old global number re-fit every terminal in the window on every press.
+  const zoomColumn = useZoomColumn(projectId, "terminal");
+  const zoom = useColumnZoom(zoomColumn);
   const resolvedTheme = useResolvedTheme();
   // Brief "Copied to clipboard" flash shown after a mouse selection is copied.
   const [copied, setCopied] = useState(false);
