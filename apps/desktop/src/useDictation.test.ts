@@ -112,6 +112,13 @@ describe("dictationStore", () => {
       level: 0,
       error: null,
       modelProgress: null,
+      // The FOURTH fixture to need these (roborev 57296), and this one is worse than the three
+      // already corrected: a row below writes `focusOwner: "terminal"`, and `setFocusOwner` is a
+      // documented NO-OP when the value is unchanged — so a leaked "terminal" makes a later row's
+      // own setup silently do nothing and the branch it means to exercise never runs. That fails
+      // OPEN: the row passes while testing the wrong path.
+      windowFocused: true,
+      focusOwner: "other",
     });
   });
 
@@ -176,6 +183,13 @@ describe("createDictationController (hook logic without renderHook)", () => {
       level: 0,
       error: null,
       modelProgress: null,
+      // The FOURTH fixture to need these (roborev 57296), and this one is worse than the three
+      // already corrected: a row below writes `focusOwner: "terminal"`, and `setFocusOwner` is a
+      // documented NO-OP when the value is unchanged — so a leaked "terminal" makes a later row's
+      // own setup silently do nothing and the branch it means to exercise never runs. That fails
+      // OPEN: the row passes while testing the wrong path.
+      windowFocused: true,
+      focusOwner: "other",
     });
 
     onSegment = vi.fn();
@@ -782,6 +796,68 @@ describe("multi-window level/speaking gate (background windows must not animate 
 describe("dictation://speech-end (the auto-send rail's silence signal)", () => {
   beforeEach(() => {
     useDictationStore.setState({ speechEndSeq: 0, speaking: false });
+  });
+
+  it("bumps committedSeq on every ARRIVED segment — the push-to-talk drain's only signal", async () => {
+    // ── roborev 57307 ─────────────────────────────────────────────────────────────────────────────
+    // The release drain settles on "has anything landed since the release", and `committedSeq` is
+    // the whole of that signal. Nothing tested that this handler bumps it: the hook-level rows in
+    // useSendMode.test.ts bump the counter BY HAND in their fixture, so deleting this production
+    // call left the entire suite green while every release with an outstanding run fell to the 4s
+    // cap — which is also the truncating path for an utterance still trickling in.
+    // DELTAS, not absolutes: this suite shares one module-level store and does not reset the
+    // counter, so an absolute expectation would encode how many rows happen to run first.
+    const seq = () => useDictationStore.getState().committedSeq;
+    const ctrl = await createDictationController({ onSegment: vi.fn(), isWindowActive: () => true });
+    const before = seq();
+    emit("dictation://partial", "hello world");
+    expect(seq() - before).toBe(1);
+    // A COUNTER, not a flag — the drain restarts its quiet window on each arrival, so two segments
+    // have to be two signals even when the text is identical.
+    emit("dictation://partial", "hello world");
+    expect(seq() - before).toBe(2);
+    ctrl.cleanup();
+  });
+
+  it("bumps it on the TERMINAL route too — the branch the composer rows can never reach", async () => {
+    // ── roborev 57319 ─────────────────────────────────────────────────────────────────────────────
+    // `dictation://partial` has TWO bump sites, and both other rows drive only the composer one:
+    // neither passes `focusOwner`, so it falls back to reading the DOM, jsdom classifies
+    // `document.body` as "other", `isTerminalRoutable()` is false, and control always reaches the
+    // composer branch. Deleting the terminal bump left the whole suite green.
+    //
+    // That call site is not decorative. With the caret in a routable terminal the phrase is typed
+    // into the PTY and the composer never moves, so `committedSeq` is the ONLY arrival signal the
+    // push-to-talk drain has on that path — losing it pins `quietSince` at null forever and sends
+    // every release with an outstanding run to the 4s cap, which is the truncating path.
+    const seq = () => useDictationStore.getState().committedSeq;
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(() => "type me"),
+      isWindowActive: () => true,
+      focusOwner: () => "terminal",
+    });
+    // The state `terminalRoutingArmed()` requires: armed, woken, not errored.
+    useDictationStore.setState({ enabled: true, phase: "active", status: "idle" });
+    const before = seq();
+    emit("dictation://partial", "restart the server");
+    expect(seq() - before, "the terminal route must record the arrival too").toBe(1);
+    ctrl.cleanup();
+  });
+
+  it("does NOT bump it in a background window — the negative that makes the row above mean something", async () => {
+    // Without this, nothing distinguishes "bumped on ARRIVAL" from "bumped on every broadcast".
+    // `dictation://partial` reaches EVERY window; only the one dictation may route into consumes it,
+    // and a background window bumping the counter would settle a release in a window that never
+    // heard the words. Mirrors the speechEndSeq treatment directly below.
+    const seq = () => useDictationStore.getState().committedSeq;
+    const ctrl = await createDictationController({
+      onSegment: vi.fn(),
+      isWindowActive: () => false,
+    });
+    const before = seq();
+    emit("dictation://partial", "hello world");
+    expect(seq() - before).toBe(0);
+    ctrl.cleanup();
   });
 
   it("bumps speechEndSeq once per utterance, so two identical endings are two signals", async () => {

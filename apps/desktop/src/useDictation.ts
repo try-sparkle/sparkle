@@ -328,6 +328,10 @@ export async function createDictationController(
       if (isTerminalRoutable()) {
         useDictationStore.getState().setModelProgress(null);
         useDictationStore.getState().setInterim("");
+        // A COMMITTED segment arrived. The push-to-talk drain keys its "is anything still landing"
+        // question on this rather than on the composer's text, which cannot tell a transcript from a
+        // keystroke (roborev 57295).
+        useDictationStore.getState().noteCommittedSegment();
         // ══ THE WAKE/STOP MACHINE RUNS FIRST, ON THIS PATH TOO ═══════════════════════════════
         // `onSegment` is the ONLY driver of the phase machine. An earlier version returned before
         // calling it, which meant that with the caret in a terminal the STOP WORD was typed onto the
@@ -374,6 +378,8 @@ export async function createDictationController(
       // A committed (final) segment supersedes the live preview — clear it so the interim text
       // doesn't briefly double up with the text that's about to land in the box.
       useDictationStore.getState().setInterim("");
+      // …and record the ARRIVAL itself, for the push-to-talk drain (roborev 57295).
+      useDictationStore.getState().noteCommittedSegment();
       onSegment(e.payload, { terminal: false });
     }),
 

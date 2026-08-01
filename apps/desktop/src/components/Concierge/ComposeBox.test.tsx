@@ -8,7 +8,7 @@
 // header — see ConciergeColumn.oneMic.test.tsx, which counts them so nothing puts a second one back.
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { C, ON_GOLD_FILL } from "../../theme/colors";
+import { C } from "../../theme/colors";
 import { ComposeBox } from "./ComposeBox";
 import { useUiStore } from "../../stores/uiStore";
 
@@ -51,11 +51,22 @@ const box = () => screen.getByRole("textbox", { name: "Message" }) as HTMLTextAr
 // is, so the next reader stops looking. The value the token resolves TO is pinned separately, in
 // theme/chromeContrast.test.ts ("dark keeps the prototype's own gold") and by the index.css mirror.
 describe("ComposeBox — the Send button carries the concierge gold", () => {
-  it("uses the THEMED goldFill + its paired ink, never amber and never the literal gold", () => {
+  it("uses the THEMED goldFill as its STROKE, never amber and never the literal gold", () => {
+    // ── THE ASSERTION MOVED FROM FILL TO STROKE, BY THE FOUNDER'S SPEC ──────────────────────────
+    // Send used to be pinned as `background === C.goldFill` — solid at REST. Under the unified tray
+    // rule (fill matches stroke = acting right now) that made Send the one position permanently
+    // claiming to be mid-send. His words: "the send button should also be a lighter color than the
+    // stroke until I hit the send button to send it."
+    //
+    // What this row was really guarding is unchanged and still guarded: the THEMED token, not amber
+    // and not a literal — it just lives on the border now, with the fill a tint of it. The
+    // click-fills-it half is pinned in SendModeTray.test.tsx, which can drive the click.
     setup();
     const send = screen.getByRole("button", { name: "Send" });
-    expect(send.style.background).toBe(C.goldFill);
-    expect(send.style.color).toBe(ON_GOLD_FILL);
+    expect(send.style.borderColor).toBe(C.goldFill);
+    expect(send.style.background).toContain("color-mix");
+    expect(send.style.background).toContain(C.goldFill);
+    expect(send.style.background).not.toBe(send.style.borderColor);
   });
 
   // The gold pair used to be pinned twice here, once on Send and once on the live mic beside it.

@@ -104,6 +104,27 @@ describe("the clock starts on SPEECH END, not on the transcript settling", () =>
     expect(onFire).not.toHaveBeenCalled();
   });
 
+  it("bumps firedSeq on a REAL countdown — the Speak pill's only honest fill trigger", async () => {
+    // ── roborev 57314 (High) ──────────────────────────────────────────────────────────────────────
+    // The tray's green "sending now" fill cannot be derived from `remainingFraction` reaching 0: the
+    // fire branch below applies its state and returns WITHOUT `setNow`, so every repaint during a
+    // countdown comes from a tick that just measured remaining > 0, and the render that would show 0
+    // is the one where counting has already stopped. Reading it off the render was a sub-millisecond
+    // race — a random flicker rather than a state.
+    //
+    // This asserts the replacement END TO END, through a real countdown rather than an injected
+    // model shape: the counter the pill keys on actually moves when a send actually goes.
+    const { onFire, result } = setup();
+    const before = result.current.firedSeq ?? 0;
+    speechEnds();
+    expect(result.current.phase).toBe("counting");
+    expect(result.current.firedSeq, "nothing has fired yet").toBe(before);
+
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+    expect(result.current.firedSeq ?? 0, "the fill trigger moves WITH the send").toBe(before + 1);
+  });
+
   it("fires once the tier's threshold of silence has passed", async () => {
     const { onFire, result } = setup();
     speechEnds();
@@ -469,13 +490,21 @@ describe("a send that did not happen is not announced or recorded", () => {
     // than the silent no-op it replaced; recording a sample is worse still, because that corpus is
     // the entire input to the §4f tuner and a phantom sample TRAINS the thresholds.
     const onFire = vi.fn(() => false);
-    const { onAnnounce } = setup({ onFire });
+    const { onAnnounce, result } = setup({ onFire });
     onAnnounce.mockClear();
+    const before = result.current.firedSeq ?? 0;
     speechEnds();
     await tick(HIGH + AUTO_SEND_TICK_MS);
 
     expect(onFire).toHaveBeenCalledTimes(1);
     expect(onAnnounce.mock.calls.map((c) => c[0]).join(" ")).not.toContain("Sent to");
+    // …AND THE TRAY STAYS SILENT TOO (roborev 57330). The green "it sent" fill reads this counter,
+    // so a bump here paints a successful send for a fire that sent nothing — showing the sighted
+    // user the opposite of what the screen-reader user is correctly told on the same tick. This row
+    // is the only place that guard can fail: `setup()`'s default `onFire` returns true.
+    expect(result.current.firedSeq ?? 0, "a fire that sent nothing must not paint 'sent'").toBe(
+      before,
+    );
   });
 });
 

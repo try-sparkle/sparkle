@@ -18,6 +18,8 @@ import {
   DEFAULT_SPEAK_LEFT_FRAC,
   TRAY_PILL_COUNT,
   fullLabelsFitAtPx,
+  iconsFitAtPx,
+  shortLabelsFitAtPx,
 } from "../components/Concierge/trayGeometry";
 import { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
 import {
@@ -26,6 +28,8 @@ import {
   SEND_MODE_LABEL_SHORT,
   SWEEP_FLOOR_MS,
   TRAY_SHORT_LABEL_MAX_PX,
+  TRAY_ICON_ONLY_MAX_PX,
+  trayDensityFor,
   chicletFor,
   chordSends,
   micIntentForMode,
@@ -238,10 +242,54 @@ describe("the keycap chip cannot lie about the keystroke", () => {
       // stale 428 — green, while widths 430-458 clipped mid-word (roborev 56213). Now a change to
       // any of the geometry fails HERE.
       expect(TRAY_SHORT_LABEL_MAX_PX).toBeGreaterThanOrEqual(fullLabelsFitAtPx());
-      // …and at every width below it, the widest label is the SHORT one.
-      for (const w of [280, 320, 360, 400, TRAY_SHORT_LABEL_MAX_PX - 1]) {
+      // …and at every width in the SHORT tier, the widest label is the short one. Scoped to that
+      // tier now: below `TRAY_ICON_ONLY_MAX_PX` the component draws no words at all, so widths
+      // down there say nothing about which label table won.
+      for (const w of [TRAY_ICON_ONLY_MAX_PX, 360, 400, TRAY_SHORT_LABEL_MAX_PX - 1]) {
         expect(trayLabelFor("ptt", w)).toBe(SEND_MODE_LABEL_SHORT.ptt);
       }
+    });
+
+    // ── THE THIRD TIER: ICONS ─────────────────────────────────────────────────────────────────
+    //
+    // The founder's narrow-column screenshot showed the tray reading "S… P… S…" — all three
+    // positions ellipsised to one letter, so the control could not be read at all. The short-label
+    // tier moved the width at which that happens; it did not remove it. These pin the tier that does.
+    describe("icons-only, for a tray too narrow even for short labels", () => {
+      it("switches to icons BEFORE the short labels would start clipping", () => {
+        // The same shape of guard as the row above, one tier down: any change to the pill geometry
+        // that outgrows this threshold fails HERE rather than silently painting "Spea…".
+        expect(TRAY_ICON_ONLY_MAX_PX).toBeGreaterThanOrEqual(shortLabelsFitAtPx());
+      });
+
+      it("still has room for three readable icons at its own floor", () => {
+        // The tier is only worth having if the thing it switches TO fits. `iconsFitAtPx` drops the
+        // chiclet slot and the label gap, which is what buys the room.
+        expect(iconsFitAtPx()).toBeLessThan(TRAY_ICON_ONLY_MAX_PX);
+      });
+
+      it("orders the three tiers, with no width falling between them", () => {
+        expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX)).toBe("full");
+        expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX - 1)).toBe("short");
+        expect(trayDensityFor(TRAY_ICON_ONLY_MAX_PX)).toBe("short");
+        expect(trayDensityFor(TRAY_ICON_ONLY_MAX_PX - 1)).toBe("icon");
+        expect(trayDensityFor(50)).toBe("icon");
+      });
+
+      it("takes the FULL tier when nothing has been measured yet", () => {
+        // Booting into an abbreviated form and widening a frame later is a visible flicker; a
+        // too-long label for one frame merely truncates the way it always did.
+        expect(trayDensityFor(0)).toBe("full");
+        expect(trayDensityFor(-1)).toBe("full");
+      });
+
+      it("covers the width the founder actually reported", () => {
+        // A concierge at its DEFAULT width already sits in the short tier (that is why "S… P… S…"
+        // appeared without resizing anything unusual). Dragging it narrower — which the removal of
+        // every width ceiling makes routine — must reach icons rather than one-letter stubs.
+        expect(trayDensityFor(CONCIERGE_DEFAULT_WIDTH)).not.toBe("full");
+        expect(trayDensityFor(CONCIERGE_DEFAULT_WIDTH / 2)).toBe("icon");
+      });
     });
 
     it("derives the tray's pill count from SEND_MODES, never from a copy of it", () => {

@@ -19,9 +19,13 @@
 // and ./ComposeBox.tsx, and breaking it produced roborev findings 52648/53010/53088.
 import { useEffect, useRef, useState } from "react";
 
+import { FiMic, FiRadio, FiSend } from "react-icons/fi";
+
 import {
   DEFAULT_SPEAK_LEFT_FRAC,
   TRAY_GEOMETRY,
+  TRAY_ICON_PX,
+  iconPillMinPx,
   speakLeftFraction,
 } from "./trayGeometry";
 
@@ -37,10 +41,30 @@ import {
   chicletFor,
   modeCountsDown,
   stepSendMode,
+  trayDensityFor,
   trayLabelFor,
   type SendChord,
   type SendMode,
 } from "../../voice/sendMode";
+
+/**
+ * The glyph each position draws when the tray is too narrow for words.
+ *
+ * `react-icons/fi`, the project's icon set — emoji-as-icons are banned repo-wide. Chosen to be
+ * distinguishable at 16px, which is the whole reason this tier exists: three ellipsised words all
+ * read as "S…", three distinct silhouettes do not.
+ *   • send  — a paper plane. The one position where YOU press to send.
+ *   • ptt   — a microphone. Hold to talk; the release sends.
+ *   • speak — a broadcast. Talk and it goes on its own when you stop.
+ *
+ * A `Record<SendMode, …>` rather than a lookup with a fallback, so adding a fourth position is a
+ * COMPILE error here instead of a pill that silently renders nothing at narrow widths.
+ */
+const SEND_MODE_ICON: Record<SendMode, typeof FiSend> = {
+  send: FiSend,
+  ptt: FiMic,
+  speak: FiRadio,
+};
 
 /**
  * How long the sweep takes to EASE to a new remaining fraction after the threshold moves.
@@ -57,6 +81,17 @@ import {
  * direction, same number, so there is nothing new to learn.
  */
 export const THRESHOLD_EASE_MS = 250;
+
+/**
+ * How long a CLICK-driven send keeps its filled state.
+ *
+ * The hold and the countdown have durations of their own; a click does not — `onSend` returns
+ * synchronously, so "fill while the action lasts" would be a fill nobody can see. This is the
+ * minimum time the acknowledgement stays legible, and it is a STATE with a duration rather than an
+ * animation: the fill appears at the click, holds, and goes. No transition, no easing, no glow —
+ * the founder's spec is the border colour moved to the background and nothing else.
+ */
+export const ACTING_FLASH_MS = 220;
 
 /** matchMedia is absent under jsdom — treat "can't ask" as "no reduction requested". */
 function prefersReducedMotion(): boolean {
@@ -85,6 +120,15 @@ export interface SendTrayModel {
   tier: Confidence;
   /** How much of the sweep is left, in [0, 1]. 1 = just started, 0 = firing. */
   remainingFraction: number;
+  /**
+   * Monotonic count of auto-sends that have actually FIRED.
+   *
+   * Speak's green fill keys on a CHANGE to this, not on `remainingFraction` reaching 0 — that value
+   * is never rendered as 0 while the countdown is still live (the fire branch returns without
+   * scheduling a repaint), so reading it was a sub-millisecond race that produced a random flicker
+   * instead of a state (roborev 57314). Optional so existing callers and fixtures are unaffected.
+   */
+  firedSeq?: number;
 }
 
 export interface SendModeTrayProps {
@@ -105,6 +149,16 @@ export interface SendModeTrayProps {
    * see voice/sendMode `trayInert` for why "is the composer focused" is not the same question.
    */
   inert?: boolean;
+  /**
+   * Is the push-to-talk key DOWN right now — i.e. is the microphone actually capturing?
+   *
+   * THE THIRD STATE. `mode === "ptt"` says only that the position is SELECTED; this says the user is
+   * holding the key and being heard. They painted identically until now, which is the founder's
+   * report: "it should show as a fully pressed button … it doesn't look any different than it does
+   * when it's in standby mode." He speaks while looking elsewhere, so the difference has to read
+   * from peripheral vision, not on inspection.
+   */
+  pttHeld?: boolean;
   /** Which keystroke sends, so the chiclets can follow the setting rather than assert a default. */
   chord: SendChord;
   /**
@@ -155,6 +209,7 @@ export function SendModeTray({
   canSend,
   model,
   inert = false,
+  pttHeld = false,
   chord,
   wired = false,
 }: SendModeTrayProps) {
@@ -197,6 +252,21 @@ export function SendModeTray({
   // Which pill is showing its keycap. Hover OR keyboard focus, never at rest — a chiclet on every
   // pill all the time is three keycaps competing with the three labels that are the actual content.
   const [revealed, setRevealed] = useState<SendMode | null>(null);
+  /** The pill whose CLICK-send is still being acknowledged — see {@link ACTING_FLASH_MS}. */
+  const [flashing, setFlashing] = useState<SendMode | null>(null);
+  // THE FIRE EVENT LIGHTS SPEAK. One clock: the same `firedSeq` bump the send itself produces.
+  const firedSeq = model?.firedSeq;
+  const lastFired = useRef(firedSeq);
+  useEffect(() => {
+    if (firedSeq === undefined || firedSeq === lastFired.current) return;
+    lastFired.current = firedSeq;
+    setFlashing("speak");
+  }, [firedSeq]);
+  useEffect(() => {
+    if (flashing === null) return;
+    const id = setTimeout(() => setFlashing(null), ACTING_FLASH_MS);
+    return () => clearTimeout(id);
+  }, [flashing]);
 
   // The pill nodes, so an arrow step can move DOM focus with the selection. Selection and focus have
   // to stay the same fact — see the arrow handler.
@@ -274,7 +344,15 @@ export function SendModeTray({
         display: "flex",
         alignItems: "stretch",
         gap: TRAY_GEOMETRY.trayGap,
-        height: TRAY_HEIGHT,
+        // WRAPS RATHER THAN OVERFLOWS. With every column width ceiling removed the concierge can be
+        // dragged to 50px, where three pills cannot share a line however tight their padding is.
+        // Wrapping turns that into two rows and then three; clipping would put the send control
+        // half outside the column, which is the founder's report one level down.
+        flexWrap: "wrap",
+        minWidth: 0,
+        // `minHeight`, not a fixed `height`, so a wrapped tray grows instead of cropping its own
+        // second row. At every width that does NOT wrap this is the identical box it always was.
+        minHeight: TRAY_HEIGHT,
         marginTop: 8,
         padding: TRAY_GEOMETRY.trayPad,
         borderRadius: RADIUS.modal,
@@ -362,6 +440,27 @@ export function SendModeTray({
 
       {SEND_MODES.map((m) => {
         const selected = m === mode;
+        // PRESSED = selected AND the key is actually down. Scoped to Push to talk because it is the
+        // only position with a held gesture: Send fires on a click and Speak on a countdown, so
+        // neither has a "currently capturing" state to draw. `!inert` because an inert tray is not
+        // being heard at all — painting it pressed would be the same lie in the other direction.
+        const pressed = selected && m === "ptt" && pttHeld && !inert;
+        // ── SPEAK FILLS WHEN THE SEND ACTUALLY GOES ───────────────────────────────────────────
+        // The founder's requirement stands unchanged — sweep arrival, fill and send are ONE event —
+        // but it is met by the fire EVENT rather than by a shared `remaining` value. An earlier
+        // revision derived this from `remaining <= 0` and said so here; that comment is gone because
+        // it was false in a way that specifically indicted its replacement. `remaining` never
+        // RENDERS as 0 while the countdown is live: useAutoSend's fire branch applies its state and
+        // returns without scheduling a repaint, so the only renders during a countdown come from
+        // ticks that just measured remaining > 0. Reading it was a sub-millisecond race.
+        //
+        // `firedSeq` is bumped inside useAutoSend's CONFIRMED-DISPATCH branch, so the fill and the
+        // "Sent to …" announcement have one trigger and cannot disagree about whether anything left
+        // the box. Speak's countdown fill and its click fill are therefore one mechanism: both light
+        // the pill through `flashing`.
+        const clicked = flashing === m;
+        const firing = clicked && m === "speak";
+        const acting = pressed || clicked;
         const ink = MODE_INK[m];
         // PRESSING THE SELECTED POSITION SENDS — except in Push to talk, where releasing the hold
         // already sends and a press would be a second, competing way to do the same thing.
@@ -390,6 +489,13 @@ export function SendModeTray({
         // Width-driven, decided by the pure `trayLabelFor` (voice/sendMode) rather than by CSS
         // truncation — see its doc for why this cannot be proven by measuring in jsdom.
         const label = trayLabelFor(m, trayWidth);
+        // The THIRD tier. Below `TRAY_ICON_ONLY_MAX_PX` even the short words ellipsize — the
+        // founder's "S… P… S…" — so the pill drops its text and draws a glyph instead. One
+        // ordered decision for all three tiers (see `trayDensityFor`), because two independent
+        // width comparisons is how a pill ends up drawing an icon AND reserving a label slot.
+        const density = trayDensityFor(trayWidth);
+        const iconOnly = density === "icon";
+        const ModeIcon = SEND_MODE_ICON[m];
         // ── THE ACCESSIBLE NAME DOES NOT MOVE WITH THE WIDTH ───────────────────────────────────
         // Built from the FULL label, never from the rendered one. An earlier revision derived it
         // from `label`, so a narrow tray silently renamed the Push-to-talk pill to "Push" — the
@@ -408,6 +514,11 @@ export function SendModeTray({
             key={m}
             type="button"
             aria-pressed={selected}
+            data-held={pressed ? "true" : undefined}
+            data-firing={firing ? "true" : undefined}
+            // ONE attribute for the shared rule, so a test can assert "is this pill acting" without
+            // knowing which position it is looking at.
+            data-acting={acting ? "true" : undefined}
             data-mode-pill={m}
             // The Send position keeps the accessible name "Send" in EVERY mode, not only when it is
             // selected. It is the name every keybinding, every voice-control user and every test in
@@ -433,6 +544,9 @@ export function SendModeTray({
             onClick={() => {
               if (pressSends) {
                 if (!canSend) return; // nothing to send: the press is inert, the PILL is not
+                // Light it BEFORE sending, so the acknowledgement cannot be lost if `onSend`
+                // synchronously unmounts or re-renders the tray.
+                setFlashing(m);
                 onSend();
               } else if (!selected) onModeChange(m);
             }}
@@ -473,14 +587,17 @@ export function SendModeTray({
             style={{
               position: "relative",
               zIndex: 1,
-              flex: 1,
-              minWidth: 0,
+              // `1 1 auto` with a real floor in the icon tier, so a pill can drop to the next line
+              // instead of being squeezed narrower than its own glyph. Unchanged (`flex: 1`,
+              // floor 0) in both label tiers, where the pills share the line equally as before.
+              flex: iconOnly ? "1 1 auto" : 1,
+              minWidth: iconOnly ? iconPillMinPx() : 0,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
               gap: TRAY_GEOMETRY.pillGap,
               height: "100%",
-              padding: `0 ${TRAY_GEOMETRY.pillPadX}px`,
+              padding: `0 ${iconOnly ? TRAY_GEOMETRY.pillPadXIcon : TRAY_GEOMETRY.pillPadX}px`,
               borderRadius: RADIUS.input,
               font: "inherit",
               fontSize: TYPE.small,
@@ -495,15 +612,74 @@ export function SendModeTray({
               // the action is your voice, and a second hot button next to a live microphone is a
               // second thing claiming to be the way to send. Mic dead, button hot; mic hot, button
               // quiet.
-              ...(selected && m === "send"
-                ? { background: ink, color: ON_GOLD_FILL, border: `${TRAY_GEOMETRY.pillBorder}px solid ${ink}` }
+              // ── HELD READS AS A PHYSICALLY DEPRESSED BUTTON ──────────────────────────────
+              // A FILL, not a brighter outline. The armed state is already an outline, and the
+              // founder's complaint is precisely that the two were indistinguishable — so the
+              // difference has to be a change of KIND (hollow → solid), not of degree. This is the
+              // same solid treatment the selected Send pill wears, which is the one thing in this
+              // tray users already read as "this is the hot control".
+              //
+              // Listed FIRST so it wins over the armed branch below for the same pill.
+              // ── FILL MATCHES STROKE = ACTING RIGHT NOW ────────────────────────────────────────
+              // The founder's rule, and it is ONE rule across the whole tray rather than a treatment
+              // per position: "when the background of the button is a different color than the
+              // stroke, I would consider that to be inactive status. But when I'm actually pushing on
+              // the button … then the button should be the same color as the stroke."
+              //
+              //   fill DIFFERS from stroke -> selected, but not acting
+              //   fill MATCHES stroke      -> acting THIS INSTANT
+              //
+              // Push to talk fills AMBER while the gesture is held; Speak fills GREEN at the instant
+              // the sweep reaches it and the send goes. Each takes ITS OWN existing stroke colour
+              // (`ink`) as the background — no new token, no glow, no animation, nothing but the
+              // border colour moved to the fill. An earlier revision added an inset shadow here; it
+              // is removed, because the spec is deliberately exactly this and nothing else.
+              //
+              // The label inverts to `ON_GOLD_FILL` (dark) so it stays readable on a saturated fill —
+              // it is amber/green text on dark at rest, which would be unreadable on its own colour.
+              // The icon tier inherits this automatically: `color` is what the glyph is drawn in.
+              ...(acting
+                ? {
+                    background: ink,
+                    color: ON_GOLD_FILL,
+                    // LONGHANDS, not the `border` shorthand — the same reason the tray root states
+                    // at its own `borderColor`: a shorthand carrying a `var()` cannot be decomposed
+                    // into its longhands, so the whole declaration stays an opaque string and
+                    // nothing can read the edge colour back off the node. That matters more here
+                    // than anywhere else in this file, because the FOUNDER'S RULE IS A COMPARISON
+                    // between the fill and the stroke — a test that cannot read the stroke cannot
+                    // assert the rule at all, and would have to fall back to a colour literal.
+                    borderWidth: TRAY_GEOMETRY.pillBorder,
+                    borderStyle: "solid",
+                    borderColor: ink,
+                  }
+                // SEND NO LONGER SHIPS PRE-FILLED. It used to wear the solid treatment at REST,
+                // which under the unified rule reads as "sending right now" the whole time the tray
+                // is parked there — the one position that was permanently lying. The founder asked
+                // for it explicitly: "the send button should also be a lighter color than the stroke
+                // until I hit the send button". It now falls through to the shared selected branch
+                // below and fills only via `acting`, exactly like Push to talk and Speak.
                 : selected
                 ? {
+                    // LONGHANDS for the same reason the acting branch above gives: the founder's
+                    // rule is a COMPARISON of fill against stroke, so a test must be able to read
+                    // the stroke. With the `border` shorthand carrying a `var()`, `borderColor` read
+                    // back as "" — which made "fill DIFFERS from stroke" pass for the wrong reason
+                    // (a colour is never equal to an empty string) rather than because the tint
+                    // genuinely differs from the edge.
                     background: `color-mix(in srgb, ${ink} 22%, transparent)`,
                     color: ink,
-                    border: `${TRAY_GEOMETRY.pillBorder}px solid ${ink}`,
+                    borderWidth: TRAY_GEOMETRY.pillBorder,
+                    borderStyle: "solid",
+                    borderColor: ink,
                   }
-                : { background: "transparent", color: C.conciergeMuted, border: `${TRAY_GEOMETRY.pillBorder}px solid transparent` }),
+                : {
+                    background: "transparent",
+                    color: C.conciergeMuted,
+                    borderWidth: TRAY_GEOMETRY.pillBorder,
+                    borderStyle: "solid",
+                    borderColor: "transparent",
+                  }),
             }}
           >
             {/* The narrow state is handled by CHOOSING a shorter word (voice/sendMode
@@ -517,17 +693,34 @@ export function SendModeTray({
                 threshold is an ESTIMATE of text metrics, so a residual error is possible in either
                 direction; with `TRAY_SHORT_LABEL_MAX_PX` at its pessimistic value this should never
                 paint, and if it does an ellipsis beats a word cut mid-stroke. */}
-            <span
-              data-testid={`send-mode-label-${m}`}
-              style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
-            >
-              {label}
-            </span>
+            {iconOnly ? (
+              /* ICONS ONLY — the narrowest tier. The glyph carries `aria-hidden` because the
+                 button already has its FULL accessible name in `aria-label`; labelling the icon
+                 too would make a screen reader read the position twice. Nothing here can clip:
+                 there is no text to truncate, and the glyph is a fixed 16px box. */
+              <span
+                data-testid={`send-mode-icon-${m}`}
+                style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", flex: "none" }}
+              >
+                <ModeIcon size={TRAY_ICON_PX - 2} aria-hidden />
+              </span>
+            ) : (
+              <span
+                data-testid={`send-mode-label-${m}`}
+                style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
+              >
+                {label}
+              </span>
+            )}
             {/* THE KEYCAP CHICLET. Hover or keyboard focus only, never at rest, at the pill's right
                 inside edge. The slot is reserved in BOTH states so nothing shifts when it appears.
                 What it says comes from voice/sendMode `chicletFor`, which is the same function the
                 keystroke handler asks — a chip that advertises a chord the handler does not honour
                 is worse than no chip at all. */}
+            {/* NOT RENDERED AT ALL in the icon tier — see `iconsFitAtPx`. A reserved 30px slot per
+                pill is the single largest thing standing between three icons and a narrow column,
+                and a keycap hint is the first thing to go when there is no room for words either. */}
+            {iconOnly ? null : (
             <span
               data-testid={showCap ? `send-chiclet-${m}` : undefined}
               aria-hidden
@@ -544,6 +737,7 @@ export function SendModeTray({
             >
               {chicletFor(m, chord)}
             </span>
+            )}
           </button>
         );
       })}

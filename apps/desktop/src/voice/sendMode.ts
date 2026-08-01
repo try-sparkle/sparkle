@@ -105,6 +105,58 @@ export function shortLabelsAreContainedInFullLabels(): boolean {
 export const TRAY_SHORT_LABEL_MAX_PX = 440;
 
 /**
+ * Below this tray width the pills drop their words entirely and draw ICONS ONLY.
+ *
+ * ── WHY A THIRD TIER EXISTS ─────────────────────────────────────────────────────────────────────
+ * The short-label tier above was introduced for exactly this failure and did not go far enough. The
+ * founder's screenshot of a narrow concierge column shows the tray reading **"S… P… S…"** — all
+ * three positions ellipsised to a single letter, so the control that decides what happens when you
+ * stop talking cannot be read at all. Short labels only moved the width at which that happens.
+ *
+ * It matters more now than it did: with every column width ceiling removed and a 50px floor in its
+ * place (engine/columnResize), a narrow concierge stops being an edge case and becomes something the
+ * user reaches deliberately and often.
+ *
+ * ── WHY ICONS AND NOT A SHORTER WORD ────────────────────────────────────────────────────────────
+ * There is no shorter word. "Send"/"Push"/"Speak" are already one syllable each, and cutting them
+ * further produces the abbreviations this tier exists to avoid — an icon at 16px still reads, a word
+ * cut to "S…" does not. Icons come from `react-icons/fi`, the project's icon set; emoji are banned
+ * as icons repo-wide.
+ *
+ * ── THE ACCESSIBLE NAME IS UNAFFECTED ───────────────────────────────────────────────────────────
+ * The pill keeps `aria-label` at the FULL label in every tier, so the icon tier is a purely visual
+ * reduction. WCAG 2.5.3 (Label in Name) is about the visible string being contained in the name;
+ * with no visible string there is nothing to contain, and the requirement is satisfied trivially —
+ * unlike a truncated "S…", which is visible text NOT contained in "Send".
+ *
+ * Set from `iconsFitAtPx()`'s sibling `shortLabelsFitAtPx()` and pinned by sendMode.test.ts the same
+ * way `TRAY_SHORT_LABEL_MAX_PX` is, so a geometry change fails loudly instead of clipping.
+ */
+export const TRAY_ICON_ONLY_MAX_PX = 320;
+
+/** How a tray of a given width draws its pills. */
+export type TrayDensity = "full" | "short" | "icon";
+
+/**
+ * Which density a tray of `trayWidthPx` draws at.
+ *
+ * ONE function for all three tiers, rather than `trayLabelFor` plus a separate icon predicate: the
+ * tiers are ordered and mutually exclusive, and two independent width comparisons is how a component
+ * ends up drawing an icon AND reserving a label slot for it.
+ *
+ * A width of 0 means "not measured yet" (first paint, before the ResizeObserver fires) and takes the
+ * FULL tier, for the reason `trayLabelFor` gives: booting into an abbreviated form and widening a
+ * frame later is a visible flicker, whereas a too-long label for one frame merely truncates the way
+ * it always did.
+ */
+export function trayDensityFor(trayWidthPx: number): TrayDensity {
+  if (!(trayWidthPx > 0)) return "full";
+  if (trayWidthPx < TRAY_ICON_ONLY_MAX_PX) return "icon";
+  if (trayWidthPx < TRAY_SHORT_LABEL_MAX_PX) return "short";
+  return "full";
+}
+
+/**
  * The label a pill draws at a given tray width.
  *
  * Pure and exported for this codebase's usual reason (cf. `chicletFor`, `micIntentForMode`): the

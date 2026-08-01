@@ -87,15 +87,11 @@ function setup() {
     box.text = "";
     return true;
   });
-  // `composedText` is a PROP, not something this hook can read off `box` directly — in production
-  // it is React state in ConciergeHost, re-rendering `useSendMode` on every change. `rerender` is
-  // that re-render; `sync()` is what a test calls after mutating `box.text` directly (a typed draft,
-  // with no dictation event of its own) to make it happen, the same way `ConciergeHost` re-renders
-  // whenever `ComposeBox`'s `onComposedText` fires.
-  const view = renderHook((composedText: string) => useSendMode({ onSend, composedText }), {
-    initialProps: box.text,
-  });
-  const sync = () => act(() => view.rerender(box.text));
+  // `sync()` simulates the composer re-rendering after `box.text` was mutated DIRECTLY — a typed
+  // draft, with no dictation event of its own. It deliberately bumps NO counter: that is precisely
+  // what separates a keystroke from an arrival, and the drain must not settle on it (roborev 57295).
+  const view = renderHook(() => useSendMode({ onSend }));
+  const sync = () => act(() => view.rerender());
   /**
    * A COMMITTED segment reaches this window: the interim is cleared and the text is appended to the
    * box — the two halves of useDictation's `dictation://partial` handler, in its order — and THEN
@@ -105,8 +101,12 @@ function setup() {
   const commits = (text: string) =>
     act(() => {
       useDictationStore.getState().setInterim("");
+      // THE ARRIVAL ITSELF. Mirrors useDictation's `dictation://partial` handler, which bumps this
+      // alongside clearing the interim — it is the signal the drain actually watches now, and a
+      // `commits()` that only moved the text would be simulating a keystroke, not a transcript.
+      useDictationStore.getState().noteCommittedSegment();
       box.text = box.text ? `${box.text} ${text}` : text;
-      view.rerender(box.text);
+      view.rerender();
     });
   return { box, onSend, sync, commits, ...view };
 }
@@ -713,6 +713,10 @@ describe("the caret moving into a terminal pauses Speak", () => {
   });
 });
 
+// ── MERGE NOTE ────────────────────────────────────────────────────────────────────────────────
+// Both blocks below are kept. They conflicted only because they were appended to the same end
+// of this file from two branches; they cover entirely different concerns — the release DRAIN
+// (when a send may fire) and the HELD state (what the tray paints while the key is down).
 describe("a decode that lags LONGER than the quiet window", () => {
   // ── roborev 57274 (High) ──────────────────────────────────────────────────────────────────────
   // THE GAP EVERY OTHER ON-DEVICE ROW LEFT OPEN. They all advance only `flush()` (1ms) between the
@@ -770,6 +774,31 @@ describe("a decode that lags LONGER than the quiet window", () => {
       .not.toHaveBeenCalled();
   });
 
+  it("a KEYSTROKE during the wait is not an arrival and must not settle it", async () => {
+    // ── roborev 57295 ─────────────────────────────────────────────────────────────────────────────
+    // Removing the release-time seed made a post-release CHANGE the only thing that can start the
+    // quiet clock — and while that change was read off the composer's own text, it could not tell a
+    // transcript from a keystroke. The wait runs for up to 4s with the key released and the box
+    // focused, so typing during it is ordinary: one character started the clock, the drain settled
+    // ~500ms later, and the tail arriving afterwards was stranded in a composer whose message had
+    // already gone out. The signal is now `committedSeq`, which only dictation can move.
+    const { box, onSend, commits, sync } = setup();
+    down();
+    vad(true);
+    vad(false);
+    up(); // released into the pending decode
+
+    box.text = `${box.text}!`; // he types a character while waiting
+    sync();
+    await advance(QUIET_WINDOW_MS_FOR_TEST * 2);
+    expect(onSend, "a keystroke is not the transcript arriving").not.toHaveBeenCalled();
+
+    // The real tail lands, and THEN the quiet window runs.
+    commits("by friday");
+    await advance(QUIET_WINDOW_MS_FOR_TEST + STABLE_PARTIAL_POLL_MS_FOR_TEST + 50);
+    expect(box.sent).toEqual(["! by friday"]);
+  });
+
   it("MULTI-CLAUSE: a clause committed during the hold does not license a quiet settle", async () => {
     // ── roborev 57287 (High) — THE EXPECTATION THAT MOVED ────────────────────────────────────────
     // This row used to assert the opposite: that a clause landing during the hold let the quiet
@@ -799,5 +828,68 @@ describe("a decode that lags LONGER than the quiet window", () => {
     commits("by friday");
     await advance(QUIET_WINDOW_MS_FOR_TEST + STABLE_PARTIAL_POLL_MS_FOR_TEST + 50);
     expect(box.sent).toEqual(["let's ship the feature by friday"]);
+  });
+});
+
+// ── `held` — THE TRAY AND THE MICROPHONE MUST AGREE ───────────────────────────────────────────
+//
+// The founder could not tell whether push-to-talk was live: "it should show as a fully pressed
+// button, but it doesn't … It doesn't look any different than it does when it's in standby mode."
+// The tray now paints a pressed pill from this flag.
+//
+// WHAT THESE ACTUALLY GUARD is the desync, not the pixel. A flag that sets on hold but fails to
+// clear paints a live microphone over a dead one — an invitation to keep talking into nothing,
+// which is worse than the ambiguity it replaced. So every exit path is covered: release, and the
+// abandon that ⌘Tab produces (usePushToTalk's header: that gesture never delivers its keyup).
+//
+// It is asserted BESIDE the mic calls on purpose. `held` is set on the same three edges that drive
+// `applyIntent`, so these rows fail together if they ever stop being one decision.
+describe("held — the third tray state", () => {
+  beforeEach(() => {
+    useUiStore.getState().setConciergeSendMode("ptt");
+    micCalls.length = 0;
+  });
+
+  it("is false while merely SELECTED, and true only while the key is down", () => {
+    const { result } = setup();
+    // Selected but not held — the state that used to look identical to capturing.
+    expect(result.current.mode).toBe("ptt");
+    expect(result.current.held).toBe(false);
+
+    down();
+    expect(result.current.held).toBe(true);
+    // …and the microphone went live on the same edge.
+    expect(micCalls).toContain("active");
+  });
+
+  it("CLEARS on release", () => {
+    const { result } = setup();
+    down();
+    expect(result.current.held).toBe(true);
+    up();
+    expect(result.current.held).toBe(false);
+  });
+
+  it("CLEARS on abandon — the ⌘Tab case that never delivers a keyup", () => {
+    // usePushToTalk abandons when the window loses focus. Without clearing here the tray would keep
+    // painting a pressed button after the mic had been stood down.
+    const { result } = setup();
+    down();
+    expect(result.current.held).toBe(true);
+    act(() => void fireEvent.blur(window));
+    expect(result.current.held).toBe(false);
+  });
+
+  it("CLEARS when the mode moves away mid-hold — via the binder's own abandon", () => {
+    // ROUTED THROUGH `onAbandon`, not through a guard of ours (roborev 57285). `usePushToTalk`
+    // abandons in its EFFECT BODY when `active` or `inert` flips with a hold in progress — its
+    // cleanup only removes listeners. An earlier revision added a separate effect here on the
+    // opposite reading; it was unreachable, and this row passed either way. Kept because the
+    // BEHAVIOUR still matters: leaving Push to talk with the key down must not strand the indicator.
+    const { result } = setup();
+    down();
+    expect(result.current.held).toBe(true);
+    act(() => useUiStore.getState().setConciergeSendMode("send"));
+    expect(result.current.held).toBe(false);
   });
 });

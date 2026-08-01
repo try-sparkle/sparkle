@@ -55,6 +55,11 @@ export const TRAY_GEOMETRY = {
   trayGap: 4,
   /** Each pill's horizontal `padding: "0 Npx"`, per side. */
   pillPadX: 8,
+  /** The same padding in the ICON tier. Tighter, because at that point the padding is competing
+   *  with the glyph for a column that may be 50px wide — and 8px per side across three pills is
+   *  48px of the ~30px the composer actually has there. Only reached below
+   *  `TRAY_ICON_ONLY_MAX_PX`, where there is no text for the padding to breathe around anyway. */
+  pillPadXIcon: 2,
   /** Each pill's border, per side. Counts toward width under `box-sizing: border-box`. */
   pillBorder: 1.5,
   /** Gap between a pill's label and its keycap slot. */
@@ -91,6 +96,68 @@ export function fullLabelsFitAtPx(): number {
   const perPill = 2 * g.pillPadX + 2 * g.pillBorder + g.pillGap + g.chicletSlot;
   // `(n - 1)` gaps, never a hardcoded 2, so the pill count and the gap count cannot disagree.
   return TRAY_PILL_COUNT * (WIDEST_LABEL_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap;
+}
+
+/**
+ * The widest SHORT label's rendered width, in px, at `TYPE.small`.
+ *
+ * "Speak" is the longest of `SEND_MODE_LABEL_SHORT` at five characters. Derived from
+ * `WIDEST_LABEL_PX` rather than guessed independently, so the two estimates cannot drift: that is a
+ * 12-character string ("Push to talk") measured pessimistically at 86px, i.e. ~7.2px per character,
+ * and 5 characters at that rate is ~36px. Rounded UP to 44 for the same reason `WIDEST_LABEL_PX`
+ * takes the larger of its two readings — erring wide costs an icon shown a notch early, erring
+ * narrow costs a silently clipped word, which is the exact defect this tier exists to delete.
+ */
+export const WIDEST_SHORT_LABEL_PX = 44;
+
+/** An icon-only pill's glyph box, in px. `FiSend` and friends are drawn at 14 and get a couple of
+ *  px of optical slack so a pill never clips its own icon. */
+export const TRAY_ICON_PX = 16;
+
+/**
+ * The tray width at which the SHORT labels stop fitting — below this the pills go icon-only.
+ *
+ * Same coordinate system and the same per-pill contributors as `fullLabelsFitAtPx`; only the label
+ * term changes. The chiclet slot is still counted, because the short-label tier still draws it.
+ */
+export function shortLabelsFitAtPx(): number {
+  const g = TRAY_GEOMETRY;
+  const perPill = 2 * g.pillPadX + 2 * g.pillBorder + g.pillGap + g.chicletSlot;
+  return TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap;
+}
+
+/**
+ * The narrowest the tray can be while still drawing three readable icons.
+ *
+ * Below this the pills keep shrinking — they are `flex: 1 1 0` against the column, so the tray can
+ * never OVERFLOW no matter how narrow the column gets, which is requirement 1. What it stops being
+ * below this width is comfortable, not correct. Stated so the icon tier's own floor is a number
+ * someone can check rather than an assumption.
+ *
+ * NO chiclet slot and no label gap here: the keycap hint is dropped with the words, because a
+ * reserved 30px slot per pill is the single largest thing standing between three icons and a narrow
+ * column.
+ */
+export function iconsFitAtPx(): number {
+  const g = TRAY_GEOMETRY;
+  const perPill = 2 * g.pillPadXIcon + 2 * g.pillBorder + TRAY_ICON_PX;
+  return TRAY_PILL_COUNT * perPill + (TRAY_PILL_COUNT - 1) * g.trayGap;
+}
+
+/**
+ * The width of ONE icon pill — the point below which three of them cannot share a line.
+ *
+ * Below this the tray WRAPS rather than overflowing: the pills are `flex: 1 1 auto` with this as
+ * their floor, so a column too narrow for a row of three becomes two rows, then three. That is what
+ * makes the 50px column floor (engine/columnResize) survivable — at ~30px of composer content width
+ * a single 21px pill still fits, where a row of three never could.
+ *
+ * Wrapping rather than clipping is the founder's requirement 1 restated: nothing may overflow the
+ * column, at any width the user can drag to.
+ */
+export function iconPillMinPx(): number {
+  const g = TRAY_GEOMETRY;
+  return 2 * g.pillPadXIcon + 2 * g.pillBorder + TRAY_ICON_PX;
 }
 
 /**

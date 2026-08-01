@@ -12,7 +12,7 @@
 // floor, the chords and the inert test all live in ./sendMode, unit-tested without React. This hook
 // is only the wiring: store reads, the mic calls, and the hold gesture's lifecycle.
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useUiStore } from "../stores/uiStore";
 import { useDictationStore } from "../stores/dictationStore";
@@ -43,8 +43,8 @@ import type { MicIntent } from "../components/MicButton";
 export const PARTIAL_SETTLE_CAP_MS = 4_000;
 
 /**
- * How long the composer's own text — and the live interim, on the cloud path — has to sit
- * COMPLETELY UNCHANGED before a release treats the utterance as settled.
+ * How long the ARRIVAL SIGNAL — committed segments, and the live interim on the cloud path — has to
+ * sit COMPLETELY UNCHANGED before a release treats the utterance as settled.
  *
  * THIS IS THE PRIMARY SIGNAL, not a fallback bolted onto the engine-close confirmation below. The
  * founder tested a shipped build carrying the fully engine-close-based design (`owed`/`deferred`,
@@ -53,9 +53,13 @@ export const PARTIAL_SETTLE_CAP_MS = 4_000;
  * A production log grep for `dictation: emit final` found nothing, which is not conclusive on its
  * own (`emit_speech_end` deliberately logs nothing at all — see dictation.rs — so its absence from
  * the log proves nothing either way), but the founder's first-hand report is not a log line to
- * second-guess. Watching the box's own text settle sidesteps the entire question of whether any
- * particular Rust signal fired, ordered correctly, or was delivered at all: it only asks "is
- * anything still landing", which is directly observable regardless of the mechanism behind it.
+ * second-guess. Watching ARRIVALS settle sidesteps the entire question of whether any particular
+ * Rust signal fired, ordered correctly, or was delivered at all: it only asks "is anything still
+ * landing", which is directly observable regardless of the mechanism behind it.
+ *
+ * It watches `dictationStore.committedSeq`, NOT the composer's text. The text also moves when the
+ * USER TYPES, and this wait routinely runs for seconds with the box focused — so a keystroke used to
+ * restart the quiet clock and settle the drain on top of a decode still in flight (roborev 57295).
  *
  * 500ms is generous relative to how often committed segments actually arrive mid-utterance (Deepgram
  * commits roughly every clause) so it does not mistake an ordinary breath for the end, while still
@@ -63,10 +67,10 @@ export const PARTIAL_SETTLE_CAP_MS = 4_000;
  */
 const QUIET_WINDOW_MS = 500;
 
-/** How often the stable-partial detector re-checks the composer's text and the live interim. Well
- *  under {@link QUIET_WINDOW_MS} so the quiet window is measured precisely, and cheap enough (a
- *  string comparison and a ref read) to run on a plain interval rather than needing its own event
- *  source — the composer's text is React state, not something this hook can `.subscribe()` to. */
+/** How often the stable-partial detector re-checks the arrival counter and the live interim. Well
+ *  under {@link QUIET_WINDOW_MS} so the quiet window is measured precisely, and cheap enough (two
+ *  store reads and a compare) that a plain interval is simpler than a subscription — the poll also
+ *  has to notice the ABSENCE of change, which a subscription cannot deliver. */
 const STABLE_PARTIAL_POLL_MS = 100;
 
 export interface UseSendModeArgs {
@@ -82,13 +86,6 @@ export interface UseSendModeArgs {
    * one that captured no speech at all.
    */
   onSend: () => boolean;
-  /**
-   * The composer's CURRENT text — read every render, purely so a release can tell whether the box
-   * is still growing. This is what the stable-partial detector in `endHold` watches; see
-   * {@link QUIET_WINDOW_MS}. Passing the same value on every render is fine — only genuine changes
-   * reset the quiet timer.
-   */
-  composedText: string;
 }
 
 export interface SendModeController {
@@ -100,9 +97,20 @@ export interface SendModeController {
   inert: boolean;
   /** Is the auto-send countdown allowed to run at all right now? Speak, and not inert. */
   armed: boolean;
+  /** Is the push-to-talk GESTURE active right now — the key or the button held down?
+   *
+   *  The third tray state, and the one that was missing: `mode === "ptt"` says only that the
+   *  position is selected, so selected-and-armed and selected-and-holding painted identically and
+   *  the user could not tell his voice was being taken.
+   *
+   *  IT TRACKS THE GESTURE, NOT THE MICROPHONE (roborev 57302). Those coincided until the release
+   *  drain landed; now a release with an outstanding run keeps the mic live for up to
+   *  {@link PARTIAL_SETTLE_CAP_MS} after this goes false. The mic's own truth is the sidebar ring's
+   *  to tell. */
+  held: boolean;
 }
 
-export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendModeController {
+export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   const mode = useUiStore((s) => s.conciergeSendMode);
   const setStoredMode = useUiStore((s) => s.setConciergeSendMode);
   // The store's MIRROR of the focus owner, not a live DOM read. That is the right choice for paint
@@ -217,11 +225,9 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
 
-  // Mirrors `composedText` every render, the same pattern as `onSendRef` — read from inside
+  // Mirrors the live value every render, the same pattern as `onSendRef` — read from inside
   // `endHold`'s stable-partial poll, which runs on a plain `setInterval` rather than React's
   // render cycle, so it needs a ref rather than the prop itself.
-  const composedTextRef = useRef(composedText);
-  composedTextRef.current = composedText;
 
   // A release that is waiting on an in-flight partial, so a second gesture (or an unmount) can call
   // it off rather than leaving a send armed against a hold that no longer exists.
@@ -394,9 +400,15 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
    * ask "did the right event fire", only "has anything changed", which is answerable regardless of
    * what Rust does or doesn't emit, in what order, or whether IPC delivers it at all.
    *
-   * THE STABLE-PARTIAL POLL watches two things no capture path can hide behind: the composer's own
-   * text (`composedTextRef`, which only moves when a segment actually commits) and the live interim
-   * (cloud only, catching "still actively transcribing, not committed yet" before it commits at all).
+   * THE STABLE-PARTIAL POLL watches two things no capture path can hide behind, and BOTH are signals
+   * only dictation can move: `committedSeq` (bumped by useDictation's `dictation://partial` handler
+   * — the one event meaning "the engine produced text") and the live interim (cloud only, catching
+   * "still actively transcribing, not committed yet" before it commits at all).
+   *
+   * It used to watch the COMPOSER'S TEXT, and that was wrong for a reason worth keeping written
+   * down: the composer's text also moves when the USER TYPES. The wait routinely runs for seconds
+   * with the key released and the box focused, so a keystroke during it restarted the quiet clock
+   * and settled the drain on top of a decode still in flight (roborev 57295).
    * {@link QUIET_WINDOW_MS} of neither changing is treated as settled. Whichever race wins —
    * `owed` reaching zero, or the poll finding quiet — calls the same `settle()`, so there is exactly
    * one send regardless of which signal got there first.
@@ -476,9 +488,23 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
         setTimeout(settle, 0);
       });
       // ── RACE 2: THE STABLE-PARTIAL POLL — the one that has to work regardless of what Rust does. ─
-      // A plain interval, not a store subscription: the composer's text is React state, not
-      // something in `dictationStore`, so there is no single event source to subscribe to for it.
-      let lastText = composedTextRef.current;
+      // A plain interval, not a store subscription — and the reason changed with the signal. It used
+      // to be "the composer's text is React state, so there is nothing to subscribe to"; both inputs
+      // now live in `dictationStore` and could be subscribed. The interval stays because this has to
+      // notice the ABSENCE of change over a window, which no change-notification can deliver: a
+      // subscriber that stops firing sends nothing, and "nothing" is exactly the event we need.
+      // ── THE ARRIVAL SIGNAL IS ONE ONLY DICTATION CAN MOVE (roborev 57295) ────────────────────
+      // This used to watch the composer's own text, which cannot tell a transcript from a USER
+      // KEYSTROKE. The wait routinely runs for seconds with the key released and the composer
+      // focused, so typing during it is ordinary — and one character restarted the quiet clock,
+      // settled the drain ~500ms later, and stranded the tail that landed afterwards in a composer
+      // whose message had already gone out. The same truncation as 57274/57281/57287, reached
+      // through the single gate the seed's removal made load-bearing.
+      //
+      // `committedSeq` is bumped only by useDictation's `dictation://partial` handler, and `interim`
+      // only by the cloud preview. A keystroke moves neither, so it resets nothing and the wait
+      // falls to the cap — the trade every one of these fixes has chosen.
+      let lastCommitted = useDictationStore.getState().committedSeq;
       let lastInterim = useDictationStore.getState().interim;
       // ── ALWAYS null: the quiet clock starts ONLY on a POST-RELEASE ARRIVAL ────────────────────
       // Three revisions of this seed were wrong in the same direction, each one narrower than the
@@ -499,11 +525,10 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
       // of these fixes made: slower is strictly better than truncated.
       let quietSince: number | null = null;
       wait.poll = setInterval(() => {
-        const text = composedTextRef.current;
-        const interimNow = useDictationStore.getState().interim;
-        if (text !== lastText || interimNow !== lastInterim) {
+        const { committedSeq: committedNow, interim: interimNow } = useDictationStore.getState();
+        if (committedNow !== lastCommitted || interimNow !== lastInterim) {
           // Something landed or is actively being previewed — the clock (re)starts from here.
-          lastText = text;
+          lastCommitted = committedNow;
           lastInterim = interimNow;
           quietSince = Date.now();
           return;
@@ -511,7 +536,7 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
         // ── "NOTHING HAS ARRIVED YET" IS NOT "QUIET" (roborev 57274, High) ────────────────────────
         // This poll started its clock at the RELEASE and settled on 500ms of no-change, which on the
         // on-device path is the state a PENDING DECODE looks like: there is no interim at all there,
-        // and `composedText` does not move until the transcript lands. So the poll fired at T+500ms
+        // and no committed segment lands until the decode finishes. So the poll fired at T+500ms
         // for a decode the source's own doc describes as running "hundreds of ms to seconds" behind
         // the audio — sending the short box and stranding the segment that arrived at T+800ms. It
         // reintroduced the exact truncation this whole mechanism exists to fix, and raising the cap
@@ -545,6 +570,36 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
     [applyIntent, stopUtteranceWatch],
   );
 
+  // ── IS THE KEY DOWN RIGHT NOW ────────────────────────────────────────────────────────────────
+  //
+  // THE FOUNDER'S REPORT, twice: "When I hit the command key to use the push to talk, it should show
+  // as a fully pressed button, but it doesn't … It doesn't look any different than it does when it's
+  // in standby mode."
+  //
+  // The tray drew TWO states where there are THREE: not-selected, selected-and-armed, and
+  // selected-and-CAPTURING. The amber outline meant "Push to talk is the chosen mode" and was shown
+  // whether or not the key was held, so a live microphone and an idle one looked identical.
+  //
+  // OWNED HERE, NOT IN `usePushToTalk`. That hook deliberately returns nothing, and its reason is
+  // sound — a `held` flag returned from the binder would be a SECOND copy of a fact its caller's
+  // callbacks establish, and two sources for one state is how a stuck-hot microphone happens. This
+  // is not a second source: this hook is where `onHoldStart` / `onHoldEnd` / `onAbandon` already
+  // converge, so the flag is set on the same three edges that drive the MIC ITSELF (`applyIntent`).
+  // ── WHAT THIS FLAG IS, AND WHAT IT IS NOT (roborev 57302) ──────────────────────────────────────
+  // It tracks THE GESTURE — is the key or button down right now — and the founder specified exactly
+  // that: the pill fills "when I'm actually pushing on the button, or when I'm using the hot key",
+  // and clears the instant he releases.
+  //
+  // IT IS NOT "the microphone is live". Those coincided while the keyup stood the mic down, and they
+  // no longer do: with the truncation drain on this branch, a release with an outstanding run leaves
+  // the mic at `pttHeldIntent` until `finish()` runs — up to PARTIAL_SETTLE_CAP_MS (4s) later. An
+  // earlier version of this comment claimed the two were one fact; that was true when it was
+  // written and is now false, so it is corrected rather than left to mislead.
+  //
+  // The mic's own truth is drawn where it is known: the sidebar ring derives from actual capture
+  // (voice/micPresentation), which is the surface that answers "is the mic taking my voice".
+  const [held, setHeld] = useState(false);
+
   usePushToTalk({
     active: mode === "ptt",
     inert,
@@ -555,12 +610,36 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
       // Fresh gesture, fresh debt — the watch is what lets the release tell "he spoke and the text
       // is still coming" apart from "he held the key in silence to send a typed draft".
       startUtteranceWatch();
+      setHeld(true);
       applyIntent(pttHeldIntent());
     }, [applyIntent, startUtteranceWatch]),
-    onHoldEnd: useCallback(() => endHold(true), [endHold]),
-    // ABANDON SENDS NOTHING — see usePushToTalk's header on ⌘Tab never delivering its keyup.
-    onAbandon: useCallback(() => endHold(false), [endHold]),
+    // CLEARED ON THE KEYUP, which is the gesture ending — NOT on the mic standing down. Those are
+    // different moments now: `endHold` may install the drain and leave the microphone live for up to
+    // PARTIAL_SETTLE_CAP_MS while it waits for the tail of the utterance to arrive. Clearing here is
+    // correct for what this flag means (see its declaration), and the drain window's own honesty is
+    // the mic ring's job, not the pill's.
+    onHoldEnd: useCallback(() => {
+      setHeld(false);
+      endHold(true);
+    }, [endHold]),
+    // ABANDON SENDS NOTHING — see usePushToTalk's header on ⌘Tab never delivering its keyup. It
+    // still has to clear the indicator, or a ⌘Tab away leaves the tray painting a pressed button
+    // over a microphone that was stood down: the precise "held but idle" lie this exists to remove.
+    onAbandon: useCallback(() => {
+      setHeld(false);
+      endHold(false);
+    }, [endHold]),
   });
+
+  // NO SEPARATE GUARD FOR "the mode changed mid-hold", and the reason is worth recording because an
+  // earlier revision of this file added one on a WRONG reading of the binder (roborev 57285).
+  //
+  // That guard claimed `usePushToTalk` abandons "through its OWN cleanup, which does not run our
+  // `onAbandon`". It does not: its cleanup only removes listeners, and the abandon happens in the
+  // EFFECT BODY — `if (!active || inert) { … cbs.current.onAbandon() }`. So flipping the mode or
+  // going inert mid-hold already routes through `onAbandon` above, which is where `setHeld(false)`
+  // lives. The extra effect was unreachable, and its comment would have had the next reader planning
+  // against a cleanup behaviour that does not exist.
 
   return {
     mode,
@@ -570,5 +649,8 @@ export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendMode
     // host hands voice/useAutoSend, so an inert tray stops counting rather than counting invisibly
     // and firing when colour returns.
     armed: mode === "speak" && !inert,
+    /** Is the push-to-talk key down RIGHT NOW — i.e. is the microphone actually capturing?
+     *  Distinct from `mode === "ptt"`, which only says the position is selected. */
+    held,
   };
 }

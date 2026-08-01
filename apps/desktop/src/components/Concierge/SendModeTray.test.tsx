@@ -10,6 +10,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ACTING_FLASH_MS,
   SendModeTray,
   DEFAULT_SPEAK_LEFT_FRAC,
   TRAY_GEOMETRY,
@@ -17,7 +18,7 @@ import {
   type SendModeTrayProps,
   type SendTrayModel,
 } from "./SendModeTray";
-import { TRAY_SHORT_LABEL_MAX_PX } from "../../voice/sendMode";
+import { TRAY_ICON_ONLY_MAX_PX, TRAY_SHORT_LABEL_MAX_PX } from "../../voice/sendMode";
 import { C } from "../../theme/colors";
 
 afterEach(cleanup);
@@ -43,6 +44,22 @@ function mount(over: Partial<SendModeTrayProps> = {}) {
     />,
   );
   return { onModeChange, onSend };
+}
+
+/** Like `mount`, but keeps the handle so a row can push a NEW model in — which is the only way to
+ *  simulate an event that arrives between renders. */
+function mountR(over: Partial<SendModeTrayProps> = {}) {
+  const onModeChange = vi.fn();
+  const onSend = vi.fn();
+  const props = (o: Partial<SendModeTrayProps>) => (
+    <SendModeTray mode="send" onModeChange={onModeChange} onSend={onSend} canSend chord="cmd-enter" {...o} />
+  );
+  const view = render(props(over));
+  return {
+    onModeChange,
+    onSend,
+    rerender: (next: Partial<SendModeTrayProps>) => act(() => view.rerender(props(next))),
+  };
 }
 
 const tray = () => screen.getByTestId("send-mode-tray");
@@ -294,8 +311,10 @@ describe("the tray sweep", () => {
       expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push to talk");
       expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
 
-      // Now narrow it. The VISIBLE label shrinks…
-      act(() => fire!(300));
+      // Now narrow it — into the SHORT tier, not past it. 300 used to be that tier and is now the
+      // ICON tier (see TRAY_ICON_ONLY_MAX_PX), where there is no label node to read at all; the
+      // icon tier gets its own case below.
+      act(() => fire!(TRAY_SHORT_LABEL_MAX_PX - 20));
       expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push");
       // …and the ACCESSIBLE NAME does not move. This is the assertion that fails against the
       // pre-fix code, where it read "Push".
@@ -305,6 +324,52 @@ describe("the tray sweep", () => {
       expect(pill("ptt").getAttribute("aria-label")).toContain(
         screen.getByTestId("send-mode-label-ptt").textContent!,
       );
+    } finally {
+      globalThis.ResizeObserver = realRO;
+    }
+  });
+
+  // ── THE ICON TIER ──────────────────────────────────────────────────────────────────────────
+  //
+  // The founder's narrow-column screenshot showed the tray reading "S… P… S…" — all three positions
+  // ellipsised to one letter, so the control that decides what happens when you stop talking could
+  // not be read. The short-label tier moved the width at which that happens; it did not remove it.
+  //
+  // Reachable here ONLY because this file stubs ResizeObserver — jsdom has none, which is exactly
+  // how the original defect shipped unnoticed.
+  it("drops to ICONS, not truncated words, when the tray is too narrow for short labels", () => {
+    const realRO = globalThis.ResizeObserver;
+    let fire: ((w: number) => void) | null = null;
+    class StubRO {
+      constructor(private cb: ResizeObserverCallback) {
+        fire = (w: number) =>
+          this.cb([{ contentRect: { width: w } } as ResizeObserverEntry], this as never);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    }
+    globalThis.ResizeObserver = StubRO as unknown as typeof ResizeObserver;
+    try {
+      mount({ mode: "ptt", model: COUNTING });
+      act(() => fire!(TRAY_ICON_ONLY_MAX_PX - 1));
+
+      for (const m of ["send", "ptt", "speak"] as const) {
+        // An icon is drawn…
+        expect(screen.getByTestId(`send-mode-icon-${m}`)).toBeTruthy();
+        // …and NO text node survives to be ellipsised into "S…".
+        expect(screen.queryByTestId(`send-mode-label-${m}`)).toBeNull();
+      }
+
+      // THE NAME IS UNTOUCHED, which is what keeps the tier a purely visual reduction: "click Push
+      // to talk" must keep working in a 200px column exactly as it does in a 600px one.
+      expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
+      expect(pill("send").getAttribute("aria-label")).toBe("Send");
+
+      // Widening brings the words back — the tier is a function of width, not a latch.
+      act(() => fire!(TRAY_SHORT_LABEL_MAX_PX + 100));
+      expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push to talk");
+      expect(screen.queryByTestId("send-mode-icon-ptt")).toBeNull();
     } finally {
       globalThis.ResizeObserver = realRO;
     }
@@ -427,17 +492,153 @@ describe("inert — not addressed, not disabled", () => {
 });
 
 describe("Send is an off state for the MICROPHONE, never for the control", () => {
-  it("draws the selected Send position as the app's primary FILL", () => {
-    // Two objects, opposite treatments, one frame: mic dead, button hot. A Send position drawn as
-    // quietly as the voice ones would say "nothing here is the action" at the one moment the button
-    // IS the only way to send.
+  it("draws the selected Send position OUTLINED at rest, like the other two", () => {
+    // ── THIS EXPECTATION WAS INVERTED BY THE FOUNDER, DELIBERATELY ──────────────────────────────
+    // It used to assert Send wore the solid primary fill AT REST. Under the unified rule — fill
+    // matches stroke = acting right now — that made Send the one position permanently claiming to
+    // be sending. His words: "the send button should also be a lighter color than the stroke until I
+    // hit the send button to send it". Send now fills only on the click, which the
+    // fill-matches-stroke rows below pin.
     mount({ mode: "send" });
-    expect(pill("send").style.background).toBe(C.goldFill);
+    expect(pill("send").style.background).toContain("color-mix");
+    expect(pill("send").style.background).not.toBe(pill("send").style.borderColor);
   });
 
   it("draws the voice positions as a TINT, not a second hot button beside a live mic", () => {
     mount({ mode: "speak", model: COUNTING });
     expect(pill("speak").style.background).toContain("color-mix");
     expect(pill("speak").style.background).not.toBe(C.successInk);
+  });
+});
+
+// ── THE THIRD STATE: HELD ─────────────────────────────────────────────────────────────────────
+//
+// THE FOUNDER'S REPORT, raised twice: "When I hit the command key to use the push to talk, it should
+// show as a fully pressed button, but it doesn't … It doesn't look any different than it does when
+// it's in standby mode."
+//
+// There are three states and the tray drew two:
+//   1. not selected            — inert
+//   2. selected, key NOT held  — armed, waiting   ← what the amber outline meant
+//   3. selected, key HELD      — capturing        ← indistinguishable from 2
+//
+// These pin that 2 and 3 now differ, and — the part that matters most — that 3 CLEARS. A tray still
+// painting "held" over a microphone that has been stood down is the same desync in the other
+// direction, and worse: it invites the user to keep talking into nothing.
+describe("push to talk shows that the key is actually down", () => {
+  const heldPill = () => pill("ptt");
+
+  it("ARMED and HELD are visually different, not the same amber outline", () => {
+    mount({ mode: "ptt", model: COUNTING });
+    const armedBg = heldPill().style.background;
+    expect(heldPill().getAttribute("data-held")).toBeNull();
+
+    cleanup();
+    mount({ mode: "ptt", model: COUNTING, pttHeld: true });
+    expect(heldPill().getAttribute("data-held")).toBe("true");
+    // A change of KIND — hollow to solid — not a brighter outline. The two states were previously
+    // identical here, which is exactly what "it doesn't look any different" meant.
+    //
+    // The inset shadow this used to also assert is GONE: the founder's spec is the border colour
+    // moved to the background and nothing else ("no glow, no animation"), so the distinguishing
+    // fact is now the fill/stroke relationship alone.
+    expect(heldPill().style.background).not.toBe(armedBg);
+    expect(heldPill().style.background).toBe(heldPill().style.borderColor);
+  });
+
+  it("marks ONLY the Push-to-talk pill, never Send or Speak", () => {
+    // Send fires on a click and Speak on a countdown; neither has a held gesture, so neither has a
+    // capturing state to draw. A `pttHeld` that leaked onto them would be decoration, not a signal.
+    mount({ mode: "ptt", model: COUNTING, pttHeld: true });
+    expect(pill("send").getAttribute("data-held")).toBeNull();
+    expect(pill("speak").getAttribute("data-held")).toBeNull();
+  });
+
+  it("does NOT paint held while the tray is INERT — the mic is not being heard", () => {
+    // An inert tray means a live PTY owns the keyboard. Painting a pressed button there would claim
+    // a capture that is not happening, which is the same lie the fix exists to remove.
+    mount({ mode: "ptt", model: COUNTING, pttHeld: true, inert: true });
+    expect(heldPill().getAttribute("data-held")).toBeNull();
+  });
+
+  it("does not paint held when Push to talk is not the selected mode", () => {
+    mount({ mode: "speak", model: COUNTING, pttHeld: true });
+    expect(heldPill().getAttribute("data-held")).toBeNull();
+  });
+});
+
+describe("FILL MATCHES STROKE = acting right now — the one rule, all three pills", () => {
+  // ── THE FOUNDER'S SPEC ────────────────────────────────────────────────────────────────────────
+  // "When the background of the button is a different color than the stroke, I would consider that
+  // to be inactive status. But when I'm actually pushing on the button … then the button should be
+  // the same color as the stroke."
+  //
+  // Asserted as the RELATIONSHIP between two computed values — background vs borderColor — never as
+  // a class name or a colour literal. That is the spec's own wording, and it means a theme change to
+  // any of the three inks cannot make these rows stale or vacuous.
+  const styleOf = (m: string) => pill(m).style;
+  /** The rule, read off the DOM exactly as the founder states it. */
+  const fillMatchesStroke = (m: string) => {
+    const st = styleOf(m);
+    return st.background !== "" && st.background === st.borderColor;
+  };
+
+  it("PUSH fills amber while held, and not before", () => {
+    mount({ mode: "ptt" });
+    expect(fillMatchesStroke("ptt"), "idle: fill must DIFFER from stroke").toBe(false);
+    cleanup();
+    mount({ mode: "ptt", pttHeld: true });
+    expect(fillMatchesStroke("ptt"), "held: fill must MATCH stroke").toBe(true);
+  });
+
+  it("SPEAK fills green on the FIRE EVENT, not on a rendered remainingFraction", () => {
+    // ── roborev 57314 (High) ──────────────────────────────────────────────────────────────────────
+    // The first version of this row hand-built `{ remainingFraction: 0 }` and fed it in as a prop —
+    // a model shape the production pipeline never emits. `useAutoSend`'s fire branch applies its
+    // state and returns WITHOUT scheduling a repaint, so every render during a countdown comes from
+    // a tick that just measured remaining > 0, and the render that would show 0 is the one where
+    // counting has already stopped. Deriving the fill from it was a sub-millisecond race: a random
+    // flicker, not a state. So the trigger is the fire EVENT, and this row drives that event.
+    const { rerender } = mountR({ mode: "speak", model: { ...COUNTING, firedSeq: 0 } });
+    expect(fillMatchesStroke("speak"), "mid-countdown: not acting yet").toBe(false);
+
+    // The send fires. ONE clock: this is the same bump the dispatch itself produces.
+    rerender({ mode: "speak", model: { ...COUNTING, firedSeq: 1 } });
+    expect(fillMatchesStroke("speak"), "fired: fill must MATCH stroke").toBe(true);
+  });
+
+  it("SEND is OUTLINED at rest and fills only on the click that sends", () => {
+    // This is a change to Send's DEFAULT look, not just an added state: it used to ship pre-filled,
+    // which under the unified rule read as "sending" permanently.
+    const { onSend } = mount({ mode: "send" });
+    expect(fillMatchesStroke("send"), "at rest: fill must DIFFER from stroke").toBe(false);
+    fireEvent.click(pill("send"));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(fillMatchesStroke("send"), "clicked: fill must MATCH stroke").toBe(true);
+  });
+
+  it("SPEAK also fills on the click that beats its own countdown", () => {
+    // The founder's second Speak trigger: "I can click the button in order to send it before the
+    // countdown is done, and when I click the button it becomes the same colour as the stroke".
+    const { onSend } = mount({ mode: "speak", model: { ...COUNTING, remainingFraction: 0.6 } });
+    expect(fillMatchesStroke("speak")).toBe(false);
+    fireEvent.click(pill("speak"));
+    expect(onSend, "the early click must actually SEND, not only paint").toHaveBeenCalledTimes(1);
+    expect(fillMatchesStroke("speak")).toBe(true);
+  });
+
+  it("the fill CLEARS once the acknowledgement is over", () => {
+    // "The fill must clear when the action ends." A click has no duration of its own, so the state
+    // is time-bounded; it must not latch.
+    vi.useFakeTimers();
+    try {
+      mount({ mode: "send" });
+      fireEvent.click(pill("send"));
+      expect(fillMatchesStroke("send")).toBe(true);
+      act(() => void vi.advanceTimersByTime(ACTING_FLASH_MS + 20));
+      expect(fillMatchesStroke("send"), "must not latch on").toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

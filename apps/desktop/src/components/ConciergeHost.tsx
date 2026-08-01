@@ -1315,10 +1315,6 @@ export function ConciergeHost({
   // until the words he just spoke have finished arriving.
   const sendTray = useSendMode({
     onSend: useCallback(() => composerSubmitRef.current?.() ?? false, []),
-    // The stable-partial detector's primary signal: is the box still growing? See useSendMode's
-    // `QUIET_WINDOW_MS` doc for why this is no longer optional — a purely engine-close-based drain
-    // shipped and still cut off the founder's last words in practice.
-    composedText,
   });
 
   /**

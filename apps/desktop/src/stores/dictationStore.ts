@@ -119,6 +119,19 @@ interface DictationState {
    */
   speechEndSeq: number;
   /**
+   * Monotonic count of COMMITTED transcript segments — bumped by useDictation's
+   * `dictation://partial` handler, the one event that means "the engine produced text".
+   *
+   * WHY A COUNTER AND NOT "DID THE COMPOSER TEXT CHANGE" (roborev 57295). The push-to-talk release
+   * drain waits for the utterance to stop arriving, and it used the composer's own text as the
+   * arrival signal — which cannot tell a transcript from a USER KEYSTROKE. The wait routinely runs
+   * for seconds with the composer focused and the key released, so typing during it is ordinary:
+   * one character restarted the quiet clock, the drain settled ~500ms later, and the tail that
+   * landed afterwards was stranded in a composer whose message had already gone out. Only dictation
+   * can move this, so a keystroke resets nothing.
+   */
+  committedSeq: number;
+  /**
    * The ON-DEVICE speaker is talking RIGHT NOW (`dictation://on-device-speech`) — the auto-send
    * countdown's CANCEL, and the on-device counterpart of {@link interim}.
    *
@@ -164,6 +177,8 @@ interface DictationState {
   setStatus: (s: Status) => void;
   setLevel: (l: number) => void;
   setSpeaking: (v: boolean) => void;
+  /** A committed segment reached the app — bump {@link committedSeq}. */
+  noteCommittedSegment: () => void;
   /** The engine says the speaker stopped — bump {@link speechEndSeq}. */
   noteSpeechEnd: () => void;
   /** The on-device speaker started/stopped talking — see {@link onDeviceSpeech}. */
@@ -218,6 +233,7 @@ export const useDictationStore = create<DictationState>()(
       insertTarget: null,
       voiceSurface: "concierge",
       speechEndSeq: 0,
+      committedSeq: 0,
       onDeviceSpeech: false,
       focusOwner: "other",
       windowFocused: true,
@@ -226,6 +242,7 @@ export const useDictationStore = create<DictationState>()(
       setLevel: (level) => set({ level }),
       setSpeaking: (speaking) => set({ speaking }),
       noteSpeechEnd: () => set((s) => ({ speechEndSeq: s.speechEndSeq + 1 })),
+      noteCommittedSegment: () => set((s) => ({ committedSeq: s.committedSeq + 1 })),
       setOnDeviceSpeech: (onDeviceSpeech) =>
         set((s) => (s.onDeviceSpeech === onDeviceSpeech ? s : { onDeviceSpeech })),
       setInterim: (interim) => set({ interim }),

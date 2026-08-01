@@ -174,6 +174,9 @@ export function useAutoSend({
   // Repaint clock. Bumped by the tick so `remainingFraction` is recomputed as time passes — the
   // state itself does not change while a countdown merely runs.
   const [, setNow] = useState(0);
+  /** Monotonic count of AUTO-SENDS that actually fired — the tray's Speak fill reads this. See the
+   *  bump site for why a rendered `remainingFraction === 0` cannot serve. */
+  const [firedSeq, setFiredSeq] = useState(0);
 
   const speechEndSeq = useDictationStore((s) => s.speechEndSeq);
   // THE ON-DEVICE CANCEL. `interim` below is the cloud path's "the user is talking again"; this is
@@ -453,6 +456,13 @@ export function useAutoSend({
         // was sent, and both the announcement and the tuning sample would then be lies — one to a
         // screen-reader user, one to the corpus that tunes the thresholds.
         if (onFireRef.current()) {
+          // THE FIRE EVENT, published as a counter — the tray's Speak fill reads this (roborev
+          // 57314). INSIDE the confirmed-dispatch guard, with the announcement it visually
+          // duplicates (roborev 57330): it was briefly bumped above this branch, so a fire that
+          // sent NOTHING — compose box unmounted behind an AI lock, or an empty box early-returning
+          // — still painted the pill green for ACTING_FLASH_MS while the screen-reader user was
+          // correctly told nothing at all. One event, one guard, or the two surfaces disagree.
+          setFiredSeq((n) => n + 1);
           recordAutoSend(sample);
           say("fired");
         }
@@ -476,6 +486,7 @@ export function useAutoSend({
     targetName,
     tier: state.tier,
     remainingFraction: remainingFraction(state, Date.now()),
+    firedSeq,
   };
 }
 
