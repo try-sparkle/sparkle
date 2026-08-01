@@ -1,7 +1,7 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiCheck } from "react-icons/fi";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
@@ -9,6 +9,8 @@ import { TYPE } from "../../theme/scale";
 import { useCopyOnSelection } from "./useCopyOnSelection";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
+import { answeredByIndex } from "./replyAnchors";
+import { ANCHOR_HIGHLIGHT_MS } from "./ReplyAnchorViews";
 // THE collapsed-text modal — the same component the BUILD-AGENT composer draws (via
 // components/composer/AttachmentRow), reused here rather than copied into a transcript-shaped twin (see
 // TextPill's header for why there is only one). The concierge's own compose box is NOT on this
@@ -151,6 +153,52 @@ export function ConciergeThread({
         );
   /** Open the full-text modal for a payload. Stable, so it does not un-memoise every row. */
   const openPayloadFor = useCallback((id: string) => setOpenPayloadId(id), []);
+  // ── Reply anchoring: the jump, and the flash that says where you landed ────────────────────────
+  //
+  // Which message a reply answers is recorded ON the reply (`ConciergeSparkleMessage.answers`, filled
+  // by ConciergeHost from the rule in ./replyAnchors). The BACK direction is derived here rather than
+  // written onto the `you` bubble, so the reply's array stays the single record and the two can never
+  // disagree about which message an answer belongs to.
+  //
+  // The lookup is rebuilt on every tick and that is fine: it walks the array once and yields plain
+  // strings, so a settled row's props are unchanged and the memo still bites. Handing rows the MAP
+  // itself would defeat it — a new container every tick re-renders the whole transcript.
+  const answeredBy = useMemo(() => answeredByIndex(messages), [messages]);
+  /** The message the reader just jumped to, lit for {@link ANCHOR_HIGHLIGHT_MS}. */
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (highlightTimer.current !== null) clearTimeout(highlightTimer.current);
+    },
+    [],
+  );
+  /**
+   * Scroll a message into view and light it up.
+   *
+   * FOUND BY SCANNING, not by `querySelector`. Message ids are minted from several producers
+   * (`you-1`, `brain-7`, `restored:0`) and one of them contains a colon; building a selector string
+   * out of user-facing data is how a lookup starts depending on escaping rules nobody checks. The
+   * thread is capped at 200 entries, so a linear scan of its own scroller costs nothing.
+   *
+   * `scrollIntoView` is called optionally because jsdom does not implement it — the guard keeps every
+   * suite that renders this thread from throwing on a click, without any of them having to know.
+   */
+  const jumpTo = useCallback((id: string) => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const target = Array.from(root.querySelectorAll<HTMLElement>("[data-message-id]")).find(
+      (el) => el.dataset.messageId === id,
+    );
+    if (!target) return;
+    target.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    setHighlightId(id);
+    if (highlightTimer.current !== null) clearTimeout(highlightTimer.current);
+    highlightTimer.current = setTimeout(() => {
+      highlightTimer.current = null;
+      setHighlightId(null);
+    }, ANCHOR_HIGHLIGHT_MS);
+  }, []);
   // Auto-follow lives in `hooks/useAutoFollow`, shared with the mounted-agent transcript thread.
   // All three guards — the content key, the stick-to-bottom read, and the live-selection deferral —
   // moved with it, so both threads behave identically and neither can drift from the other. What
@@ -233,6 +281,9 @@ export function ConciergeThread({
             onRedirect={redirect}
             onDigestClick={digestClick}
             onAnswerCopied={onAnswerCopied}
+            answeredBy={m.kind === "you" ? answeredBy.get(m.id) : undefined}
+            highlighted={highlightId === m.id}
+            onJump={jumpTo}
           />
         ))}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app

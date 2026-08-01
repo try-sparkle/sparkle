@@ -18,6 +18,9 @@ import type { ConciergeMessage } from "../components/Concierge/types";
 // `countLines` is the line-count rule for a collapsed block, imported rather than re-derived so a
 // clipped block's subtitle ("41 lines") counts the same way the pill that made it did.
 import { countLines, type Attachment } from "../components/composer/attachments";
+// The anchor-id rewrite lives with the module that owns what an anchor IS, for the same reason
+// `countLines` is imported rather than re-derived: the rule and its persistence must not drift.
+import { remapAnchors } from "../components/Concierge/replyAnchors";
 
 // Keep the thread bounded so localStorage can't grow without limit, exactly as
 // promptHistoryStore.PROMPT_HISTORY_MAX does. 200 messages is far more than anyone scrolls back
@@ -300,10 +303,22 @@ export const RESTORED_ID_PREFIX = "restored:";
  * to offer the one-tap redirect, and after a restart every restored receipt is old. Leaving it set
  * would render a redirect button whose backing text (`sentTextRef`) no longer exists — a dead
  * affordance, until the next send happens to clear it.
+ *
+ * REPLY ANCHORS ARE THE ONE THING HERE THAT REFERS TO ANOTHER MESSAGE, so the reindex above has to be
+ * applied to them too (`ConciergeSparkleMessage.answers`, see Concierge/replyAnchors). A reply carries
+ * the ids of the messages it answered; renaming every message and not the references turns a restored
+ * thread's quoted stubs — and every "Answered below" marker derived from them — into buttons pointing
+ * at ids nothing holds. Anchors whose target did NOT survive (it was trimmed from the front by
+ * {@link persistableThread}) keep their quote and lose only the jump; see `remapAnchors`.
  */
 export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
+  // Built over the SAME positional rule the map below applies, in a first pass, because an anchor may
+  // point backwards or forwards and a single pass would only ever have half the map.
+  const idMap = new Map(chat.map((m, i) => [m.id, `${RESTORED_ID_PREFIX}${i}`]));
   return chat.map((m, i) => {
     const next = { ...m, id: `${RESTORED_ID_PREFIX}${i}` };
+    if (next.kind === "sparkle" && next.answers)
+      return { ...next, answers: remapAnchors(next.answers, idMap) };
     return next.kind === "you" && next.receipt?.redirectable
       ? { ...next, receipt: { ...next.receipt, redirectable: false } }
       : next;

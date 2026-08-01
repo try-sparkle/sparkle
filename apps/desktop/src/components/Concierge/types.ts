@@ -31,6 +31,10 @@ import type { ProjectNeedsYou } from "./ScopeVitals";
 // declaration, so the composer that produces a mention and the bubble that draws it cannot drift
 // about what one is.
 import type { ConciergeMention, MentionAgent } from "./mentions";
+// Same rule as ./mentions above: the shape lives with the pure module that owns the RULE deciding
+// what an anchor is (./replyAnchors — no React, no stores), so the reply that records one and the
+// stub that draws it cannot drift about what one is.
+import type { ReplyAnchor } from "./replyAnchors";
 // The rail's view-model lives with the component that RENDERS it, for the same reason `Attachment`
 // lives with the composer's model and the mention shapes live with ./mentions: one declaration, so
 // the host that builds a rail state and the strip that draws it cannot drift about what one is.
@@ -39,6 +43,7 @@ import type { SendMode } from "../../voice/sendMode";
 
 export type { ProjectNeedsYou };
 export type { ConciergeMention, MentionAgent };
+export type { ReplyAnchor };
 export type { SendTrayModel };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
@@ -144,6 +149,24 @@ export interface ConciergeSparkleMessage {
    * persisted, and an empty field per message buys nothing the absent one doesn't.
    */
   collapsed?: TextBlock;
+  /**
+   * The user messages this reply is answering, in the order they were SENT — rendered as quoted stubs
+   * above the reply, the way iMessage shows the original it is replying to.
+   *
+   * WHY IT IS ON THE MESSAGE. The founder sends several messages while a turn is in flight; each send
+   * kills the turn before it, so one reply arrives covering the lot and nothing says which question
+   * any paragraph belongs to. This field is that record. The rule that fills it — "everything the
+   * brain still owed an answer on when this reply began" — is INFERRED by the app, not declared by the
+   * model (see ./replyAnchors for why), so it cannot quietly stop working on a terse turn.
+   *
+   * It carries a QUOTE SNAPSHOT alongside each id, like `ConciergeUserMessage.mentions` carries the
+   * addressed names: the thread is trimmed from the front and reindexed on restore, so a stub
+   * resolved from the live array would vanish the moment its target aged out.
+   *
+   * `undefined` on a reply that answers nothing — a push, or the first line of a session — matching
+   * every other optional field here: this thread is persisted.
+   */
+  answers?: ReplyAnchor[];
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */

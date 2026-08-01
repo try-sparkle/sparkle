@@ -31,6 +31,10 @@ import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
 import { splitMentionText, type ConciergeMention } from "./mentions";
 import { MentionPill } from "./MentionPill";
+// `ReplyAnchorViews`, not `ReplyAnchors` — the RULE module is `replyAnchors.ts`, and on a
+// case-insensitive filesystem two modules differing only in case are the same path to the resolver
+// (tsc rejects the program outright). The suffix keeps the pair distinguishable everywhere.
+import { AnsweredMarker, ReplyAnchorStubs } from "./ReplyAnchorViews";
 import type {
   ConciergeDigestMessage,
   ConciergeMessage,
@@ -101,6 +105,19 @@ export interface ConciergeMessageRowProps {
   onRedirect?: (messageId: string) => void;
   onDigestClick?: (digest: ConciergeDigestMessage) => void;
   onAnswerCopied: () => void;
+  /** For a `you` message THAT WAS ANSWERED: the id of the reply that answered it (see
+   *  ./replyAnchors). Undefined on every other kind and on a message nothing has replied to yet.
+   *
+   *  A PLAIN STRING, derived by the thread rather than stored on the message, and both halves of that
+   *  matter. Derived, so the reply's `answers` array stays the single record and the two directions
+   *  cannot disagree. A string rather than the thread's map, for the same reason `shownAsText` is a
+   *  boolean and not the thread's `Set`: this row is memoised, and handing it a container that is
+   *  rebuilt every tick would re-render the whole transcript for a fact about one message. */
+  answeredBy?: string;
+  /** This message was just jumped to — light it briefly so the reader can see where they landed. */
+  highlighted?: boolean;
+  /** Scroll to the message with this id and light it up. Stable, or the memo above is worthless. */
+  onJump?: (id: string) => void;
 }
 
 export const ConciergeMessageRow = memo(function ConciergeMessageRow({
@@ -114,7 +131,27 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   onRedirect,
   onDigestClick,
   onAnswerCopied,
+  answeredBy,
+  highlighted = false,
+  onJump,
 }: ConciergeMessageRowProps) {
+  /**
+   * The "you landed here" flash, and why it is a SHADOW rather than padding or a border.
+   *
+   * The jump scrolls a message into the middle of the column, where nothing else has changed — so
+   * without a flash the reader has to work out which of the bubbles now on screen is the one they
+   * asked for. It must cost ZERO layout: this row sits in the thread's flex column, and a highlight
+   * that added padding or a border would nudge every message below it at the exact moment the
+   * scroller is trying to settle on a position. An outset shadow paints outside the box and shifts
+   * nothing.
+   */
+  const flash = highlighted
+    ? {
+        borderRadius: 6,
+        boxShadow: `0 0 0 3px color-mix(in srgb, ${C.accentInk} 40%, transparent)`,
+        transition: "box-shadow 200ms ease",
+      }
+    : { borderRadius: 6, transition: "box-shadow 400ms ease" };
   /**
    * The pill (or the expanded text) under a sparkle line that carries a payload.
    *
@@ -156,7 +193,15 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   if (m.kind === "recap") return <RecapCard recap={m} onRevealAgent={onRevealAgent} />;
   if (m.kind === "you")
     return (
-      <div style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}>
+      // `data-message-id` is THE JUMP TARGET (see ConciergeThread's `jumpTo`) — an attribute rather
+      // than a ref registry because the thread already owns the scroller and can find its own
+      // descendants, and a registry of refs across a memoised list is a leak waiting to happen.
+      // Carried by the two kinds an anchor can name, `you` and `sparkle`; nothing else is jumpable.
+      <div
+        data-message-id={m.id}
+        data-highlighted={highlighted ? "yes" : "no"}
+        style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right", ...flash }}
+      >
         <div
           data-testid="you-bubble"
           data-wired={wired ? "yes" : "no"}
@@ -200,6 +245,11 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
             onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
           />
         )}
+        {/* THE HALF THAT ANSWERS THE COMPLAINT. The founder counts unanswered messages by looking at
+            his OWN bubbles, not at the reply — so an answered one has to say so from here, and offer
+            the jump forward. Below the receipt: "where it went" is a fact about the send, "answered
+            below" is what happened next, and they read in that order. */}
+        {answeredBy && <AnsweredMarker replyId={answeredBy} onJump={onJump} />}
       </div>
     );
   if (m.kind === "digest") {
@@ -316,8 +366,10 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
     return (
       <div
         data-testid="concierge-push"
+        data-message-id={m.id}
+        data-highlighted={highlighted ? "yes" : "no"}
         data-stale={m.stale ? "true" : "false"}
-        style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1 }}
+        style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1, ...flash }}
       >
         <div
           style={{
@@ -340,7 +392,16 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       </div>
     );
   return (
-    <div style={{ maxWidth: "92%", alignSelf: "flex-start" }}>
+    <div
+      data-message-id={m.id}
+      data-highlighted={highlighted ? "yes" : "no"}
+      style={{ maxWidth: "92%", alignSelf: "flex-start", minWidth: 0, ...flash }}
+    >
+      {/* WHAT THIS REPLY IS ANSWERING, above its own words — the iMessage idiom, and the reason this
+          component exists (see ./replyAnchors). One quoted stub per message it covers, in the order
+          they were sent, so a single reply to a burst of five is legible as five answers rather than
+          one paragraph nobody can aim at. */}
+      <ReplyAnchorStubs anchors={m.answers} onJump={onJump} />
       <Markdown text={m.text} />
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}

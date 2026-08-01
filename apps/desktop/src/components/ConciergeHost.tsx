@@ -44,6 +44,10 @@ import {
   type ConciergeViewModel,
 } from "./Concierge";
 import type { ConciergeMountedAgent } from "./Concierge/types";
+// The reply-anchoring RULE — which of the user's messages a reply is answering — lives in its own
+// pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
+// so the stub that draws an anchor reads the same declaration the host writes.
+import { pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
 import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // The two ALARM controls the card draws (Mute, [x]). Imported rather than re-spelled: the card
 // fires them and this file handles them, and a literal on each side is a silent no-op waiting to
@@ -1632,13 +1636,30 @@ export function ConciergeHost({
     // `done`, so a push that dies mid-stream is still identifiable as one.
     const pushFields = (id: string): { proactive?: true; digest?: string } =>
       isProactiveTurn(id) ? { proactive: true, digest: pushDigestRef.current.get(id) } : {};
+    // WHICH OF THE USER'S MESSAGES THIS REPLY IS ANSWERING (see Concierge/replyAnchors).
+    //
+    // Stamped at BUBBLE CREATION, from the thread as it stands at that instant, and both halves of
+    // that are load-bearing. At creation, because the outstanding set is only correct before this
+    // reply is in the array — a moment later the reply itself is the thing that ends the burst.
+    // From `prev` inside the updater, because the answer depends on the array being written to, and
+    // reading a ref beside it is how two sources of one truth start to disagree.
+    //
+    // A PUSH ANCHORS NOTHING. Nobody asked for it (services/conciergeProactive), so it answers
+    // nothing, and quoting the user's last message over an unprompted line would be a claim the
+    // channel exists to avoid making.
+    const answerFields = (prev: ConciergeMessage[], id: string): { answers?: ReplyAnchor[] } => {
+      if (isProactiveTurn(id)) return {};
+      const answers = pendingAnchors(prev);
+      return answers.length ? { answers } : {};
+    };
     const upsert = (id: string, text: string, replace: boolean) => {
       const prior = brainTextRef.current[id] ?? "";
       brainTextRef.current[id] = replace ? text : prior + text;
       setChat((prev) => {
         const k = key(id);
         const i = prev.findIndex((m) => m.id === k);
-        if (i === -1) return [...prev, { id: k, kind: "sparkle", text, ...pushFields(id) }];
+        if (i === -1)
+          return [...prev, { id: k, kind: "sparkle", text, ...pushFields(id), ...answerFields(prev, id) }];
         const next = prev.slice();
         const cur = next[i]!;
         next[i] = {
