@@ -913,9 +913,15 @@ export function AgentSidebar({
   // its drag from the stale 294, jumping ~416px on the first pointer move and persisting the
   // result. The cache was the only stale thing in the design; the fix is to not have one.
   //
-  // So the reading is read and discarded, per gesture, by `ColumnPullTab` alone. The cost is that
-  // `aria-valuemax` names only the window ceiling — which is what it named before this change, so
-  // nothing regressed, and it is recorded as a known limit rather than claimed as fixed.
+  // So the reading is read and discarded, per gesture, by `ColumnPullTab` alone: it latches the
+  // value for the duration of one drag or keypress, clears it at the end, and nothing outlives that.
+  //
+  // THE COST IS THE ARIA RANGE, and it is a known, filed defect rather than an oversight —
+  // `aria-valuemax` names the window ceiling, so with the left pair open the seam advertises a range
+  // roughly twice the one it will honour. Retaining the reading to fix that was tried five ways and
+  // every one of them had a state strictly WORSE than this; the full autopsy is in `ColumnPullTab`
+  // beside the `aria-value*` attributes, and the work is bead sparkle-xbnw7. Read that before
+  // "fixing" this, because the obvious repairs are the ones already known to fail.
   const columnRef = useRef<HTMLDivElement>(null);
   const measureGestureMax = useCallback((): number | null => {
     const box = columnRef.current?.parentElement;

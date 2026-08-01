@@ -247,6 +247,37 @@ export function ColumnPullTab({
    *  that moved MID-gesture would make one pointer position mean two different widths.
    *  `null` = no reading; `cfg.current.max` then stands alone, which is every seam without `maxAt`. */
   const gestureMax = useRef<number | null>(null);
+  // ── WHY `aria-value*` STILL NAMES THE WINDOW CEILING, AND NOT THE PAIR'S ──────────────────────
+  //
+  // It is wrong, it is KNOWN to be wrong, and it is deliberately left that way — bead sparkle-xbnw7.
+  //
+  // The separator advertises `max` while a gesture may enforce something tighter, so with the left
+  // pair open it announces a range roughly twice the one the seam will honour. That is a real defect
+  // for AT users, who have no other channel for the value. It was fixed here, five times, and every
+  // version had a state STRICTLY WORSE than this one:
+  //
+  //   • a `measuredMax` state feeding the tab's width  → a click that committed nothing cached a
+  //     narrow bound and the next drag started from a width that was not on screen (roborev 56159);
+  //   • a ref written by `readGestureMax`              → a pointer gesture has no following blur, so
+  //     the reading outlived its layout and under-reported while unfocused (57044);
+  //   • a ref written only on focus                    → the announced POSITION froze while the
+  //     boundary moved, because a keyboard user resizing never blurs (57046);
+  //   • a ref written on focus and on gestures         → written-without-repaint on a pinned press
+  //     (no state change → no render), and repainted-without-write on any unrelated store write,
+  //     since this component is not memoised (57050).
+  //
+  // The last two are the two failure modes of reading a ref during render, and they are inherent to
+  // it rather than bugs in it. Mirroring into state fixes the first and not the second. What all
+  // five share is the same root: THIS COMPONENT CANNOT LEARN ITS CONTAINER CHANGED. Only a
+  // render-time measurement or a ResizeObserver can, and both re-render the sidebar at pointer rate,
+  // which `Workspace.renderCost.test.tsx` holds to zero — and the observer would be invisible to
+  // that ratchet, since jsdom never lays out.
+  //
+  // So the honest state is the pre-existing one: a range that is consistently too wide, rather than
+  // one that is sometimes right and sometimes under-reports a column's actual width. Doing it
+  // properly means giving the tab a live bound from `Workspace`, which means revisiting that
+  // ratchet — a real change with a real budget, not a comment. The GESTURE is correct either way:
+  // `readGestureMax` re-reads before every drag and every arrow, and no announcement feeds it.
   /**
    * Take a fresh reading and return the bound now in force.
    *
@@ -264,13 +295,18 @@ export function ColumnPullTab({
    * been laid out yet (the first frame of a mount, a test environment with no layout engine) must
    * not silently pin the column to its minimum.
    */
-  const readGestureMax = useCallback(() => {
+  /** The intersected bound, or `null` for "unknown" — with NO side effects, so both the gesture path
+   *  and the announcement path can take a reading without one implying the other. */
+  const measureBound = useCallback(() => {
     const hard = cfg.current.max;
     const m = cfg.current.maxAt?.();
     const usable = typeof m === "number" && Number.isFinite(m) && m > 0;
-    gestureMax.current = usable ? Math.min(m, hard) : null;
-    return gestureMax.current ?? hard;
+    return usable ? Math.min(m, hard) : null;
   }, []);
+  const readGestureMax = useCallback(() => {
+    gestureMax.current = measureBound();
+    return gestureMax.current ?? cfg.current.max;
+  }, [measureBound]);
   /** The bound in force right now: the gesture's latched reading, else the render-time prop. Reads
    *  only refs, so its identity is stable and it can never be the reason a listener is re-installed. */
   const ceiling = useCallback(() => gestureMax.current ?? cfg.current.max, []);
@@ -521,6 +557,14 @@ export function ColumnPullTab({
     // LOG ALWAYS, WRITE ONLY IF IT MOVED — the same rule `endDrag` applies to the pointer. See
     // `commit`'s `apply` parameter for why an unconditional write here destroys a stored width.
     commit(target, moves);
+    // AND THE GESTURE ENDS HERE, exactly as `endDrag` ends the pointer's. `gestureMax` is documented
+    // as belonging to ONE gesture and `endDrag` says so in as many words; the keyboard used to latch
+    // a reading and leave it set forever. That is inert only by an accident of the current call
+    // graph — `preview` needs `drag.current` and `ceiling` is reached only from `commit` — so the
+    // stated invariant was simply false, and any future caller of either outside a gesture would
+    // silently inherit a container bound measured against a layout that no longer exists
+    // (roborev 56182).
+    gestureMax.current = null;
   };
 
   // Visible while hovered, FOCUSED, or mid-drag.

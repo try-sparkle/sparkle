@@ -471,6 +471,25 @@ describe("AgentSidebar — keyboard resize", () => {
     });
   });
 
+  // THE SAME RULE ON THE POINTER PATH, and it needs its own row (roborev 56182). The keyboard row
+  // above pinned the intersect; every DRAG row stubs a container tighter than `max`, so dropping the
+  // `Math.min(m, hard)` for the pointer alone left the whole suite green while a drag on a 2560px
+  // display would run to ~1880 and persist a width the next mousedown destroys.
+  it("still honours the HARD cap on the DRAG path too, not only the arrows", () => {
+    withWindow(2600, () => {
+      render(<AgentSidebar project={mkProject()} />);
+      givePairWidth(2400);
+
+      fireEvent.mouseEnter(rail());
+      fireEvent.pointerDown(resizeTab(), { pointerId: 1, button: 0, buttons: 1, clientX: 500 });
+      // Outward by 2000px — past the 1200 cap and past the container's 2080 alike.
+      fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 2500 });
+      fireEvent.pointerUp(window, { pointerId: 1 });
+
+      expect(column().dataset.width).toBe("1200");
+    });
+  });
+
   // AND IT IS RE-TAKEN PER GESTURE, which is the other half of the contract and the half a
   // "measure once and cache it" refactor would silently break while leaving every row above green.
   it("re-reads the container each gesture, so a pair that grows back is not permanently capped", () => {
