@@ -277,8 +277,18 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
       }}
     >
       <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
-        {/* ② Builder agents. `showSparkleRow={false}`: Improve Sparkle is main's agent. */}
-        <AgentSidebar project={closing ? null : project} showSparkleRow={false} forcePairSide={SATELLITE_PAIR_SIDE} />
+        {/* ② Builder agents. `showSparkleRow={false}`: Improve Sparkle is main's agent.
+            `covered` because this window has ALWAYS had the shape main only just grew: the board
+            below is `absolute; inset: 0` inside this relative wrapper, so it covers this column
+            too, and both render a PlanBuildToggle. Without it Tab walks hidden agent rows and a
+            duplicate mode toggle behind an opaque surface and AT announces both. The condition
+            mirrors the board's own render gate exactly — they must not be able to disagree. */}
+        <AgentSidebar
+          project={closing ? null : project}
+          showSparkleRow={false}
+          forcePairSide={SATELLITE_PAIR_SIDE}
+          covered={boardActive && !!project && !closing}
+        />
         {/* ③ The terminal stage. */}
         <div
           data-testid="terminal-stage"

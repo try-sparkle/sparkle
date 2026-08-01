@@ -8,20 +8,24 @@
 // these two numbers are the whole contract:
 //
 //   SIDEBAR_OVERLAY_Z  the Build column once the overlay pull tab has floated it over the terminal.
-//   PLAN_COLUMN_Z      a column's opaque Plan board, filling that column's TERMINAL slot.
+//   PLAN_COLUMN_Z      a pair's opaque Plan board, laid over BOTH of that pair's columns.
 //
-// THE ORDER BETWEEN THESE TWO IS INVERTED FROM WHAT IT WAS, and the reason is worth keeping. The
-// board used to be laid over BOTH columns of the pair, which took the Build column's header — and
-// therefore the PlanBuildToggle — off screen with it. The board carried its own duplicate toggle,
-// so the board HAD to out-rank the floated sidebar: if the sidebar won, it painted through the
-// board and covered the only way back to Build.
+// THE BOARD OUT-RANKS THE FLOATED COLUMN, AND WHICH WAY THIS POINTS FOLLOWS FROM ONE FACT: HOW MUCH
+// THE BOARD COVERS. It has been both, so the reasoning is worth keeping rather than the value.
 //
-// The board belongs to a COLUMN now (one per pair, in that pair's terminal stage), so it covers the
-// terminal only and the sidebar keeps its own toggle beside it. That removes the old constraint and
-// replaces it with the opposite one: floating the Build column over the terminal is an explicit
-// user gesture, and the board is simply what occupies the terminal at that moment — so the floated
-// column must paint OVER the board, exactly as it does over a terminal. With the old ordering the
-// board hid the column the user had just floated.
+// While the board filled one column's TERMINAL SLOT, the sidebar had to win. Floating the Build
+// column over the terminal is an explicit user gesture, the board was simply what occupied the
+// terminal at that moment, and the reverse order hid the column the user had just floated. That
+// ordering shipped, and it was right for that geometry.
+//
+// The board spans the PAIR again (founder, 2026-07-31: "They should be in both the terminal and the
+// builder area") — so it covers the Build column, takes that column's header with it, and carries
+// its own PlanBuildToggle because otherwise there is no way back to Build. That restores the
+// constraint the terminal-slot version had removed, and it is the stronger one: if the sidebar
+// painted through, it would cover the only control that closes the board, which is a dead end
+// rather than a cosmetic overlap. The float gesture loses nothing real — its pull tab is under the
+// board in Plan mode, so it cannot be started there, and leaving Plan hands the floated column
+// straight back.
 //
 // WHY THESE ARE BIG-ISH NUMBERS AND NOT 1 AND 2. `terminal-stage` is `position: relative` with
 // `z-index: auto`, so it is not a stacking context either, and the things inside it do not stay
@@ -74,8 +78,9 @@
 // sidebar renders at its own; Workspace.tabs.test.tsx pins the board to PLAN_COLUMN_Z. Changing
 // either number in a way that inverts them fails a test instead of silently restoring the bug.
 export const SIDEBAR_OVERLAY_Z = 25;
-// Below the floated Build column (see above), still clear of the stage's own overlays at 19-21.
-export const PLAN_COLUMN_Z = 24;
+// Above the floated Build column (see above) — the board covers that column, so it must also cover
+// it when floated — and clear of the stage's own overlays at 19-21. Well under the 38–45 band.
+export const PLAN_COLUMN_Z = 26;
 
 // ── THE TWO COLUMNS OF A PAIR, AT REST ─────────────────────────────────────────────────────────
 // Separate from the two constants above, which are about a column that has been FLOATED. These are

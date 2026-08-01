@@ -9,13 +9,19 @@
 // symptoms, one cause:
 //
 //   1. Pressing Plan on the LEFT column opened the board on the RIGHT.
-//   2. The board overlaid the WHOLE pair (build + terminal) instead of taking the terminal's slot.
-//   3. Opening one column's board CLOBBERED the other's, because both read the same global.
+//   2. Opening one column's board CLOBBERED the other's, because both read the same global.
 //
 // This is the same shape as the mount-cable bug: a per-column feature implemented as one global
 // with a decorative per-column appearance. The guard against a regression to that shape is the
 // third test — two boards open AT ONCE showing DIFFERENT projects. That is unrepresentable in a
 // singleton, so it cannot pass by accident.
+//
+// OWNERSHIP ONLY — NOT GEOMETRY. This file used to carry a third symptom, "the board overlaid the
+// whole pair instead of taking the terminal's slot", and an assertion pinning the board inside the
+// terminal stage. That was a mistake bundled into an ownership fix: a board confined to one column
+// of the pair left the Build column beside it completely blank, which is exactly what the founder
+// rejected on 2026-07-31. The board spans the pair again, and how much it covers is now asserted in
+// Workspace.planBoardSpansPair.test.tsx. Keep the two questions in the two files.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 
@@ -152,18 +158,22 @@ describe("the plan board is owned by the column that opened it", () => {
     expect(screen.queryByTestId("board-p1")).toBe(null);
   });
 
-  // DEFECT 2 — the board must take the TERMINAL's slot inside its own column, not overlay the
-  // pair. Asserting containment in the left terminal stage is what pins "in place, same slot":
-  // a board rendered as a pair-wide overlay is a SIBLING of the stage, not a descendant of it.
-  it("renders the board inside its own column's terminal stage, replacing the terminal", () => {
+  // DEFECT 2 — the board opens in the pair whose chevron was pressed, and covers THAT pair. It
+  // used to be written once inside the right pair, so the left pair could not show one at all.
+  //
+  // HOW MUCH of the pair it covers is a separate question with its own file: the board spans BOTH
+  // columns (Workspace.planBoardSpansPair.test.tsx). This test deliberately asserts only that the
+  // board is inside the LEFT pair and that the right pair still has none — the containment that
+  // distinguishes "which pair" from "which pair" — so the two files cannot contradict each other
+  // when the geometry moves. It briefly asserted the opposite (containment in the terminal stage),
+  // which is what pinned the founder's blank build column in place.
+  it("renders the board in the pair whose chevron was pressed, over that pair's columns", () => {
     render(<Workspace />);
     planOn("left");
 
-    const leftStage = screen.getByTestId("terminal-stage-left");
-    expect(leftStage.contains(screen.getByTestId("board-p2"))).toBe(true);
-    // The left build column is still there beside it — the board replaced the TERMINAL, not the
-    // whole pair. (The sidebar owns the Plan/Build toggle, so this is also the way back to Build.)
-    expect(screen.getByTestId("sidebar-left")).toBeTruthy();
+    const board = screen.getByTestId("board-p2");
+    expect(screen.getByTestId("pair-cols-left").contains(board)).toBe(true);
+    expect(screen.getByTestId("pair-cols-right").contains(board)).toBe(false);
   });
 
   // DEFECT 3 — THE DIAGNOSTIC ONE, and the regression guard. Two boards, different content, open
@@ -181,10 +191,12 @@ describe("the plan board is owned by the column that opened it", () => {
     // that fails against a singleton: opening the left board used to overwrite this one.
     expect(screen.getByTestId("board-p1")).toBeTruthy();
 
-    const leftStage = screen.getByTestId("terminal-stage-left");
-    const rightStage = screen.getByTestId("terminal-stage");
-    expect(leftStage.contains(screen.getByTestId("board-p2"))).toBe(true);
-    expect(rightStage.contains(screen.getByTestId("board-p1"))).toBe(true);
+    // Each in ITS OWN pair — the containment that makes "two boards" mean two independent boards
+    // rather than one component rendered twice from the same global.
+    expect(screen.getByTestId("pair-cols-left").contains(screen.getByTestId("board-p2"))).toBe(true);
+    expect(screen.getByTestId("pair-cols-right").contains(screen.getByTestId("board-p1"))).toBe(
+      true,
+    );
   });
 
   // AN INVARIANT THE SPLIT REMOVED, restored explicitly. The board and the Improve-Sparkle pane

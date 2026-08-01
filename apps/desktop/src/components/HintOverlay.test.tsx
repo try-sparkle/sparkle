@@ -268,6 +268,56 @@ describe("HintOverlay", () => {
     expect(screen.queryByText("o")).toBeNull();
   });
 
+  it("skips a control hidden by `visibility`, so a covered duplicate can't win the mnemonic", async () => {
+    // `offsetParent === null` catches `display: none` and NOTHING else — a `visibility: hidden`
+    // element keeps its layout box, so it has an offsetParent and a plausible rect. That is the
+    // repo's own way of saying "covered" (paneVisibilityStyle; the Build column under a pair's Plan
+    // board), and the key handler takes the FIRST match in DOM order — so the hidden copy of a
+    // duplicated control both drew a chiclet over an opaque surface and STOLE its key.
+    const onHidden = vi.fn();
+    const onShown = vi.fn();
+    render(
+      <>
+        <div style={{ visibility: "hidden" }}>
+          <button data-hint="build" onClick={onHidden}>covered Build</button>
+        </div>
+        <button data-hint="build" onClick={onShown}>the Build you can see</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    // ONE chiclet, not two — and pressing its key reaches the visible control.
+    expect(screen.getAllByText("b")).toHaveLength(1);
+    fireEvent.keyDown(window, { key: "b" });
+    await waitFor(() => expect(onShown).toHaveBeenCalledTimes(1));
+    expect(onHidden).not.toHaveBeenCalled();
+  });
+
+  it("skips a control inside an inert subtree even when it re-declares itself visible", async () => {
+    // The case `visibility` alone gets wrong, and the reason the covered column carries BOTH. It is
+    // an INHERITED property, so a descendant can take it back — the status-filter Reset link does
+    // exactly that whenever a filter is on. `inert` is not overridable from inside, so honouring it
+    // here is what actually keeps a covered duplicate out of the overlay.
+    const onCovered = vi.fn();
+    const onShown = vi.fn();
+    render(
+      <>
+        <div inert style={{ visibility: "hidden" }}>
+          <button data-hint="build" style={{ visibility: "visible" }} onClick={onCovered}>
+            covered but self-declared visible
+          </button>
+        </div>
+        <button data-hint="build" onClick={onShown}>the Build you can see</button>
+        <HintOverlay />
+      </>,
+    );
+    controlTap();
+    expect(screen.getAllByText("b")).toHaveLength(1);
+    fireEvent.keyDown(window, { key: "b" });
+    await waitFor(() => expect(onShown).toHaveBeenCalledTimes(1));
+    expect(onCovered).not.toHaveBeenCalled();
+  });
+
   it("skips rows scrolled out of a clipping ancestor instead of badging them off-popover", () => {
     // The Recent dropdown is maxHeight + overflowY:auto. getBoundingClientRect reports UNCLIPPED
     // layout, so an overflowing row still claims a plausible rect — the bug that drew badges below

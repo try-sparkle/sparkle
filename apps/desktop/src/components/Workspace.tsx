@@ -30,6 +30,7 @@ import { NewAgentRuntimeToggle } from "./NewAgentRuntimeToggle";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar, NewBuildAgentButton } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
+import { PlanBuildToggle } from "./PlanBuildToggle";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
@@ -360,7 +361,9 @@ export function Pair({
   wired?: boolean;
   /** The pair's project tab strip. Above the pair only — never above the concierge. */
   tabs: React.ReactNode;
-  /** `[build, terminal]`, in that order, on both sides. */
+  /** `[build, terminal]`, in that order, on both sides — plus, optionally, this pair's Plan board
+   *  as a THIRD child. The board is `position: absolute` so it is not a flex item at all: it lays
+   *  over both columns without displacing either. See `PlanBoardSlot`. */
   children: React.ReactNode;
 }) {
   return (
@@ -1631,7 +1634,7 @@ export function Workspace() {
           >
             {/* `slotSide` because `leftProject` is null whenever this pair's tab is closed, and a
                 column with no project cannot ask the assignment map which side it is on. */}
-            <MemoAgentSidebar project={leftProject} slotSide="left" />
+            <MemoAgentSidebar project={leftProject} slotSide="left" covered={leftBoardActive} />
             {/* NO `AgentPaneList` HERE. The panes are mounted once, elsewhere, and portalled in —
                 this stage contributes the destination (`ref`) and nothing else, which is what keeps
                 a project moving to the other pair from unmounting its terminals. See `PaneHost`. */}
@@ -1647,12 +1650,15 @@ export function Workspace() {
                   <strong>Move to the left pair</strong> in its build column header.
                 </Hint>
               )}
-              {/* THE LEFT COLUMN'S OWN PLAN BOARD. This pair used to carry none at all — the
-                  comment above said so — which is why pressing Plan here opened the board on the
-                  right. It is its own element with its own project; nothing about it is shared
-                  with the right pair's board. */}
-              {leftBoardActive && leftProject && <PlanBoardSlot project={leftProject} side="left" />}
             </div>
+            {/* THE LEFT PAIR'S OWN PLAN BOARD — a THIRD child of the pair, and that placement is
+                the point. This pair used to carry none at all (which is why pressing Plan here
+                opened the board on the right), then carried one INSIDE the stage above (which is
+                why the build column beside it went blank). As a sibling of both columns it lays
+                over the pair's whole `paircols` box: absolutely positioned, so it is not a flex
+                item and the two columns underneath keep their widths. Its project is its own;
+                nothing about it is shared with the right pair's board. */}
+            {leftBoardActive && leftProject && <PlanBoardSlot project={leftProject} side="left" />}
           </Pair>
         )}
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
@@ -1777,8 +1783,10 @@ export function Workspace() {
           wired={wired === "right"}
           tabs={<MemoProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
         >
-          {/* ② Builder agents (the sidebar owns the Plan/Build toggle as its header). */}
-          <MemoAgentSidebar project={sidebarProject} />
+          {/* ② Builder agents. The sidebar owns the Plan/Build toggle as its header in BUILD mode;
+              in Plan the board is painted over this whole column and carries its own, so this one
+              goes unreachable rather than merely invisible — see AgentSidebar's `covered`. */}
+          <MemoAgentSidebar project={sidebarProject} covered={boardActive} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
               paints in C.forest too, so the join is seamless).
 
@@ -1924,11 +1932,13 @@ export function Workspace() {
                 </button>
               </Hint>
             )}
-            {/* The right pair's board — same component, same slot, its own project. Last in the
-                stage so it lays over the empty-state hints as well as the panes. */}
-            {boardActive && project && <PlanBoardSlot project={project} side="right" />}
           </div>
 
+          {/* The right pair's board — same component, its own project, and OUTSIDE the stage above
+              for the same reason as the left pair's: it lays over both of this pair's columns, not
+              over the terminal alone. Last child, so it paints over the stage's empty-state hints
+              and the portalled panes as well as the Build column. */}
+          {boardActive && project && <PlanBoardSlot project={project} side="right" />}
         </Pair>
       </div>
 
@@ -2013,25 +2023,48 @@ export function Workspace() {
 }
 
 /**
- * A column's Plan board, filling THAT column's terminal slot.
+ * A pair's Plan board — ONE WIDE COLUMN over BOTH of that pair's columns.
  *
- * WHERE THIS RENDERS IS THE FIX. It used to be a single block inside the RIGHT pair, positioned
- * `absolute; inset: 0` over the pair — so it covered the build column too ("columns ②+③ collapse
- * into one wide column", the old PRD §3 reading) and, being written once in one pair, it could only
- * ever appear on the right no matter which column's chevron was pressed.
+ * TWO SEPARATE QUESTIONS, and the history here is only confusing if they are run together:
  *
- * Now each pair renders its own, INSIDE its own terminal stage. Two consequences the old shape
- * could not give:
- *   - The board replaces the TERMINAL, in place, at the terminal's exact geometry. The build column
- *     beside it stays visible — and since the sidebar owns the Plan/Build toggle as its header, the
- *     way back to Build is exactly where it always was, with no duplicate toggle to render.
- *   - Two of these can be on screen at once, showing different projects, with no shared state.
+ *   WHICH PAIR does a board belong to? Each. It used to be a single block written once inside the
+ *   RIGHT pair, reading a window-global, so pressing Plan on the left opened the board on the
+ *   right and either column's board clobbered the other's. That is fixed and STAYS fixed: every
+ *   pair renders its own, for its own project, with no shared state
+ *   (Workspace.planBoardPerColumn.test.tsx).
  *
- * `inset: 0` inside the stage (not over the pair) and PLAN_COLUMN_Z to sit above the portalled
- * agent panes, which paint at TERMINAL_PANE_Z. The pane for a board-showing column is also hidden
- * outright (`visibleAgentId` below goes null), so this is belt-and-braces rather than a race.
+ *   HOW MUCH of that pair does it cover? BOTH COLUMNS. The per-pair fix also narrowed the board
+ *   into the terminal stage, and that half was wrong — founder, 2026-07-31: "These plan columns are
+ *   not taking over the builder row. They should be in both the terminal and the builder area."
+ *   The Build column beside it rendered COMPLETELY EMPTY (its toggle and the Improve-Sparkle row
+ *   and nothing else) while the board was squeezed into half the width it had: five board columns
+ *   at a 220px floor do not fit a terminal column, so Blocked clipped mid-word at the edge and
+ *   Being built / Done / Shipped sat off-screen behind a scrollbar. Spanning the pair is what pays
+ *   for them — the columns are `flex: 1 1 0` with that floor, so width buys COLUMNS first and only
+ *   stretches once all five are on screen (BoardView).
+ *
+ * IT COVERS, IT DOES NOT RE-FLOW. `position: absolute; inset: 0` over `paircols`, which is the
+ * pair's own `position: relative` box holding [build, terminal]. An absolute child takes no part in
+ * that flex row, so neither column is unmounted, resized, or asked to give its width up — leaving
+ * Plan restores the user's layout exactly because nothing ever changed it. Unmounting would also
+ * kill the terminal's PTY, and `display: none` would zero its measured size.
+ *
+ * IT CARRIES ITS OWN PLAN/BUILD TOGGLE, and it has to. Covering the Build column takes the
+ * sidebar's copy off screen with it, so without one there is no way back to Build. This is the
+ * duplicate the terminal-slot version was able to delete, and re-adding it re-inverts the paint
+ * order in `layers.ts` — see the note there.
+ *
+ * The two handlers are the store's own paired writes (`openPlanBoard` / `showBuildStage`), the same
+ * ones the satellite window's board header uses. They are deliberately THINNER than
+ * AgentSidebar.onPickBuild, which additionally lands selection on the first rendered row: that
+ * refinement is for a chevron pressed against a visible row list, and here there is none — leaving
+ * Build with the selection it had is what "put my columns back the way they were" means.
  */
 function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) {
+  const mode = useUiStore((s) => s.workModeBySide[side]);
+  const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
+  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
+  const showBuildStage = useUiStore((s) => s.showBuildStage);
   return (
     <div
       data-testid="plan-column"
@@ -2045,6 +2078,25 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
         zIndex: PLAN_COLUMN_Z,
       }}
     >
+      {/* THE TOGGLE SITS OVER THE COLUMN IT REPLACED. A pair's Build column is its INBOARD one
+          (`TERM │ BUILD │ concierge │ BUILD │ TERM`), so the left pair's is on the right and the
+          right pair's on the left — align to that edge and the control stays where the user's eye
+          and cursor already were, instead of jumping across the pair on one side. */}
+      <div
+        style={{
+          paddingTop: 12,
+          display: "flex",
+          justifyContent: side === "left" ? "flex-end" : "flex-start",
+        }}
+      >
+        <PlanBuildToggle
+          mode={mode}
+          beadsEnabled={beadsEnabled}
+          onPickPlan={() => openPlanBoard(side)}
+          onPickBuild={() => showBuildStage(side)}
+          style={{ margin: "0 12px 8px", width: 320, maxWidth: "100%" }}
+        />
+      </div>
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
         <Suspense fallback={<PaneFallback />}>
           <BoardView project={project} side={side} />

@@ -696,15 +696,17 @@ describe("AgentSidebar — overlay mode", () => {
     // terminal slot rather than covering both columns. Neither the ②+③ wrapper nor the stage is a
     // stacking context, so these two numbers compete directly and the order is the whole contract.
     //
-    // THE FLOATED COLUMN WINS. It used to be the board, back when the board covered the Build
-    // column and carried the only PlanBuildToggle; losing that toggle behind a floated sidebar was
-    // the bug the old ordering prevented. The board no longer takes the sidebar's header away, so
-    // floating the Build column over the terminal — an explicit user gesture — must show that
-    // column, whether the terminal slot currently holds a terminal or a board.
+    // THE BOARD WINS. It spans the whole pair (2026-07-31: "in both the terminal and the builder
+    // area"), so it covers the Build column and carries the only PlanBuildToggle left on screen —
+    // and a floated sidebar painting through would cover the one control that closes the board.
+    // That is a dead end, not a cosmetic overlap, which is why it outranks the float gesture; the
+    // float loses nothing real, since its pull tab is under the board in Plan mode and cannot be
+    // started there anyway. The order was the other way while the board filled the terminal SLOT
+    // only, and it will have to flip back if the board is ever narrowed to one column again.
     //
     // Both numbers are read from the ONE module both sides import. A hand-copied literal here would
     // keep passing after someone changed the board's layer and would let the bug back in silently.
-    expect(PLAN_COLUMN_Z).toBeLessThan(SIDEBAR_OVERLAY_Z);
+    expect(PLAN_COLUMN_Z).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
     // It must still beat the terminal stage, a `z-index: auto` sibling later in DOM order.
     expect(SIDEBAR_OVERLAY_Z).toBeGreaterThan(0);
     // ...and both must stay inside the window layers.ts documents: above the stage's own overlays

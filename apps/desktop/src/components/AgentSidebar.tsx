@@ -326,6 +326,7 @@ export function AgentSidebar({
   slotSide = "right",
   forcePairSide,
   showSparkleRow = true,
+  covered = false,
 }: {
   project: Project | null;
   /** WHICH STAGE MOUNTED THIS COLUMN — used ONLY when `project` is null.
@@ -351,6 +352,31 @@ export function AgentSidebar({
    *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
    *  tear-off ownership split exists to prevent. Defaults to true so the main window is untouched. */
   showSparkleRow?: boolean;
+  /** IS SOMETHING OPAQUE PAINTED OVER THIS WHOLE COLUMN? True while the pair's Plan board is up,
+   *  which covers both columns (Workspace.PlanBoardSlot).
+   *
+   *  A column that cannot be SEEN must also not be reachable, and covering it does not achieve that
+   *  by itself. The board renders its own Plan/Build toggle — it has to, since it takes this one
+   *  off screen — and with this column still fully live there were two of every control underneath:
+   *  Tab still walked the hidden agent rows and a second mode toggle, AT announced two identical
+   *  toggles, and the ⌃-hint overlay drew a second "b"/"p" chiclet FLOATING OVER THE BOARD whose
+   *  key fired the hidden button (first-in-DOM wins, and this column precedes the board).
+   *
+   *  TWO MECHANISMS, AND BOTH ARE LOAD-BEARING — `visibility: hidden` ALONE IS NOT INERT.
+   *
+   *  `visibility: hidden` is the treatment `paneVisibilityStyle` already uses for a covered pane,
+   *  and it is here for one property the alternatives lack: it keeps the LAYOUT BOX. This column's
+   *  measured width is what the seam and the CSS clamp both read, so `display: none` would zero it
+   *  and lose the user's width outright.
+   *
+   *  But `visibility` is INHERITED, which means a descendant can take it back — and two here do.
+   *  `StatusFilterBar`'s Reset link is `visibility: filtered ? "visible" : "hidden"`, so with any
+   *  status chip active it computes VISIBLE under the board: a tab stop behind an opaque surface,
+   *  and Enter clears a filter the user cannot see (`pointer-events` never enters it — keyboard
+   *  activation does not hit-test). Every agent row's strip content does the same. So `inert` is
+   *  the one that actually makes the subtree unreachable: it is NOT overridable from inside, and
+   *  it covers focus, activation and the a11y tree together. (roborev 57298) */
+  covered?: boolean;
 }) {
   const selectAgent = useProjectStore((s) => s.selectAgent);
   const removeAgent = useProjectStore((s) => s.removeAgent);
@@ -2018,6 +2044,10 @@ export function AgentSidebar({
       ref={columnRef}
       data-testid="agent-sidebar-column"
       data-overlay={String(overlay)}
+      data-covered={String(covered)}
+      // THE HALF A DESCENDANT CANNOT UNDO — see the `covered` prop. React 19 renders this as the
+      // real `inert` attribute; `false` omits it entirely.
+      inert={covered}
       // The NUMBER, separate from the CSS `min()` in `width` — see RENDERED_WIDTH.
       data-width={String(width)}
       style={{
@@ -2025,6 +2055,10 @@ export function AgentSidebar({
         width: RENDERED_WIDTH,
         flex: "0 0 auto",
         position: "relative",
+        // COVERED BY THE PAIR'S PLAN BOARD — see the `covered` prop. Layout box kept, everything
+        // inside it unreachable: no tab stop, no a11y announcement, no keyboard-hint chiclet, and
+        // no click that lands on a control the user cannot see.
+        ...(covered ? { visibility: "hidden" as const, pointerEvents: "none" as const } : null),
         // THE HALF OF THE CIRCUIT THAT WAS NEVER WIRED — and the reason the selected row read as
         // plugged in at the concierge end and dead flat at the terminal end.
         //

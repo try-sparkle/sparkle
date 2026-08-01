@@ -391,6 +391,12 @@ function Column({
 
   return (
     <div
+      // Named so a measurement can ask which of the five columns actually FIT. The board is
+      // `flex: 1 1 0` against a floor, in a horizontally scrolling row: width buys COLUMNS first
+      // and only stretches once all five are on screen. That is the whole reason the board spans
+      // its pair rather than one column of it (Workspace.PlanBoardSlot), so it needs to be
+      // measurable rather than argued about.
+      data-board-column={columnKey}
       style={{
         flex: "1 1 0",
         minWidth: 220,

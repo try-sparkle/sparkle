@@ -38,7 +38,22 @@ type HintLayer = null | "attach";
 function isVisible(el: HTMLElement): boolean {
   // A disabled control can't be clicked, so don't offer a (dead) chiclet for it.
   if ((el as HTMLButtonElement).disabled || el.getAttribute("aria-disabled") === "true") return false;
-  if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") return false;
+  const cs = getComputedStyle(el);
+  // NOT PAINTED → NOT OFFERED. `offsetParent === null` catches `display: none` and nothing else:
+  // a `visibility: hidden` element keeps its layout box, so it has an offsetParent and a plausible
+  // on-screen rect, and every check below passes. That is the repo's OWN way of saying "covered"
+  // (`paneVisibilityStyle`, and the Build column under a pair's Plan board), so without this the
+  // overlay drew a chiclet floating over an opaque surface for a control nobody could see — and
+  // since the key handler takes the FIRST match in DOM order, the covered copy of a duplicated
+  // control won the mnemonic outright. A hidden element cannot be clicked, exactly like the
+  // disabled one on the line above.
+  if (cs.visibility === "hidden" || cs.visibility === "collapse") return false;
+  // AND THE ONE A DESCENDANT CANNOT UNDO. `visibility` is inherited, so a control inside a covered
+  // column that re-declares `visibility: visible` (the status-filter Reset link does exactly that,
+  // conditionally) computes visible and slips past the line above. `inert` is not overridable from
+  // inside, which is why the covered column carries both — so honour it here as well.
+  if (el.closest("[inert]") !== null) return false;
+  if (el.offsetParent === null && cs.position !== "fixed") return false;
   const r = el.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return false;
   if (!(r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth)) {

@@ -450,12 +450,13 @@ describe("Workspace — Plan mode fills that column’s terminal slot", () => {
     // The panes are covered, not torn down — their PTYs must survive a mode flip.
     expect(screen.getByTestId("pane-a1")).toBeTruthy();
     expect(screen.getByTestId("pane-a1").dataset.visible).toBe("false");
-    // The board paints at the SHARED layer, not an inline number of its own. It fills the
-    // terminal's slot, so a Build column floated out over that terminal must paint OVER it — the
+    // The board paints at the SHARED layer, not an inline number of its own. It covers BOTH of the
+    // pair's columns — including the Build column's Plan/Build toggle, whose only replacement is
+    // the board's own — so it must paint over that column even when the user has floated it. The
     // ordering itself is asserted in AgentSidebar.pullTabs.test.tsx; this pins the board's end of
     // it so an inline z-index re-edit here can't slip past that assertion.
     expect(Number(screen.getByTestId("plan-column").style.zIndex)).toBe(PLAN_COLUMN_Z);
-    expect(PLAN_COLUMN_Z).toBeLessThan(SIDEBAR_OVERLAY_Z);
+    expect(PLAN_COLUMN_Z).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
   });
 
   it("leaves the terminal stage un-isolated so its full-window modals still escape it", () => {
