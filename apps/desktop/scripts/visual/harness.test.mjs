@@ -25,6 +25,19 @@ import {
 import { numericArg, parseArgs } from "./capture.mjs";
 import { MOCK_REL, mockChromeCss, resolveMock, viewportFromManifest } from "./compare.mjs";
 import { compareDirs, shouldKeep } from "./verify-stable.mjs";
+import {
+  channelDelta,
+  parseArgs as probeArgs,
+  parseRange,
+  probeOptions,
+  probeRows,
+  runsOf,
+  scanRow,
+  toHex,
+  verdict,
+  wantsStrict,
+} from "./seam-probe.mjs";
+import { crop } from "./crop.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -246,7 +259,15 @@ describe("surface registry", () => {
   });
 
   it("resolves and filters surfaces by name", () => {
-    expect(selectSurfaces(null)).toHaveLength(SURFACES.length);
+    // An unfiltered run takes the DEFAULT set. A surface the fixture cannot reach is held out of it
+    // rather than failing every run — but naming it still selects it, so nothing is hidden from
+    // someone who asks. See `excludeFromDefault` in the registry.
+    const defaults = SURFACES.filter((s) => !s.excludeFromDefault);
+    expect(selectSurfaces(null)).toHaveLength(defaults.length);
+    expect(selectSurfaces(null).map((s) => s.name)).not.toContain("workspace-wired-left");
+    expect(selectSurfaces("workspace-wired-left").map((s) => s.name)).toEqual([
+      "workspace-wired-left",
+    ]);
     expect(selectSurfaces("agent-sidebar").map((s) => s.name)).toEqual(["agent-sidebar"]);
     expect(selectSurfaces("agent-sidebar, concierge-column")).toHaveLength(2);
     expect(surfaceByName("agent-sidebar").name).toBe("agent-sidebar");
@@ -283,6 +304,26 @@ describe("step compilation", () => {
       for (const step of s.app.steps) expect(() => stepToExpression(step)).not.toThrow();
       for (const step of s.mock?.steps ?? []) expect(() => stepToExpression(step)).not.toThrow();
     }
+  });
+});
+
+describe("the cable step asserts the SHELL agrees, not just that it called the store", () => {
+  // THE BUG THIS GUARDS. The step used to return true as soon as `__sparkleCable(side)` had been
+  // CALLED — a precondition, not the effect. `useEffectiveWired` only projects a side once the far
+  // end has a selected agent, so `workspace-wired-left` photographed the UNWIRED app for its entire
+  // life. Nothing failed if that verification were dropped again, which is the same class of silent
+  // mislabelling the commit found (roborev 57327).
+  it("emits a data-wired comparison against the requested side", () => {
+    const expr = stepToExpression({ cable: "right" });
+    expect(expr).toContain("__sparkleCable");
+    expect(expr).toMatch(/data-wired[\s\S]*"right"/);
+    expect(expr).toContain("workspace-shell");
+  });
+
+  it("compares against the side actually requested, for every side", () => {
+    expect(stepToExpression({ cable: "left" })).toMatch(/data-wired[\s\S]*"left"/);
+    // `off` is a projected value like any other — it must be verified, not exempted.
+    expect(stepToExpression({ cable: "off" })).toMatch(/data-wired[\s\S]*"off"/);
   });
 });
 
@@ -589,5 +630,193 @@ describe("keep-or-clean rule for the determinism check", () => {
     // …but an explicit --keep=false must NOT override the failure path, which is what the
     // evidence rule is for.
     expect(shouldKeep({ keepArg: "false", outcome: "unstable" })).toBe(true);
+  });
+});
+
+// ── THE SEAM PROBE ─────────────────────────────────────────────────────────────────────────────
+//
+// This instrument is the reason the mounted-row seam was finally diagnosed rather than guessed at,
+// so its arithmetic has to be trustworthy in its own right: a probe that reports "continuous" for a
+// broken join is worse than no probe, because it launders a guess into a measurement. The cases
+// below pin the two judgements that actually decided the diagnosis.
+describe("seam probe", () => {
+  /** One scanline as an image, so scanRow is exercised through real pixel data. */
+  const strip = (colors) => {
+    const im = { width: colors.length, height: 1, data: Buffer.alloc(colors.length * 4) };
+    colors.forEach((c, i) => {
+      im.data[i * 4] = c[0];
+      im.data[i * 4 + 1] = c[1];
+      im.data[i * 4 + 2] = c[2];
+      im.data[i * 4 + 3] = 255;
+    });
+    return im;
+  };
+  const A = [3, 9, 19];
+  const B = [9, 20, 38];
+
+  it("collapses a scanline into runs with absolute positions", () => {
+    const runs = scanRow(strip([A, A, B, B, B, A]), 0, 0, 5, 2);
+    expect(runs.map((r) => [r.from, r.to, r.hex])).toEqual([
+      [0, 1, "#030913"],
+      [2, 4, "#091426"],
+      [5, 5, "#030913"],
+    ]);
+  });
+
+  it("anchors tolerance to the run's START, so a gradient cannot be swallowed", () => {
+    // Each step is within tolerance of the LAST pixel but not of the first. Chained comparison
+    // would report one run and hide a soft shadow edge — which is a real way this seam separates.
+    const ramp = [[0, 0, 0], [0, 0, 2], [0, 0, 4], [0, 0, 6], [0, 0, 8]];
+    expect(runsOf(ramp.map(([r, g, b]) => ({ r, g, b })), 2).length).toBeGreaterThan(1);
+  });
+
+  it("uses MAX per-channel difference, so a one-channel rule still counts", () => {
+    expect(channelDelta({ r: 0, g: 0, b: 0 }, { r: 0, g: 0, b: 40 })).toBe(40);
+  });
+
+  // THE JUDGEMENT THAT MATTERED. The real defect was a 14px band — far too wide for any rule-width
+  // threshold — sitting between two byte-identical planes. A width-only verdict called that
+  // "continuous", which is precisely the false pass this whole exercise exists to stop.
+  it("calls a WIDE band a seam when the plane either side is the same", () => {
+    const runs = scanRow(strip([...Array(6).fill(A), ...Array(14).fill(B), ...Array(6).fill(A)]), 0, 0, 25, 2);
+    const v = verdict(runs, 6, 2);
+    expect(v.sameEnds).toBe(true);
+    expect(v.continuous).toBe(false);
+    expect(v.interlopers).toHaveLength(1);
+    expect(v.interlopers[0].width).toBe(14);
+  });
+
+  it("does NOT flag a wide band between two genuinely different planes", () => {
+    const C = [200, 200, 200];
+    const runs = scanRow(strip([...Array(6).fill(A), ...Array(14).fill(B), ...Array(6).fill(C)]), 0, 0, 25, 2);
+    expect(verdict(runs, 6, 2).continuous).toBe(true);
+  });
+
+  it("still flags a NARROW rule even when the planes either side differ", () => {
+    const C = [200, 200, 200];
+    const runs = scanRow(strip([...Array(6).fill(A), B, B, ...Array(6).fill(C)]), 0, 0, 13, 2);
+    expect(verdict(runs, 6, 2).continuous).toBe(false);
+  });
+
+  it("reports a truly continuous join as continuous", () => {
+    const v = verdict(scanRow(strip(Array(20).fill(A)), 0, 0, 19, 2), 6, 2);
+    expect(v.continuous).toBe(true);
+    expect(v.runCount).toBe(1);
+    // The ends of a one-run scan are trivially identical; reporting false made the field useless
+    // to a JSON consumer trying to tell the two shapes apart.
+    expect(v.sameEnds).toBe(true);
+  });
+
+  // THE FALSE PASS `strict` EXISTS FOR. Two runs meeting is the right answer for a panel BOUNDARY
+  // and the wrong one for a JOINT: if the row's plane drifts off the token while the fill and the
+  // concierge keep it, the scan is a hard colour step down the join with no middle run for
+  // `sameEnds` to flag, and the default rule passes it (roborev 57327).
+  it("passes a two-plane step by default but fails it under --strict", () => {
+    const step = scanRow(strip([...Array(10).fill(A), ...Array(10).fill(B)]), 0, 0, 19, 2);
+    expect(verdict(step, 6, 2).continuous).toBe(true);
+    expect(verdict(step, 6, 2, { strict: true }).continuous).toBe(false);
+    expect(verdict(step, 6, 2, { strict: true }).runCount).toBe(2);
+    // …and strict still passes the genuinely unbroken join.
+    const solid = scanRow(strip(Array(20).fill(A)), 0, 0, 19, 2);
+    expect(verdict(solid, 6, 2, { strict: true }).continuous).toBe(true);
+  });
+
+  it("parses N and N..M ranges, and rejects an inverted one", () => {
+    expect(parseRange("700..760", "x")).toEqual({ from: 700, to: 760 });
+    expect(parseRange("42", "y")).toEqual({ from: 42, to: 42 });
+    expect(() => parseRange("9..2", "x")).toThrow(/inverted/);
+    expect(() => parseRange(undefined, "x")).toThrow(/required/);
+  });
+
+  it("refuses a pixel read outside the image rather than returning black", () => {
+    // A silent 0 reads as a real colour, which would turn a bad coordinate into a confident wrong
+    // answer — the exact failure mode this tool exists to remove.
+    expect(() => scanRow(strip([A]), 0, 0, 5, 2)).toThrow(/outside/);
+  });
+
+  it("hexes a colour the way the report prints it", () => {
+    expect(toHex({ r: 3, g: 9, b: 19 })).toBe("#030913");
+  });
+});
+
+// ── THE --strict FLAG'S WIRING ────────────────────────────────────────────────────────────────
+//
+// `verdict`'s strict branch was covered; the wiring that lets `--strict` REACH it was not. `main()`
+// is not exported and no test drove the flag, so deleting the resolution would have left every test
+// green while `--strict` silently degraded to the permissive panel rule and reported `continuous`
+// on the exact two-plane step it was added to catch — the instrument scoring the wrong state with
+// nothing failing, which is the shape this whole branch is draining (roborev 57352).
+describe("--strict reaches the verdict", () => {
+  const strip2 = (colors) => {
+    const im = { width: colors.length, height: 1, data: Buffer.alloc(colors.length * 4) };
+    colors.forEach((c, i) => {
+      im.data[i * 4] = c[0];
+      im.data[i * 4 + 1] = c[1];
+      im.data[i * 4 + 2] = c[2];
+      im.data[i * 4 + 3] = 255;
+    });
+    return im;
+  };
+
+  it("resolves the flag from the CLI, present or absent", () => {
+    expect(wantsStrict(probeArgs(["--strict"]))).toBe(true);
+    expect(wantsStrict(probeArgs(["--strict=true"]))).toBe(true);
+    expect(wantsStrict(probeArgs([]))).toBe(false);
+    expect(wantsStrict(probeArgs(["--json"]))).toBe(false);
+  });
+
+  // END TO END over the row loop the CLI actually runs: the same two-plane image flips verdict with
+  // the flag. This is what fails if `{ strict }` is dropped on the way through.
+  it("flips the row loop's verdict on a two-plane step", () => {
+    const img = strip2([...Array(10).fill([3, 9, 19]), ...Array(10).fill([9, 20, 38])]);
+    const opts = { yFrom: 0, yTo: 0, xFrom: 0, xTo: 19, tolerance: 2 };
+    expect(probeRows(img, { ...opts, strict: false })[0].continuous).toBe(true);
+    expect(probeRows(img, { ...opts, strict: true })[0].continuous).toBe(false);
+    // …and the genuinely unbroken join passes under both.
+    const solid = strip2(Array(20).fill([3, 9, 19]));
+    expect(probeRows(solid, { ...opts, strict: true })[0].continuous).toBe(true);
+  });
+
+  // THE JOIN ITSELF, not just its two ends. Extracting `wantsStrict` alone only moved the untested
+  // seam one frame out: the line mapping argv onto `probeRows`' parameters lived in the unexported
+  // `main()`, so `strict: false` there left everything green while `--strict` degraded on the real
+  // command line — and a transposed `xFrom`/`yFrom` was equally invisible (roborev 57377).
+  it("maps the whole argv into probeRows' parameters, strict included", () => {
+    expect(probeOptions(probeArgs(["--y=5..7", "--x=1..9", "--strict"]))).toEqual({
+      yFrom: 5, yTo: 7, xFrom: 1, xTo: 9, tolerance: 2, strict: true,
+    });
+    // Axes must not transpose, and the flag must not leak in when absent.
+    expect(probeOptions(probeArgs(["--y=100..100", "--x=200..300", "--tolerance=5"]))).toEqual({
+      yFrom: 100, yTo: 100, xFrom: 200, xTo: 300, tolerance: 5, strict: false,
+    });
+  });
+
+  it("does not call an EMPTY scan continuous", () => {
+    // `pixelAt` throws rather than returning a confident wrong answer for an out-of-bounds read;
+    // a verdict on nothing must not be a confident pass either.
+    expect(verdict([], 6, 2, { strict: true }).continuous).toBe(false);
+    expect(verdict([], 6, 2).continuous).toBe(false);
+  });
+});
+
+describe("crop", () => {
+  it("cuts the requested region and magnifies by pixel replication", () => {
+    const im = { width: 4, height: 1, data: Buffer.alloc(16) };
+    [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]].forEach((c, i) => {
+      im.data[i * 4] = c[0];
+      im.data[i * 4 + 1] = c[1];
+      im.data[i * 4 + 2] = c[2];
+      im.data[i * 4 + 3] = 255;
+    });
+    const out = crop(im, { x0: 1, x1: 2, y0: 0, y1: 0, zoom: 3 });
+    expect([out.width, out.height]).toEqual([6, 3]);
+    // Nearest-neighbour: every replicated pixel is the SOURCE colour, never an interpolation —
+    // a smoothed zoom invents intermediate colours, which is what makes a 1px rule arguable.
+    expect([out.data[0], out.data[1], out.data[2]]).toEqual([4, 5, 6]);
+    expect([out.data[12], out.data[13], out.data[14]]).toEqual([7, 8, 9]);
+  });
+
+  it("refuses a region that falls outside the image", () => {
+    expect(() => crop(blank(4, 4), { x0: 0, x1: 9, y0: 0, y1: 1 })).toThrow(/outside/);
   });
 });

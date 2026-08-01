@@ -135,6 +135,33 @@ export interface ColumnPullTabProps {
   /** Which side the owned column sits on. `left` means dragging right grows it. */
   grows?: "left" | "right";
   /**
+   * PAINT THE GAP, because this rail IS the gap.
+   *
+   * The rail is a 6px in-flow flex band with no background of its own, so whatever sits behind it
+   * — `workspace-shell`, which is `bridge` — shows through. Between two columns that are meant to
+   * read as SEPARATE panels that is correct and invisible. Between two columns that are meant to
+   * read as ONE CONTINUOUS SURFACE it is a 6px rule straight down the join, and it is the vertical
+   * line the founder reported five times.
+   *
+   * WHY EVERY PREVIOUS FIX MISSED IT. All of them moved a BORDER — the concierge's `borderRight`,
+   * the sidebar's `[data-wired]` rule — and the line on screen was never a border. It is the shell's
+   * own ground, seen through a hole between the columns. Removing borders cannot close a hole.
+   *
+   * WHY IT CANNOT BE FIXED FROM THE ROW'S SIDE EITHER, which is the other obvious approach: the row
+   * lives inside `agent-list-scroll`, which is `overflow: auto` and therefore CLIPS at the column's
+   * edge. A negative margin on the row is silently cut off at exactly the boundary it needs to
+   * cross. The gap has to be painted by something that lives IN the gap — this rail.
+   *
+   * The pane-side seam has never had this problem and is the model: its rail sits INSIDE the pair,
+   * whose ground already is the terminal's plane, so the row's colour runs unbroken into the
+   * terminal. Passing `seamFill` gives this rail the same property explicitly.
+   *
+   * Pass the JOINED PLANE (`C.forest`) while this boundary is a live joint, and omit it otherwise —
+   * an unwired concierge separates by its lift shadow, and filling the rail would paint over the one
+   * thing holding that edge apart. See `seamFillStyle` for why the band overhangs 1px each way.
+   */
+  seamFill?: string;
+  /**
    * HOW MUCH WIDTH ONE PIXEL OF POINTER TRAVEL BUYS. 1 for an ordinary seam; 2 for a column that
    * grows from BOTH edges at once.
    *
@@ -221,6 +248,7 @@ export function ColumnPullTab({
   cssVar,
   topOffset = HEADER_H,
   testId = "column-pull-tab",
+  seamFill,
 }: ColumnPullTabProps) {
   const [hovered, setHovered] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -585,6 +613,13 @@ export function ColumnPullTab({
       onBlur={() => setFocused(false)}
       style={rail}
     >
+      {/* THE SEAM FILL — the gap, painted. See `seamFill` on the props for why this is what the
+          reported vertical line actually is, and why neither a border change nor a bleed on the row
+          could ever have closed it. Rendered before the zone so the tab and its chevron paint over
+          it; `pointerEvents:none` so it cannot take a press away from the drag rail. */}
+      {seamFill && (
+        <div aria-hidden data-testid={`${testId}-fill`} style={{ ...seamFillStyle, background: seamFill }} />
+      )}
       {/* The ZONE — the tab's reach area, straddling the seam.
           POINTER-TRANSPARENT AT REST, and this is not a detail. The mock can leave `.tabzone`
           permanently pointer-active because there it is a box hung off an absolutely-positioned
@@ -856,6 +891,34 @@ const rail: CSSProperties = {
   // satisfy it by bumping the constant while the rail stayed at 4 and the lift went back
   // to eating the tab's hit area — the exact roborev 54712 regression (roborev 54841).
   zIndex: PULL_TAB_RAIL_Z,
+};
+
+/**
+ * The seam fill's box — the rail's full height, PLUS one pixel into each neighbour.
+ *
+ * THE 1px OVERHANG IS NOT A FUDGE, it is the second half of the defect. Both columns either side of
+ * this rail carry a `1px solid transparent` border on their facing edge, kept deliberately so that
+ * `box-sizing: border-box` plus an explicit `width` does not shift their content when the border's
+ * colour is dropped (see `ConciergeColumn`'s `borderRight`). Transparent means the COLUMN's own
+ * background shows through those two pixels, so filling only the rail's 6px leaves a 1px line of
+ * `bridge` immediately beside it — measurably, 14 image px of interloper at devicePixelRatio 2
+ * rather than 12. Closing 6 of the 7 px would have reproduced this whole bug at one seventh the
+ * width, which is exactly the kind of "fixed it" that keeps getting reported as still broken.
+ *
+ * Symmetric rather than keyed off `grows`, so one rule serves a left pair and a right pair without a
+ * direction to get backwards. Overhanging into the concierge is harmless in the only state that
+ * paints this: while joined, the concierge is the very colour being painted.
+ *
+ * It outranks both neighbours because the RAIL does (`PULL_TAB_RAIL_Z` is 4; the concierge's lift is
+ * 3 and the build column 2), which is the same ordering that lets the tab overhang them.
+ */
+const seamFillStyle: CSSProperties = {
+  position: "absolute",
+  top: 0,
+  bottom: 0,
+  left: -1,
+  right: -1,
+  pointerEvents: "none",
 };
 
 /**

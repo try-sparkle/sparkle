@@ -38,9 +38,23 @@ export const SURFACES = [
       clip: "#shell",
     },
   },
+  // ── NOT IN THE DEFAULT SET: THIS STATE IS UNREACHABLE WITH THE CURRENT FIXTURE ────────────────
+  //
+  // `visualFixtures` seeds ONE project and leaves `leftProjectId` / `pairAssignment` empty, so the
+  // left pair has no project and therefore no selected agent. `useEffectiveWired` requires one
+  // before it will project a side, so `patch("left")` is a no-op as far as the shell is concerned
+  // and this surface captured the UNWIRED app — byte-identical to `workspace-unwired`, silently,
+  // for its whole life. Now that the `cable` step verifies the shell agrees, keeping it in the
+  // default set would fail every `visual:capture` run for a reason that has nothing to do with the
+  // change under test.
+  //
+  // Held here, still addressable by name (`--surfaces=workspace-wired-left`), so it comes back the
+  // moment the fixture can seed a left pair — that is the actual missing piece, not this entry.
+  // Tracked as a bead; see PRD/sparkle/mounted-row-seam.md.
   {
     name: "workspace-wired-left",
-    description: "The live cable seated in the LEFT pair.",
+    excludeFromDefault: true,
+    description: "The live cable seated in the LEFT pair. NEEDS A LEFT-PAIR FIXTURE — see above.",
     app: {
       steps: [
         { waitFor: "[data-testid=workspace-shell]" },
@@ -138,7 +152,10 @@ export function surfaceByName(name) {
  * Pure, so the CLI parsing is unit-testable without a browser.
  */
 export function selectSurfaces(filter) {
-  if (!filter) return SURFACES;
+  // An unfiltered run takes the DEFAULT set, not literally everything: a surface whose state the
+  // fixture cannot reach would otherwise fail every run. Naming it explicitly still selects it, so
+  // the exclusion hides nothing from someone who asks for it.
+  if (!filter) return SURFACES.filter((s) => !s.excludeFromDefault);
   return filter
     .split(",")
     .map((s) => s.trim())
@@ -178,8 +195,26 @@ export function stepToExpression(step) {
     // wired nothing — React owns that attribute — so this drives the store through the dev-only
     // handle visualFixtures installs, and returns false when it is absent so a missing handle fails
     // the step loudly instead of silently capturing the unwired app.
+    //
+    // ── AND THEN IT VERIFIES, BECAUSE CALLING `patch` IS NOT BEING WIRED ────────────────────────
+    // This step used to return `true` the moment the store action had been CALLED. That is a
+    // precondition, not the effect: `useEffectiveWired` only projects a side once the far end
+    // actually has a selected agent, so `patch("left")` against a fixture with no left-pair project
+    // leaves the shell at `data-wired="off"` and the capture photographs the UNWIRED app under a
+    // name that says otherwise. `workspace-wired-left` did exactly that — including after the fix
+    // whose comment claims it made these surfaces real — and a mounted-row seam went five rounds
+    // partly because the one instrument that could have shown it was scoring the wrong state.
+    //
+    // So the step now succeeds only when the SHELL AGREES. Since steps are retried until they pass,
+    // a side that cannot actually be reached fails the run loudly instead of quietly mislabelling a
+    // PNG. AGENTS.md: assert the side effect, never the precondition.
+    // The requested side IS the value the shell must project — `off` included — so this compares
+    // against `step.cable` directly. It was written as a ternary mapping "off" to "off", which is a
+    // tautology that reads as though it were translating a value it is not (roborev 57327).
     return `(() => { const f = window.__sparkleCable; if (!f) return false;
-      f(${JSON.stringify(step.cable)}); return true; })()`;
+      f(${JSON.stringify(step.cable)});
+      const shell = document.querySelector("[data-testid=workspace-shell]");
+      return shell != null && shell.getAttribute("data-wired") === ${JSON.stringify(step.cable)}; })()`;
   }
   throw new Error(`Unrecognised step: ${JSON.stringify(step)}`);
 }

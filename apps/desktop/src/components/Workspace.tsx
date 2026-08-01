@@ -1715,6 +1715,9 @@ export function Workspace() {
             cssVar={CONCIERGE_WIDTH_VAR}
             label="Sparkle column"
             testId="left-pair-pull-tab"
+            // JOINED ONLY WHEN THE LEFT PAIR HOLDS THE CABLE. This rail is the concierge's LEFT
+            // boundary, so it is the one the left pair's mounted row runs into.
+            seamFill={shownWired === "left" ? C.forest : undefined}
           />
         )}
         {/* ── THE CONCIERGE'S BOX IS OWNED BY THE SHELL, NOT BY THE COLUMN ────────────────────────
@@ -1793,6 +1796,19 @@ export function Workspace() {
           cssVar={CONCIERGE_WIDTH_VAR}
           label="Sparkle column"
           testId="concierge-pull-tab"
+          // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is
+          // the concierge's RIGHT boundary and therefore the right pair's joint.
+          //
+          // `shownWired`, not the raw `wired`: it is the same derivation the concierge column paints
+          // its flood from (`hooks/useEffectiveWired`), so the fill cannot appear while the column
+          // beside it is still drawing itself unplugged — the shell-contradicts-itself failure
+          // roborev 55386 and 55490 are both about.
+          //
+          // `C.forest` is the CSS var `--c-forest`, i.e. `BLUEPRINT[mode].term` — the exact token the
+          // concierge floods with and the row paints in. Reading the same token is what makes the
+          // three surfaces provably one plane in BOTH themes rather than three colours that happen to
+          // match in dark.
+          seamFill={shownWired === "right" ? C.forest : undefined}
         />
         </div>
         {/* THE PAIR — build + its terminal, one project, never split, with its OWN project tabs.

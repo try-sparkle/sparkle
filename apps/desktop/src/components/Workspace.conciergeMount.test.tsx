@@ -109,6 +109,7 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
 import type { AgentTab, Project } from "../types";
+import { C } from "../theme/colors";
 
 function mkAgent(id: string, name: string): AgentTab {
   return {
@@ -201,6 +202,146 @@ describe("clicking an agent row mounts the concierge to it", () => {
     render(<Workspace />);
     fireEvent.click(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("left");
+  });
+
+  // ── THE JOIN IS PAINTED, NOT JUST RECORDED ───────────────────────────────────────────────────
+  //
+  // THE SEAM THE FOUNDER REPORTED FIVE TIMES, and the reason five "fixes" did not change it: every
+  // one of them asserted the mount was RECORDED (`data-wired`, the store, the pair flag) and none
+  // asserted anything was PAINTED across the boundary. All of those assertions were already true
+  // while the line was still on screen, so the whole suite stayed green through five rounds.
+  //
+  // The line was never a border. It is the shell's own ground (`bridge`) seen through the 6px
+  // in-flow rail that separates the concierge from the build column — a HOLE, which no amount of
+  // border removal can close, and which the row cannot cover from its own side because
+  // `agent-list-scroll` is `overflow:auto` and clips at the column's edge.
+  //
+  // These cases assert the FILL: the element that closes the hole, on the correct seam, in the same
+  // token the concierge floods with. Measured proof that the pixels are actually continuous lives in
+  // `scripts/visual/seam-probe.mjs` — jsdom computes no layout and cannot settle a pixel question
+  // (see the `jsdom cannot verify CSS clamps` note); what jsdom CAN prove is that the fill exists,
+  // carries the joined plane, and is absent when it must not paint. Both halves are needed.
+  describe("the mounted row's plane runs unbroken into the concierge", () => {
+    const fill = () => document.querySelector('[data-testid="concierge-pull-tab-fill"]');
+
+    it("paints nothing at rest — an unmounted concierge separates by its lift shadow", () => {
+      render(<Workspace />);
+      // Filling the rail here would paint over the ONLY thing holding the unwired edge apart: the
+      // fill step alone measures under EDGE_MIN_CONTRAST, so the shadow is the separation.
+      expect(fill()).toBeNull();
+    });
+
+    it("closes the seam with the concierge's own plane when a row is clicked", () => {
+      render(<Workspace />);
+      expect(fill()).toBeNull();
+
+      fireEvent.click(rowFor(SLIDER));
+
+      const el = fill() as HTMLElement | null;
+      expect(el).not.toBeNull();
+      // THE JOINED PLANE, by token. `C.forest` is `var(--c-forest)` = `BLUEPRINT[mode].term` — the
+      // exact value the concierge floods with and the selected row paints in, which is what makes
+      // the three surfaces one plane in BOTH themes rather than three colours that agree in dark.
+      expect((el as HTMLElement).style.background).toBe(C.forest);
+    });
+
+    it("un-paints it when the cable is dropped", () => {
+      render(<Workspace />);
+      fireEvent.click(rowFor(SLIDER));
+      expect(fill()).not.toBeNull();
+
+      act(() => {
+        useCableStore.getState().unbind();
+      });
+      expect(fill()).toBeNull();
+    });
+
+    // WHICH SEAM. The concierge has a rail on each side and only the one facing the pair that holds
+    // the cable is a joint; filling both would paint a plane onto a boundary that is still a
+    // boundary. With the project in the LEFT pair the RIGHT-hand rail must stay clear.
+    //
+    // BOTH HALVES, and the positive one is the point. Asserting only that the RIGHT rail is clear
+    // was itself a vacuous test of the very kind this file exists to end: assigning a project left
+    // makes `pairCountFor` return 2, so `left-pair-pull-tab` really is mounted here — and flipping
+    // its prop to `shownWired === "right"`, or dropping it outright, would have left every case in
+    // this file green with the founder's seam back in the two-pair cockpit (roborev 57327). An
+    // absence assertion cannot notice a fill that never appears.
+    // THE LEFT RAIL'S *CONDITION*, not just its truthy branch. The positive case above runs in the
+    // one state where the condition is true, and the other cases run single-pair — where
+    // `left-pair-pull-tab` is not mounted at all, so its fill is trivially absent. So
+    // `seamFill={C.forest}` unconditional would have left the whole file green while the two-pair
+    // cockpit painted the joined plane across the left rail AT REST, i.e. a plane onto a boundary
+    // that is still a boundary (roborev 57352). The right rail already has its negatives
+    // ("paints nothing at rest", "un-paints it"); this is the left rail's.
+    it("leaves the LEFT rail unpainted at rest, even with two pairs mounted", () => {
+      act(() => {
+        useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+      });
+      render(<Workspace />);
+
+      // Two pairs, so the left rail IS mounted — its fill being absent is a real observation here,
+      // not the vacuous absence of an unmounted component.
+      expect(document.querySelector('[data-testid="left-pair-pull-tab"]')).not.toBeNull();
+      expect(shell().getAttribute("data-wired")).toBe("off");
+      expect(document.querySelector('[data-testid="left-pair-pull-tab-fill"]')).toBeNull();
+    });
+
+    // THE OTHER HALF OF THE LEFT RAIL'S CONDITION — and the mutant it kills is the founder's defect
+    // verbatim: the joined plane painted across the LEFT rail while the cable sits on the RIGHT
+    // pair, i.e. a plane onto a boundary that is still a boundary.
+    //
+    // The at-rest case above only pins `shownWired === "off"`, so `shownWired !== "off"` would have
+    // left every case in this file green — the two-pair cases were at-rest (mutant paints nothing)
+    // and cable-left (mutant paints exactly what is expected). The mirror rail was already protected
+    // against this by "fills the LEFT rail, and only that rail"; the asymmetry WAS the gap
+    // (roborev 57377). A previous commit message claimed this state was covered. It was not.
+    it("leaves the LEFT rail unpainted while the cable sits on the RIGHT pair", () => {
+      act(() => {
+        useProjectStore.setState({
+          ...useProjectStore.getState(),
+          projects: [
+            mkProject("p1", "Alpha", [mkAgent("a1", OTHER), mkAgent("a2", SLIDER)], "a2"),
+            mkProject("p2", "Beta", [mkAgent("b1", FAR)], "b1"),
+          ],
+          selectedProjectId: "p1",
+        } as never);
+        useRuntimeStore.setState({
+          ...useRuntimeStore.getState(),
+          openAgentIds: ["a1", "a2", "b1"],
+        } as never);
+        // p2 on the LEFT, p1 stays on the right — the same fixture the MOVES case builds.
+        useUiStore.setState({
+          ...useUiStore.getState(),
+          openProjectIds: ["p1", "p2"], pairAssignment: { p2: "left" }, leftProjectId: "p2",
+        } as never);
+      });
+      render(<Workspace />);
+      // Click a row in the RIGHT pair.
+      fireEvent.click(rowFor(SLIDER));
+
+      expect(shell().getAttribute("data-wired")).toBe("right");
+      // The left rail is MOUNTED (two pairs), so its empty fill is a real observation.
+      expect(document.querySelector('[data-testid="left-pair-pull-tab"]')).not.toBeNull();
+      expect(document.querySelector('[data-testid="left-pair-pull-tab-fill"]')).toBeNull();
+      // …and the rail that IS the joint does paint.
+      expect(fill()).not.toBeNull();
+    });
+
+    it("fills the LEFT rail, and only that rail, when the left pair holds the cable", () => {
+      act(() => {
+        useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+      });
+      render(<Workspace />);
+      fireEvent.click(rowFor(SLIDER));
+
+      expect(shell().getAttribute("data-wired")).toBe("left");
+
+      const left = document.querySelector('[data-testid="left-pair-pull-tab-fill"]') as HTMLElement | null;
+      expect(left).not.toBeNull();
+      expect((left as HTMLElement).style.background).toBe(C.forest);
+      // …and the concierge's other boundary is still a boundary.
+      expect(fill()).toBeNull();
+    });
   });
 
   // The founder's words: "that one row would be bold". The mount has to be legible ON THE ROW.
