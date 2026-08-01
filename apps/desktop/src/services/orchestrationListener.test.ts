@@ -367,6 +367,59 @@ describe("orchestrationListener", () => {
     expect(workers[0]!.status).toBe("running");
   });
 
+  it("list_workers gates 'done' on result.json, not the coarse tab status (sparkle-7kra)", async () => {
+    // Root cause: workerStatus read the live UI tab status, where "done" means only that a Claude
+    // TURN ended (statusRouter) — NOT process exit, commits, or result.json. A worker whose turn
+    // finished but is still live with uncommitted edits therefore reported "done", which licensed
+    // the orchestrator's merge → spin_down loop to land nothing and DELETE live work mid-edit.
+    // Fix: derive completion from `.sparkle/result.json` — the same fact wait_for_workers blocks on.
+    for (const t of ["success", "failed", "live"]) {
+      fire({ reqId: `s-${t}`, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: t } });
+    }
+    await flush();
+    const [wSuccess, wFailed, wLive] = (useProjectStore.getState().projects
+      .find((p) => p.id === projectId)!
+      .agents.filter((a) => a.kind === "worker" && a.parentId === buildId));
+
+    // ALL THREE carry a "done" TAB status — the OLD (buggy) completion signal. Under the pre-fix
+    // code every one of these would read "done"; the assertions below prove the verdict now comes
+    // from result.json, so wFailed and wLive diverge from what the tab status alone would produce.
+    useRuntimeStore.setState({
+      status: { [wSuccess!.id]: "done", [wFailed!.id]: "done", [wLive!.id]: "done" },
+    });
+
+    // Only wSuccess/wFailed have actually WRITTEN a result.json; wLive (still live, uncommitted) has none.
+    const resultFor: Record<string, string> = {
+      [wSuccess!.worktreePath!]: JSON.stringify({
+        schemaVersion: 1, taskId: "s", branch: "b", status: "success", filesChanged: [], summary: "ok",
+      }),
+      [wFailed!.worktreePath!]: JSON.stringify({
+        schemaVersion: 1, taskId: "f", branch: "b", status: "failed", filesChanged: [], summary: "nope",
+      }),
+    };
+    try {
+      invokeMock.mockImplementation((cmd: string, args: { worktree?: string }) =>
+        Promise.resolve(cmd === "read_worker_result" ? (resultFor[args.worktree ?? ""] ?? null) : undefined),
+      );
+
+      fire({ reqId: "l7kra", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+
+      const reply = invokeMock.mock.calls.filter(([c]) => c === "orchestration_respond").at(-1)!;
+      const workers = (reply[1] as { result: { workers: Array<{ workerId: string; status: string }> } })
+        .result.workers;
+      const statusOf = (id: string) => workers.find((w) => w.workerId === id)!.status;
+
+      expect(statusOf(wSuccess!.id)).toBe("done"); // result.json status:"success" → done
+      expect(statusOf(wFailed!.id)).toBe("failed"); // result.json status:"failed" → failed (tab said "done")
+      expect(statusOf(wLive!.id)).toBe("running"); // NO result.json → running, though the tab said "done"
+    } finally {
+      // Restore the module-load default so the custom impl can't leak into later tests.
+      invokeMock.mockReset();
+      invokeMock.mockReturnValue(Promise.resolve());
+    }
+  });
+
   it("spin_down → tears down the worker and replies spunDown:true", async () => {
     const workerId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: buildId })!;
     fire({ reqId: "d1", op: "spin_down", buildAgentId: buildId, projectId, payload: { workerId } });

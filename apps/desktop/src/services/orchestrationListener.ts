@@ -16,6 +16,7 @@ import { shouldHandleInThisWindow } from "./windowOwnership";
 import { findWindowForProject, clearWindowProject } from "./windowRegistry";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
+import { parseWorkerResult } from "./buildAgent";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
@@ -263,13 +264,32 @@ function globalGateBinds(): boolean {
   return globalUsedSlots() >= Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
 }
 
-/** Coarse runtime status for list_workers. Authoritative completion is wait_for_workers
- *  (result.json); this is the live tab status the build agent can glance at meanwhile. */
-function workerStatus(workerId: string): "running" | "done" | "failed" {
-  const s = useRuntimeStore.getState().status[workerId];
-  if (s === "errored") return "failed";
-  if (s === "done") return "done";
-  return "running";
+/** Completion status for list_workers, derived from the SAME authoritative fact wait_for_workers
+ *  blocks on: the worker's `<worktree>/.sparkle/result.json` (read_result → read_worker_result_at).
+ *  `resultRaw` is that file's contents, or null/undefined when it is absent or unreadable.
+ *
+ *    - result present, status "failed"            → "failed"
+ *    - result present, status "success"/"partial" → "done"
+ *    - result ABSENT (regardless of tab status)   → "running"
+ *
+ *  The coarse live TAB status is deliberately NOT the verdict. `statusRouter` marks a worker "done"
+ *  the instant a Claude turn ENDS (Stop hook / screen scraper) — but a turn ending is not process
+ *  exit, not a commit, and not result.json: the process can still be live with uncommitted edits and
+ *  zero commits. Reporting that worker "done" here licensed the orchestrator's merge → spin_down
+ *  loop to land a branch with NO commits and then DELETE a live worker's worktree mid-edit
+ *  (sparkle-7kra). So absence of a valid result.json always reads "running"; the tab status is kept
+ *  only as a secondary hint for humans, never as the completion verdict this function returns. */
+function workerStatus(resultRaw: string | null | undefined): "running" | "done" | "failed" {
+  // No result.json → the worker has NOT completed, whatever its tab status claims.
+  if (resultRaw == null) return "running";
+  try {
+    return parseWorkerResult(resultRaw).status === "failed" ? "failed" : "done";
+  } catch {
+    // The file exists but is not a valid result yet (e.g. a partial write caught mid-flush). An
+    // invalid completion record is not completion → keep it "running" rather than declare a false
+    // terminal that could license a premature spin_down.
+    return "running";
+  }
 }
 
 async function runSpawn(req: OrchestrationRequest): Promise<void> {
@@ -668,19 +688,34 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
     // (possibly-corrupted) in-memory store (sparkle-3xus).
     await reconcileWorkersFromDisk(req.projectId);
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
-    const workers = (project?.agents ?? [])
-      .filter((a) => a.kind === "worker" && a.parentId === req.buildAgentId)
-      .map((a) => ({
-        workerId: a.id,
-        branch: a.branch ?? "",
-        worktree: a.worktreePath ?? "",
-        status: workerStatus(a.id),
-        // The bead this worker owns. Without it the roster is N ANONYMOUS workers: a resumed
-        // orchestrator cannot tell which unit any live worker is already handling, so it
-        // re-dispatches everything still showing in `bd ready`. Omitted (rather than "") when the
-        // worker carries no bead, so "no claim" stays distinguishable from "claim unknown".
-        ...(a.beadId ? { beadId: a.beadId } : {}),
-      }));
+    const agents = (project?.agents ?? []).filter(
+      (a) => a.kind === "worker" && a.parentId === req.buildAgentId,
+    );
+    // Read each worker's authoritative completion fact from disk — the SAME `.sparkle/result.json`
+    // wait_for_workers blocks on — before deriving status, so a turn-ended-but-uncommitted worker is
+    // never reported "done" (sparkle-7kra). A read failure (worktree gone, backend hiccup, or no
+    // worktree path yet) is treated as "no result" → "running", never a false terminal.
+    const workers = await Promise.all(
+      agents.map(async (a) => {
+        // Same backend op wait_for_workers uses (read_result → read_worker_result_at): returns the
+        // result.json contents, or null when it is absent. Called directly rather than through
+        // pty.readWorkerResult so this service stays off the React/UI module graph.
+        const resultRaw = a.worktreePath
+          ? await invoke<string | null>("read_worker_result", { worktree: a.worktreePath }).catch(() => null)
+          : null;
+        return {
+          workerId: a.id,
+          branch: a.branch ?? "",
+          worktree: a.worktreePath ?? "",
+          status: workerStatus(resultRaw),
+          // The bead this worker owns. Without it the roster is N ANONYMOUS workers: a resumed
+          // orchestrator cannot tell which unit any live worker is already handling, so it
+          // re-dispatches everything still showing in `bd ready`. Omitted (rather than "") when the
+          // worker carries no bead, so "no claim" stays distinguishable from "claim unknown".
+          ...(a.beadId ? { beadId: a.beadId } : {}),
+        };
+      }),
+    );
     await respond(req.reqId, { workers });
   } catch (e) {
     // Every dispatch path MUST reply exactly once — a thrown store read would otherwise leave the
