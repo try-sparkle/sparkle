@@ -412,11 +412,55 @@ describe("orchestrationListener", () => {
 
       expect(statusOf(wSuccess!.id)).toBe("done"); // result.json status:"success" → done
       expect(statusOf(wFailed!.id)).toBe("failed"); // result.json status:"failed" → failed (tab said "done")
-      expect(statusOf(wLive!.id)).toBe("running"); // NO result.json → running, though the tab said "done"
+      // NO result.json → NEVER the terminal "done"/"failed" (the 7kra invariant). The live tab
+      // status "done" (a turn ended, nothing landed) is remapped to the non-terminal "idle"
+      // (sparkle-0an0) rather than flattened to "running" — either way it can't license spin_down.
+      expect(statusOf(wLive!.id)).toBe("idle");
     } finally {
       // Restore the module-load default so the custom impl can't leak into later tests.
       invokeMock.mockReset();
       invokeMock.mockReturnValue(Promise.resolve());
+    }
+  });
+
+  it("list_workers surfaces each worker's live tab state, not a flat 'running' (sparkle-0an0)", async () => {
+    // Root cause: with no result.json the status collapsed EVERY live state to "running", so an
+    // orchestrator polling list_workers could not tell a worker mid-cargo-test from one blocked on a
+    // session limit, waiting on an on-screen prompt, or awaiting approval. Real work was stranded:
+    // a `waiting` worker whose PR sat green and mergeable read exactly like a busy one. Fix: while
+    // result.json is still ABSENT, surface the live tab status VERBATIM (the 7kra completion gate is
+    // untouched — none of these has a result.json, so none can read the terminal "done"/"failed").
+    // Create the workers directly (as the spin_down tests do) so the concurrency cap/queue never
+    // holds one back — this test is about how list_workers REPORTS live workers, not about spawning.
+    const states = ["working", "idle", "waiting", "blocked", "approval"] as const;
+    const ps = useProjectStore.getState();
+    const idFor = new Map<string, string>();
+    for (const s of states) {
+      const id = ps.addAgent(projectId, { kind: "worker", parentId: buildId, task: s })!;
+      ps.setAgentWorktree(projectId, id, `/wt/${id}`, `sparkle/agent-${id}`);
+      idFor.set(s, id);
+    }
+    useRuntimeStore.setState({
+      status: Object.fromEntries(states.map((s) => [idFor.get(s)!, s])),
+    });
+
+    // No result.json for ANY of them (default invoke → undefined), so completion never fires and the
+    // returned status is purely the liveness signal this bug is about.
+    invokeMock.mockClear();
+    fire({ reqId: "l0an0", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+
+    const reply = invokeMock.mock.calls.filter(([c]) => c === "orchestration_respond").at(-1)!;
+    const workers = (reply[1] as { result: { workers: Array<{ workerId: string; status: string }> } })
+      .result.workers;
+    const statusOf = (id: string) => workers.find((w) => w.workerId === id)!.status;
+
+    // THE SIDE EFFECT: each DISTINCT live state travels through to the reply. Reverting workerStatus
+    // to flatten-to-"running" collapses all five to "running" and every assertion below fails — and
+    // none of these result-less workers ever leaks a terminal "done" (the 7kra invariant holds).
+    for (const s of states) {
+      expect(statusOf(idFor.get(s)!)).toBe(s);
+      expect(statusOf(idFor.get(s)!)).not.toBe("done");
     }
   });
 

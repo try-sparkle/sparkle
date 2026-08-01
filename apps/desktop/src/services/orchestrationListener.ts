@@ -19,6 +19,7 @@ import { scanWorkerManifests, type WorkerManifest } from "./worktree";
 import { parseWorkerResult } from "./buildAgent";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import type { AgentTabStatus } from "../types";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
 import { workersNeedingOpen, isNotYetLiveWorker } from "../engine/workerAttention";
 
@@ -264,32 +265,57 @@ function globalGateBinds(): boolean {
   return globalUsedSlots() >= Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
 }
 
-/** Completion status for list_workers, derived from the SAME authoritative fact wait_for_workers
- *  blocks on: the worker's `<worktree>/.sparkle/result.json` (read_result → read_worker_result_at).
- *  `resultRaw` is that file's contents, or null/undefined when it is absent or unreadable.
+/** Status token surfaced by list_workers: the terminal completion VERDICT when the worker has
+ *  finished, otherwise its live TAB state. A superset of the two terminal verdicts plus every
+ *  `AgentTabStatus` the orchestrator might need to tell a busy worker from a stuck one. */
+export type WorkerStatus = "running" | "done" | "failed" | AgentTabStatus;
+
+/** Status for list_workers, layering TWO independent facts so an orchestrator can act on both:
  *
- *    - result present, status "failed"            → "failed"
- *    - result present, status "success"/"partial" → "done"
- *    - result ABSENT (regardless of tab status)   → "running"
+ *  1. COMPLETION — derived from the SAME authoritative fact wait_for_workers blocks on: the worker's
+ *     `<worktree>/.sparkle/result.json` (read_result → read_worker_result_at). `resultRaw` is that
+ *     file's contents, or null/undefined when it is absent or unreadable.
+ *       - result present, status "failed"            → "failed"
+ *       - result present, status "success"/"partial" → "done"
  *
- *  The coarse live TAB status is deliberately NOT the verdict. `statusRouter` marks a worker "done"
- *  the instant a Claude turn ENDS (Stop hook / screen scraper) — but a turn ending is not process
- *  exit, not a commit, and not result.json: the process can still be live with uncommitted edits and
- *  zero commits. Reporting that worker "done" here licensed the orchestrator's merge → spin_down
- *  loop to land a branch with NO commits and then DELETE a live worker's worktree mid-edit
- *  (sparkle-7kra). So absence of a valid result.json always reads "running"; the tab status is kept
- *  only as a secondary hint for humans, never as the completion verdict this function returns. */
-function workerStatus(resultRaw: string | null | undefined): "running" | "done" | "failed" {
-  // No result.json → the worker has NOT completed, whatever its tab status claims.
-  if (resultRaw == null) return "running";
-  try {
-    return parseWorkerResult(resultRaw).status === "failed" ? "failed" : "done";
-  } catch {
-    // The file exists but is not a valid result yet (e.g. a partial write caught mid-flush). An
-    // invalid completion record is not completion → keep it "running" rather than declare a false
-    // terminal that could license a premature spin_down.
-    return "running";
+ *     The coarse live TAB status is deliberately NOT the completion verdict. `statusRouter` marks a
+ *     worker "done" the instant a Claude turn ENDS (Stop hook / screen scraper) — but a turn ending
+ *     is not process exit, not a commit, and not result.json: the process can still be live with
+ *     uncommitted edits and zero commits. Reporting that worker "done" licensed the orchestrator's
+ *     merge → spin_down loop to land a branch with NO commits and then DELETE a live worker's
+ *     worktree mid-edit (sparkle-7kra). So **absence of a valid result.json can NEVER read "done" or
+ *     "failed"** — that gate is preserved verbatim.
+ *
+ *  2. LIVENESS — when the worker has NOT completed (no valid result.json), the old code flattened
+ *     every live state to "running". That is the sparkle-0an0 bug: an orchestrator polling
+ *     list_workers then could not tell a worker mid-cargo-test from one blocked on a session limit,
+ *     waiting on an on-screen prompt, or awaiting approval — so a `waiting` worker whose PR sat green
+ *     and mergeable read as `running` and its work was stranded. So instead of flattening, we surface
+ *     the live TAB status (`working` | `idle` | `waiting` | `approval` | `blocked` | …) VERBATIM,
+ *     with two guards that keep the 7kra invariant intact:
+ *       - The live TAB status `"done"` is remapped to `"idle"` (turn ended, nothing landed): a
+ *         result-less worker must never surface the terminal `"done"` token this way. `"failed"` is
+ *         not an `AgentTabStatus` (the runtime crash state is `"errored"`), so no such collision
+ *         exists on the failure side.
+ *       - No known live status → "running" — we know only that it has not completed. */
+function workerStatus(
+  resultRaw: string | null | undefined,
+  liveStatus: AgentTabStatus | undefined,
+): WorkerStatus {
+  if (resultRaw != null) {
+    try {
+      return parseWorkerResult(resultRaw).status === "failed" ? "failed" : "done";
+    } catch {
+      // The file exists but is not a valid result yet (e.g. a partial write caught mid-flush). An
+      // invalid completion record is NOT completion → fall through to the live-status path rather
+      // than declare a false terminal that could license a premature spin_down.
+    }
   }
+  // No valid result.json → the worker has NOT completed. Surface its live state so a stalled worker
+  // is distinguishable from a busy one, but never emit a terminal verdict from here (sparkle-7kra).
+  if (liveStatus === undefined) return "running";
+  if (liveStatus === "done") return "idle"; // turn ended, nothing landed — NOT the terminal "done"
+  return liveStatus;
 }
 
 async function runSpawn(req: OrchestrationRequest): Promise<void> {
@@ -707,7 +733,11 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
           workerId: a.id,
           branch: a.branch ?? "",
           worktree: a.worktreePath ?? "",
-          status: workerStatus(resultRaw),
+          // Pair the result.json completion verdict with the worker's LIVE tab status so a
+          // result-less worker reports its real state (working / idle / waiting / blocked / approval)
+          // instead of a flat "running" (sparkle-0an0). The live status map is per-window and
+          // live-only; an unknown entry (worker not open here) falls back to "running".
+          status: workerStatus(resultRaw, useRuntimeStore.getState().status[a.id]),
           // The bead this worker owns. Without it the roster is N ANONYMOUS workers: a resumed
           // orchestrator cannot tell which unit any live worker is already handling, so it
           // re-dispatches everything still showing in `bd ready`. Omitted (rather than "") when the
