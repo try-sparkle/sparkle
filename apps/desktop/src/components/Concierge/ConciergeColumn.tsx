@@ -26,6 +26,7 @@ import { WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
+import { FleetNotices } from "./FleetNotices";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
@@ -574,6 +575,23 @@ export function ConciergeColumn({
           GATED ON THE AI LOCK for the same reason the thread is: when the paid half is switched off,
           unbought, or out of credits, there is no brain to be unresponsive and ConciergeAiLocked has
           already said the true thing about why. */}
+      {/* WHAT IS WRONG ACROSS THE FLEET — quota walls, shutdown casualties, escalated goals, agents
+          safe to retire, and standing duties that have stopped. Every one of those was already
+          detected somewhere and none of it was aggregated, so answering "which agents are stuck"
+          meant reading rows one at a time (Concierge/FleetNoticeCard).
+
+          Mounted DIRECTLY, like `ConciergeUnavailable` below and `PresenceSlider`, because it takes
+          no data from the host — it reads its own stores.
+
+          NOT gated on the AI lock, unlike everything else in this stack. It needs no model and no
+          network, so it is the one row here that still works when the paid half is off, unbought or
+          out of credits — which is exactly the state a quota-blocked fleet is in. Gating it would
+          hide the report precisely when it is the only report available.
+
+          FIRST in this stack, i.e. furthest from the composer: the rows below get more immediate as
+          they approach it ("may I do this at all?" then "this is about to go out"), and a briefing
+          about the fleet is the least immediate thing here. It renders null when nothing is wrong. */}
+      <FleetNotices />
       {!aiLock && <ConciergeUnavailable />}
       {approvalSlot}
       {/* Armed sends counting down (Concierge/CountdownBanner), directly above the box — the last

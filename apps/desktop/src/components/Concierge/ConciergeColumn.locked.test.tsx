@@ -16,6 +16,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("../../useFleetNotices", () => ({ useFleetNotices: vi.fn(() => []) }));
 vi.mock("../LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("../BalanceBadge", () => ({ BalanceBadge: () => null }));
 // AiLockedNotice's checkout rails reach for Tauri; its own test owns that behavior.
@@ -28,6 +29,8 @@ vi.mock("../../services/creditsMenuApi", () => ({
   lastCheckoutUrl: vi.fn(() => null),
 }));
 
+import { useFleetNotices } from "../../useFleetNotices";
+import { evaluateFleetConditions } from "@sparkle/core";
 import { ConciergeColumn } from "./ConciergeColumn";
 import { CONCIERGE_AI_PITCH } from "./ConciergeAiLocked";
 import { CONCIERGE_UNAVAILABLE_TESTID } from "./ConciergeUnavailable";
@@ -86,6 +89,34 @@ function makeConciergeUnavailable() {
 }
 
 describe("ConciergeColumn with AI enhancements locked — the FREE half stays live", () => {
+  // THE FLEET NOTICE IS FREE TOO, and it matters most in exactly this state. Its neighbours in that
+  // stack (ConciergeUnavailable, MountedNotice) render only when the gate is OPEN, because with no
+  // brain there is nothing to be unresponsive about. This row needs no model and no network, so it
+  // is the one thing in the column that still reports when the paid half is off, unbought, or out
+  // of credits — which is the same condition a quota-blocked fleet is in. Gating it would hide the
+  // report precisely when it is the only report available.
+  it("still renders the fleet notice, which needs no brain to compute", () => {
+    vi.mocked(useFleetNotices).mockReturnValue(
+      evaluateFleetConditions(
+        [
+          {
+            agentId: "a",
+            label: "Agent a",
+            quota: {
+              message: "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
+              resetAt: Date.now() + 4 * 60 * 60 * 1000,
+              resetParsed: true,
+            },
+          },
+        ],
+        Date.now(),
+      ),
+    );
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    expect(screen.getByTestId("fleet-notice")).toBeTruthy();
+    expect(screen.getByText(/Restarting them does not help/)).toBeTruthy();
+  });
+
   it("still renders the status readout: the needs-you count, on the red pill", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
     // THE COUNT SURVIVES THE GATE. It is derived from local app state and costs nothing to run, so
