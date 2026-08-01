@@ -417,6 +417,14 @@ function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: 
       return approving
         ? line`${a} is waiting on a choice on screen — open it and pick.`
         : line`${a} is waiting on a choice on screen, so I didn't send that to it as a message — open ${a} and pick.`;
+    // A full-screen app owns the screen, so the write would have been EXECUTED as editor/pager
+    // commands. Name the app class rather than the buffer ("alternate screen" means nothing to the
+    // person reading), and name the ONE exit — leaving it. Deliberately no "try rephrasing":
+    // rewording changes nothing about a screen that executes whatever arrives.
+    case "alternate-screen":
+      return approving
+        ? line`${a} is in a full-screen app right now, so I didn't send the approval — anything typed there would run as commands. Quit it and approve again.`
+        : line`${a} is in a full-screen app right now (an editor or pager), so I didn't send that — anything typed there would run as commands. Quit it and send again.`;
     case "unauthorized":
       // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
       // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,

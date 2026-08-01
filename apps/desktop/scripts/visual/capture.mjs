@@ -126,7 +126,10 @@ async function main() {
           await page.setViewport({ width, height, deviceScaleFactor: scale });
           await page.addInitScript(TAURI_SHIM);
           await page.addInitScript(FROZEN_CLOCK);
-          await page.navigate(`${server.url}/?visual=1`);
+          // `?visual=1`, PLUS whatever extra state this surface needs the FIXTURE to seed. A
+          // surface that needs two pairs (`workspace-wired-left`) cannot get them from a step —
+          // steps run after mount, and the pair layout is decided by the seed — so it asks here.
+          await page.navigate(`${server.url}/?visual=1${surface.query ? `&${surface.query}` : ""}`);
           // Media emulation FIRST (the app reads prefers-color-scheme as it mounts), then the
           // steps that wait for the shell, and only then applyTheme — which asserts the attribute
           // holds. See applyTheme's docblock for why the old order could not have worked.

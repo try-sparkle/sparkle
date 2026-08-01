@@ -243,6 +243,17 @@ describe("surface registry", () => {
     expect(THEMES).toEqual(["light", "dark"]);
   });
 
+  // THE SURFACE THAT NEEDS TWO PAIRS MUST ASK FOR THEM. Without `?pairs=2` the fixture seeds one
+  // project, the left pair has no selected agent, `useEffectiveWired` refuses to project that side,
+  // and this surface photographs the unwired app — which is exactly what it did for its whole life.
+  it("asks the fixture for the second pair on the surface that needs it", () => {
+    expect(surfaceByName("workspace-wired-left").query).toBe("pairs=2");
+    // …and no other surface opens a second pair, or every other baseline would move.
+    for (const s of SURFACES.filter((x) => x.name !== "workspace-wired-left")) {
+      expect(s.query, `${s.name} must not change the fixture`).toBeUndefined();
+    }
+  });
+
   it("gives every surface app steps, and a mock half or an explicit null", () => {
     for (const s of SURFACES) {
       expect(Array.isArray(s.app.steps), `${s.name} has app steps`).toBe(true);
@@ -259,15 +270,9 @@ describe("surface registry", () => {
   });
 
   it("resolves and filters surfaces by name", () => {
-    // An unfiltered run takes the DEFAULT set. A surface the fixture cannot reach is held out of it
-    // rather than failing every run — but naming it still selects it, so nothing is hidden from
-    // someone who asks. See `excludeFromDefault` in the registry.
-    const defaults = SURFACES.filter((s) => !s.excludeFromDefault);
-    expect(selectSurfaces(null)).toHaveLength(defaults.length);
-    expect(selectSurfaces(null).map((s) => s.name)).not.toContain("workspace-wired-left");
-    expect(selectSurfaces("workspace-wired-left").map((s) => s.name)).toEqual([
-      "workspace-wired-left",
-    ]);
+    expect(selectSurfaces(null)).toHaveLength(SURFACES.length);
+    // Back in the default set now that the fixture can seed a left pair via `?pairs=2`.
+    expect(selectSurfaces(null).map((s) => s.name)).toContain("workspace-wired-left");
     expect(selectSurfaces("agent-sidebar").map((s) => s.name)).toEqual(["agent-sidebar"]);
     expect(selectSurfaces("agent-sidebar, concierge-column")).toHaveLength(2);
     expect(surfaceByName("agent-sidebar").name).toBe("agent-sidebar");

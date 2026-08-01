@@ -815,6 +815,13 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // falling into the bare "Not sent." default if a caller ever sets it.
     case "addressed-at-picker":
       return "Not sent: the agent is waiting on a choice on screen, so a message can't go in right now.";
+    // The remedy is the SAME whoever is reading: nothing may be written to a full-screen app,
+    // because it would run as editor/pager commands. The exit is for the human to leave that app —
+    // there is no wording of the message that makes it safe, so this line offers no alternative
+    // phrasing to try (AGENTS.md: a remedy string is an instruction, and must be safe under the
+    // same conditions that triggered the refusal).
+    case "alternate-screen":
+      return "Not sent: the agent is in a full-screen app (an editor or pager), where typed text would run as commands.";
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
     default: {

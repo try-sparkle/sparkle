@@ -191,6 +191,12 @@ export interface PassGate {
    *  "working" means an interactive session is actively producing output; a pass must not
    *  share the worktree with it. */
   paneStatus: AgentTabStatus | undefined;
+  /** Epoch ms at which the pane's CURRENT unbroken run of `working` began, or null when it is not
+   *  working / nothing has sampled it (see the `notePaneStatus` latch). Only used to tell a live
+   *  session apart from a wedged one; a null reads as "just started", which is the conservative
+   *  direction — it holds the pass and reports the plain `pane-busy`. Omitted by callers that
+   *  don't model the distinction. */
+  paneBusySince?: number | null;
   /** Epoch ms at which the connectivity re-attempt comes due, or null when none is armed
    *  (module-level latch below). Omitted by callers that don't model retries. */
   retryDueAt?: number | null;
@@ -207,6 +213,21 @@ export interface PassGate {
 export function isHourlySlotDue(lastRunAt: number, now: number): boolean {
   return now - lastRunAt >= IMPROVEMENT_INTERVAL_MS;
 }
+
+/** How long a `working` pane is read as a LIVE session rather than a wedged one.
+ *
+ *  Three whole slots. One slot lost to a pane is ordinary — an interactive session that outlasts a
+ *  tick is exactly what the `pane-busy` hold is for, and the pass genuinely must not share the
+ *  agent worktree with it. Three in a row is not: it means the hourly duty has been silently off
+ *  for the better part of a morning, which is the shape the founder actually hit.
+ *
+ *  IT DOES NOT MAKE THE PASS RUN ANYWAY, AND THAT IS DELIBERATE. Two `claude` processes in one
+ *  worktree is the failure the hold exists to prevent, and a stuck status line is not evidence the
+ *  process is gone — `pane-busy` is set from a tab status, not from a liveness probe, so "it has
+ *  been working a long time" and "nothing is there" are different claims and only the first is in
+ *  evidence. What the bound buys is a hold that stops SOUNDING routine, so the condition can be
+ *  reported and cleared instead of persisting under a sentence nobody re-reads. */
+export const PANE_BUSY_HOLD_LIMIT_MS = 3 * IMPROVEMENT_INTERVAL_MS;
 
 /** How far `hourlySlotStamp` may rewind the stamp to undo a late tick.
  *
@@ -278,6 +299,12 @@ export type PassHoldReason =
   | "already-running"
   /** The Sparkle agent pane is `working`. THE SELF-SUSTAINING ONE — see the header. */
   | "pane-busy"
+  /** The pane has read `working` for longer than {@link PANE_BUSY_HOLD_LIMIT_MS} — i.e. it has
+   *  eaten several whole slots in a row. Still holds the pass (see the constant for why running
+   *  anyway is not the answer), but it is a SEPARATE reason so a surface can escalate it: at
+   *  minute two and at hour thirty `pane-busy` reads identically, and that sameness is what let
+   *  the duty stop forever without anything sounding different. */
+  | "pane-wedged"
   /** The scheduler has not seeded its clock yet (first tick after launch). */
   | "clock-unseeded"
   /** Known-offline: the slot is held rather than spent on a guaranteed connectivity failure. */
@@ -291,7 +318,16 @@ export type PassHoldReason =
 export function passHoldReason(gate: PassGate): PassHoldReason | null {
   if (gate.consent === "never") return "consent-off";
   if (gate.passRunning) return "already-running";
-  if (gate.paneStatus === "working") return "pane-busy";
+  if (gate.paneStatus === "working") {
+    // Bounded, not unbounded. A pane that has read `working` across several consecutive slots is
+    // no longer distinguishable from a live session by status alone — and the plain `pane-busy`
+    // string is the same sentence either way, so the hold announces itself identically whether it
+    // is two minutes or two days old. Past the limit it becomes its own reason, which is the half
+    // of this that a caller can act on.
+    const since = gate.paneBusySince;
+    const wedged = since != null && gate.now - since >= PANE_BUSY_HOLD_LIMIT_MS;
+    return wedged ? "pane-wedged" : "pane-busy";
+  }
   if (gate.lastRunAt === null) return "clock-unseeded"; // scheduler seeds on its first tick
   // Known-offline: hold the slot rather than spend it. A pass needs the network from its very
   // first step, so launching one now buys a guaranteed connectivity failure — and because the
@@ -534,6 +570,34 @@ let retryUsed = false;
 /** Epoch ms of the armed connectivity re-attempt, or null (read by the scheduler's gate). */
 export function passRetryDueAt(): number | null {
   return retryDueAt;
+}
+
+/** When the pane's CURRENT unbroken run of `working` began, or null when it is not working.
+ *  Module-level for the same reason as the two latches above: it describes this webview's own
+ *  observation, and a reload should start the clock over rather than inherit a stale one. */
+let paneBusySince: number | null = null;
+
+/** Sample the pane's status and keep the latch above honest; returns the (possibly new) start.
+ *
+ *  The status stores carry no timestamp of their own, so SOMETHING has to observe the transition —
+ *  this is that seam, and the scheduler's tick is the sampler (it already runs on a fixed interval
+ *  and already reads the status for the gate). A status that is not `working` clears the latch, so
+ *  a pane that finishes and starts again is a NEW run and not a continuation of the old one; that
+ *  matters because the wedge this bound is looking for is one unbroken run, not busy-in-aggregate. */
+export function notePaneStatus(status: AgentTabStatus | undefined, now: number): number | null {
+  if (status !== "working") paneBusySince = null;
+  else if (paneBusySince === null) paneBusySince = now;
+  return paneBusySince;
+}
+
+/** Read the latch without disturbing it — for surfaces that render the hold but do not sample. */
+export function paneBusySinceAt(): number | null {
+  return paneBusySince;
+}
+
+/** Test seam: forget the pane-busy run, as a fresh webview would. */
+export function resetPaneBusyForTests(): void {
+  paneBusySince = null;
 }
 
 /** Test seam: forget any armed retry, as a fresh webview would. */

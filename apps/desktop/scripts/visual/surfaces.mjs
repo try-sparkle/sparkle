@@ -15,6 +15,9 @@
  *   { clickText: {sel,t} } click the first match whose textContent is exactly `t` (trimmed)
  *   { setAttr: {sel,name,value} }  set an attribute (how MOCK states are reached)
  *   { cable: "off"|"left"|"right" } patch the real cable store (how APP states are reached)
+ *
+ * A surface may also carry `query`: extra URL parameters appended after `?visual=1`, for state the
+ * FIXTURE must seed before mount (the two-pair cockpit) and which therefore cannot come from a step.
  */
 
 /** Everything in the mock page that is scaffolding rather than design, hidden before capture. */
@@ -38,23 +41,15 @@ export const SURFACES = [
       clip: "#shell",
     },
   },
-  // ── NOT IN THE DEFAULT SET: THIS STATE IS UNREACHABLE WITH THE CURRENT FIXTURE ────────────────
-  //
-  // `visualFixtures` seeds ONE project and leaves `leftProjectId` / `pairAssignment` empty, so the
-  // left pair has no project and therefore no selected agent. `useEffectiveWired` requires one
-  // before it will project a side, so `patch("left")` is a no-op as far as the shell is concerned
-  // and this surface captured the UNWIRED app — byte-identical to `workspace-unwired`, silently,
-  // for its whole life. Now that the `cable` step verifies the shell agrees, keeping it in the
-  // default set would fail every `visual:capture` run for a reason that has nothing to do with the
-  // change under test.
-  //
-  // Held here, still addressable by name (`--surfaces=workspace-wired-left`), so it comes back the
-  // moment the fixture can seed a left pair — that is the actual missing piece, not this entry.
-  // Tracked as a bead; see PRD/sparkle/mounted-row-seam.md.
   {
     name: "workspace-wired-left",
-    excludeFromDefault: true,
-    description: "The live cable seated in the LEFT pair. NEEDS A LEFT-PAIR FIXTURE — see above.",
+    // TWO PAIRS, and that is why this entry carries a `query`. The fixture seeds ONE project by
+    // default, so the left pair had no project, no selected agent, and therefore no side for
+    // `useEffectiveWired` to project — this surface photographed the UNWIRED app, byte-identical to
+    // `workspace-unwired`, for its whole life. `?pairs=2` seeds the second project; it is opt-in
+    // because seeding it always would re-lay-out every OTHER surface and invalidate their baselines.
+    query: "pairs=2",
+    description: "The live cable seated in the LEFT pair (two-pair cockpit).",
     app: {
       steps: [
         { waitFor: "[data-testid=workspace-shell]" },
@@ -152,10 +147,7 @@ export function surfaceByName(name) {
  * Pure, so the CLI parsing is unit-testable without a browser.
  */
 export function selectSurfaces(filter) {
-  // An unfiltered run takes the DEFAULT set, not literally everything: a surface whose state the
-  // fixture cannot reach would otherwise fail every run. Naming it explicitly still selects it, so
-  // the exclusion hides nothing from someone who asks for it.
-  if (!filter) return SURFACES.filter((s) => !s.excludeFromDefault);
+  if (!filter) return SURFACES;
   return filter
     .split(",")
     .map((s) => s.trim())

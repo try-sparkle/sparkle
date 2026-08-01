@@ -29,6 +29,7 @@ import { buildFleetSnapshots, buildStandingDuties, PASS_HOLD_TEXT } from "./serv
 import {
   IMPROVEMENT_INTERVAL_MS,
   isPassRunning,
+  paneBusySinceAt,
   passHoldReason,
   passRetryDueAt,
 } from "./services/improvementPass";
@@ -84,6 +85,10 @@ export function improvementHoldText(now: number): string | undefined {
     now,
     passRunning: isPassRunning(),
     paneStatus: useRuntimeStore.getState().status[SPARKLE_AGENT_ID],
+    // READ, not sampled — the scheduler's tick owns the latch. A render must not start the clock,
+    // or the card would reset the pane's age every time it re-rendered and the wedge would never
+    // age at all. Before the first tick this is null, which reads as the plain `pane-busy`.
+    paneBusySince: paneBusySinceAt(),
     retryDueAt: passRetryDueAt(),
     isOnline: useConnectionStore.getState().isOnline,
   });

@@ -41,6 +41,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
+import { useUiStore } from "../stores/uiStore";
 import { useDictationStore } from "../stores/dictationStore";
 import { devBypassAuthEnabled } from "./devBypassAuth";
 
@@ -65,6 +66,29 @@ export function visualFixturesRequested(search: string): boolean {
 }
 
 export const FIXTURE_PROJECT_ID = "visual-fixture-project";
+
+/** The second project, seeded onto the LEFT pair only when `?pairs=2` is asked for. */
+export const FIXTURE_LEFT_PROJECT_ID = "visual-fixture-project-left";
+
+/** The left project's selected row — the one whose seam a left-pair capture is taken to inspect. */
+const LEFT_SELECTED_ROW_ID = "vfx-left-agent-1";
+
+/** The query parameter that opens the SECOND pair: `?pairs=2`. */
+export const VISUAL_PAIRS_PARAM = "pairs";
+
+/**
+ * How many pairs the capture wants. Default 1 — the single-pair cockpit every existing surface is
+ * baselined against, which must not move.
+ *
+ * OPT-IN, and that is the whole design constraint. `workspace-wired-left` needs a project on the
+ * left pair (`useEffectiveWired` refuses to project a side whose far end has no selected agent), but
+ * seeding one unconditionally opens a second pair and re-lays-out EVERY other surface — so the
+ * fixture would fix one capture by invalidating the baselines of all the rest. A parameter keeps the
+ * default seed byte-identical and lets exactly the surfaces that need two pairs ask for them.
+ */
+export function visualPairCount(search: string): 1 | 2 {
+  return new URLSearchParams(search).get(VISUAL_PAIRS_PARAM) === "2" ? 2 : 1;
+}
 
 /** One agent row's worth of fixture, flattened so the table below reads as a spec. */
 interface Row {
@@ -312,6 +336,47 @@ export function buildVisualFixture(): {
 }
 
 /**
+ * The LEFT pair's project. Deliberately small — three rows, one selected — because its job is to
+ * make the left pair REAL (a project with a selected agent, so the cable can seat there), not to
+ * re-photograph the whole sidebar from the other side.
+ *
+ * Ids are prefixed so they cannot collide with the right project's; a duplicate agent id would put
+ * two rows in the roster under one key and make the capture quietly wrong rather than fail.
+ */
+export function buildLeftPairFixture(): {
+  project: Project;
+  status: Record<string, AgentTabStatus>;
+  workflowStage: Record<string, WorkflowStageId>;
+} {
+  const iso = new Date(FIXTURE_NOW).toISOString();
+  const rows: Row[] = ROWS.slice(0, 3).map((r, i) => ({
+    ...r,
+    id: `vfx-left-agent-${i + 1}`,
+    // Workers point at the RIGHT project's ids otherwise, which would orphan them in this project.
+    parentId: null,
+    kind: "build",
+  }));
+  const project: Project = {
+    id: FIXTURE_LEFT_PROJECT_ID,
+    name: "mobile",
+    rootPath: "/Users/dev/Projects/mobile",
+    defaultBranch: "main",
+    createdAt: iso,
+    lastOpenedAt: iso,
+    agents: rows.map(toAgent),
+    selectedAgentId: LEFT_SELECTED_ROW_ID,
+    freshBuildAgentId: LEFT_SELECTED_ROW_ID,
+  };
+  const status: Record<string, AgentTabStatus> = {};
+  const workflowStage: Record<string, WorkflowStageId> = {};
+  for (const r of rows) {
+    status[r.id] = r.status;
+    workflowStage[r.id] = r.stage;
+  }
+  return { project, status, workflowStage };
+}
+
+/**
  * Seed the stores. No-op unless the dev auth bypass is on, so a normal dev session can never be
  * clobbered by fixtures just because the URL carried a stray parameter.
  *
@@ -365,6 +430,8 @@ export function applyVisualFixtures(
   if (!visualFixturesRequested(search)) return false;
 
   const { project, status, workflowStage } = buildVisualFixture();
+  // The second pair is OPT-IN (`?pairs=2`); see `visualPairCount` for why it cannot be the default.
+  const left = visualPairCount(search) === 2 ? buildLeftPairFixture() : null;
 
   // FIRST — before a single write. See "SAFETY, PART TWO" at the top of this file.
   detachPersistence();
@@ -373,10 +440,28 @@ export function applyVisualFixtures(
   // the non-determinism the fixture exists to avoid. Replaces `projects` outright so a persisted
   // localStorage profile from an earlier run can't leak extra rows into the capture.
   useProjectStore.setState({
-    projects: [project],
+    // The RIGHT project stays first and stays `selectedProjectId`, so the single-pair layout — and
+    // every surface baselined against it — is untouched when `?pairs=2` is absent.
+    projects: left ? [project, left.project] : [project],
     selectedProjectId: project.id,
     removedIds: {},
   });
+
+  // ── THE SECOND PAIR ────────────────────────────────────────────────────────────────────────
+  //
+  // Three ui values, and all three are load-bearing: `pairAssignment` is what `pairCountFor` reads
+  // to decide there are two pairs at all, and `leftProjectId` is what `useEffectiveWired` resolves
+  // the LEFT side's selected agent through — without it, `patch("left")` is a no-op as far as the
+  // shell is concerned and the capture silently photographs an unwired app. That is the exact bug
+  // that let `workspace-wired-left` score the wrong state for its whole life; the harness's `cable`
+  // step now verifies `data-wired` agrees, so this being wrong fails loudly instead.
+  if (left) {
+    useUiStore.setState({
+      openProjectIds: [project.id, left.project.id],
+      pairAssignment: { [left.project.id]: "left" },
+      leftProjectId: left.project.id,
+    });
+  }
 
   // `status` is the only live-only key here — it is never persisted, so it must be written on every
   // boot or the rows render with no dot at all. `workflowStage` and `openAgentIds` ARE persisted
@@ -384,7 +469,11 @@ export function applyVisualFixtures(
   // them is only safe because detachPersistence() ran above. Do NOT drop useRuntimeStore from that
   // loop on the strength of a "live-only" reading of this line — that restores the clobber, this
   // time of the developer's stage watermarks. (roborev 54756)
-  useRuntimeStore.setState({ status, workflowStage, openAgentIds: [] });
+  useRuntimeStore.setState({
+    status: left ? { ...status, ...left.status } : status,
+    workflowStage: left ? { ...workflowStage, ...left.workflowStage } : workflowStage,
+    openAgentIds: [],
+  });
 
   // The offline banner is real UI that pushes the whole workspace down, and a headless browser
   // with no reachable probe endpoint always shows it. The mock has no such banner, so leaving it

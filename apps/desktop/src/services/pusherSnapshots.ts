@@ -171,6 +171,8 @@ export const PASS_HOLD_TEXT: Record<PassHoldReason, string> = {
   "consent-off": "improvement consent is set to never",
   "already-running": "a pass is already in flight",
   "pane-busy": "the Sparkle agent pane reads 'working' — which also prevents the next tick, so this one does not clear itself",
+  "pane-wedged":
+    "the Sparkle agent pane has read 'working' for over three hours — the hourly duty has been off that whole time, and it will not clear itself: interrupt or restart that pane",
   "clock-unseeded": "the scheduler has not seeded its clock yet",
   offline: "this machine is offline",
 };

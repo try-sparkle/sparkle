@@ -9,6 +9,7 @@ import {
   IMPROVEMENT_TICK_MS,
   isHourlySlotDue,
   isPassRunning,
+  notePaneStatus,
   passRetryDueAt,
   runImprovementPass,
   shouldRunImprovementPass,
@@ -23,6 +24,11 @@ export function useImprovementScheduler(enabled: boolean) {
     if (!enabled) return;
     const tick = () => {
       const settings = useSettingsStore.getState();
+      // Sample the pane BEFORE any early return: this tick is the only regular observer of the
+      // pane's status, and a latch that only advanced on ticks that got as far as the gate would
+      // never age past the first hold — which is the one measurement the wedge bound needs.
+      const paneStatus = useRuntimeStore.getState().status[SPARKLE_AGENT_ID];
+      const paneBusySince = notePaneStatus(paneStatus, Date.now());
       const consent = settings.sparkleImprovementConsent;
       if (consent === "never") return;
       // First-ever tick with consent active: seed the clock instead of running, so the first
@@ -37,7 +43,8 @@ export function useImprovementScheduler(enabled: boolean) {
         lastRunAt: settings.improvementLastRunAt,
         now,
         passRunning: isPassRunning(),
-        paneStatus: useRuntimeStore.getState().status[SPARKLE_AGENT_ID],
+        paneStatus,
+        paneBusySince,
         // A pass that died because the network was unreachable never ran; it gets ONE early
         // re-attempt instead of forfeiting the slot (improvementPass.ts owns the latch).
         retryDueAt: passRetryDueAt(),

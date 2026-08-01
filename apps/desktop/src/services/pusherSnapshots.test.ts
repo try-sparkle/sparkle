@@ -251,6 +251,15 @@ describe("standing duties", () => {
   // know it is self-sustaining will wait for it to clear.
   it("spells out that the busy-pane hold does not clear itself", () => {
     expect(PASS_HOLD_TEXT["pane-busy"]).toMatch(/does not clear itself/);
+    expect(PASS_HOLD_TEXT["pane-wedged"]).toMatch(/will not clear itself/);
+  });
+
+  // The escalated arm has to carry the two things the ordinary one cannot: that the duty has been
+  // off for a long time, and what to DO. Without an action it is a louder version of the same
+  // sentence nobody acted on, which is the failure it was added for.
+  it("tells the reader how long the duty has been off, and what to do about it", () => {
+    expect(PASS_HOLD_TEXT["pane-wedged"]).toMatch(/three hours/);
+    expect(PASS_HOLD_TEXT["pane-wedged"]).toMatch(/interrupt or restart/);
   });
 
   // EXHAUSTIVE. Typing the record on `PassHoldReason` makes a missing arm a compile error, and this
@@ -266,6 +275,7 @@ describe("standing duties", () => {
       "consent-off",
       "offline",
       "pane-busy",
+      "pane-wedged",
     ]);
   });
 });

@@ -75,6 +75,7 @@ import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
 import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
+import { getAgentViewport } from "./terminalViewport";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useProjectStore } from "../stores/projectStore";
 import { usePromptHistoryStore } from "../stores/promptHistoryStore";
@@ -95,6 +96,8 @@ export type ConciergeDispatchPath =
   | "abandoned" // the pane closed or errored while the send was held (NOT delivered)
   | "agent-failed" // the pane GAVE UP (spawn error / Claude missing) — Retry is the remedy (NOT delivered)
   | "cloud-agent" // the target runs in the cloud — there is no local PTY to write to (NOT delivered)
+  | "alternate-screen" // a full-screen app (vim/less/htop) owns the screen, which would EXECUTE the
+                       // write as commands (refused — see the guard in dispatchConciergeAnswer)
   | "unauthorized" // no valid DispatchAuthority — nobody declared why this may be sent (NOT delivered)
   | "pty-gone"; // the agent's PTY was dead (answer NOT delivered)
 
@@ -368,6 +371,30 @@ export async function dispatchConciergeAnswer(
   // front with its own path beats the lie "its terminal has closed" (roborev 46916). Wiring a
   // cloud input path is tracked separately; until then the box is honest about the limit.
   if (isCloudAgent(agentId)) return { ok: false, path: "cloud-agent", agentId };
+  // ══ THE SCREEN GUARD LIVES HERE, NOT IN EACH CALLER ═════════════════════════════════════════════
+  // Every door into a local PTY in this app comes through this function — the concierge composer's
+  // two gestures, the concierge's own `send_to_agent_terminal` tool, the nudge Approve relay, and
+  // the goal-continuation auto-resume. Until now the only screen fact it read was "is a picker
+  // live", so a write into an agent sitting in `vim`/`less`/`htop` was pasted AND submitted, where
+  // the alternate-screen app reads it as COMMANDS rather than as input. That guard did get built —
+  // twice — but each time in a CALLER (dictation, then the composer), which is why the third and
+  // fourth callers never inherited it. Putting it at the chokepoint means the next caller does.
+  //
+  // ONLY the alternate-buffer refusal is taken here, deliberately — not the whole of
+  // `terminalWriteRefusal`:
+  //   • `no-viewport` (the terminal isn't mounted in this window) is a LEGITIMATE state for several
+  //     callers — an `@Name` address at an agent whose pane is elsewhere, an auto-resume with no
+  //     window open at all — so refusing it here would break shipped paths to guard a screen nobody
+  //     is looking at. The callers that must refuse it already weigh it themselves (ConciergeHost
+  //     refuses a MOUNT on it; dictation treats it as fatal).
+  //   • `awaiting-input` is the picker case, which this function does not refuse but ANSWERS, a few
+  //     lines down, when the text maps to an option. Hoisting it would break that.
+  // Alternate-screen is the one refusal that is unconditionally right for every caller: no write of
+  // any kind belongs on that screen, whoever authored it.
+  if (getAgentViewport(agentId)?.alternateBuffer) {
+    log.warn("concierge", "refused a write into a full-screen app", { agentId });
+    return { ok: false, path: "alternate-screen", agentId };
+  }
   const options = liveOptionsFor(agentId);
 
   if (options.length > 0) {

@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { PASS_HOLD_TEXT } from "./pusherSnapshots";
 import {
+  notePaneStatus,
+  paneBusySinceAt,
+  PANE_BUSY_HOLD_LIMIT_MS,
+  resetPaneBusyForTests,
   hourlyMissionPrompt,
   hourlySlotStamp,
   IMPROVEMENT_INTERVAL_MS,
@@ -359,11 +364,96 @@ describe("passHoldReason", () => {
       gate({ consent: "never" }),
       gate({ passRunning: true }),
       gate({ paneStatus: "working" }),
+      gate({ paneStatus: "working", paneBusySince: T - PANE_BUSY_HOLD_LIMIT_MS }),
       gate({ lastRunAt: null }),
       gate({ isOnline: false }),
     ]) {
       expect(passHoldReason(g)).not.toBeNull();
       expect(shouldRunImprovementPass(g)).toBe(false);
     }
+  });
+
+  // ── THE BOUND ON THE SELF-SUSTAINING HOLD ──────────────────────────────────────────────────────
+  // The failure this exists for is silence, not a wrong boolean: a wedged pane held the hourly duty
+  // for a whole morning while the only thing describing it read exactly the same as a two-minute
+  // interactive session. So the assertion that matters is that the REASON changes with age — a test
+  // that only re-checked `shouldRunImprovementPass(...) === false` would have passed before this
+  // existed, since the pass was held either way.
+  describe("a pane that has been working for several slots", () => {
+    const working = (sinceMsAgo: number) =>
+      gate({ paneStatus: "working" as const, paneBusySince: T - sinceMsAgo });
+
+    it("escalates to pane-wedged past the limit, and stays pane-busy under it", () => {
+      expect(passHoldReason(working(PANE_BUSY_HOLD_LIMIT_MS - 1))).toBe("pane-busy");
+      expect(passHoldReason(working(PANE_BUSY_HOLD_LIMIT_MS))).toBe("pane-wedged");
+      expect(passHoldReason(working(4 * PANE_BUSY_HOLD_LIMIT_MS))).toBe("pane-wedged");
+    });
+
+    // Escalating must not become a way to run: two `claude` processes in one worktree is the exact
+    // failure the hold prevents, and a stuck status line is not evidence the process is gone.
+    it("still holds the pass", () => {
+      expect(shouldRunImprovementPass(working(4 * PANE_BUSY_HOLD_LIMIT_MS))).toBe(false);
+      // Even with the connectivity retry armed and long overdue, which short-circuits the hourly wait.
+      expect(
+        shouldRunImprovementPass({ ...working(4 * PANE_BUSY_HOLD_LIMIT_MS), retryDueAt: T - 1 }),
+      ).toBe(false);
+    });
+
+    // A caller that does not model the distinction, and every tick before the latch is first
+    // sampled, must land on the ordinary hold rather than accusing a live session of being wedged.
+    it("reads an unknown start as a fresh hold", () => {
+      expect(passHoldReason(gate({ paneStatus: "working" }))).toBe("pane-busy");
+      expect(passHoldReason(gate({ paneStatus: "working", paneBusySince: null }))).toBe("pane-busy");
+    });
+
+    // The escalation is only worth anything if it SAYS something different — the two strings are
+    // the whole product surface here (see the header above this describe block).
+    it("is quoted to the founder as a different sentence", () => {
+      expect(PASS_HOLD_TEXT["pane-wedged"]).not.toBe(PASS_HOLD_TEXT["pane-busy"]);
+      expect(PASS_HOLD_TEXT["pane-wedged"]).not.toBe("");
+    });
+  });
+});
+
+// The latch is what turns a status with no timestamp into an age. Its one real rule: a run of
+// `working` must be UNBROKEN, because busy-in-aggregate is ordinary and only one continuous run is
+// the wedge.
+describe("notePaneStatus", () => {
+  const T = 1_700_000_000_000;
+  beforeEach(() => resetPaneBusyForTests());
+
+  it("holds the start of an unbroken working run", () => {
+    expect(notePaneStatus("working", T)).toBe(T);
+    expect(notePaneStatus("working", T + 60_000)).toBe(T);
+    expect(paneBusySinceAt()).toBe(T);
+  });
+
+  it("restarts the clock when the run breaks", () => {
+    notePaneStatus("working", T);
+    expect(notePaneStatus("idle", T + 60_000)).toBeNull();
+    expect(notePaneStatus("working", T + 120_000)).toBe(T + 120_000);
+  });
+
+  it("reads a never-opened pane as not working", () => {
+    expect(notePaneStatus(undefined, T)).toBeNull();
+    expect(paneBusySinceAt()).toBeNull();
+  });
+
+  // The end-to-end claim: sampling a pane that never stops working eventually makes the gate say
+  // something new. Nothing else in this file connects the latch to the reason.
+  it("ages a pinned pane into the escalated reason", () => {
+    notePaneStatus("working", T);
+    const at = (now: number) =>
+      passHoldReason({
+        consent: "always",
+        lastRunAt: T - 2 * 60 * 60 * 1000,
+        now,
+        passRunning: false,
+        paneStatus: "working",
+        paneBusySince: notePaneStatus("working", now),
+        isOnline: true,
+      });
+    expect(at(T + IMPROVEMENT_INTERVAL_MS)).toBe("pane-busy");
+    expect(at(T + PANE_BUSY_HOLD_LIMIT_MS)).toBe("pane-wedged");
   });
 });
