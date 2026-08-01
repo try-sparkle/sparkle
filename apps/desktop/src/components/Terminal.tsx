@@ -1075,7 +1075,12 @@ export function Terminal({
     // active toggle) and with no further output still gets drained. settleRepaintPlan keeps the
     // expensive cold repaint to once per poisoning episode (see terminalWebgl.ts).
     const applyRepaintPlan = () => {
-      const plan = settleRepaintPlan(poisonedRef.current, isPaintable());
+      // Gate on isOnScreen(), NOT isPaintable(): a backgrounded pane stays `display: flex` at full
+      // size (paneVisibility.ts hides it with `visibility: hidden`), so `isPaintable()` — which is
+      // just `clientWidth > 0` — is TRUE for it and the plan would `refresh` sixty hidden panes per
+      // settle (bead sparkle-nwpf). `isOnScreen()` adds the `activeRef` half, so a hidden pane
+      // resolves to `skip` (poisoned preserved); the become-active reveal force-repaints on show.
+      const plan = settleRepaintPlan(poisonedRef.current, isOnScreen());
       if (plan.action === "full") forceFullRepaint(webglRef.current, term);
       else if (plan.action === "refresh") term.refresh(0, term.rows - 1);
       // "skip": the pane is hidden (not paintable) — don't spend a refresh on an off-screen pane
