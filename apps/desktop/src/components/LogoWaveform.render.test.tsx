@@ -22,6 +22,7 @@ import { BACKEND_MIC_DENIED } from "../voice/backendVoiceErrors";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useUiStore } from "../stores/uiStore";
+import { PAUSED_WINDOW_CAPTION } from "../voice/dictationCopy";
 import { C } from "../theme/colors";
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
@@ -37,6 +38,14 @@ beforeEach(() => {
     error: null,
     modelProgress: null,
     outOfCreditsNotice: false,
+    // The THIRD fixture to need this (roborev 57291), and the one where it matters most: this file
+    // is the primary home of the ring-vs-caption invariant, so a row passing vacuously here is worth
+    // more than in the two already corrected. Four rows below write `windowFocused: false` /
+    // `focusOwner: "terminal"`, the store is module-level, declaration order is deterministic (no
+    // `sequence.shuffle`), and `test-setup.ts`'s global beforeEach resets only the thread store —
+    // so without this the last describe leaves a pause set for anything appended after it.
+    windowFocused: true,
+    focusOwner: "other",
   });
   // Push to talk is the position that matches the dictation defaults above (armed, not routing), so
   // the health-ladder cases below read exactly as they did before the tray existed. Cases about the
@@ -504,5 +513,66 @@ describe("the ring reflects the CARET, not just the tray — through the compone
     // finish" directly beneath a grey "Microphone: off" ring — the ring denying its own caption,
     // which is the same contradiction shape the window term was added to remove.
     expect(document.body.textContent).not.toMatch(/actively listening/i);
+  });
+});
+
+describe("a background window: every surface says paused, or none of them do", () => {
+  // ── roborev 57117 ─────────────────────────────────────────────────────────────────────────────
+  // The demotion was first applied at ONE call site, which broke the invariant deriveMicPresentation
+  // exists for. This is the NON-TERMINAL case — `focusOwner: "other"`, the DEFAULT — where the ring's
+  // own terminal branch is not taken, so nothing else was demoting it. It is strictly more common
+  // than the terminal case that was tested.
+  const ring = () => screen.getByRole("img", { name: /microphone/i });
+
+  beforeEach(() => {
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      // The per-window blur path deliberately leaves `status` at "listening" — that is exactly why
+      // `status` alone cannot carry the pause and the term had to become its own input.
+      status: "listening",
+      phase: "active",
+      focusOwner: "other",
+      windowFocused: false,
+    });
+  });
+
+  it("does not let the RING claim live capture", () => {
+    render(<LogoWaveform />);
+    expect(ring().getAttribute("aria-label")).not.toMatch(/actively listening/i);
+  });
+
+  it("states the pause POSITIVELY in the caption, not merely the absence of a lie", () => {
+    // Asserted positively so the caption regressing to some OTHER wrong copy is caught too — a
+    // negative regex passes for any string that merely avoids two words.
+    render(<LogoWaveform />);
+    expect(screen.getByText(PAUSED_WINDOW_CAPTION)).toBeTruthy();
+  });
+
+  it("keeps the ring and the caption telling the SAME story", () => {
+    // The invariant itself, asserted as a relationship: whatever the caption says about capture, the
+    // ring must not contradict it. This is the row that fails whichever surface is left un-demoted.
+    render(<LogoWaveform />);
+    const paused = screen.queryByText(PAUSED_WINDOW_CAPTION) !== null;
+    const ringClaimsLive = /actively listening/i.test(ring().getAttribute("aria-label") ?? "");
+    expect(paused && ringClaimsLive).toBe(false);
+  });
+});
+
+describe("the fixture leaves no pause behind (LogoWaveform)", () => {
+  // Declared LAST on purpose — the canary for the reset above. Under a leaked pause this renders
+  // `focusPaused` and the ring reads "Microphone: off", so it fails for a reason unrelated to its
+  // subject. Asserted POSITIVELY (the ring DOES claim live capture), because the negative form is
+  // exactly what would pass vacuously.
+  it("a live Speak ring still reads as actively listening when declared last", () => {
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    // DELIBERATELY does NOT set `windowFocused`/`focusOwner` — it must INHERIT them from the
+    // fixture, or it is not testing the reset at all. Setting them here is what made the first
+    // draft of this canary pass under the very mutant it exists to catch.
+    useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
+    render(<LogoWaveform />);
+    expect(
+      screen.getByRole("img", { name: /microphone/i }).getAttribute("aria-label"),
+    ).toMatch(/actively listening/i);
   });
 });

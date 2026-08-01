@@ -22,21 +22,52 @@ import { usePushToTalk } from "./usePushToTalk";
 import type { MicIntent } from "../components/MicButton";
 
 /**
- * The longest a push-to-talk release will wait for the utterance it captured to finish arriving
- * before sending whatever is in the box.
+ * The absolute longest a push-to-talk release will wait for the utterance it captured to finish
+ * arriving before sending whatever is in the box, no matter what.
  *
- * A BACKSTOP, not a policy — see `endHold`. The wait ends the instant the engine closes the
- * utterance, so this number is only ever reached when that close never arrives at all (a dropped
- * socket, a capture torn down mid-utterance). 1.5s is long enough to cover a normal commit's tail
- * and short enough that a user who hit the failure case is not left staring at a composer that
- * appears to have ignored them.
+ * A BACKSTOP, not a policy — see `endHold`. In the ordinary case the wait ends far sooner, via
+ * {@link QUIET_WINDOW_MS} or a confirmed engine close. This is what fires when NEITHER of those
+ * ever does — a dropped socket, a capture torn down mid-utterance, or content that keeps trickling
+ * in without ever settling. BOUNDED GENEROUSLY, deliberately: the failure this whole file exists to
+ * prevent is losing his words, and a slightly slower send is strictly better than a truncated one
+ * — see the reopening note on the commit that raised this from 1.5s. 4s is long enough to cover
+ * on-device decode latency described as running "hundreds of ms to seconds" behind the audio
+ * (`dictationStore.onDeviceSpeech`), and short enough that a release which genuinely never settles
+ * is not left hanging indefinitely.
  *
  * IT IS ALSO NEVER REACHED BY A HOLD THAT CAPTURED NOTHING. A silent hold has no utterance to wait
- * for, so it does not enter the wait at all — see `endHold`'s pending test. That matters because a
+ * for, so it does not enter the wait at all — see `endHold`'s owed test. That matters because a
  * hold whose only content is TYPED text is a first-class case here, not an edge one, and making it
  * sit out a cap would make the send feel broken.
  */
-export const PARTIAL_SETTLE_CAP_MS = 1_500;
+export const PARTIAL_SETTLE_CAP_MS = 4_000;
+
+/**
+ * How long the composer's own text — and the live interim, on the cloud path — has to sit
+ * COMPLETELY UNCHANGED before a release treats the utterance as settled.
+ *
+ * THIS IS THE PRIMARY SIGNAL, not a fallback bolted onto the engine-close confirmation below. The
+ * founder tested a shipped build carrying the fully engine-close-based design (`owed`/`deferred`,
+ * hardened across three roborev passes and a green suite) and it STILL cut off his last words —
+ * proof that trusting `speechEndSeq` alone, however carefully gated, was not sufficient in practice.
+ * A production log grep for `dictation: emit final` found nothing, which is not conclusive on its
+ * own (`emit_speech_end` deliberately logs nothing at all — see dictation.rs — so its absence from
+ * the log proves nothing either way), but the founder's first-hand report is not a log line to
+ * second-guess. Watching the box's own text settle sidesteps the entire question of whether any
+ * particular Rust signal fired, ordered correctly, or was delivered at all: it only asks "is
+ * anything still landing", which is directly observable regardless of the mechanism behind it.
+ *
+ * 500ms is generous relative to how often committed segments actually arrive mid-utterance (Deepgram
+ * commits roughly every clause) so it does not mistake an ordinary breath for the end, while still
+ * resolving well inside {@link PARTIAL_SETTLE_CAP_MS} once things actually go quiet.
+ */
+const QUIET_WINDOW_MS = 500;
+
+/** How often the stable-partial detector re-checks the composer's text and the live interim. Well
+ *  under {@link QUIET_WINDOW_MS} so the quiet window is measured precisely, and cheap enough (a
+ *  string comparison and a ref read) to run on a plain interval rather than needing its own event
+ *  source — the composer's text is React state, not something this hook can `.subscribe()` to. */
+const STABLE_PARTIAL_POLL_MS = 100;
 
 export interface UseSendModeArgs {
   /**
@@ -51,6 +82,13 @@ export interface UseSendModeArgs {
    * one that captured no speech at all.
    */
   onSend: () => boolean;
+  /**
+   * The composer's CURRENT text — read every render, purely so a release can tell whether the box
+   * is still growing. This is what the stable-partial detector in `endHold` watches; see
+   * {@link QUIET_WINDOW_MS}. Passing the same value on every render is fine — only genuine changes
+   * reset the quiet timer.
+   */
+  composedText: string;
 }
 
 export interface SendModeController {
@@ -64,7 +102,7 @@ export interface SendModeController {
   armed: boolean;
 }
 
-export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
+export function useSendMode({ onSend, composedText }: UseSendModeArgs): SendModeController {
   const mode = useUiStore((s) => s.conciergeSendMode);
   const setStoredMode = useUiStore((s) => s.setConciergeSendMode);
   // The store's MIRROR of the focus owner, not a live DOM read. That is the right choice for paint
@@ -178,6 +216,12 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
 
   const onSendRef = useRef(onSend);
   onSendRef.current = onSend;
+
+  // Mirrors `composedText` every render, the same pattern as `onSendRef` — read from inside
+  // `endHold`'s stable-partial poll, which runs on a plain `setInterval` rather than React's
+  // render cycle, so it needs a ref rather than the prop itself.
+  const composedTextRef = useRef(composedText);
+  composedTextRef.current = composedText;
 
   // A release that is waiting on an in-flight partial, so a second gesture (or an unmount) can call
   // it off rather than leaving a send armed against a hold that no longer exists.
@@ -334,15 +378,28 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    * `speech_final` frame and re-arms on the next interim, so at `endpointing=200` a mid-sentence
    * breath produces one while the user is still talking. "A speech-end arrived" therefore does NOT
    * mean the utterance is over — only that SOME clause is, and on the on-device path it can even be
-   * one of SEVERAL still-queued segments. What makes it mean everything captured has landed is
-   * `utterance.owed`, the watch's own counted debt: it reaches zero only once every run's close has
-   * been confirmed against a moment the room was quiet — the same event as the close, or, for the
-   * cloud race where a close can outrun the VAD's slower drop, whatever LATER event first finds the
-   * room quiet. See the watch's own doc for why this has to be an accumulated, counted debt and NOT a
-   * live "is it quiet right now" read: that reopens the bug on the on-device path (quiet-but-still-
-   * decoding) exactly as badly as it reopens it on the cloud path (the confirming close deduped away,
-   * so only the cap would ever fire) — and why a single flag isn't enough either, once a hold can
-   * genuinely owe more than one segment at release time.
+   * one of SEVERAL still-queued segments. `utterance.owed`, the watch's own counted debt, is what
+   * turns a bare close into that judgment: it reaches zero only once every run's close has been
+   * confirmed against a moment the room was quiet.
+   *
+   * IT IS ALSO NOT TRUSTED ALONE ANY MORE, and that is the point of what follows. A build carrying
+   * exactly this design — `owed`/`deferred`, hardened across three roborev passes, a green suite —
+   * shipped and STILL cut off the founder's last words in his own testing. Whatever the exact reason
+   * (a log grep for the engine's own "final" language found nothing, though `emit_speech_end`
+   * deliberately never logs at all, so that is not proof either way — see `dictation.rs`), the
+   * lesson is not "find the one true signal": it is that NO single Rust-side signal is safe to trust
+   * exclusively for a failure whose cost is losing someone's words. So `owed` reaching zero is now an
+   * OPTIMIZATION — it can settle the wait quickly when the engine's own close does arrive and confirm
+   * correctly — and the STABLE-PARTIAL poll below is the thing that actually has to work: it does not
+   * ask "did the right event fire", only "has anything changed", which is answerable regardless of
+   * what Rust does or doesn't emit, in what order, or whether IPC delivers it at all.
+   *
+   * THE STABLE-PARTIAL POLL watches two things no capture path can hide behind: the composer's own
+   * text (`composedTextRef`, which only moves when a segment actually commits) and the live interim
+   * (cloud only, catching "still actively transcribing, not committed yet" before it commits at all).
+   * {@link QUIET_WINDOW_MS} of neither changing is treated as settled. Whichever race wins —
+   * `owed` reaching zero, or the poll finding quiet — calls the same `settle()`, so there is exactly
+   * one send regardless of which signal got there first.
    *
    * WE ONLY WAIT WHEN SOMETHING IS ACTUALLY OUTSTANDING — a hold that captured no audio at all
    * (`utterance.owed` stays `0`) never enters the wait.
@@ -350,13 +407,14 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    * THE MACROTASK IS STILL LOAD-BEARING. `submit` reads `text` from React state as of the last
    * render, so the insert triggered by the preceding `dictation://partial` needs its RE-RENDER to
    * have flushed. A microtask is not enough (roborev 56078), so this yields a full macrotask after
-   * the seq bump before sending.
+   * a settle before sending.
    *
-   * THE CAP IS A BACKSTOP, NOT A POLICY, and ON EXPIRY IT SENDS. If the close never arrives — a
-   * dropped socket, a capture torn down mid-utterance — the message must not be stranded, so after
-   * {@link PARTIAL_SETTLE_CAP_MS} it sends what is in the box. Reaching the cap means a possibly
-   * truncated phrase went out, which is still strictly better than swallowing the message; losing
-   * his words is the failure being fixed here and must never be the timeout's behaviour.
+   * THE CAP IS A BACKSTOP, NOT A POLICY, and ON EXPIRY IT SENDS. If nothing ever settles — a dropped
+   * socket, a capture torn down mid-utterance, content that never stops trickling in — the message
+   * must not be stranded, so after {@link PARTIAL_SETTLE_CAP_MS} it sends what is in the box.
+   * Reaching the cap means a possibly truncated phrase went out, which is still strictly better than
+   * swallowing the message; losing his words is the failure being fixed here and must never be the
+   * timeout's behaviour.
    *
    * THE MIC IS DROPPED AFTER THE SEND, not before, and that ordering is load-bearing on this path:
    * `paused` stops routing, so tearing the mic down first can be what prevents the very transcript
@@ -384,18 +442,27 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         finish();
         return;
       }
-      // TWO RACES END THIS WAIT — the utterance closing and the cap expiring — and each needs a
-      // handle on the other to tear it down. Held in one object rather than two `let`s so neither can
-      // be read before it is assigned, with `settled` making the teardown idempotent: both paths can
-      // fire in the same turn, and finishing twice would send the message twice.
-      const wait: { timer?: ReturnType<typeof setTimeout>; unsub?: () => void; settled?: boolean } = {};
+      // THREE RACES END THIS WAIT — the engine's own close, the stable-partial poll finding quiet,
+      // and the cap expiring — and each needs a handle on the others to tear them all down together.
+      // Held in one object rather than several `let`s so nothing can be read before it is assigned,
+      // with `settled` making the teardown idempotent: more than one race can fire in the same turn
+      // (the poll and the cap, if the last tick lands exactly on the boundary), and finishing twice
+      // would send the message twice.
+      const wait: {
+        timer?: ReturnType<typeof setTimeout>;
+        poll?: ReturnType<typeof setInterval>;
+        unsub?: () => void;
+        settled?: boolean;
+      } = {};
       const settle = () => {
         if (wait.settled) return;
         wait.settled = true;
         if (wait.timer) clearTimeout(wait.timer);
+        if (wait.poll) clearInterval(wait.poll);
         wait.unsub?.();
         finish();
       };
+      // ── RACE 1: THE ENGINE'S OWN CLOSE — an optimization, not the safety net. See the doc above. ─
       wait.unsub = useDictationStore.subscribe(() => {
         // The watch's own subscriber (registered earlier, in `onHoldStart`) has already run for this
         // exact event by the time this one does — zustand notifies subscribers in registration order
@@ -408,10 +475,68 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
         // insert's render lands first, then send.
         setTimeout(settle, 0);
       });
+      // ── RACE 2: THE STABLE-PARTIAL POLL — the one that has to work regardless of what Rust does. ─
+      // A plain interval, not a store subscription: the composer's text is React state, not
+      // something in `dictationStore`, so there is no single event source to subscribe to for it.
+      let lastText = composedTextRef.current;
+      let lastInterim = useDictationStore.getState().interim;
+      // ── ALWAYS null: the quiet clock starts ONLY on a POST-RELEASE ARRIVAL ────────────────────
+      // Three revisions of this seed were wrong in the same direction, each one narrower than the
+      // last, so the rule is now the simple one with no seed at all:
+      //   1. `Date.now()` — settled 500ms after release on a pending decode (roborev 57274).
+      //   2. non-empty box — same bug whenever a TYPED draft was present (roborev 57281).
+      //   3. changed-since-hold-start — same bug for MULTI-CLAUSE speech, the ordinary case:
+      //      "let's ship the feature" commits during the hold, "by friday" is still decoding at the
+      //      keyup, so the box HAS changed, the clock starts at the release, and the poll ships the
+      //      prefix (roborev 57287).
+      //
+      // What they share is measuring quiet from a moment when nothing has been heard from yet. And
+      // this poll is reachable ONLY with a run still outstanding — `endHold`'s fast path returns
+      // early on `owed <= 0` — so "we are already waiting on something" is the premise, which makes
+      // treating the release itself as quiet indefensible in every one of these shapes.
+      //
+      // A hold whose transcript never lands now falls to the cap. That is the same trade every one
+      // of these fixes made: slower is strictly better than truncated.
+      let quietSince: number | null = null;
+      wait.poll = setInterval(() => {
+        const text = composedTextRef.current;
+        const interimNow = useDictationStore.getState().interim;
+        if (text !== lastText || interimNow !== lastInterim) {
+          // Something landed or is actively being previewed — the clock (re)starts from here.
+          lastText = text;
+          lastInterim = interimNow;
+          quietSince = Date.now();
+          return;
+        }
+        // ── "NOTHING HAS ARRIVED YET" IS NOT "QUIET" (roborev 57274, High) ────────────────────────
+        // This poll started its clock at the RELEASE and settled on 500ms of no-change, which on the
+        // on-device path is the state a PENDING DECODE looks like: there is no interim at all there,
+        // and `composedText` does not move until the transcript lands. So the poll fired at T+500ms
+        // for a decode the source's own doc describes as running "hundreds of ms to seconds" behind
+        // the audio — sending the short box and stranding the segment that arrived at T+800ms. It
+        // reintroduced the exact truncation this whole mechanism exists to fix, and raising the cap
+        // to 4s could not help because the poll always won the race first.
+        //
+        // So the quiet window is measured from the FIRST POST-RELEASE ARRIVAL, never from the
+        // release itself: until something lands there is no quiet period, because we never left the
+        // gap. `quietSince` stays null and this poll simply does not settle.
+        //
+        // DELIBERATELY NOT ALSO GATED ON `owed > 0`. That was tried and is wrong: this poll exists
+        // precisely to work WITHOUT the engine-close bookkeeping — the founder tested a build whose
+        // drain was fully engine-close-based and it still truncated — so blocking it on that debt
+        // makes the primary mechanism depend on the signal it was written to route around. Two rows
+        // in this file ("with no help from speechEnds") assert that independence directly.
+        //
+        // The cap remains the backstop for "nothing ever arrives at all".
+        if (quietSince === null) return;
+        if (Date.now() - quietSince >= QUIET_WINDOW_MS) settle();
+      }, STABLE_PARTIAL_POLL_MS);
+      // ── RACE 3: THE CAP — the absolute ceiling if NEITHER of the above ever resolves. ────────────
       wait.timer = setTimeout(settle, PARTIAL_SETTLE_CAP_MS);
       settling.current = () => {
-        wait.settled = true; // cancelled, so neither race may finish
+        wait.settled = true; // cancelled, so none of the three races may finish
         if (wait.timer) clearTimeout(wait.timer);
+        if (wait.poll) clearInterval(wait.poll);
         wait.unsub?.();
         settling.current = null;
         stopUtteranceWatch();

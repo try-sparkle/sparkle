@@ -9,14 +9,25 @@
 // modelled as a box these tests can write into the way the real pipeline does, and every row asserts
 // the STRING that went out.
 //
+// THIS FILE WAS REOPENED ONCE ALREADY. A build carrying the fully engine-close-based design in this
+// suite's previous form — `owed`/`deferred`, hardened across three roborev passes, every row here
+// green — shipped and still cut off the founder's words in his own testing (most likely against a
+// stale pre-fix build that hadn't updated yet, but that could not be confirmed with certainty, and
+// the point stands regardless: a green suite is not proof of correct behaviour when every row trusts
+// the same signal). So `useSendMode.ts` no longer trusts `speechEndSeq` alone — a STABLE-PARTIAL
+// detector (composer text + live interim going quiet for `QUIET_WINDOW_MS`) is the primary mechanism
+// now, with the engine's own close kept only as a faster-settling optimization. The rows below cover
+// both, and specifically the scenario named in the reopening: partials that keep growing after
+// release, asserting the sent text is the LAST one's full content, not merely that a send happened.
+//
 // THE PIPELINE IS MODELLED FROM ITS OWN CONTRACT, not invented:
 //   • `dictation://interim` — the live preview, cloud only, replaced in place (dictationStore.interim)
 //   • `dictation://partial` — a COMMITTED segment. useDictation clears the interim and then inserts,
 //     and ComposeBox's `append` puts dictated text at the caret, which follows the text: so a segment
-//     lands AFTER whatever was already in the box.
+//     lands AFTER whatever was already in the box, and (in production) `onComposedText` reports the
+//     new value to `ConciergeHost` synchronously off the same update, re-rendering `useSendMode`.
 //   • `dictation://speech-end` — the engine's endpoint decision, bumping `speechEndSeq`. Rust emits
-//     it AFTER the committed transcript of the same utterance, on both capture paths — that ordering
-//     is the whole reason `endHold` can use it as "everything for this utterance has arrived".
+//     it AFTER the committed transcript of the same utterance, on both capture paths.
 //   • `dictation://speaking` — the raw Silero VAD edge, on both capture paths, with no transcription
 //     latency in front of it.
 // Reproducing the ORDER of those events is what makes these rows mean anything: the failure is an
@@ -43,6 +54,21 @@ import { useUiStore } from "../stores/uiStore";
 import { PARTIAL_SETTLE_CAP_MS, useSendMode } from "./useSendMode";
 import { TALK_KEY } from "./usePushToTalk";
 
+// A local copy of `QUIET_WINDOW_MS`, since useSendMode.ts deliberately does not export it (it is an
+// implementation detail of the drain, not a contract this suite should import and silently follow
+// wherever the source changes it — a mismatch here is exactly what SHOULD fail these rows).
+const QUIET_WINDOW_MS_FOR_TEST = 500;
+/** Mirrors STABLE_PARTIAL_POLL_MS. The tick that OBSERVES an arrival is the one that starts the
+ *  quiet clock, so a wait measured from the commit needs one extra tick of margin. */
+const STABLE_PARTIAL_POLL_MS_FOR_TEST = 100;
+// The stable-partial poll is a plain `setInterval`, so it notices a change on its NEXT tick, not the
+// instant it happens — up to `STABLE_PARTIAL_POLL_MS` (100ms in the source) of detection lag. A row
+// that asserts against the exact millisecond of the quiet window is asserting against a boundary the
+// mechanism does not promise. These give every "not yet" / "now" check real margin on both sides —
+// generously, per the same "bound it generously" reasoning as the production code itself.
+const GROWTH_GAP_MS = 200; // comfortably under the window, even with detection lag on both ends
+const SETTLE_MARGIN_MS = 800; // comfortably over the window, even with detection lag on both ends
+
 /** The composer, as far as a send is concerned: what is in it, and what left it. */
 interface Box {
   /** What the box holds right now — typed, dictated, or both. */
@@ -61,8 +87,28 @@ function setup() {
     box.text = "";
     return true;
   });
-  const view = renderHook(() => useSendMode({ onSend }));
-  return { box, onSend, ...view };
+  // `composedText` is a PROP, not something this hook can read off `box` directly — in production
+  // it is React state in ConciergeHost, re-rendering `useSendMode` on every change. `rerender` is
+  // that re-render; `sync()` is what a test calls after mutating `box.text` directly (a typed draft,
+  // with no dictation event of its own) to make it happen, the same way `ConciergeHost` re-renders
+  // whenever `ComposeBox`'s `onComposedText` fires.
+  const view = renderHook((composedText: string) => useSendMode({ onSend, composedText }), {
+    initialProps: box.text,
+  });
+  const sync = () => act(() => view.rerender(box.text));
+  /**
+   * A COMMITTED segment reaches this window: the interim is cleared and the text is appended to the
+   * box — the two halves of useDictation's `dictation://partial` handler, in its order — and THEN
+   * the composer's own re-render is simulated, the same order production runs in (`ComposeBox.append`
+   * calls `onComposedText` synchronously off the same state update).
+   */
+  const commits = (text: string) =>
+    act(() => {
+      useDictationStore.getState().setInterim("");
+      box.text = box.text ? `${box.text} ${text}` : text;
+      view.rerender(box.text);
+    });
+  return { box, onSend, sync, commits, ...view };
 }
 
 // ── THE GESTURE ──────────────────────────────────────────────────────────────────────────────────
@@ -75,15 +121,6 @@ const up = () => act(() => void fireEvent.keyUp(window, { key: TALK_KEY }));
 const vad = (speaking: boolean) => act(() => useDictationStore.setState({ speaking }));
 /** Deepgram's live preview for the clause in progress. */
 const interim = (t: string) => act(() => useDictationStore.getState().setInterim(t));
-/**
- * A COMMITTED segment reaches this window: the interim is cleared and the text is appended to the
- * box — the two halves of useDictation's `dictation://partial` handler, in its order.
- */
-const commits = (box: Box, text: string) =>
-  act(() => {
-    useDictationStore.getState().setInterim("");
-    box.text = box.text ? `${box.text} ${text}` : text;
-  });
 /** The engine's endpoint decision. Always AFTER the transcript it belongs to — see the header. */
 const speechEnds = () => act(() => useDictationStore.getState().noteSpeechEnd());
 /**
@@ -92,7 +129,9 @@ const speechEnds = () => act(() => useDictationStore.getState().noteSpeechEnd())
  */
 const levelTicks = () => act(() => useDictationStore.getState().setLevel(Math.random()));
 
-/** Let the queued macrotask (the send) and its render run. */
+/** Let the queued macrotask (the send) and its render run — well under QUIET_WINDOW_MS, so a row
+ *  using this to check an intermediate state is checking it before the stable-partial poll could
+ *  possibly have fired on its own. */
 async function flush() {
   await act(async () => {
     vi.advanceTimersByTime(1);
@@ -134,19 +173,21 @@ describe("a release waits for the words he already said", () => {
     // He keeps talking through that gap and lets go a beat after the last word — at which point the
     // interim is EMPTY (the commit cleared it, and the words since have not been transcribed yet)
     // and the box is a sentence short. The old `endHold` tested exactly that empty interim, decided
-    // nothing was outstanding, and sent the truncated phrase.
-    const { box } = setup();
+    // nothing was outstanding, and sent the truncated phrase. Resolved here via the engine-close
+    // race — well within QUIET_WINDOW_MS, via a single `flush()` — but see the "GROWING PARTIALS"
+    // row below for the case where that race is not available at all.
+    const { box, commits } = setup();
     down();
     vad(true);
     interim("let's ship the");
-    commits(box, "let's ship the feature");
+    commits("let's ship the feature");
     // …and he says "tomorrow", which has produced nothing observable yet, and lets go.
     up();
 
     expect(box.sent, "nothing may go out while the utterance is still open").toEqual([]);
 
     // The tail commits, the VAD closes, and only then does the engine close the utterance.
-    commits(box, "tomorrow");
+    commits("tomorrow");
     vad(false);
     speechEnds();
     await flush();
@@ -164,17 +205,17 @@ describe("a release waits for the words he already said", () => {
     // min_silence_duration is 250ms, LONGER than the 200ms gap that closed the clause, so `speaking`
     // never falls across it and there is no rising edge to re-arm on. Hence the VAD is read as a
     // LEVEL — note this row never lowers it until he has genuinely stopped.
-    const { box } = setup();
+    const { box, commits } = setup();
     down();
     vad(true);
     interim("deploy the");
-    commits(box, "deploy the");
+    commits("deploy the");
     speechEnds(); // the clause closed on a ~220ms breath — he is still talking
     up();
 
     expect(box.sent, "a mid-sentence clause close must not release the send").toEqual([]);
 
-    commits(box, "staging branch");
+    commits("staging branch");
     vad(false);
     speechEnds();
     await flush();
@@ -189,20 +230,20 @@ describe("a release waits for the words he already said", () => {
     // been said yet. A wait subscriber that settled on the bump ALONE, without reading `speaking` /
     // `interim` live at that same event, sends the first clause and drops the rest; only a bump that
     // coincides with quiet makes a close mean the whole utterance is over.
-    const { box } = setup();
+    const { box, commits } = setup();
     down();
     vad(true);
     interim("let's ship the");
     up();
 
-    commits(box, "let's ship the feature");
+    commits("let's ship the feature");
     speechEnds();
     await flush();
     expect(box.sent, "a commit-and-close with no quiet after it must not release the send").toEqual(
       [],
     );
 
-    commits(box, "tomorrow");
+    commits("tomorrow");
     vad(false);
     speechEnds();
     await flush();
@@ -220,8 +261,9 @@ describe("a release waits for the words he already said", () => {
     // dropping the VAD from the seed and sending immediately looks identical to waiting — `onSend`
     // early-returns false either way. With "ship it" already typed, the wrong behaviour is visible
     // immediately: it goes out alone, before "by friday" has joined it.
-    const { box } = setup();
+    const { box, sync, commits } = setup();
     box.text = "ship it";
+    sync();
     vad(true);
     down();
     up();
@@ -231,7 +273,7 @@ describe("a release waits for the words he already said", () => {
       "speech already in progress at keydown is still speech that owes us a transcript",
     ).toEqual([]);
 
-    commits(box, "by friday");
+    commits("by friday");
     vad(false);
     speechEnds();
     await flush();
@@ -244,11 +286,11 @@ describe("a release waits for the words he already said", () => {
     // stopped, the transcript landed and the engine closed it — all before he let go. There is
     // nothing outstanding, so the send happens in the keyup's own tick. A drain that waited for the
     // NEXT speech-end would sit here for the full cap on every ordinary release.
-    const { box } = setup();
+    const { box, commits } = setup();
     down();
     vad(true);
     interim("ship it");
-    commits(box, "ship it");
+    commits("ship it");
     speechEnds();
     vad(false);
     up();
@@ -267,7 +309,7 @@ describe("a release waits for the words he already said", () => {
     // the case a bare `quiet` fast-path check gets wrong — it has nothing left to distinguish "never
     // spoke" from "spoke, decode still pending" once the VAD has dropped, which is why the debt has
     // to be a watch, not a keyup-time read.
-    const { box } = setup();
+    const { box, commits } = setup();
     down();
     vad(true); // he starts talking, mic captures audio
     vad(false); // 250ms of silence — Silero closes, decode is still running
@@ -278,7 +320,7 @@ describe("a release waits for the words he already said", () => {
     );
 
     // The decode finally finishes: the segment's own partial-then-speech-end pair.
-    commits(box, "restart the server");
+    commits("restart the server");
     speechEnds();
     await flush();
 
@@ -291,7 +333,7 @@ describe("a release waits for the words he already said", () => {
     // the key ever comes up. A debt that only remembers ONE outstanding run confirms itself the
     // instant the FIRST segment's close lands in a now-quiet room, and the second segment — "now" —
     // is discarded outright. Both must land.
-    const { box } = setup();
+    const { box, commits } = setup();
     down();
     vad(true); // segment 1 starts
     vad(false); // segment 1's VAD closes
@@ -303,13 +345,13 @@ describe("a release waits for the words he already said", () => {
 
     // Segment 1 finishes decoding first — the room is quiet, so this confirms IMMEDIATELY, but only
     // for the one run it belongs to.
-    commits(box, "restart the server");
+    commits("restart the server");
     speechEnds();
     await flush();
     expect(box.sent, "segment 2 is still owed — its own close hasn't landed").toEqual([]);
 
     // Segment 2 finishes.
-    commits(box, "now");
+    commits("now");
     speechEnds();
     await flush();
 
@@ -321,15 +363,17 @@ describe("a release waits for the words he already said", () => {
     // Silero drops `speaking` at 250ms. On a fast connection the bump for the FINAL clause can land
     // while the local VAD still reads speech — and `speech_end_action` dedupes to one speech-end per
     // utterance, re-arming only on a fresh interim/non-final partial, so if settling required the
-    // bump and quiet to coincide in the very same event, no SECOND bump would ever arrive: the wait
-    // would silently run the full cap on this perfectly ordinary release. It must resolve the moment
-    // the VAD catches up instead — well inside the cap, with no interim and no second bump.
-    const { box } = setup();
+    // bump and quiet to coincide in the very same event, no SECOND bump would ever arrive. It must
+    // resolve the moment the VAD catches up instead — well inside the cap, with no interim and no
+    // second bump — via the engine-close race, not the stable-partial one (nothing here changes
+    // `composedText` after the commit, so this row also proves the close race alone is still enough
+    // when it works correctly).
+    const { box, commits } = setup();
     down();
     vad(true);
     up();
 
-    commits(box, "ship it");
+    commits("ship it");
     speechEnds(); // the bump for the only clause — but the VAD hasn't caught up yet
     await flush();
     expect(box.sent, "a bump while still noisy must not settle on its own").toEqual([]);
@@ -361,8 +405,9 @@ describe("a release is a SEND, not a send-if-there-was-speech", () => {
     // in Push to talk on purpose. So a silent hold is not a no-op, and it must not feel like one:
     // the assertion is made BEFORE any timer is advanced, so a drain that ran unconditionally fails
     // this row even though it would eventually send.
-    const { box } = setup();
+    const { box, sync } = setup();
     box.text = "ship it";
+    sync();
     down();
     up();
 
@@ -380,15 +425,16 @@ describe("a release is a SEND, not a send-if-there-was-speech", () => {
     // ComposeBox's (`append` inserts at the caret, which follows the text); what this row pins is
     // that the release does not send BEFORE the spoken half has joined the typed half — which is
     // exactly what the old empty-interim test did here, since he let go before any interim arrived.
-    const { box } = setup();
+    const { box, sync, commits } = setup();
     box.text = "ship it";
+    sync();
     down();
     vad(true);
     up();
 
     expect(box.sent, "the typed half must not go out on its own").toEqual([]);
 
-    commits(box, "by friday");
+    commits("by friday");
     vad(false);
     speechEnds();
     await flush();
@@ -397,27 +443,146 @@ describe("a release is a SEND, not a send-if-there-was-speech", () => {
   });
 });
 
-describe("the cap is a backstop, and it SENDS", () => {
-  it("sends what is in the box when the utterance never closes", async () => {
-    // A dropped socket, a relay torn down mid-utterance, or a key bumped by accident so the
-    // transcript comes back empty. Losing his words is the failure being fixed — it must never be
-    // what the timeout does.
-    const { box } = setup();
-    box.text = "ship it";
+// ══ THE STABLE-PARTIAL DETECTOR — the drain's PRIMARY mechanism, not a fallback bolted onto the
+// engine-close race. See useSendMode.ts's QUIET_WINDOW_MS doc for why: a build trusting the
+// engine-close race alone shipped and still cut off the founder's words in his own testing. These
+// rows exist so that claim cannot regress silently — they never call `speechEnds()` at all, so
+// `utterance.owed` never reaches zero on its own; the ONLY thing that can send here is the box
+// going quiet, or the absolute cap. ═══════════════════════════════════════════════════════════════
+describe("the stable-partial detector — sends once nothing is CHANGING, with no help from speechEnds", () => {
+  it("GROWING PARTIALS: keeps waiting while the box keeps growing, then sends the LAST one — not merely that a send happened", async () => {
+    // THE EXACT SCENARIO THE REOPENING NAMED: Deepgram (or a slow on-device decode) keeps delivering
+    // partials after release, and NO speech-end ever arrives to confirm anything via the engine-close
+    // race. Each new partial must reset the quiet clock, and the sent text must be the FULL, LATEST
+    // content — not an earlier partial, and not merely "a send occurred", which is the assertion
+    // AGENTS.md calls out as the one that let a truncating build ship green.
+    //
+    // Each `commits()` call is a genuinely NEW chunk (matching production: a committed segment lands
+    // AFTER whatever was already in the box, never revising it), so the box accumulates exactly the
+    // way ComposeBox's `append` does. The gaps between them are comfortably under the quiet window —
+    // and the final wait comfortably over it, with margin either side for the poll's own granularity
+    // (`STABLE_PARTIAL_POLL_MS` — the poll notices a change on its NEXT tick, not the instant it
+    // happens, so a check timed to the exact millisecond of the window is not safe to assert on).
+    const { box, commits } = setup();
+    down();
+    vad(true);
+    up(); // released — nothing has committed yet, `owed` is 1 and staying that way: no speechEnds()
+    // anywhere in this row.
+
+    // Partials keep landing, each one well before the previous one's quiet window would have expired.
+    commits("we");
+    await advance(GROWTH_GAP_MS);
+    expect(box.sent, "must not settle mid-growth").toEqual([]);
+
+    commits("should");
+    await advance(GROWTH_GAP_MS);
+    expect(box.sent, "a fresh partial resets the quiet clock").toEqual([]);
+
+    commits("deploy the staging environment");
+    await advance(GROWTH_GAP_MS);
+    expect(box.sent, "still growing — still must not settle").toEqual([]);
+
+    // …and now he is actually done. Nothing else lands.
+    await advance(SETTLE_MARGIN_MS);
+
+    expect(box.sent, "the sent text is the LAST partial's full content").toEqual([
+      "we should deploy the staging environment",
+    ]);
+  });
+
+  it("a live INTERIM still updating (nothing committed yet) also resets the quiet clock", async () => {
+    // Deepgram can preview words for a while before committing them. If only `composedText` were
+    // watched, an actively-updating interim with no commits yet would look "quiet" and send an
+    // incomplete phrase — this proves the interim itself is watched too.
+    const { box, commits } = setup();
     down();
     vad(true);
     up();
 
-    await advance(PARTIAL_SETTLE_CAP_MS - 1);
-    expect(box.sent, "still draining right up to the cap").toEqual([]);
+    interim("we should");
+    await advance(GROWTH_GAP_MS);
+    expect(box.sent, "an updating interim is not quiet").toEqual([]);
 
-    await advance(1);
-    expect(box.sent, "on expiry it sends — it never drops").toEqual(["ship it"]);
+    interim("we should deploy the");
+    await advance(GROWTH_GAP_MS);
+    expect(box.sent, "still previewing — still not quiet").toEqual([]);
+
+    // It commits, and THEN goes quiet for real.
+    commits("we should deploy the staging environment");
+    await advance(SETTLE_MARGIN_MS);
+
+    expect(box.sent).toEqual(["we should deploy the staging environment"]);
   });
 
-  it("sends only once when the utterance closes and the cap expires", async () => {
-    const { box } = setup();
+  it("falls to the CAP when a run was captured and NOTHING ever arrives", async () => {
+    // ── THIS ROW'S EXPECTATION CHANGED, DELIBERATELY (roborev 57281) ─────────────────────────────
+    // It used to assert a quiet settle at 500ms. That was only reachable because the quiet clock was
+    // seeded from "the box is non-empty" — and here the box is non-empty only because of a TYPED
+    // draft. Nothing is ever transcribed in this scenario: a run opens (`vad(true)`), never closes,
+    // and no partial lands. Settling on quiet there is precisely the truncation the founder
+    // reported, since a decode arriving later has nowhere to go.
+    //
+    // So this is now the CAP's case — "the engine never closes and nothing ever arrives" — which is
+    // what the cap exists for. Slower, and correct: losing his words is the failure being fixed, and
+    // a slower send is strictly better than a truncated one. The fast quiet path is still pinned, by
+    // the row below where a segment actually COMMITS during the hold.
+    const { box, sync } = setup();
     box.text = "ship it";
+    sync();
+    down();
+    vad(true);
+    up();
+
+    await advance(QUIET_WINDOW_MS_FOR_TEST + 50);
+    expect(box.sent, "a typed draft is not an arrival — quiet must not settle it").toEqual([]);
+
+    await advance(PARTIAL_SETTLE_CAP_MS);
+    expect(box.sent, "the cap is the backstop, and it still sends rather than dropping").toEqual([
+      "ship it",
+    ]);
+  });
+
+  it("THE ABSOLUTE CAP: content that never once goes quiet still sends everything received, never a prefix", async () => {
+    // The backstop beneath the backstop. If partials keep landing faster than the quiet window can
+    // ever close — a runaway stream, a decode that never stops producing fragments — the release
+    // must not hang forever, and when the cap fires it must send the FULL accumulated text, not
+    // whatever an earlier, smaller send would have contained.
+    const { box, commits } = setup();
+    down();
+    vad(true);
+    up();
+
+    // Keep the box growing at a steady drumbeat SHORTER than the quiet window, so it can never once
+    // close, and track exactly what was committed — the loop stops the instant a send is observed,
+    // so `words` always matches what was actually in the box at that moment, whatever iteration it
+    // happened to be. A loop that kept running past the send (tracking its OWN counter instead) would
+    // let a truncated send masquerade as complete, by comparing against the wrong, later value.
+    const STEP_MS = QUIET_WINDOW_MS_FOR_TEST - 150;
+    const words: string[] = [];
+    // Bounded generously above what the cap could possibly need (cap / step, plus slack) so a bug
+    // that never sends fails with a clear assertion instead of an opaque test-runner timeout.
+    const MAX_ITERATIONS = Math.ceil(PARTIAL_SETTLE_CAP_MS / STEP_MS) + 5;
+    for (let i = 0; i < MAX_ITERATIONS && box.sent.length === 0; i++) {
+      const word = `word${i + 1}`;
+      words.push(word);
+      commits(word);
+      await advance(STEP_MS);
+    }
+
+    expect(box.sent, "the cap must have fired by now — never once went quiet").toHaveLength(1);
+    expect(box.sent[0], "everything committed before the cap fired, never a prefix of it").toBe(
+      words.join(" "),
+    );
+  });
+});
+
+describe("the cap is a backstop, and it SENDS", () => {
+  it("sends only once when the utterance closes and the cap expires", async () => {
+    // Proves the engine-close race and the cap timer are torn down together, so a close that lands
+    // just before the (now much longer) cap does not ALSO fire the cap and send twice.
+    const { box, sync } = setup();
+    box.text = "ship it";
+    sync();
     down();
     vad(true);
     up();
@@ -434,13 +599,14 @@ describe("what still must NOT send", () => {
   it("an abandoned hold sends nothing, however much was said during it", async () => {
     // ⌘Tab never delivers its keyup, so blur is the only end that hold gets — and it must not
     // dispatch the draft. The drain must not turn an abandon into a delayed send either.
-    const { box } = setup();
+    const { box, sync, commits } = setup();
     box.text = "ship it";
+    sync();
     down();
     vad(true);
     act(() => void fireEvent.blur(window));
 
-    commits(box, "by friday");
+    commits("by friday");
     speechEnds();
     await advance(PARTIAL_SETTLE_CAP_MS * 2);
 
@@ -449,14 +615,15 @@ describe("what still must NOT send", () => {
 
   it("a second hold calls off a release that is still draining", async () => {
     // He carried on talking, so the phrase he was about to send is no longer the whole of what he
-    // means to say. The pending send is cancelled, not merely postponed.
-    const { box } = setup();
+    // means to say. The pending send is cancelled, not merely postponed — and that includes the
+    // stable-partial poll, not only the engine-close subscription and the cap timer.
+    const { box, commits } = setup();
     down();
     vad(true);
     up();
     down();
 
-    commits(box, "and one more thing");
+    commits("and one more thing");
     speechEnds();
     await advance(PARTIAL_SETTLE_CAP_MS * 2);
 
@@ -543,5 +710,94 @@ describe("the caret moving into a terminal pauses Speak", () => {
     // …and the mic really is still released, not merely un-narrated. This is the assertion the
     // mocked `useMicActions` could not make on its own — it reduces an arm to a pushed string.
     expect(useDictationStore.getState().enabled).toBe(false);
+  });
+});
+
+describe("a decode that lags LONGER than the quiet window", () => {
+  // ── roborev 57274 (High) ──────────────────────────────────────────────────────────────────────
+  // THE GAP EVERY OTHER ON-DEVICE ROW LEFT OPEN. They all advance only `flush()` (1ms) between the
+  // release and the commit, so the stable-partial poll can never TICK before the transcript lands —
+  // which is exactly why a drain that settled after 500ms of NO ARRIVAL stayed green.
+  //
+  // On the on-device path there is no `interim` at all and `composedText` does not move until the
+  // decode lands, so "nothing has changed since the release" is what a PENDING DECODE looks like.
+  // Treating that as quiet sent the short box and stranded the segment arriving afterwards —
+  // reintroducing the very truncation the founder reported. The cap could not save it, because the
+  // poll won the race first.
+  //
+  // This asserts the guard itself. That the full phrase then goes out is already pinned by the
+  // "ON-DEVICE: the VAD dropping is not the same as the transcript arriving" row above.
+  it("does NOT send while nothing has arrived, however long the silence runs", async () => {
+    const { onSend } = setup();
+    down();
+    vad(true);
+    vad(false); // Silero closes the segment; the decode is still running
+    up(); // released into the gap — empty box, no interim, nothing arrived yet
+
+    // Well past the quiet window and many poll ticks. A decode running "hundreds of ms to seconds"
+    // behind the audio is the DOCUMENTED case, not an adversarial one.
+    await advance(QUIET_WINDOW_MS_FOR_TEST * 3);
+
+    // ASSERTED ON `onSend`, NOT ON `box.sent` — and that distinction is the whole row. A premature
+    // settle here calls `onSend` against an EMPTY box, which pushes nothing, so `box.sent` reads []
+    // whether the drain behaved or not. The first draft of this row asserted exactly that and was
+    // VACUOUS: restoring the bug left it green. What separates the two states is whether the send
+    // was ATTEMPTED at all — and an attempt here also drops the mic, stranding the segment that
+    // arrives moments later.
+    expect(onSend, "silence during a pending decode is not the utterance being finished")
+      .not.toHaveBeenCalled();
+  });
+
+  it("a TYPED draft is not an arrival — a pending decode still holds the send", async () => {
+    // ── roborev 57281 (High) ──────────────────────────────────────────────────────────────────────
+    // The first version of the seed treated ANY non-empty box as "something already arrived", which
+    // is false for text the user typed. This file calls typed-text-plus-speech a first-class case,
+    // and it is where the truncation survived: type "ship it", hold, say "by friday", release into
+    // the on-device gap (no interim on that path, `composedText` frozen at the draft) — the clock was
+    // seeded at the release, settled ~500ms later, dispatched "ship it" alone, and stranded
+    // "by friday" arriving at ~800ms in a composer whose message had already gone out.
+    const { box, onSend, sync } = setup();
+    box.text = "ship it"; // TYPED, before the key is ever pressed
+    sync();
+
+    down();
+    vad(true);
+    vad(false); // segment closed, decode still running
+    up();
+
+    await advance(QUIET_WINDOW_MS_FOR_TEST * 3);
+    expect(onSend, "a typed draft must not be mistaken for the transcript having landed")
+      .not.toHaveBeenCalled();
+  });
+
+  it("MULTI-CLAUSE: a clause committed during the hold does not license a quiet settle", async () => {
+    // ── roborev 57287 (High) — THE EXPECTATION THAT MOVED ────────────────────────────────────────
+    // This row used to assert the opposite: that a clause landing during the hold let the quiet
+    // clock start at the release. That is the ordinary multi-clause case — `endpointing=200` closes
+    // a clause on a mid-sentence breath — and it is the same truncation one segment later. Say
+    // "let's ship the feature by friday": clause 1 commits during the hold, clause 2 is still
+    // decoding at the keyup, and starting the clock at the release ships "let's ship the feature"
+    // while "by friday" is stranded in a composer whose message has already gone out.
+    //
+    // The poll is reachable ONLY with a run still outstanding (the fast path returns early on
+    // `owed <= 0`), so "already waiting on something" is the premise here. Quiet may only start on a
+    // POST-RELEASE arrival; a transcript that never lands falls to the cap.
+    const { box, onSend, commits } = setup();
+    down();
+    vad(true);
+    commits("let's ship the feature"); // clause 1 lands DURING the hold
+    vad(false);
+    up(); // clause 2 still decoding
+
+    await advance(QUIET_WINDOW_MS_FOR_TEST * 3);
+    expect(onSend, "a clause from during the hold is not the utterance being finished")
+      .not.toHaveBeenCalled();
+
+    // Clause 2 finally lands, and THEN the quiet window runs — the whole phrase goes out. The extra
+    // margin covers the poll tick that OBSERVES the arrival: that tick starts the quiet clock, so
+    // the window is measured from it rather than from the commit itself.
+    commits("by friday");
+    await advance(QUIET_WINDOW_MS_FOR_TEST + STABLE_PARTIAL_POLL_MS_FOR_TEST + 50);
+    expect(box.sent).toEqual(["let's ship the feature by friday"]);
   });
 });

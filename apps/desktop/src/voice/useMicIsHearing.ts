@@ -11,6 +11,7 @@
 // point is that both surfaces read the SAME snapshot through the SAME derivation. The pure half
 // (deriveMicPresentation / micIsHearing) stays in micPresentation.ts and is unit-tested there.
 import { useDictationStore } from "../stores/dictationStore";
+import { useDictationPauseReason } from "./useDictationPauseReason";
 import { deriveMicPresentation, micIsHearing } from "./micPresentation";
 import { voiceErrorNotice } from "./dictationCopy";
 
@@ -21,6 +22,7 @@ export function useMicIsHearing(): boolean {
   const modelProgress = useDictationStore((s) => s.modelProgress);
   const error = useDictationStore((s) => s.error);
   const outOfCreditsNotice = useDictationStore((s) => s.outOfCreditsNotice);
+  const pauseReason = useDictationPauseReason();
   // `hasError` is "is there a notice to show", not "is the string non-empty" — the same test the
   // rendering surfaces apply, so an unrenderable error can't silently count as one here.
   return micIsHearing(
@@ -31,6 +33,10 @@ export function useMicIsHearing(): boolean {
       modelProgress,
       hasError: voiceErrorNotice(error) !== null,
       outOfCreditsNotice,
+      // The device caption's verb hangs off this, and it is rendered two lines under the sidebar's
+      // own caption — so without the pause term it printed "Listening: Yeti" beneath a freshly
+      // demoted "Listening paused", the exact re-assertion its own doc forbids (roborev 57117/55289).
+      pauseReason,
     }),
   );
 }

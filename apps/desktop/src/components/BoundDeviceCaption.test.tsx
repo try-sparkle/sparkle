@@ -53,7 +53,11 @@ beforeEach(() => {
   for (const k of Object.keys(listeners)) delete listeners[k];
   resetAudioInputStore();
   // Armed AND capturing, so the caption's default register is the present-tense "Listening:".
-  useDictationStore.setState({ enabled: true, status: "listening", phase: "passive", error: null, modelProgress: null, outOfCreditsNotice: false });
+  // `windowFocused`/`focusOwner` are reset here too: `deriveMicPresentation` now takes the pause as
+  // an INPUT (roborev 57117), so a row that demotes via the window would otherwise leak that pause
+  // into every row after it — which is exactly what happened when the background-window case below
+  // was first added.
+  useDictationStore.setState({ enabled: true, status: "listening", phase: "passive", error: null, modelProgress: null, outOfCreditsNotice: false, windowFocused: true, focusOwner: "other" });
   useAuthStore.setState({ me: { clerkUserId: "u1", entitled: true, balanceCents: 500, tokenVersion: 1 } });
 });
 afterEach(() => cleanup());
@@ -105,6 +109,32 @@ describe("BoundDeviceCaption — a non-microphone bind says so", () => {
       expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
     });
     expect(screen.queryByText(BOUND_VIRTUAL_WARNING)).toBeNull();
+  });
+
+  it("uses a POINTING verb in a BACKGROUND window, where `status` never drops", async () => {
+    // ── roborev 57277 ───────────────────────────────────────────────────────────────────────────
+    // The row below demotes by writing `status: "idle"` — which `deriveMicPresentation` already
+    // honoured before `pauseReason` became an input, so it cannot fail without that wiring.
+    //
+    // THIS is the snapshot that needed it: the per-window blur path deliberately leaves `status` at
+    // "listening" (`tearDownOwnedStream` touches interim/level/speaking and not status, and the
+    // app-level `dictation://focus(false)` never fires while another Sparkle window is active). So
+    // without the pause term this caption printed "Listening: MacBook Pro Microphone" two lines
+    // under LogoWaveform's freshly demoted "Listening paused" — the present-tense re-assertion this
+    // component's own header forbids (roborev 55289).
+    await renderHost();
+    emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
+    await waitFor(() => {
+      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+    });
+    act(() => {
+      // `status` STAYS "listening" — that is the whole point of the case.
+      useDictationStore.setState({ windowFocused: false, phase: "active" });
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Mic: MacBook Pro Microphone")).toBeTruthy();
+    });
+    expect(screen.queryByText("Listening: MacBook Pro Microphone")).toBeNull();
   });
 
   it("uses a POINTING verb when armed but not actually capturing", async () => {

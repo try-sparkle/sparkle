@@ -56,6 +56,14 @@ beforeEach(() => {
       error: null,
       modelProgress: null,
       outOfCreditsNotice: false,
+      // Reset too, symmetrical with BoundDeviceCaption's fixture (roborev 57282). The pause is an
+      // INPUT to `deriveMicPresentation` now, so the background-window row below leaves a window
+      // pause set for every row DECLARED AFTER it — the store is module-level and vitest preserves
+      // declaration order. Harmless only by accident today (every mic-arming row happens to sit
+      // above it); the next `mic.active()` row appended to this file would render `focusPaused` and
+      // fail for a reason unrelated to its subject, or pass a negative assertion vacuously.
+      windowFocused: true,
+      focusOwner: "other",
     }),
   );
   act(() =>
@@ -203,6 +211,30 @@ describe("ComposeBox — the wake phrase is a styled substring", () => {
       // NOT asserted here: that clicking the box focuses it and resumes. jsdom's fireEvent.click
       // does not move focus, so any such assertion would pass or fail on the harness rather than on
       // this code. That half is verified in a real browser instead (see the branch's progress doc).
+    });
+
+    it("shows the PAUSED copy in a background window, where `status` never drops", () => {
+      // ── roborev 57277 ─────────────────────────────────────────────────────────────────────────
+      // The row below writes `status: "idle"`, which already yielded `focusPaused` before
+      // `pauseReason` became an input to `deriveMicPresentation` — so it was true of the old code
+      // and proves nothing about the new wiring.
+      //
+      // This is the snapshot that needed it: the per-window blur leaves `status` at "listening", so
+      // without the pause term the composer invited the user to speak ("Say <stop> to finish")
+      // while the sidebar two panes over said listening was paused.
+      act(() =>
+        useDictationStore.setState({
+          enabled: true,
+          status: "listening", // NOT demoted by the blur path — the point of the case
+          phase: "active",
+          windowFocused: false,
+          focusOwner: null,
+        } as never),
+      );
+      setup();
+      expect(bodyText()).toContain("Listening paused");
+      // …and it must NOT be inviting speech at the same time.
+      expect(bodyText()).not.toContain("to finish");
     });
 
     it("does NOT put the concierge wording on a pause with a different cause", () => {
@@ -361,5 +393,24 @@ describe("ComposeBox — the pill zone and this textarea are mutually exclusive"
   it("placeholderRightInset still swaps in the pill's own footprint for a host that DOES overlay", () => {
     expect(placeholderRightInset(true, 13)).toBe(SUGGESTION_PILL_ZONE);
     expect(placeholderRightInset(false, 13)).toBe(13);
+  });
+});
+
+describe("the fixture leaves no pause behind", () => {
+  // ── roborev 57282 ─────────────────────────────────────────────────────────────────────────────
+  // THE CANARY, declared LAST on purpose. The background-window row above writes
+  // `windowFocused: false`, and with the pause now an INPUT to `deriveMicPresentation` that leaks
+  // into every row declared after it — the store is module-level and vitest preserves declaration
+  // order. This is the exact row the reviewer described as the one that would break: an armed,
+  // actively-dictating mic, which renders `focusPaused` instead of `activeListening` under a leaked
+  // pause, failing for a reason that has nothing to do with its subject.
+  //
+  // It asserts POSITIVELY (the mic-hot copy is present) rather than only the absence of the wake
+  // word, because the negative half is exactly what would pass vacuously under the leak.
+  it("an actively-dictating mic still reads as live when declared after a paused row", () => {
+    act(() => useDictationStore.setState(mic.active()));
+    setup();
+    expect(bodyText()).toContain("I'm listening, so just start talking.");
+    expect(bodyText()).not.toContain("Listening paused");
   });
 });

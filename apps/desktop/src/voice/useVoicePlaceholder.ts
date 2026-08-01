@@ -68,6 +68,9 @@ export function useVoicePlaceholder(): VoicePlaceholderState {
     modelProgress,
     hasError: errorNotice !== null,
     outOfCreditsNotice,
+    // Already computed just above for the COPY, and previously discarded for the STATE — which is
+    // how the composer went on claiming live capture while the sidebar said paused (roborev 57117).
+    pauseReason,
   });
   return {
     micPresentation,

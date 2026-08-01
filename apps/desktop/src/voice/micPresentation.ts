@@ -12,6 +12,7 @@
 // deriveMicState, classifyVoiceError), and the two components import the RESULT rather than each
 // re-deriving it.
 import type { Phase } from "./wakeMachine";
+import type { PauseReason } from "./dictationFocus";
 import { micIntentForMode, type SendMode } from "./sendMode";
 import { deriveMicState, type MicState } from "../components/MicButton";
 import type { FocusOwner } from "./dictationFocus";
@@ -46,6 +47,26 @@ export interface MicPresentationInput {
   /** The shared transient "you're out of credits" notice (set when an arm is refused). Outranks
    *  everything because it is set with the mic still disarmed, so it must beat `off`. */
   outOfCreditsNotice: boolean;
+  /**
+   * WHY dictation is paused for this window, or null when it is free to route
+   * (voice/dictationFocus `dictationPauseReason`, read reactively via `useDictationPauseReason`).
+   *
+   * ── WHY THIS BELONGS HERE AND NOT AT A CALL SITE (roborev 57117) ────────────────────────────────
+   * This module's entire purpose is that ONE store snapshot yields ONE answer for EVERY mic surface.
+   * `status` alone cannot carry the pause, because the per-window blur path deliberately leaves it at
+   * "listening" (`tearDownOwnedStream` touches interim/level/speaking and not status, and the
+   * app-level `dictation://focus(false)` never fires while another Sparkle window is active).
+   *
+   * The demotion was first applied at ONE caller, which broke the very invariant this function
+   * exists for: the sidebar caption went honest while the ring beside it, the bound-device caption
+   * two lines below it, and the composer placeholder all still read raw `status` and went on
+   * claiming live capture. Patching per-surface is precisely how that contradiction kept relocating
+   * — three commits, three axes. Taking the term as an INPUT means a caller cannot opt out of it.
+   *
+   * Optional, defaulting to null, so a caller that genuinely has no pause fact keeps the original
+   * meaning — and the default can only ever UNDER-claim a pause, never invent one.
+   */
+  pauseReason?: PauseReason | null;
 }
 
 /** Reduce a dictation-store snapshot to the one voice state both mic surfaces render from.
@@ -81,6 +102,9 @@ export function deriveMicPresentation(i: MicPresentationInput): MicPresentation 
   if (i.hasError) return "error";
   if (!i.enabled) return "off";
   if (i.modelProgress !== null) return "preparing";
+  // Ranked WITH the status check, not before `preparing`: an in-flight model download is a truer
+  // thing to say about the microphone than where the caret or the window is.
+  if (i.pauseReason !== null && i.pauseReason !== undefined) return "focusPaused";
   if (i.status !== "listening") return "focusPaused";
   return i.phase === "active" ? "activeListening" : "passiveWaiting";
 }

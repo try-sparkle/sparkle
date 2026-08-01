@@ -286,20 +286,16 @@ export function LogoWaveform() {
   // STATE is shared. `errorNotice != null` is this surface's `hasError`.
   const presentation = deriveMicPresentation({
     enabled,
-    // `capturing`, NOT the raw `status` (roborev 56775). This is the ONE input every word and every
-    // pixel in this component flows from — the ring, the two-line live caption, the paused caption
-    // and the meter all switch on the presentation it returns — so demoting it here is what makes
-    // them move TOGETHER. Fixing only the ring is what re-created the contradiction one axis over:
-    // a grey "Microphone: off" glyph sitting above an "Actively listening" sentence.
-    //
-    // `status` alone cannot carry this: the per-window blur path (`tearDownOwnedStream`)
-    // deliberately leaves it at "listening", so a background window kept claiming live capture.
-    // `pauseReason` is the honest fact and was already computed above.
-    status: capturing ? status : "idle",
+    status,
+    // The pause travels as its OWN input now, rather than being pre-baked into `status` here
+    // (roborev 57117). Demoting at this one call site left the ring, the bound-device caption and
+    // the composer on raw `status` — so the contradiction simply moved to whichever surface was not
+    // patched. `deriveMicPresentation` takes the term itself, so no caller can opt out of it.
     phase,
     modelProgress,
     hasError: errorNotice !== null,
     outOfCreditsNotice,
+    pauseReason,
   });
   // Visual "active sweep" only when capture is genuinely live; phase alone isn't
   // enough (we could be in active phase but focus-paused). Still a HARDWARE fact, deliberately not
@@ -330,7 +326,11 @@ export function LogoWaveform() {
   const windowFocused = useDictationStore((s) => s.windowFocused);
   const indicator = micIndicatorFor(sendMode, {
     enabled,
-    status,
+    // The SAME demoted fact the presentation gets. `indicatorState` has no window term and no
+    // pauseReason term — its only pause path is `status === "listening" ? intent : "paused"` — so on
+    // raw `status` it painted a green "Microphone: actively listening" above a caption reading
+    // "Listening paused", in the NON-terminal case, which is the common one (roborev 57117).
+    status: capturing ? status : "idle",
     phase,
     modelProgress,
     focusOwner,
