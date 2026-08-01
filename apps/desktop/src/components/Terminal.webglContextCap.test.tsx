@@ -51,7 +51,10 @@ const {
   // "painted nothing".
   innerRenderRows: vi.fn(),
   // Live addon instances, so a test can drive the draw path the way the compositor would.
-  addonInstances: [] as Array<{ _renderer: { renderRows: (s: number, e: number) => unknown } }>,
+  addonInstances: [] as Array<{
+    _renderer: { renderRows: (s: number, e: number) => unknown };
+    clearTextureAtlas: ReturnType<typeof vi.fn>;
+  }>,
 }));
 
 // A canvas that answers getContext("webgl2") — jsdom's real canvas returns null for WebGL, so the
@@ -60,7 +63,8 @@ const {
 function makeGlCanvas(): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   const gl = {
-    getExtension: (name: string) => (name === "WEBGL_lose_context" ? { loseContext } : null),
+    getExtension: (name: string) =>
+      name === "WEBGL_lose_context" ? { loseContext } : null,
     isContextLost: () => contextLost.value,
   };
   Object.defineProperty(canvas, "getContext", {
@@ -89,8 +93,14 @@ vi.mock("@xterm/xterm", () => {
     loadAddon(): void {}
     open(parent: HTMLElement): void {
       const el = document.createElement("div");
-      Object.defineProperty(el, "clientWidth", { value: 720, configurable: true });
-      Object.defineProperty(el, "clientHeight", { value: 380, configurable: true });
+      Object.defineProperty(el, "clientWidth", {
+        value: 720,
+        configurable: true,
+      });
+      Object.defineProperty(el, "clientHeight", {
+        value: 380,
+        configurable: true,
+      });
       // xterm puts a 2d link layer next to the WebGL canvas; include one so the probe has to
       // discriminate rather than grabbing the first canvas it sees.
       const layer = document.createElement("canvas");
@@ -144,7 +154,10 @@ vi.mock("@xterm/addon-webgl", () => ({
       addonInstances.push(this);
     }
     onContextLoss(_cb: () => void): void {}
-    clearTextureAtlas = clearTextureAtlas;
+    // PER-INSTANCE so a test can tell WHICH pane was cleared — the shared-atlas broadcast is
+    // exactly a claim about one pane's clear reaching another. Still forwards to the shared spy so
+    // every existing "was the atlas cleared at all" assertion in this file keeps working.
+    clearTextureAtlas = vi.fn(() => sharedClearTextureAtlas());
     dispose = disposeSpy;
   },
 }));
@@ -158,8 +171,12 @@ vi.mock("../pty", () => ({
   onPtyExit: vi.fn(() => Promise.resolve(() => {})),
   ignorePtyGone: vi.fn(),
 }));
-vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
-vi.mock("../clipboard", () => ({ copyToClipboard: vi.fn(() => Promise.resolve(true)) }));
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("../clipboard", () => ({
+  copyToClipboard: vi.fn(() => Promise.resolve(true)),
+}));
 vi.mock("../engine/statusEngine", () => ({
   StatusEngine: class {
     constructor(_opts: unknown) {}
@@ -169,6 +186,8 @@ vi.mock("../engine/statusEngine", () => ({
   },
 }));
 vi.mock("../theme/theme", () => ({ useResolvedTheme: () => "dark" }));
+
+const sharedClearTextureAtlas = clearTextureAtlas;
 
 import { Terminal } from "./Terminal";
 import {
@@ -192,7 +211,10 @@ const baseProps = {
 // cached reference would call straight past the thing under test.
 function renderRowsNow(): void {
   const addon = addonInstances[addonInstances.length - 1];
-  if (!addon) throw new Error("no WebglAddon was constructed — the pane never attached a renderer");
+  if (!addon)
+    throw new Error(
+      "no WebglAddon was constructed — the pane never attached a renderer",
+    );
   addon._renderer.renderRows(0, 23);
 }
 
@@ -274,7 +296,11 @@ describe("WebGL context count vs agent count", () => {
       // effect and the visibility effect, so a refused pane warns twice. Attach is idempotent so
       // the duplicate is only log noise — what matters is that every refused pane is named.
       expect(refusedAgents).toEqual(
-        new Set([`agent-${MAX_WEBGL_CONTEXTS}`, `agent-${MAX_WEBGL_CONTEXTS + 1}`, `agent-${MAX_WEBGL_CONTEXTS + 2}`]),
+        new Set([
+          `agent-${MAX_WEBGL_CONTEXTS}`,
+          `agent-${MAX_WEBGL_CONTEXTS + 1}`,
+          `agent-${MAX_WEBGL_CONTEXTS + 2}`,
+        ]),
       );
     } finally {
       warn.mockRestore();
@@ -286,7 +312,9 @@ describe("WebGL context count vs agent count", () => {
     // everything to zero: one visible pane in a 4-agent fleet and one in a 40-agent fleet must
     // allocate the SAME number of contexts.
     for (let i = 0; i < 4; i++) {
-      render(<Terminal {...baseProps} agentId={`small-${i}`} active={i === 0} />);
+      render(
+        <Terminal {...baseProps} agentId={`small-${i}`} active={i === 0} />,
+      );
     }
     const smallFleet = addonCtors.count;
 
@@ -459,9 +487,13 @@ describe("when the WebGL canvas cannot be found", () => {
     // The control comes first: with a findable canvas, an off/on cycle really does re-run
     // attachWebgl and construct another addon. Without establishing that, a later "count stayed 1"
     // could equally mean the effect never re-ran, and the test would pass with the latch deleted.
-    const healthy = render(<Terminal {...baseProps} agentId="control" active />);
+    const healthy = render(
+      <Terminal {...baseProps} agentId="control" active />,
+    );
     expect(addonCtors.count).toBe(1);
-    healthy.rerender(<Terminal {...baseProps} agentId="control" active={false} />);
+    healthy.rerender(
+      <Terminal {...baseProps} agentId="control" active={false} />,
+    );
     healthy.rerender(<Terminal {...baseProps} agentId="control" active />);
     expect(addonCtors.count).toBe(2); // activation DOES re-attach — the loop below has teeth
     healthy.unmount();
@@ -492,7 +524,9 @@ describe("when the WebGL canvas cannot be found", () => {
     // A process-wide, one-way latch costs every pane its renderer if it fires wrongly, while a
     // missed latch costs one stranded context. So one failure is not enough evidence.
     canvasPresent.value = false;
-    const { rerender } = render(<Terminal {...baseProps} agentId="unlucky" active />);
+    const { rerender } = render(
+      <Terminal {...baseProps} agentId="unlucky" active />,
+    );
     expect(isWebglCanvasUnfindable()).toBe(false);
 
     // Declining to latch is only SAFE because the pane itself stops re-allocating. An addon has to
@@ -542,7 +576,9 @@ describe("when the WebGL canvas cannot be found", () => {
     // teardownWebgl is shared by hide / unmount / context-loss. An over-eager latch set anywhere in
     // it would permanently disable WebGL for the session, and every other test in this file resets
     // the latch in beforeEach, so nothing else here would notice.
-    const { rerender, unmount } = render(<Terminal {...baseProps} agentId="a" active />);
+    const { rerender, unmount } = render(
+      <Terminal {...baseProps} agentId="a" active />,
+    );
     rerender(<Terminal {...baseProps} agentId="a" active={false} />); // hide
     rerender(<Terminal {...baseProps} agentId="a" active />); // show
     lostListeners.forEach((fn) => fn()); // context loss
@@ -624,5 +660,75 @@ describe("a context evicted SILENTLY, before any webglcontextlost event", () => 
 
     expect(innerRenderRows).not.toHaveBeenCalled();
     expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// DEFECT #4 — THE SHARED-ATLAS BROADCAST, tested through the COMPONENT rather than the module.
+//
+// terminalWebgl.sharedAtlas.test.ts covers clearSharedAtlasEverywhere in isolation, but the whole
+// fix is load-bearing on two lines of Terminal.tsx wiring: registerAtlasPeer on attach and
+// unregisterAtlasPeer on teardown. Deleting either leaves that module suite fully green while the
+// cross-pane corruption returns in full and disposed addons pile up in the module-global peer set.
+// These two tests are the only thing standing between that wiring and a silent regression.
+describe("the shared texture atlas, across panes", () => {
+  it("a repaint on ONE pane resyncs the OTHER — the corruption this fixes is cross-pane", () => {
+    // Two visible panes, both under MAX_WEBGL_CONTEXTS, so both really attach a renderer.
+    const paneA = render(<Terminal {...baseProps} agentId="a" active />);
+    render(<Terminal {...baseProps} agentId="b" active />);
+    expect(addonInstances.length).toBe(2);
+    const addonA = addonInstances[0]!;
+    const addonB = addonInstances[1]!;
+    addonA.clearTextureAtlas.mockClear();
+    addonB.clearTextureAtlas.mockClear();
+
+    // Hide/show pane A: the become-active reveal owns a forceFullRepaint, which is one of the four
+    // production triggers that wipe the SHARED atlas.
+    paneA.rerender(<Terminal {...baseProps} agentId="a" active={false} />);
+    paneA.rerender(<Terminal {...baseProps} agentId="a" active />);
+
+    // B never repainted itself, but A's clear wiped the atlas B is drawing from. Without the
+    // broadcast B keeps a per-cell model pointing into the old packing — mojibake in B while A,
+    // the pane that actually repainted, looks perfectly fine. That asymmetry is the reported bug.
+    //
+    // Assert on B's OWN spy by identity. An earlier version of this test scanned
+    // `addonInstances.slice(1)` for "some pane was cleared", which was vacuous: hiding and showing A
+    // constructs a BRAND NEW addon for A that lands in that slice, so the check passed on A clearing
+    // itself and stayed green with registerAtlasPeer deleted entirely.
+    expect(addonB.clearTextureAtlas).toHaveBeenCalled();
+
+    // ...and the HIDE/DETACH teardown path unregisters too. This is the path that fires constantly
+    // in production — every agent switch — whereas the test below covers only unmount. Hiding A
+    // disposed the addon captured above, so the new addon's broadcast must NOT reach it; if
+    // unregisterAtlasPeer ever moved out of teardownWebgl into an unmount-only cleanup, every
+    // hidden-then-shown pane would leave a DISPOSED addon in the module-global peer set forever.
+    expect(addonA.clearTextureAtlas).not.toHaveBeenCalled();
+  });
+
+  it("stops clearing a pane once it is UNMOUNTED — no calls into a disposed addon", () => {
+    render(<Terminal {...baseProps} agentId="a" active />);
+    const paneB = render(<Terminal {...baseProps} agentId="b" active />);
+    expect(addonInstances.length).toBe(2);
+    const addonB = addonInstances[1]!;
+
+    paneB.unmount();
+    addonB.clearTextureAtlas.mockClear();
+
+    // Any later broadcast must not reach B. If teardown forgot to unregister — or unregistered
+    // AFTER dispose — the peer set would keep a disposed addon forever and every subsequent repaint
+    // anywhere in the app would call clearTextureAtlas() on it.
+    const paneC = render(<Terminal {...baseProps} agentId="c" active />);
+    paneC.rerender(<Terminal {...baseProps} agentId="c" active={false} />);
+    paneC.rerender(<Terminal {...baseProps} agentId="c" active />);
+
+    // POSITIVE CONTROL FIRST. Without it this is a bare negative that would hold in a world where
+    // the mechanism never ran: clearSharedAtlasEverywhere(null) early-returns, so if pane C ever
+    // failed to attach (permit accounting, a lower MAX_WEBGL_CONTEXTS, the canvas-unfindable latch
+    // arming, the reveal rAF no longer stubbed synchronously) the broadcast would emit ZERO peer
+    // clears and the assertion below would pass green with unregisterAtlasPeer deleted outright.
+    // Pane C's post-reveal addon is the last one constructed, and it must have cleared.
+    const addonCafterReveal = addonInstances[addonInstances.length - 1]!;
+    expect(addonCafterReveal.clearTextureAtlas).toHaveBeenCalled();
+
+    expect(addonB.clearTextureAtlas).not.toHaveBeenCalled();
   });
 });

@@ -16,8 +16,110 @@
 // real GPU — jsdom has no WebGL at all.
 
 // Structural subsets of the xterm types so this stays trivially unit-testable.
-type RefreshableTerm = { refresh: (start: number, end: number) => void; rows: number };
+type RefreshableTerm = {
+  refresh: (start: number, end: number) => void;
+  rows: number;
+};
 type AtlasClearableAddon = { clearTextureAtlas: () => void };
+
+// DEFECT #4: THE TEXTURE ATLAS IS SHARED BETWEEN PANES, BUT CLEARING IT IS NOT.
+//
+// This is the cause of "one pane renders as mojibake while every other pane in the same window is
+// fine" — the corrupted-glyph symptom that SURVIVED the context cap, the explicit context release
+// and the lost-context draw guard, because it has nothing to do with context loss at all.
+//
+// xterm hands every terminal with an equal config the SAME TextureAtlas object. From
+// addon-webgl 0.19.0's acquireTextureAtlas: `if (configEquals(entry.config, wanted)) {
+// entry.ownedBy.push(term); return entry.atlas }`. The config is font family/size/weight, cell and
+// char dimensions, devicePixelRatio, letterSpacing, lineHeight, minimumContrastRatio and the ansi
+// palette — every one of which is IDENTICAL across Sparkle's panes. So all 60-80 terminals share a
+// single atlas.
+//
+// Now read what one renderer's clearTextureAtlas() actually does (verbatim):
+//
+//     clearTextureAtlas() {
+//       this._charAtlas?.clearTexture();     // <- wipes the SHARED bitmap + glyph->coords cache
+//       this._clearModel(true);              // <- clears only THIS renderer's per-cell model
+//       this._requestRedrawViewport();       // <- redraws only THIS pane
+//     }
+//
+// The first line is process-wide; the other two are per-pane. So when ANY pane clears the atlas —
+// our idle sweep, a reveal repaint, a poisoned-output settle, or the theme/calm toggle — every OTHER
+// pane keeps a per-cell model full of texture coordinates that pointed into the OLD packing, while
+// the atlas re-rasterizes those glyphs on demand in a DIFFERENT order. Those panes then draw the
+// right cells, at the right positions, in the right colors, with the WRONG GLYPHS.
+//
+// Two consequences worth stating plainly, because they explain why earlier fixes could not help:
+//   · NO CONTEXT IS EVER LOST. `isContextLost()` stays false and `webglcontextlost` never fires, so
+//     guardWebglDrawPath and onWebglContextLostImmediately correctly do nothing. Fallback logic that
+//     waits for a loss signal cannot fire for a failure mode that never loses a context.
+//   · THE IDLE SWEEP THAT EXISTS TO HEAL STRAY GLYPHS IS ITSELF A TRIGGER. It calls forceFullRepaint
+//     on whichever pane went quiet, which corrupts the panes that did not.
+//
+// THE FIX: an atlas clear is a shared-state mutation, so it has to be broadcast. Every live renderer
+// re-clears its own model when any one of them clears the atlas. Calling clearTextureAtlas() on the
+// peers is exactly right and cheap: TextureAtlas.clearTexture() early-returns when the atlas is
+// already at its origin (`if (0 !== pages[0].currentRow.x || 0 !== pages[0].currentRow.y)`), so the
+// FIRST call does the bitmap wipe and the rest only resync their own model and redraw.
+const atlasPeers = new Set<AtlasClearableAddon>();
+
+// Register a renderer as sharing the process-wide atlas. Called on attach; the matching
+// unregisterAtlasPeer MUST run on every teardown path or we would clear a disposed addon.
+export function registerAtlasPeer(
+  addon: AtlasClearableAddon | null | undefined,
+): void {
+  if (addon) atlasPeers.add(addon);
+}
+
+export function unregisterAtlasPeer(
+  addon: AtlasClearableAddon | null | undefined,
+): void {
+  if (addon) atlasPeers.delete(addon);
+}
+
+// Clear the shared atlas and resync EVERY pane that shares it, not just `origin`.
+//
+// `origin` may legitimately be non-null yet unregistered (a pane mid-attach), so it is cleared
+// explicitly and then skipped in the peer loop rather than assumed present.
+//
+// THE PEER SET IS SMALL, BY CONSTRUCTION. Panes register only after acquiring a permit, and permits
+// are capped at MAX_WEBGL_CONTEXTS, so this loop is bounded at that cap (4) — NOT at the 60-80 open
+// agents. A broadcast therefore costs at most three extra model-clears, which is why it is done
+// synchronously rather than coalesced per frame. Each peer is isolated: one torn-down addon must not stop the rest from resyncing,
+// which is the whole point of the broadcast.
+export function clearSharedAtlasEverywhere(
+  origin: AtlasClearableAddon | null | undefined,
+): void {
+  // A PANE WITH NO RENDERER HAS NOTHING TO BROADCAST. Only a renderer that actually ran
+  // clearTexture() invalidated the shared atlas; a pane on the DOM-renderer fallback never touched
+  // it, so waking every peer on its behalf is pure destruction. This matters at Sparkle's scale
+  // because the callers are nullable and MOST PANES ARE NULL: attachment is capped at
+  // MAX_WEBGL_CONTEXTS and only visible panes hold one, so of 60-80 open agents all but ~4 have no
+  // addon. Without this early return the theme/calm effect (which runs on every pane's MOUNT) and
+  // the document.fonts.ready repaint (which every pane runs) would each wipe the shared bitmap once
+  // PER PANE on a cold launch — the atlas would never stay warm and every live pane would
+  // re-rasterize its whole viewport 60-80 times over. `webglRef.current?.clearTextureAtlas()` was a
+  // harmless no-op for those panes before the broadcast existed; it has to stay one.
+  if (!origin) return;
+  try {
+    origin.clearTextureAtlas();
+  } catch {
+    /* addon torn down mid-clear — peers below still need the resync */
+  }
+  for (const peer of atlasPeers) {
+    if (peer === origin) continue;
+    try {
+      peer.clearTextureAtlas();
+    } catch {
+      /* one dead peer must not strand the others with a stale model */
+    }
+  }
+}
+
+// Test-only: module-global state, so suites must start from zero.
+export function resetAtlasPeers(): void {
+  atlasPeers.clear();
+}
 
 // Force a FULL, unconditional repaint of the terminal viewport.
 //
@@ -43,7 +145,12 @@ export function forceFullRepaint(
   if (!term) return;
   try {
     // Order matters: clear the model FIRST so the following refresh isn't skipped by the cache.
-    webgl?.clearTextureAtlas();
+    //
+    // Broadcast rather than clearing only `webgl`: the atlas is SHARED process-wide, so wiping it
+    // for this pane invalidates every other pane's per-cell model too. Clearing just this one is
+    // what left siblings drawing old texture coordinates into a re-packed atlas — mojibake. See
+    // DEFECT #4 above.
+    clearSharedAtlasEverywhere(webgl);
     term.refresh(0, term.rows - 1);
   } catch {
     /* terminal/addon torn down — nothing to repaint */
@@ -119,11 +226,16 @@ type GlContextLike = { getExtension: (name: string) => unknown };
 // MUST be called AFTER the addon is disposed, never before: calling it on a canvas whose addon is
 // still listening dispatches `webglcontextlost` into that addon and trips its restore machinery
 // (see DEFECT #2), i.e. we would be manufacturing the very failure we are trying to prevent.
-export function releaseGlContext(canvas: GlCanvasLike | null | undefined): void {
+export function releaseGlContext(
+  canvas: GlCanvasLike | null | undefined,
+): void {
   if (!canvas) return;
   try {
     const gl = canvas.getContext("webgl2") as GlContextLike | null;
-    const ext = gl?.getExtension("WEBGL_lose_context") as LoseContextExtension | null | undefined;
+    const ext = gl?.getExtension("WEBGL_lose_context") as
+      | LoseContextExtension
+      | null
+      | undefined;
     ext?.loseContext();
   } catch {
     /* context already gone, or a canvas without webgl — nothing to release */
@@ -136,9 +248,11 @@ export function releaseGlContext(canvas: GlCanvasLike | null | undefined): void 
 // find it by probing: `getContext("webgl2")` returns the EXISTING context for the webgl canvas and
 // null for xterm's 2d render layers (a canvas can only ever have one context type). Capture this at
 // ATTACH time — after dispose the canvas is detached from the DOM and unfindable.
-export function findWebglCanvas(root: {
-  querySelectorAll: (selector: string) => ArrayLike<GlCanvasLike>;
-} | null): GlCanvasLike | null {
+export function findWebglCanvas(
+  root: {
+    querySelectorAll: (selector: string) => ArrayLike<GlCanvasLike>;
+  } | null,
+): GlCanvasLike | null {
   if (!root) return null;
   try {
     const canvases = root.querySelectorAll("canvas");
@@ -254,7 +368,9 @@ export function onWebglContextLostImmediately(
 // the property is unmangled in the shipped bundle (the same bundle we already read `_core` out of),
 // and if a future xterm bump moves it we warn and return a no-op rather than throwing — the pane
 // keeps its renderer and degrades to the event-driven path, which is where we were before.
-type GuardableRenderer = { renderRows?: (start: number, end: number) => unknown };
+type GuardableRenderer = {
+  renderRows?: (start: number, end: number) => unknown;
+};
 type GuardableAddon = { _renderer?: GuardableRenderer };
 type LostCheckable = { isContextLost?: () => boolean };
 
@@ -287,7 +403,11 @@ export function guardWebglDrawPath(
 
   const checkable = gl;
   let fired = false;
-  const guarded = function guardedRenderRows(this: unknown, start: number, end: number) {
+  const guarded = function guardedRenderRows(
+    this: unknown,
+    start: number,
+    end: number,
+  ) {
     let lost = false;
     try {
       lost = checkable.isContextLost?.() === true;

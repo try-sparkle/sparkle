@@ -52,6 +52,9 @@ import {
   findWebglCanvas,
   onWebglContextLostImmediately,
   guardWebglDrawPath,
+  registerAtlasPeer,
+  unregisterAtlasPeer,
+  clearSharedAtlasEverywhere,
   type GlCanvasLike,
 } from "./terminalWebgl";
 import {
@@ -418,6 +421,9 @@ export function Terminal({
     webglDrawGuardRef.current?.();
     webglDrawGuardRef.current = null;
     const webgl = webglRef.current;
+    // Drop out of the shared-atlas broadcast FIRST. A peer clearing the atlas mid-teardown would
+    // otherwise call clearTextureAtlas() on an addon we are about to dispose.
+    unregisterAtlasPeer(webgl);
     const canvas = webglCanvasRef.current;
     webglCanvasRef.current = null;
     // 2. Null the ref BEFORE dispose so any repaint/re-theme effect that reads webglRef can't touch
@@ -556,6 +562,8 @@ export function Terminal({
       // painted in between go through a dead context: right cells, right colors, wrong glyphs. This
       // is what makes corruption IMPOSSIBLE rather than merely rare — a frame that is never drawn
       // cannot be drawn wrong, no matter when the event lands. See guardWebglDrawPath.
+      // Join the shared-atlas broadcast: from here on, any pane clearing the atlas resyncs us too.
+      registerAtlasPeer(webgl);
       webglDrawGuardRef.current = guardWebglDrawPath(webgl, webglCanvasRef.current, () =>
         detachWebglRef.current?.(),
       );
@@ -1554,7 +1562,10 @@ export function Terminal({
     // can leave already-painted cells with stale colors until the next reflow. Clear the atlas
     // and force a full repaint so the live toggle is instantaneous like the rest of the app.
     // safeRefresh no-ops if a dispose raced in between the null check and here.
-    webglRef.current?.clearTextureAtlas();
+    // Broadcast: the atlas is shared process-wide, so a palette change invalidates EVERY pane's
+    // per-cell model, not just this one's. Clearing only this pane left the others drawing stale
+    // texture coordinates into a re-packed atlas (DEFECT #4 in terminalWebgl.ts).
+    clearSharedAtlasEverywhere(webglRef.current);
     safeRefresh();
     // `calm` rides the SAME effect as the theme flip: both are "the palette changed", and both
     // need the atlas cleared. It flips on a priority change (rare) — unlike the CSS filter it
