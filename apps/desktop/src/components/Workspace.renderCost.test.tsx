@@ -317,34 +317,53 @@ describe("dragging the concierge seam does not re-render the terminal panes", ()
     expect(conciergeWidth()).toBe(draggedWidth(DRAG_STEPS));
   });
 
-  // The mirror's identity guard, asserted where it can actually redden. `Workspace.resize.test.tsx`
-  // carried a version of this that could not fail: it re-announced the width the mirror already held
-  // and asserted the concierge's CEILING was unchanged — but that ceiling is a pure function of the
-  // build widths, so it is unchanged whether or not the guard exists (roborev 56115). The guard's
-  // real effect is that a duplicate announcement writes no state and therefore renders nothing, and
-  // that needs a render counter, which lives in this file.
-  it("re-announcing the SAME build width costs no render; a NEW one does", async () => {
+  // THE GUARANTEE GOT STRONGER, so this row did too. It used to assert the mirror's identity guard —
+  // a duplicate `BUILD_WIDTH_EVENT` writes no state and renders nothing, while a NEW width does
+  // render. The shell no longer mirrors build widths at all: the concierge's ceiling reserves the
+  // shared 50px floors, a constant, so there is nothing to keep in step and nothing to re-render.
+  //
+  // A build column announcing a width can now never cost this shell a render — including the case
+  // the old row deliberately allowed. That matters on the hot path: the sidebar announces on mount
+  // AND on every width change, so under the old contract dragging a BUILD seam re-rendered the whole
+  // concierge shell on every committed step.
+  it("costs the shell NO render when a build column announces a width — new or repeated", async () => {
     await mount();
 
-    // A real change must re-render the shell. Without this half, the bound below is satisfied by a
-    // listener that is simply broken — the precondition, not the side effect.
     const before = counts.concierge;
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: "left", width: 640 } }),
-      );
-    });
-    expect(counts.concierge).toBeGreaterThan(before);
+    for (const width of [640, 640, 900]) {
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: "left", width } }),
+        );
+      });
+    }
+    expect(counts.concierge - before).toBe(0);
 
-    // Now the case every sidebar mount produces: the same width, announced again. `setBuildWidths`
-    // must return the identical object so React bails out. Drop the `prev[side] === width` guard and
-    // this goes above zero — which is the whole point of asserting it here rather than on the ceiling.
-    const settled = counts.concierge;
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent(BUILD_WIDTH_EVENT, { detail: { side: "left", width: 640 } }),
-      );
-    });
-    expect(counts.concierge - settled).toBe(0);
+    // …and the shell is still ALIVE and still renders when something it actually owns changes —
+    // without this the row above is satisfied by a component that unmounted or wedged.
+    //
+    // A DELTA AGAINST A STIMULUS THAT REALLY CHANGES STATE, and both halves of that are load-bearing.
+    // The first version asserted `counts.concierge > 0` after a bare `resize` dispatch and was doubly
+    // vacuous: the stub counts the MOUNT, so the count is already ≥ 1 before the dispatch and the
+    // assertion cannot fail; and `useWindowWidth` sets `window.innerWidth`, which the test never
+    // moved, so React bailed on the identical value and the dispatch rendered nothing anyway. That is
+    // precisely the precondition-not-side-effect trap this file exists to avoid, written into the
+    // guard against it (roborev 57344).
+    // RESTORED IN A `finally`, like every other innerWidth mutation in this file and in
+    // Workspace.resize.test.tsx. jsdom's 1024 default is what makes the concierge's window-aware
+    // clamp behave the way the measurements above assume (roborev 55910), so a leaked 1777 would
+    // silently re-clamp any case appended after this one. Invisible today only because this is the
+    // last `it` in the file — which is not a property worth depending on (roborev 57371).
+    const realWidth = window.innerWidth;
+    try {
+      const alive = counts.concierge;
+      act(() => {
+        Object.defineProperty(window, "innerWidth", { value: 1777, configurable: true });
+        window.dispatchEvent(new Event("resize"));
+      });
+      expect(counts.concierge).toBeGreaterThan(alive);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { value: realWidth, configurable: true });
+    }
   });
 });

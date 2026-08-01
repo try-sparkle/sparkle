@@ -212,12 +212,23 @@ describe("parseWorkerResult", () => {
       );
     });
 
-    it("throws on a severity outside 1-3", () => {
-      const bad = withRetro({
-        tldr: "t",
-        painPoints: [{ summary: "s", severity: 4, recommendation: "r" }],
-      });
-      expect(() => parseWorkerResult(bad)).toThrow(/severity/);
+    it("accepts SEVERITY 4 — a blocker must not cost the worker its whole result.json", () => {
+      // This validator said 1-3 while the JSON Schema, the marker parser, the persona and both
+      // bead-capture paths all say 1-4. A malformed retro throws for the WHOLE file, so a worker
+      // that reported a full blocker lost its status, summary and filesChanged along with it —
+      // the worst finding being the one guaranteed to be discarded.
+      const r = parseWorkerResult(
+        withRetro({ tldr: "t", painPoints: [{ summary: "s", severity: 4, recommendation: "r" }] }),
+      );
+      expect(r.retro?.painPoints[0]?.severity).toBe(4);
+      expect(r.status).toBe("success");
+    });
+
+    it("throws on a severity outside 1-4", () => {
+      for (const severity of [0, 5]) {
+        const bad = withRetro({ tldr: "t", painPoints: [{ summary: "s", severity, recommendation: "r" }] });
+        expect(() => parseWorkerResult(bad)).toThrow(/severity/);
+      }
     });
 
     it("throws when a pain point is missing its recommendation", () => {
@@ -285,7 +296,7 @@ describe("retroEmissionProtocol — the frozen retro emit contract, shared acros
       "**MORE DETAILS:**",
       "**SPARKLE IMPROVEMENTS:**",
       "**AGENT ID:**",
-      "**PAIN POINT:**",
+      "**PAIN POINT [<bead id>]:**",
       "**SEVERITY:**",
       "**RECOMMENDATION:**",
       "**ADDITIONAL CONTEXT:**",
@@ -296,6 +307,36 @@ describe("retroEmissionProtocol — the frozen retro emit contract, shared acros
     expect(r).toContain(RETRO_MARKER_TEMPLATE);
     expect(r).toMatch(/REPLACES any free-form completion report/);
     expect(r).toMatch(/ANONYMIZED|no PII/);
+  });
+
+  it("tells the agent to FILE each pain point as a bead and print the id in the heading", () => {
+    // The hole this closes (bead sparkle-w4fjz): the merge-capture hook fires only on
+    // `gh pr merge`, so an agent that never opens a PR loses its whole retro when the pane
+    // scrolls. The instruction has to name the real script — a persona that says "file a bead"
+    // without the command is one an agent satisfies by running `bd create` by hand, which
+    // produces exactly the un-deduped duplicate the shared fbkey exists to prevent.
+    expect(r).toContain("scripts/file-retro-pain-point.sh");
+    expect(r).toMatch(/--summary/);
+    expect(r).toMatch(/--severity/);
+    expect(r).toMatch(/--recommendation/);
+    // BEFORE the retro is printed, not after — filing at merge time is what already failed.
+    expect(r).toMatch(/BEFORE you print the retro/);
+    // The id goes in the heading, and the decline token is printable too, so a reader can tell
+    // "this is in the backlog" from "this is only on screen".
+    expect(r).toContain("**PAIN POINT [sparkle-xxxx]:**");
+    expect(r).toMatch(/unfiled:/);
+    // Hand-filing is the failure mode to forbid explicitly.
+    expect(r).toMatch(/[Nn]ever `bd create` a pain point by hand/);
+    // Re-running must be advertised as safe, or an agent that is unsure will skip filing.
+    expect(r).toMatch(/IDEMPOTENT/);
+  });
+
+  it("asks for severity-1 findings instead of telling agents to drop them", () => {
+    // The capture floor moved from SEV2 to SEV1 (scripts/lib/retro-beads.sh). The persona and
+    // the filing script have to agree: a persona that still said "only file 2+" would silently
+    // re-open the hole for the class of finding the founder specifically kept.
+    expect(r).toMatch(/SEVERITY 1 points too/);
+    expect(r).not.toMatch(/severity 1.*(?:skip|omit|drop|not worth filing)/i);
   });
 });
 

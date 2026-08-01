@@ -86,13 +86,23 @@ vi.mock("./NewProjectDialog", () => ({ NewProjectDialog: () => null }));
 vi.mock("./StatusStrip", () => ({ StatusStrip: () => null }));
 vi.mock("./NewCloudAgentDialog", () => ({ NewCloudAgentDialog: () => null }));
 
-import { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED, Workspace } from "./Workspace";
+import {
+  CONCIERGE_WIDTH_KEY,
+  CONCIERGE_WIDTH_KEY_PAIRED,
+  PRIMARY_PAIR_ROW_RESERVE,
+  Workspace,
+} from "./Workspace";
 // ONLY THE VARIABLE NAME. The geometry helpers were imported here to run the app's rendered numbers
 // through `cockpitGeometry`, which turned out to prove nothing: the model's concierge centre reduces
 // to `windowWidth / 2` algebraically for every input, so restating it at the app level was a
 // pass-by-construction check (roborev 56086). The arithmetic lives in `engine/columnResize.test.ts`;
 // what this file pins is the DOM structure that model assumes — see `assertRowStructure`.
-import { CONCIERGE_WIDTH_VAR } from "../engine/columnResize";
+import {
+  COLUMN_HARD_MAX,
+  COLUMN_MIN_WIDTH,
+  CONCIERGE_WIDTH_VAR,
+  windowAwareMax,
+} from "../engine/columnResize";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -543,9 +553,20 @@ describe("the concierge is the centred anchor in double mode", () => {
   // as the mirror it reads, and the mirror is fed by `sparkle:build-width`. `AgentSidebar` is stubbed
   // in this suite, so the EMITTER is pinned in `AgentSidebar.pullTabs.test.tsx` ("announces ON
   // MOUNT"); this is the other half — that the shell acts on what it hears.
-  it("LOWERS the concierge's ceiling when a build column announces a wider width", () => {
+  // THE RULE THIS ROW ASSERTS WAS REVERSED ON PURPOSE. It used to require that announcing a wider
+  // build column LOWERED this ceiling by twice the extra width, because the reserve was
+  // `2 * max(left, right)`. That is precisely what the founder asked to remove: "Nothing should block
+  // the other columns from going to any sort of width except for maybe a minimum width of 50 pixels
+  // for any given column." Under the old rule, widening one column made another un-widenable — and on
+  // a ~890px window it drove this ceiling down ONTO its own floor, so `min === max` and the seam went
+  // dead through three consecutive drags in a real session.
+  //
+  // The guarantee the old reserve bought — a widened builder never gets squeezed — is now delivered
+  // by paint clamping plus stored-width preservation instead (see `conciergePairedReserve`), so the
+  // preference survives the squeeze and springs back.
+  it("does NOT lower the concierge's ceiling when a build column announces a wider width", () => {
     render(<Workspace />);
-    // Where the seam stops with the builders at their default 220.
+    // Where the seam stops with the builders at their default.
     drag(500, 9000);
     const ceilingAtDefault = conciergeWidth();
     expect(ceilingAtDefault).toBeGreaterThan(360);
@@ -556,10 +577,10 @@ describe("the concierge is the centred anchor in double mode", () => {
       );
     });
 
-    // The same shove now stops lower, by exactly twice the extra width the builder claimed — the
-    // reserve is `2 * max(left, right)`, and both halves are equal so both pay for the wider one.
+    // The same shove stops in exactly the same place: a neighbour's width is not this column's
+    // business. Against the old reserve this is `ceilingAtDefault - 1160`.
     drag(500, 9000);
-    expect(conciergeWidth()).toBe(ceilingAtDefault - 2 * (800 - 220));
+    expect(conciergeWidth()).toBe(ceilingAtDefault);
   });
 
   // The duplicate-announcement guard is asserted in `Workspace.renderCost.test.tsx`, not here. The
@@ -644,14 +665,15 @@ describe("the 5760px target layouts are reachable in the running shell", () => {
     });
   }
 
-  it("still collapses to the 280 floor on a window too narrow to seat the row", () => {
-    // The small-window behaviour is unchanged: the ceiling floors at the column's own minimum rather
-    // than inverting the range.
-    Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
+  it("still collapses to the shared floor on a window too narrow to seat the row", () => {
+    // The small-window behaviour is unchanged in KIND: the ceiling floors at the column's own minimum
+    // rather than inverting the range. The window has to be genuinely tiny now — with every column on
+    // a 50px floor, 900px is roomy, which is exactly the point of the change.
+    Object.defineProperty(window, "innerWidth", { value: 200, configurable: true });
     localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "1920");
     render(<Workspace />);
     // The stored 1920 is KEPT (re-docking to the big display restores it) but PAINTED at the floor.
-    expect(paintedConciergeWidth()).toBe(280);
+    expect(paintedConciergeWidth()).toBe(COLUMN_MIN_WIDTH);
   });
 
   it("keeps the width the window cannot show, and restores it when the window can again", () => {
@@ -698,12 +720,36 @@ describe("the single-pair shell is untouched by the anchor model", () => {
     expect(conciergeWidth()).toBe(before + 60);
   });
 
-  it("keeps its own 560 ceiling and its own storage key", () => {
+  it("keeps its own window-aware ceiling and its own storage key", () => {
+    // The single-pair row has its OWN reserve (one rail, one pair) and so its own ceiling — that
+    // separation is what this row pins, not the old bare 560, which the founder's "nothing should
+    // block a column but a 50px floor" rule removed along with every other fixed cap.
     const { unmount } = render(<Workspace />);
     drag(500, 5000);
-    expect(conciergeWidth()).toBe(560); // the single-pair hard max, unchanged
+    // TWO ASSERTIONS, BECAUSE ONE OF THEM CANNOT SEE THE REGRESSION IT NAMES.
+    //
+    // The wiring check below builds `expected` from the production helper and the production
+    // constants — the same expression `Workspace` evaluates. That pins that the ceiling really is
+    // this formula rather than a stray literal, but it is a CONSTRUCTION MIRROR: move
+    // `PRIMARY_PAIR_ROW_RESERVE` and both sides move together and it stays green. Which is exactly
+    // how the reserve slid 360 → 250 unnoticed, and my first attempt at fixing that shipped the same
+    // blind spot (roborev 57344 then 57371).
+    //
+    // So the VALUE is pinned independently, as a literal. If the single-pair reserve is ever meant to
+    // change, this line is the one that has to be edited on purpose.
+    expect(PRIMARY_PAIR_ROW_RESERVE).toBe(360);
+    expect(conciergeWidth()).toBe(window.innerWidth - 366); // 360 reserve + the one 6px rail
+
+    const expected = windowAwareMax(
+      COLUMN_HARD_MAX,
+      window.innerWidth,
+      6 + PRIMARY_PAIR_ROW_RESERVE,
+      COLUMN_MIN_WIDTH,
+    );
+    expect(conciergeWidth()).toBe(expected);
+    expect(expected).toBeGreaterThan(560); // the wall that used to stop this drag is gone
     unmount();
-    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("560");
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe(String(expected));
     // …and nothing was written under the paired key by a single-pair drag.
     expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBeNull();
   });
@@ -960,7 +1006,11 @@ describe("dragging the concierge seam moves the column", () => {
   // Empty storage cannot substitute for either case: `Number(null) === 0` reaches the default
   // through the same branch without testing a bound at all.
   it.each([
-    ["above the maximum", (g: { min: number; max: number }) => g.max + 1],
+    // ONE PAST THE VALIDATION BOUND, which is the HARD ceiling rather than the window-aware one:
+    // the initializer deliberately keeps a width chosen on a bigger display and clamps it at PAINT
+    // (see `renderedConciergeWidth`), so seeding one past the learned window max would be restored
+    // on purpose and this row would be asserting the opposite of the contract.
+    ["above the maximum", () => COLUMN_HARD_MAX + 1],
     ["below the minimum", (g: { min: number; max: number }) => g.min - 1],
   ])("ignores a persisted width %s rather than restoring it", async (_label, seedFor) => {
     const geo = learnGeometry();

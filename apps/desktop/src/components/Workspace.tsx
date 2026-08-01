@@ -54,12 +54,11 @@ import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
-  BUILD_COLUMN_MIN_WIDTH,
-  BUILD_WIDTH_EVENT,
+  COLUMN_HARD_MAX,
+  COLUMN_MIN_WIDTH,
   CONCIERGE_PAIRED_HARD_MAX,
   CONCIERGE_WIDTH_VAR,
   conciergePairedMax,
-  readStoredBuildWidth,
   windowAwareMax,
 } from "../engine/columnResize";
 import {
@@ -442,10 +441,14 @@ export const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
  *  SEEDED from the single-pair value on first use, so an existing install's width is where the
  *  cockpit starts rather than snapping to a default. */
 export const CONCIERGE_WIDTH_KEY_PAIRED = "sparkle-concierge-width:2";
-const CONCIERGE_MIN_WIDTH = 280;
-/** The single-pair ceiling, DELIBERATELY UNCHANGED. That layout "is working fine" and this pass must
- *  not move it; the paired row gets its own, window-aware ceiling (`conciergePairedMax`). */
-const CONCIERGE_MAX_WIDTH = 560;
+/** The shared 50px floor every column now answers to — see `COLUMN_MIN_WIDTH` in engine/columnResize.
+ *  Was 280, which on a ~890px window put this column's ceiling AT its floor (`min 280, max 280` in the
+ *  log) and left the seam dead through three consecutive drags. */
+const CONCIERGE_MIN_WIDTH = COLUMN_MIN_WIDTH;
+/** The single-pair ceiling. Now the shared sanity cap rather than a bare 560: the founder's rule is
+ *  that only the 50px floors narrow a column, and `windowAwareMax` below still keeps the seam inside
+ *  the window. */
+const CONCIERGE_MAX_WIDTH = COLUMN_HARD_MAX;
 // Re-exported from engine/columnResize, which owns the sibling column widths and is importable
 // from a node-environment test without pulling this module's store/Tauri graph in (roborev 56223).
 export { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
@@ -477,17 +480,19 @@ function conciergeWidthKeyFor(pairCount: number): string {
 
 /** How much of the row the sole pair must be left in a SINGLE-pair shell.
  *
- *  UNCHANGED, and deliberately still expressed for the one-pair row: that layout is the one the
- *  founder says already works, so its ceiling arithmetic is preserved exactly rather than
- *  re-derived from the five-column budget (which would move it).
+ *  SPELLED AS A LITERAL, not derived from `BUILD_COLUMN_MIN_WIDTH`, and that is the fix rather than
+ *  the shortcut. It used to read `BUILD_COLUMN_MIN_WIDTH + 200`, so when every column was put on one
+ *  50px floor this reserve silently moved 360 → 250 — changing the single-pair ceiling by 110px in a
+ *  change whose whole premise was that the single-pair row is the layout the founder says already
+ *  works and must not move. A constant that tracks another constant it was never conceptually tied to
+ *  is how "untouched" becomes untrue without anyone editing the line.
  *
- *  360 = a build column at its floor (160) + 200 of terminal. DELIBERATELY BELOW
- *  `BUILD_COLUMN_MIN_WIDTH + TERMINAL_MIN_WIDTH` (480), which is what `AgentSidebar`'s own CSS clamp
- *  would prefer: at the 900px window `tauri.conf.json` permits, reserving 480 leaves the cockpit
- *  unable to seat anyone above their minimum, so the honest reserve is the one the narrowest
- *  supported window can actually honour. A 200px terminal is cramped; it is not a lockout, and the
- *  build column's `max(160px, …)` floor keeps it from being eaten below that. */
-const PRIMARY_PAIR_ROW_RESERVE = BUILD_COLUMN_MIN_WIDTH + 200;
+ *  360 = a build column at 160 + 200 of terminal. Those two numbers are this row's own history, not
+ *  the five-column floors: 160 was the build column's minimum when this reserve was chosen, and the
+ *  pairing is what the narrowest window `tauri.conf.json` permits (900px) can actually honour. A
+ *  200px terminal is cramped; it is not a lockout, and the build column's own CSS floor keeps it from
+ *  being eaten below that. */
+export const PRIMARY_PAIR_ROW_RESERVE = 360;
 /** The single-pair concierge reserve: its one seam rail plus the pair beside it. */
 function conciergeSingleRowReserve(): number {
   return 6 + PRIMARY_PAIR_ROW_RESERVE;
@@ -587,33 +592,17 @@ export function Workspace() {
   const conciergeDirty = useRef<Set<1 | 2>>(new Set());
   const windowWidth = useWindowWidth();
 
-  // THE TWO BUILD COLUMNS' WIDTHS, MIRRORED HERE — because the concierge's ceiling depends on them.
+  // THE BUILD COLUMNS' WIDTHS ARE NO LONGER MIRRORED HERE, and that removal is the point rather than
+  // a tidy-up. This shell used to keep a copy of both, fed by `BUILD_WIDTH_EVENT`, for one reason:
+  // the concierge's ceiling reserved `2 × max(left, right)` so a widened builder could never be
+  // squeezed. That reserve is gone — it made widening ONE column silently un-widen another, which is
+  // exactly what the founder asked to remove, and on a narrow window it drove the concierge's ceiling
+  // onto its own floor and killed the seam outright. The reserve is now the shared 50px floors
+  // (`conciergePairedReserve`), a constant, so there is nothing here to keep in step.
   //
-  // `AgentSidebar` owns these widths and keeps owning them; this is a read-only reflection so the row
-  // can reserve the space they actually occupy rather than their minimums. Reserving the minimums
-  // would let the concierge be dragged straight over a build column the user deliberately widened.
-  //
-  // It stays in step through a custom event the sidebar emits ON MOUNT AND ON EVERY WIDTH CHANGE —
-  // not only on commit. The row has to reserve for a column the user has never dragged, and a sidebar
-  // that mounts later than this shell at a different window width would otherwise leave the two
-  // disagreeing for good. The listener below ignores an event that does not change the mirror, so a
-  // re-announcement costs one comparison and no render, which is what keeps this off the drag's hot
-  // path — the gesture itself paints a CSS variable and never calls `onWidth` per move.
-  const [buildWidths, setBuildWidths] = useState<{ left: number; right: number }>(() => ({
-    left: readStoredBuildWidth("left", typeof window === "undefined" ? 1600 : window.innerWidth),
-    right: readStoredBuildWidth("right", typeof window === "undefined" ? 1600 : window.innerWidth),
-  }));
-  useEffect(() => {
-    const onBuildWidth = (e: Event) => {
-      const detail = (e as CustomEvent<{ side?: "left" | "right"; width?: number }>).detail;
-      if (!detail?.side || typeof detail.width !== "number") return;
-      setBuildWidths((prev) =>
-        prev[detail.side!] === detail.width ? prev : { ...prev, [detail.side!]: detail.width! },
-      );
-    };
-    window.addEventListener(BUILD_WIDTH_EVENT, onBuildWidth);
-    return () => window.removeEventListener(BUILD_WIDTH_EVENT, onBuildWidth);
-  }, []);
+  // `AgentSidebar` still EMITS the event; a consumer that needs live build widths can subscribe
+  // without this shell paying a state update — and a re-render on the drag's hot path — for a value
+  // nothing reads.
 
   // TWO PAIRS OR ONE — derived from the assignment map, never stored, so a count that disagrees with
   // what the map says is unrepresentable. Read HERE, above the width plumbing, because which key the
@@ -965,13 +954,14 @@ export function Workspace() {
   // There used to be three, chained: the left pair's, the concierge's (which depended on it), and the
   // painted mirror of each. There is one column with a stored width in the row now, so there is one.
   //
-  // TWO MODES, TWO BUDGETS, and the single-pair one is untouched on purpose. The paired row reserves
-  // both build columns AT THE WIDTHS THEY ACTUALLY HAVE plus both terminals and both rails, which is
-  // what makes the founder's ~1100 and ~1920 targets reachable where a bare 560 blocked them by
-  // 2–3.5×. The single-pair row keeps the exact arithmetic it shipped with.
+  // TWO MODES, TWO BUDGETS. The paired row reserves every OTHER column at the shared 50px floor plus
+  // both rails — no longer the build columns' live widths, so widening a builder can no longer lower
+  // this column's ceiling (the squeeze is absorbed by paint, and the stored widths spring back; see
+  // `conciergePairedReserve`). The single-pair row keeps the shape of the arithmetic it shipped with,
+  // now against the shared floor.
   const conciergeMax =
     pairCount === 2
-      ? conciergePairedMax(windowWidth, buildWidths.left, buildWidths.right, CONCIERGE_MIN_WIDTH)
+      ? conciergePairedMax(windowWidth, CONCIERGE_MIN_WIDTH)
       : windowAwareMax(
           CONCIERGE_MAX_WIDTH,
           windowWidth,

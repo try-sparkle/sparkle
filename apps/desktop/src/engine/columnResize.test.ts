@@ -6,7 +6,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   BUILD_COLUMN_DEFAULT_WIDTH,
+  BUILD_COLUMN_ROW_RESERVE,
   BUILD_COLUMN_MIN_WIDTH,
+  COLUMN_MIN_WIDTH,
   buildColumnMax,
   buildWidthKey,
   RAIL_WIDTH,
@@ -107,10 +109,14 @@ function row(over: Partial<CockpitInput> = {}): CockpitInput {
 const widthOf = (g: ReturnType<typeof cockpitGeometry>, key: Parameters<typeof centreOf>[1]) =>
   g.find((c) => c.key === key)!.width;
 
-/** The bound the seam is actually clamped to, at the concierge's 280px floor — the same call
- *  `Workspace` makes, so a case can never assert a width the app would refuse. */
-const conciergeCeiling = (windowWidth: number, buildL: number, buildR: number) =>
-  conciergePairedMax(windowWidth, buildL, buildR, 280);
+/** The bound the seam is actually clamped to, at the shared 50px floor — the same call `Workspace`
+ *  makes, so a case can never assert a width the app would refuse.
+ *
+ *  The build widths are no longer arguments: the reserve is the FLOORS, not the live widths, so a
+ *  neighbour's width can no longer lower this ceiling. Callers still pass them for readability of the
+ *  scenario; they are deliberately ignored here, which is itself the change under test. */
+const conciergeCeiling = (windowWidth: number, _buildL?: number, _buildR?: number) =>
+  conciergePairedMax(windowWidth, COLUMN_MIN_WIDTH);
 
 describe("cockpitGeometry — the concierge is pinned dead centre", () => {
   it("puts the concierge's centre exactly on the row's centre at rest", () => {
@@ -319,24 +325,35 @@ describe("the 5760px targets", () => {
   });
 
   it("leaves BOTH targets reachable under the window-aware ceiling", () => {
-    // The bound the drag is actually clamped to. With 400px builders the reserve is
-    // 400+400+2·320+2·6 = 1452, so the span permits 4308 — comfortably past both targets, where the
+    // The bound the drag is actually clamped to. Every other column at the shared 50px floor plus
+    // both rails: 2·50 + 2·50 + 2·6 = 212, so the span permits 5548 — past both targets, where the
     // old bare 560 permitted neither.
-    const reserve = conciergePairedReserve(400, 400);
-    expect(reserve).toBe(1452);
-    const ceiling = conciergeCeiling(SPAN, 400, 400);
+    const reserve = conciergePairedReserve();
+    expect(reserve).toBe(212);
+    const ceiling = conciergeCeiling(SPAN);
     expect(ceiling).toBeGreaterThanOrEqual(1100);
     expect(ceiling).toBeGreaterThanOrEqual(1920);
-    expect(clampWidth(1920, 280, ceiling).clampedBy).toBeNull();
-    expect(clampWidth(1100, 280, ceiling).clampedBy).toBeNull();
+    expect(clampWidth(1920, COLUMN_MIN_WIDTH, ceiling).clampedBy).toBeNull();
+    expect(clampWidth(1100, COLUMN_MIN_WIDTH, ceiling).clampedBy).toBeNull();
   });
 
-  it("still collapses to the 280 floor on a window too narrow to seat anyone", () => {
+  it("STAYS draggable on the narrow window that used to freeze it solid", () => {
+    // THE REGRESSION THIS EXISTS FOR, taken from a real session: at ~890px the old reserve (600)
+    // put the concierge's ceiling AT its 280 floor, so `min === max`, and the log recorded three
+    // consecutive drags that moved nothing. The floors alone must leave real travel.
+    const ceiling = conciergeCeiling(890);
+    expect(ceiling).toBe(890 - 212);
+    expect(ceiling).toBeGreaterThan(COLUMN_MIN_WIDTH); // a range, not a point
+    // …and a drag inside it is honoured rather than clamped — the thing that was broken.
+    expect(clampWidth(600, COLUMN_MIN_WIDTH, ceiling).clampedBy).toBeNull();
+  });
+
+  it("still collapses to the shared floor on a window too narrow to seat anyone", () => {
     // The small-window behaviour must be exactly what it was: an inverted range is how a clamp
     // starts returning nonsense, so the floor wins rather than a negative ceiling.
-    const ceiling = conciergeCeiling(900, 220, 220);
-    expect(ceiling).toBe(280);
-    expect(clampWidth(600, 280, ceiling).applied).toBe(280);
+    const ceiling = conciergeCeiling(180);
+    expect(ceiling).toBe(COLUMN_MIN_WIDTH);
+    expect(clampWidth(600, COLUMN_MIN_WIDTH, ceiling).applied).toBe(COLUMN_MIN_WIDTH);
   });
 });
 
@@ -346,22 +363,29 @@ describe("paintedBuildWidth — the terminal is the only column that gives", () 
   });
 
   it("yields to keep the terminal at its floor before pinning at its own", () => {
-    // A 600px half: the build column stops at 280 so 320 of terminal survives.
-    expect(paintedBuildWidth(400, 600)).toBe(600 - TERMINAL_MIN_WIDTH);
+    // A half that cannot seat the stored width: the build column gives back exactly enough to leave
+    // the terminal its floor. Stated against the constant, not a number chosen for a past value of it.
+    expect(paintedBuildWidth(1000, 600)).toBe(600 - TERMINAL_MIN_WIDTH);
   });
 
   it("never paints below its own floor, even when that costs the terminal everything", () => {
     // Collapse order: terminal to a strip FIRST, then build. A floorless expression went negative
-    // here and painted the build column away entirely (roborev 55883).
-    expect(paintedBuildWidth(220, 200)).toBe(BUILD_COLUMN_MIN_WIDTH);
-    const g = cockpitGeometry(row({ windowWidth: 900, conciergeWidth: 280 }));
+    // here and painted the build column away entirely (roborev 55883). The half has to be tighter
+    // than floor+floor for the build column to be the one that pins, so it is derived rather than
+    // hardcoded — the previous literals were sized for a 320px terminal floor and stopped biting.
+    const tightHalf = BUILD_COLUMN_MIN_WIDTH + TERMINAL_MIN_WIDTH - 20;
+    expect(paintedBuildWidth(220, tightHalf)).toBe(BUILD_COLUMN_MIN_WIDTH);
+
+    // The same collapse through the whole row. Window chosen so each half lands under that bound.
+    const conciergeWidth = 280;
+    const windowWidth = 2 * tightHalf + conciergeWidth + 2 * RAIL_WIDTH;
+    const g = cockpitGeometry(row({ windowWidth, conciergeWidth }));
     expect(widthOf(g, "build-left")).toBe(BUILD_COLUMN_MIN_WIDTH);
     // THIS USED TO ASSERT `terminal-left >= 0`, WHICH WAS VACUOUS: the value is literally
     // `Math.max(0, …)`, so it was true before the function existed and would survive any change to
     // it (roborev 56070). The real invariant is that the terminal takes exactly what the build
     // column left, which is what "the terminal absorbs the shortfall" actually means.
-    const half = (900 - 280 - 2 * RAIL_WIDTH) / 2;
-    expect(widthOf(g, "terminal-left")).toBe(half - BUILD_COLUMN_MIN_WIDTH);
+    expect(widthOf(g, "terminal-left")).toBe(tightHalf - BUILD_COLUMN_MIN_WIDTH);
   });
 });
 
@@ -377,17 +401,20 @@ describe("paintedBuildWidth — the terminal is the only column that gives", () 
 // the model actually does when the precondition is violated, and the tell a caller can look for.
 describe("a concierge wider than the row can seat — the caller's bug, made loud", () => {
   it("over-subscribes the row rather than silently re-centring, and the total says so", () => {
-    // 600px window, 280px concierge: half = 154, below the build column's 160 floor.
-    const g = cockpitGeometry(row({ windowWidth: 600, conciergeWidth: 280 }));
+    // A concierge so wide the halves cannot even seat the build column's floor, so the terminal is
+    // squeezed to nothing. Derived from the floor rather than a literal sized for the old constants.
+    const conciergeWidth = 280;
+    const windowWidth = conciergeWidth + 2 * RAIL_WIDTH + 2 * (BUILD_COLUMN_MIN_WIDTH - 4);
+    const g = cockpitGeometry(row({ windowWidth, conciergeWidth }));
     expect(widthOf(g, "build-left")).toBe(BUILD_COLUMN_MIN_WIDTH);
     expect(widthOf(g, "terminal-left")).toBe(0);
     // THE TELL: the columns no longer tile the row. A caller that failed to clamp can detect it with
     // exactly this sum, which is why the model is left honest instead of quietly absorbing it.
     const total = g.reduce((n, c) => n + c.width, 0);
-    expect(total).toBeGreaterThan(600);
+    expect(total).toBeGreaterThan(windowWidth);
     // …and the concierge is NOT centred in that state, which is the point: centring is a consequence
     // of the halves having free space to share, not a property the model can assert unconditionally.
-    expect(centreOf(g, "concierge")).not.toBeCloseTo(300, 9);
+    expect(centreOf(g, "concierge")).not.toBeCloseTo(windowWidth / 2, 9);
   });
 
   it("is unreachable through the ceiling, which is what makes the above a caller bug and not a mode", () => {
@@ -426,48 +453,68 @@ describe("single-pair rows are left exactly as they were", () => {
 });
 
 
-// ── THE CEILING MUST FIT THE WIDER BUILDER, NOT THE AVERAGE ───────────────────────────────────
+// ── A NEIGHBOUR'S WIDTH NO LONGER NARROWS THIS COLUMN ─────────────────────────────────────────
 //
-// The halves are EQUAL, so there is one half-width and it has to seat the LARGER build column.
-// Reserving `buildLeft + buildRight` reserves the AVERAGE, which is right only when the two are the
-// same — i.e. wrong in exactly the case this feature exists for (roborev 56070).
-describe("conciergePairedReserve — asymmetric builders", () => {
-  it("reserves twice the WIDER column", () => {
-    expect(conciergePairedReserve(160, 900)).toBe(2 * 900 + 2 * TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH);
-    // …and is symmetric in its arguments: which side is wider cannot matter.
-    expect(conciergePairedReserve(900, 160)).toBe(conciergePairedReserve(160, 900));
+// The reserve used to be `2 × max(buildLeft, buildRight)` so that both builders could always paint
+// at their stored widths (roborev 56070). That guarantee is now delivered a different way — by paint
+// clamping plus stored-width preservation — because the old one made widening ONE column silently
+// un-widen another, which is the founder's "nothing should block the other columns".
+describe("conciergePairedReserve — the floors, not the neighbours", () => {
+  it("is the same number no matter how wide the builders are", () => {
+    // THE ASSERTION THAT WOULD HAVE FAILED BEFORE: the reserve is constant, so a builder the user
+    // widened cannot lower the concierge's ceiling by even one pixel.
+    expect(conciergePairedReserve()).toBe(
+      2 * BUILD_COLUMN_MIN_WIDTH + 2 * TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH,
+    );
+    expect(conciergePairedReserve()).toBe(212);
+    for (const w of [1600, 2560, 3840]) {
+      expect(conciergeCeiling(w)).toBe(w - 212);
+    }
   });
 
-  it("leaves symmetric rows untouched, so no target-layout number moves", () => {
-    expect(conciergePairedReserve(400, 400)).toBe(1452);
-    expect(conciergePairedReserve(220, 220)).toBe(1092);
+  it("SQUEEZES a wide builder's paint instead of refusing the drag — and the preference survives", () => {
+    // The replacement guarantee, and the reason the old one is safe to drop. At the ceiling the
+    // halves are only 50px wider than the floors, so a 900px builder cannot paint at 900 — it paints
+    // at its floor. What matters is that nothing REWROTE 900: `cockpitGeometry` is a pure function of
+    // the STORED width, so narrowing the concierge again restores it.
+    const windowWidth = 2560;
+    const stored = 900;
+    const at = conciergeCeiling(windowWidth);
+    const squeezed = cockpitGeometry(
+      row({ windowWidth, conciergeWidth: at, buildLeftWidth: stored, buildRightWidth: stored }),
+    );
+    expect(widthOf(squeezed, "build-left")).toBe(BUILD_COLUMN_MIN_WIDTH);
+
+    // …and the SAME stored width paints in full once the concierge yields the room back. This is the
+    // spring-back, asserted rather than assumed — if the squeeze had been written back, this fails.
+    const restored = cockpitGeometry(
+      row({ windowWidth, conciergeWidth: 360, buildLeftWidth: stored, buildRightWidth: stored }),
+    );
+    expect(widthOf(restored, "build-left")).toBe(stored);
   });
 
-  it("AT THE CEILING, BOTH builders still paint at their stored widths", () => {
-    // The property the reserve exists to guarantee, asserted as geometry. Under the old sum-based
-    // reserve this row permitted a 848px concierge at which the 900px builder painted at 530 — a
-    // 370px squeeze the drag reported as unclamped.
+  it("keeps every column at or above the shared 50px floor at the ceiling", () => {
+    // The budget's other half: the floors are what the reserve is made of, so they must actually hold.
     const windowWidth = 3840;
-    for (const [bl, br] of [
-      [160, 900],
-      [900, 160],
-      [400, 220],
-    ]) {
-      const at = conciergeCeiling(windowWidth, bl!, br!);
-      const g = cockpitGeometry(row({ windowWidth, conciergeWidth: at, buildLeftWidth: bl, buildRightWidth: br }));
-      expect(widthOf(g, "build-left")).toBe(bl);
-      expect(widthOf(g, "build-right")).toBe(br);
-      // …and both terminals are still at or above their floor, which is the other half of the budget.
-      expect(widthOf(g, "terminal-left")).toBeGreaterThanOrEqual(TERMINAL_MIN_WIDTH);
-      expect(widthOf(g, "terminal-right")).toBeGreaterThanOrEqual(TERMINAL_MIN_WIDTH);
+    const g = cockpitGeometry(
+      row({
+        windowWidth,
+        conciergeWidth: conciergeCeiling(windowWidth),
+        buildLeftWidth: 900,
+        buildRightWidth: 160,
+      }),
+    );
+    for (const key of ["terminal-left", "build-left", "build-right", "terminal-right"] as const) {
+      expect(widthOf(g, key)).toBeGreaterThanOrEqual(COLUMN_MIN_WIDTH);
     }
   });
 });
 
 // ── THE STORED BUILD WIDTH ────────────────────────────────────────────────────────────────────
 //
-// `Workspace` feeds this straight into the reserve above, so a wrong answer here moves the
-// concierge's ceiling. It had no direct coverage at all when it was introduced.
+// `AgentSidebar`'s width state is seeded from this, and it is the only caller. It used to feed the
+// concierge's reserve as well — a wrong answer moved that ceiling — but the reserve is the shared
+// floors now, so what these pin is the seed itself. It had no direct coverage when it was introduced.
 describe("readStoredBuildWidth", () => {
   beforeEach(() => localStorage.clear());
 
@@ -494,15 +541,21 @@ describe("readStoredBuildWidth", () => {
     // Clamping would put the reduced number where the next drag persists it, destroying a preference
     // set on a bigger display. Reading never writes, so the stored 1100 is still there afterwards.
     localStorage.setItem(buildWidthKey("left"), "1100");
-    expect(readStoredBuildWidth("left", 1280)).toBe(BUILD_COLUMN_DEFAULT_WIDTH);
+    // A window that genuinely cannot show 1100 — derived, since the reserve shrank with the floors.
+    const tooNarrow = 1100 + BUILD_COLUMN_ROW_RESERVE - 100;
+    expect(buildColumnMax(tooNarrow)).toBeLessThan(1100);
+    expect(readStoredBuildWidth("left", tooNarrow)).toBe(BUILD_COLUMN_DEFAULT_WIDTH);
     expect(localStorage.getItem(buildWidthKey("left"))).toBe("1100");
   });
 
   it("clamps the DEFAULT to the live ceiling on a window too narrow for it", () => {
-    // At 700px the build column's ceiling is its own 160 floor. Answering 220 told the row to reserve
-    // space for a column that paints at 160, lowering the concierge's ceiling for nothing.
-    expect(buildColumnMax(700)).toBe(BUILD_COLUMN_MIN_WIDTH);
-    expect(readStoredBuildWidth("left", 700)).toBe(BUILD_COLUMN_MIN_WIDTH);
+    // On a window whose ceiling is the build column's own floor, the value returned here is the
+    // floor rather than the raw default. Scoped to the SEED: the state is deliberately not
+    // reconciled afterwards, so this says nothing about `data-width` later in the column's life.
+    // Derived from the reserve so it keeps biting as the floors move.
+    const pinned = BUILD_COLUMN_ROW_RESERVE + BUILD_COLUMN_MIN_WIDTH - 10;
+    expect(buildColumnMax(pinned)).toBe(BUILD_COLUMN_MIN_WIDTH);
+    expect(readStoredBuildWidth("left", pinned)).toBe(BUILD_COLUMN_MIN_WIDTH);
   });
 
   it("falls back to the default when nothing is stored, and when the value is junk", () => {

@@ -141,15 +141,39 @@ export function retroEmissionProtocol(): string {
     "  **SPARKLE IMPROVEMENTS:**",
     `  ${RETRO_SEVERITY_SCALE_LINE}`,
     "  **AGENT ID:** <your PR number, branch name, and latest commit sha>",
-    "  **PAIN POINT:** <a friction / error / slow-path you hit doing this task>",
+    "  **PAIN POINT [<bead id>]:** <a friction / error / slow-path you hit doing this task>",
     "  **SEVERITY:** <1-4 per the scale above>",
     "  **RECOMMENDATION:** <the concrete fix: files/subsystem to touch, approach>",
     "  **ADDITIONAL CONTEXT:** <optional extra evidence a future agent needs; omit if none>",
+    "",
+    "FILE EACH PAIN POINT AS A BEAD — BEFORE you print the retro, and it is what fills in <bead id>",
+    "A printed pain point is not durable: the pane scrolls and the finding is gone. Filing it is the",
+    "only thing that keeps it. So for EACH pain point, run this from the repo root FIRST and keep the",
+    "line it prints:",
+    "  scripts/file-retro-pain-point.sh --summary '<what went wrong>' --severity <1-4> \\",
+    "    --recommendation '<the concrete fix>' [--subsystem '<area>'] [--context '<evidence>']",
+    "It prints exactly ONE line and always exits 0: a bead id (`sparkle-xxxx`), or `unfiled:<reason>`",
+    "when it declined. Put that line in the heading verbatim — `**PAIN POINT [sparkle-xxxx]:** …` or",
+    "`**PAIN POINT [unfiled:scrubbed]:** …` — so the human reading your retro can tell a finding that",
+    "is now in the backlog from one that is only on screen.",
+    "- Quoting prose into flags is error-prone; `--json-stdin` takes the whole point as JSON on stdin:",
+    '  {"summary":"…","severity":<1-4>,"recommendation":"…","subsystem":"…","context":"…"}',
+    "- It is IDEMPOTENT and shares one dedupe key with the merge-time capture hook, so filing a point",
+    "  that is already filed ESCALATES that bead (recurrence counter + priority) instead of creating a",
+    "  second one. Re-running it is safe. Never `bd create` a pain point by hand: a hand-filed bead",
+    "  carries no dedupe key, so it becomes the duplicate the mechanism exists to prevent.",
+    "- The text is scrubbed for PII/secrets before anything is filed; `unfiled:scrubbed` means rewrite",
+    "  it anonymized, not that the finding was rejected.",
+    "- If that script does not exist in the repo you are working in, skip this step and print plain",
+    "  `**PAIN POINT:**` headings — it is a Sparkle-repo tool, not something for you to install.",
     "",
     "Rules for the SPARKLE IMPROVEMENTS section:",
     "- Repeat the PAIN POINT / SEVERITY / RECOMMENDATION / ADDITIONAL CONTEXT block once per finding,",
     `  ordered by SEVERITY highest-first, up to ${RETRO_MAX_PAIN_POINTS} blocks. Print the severity`,
     "  scale line exactly once.",
+    "- File and report SEVERITY 1 points too. They are cheap to record and they are the ones that",
+    "  compound: an identical trivial annoyance seen fifty times collapses onto ONE bead whose",
+    "  priority climbs each time, which is how a paper cut becomes visible as a real problem.",
     "- Omit the pain-point blocks only if the task was genuinely frictionless; TL;DR, PERCENT",
     "  COMPLETE, EST COMPLETION, and MORE DETAILS are ALWAYS required.",
     "- Keep everything ANONYMIZED — no PII, secrets, raw log lines, or user/project paths.",
@@ -177,8 +201,10 @@ export function retroEmissionProtocol(): string {
 export interface WorkerRetroPainPoint {
   /** Anonymized description of the friction/error/slow-path. */
   summary: string;
-  /** SEV1 (minor/cosmetic) .. SEV3 (blocked/expensive/repeated). */
-  severity: 1 | 2 | 3;
+  /** SEV1 (hardly worth mentioning) .. SEV4 (full blocker). The scale the persona prints, the
+   *  JSON Schema, the PR-body marker parser and both bead-capture paths all use is 1-4; this
+   *  said 1-3, so a worker that reported a BLOCKER had its whole result.json rejected. */
+  severity: 1 | 2 | 3 | 4;
   /** The concrete proposed fix (files/subsystem to touch, approach). Anonymized. */
   recommendation: string;
   /** Coarse area hint (e.g. "orchestrator-mcp", "ci") used to cluster/dedupe. Optional. */
@@ -219,7 +245,7 @@ const STATUSES = ["success", "failed", "partial"] as const;
 
 /** Validate a worker's retro when present. Strict-when-present, mirroring
  *  docs/schemas/worker-retro.schema.json: `tldr` + `painPoints` are required, and every pain point
- *  needs `summary` + `severity` (1-3) + `recommendation`. Optional fields are type-checked when
+ *  needs `summary` + `severity` (1-4) + `recommendation`. Optional fields are type-checked when
  *  present and dropped when null/absent. Throws Error naming the first offending field. */
 function parseWorkerRetro(raw: unknown): WorkerRetro {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -236,8 +262,8 @@ function parseWorkerRetro(raw: unknown): WorkerRetro {
     if (typeof pp.summary !== "string" || !pp.summary) {
       throw new Error(`retro.painPoints[${i}].summary is required`);
     }
-    if (pp.severity !== 1 && pp.severity !== 2 && pp.severity !== 3) {
-      throw new Error(`retro.painPoints[${i}].severity must be 1, 2, or 3`);
+    if (pp.severity !== 1 && pp.severity !== 2 && pp.severity !== 3 && pp.severity !== 4) {
+      throw new Error(`retro.painPoints[${i}].severity must be 1, 2, 3, or 4`);
     }
     if (typeof pp.recommendation !== "string" || !pp.recommendation) {
       throw new Error(`retro.painPoints[${i}].recommendation is required`);

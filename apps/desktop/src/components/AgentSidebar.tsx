@@ -800,7 +800,8 @@ export function AgentSidebar({
   // can never speak for the other column (roborev 55391).
   const widthKey = buildWidthKey(pairSide);
   // The restore — including the read-through of the pre-split key, so a user's existing width
-  // survives — is `readStoredBuildWidth`, shared with the row that reserves space for this column.
+  // survives — is `readStoredBuildWidth`. It USED to be shared with the row that reserved space for
+  // this column; that reserve is the shared 50px floors now, so this is the function's only caller.
   const [width, setWidth] = useState<number>(() => readStoredBuildWidth(pairSide, windowWidth));
 
   /** Commit a width the pull tab has ALREADY clamped and logged.
@@ -882,9 +883,12 @@ export function AgentSidebar({
   // `2 * max(left, right)` reserve was introduced to remove, reached through the mirror instead of
   // through the formula.
   //
-  // Cheap: this effect already runs exactly when the width or the side changes, and `Workspace`
-  // ignores an event that does not change its mirror, so a re-announcement of the same width costs
-  // one comparison and no render.
+  // NOTHING LISTENS TO THIS TODAY. The paragraph above describes why the row used to need it: the
+  // concierge's ceiling reserved `2 * max(left, right)`, so the shell mirrored both build widths and
+  // a stale mirror let the concierge squeeze a builder. That reserve is now the shared 50px floors —
+  // a constant — so the mirror was removed and this event has no subscriber. Kept as the one channel
+  // that reports a build width app-wide; see `BUILD_WIDTH_EVENT`. The CSS variable beside it IS live
+  // and is what actually paints this column, so this effect earns its place regardless.
   useEffect(() => {
     publishColumnWidthVar(buildWidthVar(pairSide), width);
     window.dispatchEvent(

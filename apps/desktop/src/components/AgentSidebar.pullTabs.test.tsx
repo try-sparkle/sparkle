@@ -33,6 +33,12 @@ vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./StatusBar", () => ({ StatusBar: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
+import {
+  BUILD_COLUMN_MIN_WIDTH,
+  BUILD_COLUMN_ROW_RESERVE,
+  TERMINAL_MIN_WIDTH,
+  buildColumnMax,
+} from "../engine/columnResize";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -216,9 +222,12 @@ describe("AgentSidebar — keyboard resize", () => {
     // `ColumnPullTab.commit` fires `onWidth(applied)` unconditionally, so a press pinned at a bound
     // used to mark the instance dirty while the width never moved — enough for its flush to speak
     // for a column the user never touched.
-    localStorage.setItem(WIDTH_KEY, "160");
+    // SEEDED AT THE REAL FLOOR, so the press genuinely has nowhere to go. Spelling it "160" pinned a
+    // number that later stopped being the minimum, at which point the press DID move the column and
+    // this row was asserting nothing about dirtiness at all.
+    localStorage.setItem(WIDTH_KEY, String(BUILD_COLUMN_MIN_WIDTH));
     const { unmount } = render(<AgentSidebar project={mkProject()} />);
-    expect(column().dataset.width).toBe("160");
+    expect(column().dataset.width).toBe(String(BUILD_COLUMN_MIN_WIDTH));
     fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" }); // already at MIN_WIDTH
     localStorage.setItem(WIDTH_KEY, "999");
     unmount();
@@ -257,19 +266,25 @@ describe("AgentSidebar — keyboard resize", () => {
     }
   };
 
-  it("clamps to the same 160-1200 range the drag clamps to, on a window that can afford it", () => {
-    withWindow(2000, () => {
+  it("clamps to the same range the drag clamps to, on a window that can afford it", () => {
+    // AGAINST THE CONSTANTS, NOT LITERALS. This row used to spell "160" and "1200"; both moved when
+    // every column was put on one 50px floor, and a test that hardcodes a budget re-breaks each time
+    // the budget is tuned while telling you nothing about the rule it meant to pin.
+    const windowWidth = 2000;
+    const ceiling = String(buildColumnMax(windowWidth));
+    const floor = String(BUILD_COLUMN_MIN_WIDTH);
+    withWindow(windowWidth, () => {
       render(<AgentSidebar project={mkProject()} />);
-      // 160 → 1200 is 1040px, and a Shift step is 40px, so 40 presses no longer reach the ceiling.
-      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-      expect(column().dataset.width).toBe("1200");
+      // A Shift step is 40px, so the loop must out-run the whole range from the default width.
+      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(column().dataset.width).toBe(ceiling);
       // Already at the ceiling — another push must not exceed it.
       fireEvent.keyDown(resizeTab(), { key: "ArrowRight" });
-      expect(column().dataset.width).toBe("1200");
-      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowLeft", shiftKey: true });
-      expect(column().dataset.width).toBe("160");
+      expect(column().dataset.width).toBe(ceiling);
+      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowLeft", shiftKey: true });
+      expect(column().dataset.width).toBe(floor);
       fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-      expect(column().dataset.width).toBe("160");
+      expect(column().dataset.width).toBe(floor);
     });
   });
 
@@ -287,24 +302,24 @@ describe("AgentSidebar — keyboard resize", () => {
     Object.defineProperty(window, "innerWidth", { value: 2000, configurable: true });
     try {
       render(<AgentSidebar project={mkProject()} />);
-      for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-      expect(column().dataset.width).toBe("1200");
+      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      const wide = String(buildColumnMax(2000));
+      expect(column().dataset.width).toBe(wide);
 
       act(() => {
         Object.defineProperty(window, "innerWidth", { value: 1000, configurable: true });
         window.dispatchEvent(new Event("resize"));
       });
 
-      // THE PREFERENCE SURVIVES. `data-width` and `RENDERED_WIDTH` still carry the raw 1200, so
+      // THE PREFERENCE SURVIVES. `data-width` and `RENDERED_WIDTH` still carry the raw wide value, so
       // re-docking to a display that can afford it gives the user their width back.
-      expect(column().dataset.width).toBe("1200");
+      expect(column().dataset.width).toBe(wide);
 
-      // …and the seam now resizes from what is PAINTED. At 1000 the ceiling is
-      // `1000 - (280 concierge + 320 terminal) = 400`, so one 8px step inward lands on 392.
+      // …and the seam now resizes from what is PAINTED — the narrow window's ceiling, one step in.
       fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-      // Against the raw 1200, `clampWidth(1192, 160, 400)` pins to 400: the seam is dead for 800px of
-      // travel and the stored 1200 is destroyed by the first keypress.
-      expect(column().dataset.width).toBe("392");
+      // Against the raw stored width the clamp would pin at the ceiling: the seam would be dead for
+      // the whole difference, and the stored preference destroyed by the first keypress.
+      expect(column().dataset.width).toBe(String(buildColumnMax(1000) - 8));
     } finally {
       Object.defineProperty(window, "innerWidth", { value: real, configurable: true });
     }
@@ -339,13 +354,14 @@ describe("AgentSidebar — keyboard resize", () => {
 
       // Now the left pair opens — no window resize, no drag, an ordinary action. The row is
       // concierge 360 + two pairs sharing ~1240, so this column's container is ~614 and the CSS
-      // clamp paints it at `min(700, 614 - 320) = 294` while the window ceiling still says 1000.
+      // clamp paints it at `min(700, 614 - TERMINAL_MIN_WIDTH)` while the window ceiling is higher.
       givePairWidth(614);
 
       fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-      // 294 - 8. Against the window bound alone the answer is 692: the seam is dead for the ~400px
-      // between what is stored and what is on screen, with no `clampedBy` line to explain it.
-      expect(column().dataset.width).toBe("286");
+      // One step in from the PAIR-bounded width. Against the window bound alone the answer is 692:
+      // the seam would be dead for the gap between what is stored and what is on screen, with no
+      // `clampedBy` line to explain it.
+      expect(column().dataset.width).toBe(String(614 - TERMINAL_MIN_WIDTH - 8));
     });
   });
 
@@ -449,9 +465,9 @@ describe("AgentSidebar — keyboard resize", () => {
       fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 990 });
       fireEvent.pointerUp(window, { pointerId: 1 });
 
-      // `grows: "left"` in the right pair, so 10px of inward travel off the PAINTED 294. Off the
+      // `grows: "left"` in the right pair, so 10px of inward travel off the PAINTED width. Off the
       // stored 700 it would be 690 — a width the column was already not rendering at.
-      expect(column().dataset.width).toBe("284");
+      expect(column().dataset.width).toBe(String(614 - TERMINAL_MIN_WIDTH - 10));
     });
   });
 
@@ -463,11 +479,16 @@ describe("AgentSidebar — keyboard resize", () => {
   it("still honours the HARD cap when the pair is roomier than the window ceiling", () => {
     withWindow(2600, () => {
       render(<AgentSidebar project={mkProject()} />);
-      // 2600 - 600 = 2000, capped by HARD_MAX_WIDTH to 1200. The pair is roomier still: 2400 - 320
-      // = 2080 of container room. The gesture must stop at 1200, not at 2080.
-      givePairWidth(2400);
-      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-      expect(column().dataset.width).toBe("1200");
+      // The pair is stubbed ROOMIER than the window ceiling, which is the whole point: the container
+      // reading must TIGHTEN `MAX_WIDTH`, never replace it. Taken neat, the gesture would run to the
+      // container's room instead of stopping at the window-derived ceiling.
+      const roomyPair = 4000;
+      givePairWidth(roomyPair);
+      for (let i = 0; i < 140; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      expect(column().dataset.width).toBe(String(buildColumnMax(2600)));
+      // THE PREMISE, ASSERTED: the container really is roomier, so this row is testing the intersect
+      // and not just agreeing with whichever bound happened to be smaller.
+      expect(buildColumnMax(2600)).toBeLessThan(roomyPair - TERMINAL_MIN_WIDTH);
     });
   });
 
@@ -478,15 +499,16 @@ describe("AgentSidebar — keyboard resize", () => {
   it("still honours the HARD cap on the DRAG path too, not only the arrows", () => {
     withWindow(2600, () => {
       render(<AgentSidebar project={mkProject()} />);
-      givePairWidth(2400);
+      givePairWidth(4000); // roomier than the window ceiling — see the keyboard row above
+      expect(buildColumnMax(2600)).toBeLessThan(4000 - TERMINAL_MIN_WIDTH);
 
       fireEvent.mouseEnter(rail());
       fireEvent.pointerDown(resizeTab(), { pointerId: 1, button: 0, buttons: 1, clientX: 500 });
-      // Outward by 2000px — past the 1200 cap and past the container's 2080 alike.
-      fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 2500 });
+      // Outward by 4000px — past the window ceiling and past the container's room alike.
+      fireEvent.pointerMove(window, { pointerId: 1, buttons: 1, clientX: 4500 });
       fireEvent.pointerUp(window, { pointerId: 1 });
 
-      expect(column().dataset.width).toBe("1200");
+      expect(column().dataset.width).toBe(String(buildColumnMax(2600)));
     });
   });
 
@@ -497,19 +519,20 @@ describe("AgentSidebar — keyboard resize", () => {
       localStorage.setItem(WIDTH_KEY, "700");
       render(<AgentSidebar project={mkProject()} />);
 
-      // Cramped: the reading pins this press to the pair-bounded 294 - 8.
+      // Cramped: the reading pins this press to the pair-bounded width, one step in.
       givePairWidth(614);
       fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
-      expect(column().dataset.width).toBe("286");
+      expect(column().dataset.width).toBe(String(614 - TERMINAL_MIN_WIDTH - 8));
 
       // The left pair closes and the room comes back. A cached bound would hold the column at ~294
       // forever; a fresh reading lets it grow again.
-      givePairWidth(1400);
-      for (let i = 0; i < 40; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
-      // The container now offers `1400 - 320 = 1080` while the window still only offers 1000, so the
+      givePairWidth(2000);
+      for (let i = 0; i < 80; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
+      // The container now offers `1400 - TERMINAL_MIN_WIDTH` while the window offers less, so the
       // intersect stops at the WINDOW ceiling — both bounds live, neither one discarded. A cached
-      // reading would have stopped it at 294 instead.
-      expect(column().dataset.width).toBe("1000");
+      // reading would have stopped it at the cramped pair bound instead.
+      expect(column().dataset.width).toBe(String(buildColumnMax(1600)));
+      expect(buildColumnMax(1600)).toBeLessThan(2000 - TERMINAL_MIN_WIDTH);
     });
   });
 
@@ -519,10 +542,10 @@ describe("AgentSidebar — keyboard resize", () => {
       render(<AgentSidebar project={mkProject()} />);
       // No stub: the container reports 0, which is what a satellite column, an unmounted pair, or
       // the first frame of a mount looks like. Reading that as a bound would pin the column to its
-      // 160px minimum on the strength of a measurement that never happened.
+      // own minimum on the strength of a measurement that never happened.
       fireEvent.keyDown(resizeTab(), { key: "ArrowLeft" });
       expect(column().dataset.width).toBe("692");
-      expect(resizeTab().getAttribute("aria-valuemax")).toBe("1000");
+      expect(resizeTab().getAttribute("aria-valuemax")).toBe(String(buildColumnMax(1600)));
     });
   });
 
@@ -531,9 +554,9 @@ describe("AgentSidebar — keyboard resize", () => {
       render(<AgentSidebar project={mkProject()} />);
       for (let i = 0; i < 60; i++) fireEvent.keyDown(resizeTab(), { key: "ArrowRight", shiftKey: true });
       const w = Number(column().dataset.width);
-      // Concierge at its 280 minimum plus a 320 terminal must still fit beside it.
-      expect(w).toBeLessThanOrEqual(900 - 600);
-      expect(w).toBeGreaterThanOrEqual(160);
+      // Every OTHER column at the shared floor, plus both rails, must still fit beside it.
+      expect(w).toBeLessThanOrEqual(900 - BUILD_COLUMN_ROW_RESERVE);
+      expect(w).toBeGreaterThanOrEqual(BUILD_COLUMN_MIN_WIDTH);
     });
   });
 
@@ -558,7 +581,7 @@ describe("AgentSidebar — keyboard resize", () => {
     // The FLOOR, which the first version dropped — without it the expression goes negative on a narrow
     // container and the column paints at 0px.
     expect(w).toContain("max(");
-    expect(w).toContain("160px");
+    expect(w).toContain(`${BUILD_COLUMN_MIN_WIDTH}px`);
     // And it is a container-relative expression, not the frozen pixel value from state.
     expect(w).not.toBe(`${column().dataset.width}px`);
   });

@@ -97,6 +97,24 @@ export function clampWidth(requested: number, min: number, max: number): ClampRe
 // the column's own minimum, never a value below it, because an inverted range is how a clamp starts
 // returning nonsense instead of a bound.
 
+// ── ONE MINIMUM, FOR EVERY COLUMN — AND NOTHING ELSE STOPS A DRAG ──────────────────────────────
+//
+// THE FOUNDER'S RULE, verbatim: "Nothing should block the other columns from going to any sort of
+// width except for maybe a minimum width of 50 pixels for any given column. Besides that it should
+// be totally possible to drag any column to any width."
+//
+// This deliberately overturns the per-column minimums the file previously carried (build 160,
+// terminal 320, concierge 280). Those were not arbitrary, but at five columns they summed to ~760px
+// of reserve before any column could move — and on a ~890px window that is what a measured session
+// actually hit: `agent column: min 160, max 290` (the max is `window - 600`), then `Sparkle column:
+// min 280, max 280`, where min EQUALS max and the seam is dead. Three drags in a row moved nothing.
+// A minimum that large is not a floor, it is a freeze.
+//
+// So every column now shares ONE floor, and every ceiling is derived from it: a column may be
+// dragged to whatever the window leaves once each OTHER column keeps its 50px and the rails keep
+// theirs. Nothing else narrows it.
+export const COLUMN_MIN_WIDTH = 50;
+
 /** THE BUILD COLUMN'S FLOOR — the width below which it stops being a column.
  *
  *  HERE, NOT IN `AgentSidebar`, because the callers that need it are the ones computing a ROW's
@@ -104,7 +122,7 @@ export function clampWidth(requested: number, min: number, max: number): ClampRe
  *  component to learn a number, which every suite that mocks `./AgentSidebar` then had to re-declare —
  *  and a constant two files declare separately is precisely the class of bug this branch keeps
  *  re-finding (roborev 55910). This module already owns the row's other invariants. */
-export const BUILD_COLUMN_MIN_WIDTH = 160;
+export const BUILD_COLUMN_MIN_WIDTH = COLUMN_MIN_WIDTH;
 
 /**
  * The concierge column's default width.
@@ -117,9 +135,24 @@ export const BUILD_COLUMN_MIN_WIDTH = 160;
  */
 export const CONCIERGE_DEFAULT_WIDTH = 360;
 /** What must stay for the terminal beside the build column — the floor its CSS clamp leaves it.
- *  Matches the thin-column hazard `paneVisibility` already carries a backstop for: a terminal driven
- *  to ~0 spawns its PTY at fallback dimensions. */
-export const TERMINAL_MIN_WIDTH = 320;
+ *
+ *  NOW THE SHARED 50px FLOOR, down from 320. The 320 was the single largest contributor to the frozen
+ *  row above: it appears TWICE in a two-pair reserve, so it alone spent 640px of any window before a
+ *  seam could move.
+ *
+ *  The hazard it was guarding is real but is NOT enforced here, and never was — a terminal squeezed
+ *  toward ~0 would have its PTY spawned or resized at a nonsense width, which bakes hard-wrapped
+ *  output into the scrollback permanently. `terminalSize.ts` is the actual guard: `isMeasuredSize`
+ *  refuses to hand the child any size below `MIN_PLAUSIBLE_COLS`/`MIN_PLAUSIBLE_ROWS`, so a terminal
+ *  dragged very narrow simply stops pushing sizes to its child rather than pushing a bad one. That
+ *  backstop sits between the layout and the PTY and is unaffected by this constant.
+ *
+ *  THE TRADEOFF, STATED: at 50px a terminal is ~7 columns, below `MIN_PLAUSIBLE_COLS` (20), so its
+ *  child keeps the last good width while xterm paints narrower. Output written in that window wraps
+ *  against the wider size and looks wrong until the column is widened again — recoverable, and the
+ *  scrollback written while squeezed stays wrapped. That is the cost of "any column to any width",
+ *  and it is the founder's call, made explicitly. */
+export const TERMINAL_MIN_WIDTH = COLUMN_MIN_WIDTH;
 
 /**
  * The largest width a column may be dragged to given the live window — its hard ceiling, lowered so
@@ -176,11 +209,14 @@ export const RAIL_WIDTH = 6;
 
 /** The concierge column's live width. */
 export const CONCIERGE_WIDTH_VAR = "--concierge-w";
-/** Emitted by `AgentSidebar` so the row can re-reserve for a build column's real width.
- *  ON MOUNT AND ON EVERY WIDTH CHANGE, not only on commit — the row must reserve for a column the
- *  user has never dragged, and a sidebar mounting later than `Workspace` at a different window width
- *  would otherwise leave the two disagreeing for good. `Workspace` ignores an event that does not
- *  change its mirror, so a re-announcement costs one comparison and no render. */
+/** Emitted by `AgentSidebar` on mount and on every width change.
+ *
+ *  NO LISTENER TODAY. It existed so the row could re-reserve for a build column's real width, back
+ *  when the concierge's ceiling reserved `2 * max(left, right)`. That reserve is gone — it made
+ *  widening one column silently un-widen another — so `Workspace` no longer mirrors these widths and
+ *  nothing subscribes. Retained because it is the only channel that reports a build width to the rest
+ *  of the app and a future consumer would otherwise have to reinvent it; delete it with the emitter
+ *  if none appears. Do NOT read the old rationale as describing live behaviour. */
 export const BUILD_WIDTH_EVENT = "sparkle:build-width";
 /** A build column's live width. Per side, because the two builders are independent. */
 export function buildWidthVar(side: "left" | "right"): string {
@@ -189,11 +225,26 @@ export function buildWidthVar(side: "left" | "right"): string {
 
 /** The build column's width when nothing has been stored — `AgentSidebar`'s historical default. */
 export const BUILD_COLUMN_DEFAULT_WIDTH = 220;
-/** The build column's own hard ceiling, before the window lowers it. */
-export const BUILD_COLUMN_HARD_MAX = 1200;
-/** What must stay beside the build column for the rest of the row: the concierge at its floor plus a
- *  terminal worth showing. Spelled here so the component and the row's reserve cannot disagree. */
-export const BUILD_COLUMN_ROW_RESERVE = 280 + TERMINAL_MIN_WIDTH;
+/** A SANITY CEILING, not the operative bound — the window is what actually stops the drag.
+ *
+ *  Set above the widest span the app is plausibly centred on (3×1920 = 5760) so it never binds in
+ *  practice; the founder's rule is that only the 50px floors narrow a column. The lockout this
+ *  number used to guard against (roborev 55847 — a column dragged wider than the window puts its
+ *  pull tab past the viewport edge, unrecoverably, because the width is persisted) is closed by the
+ *  window-aware bound below instead: a column can never exceed `windowWidth - reserve`, so the seam
+ *  always stays at least `reserve` px inside the window and remains grabbable. */
+export const COLUMN_HARD_MAX = 8000;
+/** @deprecated Prefer {@link COLUMN_HARD_MAX}; kept as the build column's spelling of it. */
+export const BUILD_COLUMN_HARD_MAX = COLUMN_HARD_MAX;
+/** What must stay beside the build column: the concierge at its floor, ONE terminal, and both rails.
+ *
+ *  NOT every other column — and the difference is deliberate rather than an oversight in the wording.
+ *  This bounds the GESTURE against the WINDOW. The other half of the row is bounded separately and
+ *  more precisely by `RENDERED_WIDTH`'s container clamp in `AgentSidebar`, which measures the pair
+ *  this column actually lives in; adding the far half here would double-count it and narrow the drag
+ *  for no gain. Spelled here so the gesture bound and the storage reader cannot disagree — the two
+ *  callers of `buildColumnMax`. (It fed a ROW reserve once; that consumer is gone.) */
+export const BUILD_COLUMN_ROW_RESERVE = COLUMN_MIN_WIDTH + TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH;
 
 /** The build column's live ceiling. ONE spelling, read by `AgentSidebar` (which bounds the gesture)
  *  and by the storage reader below (which rejects a width saved on a bigger display). */
@@ -219,11 +270,13 @@ export function buildWidthKey(side: "left" | "right"): string {
 const LEGACY_BUILD_WIDTH_KEY = "sparkle-sidebar-width";
 
 /**
- * A side's stored build width, validated against the live window.
+ * A side's stored build width, validated against the live window — the SEED for `AgentSidebar`'s
+ * width state, and its only caller.
  *
- * Shared by the component that owns the width and by the row that has to reserve space for it — the
- * alternative was `Workspace` re-implementing `AgentSidebar`'s restore rules, which is precisely how
- * the concierge's ceiling would come to disagree with the column it was reserving for.
+ * It was once shared with `Workspace`, which mirrored the result into the concierge's reserve; that
+ * reserve is the shared 50px floors now, so nothing else reads this. The old rationale (keeping the
+ * row from re-implementing the restore rules) is retracted rather than merely stale — see the body's
+ * note on why the default's clamp is defensive today.
  */
 export function readStoredBuildWidth(side: "left" | "right", windowWidth: number): number {
   const max = buildColumnMax(windowWidth);
@@ -235,10 +288,27 @@ export function readStoredBuildWidth(side: "left" | "right", windowWidth: number
   }
   const saved = Number(raw);
   if (saved >= BUILD_COLUMN_MIN_WIDTH && saved <= max) return saved;
-  // THE DEFAULT IS A WIDTH TOO, so it answers to the same ceiling. On a narrow window
-  // `buildColumnMax` can fall below 220 — at 700px it is 160 — and returning the raw default there
-  // told the ROW to reserve 220 for a column that paints at 160, lowering the concierge's ceiling
-  // below what the window could actually give (roborev 56070).
+  // THE DEFAULT IS A WIDTH TOO, so it answers to the same ceiling — but this clamp is now DEFENSIVE
+  // rather than load-bearing, and saying so is more useful than inventing a consequence for it.
+  //
+  // It used to matter: `Workspace` mirrored this value into the concierge's reserve, so an over-large
+  // default lowered the concierge's ceiling for a column that painted narrower. That consumer is
+  // gone — the reserve is the shared floors now, a constant. And it is NOT what keeps a drag on
+  // screen: `AgentSidebar` computes its gesture bound as `buildColumnMax(windowWidth)` independently
+  // of this return, and hands the tab `min(width, MAX_WIDTH)`, which is the roborev-55993
+  // painted-not-stored fix. Remove the clamp and the seeded column would paint and drag identically.
+  //
+  // What it still buys, scoped precisely: the value RETURNED here is within `buildColumnMax(
+  // windowWidth)` AT SEED TIME. It says nothing after that, and deliberately so — `AgentSidebar`
+  // never reconciles `width` against `MAX_WIDTH` again, so `width > MAX_WIDTH` is that column's
+  // normal steady state after a window shrink and is exactly what makes the preference survive
+  // (see its painted-not-stored block). The container clamp in a two-pair row is a separate bound
+  // again, which a seed inside `buildColumnMax` can still exceed with no window resize at all.
+  //
+  // So: do NOT read this as "`data-width` never exceeds the window ceiling". It routinely does, by
+  // design. (Three earlier attempts at this comment each claimed a consequence that did not survive
+  // inspection — roborev 57344, 57371, 57385, 57399. The clamp is cheap and keeps the seed honest;
+  // that is the whole of it.)
   //
   // AN OUT-OF-RANGE STORED WIDTH IS STILL DISCARDED RATHER THAN CLAMPED, deliberately. Clamping it
   // would put the reduced number into `AgentSidebar`'s state, and the first drag after that would
@@ -248,55 +318,41 @@ export function readStoredBuildWidth(side: "left" | "right", windowWidth: number
 }
 
 /**
- * What the concierge must leave for the rest of a TWO-PAIR row.
+ * What the concierge must leave for the rest of a TWO-PAIR row: every other column at the shared
+ * 50px floor, plus both rails. Nothing else.
  *
- * TWICE THE WIDER BUILD COLUMN, NOT THE SUM OF THE TWO — and the difference is the whole point of the
- * function. The halves are EQUAL (`flex: 1 1 0`), so there is only one half-width and it has to
- * accommodate the LARGER builder; reserving the sum reserves the AVERAGE, which is correct only when
- * the two happen to be equal. Every asymmetric row — the exact case the founder asked for, "one
- * doesn't change when the other changes" — got a ceiling that was too permissive.
+ * THE MINIMUMS, NOT THE LIVE WIDTHS — and this reverses the previous rule deliberately. It used to
+ * reserve `2 × max(buildLeft, buildRight)`, on the reasoning that reserving less "would let the
+ * concierge be dragged straight over a build column the user had deliberately widened" (roborev
+ * 56070). That reasoning holds only if being squeezed is damage. It is not: `paintedBuildWidth`
+ * below clamps a build column to `half - TERMINAL_MIN_WIDTH` for PAINT while its STORED width is
+ * left untouched, so a builder squeezed by a wide concierge springs back to the width its owner
+ * chose as soon as the concierge narrows again. The preference survives; only the pixels yield.
  *
- * Worked example of what that cost: at a 2560px window with builders of 160 and 900, the sum reserved
- * 1712 and permitted a 848px concierge. At that width each half is 850, so the 900px builder painted
- * at 530 — squeezed by 370px — while the drag reported itself unclamped. That is the "a drag that goes
- * nowhere is indistinguishable from a drag that isn't applied" failure this module exists to
- * eliminate, reached through the ceiling instead of through the clamp (roborev 56070).
+ * What the old rule cost instead was the founder's actual request. Reserving live widths means a
+ * neighbour you widened silently lowers this column's ceiling — so widening one column makes another
+ * un-widenable, which is exactly the "nothing moves" report. With both builders at 316 on an ~890px
+ * window the concierge's ceiling landed at its own floor, and `min === max` made the seam dead.
  *
- * Symmetric rows are unchanged, which is why no target-layout number moves: at 400/400 the reserve is
- * 1452 either way.
- *
- * THE LIVE WIDTHS, not the minimums: reserving the minimums would let the concierge be dragged
- * straight over a build column the user had deliberately widened.
- *
- * Single-pair rows do NOT use this. That path keeps its own reserve untouched, because the one thing
- * this change must not do is move a layout the founder says is already working.
+ * Single-pair rows do NOT use this. That path keeps its own reserve, because the one thing this
+ * change must not do is move a layout the founder says is already working.
  */
-export function conciergePairedReserve(buildLeftWidth: number, buildRightWidth: number): number {
-  return 2 * Math.max(buildLeftWidth, buildRightWidth) + 2 * TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH;
+export function conciergePairedReserve(): number {
+  return 2 * BUILD_COLUMN_MIN_WIDTH + 2 * TERMINAL_MIN_WIDTH + 2 * RAIL_WIDTH;
 }
 
 /** A SANITY CEILING, not the operative bound — the reserve above is what actually stops the drag.
  *
  *  `CONCIERGE_MAX_WIDTH` was 560, which blocked the founder's two target layouts (~1100 and ~1920 on
  *  a 3×1920 span) by 2–3.5×. This number exists only so a corrupt or hand-edited stored width cannot
- *  name something absurd; it is set above the widest single display the app is likely to be centred
- *  on, and every real limit comes from `conciergePairedReserve` against the live window. */
-export const CONCIERGE_PAIRED_HARD_MAX = 3200;
+ *  name something absurd; every real limit comes from `conciergePairedReserve` against the live
+ *  window. Shares `COLUMN_HARD_MAX` so no column carries a tighter sanity cap than any other. */
+export const CONCIERGE_PAIRED_HARD_MAX = COLUMN_HARD_MAX;
 
-/** The widest the concierge may be dragged in a TWO-PAIR row: bounded by the window once both build
- *  columns, both terminals and both rails are accounted for, and never below `min`. */
-export function conciergePairedMax(
-  windowWidth: number,
-  buildLeftWidth: number,
-  buildRightWidth: number,
-  min: number,
-): number {
-  return windowAwareMax(
-    CONCIERGE_PAIRED_HARD_MAX,
-    windowWidth,
-    conciergePairedReserve(buildLeftWidth, buildRightWidth),
-    min,
-  );
+/** The widest the concierge may be dragged in a TWO-PAIR row: whatever the window leaves once every
+ *  other column keeps its 50px floor and both rails keep theirs, and never below `min`. */
+export function conciergePairedMax(windowWidth: number, min: number): number {
+  return windowAwareMax(CONCIERGE_PAIRED_HARD_MAX, windowWidth, conciergePairedReserve(), min);
 }
 
 /** The columns of the cockpit, outboard-left to outboard-right. */

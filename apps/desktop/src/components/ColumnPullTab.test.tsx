@@ -67,6 +67,78 @@ afterEach(() => {
   document.documentElement.removeAttribute("style");
 });
 
+// ── THE WHOLE SEAM IS THE HANDLE ───────────────────────────────────────────────────────────────
+//
+// The founder: "I also want to be able to drag anywhere up and down the column, even though the pull
+// tab shows at the top. I don't want to be limited to dragging at the top." The tab is a 52px-tall
+// affordance near the top of a full-height boundary, so before this the other ~95% of the seam took
+// no press at all.
+describe("ColumnPullTab — the seam is draggable along its whole height", () => {
+  it("starts a drag from the RAIL, not only from the tab's dots", () => {
+    // THE ASSERTION IS THE COMMITTED WIDTH, not that a handler exists: a rail wired to a no-op would
+    // satisfy "it has an onPointerDown" and still be undraggable. Pressing the rail directly is the
+    // whole point — no hover first, because the tab is not involved.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(root(), 500);
+    moveTo(560);
+    release();
+    expect(onWidth).toHaveBeenCalledWith(420);
+  });
+
+  it("paints the preview during a rail drag, so the seam tracks the pointer", () => {
+    setup({ cssVar: VAR });
+    press(root(), 500);
+    moveTo(540);
+    expect(painted()).toBe("400px");
+    release();
+  });
+
+  it("advertises the resize cursor across the whole rail, not just under the tab", () => {
+    // Without this the reach exists but is invisible: a 6px column with a default cursor reads as
+    // decoration, and the founder would have no way to discover the thing he asked for.
+    setup({ cssVar: VAR });
+    expect(root().style.cursor).toBe("col-resize");
+  });
+
+  it("does NOT start a drag from the rail while the column is OVERLAID", () => {
+    // Overlaid there is no boundary to drag — the column floats over its neighbour and its width
+    // comes from the viewport, so a drag would move an edge the user cannot see. The dots already
+    // refuse in that state; the rail has to refuse on the same terms or it reopens the hole.
+    const { onWidth } = setup({ cssVar: VAR, overlaid: true });
+    press(root(), 500);
+    moveTo(560);
+    release();
+    expect(onWidth).not.toHaveBeenCalled();
+    expect(root().style.cursor).not.toBe("col-resize");
+  });
+
+  it("commits ONCE when the press lands on the dots, which bubble to the rail", () => {
+    // Both the dots and the rail start a drag and the dots are a DESCENDANT, so one press fires the
+    // handler twice. The second call must not re-latch the origin — if it did, the gesture would
+    // start from a width the first call had already begun moving away from and the seam would jump.
+    const { onWidth } = setup({ cssVar: VAR });
+    fireEvent.mouseEnter(root());
+    press(dots(), 500);
+    moveTo(560);
+    release();
+    expect(onWidth).toHaveBeenCalledTimes(1);
+    expect(onWidth).toHaveBeenCalledWith(420);
+  });
+
+  it("lets the CHEVRON still toggle the overlay instead of grabbing the seam", () => {
+    // The chevron sits inside the rail, so without stopping propagation the press that means
+    // "overlay me" would also start a drag — raising the full-window shield, which then eats the
+    // click that was the entire point of pressing it.
+    const { onOverlayToggle, onWidth } = setup({ cssVar: VAR });
+    fireEvent.mouseEnter(root());
+    fireEvent.pointerDown(chevron(), { pointerId: 1, button: 0, buttons: 1, clientX: 500 });
+    fireEvent.click(chevron());
+    expect(onOverlayToggle).toHaveBeenCalledTimes(1);
+    expect(onWidth).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-testid="column-drag-shield"]')).toBeNull();
+  });
+});
+
 describe("ColumnPullTab — one tab, two zones", () => {
   it("is hidden at rest and revealed on hover", () => {
     // The founder's note verbatim: "It should also only show on hover. It's showing all the time

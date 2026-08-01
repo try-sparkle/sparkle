@@ -446,6 +446,12 @@ export function ColumnPullTab({
   const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== undefined && e.button !== 0) return; // primary button only
     if (overlaid) return;
+    // IDEMPOTENT PER GESTURE. The rail and the tab's dots both start a drag (the founder asked to be
+    // able to grab the seam anywhere down its height, not only at the tab), and the dots are a
+    // DESCENDANT of the rail — so one press on the dots fires this twice as it bubbles. The second
+    // call would re-latch the origin from a `width` the first call has already begun moving away
+    // from, which reads as the seam jumping on grab.
+    if (drag.current) return;
     e.preventDefault();
     // THE BOUND FIRST, THEN THE ORIGIN — and the origin is clamped to it. `width` is what the owner
     // painted as of its last render, which for a container-bounded column can exceed what is on
@@ -611,7 +617,20 @@ export function ColumnPullTab({
       onMouseLeave={() => setHovered(false)}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
-      style={rail}
+      // THE WHOLE SEAM IS THE HANDLE, not just the tab. The founder: "I also want to be able to drag
+      // anywhere up and down the column, even though the pull tab shows at the top. I don't want to
+      // be limited to dragging at the top."
+      //
+      // The rail is the right owner for this and nothing else is: it is the in-flow flex sibling
+      // between the two columns, so it already spans the row's FULL HEIGHT and — unlike `zone` — it
+      // overhangs nothing, which is the property that let it own hover in the first place. Putting
+      // the gesture here therefore costs no hit area anywhere else; the 15px-overhang hazard the
+      // comment below spends its length on is exactly what we are NOT reintroducing.
+      //
+      // The tab keeps its own handler: it is a DESCENDANT, so a press there fires this too as it
+      // bubbles, which `startResize` absorbs (see its `drag.current` guard).
+      onPointerDown={overlaid ? undefined : startResize}
+      style={overlaid ? rail : railDraggable}
     >
       {/* THE SEAM FILL — the gap, painted. See `seamFill` on the props for why this is what the
           reported vertical line actually is, and why neither a border change nor a bleed on the row
@@ -673,6 +692,10 @@ export function ColumnPullTab({
             <button
               type="button"
               onClick={onOverlayToggle}
+              // The RAIL starts a drag on pointerdown now, and this button is inside it. Without
+              // this the press that means "overlay me" would also grab the seam: the shield would go
+              // up over the whole window and the click would land on that instead of the button.
+              onPointerDown={(e) => e.stopPropagation()}
               aria-pressed={overlaid}
               data-testid={`${testId}-chevron`}
               aria-label={
@@ -892,6 +915,11 @@ const rail: CSSProperties = {
   // to eating the tab's hit area — the exact roborev 54712 regression (roborev 54841).
   zIndex: PULL_TAB_RAIL_Z,
 };
+
+/** The rail when it is actually a handle — i.e. every state except overlaid, where there is no
+ *  boundary to drag. Only the cursor differs: the hit area is the rail's own 6px column, full height,
+ *  so the affordance has to be visible for the whole of it or the reach is undiscoverable. */
+const railDraggable: CSSProperties = { ...rail, cursor: "col-resize", touchAction: "none" };
 
 /**
  * The seam fill's box — the rail's full height, PLUS one pixel into each neighbour.
