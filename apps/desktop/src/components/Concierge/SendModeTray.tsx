@@ -30,6 +30,7 @@ import {
 } from "./trayGeometry";
 
 import { C, FONT_WEIGHT, ON_GOLD_FILL } from "../../theme/colors";
+import { KeyPill } from "./KeyPill";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { RADIUS, TYPE } from "../../theme/scale";
 import { useResolvedTheme } from "../../theme/theme";
@@ -727,15 +728,28 @@ export function SendModeTray({
               style={{
                 flex: "none",
                 width: TRAY_GEOMETRY.chicletSlot,
-                textAlign: "right",
+                display: "inline-flex",
+                justifyContent: "flex-end",
                 // TYPE.micro (10), not an off-scale 11: a keycap IS a badge — the rung this scale
                 // names for tracked labels, badges and ticks. theme/scale.test.ts ratchets off-scale
                 // fontSize at zero, so an eyeballed 11 here is a hard red, not a nit.
                 fontSize: TYPE.micro,
-                opacity: showCap ? 0.85 : 0,
+                // ── THE SLOT IS ALWAYS LAID OUT; ONLY ITS CONTENTS APPEAR ─────────────────────
+                // `visibility`/opacity on a FIXED-WIDTH box, never a conditional render. The
+                // founder's open complaint is Send/Push/Speak truncating to "Se…" at narrow widths,
+                // and a pill that materialises on hover would push the label into exactly that
+                // ellipsis — trading one bug for another. The slot's width is a first-class input to
+                // the label threshold (trayGeometry `chicletSlot`), so it is reserved at rest by
+                // construction.
+                opacity: showCap ? 1 : 0,
               }}
             >
-              {chicletFor(m, chord)}
+              {/* THE APP'S ONE KEYCAP (./KeyPill), not a bare glyph. The founder asked for the tray's
+                  shortcuts to look exactly like Search's: "a little pill around like the command K
+                  and it's gray". Sharing the component rather than restyling here is what stops the
+                  two drifting — which is the defect KeyPill was extracted to fix in the first place,
+                  when the palette's two copies had already diverged on padding. */}
+              <KeyPill>{chicletFor(m, chord)}</KeyPill>
             </span>
             )}
           </button>

@@ -642,3 +642,55 @@ describe("FILL MATCHES STROKE = acting right now — the one rule, all three pil
     }
   });
 });
+
+describe("the shortcut pill — one treatment, revealed not resident (sparkle-bis16)", () => {
+  const slot = (m: string) =>
+    pill(m).querySelector<HTMLElement>(`[data-testid="send-chiclet-${m}"]`) ??
+    // At rest the testid is withheld, so reach the slot positionally — it is the last child.
+    (pill(m).lastElementChild as HTMLElement);
+
+  it("draws the SAME <kbd> element Search does, not a bare glyph", () => {
+    // The founder's ask is literally sameness: "I want the keyboard shortcuts for the send, push
+    // and speak to also look that same way as they do in search." Asserted as the shared COMPONENT's
+    // output — a real <kbd> — rather than by re-listing its colours here, because two copies of a
+    // style is the exact defect KeyPill was extracted to fix (the palette's own two copies had
+    // already drifted on padding).
+    mount({ mode: "send" });
+    act(() => fireEvent.mouseEnter(pill("send")));
+    const kbd = pill("send").querySelector("kbd");
+    expect(kbd, "the tray must render the shared KeyPill, which is a real <kbd>").toBeTruthy();
+    expect(kbd!.textContent).toBe("⌘↩");
+  });
+
+  it("reserves the slot at REST so revealing the pill cannot shove the label into an ellipsis", () => {
+    // Requirement 4, and the reason it exists: the founder has an open complaint about
+    // Send/Push/Speak truncating to "Se…" at narrow widths. A pill that materialises on hover would
+    // widen the row and cause exactly that. The slot is a fixed-width box in BOTH states — only its
+    // contents fade — and its width is a first-class input to the label threshold.
+    mount({ mode: "send" });
+    const restWidth = slot("send").style.width;
+    expect(restWidth, "the slot has a width before any hover").toBe(
+      `${TRAY_GEOMETRY.chicletSlot}px`,
+    );
+    act(() => fireEvent.mouseEnter(pill("send")));
+    expect(slot("send").style.width, "and the SAME width after").toBe(restWidth);
+  });
+
+  it("hides the pill at rest and shows it on hover", () => {
+    mount({ mode: "send" });
+    expect(slot("send").style.opacity, "resting state shows no pill").toBe("0");
+    act(() => fireEvent.mouseEnter(pill("send")));
+    expect(slot("send").style.opacity).toBe("1");
+    act(() => fireEvent.mouseLeave(pill("send")));
+    expect(slot("send").style.opacity).toBe("0");
+  });
+
+  it("also reveals on keyboard FOCUS — the person who wants a shortcut has no pointer", () => {
+    // A hover-only affordance is invisible to exactly the user it is for.
+    mount({ mode: "send" });
+    act(() => fireEvent.focus(pill("send")));
+    expect(slot("send").style.opacity).toBe("1");
+    act(() => fireEvent.blur(pill("send")));
+    expect(slot("send").style.opacity).toBe("0");
+  });
+});

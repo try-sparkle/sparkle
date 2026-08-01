@@ -688,3 +688,29 @@ describe("a terminal owning the keyboard makes the tray inert", () => {
     expect(box().value).toBe("not for the terminal");
   });
 });
+
+describe("the held state reaches the TRAY — the seam, not the two ends (roborev 57452)", () => {
+  // ── WHY THIS ROW EXISTS ────────────────────────────────────────────────────────────────────────
+  // `useSendMode` returned `held` and `SendModeTray` accepted `pttHeld`, and NOTHING connected them:
+  // ConciergeHost never passed it, ConciergeColumn had no such prop, ComposeBox never forwarded it.
+  // So the whole held treatment was dead code in the running app while BOTH suites stayed green —
+  // SendModeTray.test.tsx passed `pttHeld` directly and useSendMode.test.ts read `result.current.held`
+  // directly, and neither could see the gap between them. The founder's original report ("when I hit
+  // the command key it doesn't look any different than standby") survived the fix meant to close it.
+  //
+  // So this asserts the WIRING, end to end: a real key press on a real host, read off the rendered
+  // pill. It fails against the unwired code, which is the only reason it is worth having.
+  const pttPill = () => tray().querySelector<HTMLElement>('[data-mode-pill="ptt"]')!;
+
+  it("holding the key marks the ptt pill held, and releasing clears it", () => {
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    mount();
+    expect(pttPill().getAttribute("data-held"), "at rest").toBeNull();
+
+    act(() => void fireEvent.keyDown(window, { key: "Meta" }));
+    expect(pttPill().getAttribute("data-held"), "while the key is DOWN").toBe("true");
+
+    act(() => void fireEvent.keyUp(window, { key: "Meta" }));
+    expect(pttPill().getAttribute("data-held"), "after release").toBeNull();
+  });
+});

@@ -593,6 +593,10 @@ export interface ConciergeColumnProps {
   onSendModeChange?: (next: SendMode) => void;
   /** A live PTY owns the keyboard, so the tray is not being addressed and goes flat grey. */
   trayInert?: boolean;
+  /** Is the push-to-talk gesture active — key or button down? Passed straight through to the tray;
+   *  the host reads it from `useSendMode`. This column is a conduit, not a decider. Missing this
+   *  link made the tray's held treatment dead code in the app (roborev 57452). */
+  pttHeld?: boolean;
   /** The compose box's contents changed, whatever wrote them — the countdown's only view of what
    *  it would send. Distinct from `onTextEdit`, which is narrower on purpose; see ComposeBox. */
   onComposedText?: (text: string) => void;

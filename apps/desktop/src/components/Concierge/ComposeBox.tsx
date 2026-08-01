@@ -523,6 +523,7 @@ export function ComposeBox({
   sendMode = "send",
   onSendModeChange,
   trayInert = false,
+  pttHeld = false,
   sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
   registerSubmit,
@@ -605,6 +606,17 @@ export function ComposeBox({
    *  still showing which mode is selected. Decided by the host from voice/dictationFocus; see
    *  voice/sendMode `trayInert` for why "is the composer focused" is a different question. */
   trayInert?: boolean;
+  /**
+   * Is the push-to-talk gesture active right now — key or button down?
+   *
+   * FORWARDED, not derived. `useSendMode` owns this and the host passes it through; this box is
+   * presentational. Without the pass-through the tray's held treatment was DEAD CODE in the running
+   * app (roborev 57452): both ends existed and both suites were green, because each drove its own
+   * end in isolation and nothing asserted the seam between them — so the founder's original report
+   * ("when I hit the command key it doesn't look any different than standby") survived the fix
+   * that was supposed to close it.
+   */
+  pttHeld?: boolean;
   /** Which keystroke sends, so the tray's keycap chiclets follow the setting instead of asserting
    *  a default the handler might not honour. Defaults to what this box actually implements. */
   sendChord?: SendChord;
@@ -1982,6 +1994,7 @@ export function ComposeBox({
         onModeChange={(next) => onSendModeChange?.(next)}
         model={autoSend ?? IDLE_COUNTDOWN}
         inert={trayInert}
+        pttHeld={pttHeld}
         chord={sendChord}
         onSend={submit}
         canSend={canSend}

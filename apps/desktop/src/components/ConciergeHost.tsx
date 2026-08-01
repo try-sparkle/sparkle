@@ -3926,6 +3926,9 @@ export function ConciergeHost({
         sendMode={sendTray.mode}
         onSendModeChange={sendTray.setMode}
         trayInert={sendTray.inert}
+        // The gesture, straight from the hook that owns it — see ComposeBox's `pttHeld` doc for why
+        // this one line is the difference between the held treatment existing and running.
+        pttHeld={sendTray.held}
         onComposedText={onComposedText}
         registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME

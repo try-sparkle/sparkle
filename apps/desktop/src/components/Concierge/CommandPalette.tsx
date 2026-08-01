@@ -375,12 +375,30 @@ export function CommandPalette({ open, onClose, jump, onJumped }: CommandPalette
 /** The small search affordance for the concierge column — attach-button idiom (muted hairline
  *  pill) with the shortcut spelled out. U7 drops this near the wordmark/scope header. */
 export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
+  // ── THE PILL IS A HOVER/FOCUS AFFORDANCE, AND THE SPACE FOR IT IS ALWAYS RESERVED ──────────────
+  // The founder wants shortcuts revealed rather than resident: "it should only show the keyboard
+  // shortcut on hover". FOCUS-VISIBLE counts as hover here, and that is not a nicety — a hover-only
+  // hint is invisible to exactly the person who wants a shortcut, the one driving from the keyboard.
+  //
+  // `visibility` rather than a conditional render, so the pill's box is laid out at rest and the
+  // button NEVER CHANGES WIDTH when it appears. Un-rendering it would make the control twitch under
+  // the pointer, and the same reveal in the tray would shove `Push to talk` into an ellipsis — the
+  // exact trade the tray's reserved keycap slot exists to avoid.
+  const [revealed, setRevealed] = useState(false);
   return (
     <button
       type="button"
       aria-label="Search history (⌘K)"
       title="Search history (⌘K)"
       onClick={onOpen}
+      onMouseEnter={() => setRevealed(true)}
+      onMouseLeave={() => setRevealed(false)}
+      onFocus={(e) => {
+        // `:focus-visible` semantics, asked of the DOM rather than reimplemented: a POINTER press
+        // focuses this button too, and revealing on that would flash the pill on every click.
+        if (e.currentTarget.matches(":focus-visible")) setRevealed(true);
+      }}
+      onBlur={() => setRevealed(false)}
       style={{
         fontSize: 12,
         color: C.muted,
@@ -397,7 +415,11 @@ export function PaletteTrigger({ onOpen }: { onOpen: () => void }) {
     >
       <FiSearch size={12} aria-hidden />
       Search
-      <KeyPill>⌘K</KeyPill>
+      {/* Hidden, not absent — see the reveal note above. `aria-hidden` because the shortcut is
+          already in this button's accessible NAME, and announcing "⌘K" twice is worse than once. */}
+      <span aria-hidden style={{ visibility: revealed ? "visible" : "hidden" }}>
+        <KeyPill>⌘K</KeyPill>
+      </span>
     </button>
   );
 }
