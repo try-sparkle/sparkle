@@ -35,6 +35,15 @@ import { FiActivity } from "react-icons/fi";
 import type { FleetCondition } from "@sparkle/core";
 import { C, CARD_WASH_PCT, FONT_WEIGHT } from "../../theme/colors";
 
+/**
+ * The floor the card may be squeezed to before it scrolls instead of shrinking further.
+ *
+ * Enough for the heading and the lead sentence of the first condition — the part that says WHAT is
+ * wrong. Everything past it is reachable by scroll, so a hard squeeze costs detail rather than the
+ * fact itself.
+ */
+export const FLEET_NOTICE_MIN_HEIGHT = 64;
+
 /** Brand cyan, matching RecapCard — see the header for why this is not the nudge sienna. */
 const accent = C.accentInk;
 
@@ -89,18 +98,23 @@ export function FleetNoticeCard({ conditions }: { conditions: readonly FleetCond
       style={{
         alignSelf: "stretch",
         maxWidth: "100%",
-        // `flex: "0 0 auto"` LIKE EVERY SIBLING IN THIS STACK, and this is a layout bug rather than
-        // a style preference (roborev 57483). `ConciergeThread` is `flex: 1` with a `0%` basis,
-        // which gives it a scaled shrink factor of ZERO, and the other rows are all explicitly
-        // `0 0 auto` — so a card left at the default `0 1 auto` is the ONLY shrinkable item in the
-        // column and absorbs 100% of any vertical overflow.
-        flex: "0 0 auto",
-        // ...and its content is uncapped BY DESIGN: the escalation, retire, shared-failure and duty
-        // conditions each emit one bullet PER AGENT, because naming them is the whole point of a
-        // batch ("one glance clears eight"). On a fleet of a dozen-plus — the normal case in this
-        // repo — that exceeds any sensible box. Capping the LIST would drop agents; capping the BOX
-        // and scrolling keeps every one of them reachable, which is the right side to err on for a
-        // card whose job is that nothing goes unnoticed.
+        // ── THE BOX IS BOUNDED, AND IT STILL GIVES WAY (roborev 57483, then 57485) ─────────────
+        // `overflowY` is what actually stops the bullets painting over the approval row and the
+        // composer: the content is one bullet PER AGENT by design, because naming them is the whole
+        // point of a batch ("one glance clears eight"), so the BOX is capped rather than the list.
+        // Capping the list would drop agents, which is the one failure a card built so that nothing
+        // goes unnoticed must not have.
+        //
+        // THE SHRINK FACTOR STAYS. The first fix also froze this at `0 0 auto` to match the other
+        // rows, and that over-corrected into a worse bug: `ConciergeThread` has a scaled shrink
+        // factor of ZERO and the column root sets no `overflow`, so with this card frozen too there
+        // was nowhere for negative free space to go — several pending approvals on a large fleet
+        // pushed the COMPOSER below the visible area, and a user who cannot send at all is worse off
+        // than one reading an overlap. `0 1 auto` keeps it the shock absorber; `minHeight` stops the
+        // absorbing from crushing it to nothing, so the lead sentence survives any squeeze and the
+        // rest stays reachable by scroll.
+        flex: "0 1 auto",
+        minHeight: FLEET_NOTICE_MIN_HEIGHT,
         maxHeight: "32vh",
         overflowY: "auto",
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,

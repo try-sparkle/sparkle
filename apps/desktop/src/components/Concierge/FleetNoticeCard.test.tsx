@@ -131,10 +131,12 @@ describe("FleetNoticeCard", () => {
   //
   // jsdom evaluates no layout, so this asserts the DECLARATIONS rather than a measured height —
   // the honest thing to check here, and the same call this repo makes for CSS it cannot compute.
-  it("does not shrink, and bounds its own height instead of overflowing the column", () => {
+  it("bounds its own height and still gives way, instead of overflowing the column", () => {
     render(<FleetNoticeCard conditions={evaluateFleetConditions([walled("a")], T0)} />);
     const style = screen.getByTestId("fleet-notice").getAttribute("style") ?? "";
-    expect(style).toContain("flex: 0 0 auto");
+    // Shrinkable ON PURPOSE — freezing it pushed the composer off-screen (roborev 57485).
+    expect(style).toContain("flex: 0 1 auto");
+    expect(style).toMatch(/min-height:\s*64px/);
     expect(style).toMatch(/max-height:\s*32vh/);
     expect(style).toMatch(/overflow-y:\s*auto/);
   });

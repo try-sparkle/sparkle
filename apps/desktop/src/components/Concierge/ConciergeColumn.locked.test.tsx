@@ -121,6 +121,36 @@ describe("ConciergeColumn with AI enhancements locked — the FREE half stays li
     expect(screen.getByText(/Restarting them does not help/)).toBeTruthy();
   });
 
+  // THE FLEX DECLARATIONS ON THE CARD ONLY MEAN ANYTHING IF THE CARD IS THE FLEX ITEM (roborev
+  // 57485). Wrap `<FleetNotices />` in a padding div — the pattern already used for `searchSlot` —
+  // or return a wrapper from `FleetNotices`, and the card's own `flex`/`minHeight`/`overflowY` go
+  // inert: the default-`0 1 auto` wrapper becomes the shock absorber, its content is unbounded, and
+  // the paint-over bug returns with the card's own suite still green. So the RELATIONSHIP is pinned
+  // here, at the only level that can see it.
+  it("mounts the notice as a DIRECT child of the column's flex stack", () => {
+    vi.mocked(useFleetNotices).mockReturnValue(
+      evaluateFleetConditions(
+        [
+          {
+            agentId: "a",
+            label: "Agent a",
+            quota: {
+              message: "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
+              resetAt: Date.now() + 4 * 60 * 60 * 1000,
+              resetParsed: true,
+            },
+          },
+        ],
+        Date.now(),
+      ),
+    );
+    render(<ConciergeColumn model={model} controller={controller()} />);
+    const parent = screen.getByTestId("fleet-notice").parentElement;
+    expect(parent).toBeTruthy();
+    // The column root declares its own flex stack inline; an intervening wrapper would not.
+    expect(parent!.getAttribute("style") ?? "").toMatch(/flex-direction:\s*column/);
+  });
+
   it("still renders the status readout: the needs-you count, on the red pill", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
     // THE COUNT SURVIVES THE GATE. It is derived from local app state and costs nothing to run, so
