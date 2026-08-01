@@ -89,6 +89,20 @@ export function FleetNoticeCard({ conditions }: { conditions: readonly FleetCond
       style={{
         alignSelf: "stretch",
         maxWidth: "100%",
+        // `flex: "0 0 auto"` LIKE EVERY SIBLING IN THIS STACK, and this is a layout bug rather than
+        // a style preference (roborev 57483). `ConciergeThread` is `flex: 1` with a `0%` basis,
+        // which gives it a scaled shrink factor of ZERO, and the other rows are all explicitly
+        // `0 0 auto` — so a card left at the default `0 1 auto` is the ONLY shrinkable item in the
+        // column and absorbs 100% of any vertical overflow.
+        flex: "0 0 auto",
+        // ...and its content is uncapped BY DESIGN: the escalation, retire, shared-failure and duty
+        // conditions each emit one bullet PER AGENT, because naming them is the whole point of a
+        // batch ("one glance clears eight"). On a fleet of a dozen-plus — the normal case in this
+        // repo — that exceeds any sensible box. Capping the LIST would drop agents; capping the BOX
+        // and scrolling keeps every one of them reachable, which is the right side to err on for a
+        // card whose job is that nothing goes unnoticed.
+        maxHeight: "32vh",
+        overflowY: "auto",
         background: `color-mix(in srgb, ${accent} ${CARD_WASH_PCT}%, transparent)`,
         border: `1px solid color-mix(in srgb, ${accent} 32%, transparent)`,
         borderRadius: 6,

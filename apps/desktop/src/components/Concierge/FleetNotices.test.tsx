@@ -64,14 +64,17 @@ describe("FleetNotices", () => {
     expect(seen[seen.length - 1]!).toBeGreaterThan(seen[0]!);
   });
 
+  // ASSERTS THE TIMER, NOT THE RE-RENDER (roborev 57483). React 18 makes a `setState` on an
+  // unmounted component a silent no-op, so the call count stays flat whether or not the interval was
+  // cleared — the obvious version of this test passes with the cleanup deleted, which is the vacuous
+  // shape AGENTS.md calls the #1 fleet-wide finding.
   it("stops ticking when unmounted, so a closed column leaves no timer behind", () => {
     vi.useFakeTimers();
     const { unmount } = render(<FleetNotices />);
+    // The interval really is armed while mounted — without this the assertion below could pass on a
+    // component that never set one.
+    expect(vi.getTimerCount()).toBe(1);
     unmount();
-    const after = vi.mocked(useFleetNotices).mock.calls.length;
-    act(() => {
-      vi.advanceTimersByTime(FLEET_NOTICE_TICK_MS * 5);
-    });
-    expect(vi.mocked(useFleetNotices).mock.calls.length).toBe(after);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

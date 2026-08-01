@@ -123,4 +123,31 @@ describe("FleetNoticeCard", () => {
     const card = screen.getByTestId("fleet-notice");
     expect(card.getAttribute("style")).toContain("accent");
   });
+
+  // THE CARD MUST NOT BE THE COLUMN'S SHOCK ABSORBER (roborev 57483). Its siblings are all
+  // `flex: "0 0 auto"` and the thread is `flex: 1` with a zero shrink factor, so a card left at the
+  // default `0 1 auto` takes 100% of any vertical overflow — and its bullet list is one row PER
+  // AGENT by design, so on a real fleet it painted over the approval row and the composer.
+  //
+  // jsdom evaluates no layout, so this asserts the DECLARATIONS rather than a measured height —
+  // the honest thing to check here, and the same call this repo makes for CSS it cannot compute.
+  it("does not shrink, and bounds its own height instead of overflowing the column", () => {
+    render(<FleetNoticeCard conditions={evaluateFleetConditions([walled("a")], T0)} />);
+    const style = screen.getByTestId("fleet-notice").getAttribute("style") ?? "";
+    expect(style).toContain("flex: 0 0 auto");
+    expect(style).toMatch(/max-height:\s*32vh/);
+    expect(style).toMatch(/overflow-y:\s*auto/);
+  });
+
+  // Capping the LIST would drop agents, which is the one thing a card built so nothing goes
+  // unnoticed must not do. The box scrolls; every agent stays reachable.
+  it("still names every agent in a large batch rather than truncating the list", () => {
+    const twenty = Array.from({ length: 20 }, (_, i) => ({
+      agentId: `a${i}`,
+      label: `Agent ${i}`,
+      escalation: { reason: `blocker ${i}` },
+    }));
+    render(<FleetNoticeCard conditions={evaluateFleetConditions(twenty, T0)} />);
+    for (let i = 0; i < 20; i++) expect(screen.getByText(new RegExp(`blocker ${i}$`))).toBeTruthy();
+  });
 });

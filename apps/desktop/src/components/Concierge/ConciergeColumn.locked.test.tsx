@@ -77,6 +77,10 @@ function shutTheGate() {
 beforeEach(() => {
   shutTheGate();
   _resetConciergeLivenessForTests();
+  // Reset the fleet notice to "nothing wrong". Vitest is not configured to clear mocks between
+  // tests here, so a `mockReturnValue` set in one case would otherwise leave a quota-blocked notice
+  // mounted for every case after it (roborev 57483).
+  vi.mocked(useFleetNotices).mockReturnValue([]);
 });
 afterEach(() => cleanup());
 
