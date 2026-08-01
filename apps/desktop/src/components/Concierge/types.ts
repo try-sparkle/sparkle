@@ -167,6 +167,29 @@ export interface ConciergeSparkleMessage {
    * every other optional field here: this thread is persisted.
    */
   answers?: ReplyAnchor[];
+  /**
+   * THE TURN BEHIND THIS BUBBLE REACHED `done` — the brain finished speaking.
+   *
+   * Set from `onConciergeDone`, so it distinguishes the three things that all render as a plain
+   * left-aligned bubble and are otherwise indistinguishable:
+   *
+   *   • a real, completed answer — this flag;
+   *   • an APP-AUTHORED status line ("Sent to Kraken Auth.", "Approving…") — `ConciergeHost.postSparkle`
+   *     appends 25 kinds of these as ordinary `sparkle` messages, and they never go near a turn;
+   *   • an ABANDONED FRAGMENT — a turn the user's next send killed mid-stream. `askSparkle`
+   *     deliberately leaves a bubble that streamed text alone, so nine characters of a dead answer
+   *     stay in the thread forever.
+   *
+   * WHY THE DISTINCTION IS LOAD-BEARING, and not just tidiness: the reply-anchor rule walks back for
+   * "everything the brain still owed an answer on" and has to stop at the previous ANSWER
+   * (./replyAnchors). Inferring that from `kind` alone made a routing receipt end the burst, and made
+   * a dead fragment both end the burst AND claim the messages the real reply went on to answer — in
+   * exactly the interleaved-burst case the affordance exists for.
+   *
+   * A restored bubble is stamped by `conciergeThreadStore.rehydrateThread`: nothing that survived a
+   * restart is still streaming.
+   */
+  settled?: true;
 }
 
 /** A thin centered divider line ("All projects calm · nothing needs you"). */

@@ -10,7 +10,7 @@
 // middleware, exactly as conciergeThreadStore.test.ts does for the caps.
 import { describe, expect, it } from "vitest";
 import { RESTORED_ID_PREFIX, persistableThread, rehydrateThread } from "./conciergeThreadStore";
-import { answeredByIndex } from "../components/Concierge/replyAnchors";
+import { answeredByIndex, pendingAnchors } from "../components/Concierge/replyAnchors";
 import type { ConciergeMessage } from "../components/Concierge/types";
 
 const thread: ConciergeMessage[] = [
@@ -68,6 +68,23 @@ describe("a restored reply still knows what it answered", () => {
       "check the retry logic",
       "also the timeout",
     ]);
+  });
+
+  it("does not let the new session's first reply claim last session's messages", () => {
+    // THE GUARD BEHIND `rehydrateThread`'s `settled` STAMP, asserted through its CONSEQUENCE rather
+    // than by reading the flag. A restored reply must end the burst exactly as a live one does; the
+    // walk stops only at a settled turn, and nothing on disk records that a reply completed — so
+    // without the stamp the first reply of a new session walks straight past a restored answer and
+    // anchors messages a previous session already dealt with, silently.
+    const answered = rehydrateThread([
+      { id: "you-1", kind: "you", text: "last session's question", receipt: { target: "sparkle" } },
+      { id: "brain-0", kind: "sparkle", text: "last session's answer" },
+    ]);
+    expect(pendingAnchors(answered)).toEqual([]);
+    // …and the same thread WITHOUT the stamp is what the bug looks like, so the case above is
+    // measuring the stamp rather than some property the fixture had anyway.
+    expect(pendingAnchors(answered.map((m) => (m.kind === "sparkle" ? { ...m, settled: undefined } : m)))).
+      toHaveLength(1);
   });
 
   it("still clears a restored receipt's redirect — the anchor branch must not skip that rule", () => {

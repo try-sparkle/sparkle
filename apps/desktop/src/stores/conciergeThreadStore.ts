@@ -317,8 +317,18 @@ export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
   const idMap = new Map(chat.map((m, i) => [m.id, `${RESTORED_ID_PREFIX}${i}`]));
   return chat.map((m, i) => {
     const next = { ...m, id: `${RESTORED_ID_PREFIX}${i}` };
-    if (next.kind === "sparkle" && next.answers)
-      return { ...next, answers: remapAnchors(next.answers, idMap) };
+    // NOTHING THAT SURVIVED A RESTART IS STILL STREAMING, so every restored reply is `settled` —
+    // including one the app quit in the middle of. That flag is what stops the reply-anchor walk
+    // (Concierge/replyAnchors), and without it the first reply of a new session would walk straight
+    // past a restored bubble and claim messages a previous session had already answered.
+    //
+    // It is applied to every restored `sparkle` message, which a live session distinguishes further
+    // (an app status line is not an answer). That distinction is not recoverable from disk, and the
+    // two directions of the error are not symmetric: erring this way makes a new reply claim FEWER
+    // of last session's messages, while the other way would have it claim a stranger's conversation.
+    // Under-claiming is the honest side of a fact the persisted thread cannot answer.
+    if (next.kind === "sparkle")
+      return { ...next, settled: true, answers: remapAnchors(next.answers, idMap) };
     return next.kind === "you" && next.receipt?.redirectable
       ? { ...next, receipt: { ...next.receipt, redirectable: false } }
       : next;

@@ -103,9 +103,15 @@ describe("a streamed reply arrives knowing what it answers", () => {
       { id: "you-1", quote: "can you check the retry logic" },
       { id: "you-2", quote: "also the timeout" },
     ]);
-    // …and it is on screen, both ways round: quoted over the reply, and marked under his own
-    // messages. This is the whole affordance, end to end through the real host.
+    // The reply says what it is answering AS SOON AS IT STARTS — the stub reads off the message
+    // itself, so a reader watching the answer arrive can already see which question it belongs to.
     expect(screen.getAllByTestId(REPLY_ANCHOR_TESTID)).toHaveLength(2);
+    // …but his own messages are NOT marked answered yet, because this turn may still die. An
+    // unsettled bubble is a claim in progress, not a delivery (see replyAnchors.answeredByIndex).
+    expect(screen.queryAllByTestId(ANSWERED_MARKER_TESTID)).toHaveLength(0);
+
+    // The turn finishes, and only now does "Answered below" appear — which is what the word means.
+    act(() => h.done?.({ id: "1", sessionId: "s", text: "Both are fine." }));
     expect(screen.getAllByTestId(ANSWERED_MARKER_TESTID)).toHaveLength(2);
   });
 
@@ -129,15 +135,89 @@ describe("a streamed reply arrives knowing what it answers", () => {
     expect(replyBubble()?.answers?.map((a) => a.id)).toEqual(["you-1", "you-2"]);
   });
 
-  it("does NOT claim a message the previous reply already answered", () => {
+  it("does NOT claim a message the previous FINISHED reply already answered", () => {
     useConciergeThreadStore.getState().setChat([
       { id: "you-1", kind: "you", text: "old question", receipt: { target: "sparkle" } },
-      { id: "brain-0", kind: "sparkle", text: "old answer" },
+      { id: "brain-0", kind: "sparkle", text: "old answer", settled: true },
       { id: "you-2", kind: "you", text: "new question", receipt: { target: "sparkle" } },
     ]);
     render(<ConciergeHost feed={feed} />);
     act(() => h.delta?.({ id: "1", text: "Sure." }));
     expect(replyBubble()?.answers?.map((a) => a.id)).toEqual(["you-2"]);
+  });
+
+  it("records that a turn FINISHED, which is what makes the line above decidable", () => {
+    // "A left-aligned bubble exists" and "the brain finished answering" are different facts. Three
+    // things render as one bubble — a real answer, an app status line, and a turn killed mid-stream —
+    // and only this flag tells them apart.
+    seedBurst();
+    render(<ConciergeHost feed={feed} />);
+    act(() => h.delta?.({ id: "1", text: "Both fine." }));
+    expect(replyBubble()?.settled).toBeUndefined();
+    act(() => h.done?.({ id: "1", sessionId: "s", text: "Both fine." }));
+    expect(replyBubble()?.settled).toBe(true);
+  });
+
+  it("marks a turn finished even when `done` carries no text of its own", () => {
+    // The final upsert is skipped for a textless `done` — which is exactly a turn whose deltas already
+    // said everything, i.e. the case where a flag set inside that upsert would never be set at all.
+    seedBurst();
+    render(<ConciergeHost feed={feed} />);
+    act(() => h.delta?.({ id: "1", text: "Both fine." }));
+    act(() => h.done?.({ id: "1", sessionId: "s", text: "" }));
+    expect(replyBubble()?.settled).toBe(true);
+    expect(replyBubble()?.text).toBe("Both fine.");
+  });
+
+  it("is not ended by the app's own status line — a receipt is not an answer", () => {
+    // The founder interleaves an agent-bound message into a burst, and `deliver` posts "Sent to
+    // Kraken Auth." as an ordinary sparkle bubble (ConciergeHost.postSparkle does this in 25 places).
+    // Reading it as the previous reply makes the brain's answer anchor NOTHING — the affordance
+    // failing in exactly the interleaved case it was built for.
+    useConciergeThreadStore.getState().setChat([
+      { id: "you-1", kind: "you", text: "how's CI", receipt: { target: "sparkle" } },
+      {
+        id: "you-2",
+        kind: "you",
+        text: "@Kraken run the tests",
+        receipt: { target: "agent", agentName: "Kraken Auth" },
+      },
+      { id: "sparkle-1", kind: "sparkle", text: "Sent to Kraken Auth." },
+    ]);
+    render(<ConciergeHost feed={feed} />);
+    act(() => h.delta?.({ id: "1", text: "CI is green." }));
+    expect(replyBubble()?.answers?.map((a) => a.id)).toEqual(["you-1"]);
+  });
+
+  it("re-answers a burst the first turn died mid-stream on, and points the marker at the LIVE reply", () => {
+    // THE MOTIVATING CASE, end to end. Turn 1 streams nine characters; the founder's next message
+    // kills it (askSparkle leaves that fragment alone on purpose); turn 2 answers both. The fragment
+    // must neither end the burst nor keep the marker it was stamped with.
+    useConciergeThreadStore
+      .getState()
+      .setChat([{ id: "you-1", kind: "you", text: "how's CI", receipt: { target: "sparkle" } }]);
+    render(<ConciergeHost feed={feed} />);
+    act(() => h.delta?.({ id: "1", text: "Let me ch" }));
+    expect(replyBubble("brain-1")?.answers?.map((a) => a.id)).toEqual(["you-1"]);
+
+    // …the second message lands, killing turn 1, and turn 2 answers the pair.
+    act(() => {
+      useConciergeThreadStore
+        .getState()
+        .setChat((prev) => [
+          ...prev,
+          { id: "you-2", kind: "you", text: "and the timeout", receipt: { target: "sparkle" } },
+        ]);
+    });
+    act(() => h.delta?.({ id: "2", text: "CI is green and the timeout is 3s." }));
+    act(() => h.done?.({ id: "2", sessionId: "s", text: "CI is green and the timeout is 3s." }));
+
+    expect(replyBubble("brain-2")?.answers?.map((a) => a.id)).toEqual(["you-1", "you-2"]);
+    // The marker under his first message points at the REAL answer, not at the dead fragment.
+    const marker = screen
+      .getAllByTestId(ANSWERED_MARKER_TESTID)
+      .find((el) => el.closest("[data-message-id]")?.getAttribute("data-message-id") === "you-1");
+    expect(marker?.getAttribute("data-reply-id")).toBe("brain-2");
   });
 
   it("leaves a PUSH anchoring nothing — nobody asked it anything", () => {

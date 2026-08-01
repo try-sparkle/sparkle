@@ -241,7 +241,22 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         </div>
         {m.receipt && (
           <RoutingReceipt
-            receipt={m.receipt}
+            // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the
+            // seam where the two facts meet.
+            //
+            // `askSparkle` stamps `unanswered: true` on a bubble the user's NEXT send displaced
+            // before a single byte came back — true at that instant. It is not the last word: the
+            // concierge usually does answer, a couple of messages later, and when it does the reply
+            // records this message in its `answers` (see ./replyAnchors). At that point the receipt's
+            // "never answered" is contradicted by the app's own record, and would render directly
+            // above an "Answered below" marker pointing at the answer. One bubble, two opposite
+            // claims, one of them demonstrably false.
+            //
+            // WITHDRAWN HERE, NOT IN RoutingReceipt: that component owns the WORDS for a state, and
+            // this row owns which state is true. Passing it a corrected receipt needs nothing from it
+            // and survives its copy changing — including the deletion of the "never answered" string,
+            // after which this becomes a no-op on a field nobody renders.
+            receipt={answeredBy && m.receipt.unanswered ? { ...m.receipt, unanswered: undefined } : m.receipt}
             onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
           />
         )}

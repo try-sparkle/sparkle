@@ -1685,6 +1685,21 @@ export function ConciergeHost({
         return next;
       });
     };
+    /** Record that this turn reached `done`. Returns `prev` untouched when there is nothing to mark,
+     *  so a `done` for a turn that never produced a bubble does not rebuild the array and re-render a
+     *  transcript of memoised rows for no reason. */
+    const markSettled = (id: string) => {
+      setChat((prev) => {
+        const k = key(id);
+        const i = prev.findIndex((m) => m.id === k);
+        if (i === -1) return prev;
+        const cur = prev[i]!;
+        if (cur.kind !== "sparkle" || cur.settled) return prev;
+        const next = prev.slice();
+        next[i] = { ...cur, settled: true };
+        return next;
+      });
+    };
     const offDelta = onConciergeDelta((e) => {
       if (supersededTurn(e.id)) return;
       // A SIGN OF LIFE, and specifically the kind that ANSWERS the user. Recorded before the text
@@ -1734,6 +1749,12 @@ export function ConciergeHost({
           })
         : null;
       if (e.text) upsert(e.id, linted?.text ?? e.text, true);
+      // THE TURN FINISHED — recorded on the bubble, because "a left-aligned bubble exists" and "the
+      // brain finished answering" are different facts and the reply-anchor rule needs the second one
+      // (see Concierge/types `ConciergeSparkleMessage.settled`). Kept OUT of the upsert above: that
+      // one is skipped entirely for a `done` carrying no text, which is exactly a turn whose deltas
+      // said everything — the case where the flag would silently never be set.
+      markSettled(e.id);
       // Recorded AFTER this turn is linted, so `restated-state` compares against the previous reply
       // rather than against itself. Stores the text as RENDERED (autofixes included): the check asks
       // whether the human is being told the same thing twice, and what they were told is the

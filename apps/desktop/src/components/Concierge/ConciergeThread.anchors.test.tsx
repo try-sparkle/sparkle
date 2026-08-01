@@ -16,6 +16,9 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import { ANCHOR_HIGHLIGHT_MS, ANSWERED_MARKER_TESTID, REPLY_ANCHOR_TESTID } from "./ReplyAnchorViews";
+// The receipt's own pure wording function — imported so the case below pins the STATE the line
+// describes rather than quoting a string that is being deleted on a sibling branch.
+import { receiptText } from "./RoutingReceipt";
 import type { ConciergeMessage } from "./types";
 
 const noop = () => {};
@@ -34,6 +37,8 @@ const burst: ConciergeMessage[] = [
     id: "brain-7",
     kind: "sparkle",
     text: "Retry is fine, the timeout was 3s, CI is green.",
+    // SETTLED: only a finished turn marks a message answered (see ./replyAnchors.answeredByIndex).
+    settled: true,
     answers: [
       { id: "you-1", quote: "can you check the retry logic" },
       { id: "you-2", quote: "also the timeout" },
@@ -137,6 +142,87 @@ describe("his own message says it was answered", () => {
     expect(
       document.querySelector('[data-message-id="brain-7"]')!.getAttribute("data-highlighted"),
     ).toBe("yes");
+  });
+
+  it("stops the receipt calling an ANSWERED message unanswered", () => {
+    // `askSparkle` stamps `unanswered` on a bubble the next send displaced — true at that instant,
+    // not the last word. Once a reply names the message, "never answered" is contradicted by the
+    // app's own record and would sit directly above an "Answered below" marker pointing at the
+    // answer: one bubble, two opposite claims.
+    //
+    // Asserted against `receiptText` rather than against the literal copy, because that string is
+    // being deleted on a sibling branch and a hardcoded quote of it would fail for the wrong reason.
+    // What is pinned is the STATE the line describes, which outlives the wording.
+    mount([
+      {
+        id: "you-1",
+        kind: "you",
+        text: "can you check the retry logic",
+        receipt: { target: "sparkle", unanswered: true },
+      },
+      {
+        id: "brain-7",
+        kind: "sparkle",
+        text: "Retry is fine.",
+        settled: true,
+        answers: [{ id: "you-1", quote: "can you check the retry logic" }],
+      },
+    ]);
+    expect(screen.getByTestId("routing-receipt").textContent).toContain(
+      receiptText({ target: "sparkle" }),
+    );
+    expect(screen.getByTestId("routing-receipt").textContent).not.toContain(
+      receiptText({ target: "sparkle", unanswered: true }),
+    );
+    // …and the marker is what replaces it: where the answer IS, not a claim there wasn't one.
+    expect(screen.getByTestId(ANSWERED_MARKER_TESTID)).toBeTruthy();
+  });
+
+  it("keeps the true receipt when the only claimant is a turn that died", () => {
+    // THE CHAIN OF KILLED TURNS, which is what 2026-07-29 actually looked like. `you-1` is displaced
+    // before a byte arrives, so `askSparkle` correctly stamps `unanswered`. Turn 2 streams nine
+    // characters claiming it, then `you-3` kills turn 2 and turn 3 fails outright — no successor ever
+    // names `you-1`.
+    //
+    // Trusting that fragment would put an "Answered below" on `you-1` pointing at nine characters of a
+    // dead turn AND delete the one true sentence the bubble had: strictly worse than saying nothing.
+    // Both halves key off the same settled evidence, so both must hold.
+    mount([
+      {
+        id: "you-1",
+        kind: "you",
+        text: "how's CI",
+        receipt: { target: "sparkle", unanswered: true },
+      },
+      {
+        id: "brain-2",
+        kind: "sparkle",
+        text: "Let me ch",
+        answers: [{ id: "you-1", quote: "how's CI" }],
+      },
+      { id: "you-3", kind: "you", text: "hello?", receipt: { target: "sparkle" } },
+      { id: "err-1", kind: "failure", headline: "That turn failed.", evidence: "boom" },
+    ]);
+    expect(screen.queryByTestId(ANSWERED_MARKER_TESTID)).toBeNull();
+    expect(screen.getAllByTestId("routing-receipt")[0]!.textContent).toContain(
+      receiptText({ target: "sparkle", unanswered: true }),
+    );
+  });
+
+  it("leaves the unanswered stamp alone on a message no reply ever named", () => {
+    // The stamp is only withdrawn by EVIDENCE. A message that really was displaced and never
+    // answered must keep saying so — withdrawing it wholesale would be the mirror-image lie.
+    mount([
+      {
+        id: "you-1",
+        kind: "you",
+        text: "still waiting",
+        receipt: { target: "sparkle", unanswered: true },
+      },
+    ]);
+    expect(screen.getByTestId("routing-receipt").textContent).toContain(
+      receiptText({ target: "sparkle", unanswered: true }),
+    );
   });
 
   it("says nothing under a message nothing has replied to yet", () => {

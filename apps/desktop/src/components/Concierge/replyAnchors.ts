@@ -95,20 +95,33 @@ export function reachedTheBrain(m: ConciergeUserMessage): boolean {
  * The user messages a reply appended to `chat` RIGHT NOW would be answering, oldest first.
  *
  * The rule: walk back from the end and collect every `you` message that reached the brain, stopping at
- * the previous REPLY. That is precisely "everything the brain still owed an answer on", which is what
+ * the previous ANSWER. That is precisely "everything the brain still owed an answer on", which is what
  * the founder is looking at when he counts unanswered messages.
  *
- * Two things deliberately do NOT stop the walk:
+ * "AN ANSWER" IS A COMPLETED, NON-PROACTIVE TURN — `settled && !proactive` — and NOT merely a
+ * left-aligned bubble. That distinction is the whole correctness of this function, because three
+ * different things render as one:
+ *
  *   • a PUSH (`proactive`) — nobody asked for it, so it settles nothing and must not make the messages
  *     under it look answered;
- *   • a FAILURE bubble — a turn that died leaves its question outstanding, and the reply that finally
- *     lands is exactly the one worth pointing at.
+ *   • an APP-AUTHORED STATUS LINE — `ConciergeHost.postSparkle` appends "Sent to Kraken Auth.",
+ *     "Approving…", the deferred-send outcomes and 20-odd others as plain `sparkle` messages. Reading
+ *     one as an answer truncates the outstanding set the moment the founder interleaves an
+ *     agent-bound message into a burst — and note the asymmetry that would create: `reachedTheBrain`
+ *     correctly skips that agent-bound `you` message, while the receipt the app posted FOR it would
+ *     have ended the burst.
+ *   • an ABANDONED FRAGMENT — a turn the user's next send killed mid-stream. `askSparkle` leaves a
+ *     bubble that streamed text alone, on purpose, so the fragment lives in the thread forever. It
+ *     answered nothing; the reply that lands next is the one worth pointing at.
+ *
+ * A FAILURE bubble does not stop the walk either, for the same reason as the last of those: a turn
+ * that died leaves its question outstanding.
  */
 export function pendingAnchors(chat: readonly ConciergeMessage[]): ReplyAnchor[] {
   const out: ReplyAnchor[] = [];
   for (let i = chat.length - 1; i >= 0; i--) {
     const m = chat[i]!;
-    if (m.kind === "sparkle" && !m.proactive) break;
+    if (m.kind === "sparkle" && m.settled && !m.proactive) break;
     if (m.kind !== "you") continue;
     if (!reachedTheBrain(m)) continue;
     const quote = anchorQuote(m.text) || attachmentQuote(m.attachments?.length ?? 0);
@@ -128,17 +141,37 @@ export function pendingAnchors(chat: readonly ConciergeMessage[]): ReplyAnchor[]
  * directions can never disagree — one reply's `answers` array is the single record, and a message is
  * answered exactly when some reply names it.
  *
- * FIRST WINS. A later reply may name the same message again (the same burst is outstanding until
- * something replies); the earliest answer is the one worth jumping to.
+ * ONLY A SETTLED REPLY MAY MARK A MESSAGE ANSWERED — the same definition of "an answer" that
+ * {@link pendingAnchors} stops at, and the two must not drift.
+ *
+ * A bubble is stamped with its anchors on its FIRST DELTA, so an unsettled one is a claim in progress,
+ * not a delivery. Trusting it puts the marker on a turn that may never finish, and LAST-WINS does not
+ * save it: that only rescues the case where a later reply names the message again, and a chain of
+ * killed turns can end without one. Concretely — `you-1` is displaced before a byte arrives (so
+ * `askSparkle` correctly stamps `receipt.unanswered`); turn 2 streams nine characters claiming
+ * `you-1`; `you-3` kills turn 2; turn 3 fails outright, producing a `failure` bubble and no anchors at
+ * all. The 2026-07-29 burst this feature exists for is exactly a run of turns dying that way. With an
+ * unsettled bubble trusted, `you-1` would render an "Answered below" pointing at nine characters of a
+ * dead turn — and, because the receipt withdrawal keys off this same index, would have lost the one
+ * true sentence it had. Strictly worse than saying nothing.
+ *
+ * The visible consequence is that the marker appears when the reply FINISHES rather than when it
+ * starts, which is what the word "Answered" means anyway.
+ *
+ * LAST WINS is kept as the safe direction rather than as load-bearing logic: with the filter above,
+ * the walk's stopping rule means a settled reply ends the burst, so two settled replies naming one
+ * message should be unreachable. If it ever becomes reachable, the newest claimant is the freshest
+ * thing said about that message — and the ordering is pinned by a test with both replies settled,
+ * because an invariant nothing enforces is one a later change can quietly invert.
  */
 export function answeredByIndex(messages: readonly ConciergeMessage[]): ReadonlyMap<string, string> {
   const out = new Map<string, string>();
   for (const m of messages) {
-    if (m.kind !== "sparkle" || !m.answers) continue;
+    if (m.kind !== "sparkle" || !m.answers || !m.settled) continue;
     // An anchor whose target did not survive restore carries `id: ""` (see {@link remapAnchors}). It
     // still draws its quote over the reply, but there is no message left to mark, and mapping the
     // empty id would put every such reply under one bogus key.
-    for (const a of m.answers) if (a.id && !out.has(a.id)) out.set(a.id, m.id);
+    for (const a of m.answers) if (a.id) out.set(a.id, m.id);
   }
   return out;
 }

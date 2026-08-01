@@ -22,7 +22,21 @@ const you = (id: string, text: string, receipt?: ConciergeReceipt): ConciergeMes
   text,
   receipt,
 });
-const sparkle = (id: string, text = "sure"): ConciergeMessage => ({ id, kind: "sparkle", text });
+/** A COMPLETED answer — the only thing that ends a burst. */
+const sparkle = (id: string, text = "sure"): ConciergeMessage => ({
+  id,
+  kind: "sparkle",
+  text,
+  settled: true,
+});
+/** An APP-AUTHORED status line (`ConciergeHost.postSparkle`): same kind, never a turn, never `done`. */
+const local = (id: string, text = "Sent to Kraken Auth."): ConciergeMessage => ({
+  id,
+  kind: "sparkle",
+  text,
+});
+/** A turn the user's next send killed mid-stream — the fragment `askSparkle` leaves alone on purpose. */
+const fragment = (id: string, text = "Let me ch"): ConciergeMessage => ({ id, kind: "sparkle", text });
 const push = (id: string, text = "heads up"): ConciergeMessage => ({
   id,
   kind: "sparkle",
@@ -94,6 +108,29 @@ describe("pendingAnchors — what a reply appended right now would be answering"
     expect(pendingAnchors(chat).map((a) => a.id)).toEqual(["y2"]);
   });
 
+  it("does NOT stop at an app-authored status line — a receipt is not an answer", () => {
+    // The founder interleaves an agent-bound message into a burst; `deliver` posts "Sent to Kraken
+    // Auth." as an ordinary `sparkle` bubble. Reading that as the previous reply truncates the
+    // outstanding set and the brain's answer anchors NOTHING — the affordance reading as broken in
+    // exactly the interleaved case it was built for. Note the asymmetry it would create:
+    // `reachedTheBrain` skips the agent-bound `you` message, while the receipt posted FOR it would
+    // have ended the burst.
+    const chat = [
+      you("y1", "how's CI", toSparkle),
+      you("y2", "@Kraken run the tests", toAgent),
+      local("s-local"),
+    ];
+    expect(pendingAnchors(chat).map((a) => a.id)).toEqual(["y1"]);
+  });
+
+  it("does NOT stop at a turn that died mid-stream — a fragment answered nothing", () => {
+    // `askSparkle` leaves a bubble that streamed text alone, on purpose, so nine characters of a dead
+    // answer live in the thread forever. Treating it as the previous reply hands the real answer only
+    // the newest message of the burst.
+    const chat = [you("y1", "one", toSparkle), fragment("brain-1"), you("y2", "two", toSparkle)];
+    expect(pendingAnchors(chat).map((a) => a.id)).toEqual(["y1", "y2"]);
+  });
+
   it("does NOT stop at a push — nobody asked for it, so it settles nothing", () => {
     const chat = [you("y1", "one", toSparkle), push("p1"), you("y2", "two", toSparkle)];
     expect(pendingAnchors(chat).map((a) => a.id)).toEqual(["y1", "y2"]);
@@ -157,6 +194,7 @@ describe("answeredByIndex — the marker under the user's own message", () => {
         id: "brain-7",
         kind: "sparkle",
         text: "both, then",
+        settled: true,
         answers: [
           { id: "y1", quote: "one" },
           { id: "y2", quote: "two" },
@@ -171,23 +209,80 @@ describe("answeredByIndex — the marker under the user's own message", () => {
   it("leaves a message no reply named out of the index", () => {
     const chat: ConciergeMessage[] = [
       you("y1", "one", toSparkle),
-      { id: "brain-7", kind: "sparkle", text: "hm", answers: [{ id: "y0", quote: "older" }] },
+      {
+        id: "brain-7",
+        kind: "sparkle",
+        text: "hm",
+        settled: true,
+        answers: [{ id: "y0", quote: "older" }],
+      },
     ];
     expect(answeredByIndex(chat).has("y1")).toBe(false);
   });
 
-  it("keeps the FIRST reply to name a message — that's the one worth jumping to", () => {
+  it("points at the NEWEST of two settled replies that name one message", () => {
+    // THE DEFENSIVE ORDERING, measured rather than merely documented. Both replies are `settled` on
+    // purpose: with one of them unsettled the filter above removes it, leaving a single writer, and
+    // the assertion would pass identically under a first-wins implementation — a test named for an
+    // ordering it does not exercise.
+    //
+    // The state itself should be unreachable: the walk stops at a settled reply, so a settled reply
+    // ends the burst and the next one cannot name the same message. That is exactly why the ordering
+    // needs a test — an invariant nothing enforces is one a later change can quietly break, and the
+    // newest claimant is the freshest thing said about a message if it ever does.
     const chat: ConciergeMessage[] = [
       you("y1", "one", toSparkle),
-      { id: "brain-7", kind: "sparkle", text: "a", answers: [{ id: "y1", quote: "one" }] },
-      { id: "brain-9", kind: "sparkle", text: "b", answers: [{ id: "y1", quote: "one" }] },
+      {
+        id: "brain-7",
+        kind: "sparkle",
+        text: "First pass.",
+        settled: true,
+        answers: [{ id: "y1", quote: "one" }],
+      },
+      {
+        id: "brain-9",
+        kind: "sparkle",
+        text: "Checked — it's fine.",
+        settled: true,
+        answers: [{ id: "y1", quote: "one" }],
+      },
+    ];
+    expect(answeredByIndex(chat).get("y1")).toBe("brain-9");
+  });
+
+  it("refuses to mark a message answered by a turn that has not finished", () => {
+    // A bubble is stamped with its anchors on its FIRST DELTA, so an unsettled one is a claim in
+    // progress, not a delivery. The marker appears when the reply FINISHES — which is what the word
+    // "Answered" means.
+    const chat: ConciergeMessage[] = [
+      you("y1", "one", toSparkle),
+      { id: "brain-7", kind: "sparkle", text: "Let me ch", answers: [{ id: "y1", quote: "one" }] },
+    ];
+    expect(answeredByIndex(chat).has("y1")).toBe(false);
+  });
+
+  it("marks it the moment that same turn settles", () => {
+    const chat: ConciergeMessage[] = [
+      you("y1", "one", toSparkle),
+      {
+        id: "brain-7",
+        kind: "sparkle",
+        text: "It's fine.",
+        settled: true,
+        answers: [{ id: "y1", quote: "one" }],
+      },
     ];
     expect(answeredByIndex(chat).get("y1")).toBe("brain-7");
   });
 
   it("ignores an anchor whose target didn't survive restore", () => {
+    // `settled` MATTERS TO THIS CASE even though it is not what it is about: without it the reply is
+    // filtered out before the loop reaches the empty-id guard, and the assertion would hold with that
+    // guard deleted outright — a test measuring nothing. The guard is a real rule (every
+    // restore-orphaned reply would otherwise be mapped under one bogus "" key), so it has to be what
+    // the assertion actually reaches.
     const chat: ConciergeMessage[] = [
-      { id: "brain-7", kind: "sparkle", text: "a", answers: [{ id: "", quote: "gone" }] },
+      { id: "brain-7", kind: "sparkle", text: "a", settled: true, answers: [{ id: "", quote: "gone" }] },
     ];
     expect(answeredByIndex(chat).has("")).toBe(false);
   });
