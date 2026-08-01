@@ -10,7 +10,9 @@ import {
   SHARED_FAILURE_MAX_AGE_MINUTES,
   SHARED_FAILURE_MIN_VICTIMS,
   SHARED_FAILURE_WINDOW_MINUTES,
+  DUTY_OVERDUE_FACTOR,
   evaluateFleetConditions,
+  overdueDuties,
   sharedFailureCohorts,
   isQuotaWalled,
   persistedConditions,
@@ -384,5 +386,97 @@ describe("shared failure", () => {
     const atThreshold = Array.from({ length: SHARED_FAILURE_MIN_VICTIMS }, (_, i) => died(`a${i}`));
     expect(sharedFailureCohorts(atThreshold, T0)).toHaveLength(1);
     expect(sharedFailureCohorts(atThreshold.slice(0, -1), T0)).toEqual([]);
+  });
+});
+
+// ── A STANDING DUTY THAT SILENTLY STOPPED ───────────────────────────────────────────────────────
+// The founder asked what the improvement agent had been doing; the honest answer was "nothing, for
+// hours", and nothing on any surface said so. This is the only class where NOTHING looks wrong —
+// every agent is fine and a promised capability has simply stopped.
+describe("duty overdue", () => {
+  const MIN = 60_000;
+  const HOURLY = 60 * MIN;
+  const duty = (over: Partial<Parameters<typeof overdueDuties>[0][number]> = {}) => ({
+    name: "the hourly improvement pass",
+    intervalMs: HOURLY,
+    lastRunAt: T0 - 7 * HOURLY,
+    ...over,
+  });
+
+  it("reports how long it has been and how often it should run", () => {
+    const [c] = evaluateFleetConditions([], T0, [duty()]);
+    expect(c!.id).toBe("duty-overdue");
+    expect(c!.text).toContain("the hourly improvement pass");
+    expect(c!.text).toContain("last ran 7h 0m ago");
+    expect(c!.text).toContain("every 1h 0m");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // The actionable half. "It has not run for nine hours" sends someone hunting; naming the holder
+  // points at the thing to fix — and the holder that matters is self-sustaining (a wedged pane
+  // reads `working`, so every tick skips and the pane never stops being busy).
+  it("names what is holding it, verbatim", () => {
+    const [c] = evaluateFleetConditions([], T0, [
+      duty({ heldBy: "the Sparkle agent pane reads 'working'" }),
+    ]);
+    expect(c!.text).toContain("Held by: the Sparkle agent pane reads 'working'.");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("says so honestly when nothing reports a cause", () => {
+    const [c] = evaluateFleetConditions([], T0, [duty()]);
+    expect(c!.text).toContain("Nothing reports why.");
+  });
+
+  // One missed slot is ordinary — offline, a pass still running, a briefly busy pane. Reporting
+  // each of those is the tune-out the two-observation rule exists to prevent.
+  it("tolerates a single missed interval", () => {
+    expect(overdueDuties([duty({ lastRunAt: T0 - 1.5 * HOURLY })], T0)).toEqual([]);
+  });
+
+  it("fires at the factor, and that boundary is real", () => {
+    const inside = overdueDuties([duty({ lastRunAt: T0 - DUTY_OVERDUE_FACTOR * HOURLY })], T0);
+    const outside = overdueDuties([duty({ lastRunAt: T0 - (DUTY_OVERDUE_FACTOR * HOURLY - 1) })], T0);
+    expect(inside).toHaveLength(1);
+    expect(outside).toEqual([]);
+  });
+
+  // An unseeded scheduler reads as undefined, and "we never looked" must not become "the product
+  // has stopped working".
+  it("never fires on a duty whose clock was never read", () => {
+    expect(overdueDuties([duty({ lastRunAt: undefined })], T0)).toEqual([]);
+    expect(evaluateFleetConditions([], T0, [duty({ lastRunAt: undefined })])).toEqual([]);
+  });
+
+  it("ignores a duty with no meaningful interval rather than dividing by it", () => {
+    expect(overdueDuties([duty({ intervalMs: 0 })], T0)).toEqual([]);
+  });
+
+  it("leads with the longest overdue", () => {
+    const out = overdueDuties(
+      [duty({ name: "recent", lastRunAt: T0 - 3 * HOURLY }), duty({ name: "ancient", lastRunAt: T0 - 40 * HOURLY })],
+      T0,
+    );
+    expect(out.map((o) => o.duty.name)).toEqual(["ancient", "recent"]);
+  });
+
+  // A duty is not an agent. Borrowing an agent id would put an unrelated agent into the cooldown's
+  // membership key, so a duty going overdue would re-open an unrelated condition.
+  it("claims no agent ids", () => {
+    const [c] = evaluateFleetConditions([], T0, [duty()]);
+    expect(c!.agentIds).toEqual([]);
+  });
+
+  it("ranks after the agent-stopping classes but before per-agent dead ends", () => {
+    const ids = evaluateFleetConditions(
+      [{ agentId: "e", label: "Esc", escalation: { reason: "gave up" } }, walled("q")],
+      T0,
+      [duty()],
+    ).map((c) => c.id);
+    expect(ids).toEqual(["quota-blocked", "duty-overdue", "goals-escalated"]);
+  });
+
+  it("says nothing when every duty is on time", () => {
+    expect(evaluateFleetConditions([], T0, [duty({ lastRunAt: T0 - 10 * MIN })])).toEqual([]);
   });
 });

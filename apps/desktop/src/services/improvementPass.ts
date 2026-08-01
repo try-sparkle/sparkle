@@ -255,12 +255,44 @@ export function hourlySlotStamp(lastRunAt: number, now: number): number {
   return remainder <= MAX_SNAP_BACK_MS ? now - remainder : now;
 }
 
-/** Pure gate: is an hourly pass due right now? (bead sparkle-4xwk.2) */
-export function shouldRunImprovementPass(gate: PassGate): boolean {
-  if (gate.consent === "never") return false;
-  if (gate.passRunning) return false;
-  if (gate.paneStatus === "working") return false;
-  if (gate.lastRunAt === null) return false; // scheduler seeds the clock on its first tick
+/**
+ * WHY a pass is not running right now, or `null` when it is due.
+ *
+ * ── WHY THIS EXISTS BESIDE THE BOOLEAN ───────────────────────────────────────────────────────────
+ * `shouldRunImprovementPass` answered `false` and said nothing more, and the consequence was not
+ * theoretical: the founder asked what the improvement agent had been doing and the honest answer was
+ * "nothing, for hours" — with no way to find out which gate was holding it. Three of these five
+ * conditions can persist INDEFINITELY without anything on any surface reporting them, and one of
+ * them is self-sustaining: an agent wedged in the Sparkle pane reads `working`, so every tick skips,
+ * so the pane never becomes not-working. The hourly duty stops forever and the banner still promises
+ * it runs once an hour.
+ *
+ * The reasons are DATA rather than prose so a caller can count them and a report can quote one —
+ * `pusherFleet`'s `duty-overdue` condition names the holder, and a reason that had to be re-derived
+ * by a second reader would be a second opinion about the same gate.
+ */
+export type PassHoldReason =
+  /** `[sparkle] improvement consent = never` — the user switched it off. Not a fault. */
+  | "consent-off"
+  /** A pass is already in flight. Transient by construction. */
+  | "already-running"
+  /** The Sparkle agent pane is `working`. THE SELF-SUSTAINING ONE — see the header. */
+  | "pane-busy"
+  /** The scheduler has not seeded its clock yet (first tick after launch). */
+  | "clock-unseeded"
+  /** Known-offline: the slot is held rather than spent on a guaranteed connectivity failure. */
+  | "offline";
+
+/**
+ * The gate, stated once. {@link shouldRunImprovementPass} delegates to this so the boolean and the
+ * reason cannot drift — two copies of a five-arm gate is exactly how a surface starts explaining a
+ * hold that is no longer the one in force.
+ */
+export function passHoldReason(gate: PassGate): PassHoldReason | null {
+  if (gate.consent === "never") return "consent-off";
+  if (gate.passRunning) return "already-running";
+  if (gate.paneStatus === "working") return "pane-busy";
+  if (gate.lastRunAt === null) return "clock-unseeded"; // scheduler seeds on its first tick
   // Known-offline: hold the slot rather than spend it. A pass needs the network from its very
   // first step, so launching one now buys a guaranteed connectivity failure — and because the
   // scheduler stamps the clock at ATTEMPT time, that doomed launch costs the whole hour AND the
@@ -271,11 +303,17 @@ export function shouldRunImprovementPass(gate: PassGate): boolean {
   // the first tick after connectivity returns. This sits BELOW the seed guard (a launch with no
   // clock still seeds) and ABOVE the retry short-circuit, since an armed re-attempt is exactly
   // what must not be spent while offline.
-  if (gate.isOnline === false) return false;
+  if (gate.isOnline === false) return "offline";
+  return null;
+}
+
+/** Pure gate: is an hourly pass due right now? (bead sparkle-4xwk.2) */
+export function shouldRunImprovementPass(gate: PassGate): boolean {
+  if (passHoldReason(gate) !== null) return false;
   // An armed retry short-circuits the hourly wait, but NOT the guards above it: the pass still
   // must not double-run or share the worktree with a live pane session.
   if (gate.retryDueAt != null && gate.now >= gate.retryDueAt) return true;
-  return isHourlySlotDue(gate.lastRunAt, gate.now);
+  return isHourlySlotDue(gate.lastRunAt!, gate.now);
 }
 
 /** Failure shapes that mean "the transport broke", as opposed to "the pass ran and something

@@ -47,3 +47,14 @@ export function noteUserInputForAgent(
 export function quotaBlockForAgent(agentId: string, now: number): QuotaBlock | undefined {
   return engines.get(agentId)?.quotaBlockNow(now);
 }
+
+/**
+ * The API-error banner this agent is currently sitting in, verbatim, or `undefined`.
+ *
+ * Sibling of {@link quotaBlockForAgent}, reached the same way and `undefined` for the same two
+ * cases — no failure, and no engine registered in this window — so the Pusher's fleet snapshot reads
+ * both walls through one registry rather than two mechanisms.
+ */
+export function lastFailureForAgent(agentId: string): { message: string; at: number } | undefined {
+  return engines.get(agentId)?.lastFailureNow();
+}

@@ -265,6 +265,22 @@ export class StatusEngine {
   // than each re-deriving it from text. Outlives the sticky red on purpose: the red clears on real
   // progress, whereas the WALL is a fact about the clock and expires only when `resetAt` passes.
   private quotaBlock: QuotaBlock | null = null;
+  /**
+   * The API-error banner this agent is CURRENTLY sitting in, verbatim, and when it arrived.
+   *
+   * Mirrors {@link quotaBlock} deliberately — same capture points, same verbatim rule — because it
+   * answers the same shape of question for a different wall. `pusherFleet.sharedFailureCohorts`
+   * groups agents by this exact string to recognise that one host event killed several of them at
+   * once, which only works if nothing here normalises it.
+   *
+   * UNLIKE the quota block, this CLEARS on ordinary recovery ({@link clearStreamFailure}), and that
+   * asymmetry is the point. A quota wall is a claim about the ACCOUNT that outlives the red, so only
+   * positive evidence retires it early. This is a claim about a turn that died — the moment the
+   * agent classifies a tool event, prompts, or takes user input, it is demonstrably not sitting in
+   * that failure any more. Without that, the field would be a permanent stamp of the last bad turn,
+   * and every consumer would keep reporting a dead agent that had been working for hours.
+   */
+  private lastFailure: { message: string; at: number } | null = null;
   // Fires at the wall's stated reset. See armQuotaRelease for why a timer and not a check-on-ingest.
   private quotaTimer: ReturnType<typeof setTimeout> | null = null;
   // The token count from the most recent spinner frame that carried one, so a strictly-higher count
@@ -382,6 +398,11 @@ export class StatusEngine {
     return b !== null && isQuotaBlocked(b, now) ? b : undefined;
   }
 
+  /** The API-error banner this agent is currently sitting in, verbatim. See {@link lastFailure}. */
+  lastFailureNow(): { message: string; at: number } | undefined {
+    return this.lastFailure ?? undefined;
+  }
+
   // The ONE way out of it: every recovery path (a classified tool event, a real prompt, user input, a
   // token advance) must drop the flag, the kind AND the churn counters together — a leftover kind or
   // a half-counted repeat re-arms red on the next line.
@@ -389,6 +410,8 @@ export class StatusEngine {
     this.sawStreamFailure = false;
     this.failureKind = null;
     this.failure.reset();
+    // Dropped WITH the red, unlike `quotaBlock` — see the field's own note for why the two differ.
+    this.lastFailure = null;
   }
 
   /**
@@ -657,7 +680,9 @@ export class StatusEngine {
         // blips while genuinely generating, and escalating repeats to "churn" would pin exactly that
         // healthy agent red — the false-red this whole line of work exists to kill. A retry loop with
         // no generation is still caught, by the frozen-counter rule.
-        this.tripStreamFailure(isApiErrorLine(line) ? "api" : "churn");
+        const apiLine = isApiErrorLine(line);
+        if (apiLine) this.lastFailure = { message: line, at: Date.now() };
+        this.tripStreamFailure(apiLine ? "api" : "churn");
         trippedThisChunk = true;
       }
       // ACCOUNT LIMIT, checked SEPARATELY from `this.failure.observe` above and not folded into it.
@@ -708,6 +733,9 @@ export class StatusEngine {
       .slice(countApiErrorFrames(base))
       .filter((f) => !this.isUserEchoLine(f.toLowerCase()));
     if (arrived.length > 0) {
+      // The LAST arrival, matching how `wallInTail` takes the last wall: within one chunk the most
+      // recent banner is the current state of the turn.
+      this.lastFailure = { message: arrived[arrived.length - 1]!, at: Date.now() };
       this.tripStreamFailure("api");
       trippedThisChunk = true;
     }

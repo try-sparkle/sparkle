@@ -1189,3 +1189,72 @@ describe("a disposed engine goes silent", () => {
     expect(statuses).not.toContain("errored");
   });
 });
+
+// ── THE FAILURE BANNER, RETAINED VERBATIM ───────────────────────────────────────────────────────
+// `pusherFleet.sharedFailureCohorts` groups agents by this exact string to recognise that ONE host
+// event killed several of them at once. That only works if nothing here normalises it, and only
+// stays honest if it clears when the agent demonstrably recovers.
+describe("lastFailureNow", () => {
+  const SPINNER = "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)";
+  const OFFLINE = "API Error: Unable to connect to API (ENOTFOUND)";
+
+  it("is undefined on a healthy agent — an absent observation never manufactures a failure", () => {
+    const { engine } = makeEngine();
+    engine.ingest(SPINNER);
+    expect(engine.lastFailureNow()).toBeUndefined();
+  });
+
+  it("retains the banner VERBATIM from a completed line", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest(`\n⏺ ${OFFLINE}\n`);
+    expect(last()).toBe("errored");
+    // Markers stripped, nothing else: two agents killed by one event must produce identical bytes.
+    expect(engine.lastFailureNow()?.message).toContain(OFFLINE);
+  });
+
+  // The live shape — no trailing newline — which is how the founder's five agents actually died.
+  it("retains the banner from the unterminated tail too", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest(`\r⏺ ${OFFLINE}`);
+    expect(last()).toBe("errored");
+    expect(engine.lastFailureNow()?.message).toContain(OFFLINE);
+  });
+
+  it("stamps when it arrived, so a cohort can be bounded against the clock", () => {
+    const { engine } = makeEngine();
+    const before = Date.now();
+    engine.ingest(SPINNER);
+    engine.ingest(`\r⏺ ${OFFLINE}`);
+    const at = engine.lastFailureNow()!.at;
+    expect(at).toBeGreaterThanOrEqual(before);
+    expect(at).toBeLessThanOrEqual(Date.now());
+  });
+
+  // THE ASYMMETRY WITH `quotaBlock`, and the reason the Pusher can trust this field. A quota wall is
+  // a claim about the ACCOUNT that outlives the red; this is a claim about a turn that died, so the
+  // moment the agent classifies real work it is demonstrably not sitting in that failure any more.
+  // Without this it would be a permanent stamp of the last bad turn.
+  it("clears when the agent demonstrably recovers", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(`${OFFLINE}\n`);
+    expect(engine.lastFailureNow()?.message).toContain(OFFLINE);
+    expect(last()).toBe("errored");
+
+    // The same recovery the red itself honours: a classified file event plus a spinner.
+    engine.ingest("Reading file src/foo.ts\n" + SPINNER);
+    expect(last()).toBe("working");
+    expect(engine.lastFailureNow()).toBeUndefined();
+  });
+
+  // The same guard the red itself uses: a human pasting the banner into the composer, or an agent
+  // reading a log, must not make it look like a shared casualty.
+  it("does not retain a banner that is only a TOOL RESULT", () => {
+    const { engine, last } = makeEngine();
+    engine.ingest(SPINNER);
+    engine.ingest(`\n  ⎿  ${OFFLINE}\n`);
+    expect(last()).toBe("working");
+    expect(engine.lastFailureNow()).toBeUndefined();
+  });
+});

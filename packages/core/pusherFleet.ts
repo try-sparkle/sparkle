@@ -81,8 +81,52 @@ export type FleetConditionId =
   | "shared-failure"
   /** Goals auto-continue gave up on. Reserved for the human by design, so a dead end until seen. */
   | "goals-escalated"
+  /** A standing recurring duty that has silently stopped running. */
+  | "duty-overdue"
   /** Goal met, nothing unlanded — occupying a slot for no reason. */
   | "done-not-retired";
+
+/**
+ * Something the app has promised to do on a schedule — the hourly improvement pass, and anything
+ * else that acquires a standing cadence later.
+ *
+ * ── WHY THIS IS NOT A PER-AGENT CONDITION ────────────────────────────────────────────────────────
+ * Every other class here is about an agent. This one is about a CAPABILITY, and it is the only case
+ * where nothing looks wrong anywhere: every agent is fine, every row is its normal colour, and a
+ * thing the product promises simply is not happening. The founder found it the way you find all
+ * invisible failures — by asking, and being told "nothing, for hours".
+ */
+export interface StandingDuty {
+  /** What it is, in the user's words. Quoted verbatim, so its numbers are whitelisted. */
+  name: string;
+  /** How often it is supposed to run. */
+  intervalMs: number;
+  /**
+   * When it last actually ran.
+   *
+   * `undefined` is NOT LOOKED and never fires — the fail-closed rule. It is also what an unseeded
+   * scheduler reads as, and a duty that has never had a clock is not yet overdue.
+   */
+  lastRunAt?: number;
+  /**
+   * Why it is being held right now, if anything is holding it — quoted verbatim in the report.
+   *
+   * This is the half that makes the condition actionable rather than merely alarming. "The hourly
+   * pass has not run for nine hours" sends someone hunting; "…because the Sparkle pane reads
+   * working" names the thing to fix.
+   */
+  heldBy?: string;
+}
+
+/**
+ * Missed intervals before a duty is called overdue.
+ *
+ * Not one: a single missed slot is ordinary. The pass legitimately skips a slot when the machine is
+ * offline, when a pass is still running, or when the pane is briefly busy, and reporting each of
+ * those would be exactly the tune-out the two-observation rule exists to prevent. Two consecutive
+ * misses is a pattern rather than a skip.
+ */
+export const DUTY_OVERDUE_FACTOR = 2;
 
 /**
  * What one sweep knows about one agent, for the fleet report.
@@ -298,6 +342,25 @@ export function sharedFailureCohorts(
 }
 
 /**
+ * Duties that have missed at least {@link DUTY_OVERDUE_FACTOR} intervals, longest-overdue first.
+ *
+ * Fail-closed on `lastRunAt`: a duty whose clock we never read is not reported as overdue, because
+ * "we did not look" must never manufacture a claim that the product has stopped working.
+ */
+export function overdueDuties(
+  duties: readonly StandingDuty[],
+  now: number,
+): Array<{ duty: StandingDuty; overdueBy: number }> {
+  const out: Array<{ duty: StandingDuty; overdueBy: number }> = [];
+  for (const duty of duties) {
+    if (duty.lastRunAt === undefined || duty.intervalMs <= 0) continue;
+    const elapsed = now - duty.lastRunAt;
+    if (elapsed >= duty.intervalMs * DUTY_OVERDUE_FACTOR) out.push({ duty, overdueBy: elapsed });
+  }
+  return out.sort((a, b) => b.overdueBy - a.overdueBy);
+}
+
+/**
  * The conditions that hold across the fleet, most-blocking first.
  *
  * ORDER IS A PRIORITY. Quota-blocked leads because it is the only one where the ordinary remedy is
@@ -312,6 +375,7 @@ export function sharedFailureCohorts(
 export function evaluateFleetConditions(
   snapshots: readonly FleetSnapshot[],
   now: number,
+  duties: readonly StandingDuty[] = [],
 ): FleetCondition[] {
   const out: FleetCondition[] = [];
 
@@ -320,6 +384,9 @@ export function evaluateFleetConditions(
 
   const cohorts = sharedFailureCohorts(snapshots, now);
   if (cohorts.length > 0) out.push(sharedFailureCondition(cohorts, now));
+
+  const overdue = overdueDuties(duties, now);
+  if (overdue.length > 0) out.push(dutyCondition(overdue));
 
   const escalated = snapshots.filter((s) => s.escalation !== undefined);
   if (escalated.length > 0) out.push(escalationCondition(escalated));
@@ -414,6 +481,43 @@ function sharedFailureCondition(
       ...quotedNumbers(...cohorts.map((c) => c.message), ...agents.map((s) => s.label)),
     ],
     text: `${head}\n${lines.join("\n")}`,
+  };
+}
+
+function dutyCondition(
+  overdue: ReadonlyArray<{ duty: StandingDuty; overdueBy: number }>,
+): FleetCondition {
+  const lines = overdue.map(({ duty, overdueBy }) => {
+    const since = splitHoursMinutes(overdueBy);
+    const every = splitHoursMinutes(duty.intervalMs);
+    // The HOLD is the actionable half — see `StandingDuty.heldBy`. Without one, the honest thing is
+    // to say the duty is simply not happening rather than to guess at a cause.
+    const why = duty.heldBy ? ` Held by: ${duty.heldBy}.` : " Nothing reports why.";
+    return (
+      `  - "${duty.name}" last ran ${since.h}h ${since.m}m ago; it is supposed to run every ` +
+      `${every.h}h ${every.m}m.${why}`
+    );
+  });
+
+  const n = overdue.length;
+  const plural = n === 1 ? "duty has" : "duties have";
+  return {
+    id: "duty-overdue",
+    // A duty is not an agent, and the report must not imply one is stuck. Empty rather than
+    // borrowing an agent id, which would put an unrelated agent in the cooldown's membership key.
+    agentIds: [],
+    measured: [
+      String(n),
+      ...overdue.flatMap(({ duty, overdueBy }) => {
+        const since = splitHoursMinutes(overdueBy);
+        const every = splitHoursMinutes(duty.intervalMs);
+        return [String(since.h), String(since.m), String(every.h), String(every.m)];
+      }),
+      ...quotedNumbers(...overdue.flatMap(({ duty }) => [duty.name, duty.heldBy])),
+    ],
+    text:
+      `${n} standing ${plural} stopped running. Nothing is visibly wrong — every agent looks ` +
+      `fine, which is why this goes unnoticed:\n${lines.join("\n")}`,
   };
 }
 
