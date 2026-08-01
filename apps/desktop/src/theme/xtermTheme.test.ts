@@ -327,30 +327,30 @@ describe("xtermTheme light-mode ANSI palette", () => {
     }
   });
 
-  it("DOES lift the calm combinations the palette never designed — that is its job", () => {
-    // roborev 56774-M1: an earlier comment claimed the adjuster never fires while calm. False, and
-    // the claim mattered — two grays across sixteen slots necessarily produce pairs nobody tuned,
-    // and the worst are degenerate. Pinning them from BELOW is what makes the rule above honest:
-    // these are under the floor, so xterm lifts them, and that is the net doing the job it exists
-    // for rather than overriding calm.
-    const floor = termMinContrastRatio("light", true);
+  it("calm has ONE register per level, which is why it needs the net at all", () => {
+    // roborev 56774-M1 asked for the honest half of the claim to be asserted, not just the
+    // flattering half: calm produces pairs it never tuned, and some are degenerate. The FIRST
+    // version of this pinned those pairs' RATIOS from below (`toBeLessThan(floor)`) — and roborev
+    // 56777 caught that as the mirror image of the M3 defect corrected in the same commit. Giving
+    // calm a paper register, so `\e[44;37m` reads on its own instead of relying on the adjuster,
+    // is a real improvement someone may want (the non-calm palette was restructured for exactly
+    // that reason); a ratio floored from below fails it, with a message demanding the pair stay
+    // unreadable. Pinning a design freedom in EITHER direction is the same mistake.
+    //
+    // So this asserts the STRUCTURE instead, which is a property calm actually has and which this
+    // file already pins for dark ("flattens hue but PRESERVES luminance ordering"): sixteen slots,
+    // two grays, no paper split. Everything about the net follows from it as a consequence rather
+    // than as a second constraint.
     const t = xtermTheme("light", true);
-    const undesigned: Array<[string, string, string]> = [
-      // A TUI paints a status bar from a BRIGHT slot and leaves the foreground default.
-      ["default ink over a bright-painted cell", t.foreground, t.brightRed!],
-      // `\e[44m\e[37m` — white on blue. Both collapse onto `dim`, so fg IS bg: invisible.
-      ["a dark slot on a dark-slot fill", t.white!, t.blue!],
-      ["a bright slot on a bright-slot fill", t.brightWhite!, t.brightBlue!],
-    ];
-    for (const [what, fg, bg] of undesigned) {
-      expect(
-        contrast(fg, bg),
-        `light calm: ${what} (${fg} on ${bg}) is a pair calm never tuned — it should sit UNDER the ${floor}:1 floor so xterm rescues it`,
-      ).toBeLessThan(floor);
-    }
-    // The degenerate ones really are fg == bg, which is what makes them unreadable rather than dim.
-    expect(t.white).toBe(t.blue);
-    expect(t.brightWhite).toBe(t.brightBlue);
+    expect(t.white, "calm's dark slots are ONE gray — no paper register").toBe(t.blue);
+    expect(t.brightWhite, "…and its bright slots likewise").toBe(t.brightRed);
+    // The consequence, and the reason the calm floor is >1 rather than off: with one register per
+    // level, a cell that paints its background from a slot and leaves the foreground default (or
+    // paints both from the same level) is fg == bg — invisible, not merely recessive. Nothing here
+    // requires it to STAY that way; if calm ever gains a paper register these two lines are a
+    // deliberate edit, not a regression, and the net simply stops firing on those cells.
+    expect(contrast(t.white!, t.blue!)).toBe(1);
+    expect(termMinContrastRatio("light", true)).toBeGreaterThan(1);
   });
 
   it("still nets the cube while CALM — flattening the sixteen does not reach it", () => {
