@@ -106,15 +106,27 @@ sparkleTerminal.setAttribute("data-dnd-target", SPARKLE_TERMINAL_DND_TARGET);
 let overButton = false;
 let overConciergeBox = false;
 let overSparkleTerminal = false;
-document.elementFromPoint = vi.fn(() =>
-  overButton
+
+/** The point every "over a marked surface" case drags to, and the one that is nowhere. */
+const ON_TARGET = { x: 10, y: 10 };
+const ELSEWHERE = { x: 400, y: 400 };
+
+// THE STUB HONOURS ITS ARGUMENTS (roborev 57048). It used to ignore them entirely and answer purely
+// from the module-level flags below, which meant the `position` half of the payload never reached an
+// assertion: `isOverDndTarget` is its only consumer, so a broken coordinate mapping — the wire
+// position arriving mangled, halved, or dropped — selected exactly the same branch and every test
+// still passed. Requiring the coordinates to match makes the emitted position load-bearing, so the
+// file now covers all three fields of `{type, paths, position}` rather than two.
+document.elementFromPoint = vi.fn((x: number, y: number) => {
+  if (x !== ON_TARGET.x || y !== ON_TARGET.y) return document.body;
+  return overButton
     ? button
     : overConciergeBox
       ? conciergeBox
       : overSparkleTerminal
         ? sparkleTerminal
-        : document.body,
-);
+        : document.body;
+});
 
 let backend: TauriEventBackend;
 
@@ -151,18 +163,23 @@ afterEach(async () => {
   backend.teardown();
 });
 
-async function renderComposer(agentId = "a1") {
-  render(
+async function renderComposer(
+  agentId = "a1",
+  inputRef = createRef<HTMLTextAreaElement>(),
+  onSubmitPrompt: () => void = vi.fn(),
+) {
+  const view = render(
     <Composer
       agentId={agentId}
       active
       disabled={false}
-      inputRef={createRef<HTMLTextAreaElement>()}
-      onSubmitPrompt={vi.fn()}
+      inputRef={inputRef}
+      onSubmitPrompt={onSubmitPrompt}
     />,
   );
   // Registration is four real IPC round-trips now, not a synchronous stub assignment.
   await waitFor(() => expect(backend.eventNames()).toContain(DRAG_DROP));
+  return view;
 }
 
 describe("Composer — new-build-agent drop target", () => {
@@ -177,6 +194,43 @@ describe("Composer — new-build-agent drop target", () => {
     );
   });
 
+  // FINDING 1's positive half: prove the emitted wire position actually reaches the hit test,
+  // rather than only proving that some element was returned.
+  it("passes the emitted wire position through to the hit test", async () => {
+    await renderComposer();
+    vi.mocked(document.elementFromPoint).mockClear();
+    fire({ type: "drop", position: ON_TARGET, paths: ["/tmp/notes.txt"] });
+    expect(document.elementFromPoint).toHaveBeenCalledWith(ON_TARGET.x, ON_TARGET.y);
+  });
+
+  // CHURN (roborev 57048). `Composer`'s effect deps are [active, attachPaths, overOtherTarget]; if
+  // any upstream link loses memoization the effect re-runs per render, and because teardown is async
+  // there is a window on EVERY render with no drop listener — precisely the "drop does nothing"
+  // symptom. Asserted on the CUMULATIVE count, because a churning effect unregisters as well as
+  // registers and the live count settles back to 4 (see tauriEventBackend.listenCount).
+  it("registers ONCE and does not churn across re-renders", async () => {
+    // STABLE PROPS ACROSS RE-RENDERS, and this is the whole care of the test. A fresh
+    // `createRef()` or a fresh `onSubmitPrompt` per re-render changes `inputRef`, which invalidates
+    // `attachPaths`, which legitimately re-runs the effect — so an unstable-props loop measures the
+    // TEST, not the component. (First draft did exactly that and read 25 `tauri://drag-enter`
+    // registrations, which looked like a Composer leak and was not.)
+    const ref = createRef<HTMLTextAreaElement>();
+    const onSubmit = vi.fn();
+    // Mount with the SAME props the re-renders use, or the first re-render legitimately re-runs the
+    // effect and the count reads 2 — measuring the harness rather than the component.
+    const view = await renderComposer("a1", ref, onSubmit);
+    for (let i = 0; i < 25; i++) view.rerender(
+      <Composer agentId="a1" active disabled={false} inputRef={ref} onSubmitPrompt={onSubmit} />,
+    );
+    // Let every pending listen()/unlisten() chain settle — each registration is four sequential
+    // awaits, so a single microtask tick would sample mid-flight and undercount.
+    await waitFor(() => expect(backend.registered.length).toBeLessThanOrEqual(4));
+    // CUMULATIVE, never decremented: a churning effect unregisters as well as registers, so the
+    // LIVE count settles back to 4 and would pass while the listener was absent half the time.
+    expect(backend.listenCount(DRAG_DROP)).toBe(1);
+    expect(backend.registered).toHaveLength(4);
+  });
+
   it("scopes its listeners to THIS webview, not to every target", async () => {
     await renderComposer();
     // A global listen would let a drop on another window attach files into this composer.
@@ -187,7 +241,7 @@ describe("Composer — new-build-agent drop target", () => {
 
   it("attaches a drop that lands anywhere else (existing behavior)", async () => {
     await renderComposer();
-    fire({ type: "drop", position: { x: 400, y: 400 }, paths: ["/tmp/notes.txt"] });
+    fire({ type: "drop", position: ELSEWHERE, paths: ["/tmp/notes.txt"] });
     expect(loadAttachment).toHaveBeenCalledWith("/tmp/notes.txt");
     expect(await screen.findByText("notes.txt")).toBeTruthy();
   });
@@ -195,7 +249,7 @@ describe("Composer — new-build-agent drop target", () => {
   it("ignores a drop on the + New Build Agent button (the button's listener owns it)", async () => {
     await renderComposer();
     overButton = true;
-    fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
+    fire({ type: "drop", position: ON_TARGET, paths: ["/tmp/notes.txt"] });
     // Nothing loads and no tile appears — the file belongs to the NEW agent's composer.
     expect(loadAttachment).not.toHaveBeenCalled();
     expect(screen.queryByText("notes.txt")).toBeNull();
@@ -208,7 +262,7 @@ describe("Composer — new-build-agent drop target", () => {
   it("ignores a drop on the concierge compose box (it stages the file itself)", async () => {
     await renderComposer();
     overConciergeBox = true;
-    fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
+    fire({ type: "drop", position: ON_TARGET, paths: ["/tmp/notes.txt"] });
     expect(loadAttachment).not.toHaveBeenCalled();
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
@@ -222,7 +276,7 @@ describe("Composer — new-build-agent drop target", () => {
   it("ignores a drop on the Sparkle pane's terminal (it pastes the path itself)", async () => {
     await renderComposer();
     overSparkleTerminal = true;
-    fire({ type: "drop", position: { x: 10, y: 10 }, paths: ["/tmp/notes.txt"] });
+    fire({ type: "drop", position: ON_TARGET, paths: ["/tmp/notes.txt"] });
     expect(loadAttachment).not.toHaveBeenCalled();
     expect(screen.queryByText("notes.txt")).toBeNull();
   });
@@ -231,10 +285,10 @@ describe("Composer — new-build-agent drop target", () => {
     await renderComposer();
     const dropHint = () =>
       (screen.getByRole("textbox") as HTMLTextAreaElement).placeholder.startsWith("Drop the file");
-    fire({ type: "enter", position: { x: 400, y: 400 }, paths: ["/tmp/notes.txt"] });
+    fire({ type: "enter", position: ELSEWHERE, paths: ["/tmp/notes.txt"] });
     expect(dropHint()).toBe(true);
     overSparkleTerminal = true;
-    fire({ type: "over", position: { x: 10, y: 10 } });
+    fire({ type: "over", position: ON_TARGET });
     expect(dropHint()).toBe(false);
   });
 
@@ -242,10 +296,10 @@ describe("Composer — new-build-agent drop target", () => {
     await renderComposer();
     const dropHint = () =>
       (screen.getByRole("textbox") as HTMLTextAreaElement).placeholder.startsWith("Drop the file");
-    fire({ type: "enter", position: { x: 400, y: 400 }, paths: ["/tmp/a.png"] });
+    fire({ type: "enter", position: ELSEWHERE, paths: ["/tmp/a.png"] });
     expect(dropHint()).toBe(true);
     overConciergeBox = true;
-    fire({ type: "over", position: { x: 10, y: 10 } });
+    fire({ type: "over", position: ON_TARGET });
     expect(dropHint()).toBe(false);
   });
 
@@ -255,13 +309,13 @@ describe("Composer — new-build-agent drop target", () => {
     // placeholder (the border shorthand doesn't survive jsdom's style parsing).
     const dropHint = () =>
       (screen.getByRole("textbox") as HTMLTextAreaElement).placeholder.startsWith("Drop the file");
-    fire({ type: "enter", position: { x: 400, y: 400 }, paths: ["/tmp/a.png"] });
+    fire({ type: "enter", position: ELSEWHERE, paths: ["/tmp/a.png"] });
     expect(dropHint()).toBe(true); // normal drag-over composer → "drop here" state
     overButton = true;
-    fire({ type: "over", position: { x: 10, y: 10 } });
+    fire({ type: "over", position: ON_TARGET });
     expect(dropHint()).toBe(false); // over the button → the button's hover visual, not ours
     overButton = false;
-    fire({ type: "over", position: { x: 400, y: 400 } });
+    fire({ type: "over", position: ELSEWHERE });
     expect(dropHint()).toBe(true); // dragging back off the button re-arms the composer
   });
 
@@ -312,6 +366,11 @@ describe("Composer — registers as the window-global catch-all drop target", ()
     // A DIFFERENT position: the reporter dedupes on the last one it saw.
     reportDropWithNoTarget({ x: 401, y: 400 });
     expect(log.warn).toHaveBeenCalledTimes(1);
+    // AND the four real listeners must actually come off (roborev 57048). The counter above is the
+    // catch-all claim only; without this, a cleanup that dropped `safeUnlisten(unlistenPromise)` —
+    // leaking a listener that keeps attaching files into an unmounted composer — passes untouched.
+    await waitFor(() => expect(backend.eventNames()).not.toContain(DRAG_DROP));
+    expect(backend.registered).toHaveLength(0);
   });
 
   it("does not register at all when it is not the active pane", async () => {
