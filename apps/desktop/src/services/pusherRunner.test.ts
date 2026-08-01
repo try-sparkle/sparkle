@@ -762,3 +762,40 @@ describe("a wall does not strand cooldown stamps", () => {
     expect(next.partners.get("a")!.lastChallengedAt).toEqual({ "goal-expired": T0 - 60_000 });
   });
 });
+
+// The founder's observed case, end to end through the sweep: the host restarts, five agents die
+// with the same banner, and it must reach the reader as ONE message rather than five.
+describe("machine-shutdown casualties", () => {
+  const OFFLINE = "API Error: Unable to connect to API (ENOTFOUND)";
+
+  const died = (id: string) => ({
+    agentId: id,
+    projectId: "p",
+    label: `Agent ${id}`,
+    failure: { message: OFFLINE, at: T0 },
+  });
+
+  it("reports five casualties as one cited report", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => ["a", "b", "c", "d", "e"].map(died),
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.agentId).toBe("boss");
+    expect(sent[0]!.text).toContain("5 agents stopped for a single shared reason");
+    expect(sent[0]!.text).toContain(OFFLINE);
+  });
+
+  // A dead agent cannot read its inbox either — but `failure` carries no reset time, so muting on it
+  // would mute for as long as the field stays set. That trade is refused deliberately; see the
+  // comment in pusherRunner.ts.
+  it("still challenges a casualty on its own channel", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ ...expired(), ...died("a") }, died("b")],
+      reportRecipient: () => undefined,
+    });
+    await sweepTimes(deps, 2);
+    expect(sent.map((s) => s.agentId)).toEqual(["a"]);
+  });
+});

@@ -1,4 +1,4 @@
-// THE THREE CONDITIONS A PARTNER CANNOT BE TOLD ABOUT — and why they are reported as ONE message
+// THE CONDITIONS A PARTNER CANNOT BE TOLD ABOUT — and why they are reported as ONE message
 // about the fleet rather than as a challenge to each agent.
 //
 // ── WHAT THIS CLOSES ─────────────────────────────────────────────────────────────────────────────
@@ -23,6 +23,10 @@
 //     per-partner channel does not reach.
 //   • DONE-BUT-OPEN. There is nothing to ask a finished agent to do. The action is to retire it,
 //     which is somebody else's authority — a Pusher may never close its partner's goal.
+//   • SHARED FAILURE. N agents killed by ONE event — a host sleeping or restarting takes every local
+//     agent with it. Each victim's row says "errored" on its own, so the one fact worth knowing (that
+//     it is a single cause) exists nowhere until something aggregates it. Telling each victim is both
+//     useless and N times the noise.
 //
 // So the recipient is different, and once the recipient is different the batching follows: eight
 // separate nudges about eight escalated goals is exactly the noise `MESSAGES_PER_HOUR` exists to
@@ -67,11 +71,14 @@
 // No clock (callers pass `now`), no store, no I/O, no model.
 
 import { numbersIn } from "./pusherGate";
+import { splitHoursMinutes } from "./pusherTriggers";
 
 /** The fleet-level conditions a Phase 1 Pusher may report. */
 export type FleetConditionId =
   /** Agents held behind an account limit — cannot run at all, and cannot be restarted into running. */
   | "quota-blocked"
+  /** Several agents killed by ONE event — same error, same moment. N victims, not N failures. */
+  | "shared-failure"
   /** Goals auto-continue gave up on. Reserved for the human by design, so a dead end until seen. */
   | "goals-escalated"
   /** Goal met, nothing unlanded — occupying a slot for no reason. */
@@ -102,6 +109,19 @@ export interface FleetSnapshot {
     resetAt: number;
     /** Did the banner actually NAME a time, or is `resetAt` the bounded fallback? */
     resetParsed: boolean;
+  };
+  /**
+   * A failure this agent is currently sitting in, as it printed it.
+   *
+   * The grouping in {@link sharedFailureCohorts} is on this exact string, which is why it must be
+   * verbatim and unnormalised: two agents killed by one host event print the SAME bytes, and any
+   * tidying this module did would be tidying the evidence that they died together.
+   */
+  failure?: {
+    /** The error text VERBATIM. */
+    message: string;
+    /** Epoch ms the failure was observed. */
+    at: number;
   };
   /** Present iff the goal is escalated. `reason` is `AgentGoal.escalationReason`, quoted verbatim. */
   escalation?: { reason?: string };
@@ -179,13 +199,115 @@ function nameOf(snap: FleetSnapshot): string {
 // founder reads names, not ids, so nothing is lost.
 
 /**
+ * Minutes within which failures count as ONE event.
+ *
+ * A host sleeping or restarting kills every local agent within seconds of each other; the spread
+ * this absorbs is detection latency, not the event — a poll interval, a scrollback scan, an agent
+ * that was mid-turn. Fifteen minutes is generous against that and still far tighter than the hours
+ * that separate genuinely independent failures, which is the case it has to keep apart.
+ */
+export const SHARED_FAILURE_WINDOW_MINUTES = 15;
+
+/**
+ * How many agents must share a failure before it is one EVENT rather than one agent's bad luck.
+ *
+ * Two, and the reason is that this condition earns its place purely by AGGREGATING. A single agent
+ * failing is already visible on its own row and is exactly the kind of transient the two-observation
+ * rule exists to swallow; reporting it here would add noise while saving nobody a glance. At two the
+ * claim being made — "this is one cause, not N problems" — becomes true and useful.
+ */
+export const SHARED_FAILURE_MIN_VICTIMS = 2;
+
+/**
+ * How old the most recent failure in a cohort may be before it stops being reported at all.
+ *
+ * ── WHY AN ABSOLUTE BOUND IS NEEDED ON TOP OF THE WINDOW (roborev 57275) ─────────────────────────
+ * `SHARED_FAILURE_WINDOW_MINUTES` is RELATIVE — it measures agents against each other, not against
+ * the clock. So a cohort that is entirely stale still satisfies it: the host is offline 02:00-03:00,
+ * five agents record `at: 02:10`, and at 09:00 they are all still within fifteen minutes of each
+ * other. Without this the report claims they stopped as if it were happening now, and re-fires every
+ * `REPEAT_COOLDOWN_MS` forever. `failure` is the only field here that records a past EVENT with no
+ * end time — a quota wall has `resetAt`, escalation and a met goal are genuinely latched states — so
+ * it is the only one that needs bounding against `now`.
+ *
+ * ── WHY TWENTY-FOUR HOURS ────────────────────────────────────────────────────────────────────────
+ * The bound cannot be the grouping window: the founder's case is finding these the morning after an
+ * overnight restart, and the agents really are still dead. It has to outlive a night. A day also
+ * bounds the repetition to at most ~6 reports at the four-hour cooldown before the cohort goes quiet
+ * for good, which is the property the finding was actually about.
+ *
+ * The honest half of this is not the cutoff, though — it is that the report QUOTES the age, so a
+ * fourteen-hour-old event never reads as a fresh one.
+ */
+export const SHARED_FAILURE_MAX_AGE_MINUTES = 24 * 60;
+
+/**
+ * Agents killed by the same thing at the same time, grouped — one entry per distinct cause.
+ *
+ * ── WHY GROUPING IS BY THE EXACT STRING, AND WHY THERE IS NO MATCHER ─────────────────────────────
+ * The observed case is a host sleep or restart, which kills every local agent with
+ * `API Error: Unable to connect to API (ENOTFOUND)` and expires their goals together. The obvious
+ * implementation is to detect THAT — but a matcher for connectivity errors would be a second copy of
+ * a rule `improvementPass.isTransientPassFailure` already owns, and the repo has been bitten twice
+ * by exactly that (`quotaBlock`'s header records the count).
+ *
+ * It is also unnecessary, because the thing worth reporting is not "these are network errors" — it
+ * is "these have ONE cause". Identical bytes at one moment establish that without classifying
+ * anything, and it generalises for free: a proxy dying, an auth lapse, a bad deploy all produce the
+ * same shape and are all worth one message instead of N. What is quoted is what the agents printed,
+ * so the citation rule needs nothing but {@link quotedNumbers}.
+ *
+ * ── THE WINDOW IS ANCHORED TO THE NEWEST FAILURE ─────────────────────────────────────────────────
+ * Not to the group's total span. A message that recurs over days — the same error hitting one agent
+ * on Monday and another on Thursday — is NOT one event, and a span test would eventually call it
+ * one. Anchoring on the most recent failure and admitting only what falls within the window of it
+ * reports the current burst and lets the stale members age out on their own.
+ *
+ * ── QUOTA-WALLED AGENTS ARE EXCLUDED, AND THIS IS LOAD-BEARING ───────────────────────────────────
+ * A limit banner is ALSO identical across agents, so without this the fleet's quota block would
+ * form a cohort here and be reported twice in one message under two different headings. Quota wins
+ * because it is the more specific and more actionable reading of the same evidence — it carries a
+ * reset time and a do-not-retry remedy that this condition cannot express.
+ */
+export function sharedFailureCohorts(
+  snapshots: readonly FleetSnapshot[],
+  now: number,
+): Array<{ message: string; agents: FleetSnapshot[]; newest: number }> {
+  const byMessage = new Map<string, FleetSnapshot[]>();
+  for (const s of snapshots) {
+    if (s.failure === undefined || isQuotaWalled(s, now)) continue;
+    const list = byMessage.get(s.failure.message);
+    if (list === undefined) byMessage.set(s.failure.message, [s]);
+    else list.push(s);
+  }
+
+  const windowMs = SHARED_FAILURE_WINDOW_MINUTES * 60_000;
+  const maxAgeMs = SHARED_FAILURE_MAX_AGE_MINUTES * 60_000;
+  const out: Array<{ message: string; agents: FleetSnapshot[]; newest: number }> = [];
+  for (const [message, all] of byMessage) {
+    const newest = Math.max(...all.map((s) => s.failure!.at));
+    // The anchor itself must be recent. Without this the window is satisfied by any group of old
+    // failures that happened near each other, however long ago — see SHARED_FAILURE_MAX_AGE_MINUTES.
+    if (now - newest > maxAgeMs) continue;
+    const agents = all.filter((s) => newest - s.failure!.at <= windowMs);
+    if (agents.length >= SHARED_FAILURE_MIN_VICTIMS) out.push({ message, agents, newest });
+  }
+  // Largest cohort first, so the biggest event leads the paragraph. Every qualifying cohort is
+  // reported — none is dropped for brevity, because a silent cap reads as "that was all of it".
+  return out.sort((a, b) => b.agents.length - a.agents.length);
+}
+
+/**
  * The conditions that hold across the fleet, most-blocking first.
  *
- * ORDER IS A PRIORITY. Quota-blocked leads because it is the only one of the three where the
- * ordinary remedy is actively wrong — a human or a machine that retries a quota-walled agent spends
- * turns achieving nothing, and `agentThrash` already documents that any output after such a banner
- * is "the auto-resume being refused, not progress". Escalated is next: a dead end, but one a human
- * can clear. Done-not-retired is last: waste, but nothing is stuck behind it.
+ * ORDER IS A PRIORITY. Quota-blocked leads because it is the only one where the ordinary remedy is
+ * actively wrong — a human or a machine that retries a quota-walled agent spends turns achieving
+ * nothing, and `agentThrash` already documents that any output after such a banner is "the
+ * auto-resume being refused, not progress". A shared failure is next because it is the largest
+ * saving available: N agents stopped by ONE cause is one decision, and it is the class most likely
+ * to be sitting there unnoticed (every victim's row says "errored" independently, so nothing on any
+ * surface says they are the same event). Escalated follows: a dead end, but one that needs a
+ * judgement per agent. Done-not-retired is last: waste, but nothing is stuck behind it.
  */
 export function evaluateFleetConditions(
   snapshots: readonly FleetSnapshot[],
@@ -195,6 +317,9 @@ export function evaluateFleetConditions(
 
   const walled = snapshots.filter((s) => isQuotaWalled(s, now));
   if (walled.length > 0) out.push(quotaCondition(walled));
+
+  const cohorts = sharedFailureCohorts(snapshots, now);
+  if (cohorts.length > 0) out.push(sharedFailureCondition(cohorts, now));
 
   const escalated = snapshots.filter((s) => s.escalation !== undefined);
   if (escalated.length > 0) out.push(escalationCondition(escalated));
@@ -248,6 +373,50 @@ function quotaCondition(walled: readonly FleetSnapshot[]): FleetCondition {
   };
 }
 
+function sharedFailureCondition(
+  cohorts: ReadonlyArray<{ message: string; agents: FleetSnapshot[]; newest: number }>,
+  now: number,
+): FleetCondition {
+  const agents = cohorts.flatMap((c) => c.agents);
+
+  // ONE LINE PER CAUSE. Usually there is exactly one, and the sentence is the whole point: the count
+  // and the claim that it is a single event, followed by the bytes that prove it.
+  //
+  // THE AGE IS QUOTED, and that is the half of roborev 57275 that matters more than the cutoff. A
+  // failure timestamp is evidence the agent died THEN; it is not evidence it is still dead now, and
+  // this module has no way to learn that it recovered. Saying how long ago hands the reader the one
+  // fact they need to judge it, instead of a present-tense sentence about a stale event.
+  const ages = cohorts.map((c) => splitHoursMinutes(Math.max(0, now - c.newest)));
+  const lines = cohorts.map((c, i) => {
+    const n = c.agents.length;
+    const { h, m } = ages[i]!;
+    const names = c.agents.map(nameOf).join(", ");
+    return (
+      `  - ${n} agents died together ${h}h ${m}m ago — one event, not ${n} problems: ` +
+      `"${c.message}" (${names})`
+    );
+  });
+
+  const total = agents.length;
+  const head =
+    cohorts.length === 1
+      ? `${total} agents stopped for a single shared reason, not ${total} separate ones.`
+      : `${total} agents stopped across ${cohorts.length} shared causes, not ${total} separate ones.`;
+
+  return {
+    id: "shared-failure",
+    agentIds: agents.map((s) => s.agentId),
+    measured: [
+      String(total),
+      String(cohorts.length),
+      ...cohorts.map((c) => String(c.agents.length)),
+      ...ages.flatMap(({ h, m }) => [String(h), String(m)]),
+      ...quotedNumbers(...cohorts.map((c) => c.message), ...agents.map((s) => s.label)),
+    ],
+    text: `${head}\n${lines.join("\n")}`,
+  };
+}
+
 function escalationCondition(escalated: readonly FleetSnapshot[]): FleetCondition {
   const n = escalated.length;
   const plural = n === 1 ? "goal is" : "goals are";
@@ -292,7 +461,7 @@ function retireCondition(retirable: readonly FleetSnapshot[]): FleetCondition {
  * The condition ids present in BOTH the previous sweep and this one.
  *
  * The same two-observation rule `persistedTriggers` applies, and for the same reason — but note that
- * the cost of the rule is close to zero here, because none of these three conditions is transient.
+ * the cost of the rule is close to zero here, because none of these conditions is transient.
  * A quota wall stands for hours, an escalation is latched, and a met goal stays met. The rule earns
  * its keep against a partial read: a store mid-refresh that reports an empty roster, or a branch
  * poll that has not landed yet, clears itself by the next sweep and never reaches the founder.

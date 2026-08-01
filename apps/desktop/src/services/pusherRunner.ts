@@ -82,7 +82,7 @@ export interface PusherRunnerDeps {
    *
    * `undefined` means there is nobody to report to in this window, so nothing is SENT — though the
    * conditions are still observed, so the report is not late when a recipient appears. That is the
-   * honest default rather than falling back to some agent: the three fleet conditions are, by
+   * honest default rather than falling back to some agent: the fleet conditions are, by
    * construction, the ones whose subjects cannot act on them (`pusherFleet`), so delivering the
    * report to an arbitrary partner would be worse than not sending it at all.
    */
@@ -229,6 +229,13 @@ export async function sweepPushers(
     // Note which trigger this suppresses in practice: a walled agent is exactly the agent whose goal
     // quietly expires while it cannot run, so without this the Pusher's highest-value trigger fires
     // hardest at the one partner guaranteed not to hear it.
+    // A SHARED-FAILURE VICTIM IS DELIBERATELY *NOT* SUPPRESSED HERE, though it is just as dead. The
+    // difference is that a quota wall carries `resetAt`, so the suppression expires on a measured
+    // clock; `failure` carries no end time, so muting on it means muting for as long as whoever
+    // supplies the snapshot keeps the field set. A stale field would then silence an agent forever —
+    // which is the same "unreachable by any channel" failure that muting the report recipient
+    // produced (roborev 56973), and it is not worth re-earning to save a message to a dead inbox.
+    //
     // THE SIGHTING IS STILL RECORDED. Suppressing the send must not suppress the observation, or a
     // wall lasting days leaves the partner's `lastTriggers` frozen and the two-observation rule
     // restarts from stale state the moment it comes down — rule 1 in `pusherDecide`'s header, which
@@ -372,7 +379,7 @@ export async function sweepPushers(
 }
 
 /**
- * The batched report — the three conditions no partner can act on, delivered once to the recipient.
+ * The batched report — the conditions no partner can act on, delivered once to the recipient.
  *
  * Runs AFTER the per-partner loop and shares its already-batched `inbox_status` read, so the whole
  * feature costs the sweep no additional IPC. The same delivery discipline applies as above: the
@@ -430,7 +437,7 @@ async function reportFleet(
   // the gate header calls that budget "the containment", and for exactly that agent it doubled.
   //
   // The first fix muted its per-partner channel instead, and that was BROADER THAN THE DEFECT: the
-  // report only ever covers the three fleet conditions, so `goal-expired`, `unpushed-commits` and
+  // report only ever covers the fleet conditions, so `goal-expired`, `unpushed-commits` and
   // `unanswered-question` for that agent became unreachable by any channel — "sat stuck and nobody
   // said anything", guaranteed for one agent per project. Sharing the budget keeps both channels
   // open and still bounds the total.

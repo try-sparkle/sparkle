@@ -7,7 +7,11 @@
 // show up as SILENCE, which is indistinguishable from a healthy fleet.
 import { describe, it, expect } from "vitest";
 import {
+  SHARED_FAILURE_MAX_AGE_MINUTES,
+  SHARED_FAILURE_MIN_VICTIMS,
+  SHARED_FAILURE_WINDOW_MINUTES,
   evaluateFleetConditions,
+  sharedFailureCohorts,
   isQuotaWalled,
   persistedConditions,
   quotedNumbers,
@@ -227,5 +231,158 @@ describe("quotedNumbers — the widening, and its limit", () => {
   it("does not whitelist a number that appears in no quoted string", () => {
     const measured = quotedNumbers("resets Aug 4 at 11pm");
     expect(checkCitations("there are 12 agents", measured).ok).toBe(false);
+  });
+});
+
+// ── MACHINE-SHUTDOWN CASUALTIES ─────────────────────────────────────────────────────────────────
+// The founder saw this three times in one day: the host sleeps or restarts, every local agent dies
+// with the same banner, and each victim's row says "errored" on its own — so nothing anywhere says
+// they are ONE event. Five separate problems is exactly the noise the message budget exists to
+// prevent.
+describe("shared failure", () => {
+  const OFFLINE = "API Error: Unable to connect to API (ENOTFOUND)";
+  const MIN = 60_000;
+
+  const died = (id: string, at = T0, message = OFFLINE): FleetSnapshot => ({
+    agentId: id,
+    label: `Agent ${id}`,
+    failure: { message, at },
+  });
+
+  it("reports N victims of one cause as ONE event, quoting the shared error verbatim", () => {
+    const five = ["a", "b", "c", "d", "e"].map((id) => died(id));
+    const [c] = evaluateFleetConditions(five, T0);
+    expect(c!.id).toBe("shared-failure");
+    expect(c!.agentIds).toEqual(["a", "b", "c", "d", "e"]);
+    expect(c!.text).toContain("5 agents stopped for a single shared reason, not 5 separate ones");
+    expect(c!.text).toContain("one event, not 5 problems");
+    expect(c!.text).toContain(OFFLINE);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("is ONE condition, so the batch spends one message however many victims", () => {
+    const ten = Array.from({ length: 10 }, (_, i) => died(`a${i}`));
+    expect(evaluateFleetConditions(ten, T0).filter((c) => c.id === "shared-failure")).toHaveLength(1);
+  });
+
+  // A single agent failing is already visible on its own row, and aggregating one thing saves nobody
+  // a glance. The claim this condition makes — "one cause, not N problems" — is only true at N >= 2.
+  it("says nothing about a lone failure", () => {
+    expect(sharedFailureCohorts([died("a")], T0)).toEqual([]);
+    expect(evaluateFleetConditions([died("a")], T0)).toEqual([]);
+  });
+
+  it("needs the failures to be the SAME error, not merely simultaneous", () => {
+    const different = [died("a", T0, OFFLINE), died("b", T0, "API Error: 529 overloaded")];
+    expect(sharedFailureCohorts(different, T0)).toEqual([]);
+  });
+
+  it("needs them to be the same MOMENT, not merely the same error", () => {
+    const apart = [died("a", T0), died("b", T0 - (SHARED_FAILURE_WINDOW_MINUTES + 1) * MIN)];
+    expect(sharedFailureCohorts(apart, T0)).toEqual([]);
+  });
+
+  // Anchored to the NEWEST failure, not to the group's span: a recurring error that hits one agent
+  // on Monday and another on Thursday is not one event, and a span test would eventually call it one.
+  it("counts only the current burst when an error recurs over days", () => {
+    const snaps = [
+      died("old1", T0 - 3 * 24 * 60 * MIN),
+      died("old2", T0 - 3 * 24 * 60 * MIN),
+      died("new1", T0),
+      died("new2", T0 - MIN),
+    ];
+    const [cohort] = sharedFailureCohorts(snaps, T0);
+    expect(cohort!.agents.map((a) => a.agentId)).toEqual(["new1", "new2"]);
+  });
+
+  // THE OVERLAP THAT WOULD DOUBLE-REPORT. A limit banner is also identical across agents, so without
+  // the exclusion the quota cohort forms here too and the same agents appear twice in one message.
+  it("never counts a quota-walled agent as a shared-failure victim", () => {
+    const both = [
+      { ...walled("q1"), failure: { message: WEEKLY, at: T0 } },
+      { ...walled("q2"), failure: { message: WEEKLY, at: T0 } },
+    ];
+    expect(sharedFailureCohorts(both, T0)).toEqual([]);
+    const ids = evaluateFleetConditions(both, T0).map((c) => c.id);
+    expect(ids).toEqual(["quota-blocked"]);
+  });
+
+  it("reports EVERY distinct cause rather than silently keeping the largest", () => {
+    const snaps = [
+      died("a", T0, OFFLINE),
+      died("b", T0, OFFLINE),
+      died("c", T0, OFFLINE),
+      died("x", T0, "API Error: 529 overloaded"),
+      died("y", T0, "API Error: 529 overloaded"),
+    ];
+    const [c] = evaluateFleetConditions(snaps, T0);
+    expect(c!.text).toContain(OFFLINE);
+    expect(c!.text).toContain("529 overloaded");
+    expect(c!.text).toContain("5 agents stopped across 2 shared causes");
+    expect(c!.agentIds).toHaveLength(5);
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("leads with the largest cohort", () => {
+    const snaps = [
+      died("x", T0, "small"),
+      died("y", T0, "small"),
+      died("a", T0, OFFLINE),
+      died("b", T0, OFFLINE),
+      died("c", T0, OFFLINE),
+    ];
+    expect(sharedFailureCohorts(snaps, T0)[0]!.message).toBe(OFFLINE);
+  });
+
+  it("ranks below quota but above escalation — retrying quota is the one actively wrong remedy", () => {
+    const ids = evaluateFleetConditions(
+      [
+        { agentId: "e", label: "Esc", escalation: { reason: "gave up" } },
+        died("a"),
+        died("b"),
+        walled("q"),
+      ],
+      T0,
+    ).map((c) => c.id);
+    expect(ids).toEqual(["quota-blocked", "shared-failure", "goals-escalated"]);
+  });
+
+  // THE WINDOW IS RELATIVE, SO IT ALONE CANNOT ANSWER "IS THIS STILL HAPPENING" (roborev 57275).
+  // The host is offline 02:00-03:00, five agents record 02:10, and at 09:00 they are still within
+  // fifteen minutes of EACH OTHER. Without an absolute bound the report claims they stopped as if it
+  // were now, and re-fires every cooldown forever. The existing "recurs over days" case cannot see
+  // this: it keeps a FRESH burst to anchor against, so it passes with or without the bound.
+  it("says nothing about a cohort that is entirely stale", () => {
+    const old = T0 - 3 * 24 * 60 * MIN;
+    expect(sharedFailureCohorts([died("a", old), died("b", old)], T0)).toEqual([]);
+    expect(evaluateFleetConditions([died("a", old), died("b", old)], T0)).toEqual([]);
+  });
+
+  it("reports a burst that is old but still inside the max age", () => {
+    const lastNight = T0 - (SHARED_FAILURE_MAX_AGE_MINUTES - 60) * MIN;
+    const [c] = evaluateFleetConditions([died("a", lastNight), died("b", lastNight)], T0);
+    expect(c!.id).toBe("shared-failure");
+  });
+
+  it("the max age is a real cutoff, not a coincidence of the fixtures", () => {
+    const inside = T0 - (SHARED_FAILURE_MAX_AGE_MINUTES - 1) * MIN;
+    const outside = T0 - (SHARED_FAILURE_MAX_AGE_MINUTES + 1) * MIN;
+    expect(sharedFailureCohorts([died("a", inside), died("b", inside)], T0)).toHaveLength(1);
+    expect(sharedFailureCohorts([died("a", outside), died("b", outside)], T0)).toEqual([]);
+  });
+
+  // A timestamp says the agent died THEN, not that it is still dead. Quoting the age is what stops a
+  // fourteen-hour-old event reading as a fresh one; the cutoff alone would not.
+  it("quotes how long ago it happened, and cites it", () => {
+    const at = T0 - (2 * 60 + 14) * MIN;
+    const [c] = evaluateFleetConditions([died("a", at), died("b", at)], T0);
+    expect(c!.text).toContain("died together 2h 14m ago");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("the minimum is a real threshold, not a coincidence of the fixtures", () => {
+    const atThreshold = Array.from({ length: SHARED_FAILURE_MIN_VICTIMS }, (_, i) => died(`a${i}`));
+    expect(sharedFailureCohorts(atThreshold, T0)).toHaveLength(1);
+    expect(sharedFailureCohorts(atThreshold.slice(0, -1), T0)).toEqual([]);
   });
 });
