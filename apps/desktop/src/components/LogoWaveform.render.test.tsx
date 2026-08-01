@@ -497,5 +497,12 @@ describe("the ring reflects the CARET, not just the tray — through the compone
     });
     render(<LogoWaveform />);
     expect(ring().getAttribute("aria-label")).toMatch(/off/i);
+    // ── AND THE SENTENCE PRINTED UNDER IT (roborev 56775) ────────────────────────────────────────
+    // Asserting the ring alone certified the half that was corrected and was blind to the half that
+    // still lied: `captionFor` reads `status === "listening"`, which the per-window blur path
+    // deliberately never demotes, so this state rendered "Actively listening: just say <stop> to
+    // finish" directly beneath a grey "Microphone: off" ring — the ring denying its own caption,
+    // which is the same contradiction shape the window term was added to remove.
+    expect(document.body.textContent).not.toMatch(/actively listening/i);
   });
 });

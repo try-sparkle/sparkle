@@ -266,14 +266,36 @@ export function LogoWaveform() {
   // component: a lost window auto-resumes and a terminal does not, so one sentence cannot be true
   // of both. Same hook, same pure decision, as the routing gate that actually stopped the audio.
   const pauseReason = useDictationPauseReason();
-  const caption = captionFor(phase, enabled, listening, wakeWord, stopWord, pauseReason);
+  // ── THE CAPTION TAKES THE SAME PAUSE FACT THE RING DOES (roborev 56775) ──────────────────────
+  // `listening` is `status === "listening"`, and the per-window blur path deliberately does NOT
+  // demote `status` — `tearDownOwnedStream` touches interim/level/speaking and leaves status alone.
+  // So in a background window this stayed true, `captionFor` took its live branch, and the caption
+  // read "Actively listening: just say <stop> to finish" directly beneath the ring that the window
+  // term had just correctly painted grey "Microphone: off". Fixing the ring alone re-created the
+  // very contradiction it was fixing, one axis over — a ring denying the sentence printed under it.
+  //
+  // `pauseReason` is the honest fact and was already being computed here and then discarded on this
+  // path: `useDictationPauseReason` returns "window" for exactly this snapshot. Feeding it in sends
+  // the state to `pausedCaption("window")`. The routing-terminal case is unaffected, because
+  // `pauseReason` is already null there.
+  const capturing = listening && pauseReason === null;
+  const caption = captionFor(phase, enabled, capturing, wakeWord, stopWord, pauseReason);
   // The ONE voice-state decision, shared with the composer (deriveMicPresentation). Both surfaces
   // switch their caption/placeholder on this, so the top-left mic and the composer mic can never
   // disagree about which state we're in. The wording each renders is still surface-local; only the
   // STATE is shared. `errorNotice != null` is this surface's `hasError`.
   const presentation = deriveMicPresentation({
     enabled,
-    status,
+    // `capturing`, NOT the raw `status` (roborev 56775). This is the ONE input every word and every
+    // pixel in this component flows from — the ring, the two-line live caption, the paused caption
+    // and the meter all switch on the presentation it returns — so demoting it here is what makes
+    // them move TOGETHER. Fixing only the ring is what re-created the contradiction one axis over:
+    // a grey "Microphone: off" glyph sitting above an "Actively listening" sentence.
+    //
+    // `status` alone cannot carry this: the per-window blur path (`tearDownOwnedStream`)
+    // deliberately leaves it at "listening", so a background window kept claiming live capture.
+    // `pauseReason` is the honest fact and was already computed above.
+    status: capturing ? status : "idle",
     phase,
     modelProgress,
     hasError: errorNotice !== null,
@@ -284,7 +306,9 @@ export function LogoWaveform() {
   // derived from the tray: a push-to-talk hold routes speech without moving the tray, and a
   // waveform that went flat mid-sentence because the position had not changed would be lying about
   // the audio it is a meter for.
-  const liveActive = listening && phase === "active";
+  // Same term: a meter animating for audio this window is not consuming is the same lie the caption
+  // was telling, in motion rather than words.
+  const liveActive = capturing && phase === "active";
   // The orb's colour follows the same in-flight dictation as the bars, for the same reason.
   const active = phase === "active";
   // WHICH sentence the live caption shows — from the tray position, the same single input the glyph
