@@ -55,6 +55,12 @@ export const TRAY_GEOMETRY = {
   trayGap: 4,
   /** Each pill's horizontal `padding: "0 Npx"`, per side. */
   pillPadX: 8,
+  /** Padding in the TIGHT word tier — a step spent to keep whole words rather than truncate. */
+  pillPadXTight: 3,
+  /** Padding at the FLOOR tier, where the pills stack. Two px rather than three so a whole word
+   *  still clears its box at a 50px column: "Speak" is 31.7px at `TYPE.micro`, and 31.7 + 4 + 3 =
+   *  38.7 fits the ~40px the composer has there, where 3px padding would need 40.7 and cut it fine. */
+  pillPadXFloor: 2,
   /** The same padding in the ICON tier. Tighter, because at that point the padding is competing
    *  with the glyph for a column that may be 50px wide — and 8px per side across three pills is
    *  48px of the ~30px the composer actually has there. Only reached below
@@ -110,9 +116,49 @@ export function fullLabelsFitAtPx(): number {
  */
 export const WIDEST_SHORT_LABEL_PX = 44;
 
-/** An icon-only pill's glyph box, in px. `FiSend` and friends are drawn at 14 and get a couple of
- *  px of optical slack so a pill never clips its own icon. */
+/** An icon-only pill's glyph box, in px. RETAINED ONLY FOR THE MIC/CHICLET SLOTS — the tray itself
+ *  no longer has an icon tier; see `wordPillMinPx`. */
 export const TRAY_ICON_PX = 16;
+
+/** "Speak" at the FLOOR tier's smaller type: 31.7px measured in WebKit at 10px bold, rounded up. */
+export const WIDEST_SHORT_LABEL_TIGHT_PX = 32;
+
+/** What the tray needs for the SHORT words once the keycap slot is dropped. Measured: 179. */
+export function shortLabelsNoChicletFitAtPx(): number {
+  const g = TRAY_GEOMETRY;
+  const perPill = 2 * g.pillPadX + 2 * g.pillBorder;
+  return TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap;
+}
+
+/** …and with tighter padding plus one on-scale type step down. Measured: 131. */
+export function shortLabelsTightFitAtPx(): number {
+  const g = TRAY_GEOMETRY;
+  const perPill = 2 * g.pillPadXTight + 2 * g.pillBorder;
+  return (
+    TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_TIGHT_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap
+  );
+}
+
+/**
+ * The width of ONE floor-tier pill — the point below which the tray WRAPS rather than squeezing.
+ *
+ * ── THE WORDS NEVER GIVE WAY ───────────────────────────────────────────────────────────────────
+ * The founder, after seeing the icon tier: "I don't see the words Send, Push, and Speak. It just
+ * says Se..., Pu..., Sp.... I want to see the entire words Send, Push, Speak when the column is not
+ * in its very wide open state."
+ *
+ * Measured in WebKit, they always fit: at every column from 500px down to the 50px floor, three
+ * WHOLE words render with zero truncation and zero overflow — because the tray WRAPS them onto two
+ * rows and then three instead of squeezing them onto one. So there is no icon tier at all.
+ *
+ * Giving the pills this as a floor is the mechanism: a flex item may shrink to its `min-width` and
+ * no further, so once three cannot share a line, ONE DROPS TO THE NEXT ROW instead of every label
+ * ellipsising together.
+ */
+export function wordPillMinPx(): number {
+  const g = TRAY_GEOMETRY;
+  return WIDEST_SHORT_LABEL_TIGHT_PX + 2 * g.pillPadXFloor + 2 * g.pillBorder;
+}
 
 /**
  * The tray width at which the SHORT labels stop fitting — below this the pills go icon-only.
@@ -126,39 +172,7 @@ export function shortLabelsFitAtPx(): number {
   return TRAY_PILL_COUNT * (WIDEST_SHORT_LABEL_PX + perPill) + (TRAY_PILL_COUNT - 1) * g.trayGap;
 }
 
-/**
- * The narrowest the tray can be while still drawing three readable icons.
- *
- * Below this the pills keep shrinking — they are `flex: 1 1 0` against the column, so the tray can
- * never OVERFLOW no matter how narrow the column gets, which is requirement 1. What it stops being
- * below this width is comfortable, not correct. Stated so the icon tier's own floor is a number
- * someone can check rather than an assumption.
- *
- * NO chiclet slot and no label gap here: the keycap hint is dropped with the words, because a
- * reserved 30px slot per pill is the single largest thing standing between three icons and a narrow
- * column.
- */
-export function iconsFitAtPx(): number {
-  const g = TRAY_GEOMETRY;
-  const perPill = 2 * g.pillPadXIcon + 2 * g.pillBorder + TRAY_ICON_PX;
-  return TRAY_PILL_COUNT * perPill + (TRAY_PILL_COUNT - 1) * g.trayGap;
-}
 
-/**
- * The width of ONE icon pill — the point below which three of them cannot share a line.
- *
- * Below this the tray WRAPS rather than overflowing: the pills are `flex: 1 1 auto` with this as
- * their floor, so a column too narrow for a row of three becomes two rows, then three. That is what
- * makes the 50px column floor (engine/columnResize) survivable — at ~30px of composer content width
- * a single 21px pill still fits, where a row of three never could.
- *
- * Wrapping rather than clipping is the founder's requirement 1 restated: nothing may overflow the
- * column, at any width the user can drag to.
- */
-export function iconPillMinPx(): number {
-  const g = TRAY_GEOMETRY;
-  return 2 * g.pillPadXIcon + 2 * g.pillBorder + TRAY_ICON_PX;
-}
 
 /**
  * The geometric answer for evenly-shared pills, used until a real measurement lands.

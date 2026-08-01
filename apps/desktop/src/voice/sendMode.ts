@@ -132,10 +132,35 @@ export const TRAY_SHORT_LABEL_MAX_PX = 440;
  * Set from `iconsFitAtPx()`'s sibling `shortLabelsFitAtPx()` and pinned by sendMode.test.ts the same
  * way `TRAY_SHORT_LABEL_MAX_PX` is, so a geometry change fails loudly instead of clipping.
  */
-export const TRAY_ICON_ONLY_MAX_PX = 320;
+// ── THE LADDER'S THRESHOLDS, WORDS-FIRST ──────────────────────────────────────────────────────
+//
+// THE FOUNDER'S SPEC, which overrides the icon tier that used to sit here: "I don't see the words
+// Send, Push, and Speak. It just says Se..., Pu..., Sp.... I want to see the entire words Send,
+// Push, Speak when the column is not in its very wide open state."
+//
+// So an ellipsised label is the ONE outcome ruled out, and every way of fitting the words is
+// exhausted before anything else gives:
+//
+//   tier         gives up                  needs   what he sees
+//   full         nothing                   440px   "Push to talk" + keycap hint
+//   fullTight    the KEYCAP SLOT           281px   "Push to talk"
+//   short        the long wording          179px   "Send" / "Push" / "Speak"
+//   shortTight   padding + one type step   131px   the same words, slightly smaller
+//   floor        nothing — the pills WRAP    —     the same words, stacked
+//
+// THE KEYCAP SLOT GOES FIRST and it is the biggest single win: 30px + a 6px gap per pill is 108px
+// across the tray, reserved for a hint that only appears on hover or keyboard focus. Dropping it
+// takes the short words from needing 287px to 179px. That reservation — not a narrow column — is
+// what produced "Se… Pu… Sp…" at ordinary widths.
+//
+// Measured in WebKit at fifteen widths from 500px to the 50px floor: whole words, zero truncation,
+// zero overflow at every one.
+export const TRAY_FULL_NO_CHICLET_MIN_PX = 281;
+export const TRAY_SHORT_NO_CHICLET_MIN_PX = 179;
+export const TRAY_SHORT_TIGHT_MIN_PX = 131;
 
 /** How a tray of a given width draws its pills. */
-export type TrayDensity = "full" | "short" | "icon";
+export type TrayDensity = "full" | "fullTight" | "short" | "shortTight" | "floor";
 
 /**
  * Which density a tray of `trayWidthPx` draws at.
@@ -151,9 +176,22 @@ export type TrayDensity = "full" | "short" | "icon";
  */
 export function trayDensityFor(trayWidthPx: number): TrayDensity {
   if (!(trayWidthPx > 0)) return "full";
-  if (trayWidthPx < TRAY_ICON_ONLY_MAX_PX) return "icon";
-  if (trayWidthPx < TRAY_SHORT_LABEL_MAX_PX) return "short";
-  return "full";
+  if (trayWidthPx >= TRAY_SHORT_LABEL_MAX_PX) return "full";
+  if (trayWidthPx >= TRAY_FULL_NO_CHICLET_MIN_PX) return "fullTight";
+  if (trayWidthPx >= TRAY_SHORT_NO_CHICLET_MIN_PX) return "short";
+  if (trayWidthPx >= TRAY_SHORT_TIGHT_MIN_PX) return "shortTight";
+  return "floor";
+}
+
+/** Does this tier draw the keycap hint? It is the FIRST thing dropped — see the ladder above. */
+export function trayShowsChiclet(density: TrayDensity): boolean {
+  return density === "full";
+}
+
+/** EVERY tier draws words. Derived from `trayLabelFor` rather than hardcoded `true`, so a tier that
+ *  ever returned an empty label would make this false instead of asserting itself green. */
+export function trayShowsWords(density: TrayDensity): boolean {
+  return SEND_MODES.every((m) => trayLabelFor(m, density) !== "");
 }
 
 /**
@@ -168,10 +206,9 @@ export function trayDensityFor(trayWidthPx: number): TrayDensity {
  * takes the FULL labels: booting into the abbreviated form and widening a frame later is a visible
  * flicker, whereas a too-long label for one frame merely truncates the way it always did.
  */
-export function trayLabelFor(mode: SendMode, trayWidthPx: number): string {
-  const table =
-    trayWidthPx > 0 && trayWidthPx < TRAY_SHORT_LABEL_MAX_PX ? SEND_MODE_LABEL_SHORT : SEND_MODE_LABEL;
-  return table[mode] ?? SEND_MODE_LABEL[mode];
+export function trayLabelFor(mode: SendMode, density: TrayDensity): string {
+  if (density === "full" || density === "fullTight") return SEND_MODE_LABEL[mode];
+  return SEND_MODE_LABEL_SHORT[mode] ?? SEND_MODE_LABEL[mode];
 }
 
 /**

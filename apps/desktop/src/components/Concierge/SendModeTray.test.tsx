@@ -18,7 +18,11 @@ import {
   type SendModeTrayProps,
   type SendTrayModel,
 } from "./SendModeTray";
-import { TRAY_ICON_ONLY_MAX_PX, TRAY_SHORT_LABEL_MAX_PX } from "../../voice/sendMode";
+import {
+  TRAY_SHORT_LABEL_MAX_PX,
+  TRAY_SHORT_NO_CHICLET_MIN_PX,
+  TRAY_SHORT_TIGHT_MIN_PX,
+} from "../../voice/sendMode";
 import { C } from "../../theme/colors";
 
 afterEach(cleanup);
@@ -312,9 +316,13 @@ describe("the tray sweep", () => {
       expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
 
       // Now narrow it — into the SHORT tier, not past it. 300 used to be that tier and is now the
-      // ICON tier (see TRAY_ICON_ONLY_MAX_PX), where there is no label node to read at all; the
+      // narrowest tier, where the pills wrap but the words stay whole; that tier has its own case
       // icon tier gets its own case below.
-      act(() => fire!(TRAY_SHORT_LABEL_MAX_PX - 20));
+      // Into the SHORT tier. This used to be `-20` off the full threshold, which landed at ~420 and
+      // was short back when there were three tiers. The ladder now inserts `fullTight` between them
+      // — the full wording survives 160px further down, which is the improvement — so the short
+      // wording starts below `TRAY_SHORT_NO_CHICLET_MIN_PX`.
+      act(() => fire!(TRAY_SHORT_NO_CHICLET_MIN_PX));
       expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push");
       // …and the ACCESSIBLE NAME does not move. This is the assertion that fails against the
       // pre-fix code, where it read "Push".
@@ -337,7 +345,16 @@ describe("the tray sweep", () => {
   //
   // Reachable here ONLY because this file stubs ResizeObserver — jsdom has none, which is exactly
   // how the original defect shipped unnoticed.
-  it("drops to ICONS, not truncated words, when the tray is too narrow for short labels", () => {
+  // ── THE FLOOR TIER KEEPS THE WORDS ───────────────────────────────────────────────────────────
+  //
+  // This case used to assert the tray dropped to ICONS below the tight tier. The founder overrode
+  // that: "I want to see the entire words Send, Push, Speak." Measurement showed icons were never
+  // necessary — three whole words fit at every column down to the 50px floor, because the tray WRAPS
+  // them onto two rows and then three rather than squeezing them onto one.
+  //
+  // Reachable only because this file stubs ResizeObserver; jsdom has none, which is how the original
+  // truncation shipped unnoticed.
+  it("keeps WHOLE WORDS at the narrowest tier — no icons, no ellipsis", () => {
     const realRO = globalThis.ResizeObserver;
     let fire: ((w: number) => void) | null = null;
     class StubRO {
@@ -352,24 +369,18 @@ describe("the tray sweep", () => {
     globalThis.ResizeObserver = StubRO as unknown as typeof ResizeObserver;
     try {
       mount({ mode: "ptt", model: COUNTING });
-      act(() => fire!(TRAY_ICON_ONLY_MAX_PX - 1));
+      act(() => fire!(TRAY_SHORT_TIGHT_MIN_PX - 1));
 
       for (const m of ["send", "ptt", "speak"] as const) {
-        // An icon is drawn…
-        expect(screen.getByTestId(`send-mode-icon-${m}`)).toBeTruthy();
-        // …and NO text node survives to be ellipsised into "S…".
-        expect(screen.queryByTestId(`send-mode-label-${m}`)).toBeNull();
+        const label = screen.getByTestId(`send-mode-label-${m}`).textContent ?? "";
+        expect(label).toBeTruthy();
+        expect(label).not.toContain("…");
+        // …and no glyph substituted for it.
+        expect(screen.queryByTestId(`send-mode-icon-${m}`)).toBeNull();
       }
 
-      // THE NAME IS UNTOUCHED, which is what keeps the tier a purely visual reduction: "click Push
-      // to talk" must keep working in a 200px column exactly as it does in a 600px one.
+      // The accessible name is untouched, as in every tier.
       expect(pill("ptt").getAttribute("aria-label")).toBe("Push to talk");
-      expect(pill("send").getAttribute("aria-label")).toBe("Send");
-
-      // Widening brings the words back — the tier is a function of width, not a latch.
-      act(() => fire!(TRAY_SHORT_LABEL_MAX_PX + 100));
-      expect(screen.getByTestId("send-mode-label-ptt").textContent).toBe("Push to talk");
-      expect(screen.queryByTestId("send-mode-icon-ptt")).toBeNull();
     } finally {
       globalThis.ResizeObserver = realRO;
     }

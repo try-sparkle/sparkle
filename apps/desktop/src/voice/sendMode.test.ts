@@ -15,20 +15,18 @@ import { describe, expect, it } from "vitest";
 
 import { CONFIDENCE_THRESHOLD_MS } from "./confidence";
 import {
-  DEFAULT_SPEAK_LEFT_FRAC,
-  TRAY_PILL_COUNT,
-  fullLabelsFitAtPx,
-  iconsFitAtPx,
-  shortLabelsFitAtPx,
 } from "../components/Concierge/trayGeometry";
-import { CONCIERGE_DEFAULT_WIDTH } from "../engine/columnResize";
 import {
   SEND_MODES,
   SEND_MODE_LABEL,
   SEND_MODE_LABEL_SHORT,
   SWEEP_FLOOR_MS,
   TRAY_SHORT_LABEL_MAX_PX,
-  TRAY_ICON_ONLY_MAX_PX,
+  TRAY_FULL_NO_CHICLET_MIN_PX,
+  TRAY_SHORT_NO_CHICLET_MIN_PX,
+  TRAY_SHORT_TIGHT_MIN_PX,
+  trayShowsChiclet,
+  trayShowsWords,
   trayDensityFor,
   chicletFor,
   chordSends,
@@ -184,157 +182,69 @@ describe("the keycap chip cannot lie about the keystroke", () => {
   // The fix picks a shorter WORD instead of clipping, and this is where that rule lives — the
   // component only measures. (jsdom has no layout engine, so proving it in the render would read
   // every width as 0 and pass vacuously.)
-  describe("trayLabelFor", () => {
-    it("spells every position out when the tray is wide", () => {
-      for (const mode of SEND_MODES) {
-        expect(trayLabelFor(mode, TRAY_SHORT_LABEL_MAX_PX)).toBe(SEND_MODE_LABEL[mode]);
-        expect(trayLabelFor(mode, TRAY_SHORT_LABEL_MAX_PX + 200)).toBe(SEND_MODE_LABEL[mode]);
+  // ── THE LADDER: WHOLE WORDS AT EVERY WIDTH ──────────────────────────────────────────────────
+  //
+  // THE FOUNDER'S SPEC, which replaced the icon tier that used to live here: "I don't see the words
+  // Send, Push, and Speak. It just says Se..., Pu..., Sp.... I want to see the entire words Send,
+  // Push, Speak when the column is not in its very wide open state."
+  //
+  // So an ELLIPSISED LABEL IS THE ONE OUTCOME RULED OUT, and these pin that no tier produces one.
+  describe("the words-first density ladder", () => {
+    it("descends full → fullTight → short → shortTight → floor as the tray narrows", () => {
+      expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX)).toBe("full");
+      expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX - 1)).toBe("fullTight");
+      expect(trayDensityFor(TRAY_FULL_NO_CHICLET_MIN_PX)).toBe("fullTight");
+      expect(trayDensityFor(TRAY_FULL_NO_CHICLET_MIN_PX - 1)).toBe("short");
+      expect(trayDensityFor(TRAY_SHORT_NO_CHICLET_MIN_PX)).toBe("short");
+      expect(trayDensityFor(TRAY_SHORT_NO_CHICLET_MIN_PX - 1)).toBe("shortTight");
+      expect(trayDensityFor(TRAY_SHORT_TIGHT_MIN_PX)).toBe("shortTight");
+      expect(trayDensityFor(TRAY_SHORT_TIGHT_MIN_PX - 1)).toBe("floor");
+    });
+
+    it("takes the FULL tier before it has been measured, so nothing flickers on first paint", () => {
+      expect(trayDensityFor(0)).toBe("full");
+      expect(trayDensityFor(-1)).toBe("full");
+    });
+
+    it("NEVER returns a truncated label — every tier shows a WHOLE word", () => {
+      // The mechanism as a property: the ladder picks a SHORTER STRING rather than letting CSS cut
+      // a longer one. A tier returning a prefix-with-ellipsis, or nothing at all, fails here.
+      for (const d of ["full", "fullTight", "short", "shortTight", "floor"] as const) {
+        for (const m of SEND_MODES) {
+          const label = trayLabelFor(m, d);
+          expect(label).toBeTruthy();
+          expect(label).not.toContain("…");
+          expect([SEND_MODE_LABEL[m], SEND_MODE_LABEL_SHORT[m]]).toContain(label);
+        }
+        expect(trayShowsWords(d), `${d} stopped showing words`).toBe(true);
       }
     });
 
-    it("shortens only the label that could not fit, and keeps the other two intact", () => {
-      const narrow = TRAY_SHORT_LABEL_MAX_PX - 1;
-      // The whole point: Send and Speak are NOT abbreviated. A narrow tray still reads
-      // "Send | Push | Speak" — three words, none of them clipped.
-      expect(trayLabelFor("send", narrow)).toBe("Send");
-      expect(trayLabelFor("ptt", narrow)).toBe("Push");
-      expect(trayLabelFor("speak", narrow)).toBe("Speak");
-      // Asserted as a RELATIONSHIP too, so renaming a position in one table without the other
-      // fails here rather than silently drifting.
-      expect(trayLabelFor("ptt", narrow)).not.toBe(SEND_MODE_LABEL.ptt);
-      expect(trayLabelFor("ptt", narrow)).toBe(SEND_MODE_LABEL_SHORT.ptt);
-    });
-
-    it("never emits an ellipsis or a truncated word in either table", () => {
-      // The defect being fixed was a CHARACTER the user had to decode. Neither table may reintroduce
-      // one, at any width.
-      for (const width of [0, 1, TRAY_SHORT_LABEL_MAX_PX - 1, TRAY_SHORT_LABEL_MAX_PX, 9999]) {
-        for (const mode of SEND_MODES) {
-          const label = trayLabelFor(mode, width);
-          expect(label).not.toMatch(/[…]|\.\.\./);
-          expect(label.trim()).toBe(label);
-          expect(label.length).toBeGreaterThan(0);
-        }
+    it("shows Send / Push / Speak WELL BELOW the default concierge column", () => {
+      // The regression this exists for: the old ladder went to icons at 320px and truncated the
+      // short words above it, so at ordinary widths the founder saw "Se… Pu… Sp…".
+      expect(TRAY_SHORT_TIGHT_MIN_PX).toBeLessThan(180);
+      for (const m of SEND_MODES) {
+        expect(trayLabelFor(m, trayDensityFor(200))).toBe(SEND_MODE_LABEL_SHORT[m]);
+        expect(trayLabelFor(m, trayDensityFor(140))).toBe(SEND_MODE_LABEL_SHORT[m]);
+        // …and even at the very floor, where the pills wrap rather than truncate.
+        expect(trayLabelFor(m, trayDensityFor(60))).toBe(SEND_MODE_LABEL_SHORT[m]);
       }
     });
 
     it("keeps every short label a SUBSTRING of its full label", () => {
-      // The invariant that lets the tray shrink the VISIBLE text while holding the accessible name
-      // at the full label: WCAG 2.5.3 requires the visible string to be CONTAINED IN the name, and
-      // "Push" is inside "Push to talk". The two tables are edited independently, so nothing else
-      // would notice them drifting apart — this is the thing that fails when they do.
+      // WCAG 2.5.3 (Label in Name): the accessible name is held at the FULL label in every tier, so
+      // the visible string must be contained in it. "Push" inside "Push to talk" satisfies that; an
+      // ellipsised "Pu…" would not — one more reason truncation is ruled out rather than tuned.
       expect(shortLabelsAreContainedInFullLabels()).toBe(true);
-      // Asserted through the predicate AND spelled out, so a predicate that started returning a
-      // constant `true` could not carry this row on its own.
-      for (const mode of SEND_MODES) {
-        expect(SEND_MODE_LABEL[mode]).toContain(SEND_MODE_LABEL_SHORT[mode]);
-      }
     });
 
-    it("switches to short labels BEFORE the full ones stop fitting, never after", () => {
-      // The regression this pins (roborev 56198): between the threshold and the real fit width the
-      // component still picks the FULL table and the span clips, so a threshold set too low paints
-      // "Push to tal" — a silently truncated word, strictly worse than the "P…" being replaced.
-      //
-      // DERIVED FROM THE COMPONENT'S OWN CONSTANTS, not from literals copied out of it. An earlier
-      // version of this row spelled the arithmetic as `3 * (86 + 52) + 14`, which meant bumping
-      // CHICLET_SLOT to 40 moved the real fit width to 458 and left this comparing 430 against a
-      // stale 428 — green, while widths 430-458 clipped mid-word (roborev 56213). Now a change to
-      // any of the geometry fails HERE.
-      expect(TRAY_SHORT_LABEL_MAX_PX).toBeGreaterThanOrEqual(fullLabelsFitAtPx());
-      // …and at every width in the SHORT tier, the widest label is the short one. Scoped to that
-      // tier now: below `TRAY_ICON_ONLY_MAX_PX` the component draws no words at all, so widths
-      // down there say nothing about which label table won.
-      for (const w of [TRAY_ICON_ONLY_MAX_PX, 360, 400, TRAY_SHORT_LABEL_MAX_PX - 1]) {
-        expect(trayLabelFor("ptt", w)).toBe(SEND_MODE_LABEL_SHORT.ptt);
-      }
-    });
-
-    // ── THE THIRD TIER: ICONS ─────────────────────────────────────────────────────────────────
-    //
-    // The founder's narrow-column screenshot showed the tray reading "S… P… S…" — all three
-    // positions ellipsised to one letter, so the control could not be read at all. The short-label
-    // tier moved the width at which that happens; it did not remove it. These pin the tier that does.
-    describe("icons-only, for a tray too narrow even for short labels", () => {
-      it("switches to icons BEFORE the short labels would start clipping", () => {
-        // The same shape of guard as the row above, one tier down: any change to the pill geometry
-        // that outgrows this threshold fails HERE rather than silently painting "Spea…".
-        expect(TRAY_ICON_ONLY_MAX_PX).toBeGreaterThanOrEqual(shortLabelsFitAtPx());
-      });
-
-      it("still has room for three readable icons at its own floor", () => {
-        // The tier is only worth having if the thing it switches TO fits. `iconsFitAtPx` drops the
-        // chiclet slot and the label gap, which is what buys the room.
-        expect(iconsFitAtPx()).toBeLessThan(TRAY_ICON_ONLY_MAX_PX);
-      });
-
-      it("orders the three tiers, with no width falling between them", () => {
-        expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX)).toBe("full");
-        expect(trayDensityFor(TRAY_SHORT_LABEL_MAX_PX - 1)).toBe("short");
-        expect(trayDensityFor(TRAY_ICON_ONLY_MAX_PX)).toBe("short");
-        expect(trayDensityFor(TRAY_ICON_ONLY_MAX_PX - 1)).toBe("icon");
-        expect(trayDensityFor(50)).toBe("icon");
-      });
-
-      it("takes the FULL tier when nothing has been measured yet", () => {
-        // Booting into an abbreviated form and widening a frame later is a visible flicker; a
-        // too-long label for one frame merely truncates the way it always did.
-        expect(trayDensityFor(0)).toBe("full");
-        expect(trayDensityFor(-1)).toBe("full");
-      });
-
-      it("covers the width the founder actually reported", () => {
-        // A concierge at its DEFAULT width already sits in the short tier (that is why "S… P… S…"
-        // appeared without resizing anything unusual). Dragging it narrower — which the removal of
-        // every width ceiling makes routine — must reach icons rather than one-letter stubs.
-        expect(trayDensityFor(CONCIERGE_DEFAULT_WIDTH)).not.toBe("full");
-        expect(trayDensityFor(CONCIERGE_DEFAULT_WIDTH / 2)).toBe("icon");
-      });
-    });
-
-    it("derives the tray's pill count from SEND_MODES, never from a copy of it", () => {
-      // ── roborev 56301 ─────────────────────────────────────────────────────────────────────────
-      // trayGeometry briefly hand-wrote `3`. Adding a fourth position is a SUPPORTED change —
-      // `stepSendMode` walks the array and the component maps over it — and with a copied literal
-      // `fullLabelsFitAtPx()` would keep returning the three-pill number while the true requirement
-      // grew, leaving the `>=` guard green while every width in between clipped mid-word. The sweep
-      // would stop short of Speak's edge for the same reason.
-      expect(TRAY_PILL_COUNT).toBe(SEND_MODES.length);
-      // ── AND THE ORDERING UNDERNEATH IT (roborev 56312) ──────────────────────────────────────
-      // The first version of this line asserted `(SEND_MODES.length - 1) / SEND_MODES.length`,
-      // which is a VERBATIM RESTATEMENT of what the implementation computed — so it stayed green on
-      // the one edit it was written to guard against. Assert Speak's POSITION instead, which is the
-      // value's actual contract.
-      expect(DEFAULT_SPEAK_LEFT_FRAC).toBeCloseTo(
-        SEND_MODES.indexOf("speak") / SEND_MODES.length,
-        10,
-      );
-      // The last-ness assumption, stated ONCE and explicitly rather than re-encoded in a formula.
-      // The sweep is anchored `right: 0` and fills leftward toward the position that counts down,
-      // so Speak being the final pill is load-bearing for the geometry as a whole — not just for
-      // this fraction. If a position is ever appended after it, this is the row that should fail.
-      expect(SEND_MODES.at(-1)).toBe("speak");
-    });
-
-    it("takes the short labels at the DEFAULT concierge column width", () => {
-      // The cross-file claim the threshold's doc rests on, finally pinned (roborev 56204):
-      // CONCIERGE_DEFAULT_WIDTH was module-private in Workspace.tsx, so it could move with nothing
-      // here noticing — and at the default width the full labels do not fit, which is why the
-      // founder saw "S… P… S…" without having resized anything.
-      //
-      // A CONSERVATIVE proxy, deliberately: this is the COLUMN width, while the tray measures its
-      // own contentRect, which is strictly SMALLER (the column insets it). So the real tray width is
-      // even further below the threshold than this comparison shows — it errs toward short labels,
-      // which is the safe direction.
-      expect(TRAY_SHORT_LABEL_MAX_PX).toBeGreaterThan(CONCIERGE_DEFAULT_WIDTH);
-      expect(trayLabelFor("ptt", CONCIERGE_DEFAULT_WIDTH)).toBe(SEND_MODE_LABEL_SHORT.ptt);
-    });
-
-    it("takes the FULL labels before it has been measured, so nothing flickers on first paint", () => {
-      // 0 = "the ResizeObserver has not fired yet". Booting abbreviated and widening a frame later
-      // is a visible flicker; a too-long label for one frame is not.
-      for (const mode of SEND_MODES) {
-        expect(trayLabelFor(mode, 0)).toBe(SEND_MODE_LABEL[mode]);
+    it("drops the KEYCAP SLOT first — the single biggest win", () => {
+      // 30px + a 6px gap per pill is 108px across the tray, reserved for a hover-only hint. That
+      // reservation, not a narrow column, is what forced the truncation.
+      expect(trayShowsChiclet("full")).toBe(true);
+      for (const d of ["fullTight", "short", "shortTight", "floor"] as const) {
+        expect(trayShowsChiclet(d)).toBe(false);
       }
     });
   });

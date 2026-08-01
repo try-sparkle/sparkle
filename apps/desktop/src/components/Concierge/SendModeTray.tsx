@@ -19,13 +19,11 @@
 // and ./ComposeBox.tsx, and breaking it produced roborev findings 52648/53010/53088.
 import { useEffect, useRef, useState } from "react";
 
-import { FiMic, FiRadio, FiSend } from "react-icons/fi";
 
 import {
   DEFAULT_SPEAK_LEFT_FRAC,
   TRAY_GEOMETRY,
-  TRAY_ICON_PX,
-  iconPillMinPx,
+  wordPillMinPx,
   speakLeftFraction,
 } from "./trayGeometry";
 
@@ -44,28 +42,11 @@ import {
   stepSendMode,
   trayDensityFor,
   trayLabelFor,
+  trayShowsChiclet,
   type SendChord,
   type SendMode,
 } from "../../voice/sendMode";
 
-/**
- * The glyph each position draws when the tray is too narrow for words.
- *
- * `react-icons/fi`, the project's icon set — emoji-as-icons are banned repo-wide. Chosen to be
- * distinguishable at 16px, which is the whole reason this tier exists: three ellipsised words all
- * read as "S…", three distinct silhouettes do not.
- *   • send  — a paper plane. The one position where YOU press to send.
- *   • ptt   — a microphone. Hold to talk; the release sends.
- *   • speak — a broadcast. Talk and it goes on its own when you stop.
- *
- * A `Record<SendMode, …>` rather than a lookup with a fallback, so adding a fourth position is a
- * COMPILE error here instead of a pill that silently renders nothing at narrow widths.
- */
-const SEND_MODE_ICON: Record<SendMode, typeof FiSend> = {
-  send: FiSend,
-  ptt: FiMic,
-  speak: FiRadio,
-};
 
 /**
  * How long the sweep takes to EASE to a new remaining fraction after the threshold moves.
@@ -489,14 +470,13 @@ export function SendModeTray({
         const showTarget = selected && m === "speak" && Boolean(model?.targetName);
         // Width-driven, decided by the pure `trayLabelFor` (voice/sendMode) rather than by CSS
         // truncation — see its doc for why this cannot be proven by measuring in jsdom.
-        const label = trayLabelFor(m, trayWidth);
-        // The THIRD tier. Below `TRAY_ICON_ONLY_MAX_PX` even the short words ellipsize — the
-        // founder's "S… P… S…" — so the pill drops its text and draws a glyph instead. One
-        // ordered decision for all three tiers (see `trayDensityFor`), because two independent
-        // width comparisons is how a pill ends up drawing an icon AND reserving a label slot.
+        // ONE ordered decision for the whole ladder (see `trayDensityFor`), because independent
+        // width comparisons is how a pill ends up drawing a word AND reserving a keycap slot for
+        // it — which is exactly what produced the founder's "Se… Pu… Sp…".
         const density = trayDensityFor(trayWidth);
-        const iconOnly = density === "icon";
-        const ModeIcon = SEND_MODE_ICON[m];
+        const label = trayLabelFor(m, density);
+        // The narrowest tier: the pills WRAP so the words stay whole, rather than dropping to icons.
+        const atFloor = density === "floor";
         // ── THE ACCESSIBLE NAME DOES NOT MOVE WITH THE WIDTH ───────────────────────────────────
         // Built from the FULL label, never from the rendered one. An earlier revision derived it
         // from `label`, so a narrow tray silently renamed the Push-to-talk pill to "Push" — the
@@ -591,17 +571,31 @@ export function SendModeTray({
               // `1 1 auto` with a real floor in the icon tier, so a pill can drop to the next line
               // instead of being squeezed narrower than its own glyph. Unchanged (`flex: 1`,
               // floor 0) in both label tiers, where the pills share the line equally as before.
-              flex: iconOnly ? "1 1 auto" : 1,
-              minWidth: iconOnly ? iconPillMinPx() : 0,
+              // `1 1 auto` with a real floor at the FLOOR TIER, so a pill drops to the next line
+              // instead of being squeezed narrower than its own word — which is what keeps all
+              // three words WHOLE at a 50px column (they stack onto three rows). Unchanged in every
+              // wider tier, where the pills share one line equally as before.
+              flex: atFloor ? "1 1 auto" : 1,
+              minWidth: atFloor ? wordPillMinPx() : 0,
               display: "inline-flex",
               alignItems: "center",
               justifyContent: "center",
               gap: TRAY_GEOMETRY.pillGap,
               height: "100%",
-              padding: `0 ${iconOnly ? TRAY_GEOMETRY.pillPadXIcon : TRAY_GEOMETRY.pillPadX}px`,
+              // Padding is one of the things the ladder spends to keep WHOLE WORDS.
+              padding: `0 ${
+                atFloor
+                  ? TRAY_GEOMETRY.pillPadXFloor
+                  : density === "shortTight"
+                  ? TRAY_GEOMETRY.pillPadXTight
+                  : TRAY_GEOMETRY.pillPadX
+              }px`,
               borderRadius: RADIUS.input,
               font: "inherit",
-              fontSize: TYPE.small,
+              // One step down at the two tightest tiers — a smaller WHOLE word beats a truncated
+              // large one. A SCALE MEMBER, not a ratio: the type ratchet reads numeric literals
+              // from the value expression, so a ratio in another module routes around it.
+              fontSize: density === "shortTight" || atFloor ? TYPE.micro : TYPE.small,
               fontWeight: selected ? FONT_WEIGHT.bold : FONT_WEIGHT.semibold,
               cursor: pressSends && !canSend ? "default" : "pointer",
               opacity: pressSends && !canSend ? 0.45 : 1,
@@ -694,25 +688,12 @@ export function SendModeTray({
                 threshold is an ESTIMATE of text metrics, so a residual error is possible in either
                 direction; with `TRAY_SHORT_LABEL_MAX_PX` at its pessimistic value this should never
                 paint, and if it does an ellipsis beats a word cut mid-stroke. */}
-            {iconOnly ? (
-              /* ICONS ONLY — the narrowest tier. The glyph carries `aria-hidden` because the
-                 button already has its FULL accessible name in `aria-label`; labelling the icon
-                 too would make a screen reader read the position twice. Nothing here can clip:
-                 there is no text to truncate, and the glyph is a fixed 16px box. */
-              <span
-                data-testid={`send-mode-icon-${m}`}
-                style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", flex: "none" }}
-              >
-                <ModeIcon size={TRAY_ICON_PX - 2} aria-hidden />
-              </span>
-            ) : (
-              <span
-                data-testid={`send-mode-label-${m}`}
-                style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
-              >
-                {label}
-              </span>
-            )}
+            <span
+              data-testid={`send-mode-label-${m}`}
+              style={{ overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}
+            >
+              {label}
+            </span>
             {/* THE KEYCAP CHICLET. Hover or keyboard focus only, never at rest, at the pill's right
                 inside edge. The slot is reserved in BOTH states so nothing shifts when it appears.
                 What it says comes from voice/sendMode `chicletFor`, which is the same function the
@@ -721,7 +702,7 @@ export function SendModeTray({
             {/* NOT RENDERED AT ALL in the icon tier — see `iconsFitAtPx`. A reserved 30px slot per
                 pill is the single largest thing standing between three icons and a narrow column,
                 and a keycap hint is the first thing to go when there is no room for words either. */}
-            {iconOnly ? null : (
+            {!trayShowsChiclet(density) ? null : (
             <span
               data-testid={showCap ? `send-chiclet-${m}` : undefined}
               aria-hidden
