@@ -41,7 +41,7 @@ import { useUiStore } from "../stores/uiStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
-import { escalateGoal, newGoal } from "../engine/agentGoal";
+import { DEFAULT_GOAL_TTL_MS, escalateGoal, markGoalMet, newGoal } from "../engine/agentGoal";
 import type { AgentGoal } from "../engine/agentGoal";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -454,8 +454,125 @@ describe("a THRASHING row shows its own verdict", () => {
   });
 });
 
-describe("the GOAL is visible, and an ESCALATED one is unmistakable", () => {
+// EVERY GOAL STATE IS ON THE ROW — bead sparkle-6kz9q.
+//
+// This suite used to assert the OPPOSITE of the first four tests below: that a healthy active goal
+// was deliberately kept OFF the column. That rule made a goal-bearing row pixel-identical to a
+// goal-less one, so a founder looking at 41 agents that all carried goals saw no evidence of a
+// single one and concluded the goals were not real. The column was the bug, not the data.
+//
+// What is asserted here is the RENDERED row, never the store: that a `row-goal` element EXISTS for
+// each of the four states (false for three of them before this change — that is the whole point),
+// that it carries the state machine-readably rather than only as a colour, and that the state is
+// spoken in words for a reader who does not get the colour.
+describe("EVERY goal state is visible on the row, and an ESCALATED one is still the loudest", () => {
   const NOW = Date.now();
+  /** 3h20m plus MOST of a minute. `formatRemaining` FLOORS to the minute, so a goal set at `t` with
+   *  this TTL reads "3h 20m left" for any render in `[t, t + 55s]` — after that it ticks down to
+   *  "3h 19m" and an exact-string assertion would flake.
+   *
+   *  55s is the whole budget, and it is spent from the moment the goal is CREATED — so the clock for
+   *  a test asserting the minute reading must be sampled inside that test, immediately before the
+   *  render, NOT in this describe body. The body runs at COLLECTION time, before all 23 tests in the
+   *  file, six describes of which each render a full sidebar into jsdom; on a loaded parallel run
+   *  that gap alone can exceed the window, and the test would go red for a reason that has nothing
+   *  to do with the code under test. */
+  const TTL_3H20M = 3 * 60 * 60_000 + 20 * 60_000 + 55_000;
+
+  it("marks a healthy ACTIVE goal on the row — icon only, state named for a screen reader", () => {
+    // THE COMMON CASE, and the one that was invisible. No visible words: the row is tight and 41
+    // rows each carrying "active · 3h 20m left" would undo the strip-down the column exists for.
+    const now = Date.now(); // see TTL_3H20M — sampled HERE, not in the describe body.
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { busy: "working" },
+          goals: { busy: newGoal("ship it", now, TTL_3H20M) },
+        })}
+      />,
+    );
+    const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+    expect(chip.getAttribute("data-goal-state")).toBe("unmet");
+    // Colour is not a channel every reader has, so the state is NAMED — and the chip has no visible
+    // text at all here, so without this a screen reader would reach an empty span. Asserted through
+    // the ACCESSIBLE NAME, not just the attribute: an `aria-label` on an element with no role is
+    // not reliably announced, so this is what proves the label is actually exposed.
+    expect(
+      within(rowFor("Busy One")).getByRole("img", { name: "Goal active, 3h 20m left — ship it" }),
+    ).toBe(chip);
+    expect(chip.getAttribute("aria-label")).toBe("Goal active, 3h 20m left — ship it");
+    expect(chip.style.color).toBe(C.accentInk);
+    // The words themselves stay one hover away rather than on the row.
+    expect(chip.textContent).not.toContain("Goal");
+    expect(chip.getAttribute("title")).toBe("Goal: ship it — active · 3h 20m left");
+  });
+
+  it("marks a MET goal on the row in the success ink", () => {
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { busy: "working" },
+          goals: { busy: markGoalMet(newGoal("ship it", NOW), NOW) },
+        })}
+      />,
+    );
+    const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+    expect(chip.getAttribute("data-goal-state")).toBe("met");
+    expect(chip.getAttribute("aria-label")).toBe("Goal met — ship it");
+    expect(chip.style.color).toBe(C.successInk);
+    expect(chip.textContent).not.toContain("Goal");
+  });
+
+  it("tells all four states apart by the GLYPH, not by colour alone", () => {
+    // WCAG 1.4.1, and the founder's own bar — he asked to see "which have met it, which have let one
+    // expire" while SCANNING. Every state is icon-only now, so if the mark were one constant shape
+    // in four inks then hue would be the ENTIRE visible difference, and a viewer who does not
+    // separate red, amber and green would be back to the bug this change fixes. A distinct glyph
+    // costs the row no width at all, so there is no reason to spend the accessibility instead.
+    const marks = new Map<string, string>();
+    for (const [state, goal] of [
+      ["unmet", newGoal("ship it", NOW)],
+      ["met", markGoalMet(newGoal("ship it", NOW), NOW)],
+      ["expired", newGoal("ship it", NOW - DEFAULT_GOAL_TTL_MS - 60_000)],
+      ["escalated", escalateGoal(newGoal("ship it", NOW), NOW, "no progress")],
+    ] as const) {
+      const { unmount } = render(
+        <AgentSidebar project={seed({ status: { busy: "working" }, goals: { busy: goal } })} />,
+      );
+      const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+      expect(chip.getAttribute("data-goal-state")).toBe(state);
+      // No words in any state, so the rendered MARK is the whole visible difference — and colour
+      // lives in `style`, never in the markup captured here.
+      expect(chip.textContent).toBe("");
+      marks.set(state, chip.innerHTML);
+      unmount();
+    }
+    // FOUR DISTINCT glyphs, not merely "met differs from unmet": collapsing any pair back to one
+    // shape is what re-creates the colour-only channel, and it can happen to any pair.
+    expect(new Set(marks.values()).size).toBe(marks.size);
+  });
+
+  it("marks an EXPIRED goal in amber — it is unfinished work, not a success", () => {
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { busy: "working" },
+          // Set far enough in the past that the default TTL has already run out at render time.
+          goals: { busy: newGoal("ship it", NOW - DEFAULT_GOAL_TTL_MS - 60_000) },
+        })}
+      />,
+    );
+    const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+    expect(chip.getAttribute("data-goal-state")).toBe("expired");
+    // "never met" is spoken, so the row cannot be mistaken for a finished one.
+    expect(chip.getAttribute("aria-label")).toBe("Goal expired, never met — ship it");
+    // No visible words in any state — the mark carries it. See GOAL_CHIP_COLOR's header.
+    expect(chip.textContent).toBe("");
+    expect(chip.getAttribute("aria-label")).toContain("Goal expired, never met");
+    // Amber, NOT danger: second loudest. Escalation keeps the top of the row to itself.
+    expect(chip.style.color).toBe(C.amberInk);
+    expect(chip.style.color).not.toBe(DANGER);
+  });
 
   it("puts an escalated goal on the row in the danger ink, even while the agent is working", () => {
     // The stall surface stays quiet for a `working` agent (verdict `active`), so without this the
@@ -470,23 +587,66 @@ describe("the GOAL is visible, and an ESCALATED one is unmistakable", () => {
         })}
       />,
     );
-    const chip = within(rowFor("Busy One")).getByTestId("row-goal-escalated");
-    expect(chip.textContent).toContain("Goal escalated");
+    const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+    expect(chip.getAttribute("data-goal-state")).toBe("escalated");
+    expect(chip.textContent).toBe("");
+    expect(chip.getAttribute("aria-label")).toBe("Goal escalated — land PR #42");
     expect(chip.style.color).toBe(DANGER);
+    // STILL the loudest of the four, and with no words to bold that has to be carried by the MARK:
+    // the biggest icon in the set, and the only DANGER ink.
+    expect(chip.querySelector("svg")?.getAttribute("width")).toBe("12");
     expect(chip.getAttribute("title")).toContain("land PR #42");
     expect(chip.getAttribute("title")).toContain("auto-continue gave up — 20 continues, no progress");
   });
 
-  it("leaves a healthy ACTIVE goal off the column — it is not an alarm", () => {
-    render(
-      <AgentSidebar
-        project={seed({ status: { busy: "working" }, goals: { busy: newGoal("ship it", NOW) } })}
-      />,
-    );
-    expect(within(rowFor("Busy One")).queryByTestId("row-goal-escalated")).toBeNull();
+  // THE MARK NEVER SHRINKS, AND IT NEVER GROWS WORDS.
+  //
+  // Both halves were learned by photographing the row, and neither is observable in jsdom, which has
+  // no layout engine — so what is asserted is the CONTRACT that decides them. An earlier cut gave
+  // `escalated` and `expired` visible text; at a 440px column that rendered `◎ ⚠ aι` and
+  // `◎ Goa ⚠ work`, two chips clipped past legibility. The row has one worded slot and the stall
+  // chip owns it.
+  it("renders every goal state as an icon-only mark that cannot shrink away", () => {
+    for (const [state, goal] of [
+      ["unmet", newGoal("ship it", NOW)],
+      ["met", markGoalMet(newGoal("ship it", NOW), NOW)],
+      ["expired", newGoal("ship it", NOW - DEFAULT_GOAL_TTL_MS - 60_000)],
+      ["escalated", escalateGoal(newGoal("ship it", NOW), NOW, "no progress")],
+    ] as const) {
+      const { unmount } = render(
+        <AgentSidebar project={seed({ status: { busy: "working" }, goals: { busy: goal } })} />,
+      );
+      const chip = within(rowFor("Busy One")).getByTestId("row-goal");
+      expect(chip.getAttribute("data-goal-state")).toBe(state);
+      // No visible text in ANY state — that is the rule the photograph established.
+      expect(chip.textContent).toBe("");
+      // …and the mark itself is unshrinkable: the icon IS the whole chip, so a shrink factor would
+      // clip the one thing bead sparkle-6kz9q exists to make visible, to save ~13px.
+      expect(chip.style.flex).toBe("0 0 auto");
+      // ESCALATED IS EXCEPTIONAL, AND BOTH SIDES OF THAT COMPARISON ARE PINNED. Asserting only
+      // escalated's 12 would leave "every other state shares one size" unguarded — raising the
+      // other three to 12, or collapsing the distinction to a single constant, would stay green
+      // while destroying the only size signal escalated has (roborev 57417).
+      expect(chip.querySelector("svg")?.getAttribute("width")).toBe(
+        state === "escalated" ? "12" : "10",
+      );
+      unmount();
+    }
   });
 
-  it("reports an escalated goal as a STALL CAUSE once the agent goes quiet", () => {
+  it("shows NOTHING for an agent with no goal — the control for all four above", () => {
+    // Without this, a chip that rendered unconditionally would satisfy every assertion above while
+    // destroying the only thing the founder asked for: telling a goal-less agent from a goal-bearing
+    // one at a glance.
+    render(<AgentSidebar project={seed({ status: { busy: "working" } })} />);
+    expect(within(rowFor("Busy One")).queryByTestId("row-goal")).toBeNull();
+  });
+
+  it("still spends the row's WORDED slot on the stall chip, not on the goal", () => {
+    // The division of labour that makes both fit: the mark says WHICH GOAL STATE (colour, size),
+    // the stall chip says WHAT IS OUTSTANDING (words). An escalated goal is also a stall cause, so
+    // a quiet escalated row shows both — and that is affordable precisely because only one of them
+    // has text. When this suite asserted worded goal chips instead, these two collided on screen.
     render(
       <AgentSidebar
         project={seed({
@@ -499,10 +659,16 @@ describe("the GOAL is visible, and an ESCALATED one is unmistakable", () => {
         })}
       />,
     );
-    const chip = within(rowFor("Stalled One")).getByTestId("row-stall");
-    expect(chip.textContent).toContain("auto-continue gave up");
+    const row = within(rowFor("Stalled One"));
+    const goal = row.getByTestId("row-goal");
+    expect(goal.getAttribute("data-goal-state")).toBe("escalated");
+    expect(goal.textContent).toBe("");
     // Escalation is categorically different from "needs merging eventually": nothing is coming for
-    // this row at all, so it takes DANGER rather than the caution ink every other cause gets.
-    expect(chip.style.color).toBe(DANGER);
+    // this row at all, so the mark takes DANGER rather than the caution ink every other cause gets.
+    expect(goal.style.color).toBe(DANGER);
+    // The WORDS are the stall chip's, and they name the cause rather than restating the state.
+    const stall = row.getByTestId("row-stall");
+    expect(stall.textContent).toContain("auto-continue gave up");
+    expect(stall.style.color).toBe(DANGER);
   });
 });

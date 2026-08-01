@@ -315,7 +315,7 @@ describe("the concierge column's themed INKS clear AA where they are read", () =
   // colour — so every ink above is suddenly read on `--k-term` instead of on `conciergeSurface`.
   // The column sets the terminal ink register on itself and anything inheriting follows, but the
   // controls that NAME a concierge-register ink do not: the grip dots, the header pills' default
-  // and pressed labels, ScopeVitals' text, a nudge's badge and chip.
+  // and pressed labels, a nudge's badge and chip.
   //
   // None of that was measured when the wired state landed — the same disagreement `amberInk`'s
   // `composerPlate` closed for the composer, reopened one level up, on a whole column rather than a

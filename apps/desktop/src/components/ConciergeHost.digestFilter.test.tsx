@@ -30,7 +30,12 @@ const h = vi.hoisted(() => ({
    *  Holding the earlier message and invoking the live controller with it is the only way to put the
    *  handler in the situation it guards against. */
   lastModel: null as { messages: { id: string; kind: string; leadAgentId?: string }[] } | null,
-  lastController: null as { onDigestClick?: (d: { id: string }) => void } | null,
+  lastController: null as {
+    onDigestClick?: (d: { id: string }) => void;
+    /** No longer reachable from the DOM — the header segments that called it are gone — so the
+     *  contract test below invokes it through here. */
+    onProjectClick?: (projectId: string) => void;
+  } | null,
 }));
 // Mirror EVERY export: Vitest throws on access to a missing mock export.
 vi.mock("../services/openProjectTab", () => ({
@@ -567,20 +572,20 @@ describe("rowless agents digest like everything else", () => {
     });
   });
 });
-
-// ── THE HEADER'S PER-PROJECT SEGMENTS ───────────────────────────────────────────────────────────
+// ── THE HEADER SAYS NOTHING ACROSS PROJECTS ANY MORE ────────────────────────────────────────────
 //
-// The other cross-project navigation the column offers, and the one PRD §2a's open question was
-// about. The answer (founder, 2026-07-28): column two stays project-scoped, so column one's one
-// line is the GLOBAL index — `All projects · 2 here · 1 in mobile`, worst project first, with the
-// other-project segments switching to them.
+// This block used to pin the header's per-project SEGMENTS — `All projects · 2 here · 1 in mobile`,
+// worst project first, each other-project segment switching to it. PRD §2a's open question (column
+// one is the GLOBAL index, column two stays project-scoped) is still answered that way in the
+// MODEL: `ConciergeHost` builds `needsYouByProject` exactly as before and hands it to the column.
 //
-// A count names a POPULATION, not an agent, so this click must switch and stop. That is the mirror
-// image of the bug bead `sparkle-vohh` fixed (a nudge selected an agent without switching project);
-// selecting an agent nobody named would be its other half. It also must not narrow column two the
-// way a DIGEST click does — the digest line states a band, the header segment states a project.
-describe("clicking a header segment switches project, and does nothing else", () => {
-  /** Two projects with Needs-you work, with `here` selected — so the line has both segment shapes. */
+// What changed is the RENDER. Bead sparkle-ircc3: the founder asked twice for nothing beside the
+// Sparkle wordmark but the red needs-you pill, so the line and its segments are gone. Kept as a
+// host-level test rather than deleted, because the column's own tests render a hand-built
+// view-model — only this file proves the REAL feed→header path prints no cross-project prose.
+describe("the header prints no cross-project line, whatever the feed says", () => {
+  /** Two projects with Needs-you work, with `here` selected — the exact feed that used to produce
+   *  both segment shapes. If anything is going to reintroduce the line, it is this input. */
   const twoProjects = () => {
     const here = projectOf("p1", "here", [tab("h1"), tab("h2")]);
     const there = projectOf("p2", "mobile", [tab("m1")]);
@@ -593,40 +598,56 @@ describe("clicking a header segment switches project, and does nothing else", ()
     return { projects: [here, there], status };
   };
 
-  it("reads worst-project-first across projects, with the current one as 'here'", () => {
+  it("renders no vitals line and no segment buttons from a real two-project feed", () => {
     const { projects, status } = twoProjects();
     render(<ConciergeHost feed={feedFrom(projects, status)} />);
-    expect(screen.getByTestId("concierge-vitals-line").textContent).toBe(
-      "All projects · 2 here · 1 in mobile",
-    );
+    expect(screen.queryByTestId("concierge-vitals-line")).toBeNull();
+    expect(screen.queryByTestId("concierge-needs-dot")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Switch to / })).toBeNull();
+    // The words themselves, not just the handles that carried them.
+    for (const gone of ["All projects", "2 here", "1 in mobile", "all calm", "Pinned to"]) {
+      expect(screen.queryByText(gone)).toBeNull();
+    }
   });
 
-  it("switches to the named project — with no agent id, so nothing is selected on its behalf", () => {
+  it("states the SAME total on the red pill instead — the count was not lost with the line", () => {
     const { projects, status } = twoProjects();
     render(<ConciergeHost feed={feedFrom(projects, status)} />);
-    fireEvent.click(screen.getByRole("button", { name: "Switch to mobile — 1 Needs you" }));
-    // ONE call, ONE argument. `toHaveBeenCalledWith` compares the whole argument list, so a stray
-    // agent id — the thing a count cannot honestly name — fails here.
+    // 2 here + 1 in mobile = 3, the number the deleted line used to add up to.
+    const pill = screen.getByTestId("concierge-needs-filter");
+    expect(pill.textContent).toBe("3");
+  });
+
+  it("switching project is no longer something the header can do on its own", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    // Nothing in the header opens a project tab any more: the digest lines below it are the one
+    // cross-project navigation the column still offers, and they are tested above.
+    fireEvent.click(screen.getByTestId("concierge-needs-filter"));
+    expect(h.openProjectTab).not.toHaveBeenCalled();
+  });
+
+  // ── THE CALLBACK OUTLIVED ITS CALLER, SO ITS CONTRACT MUST OUTLIVE ITS BUTTON ─────────────────
+  //
+  // `onProjectClick` is still wired by the host and is now called by nothing (roborev 57364). The
+  // segments that used to call it were the only test of what it must NOT do — switch and stop, no
+  // agent selected on its behalf (`sparkle-vohh`'s mirror image), and no narrowing of column two
+  // the way a digest click does. Deleting those tests with the buttons would hand the next person
+  // who adds a caller a green suite whether or not they reintroduce the bug. So the contract is
+  // asserted against the CALLBACK directly, through the controller the host hands the column.
+  it("still upholds switch-and-stop if anything calls it: no agent named, no band isolated", () => {
+    const { projects, status } = twoProjects();
+    render(<ConciergeHost feed={feedFrom(projects, status)} />);
+    h.lastController!.onProjectClick!("p2");
+    // ONE call, ONE argument. `toEqual` compares the whole argument list, so a stray agent id —
+    // the thing a count cannot honestly name — fails here.
     expect(h.openProjectTab.mock.calls).toEqual([["p2"]]);
-  });
-
-  it("does NOT narrow column two the way a digest line does", () => {
-    const { projects, status } = twoProjects();
-    render(<ConciergeHost feed={feedFrom(projects, status)} />);
-    fireEvent.click(screen.getByRole("button", { name: "Switch to mobile — 1 Needs you" }));
-    // Every band still visible: the segment named a project, not a band, and silently isolating one
-    // would hide the very rows the user switched over to look at.
+    // Every band still visible: it named a project, not a band, and silently isolating one would
+    // hide the very rows the user switched over to look at.
     expect(useUiStore.getState().statusFilter).toEqual({
       needs_you: true,
       running: true,
       done: true,
     });
-  });
-
-  it("the 'here' segment offers no switch at all — you are already there", () => {
-    const { projects, status } = twoProjects();
-    render(<ConciergeHost feed={feedFrom(projects, status)} />);
-    expect(screen.queryByRole("button", { name: /^Switch to here/ })).toBeNull();
-    expect(screen.getByText("2 here").tagName).toBe("SPAN");
   });
 });

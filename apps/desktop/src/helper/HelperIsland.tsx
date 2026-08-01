@@ -69,7 +69,7 @@ function Dot({ color }: { color: string }) {
  * window sitting over the user's screen. The dot already carries the band, so the words were
  * saying it twice. But a bare "3" is meaningless to a screen reader, and `Dot` is
  * aria-hidden, so the visible text is ALL the semantics there used to be. The meaning is moved,
- * not deleted: `bandCountLabel` — the same helper the sidebar and ScopeVitals use, so singular
+ * not deleted: `bandCountLabel` — the same helper the sidebar's chips use, so singular
  * agreement ("1 Needs you" vs "3 Need you") stays consistent — now feeds the aria-label and the
  * title. The label is what assistive tech announces; the title is how a sighted user finds out
  * what a naked colored dot means.

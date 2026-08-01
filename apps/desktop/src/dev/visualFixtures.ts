@@ -36,6 +36,7 @@ import { createJSONStorage } from "zustand/middleware";
 import type { AgentTab, Project } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import type { AgentGoal } from "../engine/agentGoal";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConnectionStore } from "../stores/connectionStore";
@@ -77,7 +78,63 @@ interface Row {
   stage: WorkflowStageId;
   activity?: string;
   lastPrompt: string;
+  /** This row's goal, if it has one. See {@link GOAL_STATES}. */
+  goal?: AgentGoal;
 }
+
+/**
+ * A goal in each of the four states a row can render, so a capture PROVES the row treatment for all
+ * of them rather than one happy path.
+ *
+ * This exists because the roster carried no goals at all, and that made the agent-sidebar capture
+ * unable to answer the founder's question — "if every agent had a goal, I would see it on the row"
+ * (bead sparkle-6kz9q). A screenshot of six goal-less agents looks identical before and after a fix
+ * to how goals are shown, so it could never have caught the regression, and could never demonstrate
+ * the fix either.
+ *
+ * Every timestamp is an offset from {@link FIXTURE_NOW} for the same reason every other one here is:
+ * `goalStateOf` and the "3h 20m left" readout are both `now`-relative, so a wall-clock goal would
+ * make the row's own text change between two runs of the same capture.
+ */
+const HOUR = 60 * MINUTE;
+
+const GOAL_STATES = {
+  /** Live, with time on the clock — the common case, and the one that reads as invisible today. */
+  unmet: {
+    text: "Land the concierge column on the left edge",
+    setAt: FIXTURE_NOW - 40 * MINUTE,
+    ttlMs: 4 * HOUR,
+    continues: 0,
+    totalContinues: 0,
+  },
+  /** Achieved. `metAt` is what makes an idle agent legitimately done (see engine/agentGoal). */
+  met: {
+    text: "Fix the seam between the sidebar and the terminal",
+    setAt: FIXTURE_NOW - 3 * HOUR,
+    ttlMs: 4 * HOUR,
+    metAt: FIXTURE_NOW - 20 * MINUTE,
+    continues: 0,
+    totalContinues: 2,
+  },
+  /** Past its TTL and never met — unfinished work whose auto-continue mandate ran out. */
+  expired: {
+    text: "Group the sidebar rows by workflow stage",
+    setAt: FIXTURE_NOW - 5 * HOUR,
+    ttlMs: 4 * HOUR,
+    continues: 3,
+    totalContinues: 6,
+  },
+  /** Auto-continue gave up and handed the agent back. The loudest state on the row. */
+  escalated: {
+    text: "Re-skin the settings dialog against rev4",
+    setAt: FIXTURE_NOW - 90 * MINUTE,
+    ttlMs: 4 * HOUR,
+    continues: 20,
+    totalContinues: 20,
+    escalatedAt: FIXTURE_NOW - 10 * MINUTE,
+    escalationReason: "no progress in 20 restarts",
+  },
+} satisfies Record<string, AgentGoal>;
 
 /**
  * The roster. Chosen to light up every band the sidebar can group into — a red row that needs you,
@@ -85,6 +142,22 @@ interface Row {
  * exercises the group headers (`.grp`) and the status dot's full colour range rather than one
  * happy path. Names are deliberately mundane and of varied length: name truncation is a real
  * fidelity risk and a roster of equal-length names would hide it.
+ *
+ * GOALS ARE SPREAD THE SAME WAY, and the rows LEFT WITHOUT ONE are as deliberate as the four that
+ * have one. The founder's test for the row treatment is "tell a goal-bearing agent from a
+ * goal-less one at a glance" (bead sparkle-6kz9q), so a roster where every row carried a goal could
+ * not photograph the distinction it exists to prove.
+ *
+ * THE CONTROL IS SAME-KIND, and that is the whole subtlety (roborev 57331). The first cut left the
+ * two nested WORKERS goal-less while every goal sat on a top-level BUILD row — so "has a goal" was
+ * perfectly confounded with "is a top-level build row", and a capture could not show which of the
+ * two a visible difference came from. A control has to differ in the ONE variable under test, so
+ * `vfx-agent-7` is a goal-less TOP-LEVEL BUILD row, matched against the four that carry goals.
+ *
+ * It is a seventh row rather than a demotion of one of the four because all four states have to stay
+ * PHOTOGRAPHABLE: a worker under a collapsed head renders as a one-line peek (AgentSidebar's "THE
+ * PEEK"), not a row, so a goal moved onto one would vanish from the very capture this table exists
+ * to feed — trading a confounded control for an invisible state.
  */
 const SELECTED_ROW_ID = "vfx-agent-1";
 
@@ -99,6 +172,7 @@ const ROWS: Row[] = [
     stage: "building_unsaved",
     activity: "Asking which side the pull tab belongs on",
     lastPrompt: "Move the concierge to the left edge and make it full height",
+    goal: GOAL_STATES.unmet,
   },
   {
     id: "vfx-agent-2",
@@ -131,6 +205,7 @@ const ROWS: Row[] = [
     elapsedMin: 24,
     stage: "pull_request",
     lastPrompt: "Group the sidebar rows by workflow stage with a rule and a count",
+    goal: GOAL_STATES.expired,
   },
   {
     id: "vfx-agent-5",
@@ -141,6 +216,7 @@ const ROWS: Row[] = [
     elapsedMin: 96,
     stage: "merged_local",
     lastPrompt: "Re-skin the settings dialog against rev4",
+    goal: GOAL_STATES.escalated,
   },
   {
     id: "vfx-agent-6",
@@ -151,6 +227,24 @@ const ROWS: Row[] = [
     elapsedMin: 240,
     stage: "shipped",
     lastPrompt: "Fix the seam between the sidebar and the terminal",
+    goal: GOAL_STATES.met,
+  },
+  {
+    // THE GOAL-LESS CONTROL, and it is a TOP-LEVEL BUILD row on purpose (roborev 57331). A control
+    // has to differ from the rows it is compared against in the ONE variable under test, and every
+    // goal above sits on a build row — so a goal-less WORKER could not serve: "has a goal" would be
+    // confounded with "is a top-level build row" and the capture could not say which difference the
+    // eye was seeing. The two nested workers stay goal-less as well, but they are not the control
+    // and nothing rests on them; a worker under a collapsed head renders as a one-line PEEK, not a
+    // row, so a goal parked there could not be photographed at all.
+    id: "vfx-agent-7",
+    name: "Credit pill contrast",
+    kind: "build",
+    parentId: null,
+    status: "idle",
+    elapsedMin: 52,
+    stage: "building_saved",
+    lastPrompt: "Check the credit pill against the flooded column in both themes",
   },
 ];
 
@@ -175,6 +269,9 @@ function toAgent(r: Row): AgentTab {
       },
     ],
     activity: r.activity,
+    // Spread conditionally so a goal-less row has NO `goal` key rather than an explicit
+    // `undefined` — the control rows must be indistinguishable from an agent that never had one.
+    ...(r.goal ? { goal: r.goal } : {}),
     task: r.parentId ? r.lastPrompt : undefined,
     parentBranch: r.parentId ? "sparkle/vfx-agent-1" : undefined,
     namePinned: false,

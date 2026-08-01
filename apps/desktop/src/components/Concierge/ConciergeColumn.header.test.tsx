@@ -2,14 +2,17 @@
 //
 // THE HEADER IS ONE ROW — rev4.html's `.ahd`, and the founder's explicit ask.
 //
-// wordmark · 8-dot grip · scope pill · needs-you filter · PR/merge pill · avatar · kebab.
+// wordmark · 8-dot grip · needs-you pill · PR/merge slot · avatar · kebab.
 //
-// The shell used to SCATTER these: the scope line had its own centred block below the mark, the
-// credit pill shared a row with the mark, the avatar and kebab lived over in the project tabs bar,
-// and there was no global "just show me what needs me" control anywhere at all. This file pins the
-// consolidation from both ends — that all seven are in ONE element, and that the pieces which are
-// NOT in the founder's list have moved OUT of it rather than being quietly left behind, which is
-// how a consolidation half-lands.
+// The shell used to SCATTER these: the credit pill shared a row with the mark, the avatar and kebab
+// lived over in the project tabs bar, and there was no global "just show me what needs me" control
+// anywhere at all. This file pins the consolidation from both ends — that all six are in ONE
+// element, and that the pieces which are NOT in the founder's list have moved OUT of it rather than
+// being quietly left behind, which is how a consolidation half-lands.
+//
+// A scope/vitals line was the seventh until bead sparkle-ircc3 deleted it: the founder asked twice
+// for nothing to appear beside the wordmark but the red pill. The last describe in this file is
+// what holds that, and it asserts the row's whole `textContent`, not just a missing testid.
 //
 // The two store-backed pieces are stubbed for the same reason ConciergeColumn.test.tsx stubs them:
 // the real ones drag a rAF audio loop and an entitlement fetch into assertions about layout.
@@ -82,17 +85,16 @@ function fullHeader(over: Partial<ConciergeViewModel> = {}) {
 const header = () => screen.getByTestId("concierge-header");
 
 describe("the concierge header is ONE row", () => {
-  it("holds all seven controls in a single element", () => {
+  it("holds all six controls in a single element", () => {
     fullHeader();
     const h = header();
     for (const el of [
       screen.getByRole("img", { name: "Sparkle" }),
       screen.getByTestId("concierge-grip"),
-      screen.getByTestId("concierge-vitals-line"),
       screen.getByTestId("concierge-needs-filter"),
       screen.getByTestId("pr-slot-stub"),
-      // THE AVATAR — the seventh, and it was missing from this loop while the test claimed "all
-      // seven" and listed six (roborev 54712). `enableAiEnhancementsForTests` seeds a `me` with no
+      // THE AVATAR — and it was once missing from this loop while the test claimed to check every
+      // control and listed one fewer (roborev 54712). `enableAiEnhancementsForTests` seeds a `me` with no
       // name or email, so `authIdentity` resolves to null and the signed-in control names itself
       // "Account". It is the other half of the `ConciergeTopRight` cluster and has to be IN the row.
       screen.getByRole("button", { name: "Account" }),
@@ -110,7 +112,6 @@ describe("the concierge header is ONE row", () => {
     const order = [
       screen.getByRole("img", { name: "Sparkle" }),
       screen.getByTestId("concierge-grip"),
-      screen.getByTestId("concierge-vitals-line"),
       screen.getByTestId("concierge-needs-filter"),
       screen.getByTestId("pr-slot-stub"),
     ];
@@ -141,14 +142,14 @@ describe("the concierge header is ONE row", () => {
     ).toBeTruthy();
   });
 
-  it("has no separate centred scope block left under it", () => {
+  it("has no scope block anywhere in the column — not in the row, not under it", () => {
     fullHeader();
-    // Exactly one scope line in the column, and it is the one INSIDE the header — a leftover block
-    // below would render a second, which is the shape this consolidation replaced.
-    const lines = screen.getAllByTestId("concierge-vitals-line");
-    expect(lines).toHaveLength(1);
-    expect(lines[0]!.style.textAlign).toBe("left");
-    expect(lines[0]!.style.marginTop).toBe("0px");
+    // The consolidation folded a separate centred scope block INTO this row; bead sparkle-ircc3
+    // then deleted the folded line outright. Both halves are asserted here, because "moved into the
+    // header" and "deleted from the header" leave the same wreckage if only one lands: ZERO scope
+    // lines in the whole column, not one in the row and not a leftover block below it.
+    expect(screen.queryAllByTestId("concierge-vitals-line")).toHaveLength(0);
+    expect(screen.queryAllByTestId("concierge-needs-dot")).toHaveLength(0);
   });
 });
 
@@ -203,7 +204,7 @@ describe("the header's pills", () => {
     expect(screen.queryByTestId("concierge-needs-filter")).toBeNull();
   });
 
-  // The same rule ScopeVitals' segment buttons follow: no handler, no affordance. A focusable,
+  // NO HANDLER, NO AFFORDANCE — the rule every optional control in this row follows. A focusable,
   // cursor-pointer, named control that does nothing is worse than no control.
   it("renders no grip and no filter pill when the shell supplies no handlers", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
@@ -323,5 +324,121 @@ describe("the voice strip lays the credit pill OVER the waveform", () => {
     expect(Number(overlay.style.zIndex)).toBeGreaterThan(0);
     // Confined to the pill's own box — the waveform underneath is untouched.
     expect(overlay.contains(screen.getByTestId("logo-waveform"))).toBe(false);
+  });
+});
+
+// ── NOTHING BESIDE THE WORDMARK (bead sparkle-ircc3) ────────────────────────────────────────────
+//
+// The founder, twice, and the second time about the pinned variant specifically:
+//
+//   "I wanna to be saying all projects, all comm, etcetera, to the right of the sparkle AI. I do
+//    not want that. I said I do not want it. … So remove that line. Remove that. It should only be
+//    showing the red dot pill when there are issues. It shouldn't say anything else next to the
+//    sparkle logo."
+//
+// So the header's CALM state is the wordmark alone, and the ONE thing allowed to appear beside it
+// is the red needs-you pill — only while something actually needs him. These assert the ABSENCE by
+// testid AND by read text, because the failure mode this bead is about is a line that survives a
+// "make it smaller" fix and keeps rendering. `concierge-vitals-line` / `concierge-needs-dot` were
+// ScopeVitals' handles; nothing may reintroduce them here.
+describe("the header says NOTHING beside the wordmark", () => {
+  /** Every word ScopeVitals could put in this row. None of them may reach the header again. */
+  const SCOPE_PROSE = ["All projects", "all calm", "Pinned to", "here", "elsewhere"];
+
+  /** The header, rendered with the shell's handlers but no PR slot — so its text is the column's
+   *  own, not a stub's. */
+  function headerOnly(over: Partial<ConciergeViewModel> = {}) {
+    render(
+      <ConciergeColumn
+        model={{ ...model, ...over }}
+        controller={controller({ onMoveSide: vi.fn(), onNeedsYouFilterToggle: vi.fn() })}
+      />,
+    );
+    return header();
+  }
+
+  // ── THE RIGHT CLUSTER MUST STAY ON THE RIGHT ─────────────────────────────────────────────────
+  // The deleted scope line was the row's ONLY flexible child. Removing it without replacing its
+  // growth packs everything left — the PR chip, avatar and kebab crowd the wordmark with dead space
+  // beside them (roborev 57364). jsdom lays nothing out, so the assertable artefact is the token:
+  // exactly one growing child, and it is the spacer, sitting before the right-hand cluster.
+  it("keeps exactly one growing child, so the right cluster is not dragged to the wordmark", () => {
+    const h = headerOnly({ vitals: { needs_you: 0, running: 0, done: 0 } });
+    const spacer = screen.getByTestId("concierge-header-spacer");
+    expect(h.contains(spacer)).toBe(true);
+    expect(spacer.style.flex).toBe("1 1 auto");
+    // It states nothing and announces nothing — it exists purely to take up the slack.
+    expect(spacer.textContent).toBe("");
+    expect(spacer.getAttribute("aria-hidden")).toBe("true");
+    // The ONE flexible child: any other `flex-grow` here would split the slack and move the cluster
+    // back toward the mark.
+    const growing = [...h.children].filter(
+      (el) => !/^0/.test((el as HTMLElement).style.flex || "0") && (el as HTMLElement).style.flex,
+    );
+    expect(growing).toEqual([spacer]);
+    // …and it sits BEFORE the right-hand cluster, or it pushes nothing.
+    const kebab = screen.getByRole("button", { name: "Settings" });
+    expect(
+      spacer.compareDocumentPosition(kebab) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("CALM: nothing needs you, so the row carries the wordmark and no words at all", () => {
+    const h = headerOnly({ vitals: { needs_you: 0, running: 5, done: 12 } });
+    // The mark is still there — this is a deletion of the LINE, not of the header.
+    expect(h.contains(screen.getByRole("img", { name: "Sparkle" }))).toBe(true);
+    // ScopeVitals' two handles, gone from the whole column, not merely from this row.
+    expect(screen.queryByTestId("concierge-vitals-line")).toBeNull();
+    expect(screen.queryByTestId("concierge-needs-dot")).toBeNull();
+    // …and the red pill too: calm means there is nothing for it to filter.
+    expect(screen.queryByTestId("concierge-needs-filter")).toBeNull();
+    // Read as a human reads it: the row states nothing. `running: 5` and `done: 12` are carried in
+    // the view-model and deliberately unprinted, so a header that grew a "5 running" would fail
+    // here as hard as one that kept "All projects".
+    for (const phrase of SCOPE_PROSE) expect(h.textContent).not.toContain(phrase);
+    expect(h.textContent?.trim()).toBe("");
+  });
+
+  it("ALARM: the red pill is the ONLY thing that appears, and it carries the count", () => {
+    const h = headerOnly({ vitals: { needs_you: 3, running: 5, done: 12 } });
+    const pill = screen.getByTestId("concierge-needs-filter");
+    expect(h.contains(pill)).toBe(true);
+    expect(pill.textContent).toBe("3");
+    expect(pill.getAttribute("aria-label")).toBe("Show only what needs you (3)");
+    // The count arriving does NOT bring the line back with it.
+    expect(screen.queryByTestId("concierge-vitals-line")).toBeNull();
+    expect(screen.queryByTestId("concierge-needs-dot")).toBeNull();
+    for (const phrase of SCOPE_PROSE) expect(h.textContent).not.toContain(phrase);
+    // The pill's numeral is the row's ENTIRE text — nothing else writes into this row.
+    expect(h.textContent?.trim()).toBe("3");
+  });
+
+  it("PINNED: a pinned scope still prints nothing — this is the one he complained about last", () => {
+    const h = headerOnly({
+      scope: { pinnedProjectName: "sparkle-desktop-experiments" },
+      vitals: { needs_you: 0, running: 2, done: 0 },
+    });
+    // The pin is still MODELLED — `scope.pinnedProjectName` is fed and simply not printed here.
+    // Where a human sees it instead: the project tab's solid, rotated, accent-ink pin
+    // (ProjectTabs.tsx `.concierge-tab-pin[data-pinned="true"]`), pinned by ProjectTabs.test.tsx.
+    expect(h.textContent?.trim()).toBe("");
+    expect(h.textContent).not.toContain("Pinned to");
+    expect(h.textContent).not.toContain("sparkle-desktop");
+    expect(screen.queryByTestId("concierge-vitals-line")).toBeNull();
+  });
+
+  it("no per-project switch buttons anywhere: the split moved out of the header entirely", () => {
+    headerOnly({
+      vitals: { needs_you: 3, running: 0, done: 0 },
+      needsYouByProject: [
+        { projectId: "p1", projectName: "web", needsYou: 2, isActive: true },
+        { projectId: "p2", projectName: "mobile", needsYou: 1, isActive: false },
+      ],
+    });
+    // `needsYouByProject` is still carried by the view-model (ConciergeHost keeps feeding it); the
+    // header just no longer renders a segment per project.
+    expect(screen.queryByRole("button", { name: /^Switch to / })).toBeNull();
+    expect(screen.queryByText("2 here")).toBeNull();
+    expect(screen.queryByText("1 in mobile")).toBeNull();
   });
 });

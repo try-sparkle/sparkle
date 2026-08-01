@@ -11,10 +11,11 @@
 // and a NUMBER. The tab badge adopted it when the tab strip dropped the phrase (§7a): the tabs are
 // read at a glance beside each other, two words per tab pushed the project name into an ellipsis,
 // and the chips directly below the strip already spell the bands out. That took the outstanding
-// `#ff9a9a` literal named here with it. ScopeVitals still renders the whole PHRASE ("1 Needs you ·
-// 2 Running"), so pointing IT here would delete words from a surface that has the room for them —
-// a design change, not a dedup. What it should take from this file if someone unifies it is the
-// COLOUR RULE below, not the markup.
+// `#ff9a9a` literal named here with it. Surfaces with the room for it still render the whole PHRASE
+// ("1 Needs you · 2 Running") — the sidebar's chips, the helper island's aria-label — so pointing
+// one of THOSE here would delete words from a surface that has room for them: a design change, not
+// a dedup. What such a surface should take from this file if someone unifies it is the COLOUR RULE
+// below, not the markup.
 //
 // TWO RULES IT ENFORCES FOR EVERY CALLER — the chips today, and anything that adopts it later:
 //

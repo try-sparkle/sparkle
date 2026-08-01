@@ -239,6 +239,39 @@ describe("ProjectTabs", () => {
     expect(screen.getByTestId("pin-sparkle").getAttribute("data-pinned")).toBe("false");
   });
 
+  // ── THIS TAB IS NOW THE ONLY PLACE PINNING IS VISIBLE (bead sparkle-ircc3) ────────────────────
+  //
+  // The concierge header used to say "Pinned to <name>" beside the Sparkle wordmark. The founder
+  // asked for that line gone, so the pinned tab's pin is what tells a user the concierge is scoped
+  // to one project — and the test above proves only that the ATTRIBUTE is set, which is the hook,
+  // not the appearance. A pinned pin painted `C.muted` at opacity 0 would pass it while pinning
+  // became invisible app-wide. These assert what a human actually sees:
+  //   • ACCENT INK on the pinned pin and muted on every other — inline, so jsdom reads it directly.
+  //   • FULL OPACITY + the 45° rotate, and the `:not([data-pinned="true"])` that keeps the hover
+  //     rule from dimming a pinned pin to .65. jsdom runs no cascade, so the rule TEXT is the
+  //     assertable artefact — and that `:not()` is the whole reason the pinned pin stays solid.
+  it("paints the pinned pin solid accent ink, held at full opacity — pinning's only remaining tell", () => {
+    renderTabs({ pinnedProjectId: "website" });
+    expect(screen.getByTestId("pin-website").style.color).toBe(C.accentInk);
+    expect(screen.getByTestId("pin-sparkle").style.color).toBe(C.muted);
+    expect(C.accentInk).not.toBe(C.muted);
+
+    const css = document.getElementById("concierge-tabs-styles")!.textContent!;
+    // The pinned pin's own rule: fully opaque and rotated, so it reads as a driven-in pin.
+    expect(css).toMatch(/\.concierge-tab-pin\[data-pinned="true"\][^}]*opacity:\s*1/);
+    expect(css).toMatch(/\.concierge-tab-pin\[data-pinned="true"\][^}]*rotate\(45deg\)/);
+    // …and BOTH reveal selectors EXCLUDE it, or the pinned pin gets dimmed to .65 the moment a
+    // neighbouring tab is hovered or focused. `:focus-within` is checked as hard as `:hover`
+    // because it is the MORE dangerous of the two: `.concierge-tab:focus-within
+    // .concierge-tab-pin` scores (0,3,0) against the pinned rule's (0,2,0), so dropping the
+    // `:not()` from that line alone wins the cascade outright (roborev 57364).
+    const revealRules = css.split("\n").filter((l) => /(:hover|:focus-within) \.concierge-tab-pin/.test(l));
+    // Assert the filter MATCHED before looping: a zero-match filter runs zero assertions and passes
+    // vacuously, so a rename or a reflow of these selectors would silently retire this check.
+    expect(revealRules).toHaveLength(2);
+    for (const rule of revealRules) expect(rule).toContain(':not([data-pinned="true"])');
+  });
+
   it("injects the hover-reveal stylesheet exactly once", () => {
     renderTabs();
     renderTabs(); // a second mount must not duplicate the <style>

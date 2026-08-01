@@ -22,10 +22,6 @@ import type { Attachment, TextBlock } from "../composer/attachments";
 // and creates no subscription, no import cycle and no runtime dependency. Naming the store's own
 // shape here is what stops the column and the store drifting into two definitions of one thing.
 import type { MountedThread } from "../../stores/mountedThreadStore";
-// The header line's per-project shape lives with the component that DERIVES it (ScopeVitals owns
-// the pure text rules the founder's strings are pinned against), and is re-exported here so the
-// column's contract still hands consumers one place to import from.
-import type { ProjectNeedsYou } from "./ScopeVitals";
 // The @-mention shapes live with the pure module that owns the matching rules (./mentions — no
 // React, no stores), for the same reason `Attachment` lives with the composer's model: one
 // declaration, so the composer that produces a mention and the bubble that draws it cannot drift
@@ -41,7 +37,22 @@ import type { ReplyAnchor } from "./replyAnchors";
 import type { SendTrayModel } from "./SendModeTray";
 import type { SendMode } from "../../voice/sendMode";
 
-export type { ProjectNeedsYou };
+/** One project's share of the Needs-you total, as the column is handed it.
+ *
+ *  It used to live with the header component that DERIVED a text line from it (`ScopeVitals`), and
+ *  moved here when that component was deleted — the header now prints nothing but the red pill
+ *  (bead sparkle-ircc3). The SHAPE outlived the line: `ConciergeHost` still builds this split from
+ *  `feed.projects[].scopedCounts.needs_you`, so it lives in the contract module rather than being
+ *  deleted along with the one renderer that happened to read it. */
+export interface ProjectNeedsYou {
+  projectId: string;
+  projectName: string;
+  /** This project's share of `vitals.needs_you` (feed.projects[].scopedCounts.needs_you). */
+  needsYou: number;
+  /** True for the project whose tab is selected — the segment that read "here". */
+  isActive: boolean;
+}
+
 export type { ConciergeMention, MentionAgent };
 export type { ReplyAnchor };
 export type { SendTrayModel };
@@ -311,16 +322,21 @@ export interface ConciergeReceipt {
 
 /** Everything the column renders, supplied by the integration layer. */
 export interface ConciergeViewModel {
-  /** Pinned → "Pinned to <name>" in gold; absent → "All projects". Hand it the FULL folder name:
-   *  the header spends its own width budget on it (ScopeVitals `shortProjectName`) and keeps the
-   *  whole thing on hover, so truncating here would only lose the recoverable half. */
+  /** Which projects the column is watching. STILL FED, NO LONGER PRINTED: the header used to read
+   *  "Pinned to <name>" / "All projects" here and the founder asked for that line gone (bead
+   *  sparkle-ircc3), so nothing in this directory renders it. Pinning stays visible on the pinned
+   *  project's TAB — a solid, rotated, accent-ink pin held at full opacity (ProjectTabs.tsx). Hand
+   *  it the FULL folder name regardless; a consumer that starts stating the scope again should get
+   *  the whole thing and spend its own width budget on it. */
   scope: { pinnedProjectName?: string };
-  /** In-scope per-band counts. The header states only `needs_you` (nothing → "all calm") — see
-   *  ScopeVitals' header for why `running` and `done` are carried but not printed. */
+  /** In-scope per-band counts. The header states only `needs_you`, and only as the red filter
+   *  pill's numeral — `running` and `done` are carried for consumers that want them and are
+   *  deliberately never printed beside the wordmark. */
   vitals: Record<StatusBand, number>;
-  /** The per-project split of `vitals.needs_you`, worst project first once rendered. Column one is
-   *  the GLOBAL index (PRD §2a, answered 2026-07-28), so its one line reads across projects while
-   *  column two stays scoped to the selected one. Absent → the line states the undivided total. */
+  /** The per-project split of `vitals.needs_you`, worst project first. Column one is the GLOBAL
+   *  index (PRD §2a, answered 2026-07-28), so it accounts across projects while column two stays
+   *  scoped to the selected one. STILL FED, NO LONGER PRINTED: the header's per-project segments
+   *  ("2 here · 1 in mobile") went with the scope line in bead sparkle-ircc3. */
   needsYouByProject?: ProjectNeedsYou[];
   /** The thread, oldest first. Nudges are messages of kind "nudge". */
   messages: ConciergeMessage[];
@@ -403,10 +419,14 @@ export interface ConciergeController {
   /** A digest line was clicked — open that project's tab and reveal its lead agent. This is the
    *  handoff to column two that the digest exists to make (bead sparkle-4562.4). */
   onDigestClick?(digest: ConciergeDigestMessage): void;
-  /** A header segment naming ANOTHER project was clicked ("1 in mobile"): switch to that project.
-   *  Switch ONLY — no agent is named by a count, so nothing may be selected on its behalf. Bead
-   *  `sparkle-vohh` fixed the mirror-image bug (a nudge selected an agent without switching
-   *  project); this must not reintroduce its other half. */
+  /** Switch to the named project. Switch ONLY — no agent is named by a count, so nothing may be
+   *  selected on its behalf. Bead `sparkle-vohh` fixed the mirror-image bug (a nudge selected an
+   *  agent without switching project); this must not reintroduce its other half.
+   *
+   *  STILL SUPPLIED, NO LONGER CALLED FROM THIS DIRECTORY: its one caller was the header's
+   *  per-project segments ("1 in mobile"), deleted with the scope line in bead sparkle-ircc3.
+   *  `ConciergeHost` still wires it, so a future cross-project affordance has the callback ready
+   *  rather than having to re-derive the switch-without-selecting rule above. */
   onProjectClick?(projectId: string): void;
   /** Something in the thread reached the clipboard: the user's own selection, or a whole answer via
    *  its copy button (PRD 1 §1/§2).
@@ -434,7 +454,7 @@ export interface ConciergeController {
   onRevealAgent?(agentId: string): void;
   /** The header's 8-dot grip was used: move the concierge to the OTHER side of the shell. Optional,
    *  and the grip renders only when it is supplied — a grip with nowhere to drag to is an
-   *  affordance that lies, the same rule ScopeVitals' segment buttons already follow. */
+   *  affordance that lies, the same rule the header's other optional controls follow. */
   onMoveSide?(): void;
   /** The header's red pill was pressed: toggle the GLOBAL "show only what needs you" filter. It
    *  focuses every open column at once, which is why it is a shell gesture rather than something

@@ -32,7 +32,6 @@ import { ConciergeThread } from "./ConciergeThread";
 import { MountedAgentThread } from "./MountedAgentThread";
 import { ConciergeTopRight } from "./KebabMenu";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
-import { ScopeVitals } from "./ScopeVitals";
 import { KeyPill } from "./KeyPill";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps } from "./types";
@@ -96,7 +95,7 @@ const pillStyle = (edge: string) =>
  * It moves the concierge between the sides of the shell, which is a thing only the shell can do —
  * so this reports the gesture and renders nothing about the outcome, like every other control in
  * this column. Rendered only when a handler is supplied: a grip with nowhere to drag to is an
- * affordance that lies (the same rule ScopeVitals' segment buttons follow).
+ * affordance that lies (the same rule the needs-you pill follows one slot over).
  *
  * A BUTTON, not a bare drag surface. The gesture the mock draws is a drag, but a drag-only control
  * is unreachable by keyboard and by assistive tech, and there are exactly two destinations — so
@@ -302,19 +301,32 @@ export function ConciergeColumn({
       }}
     >
       {/* ── `.ahd` — ONE ROW ────────────────────────────────────────────────────────────────────
-          wordmark · 8-dot grip · scope pill · needs-you filter · PR/merge pill · avatar · kebab.
+          wordmark · 8-dot grip · needs-you pill · PR/merge slot · avatar · kebab.
 
           The founder asked for this consolidation explicitly, and the reason it is worth a whole
-          restructure is that the shell used to SCATTER these: the scope line had its own centred
-          block, the credit pill shared a row with the mark, the avatar and kebab lived over in the
-          project tabs bar, and there was no global "just show me what needs me" control anywhere.
-          Gathering them costs one row of header height — the column's scarcest space, since
-          everything below it is the thread — and it puts every cross-project control in the one
-          column that is about every project.
+          restructure is that the shell used to SCATTER these: the credit pill shared a row with the
+          mark, the avatar and kebab lived over in the project tabs bar, and there was no global
+          "just show me what needs me" control anywhere. Gathering them costs one row of header
+          height — the column's scarcest space, since everything below it is the thread — and it
+          puts every cross-project control in the one column that is about every project.
 
-          Nothing here is a second rendering of something that exists elsewhere. The scope pill IS
-          ScopeVitals (`dense`), the avatar and kebab ARE `ConciergeTopRight`, and the counts come
-          off the same view-model the thread does. */}
+          AND THE ROW IS OTHERWISE SILENT (bead sparkle-ircc3). A scope/vitals line used to sit
+          between the grip and the pill — "All projects · 2 here · 1 in mobile", "Pinned to <name> ·
+          all calm" — and the founder asked for it gone TWICE, the second time about the pinned
+          variant: "It should only be showing the red dot pill when there are issues. It shouldn't
+          say anything else next to the sparkle logo." So the CALM state is the wordmark alone, and
+          the needs-you pill is the one thing allowed to appear beside it. Do not reintroduce a
+          status line here in any width — the previous fix made it narrower rather than absent,
+          which is what earned the second ask. `ConciergeColumn.header.test.tsx` pins the row's
+          whole `textContent` in the calm, alarm and pinned cases.
+
+          Pinning is still VISIBLE, just not here: the pinned project's tab carries a solid,
+          45°-rotated, `C.accentInk` pin held at full opacity while every other tab's is hidden
+          until hover (ProjectTabs.tsx, `.concierge-tab-pin[data-pinned="true"]`).
+
+          Nothing here is a second rendering of something that exists elsewhere. The avatar and
+          kebab ARE `ConciergeTopRight`, and the count comes off the same view-model the thread
+          does. */}
       <div
         data-testid="concierge-header"
         style={{
@@ -342,14 +354,25 @@ export function ConciergeColumn({
             screen. Still the same masked asset and the same accessible name. */}
         <SparkleLogoLink height={WORDMARK_H} fill={wordmarkRamp(mode)} />
         {controller.onMoveSide && <ConciergeGrip onMoveSide={controller.onMoveSide} />}
-        {/* Scope + who needs you (`All projects · 2 here · 1 in mobile`), inline. */}
-        <ScopeVitals
-          dense
-          pinnedProjectName={model.scope.pinnedProjectName}
-          counts={model.vitals}
-          byProject={model.needsYouByProject}
-          onProjectClick={controller.onProjectClick}
-        />
+        {/* THE ROW'S ONLY FLEXIBLE CHILD, and the reason it is an empty box rather than nothing.
+            The deleted scope line carried `flex: "1 1 auto"` and was the one item here that could
+            give way; every remaining child is fixed-size (`ConciergeGrip` is `flex: "0 0 auto"`,
+            the PR slot and `ConciergeTopRight` size to their content) and this row sets no
+            `justifyContent`. So deleting the line without replacing its GROWTH packs the whole row
+            left: the PR chip, the avatar and the kebab leave the right edge and crowd up against
+            the wordmark, with dead space beside them — the opposite of what the founder asked for
+            (roborev 57364).
+
+            A spacer rather than `marginLeft: "auto"` on the right cluster, because the pill in
+            front of it is CONDITIONAL: hang the auto margin on the first right-hand element and the
+            row re-packs left in exactly the calm state this bead is about. This box is
+            unconditional, states nothing, and is `aria-hidden` so it adds no accessible node.
+
+            CAUGHT BY PHOTOGRAPHING THE HEADER, not by the suite — and that is the lesson worth
+            keeping. Every assertion the scope-line deletion added is about TEXT (`textContent`,
+            absent testids), and none of them can see where a box SITS, so the regression was fully
+            green. The testid above exists so that is no longer true. */}
+        <div data-testid="concierge-header-spacer" aria-hidden style={{ flex: "1 1 auto", minWidth: 0 }} />
         {/* THE GLOBAL NEEDS-YOU FILTER — the red pill. It focuses every open column at once, where
             a build column's own chips filter only themselves; that split is why it lives here and
             not there.

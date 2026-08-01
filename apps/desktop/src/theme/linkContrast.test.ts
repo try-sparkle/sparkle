@@ -8,7 +8,7 @@
 //   • `C.accent`  #34e0f0 — StatusFilterBar's "Reset", AgentSidebar's "Show all".   1.48–1.61:1
 //   • `C.violet`  #8b6df0 — OpenPrMenu's PR chip and its per-PR "View on GitHub".   3.50–3.79:1
 //   • `C.teal`    #2f6bff — RefillLink's "Refill", in the composer and the sidebar. 4.30–4.50:1
-//   • `C.sienna`  #e0533f — ScopeVitals' link-shaped project button.                3.66–3.83:1
+//   • `C.sienna`  #e0533f — the concierge header's needs-you label (band red as TEXT). 3.66–3.83:1
 //
 // The `C.teal` one is the reason this file measures RATIOS rather than asserting hex values: at
 // 4.50:1 on pure white it is a rounding error away from passing, and it FAILS the moment the same
@@ -79,7 +79,7 @@ const LINK_INKS: ReadonlyArray<readonly [keyof (typeof THEME_HEX)["light"], stri
   ["accentInk", "Markdown <a>, BoardView 'Clear', Composer 'Manage', ApprovalNudge, 'Reset', 'Show all'"],
   ["tealInk", "RefillLink 'Refill'"],
   ["violetInk", "OpenPrMenu PR chip + per-PR 'View on GitHub'"],
-  ["dangerInk", "ScopeVitals' link-shaped project button"],
+  ["dangerInk", "the concierge header's needs-you filter pill label"],
   ["muted", "AuthGate, CloseAgentPrompt, StatusStrip, .settings-link-btn"],
   ["conciergeMuted", "ApprovalPrompt's 'why' disclosure"],
   ["cream", "AgentPill's label"],

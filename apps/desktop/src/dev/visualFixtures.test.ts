@@ -15,6 +15,7 @@ import {
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
+import { goalStateOf } from "../engine/agentGoal";
 import type { Project } from "../types";
 import { createJSONStorage } from "zustand/middleware";
 
@@ -71,6 +72,76 @@ describe("buildVisualFixture", () => {
   it("selects an agent, so captures show the selected-row geometry", () => {
     const { project } = buildVisualFixture();
     expect(project.agents.some((a) => a.id === project.selectedAgentId)).toBe(true);
+  });
+
+  // The capture is the only thing that can answer "can the founder see a goal on the row", and it
+  // can only answer it about states the roster actually contains. Before bead sparkle-6kz9q the
+  // roster had NO goals at all, so the agent-sidebar shot was identical with the feature working
+  // and with it entirely absent. These two assertions are what stop that returning: they pin the
+  // COVERAGE the screenshot depends on, not the fixture's wording.
+  it("carries a goal in each of the four states the row must distinguish", () => {
+    const { project } = buildVisualFixture();
+    const states = project.agents
+      .map((a) => goalStateOf(a.goal, FIXTURE_NOW))
+      .filter((s) => s !== "none");
+    for (const want of ["unmet", "met", "expired", "escalated"] as const) {
+      expect(states, `no fixture agent renders a ${want} goal`).toContain(want);
+    }
+  });
+
+  it("keeps every goal on a PHOTOGRAPHABLE row — never on a nested worker", () => {
+    // The invariant the whole table rests on, and it was verified by hand and asserted nowhere
+    // (roborev 57429). A worker under a collapsed head renders as a one-line PEEK (AgentSidebar's
+    // "THE PEEK"), not an AgentRow, so it has no goal chip: a goal parked there is invisible in the
+    // very capture this fixture exists to feed. That is not hypothetical — it happened, and the
+    // amber `expired` mark disappeared from the shot.
+    //
+    // The per-kind pairing test below does NOT catch it: with `expired` moved onto `vfx-agent-2`,
+    // `vfx-agent-3` is still a goal-less nested-worker control and `build:top` still pairs, so the
+    // suite stays green while the state stops being photographable. This is the assertion that
+    // makes that red.
+    const { project } = buildVisualFixture();
+    for (const a of project.agents) {
+      if (!a.goal) continue;
+      expect(
+        a.parentId,
+        `${a.id} carries a goal but is nested — it renders as a peek, not a row`,
+      ).toBeNull();
+    }
+  });
+
+  it("pairs every goal-bearing agent kind with a SAME-KIND goal-less control", () => {
+    // `some(a => a.goal === undefined)` is not enough, and the weaker version of this test passed
+    // while the property failed (roborev 57331): the only goal-less rows were the two nested
+    // WORKERS, and every goal sat on a top-level BUILD row. "Has a goal" was therefore perfectly
+    // confounded with "is a top-level build row", so a capture could not show which of the two a
+    // visible difference came from — the exact question the fixture exists to answer.
+    //
+    // A control has to differ in the ONE variable under test, so the assertion is per nesting
+    // level: whatever kind of row carries a goal, a row of that same kind must lack one.
+    const { project } = buildVisualFixture();
+    const kindOf = (a: (typeof project.agents)[number]) =>
+      `${a.kind}:${a.parentId === null ? "top" : "nested"}`;
+    const withGoal = new Set(project.agents.filter((a) => a.goal).map(kindOf));
+    const without = new Set(project.agents.filter((a) => !a.goal).map(kindOf));
+    expect(withGoal.size).toBeGreaterThan(0);
+    for (const k of withGoal) {
+      expect(without, `no goal-less control among ${k} rows`).toContain(k);
+    }
+  });
+
+  it("expresses every goal timestamp as an offset from the pinned instant", () => {
+    // Same rule as `carries no wall-clock value` above, for the fields that test does not walk.
+    // `goalStateOf` and the "3h 20m left" readout are both `now`-relative, so a wall-clock goal
+    // would change the row's own TEXT between two runs of the same capture.
+    const { project } = buildVisualFixture();
+    const stamps = project.agents.flatMap((a) =>
+      a.goal ? [a.goal.setAt, a.goal.metAt, a.goal.escalatedAt] : [],
+    );
+    expect(stamps.length).toBeGreaterThan(0);
+    for (const t of stamps) {
+      if (t !== undefined) expect(t).toBeLessThanOrEqual(FIXTURE_NOW);
+    }
   });
 
   it("points every worker at a build parent that exists", () => {

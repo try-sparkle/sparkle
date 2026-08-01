@@ -21,7 +21,9 @@
 //
 // THE SECOND HALF, same root cause: `feed.scopedCounts` counted every un-muted in-scope agent, so a
 // red worker AND the orchestrator that inherited its red were counted twice for one piece of work —
-// the vitals line said "2 Need you" over a thread holding one card.
+// the header said "2 Need you" over a thread holding one card. (That sentence lived on a vitals
+// line beside the wordmark until bead sparkle-ircc3 deleted it; the header states the same number
+// on the red needs-you pill now, and this file's invariant is unchanged.)
 //
 // The rule that closes both: an agent is REPRESENTED ELSEWHERE when a present ancestor already
 // carries its band. Represented → counted once, at the row. Not represented → it surfaces itself.
@@ -393,16 +395,23 @@ describe("no red agent falls through the floor", () => {
 });
 
 describe("column one states ONE number", () => {
-  /** The vitals line's "N Need you", read off the rendered header.
+  /** The Needs-you number the header states, read off the rendered header.
    *
-   *  By LABEL, not by text: the header collapsed to one line on 2026-07-27 and the count is now a
-   *  red status dot plus a bare number, with the inflected sentence surviving as the dot's
-   *  accessible name. Same string, same shared `bandCountLabel` — it just isn't printed any more. */
+   *  It used to be the vitals line's status dot, read by its `bandCountLabel` accessible name. Bead
+   *  sparkle-ircc3 deleted that line — nothing may appear beside the Sparkle wordmark but the red
+   *  pill — so the ONE place column one still states this number is the pill itself, as its bare
+   *  numeral. This file's subject is unchanged: whatever number the header states, the thread must
+   *  account for exactly that many items.
+   *
+   *  ZERO reads as an absent pill, which is the same fact stated by omission: a filter with nothing
+   *  to hide does not render. So a header that stopped stating the count at all fails the
+   *  `toBeGreaterThan(3)` row below rather than passing by silence. */
   const vitalsNeedsYou = (): number => {
-    for (let n = 0; n <= 40; n++) {
-      if (screen.queryByLabelText(bandCountLabel("needs_you", n))) return n;
-    }
-    throw new Error("no needs_you vitals part rendered");
+    const pill = screen.queryByTestId("concierge-needs-filter");
+    if (!pill) return 0;
+    const n = Number(pill.textContent);
+    if (!Number.isInteger(n)) throw new Error(`unreadable needs-you count: ${pill.textContent}`);
+    return n;
   };
 
   // The double-count that made the two numbers disagree: `scopedCounts` counted the worker AND the
@@ -418,8 +427,8 @@ describe("column one states ONE number", () => {
 
   // The general statement, over the fleet that mixes every shape at once: bubbled workers,
   // suppressed workers, a parentless one, a dangling parent, two projects and two bands. Whatever
-  // the vitals line says, the thread accounts for exactly that many items.
-  it("the vitals number equals what the thread accounts for, across a mixed fleet", () => {
+  // the header says, the thread accounts for exactly that many items.
+  it("the header's number equals what the thread accounts for, across a mixed fleet", () => {
     const web = projectOf("p1", "web", [
       tab("w-a"), //    idle, but inherits w-x's red
       tab("w-b"), //    blocked on its own

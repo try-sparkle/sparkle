@@ -7,8 +7,10 @@
 //
 // That is exactly the property a future refactor breaks silently ("the gate is shut, render the
 // upsell and nothing else"), so it is asserted here rather than left implied:
-//   1. ScopeVitals, the needs-you counts, and the per-project segments all keep working, and the
-//      segment click still routes through the controller.
+//   1. The needs-you readout keeps working and its control still routes through the shell. Since
+//      bead sparkle-ircc3 that readout is the red filter pill and nothing else — the scope/vitals
+//      line beside the wordmark was deleted, so what a locked column must still show is the COUNT
+//      and a working filter, not a sentence.
 //   2. The composer is GONE, so no send can even be attempted while gated — the paid `claude -p`
 //      brain can never be reached from a column in this state.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -34,7 +36,6 @@ import {
   _resetConciergeLivenessForTests,
   noteConciergeFailed,
 } from "../../services/conciergeLiveness";
-import { switchLabel } from "./ScopeVitals";
 import { useAuthStore } from "../../stores/authStore";
 import { CONCIERGE_THREAD_TESTID } from "../../engine/composeBoxHeight";
 import type { ConciergeController, ConciergeViewModel } from "./types";
@@ -58,6 +59,10 @@ function controller(): ConciergeController {
     onNudgeClick: vi.fn(),
     onNudgeAction: vi.fn(),
     onProjectClick: vi.fn(),
+    // The free half's ONE control since bead sparkle-ircc3. It is optional, and the pill does not
+    // render without it — so a locked-column test that omitted it would assert the readout is
+    // missing for the wrong reason and pass while the gate was over-reaching.
+    onNeedsYouFilterToggle: vi.fn(),
   };
 }
 
@@ -81,23 +86,22 @@ function makeConciergeUnavailable() {
 }
 
 describe("ConciergeColumn with AI enhancements locked — the FREE half stays live", () => {
-  it("still renders the status readout: the scope line and the needs-you count", () => {
+  it("still renders the status readout: the needs-you count, on the red pill", () => {
     render(<ConciergeColumn model={model} controller={controller()} />);
-    // The FULL split, not just a total: who is waiting and where. Exactly what the mock's column
-    // shows above the lock, and exactly what a "render the upsell and nothing else" refactor loses.
-    expect(screen.getByTestId("concierge-vitals-line").textContent).toBe(
-      "All projects · 1 here · 1 in api · 1 in docs",
-    );
-    expect(screen.getByTestId("concierge-needs-dot")).toBeTruthy();
-    expect(screen.getByLabelText("3 Need you")).toBeTruthy();
+    // THE COUNT SURVIVES THE GATE. It is derived from local app state and costs nothing to run, so
+    // a shut gate has no reason to take it away — and "render the upsell and nothing else" is the
+    // refactor that does exactly that. The pill states the whole in-scope total (3, across web/api/
+    // docs), and names it for assistive tech too.
+    const pill = screen.getByTestId("concierge-needs-filter");
+    expect(pill.textContent).toBe("3");
+    expect(pill.getAttribute("aria-label")).toBe("Show only what needs you (3)");
   });
 
-  it("still renders the per-project segments, and clicking one still switches projects", () => {
+  it("still routes the filter through the shell — the free control is live, not decoration", () => {
     const c = controller();
     render(<ConciergeColumn model={model} controller={c} />);
-    const seg = screen.getByRole("button", { name: switchLabel("api", 1) });
-    fireEvent.click(seg);
-    expect(c.onProjectClick).toHaveBeenCalledWith("p2");
+    fireEvent.click(screen.getByTestId("concierge-needs-filter"));
+    expect(c.onNeedsYouFilterToggle).toHaveBeenCalled();
   });
 
   it("still renders a search slot the host hands it — the free chrome is untouched", () => {

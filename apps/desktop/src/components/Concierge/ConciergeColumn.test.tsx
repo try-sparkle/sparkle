@@ -63,7 +63,7 @@ function controller(): ConciergeController {
 }
 
 describe("ConciergeColumn — view-model → rendered output", () => {
-  it("renders the brand mark, scope, vitals, and every message kind", () => {
+  it("renders the brand mark, no scope line, and every message kind", () => {
     const { container } = render(<ConciergeColumn model={model} controller={controller()} />);
     // The mark is the Sparkle.ai LOGO, sharing the header's one row with the credit pill — see
     // SparkleLogo.placement.test for the one-mark contract and the corner-to-corner placement.
@@ -72,10 +72,13 @@ describe("ConciergeColumn — view-model → rendered output", () => {
     // the accessible name moved from `alt` to `role="img"` + `aria-label`. Same name, no longer an
     // image element.
     expect(screen.getByRole("img", { name: "Sparkle" })).toBeTruthy();
-    // ONE header line now, not two: scope + the Needs-you count, with `2 Running` deliberately
-    // absent (founder, 2026-07-27 — see ScopeVitals' header). The dot carries the words.
-    expect(screen.getByTestId("concierge-vitals-line").textContent).toBe("All projects · 1");
-    expect(screen.getByLabelText("1 Needs you")).toBeTruthy();
+    // NO header line at all now (bead sparkle-ircc3): the row that read "All projects · 1" is gone,
+    // and the count survives only as the red needs-you pill's numeral. `2 Running` was already
+    // deliberately absent (founder, 2026-07-27) and stays absent — the header states one band or
+    // nothing. ConciergeColumn.header.test.tsx pins the whole row's text in all three states.
+    expect(screen.queryByTestId("concierge-vitals-line")).toBeNull();
+    expect(screen.queryByTestId("concierge-needs-dot")).toBeNull();
+    expect(container.textContent).not.toContain("All projects · 1");
     expect(container.textContent).not.toContain("2 Running");
     expect(screen.getByText("Morning — I'm watching every open project.")).toBeTruthy();
     expect(screen.getByText("Thanks, keep me posted.")).toBeTruthy();

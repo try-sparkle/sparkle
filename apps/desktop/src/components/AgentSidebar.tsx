@@ -24,9 +24,13 @@ import {
   FiPlus,
   FiMinus,
   FiAlertTriangle,
+  FiCheckCircle,
   FiRepeat,
   FiTarget,
+  FiClock,
+  FiAlertOctagon,
 } from "react-icons/fi";
+import type { IconType } from "react-icons";
 import { C, AGENT_STATUS, FONT_WEIGHT, ON_BRAND_FILL, DANGER, statusInk } from "../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { listMyTickets, bannerFromTickets, TICKET_CREATED_EVENT, type TicketStatus } from "../services/supportApi";
@@ -126,6 +130,7 @@ import {
   stallInputsFor,
   thrashChipLabel,
 } from "./rowAttention";
+import type { GoalBadge } from "./rowAttention";
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
 import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
@@ -3780,6 +3785,80 @@ function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): boolean {
   );
 }
 
+// THE GOAL CHIP'S FOUR STATES, as lookups keyed by `GoalBadge.state` (bead sparkle-6kz9q).
+// Split out of the row so the treatments sit side by side and the ordering claim — escalated is the
+// loudest, expired next, met and unmet quiet — is READABLE rather than buried in a ternary chain.
+// Keyed by the state union, so adding a goal state to rowAttention fails the typecheck here instead
+// of silently rendering an unstyled chip.
+type GoalChipState = GoalBadge["state"];
+
+/** THE MARK IS SILENT IN EVERY STATE, AND THAT IS A MEASURED DECISION — NOT A TIMID ONE.
+ *
+ *  The first cut of this gave `escalated` and `expired` visible words, on the reasoning that the two
+ *  states which are somebody's PROBLEM had earned the space. Photographing the row is what settled
+ *  it: at a 440px column an escalated row rendered `◎ ⚠ aι` and an expired one `◎ Goa ⚠ work`. The
+ *  chips were not merely tight, they had clipped past legibility — and the first version of the fix
+ *  (letting them shrink and ellipsize instead of overflowing) only converted an OVERLAP into two
+ *  unreadable stubs. The row has room for exactly ONE worded chip beside the name and the stage
+ *  chip, and that slot is already spoken for by the STALL chip, which names the outstanding work
+ *  ("PR unmerged", "auto-continue gave up") — strictly more actionable than restating a state.
+ *
+ *  So the goal is a MARK, not a phrase, and the state is carried by GLYPH first and colour second.
+ *  The words are not lost: they are on the chip's `title`, in its accessible name, and in full in
+ *  the detail card.
+ *
+ *  DO NOT reintroduce visible text here without re-photographing the row at 440px. A green suite
+ *  will not tell you: jsdom has no layout engine, so every assertion in this file passes just as
+ *  happily against two chips drawn on top of each other. */
+
+/** THE GLYPH IS THE STATE — colour is the second channel, never the only one.
+ *
+ *  Once the mark went wordless, a constant `FiTarget` in four inks made hue the ONLY thing telling
+ *  a sighted reader "finished" from "handed back" — WCAG 1.4.1, and a regression rather than a
+ *  pre-existing gap, since `escalated` and `expired` used to be readable as text. It also fails
+ *  precisely the founder's stated test ("which have met it, which have let one expire") for anyone
+ *  who cannot separate red, amber and green.
+ *
+ *  A distinct glyph costs the row NOTHING — same 10px slot — so there is no reason to spend the
+ *  accessibility instead. `FiTarget` stays for `unmet` (a goal still being aimed at), and the other
+ *  three each say their own state: a check for done, a clock for out of time, an octagon for
+ *  stopped. `FiAlertOctagon` deliberately rather than `FiAlertTriangle`, which is the STALL chip's
+ *  glyph one slot over — two different facts must not share a shape on the same row. */
+const GOAL_CHIP_ICON: Record<GoalChipState, IconType> = {
+  escalated: FiAlertOctagon,
+  expired: FiClock,
+  met: FiCheckCircle,
+  unmet: FiTarget,
+};
+const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
+  escalated: DANGER,
+  // Amber, not danger: the mandate ran out on unfinished work. Loud, but not the top of the row.
+  expired: C.amberInk,
+  met: C.successInk,
+  unmet: C.accentInk,
+};
+
+/** Escalated is the loudest of the four, and with no words to bold it that has to be carried by the
+ *  MARK. Two px of diameter plus the only DANGER ink in the set reads at a glance without spending
+ *  the horizontal space a phrase would; every other state shares one size so the eye reads the
+ *  bigger one as exceptional rather than as a fifth category. */
+const GOAL_CHIP_SIZE: Record<GoalChipState, number> = {
+  escalated: 12,
+  expired: 10,
+  met: 10,
+  unmet: 10,
+};
+
+/** The state in WORDS, for the accessible name — colour carries it visually, and colour is not a
+ *  channel every reader has. `unmet` borrows the badge's own "active · 3h 20m left" so the remaining
+ *  time is spoken too; the rest are fixed phrases that name the state outright. */
+const GOAL_CHIP_A11Y: Record<GoalChipState, (b: GoalBadge) => string> = {
+  escalated: () => "Goal escalated",
+  expired: () => "Goal expired, never met",
+  met: () => "Goal met",
+  unmet: (b) => `Goal ${b.label.replace(" · ", ", ")}`,
+};
+
 const AgentRow = memo(function AgentRow({
   project,
   a,
@@ -4280,6 +4359,7 @@ const AgentRow = memo(function AgentRow({
   // `isStalled` is the gate, not `verdict !== "finished"`: it is true ONLY for a confident stall, so
   // the `unknown` verdict — idle with git state we never read — raises nothing. A stall claim that
   // fires on missing data trains the human to ignore the signal, which costs more than the stall.
+  const goalBadge = goalBadgeFor(a.goal, clockNow);
   const stallChip = isStalled(stall) ? stallChipFor(stall) : null;
   // `goalOutstanding` gates the no-progress alarm only (three tool-less turns are just a
   // conversation when nothing is outstanding). We genuinely know this — no goal means no goal work —
@@ -4290,7 +4370,6 @@ const AgentRow = memo(function AgentRow({
     quotaBlock: quotaBlockForAgent(a.id, clockNow),
   });
   const thrashLabel = thrashChipLabel(thrash);
-  const goalBadge = goalBadgeFor(a.goal, clockNow);
 
   // Per-agent Claude model (bead sparkle-i6rw). Only claude-terminal kinds get the pill — think
   // (Chief chat) and shell (plain command) tabs never spawn `claude`, so a model is meaningless
@@ -4448,37 +4527,59 @@ const AgentRow = memo(function AgentRow({
     </span>
   ) : null;
 
-  // THE GOAL CHIP, collapsed-row half. Only an ESCALATED goal earns space in the column — that is
-  // the "single most important thing on the screen for this row" case, and it is the one a human
-  // must not have to hover to find. Every other goal state (active with time remaining, met,
-  // expired) reads in the detail card below, where there is room for the goal's own words.
+  // THE GOAL CHIP, collapsed-row half. EVERY goal state earns a mark here — that is bead
+  // sparkle-6kz9q. It used to render for `escalated` ONLY, which made a healthy goal-bearing row
+  // pixel-identical to a goal-less one: the founder scanned a fleet in which all 41 agents carried
+  // a goal, saw nothing, and reasonably concluded the goals were not real. The data was fine; the
+  // column was silent.
+  //
+  // The row is tight, so a MARK in a constant slot means "this agent has a goal", the GLYPH says
+  // which state, the colour reinforces it, and the SIZE keeps escalated the loudest. No visible
+  // words in any state — that is measured, not timid; see GOAL_CHIP_ICON's header for the
+  // photograph that decided it, and for why the glyph and not only the ink carries the state.
   //
   // Note the deliberate overlap with the stall chip: an escalated goal is ALSO a stall cause, so a
-  // resting escalated row shows both. That is not duplication — the stall chip says the row owes
-  // work, this says the goal itself has been handed back, and a WORKING agent (stall verdict
-  // `active`) gets only this one.
-  const goalChipEl =
-    goalBadge?.escalated ? (
-      <span
-        data-testid="row-goal-escalated"
-        title={`Goal: ${goalBadge.text} — ${goalBadge.label}`}
-        aria-label={`Goal escalated — ${goalBadge.text}`}
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 3,
-          flex: "0 0 auto",
-          lineHeight: 1.4,
-          fontSize: 10,
-          fontWeight: FONT_WEIGHT.bold,
-          whiteSpace: "nowrap",
-          color: DANGER,
-        }}
-      >
-        <FiTarget size={10} style={{ flex: "0 0 auto" }} />
-        Goal escalated
-      </span>
-    ) : null;
+  // resting escalated row shows both. That is not duplication — the stall chip spends the row's one
+  // worded slot on the outstanding WORK, this mark says the goal itself has been handed back. They
+  // no longer compete for width, because only one of them has text. A WORKING agent (stall verdict
+  // `active`) gets no stall chip at all, so on those rows this mark is the only goal signal there
+  // is — which is exactly the case bead sparkle-6kz9q was filed about.
+  // Capitalized so JSX renders it as a component rather than the literal element `goalchipicon`.
+  const GoalChipIcon = GOAL_CHIP_ICON[goalBadge?.state ?? "unmet"];
+  const goalChipEl = goalBadge ? (
+    <span
+      // ONE testid for all four states, with the state as a DATA ATTRIBUTE. A per-state testid
+      // would force a reader to know every state's name to ask "does this row have a goal at all",
+      // which is the founder's actual question; and it would leave the state itself assertable only
+      // by sniffing a colour.
+      data-testid="row-goal"
+      data-goal-state={goalBadge.state}
+      title={`Goal: ${goalBadge.text} — ${goalBadge.label}`}
+      // `role="img"`, because for `met`/`unmet` this span's ONLY content is the icon. An
+      // `aria-label` on a bare generic span is not reliably announced; on an `img` it is the
+      // element's accessible name by definition — which is the whole point on the two states that
+      // have no visible text to fall back on.
+      role="img"
+      // The state, NAMED. Colour is not an accessible channel, and the `met`/`unmet` chips have no
+      // visible text at all — without this a screen reader reaches an empty span on the two most
+      // common rows in the fleet.
+      aria-label={`${GOAL_CHIP_A11Y[goalBadge.state](goalBadge)} — ${goalBadge.text}`}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 3,
+        lineHeight: 1.4,
+        fontSize: 10,
+        whiteSpace: "nowrap",
+        color: GOAL_CHIP_COLOR[goalBadge.state],
+        // NEVER SHRINKS. The chip's entire content is the icon, so a shrink factor would clip the
+        // one mark this change exists to make visible, to save ~13px.
+        flex: "0 0 auto",
+      }}
+    >
+      <GoalChipIcon size={GOAL_CHIP_SIZE[goalBadge.state]} style={{ flex: "0 0 auto" }} />
+    </span>
+  ) : null;
 
   // The source-epic pill (spec §8): a small 4px-radius chip on orchestrator rows showing the epic
   // title (ellipsized ~18ch). Clicking it (stopPropagation so it doesn't select the agent) jumps to
