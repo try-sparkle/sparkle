@@ -81,11 +81,16 @@ describe("composeRenderH — the words being spoken lift the box", () => {
   it("LIFTS a dragged height — the one thing that does", () => {
     // `userH` otherwise returns outright, ignoring every measurement. A user who once dragged this
     // box short would keep a box that erases dictation, with nothing on screen to say so.
+    //
+    // To exactly what the draft plus the phrase NEEDS — not `dragged + extra`, which this asserted
+    // while the lift was unconditional. The two differ whenever the box was not already full, and
+    // the difference is overshoot: growth nobody can see, undone on the next settle.
     const dragged = COMPOSE_MIN_H + 20;
+    const typed = 20;
     const extra = 76;
     expect(
-      composeRenderH({ contentH: 20, userH: dragged, availableH: AVAILABLE, interimH: extra }),
-    ).toBe(dragged + extra);
+      composeRenderH({ contentH: typed, userH: dragged, availableH: AVAILABLE, interimH: extra }),
+    ).toBe(typed + COMPOSE_BORDER_H + extra);
   });
 
   it("a long TYPED draft never lifts a dragged box — only speech does", () => {
@@ -130,6 +135,36 @@ describe("composeRenderH — the words being spoken lift the box", () => {
     expect(
       composeRenderH({ contentH: 20, userH: tall, availableH: AVAILABLE, interimH: 96 }),
     ).toBe(tall);
+  });
+
+  it("does not move a dragged box that ALREADY has room for the phrase", () => {
+    // THE OSCILLATION IN THE STABLE BRANCH. `userH + speaking` unconditionally grew every dragged
+    // box on every partial and snapped it back on every settle — several times an utterance — even
+    // though nothing was ever clipped in a roomy box: the mirror is `inset: 0`, so it already fills
+    // the box and every line of it is on screen. Motion with no payoff is the exact defect class
+    // this branch exists to remove.
+    //
+    // Deliberately BELOW the cap (150, not 300): above it the cap bound would pin this assertion on
+    // its own and the test could not tell whether "grow only as far as needed" exists at all.
+    const roomy = 150;
+    const oneTypedLine = 20;
+    expect(
+      composeRenderH({ contentH: oneTypedLine, userH: roomy, availableH: AVAILABLE, interimH: 40 }),
+    ).toBe(roomy);
+  });
+
+  it("still grows a box dragged ABOVE the cap when its draft fills it", () => {
+    // The cap is a bound on the GROWTH, not on the absolute height, and the difference is only
+    // visible here. Expressed as a `Math.max(userH, CAP)` CEILING it makes `userH` its own ceiling
+    // for any box dragged past the cap — which does not bound dictation growth, it disables it, so
+    // the phrase is erased in precisely the boxes the user made roomiest. The earlier test above
+    // cannot catch that: with a one-line draft such a box needs no growth at all.
+    const tall = 260; // dragged past COMPOSE_CAP_H (212)
+    const nearlyFull = 250; // …and a draft that nearly fills it
+    const spoken = 40;
+    expect(
+      composeRenderH({ contentH: nearlyFull, userH: tall, availableH: AVAILABLE, interimH: spoken }),
+    ).toBe(nearlyFull + COMPOSE_BORDER_H + spoken);
   });
 });
 

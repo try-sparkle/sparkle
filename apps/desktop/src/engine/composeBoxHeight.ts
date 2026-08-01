@@ -183,7 +183,24 @@ export function composeRenderH({
   // dragged box may exceed the cap because the user said so, and a spoken sentence may not decide
   // that on their behalf. `max` still bounds everything, so the drag ceiling is never crossed.
   if (userH != null) {
-    return clamp(userH + speaking, COMPOSE_MIN_H, Math.min(max, Math.max(userH, COMPOSE_CAP_H)));
+    // THREE BOUNDS ON ONE NUMBER, each of which is a defect that actually happened.
+    //
+    //   Math.max(userH, needed)  GROW ONLY AS FAR AS NEEDED. `userH + speaking` unconditionally was
+    //                            wrong: a box with room to spare still grew on every partial and
+    //                            snapped back on every settle — an oscillation in the branch that is
+    //                            supposed to be the stable one. Nothing was ever clipped in a roomy
+    //                            box; the mirror is `inset: 0`, so it already filled it.
+    //   userH + allowed          NEVER BY MORE THAN THE SPOKEN LINES ADD. This is what stops a long
+    //                            typed draft riding in on the phrase and overriding the drag.
+    //   allowed ≤ CAP - MIN      NEVER MORE THAN A CAPFUL OF GROWTH — expressed as a bound on the
+    //                            GROWTH, not on the absolute height. `Math.max(userH, CAP)` as a
+    //                            ceiling looked equivalent and was not: for a box dragged ABOVE the
+    //                            cap it makes `userH` its own ceiling, which does not bound
+    //                            dictation growth, it disables it — re-erasing the phrase in exactly
+    //                            the boxes the user made roomiest.
+    const needed = (contentH == null ? COMPOSE_MIN_H : contentH + COMPOSE_BORDER_H) + speaking;
+    const allowed = Math.min(speaking, COMPOSE_CAP_H - COMPOSE_MIN_H);
+    return clamp(Math.min(Math.max(userH, needed), userH + allowed), COMPOSE_MIN_H, max);
   }
   // `contentH` is the raw scrollHeight, which already includes the padding — but not the borders.
   const desired = (contentH == null ? COMPOSE_MIN_H : contentH + COMPOSE_BORDER_H) + speaking;

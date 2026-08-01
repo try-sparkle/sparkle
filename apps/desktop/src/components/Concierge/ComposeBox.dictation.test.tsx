@@ -315,10 +315,11 @@ describe("ComposeBox — the interim is painted IN the prompt bar", () => {
     Object.defineProperty(mirror(), "scrollHeight", { configurable: true, get: () => MIRRORED });
 
     setInterim("a phrase long enough to wrap several times over in a narrow column");
-    // The drag still decides how much of the DRAFT is on screen; it lends back exactly the lines the
-    // live phrase adds, and no more. Asserting the mirror's TOTAL here instead would be asserting
-    // the bug roborev 57354 caught — the typed draft overriding the user's own height.
-    expect(box().style.height).toBe(`${DRAGGED + SPOKEN}px`);
+    // Grown to exactly what the draft plus the phrase NEEDS — not `DRAGGED + SPOKEN`, which this
+    // asserted while the lift was unconditional and which overshoots by however much slack the box
+    // already had. Nor the mirror's TOTAL, which would be the typed draft overriding the user's own
+    // height (roborev 57354). It is the smallest box that shows both.
+    expect(box().style.height).toBe(`${TYPED + 2 + SPOKEN}px`);
 
     // …and the moment it settles the box is the user's again. The floor lasts as long as the words
     // are un-scrollable, not a moment longer.
