@@ -341,16 +341,35 @@ describe("xtermTheme light-mode ANSI palette", () => {
     // file already pins for dark ("flattens hue but PRESERVES luminance ordering"): sixteen slots,
     // two grays, no paper split. Everything about the net follows from it as a consequence rather
     // than as a second constraint.
-    const t = xtermTheme("light", true);
-    expect(t.white, "calm's dark slots are ONE gray — no paper register").toBe(t.blue);
-    expect(t.brightWhite, "…and its bright slots likewise").toBe(t.brightRed);
+    // ALL SIXTEEN, not four exemplars (roborev 57272-M1). The first cut pinned `white`/`blue` and
+    // `brightWhite`/`brightRed` and called that "sixteen slots, two grays" — but `calmAnsi` could
+    // have pointed `green` or `brightCyan` at a THIRD gray with every assertion still passing, so
+    // the contract the comment leans on was not actually pinned. Nothing else closes the gap: the
+    // dark "flattens hue" test runs against dark only and its sets are partial, and the
+    // legibility-palette test only asserts each calm slot DIFFERS from its non-calm value, which a
+    // third gray satisfies too.
+    const t = xtermTheme("light", true) as Record<string, string | undefined>;
+    const levels = new Map<string, Set<string>>([
+      ["dim", new Set()],
+      ["bright", new Set()],
+    ]);
+    for (const slot of ANSI_SLOTS) {
+      const value = t[slot];
+      expect(value, `calm must set light.${slot}`).toBeTruthy();
+      levels.get(slot.startsWith("bright") && slot !== "brightBlack" ? "bright" : "dim")!.add(value!);
+    }
+    const dim = levels.get("dim")!;
+    const bright = levels.get("bright")!;
+    expect([...dim], "calm's dark slots (brightBlack included) are ONE gray — no paper register").toHaveLength(1);
+    expect([...bright], "…and its bright slots likewise").toHaveLength(1);
+    expect([...dim][0], "and the two levels are distinct — that is why there are two").not.toBe(
+      [...bright][0],
+    );
     // The consequence, and the reason the calm floor is >1 rather than off: with one register per
     // level, a cell that paints its background from a slot and leaves the foreground default (or
     // paints both from the same level) is fg == bg — invisible, not merely recessive. Nothing here
-    // requires it to STAY that way; if calm ever gains a paper register these two lines are a
-    // deliberate edit, not a regression, and the net simply stops firing on those cells.
-    expect(contrast(t.white!, t.blue!)).toBe(1);
-    expect(termMinContrastRatio("light", true)).toBeGreaterThan(1);
+    // requires it to STAY that way; if calm ever gains a paper register this test is a deliberate
+    // edit, not a regression, and the net simply stops firing on those cells.
   });
 
   it("still nets the cube while CALM — flattening the sixteen does not reach it", () => {

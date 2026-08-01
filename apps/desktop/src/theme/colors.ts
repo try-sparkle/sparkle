@@ -805,10 +805,13 @@ export const TERM_ANSI_MIN_CONTRAST = 4.5;
  *
  * WHICH IS NOT "the adjuster never fires while calm" — an earlier draft of this comment said that
  * and it was false (roborev 56774-M1). Calm ships two grays across sixteen slots, so the palette
- * necessarily produces combinations it never designed, and some are degenerate: default ink over a
- * `bright`-painted fill is very nearly the same gray, and a dark slot on a dark-slot fill
- * (`\e[44m\e[37m`) is fg == bg exactly — invisible, not merely recessive. (No ratios here, per this
- * file's rule; xtermTheme.test.ts measures calm's single-register structure and the rest follows.)
+ * necessarily produces combinations it never designed, and the sharpest is degenerate: a dark slot
+ * on a dark-slot fill (`\e[44m\e[37m`) is fg == bg exactly — invisible, not merely recessive. That
+ * one follows from a property the test DOES pin (xtermTheme.test.ts asserts all sixteen light calm
+ * slots collapse onto two grays), which is the only reason it is asserted here as fact and not as
+ * prose — an earlier draft also claimed something about ink over a `bright` fill, and that
+ * relationship is measured nowhere and constrained by neither calm floor, so it is gone rather than
+ * left to drift (roborev 57272-M2). No ratios, per this file's rule.
  * Those are not calm working as intended, they are calm having nothing to
  * say about a pair; the net lifting them is the whole reason it exists. What the floor guarantees is
  * narrower and is what xtermTheme.test.ts measures: the pairs calm DOES design — each ink on the
