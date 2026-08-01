@@ -20,6 +20,18 @@
 // One coordination check remains and it is the real half of that concern: an agent the goal runner
 // has a send IN FLIGHT to is skipped, so the two never arrive in the same moment.
 //
+// ── NOT MOUNTED YET, AND SAYING SO HERE IS THE POINT (roborev 57400) ─────────────────────────────
+// `startPusherRunner` and `sweepPushers` have no production caller: the only place they are invoked
+// is `pusherRunner.test.ts`. So nothing in a running app constructs a `StandingDuty` or reads
+// `passHoldReason`, and every condition below is computed and tested but never delivered.
+//
+// This is recorded rather than left implicit because the same gap has now been reported three times
+// from three different layers, each time because a comment described wiring that did not exist. The
+// binding that is missing is small and specific — building the deps at a mount site, with
+// `duties: () => buildStandingDuties({ improvementLastRunAt, improvementIntervalMs, improvementHeldBy })`
+// driven off `passHoldReason` and the settings store — and it lands with the surface that renders
+// these conditions, which is a deliberate follow-up rather than an oversight.
+//
 // ── ATTACH-AT-BIRTH NEEDS NO SPAWN HOOK ──────────────────────────────────────────────────────────
 // A Pusher is not an agent row, so "attaching" is just this sweep covering every build agent from
 // the moment it appears in the roster; the per-partner memory is created lazily on first sight.
@@ -221,7 +233,22 @@ export async function sweepPushers(
   }
 
   // Read ONCE per sweep, so every project's report describes the same moment.
-  const duties = deps.duties();
+  const allDuties = deps.duties();
+
+  // ...AND ASSIGNED TO EXACTLY ONE PROJECT (roborev 57400). A duty is APP-GLOBAL — the hourly pass
+  // belongs to the app, not to a project — but the report loop below is per project, each with its
+  // own `FleetMemory`. Threading the same list into every project raised `duty-overdue` in each of
+  // them independently, so with two projects the identical "the hourly improvement pass is 9h
+  // overdue" paragraph was composed twice; and where both resolve to the SAME recipient (explicitly
+  // supported here — `reportRecipient(projectId)` need not name an agent inside that project) the
+  // founder simply received it twice. It also spent the shared budget a genuinely project-specific
+  // condition might then be refused for.
+  //
+  // Assigned by SORTED projectId rather than by iteration order, so the owner is stable across
+  // sweeps: picking "the first project we happened to walk" would migrate the duty whenever the
+  // roster reordered, and each move would reset that project's two-observation rule and cooldown —
+  // making a permanently-overdue duty re-report forever.
+  const dutyOwner = [...byProject.keys()].sort()[0];
 
   const partners = new Map(state.partners);
 
@@ -373,7 +400,8 @@ export async function sweepPushers(
         // (roborev 56973).
         owned,
         partners,
-        duties,
+        // Only the owning project carries the app-global duties; the rest report agents only.
+        projectId === dutyOwner ? allDuties : [],
       ),
     );
   }

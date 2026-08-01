@@ -840,6 +840,66 @@ describe("standing duties reach the report through the sweep", () => {
     expect(sent).toEqual([]);
   });
 
+  // A duty is APP-GLOBAL but the report loop is per project. Threading it into every project told
+  // the founder the same thing once per project — and twice to the same person where two projects
+  // share a recipient, which this file explicitly supports (roborev 57400). Every other duty test
+  // uses ONE project, which is exactly why none of them caught it.
+  it("tells a shared recipient about a global duty exactly ONCE", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [
+        { agentId: "a", projectId: "p1", label: "Agent A" },
+        { agentId: "b", projectId: "p2", label: "Agent B" },
+      ],
+      duties: () => [overdue],
+      reportRecipient: () => "boss", // both projects report to the same person
+    });
+    await sweepTimes(deps, 2);
+    const mentioning = sent.filter((s) => s.text.includes("logs + beads backlog"));
+    expect(mentioning).toHaveLength(1);
+  });
+
+  it("does not compose the duty paragraph once per project", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [
+        { agentId: "a", projectId: "p1", label: "Agent A" },
+        { agentId: "b", projectId: "p2", label: "Agent B" },
+      ],
+      duties: () => [overdue],
+      reportRecipient: (projectId) => `boss-${projectId}`, // distinct recipients
+    });
+    await sweepTimes(deps, 2);
+    expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
+  });
+
+  // Stable owner: picking "whichever project we walked first" would migrate the duty when the roster
+  // reordered, and each move resets that project's two-observation rule and cooldown — so a
+  // permanently-overdue duty would re-report forever.
+  it("keeps the same owner when the roster order flips", async () => {
+    let flipped = false;
+    const rows = [
+      { agentId: "a", projectId: "p1", label: "Agent A" },
+      { agentId: "b", projectId: "p2", label: "Agent B" },
+    ];
+    const { deps, sent } = fakeDeps({
+      snapshots: () => (flipped ? [...rows].reverse() : rows),
+      duties: () => [overdue],
+      reportRecipient: (projectId) => `boss-${projectId}`,
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st);
+    const first = sent.filter((s) => s.text.includes("logs + beads backlog"));
+    expect(first).toHaveLength(1);
+    flipped = true;
+    // TWO more sweeps, not one: if the owner migrated, the new project needs a second sighting
+    // before the two-observation rule lets it speak — so a single sweep here would pass against the
+    // very bug this test names.
+    st = await sweepPushers(deps, st);
+    await sweepPushers(deps, st);
+    // Still exactly one — the owner did not move and re-open the condition elsewhere.
+    expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
+  });
+
   it("reads duties fresh each sweep, so one that starts late is still picked up", async () => {
     let list: (typeof overdue)[] = [];
     const { deps, sent } = fakeDeps({
