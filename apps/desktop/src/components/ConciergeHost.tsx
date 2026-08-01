@@ -126,6 +126,8 @@ import {
   type ConciergeMention,
 } from "./Concierge/mentions";
 import { buildDigest } from "../services/conciergeDigest";
+import { isSparkleAgentId } from "../services/sparkleAgent";
+import { findKnownAgent } from "../services/knownAgents";
 import { createArrivalOrder, orderByArrival } from "../engine/conciergeStreamOrder";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { useUiStore } from "../stores/uiStore";
@@ -371,6 +373,17 @@ function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: 
 /** Flatten every agent across the feed (used to resolve a nudge back to its source agent). */
 function allAgents(feed: ConciergeFeed): ConciergeAgent[] {
   return feed.projects.flatMap((p) => p.agents);
+}
+
+/** Does THIS window hold a promptable target with this id? Feed membership, OR the app-owned Sparkle
+ *  agent, which is never a feed member (services/knownAgents) but IS a live local PTY whenever its
+ *  pane is mounted — so feed membership ALONE reads the Improve-Sparkle mount as "gone" and strands
+ *  every send at the brain (bead sparkle-0rf5). For any non-sparkle id this is exactly the old
+ *  `allAgents(feed).some(...)` test, so no other target's resolution changes. */
+function isPromptableTarget(feed: ConciergeFeed, id: string | undefined): boolean {
+  if (!id) return false;
+  if (allAgents(feed).some((a) => a.id === id)) return true;
+  return isSparkleAgentId(id) && findKnownAgent(id)?.source === "sparkle";
 }
 
 /**
@@ -976,9 +989,7 @@ export function ConciergeHost({
   // nothing that moves the selection while a send is queued can redirect it.
   const target = useMemo(
     () =>
-      promptTarget && allAgents(feed).some((a) => a.id === promptTarget.agentId)
-        ? promptTarget
-        : null,
+      promptTarget && isPromptableTarget(feed, promptTarget.agentId) ? promptTarget : null,
     [promptTarget, feed],
   );
   // What a send may be ROUTED at: the shown agent only (see promptTargetShown). The suggestions row
@@ -1971,9 +1982,11 @@ export function ConciergeHost({
 
 
 
-  /** Is this agent still in the feed? Absence IS "closed / deleted / project unloaded". */
+  /** Is this agent still reachable? Feed membership — absence IS "closed / deleted / project
+   *  unloaded" — plus the app-owned Sparkle agent, whose live mount is never a feed member
+   *  (isPromptableTarget / bead sparkle-0rf5). Unchanged for every other id. */
   const agentStillExists = useCallback(
-    (id: string | undefined) => !!id && allAgents(feedRef.current).some((a) => a.id === id),
+    (id: string | undefined) => isPromptableTarget(feedRef.current, id),
     [],
   );
 
@@ -2813,6 +2826,24 @@ export function ConciergeHost({
         named && !conciergeAddressed
           ? mentionAgentsRef.current.find((a) => a.id === named.agentId)
           : undefined;
+      // ══ THE IMPROVE-SPARKLE MOUNT IS ITS OWN ADDRESS (bead sparkle-0rf5) ═════════════════════════
+      // The app-owned Sparkle agent is the resolved routing target ONLY while its pane is mounted
+      // (Workspace derives the prompt target from `sparkleAgentId` then and never otherwise), and its
+      // own composer is gone — so the concierge box is the SOLE way into its terminal. `routeMessage`
+      // never aims at a PTY (only the user NAMING an agent may — see conciergeRouter's header), so an
+      // UNADDRESSED send would fall to the brain and never reach the agent the mount exists to talk
+      // to. Treat the mount as exactly that naming gesture: the sparkle target takes the SAME
+      // cancellable, picker-safe addressed path as an `@Name` (armed intent, countdown,
+      // `neverPickerAnswer`). Gated on `!named` so a message the user addressed elsewhere (`@Kraken`)
+      // or to the brain (`@Sparkle`, which sets `named`) is untouched. This is a special-case of the
+      // sparkle SURFACE, deliberately, not a change to what any other mount does — the general
+      // "mounted send routes to the mounted agent" work is still cable-blind (PRD/concierge-mount).
+      const mountAim = targetRef.current;
+      const mountAddress =
+        !named && mountAim && isSparkleAgentId(mountAim.agentId)
+          ? { id: mountAim.agentId, projectId: mountAim.projectId, name: mountAim.name }
+          : undefined;
+      const addressedAgent = mentionedAgent ?? mountAddress;
       // NO GUARD HERE FOR "named but unresolvable", deliberately, and it is worth saying why since it
       // is the obvious thing to add. `named` exists only when the COMPOSER's roster recognised the
       // span, and this lookup uses the same feed — one render, one source — so a recognised name is
@@ -2836,11 +2867,13 @@ export function ConciergeHost({
       if (!autoFiringRef.current) maybePauseOnSubmit();
       const id = nextId("you");
       // A named agent OVERRIDES what happens to be selected — that is the whole point of naming one.
-      const submitted: ConciergePromptTarget | null = mentionedAgent
+      // `addressedAgent` folds in the Improve-Sparkle mount (above), which resolves to the same
+      // `targetRef.current` it is built from, so the fallback is unchanged for every other send.
+      const submitted: ConciergePromptTarget | null = addressedAgent
         ? {
-            projectId: mentionedAgent.projectId,
-            agentId: mentionedAgent.id,
-            name: mentionedAgent.name,
+            projectId: addressedAgent.projectId,
+            agentId: addressedAgent.id,
+            name: addressedAgent.name,
           }
         : targetRef.current;
       // ══ THERE IS NO LONGER A PICKER SHORT-CIRCUIT HERE, AND THERE MUST NOT BE ═══════════════
@@ -2896,7 +2929,7 @@ export function ConciergeHost({
       // Built from the resolved mentions rather than the whole roster, so it strips exactly the
       // spans that were recognised — no second, laxer notion of what a mention looks like.
       const mentionAim: ConciergeMentionAim | null =
-        mentionedAgent && submitted
+        addressedAgent && submitted
           ? (() => {
               const wire = mentionFreeText(text, rosterFromMentions(mentions ?? []));
               return { target: submitted, payload: attachedPayload(wire, staged), text: wire };

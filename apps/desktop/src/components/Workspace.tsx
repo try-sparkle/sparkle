@@ -42,6 +42,7 @@ import {
   shouldWarmSparkleAtLaunch,
   sparkleAgentIdFor,
   sparkleOpenSetWhitelist,
+  SPARKLE_AGENT_NAME,
 } from "../services/sparkleAgent";
 import {
   useCurrentProjectId,
@@ -1257,9 +1258,24 @@ export function Workspace() {
   // no surface left: a target that can't take input simply routes to Sparkle, where the reply is
   // recoverable, rather than sitting inert behind a tooltip. The decision function keeps returning
   // it so the reason is one edit away if a surface ever wants it again.
+  // ══ THE IMPROVE-SPARKLE PANE IS THE FAR END OF THE CABLE (bead sparkle-0rf5) ══════════════════
+  // When the Improve-Sparkle pane owns the shell, a concierge send belongs in ITS terminal, not the
+  // pair's build agent — the pane's own composer was removed, so the concierge box is the only way
+  // in. The Sparkle agent is app-owned and DELIBERATELY never a member of `project.agents`
+  // (services/knownAgents), so it can only reach the compose box's target as an explicit special
+  // case here; `decidePromptTarget` cannot resolve it through the roster lookup. `projectId` is ""
+  // — the dispatcher keys a PTY by agent id ("PTY id === agent id", services/conciergeDispatch), and
+  // this agent owns no project row.
+  const sparkleTarget = useMemo(
+    () =>
+      activeSpecial === "sparkle"
+        ? { projectId: "", agentId: sparkleAgentId, name: SPARKLE_AGENT_NAME }
+        : null,
+    [activeSpecial, sparkleAgentId],
+  );
   const { target: promptTarget } = useMemo(
-    () => decidePromptTarget(wiredProject, wiredAgentId),
-    [wiredProject, wiredAgentId],
+    () => decidePromptTarget(wiredProject, wiredAgentId, sparkleTarget),
+    [wiredProject, wiredAgentId, sparkleTarget],
   );
   // Lets the empty-state start button create a build agent exactly like the sidebar's "+ New Build
   // Agent" row does (same hook → same behavior).
@@ -1458,7 +1474,12 @@ export function Workspace() {
   // selection could never receive anything by itself. The router infers "there is a build agent in
   // view" from this, so ungated it would write an imperative typed while looking at the board into
   // a terminal the user cannot see. See PRD/sparkle/concierge-auto-routing.md §2.
-  const promptTargetShown = !sparkleActive && !boardActive && activeIsOpen;
+  // When the Improve-Sparkle pane is the active surface it IS what the user is looking at, so a send
+  // routes into its terminal (bead sparkle-0rf5). This is the SAME guard that stops an imperative
+  // typed at the Plan board from landing in an unseen terminal — it now admits the sparkle pane
+  // BECAUSE it is on screen, gated on `sparkleOpen` so a mount whose PTY has not come up yet still
+  // routes to the brain (recoverable) rather than a terminal that isn't there.
+  const promptTargetShown = sparkleActive ? sparkleOpen : !boardActive && activeIsOpen;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
   // nothing for you, its terminal TEXT desaturates, so only a screen that wants something from you

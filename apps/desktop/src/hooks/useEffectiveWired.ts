@@ -56,7 +56,16 @@ function useFarEndHasAgent(side: PairSide | null): boolean {
 export function useEffectiveWired(): WiredSide {
   const wired = useCableStore((s) => s.wired);
   const farEndHasAgent = useFarEndHasAgent(wired === "off" ? null : wired);
-  return effectiveWired(wired, farEndHasAgent);
+  // THE IMPROVE-SPARKLE PANE IS A VALID FAR END EVEN WITH ZERO BUILD AGENTS (bead sparkle-0rf5). The
+  // app-owned Sparkle agent is never a `project.agents` member (services/knownAgents), so
+  // `useFarEndHasAgent` — which asks `project.selectedAgentId !== null` — reads the patched side as
+  // empty and `effectiveWired` darkens the cable on the exact surface whose whole purpose is that
+  // connection: the click patches the store, the projection forces the side back to "off", and the
+  // mount is a visual no-op. Counting an active sparkle pane as an occupied far end lights it. (This
+  // rides the GLOBAL `activeSpecial` — the pane is not yet pair-scoped; see the bead — so with two
+  // pairs the patched side is whichever the click chose, which is exactly the side the cable names.)
+  const sparkleActive = useUiStore((s) => s.activeSpecial === "sparkle");
+  return effectiveWired(wired, farEndHasAgent || sparkleActive);
 }
 
 /** Does THIS pair hold a cable that is actually connected? The projected form of `pairIsLive`, for

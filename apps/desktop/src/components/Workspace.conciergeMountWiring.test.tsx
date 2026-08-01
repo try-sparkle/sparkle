@@ -62,12 +62,31 @@ vi.mock("../services/branchStatus", () => ({
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
   projectAgentsStatus: vi.fn(() => Promise.resolve([])),
 }));
+// `__sparkle_self__` is the REAL app-owned Sparkle agent id (services/sparkleAgent.SPARKLE_AGENT_ID),
+// not a placeholder: the routing block below gates on the real `isSparkleAgentId`, which only matches
+// that namespace, so a stand-in like "sparkle" would resolve to a normal agent and route to the brain.
+const SPARKLE_ID = "__sparkle_self__";
 vi.mock("../services/sparkleAgent", async (orig) => ({
   ...(await orig<typeof import("../services/sparkleAgent")>()),
-  sparkleAgentIdFor: () => "sparkle",
+  sparkleAgentIdFor: () => "__sparkle_self__",
   sparkleOpenSetWhitelist: () => [],
   shouldWarmSparkleAtLaunch: () => false,
 }));
+// The Sparkle agent's terminal write is the SIDE EFFECT this suite's routing cases assert — so the
+// PTY dispatcher is spied, and ONLY it: `agentCanAcceptInput`/`onDeferredSendOutcome` stay real so
+// the mount still has to resolve as a promptable local PTY (services/knownAgents) to reach the spy.
+const disp = vi.hoisted(() => ({
+  dispatchConciergeAnswer: vi.fn(async (agentId: string) => ({
+    ok: true,
+    path: "free-text" as const,
+    agentId,
+  })),
+}));
+vi.mock("../services/conciergeDispatch", async (orig) => ({
+  ...(await orig<typeof import("../services/conciergeDispatch")>()),
+  dispatchConciergeAnswer: disp.dispatchConciergeAnswer,
+}));
+vi.mock("../services/dictationControls", () => ({ maybePauseOnSubmit: vi.fn() }));
 // The concierge's PAID brain — stubbed because nothing here sends anything. The column itself still
 // renders in full (thread + composer), which is the point, and the first case below ASSERTS that
 // rather than assuming it.
@@ -115,6 +134,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { AgentTab, Project } from "../types";
 
@@ -208,8 +228,12 @@ beforeEach(() => {
   enableAiEnhancementsForTests();
   resetVisitedProjects();
   resetCable();
+  disp.dispatchConciergeAnswer.mockClear();
 });
 afterEach(() => {
+  // An armed countdown outlives its render (the intent registry is a module singleton) — cancel any
+  // the routing cases left standing so the next case starts from an empty queue.
+  for (const i of armedIntents()) cancelIntent(i.id);
   cleanup();
   resetCable();
 });
@@ -260,5 +284,90 @@ describe("the mount reaches the concierge column, through the real host", () => 
     });
     expect(columnWired()).toBe("off");
     expect(useCableStore.getState().wired).toBe("off");
+  });
+});
+
+// ══ THE ROUTING HALF THE MOUNT WIRING NEVER PINNED (bead sparkle-0rf5) ══════════════════════════
+//
+// The suite above pins the PRESENTATIONAL wire and its own header disclaims the rest: "It does NOT
+// pin that a mounted message is ROUTED to the mounted agent … That is the unbuilt half, and … gets
+// its own coverage when the routing work lands." This is that coverage, for the Improve-Sparkle
+// surface specifically. Two facts the store getter cannot show, both asserted THROUGH the shell:
+//
+//   1. the cable LIGHTS on the app-owned Sparkle mount even with ZERO build agents — the
+//      `project.agents === []` case the bead names, where the old projection forced the side back to
+//      "off" and the mount was a visual no-op;
+//   2. a send ROUTES into the Sparkle agent's terminal — asserted at the PTY dispatcher, the far end
+//      of the shell/dispatch path, not at any intermediate store.
+//
+// The Sparkle pane is the active surface (`activeSpecial === "sparkle"`), its id is in the shared
+// open set so it resolves as a live local PTY (services/knownAgents), and the cable is patched — the
+// exact state `AgentSidebar.onSelectSparkle` leaves behind.
+describe("the Improve-Sparkle mount routes to the Sparkle agent, through the real shell", () => {
+  function mountSparkle(agents: AgentTab[], selectedAgentId: string | null = null) {
+    useProjectStore.setState({
+      projects: [mkProject("p1", "Alpha", agents, selectedAgentId)],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({
+      openAgentIds: [SPARKLE_ID, ...agents.map((a) => a.id)],
+      status: {},
+    } as never);
+    useUiStore.setState({
+      activeSpecial: "sparkle",
+      workModeBySide: { left: "build", right: "build" },
+      pinnedProjectId: null,
+      openProjectIds: null,
+      pairAssignment: {},
+      leftProjectId: null,
+      collapsedOrchestrators: {},
+    } as never);
+    // What the click leaves behind: the cable patched into the pair the row sits in.
+    act(() => useCableStore.getState().patch("right"));
+    render(<Workspace />);
+  }
+
+  /** Type into the CONCIERGE column's own composer and press Send, then let the armed countdown —
+   *  the same cancellable gate an @-addressed send passes through — elapse to the dispatch. */
+  async function sendToMount(text: string) {
+    const ta = within(columnEl()).getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, {
+      target: { value: text, selectionStart: text.length, selectionEnd: text.length },
+    });
+    await act(async () => {
+      fireEvent.click(within(columnEl()).getByRole("button", { name: "Send" }));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      for (const i of armedIntents()) fireIntent(i.id);
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+  }
+
+  it("lights the cable with NO build agents — the visual no-op the bead names", () => {
+    mountSparkle([]);
+    // effectiveWired darkens the cable when the patched side has no selected agent; the Sparkle mount
+    // is a valid far end, so the column stays lit on the patched side. Without the fix this reads
+    // "off" (the reported no-op), which is the transition this case pins.
+    expect(columnWired()).toBe("right");
+  });
+
+  it("routes a concierge send into the Sparkle agent's terminal, with NO build agents", async () => {
+    mountSparkle([]);
+    await sendToMount("tighten the retry backoff");
+    // THE SIDE EFFECT: the PTY dispatcher was driven at the Sparkle agent's own id. Before the fix
+    // the resolved target is null/absent (the Sparkle agent is not a feed member) and the send falls
+    // to the brain — dispatchConciergeAnswer is never called.
+    expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(SPARKLE_ID);
+  });
+
+  it("routes to the Sparkle agent even when build agents exist and one is selected", async () => {
+    // A build agent is present and selected, but the Sparkle pane owns the surface — the send must
+    // still reach Sparkle, not the build agent the pair happens to hold.
+    mountSparkle([mkAgent("a1", "Stripe checkout retry")], "a1");
+    await sendToMount("rename the flag");
+    expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(SPARKLE_ID);
   });
 });

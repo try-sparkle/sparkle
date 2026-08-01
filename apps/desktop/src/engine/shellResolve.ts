@@ -39,10 +39,31 @@ export interface PromptTargetDecision {
   refusal?: string;
 }
 
+/** A surface that OWNS the far end of the cable without being a project tab — today only the
+ *  Improve-Sparkle pane. Its agent is app-owned and DELIBERATELY never a member of `project.agents`
+ *  (services/knownAgents), so it can never resolve through the roster lookup below; it is passed in
+ *  already-resolved because this module reads no stores. */
+export interface SpecialPromptTarget {
+  projectId: string;
+  agentId: string;
+  name: string;
+}
+
 export function decidePromptTarget(
   project: Project | null,
   activeAgentId: string | null,
+  special?: SpecialPromptTarget | null,
 ): PromptTargetDecision {
+  // A SPECIAL SURFACE OWNS THE FAR END (bead sparkle-0rf5). The Improve-Sparkle pane's agent is not a
+  // roster row, so it neither can nor should be resolved against `project.agents` — feeding the pair's
+  // build agent here (or nothing) is what let a mounted concierge send miss the agent entirely. It is
+  // a promptable local PTY (findKnownAgent's `sparkle` arm), so it is a target with no refusal. Wins
+  // over the roster path because when it is set the roster is not what the user is looking at.
+  if (special) {
+    return {
+      target: { projectId: special.projectId, agentId: special.agentId, name: special.name },
+    };
+  }
   if (!project || !activeAgentId) return { target: null };
   const agent: AgentTab | undefined = project.agents.find((a) => a.id === activeAgentId);
   if (!agent) return { target: null };
