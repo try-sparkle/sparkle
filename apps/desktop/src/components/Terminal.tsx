@@ -8,6 +8,8 @@ import { copyToClipboard } from "../clipboard";
 import { C, termMinContrastRatio, xtermTheme } from "../theme/colors";
 import { useResolvedTheme } from "../theme/theme";
 import {
+  TERM_BODY_BASE_SIZE,
+  TERM_BODY_FONT,
   TERM_HAIRLINE,
   TERM_PLANE,
   TERM_RADIUS,
@@ -72,7 +74,11 @@ import { perfMark, perfSpan } from "../perfTrace";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
-const BASE_FONT_SIZE = 13;
+//
+// FROM terminalChrome, not a literal: the mounted concierge composer is set in this same face and
+// size while it is aimed at a terminal (the founder's routing indicator), and two copies of a font
+// stack drift silently — the composer would just stop looking like the terminal, with nothing red.
+const BASE_FONT_SIZE = TERM_BODY_BASE_SIZE;
 
 // When jumping to a prompt's marker, scroll a few rows above it so the matched turn has lead-in
 // context rather than sitting flush at the viewport top.
@@ -614,8 +620,9 @@ export function Terminal({
 
     const term = new XTerm({
       // System monospaces (Menlo/SF Mono) carry full box-drawing glyphs as a fallback;
-      // the Google-Fonts subset of Source Code Pro drops U+2500-block glyphs.
-      fontFamily: '"Source Code Pro", "SF Mono", Menlo, ui-monospace, monospace',
+      // the Google-Fonts subset of Source Code Pro drops U+2500-block glyphs. The stack itself lives
+      // in terminalChrome (TERM_BODY_FONT) because the mounted composer is set in it too.
+      fontFamily: TERM_BODY_FONT,
       // Initial size; the zoom effect below keeps this in sync as the user adjusts it.
       fontSize: Math.round(BASE_FONT_SIZE * zoom),
       // Must be 1.0 so box-drawing verticals (│ ╭ ╰) connect across rows with no gap.

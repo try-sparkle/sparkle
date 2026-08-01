@@ -61,6 +61,42 @@ export const TERM_MONO = FONT_MONO;
 /** `--k-ui` — the system face the whole direction is set in. */
 export const TERM_UI = FONT_UI;
 
+/**
+ * THE TERMINAL BODY'S OWN FACE — the stack xterm renders the session in.
+ *
+ * ══ WHY THIS IS A CONCRETE STACK AND NOT `TERM_MONO` ════════════════════════════════════════════
+ * Every other face on this plane is a CSS var, and re-typing one is the drift `fontTokens.test.ts`
+ * exists to stop. This one cannot be: xterm measures glyph cells itself and reads its `fontFamily`
+ * option as a real font stack, not through the cascade — the same reason its `theme` takes concrete
+ * hex rather than `var()` (see Terminal's XTerm options). So the terminal body has always been a
+ * literal, and the only question is whether there is ONE of it.
+ *
+ * ══ WHY IT MOVED HERE ═══════════════════════════════════════════════════════════════════════════
+ * There is now a second consumer. When the concierge is mounted to a build agent, its composer
+ * routes what you type into that agent's terminal — and the founder asked for the composer to be SET
+ * in this face while it is aimed there, so the typeface itself says where the words are going,
+ * without a label to read. A second copy of the stack in the composer would be exactly the
+ * substitution this file's header warns about, and it would fail silently: the composer would simply
+ * stop looking like the terminal, and nothing would be red.
+ *
+ * ORDER IS LOAD-BEARING. The system monospaces (SF Mono, Menlo) carry the full box-drawing block as a
+ * fallback; the Google-Fonts subset of Source Code Pro drops U+2500. Do not reorder to put a webfont
+ * last "for consistency" — a TUI's borders come apart.
+ */
+export const TERM_BODY_FONT =
+  '"Source Code Pro", "SF Mono", Menlo, ui-monospace, monospace';
+
+/**
+ * The terminal body's font size at zoom 1, in px.
+ *
+ * The composer takes THIS rather than the zoomed value, and that is deliberate rather than a
+ * simplification: per-column zoom is a property of the pane the user scaled, the composer lives in a
+ * different column with its own width, and a compose box that resized itself every time someone
+ * zoomed a terminal would reflow the thread above it for a reason nobody asked for. Matching the
+ * FACE is what makes the typeface legible as the terminal's; matching a zoom level is not.
+ */
+export const TERM_BODY_BASE_SIZE = 13;
+
 /** Primary ink ON the terminal plane. A separate register from the shell's `cream`. */
 export function termInk(resolved: ResolvedTheme): string {
   return BLUEPRINT[resolved].termInk;

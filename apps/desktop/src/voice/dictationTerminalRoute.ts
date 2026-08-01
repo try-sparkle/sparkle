@@ -120,6 +120,47 @@ export type TerminalRouteRefusal =
   /** A live picker, `(y/n)`, or a password prompt is on screen. */
   | "awaiting-input";
 
+/** The refusals that are about THE SCREEN rather than about the text or the agent — the subset any
+ *  write path can ask about, whatever it is writing. */
+export type TerminalScreenRefusal = Extract<
+  TerminalRouteRefusal,
+  "no-viewport" | "alternate-screen" | "awaiting-input"
+>;
+
+/**
+ * MAY ANYTHING BE WRITTEN TO THIS SCREEN? The screen half of {@link classifyTerminalRoute}, split out
+ * so a second caller can ask the same question without inheriting the rest.
+ *
+ * ══ WHY THIS IS SHARED RATHER THAN COPIED ═══════════════════════════════════════════════════════
+ * The concierge composer routes into a terminal too, on two paths: an `@Name` address, and — since
+ * the mounted-composer rule — plain text while the cable is patched to a build agent. Those writes
+ * face exactly the dangers this file was written about: a paste into `vim` normal mode is EXECUTED as
+ * editor commands, and a sentence typed at `[sudo] password for …:` is a credential in the clear.
+ * `dispatchConciergeAnswer` checks neither — it looks for a live PICKER and nothing else — so without
+ * this the composer would have been the unguarded twin of a path guarded to four decimal places.
+ *
+ * A second implementation was the alternative and it is the worse one for a reason this repo keeps
+ * re-learning: the two lists above (`WRITE_BLOCKING_PROMPTS`, `CREDENTIAL_WORD`) grew four entries
+ * apiece from real misses found in the field, and a copy would have inherited the misses and not the
+ * fixes. One function, both callers.
+ *
+ * IT DOES NOT DECIDE WHAT `null` MEANS — it only reports it. `no-viewport` is "I cannot read this
+ * terminal", which is the state where a clean prompt and a `vim` session are indistinguishable.
+ * Dictation treats that as fatal. The composer's ADDRESS path cannot: it may legitimately name an
+ * agent whose pane is not mounted in this window, and refusing there would break a shipped feature to
+ * guard a screen nobody is looking at. So the caller weighs it — see ConciergeHost, which refuses a
+ * MOUNT on it (the mounted agent's terminal is on screen by construction, so unreadable means
+ * something is actually wrong) and lets an ADDRESS through.
+ */
+export function terminalWriteRefusal(
+  viewport: TerminalViewport | null,
+): TerminalScreenRefusal | null {
+  if (!viewport) return "no-viewport";
+  if (viewport.alternateBuffer) return "alternate-screen";
+  if (screenBlocksWrite(viewport.text)) return "awaiting-input";
+  return null;
+}
+
 export type TerminalRouteVerdict =
   /** Type `text` at the agent's input line. Already normalized — deliver it verbatim. */
   | { kind: "deliver"; text: string }
@@ -172,8 +213,10 @@ export function classifyTerminalRoute(i: TerminalRouteInput): TerminalRouteVerdi
   const text = normalizeForTerminal(i.text);
   if (!text) return { kind: "refuse", reason: "empty" };
   if (!i.writable) return { kind: "refuse", reason: "not-writable" };
-  if (!i.viewport) return { kind: "refuse", reason: "no-viewport" };
-  if (i.viewport.alternateBuffer) return { kind: "refuse", reason: "alternate-screen" };
-  if (screenBlocksWrite(i.viewport.text)) return { kind: "refuse", reason: "awaiting-input" };
+  // The three screen refusals, through the SHARED predicate — dictation and the concierge composer
+  // ask the same question of the same screen, and a second copy here would be the one that missed
+  // the next credential prompt somebody adds to the list above.
+  const blocked = terminalWriteRefusal(i.viewport);
+  if (blocked) return { kind: "refuse", reason: blocked };
   return { kind: "deliver", text };
 }

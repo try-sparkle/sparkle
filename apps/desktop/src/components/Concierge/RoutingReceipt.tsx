@@ -30,6 +30,14 @@ export function receiptText(r: ConciergeReceipt): string {
   // qualifier to it — a line reading "Answered here — never answered" is a contradiction the reader
   // has to resolve, and half of them will resolve it wrong.
   if (r.unanswered) return "→ Replaced by your next message — never answered";
+  // A REFUSED MESSAGE WENT NOWHERE, so it must not borrow either destination's wording. Checked
+  // BEFORE the target line below for the same reason `unanswered` is: the target field still names
+  // who it was FOR, and rendering that name through "Answered here" / "Sent to X" would report a
+  // delivery that did not happen (roborev 57360). Names the agent when there is one, because "not
+  // sent" without a subject leaves the reader guessing which of their agents declined.
+  if (r.refused) {
+    return r.agentName ? `→ Not sent — ${r.agentName} couldn't take it` : "→ Not sent";
+  }
   const first = r.target === "sparkle" ? "Answered here" : `Sent to ${place(r.target, r.agentName)}`;
   if (!r.alsoSentTo) return `→ ${first}`;
   // "then" — strictly sequential, so it cannot be read as a correction of the first delivery.

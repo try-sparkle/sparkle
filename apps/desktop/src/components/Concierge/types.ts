@@ -36,6 +36,9 @@ import type { ReplyAnchor } from "./replyAnchors";
 // the host that builds a rail state and the strip that draws it cannot drift about what one is.
 import type { SendTrayModel } from "./SendModeTray";
 import type { SendMode } from "../../voice/sendMode";
+// Same rule as ./mentions and ./replyAnchors: the shape lives with the component that RENDERS it, so
+// the host that builds a notice and the row that draws it cannot drift about what one is.
+import type { MountedNoticeModel } from "./MountedNotice";
 
 /** One project's share of the Needs-you total, as the column is handed it.
  *
@@ -56,6 +59,7 @@ export interface ProjectNeedsYou {
 export type { ConciergeMention, MentionAgent };
 export type { ReplyAnchor };
 export type { SendTrayModel };
+export type { MountedNoticeModel };
 
 // The column speaks the app's ONE status vocabulary — "Needs you" / "Running" / "Done" — rather
 // than a private P0/P1 scale. Re-exported so consumers of this module's public surface don't have
@@ -318,6 +322,22 @@ export interface ConciergeReceipt {
    * (engine/conciergeLiveness). It is a fact about ONE message, stated on that message.
    */
   unanswered?: true;
+  /**
+   * The message was NOT sent anywhere: the target terminal declined free text (a full-screen app, a
+   * prompt waiting on screen, a screen that could not be read) and the words went back to the
+   * composer.
+   *
+   * WHY THIS IS ITS OWN FIELD (roborev 57360). The refusal used to post `target: "sparkle"`, on the
+   * reasoning that the message had "fallen back" — but `receiptText` renders a sparkle target as
+   * **"→ Answered here"**, and nothing was answered anywhere. The brain was never asked; the text is
+   * sitting back in the box. That is the same class of lie as a `target: "agent"` receipt over a
+   * write that never landed, which the code around it already guards against — the `sparkle` arm was
+   * simply the unguarded twin.
+   *
+   * NOT `unanswered`, which is a different fact with different copy ("Replaced by your next message
+   * — never answered"): that one reached the brain and got silence. This one never left.
+   */
+  refused?: true;
 }
 
 /** Everything the column renders, supplied by the integration layer. */
@@ -594,6 +614,30 @@ export interface ConciergeColumnProps {
    *  A mount can be visually live for a moment before the agent's transcript is resolvable, and
    *  collapsing the two would make the pane flicker between two conversations on that seam. */
   mountedAgent?: ConciergeMountedAgent | null;
+  /**
+   * The mounted agent a SEND would actually reach — which is a narrower fact than {@link
+   * mountedAgent}, and the composer's typeface reports this one.
+   *
+   * DELIBERATELY A THIRD VALUE rather than a derivation of the two above (roborev 57358/57361). The
+   * cable being patched is enough to decide whose CONVERSATION to show; it is not enough to decide
+   * where words GO, because the host also gates routing on whether the agent's pane is on screen at
+   * all (`promptTargetShown` — false with the Plan board or Improve-Sparkle up, or the tab closed).
+   * In those states the mounted conversation should stay visible while the composer must NOT claim
+   * to be typing into a PTY, because the send path has already decided it is not.
+   *
+   * Null is the honest default: a column that is not told this paints the app's own face, which is
+   * what every composer did before the mounted-composer rule existed.
+   */
+  routableMountedAgentId?: string | null;
+  /**
+   * The latest mounted-path outcome, rendered in a row that survives the mount swap.
+   *
+   * MOUNTED, THIS COLUMN DOES NOT RENDER `ConciergeThread` AT ALL — so everything the send path says
+   * with `postSparkle` is written to a component that is off screen, including terminal refusals and
+   * the `@Sparkle` escape hatch's own reply (roborev 57360). This is the surface that is still there.
+   * See ./MountedNotice for why it is a sibling row rather than a thread entry.
+   */
+  mountedNotice?: MountedNoticeModel | null;
 }
 
 /** One write to the column's live region. `seq` is a monotonic WRITE COUNTER, not data — it exists

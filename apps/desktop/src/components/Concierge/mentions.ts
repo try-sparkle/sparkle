@@ -182,6 +182,24 @@ function blocksBoundary(text: string, i: number, step: 1 | -1): boolean {
   return blocksBoundary(text, i + step, step);
 }
 
+/**
+ * Is a span starting at `start` in ADDRESSING POSITION — i.e. is it the message's envelope rather
+ * than a name inside a sentence?
+ *
+ * Nothing but whitespace before it. That is the whole test, and it is POSITIONAL rather than
+ * ordinal: being FIRST is not what makes a mention an address, being a PREFIX is. See the block
+ * comment in {@link mentionFreeText} for the two founder messages that ordinal test corrupted.
+ *
+ * ONE PREDICATE, TWO CONSUMERS, AND THEY MUST NOT DRIFT. This decides what `mentionFreeText`
+ * CONSUMES from the text, and it decides what `composerRoute.classifyComposerRoute` treats as the
+ * DESTINATION. Those used to be different rules — the strip went positional in 898cea330 while
+ * routing stayed on `mentions[0]` — and the gap is a message delivered to an agent with the subject
+ * of its own sentence deleted. Sharing the function is what makes the two answers the same answer.
+ */
+export function isAddressingPosition(text: string, start: number): boolean {
+  return text.slice(0, start).trim() === "";
+}
+
 /** Where a mention's literal sits in the text. Half-open `[start, end)`, like every other range in
  *  this codebase's string handling. */
 export interface MentionSpan {
@@ -333,11 +351,14 @@ export function mentionFreeText(text: string, agents: readonly MentionAgent[]): 
     // @X" names its subject mid-sentence, and deleting that destroys the only noun in the clause.
     //
     // So the test is POSITIONAL: only a mention with nothing but whitespace before it is consumed.
+    // It is `isAddressingPosition`, shared with the ROUTING rule (Concierge/composerRoute) rather
+    // than spelled out here, so the span this deletes and the span that chose the destination are
+    // the same span by construction.
     // Every other mention — later spans as before, and now a first span that does not lead — keeps
     // its NAME and loses only its sigil, which is all this function ever needed to do (the `@` is
     // what opens the CLI's file picker; the name is content the user wrote). A pill means nothing
     // inside a PTY, so the plain name is the right rendering there.
-    const leads = text.slice(0, s.start).trim() === "";
+    const leads = isAddressingPosition(text, s.start);
     if (i > 0 || !leads) {
       out += text.slice(at, s.start);
       out += text.slice(s.start + MENTION_SIGIL.length, s.end);
@@ -518,11 +539,24 @@ export function isCompletedMention(query: string, agents: readonly MentionAgent[
  *
  * NOT a real agent id, and it deliberately cannot collide with one: `agentCanAcceptInput`,
  * `agentStillExists` and the feed all key on uuids, so this string resolves to nothing in any of
- * them. That is the SAFE direction and the reason the value is spelled this way rather than, say,
- * `"sparkle"` — `ConciergeHost.deliver` builds a `mentionAim` only when the first mention resolves
- * to a live feed agent, so a `@Sparkle` mention leaves the aim null and the message falls through to
- * the ordinary router exactly as an unaddressed one does. Nothing is misdelivered while the host's
- * own `@Sparkle` routing is still being written; the pill is simply legible ahead of it.
+ * them. That is the SAFE direction, and it is why the value is spelled this way rather than, say,
+ * `"sparkle"`: every lookup that could turn a mention into a PTY write misses on it by construction,
+ * so the failure mode of forgetting to special-case the concierge is "no aim", never "the wrong
+ * terminal".
+ *
+ * ══ THE ROUTING BEHIND THIS PILL IS BUILT NOW ═══════════════════════════════════════════════════
+ * This used to say the aim was left null and the message fell through to the ordinary router, and
+ * that "the host's own `@Sparkle` routing is still being written; the pill is simply legible ahead of
+ * it". Both halves are stale, and the second one was the load-bearing lie: an agent reading it would
+ * conclude the escape hatch was decorative.
+ *
+ * `Concierge/composerRoute.classifyComposerRoute` is the rule, and this id is what it matches on. A
+ * LEADING `@Sparkle` routes the message to the concierge deterministically — beating a mount, which
+ * is the whole reason the escape hatch exists: while the concierge is patched to a build agent every
+ * other word typed into that box goes to the agent's terminal, and this is the way back. A `Sparkle`
+ * that is not in addressing position is a subject, not a redirect (see {@link isAddressingPosition}),
+ * because this app is itself called Sparkle and "ask Sparkle once you've landed" is an instruction
+ * for the agent.
  */
 export const SPARKLE_MENTION_ID = "sparkle-concierge";
 

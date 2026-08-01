@@ -21,12 +21,18 @@ const h = vi.hoisted(() => ({
   dispatchConciergeAnswer: vi.fn(
     async (_agentId: string, _text: string, _opts?: unknown) => ({ ok: true, path: "free-text" }),
   ),
-  routeMessage: vi.fn(async () => ({
+  // TYPED WITH ITS ARGUMENTS, so a row can assert WHAT the router was asked — "consulted" and
+  // "consulted about the user's own words" are different facts, and only the second catches a caller
+  // that hands the classifier a string with a name deleted out of it.
+  routeMessage: vi.fn(async (_text: string, _ctx?: unknown) => ({
     target: "sparkle" as "sparkle" | "agent",
     reason: "test",
     source: "heuristic" as const,
   })),
   agentCanAcceptInput: vi.fn((_agentId: string) => true),
+  /** The rendered screen, for the write-guard. Defaults to a clean prompt; a row that wants a
+   *  refusal points it at a full-screen app. */
+  viewport: vi.fn((_agentId: string) => CLEAN as null | { text: string; alternateBuffer: boolean }),
   answersLivePicker: vi.fn((_agentId: string, _text: string) => false),
 }));
 
@@ -56,6 +62,13 @@ vi.mock("../services/conciergeDispatch", () => ({
   onDeferredSendOutcome: () => () => {},
 }));
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.routeMessage }));
+/** A terminal at an ordinary prompt — nothing that blocks a write. */
+const CLEAN = { text: "> \n", alternateBuffer: false };
+vi.mock("../services/terminalViewport", () => ({
+  getAgentViewport: (id: string) => h.viewport(id),
+  registerViewport: () => () => {},
+  resetViewportRegistry: () => {},
+}));
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: {
     getState: () => ({ setInterruptPreference: vi.fn(), shouldInterrupt: () => true }),
@@ -150,6 +163,8 @@ beforeEach(() => {
   h.agentCanAcceptInput.mockReturnValue(true);
   h.answersLivePicker.mockReset();
   h.answersLivePicker.mockReturnValue(false);
+  h.viewport.mockReset();
+  h.viewport.mockReturnValue(CLEAN);
 });
 afterEach(() => {
   for (const i of armedIntents()) cancelIntent(i.id);
@@ -214,82 +229,95 @@ describe("ConciergeHost — an addressed message goes where it was addressed", (
   // the unit rule and the bytes that actually reach the dispatcher are different facts, and only
   // this one would have caught a caller that stripped a second time on the way to the wire.
   //
-  // It does depend on a subject mention being DELIVERED to an agent, which is today's ordinal
-  // routing and an open question (see the row below). That is unavoidable — observing the bytes that
-  // reach a terminal requires a terminal delivery — so it is stated rather than hidden: if routing
-  // later sends a subject mention to Sparkle, this row needs re-aiming at a message with a LEADING
-  // address plus a subject mention, and it is the TEXT assertion that must be preserved, not the
-  // destination.
+  // RE-AIMED, exactly as the previous version of this comment said it would have to be. It used to
+  // send a message whose ONLY mention was a subject, and read the bytes off the resulting terminal
+  // delivery — which worked only because routing then read `mentions[0]` by ordinal and dispatched a
+  // subject mention into that agent's PTY. That is the misdelivery, and it is fixed (bead
+  // sparkle-3dbp6, Concierge/composerRoute): a subject mention aims nowhere.
+  //
+  // So the message now carries BOTH shapes at once — a leading address that supplies the delivery,
+  // and a subject mention inside it — which is the arrangement that keeps the TEXT assertion (the
+  // part worth preserving) observable at this layer without asserting a destination that is no longer
+  // true. The name survives, the sigil does not.
   it("keeps a subject mention's name in the bytes that reach the terminal", async () => {
     mount();
-    await send("Why is @Kraken Auth just sitting there? It looks like it has unmerged work.");
+    await send("@Kraken Auth why is @Blueprint UI/UX just sitting there? It has unmerged work.");
     await elapse();
     const wire = h.dispatchConciergeAnswer.mock.calls[0]![1] as string;
-    expect(wire).toBe("Why is Kraken Auth just sitting there? It looks like it has unmerged work.");
+    expect(wire).toBe("why is Blueprint UI/UX just sitting there? It has unmerged work.");
     // The sigil is still the one thing that may never survive — asserting the sentence alone would
-    // pass against a wire that relayed "@Kraken Auth" verbatim and opened the CLI's file picker.
+    // pass against a wire that relayed "@Blueprint UI/UX" verbatim and opened the CLI's file picker.
     expect(wire).not.toContain("@");
   });
 
-  // ══ WHAT THIS DOES *NOT* PIN, AND WHY THE WEAKER ASSERTION IS THE HONEST ONE ═══════════════════
-  // The obvious row here is "delivers to ag2" — today's behaviour, since routing reads `mentions[0]`
-  // by ordinal and this commit deliberately left that alone. But writing it that way asserts a
-  // question that is genuinely OPEN as though it were settled (roborev 56011, and it is right):
-  // "Why is @Status Check just sitting there? It looks like it has unmerged work." reads as a
-  // question ABOUT that agent, aimed at the concierge — yet it is dispatched INTO that agent's PTY
-  // as a third-person question about itself, and Sparkle, who it was plainly for, never sees it.
-  // The corruption is fixed; the misdelivery is not. Pinning the destination would make the
-  // remaining half harder to correct, and a test is an endorsement whatever the comment says.
+  // ══ THE OPEN QUESTION IS NOW ANSWERED — bead sparkle-3dbp6 ══════════════════════════════════════
+  // This row used to assert only the part that held under EITHER answer ("not the selected agent"),
+  // because the destination of a subject mention was genuinely undecided: 898cea330 fixed the TEXT
+  // and deliberately left routing on `mentions[0]` by ordinal, so
   //
-  // So this asserts only the part that must hold under EITHER answer: the mention is not silently
-  // ignored and the message never lands on the SELECTED agent, which is the misroute a mention
-  // exists to prevent. It holds today (delivered to the named agent) and it would still hold if a
-  // subject mention were later routed to Sparkle instead (nothing dispatched at all).
-  // Tracked as bead sparkle-3dbp6 rather than frozen here.
+  //     "Why is @Kraken Auth just sitting there? It looks like it has unmerged work."
   //
-  // THE ROUTER IS POINTED AT THE AGENT, and that is what keeps this from being vacuous. "Never ag1"
-  // is trivially true whenever nothing dispatches, so with the default (sparkle-saying) router this
-  // row passed even when the mention was ignored outright — a test satisfied by silence. Pointing
-  // the router at the agent gives the ignored-mention case somewhere to go: drop the mention and the
-  // auto-router delivers to the SELECTED agent, which is the misroute, and this fails. Honouring the
-  // mention sends it elsewhere (today: the named agent) and it passes — under either answer to the
-  // open question, neither of which is asserted here.
-  it("never lets a subject mention deliver to the SELECTED agent", async () => {
-    h.routeMessage.mockResolvedValue({ target: "agent", reason: "test", source: "heuristic" });
+  // — plainly a question ABOUT that agent, aimed at the concierge — was dispatched INTO its PTY as a
+  // third-person question about itself, and Sparkle never saw it.
+  //
+  // The mounted-composer rule settles it (Concierge/composerRoute): an address is a PREFIX, a name in
+  // a sentence is a SUBJECT, and only a prefix chooses a destination. So this message reaches the
+  // CONCIERGE, and the row can say so.
+  //
+  // THE ROUTER IS NO LONGER FORCED TO SAY "agent", and that reversal matters. The old fixture pointed
+  // it at the agent so that an IGNORED mention had somewhere visible to go — which only worked while
+  // a mention short-circuited the router entirely. It does not: an unaddressed message is exactly
+  // what `routeMessage` is for, so forcing that (impossible-in-production) verdict now asserts that a
+  // subject mention beats the router, which is not a property anything should have. The default
+  // sparkle-saying router is the honest fixture, and the PAIR below is what keeps this from being
+  // satisfied by silence: the same name, moved to the front, still routes.
+  it("sends a subject mention's message to the concierge, and a leading one to the agent", async () => {
     mount();
     await send("Why is @Kraken Auth just sitting there?");
     await elapse();
-    // ══ THE MESSAGE WENT SOMEWHERE — destination-agnostic, so it pins nothing (roborev 56019) ═════
-    // An earlier cut had NO precondition at all, on the reasoning that any "something dispatched"
-    // check would pin AGENT DELIVERY, the half deliberately left open. That framed the choice as
-    // binary and missed this third option. Without it the loop below iterates zero times and passes
-    // for any change that stops the send reaching a sink at all — `Send` throwing before `deliver()`,
-    // no intent arming so `elapse()` is a no-op, mention resolution throwing. None of those are the
-    // open routing question; they are ordinary breakage, and the row would have stayed green through
-    // them under a name implying it guards a misroute.
-    //
-    // WHAT THIS DOES *NOT* COVER, since an earlier version of this comment claimed it did
-    // (roborev 56033): an UNREACHABLE agent. `agentCanAcceptInput` returning false is not silence —
-    // `deliver()` posts the "can't take a message" notice and falls through to Sparkle, so a sink
-    // still runs. That is correct rather than a gap: the message really does reach Sparkle, which is
-    // the designed recoverable direction, pinned by "says so when the named agent cannot take a
-    // message, and keeps the words" below. Listing it here was simply wrong.
-    //
-    // The suggested stronger form — require a sink to carry the user's own words, not merely to have
-    // been called — was built and then dropped, because three mutations failed to find a case where
-    // it and this count disagree (losing the words from `askSparkle`, forcing the unreachable path,
-    // and both together all still left the text on some sink). An assertion whose extra strength
-    // cannot be shown to catch anything is the guard-for-an-impossible-case the anti-bloat rule
-    // warns about, and shipping it on an unverified claim would repeat the overclaiming this finding
-    // is about.
-    //
-    // Counting BOTH sinks is what keeps it neutral: true today (dispatched to the named agent), true
-    // under a future "subject mention → Sparkle" rule (a concierge turn instead), and true in the
-    // mention-ignored case this row exists to catch (dispatched to ag1, which the loop then fails).
-    expect(
-      h.dispatchConciergeAnswer.mock.calls.length + h.startConciergeTurn.mock.calls.length,
-    ).toBeGreaterThan(0);
-    for (const call of h.dispatchConciergeAnswer.mock.calls) expect(call[0]).not.toBe("ag1");
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    // THE CONTROL. Without it, "nothing dispatched" passes against a build that dropped mentions —
+    // or terminal delivery — altogether.
+    await send("@Kraken Auth why are you just sitting there?");
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag2");
+  });
+
+  // ══ WHO NOW GUARANTEES "not the selected agent", AND WHY THIS ROW CHANGED SHAPE ═══════════════
+  // The previous version of this row forced `routeMessage` to answer `target: "agent"` and then
+  // asserted the message did not land on the SELECTED agent. That fixture was chosen so an IGNORED
+  // mention had somewhere visible to go, and it worked only while a subject mention overrode the
+  // router. It no longer does — a subject mention is not a destination, so the message is exactly the
+  // unaddressed kind `routeMessage` exists to classify — and keeping the old assertion would pin a
+  // property that ought not to hold: that a name mentioned in passing beats the router's verdict.
+  //
+  // The guarantee itself did not weaken; it MOVED, and it is worth naming where. Nothing routes an
+  // unaddressed message into a terminal any more because `routeMessage` cannot return `agent` at all,
+  // on any tier — an absolute rule with its own suite (services/conciergeRouter.test.ts) written after
+  // the founder's answers to the CONCIERGE were typed into a build agent. That is a stronger guard
+  // than this row ever was: it holds for every unaddressed message, not just the ones containing a
+  // name.
+  //
+  // What is left for THIS layer to prove is that the host actually hands a subject-mention message to
+  // that guard rather than deciding for itself — i.e. the router is consulted, exactly as it is for a
+  // message with no names in it at all. The leading-address control is what keeps it non-vacuous:
+  // same name, moved to the front, and the router is not consulted at all.
+  it("leaves a subject mention's destination to the router, and a leading one to the address", async () => {
+    mount();
+    await send("Why is @Kraken Auth just sitting there?");
+    await elapse();
+    expect(h.routeMessage).toHaveBeenCalledTimes(1);
+    // The router was asked about the user's OWN words, sigil-free — not about a string with the
+    // name deleted, which is what an ordinal strip would have handed it.
+    expect(h.routeMessage.mock.calls[0]![0]).toContain("Kraken Auth");
+
+    h.routeMessage.mockClear();
+    await send("@Kraken Auth why are you just sitting there?");
+    await elapse();
+    expect(h.routeMessage).not.toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag2");
   });
 
   // Explicitness buys a skipped CLASSIFY, never a skipped GATE. This is the line the "no forceAgent
@@ -671,5 +699,44 @@ describe("ConciergeHost — @Sparkle addresses the concierge", () => {
     await send("@Sparkle what is the status of the build?");
     await elapse();
     await waitFor(() => expect(screen.getByRole("button", { name: /^Also ask / })).toBeTruthy());
+  });
+
+  // ══ THE THIRD DOOR INTO A LIVE PTY (roborev 57358) ══════════════════════════════════════════════
+  // "Also ask <agent>" calls `promptAgent` DIRECTLY — no armed intent, no countdown, one tap
+  // dispatches irreversibly. The mounted-composer change gated the composer's two doors (at submit,
+  // and again after the countdown) and left this one open, which is the worst of the three precisely
+  // because there is nothing to cancel. `neverPickerAnswer` is not this guard: it suppresses option
+  // MATCHING and says nothing about the alternate screen, where a paste is executed as commands.
+  it("refuses a redirect into an agent running a full-screen app", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    const redirect = await waitFor(() => screen.getByRole("button", { name: /^Also ask / }));
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await act(async () => {
+      fireEvent.click(redirect);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await elapse();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    await waitFor(() => expect(thread().textContent).toContain("full-screen app"));
+    // THE BUTTON STAYS LIVE. Nothing was passed along, so recording `alsoSentTo` would both claim a
+    // delivery that did not happen and remove the founder's only way to retry once they leave `vim`.
+    expect(screen.getByRole("button", { name: /^Also ask / })).toBeTruthy();
+  });
+
+  // The control: with an ordinary prompt on screen the same two taps still deliver. Without it,
+  // "nothing dispatched" passes against a build that broke the redirect outright.
+  it("still redirects when the target's screen is an ordinary prompt", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    const redirect = await waitFor(() => screen.getByRole("button", { name: /^Also ask / }));
+    await act(async () => {
+      fireEvent.click(redirect);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await elapse();
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
   });
 });

@@ -118,13 +118,16 @@ import { flat, line, plain, ref } from "./Concierge/conciergeLine";
 import type { Line, ReferencableAgent } from "./Concierge/conciergeLine";
 import { routeMessage } from "../services/conciergeRouter";
 import {
-  isSparkleMention,
   mentionFreeText,
   mentionRoster,
   mentionsIn,
   rosterFromMentions,
   type ConciergeMention,
 } from "./Concierge/mentions";
+import { classifyComposerRoute } from "./Concierge/composerRoute";
+import type { MountedNoticeModel } from "./Concierge/MountedNotice";
+import { terminalWriteRefusal, type TerminalScreenRefusal } from "../voice/dictationTerminalRoute";
+import { getAgentViewport } from "../services/terminalViewport";
 import { buildDigest } from "../services/conciergeDigest";
 import { isSparkleAgentId } from "../services/sparkleAgent";
 import { findKnownAgent } from "../services/knownAgents";
@@ -281,6 +284,84 @@ function refusedPath(r: ConciergeDispatchResult): RefusedPath | null {
  *  from a real one. */
 function asAgent(t: { agentId: string; name: string }): ReferencableAgent {
   return { id: t.agentId, name: t.name };
+}
+
+/**
+ * MAY THIS COMPOSER SEND BE WRITTEN INTO THAT AGENT'S TERMINAL RIGHT NOW?
+ *
+ * The guard shipped for dictation (`voice/dictationTerminalRoute.terminalWriteRefusal`), reused
+ * verbatim rather than reimplemented — its two prompt lists each grew four entries from real misses
+ * found in the field, and a private copy would inherit the misses and not the fixes.
+ *
+ * ══ WHY THE COMPOSER NEEDS IT AT ALL ════════════════════════════════════════════════════════════
+ * `dispatchConciergeAnswer` guards exactly one hazard: a live PICKER, which it refuses via
+ * `neverPickerAnswer`. It does not look at the screen otherwise. So a send into an agent sitting in
+ * `vim` is pasted AND submitted — and vim normal mode does not insert a sentence, it EXECUTES it (`d`
+ * deletes, `2` counts, `p` pastes). A send at `[sudo] password for …:` types a sentence into a field
+ * that echoes nothing and presses Enter on it. Both are reachable from this box today.
+ *
+ * ══ `no-viewport` IS FATAL FOR A MOUNT AND NOT FOR AN ADDRESS ═══════════════════════════════════
+ * and the asymmetry is about what the two aims can honestly claim to know.
+ *
+ * A MOUNT points at the agent the cable is patched to — its pair is on screen, its terminal is
+ * mounted, its column is the one the founder is looking at. "I cannot read that screen" there is not
+ * a normal state; it is the state where a clean prompt and a `vim` session are indistinguishable, and
+ * the thing being routed is the founder's ordinary typing with no address on it. Refuse.
+ *
+ * An ADDRESS may legitimately name an agent in another project whose pane is not mounted in this
+ * window at all, and that send has worked since mentions shipped (it queues on `pendingSends` if the
+ * PTY is still coming up). Refusing it would break a shipped feature to protect a screen nobody is
+ * looking at, and the user named that destination explicitly. So an address is refused only on what
+ * the screen POSITIVELY shows — `alternate-screen`, `awaiting-input` — which is strictly more
+ * protection than it had, with nothing taken away.
+ */
+function terminalWriteBlocked(
+  agentId: string,
+  via: "address" | "mount",
+  read: (id: string) => ReturnType<typeof getAgentViewport> = getAgentViewport,
+): TerminalScreenRefusal | null {
+  const refusal = terminalWriteRefusal(read(agentId));
+  if (!refusal) return null;
+  if (refusal === "no-viewport" && via === "address") return null;
+  return refusal;
+}
+
+/**
+ * The same three refusals as PLAIN TEXT, for the mounted notice row.
+ *
+ * A SECOND RENDERING, not a second decision — exactly like `payload`/`display`/`text` on a send. The
+ * thread's version builds a `Line` so the agent draws as a pill; the notice row is one line of text
+ * in a banner, where a pill would be chrome nobody can click through to anything. Both take the same
+ * `reason`, so they cannot disagree about WHY; only about how the agent is named.
+ *
+ * Kept adjacent to {@link terminalRefusalLine} so the pair is obvious and a fourth reason has to be
+ * added to both or neither.
+ */
+function terminalRefusalText(agentName: string, reason: TerminalScreenRefusal): string {
+  if (reason === "alternate-screen") {
+    return `Not sent — ${agentName} has a full-screen app open, so the keys would have run as commands. Your message is back in the box.`;
+  }
+  if (reason === "awaiting-input") {
+    return `Not sent — ${agentName} is waiting on something on screen. Answer that first; your message is back in the box.`;
+  }
+  return `Not sent — I can't see ${agentName}'s screen, so I'd be guessing what this would land in. Your message is back in the box.`;
+}
+
+/** What the founder is told when a terminal declines the message, per cause.
+ *
+ *  NAMES THE CAUSE, never a generic "couldn't send". The three causes have three different exits —
+ *  leave the full-screen app, answer the prompt on screen, or look at why that pane is not there —
+ *  and a message that does not distinguish them leaves the user retyping the same thing into the same
+ *  refusal, which is the dead-end this file's copy rules exist against (roborev 54665). The words are
+ *  in the composer either way: the caller restores the draft, so nothing is lost while they decide. */
+function terminalRefusalLine(agent: ReferencableAgent, reason: TerminalScreenRefusal): Line {
+  if (reason === "alternate-screen") {
+    return line`${ref(agent)} has a full-screen app open, so I didn't type that into it — the keys would have run as commands rather than landing as text. Your message is back in the box.`;
+  }
+  if (reason === "awaiting-input") {
+    return line`${ref(agent)} is waiting on something on screen, so I didn't type that into it. Open it and answer the prompt first — your message is back in the box.`;
+  }
+  return line`I can't see ${ref(agent)}'s screen right now, so I didn't type that into it — I'd be guessing what it would land in. Your message is back in the box.`;
 }
 
 function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, voice: RefusalVoice): Line {
@@ -602,7 +683,20 @@ export interface ConciergePromptTarget {
  * to dispatch a mention directly, that is the line this comment exists to hold.
  */
 interface ConciergeMentionAim {
-  /** The agent the message named. */
+  /**
+   * HOW this terminal was chosen — the user naming it, or the cable being patched to it.
+   *
+   * The `mount` arm is the founder's mounted-composer rule (Concierge/composerRoute): while the
+   * concierge is patched to a build agent, plain text goes to that agent's terminal. It arrives on
+   * THIS type rather than on a parallel one because everything downstream of the choice is identical
+   * — the same stripped wire, the same armed intent, the same countdown, the same receipt — and a
+   * second aim type would be a second delivery path to keep in step with this one.
+   *
+   * Three things read it, and each difference is deliberate: the decision's `reason` string, whether
+   * Sparkle follows up with a turn of its own, and whether an unreadable terminal screen is fatal.
+   */
+  via: "address" | "mount";
+  /** The agent the message named, or — under a mount — the agent the cable is patched to. */
   target: ConciergePromptTarget;
   /** What the PTY receives — the address stripped off, attachment paths prefixed. The `@` must not
    *  reach the terminal: the agent there is a Claude Code CLI, where a leading `@` opens its own
@@ -858,6 +952,19 @@ export function ConciergeHost({
   const announce = useCallback((text: string) => {
     setAnnouncement((prev) => ({ seq: prev.seq + 1, text }));
   }, []);
+  // ══ WHAT A MOUNTED COLUMN CAN STILL SHOW (roborev 57360) ════════════════════════════════════════
+  // Mounted, the column renders the AGENT's transcript and does not render `ConciergeThread` at all —
+  // so `postSparkle` writes into a component that is off screen. This is the sibling row that stays
+  // (Concierge/MountedNotice), and it carries the outcomes that would otherwise be invisible in the
+  // exact state the mounted-composer feature exists for.
+  //
+  // `{ seq, text, tone }` and a bump per write, for the same reason `announcement` is not a bare
+  // string: refusing TWICE FOR THE SAME REASON is the common case here — the founder retypes and hits
+  // the same `vim` — and an `Object.is`-equal setState would render the second refusal as no change.
+  const [mountedNotice, setMountedNotice] = useState<MountedNoticeModel | null>(null);
+  const noteMounted = useCallback((text: string, tone: "warn" | "info") => {
+    setMountedNotice((prev) => ({ seq: (prev?.seq ?? 0) + 1, text, tone }));
+  }, []);
   // "Copy on selection" (PRD 1 §1) — a PRESENTATION preference, so it lives in uiStore rather than
   // config.toml, and is READ HERE rather than in the column: nothing under components/Concierge
   // touches a store (see Concierge/types' header).
@@ -1058,6 +1165,65 @@ export function ConciergeHost({
       restoreAttachments(waiting);
     }
   }, [draftKey, takeAttachments, restoreAttachments]);
+
+  // ══ THE MOUNT THAT ROUTES — ONE VALUE, NOT TWO NOTIONS OF "MOUNTED" (roborev 57358/57361) ═══════
+  // `mountedAgentId` above is the DISPLAY mount: it asks only whether the cable is patched, which is
+  // the right question for "whose conversation does the column show". It is the WRONG question for
+  // "where do the founder's words go", and the difference is reachable rather than theoretical:
+  // `routingTarget` is `promptTargetShown ? target : null`, and `Workspace` sets `promptTargetShown =
+  // !sparkleActive && !boardActive && activeIsOpen` — false whenever the Plan board or the
+  // Improve-Sparkle pane is up, or the agent's tab is closed.
+  //
+  // In those states the cable is still patched, so an ungated mount would have `send` refuse to route
+  // (`mountRouted` also requires the routing target to agree) while the COMPOSER painted itself in the
+  // terminal's face — the indicator telling the founder their words were going into a PTY at the exact
+  // moment the app had decided they must not. An indicator that is wrong in the direction of "this is
+  // going somewhere irreversible" is worse than no indicator.
+  //
+  // So this is the one value both halves read: the send path through `mountedAgentIdRef`, and the
+  // composer's typeface through the prop the column hands down. The thread swap deliberately keeps
+  // the UNGATED `mountedAgent` — which conversation is on screen is a display question, and hiding
+  // the agent's transcript because the Plan board is open would be a different bug.
+  const routableMountedAgentId = promptTargetShown ? mountedAgentId : null;
+  // `send` is memoized on stable deps and runs after render, so it reads this through a ref exactly
+  // as it reads the aim through `targetRef` — and for the same reason: the value has to be the one
+  // that was true AT SUBMIT. Re-reading a live store inside the queued half would route a message at
+  // whatever the founder mounted while it was waiting, which is the misdelivery every other
+  // captured-at-submit value in this file exists to prevent.
+  const mountedAgentIdRef = useRef(routableMountedAgentId);
+  useEffect(() => {
+    mountedAgentIdRef.current = routableMountedAgentId;
+  }, [routableMountedAgentId]);
+  // ══ AND THE *DISPLAY* MOUNT, WHICH IS THE ONE THE NOTICE ROW KEYS OFF (roborev 57424) ═══════════
+  // These two must not be conflated, and the first cut conflated them in the damaging direction:
+  // every notice write was gated on the ROUTING mount. That is the wrong question. The notice row
+  // exists for exactly one reason — `ConciergeThread` is not rendered, so anything said with
+  // `postSparkle` is off screen — and whether the thread is hidden is decided by the DISPLAY mount
+  // (`mountedAgent`, which the column keeps ungated). Two failures fell out of gating it on routing:
+  //
+  //   • DISPLAY-MOUNTED BUT NOT ROUTABLE (the Plan board or Improve-Sparkle up, or the tab closed):
+  //     the thread is still swapped away, the message falls through to Sparkle, Sparkle answers into
+  //     the hidden thread — and the notice was suppressed because the routing id is null there. That
+  //     is the very defect this row was added to fix, reintroduced one state over.
+  //   • NOT MOUNTED AT ALL: the two refusal writes were unconditional, so an ADDRESSED send refused
+  //     with the cable unplugged painted a banner in a column whose thread is perfectly visible —
+  //     saying the same thing a third time — and it could never clear, because the clearing effect
+  //     keyed on a routing id that stays `null` throughout. A stale "Not sent" row for the rest of
+  //     the session, sitting over later successful sends.
+  //
+  // So: routing and the typeface take `routableMountedAgentId`; the notice takes this.
+  const displayMountedRef = useRef(mountedAgentId);
+  useEffect(() => {
+    displayMountedRef.current = mountedAgentId;
+  }, [mountedAgentId]);
+  // THE NOTICE DIES WITH THE MOUNT IT DESCRIBES. Left standing after an unmount it asserts a state
+  // that is over, which is the same stale signal the unmount hint is gated to avoid. Keyed on the
+  // DISPLAY mount for the same reason the writes are — that is when the row is on screen — and on
+  // the id rather than a boolean, so moving the cable between agents also clears the previous
+  // agent's line rather than attributing it to the new one.
+  useEffect(() => {
+    setMountedNotice(null);
+  }, [mountedAgentId]);
 
   const mountedAgent = useMemo<ConciergeMountedAgent | null>(
     () =>
@@ -2555,6 +2721,9 @@ export function ConciergeHost({
        *  passed rather than recomputed so the flag and the remembered replay cannot disagree. */
       redirectable: boolean,
     ): Promise<boolean> => {
+      // Has this send already claimed the mounted notice row with something SPECIFIC? The row holds
+      // one line, so a later, vaguer notice would silently replace the explanation the founder needs.
+      let notedThisSend = false;
       // An agent that has since LEFT the feed is gone (closed, deleted, project unloaded), and
       // routing at it would report a delivery that cannot happen. Gone → the safe direction.
       const aim = submitted && agentStillExists(submitted.agentId) ? submitted : null;
@@ -2577,6 +2746,19 @@ export function ConciergeHost({
         postSparkle(
           line`${ref(asAgent(mentionAim.target))} can't take a message right now, so I've kept this here instead.`,
         );
+        // Same hidden-thread problem as the refusals below: mounted, that line is off screen.
+        if (displayMountedRef.current) {
+          noteMounted(
+            `${mentionAim.target.name} can't take a message right now, so I've kept this with Sparkle instead.`,
+            "warn",
+          );
+          // AND THE GENERIC LINE MUST NOT OVERWRITE IT. This message now falls through to Sparkle,
+          // which posts its own "Asked Sparkle" notice a few lines down — so without this the founder
+          // is told the least specific true thing ("asked Sparkle") instead of the one that explains
+          // WHY ("that agent can't take a message"). Last write wins in a one-line row, so the
+          // specific notice has to claim the row rather than merely arrive first.
+          notedThisSend = true;
+        }
       }
       // An address with NOTHING TO SAY is not a send. "@Kraken Auth" on its own strips to an empty
       // wire payload, and writing an empty line into a live PTY is at best a stray newline at the
@@ -2593,13 +2775,56 @@ export function ConciergeHost({
         });
         return true;
       }
+      // ══ THE SCREEN GUARD, ASKED BEFORE ANYTHING IS ARMED ════════════════════════════════════════
+      // Cheapest and kindest point to refuse: no countdown runs, no banner appears, and the founder
+      // gets the reason while the words are still the last thing they typed. It is asked AGAIN at
+      // dispatch (below) because the screen can change during the countdown — these are two different
+      // instants and both of them have to be safe. See `terminalWriteBlocked` for why a null viewport
+      // stops a mount and not an address.
+      if (addressable && aim) {
+        const blocked = terminalWriteBlocked(aim.agentId, mentionAim.via);
+        if (blocked) {
+          postSparkle(terminalRefusalLine(asAgent(aim), blocked));
+          // AND on the surface a mounted column can actually show (roborev 57360) — the line above
+          // goes to a thread the mount replaces. ONLY while the thread is actually replaced
+          // (roborev 57424): unmounted, this refusal is already visible twice (the thread line and
+          // the receipt), and a third copy in a row that could never clear would outlive the send.
+          if (displayMountedRef.current) noteMounted(terminalRefusalText(aim.name, blocked), "warn");
+          restoreDraft(text);
+          restoreAttachments(staged);
+          setReceipt(id, {
+            // NEITHER destination's wording (roborev 57360). `target: "agent"` would read "Sent to
+            // X" over a write that never landed — and `target: "sparkle"`, which this used to say,
+            // reads "ANSWERED HERE", which is just as false: the brain was never asked and the words
+            // are back in the box. `refused` is the arm that says what actually happened. The target
+            // still names who it was FOR, so the copy can name them.
+            target: "agent",
+            refused: true,
+            agentName: aim.name,
+            agentId: aim.agentId,
+            // The words are back in the composer, so there is nothing for a redirect to replay that
+            // the founder cannot simply send themselves — and offering to pass a message on to an
+            // agent that just declined it is a button pointed at the refusal.
+            redirectable: false,
+          });
+          return true;
+        }
+      }
       const decision = addressable
         ? ({
             target: "agent",
-            reason: "you named this agent in the message",
+            // Two ways to have chosen this terminal, and the reason exists so a surprising route is
+            // debuggable — so it must say WHICH. "you named this agent" over a message that named
+            // nobody would send the next person reading a log hunting for an address that was never
+            // typed.
+            reason:
+              mentionAim.via === "mount"
+                ? "the concierge is mounted to this agent"
+                : "you named this agent in the message",
             // "heuristic" for the same reason `forceSparkle` claims it: tier 1 means deterministic
             // and zero-cost, and no model was asked. Naming the agent yourself is as tier-1 as it
-            // gets — it is not a guess at all.
+            // gets — it is not a guess at all. Nor is patching a cable into one: both are gestures
+            // the user made, which is the distinction conciergeRouter's header turns on.
             source: "heuristic",
           } as const)
         : forceSparkle
@@ -2683,6 +2908,36 @@ export function ConciergeHost({
                 restoreAttachments(staged);
                 return false;
               }
+              // ══ AND THE SCREEN AGAIN, IMMEDIATELY BEFORE THE WRITE ═══════════════════════════
+              // The same re-check the block above makes for the agent's existence, over the same
+              // gap and for the same reason: seconds have passed, and the countdown is exactly long
+              // enough to open `vim` or hit a `sudo` prompt in. The submit-time check is the one
+              // that gives a fast, cheap answer; THIS one is the one that is actually load-bearing,
+              // because it is the last thing between the founder's text and `submitPrompt`'s
+              // paste-and-carriage-return. Do not delete either as redundant — they observe two
+              // different instants, and only the second observes the instant that matters.
+              const blocked = mentionAim
+                ? terminalWriteBlocked(aim.agentId, mentionAim.via)
+                : null;
+              if (blocked) {
+                postSparkle(terminalRefusalLine(asAgent(aim), blocked));
+                if (displayMountedRef.current)
+                  noteMounted(terminalRefusalText(aim.name, blocked), "warn");
+                restoreDraft(text);
+                restoreAttachments(staged);
+                // THE SAME RECEIPT THE SUBMIT-TIME REFUSAL POSTS. This used to post none at all, so
+                // the two refusal instants told the user different stories about the identical
+                // outcome — and the later one, which is the one that happens after they have watched
+                // a countdown run, was the silent one (roborev 57360).
+                setReceipt(id, {
+                  target: "agent",
+                  refused: true,
+                  agentName: aim.name,
+                  agentId: aim.agentId,
+                  redirectable: false,
+                });
+                return false;
+              }
               // announceSuccess: false — the receipt below already reads "→ Sent to <agent>".
               const ok = await promptAgent(
                 aim,
@@ -2721,7 +2976,20 @@ export function ConciergeHost({
                 //
                 // Quotes the DISPLAY rendering, never the wire: `payload` carries the attachments'
                 // temp paths, and this text reaches the brain's context (roborev 46925).
-                if (mentionAim && addressable) askSparkle(relayFollowUp(aim.name, display));
+                //
+                // ══ AND NOT FOR A MOUNTED SEND EITHER (`via === "mount"`) ══════════════════════
+                // Same reasoning as the router-decided case above, arrived at from the other side.
+                // A message ADDRESSED to an agent is sent THROUGH the concierge — the founder
+                // handed it something to relay, so the concierge is a party to that. A MOUNTED
+                // message is the founder talking straight to the agent: the column has swapped to
+                // that agent's own conversation, the compose box is keyed to that agent's draft,
+                // and Sparkle is not in the room. Following every line of that conversation with a
+                // paragraph of unbidden commentary — and billing a brain turn for each one — is not
+                // a thought partner, it is a tax on typing. The receipt still names where the
+                // message went, and the redirect is still one tap away when the founder does want
+                // Sparkle's read on it.
+                if (mentionAim?.via === "address" && addressable)
+                  askSparkle(relayFollowUp(aim.name, display));
                 return true;
               }
               // A failed delivery must not cost the user their files any more than their words
@@ -2777,6 +3045,17 @@ export function ConciergeHost({
       // WITH THE BUBBLE ID: this turn answers `id`, and if the user's next message displaces it
       // before a single byte comes back, that bubble is the one that has to say so.
       askSparkle(payload, id);
+      // ══ THE ESCAPE HATCH HAS TO SAY WHERE ITS ANSWER WENT (roborev 57360) ═══════════════════════
+      // Sparkle's reply lands in `ConciergeThread`, which a MOUNTED column does not render — so
+      // `@Sparkle what is the status?` produced a routed message, a real answer, and nothing on
+      // screen. That makes the documented way out of a mount look broken.
+      //
+      // The full prose does not belong in a one-line banner, so this points at it rather than
+      // quoting it. Only while mounted: unmounted, the answer appears in the thread the founder is
+      // already looking at and a notice would be noise about the ordinary case.
+      if (displayMountedRef.current && !notedThisSend) {
+        noteMounted("Asked Sparkle — press Esc to unmount and read the reply.", "info");
+      }
       const here = stillThere ? aim : null;
       setReceipt(id, {
         target: "sparkle",
@@ -2799,6 +3078,7 @@ export function ConciergeHost({
       enqueue,
       postSparkle,
       announce,
+      noteMounted,
     ],
   );
 
@@ -2822,30 +3102,38 @@ export function ConciergeHost({
       // queued cannot retroactively redirect it.
       const forceSparkle = forceSparkleRef.current;
       forceSparkleRef.current = false;
-      // THE ADDRESSED AGENT, if the user named one. The FIRST mention only: a message goes to one
-      // terminal, and fanning it out to several would multiply an irreversible action across agents
-      // the user named in one sentence — every extra name is still drawn as a pill in the bubble, so
-      // nothing is hidden, and the receipt names the one that was actually used. (A deliberate
-      // multi-send belongs behind its own affordance, not behind a comma.)
+      // ══ WHERE THIS MESSAGE GOES ═════════════════════════════════════════════════════════════════
+      // The founder's rule, whole, in one pure function (Concierge/composerRoute):
       //
-      // Resolved against the LIVE roster, so a mention naming an agent that has since closed simply
+      //   a leading @Sparkle → the concierge   |   a leading @Name → that agent's terminal
+      //   otherwise, mounted → the mount's terminal   |   otherwise → the concierge
+      //
+      // THE FIRST MENTION ONLY, and only when it LEADS. One terminal per message: fanning an
+      // irreversible action across every name in a sentence is not something to do behind a comma —
+      // every extra name is still drawn as a pill in the bubble, so nothing is hidden, and the
+      // receipt names the one that was actually used. And a name that does not lead is the sentence's
+      // SUBJECT, not its envelope ("Why is @Kraken Auth just sitting there?" is a question about that
+      // agent, aimed at the concierge) — the same positional test `mentionFreeText` uses to decide
+      // what to strip, shared so the span that chose the terminal is the span that gets consumed.
+      //
+      // @Sparkle IS A REAL DESTINATION, NOT AN UNRESOLVABLE NAME. The concierge is a first-class
+      // target of this box — `mentionRoster` offers it in the picker, and dictating the word
+      // "Sparkle" inserts that pill — but it is not a FEED agent, so looking it up in
+      // `mentionAgentsRef` was always going to miss and fall through as "named nobody", which is a
+      // lie about a name the user explicitly chose from a picker (bead sparkle-kaz1l). It is now the
+      // ESCAPE HATCH from the mount, which is the only reason it has to beat everything else.
+      const route = classifyComposerRoute({
+        text,
+        mentions: mentions ?? [],
+        mountedAgentId: mountedAgentIdRef.current,
+      });
+      const conciergeAddressed = route.kind === "sparkle" && route.via === "address";
+      // Resolved against the LIVE roster, so an address naming an agent that has since closed simply
       // fails to resolve and the message falls back to the auto-router — the recoverable direction,
       // and the same answer `deliver` gives when an aim goes missing mid-flight.
-      const named = mentions?.[0];
-      // ══ @Sparkle IS A REAL DESTINATION, NOT AN UNRESOLVABLE NAME ════════════════════════════════
-      // The concierge is a first-class target of this box — `mentionRoster` offers `@Sparkle` in the
-      // picker, and dictating the word "Sparkle" inserts that pill — but the concierge is not a FEED
-      // agent, so looking it up in `mentionAgentsRef` was always going to miss. It fell through as
-      // "named nobody", which is a lie about a name the user explicitly chose from a picker.
-      //
-      // Recognised here and routed deterministically to Sparkle below (bead sparkle-kaz1l). This is
-      // the founder's rule — "an explicit address routes THAT message, everything else follows the
-      // mount" — and it is the reason the concierge had to become a roster citizen rather than a
-      // special case downstream: a special case leaves the next surface with the same hole.
-      const conciergeAddressed = named ? isSparkleMention(named) : false;
       const mentionedAgent =
-        named && !conciergeAddressed
-          ? mentionAgentsRef.current.find((a) => a.id === named.agentId)
+        route.kind === "agent" && route.via === "address"
+          ? mentionAgentsRef.current.find((a) => a.id === route.agentId)
           : undefined;
       // ══ THE IMPROVE-SPARKLE MOUNT IS ITS OWN ADDRESS (bead sparkle-0rf5) ═════════════════════════
       // The app-owned Sparkle agent is the resolved routing target ONLY while its pane is mounted
@@ -2858,13 +3146,37 @@ export function ConciergeHost({
       // `neverPickerAnswer`). Gated on `!named` so a message the user addressed elsewhere (`@Kraken`)
       // or to the brain (`@Sparkle`, which sets `named`) is untouched. This is a special-case of the
       // sparkle SURFACE, deliberately, not a change to what any other mount does — the general
-      // "mounted send routes to the mounted agent" work is still cable-blind (PRD/concierge-mount).
+      // "mounted send routes to the mounted agent" work is now below, and is CABLE-gated.
+      //
+      // `!named` BECAME `route.via !== "address"`, and that is the same question asked properly. The
+      // old test was "is there a first mention at all", which is ordinal; the rule is now positional,
+      // so a name used mid-sentence as a SUBJECT no longer counts as addressing anybody (see
+      // Concierge/composerRoute). That is strictly more correct for this gate too: "ask Sparkle about
+      // the retry path" typed at a mounted Improve-Sparkle pane is a message FOR that pane, not a
+      // message addressed away from it.
       const mountAim = targetRef.current;
+      const addressedByUser = route.via === "address";
       const mountAddress =
-        !named && mountAim && isSparkleAgentId(mountAim.agentId)
+        !addressedByUser && mountAim && isSparkleAgentId(mountAim.agentId)
           ? { id: mountAim.agentId, projectId: mountAim.projectId, name: mountAim.name }
           : undefined;
       const addressedAgent = mentionedAgent ?? mountAddress;
+      // ══ AND THE GENERAL RULE THE ABOVE WAS A SPECIAL CASE OF ════════════════════════════════════
+      // Any CABLE-MOUNTED build agent, not just the app-owned Sparkle one. The two coexist rather
+      // than one replacing the other, because they answer different questions: `mountAddress` fires
+      // on the Improve-Sparkle SURFACE whether or not a cable is patched (that pane has no other
+      // composer, so the concierge box is its only way in), while this fires on the cable. Where both
+      // are true the address arm wins below, which preserves sparkle-0rf5's shipped behaviour exactly.
+      //
+      // A MOUNT AIMS AT `targetRef`, NOT AT A ROSTER LOOKUP, and the two cannot disagree:
+      // `routableMountedAgentId` is derived from that very target, so re-deriving the projectId/name
+      // from anywhere else would be a second source of truth for one fact. False when the cable moved
+      // between render and submit, which falls through to the ordinary unaddressed path — the
+      // recoverable direction.
+      const mountRouted =
+        route.kind === "agent" &&
+        route.via === "mount" &&
+        targetRef.current?.agentId === route.agentId;
       // NO GUARD HERE FOR "named but unresolvable", deliberately, and it is worth saying why since it
       // is the obvious thing to add. `named` exists only when the COMPOSER's roster recognised the
       // span, and this lookup uses the same feed — one render, one source — so a recognised name is
@@ -2949,11 +3261,29 @@ export function ConciergeHost({
       //
       // Built from the resolved mentions rather than the whole roster, so it strips exactly the
       // spans that were recognised — no second, laxer notion of what a mention looks like.
+      //
+      // A MOUNT BUILDS THE SAME AIM. It has no address to strip, but it goes through the identical
+      // `mentionFreeText` pass anyway and that is deliberate rather than incidental: a mounted
+      // message can still carry a SUBJECT mention ("check what Kraken Auth did first"), and the `@`
+      // on it must not reach the terminal for exactly the reason it must not on an addressed one —
+      // the Claude Code CLI opens its file-reference autocomplete on a leading `@` and strands the
+      // instruction behind a picker. `mentionFreeText` with no leading span drops sigils and keeps
+      // every name, which is precisely what a mounted message wants.
       const mentionAim: ConciergeMentionAim | null =
-        addressedAgent && submitted
+        (addressedAgent || mountRouted) && submitted
           ? (() => {
               const wire = mentionFreeText(text, rosterFromMentions(mentions ?? []));
-              return { target: submitted, payload: attachedPayload(wire, staged), text: wire };
+              return {
+                // `addressedAgent`, not `mentionedAgent`: the Improve-Sparkle mount (sparkle-0rf5)
+                // deliberately takes the ADDRESSED path — armed intent, countdown, `neverPickerAnswer`
+                // AND the concierge's follow-up turn — because that pane's whole purpose is a
+                // conversation the concierge is a party to. A cable mount is the other case: the
+                // founder talking straight to a build agent, where a brain turn per line is a tax.
+                via: addressedAgent ? ("address" as const) : ("mount" as const),
+                target: submitted,
+                payload: attachedPayload(wire, staged),
+                text: wire,
+              };
             })()
           : null;
       // ══ A FIFTH: THE SAME STRIP, BUT FOR THE REDIRECT REPLAY ════════════════════════════════════
@@ -3137,6 +3467,30 @@ export function ConciergeHost({
               ? ref({ id: promised, name: receipt.agentName })
               : plain("That agent");
           postSparkle(line`${who} isn't open any more, so I couldn't pass the message along.`);
+          return;
+        }
+        // ══ THE THIRD DOOR INTO A LIVE PTY, AND IT NEEDS THE SAME SCREEN GUARD (roborev 57358) ═════
+        // This file already names it: "the receipt's 'Also ask <agent>' is the THIRD way this box
+        // reaches a live terminal". The mounted-composer change gated the other two — at submit and
+        // again after the countdown — and left this one open, which is the worse omission of the
+        // three: `redirect` calls `promptAgent` DIRECTLY. There is no armed intent and no countdown,
+        // so one tap dispatches irreversibly, with nothing to cancel.
+        //
+        // `neverPickerAnswer` below is NOT this guard. It stops the replay being matched against a
+        // live picker's options; it says nothing about the alternate screen. So without this, a
+        // receipt offering "Also ask Kraken Auth" while Kraken sits in `vim` pasted the replay AND
+        // submitted it into normal mode, where the keys execute as editor commands.
+        //
+        // "address" SEMANTICS, deliberately: the redirect target is an agent the user NAMED (the
+        // button's label is an explicit promise), and its pane may not be mounted in this window at
+        // all — so an unreadable screen must not block it, exactly as it does not block an addressed
+        // send. Only what the screen positively shows refuses.
+        const redirectBlocked = terminalWriteBlocked(aim.agentId, "address");
+        if (redirectBlocked) {
+          // NO `alsoSentTo` IS RECORDED, so the button stays live: nothing was passed along, and a
+          // receipt that read "then to Kraken Auth" over a refused write would be the same lie the
+          // refusal exists to avoid. The user can leave `vim` and tap it again.
+          postSparkle(terminalRefusalLine(asAgent(aim), redirectBlocked));
           return;
         }
         // Through the queue: a redirect clicked while a compose send is still routing must land
@@ -3538,6 +3892,8 @@ export function ConciergeHost({
         // holder of the value (MAPPING.md: `data-wired` must not become scattered component state).
         wired={wired}
         mountedAgent={mountedAgent}
+        routableMountedAgentId={routableMountedAgentId}
+        mountedNotice={mountedNotice}
         searchSlot={searchSlot}
         prSlot={<ConciergePrChip />}
         // Armed sends, each cancellable, directly above the box. `cancelIntent` runs the arm site's

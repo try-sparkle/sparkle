@@ -49,7 +49,21 @@ const BANNED = ["IBM Plex Sans", "IBM Plex Mono", "Source Code Pro", "Verdana"];
  * Pro is named there deliberately for exactly that reason (see the comment at its call site). An
  * exemption you can see in a list is one the next person can argue with; a number they cannot.
  */
-const FONT_EXEMPT = new Set(["components/Terminal.tsx"]);
+// MOVED, NOT ADDED (the mounted-composer font branch). The terminal body's stack used to be typed
+// inline in Terminal's XTerm options, and this exemption followed it there. It now lives in
+// `terminalChrome.TERM_BODY_FONT`, because the mounted concierge composer is set in the SAME face
+// while what you type is bound for that agent's terminal — and a second copy of the stack in the
+// composer is precisely the silent substitution this ratchet exists to prevent (it would not be
+// WRONG, only different, so nothing else would ever go red).
+//
+// Terminal.tsx dropped OUT of both sets in the same move: it now imports the constant and names the
+// faces only in a comment. That is the shape an exemption should have — it follows the one line that
+// earns it rather than accumulating on files that used to.
+//
+// The blanket-immunity worry that `QUOTED_PATH_EXEMPT`'s note raises is answered by a HARD assertion
+// below ("terminalChrome names exactly one face, and it is the terminal body's"), so this path
+// cannot quietly grow an `IBM Plex Sans` behind the exemption.
+const FONT_EXEMPT = new Set(["components/terminalChrome.ts"]);
 
 /**
  * Paths allowed to name a font stack literally — exempt from the QUOTED count ONLY.
@@ -64,8 +78,10 @@ const FONT_EXEMPT = new Set(["components/Terminal.tsx"]);
  * per-file const sweep is the only thing that would have counted it.
  */
 const QUOTED_PATH_EXEMPT = new Set([
-  // xterm needs a real monospace carrying the U+2500 box-drawing block.
-  "components/Terminal.tsx",
+  // xterm needs a real monospace carrying the U+2500 box-drawing block, and reads its `fontFamily`
+  // option as a real stack rather than through the cascade — so this one cannot be a var. It lives
+  // in terminalChrome now because the mounted composer borrows it; see FONT_EXEMPT above.
+  "components/terminalChrome.ts",
   // The Sparkle voice overlay's reply is set in a SERIF on purpose — the one surface deliberately
   // not in the instrument's own face. Listed rather than counted: an exemption you can see is one
   // the next person can argue with; a number they cannot.
@@ -413,6 +429,51 @@ describe("font families come from the scale, never from a retyped literal", () =
         `${rel} re-typed a font stack — import FONT_UI / FONT_MONO from theme/scale instead`,
       ).toEqual([]);
     }
+  });
+
+  // ══ THE EXEMPT PATH IS NOT A BLANK CHEQUE ═══════════════════════════════════════════════════════
+  // `terminalChrome.ts` is exempt from BOTH ratchets, which is wider than the one line that earns it:
+  // the file also re-exports TERM_UI / TERM_MONO, and blanket immunity is exactly what
+  // QUOTED_PATH_EXEMPT's own note warns about — someone could type `IBM Plex Sans` in there and both
+  // ceilings would stay green, which is the substitution this whole guard exists to prevent.
+  //
+  // So the exemption is bounded HERE instead of by a number: exactly one face may be named in that
+  // file, and it must be the terminal body's. A second stack — for any surface, however good the
+  // reason — fails this and has to be argued for rather than slipped in behind the path.
+  it("terminalChrome names exactly one face, and it is the terminal body's", () => {
+    const rel = "components/terminalChrome.ts";
+    const r = scanSource(rel, readFileSync(join(SRC, rel), "utf8"));
+    expect(
+      r.quoted,
+      `terminalChrome may name ONE font stack (TERM_BODY_FONT, which xterm needs as a literal). ` +
+        `Everything else on that plane re-exports FONT_UI / FONT_MONO:\n${r.quoted.join("\n")}`,
+    ).toHaveLength(1);
+    expect(r.quoted[0]).toContain("TERM_BODY_FONT");
+    // ══ THE BANNED HALF, WHICH THE FIRST CUT OF THIS TEST LEFT OPEN (roborev 57361) ═══════════════
+    // `FONT_EXEMPT` suppresses BANNED for this whole file, and bounding only `quoted` did not close
+    // that: the const sweep records a literal only when it `looksLikeStack` (a strong token, or a
+    // generic keyword AND a comma). `export const TERM_HEADING_FONT = "IBM Plex Sans";` matches
+    // none of those — so it would be invisible to `quoted`, suppressed in `banned`, and all three
+    // assertions would stay green while the file grew exactly the webfont substitution this whole
+    // guard exists to prevent. That shape — an exported face const with no fallback list — is the
+    // LIKELY one here, not a corner case.
+    //
+    // So every banned-family mention in this file must be on the TERM_BODY_FONT line (its own
+    // declaration, plus the doc comment that explains why the order matters).
+    for (const hit of r.banned) {
+      expect(
+        hit,
+        `terminalChrome may name a replaced webfont ONLY in TERM_BODY_FONT, which xterm needs as a ` +
+          `literal. Everything else must come from FONT_UI / FONT_MONO:\n${hit}`,
+      ).toMatch(/Source Code Pro/);
+    }
+  });
+
+  // …and the file it moved OUT of must stay clean, or the exemption has simply been duplicated.
+  // Terminal.tsx now imports the constant; the faces appear there only in a comment.
+  it("Terminal.tsx reads the constant rather than re-typing the stack", () => {
+    const rel = "components/Terminal.tsx";
+    expect(scanSource(rel, readFileSync(join(SRC, rel), "utf8")).quoted).toEqual([]);
   });
 });
 

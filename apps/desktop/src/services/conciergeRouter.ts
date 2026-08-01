@@ -5,10 +5,26 @@
 //
 // ══ THE RULE, AND IT IS ABSOLUTE ═════════════════════════════════════════════════════════════════
 // `routeMessage` NEVER returns `target: "agent"`. Not on a fallback, not on a heuristic, not on any
-// future tier. The only thing in this app that may aim a message at a live PTY is the USER NAMING
-// THE AGENT — an explicit `@Kraken Auth` in the text, resolved by Concierge/mentions and turned into
-// a `{ target: "agent" }` decision by ConciergeHost BEFORE it ever calls this module. Everything
-// that reaches here resolves to `sparkle`.
+// future tier. Everything that reaches here resolves to `sparkle`.
+//
+// The only things in this app that may aim a message at a live PTY are USER GESTURES, and there are
+// exactly two. Both are resolved by `Concierge/composerRoute` and turned into a `{ target: "agent" }`
+// decision by ConciergeHost BEFORE it ever calls this module:
+//
+//   1. NAMING THE AGENT — a leading `@Kraken Auth` in the text (Concierge/mentions).
+//   2. MOUNTING TO IT — the cable patched into that build agent, which is the founder's rule that
+//      while mounted, what you type goes to that agent's terminal. `@Sparkle` is the escape hatch.
+//
+// THE SECOND IS NOT A LOOSENING OF THIS RULE, and it is worth being precise about why, because it
+// looks like one. What this file forbids is a DESTINATION INFERRED FROM THE TEXT — the deleted branch
+// below read "the agent is asking something" plus "this reply looks terse" and concluded a terminal.
+// A mount reads neither: the user clicked that row, the cable is drawn on screen, the column has
+// swapped to that agent's own conversation, and the compose box is keyed to that agent's draft and
+// set in that terminal's typeface. The sentence that governs this file — *"a heuristic verdict is not
+// a user gesture"* — is exactly what separates the two. Nothing about the mount is a guess, and the
+// user can see it without reading anything.
+//
+// What is still forbidden, unchanged: this module answering `agent`, on any tier, for any reason.
 //
 // This used to be weaker: the header said "NEVER change this FALLBACK to agent" while a heuristic
 // one screen down did exactly that. The branch read "the agent on screen is in `waiting`/`approval`

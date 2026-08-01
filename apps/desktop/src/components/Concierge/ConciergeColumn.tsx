@@ -30,6 +30,7 @@ import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
 import { MountedAgentThread } from "./MountedAgentThread";
+import { MountedNotice } from "./MountedNotice";
 import { ConciergeTopRight } from "./KebabMenu";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { KeyPill } from "./KeyPill";
@@ -150,6 +151,8 @@ export function ConciergeColumn({
   approvalSlot,
   wired = "off",
   mountedAgent = null,
+  routableMountedAgentId = null,
+  mountedNotice = null,
   mentionAgents,
   preferredAgentId,
   copyOnSelection = true,
@@ -579,6 +582,16 @@ export function ConciergeColumn({
           It deliberately carries NO live region of its own — the single announcer below is fed by
           the host when an intent arms (a second region double-announces). */}
       {countdownSlot}
+      {/* THE ONE EXPLANATION THAT SURVIVES THE MOUNT SWAP. Mounted, the thread above is the AGENT's
+          transcript and `ConciergeThread` is not rendered at all — so a terminal refusal, or the
+          @Sparkle escape hatch's reply, is written to a component that is off screen (roborev 57360).
+          This row is outside the swap, like `countdownSlot` above and the unmount hint below, which
+          is what makes it visible in the state the mounted-composer feature exists for.
+
+          NOT gated on `mountedAgent`: the host only ever fills it on the mounted path, and gating it
+          here as well would be a second place for "are we mounted" to be decided — the divergence
+          that put the composer in the terminal's face while the send path refused to route. */}
+      {!aiLock && <MountedNotice notice={mountedNotice} />}
       {/* THE WAY OUT OF THE MOUNT. Mounted, the human's typing goes to a build agent's terminal
           rather than to the concierge — a big change in where their words land, and Escape is the
           only gesture that undoes it. So the affordance is ON SCREEN while the state is live rather
@@ -689,6 +702,14 @@ export function ConciergeColumn({
           onTextEdit={onTextEdit}
           mentionAgents={mentionAgents}
           preferredAgentId={preferredAgentId}
+          /* NOT `mountedAgent?.agentId` (roborev 57358/57361). The thread swap above keys off the
+             DISPLAY mount — is the cable patched — which is the right question for "whose
+             conversation is shown" and the wrong one for "where do my words go". The host gates this
+             one on `promptTargetShown` as well, so the typeface can never claim a draft is bound for
+             a PTY in a state where the send path has already decided it is not (Plan board up,
+             Improve-Sparkle up, the agent's tab closed). The composer takes the ROUTING fact,
+             because that is the fact its typeface is reporting. */
+          mountedAgentId={routableMountedAgentId}
           autoSend={autoSend}
           sendMode={sendMode}
           onSendModeChange={onSendModeChange}

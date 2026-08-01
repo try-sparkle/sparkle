@@ -150,6 +150,8 @@ import {
   type ConciergeMention,
   type MentionAgent,
 } from "./mentions";
+import { classifyComposerRoute } from "./composerRoute";
+import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT } from "../terminalChrome";
 import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
 import { SendModeTray, type SendTrayModel } from "./SendModeTray";
 import { DEFAULT_SEND_CHORD, chordSends, type SendChord, type SendMode } from "../../voice/sendMode";
@@ -237,6 +239,45 @@ const COMPOSE_TEXT_METRICS: CSSProperties = {
   // the placeholder overlay's geometry and the auto-grow measurement are both taken off this box.
   border: "1px solid transparent",
   borderRadius: 6,
+};
+
+/**
+ * THE SAME GEOMETRY, SET IN THE TERMINAL'S OWN FACE — what the box looks like while what you type
+ * is going into an agent's terminal rather than to the concierge.
+ *
+ * ══ THE FOUNDER'S ASK, AND WHY IT IS THE TYPEFACE ═══════════════════════════════════════════════
+ * *"When I'm talking to a terminal view in a mounted concierge, I want the font style to change, to
+ * be the same font style as it is in the terminal."* The font IS the routing indicator: with the
+ * concierge patched to a build agent, plain text goes to that agent's PTY and `@Sparkle` pulls it
+ * back to the concierge (Concierge/composerRoute) — and the difference between those two
+ * destinations is otherwise invisible while you are mid-sentence. A label would have to be read; a
+ * typeface is seen.
+ *
+ * ══ WHY THE FACE COMES FROM `TERM_BODY_FONT` ════════════════════════════════════════════════════
+ * It is the literal stack xterm is constructed with (components/Terminal). Re-typing it here would
+ * be the exact silent drift `terminalChrome`'s header is about: the composer would simply stop
+ * looking like the terminal, and no test would go red because nothing would be WRONG, only
+ * different. Same for the size — `TERM_BODY_BASE_SIZE` is what xterm gets at zoom 1, and it happens
+ * to equal the composer's own 13, so today this changes the FACE and not the metrics. Reading it
+ * from the constant is what keeps that true if somebody retunes the terminal.
+ *
+ * ZOOM IS DELIBERATELY NOT FOLLOWED — see TERM_BODY_BASE_SIZE. The base size, not the zoomed one.
+ *
+ * `fontWeight: 400` is stated rather than inherited because xterm's own default is `normal`, and the
+ * composer sits inside the app's UI cascade, which is free to set something else. Matching "closely
+ * enough that it reads as the same typeface" means the weight is part of the match, not an accident
+ * of what the surrounding column happened to be set in.
+ *
+ * ONE OBJECT, SPREAD INTO BOTH CONSUMERS, for the reason the constant above exists at all: the
+ * mention mirror paints pill fills behind the real glyphs, and a font swap that reached the textarea
+ * but not the mirror would slide every fill off the word it belongs to — silently, because a
+ * misaligned pill still renders.
+ */
+const COMPOSE_TEXT_METRICS_TERMINAL: CSSProperties = {
+  ...COMPOSE_TEXT_METRICS,
+  fontFamily: TERM_BODY_FONT,
+  fontSize: TERM_BODY_BASE_SIZE,
+  fontWeight: 400,
 };
 
 const attachStyle: CSSProperties = {
@@ -477,6 +518,7 @@ export function ComposeBox({
   wired = false,
   mentionAgents = EMPTY_MENTION_AGENTS,
   preferredAgentId = null,
+  mountedAgentId = null,
   autoSend,
   sendMode = "send",
   onSendModeChange,
@@ -532,6 +574,22 @@ export function ComposeBox({
   /** The agent a send would reach WITHOUT a mention — the selected build agent. Sorts to the top of
    *  the picker, so "@" then Enter aims at the thing already in front of you. */
   preferredAgentId?: string | null;
+  /**
+   * The agent the concierge is MOUNTED to (the cable is patched to it), or null when it floats free.
+   *
+   * Purely a rendering input here: it is what lets the box ask `classifyComposerRoute` where the
+   * draft in front of the user would actually go, and SET ITSELF IN THE TERMINAL'S FACE when the
+   * answer is a terminal. The founder's ask, and the reason it is the typeface rather than a label:
+   * *"I want the font style to change, to be the same font style as it is in the terminal… when the
+   * concierge is mounted and I'm interacting with that agent."* You can see where your words are
+   * going without reading anything.
+   *
+   * NOT how the message is routed. The host decides that at submit, from its own captured-at-submit
+   * mount (ConciergeHost's `send`), and it must stay that way — a live prop read inside a queued send
+   * would deliver to whatever the user mounted while it was waiting. This prop and that decision are
+   * two readings of one fact, and they agree because both call the same pure rule.
+   */
+  mountedAgentId?: string | null;
   /** The auto-send countdown's live state (PRD §4), supplied by the host from voice/autoSendTimer.
    *
    *  OPTIONAL, and its absence means NOTHING IS COUNTING rather than no tray: the tray is where
@@ -794,6 +852,21 @@ export function ComposeBox({
   // …and the same list for the dictation callback, which is registered once and must not re-register
   // on every fleet change (see `rosterRef` above).
   rosterRef.current = roster;
+  // ══ WHERE THIS DRAFT WOULD GO, RIGHT NOW — and therefore what face to set it in ════════════════
+  // THE SAME PURE RULE THE SEND PATH USES (Concierge/composerRoute), not a second reading of the
+  // mount. That matters more than it looks: the indicator has to be right about the ESCAPE HATCH,
+  // and "am I mounted" cannot answer that. Typing `@Sparkle ` at the head of the box reverts the box
+  // to the concierge's face the moment the pill resolves, because the message really has stopped
+  // being terminal-bound — and a mid-sentence "Sparkle" does NOT revert it, because that one is the
+  // sentence's subject and the message is still going to the terminal. An indicator derived from
+  // anything cheaper would lie in exactly the cases the founder needs it for.
+  //
+  // Resolved against `roster`, so what the box RESOLVED as a mention (and drew as a pill) is what the
+  // font reflects — one matcher, one answer, no third notion of what an address looks like.
+  const aimedAtTerminal =
+    classifyComposerRoute({ text, mentions: mentionsIn(text, roster), mountedAgentId }).kind ===
+    "agent";
+  const textMetrics = aimedAtTerminal ? COMPOSE_TEXT_METRICS_TERMINAL : COMPOSE_TEXT_METRICS;
   const pending = mentionQuery(text, caret);
   const matches =
     pending &&
@@ -1771,13 +1844,21 @@ export function ComposeBox({
               // The type ramp, the padding and that border now come from COMPOSE_TEXT_METRICS,
               // because the MENTION MIRROR behind this element has to match them exactly or its pill
               // fills sit off the words they belong to (see that constant).
-              ...COMPOSE_TEXT_METRICS,
+              //
+              // …and the FACE follows the aim: while this draft is bound for a mounted agent's
+              // terminal it is set in the terminal's own font, so the typeface says where the words
+              // are going (see COMPOSE_TEXT_METRICS_TERMINAL). The mirror below takes the same
+              // object, which is what keeps the pills on their words through the swap.
+              ...textMetrics,
               // THE DICTATION SPACER. While a phrase is provisional the mirror behind this element
               // paints `interimH` more pixels than this element's own value does, and this element's
               // scroll range is what the mirror follows — so without matching room down here the tail
               // of the preview sits below anything `ta.scrollTop` can reach. Padding, not content:
               // it moves no glyph and changes no wrap point, so the pill fills stay on their words.
               // The layout effect measures with this reset, or it would feed itself.
+              //
+              // AFTER the spread, and that ordering is load-bearing: `textMetrics` carries a
+              // `padding` shorthand, so a spacer written above it would be silently overwritten.
               paddingBottom: dictationPadBottom,
               background: "transparent",
               color: "inherit",
@@ -1810,7 +1891,7 @@ export function ComposeBox({
           <MentionMirror
             text={text}
             agents={roster}
-            metrics={COMPOSE_TEXT_METRICS}
+            metrics={textMetrics}
             textareaRef={textareaRef}
             interim={interim}
           />
