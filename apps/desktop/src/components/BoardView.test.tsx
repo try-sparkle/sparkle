@@ -109,7 +109,7 @@ vi.mock("../services/beads", async (importOriginal) => {
   };
 });
 
-import { BoardView } from "./BoardView";
+import { BoardView, boardScrollDelta } from "./BoardView";
 import { sendToBuild } from "../services/sendToBuild";
 import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
@@ -837,5 +837,184 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
     expect(screen.queryByTestId("board-agent-filter-banner")).toBeNull();
     expect(screen.getByText("My feedback bead")).toBeTruthy();
     expect(screen.getByText("Someone elses bead")).toBeTruthy();
+  });
+});
+
+// ── THE WHEEL MOVES THE BOARD, NOT ONE COLUMN'S CARDS ─────────────────────────────────────────
+//
+// A kanban is a HORIZONTAL thing and the wheel is the gesture people reach for to travel along it,
+// but the browser will not do that unaided: `deltaY` scrolls the nearest ancestor overflowing on Y,
+// and the only such ancestor here is a column's card list. So the board could never be moved by a
+// wheel at all — the founder's BACKLOG (606 items) ate every scroll while BLOCKED sat clipped at
+// the right edge with no gesture that would bring it in.
+describe("boardScrollDelta — which thing the wheel moves", () => {
+  const atRest = { scrollTop: 0, scrollHeight: 100, clientHeight: 100 };
+  const roomBelow = { scrollTop: 0, scrollHeight: 900, clientHeight: 300 };
+  const atBottom = { scrollTop: 600, scrollHeight: 900, clientHeight: 300 };
+
+  it("moves the BOARD when the pointer is not over a card list at all", () => {
+    // Column headers, the gaps between columns, the padding — most of the board's surface.
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 120 }, null)).toBe(120);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: -120 }, null)).toBe(-120);
+  });
+
+  it("moves the BOARD over a column whose cards all fit — there is nothing to scroll there", () => {
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 120 }, atRest)).toBe(120);
+  });
+
+  it("leaves a column that can still move in the wheel's own direction alone", () => {
+    // The exception, and the reason a 606-card column stays readable: while the list has room the
+    // list keeps the event. Board-always-wins would make those cards reachable only by dragging a
+    // scrollbar, which trades the founder's bug for a worse one.
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 120 }, roomBelow)).toBe(0);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: -120 }, atBottom)).toBe(0);
+  });
+
+  it("hands the board the event once that column is at its end — one continuous gesture", () => {
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 120 }, atBottom)).toBe(120);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: -120 }, roomBelow)).toBe(-120);
+  });
+
+  it("keeps its hands off a horizontal gesture, which already lands on the board", () => {
+    // The board row IS the nearest X scroller, so the browser does this one right unaided; adding
+    // to scrollLeft as well would double every trackpad swipe.
+    expect(boardScrollDelta({ deltaX: 90, deltaY: 4 }, null)).toBe(0);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 0 }, null)).toBe(0);
+  });
+
+  it("reads a LINE-mode wheel in pixels, like the sidebar's forwarder already does", () => {
+    // A mouse in DOM_DELTA_LINE mode reports ~3 per notch. Taken raw, the board would creep 3px a
+    // notch — indistinguishable from "the wheel does nothing", which is the bug being fixed.
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 3, deltaMode: 1 }, null)).toBe(48);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: -3, deltaMode: 1 }, null)).toBe(-48);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 1, deltaMode: 2 }, null)).toBe(400);
+    // The normalisation reaches the RETURNED VALUE with a list in play too, not just the null case:
+    // a list at its end hands the gesture over, and what it hands over is 48px, not 3.
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 3, deltaMode: 1 }, atBottom)).toBe(48);
+  });
+
+  it("decides the handoff on DIRECTION alone — never on how big the gesture is", () => {
+    // Worth pinning because the obvious "improvement" is to compare travel against slack, which
+    // would change when the board takes over on every column. It does not: `room`/`scrollTop` are
+    // tested against a sub-pixel constant, and the delta contributes only its SIGN. A list with
+    // 20px left keeps a 3-line gesture and a 1000px one alike.
+    const nearlyDone = { scrollTop: 0, scrollHeight: 320, clientHeight: 300 };
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 3, deltaMode: 1 }, nearlyDone)).toBe(0);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 3, deltaMode: 0 }, nearlyDone)).toBe(0);
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 1000, deltaMode: 0 }, nearlyDone)).toBe(0);
+  });
+
+  it("treats a sub-pixel remainder as 'at the end'", () => {
+    // Fractional scrollHeight (zoom, fractional DPR) otherwise leaves a list able to scroll by a
+    // hair forever, and the board would never take over — the original bug, restored by rounding.
+    expect(boardScrollDelta({ deltaX: 0, deltaY: 120 }, { scrollTop: 0, scrollHeight: 300.4, clientHeight: 300 })).toBe(120);
+  });
+});
+
+describe("the board's scroll containers", () => {
+  it("scrolls the columns sideways when a wheel arrives over a list with no room left", () => {
+    render(<BoardView project={project} side="right" />);
+    const row = screen.getByTestId("board-columns");
+    // jsdom has no layout, so scrollLeft is a permanent 0 there — make it a real settable property
+    // so the handler's write is observable. The GEOMETRY below is the test's actual input.
+    Object.defineProperty(row, "scrollLeft", { value: 0, writable: true, configurable: true });
+    const list = row.querySelector("[data-board-column-list]") as HTMLElement;
+    expect(list).toBeTruthy();
+
+    fireEvent.wheel(list, { deltaX: 0, deltaY: 150 });
+    expect(row.scrollLeft).toBe(150);
+  });
+
+  it("leaves the board alone while the column under the pointer still has cards to reveal", () => {
+    render(<BoardView project={project} side="right" />);
+    const row = screen.getByTestId("board-columns");
+    Object.defineProperty(row, "scrollLeft", { value: 0, writable: true, configurable: true });
+    const list = row.querySelector("[data-board-column-list]") as HTMLElement;
+    Object.defineProperty(list, "scrollHeight", { value: 900, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: 300, configurable: true });
+
+    fireEvent.wheel(list, { deltaX: 0, deltaY: 150 });
+    expect(row.scrollLeft).toBe(0);
+  });
+
+  it("gives each axis exactly one owner", () => {
+    const { container } = render(<BoardView project={project} side="right" />);
+    const row = screen.getByTestId("board-columns");
+    // The row is the X scroller and NOT a Y one. Left `visible`, CSS would force overflow-y to
+    // `auto` here (one axis non-visible forces the other) and put a second vertical scroller around
+    // the columns, so "which thing did I just scroll" would have no answer.
+    expect(row.style.overflowX).toBe("auto");
+    expect(row.style.overflowY).toBe("hidden");
+    // ...and each card list is the Y scroller and NOT an X one. That same CSS rule is what silently
+    // made these horizontal scrollers: any card wider than its column gave the list scrollable
+    // width, and one sideways nudge pushed the text out of view on the LEFT — the founder's clipped
+    // titles ("window drop is", "causes").
+    const lists = container.querySelectorAll<HTMLElement>("[data-board-column-list]");
+    expect(lists.length).toBe(5);
+    for (const l of lists) {
+      expect(l.style.overflowY).toBe("auto");
+      expect(l.style.overflowX).toBe("hidden");
+      // CONTAINED ON Y ONLY, and the suffix is load-bearing (roborev 57312). A hidden axis is a
+      // CLIPPED scrollport, not an absent one, so this element is still a scroll container on X —
+      // an unsuffixed `overscroll-behavior: contain` latches a horizontal swipe HERE, where nothing
+      // can move, instead of letting it chain to the board row. Over a column tall enough to be a
+      // scroller that leaves NO gesture that reaches the board, since the vertical rule hands the
+      // list the wheel: the exact bug this file is guarding, on the exact column that reported it.
+      expect(l.style.overscrollBehaviorY).toBe("contain");
+      expect(l.style.overscrollBehavior).toBe("");
+      expect(l.style.overscrollBehaviorX).toBe("");
+    }
+  });
+
+  it("leaves a horizontal gesture to the browser rather than half-handling it", () => {
+    render(<BoardView project={project} side="right" />);
+    const row = screen.getByTestId("board-columns");
+    Object.defineProperty(row, "scrollLeft", { value: 0, writable: true, configurable: true });
+    const list = row.querySelector("[data-board-column-list]") as HTMLElement;
+    // The row is the nearest X scroller, so the browser already moves it; adding to scrollLeft here
+    // as well would double every trackpad swipe.
+    fireEvent.wheel(list, { deltaX: 150, deltaY: 2 });
+    expect(row.scrollLeft).toBe(0);
+  });
+
+  it("lets a card be narrower than its longest word, so a title wraps instead of overflowing", () => {
+    // The other half of the clipped-title fix: hiding the axis alone would CLIP the overflow rather
+    // than scroll it, which is no better. Bead titles carry paths and branch names with no break
+    // opportunity, so the text has to be allowed to break anywhere and the card to shrink below it.
+    render(<BoardView project={project} side="right" />);
+    const title = screen.getByText("Backlog one");
+    expect(title.style.overflowWrap).toBe("anywhere");
+    // The description preview carries the same text, and the same risk.
+    expect(screen.getByText("First backlog task description.").style.overflowWrap).toBe("anywhere");
+    // And NO `minWidth: 0` anywhere on the way up (roborev 57312): the content-based automatic
+    // minimum is a MAIN-AXIS rule, and every box here is an item of a column-direction flex
+    // container, so `min-width: auto` already resolves to 0. Declaring it is dead style that reads
+    // as load-bearing — pin its absence so it does not come back as cargo.
+    const body = title.closest("button") as HTMLElement;
+    const card = body.parentElement as HTMLElement;
+    expect(card.style.background).toBeTruthy(); // it really is the card shell, not another wrapper
+    expect(body.style.minWidth).toBe("");
+    expect(card.style.minWidth).toBe("");
+  });
+});
+
+describe("the board's header", () => {
+  it("does not restate the project name above the columns", () => {
+    // Founder's call: the tab bar directly above already says which project this is, and a 17px
+    // row plus its hairline was ~44px of board height spent repeating it — taken from the cards.
+    render(<BoardView project={project} side="right" />);
+    expect(screen.queryByText(/Tasks —/)).toBeNull();
+    expect(screen.queryByText(`Tasks — ${project.name}`)).toBeNull();
+  });
+
+  it("still surfaces a fetch error, which that row also carried", () => {
+    error = "bd blew up";
+    render(<BoardView project={project} side="right" />);
+    expect(screen.getByTestId("board-error").textContent).toBe("bd blew up");
+  });
+
+  it("reserves no banner when there is no error", () => {
+    render(<BoardView project={project} side="right" />);
+    expect(screen.queryByTestId("board-error")).toBeNull();
   });
 });

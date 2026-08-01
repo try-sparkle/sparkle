@@ -87,6 +87,66 @@ const DESC_PREVIEW = 120;
 // render, which makes the store re-render in a loop. Reuse one frozen array instead.
 const NO_AGENTS: AgentTab[] = [];
 
+/** The card list inside a column — the only element on this board that scrolls vertically, and the
+ *  one `boardScrollDelta` asks whether it still has room. */
+const COLUMN_LIST_ATTR = "data-board-column-list";
+
+/** A vertically scrollable list's geometry — the three numbers, so a test can state a case without
+ *  a layout engine (jsdom reports every element as 0×0 and would make the real thing untestable). */
+export type ListScroll = { scrollTop: number; scrollHeight: number; clientHeight: number };
+
+/** A wheel's deltas are only PIXELS when `deltaMode` says so. A mouse reporting LINE mode sends
+ *  `deltaY ≈ 3` per notch, so a handler that adds the raw number to `scrollLeft` creeps 3px a notch
+ *  — indistinguishable from "the wheel does nothing". `AgentSidebar`'s forwarder already scales by
+ *  16 for line mode; match it rather than letting two handlers disagree about the same input.
+ *  (0 = pixel, 1 = line, 2 = page.) */
+const LINE_PX = 16;
+const PAGE_PX = 400;
+export function wheelPixels(delta: number, deltaMode: number): number {
+  if (deltaMode === 1) return delta * LINE_PX;
+  if (deltaMode === 2) return delta * PAGE_PX;
+  return delta;
+}
+
+/**
+ * HOW MUCH THE BOARD SCROLLS HORIZONTALLY FOR ONE WHEEL EVENT — the axis rule, as a pure function.
+ *
+ * A kanban is a HORIZONTAL thing, and the wheel is the gesture people reach for to move along it.
+ * The browser will not do that on its own: `deltaY` scrolls the nearest ancestor that overflows on
+ * Y, and the board row overflows on X, so a plain wheel over this board could only ever move a
+ * column's cards. That is what the founder hit — BACKLOG holding 606 items ate every scroll while
+ * BLOCKED sat clipped at the right edge with no gesture that would reach it.
+ *
+ * So a vertical wheel drives the board sideways. The ONE exception is the case where the user is
+ * plainly reading a column: if the pointer is over a card list that can still move in the wheel's
+ * own direction, that list keeps the event. Chaining that way round is what keeps a 606-card column
+ * readable — the alternative (board always wins) makes its cards reachable only by dragging a
+ * scrollbar. Once the list is at its end the board takes over, so one continuous gesture reads to
+ * the bottom of a column and then carries on across the board.
+ *
+ * `deltaX` is returned untouched-by-us (0): a horizontal wheel or trackpad swipe already lands on
+ * the board row, which is the nearest X scroller, so the browser does the right thing unaided.
+ *
+ * @returns pixels to add to the board's `scrollLeft`; 0 means "leave this event alone".
+ */
+export function boardScrollDelta(
+  { deltaX, deltaY, deltaMode = 0 }: { deltaX: number; deltaY: number; deltaMode?: number },
+  list: ListScroll | null,
+): number {
+  // A horizontal gesture is already aimed at the board. Don't double-apply it.
+  if (Math.abs(deltaX) > Math.abs(deltaY)) return 0;
+  if (deltaY === 0) return 0;
+  deltaY = wheelPixels(deltaY, deltaMode);
+  if (list) {
+    // Sub-pixel slack: a fractional scrollHeight/clientHeight (zoom, fractional DPR) otherwise
+    // leaves a list permanently "able to scroll" by a hair, and the board would never take over.
+    const room = list.scrollHeight - list.clientHeight - list.scrollTop;
+    if (deltaY > 0 && room > 1) return 0;
+    if (deltaY < 0 && list.scrollTop > 1) return 0;
+  }
+  return deltaY;
+}
+
 /**
  * Read-only Tasks Kanban for a project (bead sparkle-hiju.10). A window, NOT a control panel:
  * it polls `bd` via the beads store and renders the four buckets (Backlog / In Progress / Done /
@@ -101,6 +161,19 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
   const error = useBeadsStore((s) => s.error[project.id]);
   // Which bead's detail overlay is open (null = none). Cleared when the board unmounts.
   const [selected, setSelected] = useState<Bead | null>(null);
+
+  // The horizontally scrolling row of columns, and the wheel that drives it — see boardScrollDelta.
+  const colsRef = useRef<HTMLDivElement | null>(null);
+  const onWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    const row = colsRef.current;
+    if (!row) return;
+    // NOT preventDefault'ed, and it does not need to be: React binds `wheel` PASSIVELY at the root,
+    // so a preventDefault here is a no-op plus a console warning. Nothing double-applies anyway —
+    // when this returns non-zero the list under the pointer is at its end, and the row does not
+    // scroll on Y, so the browser's own handling of the event moves nothing.
+    const dx = boardScrollDelta(e, (e.target as HTMLElement).closest<HTMLElement>(`[${COLUMN_LIST_ATTR}]`));
+    if (dx !== 0) row.scrollLeft += dx;
+  };
 
   // Live the board off the beads-store poller: start it on mount, stop on unmount. The store is
   // idempotent (one timer per project), so this co-exists with any other viewer of the same project.
@@ -240,25 +313,30 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
         minHeight: 0,
       }}
     >
-      {/* Header: title + (when present) the error banner. */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          padding: "12px 16px",
-          borderBottom: `1px solid ${C.hairline}`,
-          flexShrink: 0,
-        }}
-      >
-        <div style={{ fontSize: 17, fontWeight: FONT_WEIGHT.semibold, color: C.cream }}>
-          Tasks — {project.name}
+      {/* NO TITLE ROW. It used to read "Tasks — <project>" above the columns, and the founder's call
+          (third correction of this sitting) is that it says nothing the tab bar directly above does
+          not already say — the project name is up there, and Plan/Build is the toggle beside it. A
+          full-width 17px row plus its hairline was ~44px of the board's height spent restating that,
+          taken from the cards, which is what the user actually came to read.
+
+          The ERROR is what that row also carried, and it stays: a fetch failure keeps any prior
+          snapshot on screen rather than wiping it, so the message is the only sign anything is
+          stale. It gets its own thin banner now, rendered ONLY when there is one — an empty row is
+          not reserved against the possibility. */}
+      {error && (
+        <div
+          data-testid="board-error"
+          style={{
+            padding: "6px 16px",
+            borderBottom: `1px solid ${C.hairline}`,
+            color: C.sienna,
+            fontSize: 12,
+            flexShrink: 0,
+          }}
+        >
+          {error}
         </div>
-        {/* Errors keep any prior snapshot visible; surface the message in sienna without wiping. */}
-        {error && (
-          <div style={{ color: C.sienna, fontSize: 12, marginLeft: "auto" }}>{error}</div>
-        )}
-      </div>
+      )}
 
       {/* Per-agent feedback filter banner: shown only while a FEEDBACK pill has narrowed the board.
           Clicking Clear drops the filter (boardAgentFilter → null) and the full board returns. */}
@@ -304,12 +382,23 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
         <div style={{ padding: 24, color: C.muted, fontSize: 13 }}>Loading tasks…</div>
       ) : (
         <div
+          ref={colsRef}
+          data-testid="board-columns"
+          // THE BOARD OWNS THE WHEEL — see `boardScrollDelta`. Without this a vertical wheel could
+          // only ever scroll a column's cards, so a board wider than its pair had columns that were
+          // simply unreachable: the founder's BLOCKED column was clipped mid-card at the right edge
+          // with no gesture that would bring it in.
+          onWheel={onWheel}
           style={{
             flex: 1,
             display: "flex",
             gap: 12,
             padding: 16,
             overflowX: "auto",
+            // Y IS NOT THIS ELEMENT'S AXIS. Leaving it `visible` makes the used value `auto` (CSS
+            // overflow: one axis non-visible forces the other), which would put a second vertical
+            // scroller around the columns and make "which thing did I just scroll" unanswerable.
+            overflowY: "hidden",
             minHeight: 0,
           }}
         >
@@ -416,6 +505,9 @@ function Column({
         onDefine={onDefine}
       />
       <div
+        // The one vertical scroller on the board, and the element `boardScrollDelta` interrogates
+        // before letting the wheel move the board sideways.
+        {...{ [COLUMN_LIST_ATTR]: "" }}
         style={{
           flex: 1,
           display: "flex",
@@ -423,6 +515,24 @@ function Column({
           gap: 8,
           padding: "0 10px 12px",
           overflowY: "auto",
+          // WHY THIS IS NOT LEFT ALONE: `overflow-x` defaults to `visible`, and CSS forces the used
+          // value to `auto` when the other axis is not visible. So this list was silently a
+          // HORIZONTAL scroller too — any card wider than the column (a long unbreakable title, an
+          // id, a path) gave it scrollable width, and one sideways trackpad nudge pushed its
+          // contents left. That is the founder's "card text clipped on the left edge": titles
+          // reading "window drop is" / "causes" with the first words scrolled out of view. The
+          // cards wrap now (see Card), and this makes the axis unavailable regardless.
+          overflowX: "hidden",
+          // CONTAIN THE Y AXIS ONLY, AND THE AXIS SUFFIX IS THE WHOLE POINT (roborev 57312).
+          // Y: don't hand a spare vertical scroll to an ancestor — the wheel handler above decides
+          // what happens at this list's end, and native chaining would race it.
+          // X: this element is still a scroll CONTAINER on X (a hidden axis is a clipped scrollport,
+          // not an absent one), so the unsuffixed `contain` also latched horizontal gestures HERE —
+          // where nothing can move — instead of letting them chain to the board row. Over a column
+          // tall enough to be a scroller (the 606-item BACKLOG) that left NO gesture that reached
+          // the board: the vertical rule gives the list the wheel, and `contain` swallowed the
+          // sideways swipe. Exactly the bug this change exists to fix, on the column that reported it.
+          overscrollBehaviorY: "contain",
           minHeight: 0,
         }}
       >
@@ -512,6 +622,12 @@ function Card({
         flexDirection: "column",
         gap: 6,
         fontFamily: FONT_UI,
+        // NO `minWidth: 0` HERE, DELIBERATELY (roborev 57312). The reflex is to add one so a long
+        // word cannot widen the card — but the content-based automatic minimum is a MAIN-AXIS rule
+        // (CSS Flexbox §4.5), and this card is an item of a `flex-direction: column` list, so its
+        // `min-width: auto` already resolves to 0. The declaration would be dead style that a later
+        // reader would preserve, and worse, would suggest the wrap fix below is conditional on it.
+        // What actually keeps a title inside its column is `overflowWrap: anywhere`.
       }}
     >
       <button
@@ -529,11 +645,24 @@ function Card({
           fontFamily: FONT_UI,
         }}
       >
-        <div style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13, lineHeight: 1.3 }}>
+        <div
+          style={{
+            color: C.cream,
+            fontWeight: FONT_WEIGHT.semibold,
+            fontSize: 13,
+            lineHeight: 1.3,
+            // `anywhere`, not `break-word`: bead titles carry paths, branch names and identifiers
+            // with no break opportunity at all, and `break-word` still lets such a word establish
+            // the box's min-content width (it only breaks AFTER overflow is unavoidable).
+            overflowWrap: "anywhere",
+          }}
+        >
           {bead.title}
         </div>
         {preview && (
-          <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4 }}>{preview}</div>
+          <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4, overflowWrap: "anywhere" }}>
+            {preview}
+          </div>
         )}
         <div
           style={{

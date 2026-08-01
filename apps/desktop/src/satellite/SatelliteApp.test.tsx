@@ -61,9 +61,12 @@ vi.mock("../components/AgentPane", async () => {
     },
   };
 });
+// `covered` is FORWARDED, not destructured away. The real column's own treatment is proven against
+// the real component (AgentSidebar.covered.test.tsx); what only this file can prove is that THIS
+// window asks for it exactly when its board is up — see the covered/board lockstep test below.
 vi.mock("../components/AgentSidebar", () => ({
-  AgentSidebar: ({ project }: { project: { id: string } | null }) => (
-    <div data-testid="sidebar" data-project={project?.id ?? "none"} />
+  AgentSidebar: ({ project, covered }: { project: { id: string } | null; covered?: boolean }) => (
+    <div data-testid="sidebar" data-project={project?.id ?? "none"} data-covered={String(!!covered)} />
   ),
 }));
 vi.mock("../components/BoardView", () => ({ BoardView: () => <div data-testid="board" /> }));
@@ -236,6 +239,56 @@ describe("SatelliteApp — project deleted in main", () => {
     render(<SatelliteApp projectId="p1" />);
     act(() => void vi.advanceTimersByTime(CLOSE_SETTLE_MS * 4));
     expect(destroySpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("SatelliteApp — the board covers the agent column", () => {
+  // THIS WINDOW HAS ALWAYS HAD THE SHAPE MAIN ONLY JUST GREW. The board is `absolute; inset: 0`
+  // inside a wrapper that holds BOTH the agent column and the terminal stage, so it covers the
+  // column too — and both render a PlanBuildToggle. Uncovered, that leaves two of every control in
+  // the window with the unreachable one FIRST in DOM order: Tab walks hidden agent rows, and AT
+  // announces two identical mode toggles behind an opaque surface.
+  //
+  // So `covered` is not decoration here, and the ONE property that makes it correct is that it
+  // cannot disagree with the board's own render gate. A comment saying "these mirror each other"
+  // is not a guard — assert the lockstep instead. Each case below moves ONE input and demands both
+  // facts flip together; a `covered` keyed off `workMode` alone (forgetting beads) fails case 2,
+  // and one that forgets `closing` fails case 4.
+  const bothAgree = () => {
+    const boardUp = screen.queryByTestId("plan-column") !== null;
+    expect(screen.getByTestId("sidebar").getAttribute("data-covered")).toBe(String(boardUp));
+    return boardUp;
+  };
+
+  it("leaves the column reachable in Build mode — the default costs nothing", () => {
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    render(<SatelliteApp projectId="p1" />);
+    expect(bothAgree()).toBe(false);
+  });
+
+  it("stays reachable in Plan mode with Beads OFF, where no board renders to cover it", () => {
+    // planBoardUp falls back to the terminal when the Beads tool is off, so a column parked in Plan
+    // shows its stage. Covering it here would black out the window's only agent list for nothing.
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    useSettingsStore.setState({ beadsEnabled: false } as never);
+    render(<SatelliteApp projectId="p1" />);
+    expect(bothAgree()).toBe(false);
+  });
+
+  it("goes unreachable exactly when the board is up", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    render(<SatelliteApp projectId="p1" />);
+    expect(bothAgree()).toBe(true);
+  });
+
+  it("becomes reachable again the moment the board unmounts on close", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    render(<SatelliteApp projectId="p1" />);
+    expect(bothAgree()).toBe(true); // the precondition, so this cannot pass on an already-false pair
+    requestClose();
+    expect(bothAgree()).toBe(false);
   });
 });
 
