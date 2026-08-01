@@ -35,7 +35,7 @@ import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { screenAwaitsInput } from "./screenClassifier";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
-import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames, isApiErrorLine } from "./streamFailure";
+import { StreamFailureDetector, apiErrorFramesIn, countApiErrorFrames } from "./streamFailure";
 import { type QuotaBlock, isQuotaBlocked, quotaBlockIn, quotaBlocksIn } from "./quotaBlock";
 import {
   logStatusTransition,
@@ -680,9 +680,27 @@ export class StatusEngine {
         // blips while genuinely generating, and escalating repeats to "churn" would pin exactly that
         // healthy agent red — the false-red this whole line of work exists to kill. A retry loop with
         // no generation is still caught, by the frozen-counter rule.
-        const apiLine = isApiErrorLine(line);
-        if (apiLine) this.lastFailure = { message: line, at: Date.now() };
-        this.tripStreamFailure(apiLine ? "api" : "churn");
+        // THE SAME EXTRACTOR AS THE TAIL PATH BELOW, and that is load-bearing rather than tidy
+        // (roborev 57313). `line` here is `raw.trim()` — NOT marker-stripped and NOT \r-split — so
+        // storing it directly yielded "⏺ API Error: …" where the tail path yields "API Error: …",
+        // and for the documented fused shape the whole spinner frame. `sharedFailureCohorts` keys a
+        // Map on this string by EXACT equality, so two agents killed by one host event — one whose
+        // banner flushed with a trailing newline and one whose did not — landed in different cohorts
+        // and the shared outage was never reported. A spinner-fused capture is worse: it carries the
+        // elapsed seconds and token count, so it is unique per agent and can never group at all,
+        // and the report would quote it and whitelist those numbers as if they were measured.
+        //
+        // It fails OPEN, which is the direction that looks like "no outage". Using one extractor on
+        // both paths makes the bytes identical by construction rather than by two rules agreeing.
+        //
+        // `apiErrorFramesIn(line).length > 0` is equivalent to the `isApiErrorLine(line)` this
+        // replaced: `line` came from a \n-split, so only the \r split matters, and `frames()` does
+        // exactly that plus the same `stripMarkers`. The RED behaviour is unchanged.
+        const apiFrames = apiErrorFramesIn(line);
+        if (apiFrames.length > 0) {
+          this.lastFailure = { message: apiFrames[apiFrames.length - 1]!, at: Date.now() };
+        }
+        this.tripStreamFailure(apiFrames.length > 0 ? "api" : "churn");
         trippedThisChunk = true;
       }
       // ACCOUNT LIMIT, checked SEPARATELY from `this.failure.observe` above and not folded into it.

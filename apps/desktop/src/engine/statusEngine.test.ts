@@ -1204,13 +1204,15 @@ describe("lastFailureNow", () => {
     expect(engine.lastFailureNow()).toBeUndefined();
   });
 
+  // EXACT equality, not `toContain` (roborev 57313). `toContain` passes for the marker-prefixed and
+  // spinner-fused forms too, so it was structurally incapable of catching the two capture points
+  // disagreeing — which is the only property `sharedFailureCohorts` depends on.
   it("retains the banner VERBATIM from a completed line", () => {
     const { engine, last } = makeEngine();
     engine.ingest(SPINNER);
     engine.ingest(`\n⏺ ${OFFLINE}\n`);
     expect(last()).toBe("errored");
-    // Markers stripped, nothing else: two agents killed by one event must produce identical bytes.
-    expect(engine.lastFailureNow()?.message).toContain(OFFLINE);
+    expect(engine.lastFailureNow()?.message).toBe(OFFLINE);
   });
 
   // The live shape — no trailing newline — which is how the founder's five agents actually died.
@@ -1219,7 +1221,41 @@ describe("lastFailureNow", () => {
     engine.ingest(SPINNER);
     engine.ingest(`\r⏺ ${OFFLINE}`);
     expect(last()).toBe("errored");
-    expect(engine.lastFailureNow()?.message).toContain(OFFLINE);
+    expect(engine.lastFailureNow()?.message).toBe(OFFLINE);
+  });
+
+  // THE PROPERTY THE COHORT GROUPING ACTUALLY NEEDS: identical bytes from both paths. Two agents
+  // killed by one host event differ only in whether their banner happened to flush with a newline,
+  // and an exact-equality Map key turns that accident into two separate cohorts — so the outage is
+  // never reported. It fails OPEN, which looks exactly like "no outage".
+  it("produces IDENTICAL bytes whichever path captured it", () => {
+    const flushed = makeEngine();
+    flushed.engine.ingest(SPINNER);
+    flushed.engine.ingest(`\n⏺ ${OFFLINE}\n`);
+
+    const live = makeEngine();
+    live.engine.ingest(SPINNER);
+    live.engine.ingest(`\r⏺ ${OFFLINE}`);
+
+    expect(flushed.engine.lastFailureNow()!.message).toBe(live.engine.lastFailureNow()!.message);
+  });
+
+  // The documented fused shape: the spinner redraws with \r and the banner lands on the same line.
+  // Storing the raw line here would carry the elapsed seconds and token count — unique per agent, so
+  // it could never group, and the report would whitelist those numbers as if they were measured.
+  // Two banners redrawn onto ONE line: the LAST is the current state of the turn, matching how
+  // `wallInTail` takes the last wall. Without this the first-vs-last choice is untestable, because
+  // `apiErrorFramesIn` filters to banner frames and a single-banner line makes them identical.
+  it("stores the LAST banner when one line carries two", () => {
+    const { engine } = makeEngine();
+    engine.ingest(`\n⏺ API Error: 529 Overloaded.\r⏺ ${OFFLINE}\n`);
+    expect(engine.lastFailureNow()?.message).toBe(OFFLINE);
+  });
+
+  it("stores the banner ALONE when it is fused onto a spinner frame", () => {
+    const { engine } = makeEngine();
+    engine.ingest(`${SPINNER}\r⏺ ${OFFLINE}\n`);
+    expect(engine.lastFailureNow()?.message).toBe(OFFLINE);
   });
 
   it("stamps when it arrived, so a cohort can be bounded against the clock", () => {

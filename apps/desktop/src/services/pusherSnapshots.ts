@@ -8,8 +8,17 @@
 //
 // ── PURE, AND TAKING ITS SOURCES AS PARAMETERS ───────────────────────────────────────────────────
 // The stores and the engine registry arrive as arguments rather than being read from module scope,
-// which is what lets the mapping be tested without a running app. The thin `fleetSnapshotsNow()`
-// wrapper at the bottom does the reading; everything interesting is above it.
+// which is what lets the mapping be tested without a running app.
+//
+// NOT YET WIRED, AND SAYING SO IS THE POINT (roborev 57313/57341). An earlier version of this
+// comment described a `fleetSnapshotsNow()` wrapper "at the bottom" that does the store reading.
+// No such function exists anywhere in the repo, and nothing outside the tests imports this module —
+// so the sentence told the next reader the app -> `@sparkle/core` seam was connected when it is not,
+// and pointed the file's whole safety argument at code that was never written.
+//
+// What is genuinely missing is exactly the part these unit tests structurally cannot cover: binding
+// `branchStatus` by `agent.id` and `quotaFor`/`failureFor` to the right registry functions. That
+// arrives with the surface that renders these conditions.
 //
 // ── THE ONE RULE THAT MATTERS ────────────────────────────────────────────────────────────────────
 // FAIL CLOSED, inherited verbatim from `pusherObserve`: `undefined` means WE DID NOT LOOK and must
