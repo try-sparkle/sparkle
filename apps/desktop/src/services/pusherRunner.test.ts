@@ -520,15 +520,175 @@ describe("the report is scoped and does not double up", () => {
     expect(fleet.some((r) => r.reason === "budget-exhausted")).toBe(true);
   });
 
-  it("a delivered report is charged to the recipient's partner budget too", async () => {
-    const { deps } = fakeDeps({
+  it("a delivered report is visible to the partner channel", async () => {
+    const { deps, recorded } = fakeDeps({
       snapshots: () => [{ ...expired(), agentId: "boss", projectId: "p" }, escIn("a", "p")],
       reportRecipient: () => "boss",
     });
     let st = await sweepPushers(deps, emptyPusherState());
-    st = await sweepPushers(deps, st); // report delivered on this sweep
-    // Two sends to boss this sweep — its own challenge and the report — and BOTH are on its ledger.
-    expect(st.partners.get("boss")!.budget.sentAt).toHaveLength(2);
+    // The report channel has already spent the whole hour.
+    st = { ...st, fleet: new Map(st.fleet) };
+    st.fleet.set("p", {
+      ...(st.fleet.get("p") ?? { lastConditions: [], budget: { sentAt: [] }, lastReported: {} }),
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+    await sweepPushers(deps, st);
+    // ...so the PARTNER channel refuses too — asserted through the refusal rather than through a
+    // stored ledger, because which ledger holds it is exactly what changed (roborev 57040).
+    expect(
+      recorded.some(
+        (r) => r.agentId === "boss" && r.scope !== "fleet" && r.reason === "budget-exhausted",
+      ),
+    ).toBe(true);
+  });
+
+  // THE SHARED BOUND IS KEYED BY AGENT, NOT BY THE AGENT'S OWN PROJECT (roborev 57043).
+  // `reportRecipient(projectId)` may name an agent living in a different project, and may name the
+  // same agent for several — so a merge that looks up only `s.projectId` lets that agent take
+  // MESSAGES_PER_HOUR challenges PLUS MESSAGES_PER_HOUR reports. Both directions are asserted,
+  // because the merge is built independently on each side.
+  const crossProject = () =>
+    fakeDeps({
+      // `boss` lives in p1 but is the recipient for p2.
+      snapshots: () => [{ ...expired(), agentId: "boss", projectId: "p1" }, escIn("a", "p2")],
+      reportRecipient: (projectId) => (projectId === "p2" ? "boss" : undefined),
+    });
+
+  it("a cross-project recipient's own challenges count against its reports", async () => {
+    const { deps, recorded } = crossProject();
+    const st = await sweepPushers(deps, emptyPusherState());
+    st.partners.set("boss", {
+      ...(st.partners.get("boss") ?? { lastTriggers: [], budget: { sentAt: [] }, lastChallengedAt: {} }),
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+    await sweepPushers(deps, st);
+    expect(
+      recorded.some((r) => r.scope === "fleet" && r.reason === "budget-exhausted"),
+    ).toBe(true);
+  });
+
+  it("a cross-project recipient's reports count against its own challenges", async () => {
+    const { deps, recorded } = crossProject();
+    let st = await sweepPushers(deps, emptyPusherState());
+    st = { ...st, fleet: new Map(st.fleet) };
+    st.fleet.set("p2", {
+      lastConditions: st.fleet.get("p2")?.lastConditions ?? [],
+      lastReported: {},
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+    await sweepPushers(deps, st);
+    expect(
+      recorded.some(
+        (r) => r.agentId === "boss" && r.scope !== "fleet" && r.reason === "budget-exhausted",
+      ),
+    ).toBe(true);
+  });
+
+  // ...and the same agent may be the recipient for SEVERAL projects, in which case one project's
+  // reports must count against another's. Without that, N projects buy N x MESSAGES_PER_HOUR
+  // interruptions for one reader.
+  it("one recipient serving two projects shares a single hourly bound", async () => {
+    const { deps, sent, recorded } = fakeDeps({
+      snapshots: () => [escIn("a", "p1"), escIn("b", "p2")],
+      reportRecipient: () => "boss", // not a partner at all — just the reader for both projects
+    });
+    let st = await sweepPushers(deps, emptyPusherState());
+    st = { ...st, fleet: new Map(st.fleet) };
+    // p1's report channel has spent the hour.
+    st.fleet.set("p1", {
+      lastConditions: st.fleet.get("p1")?.lastConditions ?? [],
+      lastReported: {},
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+    await sweepPushers(deps, st);
+    // p2 must see p1's spend: nothing reaches boss, and both projects report the same reason.
+    expect(sent).toEqual([]);
+    expect(
+      recorded.filter((r) => r.scope === "fleet" && r.reason === "budget-exhausted"),
+    ).toHaveLength(2);
+  });
+
+  // THE LEDGER SURVIVING IS WORTH NOTHING IF THE LOOKUP DOES NOT (roborev 57047). `FleetMemory` is
+  // never pruned, but the recipient map that finds it was built from THIS sweep's projects — so one
+  // sweep where a project contributed zero owned snapshots made its spend invisible. Every other
+  // test here keeps all projects present on every sweep, which is exactly why none of them saw it.
+  it("holds the bound when the reporting project drops out of the roster for a sweep", async () => {
+    let p2Present = true;
+    const { deps, recorded } = fakeDeps({
+      snapshots: () =>
+        p2Present
+          ? [{ ...expired(), agentId: "boss", projectId: "p1" }, escIn("a", "p2")]
+          : [{ ...expired(), agentId: "boss", projectId: "p1" }],
+      reportRecipient: (projectId) => (projectId === "p2" ? "boss" : undefined),
+    });
+    let st = await sweepPushers(deps, emptyPusherState());
+    st = { ...st, fleet: new Map(st.fleet) };
+    // p2's report channel has spent its whole hour.
+    st.fleet.set("p2", {
+      lastConditions: st.fleet.get("p2")?.lastConditions ?? [],
+      lastReported: {},
+      budget: { sentAt: Array.from({ length: MESSAGES_PER_HOUR }, (_, i) => T0 - i - 1) },
+    });
+
+    p2Present = false; // a partial read, or the ownsProject election flipping
+    await sweepPushers(deps, st);
+
+    // boss's own challenge must still be refused: the spend is on p2's ledger, which is not pruned,
+    // and the aggregate has to keep looking there even though p2 sent no snapshots this sweep.
+    expect(
+      recorded.some(
+        (r) => r.agentId === "boss" && r.scope !== "fleet" && r.reason === "budget-exhausted",
+      ),
+    ).toBe(true);
+  });
+
+  // The report channel's bound must survive roster churn. `partners` is pruned every sweep for any
+  // agent absent from `owned`, so parking the report's only send record there let one partial
+  // snapshots() read reset the containment and allow 8 interruptions in an hour instead of 4.
+  it("keeps the report channel's spend when the recipient briefly leaves the roster", async () => {
+    let present = true;
+    const { deps, sent } = fakeDeps({
+      snapshots: () =>
+        present
+          ? [{ agentId: "boss", projectId: "p", label: "Boss" }, escIn("a", "p")]
+          : [escIn("a", "p")],
+      reportRecipient: () => "boss",
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st); // one report delivered
+    expect(sent.filter((s) => s.agentId === "boss")).toHaveLength(1);
+
+    present = false; // a partial read drops boss from the roster for one sweep
+    st = await sweepPushers(deps, st);
+    present = true;
+
+    // The condition has not grown, so nothing new is owed — and the earlier spend must still be on
+    // the books rather than reset by the absence.
+    st = await sweepPushers(deps, st);
+    expect(st.fleet.get("p")!.budget.sentAt).toHaveLength(1);
+  });
+
+  // ONE LEDGER, NOT TWO. Recording a delivered report on BOTH the fleet and partner budgets looks
+  // symmetric, but the merged view is a plain concatenation — so every later sweep counts that one
+  // send twice and the report channel exhausts after 2 messages an hour instead of 4 (roborev
+  // 57039). Silent under-reporting, on the channel that exists because under-reporting cost hours.
+  //
+  // The recipient here has NO per-partner triggers of its own, so every message counted is a report;
+  // membership grows each sweep, which is what re-opens the cooldown so reports keep coming.
+  it("does not count a delivered report twice against its own budget", async () => {
+    let n = 0;
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [
+        { agentId: "boss", projectId: "p", label: "Boss" },
+        ...Array.from({ length: ++n }, (_, i) => escIn(`e${i}`, "p")),
+      ],
+      reportRecipient: () => "boss",
+    });
+    let st = emptyPusherState();
+    for (let i = 0; i < MESSAGES_PER_HOUR + 4; i++) st = await sweepPushers(deps, st);
+    // The full hourly allowance, not half of it.
+    expect(sent.filter((s) => s.agentId === "boss")).toHaveLength(MESSAGES_PER_HOUR);
   });
 
   // `reportRecipient(projectId)` is not required to name an agent inside that project.

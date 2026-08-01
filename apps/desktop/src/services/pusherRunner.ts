@@ -168,10 +168,25 @@ export async function sweepPushers(
     else list.push(s);
   }
 
+  // WHO RECEIVES A REPORT — this sweep's projects only. Also what the inbox batch is sized from: a
+  // project with nothing owned this sweep gets no report, so its recipient's mailbox need not be read.
   const recipients = new Map<string, string>();
   for (const projectId of byProject.keys()) {
     const r = deps.reportRecipient(projectId);
     if (r !== undefined) recipients.set(projectId, r);
+  }
+
+  // ...and the SAME lookup over every project we still hold memory for, used ONLY to aggregate
+  // ledgers (roborev 57047). `FleetMemory` is deliberately never pruned so its ledger survives a
+  // project's transient absence — but the ledger surviving is worth nothing if the lookup that reads
+  // it does not. Built from `recipients` alone, one sweep where a project contributes zero owned
+  // snapshots made its spend invisible and the bound lapsed: the same "a transient absence must not
+  // reset the containment" failure as the previous two commits, relocated a third time.
+  // `deps.reportRecipient` is a pure lookup by projectId, so asking it about an absent project is safe.
+  const ledgerRecipients = new Map<string, string>();
+  for (const projectId of new Set([...byProject.keys(), ...state.fleet.keys()])) {
+    const r = deps.reportRecipient(projectId);
+    if (r !== undefined) ledgerRecipients.set(projectId, r);
   }
 
   // Batched, once. `inbox_status` takes `agentIds: Vec<String>`, so the whole fleet costs one call.
@@ -185,6 +200,18 @@ export async function sweepPushers(
     // like it had room; the gate's own `capacity > 0 ? … : 100` then reads an absent entry as full
     // and yields, which is the direction to fail in.
     log.warn("pusher", "inbox status read failed; yielding this cycle", { error: String(e) });
+  }
+
+  // EVERY FLEET LEDGER THAT NAMES THIS AGENT AS ITS RECIPIENT (roborev 57043). Keyed by AGENT, not
+  // by the agent's own project, because `reportRecipient(projectId)` may name an agent that lives in
+  // a different project — and may name the same agent for several. Keying on `s.projectId` made the
+  // shared bound silently lapse in exactly those cases.
+  const fleetLedgerFor = new Map<string, number[]>();
+  for (const [projectId, r] of ledgerRecipients) {
+    fleetLedgerFor.set(r, [
+      ...(fleetLedgerFor.get(r) ?? []),
+      ...(state.fleet.get(projectId)?.budget.sentAt ?? []),
+    ]);
   }
 
   const partners = new Map(state.partners);
@@ -234,10 +261,33 @@ export async function sweepPushers(
         : { used, capacity: INBOX_CAPACITY };
 
     const memory = partners.get(s.agentId) ?? emptyPartnerMemory();
-    const decision = decidePusherAction({ policy, observation, memory, inbox, now });
+
+    // ONE BOUND, READ FROM BOTH SIDES (roborev 57040). When this agent is also its project's report
+    // recipient, the two channels share `MESSAGES_PER_HOUR` — so each MERGES the other's ledger for
+    // the decision, while each STORES only its own. One send therefore lands on exactly one ledger
+    // and is counted exactly once by both channels.
+    //
+    // Which ledger a send is stored on is the part that took three attempts to get right. Storing
+    // it on both double-counted it (roborev 57039). Storing the report's on the PARTNER ledger fixed
+    // that and broke something worse: `partners` is pruned every sweep for any agent absent from
+    // `owned`, so one partial `snapshots()` read or transient `ownsProject` flip wiped the report
+    // channel's entire hourly bound and allowed 8 interruptions instead of 4 — the exact
+    // "a transient absence must not reset the containment" argument already accepted for the fleet
+    // map, reintroduced through the other ledger. So each channel stores on its OWN ledger, and the
+    // report's lives in `FleetMemory`, which is never pruned.
+    const fleetSent = fleetLedgerFor.get(s.agentId);
+    const forDecision: PartnerMemory =
+      fleetSent === undefined || fleetSent.length === 0
+        ? memory
+        : { ...memory, budget: { sentAt: [...memory.budget.sentAt, ...fleetSent] } };
+
+    /** Strip the merged view back to this partner's own ledger before storing. */
+    const ownPartner = (m: PartnerMemory): PartnerMemory => ({ ...m, budget: memory.budget });
+
+    const decision = decidePusherAction({ policy, observation, memory: forDecision, inbox, now });
 
     if (decision.action === "quiet") {
-      partners.set(s.agentId, decision.memory);
+      partners.set(s.agentId, ownPartner(decision.memory));
       deps.record({ at: now, agentId: s.agentId, outcome: "refused", reason: decision.reason });
       continue;
     }
@@ -252,7 +302,10 @@ export async function sweepPushers(
     }
 
     if (delivered) {
-      partners.set(s.agentId, decision.memoryOnDelivered);
+      partners.set(s.agentId, {
+        ...ownPartner(decision.memoryOnDelivered),
+        budget: recordSend(memory.budget, now),
+      });
       deps.record({
         at: now,
         agentId: s.agentId,
@@ -294,6 +347,11 @@ export async function sweepPushers(
         usage,
         fleet.get(projectId) ?? emptyFleetMemory(),
         now,
+        // The same aggregate from the other side: every OTHER project whose reports go to this same
+        // recipient. Read from the live `fleet` map, so a report already sent this sweep counts.
+        [...ledgerRecipients]
+          .filter(([pid, r]) => pid !== projectId && r === recipients.get(projectId))
+          .flatMap(([pid]) => fleet.get(pid)?.budget.sentAt ?? []),
         // The WHOLE roster, not just this project's slice: `reportRecipient(projectId)` is not
         // required to name an agent inside that project, and the wall check must still find it
         // (roborev 56973).
@@ -327,6 +385,7 @@ async function reportFleet(
   usage: ReadonlyMap<string, number>,
   memory: FleetMemory,
   now: number,
+  otherProjectSent: readonly number[],
   everyone: readonly (FleetSnapshot & { projectId: string })[],
   partners: Map<string, PartnerMemory>,
 ): Promise<FleetMemory> {
@@ -375,11 +434,17 @@ async function reportFleet(
   // `unanswered-question` for that agent became unreachable by any channel — "sat stuck and nobody
   // said anything", guaranteed for one agent per project. Sharing the budget keeps both channels
   // open and still bounds the total.
+  //
+  // The merge is SYMMETRIC: the per-partner loop builds the mirror of this one. Each channel reads
+  // both ledgers and writes only its own.
   const partnerMemory = partners.get(recipient);
-  const shared: BudgetState =
-    partnerMemory === undefined
-      ? memory.budget
-      : { sentAt: [...memory.budget.sentAt, ...partnerMemory.budget.sentAt] };
+  const shared: BudgetState = {
+    sentAt: [
+      ...memory.budget.sentAt,
+      ...(partnerMemory?.budget.sentAt ?? []),
+      ...otherProjectSent,
+    ],
+  };
 
   const decision = decideFleetReport({
     policy: deps.policy(),
@@ -420,11 +485,12 @@ async function reportFleet(
       cited: decision.cited,
       scope: "fleet",
     });
-    // Recorded against BOTH ledgers when they coincide, so the shared bound is symmetric: the next
-    // per-partner sweep sees this send too, not just the next report.
-    if (partnerMemory !== undefined) {
-      partners.set(recipient, { ...partnerMemory, budget: recordSend(partnerMemory.budget, now) });
-    }
+    // CHARGED TO EXACTLY ONE LEDGER, AND IT IS THIS ONE (roborev 57039, then 57040). Recording it
+    // on both double-counted it; recording it on the PARTNER ledger instead put the report
+    // channel's whole bound in the map that is pruned on roster absence. `FleetMemory` is never
+    // pruned, so the report's send lives here and the partner channel reads it through the same
+    // merge the report uses in the other direction. Deduping the merged timestamps would not have
+    // worked either: a challenge and a report in the same sweep legitimately share `now`.
     return { ...decision.memoryOnDelivered, budget: recordSend(memory.budget, now) };
   }
 

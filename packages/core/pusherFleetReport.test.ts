@@ -210,16 +210,36 @@ describe("the per-condition cooldown", () => {
     expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
   });
 
-  // The flap the set-keyed version could not survive: a stamp covering the ORIGINAL set is still
-  // present, so returning to it is not growth and must not re-send byte-identical text.
-  it("does NOT re-report when membership flaps back to a set already reported", () => {
-    const ab = [finished("f1"), finished("f2")];
-    const d = decide({
-      snapshots: ab,
-      // Reported covering {f1,f2}; a poll dropped f2 last sweep; it is back now.
-      memory: seen(ab, { lastReported: stamp(ab, "done-not-retired", T0 - TEN_MIN) }),
+  // THE FLAP THE SET-KEYED VERSION COULD NOT SURVIVE — and it takes THREE sweeps to see, because
+  // the bug lived in the INTERMEDIATE one: `fleetObservationMemory` drops the stamp for a key nobody
+  // currently covers, so returning to the original set found no stamp left to stop it.
+  //
+  // A single-`decide` version of this test passed against the very code it was meant to guard
+  // against (roborev 57039): with a stamp already covering {f1,f2} and snapshots {f1,f2}, the
+  // set-key matches exactly and the old implementation is quiet too. It has to run the sweeps.
+  it("does NOT re-report when membership flaps away and back", () => {
+    const both = [finished("f1"), finished("f2")];
+    const one = [finished("f1")];
+
+    const first = decide({ snapshots: both, memory: seen(both) });
+    if (first.action !== "send") throw new Error("expected the first report");
+
+    // Sweep 2: a branch poll dropped f2, so the condition SHRINKS. Old code: a new key, re-sends.
+    const shrunk = decide({
+      snapshots: one,
+      memory: first.memoryOnDelivered,
+      now: T0 + 60_000,
     });
-    expect(d).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+    expect(shrunk).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
+
+    // Sweep 3: f2 is back. Old code: the {f1,f2} key was expired in sweep 2, so it re-sends
+    // byte-identical text. New code: the class stamp still covers both, so this is not growth.
+    const back = decide({
+      snapshots: both,
+      memory: shrunk.action === "quiet" ? shrunk.memory : first.memoryOnDelivered,
+      now: T0 + 120_000,
+    });
+    expect(back).toMatchObject({ action: "quiet", reason: "all-conditions-cooled" });
   });
 
   it("keys on the SET, not on roster order, so a reshuffle is not a new episode", () => {
