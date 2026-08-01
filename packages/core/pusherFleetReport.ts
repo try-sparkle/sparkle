@@ -66,6 +66,7 @@ import {
 import {
   evaluateFleetConditions,
   persistedConditions,
+  type StandingDuty,
   type FleetCondition,
   type FleetConditionId,
   type FleetSnapshot,
@@ -180,6 +181,15 @@ export type FleetReportDecision = FleetReportSend | FleetReportQuiet;
 export interface FleetReportInput {
   policy: PusherPolicy;
   snapshots: readonly FleetSnapshot[];
+  /**
+   * The app's standing recurring duties, for the `duty-overdue` condition.
+   *
+   * Threaded rather than defaulted at the evaluator (roborev 57323): `evaluateFleetConditions` takes
+   * `duties` with a `[]` default, so a caller that simply forgot to pass them still compiles and
+   * silently reports nothing. Making it a required field of this input means the omission is a type
+   * error at every call site instead of a condition that can never fire.
+   */
+  duties: readonly StandingDuty[];
   memory: FleetMemory;
   /** The RECIPIENT's mailbox — the surface the report is delivered to, not any partner's. */
   inbox: InboxReading;
@@ -193,9 +203,9 @@ export interface FleetReportInput {
  * path and `memoryOnDelivered` only once the transport confirms.
  */
 export function decideFleetReport(input: FleetReportInput): FleetReportDecision {
-  const { policy, snapshots, memory, inbox, now } = input;
+  const { policy, snapshots, duties, memory, inbox, now } = input;
 
-  const current = evaluateFleetConditions(snapshots, now);
+  const current = evaluateFleetConditions(snapshots, now, duties);
 
   // COMPUTED FIRST AND UNCONDITIONALLY, exactly as `decidePusherAction` does it: every early return
   // below carries this sweep's sighting, so there is no path on which the two-observation rule loses

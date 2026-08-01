@@ -51,6 +51,7 @@ function decide(over: Partial<FleetReportInput> = {}): FleetReportDecision {
     policy: POLICY,
     snapshots: [walled("a")],
     memory: emptyFleetMemory(),
+    duties: [],
     inbox: { used: 0, capacity: 50 },
     now: T0,
     ...over,
@@ -318,5 +319,38 @@ describe("the gate still binds", () => {
     const d = decide({ memory: seen([walled("a")]), inbox: { used: 50, capacity: 50 } });
     if (d.action !== "quiet") throw new Error("expected quiet");
     expect(d.memory.budget.sentAt).toEqual([]);
+  });
+});
+
+// A duty reaching the REPORT, not just the evaluator. `evaluateFleetConditions` defaults `duties` to
+// `[]`, so a caller that forgot to thread them compiled and silently reported nothing — the
+// condition could not fire in production at all (roborev 57323). `FleetReportInput.duties` is
+// required precisely so that omission is a type error; this pins that a supplied duty arrives.
+describe("standing duties reach the report", () => {
+  const HOUR = 60 * 60 * 1000;
+  const duty = {
+    name: "the hourly improvement pass (logs + beads backlog)",
+    intervalMs: HOUR,
+    lastRunAt: T0 - 9 * HOUR,
+    heldBy: "the Sparkle agent pane reads 'working'",
+  };
+
+  it("reports an overdue duty even when no agent is in trouble", () => {
+    const d = decide({
+      snapshots: [],
+      duties: [duty],
+      memory: { ...emptyFleetMemory(), lastConditions: evaluateFleetConditions([], T0, [duty]) },
+    });
+    if (d.action !== "send") throw new Error("expected a send");
+    expect(d.conditionIds).toEqual(["duty-overdue"]);
+    expect(d.text).toContain("logs + beads backlog");
+    expect(d.text).toContain("Held by: the Sparkle agent pane reads 'working'.");
+  });
+
+  it("stays silent when no duty is supplied", () => {
+    expect(decide({ snapshots: [], duties: [] })).toMatchObject({
+      action: "quiet",
+      reason: "no-condition",
+    });
   });
 });

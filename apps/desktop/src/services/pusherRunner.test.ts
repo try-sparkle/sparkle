@@ -48,6 +48,7 @@ function fakeDeps(over: Partial<PusherRunnerDeps> = {}) {
     // No recipient by default, so the per-partner cases below stay about the per-partner path. The
     // fleet report has its own block at the bottom of this file, which supplies one.
     reportRecipient: () => undefined,
+    duties: () => [],
     send: async (agentId, text) => {
       sent.push({ agentId, text });
       return true;
@@ -365,6 +366,7 @@ describe("the fleet report", () => {
       // provably cannot hear it.
       snapshots: () => [{ ...expired(), ...walledSnap("a") }],
       reportRecipient: () => undefined,
+    duties: () => [],
     });
     await sweepTimes(deps, 3);
     expect(sent.filter((s) => s.agentId === "a")).toEqual([]);
@@ -388,6 +390,7 @@ describe("the fleet report", () => {
     const { deps, sent } = fakeDeps({
       snapshots: () => [walledSnap("q1")],
       reportRecipient: () => undefined,
+    duties: () => [],
     });
     await sweepTimes(deps, 3);
     expect(sent).toEqual([]);
@@ -794,8 +797,62 @@ describe("machine-shutdown casualties", () => {
     const { deps, sent } = fakeDeps({
       snapshots: () => [{ ...expired(), ...died("a") }, died("b")],
       reportRecipient: () => undefined,
+    duties: () => [],
     });
     await sweepTimes(deps, 2);
     expect(sent.map((s) => s.agentId)).toEqual(["a"]);
+  });
+});
+
+// THE WIRING HALF of the duty condition. `evaluateFleetConditions` defaults `duties` to `[]`, so a
+// sweep that never threaded them compiled and silently reported nothing — the condition could not
+// fire in production at all (roborev 57323). The pure tests cannot see that; only a sweep can.
+describe("standing duties reach the report through the sweep", () => {
+  const HOUR = 60 * MIN;
+  const overdue = {
+    name: "the hourly improvement pass (logs + beads backlog)",
+    intervalMs: HOUR,
+    lastRunAt: T0 - 9 * HOUR,
+    heldBy: "the Sparkle agent pane reads 'working'",
+  };
+
+  it("reports an overdue duty even with a completely healthy fleet", async () => {
+    const { deps, sent } = fakeDeps({
+      // A healthy agent: no quota wall, no failure, no escalation, nothing to retire.
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      duties: () => [overdue],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.agentId).toBe("boss");
+    expect(sent[0]!.text).toContain("logs + beads backlog");
+    expect(sent[0]!.text).toContain("Held by: the Sparkle agent pane reads 'working'.");
+  });
+
+  it("says nothing when every duty is on time", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      duties: () => [{ ...overdue, lastRunAt: T0 - 10 * MIN }],
+      reportRecipient: () => "boss",
+    });
+    await sweepTimes(deps, 2);
+    expect(sent).toEqual([]);
+  });
+
+  it("reads duties fresh each sweep, so one that starts late is still picked up", async () => {
+    let list: (typeof overdue)[] = [];
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [{ agentId: "a", projectId: "p", label: "Agent A" }],
+      duties: () => list,
+      reportRecipient: () => "boss",
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    list = [overdue]; // the duty only becomes overdue after the first sweep
+    st = await sweepPushers(deps, st);
+    await sweepPushers(deps, st);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.text).toContain("logs + beads backlog");
   });
 });

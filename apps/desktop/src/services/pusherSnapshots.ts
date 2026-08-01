@@ -31,6 +31,7 @@ import type { FleetSnapshot, StandingDuty } from "@sparkle/core";
 import type { AgentTab, Project } from "../types";
 import type { BranchStatus } from "./branchStatus";
 import type { QuotaBlock } from "../engine/quotaBlock";
+import type { PassHoldReason } from "./improvementPass";
 import { agentDisplayName } from "../engine/agentDisplayName";
 
 /** Everything the mapping reads. Supplied by the caller so this stays testable and pure. */
@@ -156,8 +157,17 @@ export function buildStandingDuties(input: {
   ];
 }
 
-/** The hold reasons as a sentence the report can quote. Kept beside the duty it describes. */
-export const PASS_HOLD_TEXT: Record<string, string> = {
+/**
+ * The hold reasons as a sentence the report can quote. Kept beside the duty it describes.
+ *
+ * TYPED ON `PassHoldReason`, NOT `string` (roborev 57323). As `Record<string, string>` a sixth arm
+ * compiled cleanly with no text and a typo'd key compiled too — and under this project's
+ * `noUncheckedIndexedAccess` the lookup is `string | undefined`, which assigns silently into the
+ * optional `heldBy`. The report would then say "Nothing reports why." about a hold whose cause was
+ * known, which is silent failure in the exact direction this feature exists to prevent. Keyed on the
+ * union, a new arm is a compile error.
+ */
+export const PASS_HOLD_TEXT: Record<PassHoldReason, string> = {
   "consent-off": "improvement consent is set to never",
   "already-running": "a pass is already in flight",
   "pane-busy": "the Sparkle agent pane reads 'working' — which also prevents the next tick, so this one does not clear itself",

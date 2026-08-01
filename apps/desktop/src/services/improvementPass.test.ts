@@ -12,6 +12,7 @@ import {
   parseImproveResult,
   shouldRunImprovementPass,
   type PassGate,
+  passHoldReason,
 } from "./improvementPass";
 
 const HOUR = IMPROVEMENT_INTERVAL_MS;
@@ -309,5 +310,60 @@ describe("hourlySlotStamp", () => {
     // A backwards clock adjustment makes `lastRunAt` sit in the future. A negative remainder
     // would stamp LATER than now and suppress real slots; `now` is the safe floor.
     expect(hourlySlotStamp(10 * HOUR, 2 * HOUR)).toBe(2 * HOUR);
+  });
+});
+
+// ── WHICH ARM DECLINED ──────────────────────────────────────────────────────────────────────────
+// The 33 tests above assert `shouldRunImprovementPass(...) === false`, which is true for EVERY arm,
+// so they cannot tell "pane-busy" from "offline". That boolean is not the product surface any more:
+// the STRING is, and it is quoted verbatim to the founder through PASS_HOLD_TEXT. A mislabelled or
+// reordered arm would tell them to un-wedge a pane when the machine is simply offline, and nothing
+// above would go red (roborev 57323).
+describe("passHoldReason", () => {
+  const T = 1_700_000_000_000;
+  const gate = (over: Partial<Parameters<typeof passHoldReason>[0]> = {}) => ({
+    consent: "always" as const,
+    lastRunAt: T - 2 * 60 * 60 * 1000,
+    now: T,
+    passRunning: false,
+    paneStatus: undefined,
+    isOnline: true,
+    ...over,
+  });
+
+  it("names each arm", () => {
+    expect(passHoldReason(gate({ consent: "never" }))).toBe("consent-off");
+    expect(passHoldReason(gate({ passRunning: true }))).toBe("already-running");
+    expect(passHoldReason(gate({ paneStatus: "working" }))).toBe("pane-busy");
+    expect(passHoldReason(gate({ lastRunAt: null }))).toBe("clock-unseeded");
+    expect(passHoldReason(gate({ isOnline: false }))).toBe("offline");
+  });
+
+  it("is null when nothing is holding it", () => {
+    expect(passHoldReason(gate())).toBeNull();
+  });
+
+  // Precedence is not cosmetic: it decides which cause the founder is told to act on.
+  it("reports the FIRST holder when several apply at once", () => {
+    expect(
+      passHoldReason(gate({ consent: "never", passRunning: true, paneStatus: "working" })),
+    ).toBe("consent-off");
+    expect(passHoldReason(gate({ passRunning: true, paneStatus: "working" }))).toBe("already-running");
+    expect(passHoldReason(gate({ paneStatus: "working", isOnline: false }))).toBe("pane-busy");
+  });
+
+  // The boolean must stay exactly the negation of "held", or the two drift and a surface explains a
+  // hold that is no longer in force.
+  it("agrees with the boolean on every arm", () => {
+    for (const g of [
+      gate({ consent: "never" }),
+      gate({ passRunning: true }),
+      gate({ paneStatus: "working" }),
+      gate({ lastRunAt: null }),
+      gate({ isOnline: false }),
+    ]) {
+      expect(passHoldReason(g)).not.toBeNull();
+      expect(shouldRunImprovementPass(g)).toBe(false);
+    }
   });
 });

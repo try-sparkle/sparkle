@@ -41,6 +41,7 @@ import {
   observeFleet,
   type FleetMemory,
   type FleetSnapshot,
+  type StandingDuty,
   type ObserveState,
   type PartnerMemory,
   type PartnerSnapshot,
@@ -87,6 +88,11 @@ export interface PusherRunnerDeps {
    * report to an arbitrary partner would be worse than not sending it at all.
    */
   reportRecipient(projectId: string): string | undefined;
+  /**
+   * The app's standing recurring duties — the hourly improvement pass, and whatever acquires a
+   * cadence later. Read per sweep so a duty that starts or stops is picked up without a restart.
+   */
+  duties(): readonly StandingDuty[];
   /** Structured record of every decision, sent or refused. */
   record(entry: PusherLogEntry): void;
 }
@@ -213,6 +219,9 @@ export async function sweepPushers(
       ...(state.fleet.get(projectId)?.budget.sentAt ?? []),
     ]);
   }
+
+  // Read ONCE per sweep, so every project's report describes the same moment.
+  const duties = deps.duties();
 
   const partners = new Map(state.partners);
 
@@ -364,6 +373,7 @@ export async function sweepPushers(
         // (roborev 56973).
         owned,
         partners,
+        duties,
       ),
     );
   }
@@ -395,6 +405,7 @@ async function reportFleet(
   otherProjectSent: readonly number[],
   everyone: readonly (FleetSnapshot & { projectId: string })[],
   partners: Map<string, PartnerMemory>,
+  duties: readonly StandingDuty[],
 ): Promise<FleetMemory> {
   // NO RECIPIENT, NO REPORT — BUT THE SIGHTING STILL ADVANCES. This is rule 1 from `pusherDecide`'s
   // header applied to the report channel, and it is easy to get backwards: returning `memory`
@@ -405,7 +416,7 @@ async function reportFleet(
   // The budget does not advance, because nothing was sent — but the cooldowns DO expire, which is
   // why this goes through `fleetObservationMemory` rather than spreading `lastConditions` by hand.
   if (recipient === undefined) {
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties));
   }
 
   // A QUOTA-WALLED RECIPIENT CANNOT READ THE REPORT EITHER, and the argument is verbatim the one the
@@ -422,7 +433,7 @@ async function reportFleet(
       reason: "recipient-quota-blocked",
       scope: "fleet",
     });
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties));
   }
 
   const used = usage.get(recipient);
@@ -456,6 +467,7 @@ async function reportFleet(
   const decision = decideFleetReport({
     policy: deps.policy(),
     snapshots: owned,
+    duties,
     memory: { ...memory, budget: shared },
     inbox,
     now,

@@ -252,4 +252,20 @@ describe("standing duties", () => {
   it("spells out that the busy-pane hold does not clear itself", () => {
     expect(PASS_HOLD_TEXT["pane-busy"]).toMatch(/does not clear itself/);
   });
+
+  // EXHAUSTIVE. Typing the record on `PassHoldReason` makes a missing arm a compile error, and this
+  // pins that nothing is an empty string — under `noUncheckedIndexedAccess` a gap would degrade to
+  // the report saying "Nothing reports why." about a hold whose cause was known (roborev 57323).
+  it("has non-empty text for every hold reason", () => {
+    for (const [reason, text] of Object.entries(PASS_HOLD_TEXT)) {
+      expect(text, reason).not.toBe("");
+    }
+    expect(Object.keys(PASS_HOLD_TEXT).sort()).toEqual([
+      "already-running",
+      "clock-unseeded",
+      "consent-off",
+      "offline",
+      "pane-busy",
+    ]);
+  });
 });
