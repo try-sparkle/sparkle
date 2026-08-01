@@ -248,7 +248,25 @@ export async function sweepPushers(
   // sweeps: picking "the first project we happened to walk" would migrate the duty whenever the
   // roster reordered, and each move would reset that project's two-observation rule and cooldown —
   // making a permanently-overdue duty re-report forever.
-  const dutyOwner = [...byProject.keys()].sort()[0];
+  // Owned by a project that can actually DELIVER, and by one that survives a bad sweep.
+  //
+  // `byProject` was both wrong answers at once (roborev 57425). It includes projects with NO
+  // recipient, so if the lowest-sorted project happened to have none, `reportFleet` returned early
+  // and the app-global duty went to NOBODY — a regression, since before the owner existed every
+  // project carried the duties and any one of them delivered. And it is rebuilt each sweep from
+  // `owned`, so a partial `snapshots()` read or an `ownsProject` flip that dropped the owner for two
+  // consecutive sweeps migrated the duty to a project with a fresh two-observation counter and no
+  // cooldown — re-telling the founder the paragraph this owner exists to send once. That is the
+  // fourth appearance of "a transient absence must not reset the containment" in this file.
+  //
+  // `ledgerRecipients` answers both by construction: it spans `byProject.keys() ∪ state.fleet.keys()`
+  // (so a project absent for a sweep is still a candidate) and contains ONLY projects with a
+  // recipient (so the owner can deliver).
+  //
+  // ACCEPTED: if the owner is absent this sweep, or its recipient is quota-walled, the duty simply
+  // is not reported until it can be — rather than migrating. Not-now is the right trade against
+  // re-reporting, which is the failure the owner exists to prevent.
+  const dutyOwner = [...ledgerRecipients.keys()].sort()[0];
 
   const partners = new Map(state.partners);
 

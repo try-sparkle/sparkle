@@ -900,6 +900,51 @@ describe("standing duties reach the report through the sweep", () => {
     expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
   });
 
+  // THE REGRESSION THE OWNER INTRODUCED (roborev 57425). Picking the owner from every project means
+  // a recipient-less project sorted first swallows the duty entirely — worse than before the owner
+  // existed, when any project with a recipient delivered it.
+  it("skips a project that cannot deliver when choosing the owner", async () => {
+    const { deps, sent } = fakeDeps({
+      snapshots: () => [
+        { agentId: "a", projectId: "p1", label: "Agent A" }, // sorts first, NO recipient
+        { agentId: "b", projectId: "p2", label: "Agent B" },
+      ],
+      duties: () => [overdue],
+      reportRecipient: (projectId) => (projectId === "p2" ? "boss" : undefined),
+    });
+    await sweepTimes(deps, 2);
+    expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
+  });
+
+  // "A transient absence must not reset the containment", for the fourth time in this file. An owner
+  // dropped for two consecutive sweeps must not hand the duty to a project with a fresh
+  // two-observation counter and no cooldown, which would re-tell the founder the same paragraph.
+  it("does not re-report when the owning project is briefly absent", async () => {
+    let p1Present = true;
+    const { deps, sent } = fakeDeps({
+      snapshots: () =>
+        p1Present
+          ? [
+              { agentId: "a", projectId: "p1", label: "Agent A" },
+              { agentId: "b", projectId: "p2", label: "Agent B" },
+            ]
+          : [{ agentId: "b", projectId: "p2", label: "Agent B" }],
+      duties: () => [overdue],
+      reportRecipient: (projectId) => `boss-${projectId}`,
+    });
+    let st = emptyPusherState();
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st);
+    expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
+
+    // p1 drops out for two sweeps — long enough for a migrated owner to satisfy the rule and speak.
+    p1Present = false;
+    st = await sweepPushers(deps, st);
+    st = await sweepPushers(deps, st);
+    await sweepPushers(deps, st);
+    expect(sent.filter((s) => s.text.includes("logs + beads backlog"))).toHaveLength(1);
+  });
+
   it("reads duties fresh each sweep, so one that starts late is still picked up", async () => {
     let list: (typeof overdue)[] = [];
     const { deps, sent } = fakeDeps({
