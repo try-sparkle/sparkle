@@ -195,6 +195,12 @@ export function normalizeVaultId(vaultId: string | null | undefined): string | n
   return vaultId?.trim() || null;
 }
 
+/** The chosen 1Password ACCOUNT id, under the same rule and for a sharper reason: a blank
+ *  `account_id` would be passed to `op` as `--account ""` on every single invocation, failing
+ *  everything instead of degrading to "no account chosen". Same function, named for the caller so
+ *  neither site has to know they share a rule. */
+export const normalizeAccountId = normalizeVaultId;
+
 /** Narrow a raw `[concierge.tools]` payload into the store's mirror: drop non-string values, keep
  *  every string VERBATIM.
  *
@@ -540,6 +546,11 @@ interface SettingsState {
    *  secrets into the wrong vault (say, one shared with a team) is not a safe default.
    *  Mirrors [onepassword].vault_id. Config-backed, NOT persisted. */
   onepasswordVaultId: string | null;
+  /** Which 1Password account `op` acts as, as its `user_uuid`. Null until the user picks one —
+   *  which they only have to do when they're signed in to more than one account, where `op`
+   *  otherwise refuses every call with "multiple accounts found". Mirrors
+   *  [onepassword].account_id. Config-backed, NOT persisted. */
+  onepasswordAccountId: string | null;
   /** Restore backed-up env files into each newly created agent worktree. This is the payoff of
    *  the feature — `.env*` is gitignored, so a worktree never carries one and every worker agent
    *  otherwise starts without its project's secrets. Mirrors [onepassword].seed_worktrees. */
@@ -638,6 +649,9 @@ interface SettingsState {
   /** Optimistically set the chosen 1Password vault (configActions persists
    *  [onepassword].vault_id). Null clears it, returning the UI to its "pick a vault" state. */
   setOnePasswordVaultId: (vaultId: string | null) => void;
+  /** Optimistically set the chosen 1Password account (configActions persists
+   *  [onepassword].account_id). Null clears it, letting `op` decide again. */
+  setOnePasswordAccountId: (accountId: string | null) => void;
   /** Optimistically set worktree seeding (configActions persists
    *  [onepassword].seed_worktrees). */
   setOnePasswordSeedWorktrees: (on: boolean) => void;
@@ -723,6 +737,7 @@ export const useSettingsStore = create<SettingsState>()(
       pluginsEnabled: { ...PLUGIN_DEFAULTS },
       onepasswordEnabled: false,
       onepasswordVaultId: null,
+      onepasswordAccountId: null,
       onepasswordSeedWorktrees: false,
       roborevConsentPrompted: false,
       roborevConsentOpen: false,
@@ -800,6 +815,8 @@ export const useSettingsStore = create<SettingsState>()(
       // same way); otherwise every `op` call would fail opaquely instead of showing the picker.
       setOnePasswordVaultId: (vaultId) =>
         set({ onepasswordVaultId: normalizeVaultId(vaultId) }),
+      setOnePasswordAccountId: (accountId) =>
+        set({ onepasswordAccountId: normalizeAccountId(accountId) }),
       setOnePasswordSeedWorktrees: (on) => set({ onepasswordSeedWorktrees: on }),
       setRoborevConsentPrompted: (prompted) => set({ roborevConsentPrompted: prompted }),
       setRoborevConsentOpen: (open) => set({ roborevConsentOpen: open }),
@@ -940,6 +957,7 @@ export const useSettingsStore = create<SettingsState>()(
           // used to skip it, so a ""/"   " payload landed verbatim and read as "a vault is
           // configured" everywhere downstream.
           onepasswordVaultId: normalizeVaultId(config.onepassword?.vault_id),
+          onepasswordAccountId: normalizeAccountId(config.onepassword?.account_id),
           onepasswordSeedWorktrees: config.onepassword?.seed_worktrees ?? false,
           // `?? false`: an absent [roborev] block (older backend) means we've never prompted, so a
           // first reviewable commit still surfaces the one-time consent modal.

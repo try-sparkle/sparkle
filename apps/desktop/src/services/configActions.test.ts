@@ -56,6 +56,7 @@ import {
   markRoborevConsentPrompted,
   setImprovementConsent,
   setBuilderIndexEnabled,
+  setOnePasswordAccount,
   setOnePasswordVault,
   setOnePasswordSeedWorktrees,
   allowAllConciergeTools,
@@ -595,14 +596,22 @@ describe("configActions", () => {
   // would misrepresent the file as configured — and nothing else pins that.
   describe("1Password write-back", () => {
     beforeEach(() => {
-      useSettingsStore.setState({ onepasswordVaultId: null, onepasswordSeedWorktrees: false });
+      useSettingsStore.setState({
+        onepasswordVaultId: null,
+        onepasswordAccountId: null,
+        onepasswordSeedWorktrees: false,
+      });
     });
     afterEach(() => {
       // `vi.clearAllMocks()` does NOT drain a queued `mockRejectedValueOnce`, and these fields are
       // module-global: leave either behind and an unrelated describe later in the file fails with
       // "disk full" or reads a stale vault.
       vi.mocked(setConfigValue).mockReset().mockResolvedValue(undefined);
-      useSettingsStore.setState({ onepasswordVaultId: null, onepasswordSeedWorktrees: false });
+      useSettingsStore.setState({
+        onepasswordVaultId: null,
+        onepasswordAccountId: null,
+        onepasswordSeedWorktrees: false,
+      });
     });
 
     it("persists a trimmed vault id and updates the store optimistically", async () => {
@@ -624,6 +633,27 @@ describe("configActions", () => {
       expect(unsetConfigValue).toHaveBeenCalledWith("onepassword.vault_id");
       expect(setConfigValue).not.toHaveBeenCalled();
       expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
+    });
+
+    it("persists a trimmed account id and updates the store optimistically", async () => {
+      // The user_uuid, not the email: two signed-in accounts can share an email, and `op` answers
+      // an ambiguous handle with the same "multiple accounts found" the choice exists to end.
+      await setOnePasswordAccount("  NZ36HQYBEVBWZMSWZLH77XMFJA  ");
+      expect(setConfigValue).toHaveBeenCalledWith(
+        "onepassword.account_id",
+        "NZ36HQYBEVBWZMSWZLH77XMFJA",
+      );
+      expect(unsetConfigValue).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().onepasswordAccountId).toBe("NZ36HQYBEVBWZMSWZLH77XMFJA");
+    });
+
+    it("UNSETS the account key rather than writing an empty string", async () => {
+      // A stored `account_id = ""` would be passed as `--account ""` on every op invocation —
+      // failing everything instead of degrading to "let `op` decide".
+      await setOnePasswordAccount("   ");
+      expect(unsetConfigValue).toHaveBeenCalledWith("onepassword.account_id");
+      expect(setConfigValue).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().onepasswordAccountId).toBeNull();
     });
 
     it("writes both directions of the worktree-seeding consent", async () => {

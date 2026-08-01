@@ -669,6 +669,13 @@ pub struct OnePasswordConfig {
     /// "pick a vault" state rather than guessing, since writing secrets into the wrong vault (say,
     /// one shared with a team) is not something to do by default.
     pub vault_id: Option<String>,
+    /// The 1Password account every `op` call acts as, as its `user_uuid`. `None` until chosen — and
+    /// only *needed* when more than one account is signed in, where `op` otherwise refuses every
+    /// call with "multiple accounts found".
+    ///
+    /// The uuid, never the email: one person can be signed in twice under the same email (personal
+    /// + a family/team membership), and those two rows are indistinguishable by any other field.
+    pub account_id: Option<String>,
     /// Restore backed-up env files into each newly created agent worktree. This is the payoff of
     /// the whole feature — `.env*` is gitignored, so a worktree never carries one and every worker
     /// agent starts without its project's secrets. Off by default: it writes files into a fresh
@@ -1183,8 +1190,14 @@ impl Default for SparkleConfig {
             // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
             // None rather than defaulting to "case_by_case" (it must not clobber a persisted choice).
             improvement: ImprovementConfig { consent: None },
-            // No vault until the user picks one, and no worktree seeding until they ask for it.
-            onepassword: OnePasswordConfig { vault_id: None, seed_worktrees: false },
+            // No vault and no account until the user picks them, and no worktree seeding until they
+            // ask for it. An unset account_id means "let `op` decide", which is right whenever
+            // exactly one account is signed in.
+            onepassword: OnePasswordConfig {
+                vault_id: None,
+                account_id: None,
+                seed_worktrees: false,
+            },
             freshness: FreshnessConfig {
                 // Keep these in sync with the bash fallback in scripts/lib/sparkle-config.sh.
                 staleness_warn_commits: 25,
@@ -1453,6 +1466,7 @@ struct PartialImprovement {
 #[derive(Debug, Default, Deserialize)]
 struct PartialOnePassword {
     vault_id: Option<String>,
+    account_id: Option<String>,
     seed_worktrees: Option<bool>,
 }
 
@@ -2030,6 +2044,12 @@ fn apply_onepassword(into: &mut OnePasswordConfig, p: Option<PartialOnePassword>
     if let Some(v) = p.vault_id {
         let v = v.trim();
         into.vault_id = if v.is_empty() { None } else { Some(v.to_string()) };
+    }
+    // Same rule, and it matters more here: a blank account_id would be passed as `--account ""` on
+    // every single `op` invocation, which fails everything rather than degrading to "not chosen".
+    if let Some(v) = p.account_id {
+        let v = v.trim();
+        into.account_id = if v.is_empty() { None } else { Some(v.to_string()) };
     }
     if let Some(v) = p.seed_worktrees {
         into.seed_worktrees = v;
@@ -3414,6 +3434,10 @@ onepassword = false # back your .env* files up to a 1Password vault. Also ships 
 # Toggle the tool itself under [tools] (onepassword), not here.
 [onepassword]
 # vault_id = ""        # the vault chosen in ⋯ Settings; unset means "no vault picked yet"
+# account_id = ""      # which 1Password account to act as, as its user_uuid (see `op account list`).
+                       # Only needed when you're signed in to MORE THAN ONE account, where `op`
+                       # refuses every call with "multiple accounts found". Pick it in ⋯ Settings;
+                       # unset means "let `op` decide", which is right for a single account.
 seed_worktrees = false # restore backed-up env files into each newly created agent worktree
 
 # --- Claude Code plugins pre-enabled for every agent (repo-scoped; overridable per project) --
@@ -4771,6 +4795,30 @@ quit_app = 42
     }
 
     #[test]
+    fn onepassword_account_id_defaults_unset_and_a_global_file_sets_it() {
+        // Unset means "let `op` decide", which is right for a single signed-in account. It only
+        // becomes load-bearing on a multi-account machine, where `op` refuses every call without it.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.onepassword.account_id, None);
+
+        let g = "[onepassword]\naccount_id = \"NZ36HQYBEVBWZMSWZLH77XMFJA\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.onepassword.account_id.as_deref(), Some("NZ36HQYBEVBWZMSWZLH77XMFJA"));
+    }
+
+    #[test]
+    fn blank_account_id_reads_as_unset_not_as_a_chosen_account() {
+        // Stored verbatim, a blank id would go out as `--account ""` on EVERY `op` invocation —
+        // failing everything, rather than degrading to "no account chosen yet".
+        let g = "[onepassword]\naccount_id = \"  \"\n";
+        let (cfg, _, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.onepassword.account_id, None);
+    }
+
+    #[test]
     fn blank_vault_id_reads_as_unset_not_as_a_configured_vault() {
         // A whitespace-only vault_id must degrade to "pick a vault", not be stored verbatim — a
         // blank string would read as configured everywhere downstream and turn every `op` call
@@ -4785,9 +4833,13 @@ quit_app = 42
     fn project_onepassword_is_ignored_with_warning() {
         // The vault belongs to the user's 1Password account, not to a repo, so a project file
         // must not be able to redirect where another repo's secrets get written.
-        let p = "[onepassword]\nvault_id = \"attacker-vault\"\nseed_worktrees = true\n";
+        let p = "[onepassword]\nvault_id = \"attacker-vault\"\naccount_id = \"attacker-account\"\n\
+                 seed_worktrees = true\n";
         let (cfg, warns, _) = effective(None, Some(p));
         assert_eq!(cfg.onepassword.vault_id, None);
+        // The account is the same kind of boundary: a repo that could redirect which 1Password
+        // account `op` acts as could point another project's secrets at an account it controls.
+        assert_eq!(cfg.onepassword.account_id, None);
         assert!(!cfg.onepassword.seed_worktrees);
         assert!(warns.iter().any(|w| w.contains("[onepassword]")));
     }

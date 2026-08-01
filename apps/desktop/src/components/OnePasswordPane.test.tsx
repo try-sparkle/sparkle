@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../services/configActions", () => ({
   setOnePasswordVault: vi.fn().mockResolvedValue(undefined),
+  setOnePasswordAccount: vi.fn().mockResolvedValue(undefined),
   setOnePasswordSeedWorktrees: vi.fn().mockResolvedValue(undefined),
   setToolEnabled: vi.fn().mockResolvedValue(undefined),
 }));
@@ -31,8 +32,15 @@ vi.mock("../services/envBackupActions", async (importOriginal) => ({
   backupRows: vi.fn(),
 }));
 
-import { setOnePasswordVault } from "../services/configActions";
-import { installOpCli, opPreflight, opVaults, refreshOpPreflight } from "../services/onepassword";
+import { setOnePasswordAccount, setOnePasswordVault } from "../services/configActions";
+import {
+  installOpCli,
+  opPreflight,
+  opVaults,
+  refreshOpPreflight,
+  type OpAccount,
+  type OpStatus,
+} from "../services/onepassword";
 import { backupRows, loadEnvBackupRows } from "../services/envBackupActions";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -42,14 +50,27 @@ import { OnePasswordPane } from "./OnePasswordPane";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
-const status = (readiness: "ready" | "cli-missing" | "integration-off", error: string | null = null) => ({
+const status = (
+  readiness: "ready" | "cli-missing" | "integration-off" | "account-ambiguous",
+  error: string | null = null,
+  accounts: OpAccount[] = [],
+): OpStatus => ({
   readiness,
   path: readiness === "cli-missing" ? null : "/opt/homebrew/bin/op",
   version: readiness === "cli-missing" ? null : "2.30.0",
   accountUrl: readiness === "ready" ? "my.1password.com" : null,
+  accountId: readiness === "ready" ? accounts[0]?.userUuid ?? "U1" : null,
+  accounts,
   error,
 });
 const READY = status("ready");
+
+/** Two accounts under the SAME email — the shape that made the old "first account wins" probe
+ *  report ready and then fail every call. `userUuid` is the only thing telling them apart. */
+const TWINS: OpAccount[] = [
+  { url: "my.1password.com", email: "same@person.example", userUuid: "UUID-ONE", accountUuid: null },
+  { url: "my.1password.com", email: "same@person.example", userUuid: "UUID-TWO", accountUuid: null },
+];
 
 function file(relPath: string, sha256 = HASH_A) {
   return {
@@ -70,6 +91,7 @@ beforeEach(() => {
   useSettingsStore.setState({
     onepasswordEnabled: true,
     onepasswordVaultId: "vault-abc",
+    onepasswordAccountId: null,
     onepasswordSeedWorktrees: false,
   });
   useProjectStore.setState({
@@ -157,6 +179,124 @@ describe("OnePasswordPane — the prerequisite chain is named, never silently sk
     await screen.findByRole("option", { name: "Private" });
     fireEvent.change(select, { target: { value: "vault-abc" } });
     expect(setOnePasswordVault).toHaveBeenCalledWith("vault-abc");
+  });
+});
+
+describe("OnePasswordPane — which 1Password account", () => {
+  const AMBIGUOUS = () =>
+    status(
+      "account-ambiguous",
+      "You’re signed in to 2 1Password accounts, so `op` can’t tell which one to use.",
+      TWINS,
+    );
+
+  it("names the ambiguity and does NOT scan or offer a vault", async () => {
+    // The bug this replaced: readiness read the FIRST account and reported ready, so the pane
+    // rendered a vault picker and a table over an `op` that failed every single call.
+    vi.mocked(opPreflight).mockResolvedValue(AMBIGUOUS());
+    render(<OnePasswordPane />);
+    await waitFor(() => expect(screen.getByText(/can’t tell which one to use/)).toBeTruthy());
+    expect(screen.queryByLabelText("Vault")).toBeNull();
+    expect(loadEnvBackupRows).not.toHaveBeenCalled();
+    expect(opVaults).not.toHaveBeenCalled();
+  });
+
+  it("lists each account by its user ID, so two accounts sharing an email are tellable apart", async () => {
+    vi.mocked(opPreflight).mockResolvedValue(AMBIGUOUS());
+    render(<OnePasswordPane />);
+    await screen.findByLabelText("Account");
+    // Same url, same email — an email-keyed picker would render these two identically.
+    const options = screen.getAllByRole("option").map((o) => o.textContent);
+    expect(options).toContain("my.1password.com — same@person.example (UUID-ONE)");
+    expect(options).toContain("my.1password.com — same@person.example (UUID-TWO)");
+  });
+
+  it("persists the chosen account by user_uuid and RE-PROBES, so the pane leaves the stuck state", async () => {
+    vi.mocked(opPreflight).mockResolvedValue(AMBIGUOUS());
+    vi.mocked(refreshOpPreflight).mockResolvedValue(status("ready", null, [TWINS[1]!]));
+    render(<OnePasswordPane />);
+    const select = await screen.findByLabelText("Account");
+    await screen.findByRole("option", { name: /UUID-TWO/ });
+
+    fireEvent.change(select, { target: { value: "UUID-TWO" } });
+    expect(setOnePasswordAccount).toHaveBeenCalledWith("UUID-TWO");
+    // Re-probing is what turns the choice into a working pane — without it the user picks an
+    // account and the notice just sits there. The vault picker appearing is the proof.
+    await waitFor(() => expect(refreshOpPreflight).toHaveBeenCalled());
+    expect(await screen.findByLabelText("Vault")).toBeTruthy();
+  });
+
+  it("writes the account BEFORE re-probing — the backend reads it while building each op call", async () => {
+    // Ordering, not just occurrence: a re-probe fired before the config write lands re-reads the
+    // OLD account and reports the same ambiguity, leaving the user clicking a picker that appears
+    // to do nothing.
+    const order: string[] = [];
+    // The write RESOLVES LATE, like the real IPC round trip it stands for. A mock that records
+    // synchronously would log "write" at call time and pass even when the probe was fired
+    // alongside it — which is exactly the race being pinned, so the delay is the test.
+    vi.mocked(setOnePasswordAccount).mockImplementation(
+      () =>
+        new Promise<void>((resolve) =>
+          setTimeout(() => {
+            order.push("write");
+            resolve();
+          }, 5),
+        ),
+    );
+    vi.mocked(refreshOpPreflight).mockImplementation(async () => {
+      order.push("probe");
+      return status("ready", null, [TWINS[1]!]);
+    });
+    vi.mocked(opPreflight).mockResolvedValue(AMBIGUOUS());
+    render(<OnePasswordPane />);
+    const select = await screen.findByLabelText("Account");
+    await screen.findByRole("option", { name: /UUID-TWO/ });
+
+    fireEvent.change(select, { target: { value: "UUID-TWO" } });
+    await waitFor(() => expect(order).toEqual(["write", "probe"]));
+  });
+
+  it("still offers the picker when the CHOSEN account was signed out and one remains", async () => {
+    // `account-ambiguous` is reachable with a SINGLE signed-in account: a chosen account that has
+    // since been signed out leaves a stale id going out as `--account` on every call. Gating the
+    // picker on "more than one account" left that case showing a notice telling the user to choose
+    // with no control to choose with — a dead end escapable only by hand-editing config.toml.
+    useSettingsStore.setState({ onepasswordAccountId: "UUID-GONE" });
+    vi.mocked(opPreflight).mockResolvedValue(
+      status(
+        "account-ambiguous",
+        "The 1Password account Sparkle is set to use isn’t signed in any more.",
+        [TWINS[0]!],
+      ),
+    );
+    vi.mocked(refreshOpPreflight).mockResolvedValue(status("ready", null, [TWINS[0]!]));
+    render(<OnePasswordPane />);
+
+    const select = (await screen.findByLabelText("Account")) as HTMLSelectElement;
+    // The stale id matches no option, so the control reads as "nothing chosen" rather than showing
+    // an account that isn't there.
+    expect(select.value).toBe("");
+    fireEvent.change(select, { target: { value: "UUID-ONE" } });
+    expect(setOnePasswordAccount).toHaveBeenCalledWith("UUID-ONE");
+    await waitFor(() => expect(refreshOpPreflight).toHaveBeenCalled());
+    expect(await screen.findByLabelText("Vault")).toBeTruthy();
+  });
+
+  it("shows no account picker when there is nothing to choose between", async () => {
+    // One signed-in account needs no choice — `op` resolves it itself, and an unset account_id
+    // means exactly that. A picker here would invent a decision the user doesn't have to make.
+    vi.mocked(opPreflight).mockResolvedValue(status("ready", null, [TWINS[0]!]));
+    render(<OnePasswordPane />);
+    await screen.findByLabelText("Vault");
+    expect(screen.queryByLabelText("Account")).toBeNull();
+  });
+
+  it("keeps the picker available after a choice, so a wrong pick is recoverable", async () => {
+    useSettingsStore.setState({ onepasswordAccountId: "UUID-TWO" });
+    vi.mocked(opPreflight).mockResolvedValue(status("ready", null, TWINS));
+    render(<OnePasswordPane />);
+    const select = (await screen.findByLabelText("Account")) as HTMLSelectElement;
+    expect(select.value).toBe("UUID-TWO");
   });
 });
 

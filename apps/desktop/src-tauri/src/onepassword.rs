@@ -91,7 +91,7 @@ const STALE_COPY_SEGMENTS: [&str; 6] = ["bak", "backup", "orig", "swp", "save", 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// How far along the user is toward a working `op`. Serializes to the contract's kebab-case union
-/// (`"cli-missing" | "integration-off" | "ready"`).
+/// (`"cli-missing" | "integration-off" | "account-ambiguous" | "ready"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpReadiness {
@@ -99,8 +99,64 @@ pub enum OpReadiness {
     CliMissing,
     /// `op` runs but reports no authenticated account — the desktop-app integration toggle is off.
     IntegrationOff,
-    /// `op` runs and is authenticated. Backup/restore are available.
+    /// `op` runs and is authenticated, but WHICH account is ambiguous: several accounts are signed
+    /// in and none of them has been chosen (or the chosen one is no longer signed in). Every `op`
+    /// call would fail with "multiple accounts found", so this is a NEEDS-SETUP state, not ready —
+    /// see the module note on why reporting it as ready was worse than failing closed.
+    AccountAmbiguous,
+    /// `op` runs, is authenticated, and the account to act as is unambiguous. Backup/restore are
+    /// available.
     Ready,
+}
+
+/// One signed-in 1Password account, as `op account list --format=json` reports it.
+///
+/// `user_uuid` is the key, NOT the email: a person can be signed in to two accounts under the SAME
+/// email (a personal and a family/team membership), and those rows are otherwise identical. Keying
+/// the picker on email would make two of them indistinguishable and the choice unstable.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpAccount {
+    /// Sign-in address, e.g. `my.1password.com`.
+    pub url: Option<String>,
+    pub email: Option<String>,
+    /// The stable per-account identifier we persist and pass as `--account`.
+    pub user_uuid: String,
+    /// The account (rather than user) uuid, when reported. Only used to match a selection a user
+    /// may have made with a different one of `op`'s accepted account handles.
+    pub account_uuid: Option<String>,
+}
+
+impl OpAccount {
+    /// Whether `sel` names this account. `op` accepts a sign-in address, an email, a user uuid or
+    /// an account uuid as `--account` / `$OP_ACCOUNT`, so a selection is matched against all four —
+    /// otherwise a perfectly valid `OP_ACCOUNT=my.1password.com` would read as "stale selection".
+    fn matches(&self, sel: &str) -> bool {
+        let sel = sel.trim();
+        if sel.is_empty() {
+            return false;
+        }
+        let eq = |v: &Option<String>| v.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(sel));
+        self.user_uuid.eq_ignore_ascii_case(sel)
+            || eq(&self.account_uuid)
+            || eq(&self.email)
+            || eq(&self.url)
+    }
+
+    /// `url — email (uuid)`, the one-line form the picker and the needs-setup message both use.
+    /// The uuid is what makes two same-email rows tellable apart, so it is never dropped.
+    fn label(&self) -> String {
+        let head = [self.url.as_deref(), self.email.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" — ");
+        if head.is_empty() {
+            self.user_uuid.clone()
+        } else {
+            format!("{head} ({})", self.user_uuid)
+        }
+    }
 }
 
 /// Result of probing the `op` CLI.
@@ -111,6 +167,13 @@ pub struct OpStatus {
     pub path: Option<String>,
     pub version: Option<String>,
     pub account_url: Option<String>,
+    /// The account `op` will actually act as — the chosen one, or the only one signed in. `None`
+    /// while the choice is still ambiguous.
+    pub account_id: Option<String>,
+    /// Every signed-in account, so the picker (and the needs-setup message) can name them. Carried
+    /// on the status rather than fetched by a second command: the probe already ran
+    /// `op account list`, and a second one is a second Touch ID prompt.
+    pub accounts: Vec<OpAccount>,
     /// Present when the probe failed for a reason the user can act on; redacted for display.
     pub error: Option<String>,
 }
@@ -122,6 +185,8 @@ impl OpStatus {
             path: None,
             version: None,
             account_url: None,
+            account_id: None,
+            accounts: Vec::new(),
             error,
         }
     }
@@ -335,13 +400,83 @@ fn stdout_is_safe_to_quote(args: &[String]) -> bool {
     !matches!(args.first().map(String::as_str), Some("document") | None)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WHICH ACCOUNT — the single chokepoint
+//
+// A user signed in to more than one 1Password account gets nothing but
+// `[ERROR] multiple accounts found. Use the --account flag or set the OP_ACCOUNT environment
+// variable to select an account.` from every `op` call that touches a vault. The fix belongs in
+// exactly ONE place — [`with_account_flag`], called by [`run_op`] — because the alternative
+// (remembering it at each of the six `*_argv` builders) is how half of them end up without it.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Test-only account selection, per THREAD so concurrent tests can't see each other's. Production
+/// never sets it; there is no override path in the shipping app (the config is the source of truth).
+#[cfg(test)]
+thread_local! {
+    static TEST_ACCOUNT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The account every `op` invocation should act as: `[onepassword].account_id`, chosen in Settings.
+///
+/// `$OP_ACCOUNT` is deliberately NOT consulted here — `op` reads that itself, so an environment
+/// that sets it is already unambiguous and needs no flag from us. (The readiness probe *does* look
+/// at it, because it changes whether a choice is still owed.)
+fn selected_account_id() -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Some(id) = TEST_ACCOUNT.with(|c| c.borrow().clone()) {
+            return Some(id);
+        }
+    }
+    crate::config::current_effective()
+        .config
+        .onepassword
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether this command takes `--account`. Two exclusions: `op --version` is a global flag query
+/// with no subcommand, and the `op account …` family manages the account list itself — the
+/// readiness probe has to be able to enumerate EVERY account before one has been chosen, and
+/// scoping that call to one account would make the ambiguity invisible.
+fn accepts_account_flag(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        None => false,
+        Some("account") => false,
+        Some(a) if a.starts_with('-') => false,
+        Some(_) => true,
+    }
+}
+
+/// `args` with `--account <id>` prepended when an account is selected and the command takes one.
+/// Prepended rather than appended so it is unambiguously the global flag, ahead of any subcommand
+/// positional (`op --account <id> document create <path> …`).
+fn with_account_flag(args: &[String]) -> Vec<String> {
+    let Some(id) = selected_account_id().filter(|_| accepts_account_flag(args)) else {
+        return args.to_vec();
+    };
+    let mut v = Vec::with_capacity(args.len() + 2);
+    v.push("--account".to_string());
+    v.push(id);
+    v.extend_from_slice(args);
+    v
+}
+
 /// Run `op` with `args`, bounded by `timeout`. Returns trimmed stdout on success.
 ///
 /// Never logs the argv: `op document create` carries an absolute path, and `op item edit` carries a
 /// field assignment. Both are exactly what must not reach a log line.
 fn run_op(op: &str, args: &[String], timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(op);
-    cmd.args(args);
+    // The account flag is added HERE and nowhere else. Note that everything below still reads the
+    // CALLER's `args`, not the flagged form: `stdout_is_safe_to_quote` keys on the subcommand, and
+    // a leading `--account` would turn its default-deny into a default-allow — putting a line of a
+    // document's plaintext into an error string.
+    cmd.args(with_account_flag(args));
     // `op` must never try to interact: stdin is already /dev/null under output_with_timeout, and
     // these keep it from reaching for a TTY-based prompt or a pager.
     cmd.env("NO_COLOR", "1");
@@ -540,21 +675,73 @@ fn parse_sha_field(stdout: &str) -> Option<String> {
     })
 }
 
-/// Sign-in address of the first account `op` reports (`op account list` / `op whoami`).
+/// Sign-in address of the first account `op` reports. Only used for `op whoami`, which describes
+/// the ONE account already in context — reading the first row of `op account list` this way is what
+/// made a multi-account machine report "ready" and then fail every real call.
 fn parse_account_url(stdout: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(stdout).ok()?;
     json_rows(&v).iter().find_map(|row| json_str(row, &["url", "domain", "shorthand", "email"]))
+}
+
+/// Every account in `op account list --format=json`.
+///
+/// A row with no usable identifier is dropped rather than kept as a nameless entry: the whole point
+/// of the list is to let the user pick one, and `--account ""` is not a choice.
+fn parse_accounts(stdout: &str) -> Vec<OpAccount> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return Vec::new();
+    };
+    json_rows(&v)
+        .iter()
+        .filter_map(|row| {
+            let user_uuid = json_str(row, &["user_uuid", "userUuid", "user_id", "id", "uuid"])
+                .or_else(|| json_str(row, &["email"]))
+                .or_else(|| json_str(row, &["url", "domain", "shorthand"]))?;
+            Some(OpAccount {
+                url: json_str(row, &["url", "domain", "shorthand"]),
+                email: json_str(row, &["email"]),
+                user_uuid,
+                account_uuid: json_str(row, &["account_uuid", "accountUuid"]),
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Readiness probe
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/// Probe an already-resolved `op` binary. Three-state by construction:
-/// `--version` fails → `cli-missing` (a broken install is indistinguishable from none, and the
-/// remedy is the same); no account from `account list` *or* `whoami` → `integration-off`; otherwise
-/// `ready`.
+/// Probe an already-resolved `op` binary. FOUR states by construction:
+///
+/// * `--version` fails → `cli-missing` (a broken install is indistinguishable from none, and the
+///   remedy is the same);
+/// * no account from `account list` *or* `whoami` → `integration-off`;
+/// * accounts exist but WHICH one to use is undecided → `account-ambiguous`;
+/// * exactly one account, or one that has been chosen → `ready`.
+///
+/// The ambiguous state is the reason this function was rewritten. It used to take the FIRST row of
+/// `op account list` and call that ready — so a user signed in to four accounts saw a green pane
+/// and then got "multiple accounts found" from every vault call. Reporting ready-then-broken is
+/// worse than failing closed, so ambiguity is now a first-class needs-setup state that names the
+/// accounts it can't choose between.
 fn probe_op(op: &str) -> OpStatus {
+    probe_op_with(op, account_decision())
+}
+
+/// What counts as "the account question is answered": our own configured account, or `$OP_ACCOUNT`.
+///
+/// The env var is NOT something we pass — `op` reads it itself — but it does settle the question,
+/// and it is the documented workaround for this very bug. Telling someone who exported it that
+/// they still owe a choice would be a lie.
+fn account_decision() -> Option<String> {
+    selected_account_id().or_else(|| {
+        std::env::var("OP_ACCOUNT").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    })
+}
+
+/// [`probe_op`] with the account decision passed in — the seam the readiness tests drive, so a
+/// developer's own exported `$OP_ACCOUNT` can't change what they assert.
+fn probe_op_with(op: &str, selected: Option<String>) -> OpStatus {
     let version = match run_op_str(op, &["--version"], PROBE_TIMEOUT) {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return OpStatus::cli_missing(Some("`op --version` printed nothing".into())),
@@ -562,38 +749,98 @@ fn probe_op(op: &str) -> OpStatus {
             return OpStatus::cli_missing(Some(format!("the 1Password CLI wouldn't run: {e}")))
         }
     };
+    let base = |readiness, account: Option<&OpAccount>, accounts: Vec<OpAccount>, error| OpStatus {
+        readiness,
+        path: Some(op.to_string()),
+        version: Some(version.clone()),
+        account_url: account.and_then(|a| a.url.clone().or_else(|| a.email.clone())),
+        account_id: account.map(|a| a.user_uuid.clone()),
+        accounts,
+        error,
+    };
 
-    // `op account list` is the authoritative "is there an account?" question; `whoami` is the
+    // `op account list` is the authoritative "which accounts are there?" question; `whoami` is the
     // fallback for a setup where the account is provided by the desktop app / a service token and
     // doesn't show up in the account list.
-    let account_url = run_op_str(op, &["account", "list", "--format=json"], PROBE_TIMEOUT)
+    let accounts = run_op_str(op, &["account", "list", "--format=json"], PROBE_TIMEOUT)
         .ok()
-        .and_then(|out| parse_account_url(&out))
-        .or_else(|| {
-            run_op_str(op, &["whoami", "--format=json"], PROBE_TIMEOUT)
-                .ok()
-                .and_then(|out| parse_account_url(&out))
-        });
+        .map(|out| parse_accounts(&out))
+        .unwrap_or_default();
 
-    match account_url {
-        Some(url) => OpStatus {
-            readiness: OpReadiness::Ready,
-            path: Some(op.to_string()),
-            version: Some(version),
-            account_url: Some(url),
-            error: None,
-        },
-        None => OpStatus {
-            readiness: OpReadiness::IntegrationOff,
-            path: Some(op.to_string()),
-            version: Some(version),
-            account_url: None,
-            error: Some(
-                "The 1Password CLI is installed but no account is signed in. In the 1Password app, \
-                 turn on Settings → Developer → “Integrate with 1Password CLI”, then refresh."
-                    .into(),
+    if accounts.is_empty() {
+        return match run_op_str(op, &["whoami", "--format=json"], PROBE_TIMEOUT)
+            .ok()
+            .and_then(|out| parse_account_url(&out))
+        {
+            // One implicit account, named only by `whoami` — nothing to disambiguate.
+            Some(url) => OpStatus {
+                account_url: Some(url),
+                ..base(OpReadiness::Ready, None, Vec::new(), None)
+            },
+            None => base(
+                OpReadiness::IntegrationOff,
+                None,
+                Vec::new(),
+                Some(
+                    "The 1Password CLI is installed but no account is signed in. In the 1Password \
+                     app, turn on Settings → Developer → “Integrate with 1Password CLI”, then \
+                     refresh."
+                        .into(),
+                ),
             ),
-        },
+        };
+    }
+
+    let names = || {
+        accounts.iter().map(OpAccount::label).collect::<Vec<_>>().join(", ")
+    };
+    match selected {
+        Some(sel) => {
+            let matched: Vec<&OpAccount> = accounts.iter().filter(|a| a.matches(&sel)).collect();
+            match matched.len() {
+                1 => base(OpReadiness::Ready, matched.first().copied(), accounts.clone(), None),
+                // A selection that names TWO accounts is no selection at all — `$OP_ACCOUNT=<email>`
+                // does this whenever the same email is signed in twice, and `op` answers it with
+                // the very "multiple accounts found" this state exists to predict.
+                n if n > 1 => base(
+                    OpReadiness::AccountAmbiguous,
+                    None,
+                    accounts.clone(),
+                    Some(format!(
+                        "The 1Password account Sparkle was told to use matches {n} of the accounts \
+                         you’re signed in to, so `op` still can’t tell them apart. Choose one by \
+                         its user ID: {}.",
+                        names()
+                    )),
+                ),
+                // A chosen account that is no longer signed in is worse than none: every `op` call
+                // would carry a `--account` the CLI rejects. Send the user back to the picker.
+                _ => base(
+                    OpReadiness::AccountAmbiguous,
+                    None,
+                    accounts.clone(),
+                    Some(format!(
+                        "The 1Password account Sparkle is set to use isn’t signed in any more. \
+                         Choose one of the accounts you are signed in to: {}.",
+                        names()
+                    )),
+                ),
+            }
+        }
+        None if accounts.len() == 1 => {
+            base(OpReadiness::Ready, accounts.first(), accounts.clone(), None)
+        }
+        None => base(
+            OpReadiness::AccountAmbiguous,
+            None,
+            accounts.clone(),
+            Some(format!(
+                "You’re signed in to {} 1Password accounts, so `op` can’t tell which one to use — \
+                 every read and write fails with “multiple accounts found”. Choose one: {}.",
+                accounts.len(),
+                names()
+            )),
+        ),
     }
 }
 
@@ -1560,6 +1807,311 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Run `f` as if `[onepassword].account_id` were `id`. The override is THREAD-local, so this is
+    /// safe under `cargo test`'s parallelism; it is also restored on the way out so one test can't
+    /// leak a selection into whatever runs next on this thread.
+    fn with_account<T>(id: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = TEST_ACCOUNT.with(|c| c.borrow().clone());
+        TEST_ACCOUNT.with(|c| *c.borrow_mut() = id.map(str::to_string));
+        let out = f();
+        TEST_ACCOUNT.with(|c| *c.borrow_mut() = prev);
+        out
+    }
+
+    /// The four accounts from the bug report, two of them sharing an email — the exact shape that
+    /// made "take the first row" look like it worked.
+    const FOUR_ACCOUNTS: &str = r#"[
+      {"url":"my.1password.com","email":"a@one.example","user_uuid":"DARLM4L2ABDHBAT4ELR23VQAYI"},
+      {"url":"my.1password.com","email":"b@two.example","user_uuid":"I6KP6RIAPNB3NKAFAB6E57KCRE"},
+      {"url":"my.1password.com","email":"b@two.example","user_uuid":"NZ36HQYBEVBWZMSWZLH77XMFJA"},
+      {"url":"my.1password.com","email":"c@three.example","user_uuid":"SUOAEYWSZNHHHCFE7GAPCLTAHI"}
+    ]"#;
+
+    /// A fake `op` that behaves like the real one on a multi-account machine: every subcommand
+    /// fails with 1Password's own "multiple accounts found" message UNLESS `--account` leads the
+    /// argv. `op account list` and `op --version` answer regardless, exactly as the real CLI does.
+    fn fake_op_requiring_account(dir: &Path) -> String {
+        fake_op(
+            dir,
+            r#"
+case "$1" in
+  --version) echo "2.30.0"; exit 0 ;;
+  account) cat <<'JSON'
+[{"url":"my.1password.com","email":"b@two.example","user_uuid":"I6KP6RIAPNB3NKAFAB6E57KCRE"},
+ {"url":"my.1password.com","email":"b@two.example","user_uuid":"NZ36HQYBEVBWZMSWZLH77XMFJA"}]
+JSON
+    exit 0 ;;
+esac
+if [ "$1" != "--account" ] || [ -z "$2" ]; then
+  echo "[ERROR] 2026/07/31 21:54:29 multiple accounts found. Use the --account flag or set the OP_ACCOUNT environment variable to select an account." >&2
+  exit 1
+fi
+shift 2
+case "$1" in
+  vault) echo '[{"id":"v1","name":"Private"}]' ;;
+  item)
+    case "$2" in
+      list) echo '[{"id":"i1","title":"proj/.env.local","updated_at":"2026-07-31T00:00:00Z"}]' ;;
+      *) echo '{"id":"i1"}' ;;
+    esac ;;
+  document) echo '{"uuid":"i1","title":"proj/.env.local","updatedAt":"2026-07-31T00:00:00Z"}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+    }
+
+    // ── which account: the flag that was missing everywhere ──────────────────────────────────
+
+    #[test]
+    fn every_op_call_omits_the_account_flag_when_none_is_chosen() {
+        // The pre-fix behaviour, pinned: with no account chosen we send no flag, and a
+        // multi-account machine answers every single call with "multiple accounts found".
+        let d = tmp();
+        let op = fake_op_requiring_account(d.path());
+        with_account(None, || {
+            let err = list_vaults(&op).unwrap_err();
+            assert!(err.contains("multiple accounts found"), "unexpected error: {err}");
+        });
+        assert!(
+            !argv_calls(d.path()).iter().flatten().any(|a| a == "--account"),
+            "no --account should have been sent when none is chosen"
+        );
+    }
+
+    #[test]
+    fn the_chosen_account_reaches_every_op_call_that_touches_a_vault() {
+        // The fix, end to end and through the REAL call paths: a read (vault list), a list (item
+        // list) and a WRITE (document create) all succeed against a fake `op` that refuses anything
+        // without `--account`. One chokepoint means one of these cannot pass while another fails.
+        let d = tmp();
+        let op = fake_op_requiring_account(d.path());
+        let file = d.path().join(".env.local");
+        std::fs::write(&file, "K=V\n").unwrap();
+
+        with_account(Some("NZ36HQYBEVBWZMSWZLH77XMFJA"), || {
+            assert_eq!(
+                list_vaults(&op).unwrap(),
+                vec![OpVault { id: "v1".into(), name: "Private".into() }]
+            );
+            assert_eq!(list_backup_items(&op, "v1").unwrap().len(), 1);
+            backup_one(
+                &op,
+                &OpBackupArgs {
+                    vault_id: "v1".into(),
+                    abs_path: file.to_string_lossy().into_owned(),
+                    title: "proj/.env.local".into(),
+                    sha256: "abc".into(),
+                    item_id: None,
+                },
+            )
+            .unwrap();
+        });
+
+        let calls = argv_calls(d.path());
+        assert!(calls.len() >= 3, "expected at least three op calls, got {calls:?}");
+        for call in &calls {
+            assert_eq!(
+                &call[..2],
+                &["--account".to_string(), "NZ36HQYBEVBWZMSWZLH77XMFJA".to_string()],
+                "this call went out without the chosen account: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_account_subcommand_is_never_scoped_to_one_account() {
+        // Enumerating accounts must show ALL of them even when one is already chosen — scoping the
+        // probe's own `account list` would hide the ambiguity it exists to detect. Same for the
+        // `--version` query, which has no subcommand to attach a global flag to.
+        assert!(!accepts_account_flag(&["account".to_string(), "list".to_string()]));
+        assert!(!accepts_account_flag(&["--version".to_string()]));
+        assert!(!accepts_account_flag(&[]));
+        assert!(accepts_account_flag(&["vault".to_string(), "list".to_string()]));
+
+        let d = tmp();
+        let op = fake_op_requiring_account(d.path());
+        let st = with_account(Some("I6KP6RIAPNB3NKAFAB6E57KCRE"), || probe_op(&op));
+        assert_eq!(st.readiness, OpReadiness::Ready);
+        assert!(
+            !argv_calls(d.path()).iter().flatten().any(|a| a == "--account"),
+            "the probe's own calls must not be scoped to one account"
+        );
+    }
+
+    #[test]
+    fn the_account_flag_leads_the_argv_and_leaves_the_command_intact() {
+        let args: Vec<String> = vault_list_argv();
+        let flagged = with_account(Some("U9"), || with_account_flag(&args));
+        assert_eq!(flagged[0], "--account");
+        assert_eq!(flagged[1], "U9");
+        assert_eq!(&flagged[2..], &args[..], "the original command must survive unchanged");
+        assert_eq!(with_account(None, || with_account_flag(&args)), args);
+    }
+
+    #[test]
+    fn an_account_flag_never_turns_a_document_error_into_a_secret_leak() {
+        // `stdout_is_safe_to_quote` keys on the SUBCOMMAND, and `op document get` streams the
+        // document itself to stdout. Had the flag been prepended before that check ran, the leading
+        // `--account` would have made every document command look like a non-document one and put a
+        // line of the user's secret into a displayed error string.
+        let d = tmp();
+        let op = fake_op(d.path(), r#"echo 'SUPER_SECRET_VALUE'; exit 1"#);
+        let err = with_account(Some("U9"), || {
+            run_op(&op, &["document".into(), "get".into(), "i1".into()], OP_TIMEOUT).unwrap_err()
+        });
+        assert!(!err.contains("SUPER_SECRET_VALUE"), "document stdout leaked into an error: {err}");
+    }
+
+    // ── account parsing ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn two_accounts_sharing_an_email_stay_distinguishable() {
+        let accounts = parse_accounts(FOUR_ACCOUNTS);
+        assert_eq!(accounts.len(), 4);
+        let uuids: Vec<&str> = accounts.iter().map(|a| a.user_uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            vec![
+                "DARLM4L2ABDHBAT4ELR23VQAYI",
+                "I6KP6RIAPNB3NKAFAB6E57KCRE",
+                "NZ36HQYBEVBWZMSWZLH77XMFJA",
+                "SUOAEYWSZNHHHCFE7GAPCLTAHI"
+            ]
+        );
+        // The two same-email rows differ ONLY by uuid, which is the whole reason the picker keys on
+        // it: matching by email hits both, and "both" is not a choice.
+        let by_email: Vec<&OpAccount> =
+            accounts.iter().filter(|a| a.matches("b@two.example")).collect();
+        assert_eq!(by_email.len(), 2);
+        assert_eq!(accounts.iter().filter(|a| a.matches("NZ36HQYBEVBWZMSWZLH77XMFJA")).count(), 1);
+        // Every label carries the uuid, so two same-email rows never render identically.
+        assert!(accounts[1].label().contains("I6KP6RIAPNB3NKAFAB6E57KCRE"));
+        assert_ne!(accounts[1].label(), accounts[2].label());
+    }
+
+    #[test]
+    fn account_rows_without_an_identifier_are_dropped() {
+        // `--account ""` is not a choice; a row we can't name is worse than no row.
+        assert!(parse_accounts(r#"[{"user_type":"HUMAN"}]"#).is_empty());
+        assert!(parse_accounts("not json").is_empty());
+    }
+
+    // ── readiness: the four states ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn readiness_is_account_ambiguous_when_several_accounts_and_none_chosen() {
+        // THE BUG: this used to report `ready` off the first row, and then every vault call failed.
+        let d = tmp();
+        let op = fake_op(
+            d.path(),
+            &format!(
+                r#"
+case "$1" in
+  --version) echo "2.30.0" ;;
+  account) cat <<'JSON'
+{FOUR_ACCOUNTS}
+JSON
+ ;;
+  *) exit 1 ;;
+esac
+"#
+            ),
+        );
+        let st = probe_op_with(&op, None);
+        assert_eq!(st.readiness, OpReadiness::AccountAmbiguous);
+        assert_eq!(st.account_id, None, "nothing may be reported as the account in effect");
+        assert_eq!(st.accounts.len(), 4, "the picker needs every account to choose from");
+        let err = st.error.unwrap();
+        // The message must NAME them — "pick an account" without saying which is unactionable when
+        // two of them share an email.
+        assert!(err.contains("NZ36HQYBEVBWZMSWZLH77XMFJA"), "accounts not named: {err}");
+        assert!(err.contains("multiple accounts found"), "the CLI's own error unmentioned: {err}");
+    }
+
+    #[test]
+    fn readiness_is_ready_once_one_of_several_accounts_is_chosen() {
+        let d = tmp();
+        let op = fake_op(
+            d.path(),
+            &format!(
+                r#"
+case "$1" in
+  --version) echo "2.30.0" ;;
+  account) cat <<'JSON'
+{FOUR_ACCOUNTS}
+JSON
+ ;;
+  *) exit 1 ;;
+esac
+"#
+            ),
+        );
+        let st = probe_op_with(&op, Some("NZ36HQYBEVBWZMSWZLH77XMFJA".into()));
+        assert_eq!(st.readiness, OpReadiness::Ready);
+        assert_eq!(st.account_id.as_deref(), Some("NZ36HQYBEVBWZMSWZLH77XMFJA"));
+        assert_eq!(st.account_url.as_deref(), Some("my.1password.com"));
+        assert_eq!(st.error, None);
+
+        // …and a selection that names TWO of them (an email both accounts share) is still not a
+        // choice — `op` would answer it with the same "multiple accounts found".
+        let both = probe_op_with(&op, Some("b@two.example".into()));
+        assert_eq!(both.readiness, OpReadiness::AccountAmbiguous);
+        assert_eq!(both.account_id, None);
+    }
+
+    #[test]
+    fn readiness_is_ambiguous_when_the_chosen_account_is_no_longer_signed_in() {
+        // Even with ONE account signed in: a stale `account_id` is passed as `--account` on every
+        // call, so "one account" does not make it safe to call ready.
+        let d = tmp();
+        let op = fake_op(
+            d.path(),
+            r#"
+case "$1" in
+  --version) echo "2.30.0" ;;
+  account) echo '[{"url":"my.1password.com","email":"a@b.c","user_uuid":"U1"}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let st = probe_op_with(&op, Some("SIGNED-OUT-UUID".into()));
+        assert_eq!(st.readiness, OpReadiness::AccountAmbiguous);
+        assert_eq!(st.account_id, None);
+        assert!(st.error.unwrap().contains("U1"), "the account it could use must be named");
+    }
+
+    #[test]
+    fn a_single_account_needs_no_choice() {
+        // The common case must not regress into a needs-setup state: one account is unambiguous,
+        // `op` resolves it itself, and no flag is owed.
+        let d = tmp();
+        let op = fake_op(
+            d.path(),
+            r#"
+case "$1" in
+  --version) echo "2.30.0" ;;
+  account) echo '[{"url":"my.1password.com","email":"a@b.c","user_uuid":"U1"}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let st = probe_op_with(&op, None);
+        assert_eq!(st.readiness, OpReadiness::Ready);
+        assert_eq!(st.account_id.as_deref(), Some("U1"));
+        assert_eq!(st.accounts.len(), 1);
+    }
+
+    #[test]
+    fn readiness_serializes_the_new_state_as_the_contract_spells_it() {
+        // The TS union is the frozen contract; a Rust-side rename would silently fall through every
+        // `switch` in the pane.
+        assert_eq!(
+            serde_json::to_string(&OpReadiness::AccountAmbiguous).unwrap(),
+            "\"account-ambiguous\""
+        );
+    }
+
     // ── readiness: the three states ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1575,7 +2127,7 @@ case "$1" in
 esac
 "#,
         );
-        let st = probe_op(&op);
+        let st = probe_op_with(&op, None);
         assert_eq!(st.readiness, OpReadiness::Ready);
         assert_eq!(st.version.as_deref(), Some("2.30.0"));
         assert_eq!(st.account_url.as_deref(), Some("my.1password.com"));
@@ -1599,7 +2151,7 @@ case "$1" in
 esac
 "#,
         );
-        let st = probe_op(&op);
+        let st = probe_op_with(&op, None);
         assert_eq!(st.readiness, OpReadiness::IntegrationOff);
         assert_eq!(st.version.as_deref(), Some("2.30.0"));
         assert_eq!(st.account_url, None);
@@ -1622,14 +2174,14 @@ case "$1" in
 esac
 "#,
         );
-        let st = probe_op(&op);
+        let st = probe_op_with(&op, None);
         assert_eq!(st.readiness, OpReadiness::Ready);
         assert_eq!(st.account_url.as_deref(), Some("team.1password.com"));
     }
 
     #[test]
     fn readiness_is_cli_missing_when_the_binary_does_not_run() {
-        let st = probe_op("/definitely/not/here/op");
+        let st = probe_op_with("/definitely/not/here/op", None);
         assert_eq!(st.readiness, OpReadiness::CliMissing);
         assert!(st.error.is_some());
         assert_eq!(st.version, None);
@@ -3021,12 +3573,24 @@ fi
             path: Some("/opt/homebrew/bin/op".into()),
             version: Some("2.30.0".into()),
             account_url: None,
+            account_id: Some("U1".into()),
+            accounts: vec![OpAccount {
+                url: Some("my.1password.com".into()),
+                email: Some("a@b.c".into()),
+                user_uuid: "U1".into(),
+                account_uuid: None,
+            }],
             error: None,
         })
         .unwrap();
         assert_eq!(j["readiness"], "integration-off");
         assert_eq!(j["accountUrl"], serde_json::Value::Null);
         assert!(j.get("account_url").is_none(), "the contract is camelCase");
+        assert_eq!(j["accountId"], "U1");
+        // The picker reads `userUuid` off each row; a snake_case field there would render every
+        // account as `undefined` and make two same-email accounts unpickable.
+        assert_eq!(j["accounts"][0]["userUuid"], "U1");
+        assert!(j["accounts"][0].get("user_uuid").is_none(), "the contract is camelCase");
         assert_eq!(
             serde_json::to_value(OpReadiness::CliMissing).unwrap(),
             "cli-missing"

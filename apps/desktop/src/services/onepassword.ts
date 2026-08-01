@@ -41,8 +41,28 @@ export type OpReadiness =
   | "cli-missing"
   /** `op` runs but reports no authenticated account — the desktop-app integration toggle is off. */
   | "integration-off"
-  /** `op` runs and is authenticated. Backup/restore are available. */
+  /** `op` runs and is authenticated, but several accounts are signed in and none has been chosen
+   *  (or the chosen one is no longer signed in). Every vault call would fail with "multiple
+   *  accounts found", so this is a needs-setup state — show the account picker, not the table. */
+  | "account-ambiguous"
+  /** `op` runs, is authenticated, and the account to act as is unambiguous. Backup/restore are
+   *  available. */
   | "ready";
+
+/** One signed-in 1Password account. Mirrors Rust `OpAccount`.
+ *
+ *  KEY ON `userUuid`, NEVER on email: a person can be signed in to two accounts under the SAME
+ *  email (a personal one and a family/team membership), and those rows are identical in every other
+ *  field. An email-keyed picker cannot express the choice between them. */
+export interface OpAccount {
+  /** Sign-in address, e.g. `my.1password.com`. */
+  url: string | null;
+  email: string | null;
+  /** The stable identifier persisted as `[onepassword].account_id` and passed as `--account`. */
+  userUuid: string;
+  /** Account (rather than user) uuid, when `op` reports one. */
+  accountUuid: string | null;
+}
 
 /** Result of probing the `op` CLI. Mirrors Rust `OpStatus`. */
 export interface OpStatus {
@@ -53,6 +73,13 @@ export interface OpStatus {
   version: string | null;
   /** The signed-in account's sign-in address (e.g. `my.1password.com`), when authenticated. */
   accountUrl: string | null;
+  /** The account `op` will actually act as — the chosen one, or the only one signed in. Null while
+   *  the choice is still ambiguous. */
+  accountId: string | null;
+  /** Every signed-in account, for the picker. Carried on the status rather than fetched by a
+   *  separate command: the probe already ran `op account list`, and a second run is a second Touch
+   *  ID prompt. Empty when `op` couldn't enumerate them. */
+  accounts: OpAccount[];
   /** Present when the probe failed for a reason the user can act on; already redacted for display. */
   error: string | null;
 }

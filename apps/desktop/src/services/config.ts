@@ -152,6 +152,11 @@ export interface OnePasswordConfig {
   /** The vault chosen in the one-time picker; null/absent until then. Rust normalizes a blank
    *  string to absent, so a falsy value here always means "no vault picked yet". */
   vault_id?: string | null;
+  /** Which 1Password account `op` acts as, as its `user_uuid`; null/absent until chosen. Only
+   *  needed when more than one account is signed in — `op` then refuses every call with "multiple
+   *  accounts found" unless it is told which. Keyed on the uuid, never the email: one person can be
+   *  signed in twice under the same email. */
+  account_id?: string | null;
   /** Restore backed-up env files into each newly created agent worktree. */
   seed_worktrees: boolean;
 }

@@ -853,6 +853,31 @@ describe("1Password env backup — config hydration", () => {
     expect(s.onepasswordSeedWorktrees).toBe(true);
   });
 
+  it("hydrates the chosen account, and treats a blank one as no account chosen", () => {
+    // The account is what `op` is told to act as; an unset value means "let `op` decide", which is
+    // right for a single signed-in account and wrong the moment there are two.
+    const eff = bare();
+    eff.config.onepassword = {
+      vault_id: "vault-abc",
+      account_id: "  NZ36HQYBEVBWZMSWZLH77XMFJA  ",
+      seed_worktrees: false,
+    };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordAccountId).toBe("NZ36HQYBEVBWZMSWZLH77XMFJA");
+
+    // A blank id must not read as "an account is chosen" — it would go out as `--account ""`.
+    useSettingsStore.setState({ onepasswordAccountId: "stale" });
+    eff.config.onepassword = { vault_id: "vault-abc", account_id: "  ", seed_worktrees: false };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordAccountId).toBeNull();
+
+    // …and an older backend that doesn't send the key at all is "not chosen", not a crash.
+    useSettingsStore.setState({ onepasswordAccountId: "stale" });
+    eff.config.onepassword = { vault_id: "vault-abc", seed_worktrees: false };
+    useSettingsStore.getState().hydrateFromConfig(eff);
+    expect(useSettingsStore.getState().onepasswordAccountId).toBeNull();
+  });
+
   it("treats a null vault_id as no vault picked", () => {
     const eff = bare();
     eff.config.onepassword = { vault_id: null, seed_worktrees: false };

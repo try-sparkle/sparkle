@@ -15,6 +15,7 @@ import {
 } from "./config";
 import {
   useSettingsStore,
+  normalizeAccountId,
   normalizeVaultId,
   type AiFeatureKey,
   type PluginKey,
@@ -393,6 +394,24 @@ export async function setOnePasswordVault(vaultId: string | null): Promise<void>
     else await unsetConfigValue("onepassword.vault_id");
   } catch (e) {
     console.warn("config write failed (onepassword vault)", e);
+  }
+}
+
+/** Set (or clear) which 1Password account every `op` call acts as, by its `user_uuid`.
+ *
+ *  A null id UNSETS the key rather than writing an empty string — Rust would have to defend against
+ *  `--account ""` on every invocation otherwise. Awaiting the write matters here beyond persistence:
+ *  the Rust side reads this key at the moment it builds each `op` command line, and `set_config_value`
+ *  refreshes the cached config before it returns, so a re-probe issued after this resolves already
+ *  sees the new account. */
+export async function setOnePasswordAccount(accountId: string | null): Promise<void> {
+  const normalized = normalizeAccountId(accountId);
+  useSettingsStore.getState().setOnePasswordAccountId(normalized);
+  try {
+    if (normalized) await setConfigValue("onepassword.account_id", normalized);
+    else await unsetConfigValue("onepassword.account_id");
+  } catch (e) {
+    console.warn("config write failed (onepassword account)", e);
   }
 }
 

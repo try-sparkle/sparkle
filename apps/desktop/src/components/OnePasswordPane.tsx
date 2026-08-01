@@ -5,8 +5,21 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
-import { setOnePasswordVault, setOnePasswordSeedWorktrees, setToolEnabled } from "../services/configActions";
-import { installOpCli, opPreflight, opVaults, refreshOpPreflight, type OpStatus, type OpVault } from "../services/onepassword";
+import {
+  setOnePasswordAccount,
+  setOnePasswordVault,
+  setOnePasswordSeedWorktrees,
+  setToolEnabled,
+} from "../services/configActions";
+import {
+  installOpCli,
+  opPreflight,
+  opVaults,
+  refreshOpPreflight,
+  type OpAccount,
+  type OpStatus,
+  type OpVault,
+} from "../services/onepassword";
 import { backupRows, loadEnvBackupRows, toScanRoots } from "../services/envBackupActions";
 import { rowsNeedingBackup, summarize, type EnvBackupRow, type EnvFileStatus } from "../engine/envBackup";
 import { CHIP, SECTION_LABEL } from "./labelTreatment";
@@ -22,6 +35,14 @@ import { CHIP, SECTION_LABEL } from "./labelTreatment";
 const CLI_DOCS = "https://developer.1password.com/docs/cli/get-started/";
 const INTEGRATION_DOCS = "https://developer.1password.com/docs/cli/app-integration/";
 
+/** `url — email (user id)`. The user id is never dropped: two signed-in accounts can carry the
+ *  SAME email (a personal one and a family/team membership), and it's the only field that
+ *  distinguishes them — which is also why it, not the email, is what gets persisted. */
+function accountLabel(a: OpAccount): string {
+  const head = [a.url, a.email].filter(Boolean).join(" — ");
+  return head ? `${head} (${a.userUuid})` : a.userUuid;
+}
+
 /** Human label + tone for each drift state. */
 const STATUS_META: Record<EnvFileStatus, { label: string; color: string }> = {
   "in-sync": { label: "Backed up", color: C.muted },
@@ -36,6 +57,7 @@ const STATUS_META: Record<EnvFileStatus, { label: string; color: string }> = {
 export function OnePasswordPane() {
   const enabled = useSettingsStore((s) => s.onepasswordEnabled);
   const vaultId = useSettingsStore((s) => s.onepasswordVaultId);
+  const accountId = useSettingsStore((s) => s.onepasswordAccountId);
   const seedWorktrees = useSettingsStore((s) => s.onepasswordSeedWorktrees);
   const projects = useProjectStore((s) => s.projects);
 
@@ -137,6 +159,23 @@ export function OnePasswordPane() {
     }
   };
 
+  // Choosing an account is what turns `account-ambiguous` into `ready`, so the write MUST be
+  // awaited before the re-probe: the backend reads `[onepassword].account_id` when it builds each
+  // `op` command line, and a probe issued in parallel would race the config write and report the
+  // old, still-ambiguous answer.
+  const onPickAccount = async (id: string | null) => {
+    setScanBusy("Checking…");
+    setError(null);
+    try {
+      await setOnePasswordAccount(id);
+      setStatus(await refreshOpPreflight());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setScanBusy(null);
+    }
+  };
+
   const onBackUpAll = async () => {
     if (!vaultId || !rows) return;
     const pending = rowsNeedingBackup(rows);
@@ -177,6 +216,10 @@ export function OnePasswordPane() {
       </div>
     );
   }
+
+  // `?? []` rather than `status.accounts`: an older backend (or a mocked status) has no such field,
+  // and a settings pane must not crash on a payload that predates it.
+  const accounts = status?.accounts ?? [];
 
   // summarize THROWS on a row with an unrecognized status — correct for a pure engine, but this is
   // a render path: an unexpected payload must degrade to "no counts", not take the settings dialog
@@ -230,6 +273,53 @@ export function OnePasswordPane() {
             <button type="button" style={linkBtn} onClick={() => void openUrl(INTEGRATION_DOCS)}>
               How to enable it
             </button>
+          </div>
+        </div>
+      )}
+
+      {status?.readiness === "account-ambiguous" && (
+        <div style={noticeStyle}>
+          <div style={noticeTitle}>
+            <FiAlertTriangle size={14} /> Choose which 1Password account to use
+          </div>
+          <p style={body}>
+            {status.error ??
+              "You’re signed in to more than one 1Password account, so `op` can’t tell which one to use."}
+          </p>
+        </div>
+      )}
+
+      {/* ── Step 3a: pick an account ───────────────────────────────────────────────────────────
+          Shown when there is a choice to MAKE, which is not the same as "more than one account".
+          One signed-in account needs no picker — `op` resolves it on its own, and an unset
+          account_id means exactly that. But `account-ambiguous` is reachable with a SINGLE account
+          (a chosen one that has since been signed out, whose stale id still goes out as
+          `--account` on every call), and gating on the count alone left that case rendering a
+          notice telling the user to choose with no control to choose WITH — a dead end whose only
+          exit was hand-editing config.toml. */}
+      {(accounts.length > 1 || status?.readiness === "account-ambiguous") && (
+        <div>
+          <label style={fieldLabel} htmlFor="op-account">
+            Account
+          </label>
+          <select
+            id="op-account"
+            style={selectStyle}
+            value={accountId ?? ""}
+            disabled={!!busy}
+            onChange={(e) => void onPickAccount(e.target.value || null)}
+          >
+            <option value="">Choose an account…</option>
+            {accounts.map((a) => (
+              <option key={a.userUuid} value={a.userUuid}>
+                {accountLabel(a)}
+              </option>
+            ))}
+          </select>
+          <div style={hintStyle}>
+            Each account is listed with its 1Password user ID — two accounts can share the same
+            email address (a personal one and a family or team membership), and the ID is the only
+            thing that tells them apart.
           </div>
         </div>
       )}
