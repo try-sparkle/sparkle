@@ -613,6 +613,20 @@ export function Terminal({
     // verb below (spawn/write/resize/kill/output/exit) goes through this, not pty.ts directly.
     const transport = getTransport({ id: agentId, runtime });
     transportRef.current = transport;
+
+    // Reset the per-BINDING witnesses. These three describe "has THIS transport produced anything
+    // yet", and until promotion they were only ever reset by `retry()` — which was sound while the
+    // only way to re-run this effect was "Start again" (which calls it). A `runtime` flip re-runs the
+    // effect WITHOUT going through retry, and a stale `true` here is not cosmetic: `firstOutput`
+    // suppresses the Starting…/Resuming… affordance, so the cutover renders a blank pane with no
+    // explanation, and `gotOutputRef` gates `if (!gotOutputRef.current) setSpawnFail("exited")` in
+    // the exit handler — so a cloud attach that yields nothing and exits would show NO error either.
+    // That is precisely the silent-nothing symptom the rebind exists to remove, reintroduced one
+    // layer down. On a first mount all three are already at these values, so React bails and this
+    // costs nothing.
+    gotOutputRef.current = false;
+    setFirstOutput(false);
+    setSpawnFail(null);
     // A fresh PTY has been told nothing yet. Clearing the memo here (rather than trusting the size
     // handed to spawn) keeps the post-spawn re-sync below unconditional, which is what preserves the
     // spawn-time width invariant: the child is always told its real size once the box is measured.
@@ -1398,6 +1412,23 @@ export function Terminal({
       // The half-typed line dies with the PTY. Without this, an agent torn down mid-compose would
       // leave `drafts[agentId]` true forever, and the action pill would stay hidden on the fresh
       // terminal a "Start again" (or an account switch) remounts here.
+      //
+      // THIS IS UNCONDITIONAL, INCLUDING ON A PROMOTION REBIND — and the reason is worth writing
+      // down, because "the tab keeps everything, only the transport changes" makes preserving it
+      // look obviously right. It isn't. `drafts[agentId]` is a BOOLEAN meaning "an unsubmitted line
+      // is pending at the CLI prompt"; the text itself lives in the local Claude's readline buffer,
+      // inside the PTY this very cleanup kills (detach() == kill for LocalTransport). So the line is
+      // destroyed by the cutover no matter what we do here, and keeping the flag preserves only a
+      // claim about something that no longer exists. Worse, the flag's sole writer is the per-effect
+      // `lineScan`, recreated empty by the new binding and fed only by the user's next keystroke in
+      // THIS terminal — which on a promoted pane may never come. It would sit `true` for the life of
+      // the tab, and ConciergeSuggestions hides the recommended-action pill on `drafts[agentId]`:
+      // exactly the "true forever, pill hidden forever" failure this call was added to prevent
+      // (roborev 57372).
+      //
+      // The visible SCROLLBACK is likewise not preserved: xterm is disposed either way, and the
+      // promoted pane redraws the resumed conversation from the sandbox's own backfill, so keeping
+      // the local buffer would paint the same transcript twice.
       useTerminalOverlayStore.getState().clearDraft(agentId);
       if (focusRef) focusRef.current = null;
       if (apiRef) apiRef.current = null;
@@ -1441,8 +1472,22 @@ export function Terminal({
     };
     // agentId is stable for the life of this component; `attempt` bumps on "Start again" to tear
     // down and re-spawn the terminal from scratch.
+    //
+    // `runtime` is a dep because THIS EFFECT SELECTS THE TRANSPORT BY IT (`getTransport` above), and
+    // a value the effect reads to make a binding decision has to re-run the effect when it changes.
+    // It is stable for every agent that was born local and stayed local, or born cloud — so for
+    // those this changes nothing. The one thing that moves it is PROMOTION (moving a running local
+    // agent into the cloud, docs/superpowers/specs/2026-07-31-agent-promotion-design.md): the tab
+    // KEEPS its id and its `attempt`, and only `runtime` flips, so without this dep the promoted
+    // pane would keep talking to the dead local PTY forever and never attach to the sandbox — the
+    // feature would look like it worked and stream nothing.
+    //
+    // The teardown does the other half for free, and correctly in both directions: it `detach()`es
+    // the transport captured in THIS closure, and for a LocalTransport detach IS kill — so the flip
+    // to "cloud" ends the local PTY as the old effect unwinds, which is exactly the cut that
+    // promotion's copy-then-cut ordering has already earned by that point.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId, attempt]);
+  }, [agentId, attempt, runtime]);
 
   // Visibility-driven WebGL renderer lifecycle — the core fix for WebGL-context-exhaustion latency.
   // Hold a live WebGL context ONLY for the visible pane: attach when this pane becomes active,

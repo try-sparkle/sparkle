@@ -179,6 +179,18 @@ export interface ProjectState {
    *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name. */
   setAgentActivity: (projectId: string, agentId: string, activity: string) => void;
   /**
+   * Flip an agent's runtime IN PLACE — local→cloud promotion (services/agentPromotion,
+   * spec 2026-07-31 §Decision 3). It changes `runtime` and NOTHING else, and that is the whole
+   * point of the action existing rather than the caller removing and re-adding a tab.
+   *
+   * The promoted agent keeps its `id`, so every downstream consumer that keys on it — runtimeStore,
+   * terminal event channels, the relay's `agent_id`, phone drill-in — needs zero changes; and it
+   * keeps its name, goal, promptHistory, alert record, bead and epic, so "same row, different
+   * transport" is simply TRUE rather than something the UI has to simulate. Nothing is copied here,
+   * so nothing can be copied wrong.
+   */
+  setAgentRuntime: (projectId: string, agentId: string, runtime: Runtime) => void;
+  /**
    * Set / replace / clear an agent's GOAL — the standing objective that decides whether an idle turn
    * gets auto-continued (engine/goalContinuation) and whether an idle row reads "done" or "stalled"
    * (engine/agentStall). An empty string CLEARS it, which also disables auto-continue for that agent.
@@ -1380,6 +1392,17 @@ export const useProjectStore = create<ProjectState>()(
             // Unlike renameAgent this NEVER pins the name or touches auto-naming — activity is a
             // separate, always-live secondary field.
             mapAgent(p, agentId, (a) => ({ ...a, activity: activity.trim() })),
+          ),
+        })),
+
+      setAgentRuntime: (projectId, agentId, runtime) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // A single-field patch, deliberately. Anything that rebuilt the record here — even
+            // "helpfully" resetting a field the new runtime seems to imply — would silently drop
+            // part of the agent's identity on promotion, which is exactly what keeping the same row
+            // is meant to make impossible.
+            mapAgent(p, agentId, (a) => (a.runtime === runtime ? a : { ...a, runtime })),
           ),
         })),
 

@@ -225,3 +225,57 @@ describe("cloud api — claude auth", () => {
     expect(calls[0]!.method).toBe("DELETE");
   });
 });
+
+// The `promotion` field turns an ordinary start into the adoption of an already-running local
+// agent. Every assertion below is about the WIRE SHAPE, because that is where it can go wrong
+// silently: the route's schema drops unknown keys, so a camelCase `sessionId` would not error — it
+// would downgrade the promotion into a normal start that cuts its own branch and loses the
+// conversation, and the desktop would never hear about it.
+describe("cloud api — startSession promotion field", () => {
+  const base = {
+    projectId: "proj-1",
+    goal: "continue",
+    repoUrl: "https://github.com/acme/repo",
+  };
+
+  it("snake_cases the promotion object AND its nested transcript", async () => {
+    const { api, calls } = harness(() => ({ json: { session_id: "tab-1" } }));
+    await api.startSession({
+      ...base,
+      promotion: {
+        sessionId: "tab-1",
+        branch: "sparkle/agent-42",
+        transcript: { sessionId: "claude-sess-9", jsonl: '{"a":1}\n{"b":2}' },
+      },
+    });
+    expect(calls[0]!.body).toEqual({
+      project_id: "proj-1",
+      goal: "continue",
+      repo_url: "https://github.com/acme/repo",
+      promotion: {
+        session_id: "tab-1",
+        branch: "sparkle/agent-42",
+        transcript: { session_id: "claude-sess-9", jsonl: '{"a":1}\n{"b":2}' },
+      },
+    });
+    const raw = JSON.stringify(calls[0]!.body);
+    expect(raw).not.toContain("sessionId");
+  });
+
+  it("omits `transcript` entirely when no conversation travels", async () => {
+    const { api, calls } = harness(() => ({ json: { session_id: "tab-1" } }));
+    await api.startSession({
+      ...base,
+      promotion: { sessionId: "tab-1", branch: "sparkle/agent-42" },
+    });
+    const body = calls[0]!.body as { promotion: Record<string, unknown> };
+    expect(body.promotion).toEqual({ session_id: "tab-1", branch: "sparkle/agent-42" });
+    expect("transcript" in body.promotion).toBe(false);
+  });
+
+  it("sends NO promotion key at all for an ordinary born-in-the-cloud start", async () => {
+    const { api, calls } = harness(() => ({ json: { session_id: "s" } }));
+    await api.startSession(base);
+    expect(calls[0]!.body).not.toHaveProperty("promotion");
+  });
+});

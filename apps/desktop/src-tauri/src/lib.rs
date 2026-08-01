@@ -67,6 +67,7 @@ mod pr_claims;
 mod pr_owner;
 mod preflight;
 mod proc;
+mod promotion;
 mod project_window;
 mod pty;
 mod retention;
@@ -626,6 +627,11 @@ pub fn run() {
             worktree::delete_agent_branch,
             worktree::delete_agent_branch_if_merged,
             worktree::open_agent_pr,
+            promotion::promotion_preflight,
+            promotion::promotion_head_sha,
+            promotion::promotion_commit_dirty,
+            promotion::promotion_push_branch,
+            promotion::promotion_read_transcript,
             worktree::markdown_changed_since,
             worktree::refresh_agent_branch,
             worktree::read_worker_result,

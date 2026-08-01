@@ -10,7 +10,8 @@
 // fake token — no network, and the secret-never-echoed guarantee is asserted on the request bodies.
 //
 // Wire contracts (pinned in the plan; snake_case on the wire, camelCase in JS):
-//   POST   /sessions/start  { project_id, goal, repo_url, base_branch?, name? } → { session_id }
+//   POST   /sessions/start  { project_id, goal, repo_url, base_branch?, name?, promotion? }
+//                                                                                → { session_id }
 //   GET    /sessions?project_id=…                                               → { sessions: [...] }
 //   GET    /claude-auth                                                          → { method } | null
 //   PUT    /claude-auth     { method, secret }                                   → 200
@@ -25,12 +26,34 @@ export interface ClaudeAuthInfo {
   method: ClaudeAuthMethod;
 }
 
+/**
+ * Present ONLY when this start is a PROMOTION of an already-running local agent
+ * (services/agentPromotion) — absent for a normal born-in-the-cloud start.
+ *
+ * Its presence changes the runner's behaviour, so it is never a harmless extra: the sandbox clones
+ * and STAYS ON `branch` instead of cutting `sparkle/cloud-<id8>`, the server adopts `sessionId` as
+ * the session row's id (so the desktop tab keeps its identity — spec Decision 3), and Claude comes
+ * up IDLE with no initial prompt, which is what closes the two-Claudes-on-one-branch window.
+ */
+export interface StartPromotion {
+  /** The promoted agent's EXISTING desktop tab id. The server adopts it (409 `session_id_taken`
+   *  if it's already in use) and echoes it back. */
+  sessionId: string;
+  /** The already-pushed branch the sandbox checks out and stays on. */
+  branch: string;
+  /** The transferred Claude Code session. ABSENT ⇒ no conversation travels and the cloud agent
+   *  starts from a handoff briefing instead (spec Decision 2). */
+  transcript?: { sessionId: string; jsonl: string };
+}
+
 export interface StartSessionInput {
   projectId: string;
   goal: string;
   repoUrl: string;
   baseBranch?: string;
   name?: string;
+  /** See {@link StartPromotion}. Omitted for every non-promotion start. */
+  promotion?: StartPromotion;
 }
 
 /** A start failure carries the parsed server signal so the UI's classifyStartError can act on it. */
@@ -104,6 +127,26 @@ export function makeCloudApi(deps: CloudApiDeps = defaultDeps) {
             repo_url: input.repoUrl,
             ...(input.baseBranch ? { base_branch: input.baseBranch } : {}),
             ...(input.name ? { name: input.name } : {}),
+            // snake_cased on the wire like every field above it, INCLUDING the nested transcript —
+            // the server reads `promotion.session_id` / `transcript.session_id`, and a camelCase
+            // key there would be dropped by the route's schema, silently downgrading a promotion
+            // into an ordinary start that cuts its own branch and loses the conversation.
+            ...(input.promotion
+              ? {
+                  promotion: {
+                    session_id: input.promotion.sessionId,
+                    branch: input.promotion.branch,
+                    ...(input.promotion.transcript
+                      ? {
+                          transcript: {
+                            session_id: input.promotion.transcript.sessionId,
+                            jsonl: input.promotion.transcript.jsonl,
+                          },
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
           }),
         }),
       );

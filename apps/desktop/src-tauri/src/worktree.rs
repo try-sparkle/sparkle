@@ -2425,7 +2425,10 @@ fn local_branch_exists(root: &str, branch: &str) -> bool {
 /// `head` is the worktree's current HEAD branch (`worktree_head_branch`), passed IN rather than
 /// re-read: every caller already has it, and re-reading would spawn a second `git rev-parse` per
 /// agent per poll — undoing half of the sparkle-zlic batch saving.
-fn resolve_agent_branch(root: &str, head: &str, agent_id: &str, base: &str) -> (String, bool) {
+/// `pub(crate)` so `promotion.rs` resolves a promoted agent's branch through THIS ladder rather
+/// than minting `sparkle/agent-<id>` at its own call site — a copy would drift, and the renamed
+/// case (rung 3) is exactly the one a promotion must not get wrong: it pushes and clones the ref.
+pub(crate) fn resolve_agent_branch(root: &str, head: &str, agent_id: &str, base: &str) -> (String, bool) {
     let minted = format!("sparkle/agent-{agent_id}");
     if head == minted {
         return (minted, true);

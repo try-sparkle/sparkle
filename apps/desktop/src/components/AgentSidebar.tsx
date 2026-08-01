@@ -27,6 +27,7 @@ import {
   FiCheckCircle,
   FiRepeat,
   FiTarget,
+  FiUploadCloud,
   FiClock,
   FiAlertOctagon,
 } from "react-icons/fi";
@@ -60,6 +61,8 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { spinDownWorker } from "../services/workerSpawn";
 import { terminateIfCloud } from "../services/cloudAgents/terminate";
+import { useCloudAgentsEnabled, useCloudGate } from "../hooks/useCloudAgents";
+import { PromoteToCloudDialog, promoteDialogDeps } from "./PromoteToCloudDialog";
 import { killPty } from "../pty";
 import { refreshAgentBranch, landAgentBranch } from "../services/branchStatus";
 import type { BranchStatus } from "../services/branchStatus";
@@ -1327,6 +1330,33 @@ export function AgentSidebar({
 
   // ── Close-agent Ship / Save / Discard (sparkle-o341) ───────────────────────────────────────────
   const closingAgent = project?.agents.find((a) => a.id === closePromptId) ?? null;
+
+  // ── Move to cloud (promotion, bead sparkle-8zpvc) ──────────────────────────────────────────────
+  // SCOPED TO THIS COLUMN'S PROJECT. `promoteAgentId` is one app-wide id; resolving it against
+  // `project.agents` is what keeps the other column — which renders a DIFFERENT project — from
+  // mounting a second copy of the same dialog.
+  const promoteAgentId = useUiStore((s) => s.promoteAgentId);
+  const closePromoteToCloud = useUiStore((s) => s.closePromoteToCloud);
+  const promoteAgent = project?.agents.find((a) => a.id === promoteAgentId) ?? null;
+  const promoteGate = useCloudGate();
+  // Workers stay LOCAL when their orchestrator is promoted (spec §Not in scope), which is a thing
+  // the dialog has to say — so the count is resolved here, where the agent list is, and handed to
+  // the pure plan.
+  const promoteWorkerCount = promoteAgent
+    ? (project?.agents.filter((a) => a.parentId === promoteAgent.id).length ?? 0)
+    : 0;
+  const promoteDeps = useMemo(
+    () =>
+      project && promoteAgent
+        ? promoteDialogDeps({
+            project,
+            agent: promoteAgent,
+            gate: promoteGate,
+            workerCount: promoteWorkerCount,
+          })
+        : null,
+    [project, promoteAgent, promoteGate, promoteWorkerCount],
+  );
 
   // Ship it: push + open a PR (review, not straight to main); local-land fallback when remoteless.
   // Orchestration (incl. the bead close/deliver + land-failure handling) lives in shipAgent so it's
@@ -2714,6 +2744,20 @@ export function AgentSidebar({
         />
       )}
 
+      {/* "Move to cloud" — the promotion confirm surface (bead sparkle-8zpvc).
+          MOUNTED BY THE COLUMN, not by the row that opened it: `AgentRow` is memoized and can
+          unmount under the dialog (a section fold, a status-band chip, a project switch), and a
+          half-made decision about moving work off this machine must not vanish with its row.
+          Gated on the agent belonging to THIS column's project, so the two sidebars in a pair can
+          never both put one up for the same id. */}
+      {promoteAgent && promoteDeps && (
+        <PromoteToCloudDialog
+          agent={promoteAgent}
+          deps={promoteDeps}
+          onClose={closePromoteToCloud}
+        />
+      )}
+
       {/* What that choice actually DID, when it wasn't what the button promised (roborev 54225):
           a ship that landed nowhere (agent kept), a push with no PR behind it, a save that never
           reached the remote. Same ModalShell chrome + zIndex as the prompt it replaces, so the
@@ -3930,6 +3974,12 @@ const AgentRow = memo(function AgentRow({
   // boolean read through a selector re-renders only the row it changed for. Narrowed to a boolean so
   // an unrelated write to the map can't invalidate every row.
   const unjudgedAsk = useRuntimeStore((s) => s.unjudgedAsk[a.id] !== undefined);
+  // May the "Move to cloud" item be OFFERED at all? Subscribed here (not threaded down) for the
+  // same reason as `unjudgedAsk` above: it is a boolean read through a selector, so a change
+  // re-renders the rows rather than the column. This is `cloudOptionVisible` — capability advertised
+  // AND signed in — exactly what the creation flow gates its Cloud option on.
+  const cloudOfferable = useCloudAgentsEnabled();
+  const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
   const sidebarScroll = useContext(SidebarScrollContext);
   // The two halves of the rendered card — measured to decide whether (and how far) to auto-scroll.
   const stripRef = useRef<HTMLDivElement>(null);
@@ -4978,6 +5028,46 @@ const AgentRow = memo(function AgentRow({
         onLand={onLand}
         onRefresh={handleRefresh}
       />
+      {/* "MOVE TO CLOUD" — promotion (bead sparkle-8zpvc). The card is where a row's actions live
+          (Land, rebase, the model picker, the path reveal), so this belongs here rather than as one
+          more control on the dense in-flow row.
+
+          THREE CONDITIONS, ALL OF THEM NARROW, and the last is why most users will never see this:
+            • `runtime === "local"` — there is nothing to promote about an agent already in a sandbox;
+            • `kind === "build"` — a shell agent has no conversation and no branch (spec §Not in scope);
+            • `cloudOfferable` — the SAME `cloudOptionVisible` gate the creation flow uses. Cloud
+              agents ship dark (`CLOUD_AGENTS_ENABLED` defaults off), so for essentially every user
+              today this item is simply absent, and that absence is asserted alongside its presence.
+          The full precondition ladder (paid / Claude auth / credits) is the DIALOG's job — it can
+          state the block and deep-link the fix, which a missing menu item cannot. */}
+      {a.runtime === "local" && a.kind === "build" && cloudOfferable && (
+        <div style={{ marginTop: 8 }}>
+          <button
+            type="button"
+            data-testid="promote-to-cloud"
+            onClick={(e) => {
+              e.stopPropagation(); // the card's own onClick re-selects the agent
+              openPromoteToCloud(a.id);
+            }}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              background: "transparent",
+              color: C.cream,
+              border: `1px solid ${C.muted}`,
+              borderRadius: RADIUS.sm,
+              padding: "4px 9px",
+              cursor: "pointer",
+              fontSize: 12,
+              fontFamily: FONT_UI,
+            }}
+          >
+            <FiUploadCloud size={12} />
+            Move to cloud…
+          </button>
+        </div>
+      )}
       {/* THE GOAL, in its own words, with its life state. The column can only afford the escalated
           case (see goalChipEl); this is where "active · 3h 20m left" and the goal TEXT live, which
           is what makes the row's chip actionable instead of merely alarming. The remaining time is a

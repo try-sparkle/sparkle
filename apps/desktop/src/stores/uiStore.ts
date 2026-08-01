@@ -56,6 +56,10 @@ const TRANSIENT_UI_KEYS = [
   "revealAnchorY",
   "newAgentRuntime",
   "cloudCreateOpen",
+  // A promotion confirm dialog is a live, half-made decision about moving work off this machine.
+  // Restoring one on the next launch would put a "Move to cloud" button in front of a user who
+  // never opened it, against a preflight read from a worktree that has moved on since.
+  "promoteAgentId",
   "zeroCreditBannerDismissed",
   "zeroCreditBannerDismissedFor",
 ] as const satisfies readonly (keyof UiState)[];
@@ -325,6 +329,16 @@ interface UiState {
   settingsRequest: CategoryId | null;
   openSettings: (cat: CategoryId) => void;
   clearSettingsRequest: () => void;
+  // Which agent has its "Move to cloud" confirm dialog open (local→cloud promotion, bead
+  // sparkle-8zpvc). Held here rather than in the row that opened it because the row is memoized and
+  // can unmount under the dialog — a section fold, a status-band filter, a project switch — and a
+  // half-finished promotion must not vanish with it. The COLUMN owns the mount (AgentSidebar), and
+  // it only mounts the dialog for an agent in the project it is rendering, so the two sidebars in a
+  // pair can never both put one up. Transient — NOT persisted (see partialize); a relaunch must
+  // never restore a dialog, least of all one whose button starts moving work.
+  promoteAgentId: string | null;
+  openPromoteToCloud: (agentId: string) => void;
+  closePromoteToCloud: () => void;
   // Focus request for the concierge compose box: a component anywhere (e.g. the drag-vision pill)
   // asks the ONE compose surface to take the caret. A monotonically increasing token, not a bool,
   // so repeat requests re-focus. Transient — NOT persisted.
@@ -552,6 +566,9 @@ export const useUiStore = create<UiState>()(
       settingsRequest: null,
       openSettings: (cat) => set({ settingsRequest: cat }),
       clearSettingsRequest: () => set({ settingsRequest: null }),
+      promoteAgentId: null,
+      openPromoteToCloud: (agentId) => set({ promoteAgentId: agentId }),
+      closePromoteToCloud: () => set({ promoteAgentId: null }),
       composeFocusSeq: 0,
       // EVERY caller of this is the user asking for the caret — the drop pill's "go to compose"
       // button, a file drop, spawning an agent, the capture-window handoff. ComposeBox's effect
