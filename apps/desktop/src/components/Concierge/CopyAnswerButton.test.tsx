@@ -21,6 +21,7 @@ afterEach(() => {
 });
 
 const btn = () => screen.getByTestId("concierge-copy-answer");
+const msgBtn = () => screen.getByTestId("concierge-copy-message");
 
 async function settle(): Promise<void> {
   await act(async () => {
@@ -125,5 +126,80 @@ describe("CopyAnswerButton", () => {
 
     expect(btn().dataset.copied).toBe("false");
     expect(onCopied).not.toHaveBeenCalled();
+  });
+
+  // ── kind="message": the founder's OWN words ───────────────────────────────────────────────────
+  //
+  // "We should also have a copy button like we do for the concierge's responses." The word doing the
+  // work is *like* — same component, same states, same confirmation window; only the label, the test
+  // id and the edge it hangs off change, because a user bubble is right-aligned and an answer is not.
+  describe('kind="message"', () => {
+    it("labels itself for the USER's words, not for an answer", async () => {
+      vi.useFakeTimers();
+      render(<CopyAnswerButton kind="message" text="what needs me?" />);
+      // A thread where BOTH sides carry a copy button is a screen-reader list of buttons, so the
+      // label has to say whose words are on the clipboard.
+      expect(msgBtn().getAttribute("aria-label")).toBe("Copy message");
+      expect(msgBtn().getAttribute("title")).toBe("Copy message");
+      // And it does NOT answer to the answer's id — the two must be tellable apart in a mixed thread.
+      expect(screen.queryByTestId("concierge-copy-answer")).toBeNull();
+
+      fireEvent.click(msgBtn());
+      await settle();
+      expect(msgBtn().getAttribute("aria-label")).toBe("Message copied");
+      expect(msgBtn().getAttribute("title")).toBe("Copied");
+
+      act(() => void vi.advanceTimersByTime(COPY_TOAST_MS + 10));
+      expect(msgBtn().getAttribute("aria-label")).toBe("Copy message");
+      expect(msgBtn().dataset.copied).toBe("false");
+    });
+
+    it("copies the user's text verbatim and confirms with a check mark", async () => {
+      const onCopied = vi.fn();
+      render(<CopyAnswerButton kind="message" text="ship the receipt fix" onCopied={onCopied} />);
+      fireEvent.click(msgBtn());
+      await settle();
+
+      expect(writeText).toHaveBeenCalledWith("ship the receipt fix");
+      expect(onCopied).toHaveBeenCalledTimes(1);
+      expect(msgBtn().dataset.copied).toBe("true");
+    });
+
+    it("mirrors to the RIGHT edge, where the user's bubble is", () => {
+      // The mirror is the whole reason `kind` touches layout at all. A user bubble is
+      // `alignSelf: "flex-end"`; a button left-pulled under it lands in the middle of the column and
+      // reads as an unrelated control. Asserted as the PAIR — answer left, message right — so a
+      // regression that mirrored both, or neither, cannot pass.
+      const { rerender } = render(<CopyAnswerButton text="an answer" />);
+      expect(btn().parentElement?.style.justifyContent).toBe("");
+      expect(btn().style.marginLeft).toBe("-2px");
+      expect(btn().style.marginRight).toBe("");
+
+      rerender(<CopyAnswerButton kind="message" text="a message" />);
+      expect(msgBtn().parentElement?.style.justifyContent).toBe("flex-end");
+      expect(msgBtn().style.marginRight).toBe("-2px");
+      expect(msgBtn().style.marginLeft).toBe("");
+    });
+
+    it("carries no live region of its own either", () => {
+      // Same contract as the answer variant: the column has exactly ONE aria-live node, and this
+      // variant doubles the number of buttons in the thread — so a per-button announcer here would
+      // double the damage rather than repeat it.
+      const { container } = render(<CopyAnswerButton kind="message" text="hello" />);
+      expect(container.querySelectorAll("[aria-live]")).toHaveLength(0);
+      expect(container.querySelectorAll('[role="status"]')).toHaveLength(0);
+    });
+
+    it("does not claim a copy that failed", async () => {
+      writeText.mockRejectedValue(new Error("denied"));
+      const onCopied = vi.fn();
+      render(<CopyAnswerButton kind="message" text="hello" onCopied={onCopied} />);
+      fireEvent.click(msgBtn());
+      await settle();
+
+      expect(msgBtn().dataset.copied).toBe("false");
+      expect(msgBtn().getAttribute("aria-label")).toBe("Copy message");
+      expect(onCopied).not.toHaveBeenCalled();
+    });
   });
 });

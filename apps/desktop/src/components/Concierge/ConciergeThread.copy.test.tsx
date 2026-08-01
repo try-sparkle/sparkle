@@ -6,6 +6,11 @@
 //   §1 selection → `sel.toString()`, the RENDERED words. A partial selection has no markdown source.
 //   §2 button    → `m.text`, the MARKDOWN SOURCE, so a table stays a table on paste.
 //
+// §2 NOW COVERS BOTH SIDES of the conversation: the founder asked for the same button on the things
+// he wrote, so the `you` bubbles carry it too (§2b below). It is the SAME component with a `kind`,
+// and the kinds are distinguishable in three places on purpose — the test id, the aria-label, and
+// the `ConciergeCopyKind` that reaches the column's one live region.
+//
 // The clipboard boundary is stubbed at `navigator.clipboard`, not by mocking ../../clipboard: going
 // through the shared helper is part of the contract.
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -41,6 +46,27 @@ const MARKDOWN_ANSWER = [
 ].join("\n");
 
 const answer: ConciergeMessage = { id: "a1", kind: "sparkle", text: MARKDOWN_ANSWER };
+
+/** One of every kind the thread renders — the fixture the "which kinds get a button" assertions
+ *  read. A fresh array per call so a test that mutates one cannot reach another. */
+function mixedThread(): ConciergeMessage[] {
+  return [
+    { id: "u1", kind: "you", text: "what needs me?" },
+    { id: "b1", kind: "batch", text: "All projects calm" },
+    { id: "d1", kind: "digest", band: "needs_you", variant: "rows", text: "3 Need you", leadAgentId: "x" },
+    {
+      id: "n1",
+      kind: "nudge",
+      band: "needs_you",
+      projectName: "drodio-website",
+      agentName: "OG Image Pipeline",
+      text: "A build warning needs your call.",
+      actions: [],
+    },
+    answer,
+    { id: "p1", kind: "sparkle", text: "Two agents went quiet.", proactive: true },
+  ];
+}
 
 async function settle(): Promise<void> {
   await act(async () => {
@@ -98,29 +124,117 @@ describe("ConciergeThread — copy affordances", () => {
       expect(writeText).toHaveBeenCalledWith(MARKDOWN_ANSWER);
     });
 
-    it("is on proactive pushes too, and on nothing else in the thread", () => {
-      const messages: ConciergeMessage[] = [
-        { id: "u1", kind: "you", text: "what needs me?" },
-        { id: "b1", kind: "batch", text: "All projects calm" },
-        { id: "d1", kind: "digest", band: "needs_you", variant: "rows", text: "3 Need you", leadAgentId: "x" },
-        {
-          id: "n1",
-          kind: "nudge",
-          band: "needs_you",
-          projectName: "drodio-website",
-          agentName: "OG Image Pipeline",
-          text: "A build warning needs your call.",
-          actions: [],
-        },
-        answer,
-        { id: "p1", kind: "sparkle", text: "Two agents went quiet.", proactive: true },
-      ];
-      render(<ConciergeThread messages={messages} onNudgeClick={noop} onNudgeAction={noop} />);
+    it("is on proactive pushes too, and on no CARD in the thread", () => {
+      render(<ConciergeThread messages={mixedThread()} onNudgeClick={noop} onNudgeAction={noop} />);
 
-      // One per ANSWER — the reply and the push — and none for the user's own bubble or the cards.
+      // One per ANSWER — the reply and the push — and none for the cards.
       expect(screen.getAllByTestId("concierge-copy-answer")).toHaveLength(2);
       expect(screen.getByTestId("concierge-push").querySelector('[data-testid="concierge-copy-answer"]')).toBeTruthy();
-      expect(screen.getByTestId("you-bubble").querySelector('[data-testid="concierge-copy-answer"]')).toBeNull();
+      // THE CARDS STAY BARE, and this is the assertion that keeps them that way. A nudge, a digest
+      // line and a batch divider are chrome the app wrote about state — nobody pastes one into a
+      // doc — so the glyph must not have spread to them along with the user's bubbles. Stated as an
+      // EXACT COUNT over every copy button in the thread rather than as four "this card has none"
+      // probes: the count is what a fifth card added later has to keep true, and a per-card probe
+      // for a card that does not exist yet cannot fail.
+      const all = thread().querySelectorAll("[data-testid^='concierge-copy-']");
+      expect(all).toHaveLength(3); // two answers + the one user bubble, nothing else
+      expect(screen.getAllByTestId("concierge-copy-message")).toHaveLength(1);
+    });
+  });
+
+  // ── §2b THE USER'S OWN MESSAGES ────────────────────────────────────────────────────────────────
+  //
+  // "We should also have a copy button like we do for the concierge's responses. We don't currently
+  // have a copy button for the things that I've written." These assertions were the exact opposite
+  // before that ask — `you-bubble` was asserted to have NO button — so nothing here can pass against
+  // the code as it stood.
+  describe("§2b the user's own message button", () => {
+    const mine: ConciergeMessage = { id: "u1", kind: "you", text: "ship the receipt fix, please" };
+
+    it("copies the user's own words — under its OWN test id, not the answer's", async () => {
+      render(<ConciergeThread messages={[mine, answer]} onNudgeClick={noop} onNudgeAction={noop} />);
+
+      const bubble = screen.getByTestId("you-bubble").parentElement!;
+      const button = bubble.querySelector('[data-testid="concierge-copy-message"]');
+      expect(button).toBeTruthy();
+      // And the ANSWER's button is not the one that ended up under the bubble — a shared component
+      // with a shared id would make the two indistinguishable to every other test in this file.
+      expect(bubble.querySelector('[data-testid="concierge-copy-answer"]')).toBeNull();
+
+      fireEvent.click(button as HTMLElement);
+      await settle();
+      expect(writeText).toHaveBeenCalledWith("ship the receipt fix, please");
+    });
+
+    it("announces kind 'message', never 'answer'", async () => {
+      // The announcement is the only channel a screen-reader user has to tell the two buttons
+      // apart, so the kind travelling up through the thread is the real side effect here.
+      const onCopied = vi.fn();
+      render(
+        <ConciergeThread
+          messages={[mine]}
+          onNudgeClick={noop}
+          onNudgeAction={noop}
+          onCopied={onCopied}
+        />,
+      );
+      fireEvent.click(screen.getByTestId("concierge-copy-message"));
+      await settle();
+
+      expect(onCopied).toHaveBeenCalledWith("message");
+      expect(onCopied).not.toHaveBeenCalledWith("answer");
+    });
+
+    it("sits ABOVE the routing receipt, clear of its redirect button", async () => {
+      // Both live on the bubble's right edge; they must not share a ROW, or the copy glyph sits
+      // beside the redirect button and is easy to hit by mistake. Asserted by document order rather
+      // than by geometry — jsdom has no layout engine (it cannot evaluate the flex box at all), so
+      // "which element comes first" is the honest question to ask here.
+      render(
+        <ConciergeThread
+          messages={[
+            {
+              ...mine,
+              receipt: { target: "sparkle", redirectable: true, agentName: "Kraken Auth" },
+            },
+          ]}
+          onNudgeClick={noop}
+          onNudgeAction={noop}
+          onRedirect={noop}
+        />,
+      );
+      const copy = screen.getByTestId("concierge-copy-message");
+      const receipt = screen.getByTestId("routing-receipt");
+      expect(receipt.contains(copy)).toBe(false);
+      expect(copy.compareDocumentPosition(receipt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // The redirect button is still reachable and still the receipt's own.
+      expect(receipt.querySelector('[data-testid="routing-redirect"]')).toBeTruthy();
+    });
+
+    it("copies the SENT text of a message that addressed an agent, with no internal id in it", async () => {
+      // A user's mention is derived from the literal `@Name` and recorded out-of-band in `mentions`
+      // (see ./agentRefs' header) — so the clipboard gets the sentence exactly as it was typed, and
+      // the agent uuid the bubble draws its pill from stays out of it.
+      render(
+        <ConciergeThread
+          messages={[
+            {
+              id: "u2",
+              kind: "you",
+              text: "@Kraken Auth can you retry the token refresh?",
+              mentions: [{ agentId: "9f3c1d2e", name: "Kraken Auth" }],
+            },
+          ]}
+          onNudgeClick={noop}
+          onNudgeAction={noop}
+        />,
+      );
+      fireEvent.click(screen.getByTestId("concierge-copy-message"));
+      await settle();
+
+      const copied = writeText.mock.calls[0]?.[0] as string;
+      expect(copied).toBe("@Kraken Auth can you retry the token refresh?");
+      expect(copied).not.toContain("9f3c1d2e");
     });
   });
 

@@ -24,17 +24,23 @@ function place(target: ConciergeReceipt["target"], agentName?: string): string {
 /** The receipt's sentence. Pure: the redirect wording is a correctness concern (see the header),
  *  so it is unit-tested directly rather than asserted through a rendered tree. */
 export function receiptText(r: ConciergeReceipt): string {
-  // AN UNANSWERED MESSAGE NEVER CLAIMS TO HAVE BEEN ANSWERED. "Answered here" is the sparkle-target
-  // wording, and it is exactly the sentence that was sitting under 149 questions the brain never
-  // replied to on 2026-07-29. So the unanswered case REPLACES the phrase rather than appending a
-  // qualifier to it — a line reading "Answered here — never answered" is a contradiction the reader
-  // has to resolve, and half of them will resolve it wrong.
-  if (r.unanswered) return "→ Replaced by your next message — never answered";
+  // `r.unanswered` IS DELIBERATELY NOT READ HERE. A displaced turn used to render "→ Replaced by
+  // your next message — never answered", and that line was deleted on 2026-07-31 because it
+  // asserted something the app cannot know: the concierge frequently answers a displaced question
+  // a couple of messages later, so the receipt was calling a turn dead that had in fact been
+  // served. An unknowable claim stated flatly is worse than no claim, so the flag stays RECORDED
+  // (types.ts ConciergeReceipt.unanswered) and unrendered — see that field's doc comment.
+  //
+  // `refused` IS READ, and the contrast is the point rather than an inconsistency: whether a
+  // message was ACCEPTED is something the app observed at the moment it tried to hand it over.
+  // Whether a turn was ever answered is not — the answer may arrive two messages later, which is
+  // exactly why the line above went.
+  //
   // A REFUSED MESSAGE WENT NOWHERE, so it must not borrow either destination's wording. Checked
-  // BEFORE the target line below for the same reason `unanswered` is: the target field still names
-  // who it was FOR, and rendering that name through "Answered here" / "Sent to X" would report a
-  // delivery that did not happen (roborev 57360). Names the agent when there is one, because "not
-  // sent" without a subject leaves the reader guessing which of their agents declined.
+  // BEFORE the target line below, because the target field still names who it was FOR, and
+  // rendering that name through "Answered here" / "Sent to X" would report a delivery that did not
+  // happen (roborev 57360). Names the agent when there is one, because "not sent" without a subject
+  // leaves the reader guessing which of their agents declined.
   if (r.refused) {
     return r.agentName ? `→ Not sent — ${r.agentName} couldn't take it` : "→ Not sent";
   }

@@ -1,6 +1,13 @@
 // The copy affordance under a concierge ANSWER (PRD 1 §2) — bottom-left, on the message's own left
 // text edge, so it reads as belonging to the paragraph above it rather than floating in the column.
 //
+// IT SERVES BOTH SIDES OF THE CONVERSATION. The founder asked for "a copy button like we do for the
+// concierge's responses" on his OWN messages, and the operative word is *like*: one component with a
+// `kind`, not a second control that would drift a shade apart from this one the first time either
+// was touched. `kind` changes exactly three things — the label, the test id, and which edge the
+// glyph is pulled onto — because a user bubble is RIGHT-aligned and a button mirrored to the left
+// edge of a right-aligned bubble floats in the middle of the column and reads as unrelated chrome.
+//
 // IT COPIES THE MARKDOWN SOURCE, not the rendered text, and that is the whole point of it existing
 // alongside copy-on-selection. The brain answers in GitHub-flavored markdown, so an answer's value
 // is often in its STRUCTURE: a table is a grid, a code block is a fenced block. Copying the rendered
@@ -25,12 +32,37 @@ import { COPY_TOAST_MS } from "./useCopyOnSelection";
 /** Resting opacity — present, findable, and quiet enough not to compete with the answer. */
 const RESTING_OPACITY = 0.45;
 
+/** WHOSE words this button copies. Drives the label, the test id and the alignment — see below. */
+export type CopyButtonKind = "answer" | "message";
+
+/**
+ * The wording, per kind.
+ *
+ * THE LABEL STATES WHAT IS COPIED, and that reasoning doubled the moment the user's own bubbles got
+ * one too. "Copy" alone, repeated once per message down a thread, was already a screen-reader list
+ * of identical buttons; now that BOTH sides of the conversation carry one, a blind reader also has
+ * to be able to tell "copy the answer Sparkle gave me" from "copy the thing I said". Two labels,
+ * one per kind, is the cheapest way that stays true.
+ *
+ * `title` is deliberately NOT the same string in the copied state — a tooltip is transient and
+ * pointer-only, so the bare "Copied" reads better there, while the aria-label has to remain
+ * self-describing for a reader tabbing through a settled thread.
+ */
+const LABELS: Record<CopyButtonKind, { idle: string; copied: string; testid: string }> = {
+  answer: { idle: "Copy answer", copied: "Answer copied", testid: "concierge-copy-answer" },
+  message: { idle: "Copy message", copied: "Message copied", testid: "concierge-copy-message" },
+};
+
 export function CopyAnswerButton({
   text,
+  kind = "answer",
   onCopied,
 }: {
   /** The RAW markdown source of the answer (`m.text`), not its rendered form. */
   text: string;
+  /** Whose words these are. Defaults to `"answer"`, so every call site that predates the user
+   *  variant is unchanged and cannot have been silently relabelled. */
+  kind?: CopyButtonKind;
   /** Copied. Announced by the integration layer through the column's ONE live region — this
    *  component adds no `aria-live` node of its own (see ConciergeColumnProps.announcement). */
   onCopied?: () => void;
@@ -55,17 +87,21 @@ export function CopyAnswerButton({
   }, []);
 
   const lit = hover || focus || copied;
+  const label = LABELS[kind];
+  // A user bubble is `alignSelf: "flex-end"` inside a right-aligned block; an answer is left-aligned
+  // prose. So the glyph mirrors, or it sits under the middle of the column attached to nothing.
+  const mirrored = kind === "message";
 
   return (
-    <div style={{ display: "flex", marginTop: 2 }}>
+    <div style={{ display: "flex", marginTop: 2, justifyContent: mirrored ? "flex-end" : undefined }}>
       <button
         type="button"
-        data-testid="concierge-copy-answer"
+        data-testid={label.testid}
         data-copied={copied ? "true" : "false"}
-        // The label states WHAT is copied. "Copy" alone, repeated once per answer down a thread, is
-        // a screen-reader list of identical buttons.
-        aria-label={copied ? "Answer copied" : "Copy answer"}
-        title={copied ? "Copied" : "Copy answer"}
+        // The label states WHAT is copied — see LABELS above for why that matters more, not less,
+        // now that the user's own messages carry one of these too.
+        aria-label={copied ? label.copied : label.idle}
+        title={copied ? "Copied" : label.idle}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         onFocus={() => setFocus(true)}
@@ -79,6 +115,14 @@ export function CopyAnswerButton({
           // the selection path already yields `@Kraken Auth`; this is what makes the third path
           // agree. Ordinary markdown — tables, fences, real links — is untouched, which is the
           // reason this button copies source at all (see the header).
+          //
+          // IT RUNS FOR `kind: "message"` TOO, and that is a backstop rather than a live need. A
+          // user's mention is DERIVED from the literal `@Name` and recorded out-of-band in
+          // `ConciergeUserMessage.mentions`, never encoded into the text — ./agentRefs' header
+          // explains why that asymmetry exists — so `m.text` is plain and this is a no-op on it
+          // today. Running it anyway costs one parse of a short string and means the day a fourth
+          // consumer starts encoding into user text, an internal uuid still cannot reach the
+          // clipboard by way of the one path that copies source verbatim.
           void copyToClipboard(stripAgentRefs(text)).then((ok) => {
             // Never claim a copy that didn't happen — no check mark, no announcement.
             if (!ok || !alive.current) return;
@@ -97,9 +141,11 @@ export function CopyAnswerButton({
           background: "transparent",
           border: "none",
           // Pulled back by its own padding so the GLYPH — not the button box — lines up with the
-          // answer's left text edge.
+          // message's own text edge. Which edge depends on the kind: an answer's is on the left, a
+          // user bubble's is on the right (and its routing receipt is right-justified against the
+          // same edge), so the negative margin swaps sides with it.
           padding: 2,
-          marginLeft: -2,
+          ...(mirrored ? { marginRight: -2 } : { marginLeft: -2 }),
           cursor: "pointer",
           color: copied ? C.teal : C.conciergeMuted,
           opacity: lit ? 1 : RESTING_OPACITY,

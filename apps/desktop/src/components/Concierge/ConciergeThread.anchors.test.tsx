@@ -150,9 +150,23 @@ describe("his own message says it was answered", () => {
     // app's own record and would sit directly above an "Answered below" marker pointing at the
     // answer: one bubble, two opposite claims.
     //
-    // Asserted against `receiptText` rather than against the literal copy, because that string is
-    // being deleted on a sibling branch and a hardcoded quote of it would fail for the wrong reason.
-    // What is pinned is the STATE the line describes, which outlives the wording.
+    // THE SIBLING BRANCH LANDED, and this assertion had to change with it.
+    //
+    // This used to read `not.toContain(receiptText({ target: "sparkle", unanswered: true }))` —
+    // differencing against the flag's own wording, chosen deliberately so a hardcoded quote of a
+    // string that was "being deleted on a sibling branch" could not fail for the wrong reason. That
+    // was the right instinct and it does not survive the deletion, because the technique's premise is
+    // that the flag CHANGES the wording. Now that the `unanswered` line is gone (2026-07-31, the
+    // founder's call: a displaced turn is frequently answered a couple of messages later, so "never
+    // answered" asserted something the app cannot know), `receiptText({unanswered: true})` returns the
+    // ordinary "→ Answered here" — so the two assertions below became `toContain(X)` and
+    // `not.toContain(X)` over the same X, which cannot both hold. It failed in CI as a self-
+    // contradiction, not as a product regression.
+    //
+    // Pinned against the WORDING it must never carry instead. That is the durable statement of the
+    // same intent — this bubble may not accuse the app of never answering while an "Answered below"
+    // marker sits under it pointing at the answer — and unlike the difference it stays meaningful
+    // whether or not the flag has a rendering of its own.
     mount([
       {
         id: "you-1",
@@ -171,8 +185,8 @@ describe("his own message says it was answered", () => {
     expect(screen.getByTestId("routing-receipt").textContent).toContain(
       receiptText({ target: "sparkle" }),
     );
-    expect(screen.getByTestId("routing-receipt").textContent).not.toContain(
-      receiptText({ target: "sparkle", unanswered: true }),
+    expect(screen.getByTestId("routing-receipt").textContent).not.toMatch(
+      /never answered|replaced by your next message/i,
     );
     // …and the marker is what replaces it: where the answer IS, not a claim there wasn't one.
     expect(screen.getByTestId(ANSWERED_MARKER_TESTID)).toBeTruthy();

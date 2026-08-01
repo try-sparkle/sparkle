@@ -113,26 +113,55 @@ describe("RoutingReceipt — rendering", () => {
   });
 });
 
-// A message the brain never got round to answering, because the user's next one displaced its turn.
-// 149 of 378 turns died this way on 2026-07-29 and every one of them kept a receipt reading
-// "Answered here".
-describe("receiptText — a message that was never answered", () => {
-  it("does not claim the message was answered", () => {
+// THE DELETED "NEVER ANSWERED" LINE — pinned absent so it cannot come back.
+//
+// `unanswered` marks a turn the user's NEXT message displaced mid-flight, and it exists because
+// displacement happened at scale: 149 of 378 turns on 2026-07-29. That is the history behind the
+// FLAG. It is not a justification for the LINE the flag used to render. A displaced turn is
+// frequently answered anyway a couple of messages later — the follow-up carries enough of the
+// earlier question that the brain addresses both — so "never answered" was an assertion the app has
+// no way to know, printed flatly on turns that had in fact been served. It was deleted on
+// 2026-07-31 for that reason (the founder's call), NOT reworded: there is no honest short phrasing
+// of a fact nobody has.
+//
+// Each absence assertion below is PAIRED with the exact ordinary line the receipt now shows. An
+// absence alone would pass against a receiptText that returned "" or threw, which would prove
+// nothing (AGENTS.md, "Tests must assert the SIDE EFFECT").
+describe("receiptText — a displaced turn renders the ordinary receipt, never 'never answered'", () => {
+  it("does not print the deleted claim, and prints the ordinary sparkle line instead", () => {
     const line = receiptText({ target: "sparkle", unanswered: true });
-    expect(line).not.toContain("Answered here");
-    expect(line).toBe("→ Replaced by your next message — never answered");
+    expect(line).not.toMatch(/never answered/i);
+    expect(line).not.toMatch(/replaced by your next message/i);
+    expect(line).toBe("→ Answered here");
   });
 
-  // REPLACES the phrase rather than qualifying it. "Answered here — never answered" is a
-  // contradiction the reader has to resolve, and half of them will resolve it wrong.
-  it("says the same thing whichever way the message was routed", () => {
+  it("renders the agent's ordinary line when a displaced message went to an agent", () => {
+    const line = receiptText({ target: "agent", agentName: "Kraken Auth", unanswered: true });
+    expect(line).not.toMatch(/never answered/i);
+    expect(line).not.toMatch(/replaced by your next message/i);
+    expect(line).toBe("→ Sent to Kraken Auth");
+  });
+
+  // The flag is now inert as far as the wording goes: setting it changes nothing the user reads.
+  it("reads identically with and without the flag", () => {
+    expect(receiptText({ target: "sparkle", unanswered: true })).toBe(
+      receiptText({ target: "sparkle" }),
+    );
     expect(receiptText({ target: "agent", agentName: "Kraken Auth", unanswered: true })).toBe(
-      receiptText({ target: "sparkle", unanswered: true }),
+      receiptText({ target: "agent", agentName: "Kraken Auth" }),
     );
   });
 
-  // The same no-retraction rule the rest of this file is tripwired against: the message WAS
-  // delivered — the brain read it and was working on it — so nothing here may imply it was unsent.
+  // Rendering-level guard: the deleted string must not reach the DOM by any other route either.
+  it("renders no 'never answered' text in the receipt element", () => {
+    render(<RoutingReceipt receipt={{ target: "sparkle", unanswered: true }} />);
+    const text = screen.getByTestId("routing-receipt").textContent ?? "";
+    expect(text).not.toContain("never answered");
+    expect(text).toContain("Answered here");
+  });
+
+  // The no-retraction rule the rest of this file is tripwired against still applies: the message
+  // WAS delivered — the brain read it and was working on it — so nothing here may imply it wasn't.
   it("never implies the message itself was retracted", () => {
     expect(receiptText({ target: "sparkle", unanswered: true })).not.toMatch(
       /instead|moved|undone|unsent|cancell?ed|not sent/i,

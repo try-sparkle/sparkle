@@ -105,6 +105,12 @@ export interface ConciergeMessageRowProps {
   onRedirect?: (messageId: string) => void;
   onDigestClick?: (digest: ConciergeDigestMessage) => void;
   onAnswerCopied: () => void;
+  /** The user's OWN message reached the clipboard. A separate callback from `onAnswerCopied`
+   *  rather than one taking a kind, because both must be `useCallback(…, [])`-stable in
+   *  ConciergeThread (see its "Handlers, STABILISED" block) and a kind-taking prop invites a call
+   *  site to build `() => onCopied("message")` inline, which would un-memoise every row on every
+   *  feed tick — the exact regression the memo exists to prevent. */
+  onMessageCopied: () => void;
   /** For a `you` message THAT WAS ANSWERED: the id of the reply that answered it (see
    *  ./replyAnchors). Undefined on every other kind and on a message nothing has replied to yet.
    *
@@ -131,6 +137,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   onRedirect,
   onDigestClick,
   onAnswerCopied,
+  onMessageCopied,
   answeredBy,
   highlighted = false,
   onJump,
@@ -239,6 +246,20 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           <AttachmentStrip attachments={m.attachments ?? []} />
           <MentionedText text={m.text} mentions={m.mentions} />
         </div>
+        {/* THE USER'S OWN WORDS, one click away — the founder's ask, and the same component the
+            answers use so the two read as one system rather than as two controls that happen to
+            share a glyph.
+
+            ABOVE THE RECEIPT, not below it, for two reasons. It belongs to the WORDS: the receipt
+            is an annotation about where they went, so a copy glyph under it attaches itself to the
+            annotation instead of to the message, and the entry would end on a control rather than
+            on the sentence that closes it. And it keeps the glyph off the receipt's own row, where
+            it would sit alongside the right-justified redirect button — two unrelated buttons on
+            one line, the smaller one easy to hit by mistake. Both live on the same right edge
+            (`marginRight: -2` mirrors the answer variant's left pull), so they still read as one
+            stack; they just don't share a row. Rendered ALWAYS, like the answer's, so nothing about
+            the entry's height changes on hover (see CopyAnswerButton's header). */}
+        <CopyAnswerButton kind="message" text={m.text} onCopied={onMessageCopied} />
         {m.receipt && (
           <RoutingReceipt
             // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the
@@ -421,10 +442,11 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the
           transcript used to echo inline and push the conversation off screen. */}
       {collapsedPayload(m)}
-      {/* ANSWERS ONLY. Not the user's own bubbles (they wrote it), and not the nudge, recap, digest
-          or batch cards above — those are chrome the app generated about state, not prose anyone
-          wants in a doc. Copies `m.text`, the markdown SOURCE, so a table stays a table on paste
-          (see CopyAnswerButton). */}
+      {/* PROSE ONLY — answers here, pushes above, and the user's own bubbles in the `you` branch.
+          NOT the nudge, recap, digest or batch cards: those are chrome the app generated about
+          state, not words anyone wants in a doc, and the negative assertions in
+          ConciergeThread.copy.test are what stops this glyph spreading to every card. Copies
+          `m.text`, the markdown SOURCE, so a table stays a table on paste (see CopyAnswerButton). */}
       <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
     </div>
   );

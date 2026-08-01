@@ -308,18 +308,27 @@ export interface ConciergeReceipt {
   /** Whether to offer the one-tap redirect (latest receipt only). */
   redirectable?: boolean;
   /**
-   * This message reached the brain, and the brain never answered it: the turn was still running with
-   * nothing emitted when the user's NEXT message displaced it (`concierge.rs` kills the old child
-   * and its reader goes silent — no event, no log, nothing).
+   * This message's TURN was displaced: it was still running with nothing emitted when the user's
+   * NEXT message arrived (`concierge.rs` kills the old child and its reader goes silent — no event,
+   * no log, nothing).
    *
-   * WHY THIS FIELD EXISTS. On 2026-07-29, 149 of 378 turns (39.4%) died this way, and 12 of the 14
-   * turns in the 20:18-20:31 burst. Every one of those questions is still sitting in the thread
-   * looking asked-and-answered-by-silence, which is the single most misleading thing this column
-   * can render: the user cannot tell a question nobody answered from one they simply scrolled past.
+   * RECORDED, BUT NO LONGER RENDERED. This used to drive a receipt line reading "→ Replaced by your
+   * next message — never answered". That line was deleted on 2026-07-31: a displaced turn is
+   * frequently answered anyway, a couple of messages later, because the user's next message carries
+   * enough of the earlier question for the brain to address both. "Never answered" is therefore a
+   * claim the app CANNOT KNOW, and it was stated flatly on turns that had in fact been served. A
+   * receipt whose whole justification is that the user can trust it must not assert an unknowable.
+   * So `receiptText` ignores this flag and a displaced message renders the ORDINARY receipt for its
+   * target ("→ Answered here" / "→ Sent to <agent>"); RoutingReceipt.test.tsx pins the absence.
+   *
+   * WHY IT IS STILL RECORDED. Displacement itself IS knowable and did happen at scale: on
+   * 2026-07-29, 149 of 378 turns (39.4%) were displaced this way, and 12 of the 14 turns in the
+   * 20:18-20:31 burst. Keeping the fact on the message keeps it available to anything that wants to
+   * count or reason about displacement without re-deriving it from the transcript.
    *
    * NOT a health claim. A displaced turn says nothing about whether the concierge is well — the
    * user's own next message is what killed it — so this never feeds the liveness detector
-   * (engine/conciergeLiveness). It is a fact about ONE message, stated on that message.
+   * (engine/conciergeLiveness). It is a fact about ONE message.
    */
   unanswered?: true;
   /**
@@ -378,10 +387,16 @@ export interface ConciergeViewModel {
   needsYouFilter?: boolean;
 }
 
-/** WHICH copy affordance fired (PRD 1). The two are deliberately different operations — a selection
- *  copies the RENDERED words, an answer copies its MARKDOWN SOURCE — so the confirmation says which
- *  one happened rather than one vague "Copied". */
-export type ConciergeCopyKind = "selection" | "answer";
+/** WHICH copy affordance fired (PRD 1). These are deliberately different operations — a selection
+ *  copies the RENDERED words, an answer or a message copies its MARKDOWN SOURCE — so the
+ *  confirmation says which one happened rather than one vague "Copied".
+ *
+ *  `message` is the user's OWN bubble, added when the founder asked for the same button on the
+ *  things he wrote. It is a distinct kind rather than folding into `answer` because the live region
+ *  is the only channel a screen-reader user has to tell the two apart: both sides of the
+ *  conversation now carry a copy button, and "Answer copied" spoken after copying your own sentence
+ *  is a lie about whose words are on the clipboard. */
+export type ConciergeCopyKind = "selection" | "answer" | "message";
 /** Which side of the shell holds the live cable, or `off` for none.
  *
  *  ONE VALUE, and every visual consequence follows from it — the flood, the dropped lift, the
@@ -448,8 +463,9 @@ export interface ConciergeController {
    *  `ConciergeHost` still wires it, so a future cross-project affordance has the callback ready
    *  rather than having to re-derive the switch-without-selecting rule above. */
   onProjectClick?(projectId: string): void;
-  /** Something in the thread reached the clipboard: the user's own selection, or a whole answer via
-   *  its copy button (PRD 1 §1/§2).
+  /** Something in the thread reached the clipboard: the user's own selection, a whole answer via
+   *  its copy button, or one of the user's own messages via the same button in its `message`
+   *  variant (PRD 1 §1/§2). {@link ConciergeCopyKind} says which.
    *
    *  A CALLBACK RATHER THAN A LOCAL ANNOUNCEMENT, and that is load-bearing. This column has exactly
    *  ONE `aria-live` region (see {@link ConciergeColumnProps.announcement}); a confirmation spoken

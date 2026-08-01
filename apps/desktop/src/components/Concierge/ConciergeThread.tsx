@@ -7,6 +7,7 @@ import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { useCopyOnSelection } from "./useCopyOnSelection";
+import { useSelectionStableThread } from "./useSelectionStableThread";
 import { ThinkingIndicator } from "./ThinkingIndicator";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
 import { answeredByIndex } from "./replyAnchors";
@@ -82,6 +83,27 @@ export function ConciergeThread({
   onCopied?: (what: ConciergeCopyKind) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // GUARD 4 — WHAT THE READER ACTUALLY SEES, which is `messages` except while a selection is being
+  // dragged out, when the thread's STRUCTURE is held still (./useSelectionStableThread).
+  //
+  // The founder's report is that the start of a drag "often gets reset". The two guards that already
+  // defend a gesture do not cover it: `useCopyOnSelection` below stops a mid-gesture clipboard write
+  // tearing the selection down, and `useAutoFollow`'s guard 3 stops the follow scrolling the
+  // container out from under him. Both protect the viewport and the Selection object; neither stops
+  // the DOCUMENT reflowing. Alert cards are interleaved into the MIDDLE of the conversation by
+  // arrival (engine/conciergeStreamOrder) and come and go as agents enter and leave `needs_you`, so
+  // one disappearing between his two endpoints shifts everything below it up by a card's height
+  // while his mouse is held still — and the browser re-extends the highlight to whatever is now
+  // under the pointer. Memoising cannot help: those entries genuinely changed.
+  //
+  // EVERYTHING DOWNSTREAM READS `visible`, not `messages` — the rows, the auto-follow keys, and the
+  // payload lookup. A key computed from the live array while the held one is on screen would make
+  // the follow chase content the reader cannot see.
+  //
+  // It takes the SAME scroll container `useCopyOnSelection` watches, because it arms on a live
+  // selection reaching into the thread rather than on a bare press — the app has several long
+  // press-and-hold gestures (a column resize, a terminal drag) that must not freeze this column.
+  const visible = useSelectionStableThread(messages, scrollRef);
   // Copy-on-selection, mounted ONCE on the scroll container — never per message. See the hook's
   // header for why the selection path copies plain text while the per-answer button copies source.
   const selectionCopied = useCopyOnSelection(scrollRef, {
@@ -119,6 +141,11 @@ export function ConciergeThread({
     onCopied,
   };
   const onAnswerCopied = useCallback(() => handlers.current.onCopied?.("answer"), []);
+  // The user's own bubble reports a DIFFERENT kind, so the live region can say "Message copied"
+  // rather than telling him his own words were an answer. Stabilised exactly like the one above —
+  // it reaches every memoised row, so an unstable identity here would re-render the whole transcript
+  // on every feed tick and bring back the drag-stutter this file's memo exists to kill.
+  const onMessageCopied = useCallback(() => handlers.current.onCopied?.("message"), []);
   const nudgeClick = useCallback((n: ConciergeNudge) => handlers.current.onNudgeClick(n), []);
   const nudgeAction = useCallback(
     (n: ConciergeNudge, a: string) => handlers.current.onNudgeAction(n, a),
@@ -147,7 +174,7 @@ export function ConciergeThread({
   const openPayload =
     openPayloadId === null
       ? undefined
-      : messages.find(
+      : visible.find(
           (m): m is ConciergeSparkleMessage =>
             m.id === openPayloadId && m.kind === "sparkle" && m.collapsed !== undefined,
         );
@@ -163,7 +190,14 @@ export function ConciergeThread({
   // The lookup is rebuilt on every tick and that is fine: it walks the array once and yields plain
   // strings, so a settled row's props are unchanged and the memo still bites. Handing rows the MAP
   // itself would defeat it — a new container every tick re-renders the whole transcript.
-  const answeredBy = useMemo(() => answeredByIndex(messages), [messages]);
+  //
+  // BUILT FROM `visible`, NOT THE RAW PROP (guard 4). These two features landed independently and
+  // only interact here. Indexed off `messages`, a reply arriving mid-drag would give the `you` bubble
+  // above it an "answered" affordance while the reply itself is still withheld — which both changes
+  // that bubble's HEIGHT under the reader's pointer (the reflow guard 4 exists to prevent) and aims
+  // `onJump` at a message id that is not currently rendered, so `jumpTo`'s scan finds nothing and the
+  // click does nothing. Indexed off what is on screen, the affordance and its target appear together.
+  const answeredBy = useMemo(() => answeredByIndex(visible), [visible]);
   /** The message the reader just jumped to, lit for {@link ANCHOR_HIGHLIGHT_MS}. */
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -214,16 +248,21 @@ export function ConciergeThread({
   //
   // `typing` is folded into the key rather than passed separately: the hook re-runs its follow on any
   // change to the key, which is exactly what a third dependency did before the extraction.
-  const last = messages.length > 0 ? messages[messages.length - 1]! : undefined;
-  const totalLength = messages.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
-  const contentKey = `${messages.length}:${last?.id ?? ""}:${totalLength}:${typing ? 1 : 0}`;
+  //
+  // Computed from `visible` (guard 4), never from the raw prop: while a drag holds the structure
+  // still, a key built from the live array would change for content that is not on screen and send
+  // the follow chasing it. Guard 3 defers the scroll for the length of the gesture and guard 4
+  // releases on the same `mouseup`, so the catch-up happens once, from the truth.
+  const last = visible.length > 0 ? visible[visible.length - 1]! : undefined;
+  const totalLength = visible.reduce((n, m) => n + ("text" in m ? m.text.length : 0), 0);
+  const contentKey = `${visible.length}:${last?.id ?? ""}:${totalLength}:${typing ? 1 : 0}`;
   // The re-arm key is the newest message the USER sent — never "a user message exists". A thread the
   // user has ever typed in contains a `you` bubble forever, and the host hands this component a fresh
   // array several times a second; a presence test would re-arm on every feed tick and restore bead
   // sparkle-y4ft's "clicking an item scrolls the column" in full.
   const { onScroll } = useAutoFollow({
     contentKey,
-    rearmKey: newestUserMessageId(messages),
+    rearmKey: newestUserMessageId(visible),
     scrollRef,
   });
 
@@ -263,7 +302,7 @@ export function ConciergeThread({
           gap: 12,
         }}
       >
-        {messages.map((m) => (
+        {visible.map((m) => (
           // KEYED BY MESSAGE ID, and memoised (./ConciergeMessageRow). Every prop below either is
           // the message itself — stable identity for anything that is not the bubble currently
           // being streamed into — or a callback stabilised above, so a settled entry re-renders
@@ -281,6 +320,7 @@ export function ConciergeThread({
             onRedirect={redirect}
             onDigestClick={digestClick}
             onAnswerCopied={onAnswerCopied}
+            onMessageCopied={onMessageCopied}
             answeredBy={m.kind === "you" ? answeredBy.get(m.id) : undefined}
             highlighted={highlightId === m.id}
             onJump={jumpTo}

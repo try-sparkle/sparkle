@@ -975,7 +975,15 @@ export function ConciergeHost({
    *  an identical repeat must still be a distinct write (roborev 53392). */
   const onCopied = useCallback(
     (what: ConciergeCopyKind) => {
-      announce(what === "answer" ? "Answer copied to clipboard." : "Selection copied to clipboard.");
+      // ONE LINE PER KIND, exhaustively — the whole reason `onCopied` carries a kind at all is that
+      // a screen-reader user has no other way to tell which of the thread's copy affordances just
+      // fired, and both sides of the conversation now have a button.
+      const said: Record<ConciergeCopyKind, string> = {
+        answer: "Answer copied to clipboard.",
+        message: "Message copied to clipboard.",
+        selection: "Selection copied to clipboard.",
+      };
+      announce(said[what]);
     },
     [announce],
   );

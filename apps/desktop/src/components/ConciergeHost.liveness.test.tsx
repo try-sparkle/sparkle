@@ -244,32 +244,44 @@ describe("a turn that FAILS says what actually went wrong", () => {
   );
 });
 
-describe("a message the brain never answered says so", () => {
-  // THE 20:18-20:31 BURST. Each send kills the turn before it; the killed reader emits NOTHING, so
-  // the only place this can be detected is here, locally, at the moment of the next send.
-  it("stamps the displaced bubble when nothing ever came back for it", async () => {
+describe("a displaced message never claims it went unanswered", () => {
+  // THE 20:18-20:31 BURST is why the host still STAMPS a displaced bubble (`ConciergeReceipt
+  // .unanswered`): each send kills the turn before it and the killed reader emits NOTHING, so the
+  // moment of the next send is the only place displacement can be detected at all.
+  //
+  // But the stamp no longer produces a receipt line. It used to render "→ Replaced by your next
+  // message — never answered"; that was deleted on 2026-07-31 because a displaced turn is FREQUENTLY
+  // answered a couple of messages later — the follow-up carries enough of the earlier question that
+  // the brain addresses both — so the line asserted something the app cannot know. These rows now
+  // pin its ABSENCE end-to-end through the real column, each paired with a positive count of the
+  // ordinary receipts, so they cannot pass on a thread that simply rendered nothing (which is
+  // exactly how the originals first failed).
+  it("keeps the ordinary receipt on a bubble nothing ever came back for", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
-    // The receipt EXISTS before the second send. Without this the row below could pass simply
-    // because no receipt renders at all in this harness (which is exactly how it first failed).
     expect(threadText()).toContain("Answered here");
     expect(threadText()).not.toContain("never answered");
 
     await send("what needs me right now?");
-    expect(threadText()).toContain("Replaced by your next message — never answered");
+    expect(threadText()).not.toContain("never answered");
+    expect(threadText()).not.toContain("Replaced by your next message");
+    // Both bubbles carry their ordinary receipt — the displaced one reads exactly like the live one.
+    expect(threadText().match(/Answered here/g)?.length).toBe(2);
   });
 
-  // A TOOL CALL IS NOT AN ANSWER (roborev 55442-M1). Reading state or a terminal before replying is
-  // the concierge's normal FIRST move, so this is the ORDINARY shape of a dropped question, not a
-  // corner case. Asking the liveness flag — which a tool call sets — exempted exactly these bubbles
-  // and left them reading "Answered here".
-  it("still stamps a bubble whose turn only called a tool", async () => {
+  // A TOOL CALL IS NOT AN ANSWER (roborev 55442-M1) — reading state or a terminal before replying is
+  // the concierge's normal FIRST move, so this is the ORDINARY shape of a displaced question, not a
+  // corner case. It is kept as its own row because it is the shape most likely to regress: whatever
+  // the host decides about a tool-only turn, the receipt under it must stay the ordinary one.
+  it("keeps the ordinary receipt on a bubble whose turn only called a tool", async () => {
     render(<ConciergeHost feed={feed()} />);
     await send("what needs me?");
     act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "ag1" }));
 
     await send("what needs me right now?");
-    expect(threadText()).toContain("Replaced by your next message — never answered");
+    expect(threadText()).not.toContain("never answered");
+    expect(threadText()).not.toContain("Replaced by your next message");
+    expect(threadText().match(/Answered here/g)?.length).toBe(2);
   });
 
   // A turn that streamed a partial answer the user then interrupted is NOT this. They got words;
