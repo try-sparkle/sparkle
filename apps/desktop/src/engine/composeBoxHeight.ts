@@ -29,6 +29,10 @@ export const COMPOSE_LINE_H = 19;
 /** Vertical padding + borders around the text, in px (10px top + 10px bottom + 1px × 2 border). */
 export const COMPOSE_CHROME_H = 22;
 
+/** Just the borders (1px × 2). What a `scrollHeight` reading is missing: it includes the padding
+ *  and excludes the border, so anything measured that way is this much short of the box it needs. */
+export const COMPOSE_BORDER_H = 2;
+
 /** The resting height: one line of text plus its chrome. */
 export const COMPOSE_MIN_H = COMPOSE_LINE_H + COMPOSE_CHROME_H;
 
@@ -59,6 +63,46 @@ export interface ComposeHeightInput {
    *  the tallest copy in the slot AND the only one carrying controls (Dismiss / Open System
    *  Settings) — clipping those out of reach would strand the user at a broken mic. */
   placeholderH?: number | null;
+  /** How much taller the LIVE DICTATION PREVIEW makes the box's content — the mention mirror's
+   *  collapsed scrollHeight MINUS the textarea's own — while a Deepgram phrase is still provisional.
+   *  Null/0 when nothing is being spoken into the box.
+   *
+   *  A THIRD input rather than part of `contentH`, because it has to survive the dragged branch. The
+   *  interim is painted in a layer behind the textarea and is deliberately NOT in the textarea's
+   *  value, so `contentH` is blind to it — and a box at a persisted drag height ignores `contentH`
+   *  entirely. Folding it in there fixed the auto-grow path and left a user who had once dragged the
+   *  box short with a preview clipped exactly as before, with no scrollbar and no caret to reach it
+   *  (roborev 57333). Spoken words are the one content that cannot be scrolled to.
+   *
+   *  AN INCREMENT, NOT THE MIRROR'S TOTAL, and the distinction is load-bearing in the dragged branch
+   *  (roborev 57354). The mirror paints the whole draft plus the provisional suffix, so passing its
+   *  total made the TYPED DRAFT outrank the drag for as long as anyone was speaking: a two-line box
+   *  holding a fifteen-line draft jumped to the cap on the first partial and snapped back on every
+   *  settle, several times an utterance — the "text jumps" class this whole branch exists to remove.
+   *  Only the pixels the interim adds PAST the textarea's own content are unreachable, so only those
+   *  are what a drag has to yield to. */
+  interimH?: number | null;
+}
+
+/**
+ * The extra height the words still being spoken need, on top of what the box already needs.
+ *
+ * AN INCREMENT — it is added to a height, never compared against one. That is the whole difference
+ * from `composePlaceholderFloorH` below, which returns a complete floor: an overlay stands in for
+ * the box's entire content, whereas the interim rides on top of a draft that is already accounted
+ * for. Treating it as a total is what let a long typed draft override a drag height (roborev 57354).
+ *
+ * NO BORDERS ADDED. Both call sites add them exactly once already — the auto branch through
+ * `contentH + COMPOSE_BORDER_H`, the dragged branch because `userH` is a rendered height that
+ * includes them — so adding them here would count them twice and creep the box a little taller on
+ * every utterance.
+ *
+ * Not capped here either; the callers clamp, because the two branches have different ceilings (the
+ * auto cap vs the drag ceiling).
+ */
+export function composeInterimExtraH(interimH: number | null | undefined): number {
+  if (interimH == null || interimH <= 0) return 0;
+  return interimH;
 }
 
 /**
@@ -100,17 +144,49 @@ export function composeMaxH(availableH: number): number {
  *   collapsed under you as you deleted a line would fight the size you just chose — and for the
  *   same reason an explicit drag outranks the placeholder floor below. Dragging back down to
  *   resting releases the box to auto-grow, which is where that floor reappears.
+ *
+ * A live dictation preview is ADDED to whichever height wins — never compared against it, and only
+ * the pixels the phrase adds PAST the textarea's own content. That distinction is not a nicety: as a
+ * `Math.max(userH, …)` it made the typed draft outrank the drag for as long as anyone was speaking,
+ * so the box jumped to fit the whole draft on every partial and snapped back on every settle
+ * (roborev 57354). Do not restore that shape.
+ *
+ * Why speech gets a lift at all, when nothing else does: everything a short box hides is still
+ * reachable — you scroll the textarea, or the caret takes you there. Provisional speech is not in
+ * the textarea at all, so a box too short for it doesn't hide the words, it DELETES them from the
+ * screen. The lift lasts exactly as long as the phrase is provisional (roborev 57333).
+ *
+ * The lift is ALLOCATION only. Making those pixels reachable when the textarea overflows is
+ * ComposeBox's job, not this function's — see the dictation spacer there (roborev 57397).
  */
 export function composeRenderH({
   contentH,
   userH,
   availableH,
   placeholderH,
+  interimH,
 }: ComposeHeightInput): number {
   const max = composeMaxH(availableH);
-  if (userH != null) return clamp(userH, COMPOSE_MIN_H, max);
+  // ADDED to whichever height wins, never compared against it — see `composeInterimExtraH`. Zero
+  // unless a phrase is actually provisional, so a typed draft reaches neither branch changed.
+  const speaking = composeInterimExtraH(interimH);
+  // A DRAG HEIGHT OUTRANKS CONTENT, BUT NOT THE WORDS BEING SPOKEN INTO THE BOX.
+  //
+  // `userH` deliberately ignores `contentH`: a box that collapsed as you deleted a line would fight
+  // the size you just chose, and typed text a short box hides is still reachable by scrolling or by
+  // the caret. Provisional speech is in neither the value nor the scroll, so a box too short for it
+  // does not hide those words — it erases them. Hence the increment, and only the increment: the
+  // drag still decides how much of the DRAFT is on screen, and lends back exactly the lines the
+  // live phrase adds. The moment it settles the height is the user's again.
+  //
+  // The lift stops at the auto cap (or at the user's own height, when they dragged past it): a
+  // dragged box may exceed the cap because the user said so, and a spoken sentence may not decide
+  // that on their behalf. `max` still bounds everything, so the drag ceiling is never crossed.
+  if (userH != null) {
+    return clamp(userH + speaking, COMPOSE_MIN_H, Math.min(max, Math.max(userH, COMPOSE_CAP_H)));
+  }
   // `contentH` is the raw scrollHeight, which already includes the padding — but not the borders.
-  const desired = contentH == null ? COMPOSE_MIN_H : contentH + 2;
+  const desired = (contentH == null ? COMPOSE_MIN_H : contentH + COMPOSE_BORDER_H) + speaking;
   // The floor, not a separate branch: a box holding BOTH a draft and (transiently) an overlay
   // takes whichever is taller, and neither can clip the other.
   return clamp(

@@ -32,9 +32,33 @@
 // draws, which is why the mirrored text is `transparent`: it exists to put the pills in the right
 // place, not to be read. Doubling the glyphs is how you get the fringing that makes this technique
 // look broken.
+//
+// ══ THE LIVE DICTATION PREVIEW RIDES ALONG ══════════════════════════════════════════════════════
+// The mirror already paints, in the textarea's exact metrics, everything the draft says up to the
+// caret — which makes it the ONLY place an un-committed word can appear at the end of that draft
+// and still look like part of it. So the Deepgram interim lands here, as one italic muted span
+// AFTER the mirrored text (see `interim` below), and NOT — as it used to — in a strip of its own
+// above the box.
+//
+// The founder's report on that strip: the live words "still showing above the actual text", two
+// lines where the sentence is one. The behaviour he specified is a single line in a single place —
+// provisional words italic in the prompt bar, going non-italic where they settle — and the strip
+// broke it twice over: the words appeared somewhere they were never going to stay, then visibly
+// MOVED into the box as each segment committed.
+//
+// Nothing paints the settled state; it is what remains when this span goes away. A final segment
+// clears the store's interim and appends the committed text to the box's own value in the same
+// handler (useDictation's `dictation://partial`), so the same words are re-drawn a frame later by
+// the REAL textarea, in the real (non-italic) ink, at the same place on the line. That is the whole
+// mechanism behind "italic while provisional, upright once settled" — there is no transition to
+// animate and no second copy of the type ramp to keep in step.
+//
+// This is the same technique Composer.tsx (the build-agent composer) uses for its own ghost layer,
+// down to the space-joining rule; the two were deliberately brought back into line.
 import { useEffect, useRef, type CSSProperties, type RefObject } from "react";
 import { mentionsIn, splitMentionText, type MentionAgent } from "./mentions";
 import { MentionPill, MENTION_PILL_FILL } from "./MentionPill";
+import { C } from "../../theme/colors";
 
 /** The composer's own pill id. Distinct from the sent bubble's on purpose — both are on screen at
  *  once (a draft under a thread), so one shared id would make `getByTestId` ambiguous exactly when a
@@ -42,6 +66,24 @@ import { MentionPill, MENTION_PILL_FILL } from "./MentionPill";
 export const COMPOSE_MENTION_PILL_TESTID = "concierge-compose-mention-pill";
 
 export const MENTION_MIRROR_TESTID = "concierge-compose-mention-mirror";
+
+/** The live dictation preview's handle. The VALUE is unchanged from when this text lived in its own
+ *  strip above the box — the node moved, the id did not, so every existing query still finds it. */
+export const CONCIERGE_INTERIM_TESTID = "concierge-interim";
+
+/**
+ * How the un-committed phrase joins the text already in the box.
+ *
+ * Exported and pure so the rule is testable on its own and is stated once. It is the same rule
+ * Composer.tsx applies to its ghost suffix: one space between the draft and the live phrase, unless
+ * the draft already ends in one (double-spacing is visible in a proportional face) or is empty (a
+ * leading space would push the first spoken word off the left margin, out of line with where it
+ * lands once it commits — `appendDictated` trims exactly the same way).
+ */
+export function interimSuffix(text: string, interim: string): string {
+  if (!interim) return "";
+  return `${text && !text.endsWith(" ") ? " " : ""}${interim}`;
+}
 
 /**
  * The marker that keeps this layer OUT of the placeholder-height measurement.
@@ -104,6 +146,9 @@ export function MentionMirror({
   metrics,
   /** The textarea, so this layer can follow it when the content scrolls past the ten-line cap. */
   textareaRef,
+  /** The live, un-committed Deepgram transcript. Painted italic at the end of the mirrored text —
+   *  see the header. "" (the default) when nothing is being spoken into this box. */
+  interim = "",
 }: {
   text: string;
   /** The LIVE roster — the same one the picker offers from and a send resolves against, so a pill
@@ -112,6 +157,7 @@ export function MentionMirror({
   agents: readonly MentionAgent[];
   metrics: CSSProperties;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  interim?: string;
 }) {
   const mirrorRef = useRef<HTMLDivElement>(null);
 
@@ -182,6 +228,35 @@ export function MentionMirror({
           </MentionPill>
         ),
       )}
+      {/* THE ONE THING IN THIS LAYER THAT IS NOT A DUPLICATE. Every other glyph here is transparent
+          because the textarea draws it; these words are not in the textarea's value at all — they
+          are still provisional — so this span is what paints them, and it needs a real colour.
+
+          Muted + italic is the provisional state, and it is the ONLY state anything paints: when
+          the segment settles, `interim` empties and the committed words arrive in the textarea's
+          own value, where the real text is drawn upright in the real ink. So the words do not move
+          and nothing crossfades — one span stops, and the glyphs underneath it are already there. */}
+      {interim ? (
+        <span
+          data-testid={CONCIERGE_INTERIM_TESTID}
+          // aria-live="off", deliberately (roborev 48171): Deepgram replaces this preview word by
+          // word, so a polite region hands the screen reader a fresh announcement per partial and
+          // the queue never drains — drowning out everything else. The text is decorative and
+          // immediately superseded. What matters — the finished reply, and each send outcome — is
+          // announced by the column's hidden role="status" node (ConciergeColumn), which is fed
+          // FINISHED lines only. Not the thread: it renders the streaming transcript, so a live
+          // region there re-announces the reply on every chunk (roborev 52648/53010/53088).
+          //
+          // Kept explicit even though this whole layer is aria-hidden. The two say different
+          // things — aria-hidden is "the textarea already carries this draft's accessible name",
+          // aria-live="off" is "do not announce these words AS THEY CHANGE" — and the reasoning
+          // above has to survive anyone who later gives this span a home that is not hidden.
+          aria-live="off"
+          style={{ color: C.muted, fontStyle: "italic" }}
+        >
+          {interimSuffix(text, interim)}
+        </span>
+      ) : null}
     </div>
   );
 }

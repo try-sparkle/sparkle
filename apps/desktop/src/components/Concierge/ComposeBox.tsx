@@ -67,9 +67,17 @@
 // mic pipeline: it hands its append fn to the integration layer through registerInsert (mirroring
 // dictationStore registerInsert, which is what the agent composer already does) and renders
 // whatever live transcript arrives back as the interim prop. COMMITTED segments land in the
-// textarea and are editable and sendable like typed text; the INTERIM preview stays outside the
-// textarea, because Deepgram replaces it word-by-word and a send that captured it would ship a
-// half-heard phrase that is about to be superseded.
+// textarea and are editable and sendable like typed text; the INTERIM preview stays out of the
+// textarea's VALUE, because Deepgram replaces it word-by-word and a send that captured it would
+// ship a half-heard phrase that is about to be superseded (see `submit`, which sends `text`).
+//
+// Out of the value is NOT out of the box. This header used to say the preview "stays outside the
+// textarea", and it was built that way — a strip of italic text in its own row above — which the
+// founder reported as the spoken words "still showing above the actual text", one sentence drawn on
+// two lines, each phrase jumping down into the box as it committed. The preview is now painted
+// INSIDE the prompt bar, in the mention mirror behind the textarea, at the end of the draft and in
+// the textarea's own metrics: italic while provisional, and simply gone once the committed words
+// are drawn upright by the real textarea in the same place. See ./MentionMirror.
 import {
   useCallback,
   useEffect,
@@ -212,11 +220,19 @@ const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 
  *
  * `borderRadius` rides along because it is part of the same box, not because the mirror needs it.
  */
+/** The textarea's resting bottom padding.
+ *
+ *  Named because the dictation spacer transiently ADDS to it — see `dictationPadBottom` in the
+ *  component below — and because the layout effect must put it back to exactly this before reading
+ *  `scrollHeight`, which counts padding. Exported so a test can model that measurement honestly
+ *  rather than stubbing a constant height that no padding can move. */
+export const COMPOSE_TEXT_PAD_BOTTOM = 10;
+
 const COMPOSE_TEXT_METRICS: CSSProperties = {
   fontFamily: "inherit",
   fontSize: 13,
   lineHeight: PLACEHOLDER_TYPE.lineHeight,
-  padding: "10px 12px",
+  padding: `${COMPOSE_TEXT_PAD_BOTTOM}px 12px`,
   // The border is `transparent` rather than absent on purpose — see the textarea's own note below;
   // the placeholder overlay's geometry and the auto-grow measurement are both taken off this box.
   border: "1px solid transparent",
@@ -616,9 +632,19 @@ export function ComposeBox({
   const { micPresentation, wakeWord, stopWord, modelProgress, errorNotice, pauseReason } =
     useVoicePlaceholder();
   // The overlay stands in for a native placeholder, so it shows on exactly the same terms one
-  // would: an empty textarea. Staged attachments and a live interim transcript each render in
-  // their OWN row above the textarea (see below), so neither competes for this slot.
-  const showRichPlaceholder = text === "";
+  // would: an empty textarea. Staged attachments render in their OWN row above the textarea (see
+  // below), so they never compete for this slot.
+  //
+  // `!interim` IS LOAD-BEARING, and it is new. The live dictation preview used to have a row of its
+  // own too, which is what made "empty textarea" a sufficient test; it is now painted into the
+  // mention mirror at the end of the draft — i.e. into THIS slot, on row one, while `text` is still
+  // "". Without this gate the invitation to speak would render on top of the words being spoken and
+  // the two would interleave into garbled copy. Composer.tsx gates its own rich placeholder on
+  // exactly this (`!interimActive`) for exactly this reason.
+  //
+  // It also stands on its own as copy: "Say Sparkle…" is an invitation, and the one moment it must
+  // not be on screen is while the user is already talking.
+  const showRichPlaceholder = text === "" && !interim;
   // Focus-on-request seam: any component can call uiStore.requestComposeFocus() (e.g. the
   // drag-vision pill pointing at the one surface that takes input) and this box takes the caret.
   //
@@ -900,6 +926,12 @@ export function ComposeBox({
   // the textarea's own scrollHeight. See the layout effect below.
   const slotRef = useRef<HTMLDivElement>(null);
   const [placeholderH, setPlaceholderH] = useState<number | null>(null);
+  /** The live dictation preview's natural height — the other thing this box displays that the
+   *  textarea's own scrollHeight cannot see, and for the opposite reason to the placeholder's: the
+   *  words are painted BEHIND the textarea rather than over it, and are not in its value. See the
+   *  layout effect, and `composeInterimExtraH` for why it is an INCREMENT applied in both height branches, never a value
+   *  compared against them. */
+  const [interimH, setInterimH] = useState<number | null>(null);
   // The space this box's TEXTAREA and the THREAD share — not the window, and not the box's whole
   // root either. Two distinct traps, both of which clip the Send row off the bottom (roborev
   // 53572 / 53586):
@@ -907,10 +939,17 @@ export function ComposeBox({
   //   1. The column carries a fixed header (wordmark, spend pill, scope vitals) and a suggestions
   //      slot that cannot compress, so sizing against `window.innerHeight` over-allocates by all of
   //      it and the thread collapses to zero.
-  //   2. The ceiling is applied to the TEXTAREA, but the root also holds the attach row, the chips,
-  //      the interim dictation line and the drag handle — ~60px the textarea never sees. Measuring
-  //      the pool in root units and spending it in textarea units silently hands the thread that
-  //      much less than COMPOSE_MIN_THREAD_H promises. So the box's own chrome comes off the pool.
+  //   2. The ceiling is applied to the TEXTAREA, but the root also holds the attach row, the chips
+  //      and the drag handle — tens of px the textarea never sees. Measuring the pool in root units
+  //      and spending it in textarea units silently hands the thread that much less than
+  //      COMPOSE_MIN_THREAD_H promises. So the box's own chrome comes off the pool.
+  //
+  //      That list used to include "the interim dictation line", and putting a figure on it (~60px)
+  //      is why this note needs correcting rather than trimming: the dictation line is GONE — the
+  //      live transcript is painted inside the textarea's own text layer now (see MentionMirror) —
+  //      so the chrome is a row shorter and its height is no longer a constant anyone can quote.
+  //      Nothing in the code depended on the number: `chrome` is MEASURED below as root height minus
+  //      textarea height, which is the whole point of measuring it.
   //
   // And because the dragged height is persisted, either mistake survives a relaunch.
   const rootRef = useRef<HTMLDivElement>(null);
@@ -982,10 +1021,112 @@ export function ComposeBox({
     const ta = textareaRef.current;
     if (!ta) return;
     const prev = ta.style.height;
+    const prevPad = ta.style.paddingBottom;
     ta.style.height = "auto";
+    // …AND THE DICTATION SPACER OFF. `scrollHeight` counts padding, and while a phrase is
+    // provisional this textarea carries `interimH` extra pixels of it (see `dictationPadBottom`), so
+    // measuring through the spacer would read the spacer back as content.
+    //
+    // THIS LINE IS WHAT STOPS AN INFINITE LOOP, not merely a drifting measurement, and it became
+    // that the moment `interimH` joined this effect's deps. Without the reset: pass 1 measures
+    // `contentH`, derives `interimExtra = mirrorH - contentH = E`, and applies `paddingBottom`
+    // 10 + E; pass 2 measures `contentH + E`, derives `0`, and drops the padding; pass 3 measures
+    // `contentH` again and derives `E`. Every pass is a real state change from a useLayoutEffect, so
+    // React raises "Maximum update depth exceeded" and takes the concierge tree down on the FIRST
+    // Deepgram partial. With the reset, `next` is padding-independent, so pass 2 measures what pass 1
+    // did, `setInterimH` bails on identity, and it settles in two passes.
+    ta.style.paddingBottom = `${COMPOSE_TEXT_PAD_BOTTOM}px`;
     const next = ta.scrollHeight;
     ta.style.height = prev;
+    ta.style.paddingBottom = prevPad;
     setContentH((cur) => (cur === next ? cur : next));
+
+    // THE PROVISIONAL LINES GET MEASURED TOO — and this is where the box learns about them.
+    //
+    // `ta.scrollHeight` is taken off the textarea's VALUE, which the live transcript is deliberately
+    // not in, so on the measurement above a dictated sentence is worth exactly zero pixels. That was
+    // harmless while the preview had a strip of its own; now that it is painted INSIDE the box, at
+    // inset 0 behind the textarea with `overflow: hidden`, "worth zero pixels" means the second and
+    // every later line of what the user is saying is CLIPPED — invisible, in the one place the whole
+    // feature exists to show it (roborev 57324, High). The empty-box case is the common one: there
+    // the box would sit at its one-line resting height while a whole spoken sentence streams into it.
+    //
+    // It goes to `interimH`, its OWN input to the height, and not into `contentH` — which is where
+    // it was first put, and that was wrong twice over (roborev 57333):
+    //
+    //   • `contentH` is ignored outright by a box at a persisted DRAG height, so folding it in there
+    //     fixed auto-grow and left anyone who had once dragged the box short with the preview
+    //     clipped exactly as before. Typed text a short box hides is still reachable by scrolling or
+    //     by the caret; provisional speech is in neither the value nor the scroll, so a box too
+    //     short for it doesn't hide those words, it erases them. It is a FLOOR in both branches.
+    //   • It is likewise not a PLACEHOLDER floor — `composePlaceholderFloorH` adds the textarea's
+    //     whole chrome (22px) to what it is handed, right for an overlay standing in for empty space
+    //     and wrong for a layer that already carries the same padding and needs only the borders.
+    //     That is what MENTION_MIRROR_SKIP_ATTR still buys: measuring the mirror in the walk below
+    //     would grow the box by a spare line for every draft with any text in it.
+    //
+    // The other half of "the words must not move": the box that fits the phrase while it is italic
+    // is the box that fits it once it commits — same string, same metrics, same wrap points — so the
+    // settle changes the ink and nothing else. Measured only while `interim` is non-empty, so a
+    // typed draft never pays for it.
+    const mirrorEl = interim
+      ? (slotRef.current?.querySelector<HTMLElement>(`[${MENTION_MIRROR_SKIP_ATTR}]`) ?? null)
+      : null;
+    let mirrorH = 0;
+    if (mirrorEl) {
+      // Same collapse-then-measure trick as the textarea and the overlays: the mirror is stretched
+      // to the box by `inset: 0`, so measuring it in place would only ever report the height we
+      // already set and the box could never come back down.
+      //
+      // AND PUT THE SCROLL BACK, in this same synchronous pass. Releasing `bottom` makes the layer
+      // auto-height, which leaves it with nothing to scroll, so the reflow that `scrollHeight`
+      // forces clamps its scrollTop to 0 — and restoring `bottom` re-creates the overflow without
+      // restoring the offset. The mirror's own scroll sync is a passive effect, i.e. after paint, so
+      // in a draft past the ten-line cap every Deepgram partial would paint one frame with the pill
+      // fills snapped to the top of the box while the textarea stayed where it was: precisely the
+      // misalignment MIRRORED_PILL exists to prevent (roborev 55574), several times a second while
+      // someone speaks (roborev 57333).
+      const prevBottom = mirrorEl.style.bottom;
+      const prevTop = mirrorEl.scrollTop;
+      const prevLeft = mirrorEl.scrollLeft;
+      mirrorEl.style.bottom = "auto";
+      mirrorH = mirrorEl.scrollHeight;
+      mirrorEl.style.bottom = prevBottom;
+      mirrorEl.scrollTop = prevTop;
+      mirrorEl.scrollLeft = prevLeft;
+    }
+    // THE INCREMENT, not the mirror's total (roborev 57354). The mirror paints the whole draft plus
+    // the provisional suffix, so its raw height is the draft's height as well — and handing that to
+    // the dragged branch let the TYPED DRAFT outrank the drag for as long as anyone was speaking: a
+    // two-line box holding a fifteen-line draft jumped to the cap on the first partial and snapped
+    // back on every settle, several times an utterance. Only the pixels the interim adds PAST the
+    // textarea's own content are unreachable, and only those are what a drag has to yield to.
+    //
+    // `next` is the textarea's own collapsed scrollHeight, measured a few lines above in the same
+    // pass, so the two are like for like: same metrics, same wrap points, both padding-inclusive.
+    const interimExtra = mirrorH > 0 ? Math.max(0, mirrorH - next) : 0;
+    setInterimH((cur) => (cur === interimExtra ? cur : interimExtra));
+
+    // MAKE THE EXTRA PIXELS REACHABLE, not merely allocated (roborev 57397).
+    //
+    // Growing the box is enough only while the textarea does not overflow. When it does — a draft
+    // longer than a box the user dragged SHORT — the mirror copies `ta.scrollTop`, and the textarea's
+    // own maximum is `contentH - clientH` while the mirror needs `mirrorH - clientH` to bring its
+    // tail into view. Since `mirrorH = contentH + speaking`, no amount of extra height closes that
+    // gap: every pixel the box grows clamps `ta.scrollTop` down by the same pixel, the window slides
+    // up over the draft, and the live phrase stays below it. The words were allocated room and still
+    // could not be seen — the pre-branch strip always showed them, so that is a regression.
+    //
+    // The spacer closes it at the source: `dictationPadBottom` gives the textarea exactly `speaking`
+    // extra pixels of bottom padding while a phrase is provisional, so its scroll range becomes the
+    // mirror's and the existing `mirror.scrollTop = ta.scrollTop` copy lines the two up EXACTLY.
+    // Bottom padding moves no glyph and changes no wrap point, so every pill fill stays on its own
+    // words — which is why this and not desynchronising the mirror (roborev 55574).
+    //
+    // Then pin to the bottom, because nothing else will: the caret is not in the provisional text and
+    // the user is speaking, not scrolling. Only while dictating; the moment the phrase settles the
+    // spacer goes and the box is the user's again.
+    if (interim) ta.scrollTop = ta.scrollHeight;
 
     // The same measurement for the RICH PLACEHOLDER, which the scrollHeight above cannot see: the
     // overlay is a SIBLING of the textarea, not its content, so an empty box measures one line
@@ -1020,9 +1161,48 @@ export function ComposeBox({
       }
     }
     setPlaceholderH((cur) => (cur === overlayH ? cur : overlayH));
-  }, [text, interim, showRichPlaceholder, micPresentation, errorNotice, modelProgress, wakeWord, stopWord]);
+    // `interim` IS a dependency — of the MIRROR measurement above, never of this floor: the mirror
+    // is skipped by the walk and always will be. Every Deepgram partial re-runs this effect, which
+    // is the price of the box fitting the words as they arrive, exactly as typing them would.
+  }, [
+    text,
+    interim,
+    // The SPACER's own size. It is written by this effect and applied on the next render, so without
+    // re-running here the pin above would scroll against the range the box had one phrase ago and
+    // stop short of the newest words. Settles in two passes: the second finds the same measurement
+    // and both setState calls bail on identity.
+    interimH,
+    showRichPlaceholder,
+    micPresentation,
+    errorNotice,
+    modelProgress,
+    wakeWord,
+    stopWord,
+  ]);
 
-  const height = composeRenderH({ contentH, userH: userH ?? null, availableH, placeholderH });
+  /**
+   * THE DICTATION SPACER — the textarea's bottom padding while a phrase is provisional.
+   *
+   * A real binding rather than an expression inlined in the style, because three comments point a
+   * reader here and a name that does not resolve is the dangling-reference defect this branch has
+   * already been reviewed for twice.
+   *
+   * The mirror behind the textarea paints `interimH` more pixels than the textarea's own value does,
+   * and the mirror follows the TEXTAREA's scroll — so without matching room down here the tail of the
+   * preview sits below anything `ta.scrollTop` can reach, however tall the box grows. Padding rather
+   * than content: it moves no glyph and changes no wrap point, so every pill fill stays on its own
+   * words (roborev 55574). The layout effect resets this to `COMPOSE_TEXT_PAD_BOTTOM` before it
+   * measures — see there for why that reset is load-bearing.
+   */
+  const dictationPadBottom = COMPOSE_TEXT_PAD_BOTTOM + (interim ? (interimH ?? 0) : 0);
+
+  const height = composeRenderH({
+    contentH,
+    userH: userH ?? null,
+    availableH,
+    placeholderH,
+    interimH,
+  });
 
   // Drag the top edge. Pointer capture keeps the gesture alive when the cursor leaves the 6px
   // handle — without it a fast drag drops on the first frame that outruns the element.
@@ -1303,10 +1483,10 @@ export function ComposeBox({
         // This was a full-bleed strip with a top rule, filled with COMPOSE_SCRIM: a 16% BLACK wash
         // over the concierge column. That scrim dropped `conciergeMuted` to 4.23 in light — under
         // AA — on the box you type into, and every control in this row (the attach buttons, the
-        // presence slider, the interim transcript, the textarea's own text) is read on it. The
-        // approved direction does not scrim the composer at all: `.cmp` is an inset box sitting on
-        // `--k-input` with a rule around it, which is both the faithful reading of the mock and the
-        // one that clears the floor. DO NOT REINTRODUCE THE SCRIM — theme/amberInk.test.ts already
+        // presence slider, the textarea's own text, and the live interim transcript painted behind
+        // it) is read on it. The approved direction does not scrim the composer at all: `.cmp` is
+        // an inset box sitting on `--k-input` with a rule around it, which is both the faithful
+        // reading of the mock and the one that clears the floor. DO NOT REINTRODUCE THE SCRIM — theme/amberInk.test.ts already
         // models this plate as `inputSurface` and will go red if it moves.
         //
         // Inset rather than full-bleed (`margin`, `borderRadius`), because a box is what makes the
@@ -1443,27 +1623,13 @@ export function ComposeBox({
             useUiStore for the same class of reason. */}
         <PresenceSlider />
       </div>
-      {interim ? (
-        <div
-          data-testid="concierge-interim"
-          // aria-live="off", deliberately (roborev 48171): Deepgram replaces this preview word by
-          // word, so a polite region hands the screen reader a fresh announcement per partial and
-          // the queue never drains — drowning out everything else. The text is decorative and
-          // immediately superseded. What matters — the finished reply, and each send outcome — is
-          // announced by the column's hidden role="status" node (ConciergeColumn), which is fed
-          // FINISHED lines only. Not the thread: it renders the streaming transcript, so a live
-          // region there re-announces the reply on every chunk (roborev 52648/53010/53088).
-          aria-live="off"
-          style={{
-            fontSize: 12,
-            fontStyle: "italic",
-            color: C.muted,
-            padding: "0 2px 6px",
-          }}
-        >
-          {interim}
-        </div>
-      ) : null}
+      {/* NO INTERIM STRIP HERE. The live dictation preview used to be its own row at exactly this
+          point — above the drag handle, above the textarea — and the founder's report was that the
+          spoken words were "still showing above the actual text": two stacked lines for one
+          sentence, with each phrase visibly JUMPING down into the box as it committed. It is now
+          painted in the mention mirror at the end of the draft (see the <MentionMirror> below), so
+          the provisional words sit exactly where the settled ones will, italic until they settle.
+          Do not put a row back here — that is the bug, not the feature. */}
       {/* Drag the compose box taller. Sits on its TOP edge, so dragging up grows it — past the
           ten-line auto cap if you want, which is the whole reason to offer a handle. Dragging back
           down to the resting height releases it to auto-grow again. */}
@@ -1606,6 +1772,13 @@ export function ComposeBox({
               // because the MENTION MIRROR behind this element has to match them exactly or its pill
               // fills sit off the words they belong to (see that constant).
               ...COMPOSE_TEXT_METRICS,
+              // THE DICTATION SPACER. While a phrase is provisional the mirror behind this element
+              // paints `interimH` more pixels than this element's own value does, and this element's
+              // scroll range is what the mirror follows — so without matching room down here the tail
+              // of the preview sits below anything `ta.scrollTop` can reach. Padding, not content:
+              // it moves no glyph and changes no wrap point, so the pill fills stay on their words.
+              // The layout effect measures with this reset, or it would feed itself.
+              paddingBottom: dictationPadBottom,
               background: "transparent",
               color: "inherit",
               outline: "none",
@@ -1621,12 +1794,25 @@ export function ComposeBox({
               while the message is still being written — the founder's report was that it only became
               one after Send. Skipped by the height measurement above (it mirrors the content, so it
               is not a placeholder floor) and inert to the pointer; see ./MentionMirror for why this
-              is a mirror rather than a contenteditable. */}
+              is a mirror rather than a contenteditable.
+
+              AND THE LIVE DICTATION PREVIEW, for the same reason the pills are here: this layer is
+              the only one drawing in the textarea's own metrics, so a word appended to it lands
+              where that word will actually be. Passing `interim` here is what puts the spoken text
+              IN the prompt bar instead of in a strip above it.
+
+              The box DOES grow to fit those words — this comment used to say the opposite, which
+              was the invariant for exactly one commit before it turned out to mean "the words are
+              clipped" (roborev 57324/57333). What the mirror's opt-out buys is narrower and still
+              true: it is skipped by the PLACEHOLDER-floor walk, which would add the textarea's 22px
+              chrome to a height that already includes the same padding. It is measured as its own
+              input to the height instead — see the layout effect and `composeInterimExtraH`. */}
           <MentionMirror
             text={text}
             agents={roster}
             metrics={COMPOSE_TEXT_METRICS}
             textareaRef={textareaRef}
+            interim={interim}
           />
           {/* The two FAILURE states each take the slot over as their OWN sibling overlay, because
               each carries a control the decorative (aria-hidden) overlay would bury: aria-hidden
