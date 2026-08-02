@@ -539,9 +539,15 @@ export function OpenPrMenu({
   };
 
   return (
-    // In compact mode the wrapper contributes NO positioning: the panel is anchored to the
-    // concierge header instead (which is `position: relative`), so it spans that header rather
-    // than hanging off this badge.
+    // THIS WRAPPER IS THE COMPACT PANEL'S ANCHOR, AND NOTHING ELSE. It stays `static` there on
+    // purpose — it must NOT be the positioned ancestor, because the panel is portaled out of this
+    // subtree entirely and pinned in window coordinates by `panelPlacement`. It is measured
+    // (`anchorRef`) rather than positioned against, so the panel hangs off this badge's box while
+    // being free of every box between here and the root. See the containment note above; the
+    // `left: 8; right: 8` spanning form this once had is the reported bug, not a simpler shape.
+    //
+    // The WIDE form is the opposite and keeps `relative`: its panel really does render in here and
+    // is positioned off this wrapper.
     <div
       ref={anchorRef}
       style={{ position: compact ? "static" : "relative" }}

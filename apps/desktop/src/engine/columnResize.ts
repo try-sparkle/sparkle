@@ -134,6 +134,22 @@ export const BUILD_COLUMN_MIN_WIDTH = COLUMN_MIN_WIDTH;
  * in that graph (roborev 56223). This module already owns the sibling column widths.
  */
 export const CONCIERGE_DEFAULT_WIDTH = 360;
+/**
+ * The localStorage key holding the concierge's persisted SINGLE-PAIR width.
+ *
+ * HERE, NOT IN Workspace.tsx, for the same reason `CONCIERGE_DEFAULT_WIDTH` above is — and it is the
+ * same failure a step further along. Workspace re-exports both, so its own readers are unchanged;
+ * what moving them buys is a NODE-environment caller that needs the key without the component. The
+ * visual harness's fixture module is exactly that: it seeds a narrowed concierge by writing this key
+ * before `createRoot`, and its test runs under node. Re-spelling the string there instead would mean
+ * a rename silently turning `?concierge=190` into a no-op, and the capture would photograph the
+ * 380px default under a filename claiming half that — the mislabelled-screenshot failure the harness
+ * exists to prevent (roborev 57506).
+ */
+export const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
+/** The TWO-PAIR width, stored separately — see Workspace.tsx's note on why the two modes cannot
+ *  share one number. Lives here for the same node-reachability reason as the key above. */
+export const CONCIERGE_WIDTH_KEY_PAIRED = "sparkle-concierge-width:2";
 /** What must stay for the terminal beside the build column — the floor its CSS clamp leaves it.
  *
  *  NOW THE SHARED 50px FLOOR, down from 320. The 320 was the single largest contributor to the frozen

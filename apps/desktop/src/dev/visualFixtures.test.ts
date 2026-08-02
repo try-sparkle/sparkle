@@ -18,6 +18,12 @@ import {
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
 import { DICTATION_PERSIST_KEY, useDictationStore } from "../stores/dictationStore";
+import {
+  COLUMN_HARD_MAX,
+  COLUMN_MIN_WIDTH,
+  CONCIERGE_WIDTH_KEY,
+  CONCIERGE_WIDTH_KEY_PAIRED,
+} from "../engine/columnResize";
 import { goalStateOf } from "../engine/agentGoal";
 import type { Project } from "../types";
 import { createJSONStorage } from "zustand/middleware";
@@ -195,6 +201,46 @@ describe("applyVisualFixtures", () => {
     const ids = useProjectStore.getState().projects.map((p) => p.id);
     expect(ids).toEqual([FIXTURE_PROJECT_ID]);
   });
+
+  // ── THE WIDTH WRITE PATH, WHICH ONLY THE PARSER USED TO COVER (roborev 57506) ────────────────
+  //
+  // `visualConciergeWidth` is well tested as a parser, and that is not the same fact as "the width
+  // reaches the app". `Workspace` reads these two keys in a `useState` initialiser, so if either
+  // string here drifts from the one it reads, `?concierge=190` becomes a silent no-op and the
+  // `open-pr-menu-narrow` capture photographs the 380px DEFAULT under a filename claiming half
+  // that — a screenshot that says the panel is contained when nothing was ever narrowed. The keys
+  // are imported from `engine/columnResize` for exactly this reason; this asserts they are what
+  // gets written.
+  it("seeds BOTH concierge width keys, using the keys the shell actually reads", () => {
+    localStorage.removeItem(CONCIERGE_WIDTH_KEY);
+    localStorage.removeItem(CONCIERGE_WIDTH_KEY_PAIRED);
+    expect(applyVisualFixtures("?visual=1&concierge=190", ON)).toBe(true);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("190");
+    // The paired key too: which one the shell reads depends on the pair count, and seeding only one
+    // makes the fixture work or not work depending on a layout the capture did not ask about.
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("190");
+  });
+
+  it("leaves a developer's own width alone when no width was asked for", () => {
+    // NOT a zustand-persisted key, so `detachPersistence` does not cover it — this is a real
+    // preference on a real machine, and the only thing keeping it safe is that nothing writes it
+    // unless `?concierge=` said so.
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "421");
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, "1337");
+    expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("421");
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY_PAIRED)).toBe("1337");
+  });
+
+  it("leaves it alone for a width the shell itself would refuse", () => {
+    // A value out of bounds parses to null, and null must mean "write nothing" rather than "write
+    // the default" — otherwise an out-of-range parameter clobbers the real preference AND produces
+    // a capture at a width nobody asked for. 40 is below the 50px column floor.
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, "421");
+    applyVisualFixtures("?visual=1&concierge=40", ON);
+    expect(localStorage.getItem(CONCIERGE_WIDTH_KEY)).toBe("421");
+    localStorage.removeItem(CONCIERGE_WIDTH_KEY);
+  });
 });
 
 describe("seeding never reaches disk", () => {
@@ -356,10 +402,19 @@ describe("the pinned clock", () => {
 // capture of the DEFAULT state filed under a name claiming otherwise — the mislabelled-screenshot
 // failure this harness has already hit twice.
 describe("the concierge-width parameter", () => {
-  it("reads a width the shell would accept", () => {
+  // THE BOUNDS ARE THE SHELL'S, ASSERTED AS THE SHELL'S CONSTANTS — not as literals that happen to
+  // match them today. This test previously pinned `1400` as the ceiling and `1401` as refused, and
+  // both were wrong: the shell's cap is `COLUMN_HARD_MAX`, so it accepts and persists 1401. The
+  // effect was that the founder's documented ~1920 cockpit width parsed to null, wrote no key, and
+  // would have been photographed at the DEFAULT column under a filename claiming a wide one — the
+  // very failure the block comment above says this parser exists to prevent (roborev 57518).
+  it("reads a width the shell would accept, across its whole real range", () => {
     expect(visualConciergeWidth("?visual=1&concierge=190")).toBe(190);
-    expect(visualConciergeWidth("?visual=1&concierge=50")).toBe(50);
-    expect(visualConciergeWidth("?visual=1&concierge=1400")).toBe(1400);
+    expect(visualConciergeWidth(`?visual=1&concierge=${COLUMN_MIN_WIDTH}`)).toBe(COLUMN_MIN_WIDTH);
+    expect(visualConciergeWidth(`?visual=1&concierge=${COLUMN_HARD_MAX}`)).toBe(COLUMN_HARD_MAX);
+    // The width the paired-key docblock names as a real founder layout. It sits above the old
+    // literal ceiling, which is the concrete case that ceiling was silently refusing.
+    expect(visualConciergeWidth("?visual=1&concierge=1920")).toBe(1920);
   });
 
   it("is absent by default, so every existing surface keeps its baseline", () => {
@@ -371,8 +426,20 @@ describe("the concierge-width parameter", () => {
   // would seed a value the capture cannot actually show — a picture of the default under another
   // name. Null means "use the app's own default", which is at least true.
   it("refuses anything the shell would clamp or cannot read", () => {
-    for (const bad of ["49", "1401", "0", "-200", "abc", "", "190.5", "1e3px"]) {
-      expect(visualConciergeWidth(`?visual=1&concierge=${bad}`), bad).toBeNull();
+    // Both rejected bounds are expressed as the shell's constants ± 1, so this test cannot drift
+    // from the shell the way the literal `1401` did.
+    const bad = [
+      String(COLUMN_MIN_WIDTH - 1),
+      String(COLUMN_HARD_MAX + 1),
+      "0",
+      "-200",
+      "abc",
+      "",
+      "190.5",
+      "1e3px",
+    ];
+    for (const b of bad) {
+      expect(visualConciergeWidth(`?visual=1&concierge=${b}`), b).toBeNull();
     }
   });
 });

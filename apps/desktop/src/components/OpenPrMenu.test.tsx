@@ -709,6 +709,50 @@ describe("OpenPrMenu, compact", () => {
     <OpenPrMenu compact rootPath="/repo" projectId="p1" resolveAgent={noAgent} onOpenAgent={noop} />
   );
 
+  // ── A REAL GEOMETRY FOR jsdom, WHICH LAYS NOTHING OUT ────────────────────────────────────────
+  //
+  // jsdom returns an all-zero rect from `getBoundingClientRect` and a fixed 1024 `innerWidth`, and
+  // both are what make the placement degenerate to its clamped floor. These two helpers hand the
+  // component a geometry it cannot get by accident, so a test that reads the placement back out of
+  // the DOM is actually reading a decision rather than a default. See the wiring test below.
+  const ORIGINAL_INNER_WIDTH = window.innerWidth;
+
+  function setViewportWidth(width: number) {
+    Object.defineProperty(window, "innerWidth", { value: width, configurable: true, writable: true });
+  }
+
+  /**
+   * Answer `getBoundingClientRect` on the MENU WRAPPER — and only on it — with `rect`.
+   *
+   * Scoped by `data-testid` rather than stubbed on the prototype wholesale, because the wrapper is
+   * the element the component is supposed to measure: a stub that answers for every element would
+   * make "measures the wrong node" — one of the mutations this test exists to catch — pass anyway.
+   */
+  function withAnchorRect(rect: { right: number; bottom: number }, viewportWidth: number) {
+    setViewportWidth(viewportWidth);
+    const real = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.dataset.testid !== "open-pr-menu") return real.call(this);
+      return {
+        ...rect,
+        left: rect.right - 40,
+        top: rect.bottom - 20,
+        width: 40,
+        height: 20,
+        x: rect.right - 40,
+        y: rect.bottom - 20,
+        toJSON: () => ({}),
+      } as DOMRect;
+    });
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setViewportWidth(ORIGINAL_INNER_WIDTH);
+  });
+
   it("shows the PR icon and the GREEN count, not the total", async () => {
     // Five open PRs, exactly one of them green. The number must be the green one.
     stubList([PASS, PR_944, PR_934, PR_925, PR_UNKNOWN]);
@@ -756,6 +800,61 @@ describe("OpenPrMenu, compact", () => {
     expect(panel.style.width).not.toBe("");
     // The wrapper must NOT be the positioned ancestor, or the panel anchors to the badge after all.
     expect(screen.getByTestId("open-pr-menu").style.position).toBe("static");
+  });
+
+  // THE WIRING BETWEEN THE ARITHMETIC AND THE DOM — the gap the tests above cannot see, and the one
+  // the repo's "assert the side effect, not the precondition" rule is about (roborev 57506).
+  //
+  // `panelPlacement` is exhaustively tested as arithmetic below, and the DOM tests above assert only
+  // the SHAPE of the pin (`fixed`, no `right`, some width). Neither notices if the two are connected
+  // wrongly, because in stock jsdom `getBoundingClientRect()` is all zeros and `innerWidth` is 1024:
+  // the placement degenerates to `{left: 8, top: 4, width: 640}`, so writing `left: placement.top`,
+  // dropping `width`, or measuring the wrong element all leave the whole suite green while the panel
+  // lands somewhere else entirely. A non-degenerate geometry is what makes those mutations visible —
+  // every number below is distinct, so no transposition can survive.
+  it("writes the PLACEMENT it computed — the real geometry, not jsdom's zeros", async () => {
+    // The concierge docked right in a 1600px window: badge at x=1400, header bottom at y=52.
+    const rect = { right: 1400, bottom: 52 };
+    withAnchorRect(rect, 1600);
+    stubList([PASS]);
+    render(compact());
+    await openMenu();
+    const panel = await screen.findByTestId("open-pr-panel");
+
+    const expected = panelPlacement(rect, { width: 1600 });
+    // Asserted FIELD BY FIELD against the helper rather than against literals, so this test states
+    // "the DOM carries what the rule decided" and cannot drift from the rule when the rule changes.
+    expect(panel.style.left).toBe(`${expected.left}px`);
+    expect(panel.style.top).toBe(`${expected.top}px`);
+    expect(panel.style.width).toBe(`${expected.width}px`);
+    // And pinned to the actual numbers too, so a helper that silently starts returning the
+    // degenerate placement cannot make the three assertions above vacuously true.
+    expect(panel.style.left).toBe("760px");
+    expect(panel.style.top).toBe("56px");
+    expect(panel.style.width).toBe("640px");
+  });
+
+  // THE RESIZE LISTENER IS THE ONLY THING THAT CAN RE-PLACE AN OPEN PANEL — the width is a function
+  // of the viewport alone, so nothing else invalidates a pin. Untested, a dropped `addEventListener`
+  // leaves the panel hanging off the window edge after a resize with every other test still green.
+  it("re-pins on resize, which is the one event that can move it", async () => {
+    withAnchorRect({ right: 1400, bottom: 52 }, 1600);
+    stubList([PASS]);
+    render(compact());
+    await openMenu();
+    const panel = await screen.findByTestId("open-pr-panel");
+    expect(panel.style.left).toBe("760px");
+
+    // Squeeze the window until the right-hand clamp is what decides the position: 640px of panel no
+    // longer fits to the left of a badge at 1400, so it is caught at `viewport − margin − width`.
+    setViewportWidth(700);
+    act(() => {
+      fireEvent(window, new Event("resize"));
+    });
+    expect(panel.style.left).toBe("52px");
+    expect(panel.style.width).toBe("640px");
+    // Still inside the window at both edges, which is the guarantee the whole helper exists for.
+    expect(52 + 640).toBeLessThanOrEqual(700 - PANEL_EDGE_MARGIN);
   });
 
   // THE PORTAL IS LOAD-BEARING, not tidiness. `ConciergeColumn`'s root section is `position:

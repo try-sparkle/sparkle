@@ -429,21 +429,24 @@ export function Pair({
 /** The concierge column's persisted width, and the range a drag/arrow-key commit is clamped to.
  *  360 is what the column shipped at as a hardcoded prop; the bounds are wider than the agent
  *  column's because this column holds prose (the thread) rather than a list of short rows. */
-/** Exported so a test asserts the key this component actually writes instead of re-spelling it, or
- *  worse, discovering it by taking a census of localStorage — see `Workspace.resize.test.tsx`. */
-export const CONCIERGE_WIDTH_KEY = "sparkle-concierge-width";
-/** THE TWO-PAIR WIDTH, STORED SEPARATELY — and it has to be, because the two modes now want very
- *  different numbers from the same column.
+/** Re-exported so a test asserts the key this component actually writes instead of re-spelling it,
+ *  or worse, discovering it by taking a census of localStorage — see `Workspace.resize.test.tsx`.
  *
- *  In the single-pair shell the concierge is a 280–560px reading column pinned to the row's left. In
- *  the five-column cockpit it is the ANCHOR, and the founder's target layouts put it at ~1100 and
- *  ~1920 on a three-display span. One shared value means opening a left pair inherits a width chosen
- *  for the other layout, and — far worse — dragging it there writes that back over the single-pair
- *  preference, so closing the pair leaves a concierge three times too wide with no way to know why.
+ *  DEFINED in engine/columnResize now, for the reason `CONCIERGE_DEFAULT_WIDTH` is: a node-
+ *  environment caller (the visual harness's fixture seeder) needs the key and must not drag this
+ *  module's store/Tauri graph in to get it. Every reader here is unaffected.
  *
- *  SEEDED from the single-pair value on first use, so an existing install's width is where the
- *  cockpit starts rather than snapping to a default. */
-export const CONCIERGE_WIDTH_KEY_PAIRED = "sparkle-concierge-width:2";
+ *  `CONCIERGE_WIDTH_KEY_PAIRED` is THE TWO-PAIR WIDTH, STORED SEPARATELY — and it has to be, because
+ *  the two modes now want very different numbers from the same column. In the single-pair shell the
+ *  concierge is a 280–560px reading column pinned to the row's left. In the five-column cockpit it is
+ *  the ANCHOR, and the founder's target layouts put it at ~1100 and ~1920 on a three-display span.
+ *  One shared value means opening a left pair inherits a width chosen for the other layout, and — far
+ *  worse — dragging it there writes that back over the single-pair preference, so closing the pair
+ *  leaves a concierge three times too wide with no way to know why. SEEDED from the single-pair value
+ *  on first use, so an existing install's width is where the cockpit starts rather than snapping to a
+ *  default. */
+export { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED } from "../engine/columnResize";
+import { CONCIERGE_WIDTH_KEY, CONCIERGE_WIDTH_KEY_PAIRED } from "../engine/columnResize";
 /** The shared 50px floor every column now answers to — see `COLUMN_MIN_WIDTH` in engine/columnResize.
  *  Was 280, which on a ~890px window put this column's ceiling AT its floor (`min 280, max 280` in the
  *  log) and left the seam dead through three consecutive drags. */

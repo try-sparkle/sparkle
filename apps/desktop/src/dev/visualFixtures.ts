@@ -43,6 +43,16 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
 import { useUiStore } from "../stores/uiStore";
 import { useDictationStore } from "../stores/dictationStore";
+// THE APP'S OWN KEYS AND FLOOR, imported rather than re-spelled. `engine/columnResize` is a true
+// leaf (no imports at all), so this costs nothing at module scope and keeps this file — and its
+// node-environment test — clear of the Workspace graph. See `visualConciergeWidth` for why a
+// re-spelled key is not a cosmetic issue here but a silently mislabelled screenshot.
+import {
+  COLUMN_HARD_MAX,
+  COLUMN_MIN_WIDTH,
+  CONCIERGE_WIDTH_KEY,
+  CONCIERGE_WIDTH_KEY_PAIRED,
+} from "../engine/columnResize";
 import { devBypassAuthEnabled } from "./devBypassAuth";
 
 /** The query parameter that turns fixtures on: `?visual=1`. */
@@ -105,16 +115,24 @@ export const VISUAL_CONCIERGE_WIDTH_PARAM = "concierge";
  * (bead sparkle-8g4qh) and no capture could have caught it, because every surface photographs the
  * concierge at its 380px default where the panel still looks fine.
  *
- * Bounds are the app's own (`COLUMN_MIN_WIDTH` … 1400): a value the shell would refuse is not a
- * state worth photographing, and returning it would produce a capture of the DEFAULT width under a
- * filename claiming otherwise — the mislabelled-screenshot failure this harness has hit before.
+ * Bounds are the app's own — `COLUMN_MIN_WIDTH` … `COLUMN_HARD_MAX`, both imported rather than
+ * re-spelled: a value the shell would refuse is not a state worth photographing, and returning it
+ * would produce a capture of the DEFAULT width under a filename claiming otherwise — the
+ * mislabelled-screenshot failure this harness has hit before.
+ *
+ * THE CEILING WAS A LITERAL `1400` AND THAT WAS THE SAME BUG AT THE OTHER END (roborev 57518). The
+ * shell's real cap is `COLUMN_HARD_MAX`, so 1400 rejected widths the app accepts and persists —
+ * including the founder's ~1920 cockpit layout, which is described in `CONCIERGE_WIDTH_KEY_PAIRED`'s
+ * own docblock. A surface asking for `?concierge=1920` parsed to null, wrote no key, and would have
+ * photographed the default column under a filename claiming a wide one. A bound that is a second
+ * spelling of the app's bound is a bound that can silently disagree with it.
  */
 export function visualConciergeWidth(search: string): number | null {
   const raw = new URLSearchParams(search).get(VISUAL_CONCIERGE_WIDTH_PARAM);
   if (raw === null) return null;
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
-  return n >= 50 && n <= 1400 ? n : null;
+  return n >= COLUMN_MIN_WIDTH && n <= COLUMN_HARD_MAX ? n : null;
 }
 
 /** The query parameter that seeds open pull requests: `?prs=1`. */
@@ -586,8 +604,8 @@ export function applyVisualFixtures(
   // was explicitly asked for, and the capture harness always launches with a fresh user-data-dir.
   const conciergeWidth = visualConciergeWidth(search);
   if (conciergeWidth !== null && typeof localStorage !== "undefined") {
-    localStorage.setItem("sparkle-concierge-width", String(conciergeWidth));
-    localStorage.setItem("sparkle-concierge-width:2", String(conciergeWidth));
+    localStorage.setItem(CONCIERGE_WIDTH_KEY, String(conciergeWidth));
+    localStorage.setItem(CONCIERGE_WIDTH_KEY_PAIRED, String(conciergeWidth));
   }
 
   // ── OPEN PULL REQUESTS, ANSWERED AT THE IPC BOUNDARY ────────────────────────────────────────
